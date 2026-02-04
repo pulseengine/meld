@@ -15,14 +15,14 @@ Today, multiple WebAssembly components can be composed using tools like WAC,
 but they still require runtime linking. This prevents:
 
 - Whole-program optimization across component boundaries
-- Using tools like LOOM to optimize the entire component graph
+- Using tools like loom to optimize the entire component graph
 - Direct browser execution without a component runtime
 - Efficient native transpilation to embedded targets
 
 Meld solves this by statically linking all components at build time:
 
 ```
-P2/P3 Components → meld → Single Module → LOOM optimize → Browser/Native
+P2/P3 Components → meld → Single Module → loom optimize → Browser/Native
 ```
 
 ## Installation
@@ -85,7 +85,7 @@ wac compose component_a.wasm component_b.wasm -o composed.wasm
 # 3. Fuse into single module
 meld fuse composed.wasm -o fused.wasm
 
-# 4. Optimize with LOOM
+# 4. Optimize with loom
 loom optimize fused.wasm -o optimized.wasm
 
 # 5. Run in browser or runtime
@@ -124,7 +124,7 @@ wasmtime run optimized.wasm
 │           │                                                   │
 │           ▼                                                   │
 │  ┌─────────────────┐                                          │
-│  │      LOOM       │  (whole-program optimization)            │
+│  │      loom       │  (whole-program optimization)            │
 │  └────────┬────────┘                                          │
 │           │                                                   │
 └───────────┼───────────────────────────────────────────────────┘
