@@ -44,6 +44,7 @@ pub mod resolver;
 pub mod merger;
 pub mod adapter;
 pub mod attestation;
+pub mod rewriter;
 
 pub use error::{Error, Result};
 pub use parser::{ParsedComponent, ComponentParser};

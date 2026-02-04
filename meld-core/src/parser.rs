@@ -76,6 +76,18 @@ pub struct CoreModule {
 
     /// Custom sections
     pub custom_sections: Vec<(String, Vec<u8>)>,
+
+    /// Code section byte range (start, end) within module bytes
+    pub code_section_range: Option<(usize, usize)>,
+
+    /// Global section byte range for init expressions
+    pub global_section_range: Option<(usize, usize)>,
+
+    /// Element section byte range
+    pub element_section_range: Option<(usize, usize)>,
+
+    /// Data section byte range
+    pub data_section_range: Option<(usize, usize)>,
 }
 
 /// Function type signature
@@ -470,6 +482,10 @@ impl ComponentParser {
             data_count: None,
             element_count: 0,
             custom_sections: Vec::new(),
+            code_section_range: None,
+            global_section_range: None,
+            element_section_range: None,
+            data_section_range: None,
         };
 
         // Parse the core module
@@ -592,6 +608,15 @@ impl ComponentParser {
 
                 Payload::ElementSection(reader) => {
                     module.element_count = reader.count();
+                    module.element_section_range = Some((reader.range().start, reader.range().end));
+                }
+
+                Payload::CodeSectionStart { range, .. } => {
+                    module.code_section_range = Some((range.start, range.end));
+                }
+
+                Payload::DataSection(reader) => {
+                    module.data_section_range = Some((reader.range().start, reader.range().end));
                 }
 
                 Payload::CustomSection(reader) => {

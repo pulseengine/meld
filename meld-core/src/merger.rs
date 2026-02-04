@@ -8,6 +8,7 @@ use crate::parser::{
     ParsedComponent, TableType,
 };
 use crate::resolver::DependencyGraph;
+use crate::rewriter::{IndexMaps, rewrite_function_body};
 use crate::{Error, MemoryStrategy, Result};
 use std::collections::HashMap;
 use wasm_encoder::{
@@ -15,6 +16,7 @@ use wasm_encoder::{
     Function, GlobalType as EncoderGlobalType, MemoryType as EncoderMemoryType,
     RefType, TableType as EncoderTableType, ValType,
 };
+use wasmparser::{Parser, Payload};
 
 /// A merged WebAssembly module ready for encoding
 #[derive(Debug, Clone)]
@@ -252,8 +254,10 @@ impl Merger {
             });
         }
 
-        // Merge functions
+        // First pass: build all function index mappings
         let func_offset = merged.functions.len() as u32;
+        let mut func_type_indices = Vec::new();
+
         for (old_idx, &type_idx) in module.functions.iter().enumerate() {
             let new_func_idx = func_offset + old_idx as u32;
             let old_func_idx = import_func_count + old_idx as u32;
@@ -272,10 +276,20 @@ impl Merger {
                     max: module.types.len() as u32,
                 })?;
 
-            // Create function body
-            // In a real implementation, we would extract and rewrite the actual bytecode
-            // For now, create a placeholder that will be filled in by actual parsing
-            let body = extract_function_body(module, old_idx)?;
+            func_type_indices.push((old_idx, old_func_idx, new_type_idx));
+        }
+
+        // Build IndexMaps for this module's function bodies
+        let index_maps = build_index_maps_for_module(
+            comp_idx,
+            mod_idx,
+            module,
+            merged,
+        );
+
+        // Second pass: extract and rewrite function bodies
+        for (old_idx, old_func_idx, new_type_idx) in func_type_indices {
+            let body = extract_function_body(module, old_idx, &index_maps)?;
 
             merged.functions.push(MergedFunction {
                 type_idx: new_type_idx,
@@ -433,6 +447,84 @@ fn convert_global_type(global: &GlobalType) -> EncoderGlobalType {
     }
 }
 
+/// Build IndexMaps for a module from the merger's index maps
+///
+/// This creates a local view of index remappings for a specific module,
+/// which is used when rewriting function bodies.
+fn build_index_maps_for_module(
+    comp_idx: usize,
+    mod_idx: usize,
+    module: &CoreModule,
+    merged: &MergedModule,
+) -> IndexMaps {
+    let mut maps = IndexMaps::new();
+
+    // Build function map (including imported functions)
+    let import_func_count = module.imports.iter()
+        .filter(|i| matches!(i.kind, ImportKind::Function(_)))
+        .count() as u32;
+
+    // Map imported functions (they're resolved elsewhere, map to self for now)
+    for i in 0..import_func_count {
+        if let Some(&new_idx) = merged.function_index_map.get(&(comp_idx, mod_idx, i)) {
+            maps.functions.insert(i, new_idx);
+        }
+    }
+
+    // Map defined functions
+    for old_idx in 0..module.functions.len() as u32 {
+        let full_idx = import_func_count + old_idx;
+        if let Some(&new_idx) = merged.function_index_map.get(&(comp_idx, mod_idx, full_idx)) {
+            maps.functions.insert(full_idx, new_idx);
+        }
+    }
+
+    // Build type map
+    for old_idx in 0..module.types.len() as u32 {
+        if let Some(&new_idx) = merged.type_index_map.get(&(comp_idx, mod_idx, old_idx)) {
+            maps.types.insert(old_idx, new_idx);
+        }
+    }
+
+    // Build global map
+    let import_global_count = module.imports.iter()
+        .filter(|i| matches!(i.kind, ImportKind::Global(_)))
+        .count() as u32;
+
+    for old_idx in 0..module.globals.len() as u32 {
+        let full_idx = import_global_count + old_idx;
+        if let Some(&new_idx) = merged.global_index_map.get(&(comp_idx, mod_idx, full_idx)) {
+            maps.globals.insert(full_idx, new_idx);
+        }
+    }
+
+    // Build table map
+    let import_table_count = module.imports.iter()
+        .filter(|i| matches!(i.kind, ImportKind::Table(_)))
+        .count() as u32;
+
+    for old_idx in 0..module.tables.len() as u32 {
+        let full_idx = import_table_count + old_idx;
+        if let Some(&new_idx) = merged.table_index_map.get(&(comp_idx, mod_idx, full_idx)) {
+            maps.tables.insert(full_idx, new_idx);
+        }
+    }
+
+    // Build memory map
+    let import_mem_count = module.imports.iter()
+        .filter(|i| matches!(i.kind, ImportKind::Memory(_)))
+        .count() as u32;
+
+    for old_idx in 0..module.memories.len() as u32 {
+        let full_idx = import_mem_count + old_idx;
+        if let Some(&new_idx) = merged.memory_index_map.get(&(comp_idx, mod_idx, full_idx)) {
+            maps.memories.insert(full_idx, new_idx);
+        }
+    }
+
+    maps
+}
+
 /// Create a default global initializer expression
 fn create_global_init(val_type: &ValType) -> ConstExpr {
     match val_type {
@@ -445,18 +537,43 @@ fn create_global_init(val_type: &ValType) -> ConstExpr {
     }
 }
 
-/// Extract function body from module bytes
-/// In a real implementation, this would parse the code section
-fn extract_function_body(_module: &CoreModule, _func_idx: usize) -> Result<Function> {
-    // For now, create an empty function body
-    // Real implementation would:
-    // 1. Parse the code section from module.bytes
-    // 2. Rewrite all indices (functions, globals, tables, memories)
-    // 3. Return the rewritten function
-    let mut func = Function::new([]);
-    func.instruction(&wasm_encoder::Instruction::Unreachable);
-    func.instruction(&wasm_encoder::Instruction::End);
-    Ok(func)
+/// Extract and rewrite function body from module bytes
+///
+/// This function:
+/// 1. Parses the code section from the module bytes
+/// 2. Finds the function body at the specified index
+/// 3. Rewrites all index references using the provided maps
+fn extract_function_body(module: &CoreModule, func_idx: usize, maps: &IndexMaps) -> Result<Function> {
+    // If no code section, return an unreachable function
+    let Some((start, end)) = module.code_section_range else {
+        let mut func = Function::new([]);
+        func.instruction(&wasm_encoder::Instruction::Unreachable);
+        func.instruction(&wasm_encoder::Instruction::End);
+        return Ok(func);
+    };
+
+    // Parse the code section to find the function body
+    let code_bytes = &module.bytes[start..end];
+    let parser = Parser::new(0);
+
+    let mut current_func_idx = 0;
+    for payload in parser.parse_all(code_bytes) {
+        let payload = payload?;
+        if let Payload::CodeSectionEntry(body) = payload {
+            if current_func_idx == func_idx {
+                // Found the function - rewrite it with the index maps
+                return rewrite_function_body(&body, maps);
+            }
+            current_func_idx += 1;
+        }
+    }
+
+    // Function not found - return unreachable
+    Err(Error::IndexOutOfBounds {
+        kind: "function",
+        index: func_idx as u32,
+        max: current_func_idx as u32,
+    })
 }
 
 impl Default for Merger {
