@@ -17,6 +17,7 @@ rust_binary(
         "@meld_deps//:env_logger",
         "@meld_deps//:log",
         "@meld_deps//:serde_json",
+        "@meld_deps//:wasmparser",
     ],
 )
 
