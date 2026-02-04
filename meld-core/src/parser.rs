@@ -4,11 +4,10 @@
 //! the core modules, types, imports, and exports needed for fusion.
 
 use crate::{Error, Result};
-use wasmparser::{
-    ComponentExternalKind, ComponentTypeRef, ExternalKind, Parser, Payload,
-    ValType as WasmValType,
-};
 use wasm_encoder::ValType;
+use wasmparser::{
+    ComponentExternalKind, ComponentTypeRef, ExternalKind, Parser, Payload, ValType as WasmValType,
+};
 
 /// A parsed WebAssembly component
 #[derive(Debug, Clone)]
@@ -351,7 +350,10 @@ impl ComponentParser {
                 // Already handled
             }
 
-            Payload::ModuleSection { parser, unchecked_range } => {
+            Payload::ModuleSection {
+                parser,
+                unchecked_range,
+            } => {
                 // Found an embedded core module
                 let module_bytes = &_full_bytes[unchecked_range.start..unchecked_range.end];
                 let core_module = self.parse_core_module(
@@ -407,9 +409,7 @@ impl ComponentParser {
                         wasmparser::Instance::FromExports(exports) => {
                             let parsed: Vec<_> = exports
                                 .iter()
-                                .map(|export| {
-                                    (export.name.to_string(), export.kind, export.index)
-                                })
+                                .map(|export| (export.name.to_string(), export.kind, export.index))
                                 .collect();
                             InstanceKind::FromExports(parsed)
                         }
@@ -497,10 +497,20 @@ impl ComponentParser {
                     for rec_group in reader {
                         let rec_group = rec_group?;
                         for subtype in rec_group.into_types() {
-                            if let wasmparser::CompositeInnerType::Func(ft) = &subtype.composite_type.inner {
+                            if let wasmparser::CompositeInnerType::Func(ft) =
+                                &subtype.composite_type.inner
+                            {
                                 module.types.push(FuncType {
-                                    params: ft.params().iter().map(|t| convert_val_type(*t)).collect(),
-                                    results: ft.results().iter().map(|t| convert_val_type(*t)).collect(),
+                                    params: ft
+                                        .params()
+                                        .iter()
+                                        .map(|t| convert_val_type(*t))
+                                        .collect(),
+                                    results: ft
+                                        .results()
+                                        .iter()
+                                        .map(|t| convert_val_type(*t))
+                                        .collect(),
                                 });
                             }
                         }
@@ -528,7 +538,9 @@ impl ComponentParser {
                                 mutable: g.mutable,
                             }),
                             wasmparser::TypeRef::Tag(_) => {
-                                return Err(Error::UnsupportedFeature("exception handling tags".to_string()));
+                                return Err(Error::UnsupportedFeature(
+                                    "exception handling tags".to_string(),
+                                ));
                             }
                         };
                         module.imports.push(ModuleImport {
@@ -587,7 +599,9 @@ impl ComponentParser {
                             wasmparser::ExternalKind::Memory => ExportKind::Memory,
                             wasmparser::ExternalKind::Global => ExportKind::Global,
                             wasmparser::ExternalKind::Tag => {
-                                return Err(Error::UnsupportedFeature("exception handling tags".to_string()));
+                                return Err(Error::UnsupportedFeature(
+                                    "exception handling tags".to_string(),
+                                ));
                             }
                         };
                         module.exports.push(ModuleExport {
@@ -620,10 +634,9 @@ impl ComponentParser {
                 }
 
                 Payload::CustomSection(reader) => {
-                    module.custom_sections.push((
-                        reader.name().to_string(),
-                        reader.data().to_vec(),
-                    ));
+                    module
+                        .custom_sections
+                        .push((reader.name().to_string(), reader.data().to_vec()));
                 }
 
                 _ => {}

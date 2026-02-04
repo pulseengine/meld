@@ -3,9 +3,7 @@
 //! This module handles building the import/export graph between components
 //! and performing topological sort for instantiation order.
 
-use crate::parser::{
-    ComponentExport, ImportKind, ModuleExport, ParsedComponent,
-};
+use crate::parser::{ComponentExport, ImportKind, ModuleExport, ParsedComponent};
 use crate::{Error, Result};
 use std::collections::HashMap;
 
@@ -176,9 +174,8 @@ impl Resolver {
                 // Look for a matching export
                 if let Some(exports) = export_index.get(&import.name) {
                     // Find an export from a different component
-                    if let Some((export_comp_idx, _export)) = exports
-                        .iter()
-                        .find(|(idx, _)| *idx != comp_idx)
+                    if let Some((export_comp_idx, _export)) =
+                        exports.iter().find(|(idx, _)| *idx != comp_idx)
                     {
                         graph.resolved_imports.insert(
                             (comp_idx, import.name.clone()),
@@ -273,11 +270,7 @@ impl Resolver {
     }
 
     /// Perform topological sort on components
-    fn topological_sort(
-        &self,
-        n: usize,
-        edges: &[(usize, usize)],
-    ) -> Result<Vec<usize>> {
+    fn topological_sort(&self, n: usize, edges: &[(usize, usize)]) -> Result<Vec<usize>> {
         // Build adjacency list and in-degree count
         let mut adj: Vec<Vec<usize>> = vec![Vec::new(); n];
         let mut in_degree = vec![0usize; n];
@@ -288,9 +281,7 @@ impl Resolver {
         }
 
         // Kahn's algorithm
-        let mut queue: Vec<usize> = (0..n)
-            .filter(|&i| in_degree[i] == 0)
-            .collect();
+        let mut queue: Vec<usize> = (0..n).filter(|&i| in_degree[i] == 0).collect();
         let mut result = Vec::with_capacity(n);
 
         while let Some(node) = queue.pop() {
@@ -337,9 +328,8 @@ impl Resolver {
                 if has_import {
                     // Find the target module that exports this
                     for (to_mod_idx, to_module) in to_component.core_modules.iter().enumerate() {
-                        let has_export = to_module.exports.iter().any(|exp| {
-                            exp.name == *export_name
-                        });
+                        let has_export =
+                            to_module.exports.iter().any(|exp| exp.name == *export_name);
 
                         if has_export {
                             // Determine if we need adapters
@@ -391,11 +381,7 @@ mod tests {
         let result = resolver.topological_sort(3, &edges).unwrap();
 
         // Verify order: 0 before 1, 1 before 2
-        let pos: HashMap<usize, usize> = result
-            .iter()
-            .enumerate()
-            .map(|(i, &v)| (v, i))
-            .collect();
+        let pos: HashMap<usize, usize> = result.iter().enumerate().map(|(i, &v)| (v, i)).collect();
         assert!(pos[&0] < pos[&1]);
         assert!(pos[&1] < pos[&2]);
     }

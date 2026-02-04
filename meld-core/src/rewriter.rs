@@ -6,10 +6,9 @@
 
 use crate::{Error, Result};
 use std::collections::HashMap;
-use wasm_encoder::{Function, Instruction, BlockType, MemArg};
+use wasm_encoder::{BlockType, Function, Instruction, MemArg};
 use wasmparser::{
-    FunctionBody, Operator, OperatorsReader,
-    BlockType as WpBlockType, MemArg as WpMemArg,
+    BlockType as WpBlockType, FunctionBody, MemArg as WpMemArg, Operator, OperatorsReader,
 };
 
 /// Index mappings for rewriting
@@ -60,10 +59,7 @@ impl IndexMaps {
 }
 
 /// Rewrite a function body with new index mappings
-pub fn rewrite_function_body(
-    body: &FunctionBody<'_>,
-    maps: &IndexMaps,
-) -> Result<Function> {
+pub fn rewrite_function_body(body: &FunctionBody<'_>, maps: &IndexMaps) -> Result<Function> {
     let locals_reader = body.get_locals_reader()?;
 
     // Collect locals
@@ -120,12 +116,14 @@ fn rewrite_operator(op: Operator<'_>, maps: &IndexMaps) -> Result<Instruction<'s
 
         // Calls - these need index remapping
         Call { function_index } => Instruction::Call(maps.remap_func(function_index)),
-        CallIndirect { type_index, table_index, .. } => {
-            Instruction::CallIndirect {
-                type_index: maps.remap_type(type_index),
-                table_index: maps.remap_table(table_index),
-            }
-        }
+        CallIndirect {
+            type_index,
+            table_index,
+            ..
+        } => Instruction::CallIndirect {
+            type_index: maps.remap_type(type_index),
+            table_index: maps.remap_table(table_index),
+        },
 
         // Reference types
         RefNull { hty } => Instruction::RefNull(convert_heap_type(hty)),
@@ -149,7 +147,10 @@ fn rewrite_operator(op: Operator<'_>, maps: &IndexMaps) -> Result<Instruction<'s
         TableGrow { table } => Instruction::TableGrow(maps.remap_table(table)),
         TableSize { table } => Instruction::TableSize(maps.remap_table(table)),
         TableFill { table } => Instruction::TableFill(maps.remap_table(table)),
-        TableCopy { dst_table, src_table } => Instruction::TableCopy {
+        TableCopy {
+            dst_table,
+            src_table,
+        } => Instruction::TableCopy {
             src_table: maps.remap_table(src_table),
             dst_table: maps.remap_table(dst_table),
         },
@@ -406,22 +407,20 @@ fn convert_ref_type(rt: wasmparser::RefType) -> wasm_encoder::RefType {
 fn convert_heap_type(ht: wasmparser::HeapType) -> wasm_encoder::HeapType {
     match ht {
         wasmparser::HeapType::Concrete(_) => wasm_encoder::HeapType::Concrete(0),
-        wasmparser::HeapType::Abstract { shared: _, ty } => {
-            match ty {
-                wasmparser::AbstractHeapType::Func => wasm_encoder::HeapType::Abstract {
-                    shared: false,
-                    ty: wasm_encoder::AbstractHeapType::Func,
-                },
-                wasmparser::AbstractHeapType::Extern => wasm_encoder::HeapType::Abstract {
-                    shared: false,
-                    ty: wasm_encoder::AbstractHeapType::Extern,
-                },
-                _ => wasm_encoder::HeapType::Abstract {
-                    shared: false,
-                    ty: wasm_encoder::AbstractHeapType::Func,
-                },
-            }
-        }
+        wasmparser::HeapType::Abstract { shared: _, ty } => match ty {
+            wasmparser::AbstractHeapType::Func => wasm_encoder::HeapType::Abstract {
+                shared: false,
+                ty: wasm_encoder::AbstractHeapType::Func,
+            },
+            wasmparser::AbstractHeapType::Extern => wasm_encoder::HeapType::Abstract {
+                shared: false,
+                ty: wasm_encoder::AbstractHeapType::Extern,
+            },
+            _ => wasm_encoder::HeapType::Abstract {
+                shared: false,
+                ty: wasm_encoder::AbstractHeapType::Func,
+            },
+        },
     }
 }
 
@@ -450,6 +449,9 @@ mod tests {
         assert!(matches!(empty, BlockType::Empty));
 
         let result = convert_block_type(WpBlockType::Type(wasmparser::ValType::I32), &maps);
-        assert!(matches!(result, BlockType::Result(wasm_encoder::ValType::I32)));
+        assert!(matches!(
+            result,
+            BlockType::Result(wasm_encoder::ValType::I32)
+        ));
     }
 }

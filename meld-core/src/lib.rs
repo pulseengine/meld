@@ -38,19 +38,20 @@
 //! - **Phase 1** (current): Single shared memory space
 //! - **Phase 2** (future): Multi-memory support where each component keeps its own memory
 
-mod error;
-pub mod parser;
-pub mod resolver;
-pub mod merger;
 pub mod adapter;
 pub mod attestation;
+mod error;
+pub mod merger;
+pub mod parser;
+pub mod resolver;
 pub mod rewriter;
+pub mod segments;
 
+pub use adapter::{AdapterConfig, AdapterGenerator};
 pub use error::{Error, Result};
-pub use parser::{ParsedComponent, ComponentParser};
-pub use resolver::{DependencyGraph, Resolver};
 pub use merger::{MergedModule, Merger};
-pub use adapter::{AdapterGenerator, AdapterConfig};
+pub use parser::{ComponentParser, ParsedComponent};
+pub use resolver::{DependencyGraph, Resolver};
 
 use wasm_encoder::Module as EncodedModule;
 
@@ -201,7 +202,10 @@ impl Fuser {
         }
 
         // Step 1: Resolve dependencies
-        log::info!("Resolving dependencies for {} components", self.components.len());
+        log::info!(
+            "Resolving dependencies for {} components",
+            self.components.len()
+        );
         let resolver = Resolver::new();
         let graph = resolver.resolve(&self.components)?;
         stats.imports_resolved = graph.resolved_imports.len();
@@ -254,10 +258,9 @@ impl Fuser {
         if !merged.types.is_empty() {
             let mut types = wasm_encoder::TypeSection::new();
             for ty in &merged.types {
-                types.ty().function(
-                    ty.params.iter().copied(),
-                    ty.results.iter().copied(),
-                );
+                types
+                    .ty()
+                    .function(ty.params.iter().copied(), ty.results.iter().copied());
             }
             module.section(&types);
         }
@@ -266,11 +269,7 @@ impl Fuser {
         if !merged.imports.is_empty() {
             let mut imports = wasm_encoder::ImportSection::new();
             for imp in &merged.imports {
-                imports.import(
-                    &imp.module,
-                    &imp.name,
-                    imp.entity_type.clone(),
-                );
+                imports.import(&imp.module, &imp.name, imp.entity_type.clone());
             }
             module.section(&imports);
         }
@@ -310,10 +309,7 @@ impl Fuser {
         if !merged.globals.is_empty() {
             let mut globals = wasm_encoder::GlobalSection::new();
             for global in &merged.globals {
-                globals.global(
-                    global.ty.clone(),
-                    &global.init_expr,
-                );
+                globals.global(global.ty.clone(), &global.init_expr);
             }
             module.section(&globals);
         }
@@ -329,13 +325,19 @@ impl Fuser {
 
         // Encode start function if present
         if let Some(start_idx) = merged.start_function {
-            module.section(&wasm_encoder::StartSection { function_index: start_idx });
+            module.section(&wasm_encoder::StartSection {
+                function_index: start_idx,
+            });
         }
 
-        // Encode element section (raw bytes, preserved from original modules)
-        // Note: Element segments require complex reindexing which is TODO
-        // For now we skip them; real implementation would reindex function refs
-        let _ = &merged.elements;
+        // Encode element section (reindexed segments)
+        if !merged.elements.is_empty() {
+            let mut elements = wasm_encoder::ElementSection::new();
+            for segment in &merged.elements {
+                elements.segment(segments::encode_element_segment(segment));
+            }
+            module.section(&elements);
+        }
 
         // Encode code section
         if !merged.functions.is_empty() || !adapters.is_empty() {
@@ -354,10 +356,14 @@ impl Fuser {
             module.section(&code);
         }
 
-        // Encode data section (raw bytes, preserved from original modules)
-        // Note: Data segments with memory references need reindexing which is TODO
-        // For now we skip them; real implementation would adjust memory indices
-        let _ = &merged.data_segments;
+        // Encode data section (reindexed segments)
+        if !merged.data_segments.is_empty() {
+            let mut data = wasm_encoder::DataSection::new();
+            for segment in &merged.data_segments {
+                data.segment(segments::encode_data_segment(segment));
+            }
+            module.section(&data);
+        }
 
         // Handle custom sections based on config
         if self.config.custom_sections != CustomSectionHandling::Drop {

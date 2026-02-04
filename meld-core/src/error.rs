@@ -34,16 +34,11 @@ pub enum Error {
 
     /// Import resolution error
     #[error("unresolved import: {module}::{name}")]
-    UnresolvedImport {
-        module: String,
-        name: String,
-    },
+    UnresolvedImport { module: String, name: String },
 
     /// Export conflict during merge
     #[error("conflicting exports: {name} defined in multiple components")]
-    ConflictingExports {
-        name: String,
-    },
+    ConflictingExports { name: String },
 
     /// Circular dependency detected
     #[error("circular dependency detected between components")]
@@ -51,10 +46,7 @@ pub enum Error {
 
     /// Type mismatch during resolution
     #[error("type mismatch: import expects {expected}, but export provides {actual}")]
-    TypeMismatch {
-        expected: String,
-        actual: String,
-    },
+    TypeMismatch { expected: String, actual: String },
 
     /// Memory strategy not supported
     #[error("memory strategy not supported: {0}")]

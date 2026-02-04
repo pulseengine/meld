@@ -95,11 +95,9 @@ fn main() -> Result<()> {
 
     // Initialize logging
     if cli.verbose {
-        env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("debug"))
-            .init();
+        env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("debug")).init();
     } else {
-        env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn"))
-            .init();
+        env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
     }
 
     match cli.command {
@@ -112,10 +110,22 @@ fn main() -> Result<()> {
             preserve_names,
             validate,
         }) => {
-            fuse_command(inputs, output, memory, stats, no_attestation, preserve_names, validate)?;
+            fuse_command(
+                inputs,
+                output,
+                memory,
+                stats,
+                no_attestation,
+                preserve_names,
+                validate,
+            )?;
         }
 
-        Some(Commands::Inspect { input, types, interfaces }) => {
+        Some(Commands::Inspect {
+            input,
+            types,
+            interfaces,
+        }) => {
             inspect_command(input, types, interfaces)?;
         }
 
@@ -159,7 +169,10 @@ fn fuse_command(
     preserve_names: bool,
     validate: bool,
 ) -> Result<()> {
-    println!("Meld v{} - Static Component Fusion", env!("CARGO_PKG_VERSION"));
+    println!(
+        "Meld v{} - Static Component Fusion",
+        env!("CARGO_PKG_VERSION")
+    );
 
     // Parse memory strategy
     let memory_strategy = match memory.as_str() {
@@ -168,7 +181,12 @@ fn fuse_command(
             println!("Multi-memory support is experimental (Phase 2)");
             MemoryStrategy::MultiMemory
         }
-        _ => return Err(anyhow!("Invalid memory strategy: {}. Use 'shared' or 'multi'", memory)),
+        _ => {
+            return Err(anyhow!(
+                "Invalid memory strategy: {}. Use 'shared' or 'multi'",
+                memory
+            ))
+        }
     };
 
     // Configure fuser
@@ -194,15 +212,15 @@ fn fuse_command(
             return Err(anyhow!("Input file not found: {}", input_path));
         }
 
-        let bytes = fs::read(path)
-            .with_context(|| format!("Failed to read {}", input_path))?;
+        let bytes = fs::read(path).with_context(|| format!("Failed to read {}", input_path))?;
 
         let size = bytes.len();
         total_input_size += size;
 
         println!("  {} ({} bytes)", input_path, size);
 
-        fuser.add_component_named(&bytes, Some(input_path))
+        fuser
+            .add_component_named(&bytes, Some(input_path))
             .with_context(|| format!("Failed to parse {}", input_path))?;
     }
 
@@ -210,8 +228,7 @@ fn fuse_command(
     println!("Fusing {} components...", fuser.component_count());
 
     // Perform fusion
-    let (fused_bytes, stats) = fuser.fuse_with_stats()
-        .context("Fusion failed")?;
+    let (fused_bytes, stats) = fuser.fuse_with_stats().context("Fusion failed")?;
 
     let elapsed = start.elapsed();
 
@@ -224,8 +241,7 @@ fn fuse_command(
     }
 
     // Write output
-    fs::write(&output, &fused_bytes)
-        .with_context(|| format!("Failed to write {}", output))?;
+    fs::write(&output, &fused_bytes).with_context(|| format!("Failed to write {}", output))?;
 
     println!();
     println!("Output: {} ({} bytes)", output, fused_bytes.len());
@@ -302,8 +318,7 @@ fn inspect_command(input: String, show_types: bool, show_interfaces: bool) -> Re
         return Err(anyhow!("Input file not found: {}", input));
     }
 
-    let bytes = fs::read(path)
-        .with_context(|| format!("Failed to read {}", input))?;
+    let bytes = fs::read(path).with_context(|| format!("Failed to read {}", input))?;
 
     println!("Inspecting: {}", input);
     println!("  Size: {} bytes", bytes.len());
@@ -335,8 +350,7 @@ fn inspect_command(input: String, show_types: bool, show_interfaces: bool) -> Re
 
     // Parse the component
     let parser = meld_core::ComponentParser::new();
-    let component = parser.parse(&bytes)
-        .context("Failed to parse component")?;
+    let component = parser.parse(&bytes).context("Failed to parse component")?;
 
     println!("  Core modules: {}", component.core_modules.len());
     println!("  Imports: {}", component.imports.len());
@@ -392,8 +406,13 @@ fn validate_wasm(bytes: &[u8]) -> Result<()> {
 
         // Validate each payload
         match &payload {
-            Payload::Version { num, encoding, range } => {
-                validator.version(*num, *encoding, range)
+            Payload::Version {
+                num,
+                encoding,
+                range,
+            } => {
+                validator
+                    .version(*num, *encoding, range)
                     .context("Invalid version")?;
             }
             _ => {
@@ -419,10 +438,7 @@ mod tests {
     #[test]
     fn test_cli_fuse_args() {
         let cli = Cli::try_parse_from([
-            "meld", "fuse",
-            "a.wasm", "b.wasm",
-            "-o", "out.wasm",
-            "--stats",
+            "meld", "fuse", "a.wasm", "b.wasm", "-o", "out.wasm", "--stats",
         ]);
         assert!(cli.is_ok());
     }

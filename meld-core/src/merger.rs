@@ -4,17 +4,16 @@
 //! reindexing all references (functions, tables, memories, globals).
 
 use crate::parser::{
-    CoreModule, ExportKind, GlobalType, ImportKind, MemoryType,
-    ParsedComponent, TableType,
+    CoreModule, ExportKind, GlobalType, ImportKind, MemoryType, ParsedComponent, TableType,
 };
 use crate::resolver::DependencyGraph;
-use crate::rewriter::{IndexMaps, rewrite_function_body};
+use crate::rewriter::{rewrite_function_body, IndexMaps};
 use crate::{Error, MemoryStrategy, Result};
 use std::collections::HashMap;
 use wasm_encoder::{
-    ConstExpr, EntityType, ExportKind as EncoderExportKind,
-    Function, GlobalType as EncoderGlobalType, MemoryType as EncoderMemoryType,
-    RefType, TableType as EncoderTableType, ValType,
+    ConstExpr, EntityType, ExportKind as EncoderExportKind, Function,
+    GlobalType as EncoderGlobalType, MemoryType as EncoderMemoryType, RefType,
+    TableType as EncoderTableType, ValType,
 };
 use wasmparser::{Parser, Payload};
 
@@ -45,11 +44,11 @@ pub struct MergedModule {
     /// Start function index (if any)
     pub start_function: Option<u32>,
 
-    /// Element segments (raw bytes for now)
-    pub elements: Vec<Vec<u8>>,
+    /// Element segments (parsed and reindexed)
+    pub elements: Vec<crate::segments::ReindexedElementSegment>,
 
-    /// Data segments (raw bytes for now)
-    pub data_segments: Vec<Vec<u8>>,
+    /// Data segments (parsed and reindexed)
+    pub data_segments: Vec<crate::segments::ReindexedDataSegment>,
 
     /// Custom sections
     pub custom_sections: Vec<(String, Vec<u8>)>,
@@ -262,13 +261,13 @@ impl Merger {
             let new_func_idx = func_offset + old_idx as u32;
             let old_func_idx = import_func_count + old_idx as u32;
 
-            merged.function_index_map.insert(
-                (comp_idx, mod_idx, old_func_idx),
-                new_func_idx,
-            );
+            merged
+                .function_index_map
+                .insert((comp_idx, mod_idx, old_func_idx), new_func_idx);
 
             // Get the remapped type index
-            let new_type_idx = *merged.type_index_map
+            let new_type_idx = *merged
+                .type_index_map
                 .get(&(comp_idx, mod_idx, type_idx))
                 .ok_or_else(|| Error::IndexOutOfBounds {
                     kind: "type",
@@ -280,12 +279,7 @@ impl Merger {
         }
 
         // Build IndexMaps for this module's function bodies
-        let index_maps = build_index_maps_for_module(
-            comp_idx,
-            mod_idx,
-            module,
-            merged,
-        );
+        let index_maps = build_index_maps_for_module(comp_idx, mod_idx, module, merged);
 
         // Second pass: extract and rewrite function bodies
         for (old_idx, old_func_idx, new_type_idx) in func_type_indices {
@@ -302,25 +296,29 @@ impl Merger {
         for export in &module.exports {
             let (kind, old_idx) = match export.kind {
                 ExportKind::Function => {
-                    let new_idx = *merged.function_index_map
+                    let new_idx = *merged
+                        .function_index_map
                         .get(&(comp_idx, mod_idx, export.index))
                         .unwrap_or(&export.index);
                     (EncoderExportKind::Func, new_idx)
                 }
                 ExportKind::Table => {
-                    let new_idx = *merged.table_index_map
+                    let new_idx = *merged
+                        .table_index_map
                         .get(&(comp_idx, mod_idx, export.index))
                         .unwrap_or(&export.index);
                     (EncoderExportKind::Table, new_idx)
                 }
                 ExportKind::Memory => {
-                    let new_idx = *merged.memory_index_map
+                    let new_idx = *merged
+                        .memory_index_map
                         .get(&(comp_idx, mod_idx, export.index))
                         .unwrap_or(&export.index);
                     (EncoderExportKind::Memory, new_idx)
                 }
                 ExportKind::Global => {
-                    let new_idx = *merged.global_index_map
+                    let new_idx = *merged
+                        .global_index_map
                         .get(&(comp_idx, mod_idx, export.index))
                         .unwrap_or(&export.index);
                     (EncoderExportKind::Global, new_idx)
@@ -346,6 +344,20 @@ impl Merger {
             merged.custom_sections.push((name.clone(), data.clone()));
         }
 
+        // Parse and merge element segments with reindexing
+        let element_segments = crate::segments::parse_element_segments(module)?;
+        for segment in element_segments {
+            let reindexed = crate::segments::reindex_element_segment(&segment, &index_maps);
+            merged.elements.push(reindexed);
+        }
+
+        // Parse and merge data segments with reindexing
+        let data_segments = crate::segments::parse_data_segments(module)?;
+        for segment in data_segments {
+            let reindexed = crate::segments::reindex_data_segment(&segment, &index_maps);
+            merged.data_segments.push(reindexed);
+        }
+
         Ok(())
     }
 
@@ -359,7 +371,8 @@ impl Merger {
             let entity_type = match &unresolved.kind {
                 ImportKind::Function(type_idx) => {
                     // Remap type index
-                    let new_type_idx = *merged.type_index_map
+                    let new_type_idx = *merged
+                        .type_index_map
                         .get(&(unresolved.component_idx, unresolved.module_idx, *type_idx))
                         .unwrap_or(type_idx);
                     EntityType::Function(new_type_idx)
@@ -390,7 +403,8 @@ impl Merger {
         for (comp_idx, component) in components.iter().enumerate() {
             for (mod_idx, module) in component.core_modules.iter().enumerate() {
                 if let Some(start_idx) = module.start {
-                    if let Some(&new_idx) = merged.function_index_map
+                    if let Some(&new_idx) = merged
+                        .function_index_map
                         .get(&(comp_idx, mod_idx, start_idx))
                     {
                         start_funcs.push(new_idx);
@@ -460,7 +474,9 @@ fn build_index_maps_for_module(
     let mut maps = IndexMaps::new();
 
     // Build function map (including imported functions)
-    let import_func_count = module.imports.iter()
+    let import_func_count = module
+        .imports
+        .iter()
         .filter(|i| matches!(i.kind, ImportKind::Function(_)))
         .count() as u32;
 
@@ -474,7 +490,10 @@ fn build_index_maps_for_module(
     // Map defined functions
     for old_idx in 0..module.functions.len() as u32 {
         let full_idx = import_func_count + old_idx;
-        if let Some(&new_idx) = merged.function_index_map.get(&(comp_idx, mod_idx, full_idx)) {
+        if let Some(&new_idx) = merged
+            .function_index_map
+            .get(&(comp_idx, mod_idx, full_idx))
+        {
             maps.functions.insert(full_idx, new_idx);
         }
     }
@@ -487,7 +506,9 @@ fn build_index_maps_for_module(
     }
 
     // Build global map
-    let import_global_count = module.imports.iter()
+    let import_global_count = module
+        .imports
+        .iter()
         .filter(|i| matches!(i.kind, ImportKind::Global(_)))
         .count() as u32;
 
@@ -499,7 +520,9 @@ fn build_index_maps_for_module(
     }
 
     // Build table map
-    let import_table_count = module.imports.iter()
+    let import_table_count = module
+        .imports
+        .iter()
         .filter(|i| matches!(i.kind, ImportKind::Table(_)))
         .count() as u32;
 
@@ -511,7 +534,9 @@ fn build_index_maps_for_module(
     }
 
     // Build memory map
-    let import_mem_count = module.imports.iter()
+    let import_mem_count = module
+        .imports
+        .iter()
         .filter(|i| matches!(i.kind, ImportKind::Memory(_)))
         .count() as u32;
 
@@ -543,7 +568,11 @@ fn create_global_init(val_type: &ValType) -> ConstExpr {
 /// 1. Parses the code section from the module bytes
 /// 2. Finds the function body at the specified index
 /// 3. Rewrites all index references using the provided maps
-fn extract_function_body(module: &CoreModule, func_idx: usize, maps: &IndexMaps) -> Result<Function> {
+fn extract_function_body(
+    module: &CoreModule,
+    func_idx: usize,
+    maps: &IndexMaps,
+) -> Result<Function> {
     // If no code section, return an unreachable function
     let Some((start, end)) = module.code_section_range else {
         let mut func = Function::new([]);

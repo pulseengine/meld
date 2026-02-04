@@ -16,7 +16,7 @@
 
 use crate::FusionStats;
 use serde::{Deserialize, Serialize};
-use sha2::{Sha256, Digest};
+use sha2::{Digest, Sha256};
 
 /// Custom section name for fusion attestation
 pub const FUSION_ATTESTATION_SECTION: &str = "wsc.transformation.attestation";
@@ -150,12 +150,7 @@ impl FusionAttestationBuilder {
     }
 
     /// Add an input component
-    pub fn add_input(
-        mut self,
-        bytes: &[u8],
-        name: impl Into<String>,
-        module_count: usize,
-    ) -> Self {
+    pub fn add_input(mut self, bytes: &[u8], name: impl Into<String>, module_count: usize) -> Self {
         let hash = compute_sha256(bytes);
         self.inputs.push(InputArtifact {
             artifact: ArtifactDescriptor {
@@ -292,7 +287,9 @@ fn generate_uuid() -> String {
         u16::from_be_bytes([bytes[4], bytes[5]]),
         u16::from_be_bytes([bytes[6], bytes[7]]),
         u16::from_be_bytes([bytes[8], bytes[9]]),
-        u64::from_be_bytes([0, 0, bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15]])
+        u64::from_be_bytes([
+            0, 0, bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15]
+        ])
     )
 }
 

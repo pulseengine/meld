@@ -41,8 +41,7 @@ impl FactStyleGenerator {
     ) -> Result<AdapterFunction> {
         let name = format!(
             "$adapter_{}_{}_to_{}_{}",
-            site.from_component, site.from_module,
-            site.to_component, site.to_module
+            site.from_component, site.from_module, site.to_component, site.to_module
         );
 
         // Determine adapter options based on call site
@@ -76,14 +75,18 @@ impl FactStyleGenerator {
         // Determine memory indices
         // In shared memory mode, all components use memory 0
         // In multi-memory mode, each component gets its own memory
-        if let Some(&caller_mem) = merged.memory_index_map
-            .get(&(site.from_component, site.from_module, 0))
+        if let Some(&caller_mem) =
+            merged
+                .memory_index_map
+                .get(&(site.from_component, site.from_module, 0))
         {
             options.caller_memory = caller_mem;
         }
 
-        if let Some(&callee_mem) = merged.memory_index_map
-            .get(&(site.to_component, site.to_module, 0))
+        if let Some(&callee_mem) =
+            merged
+                .memory_index_map
+                .get(&(site.to_component, site.to_module, 0))
         {
             options.callee_memory = callee_mem;
         }
@@ -105,7 +108,8 @@ impl FactStyleGenerator {
         let target_func = self.resolve_target_function(site, merged)?;
 
         // Find the target function's type
-        let type_idx = merged.functions
+        let type_idx = merged
+            .functions
             .get(target_func as usize)
             .map(|f| f.type_idx)
             .unwrap_or(0);
@@ -141,7 +145,8 @@ impl FactStyleGenerator {
         // This handles cases like copying byte arrays between components
 
         let target_func = self.resolve_target_function(site, merged)?;
-        let type_idx = merged.functions
+        let type_idx = merged
+            .functions
             .get(target_func as usize)
             .map(|f| f.type_idx)
             .unwrap_or(0);
@@ -185,7 +190,8 @@ impl FactStyleGenerator {
         options: &AdapterOptions,
     ) -> Result<(u32, Function)> {
         let target_func = self.resolve_target_function(site, merged)?;
-        let type_idx = merged.functions
+        let type_idx = merged
+            .functions
             .get(target_func as usize)
             .map(|f| f.type_idx)
             .unwrap_or(0);
@@ -201,7 +207,10 @@ impl FactStyleGenerator {
         // - Target encoding (callee)
         // - Whether we need to allocate new memory
 
-        match (options.caller_string_encoding, options.callee_string_encoding) {
+        match (
+            options.caller_string_encoding,
+            options.callee_string_encoding,
+        ) {
             (StringEncoding::Utf8, StringEncoding::Utf8) => {
                 // No transcoding needed, just copy
                 for i in 0..param_count {
@@ -295,7 +304,8 @@ impl FactStyleGenerator {
     fn resolve_target_function(&self, site: &AdapterSite, merged: &MergedModule) -> Result<u32> {
         // Look up the export in the target module and find its merged index
         // For now, use a simple heuristic
-        if let Some(&idx) = merged.function_index_map
+        if let Some(&idx) = merged
+            .function_index_map
             .get(&(site.to_component, site.to_module, 0))
         {
             return Ok(idx);
