@@ -30,12 +30,125 @@ git_override(
 )
 
 ###############################################################################
+# Rocq/Coq Formal Verification (rules_rocq_rust)
+###############################################################################
+
+# Rocq/Coq formal verification support
+# See: https://github.com/pulseengine/rules_rocq_rust
+# Requires nix to be installed: sh <(curl -L https://nixos.org/nix/install)
+bazel_dep(name = "rules_rocq_rust", version = "0.1.0")
+
+# Override to fetch from GitHub (not yet in BCR)
+git_override(
+    module_name = "rules_rocq_rust",
+    remote = "https://github.com/pulseengine/rules_rocq_rust.git",
+    commit = "307b65f",
+)
+
+# Rocq toolchain extension (creates internal nixpkgs for bzlmod compatibility)
+rocq = use_extension("@rules_rocq_rust//rocq:extensions.bzl", "rocq")
+rocq.toolchain(
+    version = "9.0",    # Rocq 9.0 for rocq-of-rust compatibility
+    strategy = "nix",   # Hermetic nix-based installation
+)
+use_repo(
+    rocq,
+    "rocq_coqutil",
+    "rocq_hammer",
+    "rocq_hammer_tactics",
+    "rocq_nixpkgs",
+    "rocq_smpl",
+    "rocq_stdlib",
+    "rocq_toolchains",
+)
+
+register_toolchains("@rocq_toolchains//:all")
+
+# rocq-of-rust toolchain for translating Rust to Rocq
+rocq_of_rust = use_extension("@rules_rocq_rust//coq_of_rust:extensions.bzl", "rocq_of_rust")
+rocq_of_rust.toolchain(
+    commit = "858907dbee116c51d7c6e87511bf5f92d6432ba4",  # Pinned for reproducibility
+    use_real_library = True,  # Full library with coqutil/hammer/smpl
+)
+use_repo(rocq_of_rust, "rocq_of_rust_toolchains", "rocq_of_rust_source")
+
+register_toolchains("@rocq_of_rust_toolchains//:toolchain")
+
+###############################################################################
+# Spec Test Suites (WebAssembly 3.0 + Component Model + WASI)
+###############################################################################
+
+git_repo = use_repo_rule("@bazel_tools//tools/build_defs/repo:git.bzl", "git_repository")
+
+git_repo(
+    name = "wasm_spec",
+    remote = "https://github.com/WebAssembly/spec.git",
+    commit = "9aa45e862ad616a1d93a115fe3ffd6c7cc2f7c2e",
+    build_file_content = """
+package(default_visibility = ["//visibility:public"])
+
+filegroup(
+    name = "core_tests",
+    srcs = glob(["test/core/**"], exclude_directories = 1),
+)
+
+filegroup(
+    name = "proposals_tests",
+    srcs = glob(["test/proposals/**"], exclude_directories = 1),
+)
+
+filegroup(
+    name = "core_spec_docs",
+    srcs = glob(["document/core/**"], exclude_directories = 1),
+)
+""",
+)
+
+git_repo(
+    name = "component_model_spec",
+    remote = "https://github.com/WebAssembly/component-model.git",
+    commit = "deb0b0a",
+    build_file_content = """
+package(default_visibility = ["//visibility:public"])
+
+filegroup(
+    name = "component_tests",
+    srcs = glob(["test/**"], exclude_directories = 1),
+)
+
+filegroup(
+    name = "component_spec_docs",
+    srcs = glob(["spec/**", "design/**"], exclude_directories = 1),
+)
+
+filegroup(
+    name = "component_wit",
+    srcs = glob(["wit/**"], exclude_directories = 1),
+)
+""",
+)
+
+git_repo(
+    name = "wasi_spec",
+    remote = "https://github.com/WebAssembly/WASI.git",
+    tag = "v0.2.3",
+    build_file_content = """
+package(default_visibility = ["//visibility:public"])
+
+filegroup(
+    name = "wit",
+    srcs = glob(["**/*.wit"]),
+)
+""",
+)
+
+###############################################################################
 # Rust Toolchain
 ###############################################################################
 
 rust = use_extension("@rules_rust//rust:extensions.bzl", "rust")
 rust.toolchain(
-    edition = "2021",
+    edition = "2024",
     extra_target_triples = ["wasm32-wasip2"],
     versions = ["1.85.0"],
 )

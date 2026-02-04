@@ -1,0 +1,104 @@
+load("@rules_rocq_rust//rocq:defs.bzl", "rocq_library", "rocq_proof_test")
+
+package(default_visibility = ["//visibility:public"])
+
+rocq_library(
+    name = "parser_proofs",
+    srcs = glob(["parser/*.v"]),
+)
+
+rocq_proof_test(
+    name = "parser_proofs_test",
+    deps = [":parser_proofs"],
+    tags = ["manual", "proofs"],
+)
+
+rocq_library(
+    name = "resolver_proofs",
+    srcs = glob(["resolver/*.v"]),
+)
+
+rocq_proof_test(
+    name = "resolver_proofs_test",
+    deps = [":resolver_proofs"],
+    tags = ["manual", "proofs"],
+)
+
+rocq_library(
+    name = "merger_proofs",
+    srcs = glob(["merger/*.v"]),
+)
+
+rocq_proof_test(
+    name = "merger_proofs_test",
+    deps = [":merger_proofs"],
+    tags = ["manual", "proofs"],
+)
+
+rocq_library(
+    name = "adapter_proofs",
+    srcs = glob(["adapter/*.v"]),
+)
+
+rocq_proof_test(
+    name = "adapter_proofs_test",
+    deps = [":adapter_proofs"],
+    tags = ["manual", "proofs"],
+)
+
+rocq_library(
+    name = "rewriter_proofs",
+    srcs = glob(["rewriter/*.v"]),
+)
+
+rocq_proof_test(
+    name = "rewriter_proofs_test",
+    deps = [":rewriter_proofs"],
+    tags = ["manual", "proofs"],
+)
+
+rocq_library(
+    name = "segments_proofs",
+    srcs = glob(["segments/*.v"]),
+)
+
+rocq_proof_test(
+    name = "segments_proofs_test",
+    deps = [":segments_proofs"],
+    tags = ["manual", "proofs"],
+)
+
+rocq_library(
+    name = "attestation_proofs",
+    srcs = glob(["attestation/*.v"]),
+)
+
+rocq_proof_test(
+    name = "attestation_proofs_test",
+    deps = [":attestation_proofs"],
+    tags = ["manual", "proofs"],
+)
+
+filegroup(
+    name = "proofs_docs",
+    srcs = [
+        "DECISIONS.md",
+        "README.md",
+        "rust_verified/README.md",
+    ],
+)
+
+filegroup(
+    name = "all_proofs",
+    srcs = [
+        ":parser_proofs",
+        ":resolver_proofs",
+        ":merger_proofs",
+        ":adapter_proofs",
+        ":rewriter_proofs",
+        ":segments_proofs",
+        ":attestation_proofs",
+        "//proofs/rust_verified:index_map",
+        "//proofs/rust_verified:index_map_proofs",
+    ],
+)

@@ -1,0 +1,26 @@
+package(default_visibility = ["//visibility:public"])
+
+filegroup(
+    name = "wasm_core_tests",
+    srcs = ["@wasm_spec//:core_tests"],
+)
+
+filegroup(
+    name = "wasm_proposals_tests",
+    srcs = ["@wasm_spec//:proposals_tests"],
+)
+
+filegroup(
+    name = "component_model_tests",
+    srcs = ["@component_model_spec//:component_tests"],
+)
+
+filegroup(
+    name = "component_model_wit",
+    srcs = ["@component_model_spec//:component_wit"],
+)
+
+filegroup(
+    name = "wasi_wit",
+    srcs = ["@wasi_spec//:wit"],
+)

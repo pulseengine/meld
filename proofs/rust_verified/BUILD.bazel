@@ -1,0 +1,36 @@
+# Rust-to-Rocq translation scaffolding for meld.
+
+load("@rules_rocq_rust//coq_of_rust:defs.bzl", "coq_of_rust_library")
+load("@rules_rocq_rust//rocq:defs.bzl", "rocq_library", "rocq_proof_test")
+
+package(default_visibility = ["//visibility:public"])
+
+alias(
+    name = "rocq_of_rust_lib",
+    actual = "@rocq_of_rust_source//:rocq_of_rust_main",
+)
+
+coq_of_rust_library(
+    name = "index_map_translated",
+    rust_sources = ["index_map.rs"],
+    edition = "2021",
+)
+
+rocq_library(
+    name = "index_map",
+    srcs = [":index_map_translated"],
+    deps = [":rocq_of_rust_lib"],
+    include_path = "meld",
+    extra_flags = ["-impredicative-set"],
+)
+
+rocq_library(
+    name = "index_map_proofs",
+    srcs = ["index_map_proofs.v"],
+)
+
+rocq_proof_test(
+    name = "index_map_proofs_test",
+    deps = [":index_map_proofs"],
+    tags = ["manual", "proofs"],
+)
