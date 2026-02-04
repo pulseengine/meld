@@ -215,7 +215,8 @@ impl FusionAttestationBuilder {
         let attestation_id = generate_uuid();
 
         let size_reduction = if stats.input_size > 0 {
-            ((stats.input_size - stats.output_size) as f64 / stats.input_size as f64) * 100.0
+            let diff = stats.input_size as i128 - stats.output_size as i128;
+            (diff as f64 / stats.input_size as f64) * 100.0
         } else {
             0.0
         };
