@@ -1,0 +1,61 @@
+[workspace]
+resolver = "2"
+members = [
+    "meld-core",
+    "meld-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+authors = ["PulseEngine <https://github.com/pulseengine>"]
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/pulseengine/meld"
+rust-version = "1.75"
+
+[workspace.dependencies]
+# WebAssembly parsing and encoding
+wasmparser = { version = "0.219", features = ["component-model"] }
+wasm-encoder = { version = "0.219", features = ["component-model"] }
+wasmprinter = "0.219"
+
+# CLI
+clap = { version = "4.5", features = ["derive", "cargo"] }
+
+# Error handling
+anyhow = "1.0"
+thiserror = "1.0"
+
+# Serialization (for attestation integration)
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Hashing
+sha2 = "0.10"
+hex = "0.4"
+
+# Logging
+log = "0.4"
+env_logger = "0.11"
+
+# Testing
+proptest = "1.5"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
+
+[profile.dev]
+opt-level = 0
+debug = true
+
+# WASM profile for wasm32-wasip2 builds
+[profile.release-wasm]
+inherits = "release"
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"

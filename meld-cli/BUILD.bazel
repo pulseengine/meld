@@ -1,0 +1,26 @@
+load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_test")
+
+package(default_visibility = ["//visibility:public"])
+
+rust_binary(
+    name = "meld",
+    srcs = glob(["src/**/*.rs"]),
+    crate_name = "meld_cli",
+    edition = "2021",
+    rustc_env = {
+        "CARGO_PKG_VERSION": "0.1.0",
+    },
+    deps = [
+        "//meld-core",
+        "@meld_deps//:anyhow",
+        "@meld_deps//:clap",
+        "@meld_deps//:env_logger",
+        "@meld_deps//:log",
+        "@meld_deps//:serde_json",
+    ],
+)
+
+rust_test(
+    name = "meld_test",
+    crate = ":meld",
+)

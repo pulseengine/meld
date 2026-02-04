@@ -1,0 +1,228 @@
+# Meld
+
+**Static WebAssembly Component Fusion**
+
+Meld fuses multiple P2/P3 WebAssembly components into a single core module,
+eliminating the need for runtime linking.
+
+Part of the **pulseengine toolchain**:
+- **[loom](https://github.com/pulseengine/loom)** - Formally verified WebAssembly optimizer
+- **meld** - Static component fuser (this tool)
+
+## Why Meld?
+
+Today, multiple WebAssembly components can be composed using tools like WAC,
+but they still require runtime linking. This prevents:
+
+- Whole-program optimization across component boundaries
+- Using tools like LOOM to optimize the entire component graph
+- Direct browser execution without a component runtime
+- Efficient native transpilation to embedded targets
+
+Meld solves this by statically linking all components at build time:
+
+```
+P2/P3 Components → meld → Single Module → LOOM optimize → Browser/Native
+```
+
+## Installation
+
+### From Source (Cargo)
+
+```bash
+cargo install --path meld-cli
+```
+
+### From Source (Bazel)
+
+```bash
+bazel build //meld-cli:meld
+```
+
+### Pre-built Binaries
+
+Coming soon on GitHub Releases.
+
+## Usage
+
+### Basic Fusion
+
+```bash
+# Fuse two components
+meld fuse component_a.wasm component_b.wasm -o fused.wasm
+
+# Fuse with statistics
+meld fuse --stats component_a.wasm component_b.wasm -o fused.wasm
+
+# Inspect a component before fusion
+meld inspect component_a.wasm --interfaces
+```
+
+### Bazel Integration
+
+```starlark
+load("@meld//rules:meld.bzl", "meld_fuse")
+
+# Fuse components built with rules_wasm_component
+meld_fuse(
+    name = "my_app",
+    components = [
+        ":component_a",
+        ":component_b",
+    ],
+)
+```
+
+### Full Pipeline Example
+
+```bash
+# 1. Build components (e.g., with cargo component)
+cargo component build --release
+
+# 2. Compose components (optional, if using WAC)
+wac compose component_a.wasm component_b.wasm -o composed.wasm
+
+# 3. Fuse into single module
+meld fuse composed.wasm -o fused.wasm
+
+# 4. Optimize with LOOM
+loom optimize fused.wasm -o optimized.wasm
+
+# 5. Run in browser or runtime
+wasmtime run optimized.wasm
+```
+
+## Pipeline Architecture
+
+```
+┌───────────────────────────────────────────────────────────────┐
+│                    Build Time                                  │
+├───────────────────────────────────────────────────────────────┤
+│                                                               │
+│  Rust/Go/C++ Sources                                          │
+│         │                                                     │
+│         ▼                                                     │
+│  ┌─────────────────┐                                          │
+│  │ P2/P3 Components│  (cargo component, wit-bindgen, etc.)    │
+│  └────────┬────────┘                                          │
+│           │                                                   │
+│           ▼                                                   │
+│  ┌─────────────────┐                                          │
+│  │  wac compose    │  (optional composition step)             │
+│  └────────┬────────┘                                          │
+│           │                                                   │
+│           ▼                                                   │
+│  ┌─────────────────┐                                          │
+│  │     meld        │  ◄── This tool                           │
+│  │  (static fuse)  │                                          │
+│  └────────┬────────┘                                          │
+│           │                                                   │
+│           ▼                                                   │
+│  ┌─────────────────┐                                          │
+│  │  Single Module  │  (core wasm, no component runtime)       │
+│  └────────┬────────┘                                          │
+│           │                                                   │
+│           ▼                                                   │
+│  ┌─────────────────┐                                          │
+│  │      LOOM       │  (whole-program optimization)            │
+│  └────────┬────────┘                                          │
+│           │                                                   │
+└───────────┼───────────────────────────────────────────────────┘
+            │
+            ▼
+┌───────────────────────────────────────────────────────────────┐
+│                    Runtime                                     │
+├───────────────────────────────────────────────────────────────┤
+│  ┌─────────┐    ┌─────────┐    ┌─────────┐    ┌─────────┐    │
+│  │ Browser │    │wasmtime │    │ wasmer  │    │ Native  │    │
+│  └─────────┘    └─────────┘    └─────────┘    └─────────┘    │
+└───────────────────────────────────────────────────────────────┘
+```
+
+## Memory Strategies
+
+### Shared Memory (Default)
+
+All components share a single linear memory. This is simpler and allows
+the most aggressive optimizations, but requires careful coordination.
+
+```bash
+meld fuse --memory shared a.wasm b.wasm -o fused.wasm
+```
+
+### Multi-Memory (Experimental)
+
+Each component retains its own linear memory. This provides better isolation
+but requires multi-memory support in the target runtime.
+
+```bash
+meld fuse --memory multi a.wasm b.wasm -o fused.wasm
+```
+
+## Supply Chain Security
+
+Meld integrates with [wsc](https://github.com/pulseengine/wsc) for supply chain
+attestation. Each fusion operation records:
+
+- Input component hashes
+- Tool version and configuration
+- Transformation metadata
+
+The attestation is embedded in the output module's custom section:
+`wsc.transformation.attestation`
+
+## How It Works
+
+1. **Parse**: Extract core modules and type information from components
+2. **Resolve**: Build import/export graph, identify cross-component calls
+3. **Merge**: Combine function/memory/table/global index spaces
+4. **Adapt**: Generate Canonical ABI trampolines for cross-component calls
+5. **Encode**: Output single core WebAssembly module
+
+### Adapter Generation
+
+Cross-component calls require adapters that handle:
+- Memory copying between component memories
+- String transcoding (UTF-8 ↔ UTF-16 ↔ Latin-1)
+- List/array serialization
+- Resource handle transfer
+
+Meld generates these adapters using techniques inspired by wasmtime's FACT
+(Fused Adapter Compiler of Trampolines).
+
+## Limitations
+
+- **Phase 1**: Currently uses shared memory strategy only
+- **Resources**: Resource handles across components are limited
+- **Async**: Async component functions not yet supported
+- **Threads**: Shared memory threading not yet supported
+
+## Development
+
+```bash
+# Build
+cargo build
+
+# Test
+cargo test
+
+# Run with debug logging
+RUST_LOG=debug cargo run -- fuse a.wasm b.wasm -o out.wasm
+
+# Bazel build
+bazel build //...
+```
+
+## Related Projects
+
+- [WAC](https://github.com/bytecodealliance/wac) - WebAssembly Composition
+- [wit-component](https://github.com/bytecodealliance/wasm-tools) - Component tooling
+- [wasmtime](https://github.com/bytecodealliance/wasmtime) - WASM runtime with FACT
+
+## License
+
+Apache-2.0
+
+## Contributing
+
+Contributions welcome! Please read the [contributing guidelines](CONTRIBUTING.md) first.

@@ -1,0 +1,42 @@
+# Rust build artifacts
+target/
+**/*.rs.bk
+
+# Bazel build artifacts
+bazel-*
+/bazel-*
+
+# WASM artifacts (generated)
+*.wasm
+*.wat
+!tests/**/*.wat
+!examples/**/*.wat
+
+# Profiling
+**/*.profraw
+*.profdata
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Environment and credentials
+.env
+*.key
+credentials.json
+
+# Local Bazel overrides
+.bazelrc.local
+
+# Build cache
+.cargo/
+
+# Test output
+test-output/

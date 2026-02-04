@@ -1,0 +1,59 @@
+###############################################################################
+# Meld Bazel Configuration
+###############################################################################
+
+# Enable Bzlmod (modern dependency management)
+common --enable_bzlmod
+
+# Strict action environment for reproducibility
+build --incompatible_strict_action_env
+build --enable_platform_specific_config
+
+###############################################################################
+# Platform-specific settings
+###############################################################################
+
+build:linux --cxxopt=-std=c++17 --host_cxxopt=-std=c++17
+build:macos --cxxopt=-std=c++17 --host_cxxopt=-std=c++17
+build:windows --cxxopt=/std:c++17 --host_cxxopt=/std:c++17
+
+###############################################################################
+# WebAssembly targets
+###############################################################################
+
+build:wasm --platforms=@platforms//cpu:wasm32
+build:rust-wasm --config=wasm
+
+###############################################################################
+# Build modes
+###############################################################################
+
+# Development build - fast compilation, full debugging
+build:dev --compilation_mode=fastbuild --strip=never
+
+# Release build - optimized, stripped
+build:release --compilation_mode=opt --strip=always
+
+###############################################################################
+# CI settings
+###############################################################################
+
+build:ci --color=no --curses=no --show_timestamps
+build:ci --announce_rc
+build:ci --verbose_failures
+
+###############################################################################
+# Performance optimizations
+###############################################################################
+
+# Reuse sandbox directories for faster builds
+build --experimental_reuse_sandbox_directories
+
+# Remote caching (when available)
+# build --remote_cache=grpcs://cache.example.com
+
+###############################################################################
+# Local overrides (gitignored)
+###############################################################################
+
+try-import %workspace%/.bazelrc.local

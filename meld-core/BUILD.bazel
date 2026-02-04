@@ -1,0 +1,30 @@
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+
+package(default_visibility = ["//visibility:public"])
+
+rust_library(
+    name = "meld-core",
+    srcs = glob(["src/**/*.rs"]),
+    crate_name = "meld_core",
+    edition = "2021",
+    deps = [
+        "@meld_deps//:anyhow",
+        "@meld_deps//:hex",
+        "@meld_deps//:log",
+        "@meld_deps//:serde",
+        "@meld_deps//:serde_json",
+        "@meld_deps//:sha2",
+        "@meld_deps//:thiserror",
+        "@meld_deps//:wasm-encoder",
+        "@meld_deps//:wasmparser",
+    ],
+)
+
+rust_test(
+    name = "meld-core_test",
+    crate = ":meld-core",
+    deps = [
+        "@meld_deps//:proptest",
+        "@meld_deps//:wasmprinter",
+    ],
+)

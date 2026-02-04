@@ -1,0 +1,44 @@
+[package]
+name = "meld-core"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Core library for static WebAssembly component fusion"
+readme = "README.md"
+keywords = ["webassembly", "component-model", "fusion", "linking", "wasm"]
+categories = ["wasm", "development-tools"]
+
+[dependencies]
+# WebAssembly parsing and encoding
+wasmparser.workspace = true
+wasm-encoder.workspace = true
+
+# Error handling
+anyhow.workspace = true
+thiserror.workspace = true
+
+# Logging
+log.workspace = true
+
+# Hashing (for attestation)
+sha2.workspace = true
+hex.workspace = true
+
+# Serialization (for attestation)
+serde.workspace = true
+serde_json.workspace = true
+
+# Optional: wsc-attestation integration
+# wsc-attestation = { path = "../../wsc/src/attestation", optional = true }
+
+[dev-dependencies]
+proptest.workspace = true
+wasmprinter.workspace = true
+wat = "1.219"
+
+[features]
+default = []
+# Enable wsc-attestation integration for supply chain tracking
+# attestation = ["wsc-attestation"]

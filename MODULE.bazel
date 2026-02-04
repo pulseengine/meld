@@ -1,0 +1,56 @@
+###############################################################################
+# Meld Bazel Module Configuration
+#
+# Static component fusion for WebAssembly
+# Uses Bzlmod for modern dependency management.
+# See: https://bazel.build/external/overview#bzlmod
+###############################################################################
+
+module(
+    name = "meld",
+    version = "0.1.0",
+)
+
+###############################################################################
+# Core Build Rules
+###############################################################################
+
+bazel_dep(name = "rules_rust", version = "0.56.0")
+bazel_dep(name = "bazel_skylib", version = "1.7.1")
+bazel_dep(name = "platforms", version = "0.0.10")
+
+# WebAssembly component rules for building WASM targets
+bazel_dep(name = "rules_wasm_component", version = "1.0.0")
+
+# Override to fetch from GitHub (not yet in BCR)
+git_override(
+    module_name = "rules_wasm_component",
+    remote = "https://github.com/aspect-build/rules_wasm_component.git",
+    commit = "main",
+)
+
+###############################################################################
+# Rust Toolchain
+###############################################################################
+
+rust = use_extension("@rules_rust//rust:extensions.bzl", "rust")
+rust.toolchain(
+    edition = "2021",
+    extra_target_triples = ["wasm32-wasip2"],
+    versions = ["1.85.0"],
+)
+use_repo(rust, "rust_toolchains")
+
+register_toolchains("@rust_toolchains//:all")
+
+###############################################################################
+# Crate Universe (Cargo Dependencies)
+###############################################################################
+
+crate = use_extension("@rules_rust//crate_universe:extension.bzl", "crate")
+crate.from_cargo(
+    name = "meld_deps",
+    cargo_lockfile = "//:Cargo.lock",
+    manifests = ["//:Cargo.toml"],
+)
+use_repo(crate, "meld_deps")

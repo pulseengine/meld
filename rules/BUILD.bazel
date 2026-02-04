@@ -1,0 +1,19 @@
+# Bazel rules for meld static component fusion
+
+load("@bazel_skylib//:bzl_library.bzl", "bzl_library")
+
+package(default_visibility = ["//visibility:public"])
+
+exports_files([
+    "meld.bzl",
+    "providers.bzl",
+])
+
+bzl_library(
+    name = "meld_rules",
+    srcs = [
+        "meld.bzl",
+        "providers.bzl",
+    ],
+    visibility = ["//visibility:public"],
+)

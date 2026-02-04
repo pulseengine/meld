@@ -1,0 +1,38 @@
+[package]
+name = "meld-cli"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "CLI for static WebAssembly component fusion"
+readme = "../README.md"
+keywords = ["webassembly", "component-model", "fusion", "cli"]
+categories = ["wasm", "command-line-utilities"]
+
+[[bin]]
+name = "meld"
+path = "src/main.rs"
+
+[dependencies]
+meld-core = { path = "../meld-core" }
+
+# CLI
+clap.workspace = true
+
+# Error handling
+anyhow.workspace = true
+
+# Logging
+log.workspace = true
+env_logger.workspace = true
+
+# Serialization (for attestation output)
+serde_json.workspace = true
+
+# WASM validation
+wasmparser.workspace = true
+
+[dev-dependencies]
+# For testing with WAT files
+wasmprinter.workspace = true
