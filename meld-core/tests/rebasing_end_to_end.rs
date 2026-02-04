@@ -136,9 +136,11 @@ fn test_address_rebasing_end_to_end() {
     let component_a = build_component(build_module_a());
     let component_b = build_component(build_module_b());
 
-    let mut config = FuserConfig::default();
-    config.memory_strategy = MemoryStrategy::SharedMemory;
-    config.address_rebasing = true;
+    let config = FuserConfig {
+        memory_strategy: MemoryStrategy::SharedMemory,
+        address_rebasing: true,
+        ..Default::default()
+    };
 
     let mut fuser = Fuser::new(config);
     fuser

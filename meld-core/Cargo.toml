@@ -38,6 +38,7 @@ proptest.workspace = true
 wasmprinter.workspace = true
 wat = "1.219"
 wasmtime = "41.0.1"
+bitflags.workspace = true  # Required for wit-bindgen component bindings
 
 [features]
 default = []

@@ -6,7 +6,7 @@ rust_binary(
     name = "meld",
     srcs = glob(["src/**/*.rs"]),
     crate_name = "meld_cli",
-    edition = "2021",
+    edition = "2024",
     rustc_env = {
         "CARGO_PKG_VERSION": "0.1.0",
     },

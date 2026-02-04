@@ -6,7 +6,7 @@ rust_library(
     name = "meld-core",
     srcs = glob(["src/**/*.rs"]),
     crate_name = "meld_core",
-    edition = "2021",
+    edition = "2024",
     deps = [
         "@meld_deps//:anyhow",
         "@meld_deps//:hex",
@@ -26,5 +26,17 @@ rust_test(
     deps = [
         "@meld_deps//:proptest",
         "@meld_deps//:wasmprinter",
+    ],
+)
+
+# Integration test: memory address rebasing end-to-end
+rust_test(
+    name = "rebasing_end_to_end_test",
+    srcs = ["tests/rebasing_end_to_end.rs"],
+    edition = "2024",
+    deps = [
+        ":meld-core",
+        "@meld_deps//:wasm-encoder",
+        "@meld_deps//:wasmtime",
     ],
 )
