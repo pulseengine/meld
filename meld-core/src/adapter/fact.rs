@@ -16,9 +16,9 @@
 //! into the fused module rather than keeping them as separate adapter modules.
 
 use super::{AdapterConfig, AdapterFunction, AdapterGenerator, AdapterOptions, StringEncoding};
+use crate::Result;
 use crate::merger::MergedModule;
 use crate::resolver::{AdapterSite, DependencyGraph};
-use crate::Result;
 use wasm_encoder::{Function, Instruction};
 
 /// FACT-style adapter generator

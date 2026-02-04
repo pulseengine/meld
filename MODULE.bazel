@@ -25,8 +25,8 @@ bazel_dep(name = "rules_wasm_component", version = "1.0.0")
 # Override to fetch from GitHub (not yet in BCR)
 git_override(
     module_name = "rules_wasm_component",
-    remote = "https://github.com/aspect-build/rules_wasm_component.git",
-    commit = "main",
+    remote = "https://github.com/pulseengine/rules_wasm_component.git",
+    branch = "fix/issue-339-bitflags-dep-and-wasm-tools-update",
 )
 
 ###############################################################################
@@ -143,6 +143,19 @@ filegroup(
 )
 
 ###############################################################################
+# wit-bindgen Test Components
+###############################################################################
+
+# wit-bindgen source for test WIT definitions and guest code
+# See: https://github.com/bytecodealliance/wit-bindgen/tree/main/tests/runtime
+git_repo(
+    name = "wit_bindgen",
+    remote = "https://github.com/bytecodealliance/wit-bindgen.git",
+    tag = "v0.52.0",
+    build_file = "//tests/wit_bindgen:wit_bindgen.BUILD.bazel",
+)
+
+###############################################################################
 # Rust Toolchain
 ###############################################################################
 
@@ -165,5 +178,14 @@ crate.from_cargo(
     name = "meld_deps",
     cargo_lockfile = "//:Cargo.lock",
     manifests = ["//:Cargo.toml"],
+    supported_platform_triples = [
+        "aarch64-apple-darwin",
+        "x86_64-apple-darwin",
+        "x86_64-unknown-linux-gnu",
+        "aarch64-unknown-linux-gnu",
+        "wasm32-wasip2",
+        "wasm32-unknown-unknown",
+    ],
 )
+
 use_repo(crate, "meld_deps")

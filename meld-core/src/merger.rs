@@ -156,10 +156,10 @@ impl Merger {
                     memory_types.extend(module.memories.iter().cloned());
                 }
 
-                if self.address_rebasing {
-                    if let Some(module_memory) = module_memory_type(module)? {
-                        module_memories.push(((comp_idx, mod_idx), module_memory));
-                    }
+                if self.address_rebasing
+                    && let Some(module_memory) = module_memory_type(module)?
+                {
+                    module_memories.push(((comp_idx, mod_idx), module_memory));
                 }
             }
         }
@@ -528,15 +528,15 @@ impl Merger {
 
         for unresolved in &graph.unresolved_imports {
             if let (Some(plan), ImportKind::Memory(_)) = (shared_memory_plan, &unresolved.kind) {
-                if let Some((module, name)) = &plan.import {
-                    if !shared_memory_import_added {
-                        merged.imports.push(MergedImport {
-                            module: module.clone(),
-                            name: name.clone(),
-                            entity_type: EntityType::Memory(plan.memory),
-                        });
-                        shared_memory_import_added = true;
-                    }
+                if let Some((module, name)) = &plan.import
+                    && !shared_memory_import_added
+                {
+                    merged.imports.push(MergedImport {
+                        module: module.clone(),
+                        name: name.clone(),
+                        entity_type: EntityType::Memory(plan.memory),
+                    });
+                    shared_memory_import_added = true;
                 }
                 continue;
             }
@@ -562,16 +562,15 @@ impl Merger {
             });
         }
 
-        if let Some(plan) = shared_memory_plan {
-            if let Some((module, name)) = &plan.import {
-                if !shared_memory_import_added {
-                    merged.imports.push(MergedImport {
-                        module: module.clone(),
-                        name: name.clone(),
-                        entity_type: EntityType::Memory(plan.memory),
-                    });
-                }
-            }
+        if let Some(plan) = shared_memory_plan
+            && let Some((module, name)) = &plan.import
+            && !shared_memory_import_added
+        {
+            merged.imports.push(MergedImport {
+                module: module.clone(),
+                name: name.clone(),
+                entity_type: EntityType::Memory(plan.memory),
+            });
         }
 
         Ok(())
@@ -587,13 +586,12 @@ impl Merger {
         let mut start_funcs = Vec::new();
         for (comp_idx, component) in components.iter().enumerate() {
             for (mod_idx, module) in component.core_modules.iter().enumerate() {
-                if let Some(start_idx) = module.start {
-                    if let Some(&new_idx) = merged
+                if let Some(start_idx) = module.start
+                    && let Some(&new_idx) = merged
                         .function_index_map
                         .get(&(comp_idx, mod_idx, start_idx))
-                    {
-                        start_funcs.push(new_idx);
-                    }
+                {
+                    start_funcs.push(new_idx);
                 }
             }
         }
@@ -667,12 +665,12 @@ fn combine_memory_types_shared(memories: &[MemoryType]) -> Result<MemoryType> {
         };
     }
 
-    if let Some(max) = maximum {
-        if minimum > max {
-            return Err(Error::MemoryStrategyUnsupported(
-                "shared memory minimum exceeds maximum".to_string(),
-            ));
-        }
+    if let Some(max) = maximum
+        && minimum > max
+    {
+        return Err(Error::MemoryStrategyUnsupported(
+            "shared memory minimum exceeds maximum".to_string(),
+        ));
     }
 
     Ok(MemoryType {
@@ -722,12 +720,12 @@ fn combine_memory_types_rebased(memories: &[MemoryType]) -> Result<MemoryType> {
                 "shared memory exceeds 32-bit address space".to_string(),
             ));
         }
-        if let Some(max) = maximum {
-            if max > max_pages {
-                return Err(Error::MemoryStrategyUnsupported(
-                    "shared memory maximum exceeds 32-bit address space".to_string(),
-                ));
-            }
+        if let Some(max) = maximum
+            && max > max_pages
+        {
+            return Err(Error::MemoryStrategyUnsupported(
+                "shared memory maximum exceeds 32-bit address space".to_string(),
+            ));
         }
     }
 

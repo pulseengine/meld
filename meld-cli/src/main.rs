@@ -16,7 +16,7 @@
 //! meld version
 //! ```
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use clap::{Parser, Subcommand};
 use meld_core::{Fuser, FuserConfig, FusionStats, MemoryStrategy};
 use std::fs;
@@ -193,7 +193,7 @@ fn fuse_command(
             return Err(anyhow!(
                 "Invalid memory strategy: {}. Use 'shared' or 'multi'",
                 memory
-            ))
+            ));
         }
     };
 
