@@ -2,6 +2,8 @@
 
 **Static WebAssembly Component Fusion**
 
+_"In protocol design, perfection has been reached not when there is nothing left to add, but when there is nothing left to take away." — RFC 1925_
+
 Meld fuses multiple P2/P3 WebAssembly components into a single core module,
 eliminating the need for runtime linking.
 
