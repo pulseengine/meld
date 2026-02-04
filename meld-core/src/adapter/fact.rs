@@ -23,6 +23,7 @@ use wasm_encoder::{Function, Instruction};
 
 /// FACT-style adapter generator
 pub struct FactStyleGenerator {
+    #[allow(dead_code)]
     config: AdapterConfig,
 }
 
@@ -365,8 +366,10 @@ mod tests {
 
     #[test]
     fn test_adapter_options_needs_transcoding() {
-        let mut options = AdapterOptions::default();
-        options.callee_string_encoding = StringEncoding::Utf16;
+        let options = AdapterOptions {
+            callee_string_encoding: StringEncoding::Utf16,
+            ..Default::default()
+        };
         assert!(options.needs_transcoding());
     }
 

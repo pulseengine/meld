@@ -333,8 +333,8 @@ impl Resolver {
 
                         if has_export {
                             // Determine if we need adapters
-                            let crosses_memory = from_component.core_modules.len() > 0
-                                && to_component.core_modules.len() > 0;
+                            let crosses_memory = !from_component.core_modules.is_empty()
+                                && !to_component.core_modules.is_empty();
 
                             graph.adapter_sites.push(AdapterSite {
                                 from_component: *from_comp,

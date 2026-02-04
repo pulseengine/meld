@@ -24,6 +24,22 @@ pub struct IndexMaps {
     pub tables: HashMap<u32, u32>,
     /// Memory index remapping: old -> new
     pub memories: HashMap<u32, u32>,
+    /// Memory base offset in bytes (for shared-memory rebasing)
+    pub memory_base_offset: u64,
+    /// Whether address rebasing is enabled
+    pub address_rebasing: bool,
+    /// Whether the memory uses 64-bit addressing
+    pub memory64: bool,
+    /// Scratch locals used for address rebasing
+    pub rebase_locals: Option<RebaseLocals>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct RebaseLocals {
+    pub addr0: u32,
+    pub addr1: u32,
+    pub addr2: u32,
+    pub value: u32,
 }
 
 impl IndexMaps {
@@ -59,21 +75,67 @@ impl IndexMaps {
 }
 
 /// Rewrite a function body with new index mappings
-pub fn rewrite_function_body(body: &FunctionBody<'_>, maps: &IndexMaps) -> Result<Function> {
+pub fn rewrite_function_body(
+    body: &FunctionBody<'_>,
+    param_count: u32,
+    maps: &IndexMaps,
+) -> Result<Function> {
     let locals_reader = body.get_locals_reader()?;
 
     // Collect locals
     let mut locals: Vec<(u32, wasm_encoder::ValType)> = Vec::new();
+    let mut local_count: u32 = 0;
     for local in locals_reader {
         let (count, ty) = local?;
         locals.push((count, convert_val_type(ty)));
+        local_count = local_count.saturating_add(count);
+    }
+
+    let needs_rebase_locals = if maps.address_rebasing {
+        let mut needs = false;
+        let ops_reader = body.get_operators_reader()?;
+        for op in ops_reader {
+            match op? {
+                Operator::MemoryCopy { .. }
+                | Operator::MemoryFill { .. }
+                | Operator::MemoryInit { .. } => {
+                    needs = true;
+                    break;
+                }
+                _ => {}
+            }
+        }
+        needs
+    } else {
+        false
+    };
+
+    let mut maps = maps.clone();
+    if needs_rebase_locals {
+        let address_type = if maps.memory64 {
+            wasm_encoder::ValType::I64
+        } else {
+            wasm_encoder::ValType::I32
+        };
+        locals.push((1, address_type));
+        locals.push((1, address_type));
+        locals.push((1, address_type));
+        locals.push((1, wasm_encoder::ValType::I32));
+
+        let base_index = param_count + local_count;
+        maps.rebase_locals = Some(RebaseLocals {
+            addr0: base_index,
+            addr1: base_index + 1,
+            addr2: base_index + 2,
+            value: base_index + 3,
+        });
     }
 
     let mut func = Function::new(locals);
 
     // Get operators and rewrite them
     let ops_reader = body.get_operators_reader()?;
-    rewrite_operators(ops_reader, maps, &mut func)?;
+    rewrite_operators(ops_reader, &maps, &mut func)?;
 
     Ok(func)
 }
@@ -86,14 +148,16 @@ fn rewrite_operators(
 ) -> Result<()> {
     for op in reader {
         let op = op?;
-        let instr = rewrite_operator(op, maps)?;
-        func.instruction(&instr);
+        let instrs = rewrite_operator(op, maps)?;
+        for instr in instrs {
+            func.instruction(&instr);
+        }
     }
     Ok(())
 }
 
 /// Convert a wasmparser operator to wasm-encoder instruction with index remapping
-fn rewrite_operator(op: Operator<'_>, maps: &IndexMaps) -> Result<Instruction<'static>> {
+fn rewrite_operator(op: Operator<'_>, maps: &IndexMaps) -> Result<Vec<Instruction<'static>>> {
     use Operator::*;
 
     let instr = match op {
@@ -161,41 +225,55 @@ fn rewrite_operator(op: Operator<'_>, maps: &IndexMaps) -> Result<Instruction<'s
         ElemDrop { elem_index } => Instruction::ElemDrop(elem_index),
 
         // Memory operations - need memory index remapping
-        I32Load { memarg } => Instruction::I32Load(convert_memarg(memarg, maps)),
-        I64Load { memarg } => Instruction::I64Load(convert_memarg(memarg, maps)),
-        F32Load { memarg } => Instruction::F32Load(convert_memarg(memarg, maps)),
-        F64Load { memarg } => Instruction::F64Load(convert_memarg(memarg, maps)),
-        I32Load8S { memarg } => Instruction::I32Load8S(convert_memarg(memarg, maps)),
-        I32Load8U { memarg } => Instruction::I32Load8U(convert_memarg(memarg, maps)),
-        I32Load16S { memarg } => Instruction::I32Load16S(convert_memarg(memarg, maps)),
-        I32Load16U { memarg } => Instruction::I32Load16U(convert_memarg(memarg, maps)),
-        I64Load8S { memarg } => Instruction::I64Load8S(convert_memarg(memarg, maps)),
-        I64Load8U { memarg } => Instruction::I64Load8U(convert_memarg(memarg, maps)),
-        I64Load16S { memarg } => Instruction::I64Load16S(convert_memarg(memarg, maps)),
-        I64Load16U { memarg } => Instruction::I64Load16U(convert_memarg(memarg, maps)),
-        I64Load32S { memarg } => Instruction::I64Load32S(convert_memarg(memarg, maps)),
-        I64Load32U { memarg } => Instruction::I64Load32U(convert_memarg(memarg, maps)),
-        I32Store { memarg } => Instruction::I32Store(convert_memarg(memarg, maps)),
-        I64Store { memarg } => Instruction::I64Store(convert_memarg(memarg, maps)),
-        F32Store { memarg } => Instruction::F32Store(convert_memarg(memarg, maps)),
-        F64Store { memarg } => Instruction::F64Store(convert_memarg(memarg, maps)),
-        I32Store8 { memarg } => Instruction::I32Store8(convert_memarg(memarg, maps)),
-        I32Store16 { memarg } => Instruction::I32Store16(convert_memarg(memarg, maps)),
-        I64Store8 { memarg } => Instruction::I64Store8(convert_memarg(memarg, maps)),
-        I64Store16 { memarg } => Instruction::I64Store16(convert_memarg(memarg, maps)),
-        I64Store32 { memarg } => Instruction::I64Store32(convert_memarg(memarg, maps)),
-        MemorySize { mem, .. } => Instruction::MemorySize(maps.remap_memory(mem)),
-        MemoryGrow { mem, .. } => Instruction::MemoryGrow(maps.remap_memory(mem)),
-        MemoryInit { data_index, mem } => Instruction::MemoryInit {
-            mem: maps.remap_memory(mem),
-            data_index,
-        },
+        I32Load { memarg } => Instruction::I32Load(convert_memarg(memarg, maps)?),
+        I64Load { memarg } => Instruction::I64Load(convert_memarg(memarg, maps)?),
+        F32Load { memarg } => Instruction::F32Load(convert_memarg(memarg, maps)?),
+        F64Load { memarg } => Instruction::F64Load(convert_memarg(memarg, maps)?),
+        I32Load8S { memarg } => Instruction::I32Load8S(convert_memarg(memarg, maps)?),
+        I32Load8U { memarg } => Instruction::I32Load8U(convert_memarg(memarg, maps)?),
+        I32Load16S { memarg } => Instruction::I32Load16S(convert_memarg(memarg, maps)?),
+        I32Load16U { memarg } => Instruction::I32Load16U(convert_memarg(memarg, maps)?),
+        I64Load8S { memarg } => Instruction::I64Load8S(convert_memarg(memarg, maps)?),
+        I64Load8U { memarg } => Instruction::I64Load8U(convert_memarg(memarg, maps)?),
+        I64Load16S { memarg } => Instruction::I64Load16S(convert_memarg(memarg, maps)?),
+        I64Load16U { memarg } => Instruction::I64Load16U(convert_memarg(memarg, maps)?),
+        I64Load32S { memarg } => Instruction::I64Load32S(convert_memarg(memarg, maps)?),
+        I64Load32U { memarg } => Instruction::I64Load32U(convert_memarg(memarg, maps)?),
+        I32Store { memarg } => Instruction::I32Store(convert_memarg(memarg, maps)?),
+        I64Store { memarg } => Instruction::I64Store(convert_memarg(memarg, maps)?),
+        F32Store { memarg } => Instruction::F32Store(convert_memarg(memarg, maps)?),
+        F64Store { memarg } => Instruction::F64Store(convert_memarg(memarg, maps)?),
+        I32Store8 { memarg } => Instruction::I32Store8(convert_memarg(memarg, maps)?),
+        I32Store16 { memarg } => Instruction::I32Store16(convert_memarg(memarg, maps)?),
+        I64Store8 { memarg } => Instruction::I64Store8(convert_memarg(memarg, maps)?),
+        I64Store16 { memarg } => Instruction::I64Store16(convert_memarg(memarg, maps)?),
+        I64Store32 { memarg } => Instruction::I64Store32(convert_memarg(memarg, maps)?),
+        MemorySize { mem, .. } => {
+            if maps.address_rebasing {
+                return Err(Error::UnsupportedFeature(
+                    "memory.size not supported with address rebasing".to_string(),
+                ));
+            }
+            Instruction::MemorySize(maps.remap_memory(mem))
+        }
+        MemoryGrow { mem, .. } => {
+            if maps.address_rebasing {
+                return Err(Error::UnsupportedFeature(
+                    "memory.grow not supported with address rebasing".to_string(),
+                ));
+            }
+            Instruction::MemoryGrow(maps.remap_memory(mem))
+        }
+        MemoryInit { data_index, mem } => {
+            return rewrite_memory_init(data_index, mem, maps);
+        }
         DataDrop { data_index } => Instruction::DataDrop(data_index),
-        MemoryCopy { dst_mem, src_mem } => Instruction::MemoryCopy {
-            src_mem: maps.remap_memory(src_mem),
-            dst_mem: maps.remap_memory(dst_mem),
-        },
-        MemoryFill { mem } => Instruction::MemoryFill(maps.remap_memory(mem)),
+        MemoryCopy { dst_mem, src_mem } => {
+            return rewrite_memory_copy(src_mem, dst_mem, maps);
+        }
+        MemoryFill { mem } => {
+            return rewrite_memory_fill(mem, maps);
+        }
 
         // Constants
         I32Const { value } => Instruction::I32Const(value),
@@ -358,7 +436,122 @@ fn rewrite_operator(op: Operator<'_>, maps: &IndexMaps) -> Result<Instruction<'s
         }
     };
 
-    Ok(instr)
+    Ok(vec![instr])
+}
+
+fn rewrite_memory_copy(
+    src_mem: u32,
+    dst_mem: u32,
+    maps: &IndexMaps,
+) -> Result<Vec<Instruction<'static>>> {
+    if !maps.address_rebasing {
+        return Ok(vec![Instruction::MemoryCopy {
+            src_mem: maps.remap_memory(src_mem),
+            dst_mem: maps.remap_memory(dst_mem),
+        }]);
+    }
+
+    let locals = maps.rebase_locals.ok_or_else(|| {
+        Error::UnsupportedFeature("address rebasing requires scratch locals".to_string())
+    })?;
+
+    let mut instrs = Vec::new();
+    instrs.push(Instruction::LocalSet(locals.addr2)); // len
+    instrs.push(Instruction::LocalSet(locals.addr1)); // src
+    instrs.push(Instruction::LocalSet(locals.addr0)); // dst
+    append_rebased_address(&mut instrs, maps, locals.addr0)?;
+    append_rebased_address(&mut instrs, maps, locals.addr1)?;
+    instrs.push(Instruction::LocalGet(locals.addr2));
+    instrs.push(Instruction::MemoryCopy {
+        src_mem: maps.remap_memory(src_mem),
+        dst_mem: maps.remap_memory(dst_mem),
+    });
+
+    Ok(instrs)
+}
+
+fn rewrite_memory_fill(mem: u32, maps: &IndexMaps) -> Result<Vec<Instruction<'static>>> {
+    if !maps.address_rebasing {
+        return Ok(vec![Instruction::MemoryFill(maps.remap_memory(mem))]);
+    }
+
+    let locals = maps.rebase_locals.ok_or_else(|| {
+        Error::UnsupportedFeature("address rebasing requires scratch locals".to_string())
+    })?;
+
+    let mut instrs = Vec::new();
+    instrs.push(Instruction::LocalSet(locals.addr2)); // len
+    instrs.push(Instruction::LocalSet(locals.value)); // value (i32)
+    instrs.push(Instruction::LocalSet(locals.addr0)); // dst
+    append_rebased_address(&mut instrs, maps, locals.addr0)?;
+    instrs.push(Instruction::LocalGet(locals.value));
+    instrs.push(Instruction::LocalGet(locals.addr2));
+    instrs.push(Instruction::MemoryFill(maps.remap_memory(mem)));
+
+    Ok(instrs)
+}
+
+fn rewrite_memory_init(
+    data_index: u32,
+    mem: u32,
+    maps: &IndexMaps,
+) -> Result<Vec<Instruction<'static>>> {
+    if !maps.address_rebasing {
+        return Ok(vec![Instruction::MemoryInit {
+            mem: maps.remap_memory(mem),
+            data_index,
+        }]);
+    }
+
+    let locals = maps.rebase_locals.ok_or_else(|| {
+        Error::UnsupportedFeature("address rebasing requires scratch locals".to_string())
+    })?;
+
+    let mut instrs = Vec::new();
+    instrs.push(Instruction::LocalSet(locals.addr2)); // len
+    instrs.push(Instruction::LocalSet(locals.addr1)); // src
+    instrs.push(Instruction::LocalSet(locals.addr0)); // dst
+    append_rebased_address(&mut instrs, maps, locals.addr0)?;
+    instrs.push(Instruction::LocalGet(locals.addr1));
+    instrs.push(Instruction::LocalGet(locals.addr2));
+    instrs.push(Instruction::MemoryInit {
+        mem: maps.remap_memory(mem),
+        data_index,
+    });
+
+    Ok(instrs)
+}
+
+fn append_rebased_address(
+    instrs: &mut Vec<Instruction<'static>>,
+    maps: &IndexMaps,
+    local_index: u32,
+) -> Result<()> {
+    instrs.push(Instruction::LocalGet(local_index));
+    if maps.memory_base_offset != 0 {
+        instrs.push(base_const_instruction(maps)?);
+        instrs.push(base_add_instruction(maps));
+    }
+    Ok(())
+}
+
+fn base_const_instruction(maps: &IndexMaps) -> Result<Instruction<'static>> {
+    if maps.memory64 {
+        Ok(Instruction::I64Const(maps.memory_base_offset as i64))
+    } else {
+        let base = u32::try_from(maps.memory_base_offset).map_err(|_| {
+            Error::UnsupportedFeature("address rebasing base offset overflow".to_string())
+        })?;
+        Ok(Instruction::I32Const(base as i32))
+    }
+}
+
+fn base_add_instruction(maps: &IndexMaps) -> Instruction<'static> {
+    if maps.memory64 {
+        Instruction::I64Add
+    } else {
+        Instruction::I32Add
+    }
 }
 
 /// Convert wasmparser BlockType to wasm-encoder BlockType
@@ -371,12 +564,18 @@ fn convert_block_type(bt: WpBlockType, maps: &IndexMaps) -> BlockType {
 }
 
 /// Convert wasmparser MemArg to wasm-encoder MemArg
-fn convert_memarg(ma: WpMemArg, maps: &IndexMaps) -> MemArg {
-    MemArg {
-        offset: ma.offset,
+fn convert_memarg(ma: WpMemArg, maps: &IndexMaps) -> Result<MemArg> {
+    let offset =
+        ma.offset
+            .checked_add(maps.memory_base_offset)
+            .ok_or(Error::UnsupportedFeature(
+                "memory offset overflow during rebasing".to_string(),
+            ))?;
+    Ok(MemArg {
+        offset,
         align: ma.align as u32,
         memory_index: maps.remap_memory(ma.memory),
-    }
+    })
 }
 
 /// Convert wasmparser ValType to wasm-encoder ValType
@@ -427,6 +626,7 @@ fn convert_heap_type(ht: wasmparser::HeapType) -> wasm_encoder::HeapType {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use wasmparser::Operator;
 
     #[test]
     fn test_index_maps_remap() {
@@ -453,5 +653,104 @@ mod tests {
             result,
             BlockType::Result(wasm_encoder::ValType::I32)
         ));
+    }
+
+    #[test]
+    fn test_rewrite_memory_copy_rebased() {
+        let mut maps = IndexMaps::new();
+        maps.address_rebasing = true;
+        maps.memory_base_offset = 16;
+        maps.memory64 = false;
+        maps.rebase_locals = Some(RebaseLocals {
+            addr0: 0,
+            addr1: 1,
+            addr2: 2,
+            value: 3,
+        });
+
+        let instrs = rewrite_operator(
+            Operator::MemoryCopy {
+                src_mem: 0,
+                dst_mem: 0,
+            },
+            &maps,
+        )
+        .unwrap();
+
+        assert!(instrs
+            .iter()
+            .any(|instr| matches!(instr, Instruction::I32Const(16))));
+        assert!(matches!(
+            instrs.last(),
+            Some(Instruction::MemoryCopy { .. })
+        ));
+    }
+
+    #[test]
+    fn test_rewrite_memory_fill_rebased() {
+        let mut maps = IndexMaps::new();
+        maps.address_rebasing = true;
+        maps.memory_base_offset = 8;
+        maps.memory64 = false;
+        maps.rebase_locals = Some(RebaseLocals {
+            addr0: 0,
+            addr1: 1,
+            addr2: 2,
+            value: 3,
+        });
+
+        let instrs = rewrite_operator(Operator::MemoryFill { mem: 0 }, &maps).unwrap();
+
+        assert!(instrs
+            .iter()
+            .any(|instr| matches!(instr, Instruction::I32Const(8))));
+        assert!(matches!(instrs.last(), Some(Instruction::MemoryFill(_))));
+    }
+
+    #[test]
+    fn test_rewrite_memory_init_rebased() {
+        let mut maps = IndexMaps::new();
+        maps.address_rebasing = true;
+        maps.memory_base_offset = 4;
+        maps.memory64 = false;
+        maps.rebase_locals = Some(RebaseLocals {
+            addr0: 0,
+            addr1: 1,
+            addr2: 2,
+            value: 3,
+        });
+
+        let instrs = rewrite_operator(
+            Operator::MemoryInit {
+                data_index: 0,
+                mem: 0,
+            },
+            &maps,
+        )
+        .unwrap();
+
+        assert!(instrs
+            .iter()
+            .any(|instr| matches!(instr, Instruction::I32Const(4))));
+        assert!(matches!(
+            instrs.last(),
+            Some(Instruction::MemoryInit { .. })
+        ));
+    }
+
+    #[test]
+    fn test_rewrite_memory_size_rebased_fails() {
+        let mut maps = IndexMaps::new();
+        maps.address_rebasing = true;
+
+        assert!(rewrite_operator(Operator::MemorySize { mem: 0 }, &maps).is_err());
+    }
+
+    #[test]
+    fn test_rewrite_memory_grow_rebased_fails() {
+        let mut maps = IndexMaps::new();
+        maps.address_rebasing = true;
+
+        assert!(rewrite_operator(Operator::MemoryGrow { mem: 0 }, &maps).is_err());
     }
 }

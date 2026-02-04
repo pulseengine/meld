@@ -3,6 +3,7 @@
 //! This module handles parsing WebAssembly P2/P3 components and extracting
 //! the core modules, types, imports, and exports needed for fusion.
 
+use crate::attestation::compute_sha256;
 use crate::{Error, Result};
 use wasm_encoder::ValType;
 use wasmparser::{
@@ -32,6 +33,9 @@ pub struct ParsedComponent {
 
     /// Original size in bytes
     pub original_size: usize,
+
+    /// SHA-256 hash of original component bytes (hex encoded)
+    pub original_hash: String,
 }
 
 /// A core WebAssembly module extracted from a component
@@ -314,6 +318,11 @@ impl ComponentParser {
             return Err(Error::NotAComponent);
         }
 
+        if self.validate {
+            let mut validator = wasmparser::Validator::new();
+            validator.validate_all(bytes)?;
+        }
+
         let mut component = ParsedComponent {
             name: None,
             core_modules: Vec::new(),
@@ -322,6 +331,7 @@ impl ComponentParser {
             types: Vec::new(),
             instances: Vec::new(),
             original_size: bytes.len(),
+            original_hash: compute_sha256(bytes),
         };
 
         let parser = Parser::new(0);
@@ -524,8 +534,8 @@ impl ComponentParser {
                             wasmparser::TypeRef::Func(idx) => ImportKind::Function(idx),
                             wasmparser::TypeRef::Table(t) => ImportKind::Table(TableType {
                                 element_type: convert_ref_type(t.element_type),
-                                initial: t.initial.into(),
-                                maximum: t.maximum.map(|m| m.into()),
+                                initial: t.initial,
+                                maximum: t.maximum,
                             }),
                             wasmparser::TypeRef::Memory(m) => ImportKind::Memory(MemoryType {
                                 memory64: m.memory64,
@@ -562,8 +572,8 @@ impl ComponentParser {
                         let table = table?;
                         module.tables.push(TableType {
                             element_type: convert_ref_type(table.ty.element_type),
-                            initial: table.ty.initial.into(),
-                            maximum: table.ty.maximum.map(|m| m.into()),
+                            initial: table.ty.initial,
+                            maximum: table.ty.maximum,
                         });
                     }
                 }

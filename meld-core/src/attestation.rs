@@ -187,6 +187,27 @@ impl FusionAttestationBuilder {
         self
     }
 
+    /// Add an input with a precomputed hash and size
+    pub fn add_input_descriptor(
+        mut self,
+        name: impl Into<String>,
+        module_count: usize,
+        hash: impl Into<String>,
+        size: u64,
+    ) -> Self {
+        self.inputs.push(InputArtifact {
+            artifact: ArtifactDescriptor {
+                name: name.into(),
+                hash: hash.into(),
+                size,
+            },
+            component_type: Some("P2".to_string()),
+            module_count,
+            prior_attestation: None,
+        });
+        self
+    }
+
     /// Build the attestation
     pub fn build(self, output_bytes: &[u8], stats: &FusionStats) -> FusionAttestation {
         let output_hash = compute_sha256(output_bytes);
@@ -252,7 +273,7 @@ impl FusionAttestation {
 }
 
 /// Compute SHA-256 hash of bytes
-fn compute_sha256(bytes: &[u8]) -> String {
+pub(crate) fn compute_sha256(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
     let result = hasher.finalize();
@@ -260,7 +281,7 @@ fn compute_sha256(bytes: &[u8]) -> String {
 }
 
 /// Generate a UUID v4
-fn generate_uuid() -> String {
+pub(crate) fn generate_uuid() -> String {
     // Simple UUID v4 generation using random bytes
     // In production, use a proper UUID crate
     let mut bytes = [0u8; 16];
@@ -294,7 +315,7 @@ fn generate_uuid() -> String {
 }
 
 /// Get current timestamp in ISO 8601 format
-fn chrono_timestamp() -> String {
+pub(crate) fn chrono_timestamp() -> String {
     use std::time::SystemTime;
 
     let now = SystemTime::now()

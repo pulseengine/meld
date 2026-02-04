@@ -17,6 +17,8 @@ use wasm_encoder::{
 };
 use wasmparser::{Parser, Payload};
 
+const WASM_PAGE_SIZE: u64 = 65536;
+
 /// A merged WebAssembly module ready for encoding
 #[derive(Debug, Clone)]
 pub struct MergedModule {
@@ -113,12 +115,109 @@ pub struct MergedExport {
 /// Module merger
 pub struct Merger {
     memory_strategy: MemoryStrategy,
+    address_rebasing: bool,
+}
+
+#[derive(Debug, Clone)]
+struct SharedMemoryPlan {
+    memory: EncoderMemoryType,
+    import: Option<(String, String)>,
+    bases: HashMap<(usize, usize), u64>,
 }
 
 impl Merger {
     /// Create a new merger with the specified memory strategy
-    pub fn new(memory_strategy: MemoryStrategy) -> Self {
-        Self { memory_strategy }
+    pub fn new(memory_strategy: MemoryStrategy, address_rebasing: bool) -> Self {
+        Self {
+            memory_strategy,
+            address_rebasing,
+        }
+    }
+
+    fn compute_shared_memory_plan(
+        &self,
+        components: &[ParsedComponent],
+    ) -> Result<Option<SharedMemoryPlan>> {
+        let mut memory_types = Vec::new();
+        let mut import_names: Vec<(String, String)> = Vec::new();
+        let mut has_defined = false;
+        let mut module_memories: Vec<((usize, usize), MemoryType)> = Vec::new();
+
+        for (comp_idx, component) in components.iter().enumerate() {
+            for (mod_idx, module) in component.core_modules.iter().enumerate() {
+                for import in &module.imports {
+                    if let ImportKind::Memory(mem) = &import.kind {
+                        memory_types.push(mem.clone());
+                        import_names.push((import.module.clone(), import.name.clone()));
+                    }
+                }
+
+                if !module.memories.is_empty() {
+                    has_defined = true;
+                    memory_types.extend(module.memories.iter().cloned());
+                }
+
+                if self.address_rebasing {
+                    if let Some(module_memory) = module_memory_type(module)? {
+                        module_memories.push(((comp_idx, mod_idx), module_memory));
+                    }
+                }
+            }
+        }
+
+        if memory_types.is_empty() {
+            return Ok(None);
+        }
+
+        let combined = if self.address_rebasing {
+            combine_memory_types_rebased(&memory_types)?
+        } else {
+            combine_memory_types_shared(&memory_types)?
+        };
+
+        let import = if has_defined {
+            None
+        } else {
+            let Some((module, name)) = import_names.first().cloned() else {
+                return Ok(None);
+            };
+            if import_names.iter().any(|(m, n)| *m != module || *n != name) {
+                return Err(Error::MemoryStrategyUnsupported(
+                    "shared memory requires a single import module/name".to_string(),
+                ));
+            }
+            Some((module, name))
+        };
+
+        let mut bases = HashMap::new();
+        if self.address_rebasing {
+            let mut next_base_pages: u64 = 0;
+            for (key, module_memory) in module_memories {
+                let base_pages = next_base_pages;
+                let base_bytes = base_pages.checked_mul(WASM_PAGE_SIZE).ok_or_else(|| {
+                    Error::MemoryStrategyUnsupported(
+                        "shared memory base offset overflow".to_string(),
+                    )
+                })?;
+                if !combined.memory64 && base_bytes > u64::from(u32::MAX) {
+                    return Err(Error::MemoryStrategyUnsupported(
+                        "shared memory base offset exceeds 32-bit address space".to_string(),
+                    ));
+                }
+                bases.insert(key, base_bytes);
+                next_base_pages = next_base_pages
+                    .checked_add(module_memory.initial)
+                    .ok_or_else(|| {
+                        Error::MemoryStrategyUnsupported("shared memory size overflow".to_string())
+                    })?;
+            }
+        }
+
+        Ok(Some(SharedMemoryPlan {
+            memory: convert_memory_type(&combined),
+            import,
+            bases,
+        }))
     }
 
     /// Merge components into a single module
@@ -127,6 +226,12 @@ impl Merger {
         components: &[ParsedComponent],
         graph: &DependencyGraph,
     ) -> Result<MergedModule> {
+        let shared_memory_plan = if self.memory_strategy == MemoryStrategy::SharedMemory {
+            self.compute_shared_memory_plan(components)?
+        } else {
+            None
+        };
+
         let mut merged = MergedModule {
             types: Vec::new(),
             imports: Vec::new(),
@@ -149,14 +254,29 @@ impl Merger {
         // Process components in topological order
         for &comp_idx in &graph.instantiation_order {
             let component = &components[comp_idx];
-            self.merge_component(comp_idx, component, graph, &mut merged)?;
+            self.merge_component(
+                comp_idx,
+                component,
+                graph,
+                &mut merged,
+                shared_memory_plan.as_ref(),
+            )?;
         }
 
         // Handle unresolved imports
-        self.add_unresolved_imports(graph, &mut merged)?;
+        self.add_unresolved_imports(graph, &mut merged, shared_memory_plan.as_ref())?;
 
         // Handle start functions
         self.resolve_start_functions(components, &mut merged)?;
+
+        if let Some(plan) = shared_memory_plan {
+            if plan.import.is_none() {
+                merged.memories.clear();
+                merged.memories.push(plan.memory);
+            } else {
+                merged.memories.clear();
+            }
+        }
 
         Ok(merged)
     }
@@ -168,9 +288,10 @@ impl Merger {
         component: &ParsedComponent,
         graph: &DependencyGraph,
         merged: &mut MergedModule,
+        shared_memory_plan: Option<&SharedMemoryPlan>,
     ) -> Result<()> {
         for (mod_idx, module) in component.core_modules.iter().enumerate() {
-            self.merge_core_module(comp_idx, mod_idx, module, graph, merged)?;
+            self.merge_core_module(comp_idx, mod_idx, module, graph, merged, shared_memory_plan)?;
         }
 
         Ok(())
@@ -184,6 +305,7 @@ impl Merger {
         module: &CoreModule,
         _graph: &DependencyGraph,
         merged: &mut MergedModule,
+        shared_memory_plan: Option<&SharedMemoryPlan>,
     ) -> Result<()> {
         // Merge types
         let type_offset = merged.types.len() as u32;
@@ -215,14 +337,21 @@ impl Merger {
         }
 
         // Merge memories
-        let mem_offset = merged.memories.len() as u32;
-        for (old_idx, mem) in module.memories.iter().enumerate() {
-            let new_idx = mem_offset + old_idx as u32;
-            merged.memory_index_map.insert(
-                (comp_idx, mod_idx, import_mem_count + old_idx as u32),
-                new_idx,
-            );
-            merged.memories.push(convert_memory_type(mem));
+        if self.memory_strategy == MemoryStrategy::SharedMemory {
+            let total_memories = import_mem_count + module.memories.len() as u32;
+            for idx in 0..total_memories {
+                merged.memory_index_map.insert((comp_idx, mod_idx, idx), 0);
+            }
+        } else {
+            let mem_offset = merged.memories.len() as u32;
+            for (old_idx, mem) in module.memories.iter().enumerate() {
+                let new_idx = mem_offset + old_idx as u32;
+                merged.memory_index_map.insert(
+                    (comp_idx, mod_idx, import_mem_count + old_idx as u32),
+                    new_idx,
+                );
+                merged.memories.push(convert_memory_type(mem));
+            }
         }
 
         // Merge tables
@@ -269,21 +398,45 @@ impl Merger {
             let new_type_idx = *merged
                 .type_index_map
                 .get(&(comp_idx, mod_idx, type_idx))
-                .ok_or_else(|| Error::IndexOutOfBounds {
+                .ok_or(Error::IndexOutOfBounds {
                     kind: "type",
                     index: type_idx,
                     max: module.types.len() as u32,
                 })?;
 
-            func_type_indices.push((old_idx, old_func_idx, new_type_idx));
+            func_type_indices.push((old_idx, old_func_idx, new_type_idx, type_idx));
         }
 
         // Build IndexMaps for this module's function bodies
-        let index_maps = build_index_maps_for_module(comp_idx, mod_idx, module, merged);
+        let memory_base_offset = shared_memory_plan
+            .and_then(|plan| plan.bases.get(&(comp_idx, mod_idx)).copied())
+            .unwrap_or(0);
+        let memory64 = if self.address_rebasing {
+            module_memory_type(module)?
+                .map(|mem| mem.memory64)
+                .unwrap_or(false)
+        } else {
+            false
+        };
+        let index_maps = build_index_maps_for_module(
+            comp_idx,
+            mod_idx,
+            module,
+            merged,
+            self.memory_strategy,
+            self.address_rebasing,
+            memory_base_offset,
+            memory64,
+        );
 
         // Second pass: extract and rewrite function bodies
-        for (old_idx, old_func_idx, new_type_idx) in func_type_indices {
-            let body = extract_function_body(module, old_idx, &index_maps)?;
+        for (old_idx, old_func_idx, new_type_idx, type_idx) in func_type_indices {
+            let param_count = module
+                .types
+                .get(type_idx as usize)
+                .map(|ty| ty.params.len() as u32)
+                .unwrap_or(0);
+            let body = extract_function_body(module, old_idx, param_count, &index_maps)?;
 
             merged.functions.push(MergedFunction {
                 type_idx: new_type_idx,
@@ -354,7 +507,7 @@ impl Merger {
         // Parse and merge data segments with reindexing
         let data_segments = crate::segments::parse_data_segments(module)?;
         for segment in data_segments {
-            let reindexed = crate::segments::reindex_data_segment(&segment, &index_maps);
+            let reindexed = crate::segments::reindex_data_segment(&segment, &index_maps)?;
             merged.data_segments.push(reindexed);
         }
 
@@ -366,8 +519,25 @@ impl Merger {
         &self,
         graph: &DependencyGraph,
         merged: &mut MergedModule,
+        shared_memory_plan: Option<&SharedMemoryPlan>,
     ) -> Result<()> {
+        let mut shared_memory_import_added = false;
+
         for unresolved in &graph.unresolved_imports {
+            if let (Some(plan), ImportKind::Memory(_)) = (shared_memory_plan, &unresolved.kind) {
+                if let Some((module, name)) = &plan.import {
+                    if !shared_memory_import_added {
+                        merged.imports.push(MergedImport {
+                            module: module.clone(),
+                            name: name.clone(),
+                            entity_type: EntityType::Memory(plan.memory),
+                        });
+                        shared_memory_import_added = true;
+                    }
+                }
+                continue;
+            }
+
             let entity_type = match &unresolved.kind {
                 ImportKind::Function(type_idx) => {
                     // Remap type index
@@ -387,6 +557,18 @@ impl Merger {
                 name: unresolved.field_name.clone(),
                 entity_type,
             });
+        }
+
+        if let Some(plan) = shared_memory_plan {
+            if let Some((module, name)) = &plan.import {
+                if !shared_memory_import_added {
+                    merged.imports.push(MergedImport {
+                        module: module.clone(),
+                        name: name.clone(),
+                        entity_type: EntityType::Memory(plan.memory),
+                    });
+                }
+            }
         }
 
         Ok(())
@@ -427,6 +609,133 @@ impl Merger {
     }
 }
 
+fn module_memory_type(module: &CoreModule) -> Result<Option<MemoryType>> {
+    let mut memory_type: Option<MemoryType> = None;
+
+    for import in &module.imports {
+        if let ImportKind::Memory(mem) = &import.kind {
+            if memory_type.is_some() {
+                return Err(Error::MemoryStrategyUnsupported(
+                    "shared memory rebasing supports a single memory per module".to_string(),
+                ));
+            }
+            memory_type = Some(mem.clone());
+        }
+    }
+
+    for mem in &module.memories {
+        if memory_type.is_some() {
+            return Err(Error::MemoryStrategyUnsupported(
+                "shared memory rebasing supports a single memory per module".to_string(),
+            ));
+        }
+        memory_type = Some(mem.clone());
+    }
+
+    Ok(memory_type)
+}
+
+fn combine_memory_types_shared(memories: &[MemoryType]) -> Result<MemoryType> {
+    let Some(first) = memories.first() else {
+        return Err(Error::MemoryStrategyUnsupported(
+            "shared memory requires at least one memory".to_string(),
+        ));
+    };
+
+    let mut minimum = first.initial;
+    let mut maximum = first.maximum;
+
+    for mem in memories.iter().skip(1) {
+        if mem.memory64 != first.memory64 {
+            return Err(Error::MemoryStrategyUnsupported(
+                "shared memory requires matching memory64 settings".to_string(),
+            ));
+        }
+        if mem.shared != first.shared {
+            return Err(Error::MemoryStrategyUnsupported(
+                "shared memory requires matching shared settings".to_string(),
+            ));
+        }
+
+        minimum = minimum.max(mem.initial);
+        maximum = match (maximum, mem.maximum) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            _ => None,
+        };
+    }
+
+    if let Some(max) = maximum {
+        if minimum > max {
+            return Err(Error::MemoryStrategyUnsupported(
+                "shared memory minimum exceeds maximum".to_string(),
+            ));
+        }
+    }
+
+    Ok(MemoryType {
+        memory64: first.memory64,
+        shared: first.shared,
+        initial: minimum,
+        maximum,
+    })
+}
+
+fn combine_memory_types_rebased(memories: &[MemoryType]) -> Result<MemoryType> {
+    let Some(first) = memories.first() else {
+        return Err(Error::MemoryStrategyUnsupported(
+            "shared memory requires at least one memory".to_string(),
+        ));
+    };
+
+    let mut minimum = 0u64;
+    let mut maximum: Option<u64> = Some(0);
+
+    for mem in memories {
+        if mem.memory64 != first.memory64 {
+            return Err(Error::MemoryStrategyUnsupported(
+                "shared memory requires matching memory64 settings".to_string(),
+            ));
+        }
+        if mem.shared != first.shared {
+            return Err(Error::MemoryStrategyUnsupported(
+                "shared memory requires matching shared settings".to_string(),
+            ));
+        }
+
+        minimum = minimum
+            .checked_add(mem.initial)
+            .ok_or_else(|| Error::MemoryStrategyUnsupported("memory size overflow".to_string()))?;
+
+        maximum = match (maximum, mem.maximum) {
+            (Some(a), Some(b)) => a.checked_add(b),
+            _ => None,
+        };
+    }
+
+    if !first.memory64 {
+        let max_pages = u64::from(u32::MAX) / WASM_PAGE_SIZE;
+        if minimum > max_pages {
+            return Err(Error::MemoryStrategyUnsupported(
+                "shared memory exceeds 32-bit address space".to_string(),
+            ));
+        }
+        if let Some(max) = maximum {
+            if max > max_pages {
+                return Err(Error::MemoryStrategyUnsupported(
+                    "shared memory maximum exceeds 32-bit address space".to_string(),
+                ));
+            }
+        }
+    }
+
+    Ok(MemoryType {
+        memory64: first.memory64,
+        shared: first.shared,
+        initial: minimum,
+        maximum,
+    })
+}
+
 /// Convert parser MemoryType to encoder MemoryType
 fn convert_memory_type(mem: &MemoryType) -> EncoderMemoryType {
     EncoderMemoryType {
@@ -446,8 +755,8 @@ fn convert_table_type(table: &TableType) -> EncoderTableType {
             _ => RefType::FUNCREF,
         },
         table64: false,
-        minimum: table.initial as u64,
-        maximum: table.maximum.map(|m| m as u64),
+        minimum: table.initial,
+        maximum: table.maximum,
         shared: false,
     }
 }
@@ -465,13 +774,21 @@ fn convert_global_type(global: &GlobalType) -> EncoderGlobalType {
 ///
 /// This creates a local view of index remappings for a specific module,
 /// which is used when rewriting function bodies.
+#[allow(clippy::too_many_arguments)]
 fn build_index_maps_for_module(
     comp_idx: usize,
     mod_idx: usize,
     module: &CoreModule,
     merged: &MergedModule,
+    memory_strategy: MemoryStrategy,
+    address_rebasing: bool,
+    memory_base_offset: u64,
+    memory64: bool,
 ) -> IndexMaps {
     let mut maps = IndexMaps::new();
+    maps.address_rebasing = address_rebasing;
+    maps.memory_base_offset = memory_base_offset;
+    maps.memory64 = memory64;
 
     // Build function map (including imported functions)
     let import_func_count = module
@@ -540,10 +857,17 @@ fn build_index_maps_for_module(
         .filter(|i| matches!(i.kind, ImportKind::Memory(_)))
         .count() as u32;
 
-    for old_idx in 0..module.memories.len() as u32 {
-        let full_idx = import_mem_count + old_idx;
-        if let Some(&new_idx) = merged.memory_index_map.get(&(comp_idx, mod_idx, full_idx)) {
-            maps.memories.insert(full_idx, new_idx);
+    let total_memories = import_mem_count + module.memories.len() as u32;
+    if memory_strategy == MemoryStrategy::SharedMemory {
+        for idx in 0..total_memories {
+            maps.memories.insert(idx, 0);
+        }
+    } else {
+        for old_idx in 0..module.memories.len() as u32 {
+            let full_idx = import_mem_count + old_idx;
+            if let Some(&new_idx) = merged.memory_index_map.get(&(comp_idx, mod_idx, full_idx)) {
+                maps.memories.insert(full_idx, new_idx);
+            }
         }
     }
 
@@ -571,6 +895,7 @@ fn create_global_init(val_type: &ValType) -> ConstExpr {
 fn extract_function_body(
     module: &CoreModule,
     func_idx: usize,
+    param_count: u32,
     maps: &IndexMaps,
 ) -> Result<Function> {
     // If no code section, return an unreachable function
@@ -591,7 +916,7 @@ fn extract_function_body(
         if let Payload::CodeSectionEntry(body) = payload {
             if current_func_idx == func_idx {
                 // Found the function - rewrite it with the index maps
-                return rewrite_function_body(&body, maps);
+                return rewrite_function_body(&body, param_count, maps);
             }
             current_func_idx += 1;
         }
@@ -607,7 +932,7 @@ fn extract_function_body(
 
 impl Default for Merger {
     fn default() -> Self {
-        Self::new(MemoryStrategy::SharedMemory)
+        Self::new(MemoryStrategy::SharedMemory, false)
     }
 }
 
@@ -638,5 +963,45 @@ mod tests {
 
         let expr = create_global_init(&ValType::F64);
         let _ = expr;
+    }
+
+    #[test]
+    fn test_combine_memory_types_rebased() {
+        let mem_a = MemoryType {
+            memory64: false,
+            shared: false,
+            initial: 2,
+            maximum: Some(5),
+        };
+        let mem_b = MemoryType {
+            memory64: false,
+            shared: false,
+            initial: 3,
+            maximum: Some(7),
+        };
+
+        let combined = combine_memory_types_rebased(&[mem_a, mem_b]).unwrap();
+        assert_eq!(combined.initial, 5);
+        assert_eq!(combined.maximum, Some(12));
+    }
+
+    #[test]
+    fn test_combine_memory_types_shared() {
+        let mem_a = MemoryType {
+            memory64: false,
+            shared: false,
+            initial: 2,
+            maximum: Some(10),
+        };
+        let mem_b = MemoryType {
+            memory64: false,
+            shared: false,
+            initial: 4,
+            maximum: Some(8),
+        };
+
+        let combined = combine_memory_types_shared(&[mem_a, mem_b]).unwrap();
+        assert_eq!(combined.initial, 4);
+        assert_eq!(combined.maximum, Some(8));
     }
 }

@@ -31,7 +31,7 @@ serde.workspace = true
 serde_json.workspace = true
 
 # Optional: wsc-attestation integration
-# wsc-attestation = { path = "../../wsc/src/attestation", optional = true }
+wsc-attestation = { version = "0.5", optional = true }
 
 [dev-dependencies]
 proptest.workspace = true
@@ -41,4 +41,4 @@ wat = "1.219"
 [features]
 default = []
 # Enable wsc-attestation integration for supply chain tracking
-# attestation = ["wsc-attestation"]
+attestation = ["wsc-attestation"]

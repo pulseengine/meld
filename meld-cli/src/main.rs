@@ -54,6 +54,10 @@ enum Commands {
         #[arg(long, default_value = "shared")]
         memory: String,
 
+        /// Rebase memory addresses for shared memory (experimental)
+        #[arg(long)]
+        address_rebase: bool,
+
         /// Show fusion statistics
         #[arg(long)]
         stats: bool,
@@ -105,6 +109,7 @@ fn main() -> Result<()> {
             inputs,
             output,
             memory,
+            address_rebase,
             stats,
             no_attestation,
             preserve_names,
@@ -114,6 +119,7 @@ fn main() -> Result<()> {
                 inputs,
                 output,
                 memory,
+                address_rebase,
                 stats,
                 no_attestation,
                 preserve_names,
@@ -160,10 +166,12 @@ fn main() -> Result<()> {
 }
 
 /// Fuse command implementation
+#[allow(clippy::too_many_arguments)]
 fn fuse_command(
     inputs: Vec<String>,
     output: String,
     memory: String,
+    address_rebase: bool,
     show_stats: bool,
     no_attestation: bool,
     preserve_names: bool,
@@ -189,10 +197,15 @@ fn fuse_command(
         }
     };
 
+    if address_rebase {
+        println!("Address rebasing is experimental and may have limitations");
+    }
+
     // Configure fuser
     let config = FuserConfig {
         memory_strategy,
         attestation: !no_attestation,
+        address_rebasing: address_rebase,
         preserve_names,
         ..Default::default()
     };

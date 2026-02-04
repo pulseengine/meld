@@ -53,6 +53,8 @@ pub use merger::{MergedModule, Merger};
 pub use parser::{ComponentParser, ParsedComponent};
 pub use resolver::{DependencyGraph, Resolver};
 
+#[cfg(not(feature = "attestation"))]
+use crate::attestation::{FusionAttestationBuilder, FUSION_ATTESTATION_SECTION};
 use wasm_encoder::Module as EncodedModule;
 
 /// Configuration for the fusion process
@@ -63,6 +65,9 @@ pub struct FuserConfig {
 
     /// Whether to generate attestation data
     pub attestation: bool,
+
+    /// Whether to rebase per-module memory addresses into a shared memory
+    pub address_rebasing: bool,
 
     /// Whether to preserve debug names
     pub preserve_names: bool,
@@ -76,6 +81,7 @@ impl Default for FuserConfig {
         Self {
             memory_strategy: MemoryStrategy::SharedMemory,
             attestation: true,
+            address_rebasing: false,
             preserve_names: false,
             custom_sections: CustomSectionHandling::Merge,
         }
@@ -189,6 +195,13 @@ impl Fuser {
         if self.components.is_empty() {
             return Err(Error::NoComponents);
         }
+        if self.config.address_rebasing
+            && self.config.memory_strategy != MemoryStrategy::SharedMemory
+        {
+            return Err(Error::MemoryStrategyUnsupported(
+                "address rebasing requires shared memory strategy".to_string(),
+            ));
+        }
 
         let mut stats = FusionStats {
             components_fused: self.components.len(),
@@ -212,7 +225,7 @@ impl Fuser {
 
         // Step 2: Merge modules
         log::info!("Merging {} core modules", stats.modules_merged);
-        let merger = Merger::new(self.config.memory_strategy);
+        let merger = Merger::new(self.config.memory_strategy, self.config.address_rebasing);
         let merged = merger.merge(&self.components, &graph)?;
         stats.total_functions = merged.functions.len();
         stats.total_exports = merged.exports.len();
@@ -229,7 +242,20 @@ impl Fuser {
 
         // Step 4: Encode output module
         log::info!("Encoding fused module");
-        let output = self.encode_output(&merged, &adapters)?;
+        let output_without_attestation = self.encode_output(&merged, &adapters, &[])?;
+        let output = if self.config.attestation {
+            // Build attestation from the output without the attestation section to avoid
+            // self-referential hashing.
+            let mut attestation_stats = stats.clone();
+            attestation_stats.output_size = output_without_attestation.len();
+            let (section_name, payload) =
+                self.build_attestation_payload(&output_without_attestation, &attestation_stats);
+            let extra_sections = vec![(section_name, payload)];
+            self.encode_output(&merged, &adapters, &extra_sections)?
+        } else {
+            output_without_attestation
+        };
+
         stats.output_size = output.len();
 
         log::info!(
@@ -251,6 +277,7 @@ impl Fuser {
         &self,
         merged: &MergedModule,
         adapters: &[adapter::AdapterFunction],
+        extra_custom_sections: &[(&str, Vec<u8>)],
     ) -> Result<Vec<u8>> {
         let mut module = EncodedModule::new();
 
@@ -269,7 +296,7 @@ impl Fuser {
         if !merged.imports.is_empty() {
             let mut imports = wasm_encoder::ImportSection::new();
             for imp in &merged.imports {
-                imports.import(&imp.module, &imp.name, imp.entity_type.clone());
+                imports.import(&imp.module, &imp.name, imp.entity_type);
             }
             module.section(&imports);
         }
@@ -291,7 +318,7 @@ impl Fuser {
         if !merged.tables.is_empty() {
             let mut tables = wasm_encoder::TableSection::new();
             for table in &merged.tables {
-                tables.table(table.clone());
+                tables.table(*table);
             }
             module.section(&tables);
         }
@@ -300,7 +327,7 @@ impl Fuser {
         if !merged.memories.is_empty() {
             let mut memories = wasm_encoder::MemorySection::new();
             for mem in &merged.memories {
-                memories.memory(mem.clone());
+                memories.memory(*mem);
             }
             module.section(&memories);
         }
@@ -309,7 +336,7 @@ impl Fuser {
         if !merged.globals.is_empty() {
             let mut globals = wasm_encoder::GlobalSection::new();
             for global in &merged.globals {
-                globals.global(global.ty.clone(), &global.init_expr);
+                globals.global(global.ty, &global.init_expr);
             }
             module.section(&globals);
         }
@@ -368,6 +395,9 @@ impl Fuser {
         // Handle custom sections based on config
         if self.config.custom_sections != CustomSectionHandling::Drop {
             for (name, contents) in &merged.custom_sections {
+                if !self.config.preserve_names && name == "name" {
+                    continue;
+                }
                 module.section(&wasm_encoder::CustomSection {
                     name: std::borrow::Cow::Borrowed(name),
                     data: std::borrow::Cow::Borrowed(contents),
@@ -375,7 +405,192 @@ impl Fuser {
             }
         }
 
+        for (name, contents) in extra_custom_sections {
+            module.section(&wasm_encoder::CustomSection {
+                name: std::borrow::Cow::Borrowed(*name),
+                data: std::borrow::Cow::Borrowed(contents),
+            });
+        }
+
         Ok(module.finish())
+    }
+
+    fn build_attestation_payload(
+        &self,
+        output_bytes: &[u8],
+        stats: &FusionStats,
+    ) -> (&'static str, Vec<u8>) {
+        #[cfg(feature = "attestation")]
+        {
+            let attestation = self.build_wsc_attestation(output_bytes, stats);
+            let payload = attestation
+                .to_json_compact()
+                .unwrap_or_else(|_| "{}".to_string())
+                .into_bytes();
+            (wsc_attestation::TRANSFORMATION_ATTESTATION_SECTION, payload)
+        }
+
+        #[cfg(not(feature = "attestation"))]
+        {
+            let attestation = self.build_attestation(output_bytes, stats);
+            (FUSION_ATTESTATION_SECTION, attestation.to_bytes())
+        }
+    }
+
+    #[cfg(not(feature = "attestation"))]
+    fn build_attestation(
+        &self,
+        output_bytes: &[u8],
+        stats: &FusionStats,
+    ) -> attestation::FusionAttestation {
+        let mut builder = FusionAttestationBuilder::new("meld", env!("CARGO_PKG_VERSION"))
+            .memory_strategy(self.memory_strategy_label());
+
+        for (index, component) in self.components.iter().enumerate() {
+            let name = component
+                .name
+                .clone()
+                .unwrap_or_else(|| format!("component-{}", index));
+            builder = builder.add_input_descriptor(
+                name,
+                component.core_modules.len(),
+                component.original_hash.clone(),
+                component.original_size as u64,
+            );
+        }
+
+        builder.build(output_bytes, stats)
+    }
+
+    #[cfg(feature = "attestation")]
+    fn build_wsc_attestation(
+        &self,
+        output_bytes: &[u8],
+        stats: &FusionStats,
+    ) -> wsc_attestation::TransformationAttestation {
+        use std::collections::HashMap;
+        use wsc_attestation::{
+            ArtifactDescriptor, AttestationSignature, InputArtifact, SignatureStatus, ToolInfo,
+            TransformationAttestation, TransformationType,
+        };
+
+        let output_hash = attestation::compute_sha256(output_bytes);
+        let timestamp = attestation::chrono_timestamp();
+        let attestation_id = attestation::generate_uuid();
+
+        let mut inputs = Vec::new();
+        for (index, component) in self.components.iter().enumerate() {
+            let name = component
+                .name
+                .clone()
+                .unwrap_or_else(|| format!("component-{}", index));
+            inputs.push(InputArtifact {
+                artifact: ArtifactDescriptor {
+                    name,
+                    hash: component.original_hash.clone(),
+                    size: component.original_size as u64,
+                },
+                signature_status: SignatureStatus::Unsigned,
+                signature_info: None,
+                provenance: None,
+                transformation_chain: None,
+            });
+        }
+
+        let mut tool_parameters = HashMap::new();
+        tool_parameters.insert(
+            "memory_strategy".to_string(),
+            serde_json::json!(self.memory_strategy_label()),
+        );
+        tool_parameters.insert(
+            "address_rebasing".to_string(),
+            serde_json::json!(self.config.address_rebasing),
+        );
+        tool_parameters.insert(
+            "preserve_names".to_string(),
+            serde_json::json!(self.config.preserve_names),
+        );
+        tool_parameters.insert(
+            "custom_sections".to_string(),
+            serde_json::json!(self.custom_sections_label()),
+        );
+
+        let mut metadata = HashMap::new();
+        metadata.insert(
+            "memory_strategy".to_string(),
+            serde_json::json!(self.memory_strategy_label()),
+        );
+        metadata.insert(
+            "components_fused".to_string(),
+            serde_json::json!(stats.components_fused),
+        );
+        metadata.insert(
+            "modules_merged".to_string(),
+            serde_json::json!(stats.modules_merged),
+        );
+        metadata.insert(
+            "adapters_generated".to_string(),
+            serde_json::json!(stats.adapter_functions),
+        );
+        metadata.insert(
+            "imports_resolved".to_string(),
+            serde_json::json!(stats.imports_resolved),
+        );
+        let size_reduction = if stats.input_size > 0 {
+            ((stats.input_size - stats.output_size) as f64 / stats.input_size as f64) * 100.0
+        } else {
+            0.0
+        };
+        metadata.insert(
+            "size_reduction_percent".to_string(),
+            serde_json::json!(size_reduction),
+        );
+
+        TransformationAttestation {
+            version: "1.0".to_string(),
+            transformation_type: TransformationType::Composition,
+            attestation_id,
+            timestamp: timestamp.clone(),
+            output: ArtifactDescriptor {
+                name: "fused.wasm".to_string(),
+                hash: output_hash,
+                size: output_bytes.len() as u64,
+            },
+            inputs,
+            tool: ToolInfo {
+                name: "meld".to_string(),
+                version: env!("CARGO_PKG_VERSION").to_string(),
+                tool_hash: None,
+                parameters: tool_parameters,
+            },
+            attestation_signature: AttestationSignature {
+                algorithm: "unsigned".to_string(),
+                signature: String::new(),
+                key_id: None,
+                public_key: None,
+                signer_identity: None,
+                certificate_chain: None,
+                rekor_uuid: None,
+                signed_at: timestamp,
+            },
+            metadata,
+        }
+    }
+
+    fn memory_strategy_label(&self) -> &'static str {
+        match self.config.memory_strategy {
+            MemoryStrategy::SharedMemory => "shared",
+            MemoryStrategy::MultiMemory => "multi",
+        }
+    }
+
+    #[cfg(feature = "attestation")]
+    fn custom_sections_label(&self) -> &'static str {
+        match self.config.custom_sections {
+            CustomSectionHandling::Merge => "merge",
+            CustomSectionHandling::Prefix => "prefix",
+            CustomSectionHandling::Drop => "drop",
+        }
     }
 }
 
@@ -388,6 +603,7 @@ mod tests {
         let config = FuserConfig::default();
         assert_eq!(config.memory_strategy, MemoryStrategy::SharedMemory);
         assert!(config.attestation);
+        assert!(!config.address_rebasing);
         assert!(!config.preserve_names);
     }
 

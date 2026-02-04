@@ -103,6 +103,9 @@ def _meld_fuse_impl(ctx):
     args.add("--memory", ctx.attr.memory_strategy)
 
     # Optional flags
+    if ctx.attr.address_rebase:
+        args.add("--address-rebase")
+
     if not ctx.attr.attestation:
         args.add("--no-attestation")
 
@@ -166,6 +169,7 @@ in browsers or WASM runtimes.
 | components | List of component targets to fuse |
 | out | Output filename (default: {name}.wasm) |
 | memory_strategy | "shared" (default) or "multi" |
+| address_rebase | Rebase memory addresses for shared memory (experimental) |
 | attestation | Include transformation attestation |
 | preserve_names | Keep debug names in output |
 | stats | Generate statistics file |
@@ -184,6 +188,10 @@ in browsers or WASM runtimes.
             doc = "Memory strategy: 'shared' (all components share memory) or 'multi' (each component has own memory).",
             default = "shared",
             values = ["shared", "multi"],
+        ),
+        "address_rebase": attr.bool(
+            doc = "Rebase memory addresses for shared memory (experimental).",
+            default = False,
         ),
         "attestation": attr.bool(
             doc = "Include transformation attestation in output custom section.",

@@ -84,20 +84,15 @@ pub trait AdapterGenerator {
 }
 
 /// String encoding used by a component
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum StringEncoding {
     /// UTF-8 encoding
+    #[default]
     Utf8,
     /// UTF-16 encoding (little-endian)
     Utf16,
     /// Latin-1 encoding (single byte per character)
     Latin1,
-}
-
-impl Default for StringEncoding {
-    fn default() -> Self {
-        StringEncoding::Utf8
-    }
 }
 
 /// Options for a single adapter
