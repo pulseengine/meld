@@ -7,7 +7,7 @@ use crate::parser::{
     CoreModule, ExportKind, GlobalType, ImportKind, MemoryType, ParsedComponent, TableType,
 };
 use crate::resolver::DependencyGraph;
-use crate::rewriter::{rewrite_function_body, IndexMaps};
+use crate::rewriter::{IndexMaps, rewrite_function_body};
 use crate::{Error, MemoryStrategy, Result};
 use std::collections::HashMap;
 use wasm_encoder::{
@@ -15,7 +15,6 @@ use wasm_encoder::{
     GlobalType as EncoderGlobalType, MemoryType as EncoderMemoryType, RefType,
     TableType as EncoderTableType, ValType,
 };
-use wasmparser::{Parser, Payload};
 
 const WASM_PAGE_SIZE: u64 = 65536;
 
@@ -411,13 +410,16 @@ impl Merger {
         let memory_base_offset = shared_memory_plan
             .and_then(|plan| plan.bases.get(&(comp_idx, mod_idx)).copied())
             .unwrap_or(0);
-        let memory64 = if self.address_rebasing {
+        let module_memory = if self.address_rebasing {
             module_memory_type(module)?
-                .map(|mem| mem.memory64)
-                .unwrap_or(false)
         } else {
-            false
+            None
         };
+        let memory64 = module_memory
+            .as_ref()
+            .map(|mem| mem.memory64)
+            .unwrap_or(false);
+        let memory_initial_pages = module_memory.as_ref().map(|mem| mem.initial);
         let index_maps = build_index_maps_for_module(
             comp_idx,
             mod_idx,
@@ -427,6 +429,7 @@ impl Merger {
             self.address_rebasing,
             memory_base_offset,
             memory64,
+            memory_initial_pages,
         );
 
         // Second pass: extract and rewrite function bodies
@@ -784,11 +787,13 @@ fn build_index_maps_for_module(
     address_rebasing: bool,
     memory_base_offset: u64,
     memory64: bool,
+    memory_initial_pages: Option<u64>,
 ) -> IndexMaps {
     let mut maps = IndexMaps::new();
     maps.address_rebasing = address_rebasing;
     maps.memory_base_offset = memory_base_offset;
     maps.memory64 = memory64;
+    maps.memory_initial_pages = memory_initial_pages;
 
     // Build function map (including imported functions)
     let import_func_count = module
@@ -908,18 +913,17 @@ fn extract_function_body(
 
     // Parse the code section to find the function body
     let code_bytes = &module.bytes[start..end];
-    let parser = Parser::new(0);
+    let binary_reader = wasmparser::BinaryReader::new(code_bytes, 0);
+    let reader = wasmparser::CodeSectionReader::new(binary_reader)?;
 
     let mut current_func_idx = 0;
-    for payload in parser.parse_all(code_bytes) {
-        let payload = payload?;
-        if let Payload::CodeSectionEntry(body) = payload {
-            if current_func_idx == func_idx {
-                // Found the function - rewrite it with the index maps
-                return rewrite_function_body(&body, param_count, maps);
-            }
-            current_func_idx += 1;
+    for body in reader {
+        let body = body?;
+        if current_func_idx == func_idx {
+            // Found the function - rewrite it with the index maps
+            return rewrite_function_body(&body, param_count, maps);
         }
+        current_func_idx += 1;
     }
 
     // Function not found - return unreachable

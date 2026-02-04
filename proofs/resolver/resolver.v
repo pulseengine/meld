@@ -6,7 +6,7 @@
   See proofs/DECISIONS.md.
 *)
 
-From Coq Require Import List Arith Lia.
+From Coq Require Import List Arith Lia PeanoNat.
 Import ListNotations.
 
 (*
@@ -15,6 +15,13 @@ Import ListNotations.
   maps to at most one index.
 *)
 Definition key_map := list (nat * nat).
+
+Fixpoint lookup (k : nat) (m : key_map) : option nat :=
+  match m with
+  | [] => None
+  | (k0, v0) :: m' =>
+      if Nat.eqb k k0 then Some v0 else lookup k m'
+  end.
 
 Theorem unique_key_value :
   forall (m : key_map) k v1 v2,
@@ -41,4 +48,28 @@ Proof.
       apply in_map with (f := fst) in H1.
       exact H1.
     + apply IH with (k := k); auto.
+Qed.
+
+Theorem lookup_complete :
+  forall (m : key_map) k v,
+    NoDup (map fst m) ->
+    In (k, v) m ->
+    lookup k m = Some v.
+Proof.
+  induction m as [| [k0 v0] m IH]; intros k v Hnodup Hin.
+  - contradiction.
+  - simpl in Hnodup.
+    inversion Hnodup as [| ? ? Hnotin Hnodup']; subst.
+    simpl in Hin.
+    destruct Hin as [Hin | Hin].
+    + inversion Hin; subst.
+      rewrite Nat.eqb_refl.
+      reflexivity.
+    + destruct (Nat.eqb k k0) eqn:Heq.
+      * apply Nat.eqb_eq in Heq; subst.
+        exfalso.
+        apply Hnotin.
+        apply in_map with (f := fst) in Hin.
+        exact Hin.
+      * apply IH; auto.
 Qed.

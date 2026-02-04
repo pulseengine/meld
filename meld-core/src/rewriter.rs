@@ -30,6 +30,8 @@ pub struct IndexMaps {
     pub address_rebasing: bool,
     /// Whether the memory uses 64-bit addressing
     pub memory64: bool,
+    /// Initial memory size in pages for the module (used for rebased memory.size)
+    pub memory_initial_pages: Option<u64>,
     /// Scratch locals used for address rebasing
     pub rebase_locals: Option<RebaseLocals>,
 }
@@ -250,9 +252,25 @@ fn rewrite_operator(op: Operator<'_>, maps: &IndexMaps) -> Result<Vec<Instructio
         I64Store32 { memarg } => Instruction::I64Store32(convert_memarg(memarg, maps)?),
         MemorySize { mem, .. } => {
             if maps.address_rebasing {
-                return Err(Error::UnsupportedFeature(
-                    "memory.size not supported with address rebasing".to_string(),
-                ));
+                let pages = maps.memory_initial_pages.ok_or_else(|| {
+                    Error::UnsupportedFeature(
+                        "memory.size requires a module memory in rebasing mode".to_string(),
+                    )
+                })?;
+                if maps.memory64 {
+                    let pages_i64 = i64::try_from(pages).map_err(|_| {
+                        Error::UnsupportedFeature(
+                            "memory.size page count exceeds i64 range".to_string(),
+                        )
+                    })?;
+                    return Ok(vec![Instruction::I64Const(pages_i64)]);
+                }
+                let pages_u32 = u32::try_from(pages).map_err(|_| {
+                    Error::UnsupportedFeature(
+                        "memory.size page count exceeds i32 range".to_string(),
+                    )
+                })?;
+                return Ok(vec![Instruction::I32Const(pages_u32 as i32)]);
             }
             Instruction::MemorySize(maps.remap_memory(mem))
         }
@@ -677,9 +695,11 @@ mod tests {
         )
         .unwrap();
 
-        assert!(instrs
-            .iter()
-            .any(|instr| matches!(instr, Instruction::I32Const(16))));
+        assert!(
+            instrs
+                .iter()
+                .any(|instr| matches!(instr, Instruction::I32Const(16)))
+        );
         assert!(matches!(
             instrs.last(),
             Some(Instruction::MemoryCopy { .. })
@@ -701,9 +721,11 @@ mod tests {
 
         let instrs = rewrite_operator(Operator::MemoryFill { mem: 0 }, &maps).unwrap();
 
-        assert!(instrs
-            .iter()
-            .any(|instr| matches!(instr, Instruction::I32Const(8))));
+        assert!(
+            instrs
+                .iter()
+                .any(|instr| matches!(instr, Instruction::I32Const(8)))
+        );
         assert!(matches!(instrs.last(), Some(Instruction::MemoryFill(_))));
     }
 
@@ -729,9 +751,11 @@ mod tests {
         )
         .unwrap();
 
-        assert!(instrs
-            .iter()
-            .any(|instr| matches!(instr, Instruction::I32Const(4))));
+        assert!(
+            instrs
+                .iter()
+                .any(|instr| matches!(instr, Instruction::I32Const(4)))
+        );
         assert!(matches!(
             instrs.last(),
             Some(Instruction::MemoryInit { .. })
@@ -739,11 +763,14 @@ mod tests {
     }
 
     #[test]
-    fn test_rewrite_memory_size_rebased_fails() {
+    fn test_rewrite_memory_size_rebased_const() {
         let mut maps = IndexMaps::new();
         maps.address_rebasing = true;
+        maps.memory64 = false;
+        maps.memory_initial_pages = Some(3);
 
-        assert!(rewrite_operator(Operator::MemorySize { mem: 0 }, &maps).is_err());
+        let instrs = rewrite_operator(Operator::MemorySize { mem: 0 }, &maps).unwrap();
+        assert!(matches!(instrs.as_slice(), [Instruction::I32Const(3)]));
     }
 
     #[test]

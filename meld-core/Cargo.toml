@@ -37,6 +37,7 @@ wsc-attestation = { version = "0.5", optional = true }
 proptest.workspace = true
 wasmprinter.workspace = true
 wat = "1.219"
+wasmtime = "41.0.1"
 
 [features]
 default = []
