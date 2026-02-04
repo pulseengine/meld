@@ -1,0 +1,22 @@
+# Clippy configuration for meld project
+# This file documents our linting standards and can be used to configure clippy behavior
+
+# Treat warnings as errors in CI
+# This is enforced via the -D warnings flag in our pre-commit hooks and CI
+
+# Common lints we want to enforce:
+# - dead_code: Find unused code
+# - unnecessary_lazy_evaluations: Avoid unnecessary closures
+# - unnecessary_cast: Avoid redundant type casts
+# - useless_conversion: Avoid redundant conversions
+# - len_zero: Prefer is_empty() over len() > 0
+# - clone_on_copy: Avoid cloning Copy types
+# - derivable_impls: Use #[derive] when possible
+
+# These are all enforced via -D warnings which treats all warnings as errors
+
+# If we need to allow specific lints in certain cases, we can add them here:
+# [lints]
+# allowed = [
+#     "clippy::some_lint_we_need_to_allow",
+# ]
