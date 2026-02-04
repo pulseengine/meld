@@ -98,28 +98,28 @@ wasmtime run optimized.wasm
 flowchart TD
     subgraph BuildTime[Build Time]
         direction TB
-        
+
         Sources[Rust/Go/C++ Sources] -->|compile| Components[P2/P3 Components]
         Components -->|optional| WAC[wac compose]
         WAC --> Meld
-        
+
         subgraph Meld[Meld - Static Fuser]
             direction LR
             MeldInput[Input Components] --> MeldProcess[Parse, Resolve, Merge, Adapt, Encode]
             MeldProcess --> MeldOutput[Single Module]
         end
-        
+
         MeldOutput --> Loom
-        
+
         subgraph Loom[loom - Optimizer]
             direction LR
             LoomInput[Single Module] --> LoomProcess[Whole-program Optimization]
             LoomProcess --> LoomOutput[Optimized Module]
         end
     end
-    
+
     LoomOutput --> Runtime
-    
+
     subgraph Runtime[Runtime]
         direction TB
         LoomOutput --> Browser
@@ -127,10 +127,10 @@ flowchart TD
         LoomOutput --> Wasmer
         LoomOutput --> Native
     end
-    
-    classDef buildFill:#f9f,stroke:#333;
-    classDef runtimeFill:#bbf,stroke:#333;
-    
+
+    classDef buildFill fill:#f9f,stroke:#333;
+    classDef runtimeFill fill:#bbf,stroke:#333;
+
     class BuildTime,Sources,Components,WAC,Meld,Loom buildFill
     class Runtime,Browser,Wasmtime,Wasmer,Native runtimeFill
 ```
