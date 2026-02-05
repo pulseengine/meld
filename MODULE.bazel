@@ -26,7 +26,7 @@ bazel_dep(name = "rules_wasm_component", version = "1.0.0")
 git_override(
     module_name = "rules_wasm_component",
     remote = "https://github.com/pulseengine/rules_wasm_component.git",
-    branch = "fix/issue-339-bitflags-dep-and-wasm-tools-update",
+    branch = "main",
 )
 
 ###############################################################################
