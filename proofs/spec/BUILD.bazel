@@ -1,0 +1,26 @@
+load("@rules_rocq_rust//rocq:defs.bzl", "rocq_library")
+
+package(default_visibility = ["//visibility:public"])
+
+rocq_library(
+    name = "wasm_core",
+    srcs = ["wasm_core.v"],
+    include_path = "MeldSpec",
+)
+
+rocq_library(
+    name = "component_model",
+    srcs = ["component_model.v"],
+    deps = [":wasm_core"],
+    include_path = "MeldSpec",
+)
+
+rocq_library(
+    name = "fusion_spec",
+    srcs = ["fusion_spec.v"],
+    deps = [
+        ":wasm_core",
+        ":component_model",
+    ],
+    include_path = "MeldSpec",
+)
