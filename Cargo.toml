@@ -4,6 +4,9 @@ members = [
     "meld-core",
     "meld-cli",
 ]
+exclude = [
+    "tools/spec-sync",
+]
 
 [workspace.package]
 version = "0.1.0"
