@@ -625,14 +625,52 @@ impl Merger {
             }
         }
 
-        // If exactly one start function, use it
-        // If multiple, we'd need to generate a wrapper that calls all of them
         if start_funcs.len() == 1 {
             merged.start_function = Some(start_funcs[0]);
         } else if start_funcs.len() > 1 {
-            // TODO: Generate a start wrapper that calls all start functions in order
-            log::warn!("Multiple start functions found, using first one");
-            merged.start_function = Some(start_funcs[0]);
+            // Generate a wrapper function that calls all start functions in order.
+            // Start functions have type [] -> [], so the wrapper is also [] -> [].
+
+            // Find or create the [] -> [] type
+            let empty_type_idx = merged
+                .types
+                .iter()
+                .position(|t| t.params.is_empty() && t.results.is_empty())
+                .unwrap_or_else(|| {
+                    let idx = merged.types.len();
+                    merged.types.push(MergedFuncType {
+                        params: vec![],
+                        results: vec![],
+                    });
+                    idx
+                }) as u32;
+
+            let mut wrapper = Function::new(vec![]);
+            for &func_idx in &start_funcs {
+                wrapper.instruction(&wasm_encoder::Instruction::Call(func_idx));
+            }
+            wrapper.instruction(&wasm_encoder::Instruction::End);
+
+            // The wrapper's function index = import_func_count + functions.len()
+            let import_func_count = merged
+                .imports
+                .iter()
+                .filter(|i| matches!(i.entity_type, EntityType::Function(_)))
+                .count() as u32;
+            let wrapper_idx = import_func_count + merged.functions.len() as u32;
+
+            merged.functions.push(MergedFunction {
+                type_idx: empty_type_idx,
+                body: wrapper,
+                origin: (usize::MAX, usize::MAX, 0), // synthetic function
+            });
+
+            log::info!(
+                "Generated start wrapper (func {}) calling {} start functions",
+                wrapper_idx,
+                start_funcs.len()
+            );
+            merged.start_function = Some(wrapper_idx);
         }
 
         Ok(())

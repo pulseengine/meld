@@ -105,24 +105,32 @@ Proof.
   apply count_imports_flat_map_aux.
 Qed.
 
-(* merge_mems_length: With SharedMemory, all memories are combined into one.
-   The merged module has exactly 1 memory regardless of how many the source
-   modules had. The inequality holds when the total memory count from all
-   source modules is at least 1 (i.e., some module has a memory or memory import).
+(* merge_mems_length: Design gap — SharedMemory MemIdx remapping.
 
-   Edge case: if input is [] (no modules), SharedMemory still creates 1 memory
-   but total_space_count is 0, making the inequality false. Similarly, if no
-   module has any memory or memory import, total MemIdx count is 0 but merged
-   has 1 memory.
+   ISSUE: SharedMemory collapses all source memories into 1 shared memory,
+   but gen_all_remaps computes cumulative offsets (total_space_count) for
+   MemIdx just like for other spaces. This creates a mismatch:
 
-   We handle the general case where the sum of memory-space items across all
-   modules is at least 1, and leave the degenerate empty-input case documented.
-   Since real fusion always has at least one module with at least one memory,
-   this is not a practical limitation.
+   - Merged module: count_mem_imports(merged) + 1 memory slots
+   - Remap bound:   fused_idx < total_space_count input MemIdx
+                   = count_mem_imports(merged) + sum(length(mod_mems(m)))
 
-   Proof requires: 1 <= fold_left (fun acc sm => acc + length (mod_mems (snd sm))) input 0,
-   which does not hold for empty input or input where no module has memories.
-   Admitted pending addition of a precondition that input contains at least one memory. *)
+   When sum(length mems) > 1, the remap can produce indices beyond the
+   merged module's memory space. The callers need fused_idx < merged_total,
+   but only have fused_idx < total_space_count >= merged_total.
+
+   ROOT CAUSE: gen_all_remaps should special-case MemIdx for SharedMemory:
+   all memory references should remap to index 0 (the single shared memory)
+   rather than using cumulative offsets. This requires:
+   1. A SharedMemory-aware remap generation for MemIdx
+   2. A tighter bound: forall r, ir_space r = MemIdx -> ir_fused_idx r = 0
+   3. Callers use: valid_memidx merged 0 (trivially true since 0 < 0 + 1)
+
+   The current lemma statement (<=) is mathematically correct with a
+   precondition (1 <= sum(length mems)), but the direction is WRONG for
+   callers which need (>=). Neither direction works universally.
+
+   Admitted pending SharedMemory-aware MemIdx remap redesign. *)
 Lemma merge_mems_length :
   forall input,
     count_mem_imports (merge_modules input) + length (mod_mems (merge_modules input))
@@ -136,9 +144,8 @@ Proof.
   rewrite <- fold_left_add_split.
   (* Goal: fold(mem_imports) + 1 <= fold(mem_imports) + fold(length mems)
      Equivalent to: 1 <= fold(length mems).
-     This requires at least one module in input to have at least one memory.
-     The SharedMemory strategy presupposes this, but no such precondition
-     appears in the lemma statement. *)
+     Even with a precondition, the callers can't use this (<= direction).
+     See design note above. *)
   admit.
 Admitted.
 
