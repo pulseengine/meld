@@ -6,7 +6,7 @@
   See proofs/DECISIONS.md.
 *)
 
-From Coq Require Import Arith Lia.
+From Stdlib Require Import Arith Lia.
 
 (*
   Minimal model of index offsetting used during segment layout. This models the

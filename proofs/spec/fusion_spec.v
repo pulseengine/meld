@@ -326,9 +326,259 @@ Definition fusion_correct (cc : composed_component) (config : fusion_config)
    a simulation relation.
    ========================================================================= *)
 
-(* Placeholder for semantic equivalence - to be developed *)
+(* -------------------------------------------------------------------------
+   WebAssembly Runtime Values and State
+
+   Core types for execution semantics. These form the basis of both
+   composed and fused execution states.
+   ------------------------------------------------------------------------- *)
+
+(* Runtime values *)
+Inductive wasm_value : Type :=
+  | I32 (n : Z)
+  | I64 (n : Z)
+  | F32 (f : Z)  (* Simplified: actual floats are complex *)
+  | F64 (f : Z)
+  | RefNull (rt : reftype)
+  | RefFunc (addr : nat).
+
+(* Memory instance: simplified as byte array *)
+Record memory_inst : Type := mkMemoryInst {
+  mem_data : list nat;  (* Byte values *)
+  mem_max : option nat;
+}.
+
+(* Table instance: simplified as function reference array *)
+Record table_inst : Type := mkTableInst {
+  tab_elem : list (option nat);  (* Function addresses *)
+  tab_max : option nat;
+}.
+
+(* Global instance *)
+Record global_inst : Type := mkGlobalInst {
+  glob_value : wasm_value;
+  glob_mut : mutability;
+}.
+
+(* Module instance state at runtime *)
+Record module_state : Type := mkModuleState {
+  ms_funcs : list nat;        (* Function addresses *)
+  ms_tables : list table_inst;
+  ms_mems : list memory_inst;
+  ms_globals : list global_inst;
+  ms_locals : list wasm_value;    (* Local variables for current frame *)
+  ms_value_stack : list wasm_value; (* Operand stack *)
+}.
+
+(* -------------------------------------------------------------------------
+   Execution States
+
+   Composed execution: each source module has its own state
+   Fused execution: single unified module state
+   ------------------------------------------------------------------------- *)
+
+(* Composed component execution state *)
+Record composed_exec_state : Type := mkComposedExecState {
+  ces_module_states : list (module_source * module_state);
+  ces_shared_memory : option memory_inst;  (* Shared for cross-module *)
+}.
+
+(* Fused module execution state *)
+Record fused_exec_state : Type := mkFusedExecState {
+  fes_module_state : module_state;
+}.
+
+(* -------------------------------------------------------------------------
+   Step Relations (Operational Semantics)
+
+   These define single-step execution for both composed and fused forms.
+   Full semantics would include all WASM instructions; we provide stubs
+   to establish the structure.
+   ------------------------------------------------------------------------- *)
+
+(* Composed component takes a step *)
+Inductive composed_step (cc : composed_component)
+  : composed_exec_state -> composed_exec_state -> Prop :=
+  (* Stub constructors - to be filled with actual instruction semantics *)
+  | CS_LocalOp : forall ces ces' (src : module_source),
+      (* Local operation within one module *)
+      (* TODO: Add actual preconditions (instruction fetch, decode, execute) *)
+      In src (map fst (ces_module_states ces)) ->
+      composed_step cc ces ces'
+  | CS_CrossModuleCall : forall ces ces' (src_module target_module : module_source),
+      (* Cross-module call requiring adapter *)
+      (* TODO: Add adapter application logic *)
+      In src_module (map fst (ces_module_states ces)) ->
+      In target_module (map fst (ces_module_states ces)) ->
+      composed_step cc ces ces'
+  | CS_MemoryOp : forall ces ces' (src : module_source),
+      (* Memory operation (possibly on shared memory) *)
+      (* TODO: Add memory bounds checks and access logic *)
+      In src (map fst (ces_module_states ces)) ->
+      composed_step cc ces ces'.
+
+(* Fused module takes a step *)
+Inductive fused_step (fr : fusion_result)
+  : fused_exec_state -> fused_exec_state -> Prop :=
+  (* Stub constructors - to be filled with actual instruction semantics *)
+  | FS_LocalOp : forall fes fes',
+      (* Local operation using fused indices *)
+      (* TODO: Add actual preconditions (instruction fetch, decode, execute) *)
+      fused_step fr fes fes'
+  | FS_InlinedCall : forall fes fes',
+      (* Former cross-module call, now inlined *)
+      (* TODO: Add direct call logic with remapped indices *)
+      fused_step fr fes fes'
+  | FS_MemoryOp : forall fes fes',
+      (* Memory operation (possibly rebased) *)
+      (* TODO: Add memory bounds checks with rebasing *)
+      fused_step fr fes fes'.
+
+(* Trap states *)
+Inductive composed_traps (cc : composed_component) : composed_exec_state -> Prop :=
+  | CT_Unreachable : forall ces, composed_traps cc ces
+  | CT_OutOfBounds : forall ces, composed_traps cc ces
+  | CT_TypeMismatch : forall ces, composed_traps cc ces.
+
+Inductive fused_traps (fr : fusion_result) : fused_exec_state -> Prop :=
+  | FT_Unreachable : forall fes, fused_traps fr fes
+  | FT_OutOfBounds : forall fes, fused_traps fr fes
+  | FT_TypeMismatch : forall fes, fused_traps fr fes.
+
+(* -------------------------------------------------------------------------
+   State Correspondence
+
+   Relates composed execution state to fused state via the remap table
+   and memory layout.
+   ------------------------------------------------------------------------- *)
+
+(* Helper: look up module state by source *)
+Definition lookup_module_state (ces : composed_exec_state) (src : module_source)
+  : option module_state :=
+  match List.find (fun '(s, _) => Nat.eqb (fst s) (fst src) && Nat.eqb (snd s) (snd src))
+                  (ces_module_states ces) with
+  | Some (_, ms) => Some ms
+  | None => None
+  end.
+
+(* Value correspondence: values are equal (no remapping needed for data) *)
+Definition values_correspond (v1 v2 : wasm_value) : Prop :=
+  v1 = v2.  (* Could be refined for references *)
+
+(* Value stack correspondence *)
+Definition value_stacks_correspond (vs1 vs2 : list wasm_value) : Prop :=
+  length vs1 = length vs2 /\
+  Forall2 values_correspond vs1 vs2.
+
+(* Global correspondence via remap *)
+Definition global_corresponds (remaps : remap_table) (src : module_source)
+                              (src_idx : idx) (g_src g_fused : global_inst) : Prop :=
+  values_correspond (glob_value g_src) (glob_value g_fused) /\
+  glob_mut g_src = glob_mut g_fused.
+
+(* Memory correspondence: source memory region maps to fused memory *)
+Definition memory_corresponds (layout_opt : option memory_layout_table)
+                             (src : module_source)
+                             (mem_src : memory_inst)
+                             (mem_fused : memory_inst) : Prop :=
+  match layout_opt with
+  | None =>
+      (* Separate memories: exact equality *)
+      mem_data mem_src = mem_data mem_fused
+  | Some layouts =>
+      (* Shared memory: source is a slice of fused, starting at base *)
+      exists layout,
+        In layout layouts /\
+        ml_source layout = src /\
+        forall offset,
+          offset < length (mem_data mem_src) ->
+          nth_error (mem_data mem_src) offset =
+          nth_error (mem_data mem_fused) (ml_base_address layout + offset)
+  end.
+
+(* Table correspondence via remap *)
+Definition table_corresponds (remaps : remap_table) (src : module_source)
+                             (tab_src tab_fused : table_inst) : Prop :=
+  length (tab_elem tab_src) = length (tab_elem tab_fused) /\
+  tab_max tab_src = tab_max tab_fused.
+  (* Full version would map function addresses via remap *)
+
+(* State correspondence record *)
+Record state_correspondence (cc : composed_component) (fr : fusion_result)
+                            (ces : composed_exec_state)
+                            (fes : fused_exec_state) : Prop := mkStateCorrespondence {
+  (* Remap and layout from fusion result *)
+  sc_remap_table : fr_remaps fr = fr_remaps fr;  (* Tautology for now *)
+  sc_memory_layout : fr_memory_layout fr = fr_memory_layout fr;
+
+  (* Value stacks correspond *)
+  sc_value_stack_eq : forall src ms,
+      lookup_module_state ces src = Some ms ->
+      value_stacks_correspond (ms_value_stack ms)
+                             (ms_value_stack (fes_module_state fes));
+
+  (* Memory correspondence *)
+  sc_memory_eq : forall src ms mem_src,
+      lookup_module_state ces src = Some ms ->
+      nth_error (ms_mems ms) 0 = Some mem_src ->
+      exists mem_fused,
+        nth_error (ms_mems (fes_module_state fes)) 0 = Some mem_fused /\
+        memory_corresponds (fr_memory_layout fr) src mem_src mem_fused;
+
+  (* Globals correspond via remap *)
+  sc_globals_eq : forall src ms src_idx g_src,
+      lookup_module_state ces src = Some ms ->
+      nth_error (ms_globals ms) src_idx = Some g_src ->
+      exists fused_idx g_fused,
+        lookup_remap (fr_remaps fr) GlobalIdx src src_idx = Some fused_idx /\
+        nth_error (ms_globals (fes_module_state fes)) fused_idx = Some g_fused /\
+        global_corresponds (fr_remaps fr) src src_idx g_src g_fused;
+
+  (* Tables correspond via remap *)
+  sc_tables_eq : forall src ms src_idx tab_src,
+      lookup_module_state ces src = Some ms ->
+      nth_error (ms_tables ms) src_idx = Some tab_src ->
+      exists fused_idx tab_fused,
+        lookup_remap (fr_remaps fr) TableIdx src src_idx = Some fused_idx /\
+        nth_error (ms_tables (fes_module_state fes)) fused_idx = Some tab_fused /\
+        table_corresponds (fr_remaps fr) src tab_src tab_fused;
+}.
+
+(* -------------------------------------------------------------------------
+   Semantic Equivalence via Forward Simulation
+
+   The fused module simulates the composed component: every step in the
+   composed execution is matched by corresponding step(s) in the fused
+   execution, preserving state correspondence.
+   ------------------------------------------------------------------------- *)
+
+Definition forward_simulation (cc : composed_component) (fr : fusion_result) : Prop :=
+  forall ces ces' fes,
+    state_correspondence cc fr ces fes ->
+    composed_step cc ces ces' ->
+    exists fes',
+      fused_step fr fes fes' /\
+      state_correspondence cc fr ces' fes'.
+
+(* Trap equivalence: both trap or neither traps *)
+Definition trap_equivalence (cc : composed_component) (fr : fusion_result) : Prop :=
+  forall ces fes,
+    state_correspondence cc fr ces fes ->
+    (composed_traps cc ces <-> fused_traps fr fes).
+
+(* Semantic equivalence combines simulation and trap equivalence *)
 Definition semantic_equivalence (cc : composed_component) (fr : fusion_result) : Prop :=
-  True. (* TODO: Define execution semantics and simulation relation *)
+  forward_simulation cc fr /\
+  trap_equivalence cc fr.
+
+(* -------------------------------------------------------------------------
+   Main Semantic Preservation Theorem
+
+   NOTE: This is the specification, not the proof. The theorem is admitted
+   because proving it requires fully developing the step relations and
+   showing that fusion transformations (index remapping, memory rebasing,
+   adapter generation) preserve behavior.
+   ------------------------------------------------------------------------- *)
 
 Theorem fusion_preserves_semantics :
   forall cc config fr,
@@ -336,8 +586,13 @@ Theorem fusion_preserves_semantics :
     fusion_correct cc config fr ->
     semantic_equivalence cc fr.
 Proof.
-  (* TODO: This is the main theorem to prove *)
-  intros. unfold semantic_equivalence. trivial.
-Qed.
+  (* TODO: Prove forward simulation by induction on composed_step.
+     Each case must show:
+     1. Instruction rewriting preserves semantics via remap table
+     2. Memory rebasing preserves memory operations via layout table
+     3. Cross-module calls become inlined calls with correct argument mapping
+     4. All index lookups succeed (by fusion_correct properties)
+  *)
+Admitted.
 
 (* End of fusion_spec specification *)

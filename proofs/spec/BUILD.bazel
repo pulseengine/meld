@@ -2,6 +2,15 @@ load("@rules_rocq_rust//rocq:defs.bzl", "rocq_library")
 
 package(default_visibility = ["//visibility:public"])
 
+# Auto-generated from WebAssembly spec (experimental)
+# Run: bazel run //tools/spec-sync -- --spec-dir <wasm-spec> --output proofs/spec/wasm_core_generated.v
+rocq_library(
+    name = "wasm_core_generated",
+    srcs = ["wasm_core_generated.v"],
+    include_path = "MeldSpec",
+    tags = ["manual"],  # May not compile due to forward references
+)
+
 rocq_library(
     name = "wasm_core",
     srcs = ["wasm_core.v"],

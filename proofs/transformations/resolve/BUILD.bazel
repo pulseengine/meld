@@ -1,0 +1,20 @@
+load("@rules_rocq_rust//rocq:defs.bzl", "rocq_library", "rocq_proof_test")
+
+package(default_visibility = ["//visibility:public"])
+
+rocq_library(
+    name = "resolve_spec",
+    srcs = ["resolve_spec.v"],
+    deps = [
+        "//proofs/spec:wasm_core",
+        "//proofs/spec:component_model",
+        "//proofs/spec:fusion_spec",
+    ],
+    include_path = "MeldResolve",
+)
+
+rocq_proof_test(
+    name = "resolve_spec_test",
+    deps = [":resolve_spec"],
+    tags = ["manual", "proofs"],
+)
