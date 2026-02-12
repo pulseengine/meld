@@ -6,7 +6,7 @@
   See proofs/DECISIONS.md.
 *)
 
-From Coq Require Import List Arith Lia PeanoNat.
+From Stdlib Require Import List Arith Lia PeanoNat.
 Import ListNotations.
 
 (*
@@ -63,9 +63,11 @@ Proof.
     simpl in Hin.
     destruct Hin as [Hin | Hin].
     + inversion Hin; subst.
+      unfold lookup; fold lookup.
       rewrite Nat.eqb_refl.
       reflexivity.
-    + destruct (Nat.eqb k k0) eqn:Heq.
+    + unfold lookup; fold lookup.
+      destruct (Nat.eqb k k0) eqn:Heq.
       * apply Nat.eqb_eq in Heq; subst.
         exfalso.
         apply Hnotin.

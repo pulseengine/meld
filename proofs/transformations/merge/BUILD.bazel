@@ -2,13 +2,68 @@ load("@rules_rocq_rust//rocq:defs.bzl", "rocq_library", "rocq_proof_test")
 
 package(default_visibility = ["//visibility:public"])
 
+# Split merge_spec into smaller modules to reduce compilation memory usage
+# Dependency chain: merge_defs -> merge_layout -> merge_remap -> merge_correctness
+
 rocq_library(
-    name = "merge_spec",
-    srcs = ["merge_spec.v"],
+    name = "merge_defs",
+    srcs = ["merge_defs.v"],
     deps = [
         "//proofs/spec:wasm_core",
         "//proofs/spec:component_model",
         "//proofs/spec:fusion_spec",
+    ],
+    include_path = "MeldMerge",
+)
+
+rocq_library(
+    name = "merge_layout",
+    srcs = ["merge_layout.v"],
+    deps = [
+        ":merge_defs",
+        "//proofs/spec:wasm_core",
+        "//proofs/spec:component_model",
+        "//proofs/spec:fusion_spec",
+    ],
+    include_path = "MeldMerge",
+)
+
+rocq_library(
+    name = "merge_remap",
+    srcs = ["merge_remap.v"],
+    deps = [
+        ":merge_defs",
+        ":merge_layout",
+        "//proofs/spec:wasm_core",
+        "//proofs/spec:component_model",
+        "//proofs/spec:fusion_spec",
+    ],
+    include_path = "MeldMerge",
+)
+
+rocq_library(
+    name = "merge_correctness",
+    srcs = ["merge_correctness.v"],
+    deps = [
+        ":merge_defs",
+        ":merge_layout",
+        ":merge_remap",
+        "//proofs/spec:wasm_core",
+        "//proofs/spec:component_model",
+        "//proofs/spec:fusion_spec",
+    ],
+    include_path = "MeldMerge",
+)
+
+# Aggregate target for all merge proofs
+rocq_library(
+    name = "merge_spec",
+    srcs = [],
+    deps = [
+        ":merge_defs",
+        ":merge_layout",
+        ":merge_remap",
+        ":merge_correctness",
     ],
     include_path = "MeldMerge",
 )

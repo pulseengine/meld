@@ -5,6 +5,8 @@ load("@rules_rocq_rust//rocq:defs.bzl", "rocq_library", "rocq_proof_test")
 
 package(default_visibility = ["//visibility:public"])
 
+exports_files(["README.md"])
+
 alias(
     name = "rocq_of_rust_lib",
     actual = "@rocq_of_rust_source//:rocq_of_rust_main",
@@ -32,5 +34,34 @@ rocq_library(
 rocq_proof_test(
     name = "index_map_proofs_test",
     deps = [":index_map_proofs"],
+    tags = ["manual", "proofs"],
+)
+
+# Merger core: offset computation and memory layout logic
+# Source: meld-core/src/merger.rs (simplified extract)
+# Spec: proofs/transformations/merge/merge_spec.v
+
+coq_of_rust_library(
+    name = "merger_core_translated",
+    rust_sources = ["merger_core.rs"],
+    edition = "2021",
+)
+
+rocq_library(
+    name = "merger_core",
+    srcs = [":merger_core_translated"],
+    deps = [":rocq_of_rust_lib"],
+    include_path = "meld",
+    extra_flags = ["-impredicative-set"],
+)
+
+rocq_library(
+    name = "merger_core_proofs",
+    srcs = ["merger_core_proofs.v"],
+)
+
+rocq_proof_test(
+    name = "merger_core_proofs_test",
+    deps = [":merger_core_proofs"],
     tags = ["manual", "proofs"],
 )

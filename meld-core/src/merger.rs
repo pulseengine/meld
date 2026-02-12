@@ -71,6 +71,10 @@ pub struct MergedModule {
 
     /// Index mapping for type references
     pub type_index_map: HashMap<(usize, usize, u32), u32>,
+
+    /// Merged index of each module's cabi_realloc function, if exported
+    /// Maps (component_idx, module_idx) -> merged function index
+    pub realloc_map: HashMap<(usize, usize), u32>,
 }
 
 /// Function type in merged module
@@ -251,6 +255,7 @@ impl Merger {
             table_index_map: HashMap::new(),
             global_index_map: HashMap::new(),
             type_index_map: HashMap::new(),
+            realloc_map: HashMap::new(),
         };
 
         // Process components in topological order
@@ -496,6 +501,25 @@ impl Merger {
                 kind,
                 index: old_idx,
             });
+        }
+
+        // Detect cabi_realloc export for adapter generation
+        for export in &module.exports {
+            if export.name == "cabi_realloc" && export.kind == ExportKind::Function {
+                if let Some(&merged_idx) =
+                    merged
+                        .function_index_map
+                        .get(&(comp_idx, mod_idx, export.index))
+                {
+                    merged.realloc_map.insert((comp_idx, mod_idx), merged_idx);
+                    log::debug!(
+                        "Found cabi_realloc in component {} module {}: merged idx {}",
+                        comp_idx,
+                        mod_idx,
+                        merged_idx
+                    );
+                }
+            }
         }
 
         // Merge custom sections
