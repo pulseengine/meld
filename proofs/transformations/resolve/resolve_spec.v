@@ -347,6 +347,656 @@ Proof.
   lia.
 Qed.
 
+(* =========================================================================
+   Forward Direction: Acyclic -> Valid Topological Order Exists
+
+   Proof strategy:
+   1. Progress lemma: in a non-empty acyclic DAG, a source node exists
+      (node with no outgoing edges). Proved by contradiction using a
+      walk + pigeonhole argument.
+   2. Main construction: strong induction on the number of nodes.
+      Remove a source, recurse on the remaining nodes, prepend the source.
+   ========================================================================= *)
+
+(* ---- Definitions ---- *)
+
+(* Iterate a function k times *)
+Fixpoint nat_iter (k : nat) (f : nat -> nat) (x : nat) : nat :=
+  match k with
+  | 0 => x
+  | S k' => f (nat_iter k' f x)
+  end.
+
+(* Find the target of the first outgoing edge from node v *)
+Definition find_dep (v : nat) (edges : list dep_edge) : option nat :=
+  match List.find (fun e => Nat.eqb (fst e) v) edges with
+  | Some e => Some (snd e)
+  | None => None
+  end.
+
+(* Build a walk by iterating a successor function *)
+Fixpoint dep_walk (next : nat -> nat) (start fuel : nat) : list nat :=
+  match fuel with
+  | 0 => [start]
+  | S fuel' => start :: dep_walk next (next start) fuel'
+  end.
+
+(* Remove a node from a list *)
+Definition remove_node (v : nat) (l : list nat) : list nat :=
+  filter (fun x => negb (Nat.eqb x v)) l.
+
+(* Restrict edges to those with both endpoints in a given node set *)
+Definition restrict_edges_to (nodes : list nat) (edges : list dep_edge)
+    : list dep_edge :=
+  filter (fun e =>
+    existsb (Nat.eqb (fst e)) nodes &&
+    existsb (Nat.eqb (snd e)) nodes
+  ) edges.
+
+(* ---- nat_iter lemmas ---- *)
+
+Lemma nat_iter_succ : forall k (f : nat -> nat) x,
+  nat_iter k f (f x) = nat_iter (S k) f x.
+Proof.
+  induction k as [|k' IH]; intros f x; simpl.
+  - reflexivity.
+  - f_equal. apply IH.
+Qed.
+
+Lemma nat_iter_add : forall a b (f : nat -> nat) x,
+  nat_iter a f (nat_iter b f x) = nat_iter (a + b) f x.
+Proof.
+  induction a as [|a' IH]; intros b f x; simpl.
+  - reflexivity.
+  - f_equal. apply IH.
+Qed.
+
+(* ---- find_dep lemmas ---- *)
+
+Lemma find_dep_Some_In : forall v edges j,
+  find_dep v edges = Some j -> In (v, j) edges.
+Proof.
+  unfold find_dep. intros v edges j Hfind.
+  destruct (List.find _ edges) as [e|] eqn:Hf; [| discriminate].
+  apply List.find_some in Hf. destruct Hf as [Hin Hpred].
+  injection Hfind as Hj. subst j.
+  simpl in Hpred. apply Nat.eqb_eq in Hpred.
+  destruct e as [a b]. simpl in *. subst a. exact Hin.
+Qed.
+
+Lemma find_dep_None_no_edge : forall v edges,
+  find_dep v edges = None -> forall j, ~ In (v, j) edges.
+Proof.
+  unfold find_dep. intros v edges Hfind j Hin.
+  destruct (List.find _ edges) as [e|] eqn:Hf; [discriminate |].
+  apply (List.find_none _ _ Hf) in Hin.
+  simpl in Hin. rewrite Nat.eqb_refl in Hin. discriminate.
+Qed.
+
+(* ---- dep_walk lemmas ---- *)
+
+Lemma dep_walk_length : forall next start fuel,
+  length (dep_walk next start fuel) = S fuel.
+Proof.
+  intros next start fuel. revert start.
+  induction fuel as [|fuel' IH]; intros start; simpl.
+  - reflexivity.
+  - f_equal. apply IH.
+Qed.
+
+Lemma dep_walk_nth : forall next start fuel k,
+  k <= fuel ->
+  nth_error (dep_walk next start fuel) k = Some (nat_iter k next start).
+Proof.
+  intros next start fuel. revert start.
+  induction fuel as [|fuel' IH]; intros start k Hk.
+  - replace k with 0 by lia. simpl. reflexivity.
+  - destruct k as [|k'].
+    + simpl. reflexivity.
+    + simpl. rewrite IH by lia. f_equal. symmetry. apply nat_iter_succ.
+Qed.
+
+(* All elements of a walk satisfy a property preserved by the step function *)
+Lemma dep_walk_all : forall next start fuel (P : nat -> Prop),
+  P start ->
+  (forall v, P v -> P (next v)) ->
+  forall x, In x (dep_walk next start fuel) -> P x.
+Proof.
+  intros next start fuel P Hstart Hstep.
+  revert start Hstart.
+  induction fuel as [|fuel' IH]; intros start Hstart x Hx; simpl in Hx.
+  - destruct Hx as [<- | []]. exact Hstart.
+  - destruct Hx as [<- | Hx'].
+    + exact Hstart.
+    + exact (IH (next start) (Hstep start Hstart) x Hx').
+Qed.
+
+(* ---- Pigeonhole and NoDup extraction ---- *)
+
+(* NoDup is preserved by filter *)
+Lemma NoDup_filter_nat : forall (f : nat -> bool) (l : list nat),
+  NoDup l -> NoDup (filter f l).
+Proof.
+  intros f l Hnd. induction l as [|a l' IH].
+  - simpl. constructor.
+  - inversion Hnd as [| ? ? Hnotin Hnd']. subst.
+    simpl. destruct (f a) eqn:Hfa.
+    + constructor.
+      * intro Habs. apply filter_In in Habs. tauto.
+      * apply IH. exact Hnd'.
+    + apply IH. exact Hnd'.
+Qed.
+
+(* filter never increases length *)
+Lemma filter_length_le : forall (A : Type) (f : A -> bool) (l : list A),
+  length (filter f l) <= length l.
+Proof.
+  intros A f l. induction l as [|a l' IH]; simpl.
+  - lia.
+  - destruct (f a); simpl; lia.
+Qed.
+
+(* A NoDup list with all elements < n has length at most n *)
+Lemma NoDup_bounded_length : forall n (l : list nat),
+  NoDup l -> (forall x, In x l -> x < n) -> length l <= n.
+Proof.
+  induction n as [|n' IH]; intros l Hnd Hbound.
+  - (* n = 0: no elements possible *)
+    destruct l as [|a l'].
+    + simpl. lia.
+    + exfalso. specialize (Hbound a (or_introl eq_refl)). lia.
+  - (* n = S n' *)
+    destruct (In_dec Nat.eq_dec n' l) as [Hin | Hnotin].
+    + (* n' in l: remove it and apply IH *)
+      set (l' := remove_node n' l).
+      assert (Hnd' : NoDup l') by (apply remove_node_NoDup; exact Hnd).
+      assert (Hbound' : forall x, In x l' -> x < n').
+      { intros x Hx. apply remove_node_In_iff in Hx. destruct Hx as [Hx Hneq].
+        specialize (Hbound x Hx). lia. }
+      specialize (IH l' Hnd' Hbound').
+      assert (Hlen_eq : length l' = pred (length l)).
+      { apply remove_node_length_pred; assumption. }
+      destruct l as [|a0 l0]; [destruct Hin |]. simpl in Hlen_eq |- *. lia.
+    + (* n' not in l: all elements < n' *)
+      assert (Hbound' : forall x, In x l -> x < n').
+      { intros x Hx. specialize (Hbound x Hx).
+        assert (x <> n') by (intro; subst; contradiction). lia. }
+      specialize (IH l Hnd Hbound'). lia.
+Qed.
+
+(* NoDup sublist has length <= superlist *)
+Lemma NoDup_incl_NoDup_length : forall (l l' : list nat),
+  NoDup l -> NoDup l' -> incl l l' -> length l <= length l'.
+Proof.
+  intros l l' Hnd Hnd' Hincl.
+  revert l Hnd Hincl.
+  induction l' as [|a l'' IH]; intros l Hnd Hincl.
+  - destruct l as [|b ?].
+    + simpl. lia.
+    + exfalso. specialize (Hincl b (or_introl eq_refl)). destruct Hincl.
+  - inversion Hnd' as [| ? ? Hnotin Hnd'']. subst.
+    destruct (In_dec Nat.eq_dec a l) as [Hin | Hnotin_l].
+    + (* a in l: remove a from l, recurse *)
+      set (l_rem := remove_node a l).
+      assert (Hnd_rem : NoDup l_rem) by (apply remove_node_NoDup; exact Hnd).
+      assert (Hincl_rem : incl l_rem l'').
+      { intros x Hx. apply remove_node_In_iff in Hx. destruct Hx as [Hx Hneq].
+        specialize (Hincl x Hx). simpl in Hincl. destruct Hincl as [<- | Hx'].
+        - exfalso. apply Hneq. reflexivity.
+        - exact Hx'. }
+      specialize (IH Hnd'' l_rem Hnd_rem Hincl_rem).
+      assert (Hlen_rem : length l_rem = pred (length l)).
+      { apply remove_node_length_pred; assumption. }
+      destruct l as [|b ?]; [destruct Hin |]. simpl in *. lia.
+    + (* a not in l: all elements go to l'' *)
+      assert (Hincl' : incl l l'').
+      { intros x Hx. specialize (Hincl x Hx). simpl in Hincl.
+        destruct Hincl as [<- | Hx']; [exfalso; apply Hnotin_l; exact Hx | exact Hx']. }
+      specialize (IH Hnd'' l Hnd Hincl'). simpl. lia.
+Qed.
+
+(* A list longer than n with elements < n cannot be NoDup *)
+Lemma too_long_not_NoDup : forall (l : list nat) n,
+  (forall x, In x l -> x < n) -> length l > n -> ~ NoDup l.
+Proof.
+  intros l n Hbound Hlen Hnd.
+  assert (length l <= n) by (apply NoDup_bounded_length; assumption).
+  lia.
+Qed.
+
+(* Extract a repeated element from a non-NoDup list *)
+Lemma not_NoDup_has_repeat : forall (l : list nat),
+  ~ NoDup l ->
+  exists x i j, i < j /\ j < length l /\
+    nth_error l i = Some x /\ nth_error l j = Some x.
+Proof.
+  induction l as [|a l' IH].
+  - intro H. exfalso. apply H. constructor.
+  - intro Hnodup.
+    destruct (In_dec Nat.eq_dec a l') as [Hin | Hnotin].
+    + (* a appears again in l' *)
+      apply In_nth_error_exists in Hin. destruct Hin as [k Hk].
+      exists a, 0, (S k). repeat split.
+      * lia.
+      * simpl. enough (k < length l') by lia.
+        apply nth_error_Some. rewrite Hk. discriminate.
+      * simpl. reflexivity.
+      * simpl. exact Hk.
+    + (* a not in l', so l' itself is not NoDup *)
+      assert (Hnd' : ~ NoDup l').
+      { intro Hnd. apply Hnodup. constructor; assumption. }
+      destruct (IH Hnd') as [x [i [j [Hij [Hj_bound [Hi_eq Hj_eq]]]]]].
+      exists x, (S i), (S j). repeat split.
+      * lia.
+      * simpl. lia.
+      * simpl. exact Hi_eq.
+      * simpl. exact Hj_eq.
+Qed.
+
+(* ---- Reachability helpers ---- *)
+
+(* Reachability is monotone: more edges means more reachability *)
+Lemma reachable_subset : forall edges edges' x y,
+  (forall e, In e edges' -> In e edges) ->
+  reachable edges' x y -> reachable edges x y.
+Proof.
+  intros edges edges' x y Hsub Hreach.
+  induction Hreach as [i j Hin | i j k Hin _ IH].
+  - apply reach_direct. apply Hsub. exact Hin.
+  - apply reach_trans with (j := j); [apply Hsub; exact Hin | exact IH].
+Qed.
+
+(* Iterating a successor function produces a reachable chain *)
+Lemma reachable_chain : forall edges (f : nat -> nat) (P : nat -> Prop)
+    start steps,
+  steps > 0 ->
+  (forall v, P v -> In (v, f v) edges) ->
+  (forall v, P v -> P (f v)) ->
+  P start ->
+  reachable edges start (nat_iter steps f start).
+Proof.
+  intros edges f P start steps Hsteps Hedge Hpres Hstart.
+  revert start Hstart.
+  induction steps as [|s' IH]; intros start Hstart.
+  - lia.
+  - destruct s'.
+    + (* steps = 1 *)
+      simpl. apply reach_direct. apply Hedge. exact Hstart.
+    + (* steps >= 2 *)
+      simpl. apply reach_trans with (j := f start).
+      * apply Hedge. exact Hstart.
+      * rewrite <- nat_iter_succ. apply IH; [lia | apply Hpres; exact Hstart].
+Qed.
+
+(* ---- Progress lemma ---- *)
+
+(* In any non-empty acyclic graph on {0..n-1}, there exists a source node
+   (one with no outgoing edges).
+
+   Proof by contradiction: if every node had a successor, build a walk of
+   length n+1 through n nodes. By pigeonhole, some node repeats. The path
+   between the two visits to that node forms a cycle, contradicting acyclicity. *)
+Lemma acyclic_has_source : forall n edges,
+  n > 0 ->
+  (forall e, In e edges -> fst e < n /\ snd e < n) ->
+  acyclic edges ->
+  exists v, v < n /\ forall j, ~ In (v, j) edges.
+Proof.
+  intros n edges Hn Hvalid Hacyclic.
+  (* Check whether any node in {0..n-1} is a source *)
+  destruct (existsb
+    (fun v => match find_dep v edges with None => true | Some _ => false end)
+    (seq 0 n)) eqn:Hcheck.
+  - (* Found a source *)
+    apply existsb_exists in Hcheck.
+    destruct Hcheck as [v [Hv_in Hv_src]].
+    apply in_seq in Hv_in.
+    exists v. split; [lia |].
+    destruct (find_dep v edges) as [j|] eqn:Hfd; [discriminate |].
+    exact (find_dep_None_no_edge v edges Hfd).
+  - (* No source exists: derive contradiction *)
+    exfalso.
+    (* Every node has a successor via find_dep *)
+    assert (Hall : forall v, v < n -> exists j, find_dep v edges = Some j).
+    { intros v Hv.
+      destruct (find_dep v edges) as [j|] eqn:Hfd.
+      - exists j. reflexivity.
+      - exfalso.
+        assert (Htrue : existsb
+          (fun v0 => match find_dep v0 edges with None => true | Some _ => false end)
+          (seq 0 n) = true).
+        { apply existsb_exists. exists v.
+          split; [apply in_seq; lia | rewrite Hfd; reflexivity]. }
+        rewrite Htrue in Hcheck. discriminate. }
+    (* Define total successor function with arbitrary default *)
+    set (next := fun v =>
+      match find_dep v edges with Some j => j | None => 0 end).
+    (* Properties of next on {0..n-1} *)
+    assert (Hnext_edge : forall v, v < n -> In (v, next v) edges).
+    { intros v Hv. unfold next.
+      destruct (Hall v Hv) as [j Hj]. rewrite Hj.
+      exact (find_dep_Some_In v edges j Hj). }
+    assert (Hnext_bound : forall v, v < n -> next v < n).
+    { intros v Hv.
+      specialize (Hvalid _ (Hnext_edge v Hv)). simpl in Hvalid. lia. }
+    (* Build walk of length n+1 starting from 0 *)
+    set (w := dep_walk next 0 n).
+    assert (Hw_len : length w = S n) by apply dep_walk_length.
+    assert (Hw_bound : forall x, In x w -> x < n).
+    { apply dep_walk_all with (P := fun x => x < n); [lia | exact Hnext_bound]. }
+    (* Pigeonhole: n+1 values in {0..n-1} cannot all be distinct *)
+    assert (Hw_not_nodup : ~ NoDup w).
+    { apply too_long_not_NoDup with (n := n); [exact Hw_bound | lia]. }
+    (* Extract the repeated element *)
+    destruct (not_NoDup_has_repeat w Hw_not_nodup)
+      as [x [i [j [Hij [Hj_len [Hi_eq Hj_eq]]]]]].
+    (* Relate walk positions to nat_iter *)
+    assert (Hi_le : i <= n) by lia.
+    assert (Hj_le : j <= n) by lia.
+    pose proof (dep_walk_nth next 0 n i Hi_le) as Hi_nth.
+    pose proof (dep_walk_nth next 0 n j Hj_le) as Hj_nth.
+    (* Both positions hold the same value x *)
+    assert (Hi_val : nat_iter i next 0 = x).
+    { rewrite Hi_nth in Hi_eq. congruence. }
+    assert (Hj_val : nat_iter j next 0 = x).
+    { rewrite Hj_nth in Hj_eq. congruence. }
+    (* Build reachable path from position i to position j *)
+    assert (Hreach : reachable edges x x).
+    { rewrite <- Hi_val, <- Hj_val.
+      replace j with (i + (j - i)) by lia.
+      rewrite <- nat_iter_add.
+      apply reachable_chain with (P := fun v => v < n).
+      - lia.
+      - exact Hnext_edge.
+      - exact Hnext_bound.
+      - rewrite Hi_val. apply Hw_bound.
+        eapply nth_error_In. exact Hi_eq. }
+    (* Contradicts acyclicity *)
+    exact (Hacyclic x Hreach).
+Qed.
+
+(* ---- Node removal and edge restriction lemmas ---- *)
+
+Lemma mem_nat_In : forall x l,
+  existsb (Nat.eqb x) l = true <-> In x l.
+Proof.
+  intros x l. split.
+  - intro H. apply existsb_exists in H.
+    destruct H as [y [Hy Heqb]].
+    apply Nat.eqb_eq in Heqb. subst. exact Hy.
+  - intro H. apply existsb_exists.
+    exists x. split; [exact H | apply Nat.eqb_refl].
+Qed.
+
+Lemma remove_node_not_In : forall v l, ~ In v (remove_node v l).
+Proof.
+  intros v l Hin. unfold remove_node in Hin.
+  apply filter_In in Hin. destruct Hin as [_ Hpred].
+  simpl in Hpred. rewrite Nat.eqb_refl in Hpred. discriminate.
+Qed.
+
+Lemma remove_node_In_iff : forall v x l,
+  In x (remove_node v l) <-> In x l /\ x <> v.
+Proof.
+  intros v x l. unfold remove_node. rewrite filter_In. simpl.
+  rewrite Bool.negb_true_iff, Nat.eqb_neq. tauto.
+Qed.
+
+Lemma remove_node_NoDup : forall v l, NoDup l -> NoDup (remove_node v l).
+Proof.
+  intros v l Hnd. unfold remove_node. apply NoDup_filter_nat. exact Hnd.
+Qed.
+
+(* filter that preserves all elements when predicate is always true *)
+Lemma filter_id : forall (A : Type) (f : A -> bool) (l : list A),
+  (forall x, In x l -> f x = true) -> filter f l = l.
+Proof.
+  intros A f l Hf. induction l as [|a l' IH]; simpl.
+  - reflexivity.
+  - rewrite (Hf a (or_introl eq_refl)). f_equal.
+    apply IH. intros x Hx. apply Hf. right. exact Hx.
+Qed.
+
+Lemma remove_node_length_lt : forall v l,
+  In v l -> length (remove_node v l) < length l.
+Proof.
+  intros v l Hin. unfold remove_node.
+  induction l as [|a l' IH].
+  - destruct Hin.
+  - simpl. destruct (negb (Nat.eqb a v)) eqn:Hpred.
+    + (* a <> v: keep a *)
+      apply Bool.negb_true_iff in Hpred. apply Nat.eqb_neq in Hpred.
+      simpl. destruct Hin as [<- | Hin']; [exfalso; apply Hpred; reflexivity |].
+      assert (IH' := IH Hin'). lia.
+    + (* a = v: skip a *)
+      apply Bool.negb_false_iff in Hpred. apply Nat.eqb_eq in Hpred. subst a.
+      enough (length (filter (fun x => negb (Nat.eqb x v)) l') <= length l') by lia.
+      apply filter_length_le.
+Qed.
+
+(* Exact length after removing one element from a NoDup list *)
+Lemma remove_node_length_pred : forall v l,
+  NoDup l -> In v l -> length (remove_node v l) = pred (length l).
+Proof.
+  intros v l Hnd Hin. unfold remove_node.
+  induction l as [|a l' IH].
+  - destruct Hin.
+  - inversion Hnd as [| ? ? Hnotin Hnd']. subst.
+    simpl. destruct (Nat.eqb a v) eqn:Heqb.
+    + (* a = v *)
+      apply Nat.eqb_eq in Heqb. subst a. simpl.
+      (* v not in l', so filter doesn't remove anything *)
+      apply filter_id. intros x Hx. simpl.
+      apply Bool.negb_true_iff, Nat.eqb_neq.
+      intro Heq. subst x. contradiction.
+    + (* a <> v *)
+      apply Nat.eqb_neq in Heqb. simpl.
+      destruct Hin as [Heq | Hin']; [subst a; exfalso; apply Heqb; reflexivity |].
+      rewrite (IH Hnd' Hin').
+      (* length l' > 0 since In v l' *)
+      destruct l' as [| b l'']; [destruct Hin' |]. simpl. lia.
+Qed.
+
+Lemma restrict_edges_In_iff : forall nodes edges e,
+  In e (restrict_edges_to nodes edges) <->
+    In e edges /\ In (fst e) nodes /\ In (snd e) nodes.
+Proof.
+  intros nodes edges e. unfold restrict_edges_to. rewrite filter_In.
+  rewrite Bool.andb_true_iff, mem_nat_In, mem_nat_In. tauto.
+Qed.
+
+Lemma restrict_edges_acyclic : forall nodes edges,
+  acyclic edges -> acyclic (restrict_edges_to nodes edges).
+Proof.
+  intros nodes edges Hac v Hreach. apply (Hac v).
+  apply reachable_subset with (edges' := restrict_edges_to nodes edges).
+  - intros e He. apply restrict_edges_In_iff in He. tauto.
+  - exact Hreach.
+Qed.
+
+(* ---- Main construction: topological order from acyclicity ---- *)
+
+(* Generalized topological sort for an arbitrary finite node set.
+   By strong induction on the number of nodes: find a source, place it first,
+   recurse on the remaining nodes with restricted edges. *)
+Lemma topo_sort_of_nodes :
+  forall (k : nat) (nodes : list nat) (edges : list dep_edge),
+    length nodes = k ->
+    NoDup nodes ->
+    (forall e, In e edges -> In (fst e) nodes /\ In (snd e) nodes) ->
+    acyclic edges ->
+    exists order,
+      length order = k /\
+      NoDup order /\
+      (forall x, In x nodes <-> In x order) /\
+      order_respects_deps order edges.
+Proof.
+  induction k as [k IH] using lt_wf_ind.
+  intros nodes edges Hlen Hnodup Hvalid Hacyclic.
+  destruct nodes as [| v0 rest] eqn:Hnodes_eq.
+  - (* Base case: no nodes, empty order *)
+    exists []. simpl in Hlen. subst k. repeat split.
+    + constructor.
+    + intro x. simpl. tauto.
+    + intros i j Hedge. destruct (Hvalid _ Hedge) as [H _]. destruct H.
+  - (* Inductive case: find a source node *)
+    simpl in Hlen.
+    (* Every node has an outgoing edge, or some node is a source *)
+    assert (Hsource : exists v, In v (v0 :: rest) /\ forall j, ~ In (v, j) edges).
+    { (* Check each node for outgoing edges *)
+      destruct (existsb
+        (fun v => match find_dep v edges with None => true | Some _ => false end)
+        (v0 :: rest)) eqn:Hcheck.
+      - (* Found a source *)
+        apply existsb_exists in Hcheck.
+        destruct Hcheck as [v [Hv_in Hv_src]].
+        exists v. split; [exact Hv_in |].
+        destruct (find_dep v edges) as [j|] eqn:Hfd; [discriminate |].
+        exact (find_dep_None_no_edge v edges Hfd).
+      - (* No source: derive contradiction via walk + pigeonhole *)
+        exfalso.
+        (* Every node in our list has a successor *)
+        assert (Hall : forall v, In v (v0 :: rest) ->
+                        exists j, find_dep v edges = Some j /\ In j (v0 :: rest)).
+        { intros v Hv.
+          destruct (find_dep v edges) as [j|] eqn:Hfd.
+          - exists j. split; [reflexivity |].
+            apply find_dep_Some_In in Hfd.
+            specialize (Hvalid _ Hfd). simpl in Hvalid. tauto.
+          - exfalso.
+            assert (Htrue : existsb
+              (fun v1 => match find_dep v1 edges with
+                         None => true | Some _ => false end)
+              (v0 :: rest) = true).
+            { apply existsb_exists. exists v.
+              split; [exact Hv | rewrite Hfd; reflexivity]. }
+            rewrite Htrue in Hcheck. discriminate. }
+        (* Define total successor function *)
+        set (next := fun v =>
+          match find_dep v edges with Some j => j | None => v end).
+        assert (Hnext_in : forall v, In v (v0 :: rest) -> In (next v) (v0 :: rest)).
+        { intros v Hv. unfold next.
+          destruct (Hall v Hv) as [j [Hj Hj_in]]. rewrite Hj. exact Hj_in. }
+        assert (Hnext_edge : forall v, In v (v0 :: rest) -> In (v, next v) edges).
+        { intros v Hv. unfold next.
+          destruct (Hall v Hv) as [j [Hj _]]. rewrite Hj.
+          exact (find_dep_Some_In v edges j Hj). }
+        (* Build walk of length k+1 starting from v0 *)
+        set (w := dep_walk next v0 k).
+        assert (Hw_len : length w = S k) by apply dep_walk_length.
+        assert (Hw_in : forall x, In x w -> In x (v0 :: rest)).
+        { apply dep_walk_all with (P := fun x => In x (v0 :: rest)).
+          - left. reflexivity.
+          - exact Hnext_in. }
+        (* Pigeonhole: k+1 values in a set of k distinct elements *)
+        assert (Hw_not_nodup : ~ NoDup w).
+        { intro Hnd.
+          assert (Hle : length w <= length (v0 :: rest)).
+          { apply NoDup_incl_NoDup_length; assumption. }
+          simpl in Hle. lia. }
+        (* Extract repeated element *)
+        destruct (not_NoDup_has_repeat w Hw_not_nodup)
+          as [x [i [j [Hij [Hj_len [Hi_eq Hj_eq]]]]]].
+        (* Build cycle from the repeat *)
+        assert (Hi_le : i <= k) by lia.
+        assert (Hj_le : j <= k) by lia.
+        pose proof (dep_walk_nth next v0 k i Hi_le) as Hi_nth.
+        pose proof (dep_walk_nth next v0 k j Hj_le) as Hj_nth.
+        assert (Hi_val : nat_iter i next v0 = x).
+        { rewrite Hi_nth in Hi_eq. congruence. }
+        assert (Hj_val : nat_iter j next v0 = x).
+        { rewrite Hj_nth in Hj_eq. congruence. }
+        assert (Hreach : reachable edges x x).
+        { rewrite <- Hi_val, <- Hj_val.
+          replace j with (i + (j - i)) by lia.
+          rewrite <- nat_iter_add.
+          apply reachable_chain with (P := fun v => In v (v0 :: rest)).
+          - lia.
+          - exact Hnext_edge.
+          - exact Hnext_in.
+          - apply Hw_in. eapply nth_error_In. exact Hi_eq. }
+        exact (Hacyclic x Hreach). }
+    (* We have a source node v *)
+    destruct Hsource as [v [Hv_in Hv_no_out]].
+    set (nodes' := remove_node v (v0 :: rest)).
+    set (edges' := restrict_edges_to nodes' edges).
+    (* Properties of the smaller problem *)
+    assert (Hlen' : length nodes' < k).
+    { unfold nodes'. rewrite <- Hlen.
+      apply remove_node_length_lt. exact Hv_in. }
+    assert (Hnodup' : NoDup nodes').
+    { apply remove_node_NoDup. exact Hnodup. }
+    assert (Hvalid' : forall e, In e edges' -> In (fst e) nodes' /\ In (snd e) nodes').
+    { intros e He. apply restrict_edges_In_iff in He. tauto. }
+    assert (Hacyclic' : acyclic edges').
+    { apply restrict_edges_acyclic. exact Hacyclic. }
+    (* Apply IH to the smaller problem *)
+    destruct (IH (length nodes') Hlen' nodes' edges'
+                 eq_refl Hnodup' Hvalid' Hacyclic')
+      as [order' [Hlen_o' [Hnodup_o' [Hiff_o' Hresp_o']]]].
+    (* Construct final order: source v first, then order' *)
+    exists (v :: order').
+    split; [| split; [| split]].
+    + (* Length *)
+      simpl. rewrite Hlen_o'.
+      unfold nodes'.
+      rewrite (remove_node_length_pred v (v0 :: rest) Hnodup Hv_in).
+      simpl. lia.
+    + (* NoDup *)
+      constructor.
+      * (* v not in order' *)
+        intro Habs. apply Hiff_o' in Habs.
+        exact (remove_node_not_In v (v0 :: rest) Habs).
+      * exact Hnodup_o'.
+    + (* Membership equivalence *)
+      intro x. split.
+      * (* In x (v0 :: rest) -> In x (v :: order') *)
+        intro Hx. destruct (Nat.eq_dec x v) as [<- | Hneq].
+        -- left. reflexivity.
+        -- right. apply Hiff_o'. apply remove_node_In_iff. tauto.
+      * (* In x (v :: order') -> In x (v0 :: rest) *)
+        intro Hx. destruct Hx as [<- | Hx'].
+        -- exact Hv_in.
+        -- apply Hiff_o' in Hx'. apply remove_node_In_iff in Hx'. tauto.
+    + (* order_respects_deps *)
+      intros i j Hedge.
+      destruct (Nat.eq_dec i v) as [Heq_i | Hneq_i].
+      * (* i = v: impossible, v has no outgoing edges *)
+        subst i. exfalso. exact (Hv_no_out j Hedge).
+      * destruct (Nat.eq_dec j v) as [Heq_j | Hneq_j].
+        -- (* j = v: v is at position 0, i is in order' *)
+           subst j.
+           assert (Hi_in_nodes : In i (v0 :: rest)).
+           { specialize (Hvalid _ Hedge). simpl in Hvalid. tauto. }
+           assert (Hi_in_order : In i order').
+           { apply Hiff_o'. apply remove_node_In_iff. tauto. }
+           apply In_nth_error_exists in Hi_in_order.
+           destruct Hi_in_order as [pi Hi_nth].
+           (* v = j at position 0, i at position S pi *)
+           exists 0, (S pi). repeat split.
+           ++ simpl. reflexivity.
+           ++ simpl. exact Hi_nth.
+           ++ lia.
+        -- (* Neither i nor j is v: edge is in edges' *)
+           assert (Hi_in : In i (v0 :: rest)).
+           { specialize (Hvalid _ Hedge). simpl in Hvalid. tauto. }
+           assert (Hj_in : In j (v0 :: rest)).
+           { specialize (Hvalid _ Hedge). simpl in Hvalid. tauto. }
+           assert (Hedge' : In (i, j) edges').
+           { apply restrict_edges_In_iff. simpl. repeat split.
+             - exact Hedge.
+             - apply remove_node_In_iff. tauto.
+             - apply remove_node_In_iff. tauto. }
+           destruct (Hresp_o' i j Hedge') as [pi [pj [Hpi [Hpj Hlt]]]].
+           (* Shift positions by 1 for the prepended v *)
+           exists (S pi), (S pj). repeat split.
+           ++ simpl. exact Hpi.
+           ++ simpl. exact Hpj.
+           ++ lia.
+Qed.
+
+(* ---- Instantiation for the main theorem ---- *)
+
 (* The topological sort fails if and only if there's a cycle *)
 Theorem topo_sort_cycle_detection :
   forall (n : nat) (edges : list dep_edge),
@@ -359,17 +1009,27 @@ Proof.
   - (* Backward: valid order exists -> acyclic *)
     intros [order [Hcomplete Hrespects]].
     eapply valid_order_implies_acyclic; eauto.
-  - (* Forward: acyclic -> valid order exists.
-       Requires constructing Kahn's algorithm in Rocq:
-       1. Define kahn_sort with fuel parameter (fuel = n)
-       2. Key progress lemma: in non-empty acyclic DAG, exists zero-in-degree node
-          (by pigeonhole: if all nodes had predecessors, follow chain -> cycle)
-       3. Each step: remove zero-in-degree node, add to order, remove its edges
-       4. Invariant: processed nodes maintain order_respects_deps
-       5. Termination: fuel decreases; acyclicity guarantees progress *)
+  - (* Forward: acyclic -> valid order exists *)
     intros Hacyclic.
-    admit.
-Admitted.
+    (* Use topo_sort_of_nodes with nodes = seq 0 n *)
+    assert (Hvalid_seq : forall e, In e edges ->
+              In (fst e) (seq 0 n) /\ In (snd e) (seq 0 n)).
+    { intros e He. specialize (Hvalid e He).
+      split; apply in_seq; lia. }
+    assert (Hseq_len : length (seq 0 n) = n) by apply seq_length.
+    assert (Hseq_nodup : NoDup (seq 0 n)) by apply seq_NoDup.
+    destruct (topo_sort_of_nodes n (seq 0 n) edges
+                Hseq_len Hseq_nodup Hvalid_seq Hacyclic)
+      as [order [Hlen [Hnodup [Hiff Hresp]]]].
+    exists order. split.
+    + (* order_complete n order *)
+      unfold order_complete. repeat split.
+      * exact Hlen.
+      * exact Hnodup.
+      * intros i Hi. apply Hiff. apply in_seq. lia.
+    + (* order_respects_deps *)
+      exact Hresp.
+Qed.
 
 (* -------------------------------------------------------------------------
    Adapter Site Identification
