@@ -4,14 +4,17 @@ members = [
     "meld-core",
     "meld-cli",
 ]
+exclude = [
+    "tools/spec-sync",
+]
 
 [workspace.package]
 version = "0.1.0"
 authors = ["PulseEngine <https://github.com/pulseengine>"]
-edition = "2021"
+edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/pulseengine/meld"
-rust-version = "1.75"
+rust-version = "1.85"
 
 [workspace.dependencies]
 # WebAssembly parsing and encoding
@@ -40,6 +43,9 @@ env_logger = "0.11"
 
 # Testing
 proptest = "1.5"
+
+# Required for wit-bindgen component bindings (WASI filesystem interfaces)
+bitflags = "2.6"
 
 [profile.release]
 opt-level = 3

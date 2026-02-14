@@ -11,6 +11,16 @@ Part of the **pulseengine toolchain**:
 - **[loom](https://github.com/pulseengine/loom)** - Formally verified WebAssembly optimizer
 - **meld** - Static component fuser (this tool)
 
+## The Name
+
+The word *meld* means to merge or fuse into a unified whole — from metallurgy,
+where metals are melded by heating them together until they become one. This
+captures exactly what the tool does: separate WebAssembly components go in,
+a single cohesive core module comes out.
+
+In the pulseengine toolchain, each tool carries a short, evocative name:
+**loom** weaves optimizations together; **meld** fuses components into one.
+
 ## Why Meld?
 
 Today, multiple WebAssembly components can be composed using tools like WAC,

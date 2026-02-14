@@ -23,9 +23,9 @@ mod fact;
 
 pub use fact::FactStyleGenerator;
 
+use crate::Result;
 use crate::merger::MergedModule;
 use crate::resolver::DependencyGraph;
-use crate::Result;
 use wasm_encoder::Function;
 
 /// Configuration for adapter generation

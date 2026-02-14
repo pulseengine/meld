@@ -1,0 +1,63 @@
+load("@rules_wasm_component//wasm:defs.bzl", "wasm_test")
+
+package(default_visibility = ["//visibility:public"])
+
+# =============================================================================
+# wit-bindgen E2E Tests for Meld
+#
+# Uses pre-built composed fixtures from wit-bindgen CI/local build.
+# wit-bindgen tests use their own macro system (include!(env!("BINDINGS")))
+# which is incompatible with rules_wasm_component's rust_wasm_component_bindgen.
+#
+# To generate fixtures:
+#   cd /path/to/wit-bindgen && git checkout v0.52.0
+#   wit-bindgen test --languages rust --artifacts artifacts tests/runtime
+#   cp artifacts/numbers/composed-runner.rs-test.rs.wasm fixtures/numbers.wasm
+# =============================================================================
+
+# Pre-built composed fixtures (place .wasm files in fixtures/ directory)
+filegroup(
+    name = "fixtures",
+    srcs = glob(
+        ["fixtures/*.wasm"],
+        allow_empty = True,
+    ),
+)
+
+WIT_BINDGEN_TESTS = [
+    "numbers",
+    "strings",
+    "lists",
+    "records",
+]
+
+# Fuse composed component with meld
+[
+    genrule(
+        name = "{}_fused".format(test),
+        srcs = ["fixtures/{}.wasm".format(test)],
+        outs = ["{}_fused.wasm".format(test)],
+        cmd = "$(execpath //meld-cli:meld) fuse $(SRCS) -o $@",
+        tools = ["//meld-cli:meld"],
+        tags = ["manual"],
+    )
+    for test in WIT_BINDGEN_TESTS
+]
+
+# Run fused modules with wasmtime, invoking run()
+[
+    wasm_test(
+        name = "{}_e2e_test".format(test),
+        wasm_file = ":{}_fused".format(test),
+        module_args = ["--invoke", "run"],
+        tags = ["manual"],
+    )
+    for test in WIT_BINDGEN_TESTS
+]
+
+# Test suite (manual until fixtures are added)
+test_suite(
+    name = "wit_bindgen_e2e",
+    tests = [":{}_e2e_test".format(test) for test in WIT_BINDGEN_TESTS],
+    tags = ["manual"],
+)

@@ -57,6 +57,8 @@ pub struct AdapterSite {
     pub to_module: usize,
     /// Export being called
     pub export_name: String,
+    /// Original function index of the export in the target module
+    pub export_func_idx: u32,
 
     /// Whether this crosses a memory boundary
     pub crosses_memory: bool,
@@ -332,6 +334,14 @@ impl Resolver {
                             to_module.exports.iter().any(|exp| exp.name == *export_name);
 
                         if has_export {
+                            // Find the exported function's original index
+                            let export_func_idx = to_module
+                                .exports
+                                .iter()
+                                .find(|exp| exp.name == *export_name)
+                                .map(|exp| exp.index)
+                                .unwrap_or(0);
+
                             // Determine if we need adapters
                             let crosses_memory = !from_component.core_modules.is_empty()
                                 && !to_component.core_modules.is_empty();
@@ -343,6 +353,7 @@ impl Resolver {
                                 to_component: *to_comp,
                                 to_module: to_mod_idx,
                                 export_name: export_name.clone(),
+                                export_func_idx,
                                 crosses_memory,
                                 requirements: AdapterRequirements::default(),
                             });

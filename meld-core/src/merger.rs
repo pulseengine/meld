@@ -3,11 +3,14 @@
 //! This module handles combining multiple core modules into a single module,
 //! reindexing all references (functions, tables, memories, globals).
 
+// Allow nested ifs for Bazel compatibility (rules_rust doesn't support if-let chains yet)
+#![allow(clippy::collapsible_if)]
+
 use crate::parser::{
     CoreModule, ExportKind, GlobalType, ImportKind, MemoryType, ParsedComponent, TableType,
 };
 use crate::resolver::DependencyGraph;
-use crate::rewriter::{rewrite_function_body, IndexMaps};
+use crate::rewriter::{IndexMaps, rewrite_function_body};
 use crate::{Error, MemoryStrategy, Result};
 use std::collections::HashMap;
 use wasm_encoder::{
@@ -15,7 +18,6 @@ use wasm_encoder::{
     GlobalType as EncoderGlobalType, MemoryType as EncoderMemoryType, RefType,
     TableType as EncoderTableType, ValType,
 };
-use wasmparser::{Parser, Payload};
 
 const WASM_PAGE_SIZE: u64 = 65536;
 
@@ -69,6 +71,10 @@ pub struct MergedModule {
 
     /// Index mapping for type references
     pub type_index_map: HashMap<(usize, usize, u32), u32>,
+
+    /// Merged index of each module's cabi_realloc function, if exported
+    /// Maps (component_idx, module_idx) -> merged function index
+    pub realloc_map: HashMap<(usize, usize), u32>,
 }
 
 /// Function type in merged module
@@ -249,6 +255,7 @@ impl Merger {
             table_index_map: HashMap::new(),
             global_index_map: HashMap::new(),
             type_index_map: HashMap::new(),
+            realloc_map: HashMap::new(),
         };
 
         // Process components in topological order
@@ -411,13 +418,16 @@ impl Merger {
         let memory_base_offset = shared_memory_plan
             .and_then(|plan| plan.bases.get(&(comp_idx, mod_idx)).copied())
             .unwrap_or(0);
-        let memory64 = if self.address_rebasing {
+        let module_memory = if self.address_rebasing {
             module_memory_type(module)?
-                .map(|mem| mem.memory64)
-                .unwrap_or(false)
         } else {
-            false
+            None
         };
+        let memory64 = module_memory
+            .as_ref()
+            .map(|mem| mem.memory64)
+            .unwrap_or(false);
+        let memory_initial_pages = module_memory.as_ref().map(|mem| mem.initial);
         let index_maps = build_index_maps_for_module(
             comp_idx,
             mod_idx,
@@ -427,6 +437,7 @@ impl Merger {
             self.address_rebasing,
             memory_base_offset,
             memory64,
+            memory_initial_pages,
         );
 
         // Second pass: extract and rewrite function bodies
@@ -490,6 +501,25 @@ impl Merger {
                 kind,
                 index: old_idx,
             });
+        }
+
+        // Detect cabi_realloc export for adapter generation
+        for export in &module.exports {
+            if export.name == "cabi_realloc" && export.kind == ExportKind::Function {
+                if let Some(&merged_idx) =
+                    merged
+                        .function_index_map
+                        .get(&(comp_idx, mod_idx, export.index))
+                {
+                    merged.realloc_map.insert((comp_idx, mod_idx), merged_idx);
+                    log::debug!(
+                        "Found cabi_realloc in component {} module {}: merged idx {}",
+                        comp_idx,
+                        mod_idx,
+                        merged_idx
+                    );
+                }
+            }
         }
 
         // Merge custom sections
@@ -595,14 +625,52 @@ impl Merger {
             }
         }
 
-        // If exactly one start function, use it
-        // If multiple, we'd need to generate a wrapper that calls all of them
         if start_funcs.len() == 1 {
             merged.start_function = Some(start_funcs[0]);
         } else if start_funcs.len() > 1 {
-            // TODO: Generate a start wrapper that calls all start functions in order
-            log::warn!("Multiple start functions found, using first one");
-            merged.start_function = Some(start_funcs[0]);
+            // Generate a wrapper function that calls all start functions in order.
+            // Start functions have type [] -> [], so the wrapper is also [] -> [].
+
+            // Find or create the [] -> [] type
+            let empty_type_idx = merged
+                .types
+                .iter()
+                .position(|t| t.params.is_empty() && t.results.is_empty())
+                .unwrap_or_else(|| {
+                    let idx = merged.types.len();
+                    merged.types.push(MergedFuncType {
+                        params: vec![],
+                        results: vec![],
+                    });
+                    idx
+                }) as u32;
+
+            let mut wrapper = Function::new(vec![]);
+            for &func_idx in &start_funcs {
+                wrapper.instruction(&wasm_encoder::Instruction::Call(func_idx));
+            }
+            wrapper.instruction(&wasm_encoder::Instruction::End);
+
+            // The wrapper's function index = import_func_count + functions.len()
+            let import_func_count = merged
+                .imports
+                .iter()
+                .filter(|i| matches!(i.entity_type, EntityType::Function(_)))
+                .count() as u32;
+            let wrapper_idx = import_func_count + merged.functions.len() as u32;
+
+            merged.functions.push(MergedFunction {
+                type_idx: empty_type_idx,
+                body: wrapper,
+                origin: (usize::MAX, usize::MAX, 0), // synthetic function
+            });
+
+            log::info!(
+                "Generated start wrapper (func {}) calling {} start functions",
+                wrapper_idx,
+                start_funcs.len()
+            );
+            merged.start_function = Some(wrapper_idx);
         }
 
         Ok(())
@@ -784,11 +852,13 @@ fn build_index_maps_for_module(
     address_rebasing: bool,
     memory_base_offset: u64,
     memory64: bool,
+    memory_initial_pages: Option<u64>,
 ) -> IndexMaps {
     let mut maps = IndexMaps::new();
     maps.address_rebasing = address_rebasing;
     maps.memory_base_offset = memory_base_offset;
     maps.memory64 = memory64;
+    maps.memory_initial_pages = memory_initial_pages;
 
     // Build function map (including imported functions)
     let import_func_count = module
@@ -908,18 +978,17 @@ fn extract_function_body(
 
     // Parse the code section to find the function body
     let code_bytes = &module.bytes[start..end];
-    let parser = Parser::new(0);
+    let binary_reader = wasmparser::BinaryReader::new(code_bytes, 0);
+    let reader = wasmparser::CodeSectionReader::new(binary_reader)?;
 
     let mut current_func_idx = 0;
-    for payload in parser.parse_all(code_bytes) {
-        let payload = payload?;
-        if let Payload::CodeSectionEntry(body) = payload {
-            if current_func_idx == func_idx {
-                // Found the function - rewrite it with the index maps
-                return rewrite_function_body(&body, param_count, maps);
-            }
-            current_func_idx += 1;
+    for body in reader {
+        let body = body?;
+        if current_func_idx == func_idx {
+            // Found the function - rewrite it with the index maps
+            return rewrite_function_body(&body, param_count, maps);
         }
+        current_func_idx += 1;
     }
 
     // Function not found - return unreachable

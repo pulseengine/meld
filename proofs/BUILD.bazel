@@ -84,7 +84,7 @@ filegroup(
     srcs = [
         "DECISIONS.md",
         "README.md",
-        "rust_verified/README.md",
+        "//proofs/rust_verified:README.md",
     ],
 )
 
@@ -100,5 +100,7 @@ filegroup(
         ":attestation_proofs",
         "//proofs/rust_verified:index_map",
         "//proofs/rust_verified:index_map_proofs",
+        "//proofs/rust_verified:merger_core",
+        "//proofs/rust_verified:merger_core_proofs",
     ],
 )

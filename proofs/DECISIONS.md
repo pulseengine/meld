@@ -20,6 +20,7 @@ proofs and specification-based tests for meld.
 - Component Model tests: same commit as the Component Model baseline
   (`deb0b0a`).
 - WASI WIT definitions: same tag as the WASI baseline (`v0.2.3`).
+- wit-bindgen e2e tests: `v0.52.0` tag - composed runtime test components.
 
 These are exposed via Bazel filegroups under `//tests/spec:*`.
 

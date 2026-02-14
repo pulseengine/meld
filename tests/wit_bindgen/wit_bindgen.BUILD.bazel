@@ -1,0 +1,53 @@
+# BUILD file for external wit-bindgen repository
+# Exposes test runtime sources for meld e2e testing
+
+package(default_visibility = ["//visibility:public"])
+
+# Export all runtime test directories as filegroups
+[
+    filegroup(
+        name = "runtime_{}_srcs".format(test),
+        srcs = glob(["tests/runtime/{}/*".format(test)]),
+    )
+    for test in [
+        "numbers",
+        "strings",
+        "lists",
+        "records",
+        "options",
+        "results",
+        "variants",
+        "many-arguments",
+        "flavorful",
+        "resources",
+    ]
+]
+
+# Export individual source files for crate_root specification
+[
+    exports_files(
+        [
+            "tests/runtime/{}/test.rs".format(test),
+            "tests/runtime/{}/runner.rs".format(test),
+            "tests/runtime/{}/world.wit".format(test),
+        ],
+    )
+    for test in [
+        "numbers",
+        "strings",
+        "lists",
+        "records",
+    ]
+]
+
+# All runtime test sources
+filegroup(
+    name = "runtime_tests",
+    srcs = glob(["tests/runtime/**"]),
+)
+
+# Guest Rust crate (wit-bindgen macros)
+filegroup(
+    name = "guest_rust",
+    srcs = glob(["crates/guest-rust/**"]),
+)

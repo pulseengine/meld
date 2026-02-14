@@ -54,7 +54,7 @@ pub use parser::{ComponentParser, ParsedComponent};
 pub use resolver::{DependencyGraph, Resolver};
 
 #[cfg(not(feature = "attestation"))]
-use crate::attestation::{FusionAttestationBuilder, FUSION_ATTESTATION_SECTION};
+use crate::attestation::{FUSION_ATTESTATION_SECTION, FusionAttestationBuilder};
 use wasm_encoder::Module as EncodedModule;
 
 /// Configuration for the fusion process
@@ -364,6 +364,13 @@ impl Fuser {
                 elements.segment(segments::encode_element_segment(segment));
             }
             module.section(&elements);
+        }
+
+        // Encode data count section before code (required by bulk memory)
+        if !merged.data_segments.is_empty() {
+            module.section(&wasm_encoder::DataCountSection {
+                count: merged.data_segments.len() as u32,
+            });
         }
 
         // Encode code section

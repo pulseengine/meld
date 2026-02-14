@@ -6,7 +6,7 @@
   translated code.
 *)
 
-From Coq Require Import Arith Lia.
+From Stdlib Require Import Arith Lia.
 
 Definition offset_map (base idx : nat) : nat := base + idx.
 
