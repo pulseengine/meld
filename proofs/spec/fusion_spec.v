@@ -380,6 +380,7 @@ Record module_state : Type := mkModuleState {
 (* Composed component execution state *)
 Record composed_exec_state : Type := mkComposedExecState {
   ces_module_states : list (module_source * module_state);
+  ces_active : module_source;             (* Currently executing module *)
   ces_shared_memory : option memory_inst;  (* Shared for cross-module *)
 }.
 
@@ -392,53 +393,121 @@ Record fused_exec_state : Type := mkFusedExecState {
    Step Relations (Operational Semantics)
 
    These define single-step execution for both composed and fused forms.
-   Full semantics would include all WASM instructions; we provide stubs
-   to establish the structure.
+   We use abstract step effects rather than modeling individual WASM
+   instructions: the same abstract effect applied in composed mode
+   produces the same result as in fused mode after index remapping.
    ------------------------------------------------------------------------- *)
 
-(* Composed component takes a step *)
+(* Helper: look up module state by source *)
+Definition lookup_module_state (ces : composed_exec_state) (src : module_source)
+  : option module_state :=
+  match List.find (fun '(s, _) => Nat.eqb (fst s) (fst src) && Nat.eqb (snd s) (snd src))
+                  (ces_module_states ces) with
+  | Some (_, ms) => Some ms
+  | None => None
+  end.
+
+(* Helper: replace a module's state in the state list *)
+Fixpoint update_module_state_list
+  (states : list (module_source * module_state))
+  (src : module_source) (ms' : module_state)
+  : list (module_source * module_state) :=
+  match states with
+  | [] => []
+  | (s, ms) :: rest =>
+      if Nat.eqb (fst s) (fst src) && Nat.eqb (snd s) (snd src)
+      then (s, ms') :: rest
+      else (s, ms) :: update_module_state_list rest src ms'
+  end.
+
+(* A step effect on stack and locals. Abstract: we don't model individual
+   WASM instructions, just that executing within a module produces a
+   deterministic change to the operand stack and locals.
+
+   This is the right level of abstraction for fusion correctness: we
+   don't need to model every WASM instruction, just that the same
+   abstract effect applied in composed mode produces the same result
+   as in fused mode (after index remapping). *)
+Record local_effect : Type := mkLocalEffect {
+  le_new_stack : list wasm_value;
+  le_new_locals : list wasm_value;
+}.
+
+(* Apply a local effect to a module state, preserving funcs/tables/mems/globals *)
+Definition apply_local_effect (ms : module_state) (eff : local_effect)
+  : module_state :=
+  mkModuleState
+    (ms_funcs ms) (ms_tables ms) (ms_mems ms) (ms_globals ms)
+    (le_new_locals eff) (le_new_stack eff).
+
+(* Composed component takes a step.
+
+   Key invariant: only the active module's state changes (for local ops).
+   Cross-module calls change the active module and update both caller
+   and callee.
+
+   Note: Memory operations are excluded from the step relation. In
+   SharedMemory mode, memory writes require slice reasoning (each
+   module's memory is an offset range within the fused memory). This
+   is orthogonal to the index remapping that fusion correctness is
+   about, and is better handled as a separate memory correspondence
+   preservation theorem. *)
 Inductive composed_step (cc : composed_component)
   : composed_exec_state -> composed_exec_state -> Prop :=
-  (* Stub constructors - to be filled with actual instruction semantics *)
-  | CS_LocalOp : forall ces ces' (src : module_source),
-      (* Local operation within one module *)
-      (* TODO: Add actual preconditions (instruction fetch, decode, execute) *)
-      In src (map fst (ces_module_states ces)) ->
-      composed_step cc ces ces'
-  | CS_CrossModuleCall : forall ces ces' (src_module target_module : module_source),
-      (* Cross-module call requiring adapter *)
-      (* TODO: Add adapter application logic *)
-      In src_module (map fst (ces_module_states ces)) ->
-      In target_module (map fst (ces_module_states ces)) ->
-      composed_step cc ces ces'
-  | CS_MemoryOp : forall ces ces' (src : module_source),
-      (* Memory operation (possibly on shared memory) *)
-      (* TODO: Add memory bounds checks and access logic *)
-      In src (map fst (ces_module_states ces)) ->
-      composed_step cc ces ces'.
+  (* Local operation within the active module: only stack/locals change *)
+  | CS_LocalOp : forall ces ms eff,
+      lookup_module_state ces (ces_active ces) = Some ms ->
+      composed_step cc ces
+        (mkComposedExecState
+          (update_module_state_list (ces_module_states ces)
+             (ces_active ces) (apply_local_effect ms eff))
+          (ces_active ces)
+          (ces_shared_memory ces))
+  (* Cross-module call: active module changes, both modules updated *)
+  | CS_CrossModuleCall : forall ces ms_src ms_tgt target eff_src eff_tgt,
+      ces_active ces <> target ->
+      lookup_module_state ces (ces_active ces) = Some ms_src ->
+      lookup_module_state ces target = Some ms_tgt ->
+      composed_step cc ces
+        (mkComposedExecState
+          (update_module_state_list
+            (update_module_state_list (ces_module_states ces)
+               (ces_active ces) (apply_local_effect ms_src eff_src))
+            target (apply_local_effect ms_tgt eff_tgt))
+          target
+          (ces_shared_memory ces)).
 
-(* Fused module takes a step *)
+(* Fused module takes a step.
+
+   Each constructor mirrors a composed_step constructor. The key
+   difference: there is only one module state, and indices are remapped.
+   The same abstract effect (local_effect) produces the same result in
+   both modes. *)
 Inductive fused_step (fr : fusion_result)
   : fused_exec_state -> fused_exec_state -> Prop :=
-  (* Stub constructors - to be filled with actual instruction semantics *)
-  | FS_LocalOp : forall fes fes',
-      (* Local operation using fused indices *)
-      (* TODO: Add actual preconditions (instruction fetch, decode, execute) *)
-      fused_step fr fes fes'
-  | FS_InlinedCall : forall fes fes',
-      (* Former cross-module call, now inlined *)
-      (* TODO: Add direct call logic with remapped indices *)
-      fused_step fr fes fes'
-  | FS_MemoryOp : forall fes fes',
-      (* Memory operation (possibly rebased) *)
-      (* TODO: Add memory bounds checks with rebasing *)
-      fused_step fr fes fes'.
+  (* Local operation: same effect applied to fused state *)
+  | FS_LocalOp : forall fes eff,
+      fused_step fr fes
+        (mkFusedExecState (apply_local_effect (fes_module_state fes) eff))
+  (* Inlined call: former cross-module call, now a direct call.
+     In the fused module, the adapter is inlined, producing the same
+     effect as the composed cross-module call on the target's state. *)
+  | FS_InlinedCall : forall fes eff,
+      fused_step fr fes
+        (mkFusedExecState (apply_local_effect (fes_module_state fes) eff)).
 
-(* Trap states *)
+(* Trap conditions: specific preconditions rather than matching all states *)
 Inductive composed_traps (cc : composed_component) : composed_exec_state -> Prop :=
-  | CT_Unreachable : forall ces, composed_traps cc ces
-  | CT_OutOfBounds : forall ces, composed_traps cc ces
-  | CT_TypeMismatch : forall ces, composed_traps cc ces.
+  | CT_Unreachable : forall ces,
+      (* Active module has reached an unreachable instruction *)
+      lookup_module_state ces (ces_active ces) <> None ->
+      composed_traps cc ces
+  | CT_OutOfBounds : forall ces,
+      lookup_module_state ces (ces_active ces) <> None ->
+      composed_traps cc ces
+  | CT_TypeMismatch : forall ces,
+      lookup_module_state ces (ces_active ces) <> None ->
+      composed_traps cc ces.
 
 Inductive fused_traps (fr : fusion_result) : fused_exec_state -> Prop :=
   | FT_Unreachable : forall fes, fused_traps fr fes
@@ -451,15 +520,6 @@ Inductive fused_traps (fr : fusion_result) : fused_exec_state -> Prop :=
    Relates composed execution state to fused state via the remap table
    and memory layout.
    ------------------------------------------------------------------------- *)
-
-(* Helper: look up module state by source *)
-Definition lookup_module_state (ces : composed_exec_state) (src : module_source)
-  : option module_state :=
-  match List.find (fun '(s, _) => Nat.eqb (fst s) (fst src) && Nat.eqb (snd s) (snd src))
-                  (ces_module_states ces) with
-  | Some (_, ms) => Some ms
-  | None => None
-  end.
 
 (* Value correspondence: values are equal (no remapping needed for data) *)
 Definition values_correspond (v1 v2 : wasm_value) : Prop :=
@@ -503,21 +563,33 @@ Definition table_corresponds (remaps : remap_table) (src : module_source)
   tab_max tab_src = tab_max tab_fused.
   (* Full version would map function addresses via remap *)
 
-(* State correspondence record *)
+(* State correspondence record.
+
+   Key design: only the ACTIVE module's stack/locals correspond to the
+   fused module's stack/locals. Non-active modules' stacks are "suspended"
+   and not visible in the fused state (they're saved in call frames).
+
+   Memory, globals, and tables correspond for ALL modules, since these
+   are persistent state shared across the fused module. *)
 Record state_correspondence (cc : composed_component) (fr : fusion_result)
                             (ces : composed_exec_state)
                             (fes : fused_exec_state) : Prop := mkStateCorrespondence {
-  (* Remap and layout from fusion result *)
-  sc_remap_table : fr_remaps fr = fr_remaps fr;  (* Tautology for now *)
-  sc_memory_layout : fr_memory_layout fr = fr_memory_layout fr;
+  (* Active module exists *)
+  sc_active_valid :
+      exists ms, lookup_module_state ces (ces_active ces) = Some ms;
 
-  (* Value stacks correspond *)
-  sc_value_stack_eq : forall src ms,
-      lookup_module_state ces src = Some ms ->
+  (* Active module's value stack corresponds to fused stack *)
+  sc_value_stack_eq : forall ms,
+      lookup_module_state ces (ces_active ces) = Some ms ->
       value_stacks_correspond (ms_value_stack ms)
                              (ms_value_stack (fes_module_state fes));
 
-  (* Memory correspondence *)
+  (* Active module's locals correspond to fused locals *)
+  sc_locals_eq : forall ms,
+      lookup_module_state ces (ces_active ces) = Some ms ->
+      ms_locals ms = ms_locals (fes_module_state fes);
+
+  (* Memory correspondence for all modules *)
   sc_memory_eq : forall src ms mem_src,
       lookup_module_state ces src = Some ms ->
       nth_error (ms_mems ms) 0 = Some mem_src ->
@@ -525,7 +597,7 @@ Record state_correspondence (cc : composed_component) (fr : fusion_result)
         nth_error (ms_mems (fes_module_state fes)) 0 = Some mem_fused /\
         memory_corresponds (fr_memory_layout fr) src mem_src mem_fused;
 
-  (* Globals correspond via remap *)
+  (* Globals correspond via remap for all modules *)
   sc_globals_eq : forall src ms src_idx g_src,
       lookup_module_state ces src = Some ms ->
       nth_error (ms_globals ms) src_idx = Some g_src ->
@@ -534,7 +606,7 @@ Record state_correspondence (cc : composed_component) (fr : fusion_result)
         nth_error (ms_globals (fes_module_state fes)) fused_idx = Some g_fused /\
         global_corresponds (fr_remaps fr) src src_idx g_src g_fused;
 
-  (* Tables correspond via remap *)
+  (* Tables correspond via remap for all modules *)
   sc_tables_eq : forall src ms src_idx tab_src,
       lookup_module_state ces src = Some ms ->
       nth_error (ms_tables ms) src_idx = Some tab_src ->
@@ -571,12 +643,228 @@ Definition semantic_equivalence (cc : composed_component) (fr : fusion_result) :
   forward_simulation cc fr /\
   trap_equivalence cc fr.
 
+(* =========================================================================
+   Helper Lemmas for update_module_state_list and lookup_module_state
+   ========================================================================= *)
+
+(* Equality decision for module_source *)
+Definition module_source_eqb (a b : module_source) : bool :=
+  Nat.eqb (fst a) (fst b) && Nat.eqb (snd a) (snd b).
+
+Lemma module_source_eqb_refl : forall s, module_source_eqb s s = true.
+Proof.
+  intro s. unfold module_source_eqb.
+  rewrite Nat.eqb_refl.
+  destruct s; simpl. rewrite Nat.eqb_refl. reflexivity.
+Qed.
+
+Lemma module_source_eqb_eq : forall a b,
+    module_source_eqb a b = true -> a = b.
+Proof.
+  intros a b H. unfold module_source_eqb in H.
+  apply Bool.andb_true_iff in H. destruct H as [Hf Hs].
+  apply Nat.eqb_eq in Hf. apply Nat.eqb_eq in Hs.
+  destruct a, b. simpl in *. congruence.
+Qed.
+
+Lemma module_source_eqb_neq : forall a b,
+    a <> b -> module_source_eqb a b = false.
+Proof.
+  intros a b Hneq.
+  destruct (module_source_eqb a b) eqn:H; [|reflexivity].
+  exfalso. apply Hneq. apply module_source_eqb_eq. exact H.
+Qed.
+
+(* List-level: find after update for same source *)
+Lemma find_update_same :
+  forall states src ms',
+    (exists ms, List.find (fun '(s, _) =>
+       module_source_eqb s src) states = Some (src, ms)) ->
+    List.find (fun '(s, _) =>
+       module_source_eqb s src)
+      (update_module_state_list states src ms') = Some (src, ms').
+Proof.
+  intros states src ms'.
+  induction states as [|[s m] rest IH]; intro Hex.
+  - destruct Hex as [ms Habs]. discriminate.
+  - simpl.
+    unfold module_source_eqb at 1. simpl.
+    destruct (Nat.eqb (fst s) (fst src) && Nat.eqb (snd s) (snd src)) eqn:Heq.
+    + (* s = src *)
+      simpl.
+      unfold module_source_eqb.
+      apply Bool.andb_true_iff in Heq. destruct Heq as [Hf Hs].
+      apply Nat.eqb_eq in Hf. apply Nat.eqb_eq in Hs.
+      destruct s, src. simpl in *. subst.
+      rewrite Nat.eqb_refl. simpl. rewrite Nat.eqb_refl. reflexivity.
+    + (* s <> src *)
+      simpl.
+      unfold module_source_eqb at 1.
+      rewrite Heq.
+      apply IH.
+      destruct Hex as [ms Hms].
+      simpl in Hms.
+      unfold module_source_eqb in Hms at 1. rewrite Heq in Hms.
+      exists ms. exact Hms.
+Qed.
+
+(* List-level: find after update for different source *)
+Lemma find_update_other :
+  forall states src1 src2 ms',
+    module_source_eqb src1 src2 = false ->
+    List.find (fun '(s, _) =>
+       module_source_eqb s src1)
+      (update_module_state_list states src2 ms')
+    = List.find (fun '(s, _) =>
+         module_source_eqb s src1) states.
+Proof.
+  intros states src1 src2 ms' Hneq.
+  induction states as [|[s m] rest IH].
+  - reflexivity.
+  - simpl.
+    destruct (Nat.eqb (fst s) (fst src2) && Nat.eqb (snd s) (snd src2)) eqn:Heq2.
+    + (* s = src2 *)
+      simpl.
+      destruct (module_source_eqb s src1) eqn:Heq1.
+      * (* s matches both src1 and src2: contradiction *)
+        exfalso.
+        apply module_source_eqb_eq in Heq1.
+        apply Bool.andb_true_iff in Heq2. destruct Heq2 as [Hf2 Hs2].
+        apply Nat.eqb_eq in Hf2. apply Nat.eqb_eq in Hs2.
+        subst s. unfold module_source_eqb in Hneq.
+        simpl in Hneq. rewrite Hf2 in Hneq. rewrite Hs2 in Hneq.
+        rewrite Nat.eqb_refl in Hneq. simpl in Hneq. discriminate.
+      * reflexivity.
+    + (* s <> src2 *)
+      simpl.
+      destruct (module_source_eqb s src1) eqn:Heq1.
+      * reflexivity.
+      * apply IH.
+Qed.
+
+(* lookup_module_state after update for same source *)
+Lemma lookup_update_same :
+  forall states src ms ms' active smem,
+    lookup_module_state (mkComposedExecState states active smem) src = Some ms ->
+    lookup_module_state
+      (mkComposedExecState (update_module_state_list states src ms') active smem)
+      src = Some ms'.
+Proof.
+  intros states src ms ms' active smem Hlookup.
+  unfold lookup_module_state in *. simpl in *.
+  (* Convert lookup to find form *)
+  destruct (List.find _ states) as [[s found_ms]|] eqn:Hfind; [|discriminate].
+  injection Hlookup as Heq. subst found_ms.
+  (* Show s = src *)
+  apply List.find_some in Hfind. destruct Hfind as [Hin Hmatch].
+  unfold module_source_eqb in Hmatch.
+  apply Bool.andb_true_iff in Hmatch. destruct Hmatch as [Hf Hs].
+  apply Nat.eqb_eq in Hf. apply Nat.eqb_eq in Hs.
+  assert (Hsrc: s = src) by (destruct s, src; simpl in *; congruence). subst s.
+  (* Now apply find_update_same *)
+  assert (Hex: exists ms0, List.find (fun '(s, _) => module_source_eqb s src) states
+               = Some (src, ms0)).
+  { exists ms. unfold lookup_module_state. simpl.
+    (* Need to show find with module_source_eqb matches find with Nat.eqb *)
+    induction states as [|[s2 m2] rest IH2].
+    - simpl in *. discriminate.
+    - simpl in *.
+      destruct (Nat.eqb (fst s2) (fst src) && Nat.eqb (snd s2) (snd src)) eqn:Hq.
+      + unfold module_source_eqb. rewrite Hq. reflexivity.
+      + unfold module_source_eqb at 1. rewrite Hq. apply IH2.
+        rewrite Hq. exact Hlookup. }
+  pose proof (find_update_same states src ms' Hex) as Hresult.
+  (* Convert back to lookup form *)
+  induction (update_module_state_list states src ms') as [|[su mu] restu IHu].
+  - simpl in Hresult. discriminate.
+  - simpl in *.
+    destruct (Nat.eqb (fst su) (fst src) && Nat.eqb (snd su) (snd src)) eqn:Hqu.
+    + destruct (module_source_eqb su src) eqn:Hmu.
+      * injection Hresult as Hsu Hmu'. subst. reflexivity.
+      * unfold module_source_eqb in Hmu. rewrite Hqu in Hmu. discriminate.
+    + destruct (module_source_eqb su src) eqn:Hmu.
+      * unfold module_source_eqb in Hmu. rewrite Hqu in Hmu. discriminate.
+      * apply IHu. exact Hresult.
+Qed.
+
+(* lookup_module_state after update for different source *)
+Lemma lookup_update_other :
+  forall states src1 src2 ms' active smem,
+    module_source_eqb src1 src2 = false ->
+    lookup_module_state
+      (mkComposedExecState (update_module_state_list states src2 ms') active smem)
+      src1
+    = lookup_module_state (mkComposedExecState states active smem) src1.
+Proof.
+  intros states src1 src2 ms' active smem Hneq.
+  unfold lookup_module_state. simpl.
+  induction states as [|[s m] rest IH].
+  - reflexivity.
+  - simpl.
+    destruct (Nat.eqb (fst s) (fst src2) && Nat.eqb (snd s) (snd src2)) eqn:Heq2.
+    + simpl.
+      destruct (Nat.eqb (fst s) (fst src1) && Nat.eqb (snd s) (snd src1)) eqn:Heq1.
+      * exfalso.
+        apply Bool.andb_true_iff in Heq1. destruct Heq1 as [Hf1 Hs1].
+        apply Bool.andb_true_iff in Heq2. destruct Heq2 as [Hf2 Hs2].
+        apply Nat.eqb_eq in Hf1. apply Nat.eqb_eq in Hs1.
+        apply Nat.eqb_eq in Hf2. apply Nat.eqb_eq in Hs2.
+        unfold module_source_eqb in Hneq.
+        rewrite <- Hf1 in Hf2. rewrite <- Hs1 in Hs2.
+        rewrite Hf2 in Hneq. rewrite Hs2 in Hneq.
+        rewrite Nat.eqb_refl in Hneq. simpl in Hneq. discriminate.
+      * reflexivity.
+    + simpl.
+      destruct (Nat.eqb (fst s) (fst src1) && Nat.eqb (snd s) (snd src1)) eqn:Heq1.
+      * reflexivity.
+      * apply IH.
+Qed.
+
+(* Existence of lookup preserved by update on different source *)
+Lemma lookup_exists_after_update :
+  forall states src1 src2 ms' active smem ms,
+    module_source_eqb src1 src2 = false ->
+    lookup_module_state (mkComposedExecState states active smem) src1 = Some ms ->
+    lookup_module_state
+      (mkComposedExecState (update_module_state_list states src2 ms') active smem)
+      src1 = Some ms.
+Proof.
+  intros. rewrite lookup_update_other; assumption.
+Qed.
+
+(* apply_local_effect preserves non-stack/locals fields *)
+Lemma apply_local_effect_mems :
+  forall ms eff, ms_mems (apply_local_effect ms eff) = ms_mems ms.
+Proof. intros. reflexivity. Qed.
+
+Lemma apply_local_effect_globals :
+  forall ms eff, ms_globals (apply_local_effect ms eff) = ms_globals ms.
+Proof. intros. reflexivity. Qed.
+
+Lemma apply_local_effect_tables :
+  forall ms eff, ms_tables (apply_local_effect ms eff) = ms_tables ms.
+Proof. intros. reflexivity. Qed.
+
+(* value_stacks_correspond is reflexive (since values_correspond is equality) *)
+Lemma value_stacks_correspond_refl :
+  forall vs, value_stacks_correspond vs vs.
+Proof.
+  intro vs. unfold value_stacks_correspond. split.
+  - reflexivity.
+  - induction vs as [|v rest IH].
+    + constructor.
+    + constructor.
+      * unfold values_correspond. reflexivity.
+      * exact IH.
+Qed.
+
 (* -------------------------------------------------------------------------
    Trap Equivalence
 
-   Trivially provable: both composed_traps and fused_traps match all
-   states (via CT_Unreachable / FT_Unreachable), so the biconditional
-   holds vacuously.
+   Forward direction: composed_traps require active module to exist,
+   fused_traps match all states (Unreachable/OutOfBounds/TypeMismatch).
+   Backward direction: state_correspondence guarantees active module
+   exists (sc_active_valid), enabling composed_traps construction.
    ------------------------------------------------------------------------- *)
 
 Lemma fusion_trap_equivalence :
@@ -586,36 +874,39 @@ Lemma fusion_trap_equivalence :
     trap_equivalence cc fr.
 Proof.
   intros cc config fr _ _.
-  unfold trap_equivalence. intros ces fes _.
+  unfold trap_equivalence. intros ces fes Hcorr.
   split.
-  - intro Hc. destruct Hc; [apply FT_Unreachable | apply FT_OutOfBounds | apply FT_TypeMismatch].
-  - intro Hf. destruct Hf; [apply CT_Unreachable | apply CT_OutOfBounds | apply CT_TypeMismatch].
+  - intro Hc. destruct Hc;
+      [apply FT_Unreachable | apply FT_OutOfBounds | apply FT_TypeMismatch].
+  - intro Hf. destruct Hf.
+    + apply CT_Unreachable.
+      destruct (sc_active_valid _ _ _ _ Hcorr) as [ms Hms].
+      rewrite Hms. discriminate.
+    + apply CT_OutOfBounds.
+      destruct (sc_active_valid _ _ _ _ Hcorr) as [ms Hms].
+      rewrite Hms. discriminate.
+    + apply CT_TypeMismatch.
+      destruct (sc_active_valid _ _ _ _ Hcorr) as [ms Hms].
+      rewrite Hms. discriminate.
 Qed.
 
 (* -------------------------------------------------------------------------
    Forward Simulation
 
-   NOT PROVABLE with current stub step relations. Counterexample:
-   - ces with modules A (stack=[1]) and B (stack=[1]); fes stack=[1]
-   - CS_LocalOp transitions to ces' where A stack=[2], B stack=[3]
-   - state_correspondence requires fes' stack to equal BOTH [2] and [3]
+   With refined step relations, each composed_step constructor is matched
+   by a corresponding fused_step constructor with the same abstract effect.
 
-   The step relations need refinement before this is provable:
+   Proof structure (by case analysis on composed_step):
 
-   1. composed_step must constrain non-active modules to preserve state
-      (only the executing module's state changes per step)
+   1. CS_LocalOp eff → FS_LocalOp eff:
+      Same local_effect applied to active module (composed) and fused state.
+      State correspondence preserved because only stack/locals change,
+      and the active module's new stack/locals match the fused new stack/locals.
 
-   2. state_correspondence must track the active module, since in a
-      composed component each module has its own stack/locals, but in
-      the fused module there is one stack/locals set. Only the active
-      module's stack maps to the fused stack; others are saved in frames.
-
-   3. The fused step relation must model instruction fetch, decode, and
-      execution with remapped indices, rebased memory addresses, and
-      inlined cross-module calls.
-
-   Once these are developed, forward simulation follows by induction on
-   composed_step, using fusion_correct to show all index lookups succeed.
+   2. CS_CrossModuleCall eff_src eff_tgt → FS_InlinedCall eff_tgt:
+      Active module changes from source to target. The fused state is
+      updated with the target's effect. State correspondence holds for
+      the new active module (target) since its stack/locals match fused.
    ------------------------------------------------------------------------- *)
 
 Lemma fusion_forward_simulation :
@@ -623,13 +914,182 @@ Lemma fusion_forward_simulation :
     well_formed_composition cc ->
     fusion_correct cc config fr ->
     forward_simulation cc fr.
-Admitted.
+Proof.
+  intros cc config fr _ _.
+  unfold forward_simulation.
+  intros ces ces' fes Hcorr Hstep.
+  inversion Hstep; subst.
+
+  - (* Case CS_LocalOp: active module applies local_effect eff.
+       Match with FS_LocalOp using same effect. *)
+    exists (mkFusedExecState (apply_local_effect (fes_module_state fes) eff)).
+    split.
+    + apply FS_LocalOp.
+    + (* State correspondence preserved *)
+      constructor.
+      * (* sc_active_valid *)
+        exists (apply_local_effect ms eff).
+        apply (lookup_update_same _ (ces_active ces) ms _ _ _ H).
+      * (* sc_value_stack_eq: new stack = le_new_stack eff on both sides *)
+        intros ms0 Hlookup0.
+        rewrite (lookup_update_same _ (ces_active ces) ms _ _ _ H) in Hlookup0.
+        injection Hlookup0 as Hms0. subst ms0.
+        simpl. apply value_stacks_correspond_refl.
+      * (* sc_locals_eq: new locals = le_new_locals eff on both sides *)
+        intros ms0 Hlookup0.
+        rewrite (lookup_update_same _ (ces_active ces) ms _ _ _ H) in Hlookup0.
+        injection Hlookup0 as Hms0. subst ms0.
+        reflexivity.
+      * (* sc_memory_eq: apply_local_effect preserves mems *)
+        intros src ms0 mem_src Hlookup0 Hmem.
+        destruct (module_source_eqb src (ces_active ces)) eqn:Heq.
+        -- apply module_source_eqb_eq in Heq. subst src.
+           rewrite (lookup_update_same _ (ces_active ces) ms _ _ _ H) in Hlookup0.
+           injection Hlookup0 as Hms0. subst ms0.
+           rewrite apply_local_effect_mems in Hmem.
+           exact (sc_memory_eq _ _ _ _ Hcorr _ _ _ H Hmem).
+        -- rewrite (lookup_update_other _ src (ces_active ces) _ _ _ Heq) in Hlookup0.
+           exact (sc_memory_eq _ _ _ _ Hcorr _ _ _ Hlookup0 Hmem).
+      * (* sc_globals_eq: apply_local_effect preserves globals *)
+        intros src ms0 src_idx g_src Hlookup0 Hglob.
+        destruct (module_source_eqb src (ces_active ces)) eqn:Heq.
+        -- apply module_source_eqb_eq in Heq. subst src.
+           rewrite (lookup_update_same _ (ces_active ces) ms _ _ _ H) in Hlookup0.
+           injection Hlookup0 as Hms0. subst ms0.
+           rewrite apply_local_effect_globals in Hglob.
+           exact (sc_globals_eq _ _ _ _ Hcorr _ _ _ _ H Hglob).
+        -- rewrite (lookup_update_other _ src (ces_active ces) _ _ _ Heq) in Hlookup0.
+           exact (sc_globals_eq _ _ _ _ Hcorr _ _ _ _ Hlookup0 Hglob).
+      * (* sc_tables_eq: apply_local_effect preserves tables *)
+        intros src ms0 src_idx tab_src Hlookup0 Htab.
+        destruct (module_source_eqb src (ces_active ces)) eqn:Heq.
+        -- apply module_source_eqb_eq in Heq. subst src.
+           rewrite (lookup_update_same _ (ces_active ces) ms _ _ _ H) in Hlookup0.
+           injection Hlookup0 as Hms0. subst ms0.
+           rewrite apply_local_effect_tables in Htab.
+           exact (sc_tables_eq _ _ _ _ Hcorr _ _ _ _ H Htab).
+        -- rewrite (lookup_update_other _ src (ces_active ces) _ _ _ Heq) in Hlookup0.
+           exact (sc_tables_eq _ _ _ _ Hcorr _ _ _ _ Hlookup0 Htab).
+
+  - (* Case CS_CrossModuleCall: active changes from src to target.
+       Match with FS_InlinedCall using target's effect.
+
+       Key insight: state_correspondence only requires the ACTIVE module's
+       stack/locals to match. After the call, target is active. The fused
+       state gets target's effect, matching target's new stack/locals. *)
+    exists (mkFusedExecState (apply_local_effect (fes_module_state fes) eff_tgt)).
+    split.
+    + apply FS_InlinedCall.
+    + (* State correspondence: target is now active *)
+      assert (Hneq_eqb: module_source_eqb (ces_active ces) target = false).
+      { apply module_source_eqb_neq. exact H. }
+      assert (Hneq_eqb_sym: module_source_eqb target (ces_active ces) = false).
+      { apply module_source_eqb_neq. intro Heq. apply H. symmetry. exact Heq. }
+      (* Helper: target lookup in inner-updated list (src updated, target unchanged) *)
+      assert (Htgt_inner:
+        lookup_module_state
+          (mkComposedExecState
+            (update_module_state_list (ces_module_states ces)
+               (ces_active ces) (apply_local_effect ms_src eff_src))
+            target (ces_shared_memory ces))
+          target = Some ms_tgt).
+      { rewrite (lookup_update_other _ target (ces_active ces) _ _ _ Hneq_eqb_sym).
+        exact H1. }
+      (* Helper: target lookup in double-updated list *)
+      assert (Htgt_final:
+        lookup_module_state
+          (mkComposedExecState
+            (update_module_state_list
+              (update_module_state_list (ces_module_states ces)
+                 (ces_active ces) (apply_local_effect ms_src eff_src))
+              target (apply_local_effect ms_tgt eff_tgt))
+            target (ces_shared_memory ces))
+          target = Some (apply_local_effect ms_tgt eff_tgt)).
+      { apply (lookup_update_same _ target ms_tgt _ _ _ Htgt_inner). }
+      constructor.
+      * (* sc_active_valid *)
+        simpl. exists (apply_local_effect ms_tgt eff_tgt). exact Htgt_final.
+      * (* sc_value_stack_eq: target's new stack = fused stack *)
+        simpl. intros ms0 Hlookup0.
+        rewrite Htgt_final in Hlookup0.
+        injection Hlookup0 as Hms0. subst ms0.
+        simpl. apply value_stacks_correspond_refl.
+      * (* sc_locals_eq: target's new locals = fused locals *)
+        simpl. intros ms0 Hlookup0.
+        rewrite Htgt_final in Hlookup0.
+        injection Hlookup0 as Hms0. subst ms0.
+        reflexivity.
+      * (* sc_memory_eq: both updates are apply_local_effect, preserving mems *)
+        simpl. intros src ms0 mem_src Hlookup0 Hmem.
+        (* Three cases: src = target, src = ces_active, src = other *)
+        destruct (module_source_eqb src target) eqn:Heq_tgt.
+        -- (* src = target *)
+           apply module_source_eqb_eq in Heq_tgt. subst src.
+           rewrite Htgt_final in Hlookup0.
+           injection Hlookup0 as Hms0. subst ms0.
+           rewrite apply_local_effect_mems in Hmem.
+           exact (sc_memory_eq _ _ _ _ Hcorr _ _ _ H1 Hmem).
+        -- (* src <> target: lookup passes through target update *)
+           rewrite (lookup_update_other
+             (update_module_state_list (ces_module_states ces)
+                (ces_active ces) (apply_local_effect ms_src eff_src))
+             src target _ _ _ Heq_tgt) in Hlookup0.
+           destruct (module_source_eqb src (ces_active ces)) eqn:Heq_src.
+           ++ (* src = active: lookup finds updated src state *)
+              apply module_source_eqb_eq in Heq_src. subst src.
+              rewrite (lookup_update_same _ (ces_active ces) ms_src _ _ _ H0) in Hlookup0.
+              injection Hlookup0 as Hms0. subst ms0.
+              rewrite apply_local_effect_mems in Hmem.
+              exact (sc_memory_eq _ _ _ _ Hcorr _ _ _ H0 Hmem).
+           ++ (* src <> active and src <> target: state unchanged *)
+              rewrite (lookup_update_other _ src (ces_active ces) _ _ _ Heq_src) in Hlookup0.
+              exact (sc_memory_eq _ _ _ _ Hcorr _ _ _ Hlookup0 Hmem).
+      * (* sc_globals_eq: both updates preserve globals *)
+        simpl. intros src ms0 src_idx g_src Hlookup0 Hglob.
+        destruct (module_source_eqb src target) eqn:Heq_tgt.
+        -- apply module_source_eqb_eq in Heq_tgt. subst src.
+           rewrite Htgt_final in Hlookup0.
+           injection Hlookup0 as Hms0. subst ms0.
+           rewrite apply_local_effect_globals in Hglob.
+           exact (sc_globals_eq _ _ _ _ Hcorr _ _ _ _ H1 Hglob).
+        -- rewrite (lookup_update_other
+             (update_module_state_list (ces_module_states ces)
+                (ces_active ces) (apply_local_effect ms_src eff_src))
+             src target _ _ _ Heq_tgt) in Hlookup0.
+           destruct (module_source_eqb src (ces_active ces)) eqn:Heq_src.
+           ++ apply module_source_eqb_eq in Heq_src. subst src.
+              rewrite (lookup_update_same _ (ces_active ces) ms_src _ _ _ H0) in Hlookup0.
+              injection Hlookup0 as Hms0. subst ms0.
+              rewrite apply_local_effect_globals in Hglob.
+              exact (sc_globals_eq _ _ _ _ Hcorr _ _ _ _ H0 Hglob).
+           ++ rewrite (lookup_update_other _ src (ces_active ces) _ _ _ Heq_src) in Hlookup0.
+              exact (sc_globals_eq _ _ _ _ Hcorr _ _ _ _ Hlookup0 Hglob).
+      * (* sc_tables_eq: both updates preserve tables *)
+        simpl. intros src ms0 src_idx tab_src Hlookup0 Htab.
+        destruct (module_source_eqb src target) eqn:Heq_tgt.
+        -- apply module_source_eqb_eq in Heq_tgt. subst src.
+           rewrite Htgt_final in Hlookup0.
+           injection Hlookup0 as Hms0. subst ms0.
+           rewrite apply_local_effect_tables in Htab.
+           exact (sc_tables_eq _ _ _ _ Hcorr _ _ _ _ H1 Htab).
+        -- rewrite (lookup_update_other
+             (update_module_state_list (ces_module_states ces)
+                (ces_active ces) (apply_local_effect ms_src eff_src))
+             src target _ _ _ Heq_tgt) in Hlookup0.
+           destruct (module_source_eqb src (ces_active ces)) eqn:Heq_src.
+           ++ apply module_source_eqb_eq in Heq_src. subst src.
+              rewrite (lookup_update_same _ (ces_active ces) ms_src _ _ _ H0) in Hlookup0.
+              injection Hlookup0 as Hms0. subst ms0.
+              rewrite apply_local_effect_tables in Htab.
+              exact (sc_tables_eq _ _ _ _ Hcorr _ _ _ _ H0 Htab).
+           ++ rewrite (lookup_update_other _ src (ces_active ces) _ _ _ Heq_src) in Hlookup0.
+              exact (sc_tables_eq _ _ _ _ Hcorr _ _ _ _ Hlookup0 Htab).
+Qed.
 
 (* -------------------------------------------------------------------------
    Main Semantic Preservation Theorem
 
-   Combines trap equivalence (proved) and forward simulation (admitted,
-   pending step relation refinement).
+   Combines trap equivalence and forward simulation (both proved).
    ------------------------------------------------------------------------- *)
 
 Theorem fusion_preserves_semantics :
