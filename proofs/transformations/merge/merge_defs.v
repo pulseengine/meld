@@ -61,7 +61,16 @@ Definition gen_remaps_for_space (src : module_source) (m : module)
                                 (count : nat) : list index_remap :=
   map (fun i => mkIndexRemap space src i (offset + i)) (seq 0 count).
 
-(* Generate all remaps for a single module *)
+(* Generate remaps for MemIdx in SharedMemory mode: all map to 0.
+   In SharedMemory mode (merger.rs lines 350, 932-933), all memory indices
+   are remapped to 0 because all modules share a single merged memory. *)
+Definition gen_remaps_for_space_zero (src : module_source) (m : module)
+                                     (space : index_space) (count : nat) : list index_remap :=
+  map (fun i => mkIndexRemap space src i 0) (seq 0 count).
+
+(* Generate all remaps for a single module.
+   MemIdx uses gen_remaps_for_space_zero (SharedMemory: all map to 0).
+   All other spaces use gen_remaps_for_space with cumulative offsets. *)
 Definition gen_remaps_for_module (src : module_source) (m : module)
                                   (offsets : index_space -> nat) : list index_remap :=
   gen_remaps_for_space src m TypeIdx (offsets TypeIdx) (length (mod_types m)) ++
@@ -69,7 +78,7 @@ Definition gen_remaps_for_module (src : module_source) (m : module)
                        (count_func_imports m + length (mod_funcs m)) ++
   gen_remaps_for_space src m TableIdx (offsets TableIdx)
                        (count_table_imports m + length (mod_tables m)) ++
-  gen_remaps_for_space src m MemIdx (offsets MemIdx)
+  gen_remaps_for_space_zero src m MemIdx
                        (count_mem_imports m + length (mod_mems m)) ++
   gen_remaps_for_space src m GlobalIdx (offsets GlobalIdx)
                        (count_global_imports m + length (mod_globals m)) ++
