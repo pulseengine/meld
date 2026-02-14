@@ -572,12 +572,64 @@ Definition semantic_equivalence (cc : composed_component) (fr : fusion_result) :
   trap_equivalence cc fr.
 
 (* -------------------------------------------------------------------------
+   Trap Equivalence
+
+   Trivially provable: both composed_traps and fused_traps match all
+   states (via CT_Unreachable / FT_Unreachable), so the biconditional
+   holds vacuously.
+   ------------------------------------------------------------------------- *)
+
+Lemma fusion_trap_equivalence :
+  forall cc config fr,
+    well_formed_composition cc ->
+    fusion_correct cc config fr ->
+    trap_equivalence cc fr.
+Proof.
+  intros cc config fr _ _.
+  unfold trap_equivalence. intros ces fes _.
+  split.
+  - intro Hc. destruct Hc; [apply FT_Unreachable | apply FT_OutOfBounds | apply FT_TypeMismatch].
+  - intro Hf. destruct Hf; [apply CT_Unreachable | apply CT_OutOfBounds | apply CT_TypeMismatch].
+Qed.
+
+(* -------------------------------------------------------------------------
+   Forward Simulation
+
+   NOT PROVABLE with current stub step relations. Counterexample:
+   - ces with modules A (stack=[1]) and B (stack=[1]); fes stack=[1]
+   - CS_LocalOp transitions to ces' where A stack=[2], B stack=[3]
+   - state_correspondence requires fes' stack to equal BOTH [2] and [3]
+
+   The step relations need refinement before this is provable:
+
+   1. composed_step must constrain non-active modules to preserve state
+      (only the executing module's state changes per step)
+
+   2. state_correspondence must track the active module, since in a
+      composed component each module has its own stack/locals, but in
+      the fused module there is one stack/locals set. Only the active
+      module's stack maps to the fused stack; others are saved in frames.
+
+   3. The fused step relation must model instruction fetch, decode, and
+      execution with remapped indices, rebased memory addresses, and
+      inlined cross-module calls.
+
+   Once these are developed, forward simulation follows by induction on
+   composed_step, using fusion_correct to show all index lookups succeed.
+   ------------------------------------------------------------------------- *)
+
+Lemma fusion_forward_simulation :
+  forall cc config fr,
+    well_formed_composition cc ->
+    fusion_correct cc config fr ->
+    forward_simulation cc fr.
+Admitted.
+
+(* -------------------------------------------------------------------------
    Main Semantic Preservation Theorem
 
-   NOTE: This is the specification, not the proof. The theorem is admitted
-   because proving it requires fully developing the step relations and
-   showing that fusion transformations (index remapping, memory rebasing,
-   adapter generation) preserve behavior.
+   Combines trap equivalence (proved) and forward simulation (admitted,
+   pending step relation refinement).
    ------------------------------------------------------------------------- *)
 
 Theorem fusion_preserves_semantics :
@@ -586,13 +638,10 @@ Theorem fusion_preserves_semantics :
     fusion_correct cc config fr ->
     semantic_equivalence cc fr.
 Proof.
-  (* TODO: Prove forward simulation by induction on composed_step.
-     Each case must show:
-     1. Instruction rewriting preserves semantics via remap table
-     2. Memory rebasing preserves memory operations via layout table
-     3. Cross-module calls become inlined calls with correct argument mapping
-     4. All index lookups succeed (by fusion_correct properties)
-  *)
-Admitted.
+  intros cc config fr Hwf Hcorrect.
+  unfold semantic_equivalence. split.
+  - exact (fusion_forward_simulation cc config fr Hwf Hcorrect).
+  - exact (fusion_trap_equivalence cc config fr Hwf Hcorrect).
+Qed.
 
 (* End of fusion_spec specification *)
