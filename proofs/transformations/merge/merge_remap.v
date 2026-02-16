@@ -8,7 +8,7 @@
    ========================================================================= *)
 
 From Stdlib Require Import List ZArith Lia Bool Arith.
-From MeldSpec Require Import wasm_core component_model fusion_spec.
+From MeldSpec Require Import wasm_core component_model fusion_types.
 From MeldMerge Require Import merge_defs merge_layout.
 Import ListNotations.
 
@@ -410,18 +410,28 @@ Lemma find_gen_remaps_for_space_wrong_src :
 Proof.
   intros src1 src2 m sp offset count src_idx Hneq.
   unfold gen_remaps_for_space.
-  induction count as [|n IH]; simpl.
+  (* Generalize the seq starting index to make IH applicable *)
+  enough (Hgen: forall start,
+    find (fun r =>
+      index_space_eqb (ir_space r) sp &&
+      Nat.eqb (fst (ir_source r)) (fst src1) &&
+      Nat.eqb (snd (ir_source r)) (snd src1) &&
+      Nat.eqb (ir_source_idx r) src_idx)
+    (map (fun i => mkIndexRemap sp src2 i (offset + i)) (seq start count))
+    = None).
+  { apply Hgen. }
+  induction count as [|n IH]; intro start; simpl.
   - reflexivity.
-  - simpl. rewrite index_space_eqb_refl.
+  - rewrite index_space_eqb_refl.
     destruct Hneq as [Hfst | Hsnd].
     + assert (Hf: Nat.eqb (fst src2) (fst src1) = false).
       { apply Nat.eqb_neq. auto. }
-      rewrite Hf. simpl. exact IH.
+      rewrite Hf. simpl. apply IH.
     + destruct (Nat.eqb (fst src2) (fst src1)); simpl.
       * assert (Hs: Nat.eqb (snd src2) (snd src1) = false).
         { apply Nat.eqb_neq. auto. }
-        rewrite Hs. simpl. exact IH.
-      * exact IH.
+        rewrite Hs. simpl. apply IH.
+      * apply IH.
 Qed.
 
 (* -------------------------------------------------------------------------
@@ -522,18 +532,27 @@ Lemma find_gen_remaps_for_space_zero_wrong_src :
 Proof.
   intros src1 src2 m sp count src_idx Hneq.
   unfold gen_remaps_for_space_zero.
-  induction count as [|n IH]; simpl.
+  (* Generalize the seq starting index to make induction work *)
+  enough (Hgen: forall start,
+    find (fun r =>
+      index_space_eqb (ir_space r) sp &&
+      Nat.eqb (fst (ir_source r)) (fst src1) &&
+      Nat.eqb (snd (ir_source r)) (snd src1) &&
+      Nat.eqb (ir_source_idx r) src_idx)
+         (map (fun i => mkIndexRemap sp src2 i 0) (seq start count)) = None).
+  { apply Hgen. }
+  induction count as [|n IH]; intro start; simpl.
   - reflexivity.
-  - simpl. rewrite index_space_eqb_refl.
+  - rewrite index_space_eqb_refl.
     destruct Hneq as [Hfst | Hsnd].
     + assert (Hf: Nat.eqb (fst src2) (fst src1) = false).
       { apply Nat.eqb_neq. auto. }
-      rewrite Hf. simpl. exact IH.
+      rewrite Hf. simpl. apply IH.
     + destruct (Nat.eqb (fst src2) (fst src1)); simpl.
       * assert (Hs: Nat.eqb (snd src2) (snd src1) = false).
         { apply Nat.eqb_neq. auto. }
-        rewrite Hs. simpl. exact IH.
-      * exact IH.
+        rewrite Hs. simpl. apply IH.
+      * apply IH.
 Qed.
 
 (* -------------------------------------------------------------------------
@@ -558,6 +577,27 @@ Proof.
   repeat split; lia.
 Qed.
 
+(* Ltac helpers for in_gen_remaps_for_module_fused *)
+Local Ltac solve_non_mem_case :=
+  match goal with
+  | [ Hin : In _ (gen_remaps_for_space _ _ _ _ _) |- _ ] =>
+    apply in_gen_remaps_for_space_fused in Hin;
+    destruct Hin as [?Hfused [?Hspace [?Hsrc ?Hbound]]];
+    rewrite ?Hspace, ?Hsrc;
+    repeat split; try reflexivity; try (intro; discriminate);
+    try (intro; assumption)
+  end.
+
+Local Ltac solve_mem_case :=
+  match goal with
+  | [ Hin : In _ (gen_remaps_for_space_zero _ _ _ _) |- _ ] =>
+    apply in_gen_remaps_for_space_zero_fused in Hin;
+    destruct Hin as [?Hfused [?Hspace [?Hsrc ?Hbound]]];
+    rewrite ?Hspace, ?Hsrc;
+    repeat split; try reflexivity; try (intro; assumption);
+    try (intro; contradiction)
+  end.
+
 (* A remap in gen_remaps_for_module: source identity and fused_idx formula.
    For MemIdx (SharedMemory), fused_idx = 0.
    For all other spaces, fused_idx = offsets(space) + source_idx. *)
@@ -574,21 +614,7 @@ Proof.
      GlobalIdx, ElemIdx, DataIdx. The MemIdx chunk uses gen_remaps_for_space_zero
      while all others use gen_remaps_for_space. *)
   repeat (apply in_app_iff in Hin; destruct Hin as [Hin | Hin]).
-  (* TypeIdx chunk *)
-  all: first
-    [ (* non-MemIdx chunks: use in_gen_remaps_for_space_fused *)
-      apply in_gen_remaps_for_space_fused in Hin;
-      destruct Hin as [Hfused [Hspace [Hsrc Hbound]]];
-      rewrite Hspace, Hsrc;
-      (split; [reflexivity |
-       split; [intro Habs; discriminate | intro _; exact Hfused]])
-    | (* MemIdx chunk: use in_gen_remaps_for_space_zero_fused *)
-      apply in_gen_remaps_for_space_zero_fused in Hin;
-      destruct Hin as [Hfused [Hspace [Hsrc Hbound]]];
-      rewrite Hspace, Hsrc;
-      (split; [reflexivity |
-       split; [intro _; exact Hfused | intro Habs; contradiction]])
-    ].
+  all: first [ solve_non_mem_case | solve_mem_case ].
 Qed.
 
 (* -------------------------------------------------------------------------

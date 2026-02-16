@@ -9,10 +9,11 @@
   - compute_offsets (offset calculation for all prior modules)
   - compute_memory_layout (memory layout computation)
 
-  The spec (merge_spec.v) provides:
-  - compute_offset (per-space offset calculation)
-  - layout_step / compute_memory_layout (memory layout)
-  - Correctness properties (monotonicity, disjointness)
+  The spec (split across merge_defs.v, merge_layout.v, merge_remap.v,
+  merge_correctness.v) provides:
+  - compute_offset (per-space offset calculation) — merge_defs.v
+  - layout_step / compute_memory_layout (memory layout) — merge_layout.v
+  - Correctness properties (monotonicity, disjointness) — merge_correctness.v
 *)
 
 From Stdlib Require Import List ZArith Lia Arith.

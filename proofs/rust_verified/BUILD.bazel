@@ -39,7 +39,7 @@ rocq_proof_test(
 
 # Merger core: offset computation and memory layout logic
 # Source: meld-core/src/merger.rs (simplified extract)
-# Spec: proofs/transformations/merge/merge_spec.v
+# Spec: proofs/transformations/merge/{merge_defs,merge_layout,merge_remap,merge_correctness}.v
 
 coq_of_rust_library(
     name = "merger_core_translated",

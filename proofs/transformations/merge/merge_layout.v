@@ -8,7 +8,7 @@
    ========================================================================= *)
 
 From Stdlib Require Import List ZArith Lia Bool Arith.
-From MeldSpec Require Import wasm_core component_model fusion_spec.
+From MeldSpec Require Import wasm_core component_model fusion_types.
 From MeldMerge Require Import merge_defs.
 Import ListNotations.
 

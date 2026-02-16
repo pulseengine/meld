@@ -13,7 +13,7 @@
    ========================================================================= *)
 
 From Stdlib Require Import List ZArith Lia Bool Arith.
-From MeldSpec Require Import wasm_core component_model fusion_spec.
+From MeldSpec Require Import wasm_core component_model fusion_types.
 Import ListNotations.
 
 (* Wasm page size: 64 KiB *)
