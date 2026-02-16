@@ -4,7 +4,7 @@
 /// from meld-core/src/merger.rs in a simplified form suitable for formal
 /// verification with Rocq.
 ///
-/// Corresponding spec: proofs/transformations/merge/merge_spec.v
+/// Corresponding spec: proofs/transformations/merge/merge_defs.v
 
 /// Wasm page size: 64 KiB
 pub const WASM_PAGE_SIZE: u64 = 65536;
@@ -62,7 +62,7 @@ impl SpaceOffsets {
 }
 
 /// Compute the offset for module at position `mod_idx` given counts for all prior modules.
-/// This corresponds to `compute_offset` in merge_spec.v.
+/// This corresponds to `compute_offset` in merge_defs.v.
 ///
 /// # Arguments
 /// * `prior_counts` - Slice of SpaceCounts for modules 0..mod_idx

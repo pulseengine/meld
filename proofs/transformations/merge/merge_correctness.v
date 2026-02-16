@@ -5,7 +5,7 @@
    ========================================================================= *)
 
 From Stdlib Require Import List ZArith Lia Bool Arith.
-From MeldSpec Require Import wasm_core component_model fusion_spec.
+From MeldSpec Require Import wasm_core component_model fusion_types.
 From MeldMerge Require Import merge_defs merge_layout merge_remap.
 Import ListNotations.
 
@@ -886,4 +886,5 @@ Proof.
     lia.
 Qed.
 
-(* End of merge_correctness *)
+(* End of merge_correctness.
+   Bridge theorem (gen_all_remaps → instr_rewrites) is in merge_bridge.v *)

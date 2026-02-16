@@ -11,7 +11,7 @@ rocq_library(
     deps = [
         "//proofs/spec:wasm_core",
         "//proofs/spec:component_model",
-        "//proofs/spec:fusion_spec",
+        "//proofs/spec:fusion_types",
     ],
     include_path = "MeldMerge",
 )
@@ -23,7 +23,7 @@ rocq_library(
         ":merge_defs",
         "//proofs/spec:wasm_core",
         "//proofs/spec:component_model",
-        "//proofs/spec:fusion_spec",
+        "//proofs/spec:fusion_types",
     ],
     include_path = "MeldMerge",
 )
@@ -36,7 +36,7 @@ rocq_library(
         ":merge_layout",
         "//proofs/spec:wasm_core",
         "//proofs/spec:component_model",
-        "//proofs/spec:fusion_spec",
+        "//proofs/spec:fusion_types",
     ],
     include_path = "MeldMerge",
 )
@@ -50,7 +50,22 @@ rocq_library(
         ":merge_remap",
         "//proofs/spec:wasm_core",
         "//proofs/spec:component_model",
-        "//proofs/spec:fusion_spec",
+        "//proofs/spec:fusion_types",
+    ],
+    include_path = "MeldMerge",
+)
+
+rocq_library(
+    name = "merge_bridge",
+    srcs = ["merge_bridge.v"],
+    deps = [
+        ":merge_defs",
+        ":merge_layout",
+        ":merge_remap",
+        ":merge_correctness",
+        "//proofs/spec:wasm_core",
+        "//proofs/spec:component_model",
+        "//proofs/spec:fusion_types",
     ],
     include_path = "MeldMerge",
 )
@@ -64,6 +79,7 @@ rocq_library(
         ":merge_layout",
         ":merge_remap",
         ":merge_correctness",
+        ":merge_bridge",
     ],
     include_path = "MeldMerge",
 )

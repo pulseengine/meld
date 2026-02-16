@@ -318,7 +318,7 @@ Proof.
 Qed.
 ```
 
-See `proofs/transformations/merge/merge_spec.v` for examples of this pattern
+See `proofs/transformations/merge/merge_layout.v` for examples of this pattern
 in `fold_left_add_nonneg_ge` and related lemmas.
 
 #### Using `set` and `remember` for Abstraction
@@ -383,7 +383,7 @@ Lemma good : forall l, 0 <= fold_left (fun a x => a + x) l 0.
 Proof. intros. apply fold_left_nonneg. Qed.
 ```
 
-See `proofs/transformations/merge/merge_spec.v:fold_left_add_nonneg_ge`.
+See `proofs/transformations/merge/merge_layout.v:fold_left_add_nonneg_ge`.
 
 #### 2. Pattern Matching Issues (Boolean Associativity)
 
@@ -435,12 +435,9 @@ apply nth_error_None in H. (* H : i >= length l *)
 
 #### 5. Admitted Proofs
 
-Some complex proofs are `Admitted` pending further development. Search for
-`Admitted` to find incomplete proofs that need attention. Priorities:
-
-1. `merge_spec.v`: Core merge correctness theorems
-2. `fusion_spec.v`: Semantic preservation (placeholder)
-3. `resolve_spec.v`: Topological sort correctness
+Some proofs may be `Admitted` pending further development. Search for
+`Admitted` to find incomplete proofs that need attention. Currently all
+proofs in the split merge modules and fusion_spec.v are fully closed.
 
 ### Proof Directory Layout
 

@@ -25,11 +25,35 @@ rocq_library(
 )
 
 rocq_library(
+    name = "wasm_semantics",
+    srcs = ["wasm_semantics.v"],
+    deps = [":wasm_core"],
+    include_path = "MeldSpec",
+)
+
+# Lightweight fusion types: index remapping, instruction rewriting.
+# Does NOT depend on wasm_semantics, so downstream files that only
+# need types/lookup can avoid the heavier operational semantics.
+rocq_library(
+    name = "fusion_types",
+    srcs = ["fusion_types.v"],
+    deps = [
+        ":wasm_core",
+        ":component_model",
+    ],
+    include_path = "MeldSpec",
+)
+
+# Full fusion spec: re-exports fusion_types + adds semantic preservation
+# proofs that depend on wasm_semantics.
+rocq_library(
     name = "fusion_spec",
     srcs = ["fusion_spec.v"],
     deps = [
         ":wasm_core",
         ":component_model",
+        ":wasm_semantics",
+        ":fusion_types",
     ],
     include_path = "MeldSpec",
 )
