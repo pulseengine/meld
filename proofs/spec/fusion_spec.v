@@ -583,6 +583,20 @@ Proof.
   exact (sc_datas_eq _ _ _ _ Hcorr src ms dataidx dat_src Hlookup Hnth).
 Qed.
 
+Lemma eval_memory_remap :
+  forall cc fr ces fes src ms memidx mem_src,
+    state_correspondence cc fr ces fes ->
+    lookup_module_state ces src = Some ms ->
+    nth_error (ms_mems ms) memidx = Some mem_src ->
+    exists memidx' mem_fused,
+      lookup_remap (fr_remaps fr) MemIdx src memidx = Some memidx' /\
+      nth_error (ms_mems (fes_module_state fes)) memidx' = Some mem_fused /\
+      memory_corresponds (fr_memory_layout fr) src mem_src mem_fused.
+Proof.
+  intros cc fr ces fes src ms memidx mem_src Hcorr Hlookup Hnth.
+  exact (sc_memory_eq _ _ _ _ Hcorr src ms memidx mem_src Hlookup Hnth).
+Qed.
+
 (* =========================================================================
    Remap Injectivity Helpers
 
@@ -1356,6 +1370,93 @@ Proof.
               exact (lookup_remap_neq_fused _ ElemIdx _ _ _ _ _ Hinj Hr Hremap Hneq_si (eq_sym Heq)).
       * intros si d Hd.
         exact (sc_datas_eq _ _ _ _ Hcorr _ ms _ _ Hlookup Hd).
+
+  - (* Eval_MemorySize + RW_MemorySize:
+       Source evaluates MemorySize memidx, looking up the memory at memidx.
+       By sc_memory_eq, the fused module has a corresponding memory at
+       the remapped index. The fused side evaluates MemorySize with that
+       remapped index. Result stack is abstract (new_stack). *)
+    grab_nth ms_mems Hnth_mem.
+    grab_remap MemIdx Hremap.
+    destruct (sc_memory_eq _ _ _ _ Hcorr _ ms _ _ Hlookup Hnth_mem)
+      as [fused_midx [mf [Hm_remap [Hm_nth Hmcorr]]]].
+    rewrite Hremap in Hm_remap. injection Hm_remap as Hmidx. subst fused_midx.
+    exists (set_stack (fes_module_state fes) new_stack).
+    split.
+    + apply Eval_MemorySize with (mem := mf). exact Hm_nth.
+    + exact (result_state_set_stack cc fr ces fes ms new_stack Hcorr Hlookup).
+
+  - (* Eval_MemoryGrow + RW_MemoryGrow:
+       Same pattern as MemorySize — resolve memidx via sc_memory_eq,
+       construct fused evaluation with remapped index. *)
+    grab_nth ms_mems Hnth_mem.
+    grab_remap MemIdx Hremap.
+    destruct (sc_memory_eq _ _ _ _ Hcorr _ ms _ _ Hlookup Hnth_mem)
+      as [fused_midx [mf [Hm_remap [Hm_nth Hmcorr]]]].
+    rewrite Hremap in Hm_remap. injection Hm_remap as Hmidx. subst fused_midx.
+    exists (set_stack (fes_module_state fes) new_stack).
+    split.
+    + apply Eval_MemoryGrow with (mem := mf). exact Hm_nth.
+    + exact (result_state_set_stack cc fr ces fes ms new_stack Hcorr Hlookup).
+
+  - (* Eval_Load + RW_Load:
+       Resolve memidx via sc_memory_eq. The valtype, offset, and alignment
+       pass through unchanged (they are not index-space references).
+       Result stack is abstract. *)
+    grab_nth ms_mems Hnth_mem.
+    grab_remap MemIdx Hremap.
+    destruct (sc_memory_eq _ _ _ _ Hcorr _ ms _ _ Hlookup Hnth_mem)
+      as [fused_midx [mf [Hm_remap [Hm_nth Hmcorr]]]].
+    rewrite Hremap in Hm_remap. injection Hm_remap as Hmidx. subst fused_midx.
+    exists (set_stack (fes_module_state fes) new_stack).
+    split.
+    + apply Eval_Load with (mem := mf). exact Hm_nth.
+    + exact (result_state_set_stack cc fr ces fes ms new_stack Hcorr Hlookup).
+
+  - (* Eval_Store + RW_Store:
+       Resolve memidx via sc_memory_eq. Like Load, non-index parameters
+       (valtype, offset, alignment) pass through unchanged. *)
+    grab_nth ms_mems Hnth_mem.
+    grab_remap MemIdx Hremap.
+    destruct (sc_memory_eq _ _ _ _ Hcorr _ ms _ _ Hlookup Hnth_mem)
+      as [fused_midx [mf [Hm_remap [Hm_nth Hmcorr]]]].
+    rewrite Hremap in Hm_remap. injection Hm_remap as Hmidx. subst fused_midx.
+    exists (set_stack (fes_module_state fes) new_stack).
+    split.
+    + apply Eval_Store with (mem := mf). exact Hm_nth.
+    + exact (result_state_set_stack cc fr ces fes ms new_stack Hcorr Hlookup).
+
+  - (* Eval_MemoryCopy + RW_MemoryCopy:
+       Two memory indices to resolve — dst and src. By sc_memory_eq,
+       both remap to valid fused indices. Pattern follows Eval_TableCopy
+       but uses MemIdx instead of TableIdx. *)
+    match goal with | [H: nth_error (ms_mems _) dst_memidx = Some _ |- _] => rename H into Hnth_dst end.
+    match goal with | [H: nth_error (ms_mems _) src_memidx = Some _ |- _] => rename H into Hnth_src end.
+    match goal with | [H: lookup_remap _ MemIdx _ dst_memidx = Some _ |- _] => rename H into Hremap_dst end.
+    match goal with | [H: lookup_remap _ MemIdx _ src_memidx = Some _ |- _] => rename H into Hremap_src end.
+    destruct (sc_memory_eq _ _ _ _ Hcorr _ ms _ _ Hlookup Hnth_dst)
+      as [fused_didx [mf_dst [Hd_remap [Hd_nth Hdcorr]]]].
+    rewrite Hremap_dst in Hd_remap. injection Hd_remap as Hdidx. subst fused_didx.
+    destruct (sc_memory_eq _ _ _ _ Hcorr _ ms _ _ Hlookup Hnth_src)
+      as [fused_sidx [mf_src [Hs_remap [Hs_nth Hscorr]]]].
+    rewrite Hremap_src in Hs_remap. injection Hs_remap as Hsidx. subst fused_sidx.
+    exists (set_stack (fes_module_state fes) new_stack).
+    split.
+    + apply Eval_MemoryCopy with (mem_dst := mf_dst) (mem_src := mf_src).
+      * exact Hd_nth. * exact Hs_nth.
+    + exact (result_state_set_stack cc fr ces fes ms new_stack Hcorr Hlookup).
+
+  - (* Eval_MemoryFill + RW_MemoryFill:
+       Resolve single memidx via sc_memory_eq. Straightforward set_stack case. *)
+    grab_nth ms_mems Hnth_mem.
+    grab_remap MemIdx Hremap.
+    destruct (sc_memory_eq _ _ _ _ Hcorr _ ms _ _ Hlookup Hnth_mem)
+      as [fused_midx [mf [Hm_remap [Hm_nth Hmcorr]]]].
+    rewrite Hremap in Hm_remap. injection Hm_remap as Hmidx. subst fused_midx.
+    exists (set_stack (fes_module_state fes) new_stack).
+    split.
+    + apply Eval_MemoryFill with (mem := mf). exact Hm_nth.
+    + exact (result_state_set_stack cc fr ces fes ms new_stack Hcorr Hlookup).
 
   - (* Eval_MemoryInit + RW_MemoryInit *)
     grab_nth ms_datas Hnth_dat.
