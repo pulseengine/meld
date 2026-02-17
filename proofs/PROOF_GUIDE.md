@@ -87,6 +87,52 @@ Proof.
 Qed.
 ```
 
+**What This Example Shows:**
+
+This simple example illustrates the fundamental structure of Rocq developments:
+
+1. **Comments** (`(* ... *)`): Explain the code, just like `//` in Rust
+2. **Inductive Types** (`Inductive`): Define data structures with constructors (like `enum` in Rust)
+3. **Definitions** (`Definition`): Create named computations (like `fn` in Rust)
+4. **Theorems** (`Theorem`): State properties we want to prove about our definitions
+5. **Proofs** (`Proof...Qed`): Construct step-by-step mathematical evidence
+
+**Line-by-Line Explanation:**
+
+```rocq
+(* Define a boolean type with two values: true and false *)
+Inductive bool : Type :=
+  | true : bool    (* true constructs a boolean value *)
+  | false : bool.  (* false constructs a boolean value *)
+
+(* Define a function that negates a boolean value *)
+Definition negb (b : bool) : bool :=
+  match b with          (* Pattern match on the input value *)
+  | true => false       (* When input is true, output false *)
+  | false => true.      (* When input is false, output true *)
+
+(* State a theorem: negating twice returns the original value *)
+Theorem negb_involutive : forall b : bool, negb (negb b) = b.
+
+(* Construct the proof step-by-step *)
+Proof.
+  intros b.                     (* Assume b is some boolean value *)
+  destruct b.                   (* Consider both cases: b is true or false *)
+  - reflexivity.               (* Case 1: b=true, negb (negb true) = true by definition *)
+  - reflexivity.               (* Case 2: b=false, negb (negb false) = false by definition *)
+Qed.                           (* Proof complete! *)
+```
+
+**Key Rocq Concepts:**
+
+- `Inductive`: Defines a new data type (like `enum` in Rust)
+- `Definition`: Creates a named function/computation
+- `Theorem`: States a property to prove about your definitions
+- `Proof...Qed`: The proof construction environment
+- `intros`: Moves hypotheses into the proof context
+- `destruct`: Performs case analysis on inductive types
+- `reflexivity`: Proves equality when both sides are identical by definition
+
 ### Common Tactics Used in Meld Proofs
 
 | Tactic | Purpose | Example |
