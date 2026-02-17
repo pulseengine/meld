@@ -138,8 +138,10 @@ flowchart TD
             index_map[index_map.rs] -->|extracted to Rocq| rust_proofs
         end
 
-        guide[PROOF_GUIDE.md] -->|documents| Proofs
+        guide[PROOF_GUIDE.md]
     end
+
+    guide -->|documents| Proofs
 
     style Proofs fill:#f0f8ff,stroke:#4a90e2,stroke-width:2px
     style Spec fill:#e6f3ff,stroke:#2196f3
