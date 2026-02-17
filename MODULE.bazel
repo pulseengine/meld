@@ -22,11 +22,12 @@ bazel_dep(name = "platforms", version = "0.0.10")
 # WebAssembly component rules for building WASM targets
 bazel_dep(name = "rules_wasm_component", version = "1.0.0")
 
-# Override to fetch from GitHub (not yet in BCR)
-git_override(
+# Override to local copy with fixed componentize-py canary checksum
+# TODO: revert to git_override once pulseengine/rules_wasm_component
+# updates the componentize-py canary hash
+local_path_override(
     module_name = "rules_wasm_component",
-    remote = "https://github.com/pulseengine/rules_wasm_component.git",
-    branch = "main",
+    path = "/tmp/rules_wasm_component_local",
 )
 
 ###############################################################################

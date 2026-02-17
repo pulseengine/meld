@@ -71,17 +71,15 @@ rocq_library(
 )
 
 # Aggregate target for all merge proofs
-rocq_library(
+filegroup(
     name = "merge_spec",
-    srcs = [],
-    deps = [
+    srcs = [
         ":merge_defs",
         ":merge_layout",
         ":merge_remap",
         ":merge_correctness",
         ":merge_bridge",
     ],
-    include_path = "MeldMerge",
 )
 
 rocq_proof_test(
