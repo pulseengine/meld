@@ -189,21 +189,52 @@ The attestation is embedded in the output module's custom section:
 
 ### Adapter Generation
 
-Cross-component calls require adapters that handle:
+Cross-component calls may require adapters that handle:
+- String transcoding (UTF-8 ↔ UTF-16, Latin-1 → UTF-8)
 - Memory copying between component memories
-- String transcoding (UTF-8 ↔ UTF-16 ↔ Latin-1)
 - List/array serialization
 - Resource handle transfer
 
 Meld generates these adapters using techniques inspired by wasmtime's FACT
-(Fused Adapter Compiler of Trampolines).
+(Fused Adapter Compiler of Trampolines). When components share a single memory,
+cross-component calls are resolved to direct function calls with no adapter
+overhead.
 
 ## Limitations
 
-- **Phase 1**: Currently uses shared memory strategy only
-- **Resources**: Resource handles across components are limited
+- **Phase 1**: Currently uses shared memory strategy only (multi-memory planned)
+- **Resources**: Resource handle transfer across components is limited
 - **Async**: Async component functions not yet supported
-- **Threads**: Shared memory threading not yet supported
+- **Cross-memory adapters**: When components use separate memories, the memory-copy
+  adapter generates direct calls (full copy-and-rewrite is planned)
+- **String transcoding**: UTF-8↔UTF-16 and Latin-1→UTF-8 are implemented;
+  UTF-8→Latin-1 is not yet supported
+
+## Formal Verification
+
+Meld's core transformations are formally verified using Rocq 9.0 (formerly Coq).
+The proofs establish that fusion preserves program semantics — the fused module
+behaves identically to the original composed components.
+
+**22 proof files, 207 theorems/lemmas, 0 Admitted.**
+
+Key verified properties:
+- **Merge correctness**: Index remapping preserves function/memory/table references
+- **Resolve correctness**: Topological sort produces valid instantiation order;
+  cycle detection terminates
+- **Adapter correctness**: Generated trampolines preserve call semantics
+- **Forward simulation**: Fused module simulates the original component graph
+  step-by-step
+
+Proofs are built via Bazel using [`rules_rocq_rust`](https://github.com/pulseengine/rules_rocq_rust):
+
+```bash
+bazel build //proofs/transformations/merge:merge_spec
+bazel build //proofs/spec:fusion_spec
+```
+
+See [`proofs/`](proofs/) for the full proof tree and [`CLAUDE.md`](CLAUDE.md)
+for proof engineering guidelines.
 
 ## Development
 
