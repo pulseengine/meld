@@ -285,6 +285,54 @@ Inductive eval_instr : module_state -> instr -> module_state -> Prop :=
                        (update_nth (ms_elems ms) elemidx new_elem) (ms_datas ms)
                        (ms_locals ms) (ms_value_stack ms))
 
+  (* --- Memory operations --- *)
+
+  (* MemorySize: resolve memidx, abstract result stack.
+     The actual result depends on the memory's page count, which
+     differs between SeparateMemory and SharedMemory modes.
+     We model only the index lookup to verify correct remapping. *)
+  | Eval_MemorySize : forall ms memidx mem new_stack,
+      nth_error (ms_mems ms) memidx = Some mem ->
+      eval_instr ms (MemorySize memidx) (set_stack ms new_stack)
+
+  (* MemoryGrow: resolve memidx, abstract result stack.
+     Growth may succeed or fail — the abstract new_stack captures
+     both outcomes. The index lookup verifies correct remapping. *)
+  | Eval_MemoryGrow : forall ms memidx mem new_stack,
+      nth_error (ms_mems ms) memidx = Some mem ->
+      eval_instr ms (MemoryGrow memidx) (set_stack ms new_stack)
+
+  (* Load: resolve memidx, read a value from memory at an offset.
+     The valtype, offset, and alignment are parameters of the instruction.
+     Result is abstract because the loaded value depends on memory contents,
+     which memory_corresponds relates between composed and fused states. *)
+  | Eval_Load : forall ms vt memidx off align mem new_stack,
+      nth_error (ms_mems ms) memidx = Some mem ->
+      eval_instr ms (Load vt memidx off align) (set_stack ms new_stack)
+
+  (* Store: resolve memidx, write a value to memory at an offset.
+     Like Load, the valtype, offset, and alignment are instruction params.
+     Result is abstract — we verify the index lookup for correct remapping.
+     Memory mutation is not modeled: ms_mems is preserved (via set_stack),
+     keeping the eval_instr_preserves_mems invariant intact. *)
+  | Eval_Store : forall ms vt memidx off align mem new_stack,
+      nth_error (ms_mems ms) memidx = Some mem ->
+      eval_instr ms (Store vt memidx off align) (set_stack ms new_stack)
+
+  (* MemoryCopy: resolve both dst and src memidx.
+     Copies bytes from source memory to destination memory.
+     Both indices must resolve; result is abstract. *)
+  | Eval_MemoryCopy : forall ms dst_memidx src_memidx mem_dst mem_src new_stack,
+      nth_error (ms_mems ms) dst_memidx = Some mem_dst ->
+      nth_error (ms_mems ms) src_memidx = Some mem_src ->
+      eval_instr ms (MemoryCopy dst_memidx src_memidx) (set_stack ms new_stack)
+
+  (* MemoryFill: resolve memidx, fill a region with a byte value.
+     Result is abstract; we verify the index lookup. *)
+  | Eval_MemoryFill : forall ms memidx mem new_stack,
+      nth_error (ms_mems ms) memidx = Some mem ->
+      eval_instr ms (MemoryFill memidx) (set_stack ms new_stack)
+
   (* --- Memory bulk operations --- *)
 
   (* MemoryInit: resolve dataidx and memidx, abstract result.

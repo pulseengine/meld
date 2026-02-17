@@ -115,6 +115,10 @@ pub struct AdapterOptions {
 
     /// Realloc function for callee (if any)
     pub callee_realloc: Option<u32>,
+
+    /// Whether the target function returns a `(ptr: i32, len: i32)` pair
+    /// that must be copied back from callee memory to caller memory
+    pub returns_pointer_pair: bool,
 }
 
 impl Default for AdapterOptions {
@@ -126,6 +130,7 @@ impl Default for AdapterOptions {
             callee_memory: 0,
             caller_realloc: None,
             callee_realloc: None,
+            returns_pointer_pair: false,
         }
     }
 }

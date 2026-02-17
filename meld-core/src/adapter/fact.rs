@@ -108,6 +108,22 @@ impl FactStyleGenerator {
         options.caller_string_encoding = StringEncoding::Utf8;
         options.callee_string_encoding = StringEncoding::Utf8;
 
+        // Detect whether the target function returns a (ptr, len) pair.
+        // Look up the target function's type in the merged module and check
+        // if the result signature is exactly [I32, I32].
+        if let Some(&merged_func_idx) = merged.function_index_map.get(&(
+            site.to_component,
+            site.to_module,
+            site.export_func_idx,
+        )) && let Some(func) = merged.functions.get(merged_func_idx as usize)
+            && let Some(func_type) = merged.types.get(func.type_idx as usize)
+            && func_type.results.len() == 2
+            && func_type.results[0] == wasm_encoder::ValType::I32
+            && func_type.results[1] == wasm_encoder::ValType::I32
+        {
+            options.returns_pointer_pair = true;
+        }
+
         options
     }
 
@@ -152,6 +168,11 @@ impl FactStyleGenerator {
     /// be remapped: allocate in callee's memory via `cabi_realloc`, copy the
     /// data with `memory.copy $callee $caller`, then call the target with the
     /// new pointer.  Handles the common `(ptr, len)` pair pattern.
+    ///
+    /// When the target function returns a `(ptr, len)` pair (detected via
+    /// `AdapterOptions::returns_pointer_pair`), the adapter also copies the
+    /// returned data from callee's memory back to caller's memory using
+    /// `caller_realloc` and `memory.copy` in the reverse direction.
     fn generate_memory_copy_adapter(
         &self,
         site: &AdapterSite,
@@ -179,29 +200,12 @@ impl FactStyleGenerator {
             return Ok((type_idx, func));
         }
 
-        // Memories differ — need cross-memory copy.
-        // Requires callee's cabi_realloc to allocate destination buffer.
-        let callee_realloc = match options.callee_realloc {
-            Some(idx) => idx,
-            None => {
-                log::warn!("Cross-memory copy: no callee realloc, falling back to direct call");
-                let mut func = Function::new([]);
-                for i in 0..param_count {
-                    func.instruction(&Instruction::LocalGet(i as u32));
-                }
-                func.instruction(&Instruction::Call(target_func));
-                func.instruction(&Instruction::End);
-                return Ok((type_idx, func));
-            }
-        };
+        let needs_outbound_copy = param_count >= 2;
+        let needs_result_copy = options.returns_pointer_pair;
 
-        // We need one scratch local (dest_ptr) for the allocated pointer
-        let dest_ptr_local = param_count as u32;
-        let mut func = Function::new(vec![(1, wasm_encoder::ValType::I32)]);
-
-        // Assume params[0] = ptr, params[1] = len (the common Canonical ABI pattern).
-        // If param_count < 2, fall back to direct call (no pointer args).
-        if param_count < 2 {
+        // If no copying needed at all, direct call
+        if !needs_outbound_copy && !needs_result_copy {
+            let mut func = Function::new([]);
             for i in 0..param_count {
                 func.instruction(&Instruction::LocalGet(i as u32));
             }
@@ -210,30 +214,117 @@ impl FactStyleGenerator {
             return Ok((type_idx, func));
         }
 
-        // 1. Allocate in callee's memory: dest_ptr = cabi_realloc(0, 0, 1, len)
-        func.instruction(&Instruction::I32Const(0)); // original_ptr
-        func.instruction(&Instruction::I32Const(0)); // original_size
-        func.instruction(&Instruction::I32Const(1)); // alignment
-        func.instruction(&Instruction::LocalGet(1)); // len
-        func.instruction(&Instruction::Call(callee_realloc));
-        func.instruction(&Instruction::LocalSet(dest_ptr_local));
+        // Determine scratch local count based on what we need.
+        // Outbound copy needs: dest_ptr (1 local)
+        // Result copy needs: callee_ret_ptr, callee_ret_len, caller_new_ptr (3 locals)
+        let scratch_count = if needs_outbound_copy && needs_result_copy {
+            4 // dest_ptr + callee_ret_ptr + callee_ret_len + caller_new_ptr
+        } else if needs_result_copy {
+            3 // callee_ret_ptr + callee_ret_len + caller_new_ptr
+        } else {
+            1 // dest_ptr
+        };
 
-        // 2. Copy data: memory.copy $callee_mem $caller_mem (dest_ptr, src_ptr, len)
-        func.instruction(&Instruction::LocalGet(dest_ptr_local)); // dst
-        func.instruction(&Instruction::LocalGet(0)); // src (caller ptr)
-        func.instruction(&Instruction::LocalGet(1)); // len
-        func.instruction(&Instruction::MemoryCopy {
-            src_mem: options.caller_memory,
-            dst_mem: options.callee_memory,
-        });
+        let mut func = Function::new(vec![(scratch_count, wasm_encoder::ValType::I32)]);
 
-        // 3. Call target with (dest_ptr, len, ...remaining args)
-        func.instruction(&Instruction::LocalGet(dest_ptr_local));
-        func.instruction(&Instruction::LocalGet(1)); // len
-        for i in 2..param_count {
-            func.instruction(&Instruction::LocalGet(i as u32));
+        // Assign scratch local indices (after params)
+        let base = param_count as u32;
+        // For outbound copy:
+        let dest_ptr_local = base; // only used when needs_outbound_copy
+        // For result copy:
+        let result_locals_base = if needs_outbound_copy { base + 1 } else { base };
+        let callee_ret_ptr_local = result_locals_base;
+        let callee_ret_len_local = result_locals_base + 1;
+        let caller_new_ptr_local = result_locals_base + 2;
+
+        // --- Phase 1: Outbound argument copy (caller → callee) ---
+        if needs_outbound_copy {
+            // Requires callee's cabi_realloc to allocate destination buffer.
+            let callee_realloc = match options.callee_realloc {
+                Some(idx) => idx,
+                None => {
+                    log::warn!("Cross-memory copy: no callee realloc, falling back to direct call");
+                    let mut func = Function::new([]);
+                    for i in 0..param_count {
+                        func.instruction(&Instruction::LocalGet(i as u32));
+                    }
+                    func.instruction(&Instruction::Call(target_func));
+                    func.instruction(&Instruction::End);
+                    return Ok((type_idx, func));
+                }
+            };
+
+            // 1. Allocate in callee's memory: dest_ptr = cabi_realloc(0, 0, 1, len)
+            func.instruction(&Instruction::I32Const(0)); // original_ptr
+            func.instruction(&Instruction::I32Const(0)); // original_size
+            func.instruction(&Instruction::I32Const(1)); // alignment
+            func.instruction(&Instruction::LocalGet(1)); // len
+            func.instruction(&Instruction::Call(callee_realloc));
+            func.instruction(&Instruction::LocalSet(dest_ptr_local));
+
+            // 2. Copy data: memory.copy $callee_mem $caller_mem (dest_ptr, src_ptr, len)
+            func.instruction(&Instruction::LocalGet(dest_ptr_local)); // dst
+            func.instruction(&Instruction::LocalGet(0)); // src (caller ptr)
+            func.instruction(&Instruction::LocalGet(1)); // len
+            func.instruction(&Instruction::MemoryCopy {
+                src_mem: options.caller_memory,
+                dst_mem: options.callee_memory,
+            });
+
+            // 3. Call target with (dest_ptr, len, ...remaining args)
+            func.instruction(&Instruction::LocalGet(dest_ptr_local));
+            func.instruction(&Instruction::LocalGet(1)); // len
+            for i in 2..param_count {
+                func.instruction(&Instruction::LocalGet(i as u32));
+            }
+            func.instruction(&Instruction::Call(target_func));
+        } else {
+            // No outbound copy — pass args through directly
+            for i in 0..param_count {
+                func.instruction(&Instruction::LocalGet(i as u32));
+            }
+            func.instruction(&Instruction::Call(target_func));
         }
-        func.instruction(&Instruction::Call(target_func));
+
+        // --- Phase 2: Result copy (callee → caller) ---
+        if needs_result_copy {
+            let caller_realloc = match options.caller_realloc {
+                Some(idx) => idx,
+                None => {
+                    log::warn!("Result copy: no caller realloc, returning callee pointers as-is");
+                    func.instruction(&Instruction::End);
+                    return Ok((type_idx, func));
+                }
+            };
+
+            // After the call, stack has: [callee_ret_ptr, callee_ret_len]
+            // Save them to locals (pop in reverse order: len first, then ptr)
+            func.instruction(&Instruction::LocalSet(callee_ret_len_local));
+            func.instruction(&Instruction::LocalSet(callee_ret_ptr_local));
+
+            // Allocate in caller's memory:
+            //   caller_new_ptr = cabi_realloc(0, 0, 1, callee_ret_len)
+            func.instruction(&Instruction::I32Const(0)); // original_ptr
+            func.instruction(&Instruction::I32Const(0)); // original_size
+            func.instruction(&Instruction::I32Const(1)); // alignment
+            func.instruction(&Instruction::LocalGet(callee_ret_len_local));
+            func.instruction(&Instruction::Call(caller_realloc));
+            func.instruction(&Instruction::LocalSet(caller_new_ptr_local));
+
+            // Copy data from callee's memory to caller's memory:
+            //   memory.copy $caller_mem $callee_mem (caller_new_ptr, callee_ret_ptr, len)
+            func.instruction(&Instruction::LocalGet(caller_new_ptr_local)); // dst
+            func.instruction(&Instruction::LocalGet(callee_ret_ptr_local)); // src
+            func.instruction(&Instruction::LocalGet(callee_ret_len_local)); // size
+            func.instruction(&Instruction::MemoryCopy {
+                src_mem: options.callee_memory,
+                dst_mem: options.caller_memory,
+            });
+
+            // Push results: (caller_new_ptr, callee_ret_len)
+            func.instruction(&Instruction::LocalGet(caller_new_ptr_local));
+            func.instruction(&Instruction::LocalGet(callee_ret_len_local));
+        }
 
         func.instruction(&Instruction::End);
 
