@@ -233,8 +233,8 @@ bazel build //proofs/transformations/merge:merge_spec
 bazel build //proofs/spec:fusion_spec
 ```
 
-See [`proofs/`](proofs/) for the full proof tree and [`CLAUDE.md`](CLAUDE.md)
-for proof engineering guidelines.
+See [`proofs/`](proofs/) for the full proof tree, [`PROOF_GUIDE.md`](proofs/PROOF_GUIDE.md)
+for a beginner-friendly introduction, and [`CLAUDE.md`](CLAUDE.md) for proof engineering guidelines.
 
 ## Development
 
