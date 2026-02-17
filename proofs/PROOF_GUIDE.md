@@ -1,6 +1,8 @@
 # Meld Formal Verification Guide
 
-**A Beginner-Friendly Introduction to Meld's Rocq Proofs**
+**Fusing Understanding: A Beginner's Journey into Meld's Proofs**
+
+_"Like metals melded in a forge, separate components become one through mathematical certainty"_
 
 This guide explains Meld's formal verification system for developers and researchers with a computer science background but no prior experience with interactive theorem provers like Rocq/Coq.
 
@@ -109,28 +111,74 @@ Qed.
 
 Meld's proofs mirror the Rust implementation structure:
 
-```
-proofs/
-├── spec/                  (* Core specifications and semantics *)
-│   ├── wasm_core.v        (* WebAssembly core semantics *)
-│   ├── component_model.v (* Component model definitions *)
-│   ├── wasm_semantics.v  (* Operational semantics *)
-│   ├── fusion_types.v    (* Fusion data structures *)
-│   └── fusion_spec.v     (* Main fusion correctness proof *)
-│
-├── transformations/      (* Transformation-specific proofs *)
-│   ├── merge/            (* Module merging proofs *)
-│   ├── resolve/          (* Dependency resolution proofs *)
-│   └── adapter/          (* Adapter generation proofs *)
-│
-├── rust_verified/        (* Rust code extracted to Rocq *)
-│   ├── merger_core.rs    (* Rust merger core *)
-│   └── index_map.rs      (* Index map implementation *)
-│
-└── PROOF_GUIDE.md        (* This document! *)
+```mermaid
+flowchart TD
+    subgraph Proofs[proofs/]
+        direction TB
+
+        subgraph Spec[spec/ - Core Specifications]
+            direction TB
+            wasm_core[wasm_core.v] -->|defines| semantics
+            component_model[component_model.v] --> semantics
+            wasm_semantics[wasm_semantics.v] --> semantics
+            fusion_types[fusion_types.v] --> semantics
+            fusion_spec[fusion_spec.v] -->|proves| semantics
+        end
+
+        subgraph Transformations[transformations/ - Transformation Proofs]
+            direction TB
+            merge[merge/] -->|proves| merge_correct
+            resolve[resolve/] -->|proves| resolve_correct
+            adapter[adapter/] -->|proves| adapter_correct
+        end
+
+        subgraph RustVerified[rust_verified/ - Extracted Rust Code]
+            direction TB
+            merger_core[merger_core.rs] -->|extracted to Rocq| rust_proofs
+            index_map[index_map.rs] -->|extracted to Rocq| rust_proofs
+        end
+
+        guide[PROOF_GUIDE.md] -->|documents| Proofs
+    end
+
+    style Proofs fill:#f0f8ff,stroke:#4a90e2,stroke-width:2px
+    style Spec fill:#e6f3ff,stroke:#2196f3
+    style Transformations fill:#e8f5e9,stroke:#4caf50
+    style RustVerified fill:#fff3e0,stroke:#ff9800
+    style guide fill:#fff8e1,stroke:#ffc107
+    style wasm_core fill:#ffffff,stroke:#64b5f6
+    style component_model fill:#ffffff,stroke:#64b5f6
+    style wasm_semantics fill:#ffffff,stroke:#64b5f6
+    style fusion_types fill:#ffffff,stroke:#64b5f6
+    style fusion_spec fill:#ffffff,stroke:#64b5f6
+    style merge fill:#ffffff,stroke:#81c784
+    style resolve fill:#ffffff,stroke:#81c784
+    style adapter fill:#ffffff,stroke:#81c784
+    style merger_core fill:#ffffff,stroke:#ffb74d
+    style index_map fill:#ffffff,stroke:#ffb74d
 ```
 
+**Directory Structure:**
+- `spec/`: Core specifications and semantics (WebAssembly model, component model, fusion semantics)
+- `transformations/`: Transformation-specific proofs (merge correctness, resolve correctness, adapter correctness)
+- `rust_verified/`: Rust code extracted to Rocq using `rocq-of-rust` for verification
+- `PROOF_GUIDE.md`: This documentation guide
+
 ### The Proof Pipeline
+
+```mermaid
+flowchart LR
+    A[Specify] -->|define semantics| B[Implement]
+    B -->|write transformation| C[Prove]
+    C -->|construct proof| D[Verify]
+    D -->|Rocq checks| E[Trusted Code]
+
+    style A fill:#e6f3ff,stroke:#2196f3
+    style B fill:#e8f5e9,stroke:#4caf50
+    style C fill:#fff3e0,stroke:#ff9800
+    style D fill:#fff8e1,stroke:#ffc107
+    style E fill:#f0f8ff,stroke:#4a90e2,stroke-width:2px
+```
 
 1. **Specify**: Define what correct behavior means (semantics)
 2. **Implement**: Write the transformation in Rocq (or extract from Rust)
@@ -248,13 +296,27 @@ Qed.
 
 Forward simulation is the primary technique used in Meld's proofs:
 
-```rocq
-(* Forward simulation diagram: *)
-(*   Original State  --step-->  Original State' *)
-(*       |                              |       *)
-(*  correspondence                   correspondence *)
-(*       |                              |       *)
-(*   Transformed State --step--> Transformed State' *)
+```mermaid
+flowchart TD
+    subgraph Original[Original System]
+        direction LR
+        S1[State] -->|step| S2[State']
+    end
+
+    subgraph Transformed[Transformed System]
+        direction LR
+        T1[State] -->|step| T2[State']
+    end
+
+    S1 -->|correspondence| T1
+    S2 -->|correspondence| T2
+
+    style Original fill:#e6f3ff,stroke:#2196f3
+    style Transformed fill:#e8f5e9,stroke:#4caf50
+    style S1 fill:#ffffff,stroke:#64b5f6
+    style S2 fill:#ffffff,stroke:#64b5f6
+    style T1 fill:#ffffff,stroke:#81c784
+    style T2 fill:#ffffff,stroke:#81c784
 ```
 
 The proof shows that:
