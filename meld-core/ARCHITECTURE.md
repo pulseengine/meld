@@ -1,17 +1,93 @@
 # Meld Core Architecture
 
-This document explains the software architecture and data flow of Meld's core fusion engine.
+**Automotive SPICE Compliant Safety Architecture with Formal Verification**
+
+This document explains the safety-critical architecture of Meld's WebAssembly fusion engine, designed to meet automotive industry standards including **Automotive SPICE (ISO/IEC 15504)** and **ISO 26262** functional safety requirements.
 
 ## Table of Contents
 
-- [Overview](#overview)
+- [Safety-Critical Overview](#safety-critical-overview)
+- [Automotive SPICE Compliance](#automotive-spice-compliance)
+- [Logical Decomposition](#logical-decomposition)
+- [Deployment Architecture](#deployment-architecture)
+- [Dynamic Flow Analysis](#dynamic-flow-analysis)
+- [Proof Architecture Linkage](#proof-architecture-linkage)
 - [Component Model](#component-model)
-- [Architecture Diagram](#architecture-diagram)
-- [Data Flow](#data-flow)
-- [Core Modules](#core-modules)
-- [Memory Strategies](#memory-strategies)
-- [Cross-Component Calls](#cross-component-calls)
-- [Error Handling](#error-handling)
+- [Core Pipeline](#core-pipeline)
+- [Memory Safety](#memory-safety)
+- [Error Containment](#error-containment)
+
+## Automotive SPICE Compliance
+
+Meld's architecture is designed to meet **Automotive SPICE (ISO/IEC 15504)** process requirements for safety-critical software development:
+
+```mermaid
+flowchart TD
+    subgraph SPICEProcesses[Automotive SPICE Process Groups]
+        direction TB
+        ENG[ENG - Engineering] -->|SWE.1-6| Software
+        MAN[MAN - Management] -->|MAN.3| Project Management
+        SUP[SUP - Support] -->|SUP.1| Quality Assurance
+    end
+
+    subgraph MeldSPICE[Meld SPICE Compliance]
+        direction TB
+        Req[SWE.1 Requirements] --> Design[SWE.3 Design]
+        Design --> Implement[SWE.4 Implementation]
+        Implement --> Test[SWE.5 Testing]
+        Test --> Integrate[SWE.6 Integration]
+    end
+
+    SPICEProcesses -->|maps to| MeldSPICE
+
+    classDef spiceFill fill:#f9f,stroke:#333;
+    class ENG,MAN,SUP,Req,Design,Implement,Test,Integrate spiceFill
+```
+
+### SPICE Process Mapping
+
+| Automotive SPICE Process | Meld Implementation | Compliance Evidence |
+|--------------------------|---------------------|---------------------|
+| **SWE.1 Requirements** | Formal specifications | `proofs/spec/fusion_spec.v` |
+| **SWE.2 System Requirements** | Component model | `meld-core/src/parser.rs` |
+| **SWE.3 Software Design** | Pipeline architecture | `meld-core/ARCHITECTURE.md` |
+| **SWE.4 Software Implementation** | Rust modules | `meld-core/src/` |
+| **SWE.5 Software Testing** | Unit/integration tests | `meld-core/tests/` |
+| **SWE.6 Software Integration** | Fusion pipeline | `meld-core/src/lib.rs` |
+
+## Safety-Critical Overview
+
+Meld follows a **pipeline-based safety architecture** with formal verification at each transformation stage, designed to meet **ISO 26262 ASIL-D** functional safety requirements:
+
+```mermaid
+flowchart TD
+    subgraph SafetyLayers[ISO 26262 Safety Layers]
+        direction TB
+        L1[Requirements] --> L2[Design]
+        L2 --> L3[Implementation]
+        L3 --> L4[Verification]
+        L4 --> L5[Validation]
+    end
+
+    subgraph Pipeline[Fusion Pipeline]
+        direction LR
+        Parse[Parser] --> Resolve[Resolver] --> Merge[Merger] --> Adapt[Adapter] --> Encode[Encoder]
+    end
+
+    SafetyLayers -->|governs| Pipeline
+
+    classDef safetyFill fill:#9f9,stroke:#333;
+    class SafetyLayers,L1,L2,L3,L4,L5 safetyFill
+    class Pipeline,Parse,Resolve,Merger,Adapter,Encoder fill:#f9f,stroke:#333
+```
+
+### Safety Principles
+
+1. **Fail-Safe Design**: All errors are detected and fail-fast
+2. **Formal Verification**: Mathematical proofs of correctness
+3. **Defense-in-Depth**: Multiple validation layers
+4. **Deterministic Behavior**: Reproducible fusion results
+5. **Memory Safety**: Rust's ownership model + formal proofs
 
 ## Overview
 
