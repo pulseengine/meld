@@ -349,6 +349,9 @@ Proof. intros. reflexivity. Qed.
 Lemma set_stack_locals : forall ms s, ms_locals (set_stack ms s) = ms_locals ms.
 Proof. intros. reflexivity. Qed.
 
+Lemma set_stack_value_stack : forall ms s, ms_value_stack (set_stack ms s) = s.
+Proof. intros. reflexivity. Qed.
+
 (* set_stack_and_global preserves funcs, tables, mems, elems, datas, locals *)
 Lemma set_stack_and_global_funcs : forall ms s idx v,
     ms_funcs (set_stack_and_global ms s idx v) = ms_funcs ms.
@@ -372,6 +375,15 @@ Proof. intros. reflexivity. Qed.
 
 Lemma set_stack_and_global_locals : forall ms s idx v,
     ms_locals (set_stack_and_global ms s idx v) = ms_locals ms.
+Proof. intros. reflexivity. Qed.
+
+Lemma set_stack_and_global_globals : forall ms s idx v,
+    ms_globals (set_stack_and_global ms s idx v) =
+    update_global_value (ms_globals ms) idx v.
+Proof. intros. reflexivity. Qed.
+
+Lemma set_stack_and_global_value_stack : forall ms s idx v,
+    ms_value_stack (set_stack_and_global ms s idx v) = s.
 Proof. intros. reflexivity. Qed.
 
 (* update_nth preserves length *)
@@ -431,7 +443,7 @@ Proof.
   intros globals idx j v Hneq.
   unfold update_global_value.
   destruct (nth_error globals idx) eqn:Hnth.
-  - apply update_nth_other. exact Hneq.
+  - apply update_nth_other. intro H; exact (Hneq (eq_sym H)).
   - reflexivity.
 Qed.
 

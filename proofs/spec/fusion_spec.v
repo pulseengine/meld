@@ -9,12 +9,21 @@
    heavier operational semantics layer.
    ========================================================================= *)
 
-From Stdlib Require Import List ZArith Bool.
+From Stdlib Require Import List ZArith Bool Lia Arith.
 From MeldSpec Require Import wasm_core component_model wasm_semantics fusion_types.
 Import ListNotations.
 
 (* Re-export all fusion_types definitions *)
 Export fusion_types.
+
+(* Rocq 9.0: repeat split no longer recurses into the right branch of
+   a conjunction.  split_all explicitly decomposes right-nested /\ into
+   all leaf subgoals. *)
+Ltac split_all :=
+  match goal with
+  | |- _ /\ _ => split; [| split_all]
+  | _ => idtac
+  end.
 
 (* =========================================================================
    Semantic Preservation
@@ -742,16 +751,16 @@ Lemma result_state_set_stack :
       (fes_module_state fes) (set_stack (fes_module_state fes) new_stack).
 Proof.
   intros cc fr ces fes ms new_stack Hcorr Hlookup.
-  unfold result_state_corresponds. repeat split.
+  unfold result_state_corresponds. split_all.
   - (* Value stacks: both are new_stack *)
     apply value_stacks_correspond_refl.
   - (* Locals: set_stack preserves locals, sc_locals_eq relates them *)
     rewrite set_stack_locals. rewrite set_stack_locals.
     exact (sc_locals_eq _ _ _ _ Hcorr ms Hlookup).
-  - apply set_stack_funcs.
-  - apply set_stack_funcs.
-  - apply set_stack_mems.
-  - apply set_stack_mems.
+  - exact (set_stack_funcs _ _).
+  - exact (set_stack_funcs _ _).
+  - exact (set_stack_mems _ _).
+  - exact (set_stack_mems _ _).
   - (* Globals: set_stack preserves, use sc_globals_eq *)
     intros si g Hg. rewrite set_stack_globals in Hg.
     destruct (sc_globals_eq _ _ _ _ Hcorr _ ms _ _ Hlookup Hg)
@@ -850,7 +859,7 @@ Proof.
         exact Hpure_i
       | reflexivity .. ]
     | (* result_state_corresponds *)
-      unfold result_state_corresponds; repeat split; [
+      unfold result_state_corresponds; split_all; [
         apply value_stacks_correspond_refl
       | reflexivity
       | exact Hpf | reflexivity | exact Hpm | reflexivity
@@ -906,9 +915,10 @@ Proof.
              (glob_value gf :: ms_value_stack (fes_module_state fes))).
     split.
     + apply Eval_GlobalGet. exact Hg_nth.
-    + unfold result_state_corresponds. repeat split.
+    + unfold result_state_corresponds. split_all.
       * unfold value_stacks_correspond.
         pose proof (sc_value_stack_eq _ _ _ _ Hcorr ms Hlookup) as [Hlen HF2].
+        rewrite set_stack_value_stack. rewrite set_stack_value_stack.
         split.
         -- simpl. f_equal. exact Hlen.
         -- constructor.
@@ -950,10 +960,10 @@ Proof.
     exists (set_stack_and_global (fes_module_state fes) rest idx' v).
     split.
     + apply Eval_GlobalSet with (g := gf).
-      * exact Hstack_corr.
+      * exact (eq_sym Hstack_corr).
       * exact Hg_nth.
       * rewrite <- Hmut_eq_gc. exact Hmut_var.
-    + unfold result_state_corresponds. repeat split.
+    + unfold result_state_corresponds. split_all.
       * apply value_stacks_correspond_refl.
       * rewrite set_stack_and_global_locals. rewrite set_stack_and_global_locals.
         exact (sc_locals_eq _ _ _ _ Hcorr ms Hlookup).
@@ -964,19 +974,22 @@ Proof.
       * (* Globals: case split *)
         intros si gi Hgi.
         destruct (Nat.eq_dec si globalidx) as [Heq_gi | Hneq_si].
-        -- subst si. simpl in Hgi.
-           rewrite update_global_value_same in Hgi by exact Hnth_glob.
+        -- subst si. rewrite set_stack_and_global_globals in Hgi.
+           rewrite (update_global_value_same _ _ _ _ Hnth_glob) in Hgi.
            injection Hgi as Hgi_eq. subst gi.
            exists idx'. exists (mkGlobalInst v (glob_mut gf)).
            split; [exact Hremap|].
            split.
-           ++ rewrite update_global_value_same by exact Hg_nth. reflexivity.
+           ++ rewrite set_stack_and_global_globals.
+              rewrite (update_global_value_same _ _ _ _ Hg_nth). reflexivity.
            ++ unfold global_corresponds, values_correspond. simpl. auto.
-        -- rewrite update_global_value_other in Hgi by exact Hneq_si.
+        -- rewrite set_stack_and_global_globals in Hgi.
+           rewrite update_global_value_other in Hgi by exact Hneq_si.
            destruct (sc_globals_eq _ _ _ _ Hcorr _ ms _ _ Hlookup Hgi)
              as [fi [gif [Hr [Hn Hgc]]]].
            exists fi, gif. split; [exact Hr|]. split.
-           ++ rewrite update_global_value_other.
+           ++ rewrite set_stack_and_global_globals.
+              rewrite update_global_value_other.
               ** exact Hn.
               ** apply (lookup_remap_neq_fused _ GlobalIdx _ _ _ _ _ Hinj Hr Hremap).
                  exact Hneq_si.
@@ -1002,9 +1015,11 @@ Proof.
              (VRefFunc func_addr :: ms_value_stack (fes_module_state fes))).
     split.
     + apply Eval_RefFunc. exact Hf_nth.
-    + unfold result_state_corresponds. repeat split.
+    + unfold result_state_corresponds. split_all.
       * pose proof (sc_value_stack_eq _ _ _ _ Hcorr ms Hlookup) as [Hlen HF2].
-        unfold value_stacks_correspond. split.
+        unfold value_stacks_correspond.
+        rewrite set_stack_value_stack. rewrite set_stack_value_stack.
+        split.
         -- simpl. f_equal. exact Hlen.
         -- constructor; [unfold values_correspond; reflexivity | exact HF2].
       * rewrite set_stack_locals. rewrite set_stack_locals.
@@ -1059,9 +1074,11 @@ Proof.
               :: ms_value_stack (fes_module_state fes))).
     split.
     + apply Eval_TableSize. exact Ht_nth.
-    + unfold result_state_corresponds. repeat split.
+    + unfold result_state_corresponds. split_all.
       * pose proof (sc_value_stack_eq _ _ _ _ Hcorr ms Hlookup) as [Hlen' HF2].
-        unfold value_stacks_correspond. split.
+        unfold value_stacks_correspond.
+        rewrite set_stack_value_stack. rewrite set_stack_value_stack.
+        split.
         -- simpl. f_equal. exact Hlen'.
         -- constructor.
            ++ unfold values_correspond. f_equal. f_equal. exact Hlen_eq.
@@ -1102,9 +1119,13 @@ Proof.
               new_stack).
     split.
     + apply Eval_TableGrow with (tab := tf). exact Ht_nth.
-    + unfold result_state_corresponds. simpl. repeat split.
+    + unfold result_state_corresponds. simpl. split_all.
       * apply value_stacks_correspond_refl.
       * exact (sc_locals_eq _ _ _ _ Hcorr ms Hlookup).
+      * reflexivity.
+      * reflexivity.
+      * reflexivity.
+      * reflexivity.
       * intros si gi Hgi.
         exact (sc_globals_eq _ _ _ _ Hcorr _ ms _ _ Hlookup Hgi).
       * intros si t Ht.
@@ -1116,14 +1137,14 @@ Proof.
                  apply nth_error_Some. rewrite Ht_nth. discriminate.
               ** unfold table_corresponds. auto.
            ++ apply nth_error_Some. rewrite Hnth_tab. discriminate.
-        -- rewrite update_nth_other in Ht by exact Hneq_si.
+        -- rewrite update_nth_other in Ht by (intro H; exact (Hneq_si (eq_sym H))).
            destruct (sc_tables_eq _ _ _ _ Hcorr _ ms _ _ Hlookup Ht)
              as [fi [tf' [Hr [Hn Htc]]]].
            exists fi, tf'. split; [exact Hr|]. split.
            ++ rewrite update_nth_other.
               ** exact Hn.
-              ** apply (lookup_remap_neq_fused _ TableIdx _ _ _ _ _ Hinj Hr Hremap).
-                 exact Hneq_si.
+              ** intro Heq.
+                 exact (lookup_remap_neq_fused _ TableIdx _ _ _ _ _ Hinj Hr Hremap Hneq_si (eq_sym Heq)).
            ++ exact Htc.
       * intros si e He.
         exact (sc_elems_eq _ _ _ _ Hcorr _ ms _ _ Hlookup He).
@@ -1147,9 +1168,13 @@ Proof.
               new_stack).
     split.
     + apply Eval_TableFill with (tab := tf). exact Ht_nth.
-    + unfold result_state_corresponds. simpl. repeat split.
+    + unfold result_state_corresponds. simpl. split_all.
       * apply value_stacks_correspond_refl.
       * exact (sc_locals_eq _ _ _ _ Hcorr ms Hlookup).
+      * reflexivity.
+      * reflexivity.
+      * reflexivity.
+      * reflexivity.
       * intros si gi Hgi.
         exact (sc_globals_eq _ _ _ _ Hcorr _ ms _ _ Hlookup Hgi).
       * intros si t Ht.
@@ -1161,14 +1186,14 @@ Proof.
                  apply nth_error_Some. rewrite Ht_nth. discriminate.
               ** unfold table_corresponds. auto.
            ++ apply nth_error_Some. rewrite Hnth_tab. discriminate.
-        -- rewrite update_nth_other in Ht by exact Hneq_si.
+        -- rewrite update_nth_other in Ht by (intro H; exact (Hneq_si (eq_sym H))).
            destruct (sc_tables_eq _ _ _ _ Hcorr _ ms _ _ Hlookup Ht)
              as [fi [tf' [Hr [Hn Htc]]]].
            exists fi, tf'. split; [exact Hr|]. split.
            ++ rewrite update_nth_other.
               ** exact Hn.
-              ** apply (lookup_remap_neq_fused _ TableIdx _ _ _ _ _ Hinj Hr Hremap).
-                 exact Hneq_si.
+              ** intro Heq.
+                 exact (lookup_remap_neq_fused _ TableIdx _ _ _ _ _ Hinj Hr Hremap Hneq_si (eq_sym Heq)).
            ++ exact Htc.
       * intros si e He.
         exact (sc_elems_eq _ _ _ _ Hcorr _ ms _ _ Hlookup He).
@@ -1178,8 +1203,8 @@ Proof.
   - (* Eval_TableCopy + RW_TableCopy *)
     match goal with | [H: nth_error (ms_tables _) dst_idx = Some _ |- _] => rename H into Hnth_dst end.
     match goal with | [H: nth_error (ms_tables _) src_idx = Some _ |- _] => rename H into Hnth_src end.
-    match goal with | [H: lookup_remap _ TableIdx _ dst = Some _ |- _] => rename H into Hremap_dst end.
-    match goal with | [H: lookup_remap _ TableIdx _ src_t = Some _ |- _] => rename H into Hremap_src end.
+    match goal with | [H: lookup_remap _ TableIdx _ dst_idx = Some _ |- _] => rename H into Hremap_dst end.
+    match goal with | [H: lookup_remap _ TableIdx _ src_idx = Some _ |- _] => rename H into Hremap_src end.
     destruct (sc_tables_eq _ _ _ _ Hcorr _ ms _ _ Hlookup Hnth_dst)
       as [fused_didx [tf_dst [Hd_remap [Hd_nth Hdcorr]]]].
     rewrite Hremap_dst in Hd_remap. injection Hd_remap as Hdidx. subst fused_didx.
@@ -1198,9 +1223,13 @@ Proof.
     split.
     + apply Eval_TableCopy with (tab_dst := tf_dst) (tab_src := tf_src).
       * exact Hd_nth. * exact Hs_nth.
-    + unfold result_state_corresponds. simpl. repeat split.
+    + unfold result_state_corresponds. simpl. split_all.
       * apply value_stacks_correspond_refl.
       * exact (sc_locals_eq _ _ _ _ Hcorr ms Hlookup).
+      * reflexivity.
+      * reflexivity.
+      * reflexivity.
+      * reflexivity.
       * intros si gi Hgi.
         exact (sc_globals_eq _ _ _ _ Hcorr _ ms _ _ Hlookup Hgi).
       * intros si t Ht.
@@ -1212,14 +1241,14 @@ Proof.
                  apply nth_error_Some. rewrite Hd_nth. discriminate.
               ** unfold table_corresponds. auto.
            ++ apply nth_error_Some. rewrite Hnth_dst. discriminate.
-        -- rewrite update_nth_other in Ht by exact Hneq_si.
+        -- rewrite update_nth_other in Ht by (intro H; exact (Hneq_si (eq_sym H))).
            destruct (sc_tables_eq _ _ _ _ Hcorr _ ms _ _ Hlookup Ht)
              as [fi [tf' [Hr [Hn Htc]]]].
            exists fi, tf'. split; [exact Hr|]. split.
            ++ rewrite update_nth_other.
               ** exact Hn.
-              ** apply (lookup_remap_neq_fused _ TableIdx _ _ _ _ _ Hinj Hr Hremap_dst).
-                 exact Hneq_si.
+              ** intro Heq.
+                 exact (lookup_remap_neq_fused _ TableIdx _ _ _ _ _ Hinj Hr Hremap_dst Hneq_si (eq_sym Heq)).
            ++ exact Htc.
       * intros si e He.
         exact (sc_elems_eq _ _ _ _ Hcorr _ ms _ _ Hlookup He).
@@ -1249,9 +1278,13 @@ Proof.
     split.
     + apply Eval_TableInit with (tab := tf) (elem := elem).
       * exact Ht_nth. * exact He_nth.
-    + unfold result_state_corresponds. simpl. repeat split.
+    + unfold result_state_corresponds. simpl. split_all.
       * apply value_stacks_correspond_refl.
       * exact (sc_locals_eq _ _ _ _ Hcorr ms Hlookup).
+      * reflexivity.
+      * reflexivity.
+      * reflexivity.
+      * reflexivity.
       * intros si gi Hgi.
         exact (sc_globals_eq _ _ _ _ Hcorr _ ms _ _ Hlookup Hgi).
       * intros si t Ht.
@@ -1263,14 +1296,14 @@ Proof.
                  apply nth_error_Some. rewrite Ht_nth. discriminate.
               ** unfold table_corresponds. auto.
            ++ apply nth_error_Some. rewrite Hnth_tab. discriminate.
-        -- rewrite update_nth_other in Ht by exact Hneq_si.
+        -- rewrite update_nth_other in Ht by (intro H; exact (Hneq_si (eq_sym H))).
            destruct (sc_tables_eq _ _ _ _ Hcorr _ ms _ _ Hlookup Ht)
              as [fi [tf' [Hr [Hn Htc]]]].
            exists fi, tf'. split; [exact Hr|]. split.
            ++ rewrite update_nth_other.
               ** exact Hn.
-              ** apply (lookup_remap_neq_fused _ TableIdx _ _ _ _ _ Hinj Hr Hremap_tab).
-                 exact Hneq_si.
+              ** intro Heq.
+                 exact (lookup_remap_neq_fused _ TableIdx _ _ _ _ _ Hinj Hr Hremap_tab Hneq_si (eq_sym Heq)).
            ++ exact Htc.
       * intros si e He.
         exact (sc_elems_eq _ _ _ _ Hcorr _ ms _ _ Hlookup He).
@@ -1294,9 +1327,13 @@ Proof.
               (ms_value_stack (fes_module_state fes))).
     split.
     + apply Eval_ElemDrop with (elem := elem). exact He_nth.
-    + unfold result_state_corresponds. simpl. repeat split.
+    + unfold result_state_corresponds. simpl. split_all.
       * exact (sc_value_stack_eq _ _ _ _ Hcorr ms Hlookup).
       * exact (sc_locals_eq _ _ _ _ Hcorr ms Hlookup).
+      * reflexivity.
+      * reflexivity.
+      * reflexivity.
+      * reflexivity.
       * intros si gi Hgi.
         exact (sc_globals_eq _ _ _ _ Hcorr _ ms _ _ Hlookup Hgi).
       * intros si t Ht.
@@ -1309,13 +1346,13 @@ Proof.
               rewrite update_nth_same; [reflexivity|].
               apply nth_error_Some. rewrite He_nth. discriminate.
            ++ apply nth_error_Some. rewrite Hnth_elem. discriminate.
-        -- rewrite update_nth_other in He by exact Hneq_si.
+        -- rewrite update_nth_other in He by (intro H; exact (Hneq_si (eq_sym H))).
            destruct (sc_elems_eq _ _ _ _ Hcorr _ ms _ _ Hlookup He) as [fi [Hr Hn]].
            exists fi. split; [exact Hr|].
            rewrite update_nth_other.
            ++ exact Hn.
-           ++ apply (lookup_remap_neq_fused _ ElemIdx _ _ _ _ _ Hinj Hr Hremap).
-              exact Hneq_si.
+           ++ intro Heq.
+              exact (lookup_remap_neq_fused _ ElemIdx _ _ _ _ _ Hinj Hr Hremap Hneq_si (eq_sym Heq)).
       * intros si d Hd.
         exact (sc_datas_eq _ _ _ _ Hcorr _ ms _ _ Hlookup Hd).
 
@@ -1347,9 +1384,13 @@ Proof.
               (ms_value_stack (fes_module_state fes))).
     split.
     + apply Eval_DataDrop with (dat := dat). exact Hd_nth.
-    + unfold result_state_corresponds. simpl. repeat split.
+    + unfold result_state_corresponds. simpl. split_all.
       * exact (sc_value_stack_eq _ _ _ _ Hcorr ms Hlookup).
       * exact (sc_locals_eq _ _ _ _ Hcorr ms Hlookup).
+      * reflexivity.
+      * reflexivity.
+      * reflexivity.
+      * reflexivity.
       * intros si gi Hgi.
         exact (sc_globals_eq _ _ _ _ Hcorr _ ms _ _ Hlookup Hgi).
       * intros si t Ht.
@@ -1364,13 +1405,13 @@ Proof.
               rewrite update_nth_same; [reflexivity|].
               apply nth_error_Some. rewrite Hd_nth. discriminate.
            ++ apply nth_error_Some. rewrite Hnth_dat. discriminate.
-        -- rewrite update_nth_other in Hd by exact Hneq_si.
+        -- rewrite update_nth_other in Hd by (intro H; exact (Hneq_si (eq_sym H))).
            destruct (sc_datas_eq _ _ _ _ Hcorr _ ms _ _ Hlookup Hd) as [fi [Hr Hn]].
            exists fi. split; [exact Hr|].
            rewrite update_nth_other.
            ++ exact Hn.
-           ++ apply (lookup_remap_neq_fused _ DataIdx _ _ _ _ _ Hinj Hr Hremap).
-              exact Hneq_si.
+           ++ intro Heq.
+              exact (lookup_remap_neq_fused _ DataIdx _ _ _ _ _ Hinj Hr Hremap Hneq_si (eq_sym Heq)).
 Qed.
 
 (* -------------------------------------------------------------------------
@@ -1431,11 +1472,11 @@ Lemma eval_call_preserves_all :
 Proof.
   intros ms funcidx ms' Heval.
   inversion Heval; subst.
-  - (* Eval_Call *) repeat split; apply set_stack_funcs
+  - (* Eval_Call *) split_all; apply set_stack_funcs
       || apply set_stack_tables || apply set_stack_mems
       || apply set_stack_globals || apply set_stack_elems
       || apply set_stack_datas.
-  - (* Eval_Pure *) repeat split; assumption.
+  - (* Eval_Pure *) split_all; assumption.
 Qed.
 
 (* -------------------------------------------------------------------------
@@ -1500,7 +1541,7 @@ Proof.
     + (* Re-establish state_correspondence *)
       destruct Hresult as [Hvs [Hloc [Hf1 [Hf2 [Hm1 [Hm2
         [Hglob [Htab [Helem Hdat]]]]]]]]].
-      constructor.
+      constructor. all: cbn [fes_module_state].
       * (* sc_active_valid *)
         exists ms'.
         exact (lookup_update_same _ (ces_active ces) ms _ _ _ Hlookup_ms).
@@ -1552,7 +1593,7 @@ Proof.
         -- rewrite (lookup_update_other _ src _ _ _ _ Heq) in Hlookup0.
            destruct (sc_globals_eq _ _ _ _ Hcorr _ _ _ _ Hlookup0 Hnth)
              as [fi [gf [Hr [Hn Hgc]]]].
-           exists fi, gf. auto.
+           exists fi, gf. split; [exact Hr|]. split; [exact Hn|exact Hgc].
       * (* sc_tables_eq *)
         intros src ms0 src_idx tab_src Hlookup0 Hnth.
         destruct (module_source_eqb src (ces_active ces)) eqn:Heq.
