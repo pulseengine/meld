@@ -216,8 +216,6 @@ Meld's core transformations are formally verified using Rocq 9.0 (formerly Coq).
 The proofs establish that fusion preserves program semantics — the fused module
 behaves identically to the original composed components.
 
-**22 proof files, 207 theorems/lemmas, 0 Admitted.**
-
 Key verified properties:
 - **Merge correctness**: Index remapping preserves function/memory/table references
 - **Resolve correctness**: Topological sort produces valid instantiation order;
