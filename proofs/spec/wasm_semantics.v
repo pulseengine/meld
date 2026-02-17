@@ -143,10 +143,6 @@ Definition is_pure_instr (i : instr) : bool :=
   | Select _ => true
   (* Locals: local indices, not module-level *)
   | LocalGet _ | LocalSet _ | LocalTee _ => true
-  (* Memory: in single-memory mode, no index needed *)
-  | MemorySize | MemoryGrow => true
-  | Load _ _ _ | Store _ _ _ => true
-  | MemoryCopy | MemoryFill => true
   (* Numeric: no indices *)
   | NumericOp _ => true
   (* Reference null/check: no index lookup *)
@@ -155,11 +151,15 @@ Definition is_pure_instr (i : instr) : bool :=
   | Call _ | CallIndirect _ _ => false
   | GlobalGet _ | GlobalSet _ => false
   | RefFunc _ => false
+  (* Memory: memidx references module-level index space *)
+  | MemorySize _ | MemoryGrow _ => false
+  | Load _ _ _ _ | Store _ _ _ _ => false
+  | MemoryCopy _ _ | MemoryFill _ => false
+  | MemoryInit _ _ | DataDrop _ => false
   | TableGet _ | TableSet _ => false
   | TableSize _ | TableGrow _ | TableFill _ => false
   | TableCopy _ _ | TableInit _ _ => false
   | ElemDrop _ => false
-  | MemoryInit _ | DataDrop _ => false
   end.
 
 (* -------------------------------------------------------------------------
@@ -287,14 +287,14 @@ Inductive eval_instr : module_state -> instr -> module_state -> Prop :=
 
   (* --- Memory bulk operations --- *)
 
-  (* MemoryInit: resolve dataidx, abstract result.
-     We model only the data segment INDEX LOOKUP. The actual memory write
-     is a side effect that doesn't involve index remapping — it copies
-     data from the segment into memory 0 (fixed), which is the same in
-     both composed and fused modes. *)
-  | Eval_MemoryInit : forall ms dataidx dat new_stack,
+  (* MemoryInit: resolve dataidx and memidx, abstract result.
+     We model the data segment INDEX LOOKUP and memory index resolution.
+     The actual memory write is a side effect — it copies data from
+     the segment into the target memory, which is the same in both
+     composed and fused modes after index remapping. *)
+  | Eval_MemoryInit : forall ms dataidx memidx dat new_stack,
       nth_error (ms_datas ms) dataidx = Some dat ->
-      eval_instr ms (MemoryInit dataidx) (set_stack ms new_stack)
+      eval_instr ms (MemoryInit dataidx memidx) (set_stack ms new_stack)
 
   (* DataDrop: resolve dataidx, only target data segment changes *)
   | Eval_DataDrop : forall ms dataidx dat new_dat,

@@ -362,9 +362,26 @@ impl Merger {
                 merged.memory_index_map.insert((comp_idx, mod_idx, idx), 0);
             }
         } else {
+            // Multi-memory: each component keeps its own memory.
+            // Both imported and defined memories get unique indices.
             let mem_offset = merged.memories.len() as u32;
+            let mut next_idx = 0u32;
+
+            // Imported memories
+            for import in &module.imports {
+                if let ImportKind::Memory(mem) = &import.kind {
+                    let new_idx = mem_offset + next_idx;
+                    merged
+                        .memory_index_map
+                        .insert((comp_idx, mod_idx, next_idx), new_idx);
+                    merged.memories.push(convert_memory_type(mem));
+                    next_idx += 1;
+                }
+            }
+
+            // Defined memories
             for (old_idx, mem) in module.memories.iter().enumerate() {
-                let new_idx = mem_offset + old_idx as u32;
+                let new_idx = mem_offset + next_idx + old_idx as u32;
                 merged.memory_index_map.insert(
                     (comp_idx, mod_idx, import_mem_count + old_idx as u32),
                     new_idx,
@@ -1010,6 +1027,12 @@ fn build_index_maps_for_module(
             maps.memories.insert(idx, 0);
         }
     } else {
+        // Multi-memory: map both imported and defined memory indices
+        for idx in 0..import_mem_count {
+            if let Some(&new_idx) = merged.memory_index_map.get(&(comp_idx, mod_idx, idx)) {
+                maps.memories.insert(idx, new_idx);
+            }
+        }
         for old_idx in 0..module.memories.len() as u32 {
             let full_idx = import_mem_count + old_idx;
             if let Some(&new_idx) = merged.memory_index_map.get(&(comp_idx, mod_idx, full_idx)) {
@@ -1149,5 +1172,114 @@ mod tests {
         let combined = combine_memory_types_shared(&[mem_a, mem_b]).unwrap();
         assert_eq!(combined.initial, 4);
         assert_eq!(combined.maximum, Some(8));
+    }
+
+    fn make_test_module(memories: Vec<MemoryType>) -> CoreModule {
+        CoreModule {
+            index: 0,
+            bytes: Vec::new(),
+            types: Vec::new(),
+            imports: Vec::new(),
+            exports: Vec::new(),
+            functions: Vec::new(),
+            memories,
+            tables: Vec::new(),
+            globals: Vec::new(),
+            start: None,
+            data_count: None,
+            element_count: 0,
+            custom_sections: Vec::new(),
+            code_section_range: None,
+            global_section_range: None,
+            element_section_range: None,
+            data_section_range: None,
+        }
+    }
+
+    #[test]
+    fn test_multi_memory_index_maps() {
+        // Simulate two modules each with one defined memory in multi-memory mode
+        let module_a = make_test_module(vec![MemoryType {
+            memory64: false,
+            shared: false,
+            initial: 1,
+            maximum: None,
+        }]);
+        let module_b = make_test_module(vec![MemoryType {
+            memory64: false,
+            shared: false,
+            initial: 2,
+            maximum: None,
+        }]);
+
+        let mut merged = MergedModule {
+            types: Vec::new(),
+            imports: Vec::new(),
+            functions: Vec::new(),
+            tables: Vec::new(),
+            memories: Vec::new(),
+            globals: Vec::new(),
+            exports: Vec::new(),
+            start_function: None,
+            elements: Vec::new(),
+            data_segments: Vec::new(),
+            custom_sections: Vec::new(),
+            function_index_map: HashMap::new(),
+            memory_index_map: HashMap::new(),
+            table_index_map: HashMap::new(),
+            global_index_map: HashMap::new(),
+            type_index_map: HashMap::new(),
+            realloc_map: HashMap::new(),
+        };
+
+        // Simulate multi-memory merging for module A (comp 0, mod 0)
+        let mem_offset_a = merged.memories.len() as u32; // 0
+        merged.memory_index_map.insert((0, 0, 0), mem_offset_a);
+        merged
+            .memories
+            .push(convert_memory_type(&module_a.memories[0]));
+
+        // Simulate multi-memory merging for module B (comp 1, mod 0)
+        let mem_offset_b = merged.memories.len() as u32; // 1
+        merged.memory_index_map.insert((1, 0, 0), mem_offset_b);
+        merged
+            .memories
+            .push(convert_memory_type(&module_b.memories[0]));
+
+        // Verify: 2 separate memories
+        assert_eq!(merged.memories.len(), 2);
+        assert_eq!(merged.memories[0].minimum, 1);
+        assert_eq!(merged.memories[1].minimum, 2);
+
+        // Verify: index maps point to different memories
+        assert_eq!(merged.memory_index_map[&(0, 0, 0)], 0);
+        assert_eq!(merged.memory_index_map[&(1, 0, 0)], 1);
+
+        // Verify: IndexMaps for rewriter map correctly
+        let maps_a = build_index_maps_for_module(
+            0,
+            0,
+            &module_a,
+            &merged,
+            MemoryStrategy::MultiMemory,
+            false,
+            0,
+            false,
+            None,
+        );
+        assert_eq!(maps_a.remap_memory(0), 0);
+
+        let maps_b = build_index_maps_for_module(
+            1,
+            0,
+            &module_b,
+            &merged,
+            MemoryStrategy::MultiMemory,
+            false,
+            0,
+            false,
+            None,
+        );
+        assert_eq!(maps_b.remap_memory(0), 1);
     }
 }

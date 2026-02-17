@@ -118,19 +118,11 @@ classDiagram
 
 ## Memory Strategies
 
-### Shared Memory (Current)
+### Multi-Memory (Default)
 
-```mermaid
-flowchart TD
-    Component_A --> Shared_Memory
-    Component_B --> Shared_Memory
-    Shared_Memory --> Fused_Module
-```
-
-**Pros:** Simpler, direct calls, better optimization
-**Cons:** Requires memory coordination
-
-### Separate Memories (Planned)
+Each component keeps its own linear memory. The fused module contains N
+memories (one per component). Cross-component calls that pass pointers
+use adapters with `cabi_realloc` + `memory.copy`.
 
 ```mermaid
 flowchart TD
@@ -140,8 +132,25 @@ flowchart TD
     Memory_B --> Fused_Module
 ```
 
-**Pros:** Better isolation
-**Cons:** Requires adapters
+**Pros:** Correct isolation — `memory.grow` in one component cannot
+corrupt another's address space
+**Cons:** Cross-component pointer-passing calls require adapter overhead
+
+### Shared Memory (Legacy)
+
+All components share a single linear memory. Cross-component calls are
+direct (no adapter overhead), but `memory.grow` in any component corrupts
+every other component's pointers.
+
+```mermaid
+flowchart TD
+    Component_A --> Shared_Memory
+    Component_B --> Shared_Memory
+    Shared_Memory --> Fused_Module
+```
+
+**Pros:** Simpler, direct calls, no adapter overhead
+**Cons:** Broken when any component uses `memory.grow`
 
 ## Cross-Component Calls
 
@@ -157,16 +166,19 @@ flowchart TD
 
 ### Direct vs Adapter Calls
 
-**Direct (shared memory):**
+**Direct (shared memory mode):**
 ```mermaid
 flowchart TD
     Caller -->|direct| Target_Function
 ```
 
-**Adapter (separate memory):**
+**Adapter (multi-memory mode, pointer args):**
 ```mermaid
 flowchart TD
-    Caller --> Adapter --> Memory_Copy --> Target_Function
+    Caller -->|ptr,len| Adapter
+    Adapter -->|cabi_realloc| Callee_Memory
+    Adapter -->|memory.copy| Callee_Memory
+    Adapter -->|new_ptr,len| Target_Function
 ```
 
 ## Error Handling

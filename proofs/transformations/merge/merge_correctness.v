@@ -121,12 +121,12 @@ Qed.
 Definition mem_remaps_zero (remaps : remap_table) : Prop :=
   forall r, In r remaps -> ir_space r = MemIdx -> ir_fused_idx r = 0.
 
-(* gen_all_remaps produces memory remaps targeting index 0 for SharedMemory.
+(* gen_all_remaps with SharedMemory produces memory remaps targeting index 0.
    Proof: any remap r in gen_all_remaps comes from some gen_remaps_for_module
    call. If ir_space r = MemIdx, then r is from the gen_remaps_for_space_zero
    chunk, so ir_fused_idx r = 0. *)
 Lemma gen_all_remaps_mem_zero : forall input,
-    mem_remaps_zero (gen_all_remaps input).
+    mem_remaps_zero (gen_all_remaps input SharedMemory).
 Proof.
   intro input.
   unfold mem_remaps_zero, gen_all_remaps.
@@ -134,9 +134,9 @@ Proof.
   (* r comes from some module's remap generation *)
   apply in_gen_all_remaps_aux in Hin.
   destruct Hin as [i [src [m [Hnth Hgen]]]].
-  (* From in_gen_remaps_for_module_fused, MemIdx implies fused_idx = 0 *)
-  pose proof (in_gen_remaps_for_module_fused _ _ _ _ Hgen) as [_ [Hmem _]].
-  exact (Hmem Hspace).
+  (* From in_gen_remaps_for_module_fused, SharedMemory + MemIdx implies fused_idx = 0 *)
+  pose proof (in_gen_remaps_for_module_fused _ _ _ _ _ Hgen) as [_ [Hmem _]].
+  exact (Hmem eq_refl Hspace).
 Qed.
 
 Lemma count_global_imports_flat_map :
@@ -188,13 +188,13 @@ Qed.
    in the remaining list. We prove both directions by induction on remaining,
    generalizing over start_idx. *)
 Lemma in_gen_all_remaps_aux :
-  forall input start_idx remaining r,
-    In r (gen_all_remaps_aux input start_idx remaining) <->
+  forall input start_idx remaining strategy r,
+    In r (gen_all_remaps_aux input start_idx remaining strategy) <->
     exists i src m,
       nth_error remaining i = Some (src, m) /\
-      In r (gen_remaps_for_module src m (offsets_for_module input (start_idx + i))).
+      In r (gen_remaps_for_module src m (offsets_for_module input (start_idx + i)) strategy).
 Proof.
-  intros input start_idx remaining.
+  intros input start_idx remaining strategy.
   revert start_idx.
   induction remaining as [|[src m] rest IH]; intros start_idx r; split; intro H.
   - (* [] forward: contradiction *)
@@ -231,23 +231,26 @@ Proof.
 Qed.
 
 (* A remap from gen_remaps_for_module has its source_idx bounded by
-   the space count of the module in the corresponding index space. *)
+   the space count of the module in the corresponding index space.
+   This holds for any memory strategy. *)
 Lemma in_gen_remaps_for_module_bound :
-  forall src m offsets r,
-    In r (gen_remaps_for_module src m offsets) ->
+  forall src m offsets strategy r,
+    In r (gen_remaps_for_module src m offsets strategy) ->
     ir_source_idx r < space_count_of_module m (ir_space r).
 Proof.
-  intros src m offsets r Hin.
+  intros src m offsets strategy r Hin.
   unfold gen_remaps_for_module in Hin.
-  (* r must be in one of the 7 appended lists. 6 use gen_remaps_for_space,
-     the MemIdx chunk uses gen_remaps_for_space_zero. *)
-  repeat (apply in_app_iff in Hin; destruct Hin as [Hin | Hin]).
-  (* Non-MemIdx cases: use in_gen_remaps_for_space_fused *)
-  all: first
+  (* r must be in one of the 7 appended lists. For SharedMemory, the MemIdx
+     chunk uses gen_remaps_for_space_zero; for SeparateMemory it uses
+     gen_remaps_for_space. All other chunks always use gen_remaps_for_space. *)
+  destruct strategy; simpl in Hin;
+  repeat (apply in_app_iff in Hin; destruct Hin as [Hin | Hin]);
+  (* Non-MemIdx cases and SeparateMemory MemIdx: use in_gen_remaps_for_space_fused *)
+  first
     [ apply in_gen_remaps_for_space_fused in Hin;
       destruct Hin as [_ [Hspace [_ Hbound]]];
       subst; unfold space_count_of_module; exact Hbound
-    | (* MemIdx case: use in_gen_remaps_for_space_zero_fused *)
+    | (* SharedMemory MemIdx case: use in_gen_remaps_for_space_zero_fused *)
       apply in_gen_remaps_for_space_zero_fused in Hin;
       destruct Hin as [_ [Hspace [_ Hbound]]];
       subst; unfold space_count_of_module; exact Hbound
@@ -264,51 +267,44 @@ Definition remaps_bounded (input : merge_input) (remaps : remap_table) : Prop :=
     ir_fused_idx r < total_space_count input (ir_space r).
 
 (* gen_all_remaps produces remaps where every fused index is within bounds.
-   For non-MemIdx spaces: fused_idx = offset(i) + source_idx < total_space_count.
-   For MemIdx (SharedMemory): fused_idx = 0 < total_space_count (since the
-   remap exists, at least one module has MemIdx entries, so total > 0). *)
+   This holds for any memory strategy:
+   - For non-MemIdx spaces: fused_idx = offset(i) + source_idx < total_space_count.
+   - For SharedMemory MemIdx: fused_idx = 0 < total_space_count (since the
+     remap exists, at least one module has MemIdx entries, so total > 0).
+   - For SeparateMemory MemIdx: same as non-MemIdx (normal offsetting). *)
 Theorem gen_all_remaps_bounded :
-  forall input,
-    remaps_bounded input (gen_all_remaps input).
+  forall input strategy,
+    remaps_bounded input (gen_all_remaps input strategy).
 Proof.
-  intro input.
+  intros input strategy.
   unfold remaps_bounded, gen_all_remaps.
   intros r Hin.
   apply in_gen_all_remaps_aux in Hin.
   destruct Hin as [i [src [m [Hnth Hgen]]]].
   (* Get the fused_idx characterization and source_idx bound *)
-  pose proof (in_gen_remaps_for_module_fused _ _ _ _ Hgen) as [Hsrc [Hmem Hnonmem]].
-  pose proof (in_gen_remaps_for_module_bound _ _ _ _ Hgen) as Hbound.
-  (* Case split: MemIdx vs non-MemIdx *)
-  destruct (index_space_eqb (ir_space r) MemIdx) eqn:Hsp.
-  - (* MemIdx: fused_idx = 0, need 0 < total_space_count input MemIdx *)
-    apply index_space_eqb_eq in Hsp.
-    rewrite (Hmem Hsp).
-    (* total_space_count >= space_count of module m >= 1 (since remap exists) *)
-    assert (Hoff: space_count_of_module m (ir_space r)
-                  <= total_space_count input (ir_space r)).
-    { assert (Hoff2: offsets_for_module input (0 + i) (ir_space r) +
-                      space_count_of_module m (ir_space r)
-                      <= total_space_count input (ir_space r)).
-      { unfold offsets_for_module.
-        rewrite <- offset_at_length_eq_total.
-        replace (0 + i) with i by lia.
-        apply offset_plus_count_total. exact Hnth. }
-      lia. }
-    rewrite Hsp in Hbound, Hoff.
-    lia.
-  - (* Non-MemIdx: fused_idx = offsets(space) + source_idx *)
-    assert (Hsp_neq: ir_space r <> MemIdx).
-    { intro Habs. rewrite Habs in Hsp. simpl in Hsp. discriminate. }
-    rewrite (Hnonmem Hsp_neq).
-    assert (Hoff: offsets_for_module input (0 + i) (ir_space r) +
-                  space_count_of_module m (ir_space r)
-                  <= total_space_count input (ir_space r)).
-    { unfold offsets_for_module.
-      rewrite <- offset_at_length_eq_total.
-      replace (0 + i) with i by lia.
-      apply offset_plus_count_total. exact Hnth. }
-    lia.
+  pose proof (in_gen_remaps_for_module_fused _ _ _ _ _ Hgen) as [Hsrc [Hmem Hnonmem]].
+  pose proof (in_gen_remaps_for_module_bound _ _ _ _ _ Hgen) as Hbound.
+  (* Offset + count bound *)
+  assert (Hoff_total: offsets_for_module input (0 + i) (ir_space r) +
+                space_count_of_module m (ir_space r)
+                <= total_space_count input (ir_space r)).
+  { unfold offsets_for_module.
+    rewrite <- offset_at_length_eq_total.
+    replace (0 + i) with i by lia.
+    apply offset_plus_count_total. exact Hnth. }
+  (* Case split on strategy and MemIdx *)
+  destruct strategy.
+  - (* SharedMemory *)
+    destruct (index_space_eqb (ir_space r) MemIdx) eqn:Hsp.
+    + (* MemIdx: fused_idx = 0, need 0 < total_space_count input MemIdx *)
+      apply index_space_eqb_eq in Hsp.
+      rewrite (Hmem eq_refl Hsp). lia.
+    + (* Non-MemIdx: fused_idx = offsets(space) + source_idx *)
+      assert (Hsp_neq: ir_space r <> MemIdx).
+      { intro Habs. rewrite Habs in Hsp. simpl in Hsp. discriminate. }
+      rewrite (Hnonmem (or_intror Hsp_neq)). lia.
+  - (* SeparateMemory: all spaces use normal offsetting *)
+    rewrite (Hnonmem (or_introl eq_refl)). lia.
 Qed.
 
 (* -------------------------------------------------------------------------
@@ -318,11 +314,11 @@ Qed.
 (* Helper: extract the fused_idx bound from gen_all_remaps lookup.
    If lookup succeeds, the fused_idx is bounded by total_space_count. *)
 Lemma lookup_fused_idx_bound :
-  forall input space src src_idx fused_idx,
-    lookup_remap (gen_all_remaps input) space src src_idx = Some fused_idx ->
+  forall input strategy space src src_idx fused_idx,
+    lookup_remap (gen_all_remaps input strategy) space src src_idx = Some fused_idx ->
     fused_idx < total_space_count input space.
 Proof.
-  intros input space src src_idx fused_idx Hlookup.
+  intros input strategy space src src_idx fused_idx Hlookup.
   unfold lookup_remap in Hlookup.
   destruct (find _ _) as [r|] eqn:Hfind; [|discriminate].
   injection Hlookup as Hfused. subst fused_idx.
@@ -337,18 +333,18 @@ Proof.
   destruct H12 as [Hspace_eq _].
   apply index_space_eqb_eq in Hspace_eq.
   (* Use gen_all_remaps_bounded *)
-  pose proof (gen_all_remaps_bounded input) as Hbounded_all.
+  pose proof (gen_all_remaps_bounded input strategy) as Hbounded_all.
   unfold remaps_bounded in Hbounded_all.
   specialize (Hbounded_all r Hin_r).
   rewrite Hspace_eq in Hbounded_all. exact Hbounded_all.
 Qed.
 
-(* For the concrete gen_all_remaps, every lookup produces a valid index
-   in the merged module. *)
+(* For the concrete gen_all_remaps with SharedMemory (used by merge_modules),
+   every lookup produces a valid index in the merged module. *)
 Theorem merge_correctness_constructed :
   forall input,
     let merged := merge_modules input in
-    let remaps := gen_all_remaps input in
+    let remaps := gen_all_remaps input SharedMemory in
     forall src m space src_idx fused_idx,
       In (src, m) input ->
       lookup_remap remaps space src src_idx = Some fused_idx ->
@@ -548,22 +544,23 @@ Qed.
 
 (* Helper: find fails for wrong source in gen_remaps_for_module *)
 Lemma find_gen_remaps_for_module_wrong_src :
-  forall src1 src2 m space offsets src_idx,
+  forall src1 src2 m space offsets strategy src_idx,
     fst src1 <> fst src2 \/ snd src1 <> snd src2 ->
     find (fun r =>
       index_space_eqb (ir_space r) space &&
       Nat.eqb (fst (ir_source r)) (fst src1) &&
       Nat.eqb (snd (ir_source r)) (snd src1) &&
       Nat.eqb (ir_source_idx r) src_idx)
-    (gen_remaps_for_module src2 m offsets) = None.
+    (gen_remaps_for_module src2 m offsets strategy) = None.
 Proof.
-  intros src1 src2 m space offsets src_idx Hneq.
+  intros src1 src2 m space offsets strategy src_idx Hneq.
   unfold gen_remaps_for_module.
-  repeat rewrite find_app.
+  destruct strategy; simpl;
+  repeat rewrite find_app;
   (* Handle both gen_remaps_for_space and gen_remaps_for_space_zero chunks *)
   repeat first
     [ rewrite find_gen_remaps_for_space_wrong_src; [|exact Hneq]
-    | rewrite find_gen_remaps_for_space_zero_wrong_src; [|exact Hneq] ].
+    | rewrite find_gen_remaps_for_space_zero_wrong_src; [|exact Hneq] ];
   reflexivity.
 Qed.
 
@@ -628,13 +625,14 @@ Qed.
 
 (* Helper: lookup_remap fails for wrong source in gen_remaps_for_module *)
 Lemma lookup_remap_module_wrong_src :
-  forall src1 src2 m space offsets src_idx,
+  forall src1 src2 m space offsets strategy src_idx,
     fst src1 <> fst src2 \/ snd src1 <> snd src2 ->
-    lookup_remap (gen_remaps_for_module src2 m offsets) space src1 src_idx = None.
+    lookup_remap (gen_remaps_for_module src2 m offsets strategy) space src1 src_idx = None.
 Proof.
-  intros src1 src2 m space offsets src_idx Hneq.
+  intros src1 src2 m space offsets strategy src_idx Hneq.
   unfold gen_remaps_for_module.
-  repeat rewrite lookup_remap_app.
+  destruct strategy; simpl;
+  repeat rewrite lookup_remap_app;
   (* Handle both gen_remaps_for_space and gen_remaps_for_space_zero chunks *)
   repeat first
     [ rewrite lookup_remap_wrong_src; auto
@@ -642,77 +640,54 @@ Proof.
 Qed.
 
 (* Helper: lookup_remap succeeds in gen_remaps_for_module for the right source.
-   For MemIdx (SharedMemory), the result is always 0.
-   For all other spaces, the result is offsets(space) + src_idx.
+   For SharedMemory + MemIdx, the result is always 0.
+   For SeparateMemory (all spaces) and non-MemIdx spaces, the result is
+   offsets(space) + src_idx.
    Note: this shadows the same-named lemma from merge_remap with identical statement. *)
 Lemma lookup_remap_gen_remaps_for_module :
-  forall src m offsets space src_idx,
+  forall src m offsets strategy space src_idx,
     src_idx < space_count_of_module m space ->
-    lookup_remap (gen_remaps_for_module src m offsets) space src src_idx
-    = Some (match space with MemIdx => 0 | _ => offsets space + src_idx end).
+    lookup_remap (gen_remaps_for_module src m offsets strategy) space src src_idx
+    = Some (match strategy, space with
+            | SharedMemory, MemIdx => 0
+            | _, _ => offsets space + src_idx
+            end).
 Proof.
-  intros src m offsets space src_idx Hbound.
+  intros src m offsets strategy space src_idx Hbound.
   unfold gen_remaps_for_module, space_count_of_module in *.
   (* Navigate through the appended lists to find the correct space.
      gen_remaps_for_module concatenates 7 segments in order:
-     TypeIdx, FuncIdx, TableIdx, MemIdx(zero), GlobalIdx, ElemIdx, DataIdx *)
+     TypeIdx, FuncIdx, TableIdx, MemIdx(zero or offset), GlobalIdx, ElemIdx, DataIdx *)
+  destruct strategy; destruct space; simpl;
   repeat rewrite lookup_remap_app.
-  destruct space.
-  - (* FuncIdx: second segment *)
-    rewrite lookup_remap_wrong_space; [|discriminate].
-    rewrite (lookup_remap_gen_space_success src m FuncIdx); auto.
-  - (* TableIdx: third segment *)
-    rewrite lookup_remap_wrong_space; [|discriminate].
-    rewrite lookup_remap_wrong_space; [|discriminate].
-    rewrite (lookup_remap_gen_space_success src m TableIdx); auto.
-  - (* MemIdx: fourth segment uses gen_remaps_for_space_zero *)
-    rewrite lookup_remap_wrong_space; [|discriminate].
-    rewrite lookup_remap_wrong_space; [|discriminate].
-    rewrite lookup_remap_wrong_space; [|discriminate].
-    rewrite (lookup_remap_gen_space_zero_success src m MemIdx); auto.
-  - (* GlobalIdx: fifth segment *)
-    rewrite lookup_remap_wrong_space; [|discriminate].
-    rewrite lookup_remap_wrong_space; [|discriminate].
-    rewrite lookup_remap_wrong_space; [|discriminate].
-    rewrite lookup_remap_zero_wrong_space; [|discriminate].
-    rewrite (lookup_remap_gen_space_success src m GlobalIdx); auto.
-  - (* TypeIdx: first segment *)
-    rewrite (lookup_remap_gen_space_success src m TypeIdx); auto.
-  - (* ElemIdx: sixth segment *)
-    rewrite lookup_remap_wrong_space; [|discriminate].
-    rewrite lookup_remap_wrong_space; [|discriminate].
-    rewrite lookup_remap_wrong_space; [|discriminate].
-    rewrite lookup_remap_zero_wrong_space; [|discriminate].
-    rewrite lookup_remap_wrong_space; [|discriminate].
-    rewrite (lookup_remap_gen_space_success src m ElemIdx); auto.
-  - (* DataIdx: seventh segment *)
-    rewrite lookup_remap_wrong_space; [|discriminate].
-    rewrite lookup_remap_wrong_space; [|discriminate].
-    rewrite lookup_remap_wrong_space; [|discriminate].
-    rewrite lookup_remap_zero_wrong_space; [|discriminate].
-    rewrite lookup_remap_wrong_space; [|discriminate].
-    rewrite lookup_remap_wrong_space; [|discriminate].
-    rewrite (lookup_remap_gen_space_success src m DataIdx); auto.
+  (* SharedMemory cases *)
+  all: repeat first
+    [ rewrite lookup_remap_wrong_space; [|discriminate]
+    | rewrite lookup_remap_zero_wrong_space; [|discriminate] ].
+  all: first
+    [ rewrite (lookup_remap_gen_space_zero_success src m MemIdx); auto
+    | rewrite (lookup_remap_gen_space_success src m _); auto ].
 Qed.
 
 (* Helper: lookup_remap in gen_all_remaps_aux succeeds with unique sources.
-   For MemIdx (SharedMemory), the result is always 0.
-   For all other spaces, the result is offset + src_idx. *)
+   For SharedMemory + MemIdx, the result is always 0.
+   For SeparateMemory (all spaces) and non-MemIdx spaces, the result is
+   offset + src_idx. *)
 Lemma lookup_gen_all_remaps_aux_unique :
-  forall input start_idx remaining src m space src_idx mod_idx,
+  forall input start_idx remaining strategy src m space src_idx mod_idx,
     (forall i j s1 sm1 s2 sm2,
       nth_error remaining i = Some (s1, sm1) ->
       nth_error remaining j = Some (s2, sm2) ->
       s1 = s2 -> i = j) ->
     nth_error remaining mod_idx = Some (src, m) ->
     src_idx < space_count_of_module m space ->
-    lookup_remap (gen_all_remaps_aux input start_idx remaining) space src src_idx
-    = Some (match space with
-            | MemIdx => 0
-            | _ => offsets_for_module input (start_idx + mod_idx) space + src_idx
+    lookup_remap (gen_all_remaps_aux input start_idx remaining strategy) space src src_idx
+    = Some (match strategy, space with
+            | SharedMemory, MemIdx => 0
+            | _, _ => offsets_for_module input (start_idx + mod_idx) space + src_idx
             end).
 Proof.
-  intros input start_idx remaining.
+  intros input start_idx remaining strategy.
   revert start_idx.
   induction remaining as [|[src' m'] rest IH];
     intros start_idx src m space src_idx mod_idx Huniq Hnth Hbound.
@@ -727,8 +702,8 @@ Proof.
       (* Lookup succeeds in current module's remaps *)
       replace (start_idx + 0) with start_idx by lia.
       rewrite (lookup_remap_gen_remaps_for_module
-                 src m (offsets_for_module input start_idx) space src_idx Hbound).
-      destruct space; reflexivity.
+                 src m (offsets_for_module input start_idx) strategy space src_idx Hbound).
+      destruct strategy; destruct space; reflexivity.
     + (* mod_idx = S mod_idx': later module *)
       simpl in Hnth. simpl.
       rewrite lookup_remap_app.
@@ -746,7 +721,7 @@ Proof.
         - left. auto.
         - left. auto. }
       rewrite (lookup_remap_module_wrong_src src src' m' space
-                 (offsets_for_module input start_idx) src_idx Hneq).
+                 (offsets_for_module input start_idx) strategy src_idx Hneq).
       (* Use IH on rest *)
       replace (start_idx + S mod_idx') with (S start_idx + mod_idx') by lia.
       assert (Huniq_rest: forall i j s1 sm1 s2 sm2,
@@ -762,22 +737,22 @@ Proof.
 Qed.
 
 (* gen_all_remaps is complete: every source index has a corresponding
-   fused index, provided sources are unique. *)
+   fused index, provided sources are unique. Holds for any memory strategy. *)
 Theorem gen_all_remaps_complete :
-  forall input,
+  forall input strategy,
     unique_sources input ->
-    remaps_complete input (gen_all_remaps input).
+    remaps_complete input (gen_all_remaps input strategy).
 Proof.
-  intros input Hunique.
+  intros input strategy Hunique.
   unfold remaps_complete.
   intros src m space src_idx Hin Hlt.
   (* Get the position of (src, m) in input *)
   apply In_nth_error in Hin.
   destruct Hin as [mod_idx Hmod_idx].
-  (* The fused index depends on space: 0 for MemIdx, offset + src_idx otherwise *)
-  exists (match space with
-          | MemIdx => 0
-          | _ => offsets_for_module input (0 + mod_idx) space + src_idx
+  (* The fused index depends on strategy and space *)
+  exists (match strategy, space with
+          | SharedMemory, MemIdx => 0
+          | _, _ => offsets_for_module input (0 + mod_idx) space + src_idx
           end).
   unfold gen_all_remaps.
   (* Convert src_idx bound to space_count_of_module form *)
@@ -788,8 +763,8 @@ Proof.
   apply lookup_gen_all_remaps_aux_unique; auto.
 Qed.
 
-(* gen_all_remaps is injective for non-MemIdx spaces: distinct source indices
-   map to distinct fused indices within each index space.
+(* gen_all_remaps with SharedMemory is injective for non-MemIdx spaces:
+   distinct source indices map to distinct fused indices within each index space.
    MemIdx is excluded because in SharedMemory mode all MemIdx remaps map to 0,
    which is intentionally non-injective (all modules share one memory).
    Proof outline for non-MemIdx:
@@ -803,8 +778,8 @@ Qed.
    - If i1 > i2: symmetric to i1 < i2 *)
 Theorem gen_all_remaps_injective :
   forall input r1 r2,
-    In r1 (gen_all_remaps input) ->
-    In r2 (gen_all_remaps input) ->
+    In r1 (gen_all_remaps input SharedMemory) ->
+    In r2 (gen_all_remaps input SharedMemory) ->
     ir_space r1 = ir_space r2 ->
     ir_space r1 <> MemIdx ->
     ir_fused_idx r1 = ir_fused_idx r2 ->
@@ -817,15 +792,15 @@ Proof.
   destruct Hin1 as [i1 [src1 [m1 [Hnth1 Hgen1]]]].
   destruct Hin2 as [i2 [src2 [m2 [Hnth2 Hgen2]]]].
   (* Extract fused_idx formulas: since space <> MemIdx, use the non-MemIdx branch *)
-  pose proof (in_gen_remaps_for_module_fused _ _ _ _ Hgen1) as [Hsrc1 [_ Hfused1_fn]].
-  pose proof (in_gen_remaps_for_module_fused _ _ _ _ Hgen2) as [Hsrc2 [_ Hfused2_fn]].
+  pose proof (in_gen_remaps_for_module_fused _ _ _ _ _ Hgen1) as [Hsrc1 [_ Hfused1_fn]].
+  pose proof (in_gen_remaps_for_module_fused _ _ _ _ _ Hgen2) as [Hsrc2 [_ Hfused2_fn]].
   assert (Hfused1: ir_fused_idx r1 = offsets_for_module input (0 + i1) (ir_space r1) + ir_source_idx r1).
-  { apply Hfused1_fn. exact Hnot_mem. }
+  { apply Hfused1_fn. right. exact Hnot_mem. }
   assert (Hfused2: ir_fused_idx r2 = offsets_for_module input (0 + i2) (ir_space r2) + ir_source_idx r2).
-  { apply Hfused2_fn. rewrite <- Hspace. exact Hnot_mem. }
+  { apply Hfused2_fn. right. rewrite <- Hspace. exact Hnot_mem. }
   (* Extract source_idx bounds *)
-  pose proof (in_gen_remaps_for_module_bound _ _ _ _ Hgen1) as Hbound1.
-  pose proof (in_gen_remaps_for_module_bound _ _ _ _ Hgen2) as Hbound2.
+  pose proof (in_gen_remaps_for_module_bound _ _ _ _ _ Hgen1) as Hbound1.
+  pose proof (in_gen_remaps_for_module_bound _ _ _ _ _ Hgen2) as Hbound2.
   (* Rewrite ir_space r1 = ir_space r2 in bounds *)
   rewrite Hspace in Hbound1.
   (* The fused indices are equal *)
@@ -886,5 +861,168 @@ Proof.
     lia.
 Qed.
 
+(* -------------------------------------------------------------------------
+   SeparateMemory Injectivity
+
+   In SeparateMemory mode, MemIdx IS injective (normal offsetting like
+   all other spaces). This drops the ir_space r1 <> MemIdx restriction
+   from gen_all_remaps_injective above.
+   ------------------------------------------------------------------------- *)
+
+(* Helper: extract fused_idx offset formula for SeparateMemory remaps.
+   In SeparateMemory, ALL spaces (including MemIdx) use normal offsetting:
+   fused_idx = offset(module_position, space) + source_idx. *)
+Lemma separate_memory_fused_idx_formula :
+  forall src m offsets r,
+    In r (gen_remaps_for_module src m offsets SeparateMemory) ->
+    ir_fused_idx r = offsets (ir_space r) + ir_source_idx r.
+Proof.
+  intros src m offsets r Hin.
+  apply in_gen_remaps_for_module_fused_separate in Hin.
+  destruct Hin as [_ Hfused]. exact Hfused.
+Qed.
+
+(* In SeparateMemory mode, gen_all_remaps is injective for ALL index spaces
+   (including MemIdx). Each module retains its own memory, so memory indices
+   are offset normally and remain distinct.
+   The proof structure mirrors gen_all_remaps_injective but applies to all
+   spaces uniformly, using the SeparateMemory fused_idx formula. *)
+Theorem remap_injective_separate_memory :
+  forall input r1 r2,
+    In r1 (gen_all_remaps input SeparateMemory) ->
+    In r2 (gen_all_remaps input SeparateMemory) ->
+    ir_space r1 = ir_space r2 ->
+    ir_fused_idx r1 = ir_fused_idx r2 ->
+    ir_source r1 = ir_source r2 /\ ir_source_idx r1 = ir_source_idx r2.
+Proof.
+  intros input r1 r2 Hin1 Hin2 Hspace Hfused.
+  unfold gen_all_remaps in Hin1, Hin2.
+  apply in_gen_all_remaps_aux in Hin1.
+  apply in_gen_all_remaps_aux in Hin2.
+  destruct Hin1 as [i1 [src1 [m1 [Hnth1 Hgen1]]]].
+  destruct Hin2 as [i2 [src2 [m2 [Hnth2 Hgen2]]]].
+  (* In SeparateMemory, ALL spaces use normal offsetting *)
+  pose proof (in_gen_remaps_for_module_fused _ _ _ _ _ Hgen1) as [Hsrc1 [_ Hfused1_fn]].
+  pose proof (in_gen_remaps_for_module_fused _ _ _ _ _ Hgen2) as [Hsrc2 [_ Hfused2_fn]].
+  assert (Hfused1: ir_fused_idx r1 = offsets_for_module input (0 + i1) (ir_space r1) + ir_source_idx r1).
+  { apply Hfused1_fn. left. reflexivity. }
+  assert (Hfused2: ir_fused_idx r2 = offsets_for_module input (0 + i2) (ir_space r2) + ir_source_idx r2).
+  { apply Hfused2_fn. left. reflexivity. }
+  (* Extract source_idx bounds *)
+  pose proof (in_gen_remaps_for_module_bound _ _ _ _ _ Hgen1) as Hbound1.
+  pose proof (in_gen_remaps_for_module_bound _ _ _ _ _ Hgen2) as Hbound2.
+  (* Rewrite ir_space r1 = ir_space r2 in bounds *)
+  rewrite Hspace in Hbound1.
+  (* The fused indices are equal *)
+  rewrite Hfused1, Hfused2 in Hfused.
+  (* Compare module positions i1 and i2 *)
+  destruct (Nat.lt_trichotomy i1 i2) as [Hlt | [Heq | Hgt]].
+  - (* i1 < i2: contradiction *)
+    exfalso.
+    assert (Hoff_bound:
+      offsets_for_module input (0 + i1) (ir_space r2) +
+      space_count_of_module m1 (ir_space r2)
+      <= offsets_for_module input (0 + i2) (ir_space r2)).
+    { unfold offsets_for_module.
+      replace (0 + i1) with i1 by lia.
+      replace (0 + i2) with i2 by lia.
+      assert (Hstep: compute_offset input (ir_space r2) i1 +
+                      space_count_of_module m1 (ir_space r2) <=
+                      compute_offset input (ir_space r2) (S i1)).
+      { unfold compute_offset.
+        rewrite (firstn_S_nth_error _ _ _ Hnth1).
+        rewrite fold_left_app. simpl.
+        unfold space_count_of_module.
+        destruct (ir_space r2); simpl; lia. }
+      assert (Hmono: compute_offset input (ir_space r2) (S i1) <=
+                      compute_offset input (ir_space r2) i2).
+      { apply offset_monotonic; try lia.
+        apply nth_error_Some. rewrite Hnth2. discriminate. }
+      lia. }
+    lia.
+  - (* i1 = i2: same module position *)
+    subst i2.
+    rewrite Hnth1 in Hnth2. injection Hnth2 as Hsrc_eq Hm_eq.
+    subst src2 m2.
+    assert (Hidx_eq: ir_source_idx r1 = ir_source_idx r2) by lia.
+    split; [congruence | exact Hidx_eq].
+  - (* i2 < i1: symmetric to i1 < i2 *)
+    exfalso.
+    assert (Hoff_bound:
+      offsets_for_module input (0 + i2) (ir_space r2) +
+      space_count_of_module m2 (ir_space r2)
+      <= offsets_for_module input (0 + i1) (ir_space r2)).
+    { unfold offsets_for_module.
+      replace (0 + i2) with i2 by lia.
+      replace (0 + i1) with i1 by lia.
+      assert (Hstep: compute_offset input (ir_space r2) i2 +
+                      space_count_of_module m2 (ir_space r2) <=
+                      compute_offset input (ir_space r2) (S i2)).
+      { unfold compute_offset.
+        rewrite (firstn_S_nth_error _ _ _ Hnth2).
+        rewrite fold_left_app. simpl.
+        unfold space_count_of_module.
+        destruct (ir_space r2); simpl; lia. }
+      assert (Hmono: compute_offset input (ir_space r2) (S i2) <=
+                      compute_offset input (ir_space r2) i1).
+      { apply offset_monotonic; try lia.
+        apply nth_error_Some. rewrite Hnth1. discriminate. }
+      lia. }
+    lia.
+Qed.
+
+(* Corollary: the user-facing form using lookup_remap.
+   In SeparateMemory mode, gen_all_remaps is injective across ALL spaces
+   including MemIdx. This is the dual of gen_all_remaps_injective which
+   excludes MemIdx due to SharedMemory's all-map-to-0 behavior.
+   The proof extracts underlying remap entries from successful lookups,
+   then delegates to remap_injective_separate_memory. *)
+Theorem remap_injective_separate_memory_lookup :
+  forall input remaps,
+    unique_sources input ->
+    remaps = gen_all_remaps input SeparateMemory ->
+    forall space src1 i1 src2 i2 fused,
+      lookup_remap remaps space src1 i1 = Some fused ->
+      lookup_remap remaps space src2 i2 = Some fused ->
+      src1 = src2 /\ i1 = i2.
+Proof.
+  intros input remaps Huniq Hremaps space src1 i1 src2 i2 fused Hlookup1 Hlookup2.
+  subst remaps.
+  (* Extract the underlying remap entries from the successful lookups *)
+  unfold lookup_remap in Hlookup1, Hlookup2.
+  destruct (find _ _) as [r1|] eqn:Hfind1; [|discriminate].
+  destruct (find _ (gen_all_remaps input SeparateMemory)) as [r2|] eqn:Hfind2; [|discriminate].
+  injection Hlookup1 as Hfused1. injection Hlookup2 as Hfused2.
+  (* Extract membership and match conditions from find *)
+  apply find_some in Hfind1. destruct Hfind1 as [Hin1 Hmatch1].
+  apply find_some in Hfind2. destruct Hfind2 as [Hin2 Hmatch2].
+  (* Parse match conditions to extract ir_space, ir_source, ir_source_idx *)
+  apply Bool.andb_true_iff in Hmatch1. destruct Hmatch1 as [H123_1 Hidx1].
+  apply Bool.andb_true_iff in H123_1. destruct H123_1 as [H12_1 Hsrc_snd1].
+  apply Bool.andb_true_iff in H12_1. destruct H12_1 as [Hsp1 Hsrc_fst1].
+  apply index_space_eqb_eq in Hsp1.
+  apply Nat.eqb_eq in Hsrc_fst1. apply Nat.eqb_eq in Hsrc_snd1.
+  apply Nat.eqb_eq in Hidx1.
+  apply Bool.andb_true_iff in Hmatch2. destruct Hmatch2 as [H123_2 Hidx2].
+  apply Bool.andb_true_iff in H123_2. destruct H123_2 as [H12_2 Hsrc_snd2].
+  apply Bool.andb_true_iff in H12_2. destruct H12_2 as [Hsp2 Hsrc_fst2].
+  apply index_space_eqb_eq in Hsp2.
+  apply Nat.eqb_eq in Hsrc_fst2. apply Nat.eqb_eq in Hsrc_snd2.
+  apply Nat.eqb_eq in Hidx2.
+  (* ir_space r1 = space = ir_space r2 and ir_fused_idx r1 = fused = ir_fused_idx r2 *)
+  assert (Hspace_eq: ir_space r1 = ir_space r2) by congruence.
+  assert (Hfused_eq: ir_fused_idx r1 = ir_fused_idx r2) by congruence.
+  (* Apply the core injectivity theorem *)
+  pose proof (remap_injective_separate_memory input r1 r2 Hin1 Hin2 Hspace_eq Hfused_eq)
+    as [Hsrc_eq Hsrcidx_eq].
+  (* Reconstruct src1 = src2 and i1 = i2 from the remap entry fields *)
+  split.
+  - (* src1 = src2: from ir_source r1 = ir_source r2 and the match conditions *)
+    destruct src1, src2. simpl in *.
+    f_equal; [lia | lia].
+  - (* i1 = i2: from ir_source_idx r1 = ir_source_idx r2 *)
+    lia.
+Qed.
+
 (* End of merge_correctness.
-   Bridge theorem (gen_all_remaps → instr_rewrites) is in merge_bridge.v *)
+   Bridge theorem (gen_all_remaps -> instr_rewrites) is in merge_bridge.v *)

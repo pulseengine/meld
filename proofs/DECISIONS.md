@@ -24,6 +24,15 @@ proofs and specification-based tests for meld.
 
 These are exposed via Bazel filegroups under `//tests/spec:*`.
 
+## Memory strategy
+
+- The default memory strategy is `MultiMemory` (`SeparateMemory` in proofs).
+  Each component keeps its own linear memory in the fused module.
+- Multi-memory relies on WebAssembly Core Specification 3.0 (the same spec
+  baseline used for all other features).
+- `SharedMemory` is retained as a legacy option but is known to be broken
+  when any component uses `memory.grow`.
+
 ## Proof organization
 
 - Proofs live under `proofs/` and mirror `meld-core/src`.

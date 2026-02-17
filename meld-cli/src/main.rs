@@ -50,8 +50,8 @@ enum Commands {
         #[arg(short, long, default_value = "fused.wasm")]
         output: String,
 
-        /// Memory strategy: "shared" (default) or "multi"
-        #[arg(long, default_value = "shared")]
+        /// Memory strategy: "multi" (default) or "shared"
+        #[arg(long, default_value = "multi")]
         memory: String,
 
         /// Rebase memory addresses for shared memory (experimental)
@@ -184,14 +184,14 @@ fn fuse_command(
 
     // Parse memory strategy
     let memory_strategy = match memory.as_str() {
-        "shared" => MemoryStrategy::SharedMemory,
-        "multi" => {
-            println!("Multi-memory support is experimental (Phase 2)");
-            MemoryStrategy::MultiMemory
+        "multi" => MemoryStrategy::MultiMemory,
+        "shared" => {
+            println!("Using shared memory (legacy mode)");
+            MemoryStrategy::SharedMemory
         }
         _ => {
             return Err(anyhow!(
-                "Invalid memory strategy: {}. Use 'shared' or 'multi'",
+                "Invalid memory strategy: {}. Use 'multi' or 'shared'",
                 memory
             ));
         }
