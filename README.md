@@ -149,22 +149,28 @@ flowchart TD
 
 ## Memory Strategies
 
-### Shared Memory (Default)
+### Multi-Memory (Default)
 
-All components share a single linear memory. This is simpler and allows
-the most aggressive optimizations, but requires careful coordination.
+Each component retains its own linear memory. Cross-component calls that
+pass pointers use adapters that allocate in the callee's memory via
+`cabi_realloc` and copy data with `memory.copy`. This is the default
+because shared memory is broken when any component uses `memory.grow`.
+
+Requires multi-memory support in the target runtime (WebAssembly Core
+Spec 3.0 — supported by wasmtime, Chrome, and Firefox).
+
+```bash
+meld fuse a.wasm b.wasm -o fused.wasm
+```
+
+### Shared Memory (Legacy)
+
+All components share a single linear memory. Simpler and allows direct
+cross-component calls without adapters, but one component's `memory.grow`
+corrupts every other component's address space.
 
 ```bash
 meld fuse --memory shared a.wasm b.wasm -o fused.wasm
-```
-
-### Multi-Memory (Experimental)
-
-Each component retains its own linear memory. This provides better isolation
-but requires multi-memory support in the target runtime.
-
-```bash
-meld fuse --memory multi a.wasm b.wasm -o fused.wasm
 ```
 
 ## Supply Chain Security
@@ -196,17 +202,18 @@ Cross-component calls may require adapters that handle:
 - Resource handle transfer
 
 Meld generates these adapters using techniques inspired by wasmtime's FACT
-(Fused Adapter Compiler of Trampolines). When components share a single memory,
-cross-component calls are resolved to direct function calls with no adapter
-overhead.
+(Fused Adapter Compiler of Trampolines). In multi-memory mode (default),
+adapters allocate in the callee's memory via `cabi_realloc`, copy data with
+`memory.copy`, and call the target. In shared memory mode, cross-component
+calls are resolved to direct function calls with no adapter overhead.
 
 ## Limitations
 
-- **Phase 1**: Currently uses shared memory strategy only (multi-memory planned)
 - **Resources**: Resource handle transfer across components is limited
 - **Async**: Async component functions not yet supported
-- **Cross-memory adapters**: When components use separate memories, the memory-copy
-  adapter generates direct calls (full copy-and-rewrite is planned)
+- **Result copying**: When a callee returns pointers into its own memory,
+  the adapter copies the data back to the caller's memory for the common
+  `(ptr, len)` return pattern; more complex return types are not yet handled
 - **String transcoding**: UTF-8↔UTF-16 and Latin-1→UTF-8 are implemented;
   UTF-8→Latin-1 is not yet supported
 

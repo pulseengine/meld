@@ -143,10 +143,10 @@ Inductive instr : Type :=
   | GlobalGet (globalidx : idx)
   | GlobalSet (globalidx : idx)
   (* Memory *)
-  | MemorySize
-  | MemoryGrow
-  | Load (vt : valtype) (memarg_offset : nat) (memarg_align : nat)
-  | Store (vt : valtype) (memarg_offset : nat) (memarg_align : nat)
+  | MemorySize (memidx : idx)
+  | MemoryGrow (memidx : idx)
+  | Load (vt : valtype) (memidx : idx) (memarg_offset : nat) (memarg_align : nat)
+  | Store (vt : valtype) (memidx : idx) (memarg_offset : nat) (memarg_align : nat)
   (* Numeric (opaque for fusion) *)
   | NumericOp (op : nat)
   (* Reference *)
@@ -163,9 +163,9 @@ Inductive instr : Type :=
   | TableInit (tableidx : idx) (elemidx : idx)
   | ElemDrop (elemidx : idx)
   (* Memory bulk *)
-  | MemoryCopy
-  | MemoryFill
-  | MemoryInit (dataidx : idx)
+  | MemoryCopy (dst_memidx : idx) (src_memidx : idx)
+  | MemoryFill (memidx : idx)
+  | MemoryInit (dataidx : idx) (memidx : idx)
   | DataDrop (dataidx : idx).
 
 (* -------------------------------------------------------------------------

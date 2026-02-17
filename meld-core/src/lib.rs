@@ -35,8 +35,11 @@
 //!
 //! ## Memory Strategy
 //!
-//! - **Phase 1** (current): Single shared memory space
-//! - **Phase 2** (future): Multi-memory support where each component keeps its own memory
+//! - **Multi-memory** (default): Each component keeps its own linear memory.
+//!   Cross-component pointer-passing calls use adapters with `cabi_realloc`
+//!   and `memory.copy`.
+//! - **Shared memory** (legacy): All components share one memory. Broken when
+//!   any component uses `memory.grow`.
 
 pub mod adapter;
 pub mod attestation;
@@ -79,7 +82,7 @@ pub struct FuserConfig {
 impl Default for FuserConfig {
     fn default() -> Self {
         Self {
-            memory_strategy: MemoryStrategy::SharedMemory,
+            memory_strategy: MemoryStrategy::MultiMemory,
             attestation: true,
             address_rebasing: false,
             preserve_names: false,
@@ -91,12 +94,15 @@ impl Default for FuserConfig {
 /// Memory strategy for the fused output
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MemoryStrategy {
-    /// All components share a single memory (Phase 1)
-    /// Simpler but requires careful offset management
+    /// All components share a single memory.
+    /// Broken when any component uses `memory.grow` — one component's
+    /// growth corrupts every other component's address space.
     SharedMemory,
 
-    /// Each component keeps its own memory (Phase 2)
-    /// Requires multi-memory support
+    /// Each component keeps its own memory (default).
+    /// Cross-component pointer-passing calls use adapters with
+    /// `cabi_realloc` and `memory.copy`. Requires WebAssembly
+    /// multi-memory (Core Spec 3.0).
     MultiMemory,
 }
 
@@ -608,7 +614,7 @@ mod tests {
     #[test]
     fn test_fuser_config_default() {
         let config = FuserConfig::default();
-        assert_eq!(config.memory_strategy, MemoryStrategy::SharedMemory);
+        assert_eq!(config.memory_strategy, MemoryStrategy::MultiMemory);
         assert!(config.attestation);
         assert!(!config.address_rebasing);
         assert!(!config.preserve_names);

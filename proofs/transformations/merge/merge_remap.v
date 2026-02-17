@@ -598,23 +598,69 @@ Local Ltac solve_mem_case :=
     try (intro; contradiction)
   end.
 
-(* A remap in gen_remaps_for_module: source identity and fused_idx formula.
-   For MemIdx (SharedMemory), fused_idx = 0.
+(* A remap in gen_remaps_for_module with SharedMemory strategy:
+   source identity and fused_idx formula.
+   For MemIdx, fused_idx = 0.
    For all other spaces, fused_idx = offsets(space) + source_idx. *)
-Lemma in_gen_remaps_for_module_fused :
+Lemma in_gen_remaps_for_module_fused_shared :
   forall src m offsets r,
-    In r (gen_remaps_for_module src m offsets) ->
+    In r (gen_remaps_for_module src m offsets SharedMemory) ->
     ir_source r = src /\
     (ir_space r = MemIdx -> ir_fused_idx r = 0) /\
     (ir_space r <> MemIdx -> ir_fused_idx r = offsets (ir_space r) + ir_source_idx r).
 Proof.
   intros src m offsets r Hin.
-  unfold gen_remaps_for_module in Hin.
+  unfold gen_remaps_for_module in Hin. simpl in Hin.
   (* r is in one of 7 appended lists: TypeIdx, FuncIdx, TableIdx, MemIdx,
      GlobalIdx, ElemIdx, DataIdx. The MemIdx chunk uses gen_remaps_for_space_zero
      while all others use gen_remaps_for_space. *)
   repeat (apply in_app_iff in Hin; destruct Hin as [Hin | Hin]).
   all: first [ solve_non_mem_case | solve_mem_case ].
+Qed.
+
+(* A remap in gen_remaps_for_module with SeparateMemory strategy:
+   source identity and fused_idx formula.
+   For ALL spaces (including MemIdx), fused_idx = offsets(space) + source_idx. *)
+Lemma in_gen_remaps_for_module_fused_separate :
+  forall src m offsets r,
+    In r (gen_remaps_for_module src m offsets SeparateMemory) ->
+    ir_source r = src /\
+    ir_fused_idx r = offsets (ir_space r) + ir_source_idx r.
+Proof.
+  intros src m offsets r Hin.
+  unfold gen_remaps_for_module in Hin. simpl in Hin.
+  (* r is in one of 7 appended lists, ALL using gen_remaps_for_space
+     (including MemIdx in SeparateMemory mode). *)
+  repeat (apply in_app_iff in Hin; destruct Hin as [Hin | Hin]).
+  all: solve_non_mem_case.
+Qed.
+
+(* General strategy-parametric version: combines SharedMemory and SeparateMemory cases.
+   This is the main lemma used by downstream proofs. *)
+Lemma in_gen_remaps_for_module_fused :
+  forall src m offsets strategy r,
+    In r (gen_remaps_for_module src m offsets strategy) ->
+    ir_source r = src /\
+    (strategy = SharedMemory -> ir_space r = MemIdx -> ir_fused_idx r = 0) /\
+    (strategy = SeparateMemory \/ ir_space r <> MemIdx ->
+       ir_fused_idx r = offsets (ir_space r) + ir_source_idx r).
+Proof.
+  intros src m offsets strategy r Hin.
+  destruct strategy.
+  - (* SharedMemory *)
+    apply in_gen_remaps_for_module_fused_shared in Hin.
+    destruct Hin as [Hsrc [Hmem Hnonmem]].
+    repeat split; auto.
+    + intros _ Hsp. exact (Hmem Hsp).
+    + intros [Habs | Hneq].
+      * discriminate.
+      * exact (Hnonmem Hneq).
+  - (* SeparateMemory *)
+    apply in_gen_remaps_for_module_fused_separate in Hin.
+    destruct Hin as [Hsrc Hfused].
+    repeat split; auto.
+    + intros Habs. discriminate.
+    + intros _. exact Hfused.
 Qed.
 
 (* -------------------------------------------------------------------------
@@ -637,11 +683,11 @@ Qed.
 
 (* Every remap in gen_remaps_for_module has ir_source = src *)
 Lemma gen_remaps_source :
-  forall src m offsets r,
-    In r (gen_remaps_for_module src m offsets) ->
+  forall src m offsets strategy r,
+    In r (gen_remaps_for_module src m offsets strategy) ->
     ir_source r = src.
 Proof.
-  intros src m offsets r Hin.
+  intros src m offsets strategy r Hin.
   apply in_gen_remaps_for_module_fused in Hin.
   destruct Hin as [Hsrc _]. exact Hsrc.
 Qed.
@@ -682,19 +728,19 @@ Qed.
 
 (* Corollary: find fails in gen_remaps_for_module when sources differ *)
 Lemma find_gen_remaps_wrong_source :
-  forall src' m' offsets space src src_idx,
+  forall src' m' offsets strategy space src src_idx,
     src <> src' ->
     find (fun r =>
       index_space_eqb (ir_space r) space &&
       Nat.eqb (fst (ir_source r)) (fst src) &&
       Nat.eqb (snd (ir_source r)) (snd src) &&
       Nat.eqb (ir_source_idx r) src_idx)
-    (gen_remaps_for_module src' m' offsets) = None.
+    (gen_remaps_for_module src' m' offsets strategy) = None.
 Proof.
-  intros src' m' offsets space src src_idx Hneq.
+  intros src' m' offsets strategy space src src_idx Hneq.
   apply find_wrong_source.
   intros r Hin.
-  pose proof (gen_remaps_source src' m' offsets r Hin) as Hsrc.
+  pose proof (gen_remaps_source src' m' offsets strategy r Hin) as Hsrc.
   rewrite Hsrc. intro Heq. apply Hneq. symmetry. exact Heq.
 Qed.
 
@@ -715,47 +761,52 @@ Qed.
 (* Helper: lookup_remap in gen_remaps_for_module succeeds for valid indices.
    Navigates the 7-space concatenation (Type, Func, Table, Mem, Global, Elem, Data)
    by case-splitting on the target space and eliminating wrong-space chunks.
-   For MemIdx (SharedMemory), the result is always 0.
-   For all other spaces, the result is offsets(space) + src_idx. *)
+   For SharedMemory + MemIdx, the result is always 0.
+   For SeparateMemory (all spaces) and non-MemIdx spaces, the result is
+   offsets(space) + src_idx. *)
 Lemma lookup_remap_gen_remaps_for_module :
-  forall src m offsets space src_idx,
+  forall src m offsets strategy space src_idx,
     src_idx < space_count_of_module m space ->
-    lookup_remap (gen_remaps_for_module src m offsets) space src src_idx
-    = Some (match space with MemIdx => 0 | _ => offsets space + src_idx end).
+    lookup_remap (gen_remaps_for_module src m offsets strategy) space src src_idx
+    = Some (match strategy, space with
+            | SharedMemory, MemIdx => 0
+            | _, _ => offsets space + src_idx
+            end).
 Proof.
-  intros src m offsets space src_idx Hbound.
+  intros src m offsets strategy space src_idx Hbound.
   unfold lookup_remap, gen_remaps_for_module, space_count_of_module in *.
-  destruct space; repeat rewrite find_app_remap.
-  (* Non-MemIdx cases: navigate past wrong-space chunks, find in correct chunk *)
+  destruct strategy; destruct space; simpl; repeat rewrite find_app_remap.
+  (* All cases: navigate past wrong-space chunks, find in correct chunk *)
   all: repeat first
     [ rewrite find_gen_remaps_for_space_wrong_space; [simpl | discriminate]
     | rewrite find_gen_remaps_for_space_zero_wrong_space; [simpl | discriminate] ].
-  (* MemIdx case: use gen_remaps_for_space_zero lookup *)
+  (* SharedMemory + MemIdx: use gen_remaps_for_space_zero lookup *)
   all: first
-    [ (* MemIdx: gen_remaps_for_space_zero *)
+    [ (* MemIdx with SharedMemory: gen_remaps_for_space_zero *)
       unfold gen_remaps_for_space_zero;
       rewrite find_remap_in_mapped_seq_zero; [simpl; reflexivity | lia]
-    | (* All other spaces: gen_remaps_for_space *)
+    | (* All other cases: gen_remaps_for_space *)
       unfold gen_remaps_for_space;
       rewrite find_remap_in_mapped_seq; [simpl; reflexivity | lia] ].
 Qed.
 
 (* Lookup in gen_all_remaps succeeds when sources are unique.
    The NoDup hypothesis ensures find correctly partitions across modules.
-   For MemIdx (SharedMemory), the result is always 0.
-   For all other spaces, the result is offset + src_idx. *)
+   For SharedMemory + MemIdx, the result is always 0.
+   For SeparateMemory (all spaces) and non-MemIdx spaces, the result is
+   offset + src_idx. *)
 Lemma lookup_gen_all_remaps_aux_success :
-  forall input start_idx remaining src m space src_idx mod_idx,
+  forall input start_idx remaining strategy src m space src_idx mod_idx,
     NoDup (map fst remaining) ->
     nth_error remaining mod_idx = Some (src, m) ->
     src_idx < space_count_of_module m space ->
-    lookup_remap (gen_all_remaps_aux input start_idx remaining) space src src_idx
-    = Some (match space with
-            | MemIdx => 0
-            | _ => offsets_for_module input (start_idx + mod_idx) space + src_idx
+    lookup_remap (gen_all_remaps_aux input start_idx remaining strategy) space src src_idx
+    = Some (match strategy, space with
+            | SharedMemory, MemIdx => 0
+            | _, _ => offsets_for_module input (start_idx + mod_idx) space + src_idx
             end).
 Proof.
-  intros input start_idx remaining.
+  intros input start_idx remaining strategy.
   revert start_idx.
   induction remaining as [|[src' m'] rest IH]; intros start_idx src m space src_idx mod_idx Hnodup Hnth Hbound.
   - destruct mod_idx; discriminate.
@@ -766,9 +817,9 @@ Proof.
       replace (start_idx + 0) with start_idx by lia.
       apply lookup_remap_app.
       rewrite lookup_remap_gen_remaps_for_module; [|exact Hbound].
-      (* The result from lookup_remap_gen_remaps_for_module uses match on space,
-         which aligns with our conclusion *)
-      destruct space; reflexivity.
+      (* The result from lookup_remap_gen_remaps_for_module uses match on
+         (strategy, space), which aligns with our conclusion *)
+      destruct strategy; destruct space; reflexivity.
     + (* mod_idx = S mod_idx': source is in the tail *)
       simpl in Hnth.
       simpl.

@@ -55,8 +55,23 @@ Inductive instr_wf (m : module) : instr -> Prop :=
         elemidx < space_count_of_module m ElemIdx) ->
       (forall elemidx, i = ElemDrop elemidx ->
         elemidx < space_count_of_module m ElemIdx) ->
-      (forall dataidx, i = MemoryInit dataidx ->
-        dataidx < space_count_of_module m DataIdx) ->
+      (* Memory instructions with memidx *)
+      (forall memidx, i = MemorySize memidx ->
+        memidx < space_count_of_module m MemIdx) ->
+      (forall memidx, i = MemoryGrow memidx ->
+        memidx < space_count_of_module m MemIdx) ->
+      (forall vt memidx off align, i = Load vt memidx off align ->
+        memidx < space_count_of_module m MemIdx) ->
+      (forall vt memidx off align, i = Store vt memidx off align ->
+        memidx < space_count_of_module m MemIdx) ->
+      (forall dst_mem src_mem, i = MemoryCopy dst_mem src_mem ->
+        dst_mem < space_count_of_module m MemIdx /\
+        src_mem < space_count_of_module m MemIdx) ->
+      (forall memidx, i = MemoryFill memidx ->
+        memidx < space_count_of_module m MemIdx) ->
+      (forall dataidx memidx, i = MemoryInit dataidx memidx ->
+        dataidx < space_count_of_module m DataIdx /\
+        memidx < space_count_of_module m MemIdx) ->
       (forall dataidx, i = DataDrop dataidx ->
         dataidx < space_count_of_module m DataIdx) ->
       (* Nested bodies must be recursively well-formed *)
@@ -180,8 +195,23 @@ Lemma single_instr_rewritable :
                     lookup_remap remaps ElemIdx src elemidx = Some e') ->
     (forall elemidx, i = ElemDrop elemidx ->
       exists idx', lookup_remap remaps ElemIdx src elemidx = Some idx') ->
-    (forall dataidx, i = MemoryInit dataidx ->
-      exists idx', lookup_remap remaps DataIdx src dataidx = Some idx') ->
+    (* Memory instructions with memidx *)
+    (forall memidx, i = MemorySize memidx ->
+      exists idx', lookup_remap remaps MemIdx src memidx = Some idx') ->
+    (forall memidx, i = MemoryGrow memidx ->
+      exists idx', lookup_remap remaps MemIdx src memidx = Some idx') ->
+    (forall vt memidx off align, i = Load vt memidx off align ->
+      exists idx', lookup_remap remaps MemIdx src memidx = Some idx') ->
+    (forall vt memidx off align, i = Store vt memidx off align ->
+      exists idx', lookup_remap remaps MemIdx src memidx = Some idx') ->
+    (forall dst_mem src_mem, i = MemoryCopy dst_mem src_mem ->
+      exists d' s', lookup_remap remaps MemIdx src dst_mem = Some d' /\
+                    lookup_remap remaps MemIdx src src_mem = Some s') ->
+    (forall memidx, i = MemoryFill memidx ->
+      exists idx', lookup_remap remaps MemIdx src memidx = Some idx') ->
+    (forall dataidx memidx, i = MemoryInit dataidx memidx ->
+      exists d' m', lookup_remap remaps DataIdx src dataidx = Some d' /\
+                    lookup_remap remaps MemIdx src memidx = Some m') ->
     (forall dataidx, i = DataDrop dataidx ->
       exists idx', lookup_remap remaps DataIdx src dataidx = Some idx') ->
     (* Nested blocks: assume bodies are already rewritable *)
@@ -198,7 +228,9 @@ Proof.
   intros remaps src i
     Hcall Hcall_ind Hgget Hgset Hreffunc
     Htget Htset Htsize Htgrow Htfill Htcopy Htinit
-    Hedrop Hminit Hddrop
+    Hedrop
+    Hmemsize Hmemgrow Hload Hstore Hmemcopy Hmemfill Hminit
+    Hddrop
     Hblock Hloop Hif.
   destruct i.
   (* Control flow — pass through unchanged *)
@@ -233,10 +265,14 @@ Proof.
   - destruct (Hgset _ eq_refl) as [idx' Hlookup].
     exists (GlobalSet idx'). apply RW_GlobalSet. exact Hlookup.
   (* Memory *)
-  - exists MemorySize. apply RW_MemorySize.
-  - exists MemoryGrow. apply RW_MemoryGrow.
-  - exists (Load vt memarg_offset memarg_align). apply RW_Load.
-  - exists (Store vt memarg_offset memarg_align). apply RW_Store.
+  - destruct (Hmemsize _ eq_refl) as [idx' Hlookup].
+    exists (MemorySize idx'). apply RW_MemorySize. exact Hlookup.
+  - destruct (Hmemgrow _ eq_refl) as [idx' Hlookup].
+    exists (MemoryGrow idx'). apply RW_MemoryGrow. exact Hlookup.
+  - destruct (Hload _ _ _ _ eq_refl) as [idx' Hlookup].
+    exists (Load vt idx' memarg_offset memarg_align). apply RW_Load. exact Hlookup.
+  - destruct (Hstore _ _ _ _ eq_refl) as [idx' Hlookup].
+    exists (Store vt idx' memarg_offset memarg_align). apply RW_Store. exact Hlookup.
   (* Numeric *)
   - exists (NumericOp op). apply RW_NumericOp.
   (* Reference *)
@@ -262,10 +298,12 @@ Proof.
   - destruct (Hedrop _ eq_refl) as [idx' Hlookup].
     exists (ElemDrop idx'). apply RW_ElemDrop. exact Hlookup.
   (* Memory bulk *)
-  - exists MemoryCopy. apply RW_MemoryCopy.
-  - exists MemoryFill. apply RW_MemoryFill.
-  - destruct (Hminit _ eq_refl) as [idx' Hlookup].
-    exists (MemoryInit idx'). apply RW_MemoryInit. exact Hlookup.
+  - destruct (Hmemcopy _ _ eq_refl) as [d' [s' [Hd Hs]]].
+    exists (MemoryCopy d' s'). apply RW_MemoryCopy; assumption.
+  - destruct (Hmemfill _ eq_refl) as [idx' Hlookup].
+    exists (MemoryFill idx'). apply RW_MemoryFill. exact Hlookup.
+  - destruct (Hminit _ _ eq_refl) as [d' [m' [Hd Hm]]].
+    exists (MemoryInit d' m'). apply RW_MemoryInit; assumption.
   - destruct (Hddrop _ eq_refl) as [idx' Hlookup].
     exists (DataDrop idx'). apply RW_DataDrop. exact Hlookup.
 Qed.
@@ -282,7 +320,7 @@ Qed.
    ------------------------------------------------------------------------- *)
 
 Lemma instr_list_rewritable :
-  forall n input,
+  forall n input strategy,
     unique_sources input ->
     forall src m,
       In (src, m) input ->
@@ -290,12 +328,12 @@ Lemma instr_list_rewritable :
         Forall (instr_wf m) instrs ->
         instr_list_size instrs <= n ->
         exists instrs',
-          Forall2 (instr_rewrites (gen_all_remaps input) src) instrs instrs'.
+          Forall2 (instr_rewrites (gen_all_remaps input strategy) src) instrs instrs'.
 Proof.
   induction n as [n IHn] using lt_wf_ind.
-  intros input Huniq src m Hin instrs Hwf Hsize.
+  intros input strategy Huniq src m Hin instrs Hwf Hsize.
   (* Get completeness of gen_all_remaps *)
-  assert (Hcomplete: remaps_complete input (gen_all_remaps input)).
+  assert (Hcomplete: remaps_complete input (gen_all_remaps input strategy)).
   { apply gen_all_remaps_complete. exact Huniq. }
   unfold remaps_complete in Hcomplete.
   destruct instrs as [|i rest].
@@ -311,17 +349,19 @@ Proof.
     pose proof (instr_size_pos i) as Hi_pos.
     (* Rewrite the rest by IH (size of rest < n since head has size >= 1) *)
     assert (Hrest: exists rest',
-      Forall2 (instr_rewrites (gen_all_remaps input) src) rest rest').
+      Forall2 (instr_rewrites (gen_all_remaps input strategy) src) rest rest').
     { apply (IHn (instr_list_size rest)); try assumption; try lia. }
     destruct Hrest as [rest' Hrest'].
     (* Rewrite the head instruction i using single_instr_rewritable *)
     inversion Hwf_i as [? Hcall Hcall_ind Hgget Hgset Hreffunc
       Htget Htset Htsize Htgrow Htfill Htcopy Htinit
-      Hedrop Hminit Hddrop Hblock Hloop Hif]. subst.
+      Hedrop
+      Hmemsize Hmemgrow Hload Hstore Hmemcopy Hmemfill Hminit
+      Hddrop Hblock Hloop Hif]. subst.
     assert (Hi: exists i',
-      instr_rewrites (gen_all_remaps input) src i i').
+      instr_rewrites (gen_all_remaps input strategy) src i i').
     { apply single_instr_rewritable.
-      (* 15 index-bound hypotheses: combine instr_wf bounds with Hcomplete *)
+      (* Index-bound hypotheses: combine instr_wf bounds with Hcomplete *)
       - (* Call *) intros funcidx Heq.
         apply (Hcomplete src m FuncIdx funcidx Hin).
         specialize (Hcall funcidx Heq).
@@ -384,10 +424,40 @@ Proof.
         apply (Hcomplete src m ElemIdx eidx Hin).
         specialize (Hedrop eidx Heq).
         unfold space_count_of_module in Hedrop. exact Hedrop.
-      - (* MemoryInit *) intros didx Heq.
-        apply (Hcomplete src m DataIdx didx Hin).
-        specialize (Hminit didx Heq).
-        unfold space_count_of_module in Hminit. exact Hminit.
+      - (* MemorySize *) intros midx Heq.
+        apply (Hcomplete src m MemIdx midx Hin).
+        specialize (Hmemsize midx Heq).
+        unfold space_count_of_module in Hmemsize. exact Hmemsize.
+      - (* MemoryGrow *) intros midx Heq.
+        apply (Hcomplete src m MemIdx midx Hin).
+        specialize (Hmemgrow midx Heq).
+        unfold space_count_of_module in Hmemgrow. exact Hmemgrow.
+      - (* Load *) intros vt midx off align Heq.
+        apply (Hcomplete src m MemIdx midx Hin).
+        specialize (Hload vt midx off align Heq).
+        unfold space_count_of_module in Hload. exact Hload.
+      - (* Store *) intros vt midx off align Heq.
+        apply (Hcomplete src m MemIdx midx Hin).
+        specialize (Hstore vt midx off align Heq).
+        unfold space_count_of_module in Hstore. exact Hstore.
+      - (* MemoryCopy *) intros dst_mem src_mem Heq.
+        specialize (Hmemcopy dst_mem src_mem Heq). destruct Hmemcopy as [Hd Hs].
+        destruct (Hcomplete src m MemIdx dst_mem Hin) as [d' Hd'].
+        { unfold space_count_of_module in Hd. exact Hd. }
+        destruct (Hcomplete src m MemIdx src_mem Hin) as [s' Hs'].
+        { unfold space_count_of_module in Hs. exact Hs. }
+        exists d', s'. auto.
+      - (* MemoryFill *) intros midx Heq.
+        apply (Hcomplete src m MemIdx midx Hin).
+        specialize (Hmemfill midx Heq).
+        unfold space_count_of_module in Hmemfill. exact Hmemfill.
+      - (* MemoryInit *) intros didx midx Heq.
+        specialize (Hminit didx midx Heq). destruct Hminit as [Hd Hm].
+        destruct (Hcomplete src m DataIdx didx Hin) as [d' Hd'].
+        { unfold space_count_of_module in Hd. exact Hd. }
+        destruct (Hcomplete src m MemIdx midx Hin) as [m' Hm'].
+        { unfold space_count_of_module in Hm. exact Hm. }
+        exists d', m'. auto.
       - (* DataDrop *) intros didx Heq.
         apply (Hcomplete src m DataIdx didx Hin).
         specialize (Hddrop didx Heq).
@@ -413,10 +483,10 @@ Proof.
         assert (Helse_size: instr_list_size else_ < instr_size i).
         { subst i. simpl. rewrite !instr_list_size_eq. lia. }
         destruct (IHn (instr_list_size then_) ltac:(lia)
-                      input Huniq src m Hin then_ Hwf_then ltac:(lia))
+                      input strategy Huniq src m Hin then_ Hwf_then ltac:(lia))
           as [then_' Hthen'].
         destruct (IHn (instr_list_size else_) ltac:(lia)
-                      input Huniq src m Hin else_ Hwf_else ltac:(lia))
+                      input strategy Huniq src m Hin else_ Hwf_else ltac:(lia))
           as [else_' Helse'].
         exists then_', else_'. auto.
     }
@@ -436,17 +506,17 @@ Qed.
    ------------------------------------------------------------------------- *)
 
 Theorem gen_all_remaps_enables_rewriting :
-  forall input,
+  forall input strategy,
     unique_sources input ->
     forall src m f,
       In (src, m) input ->
       module_wf m ->
       In f (mod_funcs m) ->
       exists body',
-        Forall2 (instr_rewrites (gen_all_remaps input) src)
+        Forall2 (instr_rewrites (gen_all_remaps input strategy) src)
                 (func_body f) body'.
 Proof.
-  intros input Huniq src m f Hin Hwf Hf_in.
+  intros input strategy Huniq src m f Hin Hwf Hf_in.
   apply (instr_list_rewritable (instr_list_size (func_body f))); auto.
   - apply Hwf. exact Hf_in.
 Qed.

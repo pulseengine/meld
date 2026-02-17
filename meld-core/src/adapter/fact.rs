@@ -147,15 +147,17 @@ impl FactStyleGenerator {
     }
 
     /// Generate an adapter that copies data between memories
+    ///
+    /// When caller and callee use different memories, pointer arguments must
+    /// be remapped: allocate in callee's memory via `cabi_realloc`, copy the
+    /// data with `memory.copy $callee $caller`, then call the target with the
+    /// new pointer.  Handles the common `(ptr, len)` pair pattern.
     fn generate_memory_copy_adapter(
         &self,
         site: &AdapterSite,
         merged: &MergedModule,
         options: &AdapterOptions,
     ) -> Result<(u32, Function)> {
-        // For simple memory copying without transcoding
-        // This handles cases like copying byte arrays between components
-
         let target_func = self.resolve_target_function(site, merged)?;
         let type_idx = merged
             .functions
@@ -166,28 +168,72 @@ impl FactStyleGenerator {
         let func_type = merged.types.get(type_idx as usize);
         let param_count = func_type.map(|t| t.params.len()).unwrap_or(0);
 
-        let mut func = Function::new([]);
-
         // If memories are the same, just do direct call
         if options.caller_memory == options.callee_memory {
+            let mut func = Function::new([]);
             for i in 0..param_count {
                 func.instruction(&Instruction::LocalGet(i as u32));
             }
             func.instruction(&Instruction::Call(target_func));
-        } else {
-            // Need to copy data between memories
-            // This is a simplified version - real implementation would:
-            // 1. Allocate space in callee's memory
-            // 2. Copy data from caller's memory
-            // 3. Call with new pointers
-            // 4. Copy results back
-
-            // For now, generate a placeholder
-            for i in 0..param_count {
-                func.instruction(&Instruction::LocalGet(i as u32));
-            }
-            func.instruction(&Instruction::Call(target_func));
+            func.instruction(&Instruction::End);
+            return Ok((type_idx, func));
         }
+
+        // Memories differ — need cross-memory copy.
+        // Requires callee's cabi_realloc to allocate destination buffer.
+        let callee_realloc = match options.callee_realloc {
+            Some(idx) => idx,
+            None => {
+                log::warn!("Cross-memory copy: no callee realloc, falling back to direct call");
+                let mut func = Function::new([]);
+                for i in 0..param_count {
+                    func.instruction(&Instruction::LocalGet(i as u32));
+                }
+                func.instruction(&Instruction::Call(target_func));
+                func.instruction(&Instruction::End);
+                return Ok((type_idx, func));
+            }
+        };
+
+        // We need one scratch local (dest_ptr) for the allocated pointer
+        let dest_ptr_local = param_count as u32;
+        let mut func = Function::new(vec![(1, wasm_encoder::ValType::I32)]);
+
+        // Assume params[0] = ptr, params[1] = len (the common Canonical ABI pattern).
+        // If param_count < 2, fall back to direct call (no pointer args).
+        if param_count < 2 {
+            for i in 0..param_count {
+                func.instruction(&Instruction::LocalGet(i as u32));
+            }
+            func.instruction(&Instruction::Call(target_func));
+            func.instruction(&Instruction::End);
+            return Ok((type_idx, func));
+        }
+
+        // 1. Allocate in callee's memory: dest_ptr = cabi_realloc(0, 0, 1, len)
+        func.instruction(&Instruction::I32Const(0)); // original_ptr
+        func.instruction(&Instruction::I32Const(0)); // original_size
+        func.instruction(&Instruction::I32Const(1)); // alignment
+        func.instruction(&Instruction::LocalGet(1)); // len
+        func.instruction(&Instruction::Call(callee_realloc));
+        func.instruction(&Instruction::LocalSet(dest_ptr_local));
+
+        // 2. Copy data: memory.copy $callee_mem $caller_mem (dest_ptr, src_ptr, len)
+        func.instruction(&Instruction::LocalGet(dest_ptr_local)); // dst
+        func.instruction(&Instruction::LocalGet(0)); // src (caller ptr)
+        func.instruction(&Instruction::LocalGet(1)); // len
+        func.instruction(&Instruction::MemoryCopy {
+            src_mem: options.caller_memory,
+            dst_mem: options.callee_memory,
+        });
+
+        // 3. Call target with (dest_ptr, len, ...remaining args)
+        func.instruction(&Instruction::LocalGet(dest_ptr_local));
+        func.instruction(&Instruction::LocalGet(1)); // len
+        for i in 2..param_count {
+            func.instruction(&Instruction::LocalGet(i as u32));
+        }
+        func.instruction(&Instruction::Call(target_func));
 
         func.instruction(&Instruction::End);
 
@@ -308,15 +354,16 @@ impl FactStyleGenerator {
         let byte_local = param_count as u32 + 3;
         let cp_local = param_count as u32 + 4;
 
-        let mem8 = wasm_encoder::MemArg {
+        // Source reads use caller_memory, destination writes use callee_memory
+        let src_mem8 = wasm_encoder::MemArg {
             offset: 0,
             align: 0,
-            memory_index: 0,
+            memory_index: options.caller_memory,
         };
-        let mem16 = wasm_encoder::MemArg {
+        let dst_mem16 = wasm_encoder::MemArg {
             offset: 0,
             align: 1,
-            memory_index: 0,
+            memory_index: options.callee_memory,
         };
 
         // Step 1: Allocate output buffer = 2 * input_len bytes via cabi_realloc
@@ -346,11 +393,11 @@ impl FactStyleGenerator {
         func.instruction(&Instruction::I32GeU);
         func.instruction(&Instruction::BrIf(1));
 
-        // Read lead byte
+        // Read lead byte from caller memory
         func.instruction(&Instruction::LocalGet(0));
         func.instruction(&Instruction::LocalGet(src_idx_local));
         func.instruction(&Instruction::I32Add);
-        func.instruction(&Instruction::I32Load8U(mem8));
+        func.instruction(&Instruction::I32Load8U(src_mem8));
         func.instruction(&Instruction::LocalSet(byte_local));
 
         // --- Decode UTF-8 sequence into code_point, advance src_idx ---
@@ -389,7 +436,7 @@ impl FactStyleGenerator {
                 func.instruction(&Instruction::I32Add);
                 func.instruction(&Instruction::I32Const(1));
                 func.instruction(&Instruction::I32Add);
-                func.instruction(&Instruction::I32Load8U(mem8));
+                func.instruction(&Instruction::I32Load8U(src_mem8));
                 func.instruction(&Instruction::I32Const(0x3F));
                 func.instruction(&Instruction::I32And);
                 func.instruction(&Instruction::I32Or);
@@ -420,7 +467,7 @@ impl FactStyleGenerator {
                     func.instruction(&Instruction::I32Add);
                     func.instruction(&Instruction::I32Const(1));
                     func.instruction(&Instruction::I32Add);
-                    func.instruction(&Instruction::I32Load8U(mem8));
+                    func.instruction(&Instruction::I32Load8U(src_mem8));
                     func.instruction(&Instruction::I32Const(0x3F));
                     func.instruction(&Instruction::I32And);
                     func.instruction(&Instruction::I32Const(6));
@@ -432,7 +479,7 @@ impl FactStyleGenerator {
                     func.instruction(&Instruction::I32Add);
                     func.instruction(&Instruction::I32Const(2));
                     func.instruction(&Instruction::I32Add);
-                    func.instruction(&Instruction::I32Load8U(mem8));
+                    func.instruction(&Instruction::I32Load8U(src_mem8));
                     func.instruction(&Instruction::I32Const(0x3F));
                     func.instruction(&Instruction::I32And);
                     func.instruction(&Instruction::I32Or);
@@ -458,7 +505,7 @@ impl FactStyleGenerator {
                     func.instruction(&Instruction::I32Add);
                     func.instruction(&Instruction::I32Const(1));
                     func.instruction(&Instruction::I32Add);
-                    func.instruction(&Instruction::I32Load8U(mem8));
+                    func.instruction(&Instruction::I32Load8U(src_mem8));
                     func.instruction(&Instruction::I32Const(0x3F));
                     func.instruction(&Instruction::I32And);
                     func.instruction(&Instruction::I32Const(12));
@@ -470,7 +517,7 @@ impl FactStyleGenerator {
                     func.instruction(&Instruction::I32Add);
                     func.instruction(&Instruction::I32Const(2));
                     func.instruction(&Instruction::I32Add);
-                    func.instruction(&Instruction::I32Load8U(mem8));
+                    func.instruction(&Instruction::I32Load8U(src_mem8));
                     func.instruction(&Instruction::I32Const(0x3F));
                     func.instruction(&Instruction::I32And);
                     func.instruction(&Instruction::I32Const(6));
@@ -482,7 +529,7 @@ impl FactStyleGenerator {
                     func.instruction(&Instruction::I32Add);
                     func.instruction(&Instruction::I32Const(3));
                     func.instruction(&Instruction::I32Add);
-                    func.instruction(&Instruction::I32Load8U(mem8));
+                    func.instruction(&Instruction::I32Load8U(src_mem8));
                     func.instruction(&Instruction::I32Const(0x3F));
                     func.instruction(&Instruction::I32And);
                     func.instruction(&Instruction::I32Or);
@@ -514,7 +561,7 @@ impl FactStyleGenerator {
             func.instruction(&Instruction::I32Shl);
             func.instruction(&Instruction::I32Add);
             func.instruction(&Instruction::LocalGet(cp_local));
-            func.instruction(&Instruction::I32Store16(mem16));
+            func.instruction(&Instruction::I32Store16(dst_mem16));
             // dst_idx += 1
             func.instruction(&Instruction::LocalGet(dst_idx_local));
             func.instruction(&Instruction::I32Const(1));
@@ -537,7 +584,7 @@ impl FactStyleGenerator {
             func.instruction(&Instruction::I32Const(10));
             func.instruction(&Instruction::I32ShrU);
             func.instruction(&Instruction::I32Add);
-            func.instruction(&Instruction::I32Store16(mem16));
+            func.instruction(&Instruction::I32Store16(dst_mem16));
 
             // low = 0xDC00 + ((code_point - 0x10000) & 0x3FF)
             func.instruction(&Instruction::LocalGet(out_ptr_local));
@@ -554,7 +601,7 @@ impl FactStyleGenerator {
             func.instruction(&Instruction::I32Const(0x3FF));
             func.instruction(&Instruction::I32And);
             func.instruction(&Instruction::I32Add);
-            func.instruction(&Instruction::I32Store16(mem16));
+            func.instruction(&Instruction::I32Store16(dst_mem16));
 
             // dst_idx += 2 (two code units)
             func.instruction(&Instruction::LocalGet(dst_idx_local));
@@ -614,15 +661,16 @@ impl FactStyleGenerator {
         let cu_local = param_count as u32 + 3;
         let cp_local = param_count as u32 + 4;
 
-        let mem8 = wasm_encoder::MemArg {
-            offset: 0,
-            align: 0,
-            memory_index: 0,
-        };
-        let mem16 = wasm_encoder::MemArg {
+        // Source reads (UTF-16) use caller_memory, destination writes (UTF-8) use callee_memory
+        let src_mem16 = wasm_encoder::MemArg {
             offset: 0,
             align: 1,
-            memory_index: 0,
+            memory_index: options.caller_memory,
+        };
+        let dst_mem8 = wasm_encoder::MemArg {
+            offset: 0,
+            align: 0,
+            memory_index: options.callee_memory,
         };
 
         // Step 1: Allocate output buffer = 3 * input_code_units bytes
@@ -658,7 +706,7 @@ impl FactStyleGenerator {
         func.instruction(&Instruction::I32Const(1));
         func.instruction(&Instruction::I32Shl);
         func.instruction(&Instruction::I32Add);
-        func.instruction(&Instruction::I32Load16U(mem16));
+        func.instruction(&Instruction::I32Load16U(src_mem16));
         func.instruction(&Instruction::LocalSet(cu_local));
 
         // --- Detect surrogate pairs ---
@@ -690,7 +738,7 @@ impl FactStyleGenerator {
             func.instruction(&Instruction::I32Const(1));
             func.instruction(&Instruction::I32Shl);
             func.instruction(&Instruction::I32Add);
-            func.instruction(&Instruction::I32Load16U(mem16));
+            func.instruction(&Instruction::I32Load16U(src_mem16));
             func.instruction(&Instruction::I32Const(0xDC00_u32 as i32));
             func.instruction(&Instruction::I32Sub);
             func.instruction(&Instruction::I32Add);
@@ -727,7 +775,7 @@ impl FactStyleGenerator {
             func.instruction(&Instruction::LocalGet(dst_idx_local));
             func.instruction(&Instruction::I32Add);
             func.instruction(&Instruction::LocalGet(cp_local));
-            func.instruction(&Instruction::I32Store8(mem8));
+            func.instruction(&Instruction::I32Store8(dst_mem8));
             // dst_idx += 1
             func.instruction(&Instruction::LocalGet(dst_idx_local));
             func.instruction(&Instruction::I32Const(1));
@@ -751,7 +799,7 @@ impl FactStyleGenerator {
                 func.instruction(&Instruction::I32Const(6));
                 func.instruction(&Instruction::I32ShrU);
                 func.instruction(&Instruction::I32Or);
-                func.instruction(&Instruction::I32Store8(mem8));
+                func.instruction(&Instruction::I32Store8(dst_mem8));
                 // out[dst_idx+1] = 0x80 | (cp & 0x3F)
                 func.instruction(&Instruction::LocalGet(out_ptr_local));
                 func.instruction(&Instruction::LocalGet(dst_idx_local));
@@ -763,7 +811,7 @@ impl FactStyleGenerator {
                 func.instruction(&Instruction::I32Const(0x3F));
                 func.instruction(&Instruction::I32And);
                 func.instruction(&Instruction::I32Or);
-                func.instruction(&Instruction::I32Store8(mem8));
+                func.instruction(&Instruction::I32Store8(dst_mem8));
                 // dst_idx += 2
                 func.instruction(&Instruction::LocalGet(dst_idx_local));
                 func.instruction(&Instruction::I32Const(2));
@@ -787,7 +835,7 @@ impl FactStyleGenerator {
                     func.instruction(&Instruction::I32Const(12));
                     func.instruction(&Instruction::I32ShrU);
                     func.instruction(&Instruction::I32Or);
-                    func.instruction(&Instruction::I32Store8(mem8));
+                    func.instruction(&Instruction::I32Store8(dst_mem8));
                     // out[dst_idx+1] = 0x80 | ((cp >> 6) & 0x3F)
                     func.instruction(&Instruction::LocalGet(out_ptr_local));
                     func.instruction(&Instruction::LocalGet(dst_idx_local));
@@ -801,7 +849,7 @@ impl FactStyleGenerator {
                     func.instruction(&Instruction::I32Const(0x3F));
                     func.instruction(&Instruction::I32And);
                     func.instruction(&Instruction::I32Or);
-                    func.instruction(&Instruction::I32Store8(mem8));
+                    func.instruction(&Instruction::I32Store8(dst_mem8));
                     // out[dst_idx+2] = 0x80 | (cp & 0x3F)
                     func.instruction(&Instruction::LocalGet(out_ptr_local));
                     func.instruction(&Instruction::LocalGet(dst_idx_local));
@@ -813,7 +861,7 @@ impl FactStyleGenerator {
                     func.instruction(&Instruction::I32Const(0x3F));
                     func.instruction(&Instruction::I32And);
                     func.instruction(&Instruction::I32Or);
-                    func.instruction(&Instruction::I32Store8(mem8));
+                    func.instruction(&Instruction::I32Store8(dst_mem8));
                     // dst_idx += 3
                     func.instruction(&Instruction::LocalGet(dst_idx_local));
                     func.instruction(&Instruction::I32Const(3));
@@ -832,7 +880,7 @@ impl FactStyleGenerator {
                     func.instruction(&Instruction::I32Const(18));
                     func.instruction(&Instruction::I32ShrU);
                     func.instruction(&Instruction::I32Or);
-                    func.instruction(&Instruction::I32Store8(mem8));
+                    func.instruction(&Instruction::I32Store8(dst_mem8));
                     // out[dst_idx+1] = 0x80 | ((cp >> 12) & 0x3F)
                     func.instruction(&Instruction::LocalGet(out_ptr_local));
                     func.instruction(&Instruction::LocalGet(dst_idx_local));
@@ -846,7 +894,7 @@ impl FactStyleGenerator {
                     func.instruction(&Instruction::I32Const(0x3F));
                     func.instruction(&Instruction::I32And);
                     func.instruction(&Instruction::I32Or);
-                    func.instruction(&Instruction::I32Store8(mem8));
+                    func.instruction(&Instruction::I32Store8(dst_mem8));
                     // out[dst_idx+2] = 0x80 | ((cp >> 6) & 0x3F)
                     func.instruction(&Instruction::LocalGet(out_ptr_local));
                     func.instruction(&Instruction::LocalGet(dst_idx_local));
@@ -860,7 +908,7 @@ impl FactStyleGenerator {
                     func.instruction(&Instruction::I32Const(0x3F));
                     func.instruction(&Instruction::I32And);
                     func.instruction(&Instruction::I32Or);
-                    func.instruction(&Instruction::I32Store8(mem8));
+                    func.instruction(&Instruction::I32Store8(dst_mem8));
                     // out[dst_idx+3] = 0x80 | (cp & 0x3F)
                     func.instruction(&Instruction::LocalGet(out_ptr_local));
                     func.instruction(&Instruction::LocalGet(dst_idx_local));
@@ -872,7 +920,7 @@ impl FactStyleGenerator {
                     func.instruction(&Instruction::I32Const(0x3F));
                     func.instruction(&Instruction::I32And);
                     func.instruction(&Instruction::I32Or);
-                    func.instruction(&Instruction::I32Store8(mem8));
+                    func.instruction(&Instruction::I32Store8(dst_mem8));
                     // dst_idx += 4
                     func.instruction(&Instruction::LocalGet(dst_idx_local));
                     func.instruction(&Instruction::I32Const(4));
@@ -937,10 +985,16 @@ impl FactStyleGenerator {
         let out_ptr_local = param_count as u32 + 2;
         let byte_local = param_count as u32 + 3;
 
-        let mem = wasm_encoder::MemArg {
+        // Source reads (Latin-1) use caller_memory, destination writes (UTF-8) use callee_memory
+        let src_mem = wasm_encoder::MemArg {
             offset: 0,
             align: 0,
-            memory_index: 0,
+            memory_index: options.caller_memory,
+        };
+        let dst_mem = wasm_encoder::MemArg {
+            offset: 0,
+            align: 0,
+            memory_index: options.callee_memory,
         };
 
         // Step 1: Allocate output buffer = 2 * input_len via cabi_realloc(0, 0, 1, size)
@@ -973,7 +1027,7 @@ impl FactStyleGenerator {
         func.instruction(&Instruction::LocalGet(0)); // string_ptr
         func.instruction(&Instruction::LocalGet(src_idx_local));
         func.instruction(&Instruction::I32Add);
-        func.instruction(&Instruction::I32Load8U(mem));
+        func.instruction(&Instruction::I32Load8U(src_mem));
         func.instruction(&Instruction::LocalSet(byte_local));
 
         // if byte < 0x80: ASCII — write single byte
@@ -987,7 +1041,7 @@ impl FactStyleGenerator {
         func.instruction(&Instruction::LocalGet(dst_idx_local));
         func.instruction(&Instruction::I32Add);
         func.instruction(&Instruction::LocalGet(byte_local));
-        func.instruction(&Instruction::I32Store8(mem));
+        func.instruction(&Instruction::I32Store8(dst_mem));
         // dst_idx += 1
         func.instruction(&Instruction::LocalGet(dst_idx_local));
         func.instruction(&Instruction::I32Const(1));
@@ -1006,7 +1060,7 @@ impl FactStyleGenerator {
         func.instruction(&Instruction::I32Const(6));
         func.instruction(&Instruction::I32ShrU);
         func.instruction(&Instruction::I32Or);
-        func.instruction(&Instruction::I32Store8(mem));
+        func.instruction(&Instruction::I32Store8(dst_mem));
 
         // Second byte: 0x80 | (byte & 0x3F)
         func.instruction(&Instruction::LocalGet(out_ptr_local));
@@ -1019,7 +1073,7 @@ impl FactStyleGenerator {
         func.instruction(&Instruction::I32Const(0x3F));
         func.instruction(&Instruction::I32And);
         func.instruction(&Instruction::I32Or);
-        func.instruction(&Instruction::I32Store8(mem));
+        func.instruction(&Instruction::I32Store8(dst_mem));
 
         // dst_idx += 2
         func.instruction(&Instruction::LocalGet(dst_idx_local));

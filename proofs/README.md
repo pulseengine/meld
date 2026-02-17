@@ -19,6 +19,24 @@ infrastructure decisions.
 | `proofs/segments/` | `meld-core/src/segments.rs` | Segment layout and bounds |
 | `proofs/attestation/` | `meld-core/src/attestation.rs` | Attestation integrity invariants |
 | `proofs/rust_verified/` | (special) | Rust-to-Rocq translated proofs |
+| `proofs/spec/` | (specifications) | Core spec definitions and fusion semantics |
+| `proofs/transformations/` | (specs for transforms) | Transform correctness specs |
+
+## Memory Strategy in Proofs
+
+The proof model supports both memory strategies via `memory_strategy` in
+`fusion_types.v`:
+
+- **`SeparateMemory`**: Each component's memory indices are remapped via
+  `gen_remaps_for_space` (normal offsetting). Memory instructions carry a
+  `memidx` parameter. State correspondence uses `lookup_remap` for `MemIdx`,
+  the same as `FuncIdx`/`GlobalIdx`/`TableIdx`. Memory index remapping is
+  injective — each component's memory maps to a distinct fused index.
+
+- **`SharedMemory`**: All memory indices remap to 0 via
+  `gen_remaps_for_space_zero`. State correspondence uses
+  `memory_corresponds` with a `memory_layout` that maps each component's
+  address range into a region of the single shared memory.
 
 ## Build
 

@@ -87,10 +87,17 @@ P2/P3 Components → Parser → Resolver → Merger → Adapter Gen → Single M
 3. **Merger**: Combines function/memory/table/global spaces
 4. **Adapter Gen**: Creates Canonical ABI trampolines for cross-component calls
 
-### Multi-Memory Support
+### Memory Strategies
 
-- Phase 1 (current): Single shared memory
-- Phase 2 (future): Multi-memory (each component keeps own memory)
+- **Multi-memory** (default): Each component keeps its own linear memory.
+  Cross-component calls that pass pointers use adapters that allocate in
+  the callee's memory via `cabi_realloc`, copy data with `memory.copy`,
+  call the target, and copy results back. Requires WebAssembly multi-memory
+  (Core Spec 3.0, supported by wasmtime/Chrome/Firefox).
+- **Shared memory** (legacy): All components share a single linear memory.
+  Simpler but broken when any component uses `memory.grow`, because one
+  component's growth corrupts every other component's address space.
+  Use `--memory shared` to opt in.
 
 ## Development Guidelines
 

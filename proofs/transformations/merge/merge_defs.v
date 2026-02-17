@@ -69,17 +69,24 @@ Definition gen_remaps_for_space_zero (src : module_source) (m : module)
   map (fun i => mkIndexRemap space src i 0) (seq 0 count).
 
 (* Generate all remaps for a single module.
-   MemIdx uses gen_remaps_for_space_zero (SharedMemory: all map to 0).
-   All other spaces use gen_remaps_for_space with cumulative offsets. *)
+   MemIdx behaviour depends on the memory strategy:
+   - SharedMemory:   gen_remaps_for_space_zero (all map to 0)
+   - SeparateMemory: gen_remaps_for_space      (normal offset, like other spaces)
+   All other spaces always use gen_remaps_for_space with cumulative offsets. *)
 Definition gen_remaps_for_module (src : module_source) (m : module)
-                                  (offsets : index_space -> nat) : list index_remap :=
+                                  (offsets : index_space -> nat)
+                                  (strategy : memory_strategy) : list index_remap :=
   gen_remaps_for_space src m TypeIdx (offsets TypeIdx) (length (mod_types m)) ++
   gen_remaps_for_space src m FuncIdx (offsets FuncIdx)
                        (count_func_imports m + length (mod_funcs m)) ++
   gen_remaps_for_space src m TableIdx (offsets TableIdx)
                        (count_table_imports m + length (mod_tables m)) ++
-  gen_remaps_for_space_zero src m MemIdx
-                       (count_mem_imports m + length (mod_mems m)) ++
+  match strategy with
+  | SharedMemory => gen_remaps_for_space_zero src m MemIdx
+                       (count_mem_imports m + length (mod_mems m))
+  | SeparateMemory => gen_remaps_for_space src m MemIdx (offsets MemIdx)
+                       (count_mem_imports m + length (mod_mems m))
+  end ++
   gen_remaps_for_space src m GlobalIdx (offsets GlobalIdx)
                        (count_global_imports m + length (mod_globals m)) ++
   gen_remaps_for_space src m ElemIdx (offsets ElemIdx) (length (mod_elems m)) ++
@@ -308,16 +315,17 @@ Definition offsets_for_module (input : merge_input) (mod_idx : nat)
 
 (* Generate all remaps for a merge input by folding over modules *)
 Fixpoint gen_all_remaps_aux (input : merge_input) (mod_idx : nat)
-    (remaining : merge_input) : remap_table :=
+    (remaining : merge_input) (strategy : memory_strategy) : remap_table :=
   match remaining with
   | [] => []
   | (src, m) :: rest =>
-      gen_remaps_for_module src m (offsets_for_module input mod_idx) ++
-      gen_all_remaps_aux input (S mod_idx) rest
+      gen_remaps_for_module src m (offsets_for_module input mod_idx) strategy ++
+      gen_all_remaps_aux input (S mod_idx) rest strategy
   end.
 
-Definition gen_all_remaps (input : merge_input) : remap_table :=
-  gen_all_remaps_aux input 0 input.
+Definition gen_all_remaps (input : merge_input) (strategy : memory_strategy)
+    : remap_table :=
+  gen_all_remaps_aux input 0 input strategy.
 
 (* Default type remap: identity (no cross-module type references yet) *)
 Definition default_type_remap (input : merge_input)
@@ -361,12 +369,13 @@ Definition default_func_remap (input : merge_input)
     | None => i
     end.
 
-Definition merge_modules (input : merge_input) : module :=
+Definition merge_modules (input : merge_input)
+    (strategy : memory_strategy) : module :=
   mkModule
     (merge_types input)
     (merge_funcs input (default_type_remap input))
     (merge_tables input)
-    (merge_mems input SharedMemory)
+    (merge_mems input strategy)
     (merge_globals input)
     (merge_elems input)
     (merge_datas input)

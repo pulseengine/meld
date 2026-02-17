@@ -251,11 +251,12 @@ Record state_correspondence (cc : composed_component) (fr : fusion_result)
         nth_error (ms_funcs (fes_module_state fes)) fused_idx = Some func_addr;
 
   (* Memory correspondence for all modules *)
-  sc_memory_eq : forall src ms mem_src,
+  sc_memory_eq : forall src ms src_idx mem_src,
       lookup_module_state ces src = Some ms ->
-      nth_error (ms_mems ms) 0 = Some mem_src ->
-      exists mem_fused,
-        nth_error (ms_mems (fes_module_state fes)) 0 = Some mem_fused /\
+      nth_error (ms_mems ms) src_idx = Some mem_src ->
+      exists fused_idx mem_fused,
+        lookup_remap (fr_remaps fr) MemIdx src src_idx = Some fused_idx /\
+        nth_error (ms_mems (fes_module_state fes)) fused_idx = Some mem_fused /\
         memory_corresponds (fr_memory_layout fr) src mem_src mem_fused;
 
   (* Globals correspond via remap for all modules *)
@@ -1570,19 +1571,19 @@ Proof.
            exists fi. split; [exact Hr|].
            rewrite Hf2. exact Hn.
       * (* sc_memory_eq *)
-        intros src ms0 mem_src Hlookup0 Hmem.
+        intros src ms0 src_idx mem_src Hlookup0 Hmem.
         destruct (module_source_eqb src (ces_active ces)) eqn:Heq.
         -- apply module_source_eqb_eq in Heq. subst src.
            rewrite (lookup_update_same _ _ ms _ _ _ Hlookup_ms) in Hlookup0.
            injection Hlookup0 as Hms0. subst ms0.
            rewrite Hm1 in Hmem.
-           destruct (sc_memory_eq _ _ _ _ Hcorr _ ms _ Hlookup_ms Hmem)
-             as [mf [Hn Hmc]].
-           exists mf. split; [rewrite Hm2; exact Hn | exact Hmc].
+           destruct (sc_memory_eq _ _ _ _ Hcorr _ ms _ _ Hlookup_ms Hmem)
+             as [fi [mf [Hr [Hn Hmc]]]].
+           exists fi, mf. split; [exact Hr|]. split; [rewrite Hm2; exact Hn | exact Hmc].
         -- rewrite (lookup_update_other _ src _ _ _ _ Heq) in Hlookup0.
-           destruct (sc_memory_eq _ _ _ _ Hcorr _ _ _ Hlookup0 Hmem)
-             as [mf [Hn Hmc]].
-           exists mf. split; [rewrite Hm2; exact Hn | exact Hmc].
+           destruct (sc_memory_eq _ _ _ _ Hcorr _ _ _ _ Hlookup0 Hmem)
+             as [fi [mf [Hr [Hn Hmc]]]].
+           exists fi, mf. split; [exact Hr|]. split; [rewrite Hm2; exact Hn | exact Hmc].
       * (* sc_globals_eq *)
         intros src ms0 src_idx g_src Hlookup0 Hnth.
         destruct (module_source_eqb src (ces_active ces)) eqn:Heq.
@@ -1713,21 +1714,21 @@ Proof.
            ++ rewrite (lookup_update_other _ src _ _ _ _ Hact_eq) in Hlookup0.
               exact (sc_funcs_eq _ _ _ _ Hcorr _ _ _ _ Hlookup0 Hnth).
       * (* sc_memory_eq *)
-        simpl. intros src ms0 mem_src Hlookup0 Hmem.
+        simpl. intros src ms0 src_idx mem_src Hlookup0 Hmem.
         destruct (module_source_eqb src target) eqn:Htgt_eq.
         -- apply module_source_eqb_eq in Htgt_eq. subst src.
            rewrite Htgt_final in Hlookup0.
            injection Hlookup0 as Hms0. subst ms0.
            rewrite Htgt_mems in Hmem.
-           exact (sc_memory_eq _ _ _ _ Hcorr _ ms_tgt _ Hlookup_tgt Hmem).
+           exact (sc_memory_eq _ _ _ _ Hcorr _ ms_tgt _ _ Hlookup_tgt Hmem).
         -- rewrite (lookup_update_other _ _ target _ _ _ Htgt_eq) in Hlookup0.
            destruct (module_source_eqb src (ces_active ces)) eqn:Hact_eq.
            ++ apply module_source_eqb_eq in Hact_eq. subst src.
               rewrite (lookup_update_same _ _ ms_src _ _ _ Hlookup_src) in Hlookup0.
               injection Hlookup0 as Hms0. subst ms0.
-              exact (sc_memory_eq _ _ _ _ Hcorr _ ms_src _ Hlookup_src Hmem).
+              exact (sc_memory_eq _ _ _ _ Hcorr _ ms_src _ _ Hlookup_src Hmem).
            ++ rewrite (lookup_update_other _ _ _ _ _ _ Hact_eq) in Hlookup0.
-              exact (sc_memory_eq _ _ _ _ Hcorr _ _ _ Hlookup0 Hmem).
+              exact (sc_memory_eq _ _ _ _ Hcorr _ _ _ _ Hlookup0 Hmem).
       * (* sc_globals_eq *)
         simpl. intros src ms0 src_idx g_src Hlookup0 Hnth.
         destruct (module_source_eqb src target) eqn:Htgt_eq.

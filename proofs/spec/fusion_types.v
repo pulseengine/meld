@@ -213,13 +213,19 @@ Inductive instr_rewrites (remaps : remap_table) (src : module_source)
   | RW_LocalGet : forall l, instr_rewrites remaps src (LocalGet l) (LocalGet l)
   | RW_LocalSet : forall l, instr_rewrites remaps src (LocalSet l) (LocalSet l)
   | RW_LocalTee : forall l, instr_rewrites remaps src (LocalTee l) (LocalTee l)
-  (* Memory operations - indices may need remapping in multi-memory *)
-  | RW_MemorySize : instr_rewrites remaps src MemorySize MemorySize
-  | RW_MemoryGrow : instr_rewrites remaps src MemoryGrow MemoryGrow
-  | RW_Load : forall vt off align,
-      instr_rewrites remaps src (Load vt off align) (Load vt off align)
-  | RW_Store : forall vt off align,
-      instr_rewrites remaps src (Store vt off align) (Store vt off align)
+  (* Memory operations - remap MemIdx for multi-memory support *)
+  | RW_MemorySize : forall memidx idx',
+      lookup_remap remaps MemIdx src memidx = Some idx' ->
+      instr_rewrites remaps src (MemorySize memidx) (MemorySize idx')
+  | RW_MemoryGrow : forall memidx idx',
+      lookup_remap remaps MemIdx src memidx = Some idx' ->
+      instr_rewrites remaps src (MemoryGrow memidx) (MemoryGrow idx')
+  | RW_Load : forall vt memidx off align idx',
+      lookup_remap remaps MemIdx src memidx = Some idx' ->
+      instr_rewrites remaps src (Load vt memidx off align) (Load vt idx' off align)
+  | RW_Store : forall vt memidx off align idx',
+      lookup_remap remaps MemIdx src memidx = Some idx' ->
+      instr_rewrites remaps src (Store vt memidx off align) (Store vt idx' off align)
   (* Numeric operations - no indices *)
   | RW_NumericOp : forall op, instr_rewrites remaps src (NumericOp op) (NumericOp op)
   (* Select *)
@@ -239,11 +245,17 @@ Inductive instr_rewrites (remaps : remap_table) (src : module_source)
       Forall2 (instr_rewrites remaps src) else_ else_' ->
       instr_rewrites remaps src (If bt then_ else_) (If bt then_' else_')
   (* Memory bulk *)
-  | RW_MemoryCopy : instr_rewrites remaps src MemoryCopy MemoryCopy
-  | RW_MemoryFill : instr_rewrites remaps src MemoryFill MemoryFill
-  | RW_MemoryInit : forall dataidx idx',
-      lookup_remap remaps DataIdx src dataidx = Some idx' ->
-      instr_rewrites remaps src (MemoryInit dataidx) (MemoryInit idx')
+  | RW_MemoryCopy : forall dst_mem src_mem d' s',
+      lookup_remap remaps MemIdx src dst_mem = Some d' ->
+      lookup_remap remaps MemIdx src src_mem = Some s' ->
+      instr_rewrites remaps src (MemoryCopy dst_mem src_mem) (MemoryCopy d' s')
+  | RW_MemoryFill : forall memidx idx',
+      lookup_remap remaps MemIdx src memidx = Some idx' ->
+      instr_rewrites remaps src (MemoryFill memidx) (MemoryFill idx')
+  | RW_MemoryInit : forall dataidx memidx d' m',
+      lookup_remap remaps DataIdx src dataidx = Some d' ->
+      lookup_remap remaps MemIdx src memidx = Some m' ->
+      instr_rewrites remaps src (MemoryInit dataidx memidx) (MemoryInit d' m')
   | RW_DataDrop : forall dataidx idx',
       lookup_remap remaps DataIdx src dataidx = Some idx' ->
       instr_rewrites remaps src (DataDrop dataidx) (DataDrop idx')
