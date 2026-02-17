@@ -354,7 +354,7 @@ flowchart TD
 flowchart TD
     A[Operation] -->|success| B[Continue]
     A -->|error| C[Error Type]
-    C -->|context| D[Error::with_context()]
+    C -->|context| D[Error_with_context]
     D -->|propagate| E[Result]
     E -->|question mark operator| F[Early Return]
 
