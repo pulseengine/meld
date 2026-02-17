@@ -1,6 +1,6 @@
 # Proof Decisions and Spec Baselines
 
-Last updated: 2026-02-04
+Last updated: 2026-02-17
 
 This file records the normative baselines and structural decisions that guide
 proofs and specification-based tests for meld.
