@@ -97,13 +97,20 @@ Qed.
 |--------|---------|---------|
 | `intros` | Move hypotheses to context | `intros H1 H2.` |
 | `split` | Break conjunction into subgoals | `split.` |
+| `split_all` | Meld's custom tactic for Rocq 9.0 compatibility | `split_all.` |
 | `exact` | Apply exact hypothesis | `exact H1.` |
 | `rewrite` | Rewrite using equality | `rewrite H2.` |
 | `auto` | Automatic proof search | `auto.` |
 | `eauto` | Extended auto with hints | `eauto.` |
 | `firstorder` | First-order logic | `firstorder.` |
 | `tauto` | Intuitionistic tautology | `tauto.` |
-| `lia` | Linear arithmetic | `lia.` |
+| `lia` | Linear arithmetic (Rocq 9.0) | `lia.` |
+| `injection` | Injectivity reasoning | `injection H as H1.` |
+| `destruct` | Case analysis | `destruct b as [Htrue | Hfalse].` |
+| `apply` | Apply lemma/theorem | `apply function_call_correspondence.` |
+| `reflexivity` | Prove equality by reflexivity | `reflexivity.` |
+
+**For more on tactics:** See [Coq Tactics Reference](https://coq.inria.fr/refman/proof-engine/tactics.html) and [Software Foundations](https://softwarefoundations.cis.upenn.edu/lf-current/Tactics.html)
 
 ## Meld's Proof Architecture
 
@@ -257,6 +264,103 @@ Qed.
 2. **Injectivity Proofs**: Show that mappings preserve uniqueness
 3. **Trap Equivalence**: Show that errors occur in the same situations
 4. **Index Remapping**: Show that function/memory references are correctly updated
+
+### Deep Dive: Tactics in Action
+
+Let's examine how tactics are used in real Meld proofs:
+
+#### Example 1: Using `split_all` (from `fusion_spec.v`)
+
+```rocq
+(* Before Rocq 9.0, we used 'repeat split' *)
+unfold result_state_corresponds. repeat split.
+
+(* After Rocq 9.0, we use 'split_all' to handle nested conjunctions *)
+unfold result_state_corresponds. split_all.
+```
+
+The `split_all` tactic recursively breaks down all conjunctions (`/\`) into separate subgoals.
+
+#### Example 2: Case Analysis with `destruct`
+
+```rocq
+(* From merge_correctness.v - analyzing WebAssembly operations *)
+destruct op; try (solve_by_invert; congruence).
+- (* i32.add case *)
+  apply i32_add_correct. auto.
+- (* i32.sub case *)
+  apply i32_sub_correct. auto.
+- (* call case *)
+  apply call_correct. eauto.
+```
+
+#### Example 3: Equality Reasoning with `rewrite` and `reflexivity`
+
+```rocq
+(* From wasm_semantics.v - proving set_stack preserves locals *)
+Lemma set_stack_locals : forall ms s, ms_locals (set_stack ms s) = ms_locals ms.
+Proof.
+  intros ms s.  (* Move variables to context *)
+  reflexivity.  (* Prove by definition - both sides are equal by definition *)
+Qed.
+```
+
+#### Example 4: Using `injection` for Injectivity
+
+```rocq
+(* From merge_layout.v - proving function index mapping is injective *)
+Lemma function_index_injective :
+  forall f1 f2, function_index f1 = function_index f2 -> f1 = f2.
+Proof.
+  intros f1 f2 H.  (* H is the equality hypothesis *)
+  injection H as H1.  (* Extract injectivity information *)
+  subst.  (* Substitute using the equality *)
+  reflexivity.  (* Conclusion is now trivial *)
+Qed.
+```
+
+#### Example 5: Combining Tactics in Complex Proofs
+
+```rocq
+(* From fusion_spec.v - typical proof structure *)
+Proof.
+  intros cc fr ces fes ms Hcorr Hresult Hcc_step Hfused_step.
+  (* Setup: destruct hypotheses to get concrete values *)
+  destruct Hcc_step as [cc' ces' Hcc_step_eq].
+  destruct Hfused_step as [fes' Hfused_step_eq].
+
+  (* Case analysis on the operation type *)
+  destruct (component_collection_step cc ces) eqn:Hstep; try congruence.
+
+  (* Handle function call case *)
+  - destruct Hstep as [fr' ces'' Hfr' Hces''].
+    apply function_call_correspondence with (fr := fr').
+    + exact Hcorr.    (* Use correspondence hypothesis *)
+    + exact Hresult.   (* Use result state hypothesis *)
+    + exact Hfr'.      (* Use function remapping *)
+    + exact Hces''.    (* Use component execution state *)
+    + exact Hcc_step_eq. (* Use step equality *)
+    + exact Hfused_step_eq. (* Use fused step equality *)
+
+  (* Handle other cases similarly... *)
+  - (* memory.load case *) ...
+  - (* global.get case *) ...
+Qed.
+```
+
+**Key Insights:**
+- `intros` moves all hypotheses into the proof context
+- `destruct` breaks down complex data structures and hypotheses
+- `apply` uses existing lemmas to solve subgoals
+- `exact` provides the exact hypothesis needed
+- `auto` and `eauto` handle routine cases automatically
+- The `+` bullets handle subgoals created by `apply`
+
+**Learning Resources for Tactics:**
+- [Coq Tactics Reference](https://coq.inria.fr/refman/proof-engine/tactics.html) - Official documentation
+- [Software Foundations: Tactics](https://softwarefoundations.cis.upenn.edu/lf-current/Tactics.html) - Interactive tutorial
+- [Coq Art](https://xavierleroy.org/coqart/) - Advanced tactics and automation
+- [Certified Programming with Dependent Types](http://adam.chlipala.net/cpdt/) - Advanced proof techniques
 
 ## Key Theorems Explained
 
