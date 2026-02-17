@@ -135,22 +135,22 @@ Qed.                           (* Proof complete! *)
 
 ### Common Tactics Used in Meld Proofs
 
-| Tactic | Purpose | Example |
-|--------|---------|---------|
-| `intros` | Move hypotheses to context | `intros H1 H2.` |
-| `split` | Break conjunction into subgoals | `split.` |
-| `split_all` | Meld's custom tactic for Rocq 9.0 compatibility | `split_all.` |
-| `exact` | Apply exact hypothesis | `exact H1.` |
-| `rewrite` | Rewrite using equality | `rewrite H2.` |
-| `auto` | Automatic proof search | `auto.` |
-| `eauto` | Extended auto with hints | `eauto.` |
-| `firstorder` | First-order logic | `firstorder.` |
-| `tauto` | Intuitionistic tautology | `tauto.` |
-| `lia` | Linear arithmetic (Rocq 9.0) | `lia.` |
-| `injection` | Injectivity reasoning | `injection H as H1.` |
-| `destruct` | Case analysis | `destruct b as [Htrue | Hfalse].` |
-| `apply` | Apply lemma/theorem | `apply function_call_correspondence.` |
-| `reflexivity` | Prove equality by reflexivity | `reflexivity.` |
+| Tactic | Plain English | Purpose | Example |
+|--------|---------------|---------|---------|
+| `intros` | "Assume these facts are true" | Move hypotheses to context | `intros H1 H2.` |
+| `split` | "Break this AND statement into parts" | Break conjunction into subgoals | `split.` |
+| `split_all` | "Break all AND statements recursively" | Meld's custom tactic for Rocq 9.0 | `split_all.` |
+| `exact` | "This hypothesis proves it directly" | Apply exact hypothesis | `exact H1.` |
+| `rewrite` | "Replace using this equality" | Rewrite using equality | `rewrite H2.` |
+| `auto` | "Try to prove this automatically" | Automatic proof search | `auto.` |
+| `eauto` | "Try harder to prove automatically" | Extended auto with hints | `eauto.` |
+| `firstorder` | "Use first-order logic rules" | First-order logic | `firstorder.` |
+| `tauto` | "This is obviously true" | Intuitionistic tautology | `tauto.` |
+| `lia` | "Solve with arithmetic" | Linear arithmetic (Rocq 9.0) | `lia.` |
+| `injection` | "This equality implies structure" | Injectivity reasoning | `injection H as H1.` |
+| `destruct` | "Consider all possible cases" | Case analysis | `destruct b as [Htrue | Hfalse].` |
+| `apply` | "Use this lemma/theorem" | Apply lemma/theorem | `apply function_call_correspondence.` |
+| `reflexivity` | "Both sides are identical" | Prove equality by reflexivity | `reflexivity.` |
 
 **For more on tactics:** See [Coq Tactics Reference](https://coq.inria.fr/refman/proof-engine/tactics.html) and [Software Foundations](https://softwarefoundations.cis.upenn.edu/lf-current/Tactics.html)
 
