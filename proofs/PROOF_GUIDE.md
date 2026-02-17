@@ -196,8 +196,7 @@ flowchart TD
     classDef runtimeFill fill:#bbf,stroke:#333;
 
     class Proofs,Spec,Transformations,RustVerified,guide buildFill
-    class wasm_core,component_model,wasm_semantics,fusion_types,fusion_spec,
-         merge,resolve,adapter,merger_core,index_map runtimeFill
+    class wasm_core,component_model,wasm_semantics,fusion_types,fusion_spec,merge,resolve,adapter,merger_core,index_map runtimeFill
 ```
 
 **Directory Structure:**
