@@ -74,6 +74,8 @@ flowchart TD
     Encoder --> FusedModule
 
     classDef buildFill fill:#f9f,stroke:#333;
+    classDef runtimeFill fill:#bbf,stroke:#333;
+
     class MeldCore,Parser,Resolver,Merger,AdapterGenerator,Encoder buildFill
     class InputComponents,FusedModule buildFill
 ```
@@ -87,9 +89,11 @@ flowchart LR
     A[WASM Components] -->|binary format| B[Parser]
     B -->|AST| C[ParsedComponent]
 
-    style A fill:#f9f,stroke:#333
-    style B fill:#bbf,stroke:#333
-    style C fill:#f9f,stroke:#333
+    classDef buildFill fill:#f9f,stroke:#333;
+    classDef runtimeFill fill:#bbf,stroke:#333;
+
+    class A,C buildFill
+    class B runtimeFill
 ```
 
 **Input**: WebAssembly binary components
@@ -107,9 +111,11 @@ flowchart LR
     A[ParsedComponent] -->|analyze| B[Resolver]
     B -->|graph| C[DependencyGraph]
 
-    style A fill:#f9f,stroke:#333
-    style B fill:#bbf,stroke:#333
-    style C fill:#f9f,stroke:#333
+    classDef buildFill fill:#f9f,stroke:#333;
+    classDef runtimeFill fill:#bbf,stroke:#333;
+
+    class A,C buildFill
+    class B runtimeFill
 ```
 
 **Input**: Parsed components
@@ -128,9 +134,9 @@ flowchart LR
     A[ParsedComponent] -->|fuse| B[Merger]
     B -->|remap| C[MergedModule]
 
-    style A fill:#f9f,stroke:#333
-    style B fill:#bbf,stroke:#333
-    style C fill:#f9f,stroke:#333
+    class A buildFill
+    class B runtimeFill
+    class C buildFill
 ```
 
 **Input**: Parsed components + dependency graph
@@ -150,9 +156,9 @@ flowchart LR
     A[Cross-Component Calls] -->|generate| B[AdapterGenerator]
     B -->|trampolines| C[AdapterCode]
 
-    style A fill:#f9f,stroke:#333
-    style B fill:#bbf,stroke:#333
-    style C fill:#f9f,stroke:#333
+    class A buildFill
+    class B runtimeFill
+    class C buildFill
 ```
 
 **Input**: Cross-component call sites
@@ -171,9 +177,9 @@ flowchart LR
     A[MergedModule] -->|serialize| B[Encoder]
     B -->|binary| C[FusedWASM]
 
-    style A fill:#f9f,stroke:#333
-    style B fill:#bbf,stroke:#333
-    style C fill:#f9f,stroke:#333
+    class A buildFill
+    class B runtimeFill
+    class C buildFill
 ```
 
 **Input**: Merged module + adapters
@@ -253,7 +259,7 @@ flowchart TD
     M -->|unified| C[Fused Module]
 
     style A,B,C fill:#f9f,stroke:#333
-    style M fill:#bbf,stroke:#333
+    class M runtimeFill
 ```
 
 **Characteristics**:
@@ -349,11 +355,14 @@ flowchart TD
     A[Operation] -->|success| B[Continue]
     A -->|error| C[Error Type]
     C -->|context| D[Error::with_context()]
-    D -->|propagate| E[Result~T, Error~]
+    D -->|propagate| E[Result]
     E -->|? operator| F[Early Return]
 
-    style A,B,F fill:#f9f,stroke:#333
-    style C,D,E fill:#bbf,stroke:#333
+    classDef buildFill fill:#f9f,stroke:#333;
+    classDef runtimeFill fill:#bbf,stroke:#333;
+
+    class A,B,F buildFill
+    class C,D,E runtimeFill
 ```
 
 **Key Principles**:
