@@ -62,8 +62,8 @@ meld/
 │   │   ├── merger.rs       # Module merging
 │   │   ├── adapter/        # Adapter generation
 │   │   │   ├── mod.rs      # Trait interface
-│   │   │   ├── fact.rs     # FACT-style implementation
-│   │   │   └── native.rs   # Future: standalone impl
+│   │   │   └── fact.rs     # FACT-style implementation
+│   │   ├── error.rs        # Error types (thiserror)
 │   │   └── attestation.rs  # wsc-attestation integration
 │   └── Cargo.toml
 ├── meld-cli/           # CLI binary
@@ -111,7 +111,10 @@ P2/P3 Components → Parser → Resolver → Merger → Adapter Gen → Single M
 - `meld-core/src/parser.rs` - Component binary parsing
 - `meld-core/src/resolver.rs` - Import/export resolution
 - `meld-core/src/merger.rs` - Module merging logic
+- `meld-core/src/rewriter.rs` - Instruction rewriting (index remapping)
 - `meld-core/src/adapter/mod.rs` - Adapter trait definition
+- `meld-core/src/adapter/fact.rs` - FACT-style adapter generation
+- `meld-core/src/segments.rs` - Data/element segment handling
 - `meld-cli/src/main.rs` - CLI entry point
 
 ## Integration Points
@@ -141,14 +144,16 @@ meld_fuse(
 ## Testing
 
 ```bash
-# Unit tests
+# All tests (unit + integration)
 cargo test
 
-# Integration tests (requires test fixtures)
-cargo test --test integration
+# Specific integration test
+cargo test --test cross_component_call
+cargo test --test multi_memory
+cargo test --test rebasing_end_to_end
 
-# Property-based tests
-cargo test --features proptest
+# Specific unit test
+cargo test --package meld-core test_name
 ```
 
 ## Verification
