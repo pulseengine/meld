@@ -264,6 +264,7 @@ impl Merger {
             self.merge_component(
                 comp_idx,
                 component,
+                components,
                 graph,
                 &mut merged,
                 shared_memory_plan.as_ref(),
@@ -293,24 +294,35 @@ impl Merger {
         &self,
         comp_idx: usize,
         component: &ParsedComponent,
+        components: &[ParsedComponent],
         graph: &DependencyGraph,
         merged: &mut MergedModule,
         shared_memory_plan: Option<&SharedMemoryPlan>,
     ) -> Result<()> {
         for (mod_idx, module) in component.core_modules.iter().enumerate() {
-            self.merge_core_module(comp_idx, mod_idx, module, graph, merged, shared_memory_plan)?;
+            self.merge_core_module(
+                comp_idx,
+                mod_idx,
+                module,
+                components,
+                graph,
+                merged,
+                shared_memory_plan,
+            )?;
         }
 
         Ok(())
     }
 
     /// Merge a single core module
+    #[allow(clippy::too_many_arguments)]
     fn merge_core_module(
         &self,
         comp_idx: usize,
         mod_idx: usize,
         module: &CoreModule,
-        _graph: &DependencyGraph,
+        components: &[ParsedComponent],
+        graph: &DependencyGraph,
         merged: &mut MergedModule,
         shared_memory_plan: Option<&SharedMemoryPlan>,
     ) -> Result<()> {
@@ -387,6 +399,71 @@ impl Merger {
                 ty: convert_global_type(global),
                 init_expr,
             });
+        }
+
+        // Resolve function imports that have been matched to exports in other
+        // modules (cross-component via adapter_sites, intra-component via
+        // module_resolutions).  This populates function_index_map for imported
+        // function indices so the body rewriter can replace call targets.
+        {
+            let mut import_func_idx = 0u32;
+            for imp in &module.imports {
+                if !matches!(imp.kind, ImportKind::Function(_)) {
+                    continue;
+                }
+
+                // Cross-component: check adapter_sites
+                let resolved = graph.adapter_sites.iter().find(|site| {
+                    site.from_component == comp_idx
+                        && site.from_module == mod_idx
+                        && (imp.name == site.import_name || imp.module.contains(&site.import_name))
+                });
+                if let Some(site) = resolved {
+                    if let Some(&target_idx) = merged.function_index_map.get(&(
+                        site.to_component,
+                        site.to_module,
+                        site.export_func_idx,
+                    )) {
+                        merged
+                            .function_index_map
+                            .insert((comp_idx, mod_idx, import_func_idx), target_idx);
+                    }
+                }
+
+                // Intra-component: check module_resolutions
+                if !merged
+                    .function_index_map
+                    .contains_key(&(comp_idx, mod_idx, import_func_idx))
+                {
+                    let intra = graph.module_resolutions.iter().find(|res| {
+                        res.component_idx == comp_idx
+                            && res.from_module == mod_idx
+                            && imp.name == res.import_name
+                    });
+                    if let Some(res) = intra {
+                        // Look up the target module's export to find its function index
+                        let target_module =
+                            &components[res.component_idx].core_modules[res.to_module];
+                        if let Some(export) = target_module
+                            .exports
+                            .iter()
+                            .find(|e| e.name == res.export_name && e.kind == ExportKind::Function)
+                        {
+                            if let Some(&target_idx) = merged.function_index_map.get(&(
+                                res.component_idx,
+                                res.to_module,
+                                export.index,
+                            )) {
+                                merged
+                                    .function_index_map
+                                    .insert((comp_idx, mod_idx, import_func_idx), target_idx);
+                            }
+                        }
+                    }
+                }
+
+                import_func_idx += 1;
+            }
         }
 
         // First pass: build all function index mappings
