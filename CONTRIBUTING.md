@@ -10,6 +10,7 @@ Welcome! We're glad you're interested in contributing to Meld.
 - Cargo
 - Git
 - Python (for pre-commit hooks)
+- [Nix](https://nixos.org/download/) (optional, for building Rocq proofs via Bazel)
 
 ### Getting Started
 
@@ -79,6 +80,15 @@ Run the full test suite:
 
 ```bash
 cargo test --all
+```
+
+### Proof Verification
+
+If you have Nix installed, you can verify the Rocq proofs:
+
+```bash
+bazel build //proofs/transformations/merge:merge_spec
+bazel build //proofs/spec:fusion_spec
 ```
 
 ## Pull Request Process
