@@ -25,9 +25,9 @@ Meld's architecture is designed to meet **Automotive SPICE (ISO/IEC 15504)** pro
 flowchart TD
     subgraph SPICEProcesses[Automotive SPICE Process Groups]
         direction TB
-        ENG[ENG - Engineering] -->|SWE.1-6| Software
-        MAN[MAN - Management] -->|MAN.3| Project Management
-        SUP[SUP - Support] -->|SUP.1| Quality Assurance
+        ENG[ENG - Engineering] --> Software
+        MAN[MAN - Management] --> ProjectManagement
+        SUP[SUP - Support] --> QualityAssurance
     end
 
     subgraph MeldSPICE[Meld SPICE Compliance]
