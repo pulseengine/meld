@@ -1,10 +1,6 @@
 # Meld Formal Verification Guide
 
-**Fusing Understanding: A Beginner's Journey into Meld's Proofs**
-
-_"Like metals melded in a forge, separate components become one through mathematical certainty"_
-
-This guide explains Meld's formal verification system for developers and researchers with a computer science background but no prior experience with interactive theorem provers like Rocq/Coq.
+A beginner-friendly introduction to Meld's Rocq proofs for developers with computer science background.
 
 ## Table of Contents
 
@@ -150,21 +146,12 @@ flowchart TD
 
     guide -->|documents| Proofs
 
-    style Proofs fill:#f0f8ff,stroke:#4a90e2,stroke-width:2px
-    style Spec fill:#e6f3ff,stroke:#2196f3
-    style Transformations fill:#e8f5e9,stroke:#4caf50
-    style RustVerified fill:#fff3e0,stroke:#ff9800
-    style guide fill:#fff8e1,stroke:#ffc107
-    style wasm_core fill:#ffffff,stroke:#64b5f6
-    style component_model fill:#ffffff,stroke:#64b5f6
-    style wasm_semantics fill:#ffffff,stroke:#64b5f6
-    style fusion_types fill:#ffffff,stroke:#64b5f6
-    style fusion_spec fill:#ffffff,stroke:#64b5f6
-    style merge fill:#ffffff,stroke:#81c784
-    style resolve fill:#ffffff,stroke:#81c784
-    style adapter fill:#ffffff,stroke:#81c784
-    style merger_core fill:#ffffff,stroke:#ffb74d
-    style index_map fill:#ffffff,stroke:#ffb74d
+    classDef buildFill fill:#f9f,stroke:#333;
+    classDef runtimeFill fill:#bbf,stroke:#333;
+
+    class Proofs,Spec,Transformations,RustVerified,guide buildFill
+    class wasm_core,component_model,wasm_semantics,fusion_types,fusion_spec,
+         merge,resolve,adapter,merger_core,index_map runtimeFill
 ```
 
 **Directory Structure:**
@@ -182,11 +169,11 @@ flowchart LR
     C -->|construct proof| D[Verify]
     D -->|Rocq checks| E[Trusted Code]
 
-    style A fill:#e6f3ff,stroke:#2196f3
-    style B fill:#e8f5e9,stroke:#4caf50
-    style C fill:#fff3e0,stroke:#ff9800
-    style D fill:#fff8e1,stroke:#ffc107
-    style E fill:#f0f8ff,stroke:#4a90e2,stroke-width:2px
+    classDef buildFill fill:#f9f,stroke:#333;
+    classDef runtimeFill fill:#bbf,stroke:#333;
+
+    class A,B,C,D buildFill
+    class E runtimeFill
 ```
 
 1. **Specify**: Define what correct behavior means (semantics)
@@ -417,12 +404,11 @@ flowchart TD
     S1 -->|correspondence| T1
     S2 -->|correspondence| T2
 
-    style Original fill:#e6f3ff,stroke:#2196f3
-    style Transformed fill:#e8f5e9,stroke:#4caf50
-    style S1 fill:#ffffff,stroke:#64b5f6
-    style S2 fill:#ffffff,stroke:#64b5f6
-    style T1 fill:#ffffff,stroke:#81c784
-    style T2 fill:#ffffff,stroke:#81c784
+    classDef buildFill fill:#f9f,stroke:#333;
+    classDef runtimeFill fill:#bbf,stroke:#333;
+
+    class Original,S1,S2 buildFill
+    class Transformed,T1,T2 runtimeFill
 ```
 
 The proof shows that:
