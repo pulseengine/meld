@@ -43,3 +43,7 @@ test-output/
 
 # Claude local files
 .claude/
+
+# Coq/Rocq auxiliary files
+*.aux
+*.glob
