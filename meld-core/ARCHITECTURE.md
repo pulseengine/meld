@@ -356,7 +356,7 @@ flowchart TD
     A -->|error| C[Error Type]
     C -->|context| D[Error::with_context()]
     D -->|propagate| E[Result]
-    E -->|? operator| F[Early Return]
+    E -->|question mark operator| F[Early Return]
 
     classDef buildFill fill:#f9f,stroke:#333;
     classDef runtimeFill fill:#bbf,stroke:#333;
