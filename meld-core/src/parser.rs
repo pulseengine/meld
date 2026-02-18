@@ -31,6 +31,9 @@ pub struct ParsedComponent {
     /// Instances defined in the component
     pub instances: Vec<ComponentInstance>,
 
+    /// Canonical function entries (lift, lower, resource ops)
+    pub canonical_functions: Vec<CanonicalEntry>,
+
     /// Original size in bytes
     pub original_size: usize,
 
@@ -171,6 +174,9 @@ pub struct GlobalType {
     pub content_type: ValType,
     /// Whether the global is mutable
     pub mutable: bool,
+    /// Raw init expression bytes (without trailing End opcode).
+    /// Empty for imported globals which have no initializer.
+    pub init_expr_bytes: Vec<u8>,
 }
 
 /// Component-level import
@@ -252,6 +258,60 @@ pub enum PrimitiveValType {
     Char,
 }
 
+/// String encoding declared in canonical options
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CanonStringEncoding {
+    Utf8,
+    Utf16,
+    CompactUtf16,
+}
+
+/// Canonical ABI options attached to a lift or lower
+#[derive(Debug, Clone)]
+pub struct CanonicalOptions {
+    pub string_encoding: CanonStringEncoding,
+    pub memory: Option<u32>,
+    pub realloc: Option<u32>,
+    pub post_return: Option<u32>,
+}
+
+impl Default for CanonicalOptions {
+    fn default() -> Self {
+        Self {
+            string_encoding: CanonStringEncoding::Utf8,
+            memory: None,
+            realloc: None,
+            post_return: None,
+        }
+    }
+}
+
+/// A canonical function entry from the ComponentCanonicalSection
+#[derive(Debug, Clone)]
+pub enum CanonicalEntry {
+    /// Lift a core function to a component function
+    Lift {
+        core_func_index: u32,
+        type_index: u32,
+        options: CanonicalOptions,
+    },
+    /// Lower a component function to a core function
+    Lower {
+        func_index: u32,
+        options: CanonicalOptions,
+    },
+    /// Create a new resource handle
+    ResourceNew { resource: u32 },
+    /// Drop a resource handle
+    ResourceDrop { resource: u32 },
+    /// Get representation of a resource handle
+    ResourceRep { resource: u32 },
+    /// Spawn a new thread
+    ThreadSpawn { func_ty_index: u32 },
+    /// Query hardware thread concurrency
+    ThreadHwConcurrency,
+}
+
 /// Component instance
 #[derive(Debug, Clone)]
 pub struct ComponentInstance {
@@ -330,6 +390,7 @@ impl ComponentParser {
             exports: Vec::new(),
             types: Vec::new(),
             instances: Vec::new(),
+            canonical_functions: Vec::new(),
             original_size: bytes.len(),
             original_hash: compute_sha256(bytes),
         };
@@ -445,8 +506,14 @@ impl ComponentParser {
                 }
             }
 
-            // Component sections we don't need to parse in detail
-            Payload::ComponentCanonicalSection(_) => {}
+            Payload::ComponentCanonicalSection(reader) => {
+                for canon in reader {
+                    let canon = canon?;
+                    component
+                        .canonical_functions
+                        .push(convert_canonical_function(canon));
+                }
+            }
             Payload::CoreTypeSection(_) => {}
             Payload::ComponentAliasSection(_) => {}
             Payload::ComponentSection { .. } => {}
@@ -546,6 +613,7 @@ impl ComponentParser {
                             wasmparser::TypeRef::Global(g) => ImportKind::Global(GlobalType {
                                 content_type: convert_val_type(g.content_type),
                                 mutable: g.mutable,
+                                init_expr_bytes: vec![],
                             }),
                             wasmparser::TypeRef::Tag(_) => {
                                 return Err(Error::UnsupportedFeature(
@@ -593,9 +661,19 @@ impl ComponentParser {
                 Payload::GlobalSection(reader) => {
                     for global in reader {
                         let global = global?;
+                        let mut bin = global.init_expr.get_binary_reader();
+                        let len = bin.bytes_remaining();
+                        let raw = bin.read_bytes(len)?;
+                        // Strip trailing End opcode (0x0B)
+                        let init_bytes = if raw.last() == Some(&0x0B) {
+                            raw[..raw.len() - 1].to_vec()
+                        } else {
+                            raw.to_vec()
+                        };
                         module.globals.push(GlobalType {
                             content_type: convert_val_type(global.ty.content_type),
                             mutable: global.ty.mutable,
+                            init_expr_bytes: init_bytes,
                         });
                     }
                 }
@@ -663,6 +741,105 @@ impl Default for ComponentParser {
     }
 }
 
+impl ParsedComponent {
+    /// Build a map from core function index → canonical options for Lift entries.
+    /// Use this to look up the callee-side encoding, realloc, and post-return
+    /// for an exported core function.
+    pub fn lift_options_by_core_func(&self) -> std::collections::HashMap<u32, &CanonicalOptions> {
+        let mut map = std::collections::HashMap::new();
+        for entry in &self.canonical_functions {
+            if let CanonicalEntry::Lift {
+                core_func_index,
+                options,
+                ..
+            } = entry
+            {
+                map.insert(*core_func_index, options);
+            }
+        }
+        map
+    }
+
+    /// Build a map from component function index → canonical options for Lower entries.
+    /// Use this to look up the caller-side encoding and realloc for a lowered import.
+    pub fn lower_options_by_func(&self) -> std::collections::HashMap<u32, &CanonicalOptions> {
+        let mut map = std::collections::HashMap::new();
+        for entry in &self.canonical_functions {
+            if let CanonicalEntry::Lower {
+                func_index,
+                options,
+            } = entry
+            {
+                map.insert(*func_index, options);
+            }
+        }
+        map
+    }
+}
+
+/// Convert wasmparser CanonicalOption list into our CanonicalOptions
+fn convert_canonical_options(options: &[wasmparser::CanonicalOption]) -> CanonicalOptions {
+    let mut result = CanonicalOptions::default();
+    for opt in options {
+        match opt {
+            wasmparser::CanonicalOption::UTF8 => {
+                result.string_encoding = CanonStringEncoding::Utf8;
+            }
+            wasmparser::CanonicalOption::UTF16 => {
+                result.string_encoding = CanonStringEncoding::Utf16;
+            }
+            wasmparser::CanonicalOption::CompactUTF16 => {
+                result.string_encoding = CanonStringEncoding::CompactUtf16;
+            }
+            wasmparser::CanonicalOption::Memory(idx) => {
+                result.memory = Some(*idx);
+            }
+            wasmparser::CanonicalOption::Realloc(idx) => {
+                result.realloc = Some(*idx);
+            }
+            wasmparser::CanonicalOption::PostReturn(idx) => {
+                result.post_return = Some(*idx);
+            }
+        }
+    }
+    result
+}
+
+/// Convert a wasmparser CanonicalFunction into our CanonicalEntry
+fn convert_canonical_function(canon: wasmparser::CanonicalFunction) -> CanonicalEntry {
+    match canon {
+        wasmparser::CanonicalFunction::Lift {
+            core_func_index,
+            type_index,
+            options,
+        } => CanonicalEntry::Lift {
+            core_func_index,
+            type_index,
+            options: convert_canonical_options(&options),
+        },
+        wasmparser::CanonicalFunction::Lower {
+            func_index,
+            options,
+        } => CanonicalEntry::Lower {
+            func_index,
+            options: convert_canonical_options(&options),
+        },
+        wasmparser::CanonicalFunction::ResourceNew { resource } => {
+            CanonicalEntry::ResourceNew { resource }
+        }
+        wasmparser::CanonicalFunction::ResourceDrop { resource } => {
+            CanonicalEntry::ResourceDrop { resource }
+        }
+        wasmparser::CanonicalFunction::ResourceRep { resource } => {
+            CanonicalEntry::ResourceRep { resource }
+        }
+        wasmparser::CanonicalFunction::ThreadSpawn { func_ty_index } => {
+            CanonicalEntry::ThreadSpawn { func_ty_index }
+        }
+        wasmparser::CanonicalFunction::ThreadHwConcurrency => CanonicalEntry::ThreadHwConcurrency,
+    }
+}
+
 /// Convert wasmparser ValType to wasm-encoder ValType
 fn convert_val_type(ty: WasmValType) -> ValType {
     match ty {
@@ -712,6 +889,79 @@ mod tests {
         // Invalid magic
         let result = parser.parse(&[1, 2, 3, 4, 5, 6, 7, 8]);
         assert!(matches!(result, Err(Error::InvalidWasm(_))));
+    }
+
+    #[test]
+    fn test_convert_canonical_options_default() {
+        // Empty options list should produce defaults
+        let opts = convert_canonical_options(&[]);
+        assert_eq!(opts.string_encoding, CanonStringEncoding::Utf8);
+        assert_eq!(opts.memory, None);
+        assert_eq!(opts.realloc, None);
+        assert_eq!(opts.post_return, None);
+    }
+
+    #[test]
+    fn test_convert_canonical_options_full() {
+        let opts = convert_canonical_options(&[
+            wasmparser::CanonicalOption::UTF16,
+            wasmparser::CanonicalOption::Memory(3),
+            wasmparser::CanonicalOption::Realloc(7),
+            wasmparser::CanonicalOption::PostReturn(12),
+        ]);
+        assert_eq!(opts.string_encoding, CanonStringEncoding::Utf16);
+        assert_eq!(opts.memory, Some(3));
+        assert_eq!(opts.realloc, Some(7));
+        assert_eq!(opts.post_return, Some(12));
+    }
+
+    #[test]
+    fn test_convert_canonical_function_lift() {
+        let canon = wasmparser::CanonicalFunction::Lift {
+            core_func_index: 5,
+            type_index: 2,
+            options: vec![
+                wasmparser::CanonicalOption::UTF8,
+                wasmparser::CanonicalOption::Memory(0),
+                wasmparser::CanonicalOption::Realloc(1),
+            ]
+            .into_boxed_slice(),
+        };
+        let entry = convert_canonical_function(canon);
+        match entry {
+            CanonicalEntry::Lift {
+                core_func_index,
+                type_index,
+                options,
+            } => {
+                assert_eq!(core_func_index, 5);
+                assert_eq!(type_index, 2);
+                assert_eq!(options.string_encoding, CanonStringEncoding::Utf8);
+                assert_eq!(options.memory, Some(0));
+                assert_eq!(options.realloc, Some(1));
+                assert_eq!(options.post_return, None);
+            }
+            _ => panic!("Expected CanonicalEntry::Lift"),
+        }
+    }
+
+    #[test]
+    fn test_convert_canonical_function_lower() {
+        let canon = wasmparser::CanonicalFunction::Lower {
+            func_index: 3,
+            options: vec![wasmparser::CanonicalOption::CompactUTF16].into_boxed_slice(),
+        };
+        let entry = convert_canonical_function(canon);
+        match entry {
+            CanonicalEntry::Lower {
+                func_index,
+                options,
+            } => {
+                assert_eq!(func_index, 3);
+                assert_eq!(options.string_encoding, CanonStringEncoding::CompactUtf16);
+            }
+            _ => panic!("Expected CanonicalEntry::Lower"),
+        }
     }
 
     #[test]
