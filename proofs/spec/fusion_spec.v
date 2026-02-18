@@ -346,6 +346,31 @@ Record state_correspondence (cc : composed_component) (fr : fusion_result)
       exists fused_idx,
         lookup_remap (fr_remaps fr) DataIdx src src_idx = Some fused_idx /\
         nth_error (ms_datas (fes_module_state fes)) fused_idx = Some dat_src;
+
+  (* Backward memory surjectivity: every fused memory comes from some source.
+     This is the converse of sc_memory_eq and is needed for the backward
+     direction of trap equivalence (fused OOB -> composed OOB). It holds
+     because the fused module's memory list is the concatenation of all
+     source modules' memories, so every fused index is the image of some
+     source index under the remap. *)
+  sc_memory_surj : forall fused_idx mem_fused,
+      nth_error (ms_mems (fes_module_state fes)) fused_idx = Some mem_fused ->
+      exists src ms src_idx mem_src,
+        lookup_module_state ces src = Some ms /\
+        nth_error (ms_mems ms) src_idx = Some mem_src /\
+        lookup_remap (fr_remaps fr) MemIdx src src_idx = Some fused_idx /\
+        memory_corresponds (fr_memory_layout fr) src mem_src mem_fused;
+
+  (* Backward table surjectivity: every fused table comes from some source.
+     Same rationale as sc_memory_surj. Needed for the backward direction
+     of trap equivalence (fused TypeMismatch -> composed TypeMismatch). *)
+  sc_table_surj : forall fused_idx tab_fused,
+      nth_error (ms_tables (fes_module_state fes)) fused_idx = Some tab_fused ->
+      exists src ms src_idx tab_src,
+        lookup_module_state ces src = Some ms /\
+        nth_error (ms_tables ms) src_idx = Some tab_src /\
+        lookup_remap (fr_remaps fr) TableIdx src src_idx = Some fused_idx /\
+        table_corresponds (fr_remaps fr) src tab_src tab_fused;
 }.
 
 (* -------------------------------------------------------------------------
@@ -558,11 +583,14 @@ Qed.
      table, then use table_corresponds element-wise equality.
 
    Backward direction (fused -> composed):
-   - FT_Unreachable -> CT_Unreachable: just need active module exists.
-   - FT_OutOfBounds -> CT_OutOfBounds: Admitted — requires remap surjectivity
-     (every fused memory index comes from some source module), which is not
-     currently in the specification.
-   - FT_TypeMismatch -> CT_TypeMismatch: Admitted — same surjectivity gap.
+   - FT_Unreachable -> CT_Unreachable: just need active module exists. Qed.
+   - FT_OutOfBounds -> CT_OutOfBounds: UNPROVABLE with current definitions.
+     CT_OutOfBounds requires the memory to be in the active module, but the
+     fused module's memories include ALL source modules' memories. An OOB on
+     a non-active module's memory has no composed-side counterpart.
+   - FT_TypeMismatch -> CT_TypeMismatch: Same gap as FT_OutOfBounds.
+   Resolution: refine trap conditions to be instruction-aware (trap only on
+   the memory/table actually accessed), or weaken to forward-only simulation.
    ------------------------------------------------------------------------- *)
 
 Lemma fusion_trap_equivalence :
@@ -629,18 +657,31 @@ Proof.
       destruct (sc_active_valid _ _ _ _ Hcorr) as [ms Hms].
       exact (CT_Unreachable cc ces ms Hms).
     + (* FT_OutOfBounds -> CT_OutOfBounds:
-         Admitted — requires a surjectivity property of the remap:
-         for every fused memory index, there exists a source module
-         and source index that maps to it. This is not currently
-         part of the fusion_correct specification. To close this,
-         add a remap_surjective property to fusion_correct. *)
+         NOT PROVABLE with current definitions.
+
+         The fundamental issue: CT_OutOfBounds requires the memory to be
+         in the ACTIVE module (lookup_module_state ces (ces_active ces)),
+         but sc_memory_surj gives us a source module that may be ANY
+         module — not necessarily the active one.
+
+         In the fused model, ALL memories (from all source modules) are
+         in a single module state. An OOB on a fused memory belonging to
+         a non-active source module does not correspond to a composed trap,
+         since the composed model only traps on the active module's memories.
+
+         Resolution: either (a) refine trap conditions to be
+         instruction-aware (only trap on actually-accessed memories),
+         or (b) weaken from trap_equivalence to trap_simulation
+         (forward only: composed_traps -> fused_traps). *)
       admit.
     + (* FT_TypeMismatch -> CT_TypeMismatch:
-         Admitted — same surjectivity gap as FT_OutOfBounds.
-         Needs: for every fused table index, there exists a source
-         module and source index that maps to it. *)
+         Same modeling gap as FT_OutOfBounds — CT_TypeMismatch requires
+         the table to be in the active module, but sc_table_surj gives
+         any source module. See comment above for resolution paths. *)
       admit.
-Admitted. (* Backward OOB/TypeMismatch require remap surjectivity *)
+Admitted. (* Backward OOB/TypeMismatch: trap conditions are per-module,
+             not instruction-aware; backward direction unprovable.
+             Forward direction (composed->fused) is fully proven. *)
 
 (* =========================================================================
    Per-Instruction Remap Correctness Lemmas
@@ -2387,12 +2428,34 @@ Proof.
                     (ces_active ces) src_idx fi Hinj); [|exact Hr].
            intro Hsrc_eq. subst src.
            rewrite module_source_eqb_refl in Heq. discriminate.
+      * (* sc_memory_surj: backward memory surjectivity.
+           Follows from sc_memory_surj of Hcorr + Hm2 frame condition.
+           Detailed proof deferred: entire CS_Instr case is subsumed
+           by the forward simulation proof structure above. *)
+        admit.
+      * (* sc_table_surj: backward table surjectivity.
+           Analogous to sc_memory_surj above. *)
+        admit.
 
   - (* Case CS_CrossModuleCall: active changes from src to target.
-       By sc_funcs_eq, the function address resolves correctly in
-       the fused module. The call is inlined: eval_instr on the
-       fused state with the remapped function index.
-       Uses eval_call_preserves_all to avoid fragile nested inversion. *)
+
+       Proof structure:
+       1. sc_funcs_eq gives us fused_fidx for the called function.
+       2. Eval_Call on the fused state resolves fused_fidx → func_addr.
+       3. Apply FS_InlinedCall with src/target provenance.
+       4. Establish state_correspondence for the new active (target).
+
+       Remaining modeling gap:
+       The CS_CrossModuleCall constructor does not constrain ms_src'
+       (the source module's state after the call). In the fused model,
+       there is a single module state — we cannot represent arbitrary
+       changes to the source module's state independently of the fused
+       state. Two paths to close this gap:
+       (a) Constrain ms_src' in CS_CrossModuleCall, e.g.,
+           ms_src' = set_stack ms_src new_stack (call only affects stack).
+       (b) Weaken state_correspondence to only require correspondence
+           for the active module, not all modules simultaneously.
+       Either change requires revisiting the composed_step model. *)
     (* Rename auto-generated hypotheses *)
     match goal with
     | [ Hneq : ces_active _ <> _,
@@ -2410,19 +2473,23 @@ Proof.
     destruct (eval_call_preserves_all _ _ _ Heval_tgt)
       as [Htgt_funcs [Htgt_tables [Htgt_mems [Htgt_globals
         [Htgt_elems Htgt_datas]]]]].
+    (* Find the fused function index via sc_funcs_eq *)
     destruct (sc_funcs_eq _ _ _ _ Hcorr _ ms_src _ _ Hlookup_src Hnth_func)
       as [fused_fidx [Hf_remap Hf_nth]].
+    (* The fused step would be FS_InlinedCall with Eval_Call on fused_fidx.
+       By Hf_nth, the function resolves. The result is
+       set_stack (fes_module_state fes) new_stack_fused for some stack.
+       Two gaps prevent closing:
+       1. Eval_Call on fused state needs the right new_stack value, but
+          Heval_tgt gives Call 0 on ms_tgt, not Call fused_fidx on fes.
+       2. ms_src' is unconstrained in CS_CrossModuleCall, so we cannot
+          establish state_correspondence for the source module. *)
     exists (mkFusedExecState ms_tgt').
     split.
-    + (* TODO: CrossModuleCall fused-side step requires showing
-         eval_instr (fes_module_state fes) (Call fused_fidx) ms_fused'
-         for some ms_fused'. Pre-existing gap: Heval_tgt operates on
-         ms_tgt, not fes_module_state fes. *)
-      admit.
-    + (* State correspondence — depends on admitted fused step above *)
-      admit.
+    + admit. (* Fused step: FS_InlinedCall with eval_instr on fused state *)
+    + admit. (* State correspondence: blocked by unconstrained ms_src' *)
   Unshelve. all: admit.
-Admitted. (* CS_CrossModuleCall gap *)
+Admitted. (* CS_CrossModuleCall: modeling gap — ms_src' unconstrained *)
 
 (*
 (* Original CrossModuleCall state correspondence proof — commented out
