@@ -123,6 +123,18 @@ Definition set_stack_and_global (ms : module_state)
     (ms_elems ms) (ms_datas ms)
     (ms_locals ms) new_stack.
 
+(* Update value stack and a specific memory instance.
+   Used by Store, MemoryGrow, MemoryCopy, MemoryFill, MemoryInit —
+   any instruction that mutates a memory. *)
+Definition set_stack_and_mem (ms : module_state)
+    (new_stack : list wasm_value) (memidx : nat) (new_mem : memory_inst)
+  : module_state :=
+  mkModuleState
+    (ms_funcs ms) (ms_tables ms)
+    (update_nth (ms_mems ms) memidx new_mem)
+    (ms_globals ms) (ms_elems ms) (ms_datas ms)
+    (ms_locals ms) new_stack.
+
 (* -------------------------------------------------------------------------
    Instruction Classifier
 
@@ -295,12 +307,15 @@ Inductive eval_instr : module_state -> instr -> module_state -> Prop :=
       nth_error (ms_mems ms) memidx = Some mem ->
       eval_instr ms (MemorySize memidx) (set_stack ms new_stack)
 
-  (* MemoryGrow: resolve memidx, abstract result stack.
+  (* MemoryGrow: resolve memidx, grow the target memory.
      Growth may succeed or fail — the abstract new_stack captures
-     both outcomes. The index lookup verifies correct remapping. *)
-  | Eval_MemoryGrow : forall ms memidx mem new_stack,
+     both outcomes. The memory IS updated: on success the page count
+     increases; on failure the memory may be unchanged. We abstract
+     the new memory content but record that ms_mems is mutated. *)
+  | Eval_MemoryGrow : forall ms memidx mem new_mem new_stack,
       nth_error (ms_mems ms) memidx = Some mem ->
-      eval_instr ms (MemoryGrow memidx) (set_stack ms new_stack)
+      eval_instr ms (MemoryGrow memidx)
+        (set_stack_and_mem ms new_stack memidx new_mem)
 
   (* Load: resolve memidx, read a value from memory at an offset.
      The valtype, offset, and alignment are parameters of the instruction.
@@ -312,37 +327,41 @@ Inductive eval_instr : module_state -> instr -> module_state -> Prop :=
 
   (* Store: resolve memidx, write a value to memory at an offset.
      Like Load, the valtype, offset, and alignment are instruction params.
-     Result is abstract — we verify the index lookup for correct remapping.
-     Memory mutation is not modeled: ms_mems is preserved (via set_stack),
-     keeping the eval_instr_preserves_mems invariant intact. *)
-  | Eval_Store : forall ms vt memidx off align mem new_stack,
+     The target memory is updated via set_stack_and_mem: new_mem is abstract
+     (universally quantified) because we don't model byte-level writes,
+     but ms_mems IS mutated. This matches the real WASM semantics where
+     Store modifies the addressed memory. *)
+  | Eval_Store : forall ms vt memidx off align mem new_mem new_stack,
       nth_error (ms_mems ms) memidx = Some mem ->
-      eval_instr ms (Store vt memidx off align) (set_stack ms new_stack)
+      eval_instr ms (Store vt memidx off align)
+        (set_stack_and_mem ms new_stack memidx new_mem)
 
   (* MemoryCopy: resolve both dst and src memidx.
      Copies bytes from source memory to destination memory.
-     Both indices must resolve; result is abstract. *)
-  | Eval_MemoryCopy : forall ms dst_memidx src_memidx mem_dst mem_src new_stack,
+     Both indices must resolve; the destination memory is updated. *)
+  | Eval_MemoryCopy : forall ms dst_memidx src_memidx mem_dst mem_src new_dst new_stack,
       nth_error (ms_mems ms) dst_memidx = Some mem_dst ->
       nth_error (ms_mems ms) src_memidx = Some mem_src ->
-      eval_instr ms (MemoryCopy dst_memidx src_memidx) (set_stack ms new_stack)
+      eval_instr ms (MemoryCopy dst_memidx src_memidx)
+        (set_stack_and_mem ms new_stack dst_memidx new_dst)
 
   (* MemoryFill: resolve memidx, fill a region with a byte value.
-     Result is abstract; we verify the index lookup. *)
-  | Eval_MemoryFill : forall ms memidx mem new_stack,
+     The target memory is updated with the filled region. *)
+  | Eval_MemoryFill : forall ms memidx mem new_mem new_stack,
       nth_error (ms_mems ms) memidx = Some mem ->
-      eval_instr ms (MemoryFill memidx) (set_stack ms new_stack)
+      eval_instr ms (MemoryFill memidx)
+        (set_stack_and_mem ms new_stack memidx new_mem)
 
   (* --- Memory bulk operations --- *)
 
-  (* MemoryInit: resolve dataidx and memidx, abstract result.
-     We model the data segment INDEX LOOKUP and memory index resolution.
-     The actual memory write is a side effect — it copies data from
-     the segment into the target memory, which is the same in both
-     composed and fused modes after index remapping. *)
-  | Eval_MemoryInit : forall ms dataidx memidx dat new_stack,
+  (* MemoryInit: resolve dataidx and memidx, copy segment data to memory.
+     Both the data segment and target memory must resolve. The target
+     memory is updated with bytes from the data segment. *)
+  | Eval_MemoryInit : forall ms dataidx memidx dat mem new_mem new_stack,
       nth_error (ms_datas ms) dataidx = Some dat ->
-      eval_instr ms (MemoryInit dataidx memidx) (set_stack ms new_stack)
+      nth_error (ms_mems ms) memidx = Some mem ->
+      eval_instr ms (MemoryInit dataidx memidx)
+        (set_stack_and_mem ms new_stack memidx new_mem)
 
   (* DataDrop: resolve dataidx, only target data segment changes *)
   | Eval_DataDrop : forall ms dataidx dat new_dat,
@@ -434,6 +453,40 @@ Lemma set_stack_and_global_value_stack : forall ms s idx v,
     ms_value_stack (set_stack_and_global ms s idx v) = s.
 Proof. intros. reflexivity. Qed.
 
+(* set_stack_and_mem preserves funcs, tables, globals, elems, datas, locals *)
+Lemma set_stack_and_mem_funcs : forall ms s idx m,
+    ms_funcs (set_stack_and_mem ms s idx m) = ms_funcs ms.
+Proof. intros. reflexivity. Qed.
+
+Lemma set_stack_and_mem_tables : forall ms s idx m,
+    ms_tables (set_stack_and_mem ms s idx m) = ms_tables ms.
+Proof. intros. reflexivity. Qed.
+
+Lemma set_stack_and_mem_mems : forall ms s idx m,
+    ms_mems (set_stack_and_mem ms s idx m) =
+    update_nth (ms_mems ms) idx m.
+Proof. intros. reflexivity. Qed.
+
+Lemma set_stack_and_mem_globals : forall ms s idx m,
+    ms_globals (set_stack_and_mem ms s idx m) = ms_globals ms.
+Proof. intros. reflexivity. Qed.
+
+Lemma set_stack_and_mem_elems : forall ms s idx m,
+    ms_elems (set_stack_and_mem ms s idx m) = ms_elems ms.
+Proof. intros. reflexivity. Qed.
+
+Lemma set_stack_and_mem_datas : forall ms s idx m,
+    ms_datas (set_stack_and_mem ms s idx m) = ms_datas ms.
+Proof. intros. reflexivity. Qed.
+
+Lemma set_stack_and_mem_locals : forall ms s idx m,
+    ms_locals (set_stack_and_mem ms s idx m) = ms_locals ms.
+Proof. intros. reflexivity. Qed.
+
+Lemma set_stack_and_mem_value_stack : forall ms s idx m,
+    ms_value_stack (set_stack_and_mem ms s idx m) = s.
+Proof. intros. reflexivity. Qed.
+
 (* update_nth preserves length *)
 Lemma update_nth_length : forall {A : Type} (l : list A) n x,
     length (update_nth l n x) = length l.
@@ -499,6 +552,7 @@ Qed.
 Global Opaque is_pure_instr.
 Global Opaque set_stack.
 Global Opaque set_stack_and_global.
+Global Opaque set_stack_and_mem.
 Global Opaque update_global_value.
 Global Opaque update_nth.
 

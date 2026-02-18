@@ -119,6 +119,10 @@ pub struct AdapterOptions {
     /// Whether the target function returns a `(ptr: i32, len: i32)` pair
     /// that must be copied back from callee memory to caller memory
     pub returns_pointer_pair: bool,
+
+    /// Post-return function index in merged module (if any).
+    /// Called after results have been copied back, to allow callee cleanup.
+    pub callee_post_return: Option<u32>,
 }
 
 impl Default for AdapterOptions {
@@ -131,6 +135,7 @@ impl Default for AdapterOptions {
             caller_realloc: None,
             callee_realloc: None,
             returns_pointer_pair: false,
+            callee_post_return: None,
         }
     }
 }

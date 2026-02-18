@@ -89,7 +89,7 @@ pub fn rewrite_function_body(
     let mut local_count: u32 = 0;
     for local in locals_reader {
         let (count, ty) = local?;
-        locals.push((count, convert_val_type(ty)));
+        locals.push((count, convert_val_type(ty, maps)?));
         local_count = local_count.saturating_add(count);
     }
 
@@ -166,9 +166,9 @@ fn rewrite_operator(op: Operator<'_>, maps: &IndexMaps) -> Result<Vec<Instructio
         // Control flow
         Unreachable => Instruction::Unreachable,
         Nop => Instruction::Nop,
-        Block { blockty } => Instruction::Block(convert_block_type(blockty, maps)),
-        Loop { blockty } => Instruction::Loop(convert_block_type(blockty, maps)),
-        If { blockty } => Instruction::If(convert_block_type(blockty, maps)),
+        Block { blockty } => Instruction::Block(convert_block_type(blockty, maps)?),
+        Loop { blockty } => Instruction::Loop(convert_block_type(blockty, maps)?),
+        If { blockty } => Instruction::If(convert_block_type(blockty, maps)?),
         Else => Instruction::Else,
         End => Instruction::End,
         Br { relative_depth } => Instruction::Br(relative_depth),
@@ -192,7 +192,7 @@ fn rewrite_operator(op: Operator<'_>, maps: &IndexMaps) -> Result<Vec<Instructio
         },
 
         // Reference types
-        RefNull { hty } => Instruction::RefNull(convert_heap_type(hty)),
+        RefNull { hty } => Instruction::RefNull(convert_heap_type(hty, maps)?),
         RefIsNull => Instruction::RefIsNull,
         RefFunc { function_index } => Instruction::RefFunc(maps.remap_func(function_index)),
 
@@ -573,12 +573,12 @@ fn base_add_instruction(maps: &IndexMaps) -> Instruction<'static> {
 }
 
 /// Convert wasmparser BlockType to wasm-encoder BlockType
-fn convert_block_type(bt: WpBlockType, maps: &IndexMaps) -> BlockType {
-    match bt {
+fn convert_block_type(bt: WpBlockType, maps: &IndexMaps) -> Result<BlockType> {
+    Ok(match bt {
         WpBlockType::Empty => BlockType::Empty,
-        WpBlockType::Type(ty) => BlockType::Result(convert_val_type(ty)),
+        WpBlockType::Type(ty) => BlockType::Result(convert_val_type(ty, maps)?),
         WpBlockType::FuncType(idx) => BlockType::FunctionType(maps.remap_type(idx)),
-    }
+    })
 }
 
 /// Convert wasmparser MemArg to wasm-encoder MemArg
@@ -597,47 +597,77 @@ fn convert_memarg(ma: WpMemArg, maps: &IndexMaps) -> Result<MemArg> {
 }
 
 /// Convert wasmparser ValType to wasm-encoder ValType
-fn convert_val_type(ty: wasmparser::ValType) -> wasm_encoder::ValType {
-    match ty {
+fn convert_val_type(ty: wasmparser::ValType, maps: &IndexMaps) -> Result<wasm_encoder::ValType> {
+    Ok(match ty {
         wasmparser::ValType::I32 => wasm_encoder::ValType::I32,
         wasmparser::ValType::I64 => wasm_encoder::ValType::I64,
         wasmparser::ValType::F32 => wasm_encoder::ValType::F32,
         wasmparser::ValType::F64 => wasm_encoder::ValType::F64,
         wasmparser::ValType::V128 => wasm_encoder::ValType::V128,
-        wasmparser::ValType::Ref(rt) => wasm_encoder::ValType::Ref(convert_ref_type(rt)),
-    }
+        wasmparser::ValType::Ref(rt) => wasm_encoder::ValType::Ref(convert_ref_type(rt, maps)?),
+    })
 }
 
-/// Convert wasmparser RefType to wasm-encoder RefType
-fn convert_ref_type(rt: wasmparser::RefType) -> wasm_encoder::RefType {
-    if rt.is_func_ref() {
-        wasm_encoder::RefType::FUNCREF
-    } else if rt.is_extern_ref() {
-        wasm_encoder::RefType::EXTERNREF
-    } else {
-        // Default to funcref for other reference types
-        wasm_encoder::RefType::FUNCREF
-    }
+/// Convert wasmparser RefType to wasm-encoder RefType, remapping concrete type indices
+fn convert_ref_type(rt: wasmparser::RefType, maps: &IndexMaps) -> Result<wasm_encoder::RefType> {
+    let nullable = rt.is_nullable();
+    let heap_type = convert_heap_type(rt.heap_type(), maps)?;
+    Ok(wasm_encoder::RefType {
+        nullable,
+        heap_type,
+    })
 }
 
-/// Convert wasmparser HeapType to wasm-encoder HeapType
-fn convert_heap_type(ht: wasmparser::HeapType) -> wasm_encoder::HeapType {
+/// Convert wasmparser HeapType to wasm-encoder HeapType, remapping concrete type indices.
+///
+/// Returns an error if the concrete type index is not a module-level index (e.g.
+/// a RecGroup or CoreTypeId index that only appears during validation internals).
+/// In practice, wasmparser always provides Module indices when parsing core wasm
+/// modules, so this error should never occur for well-formed inputs.
+fn convert_heap_type(ht: wasmparser::HeapType, maps: &IndexMaps) -> Result<wasm_encoder::HeapType> {
     match ht {
-        wasmparser::HeapType::Concrete(_) => wasm_encoder::HeapType::Concrete(0),
-        wasmparser::HeapType::Abstract { shared: _, ty } => match ty {
-            wasmparser::AbstractHeapType::Func => wasm_encoder::HeapType::Abstract {
-                shared: false,
-                ty: wasm_encoder::AbstractHeapType::Func,
-            },
-            wasmparser::AbstractHeapType::Extern => wasm_encoder::HeapType::Abstract {
-                shared: false,
-                ty: wasm_encoder::AbstractHeapType::Extern,
-            },
-            _ => wasm_encoder::HeapType::Abstract {
-                shared: false,
-                ty: wasm_encoder::AbstractHeapType::Func,
-            },
-        },
+        wasmparser::HeapType::Concrete(idx) => {
+            // Extract the module-level type index and remap it.
+            // wasmparser's UnpackedIndex can be Module(u32), RecGroup(u32), or
+            // Id(CoreTypeId). Only Module indices are valid here -- RecGroup and
+            // Id are internal to the validator and should never appear in parsed
+            // core module instructions.
+            let old_idx = idx.as_module_index().ok_or_else(|| {
+                Error::UnsupportedFeature(format!(
+                    "concrete heap type has non-module index ({:?}); \
+                     only module-level type indices are supported during fusion",
+                    idx
+                ))
+            })?;
+            let new_idx = maps.remap_type(old_idx);
+            Ok(wasm_encoder::HeapType::Concrete(new_idx))
+        }
+        wasmparser::HeapType::Abstract { shared, ty } => {
+            let enc_ty = convert_abstract_heap_type(ty);
+            Ok(wasm_encoder::HeapType::Abstract { shared, ty: enc_ty })
+        }
+    }
+}
+
+/// Convert wasmparser AbstractHeapType to wasm-encoder AbstractHeapType
+pub(crate) fn convert_abstract_heap_type(
+    ty: wasmparser::AbstractHeapType,
+) -> wasm_encoder::AbstractHeapType {
+    match ty {
+        wasmparser::AbstractHeapType::Func => wasm_encoder::AbstractHeapType::Func,
+        wasmparser::AbstractHeapType::Extern => wasm_encoder::AbstractHeapType::Extern,
+        wasmparser::AbstractHeapType::Any => wasm_encoder::AbstractHeapType::Any,
+        wasmparser::AbstractHeapType::None => wasm_encoder::AbstractHeapType::None,
+        wasmparser::AbstractHeapType::NoExtern => wasm_encoder::AbstractHeapType::NoExtern,
+        wasmparser::AbstractHeapType::NoFunc => wasm_encoder::AbstractHeapType::NoFunc,
+        wasmparser::AbstractHeapType::Eq => wasm_encoder::AbstractHeapType::Eq,
+        wasmparser::AbstractHeapType::Struct => wasm_encoder::AbstractHeapType::Struct,
+        wasmparser::AbstractHeapType::Array => wasm_encoder::AbstractHeapType::Array,
+        wasmparser::AbstractHeapType::I31 => wasm_encoder::AbstractHeapType::I31,
+        wasmparser::AbstractHeapType::Exn => wasm_encoder::AbstractHeapType::Exn,
+        wasmparser::AbstractHeapType::NoExn => wasm_encoder::AbstractHeapType::NoExn,
+        wasmparser::AbstractHeapType::Cont => wasm_encoder::AbstractHeapType::Cont,
+        wasmparser::AbstractHeapType::NoCont => wasm_encoder::AbstractHeapType::NoCont,
     }
 }
 
@@ -663,10 +693,11 @@ mod tests {
     fn test_convert_block_type() {
         let maps = IndexMaps::new();
 
-        let empty = convert_block_type(WpBlockType::Empty, &maps);
+        let empty = convert_block_type(WpBlockType::Empty, &maps).unwrap();
         assert!(matches!(empty, BlockType::Empty));
 
-        let result = convert_block_type(WpBlockType::Type(wasmparser::ValType::I32), &maps);
+        let result =
+            convert_block_type(WpBlockType::Type(wasmparser::ValType::I32), &maps).unwrap();
         assert!(matches!(
             result,
             BlockType::Result(wasm_encoder::ValType::I32)
@@ -779,5 +810,170 @@ mod tests {
         maps.address_rebasing = true;
 
         assert!(rewrite_operator(Operator::MemoryGrow { mem: 0 }, &maps).is_err());
+    }
+
+    #[test]
+    fn test_convert_heap_type_concrete_with_remapping() {
+        // Verify that concrete heap type indices get remapped through the type map
+        let mut maps = IndexMaps::new();
+        maps.types.insert(3, 10);
+        maps.types.insert(7, 42);
+
+        // Module-level type index 3 should remap to 10
+        let ht = wasmparser::HeapType::Concrete(wasmparser::UnpackedIndex::Module(3));
+        let result = convert_heap_type(ht, &maps).unwrap();
+        assert!(matches!(result, wasm_encoder::HeapType::Concrete(10)));
+
+        // Module-level type index 7 should remap to 42
+        let ht = wasmparser::HeapType::Concrete(wasmparser::UnpackedIndex::Module(7));
+        let result = convert_heap_type(ht, &maps).unwrap();
+        assert!(matches!(result, wasm_encoder::HeapType::Concrete(42)));
+
+        // Unmapped index 5 should pass through as-is
+        let ht = wasmparser::HeapType::Concrete(wasmparser::UnpackedIndex::Module(5));
+        let result = convert_heap_type(ht, &maps).unwrap();
+        assert!(matches!(result, wasm_encoder::HeapType::Concrete(5)));
+    }
+
+    #[test]
+    fn test_convert_heap_type_rec_group_returns_error() {
+        // RecGroup indices are internal to the validator and should produce an
+        // error during fusion rather than silently mapping to index 0.
+        let maps = IndexMaps::new();
+        let ht = wasmparser::HeapType::Concrete(wasmparser::UnpackedIndex::RecGroup(2));
+        let result = convert_heap_type(ht, &maps);
+        assert!(result.is_err(), "RecGroup index should return an error");
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(
+            err_msg.contains("non-module index"),
+            "Error message should mention non-module index, got: {}",
+            err_msg
+        );
+    }
+
+    #[test]
+    fn test_convert_ref_type_nullable() {
+        let maps = IndexMaps::new();
+
+        // Nullable funcref
+        let rt = wasmparser::RefType::FUNCREF;
+        let result = convert_ref_type(rt, &maps).unwrap();
+        assert!(result.nullable, "funcref should be nullable");
+        assert!(matches!(
+            result.heap_type,
+            wasm_encoder::HeapType::Abstract {
+                shared: false,
+                ty: wasm_encoder::AbstractHeapType::Func
+            }
+        ));
+
+        // Nullable externref
+        let rt = wasmparser::RefType::EXTERNREF;
+        let result = convert_ref_type(rt, &maps).unwrap();
+        assert!(result.nullable, "externref should be nullable");
+        assert!(matches!(
+            result.heap_type,
+            wasm_encoder::HeapType::Abstract {
+                shared: false,
+                ty: wasm_encoder::AbstractHeapType::Extern
+            }
+        ));
+    }
+
+    #[test]
+    fn test_convert_ref_type_non_nullable() {
+        let maps = IndexMaps::new();
+
+        // Non-nullable ref to abstract func type
+        let rt = wasmparser::RefType::new(
+            false,
+            wasmparser::HeapType::Abstract {
+                shared: false,
+                ty: wasmparser::AbstractHeapType::Func,
+            },
+        )
+        .unwrap();
+        let result = convert_ref_type(rt, &maps).unwrap();
+        assert!(!result.nullable, "should be non-nullable");
+        assert!(matches!(
+            result.heap_type,
+            wasm_encoder::HeapType::Abstract {
+                shared: false,
+                ty: wasm_encoder::AbstractHeapType::Func
+            }
+        ));
+    }
+
+    #[test]
+    fn test_convert_abstract_heap_type_all_variants() {
+        // Verify all 14 AbstractHeapType variants are handled correctly
+        let pairs: Vec<(wasmparser::AbstractHeapType, wasm_encoder::AbstractHeapType)> = vec![
+            (
+                wasmparser::AbstractHeapType::Func,
+                wasm_encoder::AbstractHeapType::Func,
+            ),
+            (
+                wasmparser::AbstractHeapType::Extern,
+                wasm_encoder::AbstractHeapType::Extern,
+            ),
+            (
+                wasmparser::AbstractHeapType::Any,
+                wasm_encoder::AbstractHeapType::Any,
+            ),
+            (
+                wasmparser::AbstractHeapType::None,
+                wasm_encoder::AbstractHeapType::None,
+            ),
+            (
+                wasmparser::AbstractHeapType::NoExtern,
+                wasm_encoder::AbstractHeapType::NoExtern,
+            ),
+            (
+                wasmparser::AbstractHeapType::NoFunc,
+                wasm_encoder::AbstractHeapType::NoFunc,
+            ),
+            (
+                wasmparser::AbstractHeapType::Eq,
+                wasm_encoder::AbstractHeapType::Eq,
+            ),
+            (
+                wasmparser::AbstractHeapType::Struct,
+                wasm_encoder::AbstractHeapType::Struct,
+            ),
+            (
+                wasmparser::AbstractHeapType::Array,
+                wasm_encoder::AbstractHeapType::Array,
+            ),
+            (
+                wasmparser::AbstractHeapType::I31,
+                wasm_encoder::AbstractHeapType::I31,
+            ),
+            (
+                wasmparser::AbstractHeapType::Exn,
+                wasm_encoder::AbstractHeapType::Exn,
+            ),
+            (
+                wasmparser::AbstractHeapType::NoExn,
+                wasm_encoder::AbstractHeapType::NoExn,
+            ),
+            (
+                wasmparser::AbstractHeapType::Cont,
+                wasm_encoder::AbstractHeapType::Cont,
+            ),
+            (
+                wasmparser::AbstractHeapType::NoCont,
+                wasm_encoder::AbstractHeapType::NoCont,
+            ),
+        ];
+
+        for (input, expected) in &pairs {
+            let result = convert_abstract_heap_type(*input);
+            assert_eq!(
+                std::mem::discriminant(&result),
+                std::mem::discriminant(expected),
+                "AbstractHeapType variant {:?} should map correctly",
+                input
+            );
+        }
     }
 }

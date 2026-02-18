@@ -18,8 +18,27 @@
 use super::{AdapterConfig, AdapterFunction, AdapterGenerator, AdapterOptions, StringEncoding};
 use crate::Result;
 use crate::merger::MergedModule;
+use crate::parser::CanonStringEncoding;
 use crate::resolver::{AdapterSite, DependencyGraph};
 use wasm_encoder::{Function, Instruction};
+
+/// Convert a canonical string encoding from the parser to the adapter's encoding enum
+fn canon_to_string_encoding(enc: CanonStringEncoding) -> StringEncoding {
+    match enc {
+        CanonStringEncoding::Utf8 => StringEncoding::Utf8,
+        CanonStringEncoding::Utf16 => StringEncoding::Utf16,
+        // CompactUTF16 is latin1+utf16 — treat as Latin1 for adapter purposes
+        CanonStringEncoding::CompactUtf16 => StringEncoding::Latin1,
+    }
+}
+
+/// Return the required alignment for a cabi_realloc call for the given string encoding
+fn alignment_for_encoding(encoding: StringEncoding) -> i32 {
+    match encoding {
+        StringEncoding::Utf8 | StringEncoding::Latin1 => 1,
+        StringEncoding::Utf16 => 2,
+    }
+}
 
 /// FACT-style adapter generator
 pub struct FactStyleGenerator {
@@ -103,10 +122,17 @@ impl FactStyleGenerator {
             options.callee_realloc = Some(realloc_idx);
         }
 
-        // For now, assume UTF-8 encoding everywhere
-        // A real implementation would inspect the component's canonical options
-        options.caller_string_encoding = StringEncoding::Utf8;
-        options.callee_string_encoding = StringEncoding::Utf8;
+        // Use canonical options from the resolver if available, fall back to UTF-8
+        options.caller_string_encoding = site
+            .requirements
+            .caller_encoding
+            .map(canon_to_string_encoding)
+            .unwrap_or(StringEncoding::Utf8);
+        options.callee_string_encoding = site
+            .requirements
+            .callee_encoding
+            .map(canon_to_string_encoding)
+            .unwrap_or(StringEncoding::Utf8);
 
         // Detect whether the target function returns a (ptr, len) pair.
         // Look up the target function's type in the merged module and check
@@ -124,6 +150,17 @@ impl FactStyleGenerator {
             options.returns_pointer_pair = true;
         }
 
+        // Populate post-return from canonical data (remap to merged index)
+        if let Some(post_return_core_idx) = site.requirements.callee_post_return
+            && let Some(&merged_pr_idx) = merged.function_index_map.get(&(
+                site.to_component,
+                site.to_module,
+                post_return_core_idx,
+            ))
+        {
+            options.callee_post_return = Some(merged_pr_idx);
+        }
+
         options
     }
 
@@ -134,6 +171,7 @@ impl FactStyleGenerator {
         merged: &MergedModule,
     ) -> Result<(u32, Function)> {
         let target_func = self.resolve_target_function(site, merged)?;
+        let options = self.analyze_call_site(site, merged);
 
         // Find the target function's type
         let type_idx = merged
@@ -144,22 +182,61 @@ impl FactStyleGenerator {
 
         let func_type = merged.types.get(type_idx as usize);
         let param_count = func_type.map(|t| t.params.len()).unwrap_or(0);
+        let result_count = func_type.map(|t| t.results.len()).unwrap_or(0);
+        let result_types: Vec<wasm_encoder::ValType> =
+            func_type.map(|t| t.results.clone()).unwrap_or_default();
 
-        // Generate a simple trampoline
-        let mut func = Function::new([]);
+        // If post-return is specified, we need scratch locals to save results
+        let has_post_return = options.callee_post_return.is_some();
 
-        // Load all parameters
-        for i in 0..param_count {
-            func.instruction(&Instruction::LocalGet(i as u32));
+        if has_post_return && result_count > 0 {
+            // Need locals to save results across the post-return call
+            let locals: Vec<(u32, wasm_encoder::ValType)> =
+                result_types.iter().map(|t| (1u32, *t)).collect();
+            let mut func = Function::new(locals);
+            let result_base = param_count as u32;
+
+            // Load all parameters and call target
+            for i in 0..param_count {
+                func.instruction(&Instruction::LocalGet(i as u32));
+            }
+            func.instruction(&Instruction::Call(target_func));
+
+            // Save results to locals (pop in reverse order)
+            for i in (0..result_count).rev() {
+                func.instruction(&Instruction::LocalSet(result_base + i as u32));
+            }
+
+            // Call post-return with the saved results
+            for i in 0..result_count {
+                func.instruction(&Instruction::LocalGet(result_base + i as u32));
+            }
+            func.instruction(&Instruction::Call(options.callee_post_return.unwrap()));
+
+            // Push saved results back onto stack
+            for i in 0..result_count {
+                func.instruction(&Instruction::LocalGet(result_base + i as u32));
+            }
+
+            func.instruction(&Instruction::End);
+            Ok((type_idx, func))
+        } else {
+            // Simple trampoline (no post-return or no results)
+            let mut func = Function::new([]);
+
+            for i in 0..param_count {
+                func.instruction(&Instruction::LocalGet(i as u32));
+            }
+            func.instruction(&Instruction::Call(target_func));
+
+            if has_post_return {
+                // No results to save, just call post-return
+                func.instruction(&Instruction::Call(options.callee_post_return.unwrap()));
+            }
+
+            func.instruction(&Instruction::End);
+            Ok((type_idx, func))
         }
-
-        // Call the target
-        func.instruction(&Instruction::Call(target_func));
-
-        // End
-        func.instruction(&Instruction::End);
-
-        Ok((type_idx, func))
     }
 
     /// Generate an adapter that copies data between memories
@@ -188,6 +265,9 @@ impl FactStyleGenerator {
 
         let func_type = merged.types.get(type_idx as usize);
         let param_count = func_type.map(|t| t.params.len()).unwrap_or(0);
+        let result_count = func_type.map(|t| t.results.len()).unwrap_or(0);
+        let result_types: Vec<wasm_encoder::ValType> =
+            func_type.map(|t| t.results.clone()).unwrap_or_default();
 
         // If memories are the same, just do direct call
         if options.caller_memory == options.callee_memory {
@@ -200,11 +280,18 @@ impl FactStyleGenerator {
             return Ok((type_idx, func));
         }
 
-        let needs_outbound_copy = param_count >= 2;
+        // Only treat first two params as (ptr, len) when callee has realloc —
+        // without realloc we cannot allocate in the callee's memory, so the
+        // params are scalar values that should be passed through directly.
+        let needs_outbound_copy = param_count >= 2 && options.callee_realloc.is_some();
         let needs_result_copy = options.returns_pointer_pair;
 
-        // If no copying needed at all, direct call
-        if !needs_outbound_copy && !needs_result_copy {
+        // Post-return with scalar results needs scratch locals to save/restore
+        let needs_post_return_save =
+            !needs_result_copy && options.callee_post_return.is_some() && result_count > 0;
+
+        // If no copying and no post-return save needed, direct call
+        if !needs_outbound_copy && !needs_result_copy && !needs_post_return_save {
             let mut func = Function::new([]);
             for i in 0..param_count {
                 func.instruction(&Instruction::LocalGet(i as u32));
@@ -214,18 +301,30 @@ impl FactStyleGenerator {
             return Ok((type_idx, func));
         }
 
-        // Determine scratch local count based on what we need.
-        // Outbound copy needs: dest_ptr (1 local)
-        // Result copy needs: callee_ret_ptr, callee_ret_len, caller_new_ptr (3 locals)
-        let scratch_count = if needs_outbound_copy && needs_result_copy {
+        // Determine scratch local count for copy operations
+        let copy_scratch_count: u32 = if needs_outbound_copy && needs_result_copy {
             4 // dest_ptr + callee_ret_ptr + callee_ret_len + caller_new_ptr
         } else if needs_result_copy {
             3 // callee_ret_ptr + callee_ret_len + caller_new_ptr
-        } else {
+        } else if needs_outbound_copy {
             1 // dest_ptr
+        } else {
+            0 // post-return-only path (no copy needed)
         };
 
-        let mut func = Function::new(vec![(scratch_count, wasm_encoder::ValType::I32)]);
+        // Build local declarations: copy scratch (i32) + post-return save (typed)
+        let mut local_decls: Vec<(u32, wasm_encoder::ValType)> = Vec::new();
+        if copy_scratch_count > 0 {
+            local_decls.push((copy_scratch_count, wasm_encoder::ValType::I32));
+        }
+        let post_return_base = param_count as u32 + copy_scratch_count;
+        if needs_post_return_save {
+            for ty in &result_types {
+                local_decls.push((1, *ty));
+            }
+        }
+
+        let mut func = Function::new(local_decls);
 
         // Assign scratch local indices (after params)
         let base = param_count as u32;
@@ -321,9 +420,38 @@ impl FactStyleGenerator {
                 dst_mem: options.caller_memory,
             });
 
+            // Call post-return if specified (callee cleanup with original return values)
+            if let Some(post_return_func) = options.callee_post_return {
+                func.instruction(&Instruction::LocalGet(callee_ret_ptr_local));
+                func.instruction(&Instruction::LocalGet(callee_ret_len_local));
+                func.instruction(&Instruction::Call(post_return_func));
+            }
+
             // Push results: (caller_new_ptr, callee_ret_len)
             func.instruction(&Instruction::LocalGet(caller_new_ptr_local));
             func.instruction(&Instruction::LocalGet(callee_ret_len_local));
+        }
+
+        // Post-return for non-result-copy case (callee returned scalars)
+        if !needs_result_copy && let Some(post_return_func) = options.callee_post_return {
+            if result_count > 0 {
+                // Save return values to scratch locals (pop in reverse order)
+                for i in (0..result_count).rev() {
+                    func.instruction(&Instruction::LocalSet(post_return_base + i as u32));
+                }
+                // Pass saved return values to cabi_post_return
+                for i in 0..result_count {
+                    func.instruction(&Instruction::LocalGet(post_return_base + i as u32));
+                }
+                func.instruction(&Instruction::Call(post_return_func));
+                // Push return values back onto the stack for the caller
+                for i in 0..result_count {
+                    func.instruction(&Instruction::LocalGet(post_return_base + i as u32));
+                }
+            } else {
+                // No results — just call post-return
+                func.instruction(&Instruction::Call(post_return_func));
+            }
         }
 
         func.instruction(&Instruction::End);
@@ -347,6 +475,10 @@ impl FactStyleGenerator {
 
         let func_type = merged.types.get(type_idx as usize);
         let param_count = func_type.map(|t| t.params.len()).unwrap_or(0);
+        let result_count = func_type.map(|t| t.results.len()).unwrap_or(0);
+        let result_types: Vec<wasm_encoder::ValType> =
+            func_type.map(|t| t.results.clone()).unwrap_or_default();
+        let needs_post_return_save = options.callee_post_return.is_some() && result_count > 0;
 
         // Determine how many scratch locals are needed for transcoding
         let needs_transcoding_locals = !matches!(
@@ -358,12 +490,19 @@ impl FactStyleGenerator {
         );
 
         // Scratch locals: src_idx, dst_idx, out_ptr, byte (+ code_point for UTF-8/16)
-        let scratch_locals = if needs_transcoding_locals { 5 } else { 0 };
-        let mut func = Function::new(if scratch_locals > 0 {
-            vec![(scratch_locals, wasm_encoder::ValType::I32)]
-        } else {
-            vec![]
-        });
+        let scratch_locals: u32 = if needs_transcoding_locals { 5 } else { 0 };
+        let post_return_base = param_count as u32 + scratch_locals;
+
+        let mut local_decls: Vec<(u32, wasm_encoder::ValType)> = Vec::new();
+        if scratch_locals > 0 {
+            local_decls.push((scratch_locals, wasm_encoder::ValType::I32));
+        }
+        if needs_post_return_save {
+            for ty in &result_types {
+                local_decls.push((1, *ty));
+            }
+        }
+        let mut func = Function::new(local_decls);
 
         // Generate transcoding logic based on encoding pair
 
@@ -401,6 +540,28 @@ impl FactStyleGenerator {
                     func.instruction(&Instruction::LocalGet(i as u32));
                 }
                 func.instruction(&Instruction::Call(target_func));
+            }
+        }
+
+        // Post-return: call cabi_post_return with the function's flat return values
+        if let Some(post_return_func) = options.callee_post_return {
+            if result_count > 0 {
+                // Save return values to scratch locals (pop in reverse order)
+                for i in (0..result_count).rev() {
+                    func.instruction(&Instruction::LocalSet(post_return_base + i as u32));
+                }
+                // Pass saved values to cabi_post_return
+                for i in 0..result_count {
+                    func.instruction(&Instruction::LocalGet(post_return_base + i as u32));
+                }
+                func.instruction(&Instruction::Call(post_return_func));
+                // Push return values back for the caller
+                for i in 0..result_count {
+                    func.instruction(&Instruction::LocalGet(post_return_base + i as u32));
+                }
+            } else {
+                // No results — just call post-return
+                func.instruction(&Instruction::Call(post_return_func));
             }
         }
 
@@ -459,9 +620,10 @@ impl FactStyleGenerator {
 
         // Step 1: Allocate output buffer = 2 * input_len bytes via cabi_realloc
         // (each UTF-8 byte produces at most one UTF-16 code unit = 2 bytes)
+        let callee_align = alignment_for_encoding(options.callee_string_encoding);
         func.instruction(&Instruction::I32Const(0)); // original_ptr
         func.instruction(&Instruction::I32Const(0)); // original_size
-        func.instruction(&Instruction::I32Const(2)); // alignment
+        func.instruction(&Instruction::I32Const(callee_align)); // alignment
         func.instruction(&Instruction::LocalGet(1)); // input_len
         func.instruction(&Instruction::I32Const(2));
         func.instruction(&Instruction::I32Mul); // alloc_size = 2 * input_len
@@ -766,9 +928,10 @@ impl FactStyleGenerator {
 
         // Step 1: Allocate output buffer = 3 * input_code_units bytes
         // (worst case: all BMP chars in U+0800-U+FFFF → 3 bytes UTF-8 each)
+        let callee_align = alignment_for_encoding(options.callee_string_encoding);
         func.instruction(&Instruction::I32Const(0)); // original_ptr
         func.instruction(&Instruction::I32Const(0)); // original_size
-        func.instruction(&Instruction::I32Const(1)); // alignment
+        func.instruction(&Instruction::I32Const(callee_align)); // alignment
         func.instruction(&Instruction::LocalGet(1)); // input_len (code units)
         func.instruction(&Instruction::I32Const(3));
         func.instruction(&Instruction::I32Mul); // alloc_size = 3 * code_units
@@ -1088,10 +1251,11 @@ impl FactStyleGenerator {
             memory_index: options.callee_memory,
         };
 
-        // Step 1: Allocate output buffer = 2 * input_len via cabi_realloc(0, 0, 1, size)
+        // Step 1: Allocate output buffer = 2 * input_len via cabi_realloc
+        let callee_align = alignment_for_encoding(options.callee_string_encoding);
         func.instruction(&Instruction::I32Const(0)); // original_ptr
         func.instruction(&Instruction::I32Const(0)); // original_size
-        func.instruction(&Instruction::I32Const(1)); // alignment
+        func.instruction(&Instruction::I32Const(callee_align)); // alignment
         func.instruction(&Instruction::LocalGet(1)); // input_len
         func.instruction(&Instruction::I32Const(2));
         func.instruction(&Instruction::I32Mul); // alloc_size = 2 * input_len
@@ -1198,30 +1362,25 @@ impl FactStyleGenerator {
 
     /// Resolve the target function index in the merged module
     fn resolve_target_function(&self, site: &AdapterSite, merged: &MergedModule) -> Result<u32> {
-        // Look up the exported function's merged index using the original export index
-        if let Some(&idx) = merged.function_index_map.get(&(
-            site.to_component,
-            site.to_module,
-            site.export_func_idx,
-        )) {
-            return Ok(idx);
-        }
-
-        // Fallback: try index 0 as last resort
-        log::warn!(
-            "Could not resolve target function for {} -> {} (export_func_idx={})",
-            site.import_name,
-            site.export_name,
-            site.export_func_idx,
-        );
+        // Look up the exported function's merged index using the original export index.
+        // If the index is missing, this indicates a bug in the resolution or merging
+        // pipeline -- we must not silently fall back to an arbitrary function (such as
+        // index 0) because that would cause the adapter to call the wrong function at
+        // runtime with no visible error.
         merged
             .function_index_map
-            .get(&(site.to_component, site.to_module, 0))
+            .get(&(site.to_component, site.to_module, site.export_func_idx))
             .copied()
             .ok_or_else(|| {
                 crate::Error::AdapterGeneration(format!(
-                    "Cannot resolve target function for adapter: {} -> {}",
-                    site.import_name, site.export_name,
+                    "Cannot resolve target function for adapter: {} -> {} \
+                     (component={}, module={}, export_func_idx={}). \
+                     The export may be missing or the function index map is incomplete.",
+                    site.import_name,
+                    site.export_name,
+                    site.to_component,
+                    site.to_module,
+                    site.export_func_idx,
                 ))
             })
     }

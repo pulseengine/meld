@@ -10,7 +10,7 @@ use crate::parser::{
     CoreModule, ExportKind, GlobalType, ImportKind, MemoryType, ParsedComponent, TableType,
 };
 use crate::resolver::DependencyGraph;
-use crate::rewriter::{IndexMaps, rewrite_function_body};
+use crate::rewriter::{IndexMaps, convert_abstract_heap_type, rewrite_function_body};
 use crate::{Error, MemoryStrategy, Result};
 use std::collections::HashMap;
 use wasm_encoder::{
@@ -390,7 +390,7 @@ impl Merger {
             }
         }
 
-        // Merge tables
+        // Merge tables (defined tables only; imported tables handled below)
         let table_offset = merged.tables.len() as u32;
         for (old_idx, table) in module.tables.iter().enumerate() {
             let new_idx = table_offset + old_idx as u32;
@@ -401,7 +401,7 @@ impl Merger {
             merged.tables.push(convert_table_type(table));
         }
 
-        // Merge globals
+        // Merge globals (defined globals only; imported globals handled below)
         let global_offset = merged.globals.len() as u32;
         for (old_idx, global) in module.globals.iter().enumerate() {
             let new_idx = global_offset + old_idx as u32;
@@ -409,13 +409,95 @@ impl Merger {
                 (comp_idx, mod_idx, import_global_count + old_idx as u32),
                 new_idx,
             );
-            // Create a placeholder init expression
-            // Real implementation would parse from module bytes
-            let init_expr = create_global_init(&global.content_type);
+            let init_expr = convert_init_expr(
+                &global.init_expr_bytes,
+                comp_idx,
+                mod_idx,
+                merged,
+                &global.content_type,
+            );
             merged.globals.push(MergedGlobal {
                 ty: convert_global_type(global),
                 init_expr,
             });
+        }
+
+        // Resolve imported global indices via intra-component module_resolutions.
+        // This mirrors how function imports are resolved below: if module A
+        // imports a global that module B exports, map A's imported global index
+        // to B's defined global's merged index.
+        {
+            let mut import_global_idx = 0u32;
+            for imp in &module.imports {
+                if !matches!(imp.kind, ImportKind::Global(_)) {
+                    continue;
+                }
+
+                // Intra-component: check module_resolutions
+                let intra = graph.module_resolutions.iter().find(|res| {
+                    res.component_idx == comp_idx
+                        && res.from_module == mod_idx
+                        && imp.name == res.import_name
+                });
+                if let Some(res) = intra {
+                    let target_module = &components[res.component_idx].core_modules[res.to_module];
+                    if let Some(export) = target_module
+                        .exports
+                        .iter()
+                        .find(|e| e.name == res.export_name && e.kind == ExportKind::Global)
+                    {
+                        if let Some(&target_idx) = merged.global_index_map.get(&(
+                            res.component_idx,
+                            res.to_module,
+                            export.index,
+                        )) {
+                            merged
+                                .global_index_map
+                                .insert((comp_idx, mod_idx, import_global_idx), target_idx);
+                        }
+                    }
+                }
+
+                import_global_idx += 1;
+            }
+        }
+
+        // Resolve imported table indices via intra-component module_resolutions.
+        // Same pattern as global import resolution above.
+        {
+            let mut import_table_idx = 0u32;
+            for imp in &module.imports {
+                if !matches!(imp.kind, ImportKind::Table(_)) {
+                    continue;
+                }
+
+                // Intra-component: check module_resolutions
+                let intra = graph.module_resolutions.iter().find(|res| {
+                    res.component_idx == comp_idx
+                        && res.from_module == mod_idx
+                        && imp.name == res.import_name
+                });
+                if let Some(res) = intra {
+                    let target_module = &components[res.component_idx].core_modules[res.to_module];
+                    if let Some(export) = target_module
+                        .exports
+                        .iter()
+                        .find(|e| e.name == res.export_name && e.kind == ExportKind::Table)
+                    {
+                        if let Some(&target_idx) = merged.table_index_map.get(&(
+                            res.component_idx,
+                            res.to_module,
+                            export.index,
+                        )) {
+                            merged
+                                .table_index_map
+                                .insert((comp_idx, mod_idx, import_table_idx), target_idx);
+                        }
+                    }
+                }
+
+                import_table_idx += 1;
+            }
         }
 
         // Resolve function imports that have been matched to exports in other
@@ -433,7 +515,7 @@ impl Merger {
                 let resolved = graph.adapter_sites.iter().find(|site| {
                     site.from_component == comp_idx
                         && site.from_module == mod_idx
-                        && (imp.name == site.import_name || imp.module.contains(&site.import_name))
+                        && (imp.name == site.import_name || imp.module == site.import_name)
                 });
                 if let Some(site) = resolved {
                     if let Some(&target_idx) = merged.function_index_map.get(&(
@@ -597,21 +679,94 @@ impl Merger {
             });
         }
 
-        // Detect cabi_realloc export for adapter generation
-        for export in &module.exports {
-            if export.name == "cabi_realloc" && export.kind == ExportKind::Function {
-                if let Some(&merged_idx) =
-                    merged
-                        .function_index_map
-                        .get(&(comp_idx, mod_idx, export.index))
+        // Detect cabi_realloc for adapter generation.
+        // 1. Check canonical section Realloc options (takes priority)
+        //
+        // The canonical section's Realloc(idx) refers to the *component-level*
+        // core function index space, which spans all modules in the component
+        // (and includes core functions from canon lower / aliases). For
+        // single-module components the component-level index equals the
+        // module-local index. For multi-module components, we decompose the
+        // component-level index by accumulating per-module function counts.
+        let mut realloc_from_canonical = false;
+        for entry in &components[comp_idx].canonical_functions {
+            let realloc_idx = match entry {
+                crate::parser::CanonicalEntry::Lift { options, .. } => options.realloc,
+                crate::parser::CanonicalEntry::Lower { options, .. } => options.realloc,
+                _ => None,
+            };
+            if let Some(core_func_idx) = realloc_idx {
+                // Decompose component-level core function index to
+                // (target_module_idx, module_local_func_idx).
+                if let Some((target_mod_idx, local_func_idx)) =
+                    decompose_component_core_func_index(&components[comp_idx], core_func_idx)
                 {
-                    merged.realloc_map.insert((comp_idx, mod_idx), merged_idx);
-                    log::debug!(
-                        "Found cabi_realloc in component {} module {}: merged idx {}",
-                        comp_idx,
-                        mod_idx,
-                        merged_idx
-                    );
+                    // Only store the realloc for the module currently being
+                    // merged (mod_idx).
+                    if target_mod_idx == mod_idx {
+                        if let Some(&merged_idx) = merged.function_index_map.get(&(
+                            comp_idx,
+                            target_mod_idx,
+                            local_func_idx,
+                        )) {
+                            merged.realloc_map.insert((comp_idx, mod_idx), merged_idx);
+                            realloc_from_canonical = true;
+                            log::debug!(
+                                "Found canonical realloc in component {} module {}: \
+                                 component core func {} -> module-local {} -> merged idx {}",
+                                comp_idx,
+                                mod_idx,
+                                core_func_idx,
+                                local_func_idx,
+                                merged_idx
+                            );
+                            break;
+                        }
+                    }
+                } else {
+                    // Decomposition failed -- the index may refer to a core
+                    // function created by canon lower or an alias, which lives
+                    // outside any module's function space. Try a direct lookup
+                    // as a fallback (works for single-module components where
+                    // component-level == module-local).
+                    if let Some(&merged_idx) =
+                        merged
+                            .function_index_map
+                            .get(&(comp_idx, mod_idx, core_func_idx))
+                    {
+                        merged.realloc_map.insert((comp_idx, mod_idx), merged_idx);
+                        realloc_from_canonical = true;
+                        log::debug!(
+                            "Found canonical realloc (direct fallback) in component {} module {}: \
+                             core func {} -> merged idx {}",
+                            comp_idx,
+                            mod_idx,
+                            core_func_idx,
+                            merged_idx
+                        );
+                        break;
+                    }
+                }
+            }
+        }
+
+        // 2. Fall back to name-based detection if canonical section didn't provide one
+        if !realloc_from_canonical {
+            for export in &module.exports {
+                if export.name == "cabi_realloc" && export.kind == ExportKind::Function {
+                    if let Some(&merged_idx) =
+                        merged
+                            .function_index_map
+                            .get(&(comp_idx, mod_idx, export.index))
+                    {
+                        merged.realloc_map.insert((comp_idx, mod_idx), merged_idx);
+                        log::debug!(
+                            "Found cabi_realloc by name in component {} module {}: merged idx {}",
+                            comp_idx,
+                            mod_idx,
+                            merged_idx
+                        );
+                    }
                 }
             }
         }
@@ -771,7 +926,37 @@ impl Merger {
     }
 }
 
-fn module_memory_type(module: &CoreModule) -> Result<Option<MemoryType>> {
+/// Decompose a component-level core function index into (module_idx, module_local_func_idx).
+///
+/// The component-level core function index space is formed by concatenating
+/// each core module's function space (imports + defined functions) in module
+/// order. This function finds which module the given index falls in and
+/// returns the module index and the module-local function index.
+///
+/// Returns `None` if `core_func_idx` exceeds the total number of functions
+/// across all modules (it may refer to a core function created by `canon lower`
+/// or an alias, which lives outside any module's function space).
+fn decompose_component_core_func_index(
+    component: &ParsedComponent,
+    core_func_idx: u32,
+) -> Option<(usize, u32)> {
+    let mut running: u32 = 0;
+    for (mod_idx, module) in component.core_modules.iter().enumerate() {
+        let import_func_count = module
+            .imports
+            .iter()
+            .filter(|i| matches!(i.kind, ImportKind::Function(_)))
+            .count() as u32;
+        let module_func_count = import_func_count + module.functions.len() as u32;
+        if core_func_idx < running.saturating_add(module_func_count) {
+            return Some((mod_idx, core_func_idx - running));
+        }
+        running = running.saturating_add(module_func_count);
+    }
+    None
+}
+
+pub(crate) fn module_memory_type(module: &CoreModule) -> Result<Option<MemoryType>> {
     let mut memory_type: Option<MemoryType> = None;
 
     for import in &module.imports {
@@ -937,7 +1122,7 @@ fn convert_global_type(global: &GlobalType) -> EncoderGlobalType {
 /// This creates a local view of index remappings for a specific module,
 /// which is used when rewriting function bodies.
 #[allow(clippy::too_many_arguments)]
-fn build_index_maps_for_module(
+pub(crate) fn build_index_maps_for_module(
     comp_idx: usize,
     mod_idx: usize,
     module: &CoreModule,
@@ -986,13 +1171,21 @@ fn build_index_maps_for_module(
         }
     }
 
-    // Build global map
+    // Build global map (including imported globals)
     let import_global_count = module
         .imports
         .iter()
         .filter(|i| matches!(i.kind, ImportKind::Global(_)))
         .count() as u32;
 
+    // Map imported globals (they may be resolved via module_resolutions)
+    for i in 0..import_global_count {
+        if let Some(&new_idx) = merged.global_index_map.get(&(comp_idx, mod_idx, i)) {
+            maps.globals.insert(i, new_idx);
+        }
+    }
+
+    // Map defined globals
     for old_idx in 0..module.globals.len() as u32 {
         let full_idx = import_global_count + old_idx;
         if let Some(&new_idx) = merged.global_index_map.get(&(comp_idx, mod_idx, full_idx)) {
@@ -1000,13 +1193,21 @@ fn build_index_maps_for_module(
         }
     }
 
-    // Build table map
+    // Build table map (including imported tables)
     let import_table_count = module
         .imports
         .iter()
         .filter(|i| matches!(i.kind, ImportKind::Table(_)))
         .count() as u32;
 
+    // Map imported tables (they may be resolved via module_resolutions)
+    for i in 0..import_table_count {
+        if let Some(&new_idx) = merged.table_index_map.get(&(comp_idx, mod_idx, i)) {
+            maps.tables.insert(i, new_idx);
+        }
+    }
+
+    // Map defined tables
     for old_idx in 0..module.tables.len() as u32 {
         let full_idx = import_table_count + old_idx;
         if let Some(&new_idx) = merged.table_index_map.get(&(comp_idx, mod_idx, full_idx)) {
@@ -1056,13 +1257,94 @@ fn create_global_init(val_type: &ValType) -> ConstExpr {
     }
 }
 
+/// Convert stored init expression bytes into a `wasm_encoder::ConstExpr`,
+/// remapping any global or function indices through the merged module maps.
+///
+/// Falls back to `create_global_init` (zeros) when `bytes` is empty (e.g. for
+/// imported globals which have no initializer stored), and to raw byte emission
+/// for any unrecognised operator pattern.
+fn convert_init_expr(
+    bytes: &[u8],
+    comp_idx: usize,
+    mod_idx: usize,
+    merged: &MergedModule,
+    val_type: &ValType,
+) -> ConstExpr {
+    if bytes.is_empty() {
+        return create_global_init(val_type);
+    }
+
+    // Append the End opcode so wasmparser sees a complete const-expr
+    let mut full = bytes.to_vec();
+    full.push(0x0B);
+
+    let bin_reader = wasmparser::BinaryReader::new(&full, 0);
+    let parser_expr = wasmparser::ConstExpr::new(bin_reader);
+    let mut ops = parser_expr.get_operators_reader();
+
+    let op = match ops.read() {
+        Ok(op) => op,
+        Err(_) => return ConstExpr::raw(bytes.iter().copied()),
+    };
+
+    match op {
+        wasmparser::Operator::I32Const { value } => ConstExpr::i32_const(value),
+        wasmparser::Operator::I64Const { value } => ConstExpr::i64_const(value),
+        wasmparser::Operator::F32Const { value } => {
+            ConstExpr::f32_const(f32::from_bits(value.bits()))
+        }
+        wasmparser::Operator::F64Const { value } => {
+            ConstExpr::f64_const(f64::from_bits(value.bits()))
+        }
+        wasmparser::Operator::V128Const { value } => {
+            ConstExpr::v128_const(i128::from_le_bytes(*value.bytes()))
+        }
+        wasmparser::Operator::GlobalGet { global_index } => {
+            let remapped = merged
+                .global_index_map
+                .get(&(comp_idx, mod_idx, global_index))
+                .copied()
+                .unwrap_or(global_index);
+            ConstExpr::global_get(remapped)
+        }
+        wasmparser::Operator::RefFunc { function_index } => {
+            let remapped = merged
+                .function_index_map
+                .get(&(comp_idx, mod_idx, function_index))
+                .copied()
+                .unwrap_or(function_index);
+            ConstExpr::ref_func(remapped)
+        }
+        wasmparser::Operator::RefNull { hty } => {
+            let heap_type = match hty {
+                wasmparser::HeapType::Abstract { shared, ty } => wasm_encoder::HeapType::Abstract {
+                    shared,
+                    ty: convert_abstract_heap_type(ty),
+                },
+                wasmparser::HeapType::Concrete(idx) => {
+                    let old_idx = idx.as_module_index().unwrap_or(0);
+                    let new_idx = merged
+                        .type_index_map
+                        .get(&(comp_idx, mod_idx, old_idx))
+                        .copied()
+                        .unwrap_or(old_idx);
+                    wasm_encoder::HeapType::Concrete(new_idx)
+                }
+            };
+            ConstExpr::ref_null(heap_type)
+        }
+        // Unrecognised pattern — emit the raw bytes as-is
+        _ => ConstExpr::raw(bytes.iter().copied()),
+    }
+}
+
 /// Extract and rewrite function body from module bytes
 ///
 /// This function:
 /// 1. Parses the code section from the module bytes
 /// 2. Finds the function body at the specified index
 /// 3. Rewrites all index references using the provided maps
-fn extract_function_body(
+pub(crate) fn extract_function_body(
     module: &CoreModule,
     func_idx: usize,
     param_count: u32,
@@ -1101,7 +1383,7 @@ fn extract_function_body(
 
 impl Default for Merger {
     fn default() -> Self {
-        Self::new(MemoryStrategy::SharedMemory, false)
+        Self::new(MemoryStrategy::MultiMemory, false)
     }
 }
 
@@ -1281,5 +1563,175 @@ mod tests {
             None,
         );
         assert_eq!(maps_b.remap_memory(0), 1);
+    }
+
+    /// Regression test for Bug #7: Merger::default() must use MultiMemory strategy.
+    /// The default memory strategy should be MultiMemory (not SharedMemory) because
+    /// SharedMemory is broken when any component uses memory.grow.
+    #[test]
+    fn test_merger_default_uses_multi_memory() {
+        let merger = Merger::default();
+        assert_eq!(
+            merger.memory_strategy,
+            MemoryStrategy::MultiMemory,
+            "Merger::default() must use MultiMemory strategy"
+        );
+        assert!(
+            !merger.address_rebasing,
+            "Merger::default() must not enable address rebasing"
+        );
+    }
+
+    /// Test decompose_component_core_func_index for single-module components
+    #[test]
+    fn test_decompose_core_func_index_single_module() {
+        use crate::parser::ParsedComponent;
+
+        // Single module with 2 imported functions + 3 defined functions = 5 total
+        let module = CoreModule {
+            index: 0,
+            bytes: Vec::new(),
+            types: Vec::new(),
+            imports: vec![
+                crate::parser::ModuleImport {
+                    module: "env".to_string(),
+                    name: "f0".to_string(),
+                    kind: ImportKind::Function(0),
+                },
+                crate::parser::ModuleImport {
+                    module: "env".to_string(),
+                    name: "f1".to_string(),
+                    kind: ImportKind::Function(0),
+                },
+            ],
+            exports: Vec::new(),
+            functions: vec![0, 0, 0], // 3 defined functions
+            memories: Vec::new(),
+            tables: Vec::new(),
+            globals: Vec::new(),
+            start: None,
+            data_count: None,
+            element_count: 0,
+            custom_sections: Vec::new(),
+            code_section_range: None,
+            global_section_range: None,
+            element_section_range: None,
+            data_section_range: None,
+        };
+
+        let component = ParsedComponent {
+            name: None,
+            core_modules: vec![module],
+            imports: Vec::new(),
+            exports: Vec::new(),
+            types: Vec::new(),
+            instances: Vec::new(),
+            canonical_functions: Vec::new(),
+            original_size: 0,
+            original_hash: String::new(),
+        };
+
+        // Function indices 0-4 should all map to (module 0, local idx)
+        assert_eq!(
+            decompose_component_core_func_index(&component, 0),
+            Some((0, 0))
+        );
+        assert_eq!(
+            decompose_component_core_func_index(&component, 2),
+            Some((0, 2))
+        );
+        assert_eq!(
+            decompose_component_core_func_index(&component, 4),
+            Some((0, 4))
+        );
+        // Index 5 is out of bounds
+        assert_eq!(decompose_component_core_func_index(&component, 5), None);
+    }
+
+    /// Test decompose_component_core_func_index for multi-module components
+    #[test]
+    fn test_decompose_core_func_index_multi_module() {
+        use crate::parser::ParsedComponent;
+
+        // Module A: 1 import + 2 defined = 3 total (indices 0, 1, 2)
+        let module_a = CoreModule {
+            index: 0,
+            bytes: Vec::new(),
+            types: Vec::new(),
+            imports: vec![crate::parser::ModuleImport {
+                module: "env".to_string(),
+                name: "f0".to_string(),
+                kind: ImportKind::Function(0),
+            }],
+            exports: Vec::new(),
+            functions: vec![0, 0],
+            memories: Vec::new(),
+            tables: Vec::new(),
+            globals: Vec::new(),
+            start: None,
+            data_count: None,
+            element_count: 0,
+            custom_sections: Vec::new(),
+            code_section_range: None,
+            global_section_range: None,
+            element_section_range: None,
+            data_section_range: None,
+        };
+
+        // Module B: 0 imports + 4 defined = 4 total (indices 3, 4, 5, 6)
+        let module_b = CoreModule {
+            index: 1,
+            bytes: Vec::new(),
+            types: Vec::new(),
+            imports: Vec::new(),
+            exports: Vec::new(),
+            functions: vec![0, 0, 0, 0],
+            memories: Vec::new(),
+            tables: Vec::new(),
+            globals: Vec::new(),
+            start: None,
+            data_count: None,
+            element_count: 0,
+            custom_sections: Vec::new(),
+            code_section_range: None,
+            global_section_range: None,
+            element_section_range: None,
+            data_section_range: None,
+        };
+
+        let component = ParsedComponent {
+            name: None,
+            core_modules: vec![module_a, module_b],
+            imports: Vec::new(),
+            exports: Vec::new(),
+            types: Vec::new(),
+            instances: Vec::new(),
+            canonical_functions: Vec::new(),
+            original_size: 0,
+            original_hash: String::new(),
+        };
+
+        // Indices 0-2 belong to module A
+        assert_eq!(
+            decompose_component_core_func_index(&component, 0),
+            Some((0, 0))
+        );
+        assert_eq!(
+            decompose_component_core_func_index(&component, 2),
+            Some((0, 2))
+        );
+
+        // Indices 3-6 belong to module B (local indices 0-3)
+        assert_eq!(
+            decompose_component_core_func_index(&component, 3),
+            Some((1, 0))
+        );
+        assert_eq!(
+            decompose_component_core_func_index(&component, 6),
+            Some((1, 3))
+        );
+
+        // Index 7 is out of bounds
+        assert_eq!(decompose_component_core_func_index(&component, 7), None);
     }
 }

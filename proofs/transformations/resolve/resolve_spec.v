@@ -1164,6 +1164,8 @@ Definition resolution_correct
   (* Edges are derived from resolutions *)
   (forall e, In e (dg_edges graph) <->
              In e (edges_from_resolutions (dg_resolved_imports graph))) /\
+  (* Dependency graph is acyclic *)
+  acyclic (dg_edges graph) /\
   (* Adapter sites match resolutions *)
   (forall site, In site (rr_adapter_sites result) ->
                 exists r, In r (dg_resolved_imports graph) /\
@@ -1172,20 +1174,16 @@ Definition resolution_correct
 
 (* Resolution correctness: the resolution algorithm produces a correct result.
 
-   The interesting content is showing that acyclicity guarantees a valid
-   topological ordering. The other properties are structural invariants
-   maintained by the algorithm (component count, edge derivation, adapter sites).
+   The non-trivial content is deriving acyclicity from the ordering properties
+   via valid_order_implies_acyclic. The ordering and structural invariants are
+   taken as preconditions about the algorithm output.
 
-   We factor the proof into:
-   1. Structural invariants (provided as preconditions about algorithm output)
-   2. Topological ordering (derived from acyclicity via topo_sort_cycle_detection)
-
-   NOTE: Once topo_sort_cycle_detection forward direction is proved, the
-   ordering preconditions can be replaced by:
+   NOTE: Once Kahn's algorithm is formalized in Rocq, the ordering preconditions
+   (order_complete, order_respects_deps) can be replaced by:
      acyclic edges ->
      dg_instantiation_order graph = kahn_sort n edges ->
-   and the ordering properties derived. For now, we take the ordering
-   as a precondition since Kahn's correctness is in progress. *)
+   and the ordering properties derived. For now, ordering is a precondition
+   and acyclicity is derived from it. *)
 Theorem resolve_correctness :
   forall (components : list component) (result : resolution_result),
     let graph := rr_graph result in
@@ -1197,8 +1195,6 @@ Theorem resolve_correctness :
     (* All edges are within bounds *)
     (forall e, In e (dg_edges graph) ->
                fst e < length components /\ snd e < length components) ->
-    (* Graph is acyclic *)
-    acyclic (dg_edges graph) ->
     (* Topological ordering is valid (from Kahn's algorithm) *)
     order_complete (length components) (dg_instantiation_order graph) ->
     order_respects_deps (dg_instantiation_order graph) (dg_edges graph) ->
@@ -1210,31 +1206,11 @@ Theorem resolve_correctness :
     resolution_correct components result.
 Proof.
   intros components result graph
-    Hcount Hedges_iff Hvalid Hacyclic Hcomplete Hrespects Hadapters.
+    Hcount Hedges_iff Hbounds Hcomplete Hrespects Hadapters.
   unfold resolution_correct.
-  repeat split; assumption.
-Qed.
-
-(* -------------------------------------------------------------------------
-   Module-Level Resolution
-   ------------------------------------------------------------------------- *)
-
-(* Resolution within a single component *)
-Record module_resolution : Type := mkModuleResolution {
-  mr_component_idx : nat;
-  mr_from_module : nat;
-  mr_to_module : nat;
-  mr_import_name : wasm_string;
-  mr_export_name : wasm_string;
-}.
-
-(* Module-level resolution is internal to component *)
-Theorem module_resolution_internal :
-  forall (resolution : module_resolution),
-    (* Both modules are in the same component - trivially true by construction *)
-    True.
-Proof.
-  trivial.
+  repeat split; try assumption.
+  (* Derive acyclicity from edge bounds + valid topological ordering *)
+  eapply valid_order_implies_acyclic; eauto.
 Qed.
 
 (* -------------------------------------------------------------------------

@@ -225,14 +225,14 @@ impl Fuser {
             "Resolving dependencies for {} components",
             self.components.len()
         );
-        let resolver = Resolver::new();
+        let resolver = Resolver::with_strategy(self.config.memory_strategy);
         let graph = resolver.resolve(&self.components)?;
         stats.imports_resolved = graph.resolved_imports.len();
 
         // Step 2: Merge modules
         log::info!("Merging {} core modules", stats.modules_merged);
         let merger = Merger::new(self.config.memory_strategy, self.config.address_rebasing);
-        let merged = merger.merge(&self.components, &graph)?;
+        let mut merged = merger.merge(&self.components, &graph)?;
         stats.total_functions = merged.functions.len();
         stats.total_exports = merged.exports.len();
 
@@ -245,6 +245,18 @@ impl Fuser {
         let generator = adapter::FactStyleGenerator::new(adapter_config);
         let adapters = generator.generate(&merged, &graph)?;
         stats.adapter_functions = adapters.len();
+
+        // Step 3.5: Wire adapter function indices into the call graph
+        //
+        // The merger (step 2) maps cross-component imports directly to the
+        // export target's merged index, bypassing adapters.  Now that adapters
+        // have been generated we know their merged indices — they are appended
+        // after all core functions — so we can patch function_index_map and
+        // re-rewrite the affected function bodies so that call sites go through
+        // the adapter trampolines instead of calling the target directly.
+        if !adapters.is_empty() {
+            self.wire_adapter_indices(&mut merged, &adapters, &graph)?;
+        }
 
         // Step 4: Encode output module
         log::info!("Encoding fused module");
@@ -276,6 +288,138 @@ impl Fuser {
         );
 
         Ok((output, stats))
+    }
+
+    /// Wire adapter function indices into the merged module's call graph.
+    ///
+    /// The merger maps cross-component imports directly to the export target's
+    /// merged index.  This method corrects those mappings so that call sites
+    /// go through the generated adapter trampolines instead.  For each adapter
+    /// we:
+    ///   1. Compute its merged function index (core functions + adapter offset).
+    ///   2. Find the import function index in the source module that this
+    ///      adapter replaces.
+    ///   3. Update `function_index_map` so that import resolves to the adapter.
+    ///   4. Re-rewrite the function bodies of the source module so that the
+    ///      already-encoded `call` instructions reference the adapter.
+    fn wire_adapter_indices(
+        &self,
+        merged: &mut merger::MergedModule,
+        adapters: &[adapter::AdapterFunction],
+        graph: &resolver::DependencyGraph,
+    ) -> Result<()> {
+        use std::collections::HashSet;
+
+        let adapter_base = merged.functions.len() as u32;
+
+        // For each adapter, update function_index_map to point the source
+        // import to the adapter's merged index rather than the direct target.
+        let mut affected_modules: HashSet<(usize, usize)> = HashSet::new();
+
+        for (adapter_offset, (adapter, site)) in
+            adapters.iter().zip(graph.adapter_sites.iter()).enumerate()
+        {
+            let adapter_merged_idx = adapter_base + adapter_offset as u32;
+            let comp_idx = adapter.source_component;
+            let mod_idx = adapter.source_module;
+            let module = &self.components[comp_idx].core_modules[mod_idx];
+
+            // Find the import function index that this adapter replaces by
+            // scanning the source module's imports for the matching name.
+            let mut import_func_idx = 0u32;
+            let mut found = false;
+            for imp in &module.imports {
+                if !matches!(imp.kind, parser::ImportKind::Function(_)) {
+                    continue;
+                }
+                if imp.name == site.import_name || imp.module == site.import_name {
+                    merged
+                        .function_index_map
+                        .insert((comp_idx, mod_idx, import_func_idx), adapter_merged_idx);
+                    affected_modules.insert((comp_idx, mod_idx));
+                    found = true;
+                    break;
+                }
+                import_func_idx += 1;
+            }
+            if !found {
+                log::warn!(
+                    "adapter {} could not find matching import '{}' in component {} module {}",
+                    adapter.name,
+                    site.import_name,
+                    comp_idx,
+                    mod_idx
+                );
+            }
+        }
+
+        // Re-rewrite function bodies for every module that had an import
+        // redirected to an adapter, so the already-encoded `call` instructions
+        // pick up the corrected indices.
+        for &(comp_idx, mod_idx) in &affected_modules {
+            let module = &self.components[comp_idx].core_modules[mod_idx];
+
+            let memory_base_offset = 0u64; // only nonzero for shared-memory rebasing
+            let module_memory = if self.config.address_rebasing {
+                merger::module_memory_type(module)?
+            } else {
+                None
+            };
+            let memory64 = module_memory
+                .as_ref()
+                .map(|mem| mem.memory64)
+                .unwrap_or(false);
+            let memory_initial_pages = module_memory.as_ref().map(|mem| mem.initial);
+
+            let index_maps = merger::build_index_maps_for_module(
+                comp_idx,
+                mod_idx,
+                module,
+                merged,
+                self.config.memory_strategy,
+                self.config.address_rebasing,
+                memory_base_offset,
+                memory64,
+                memory_initial_pages,
+            );
+
+            let import_func_count = module
+                .imports
+                .iter()
+                .filter(|i| matches!(i.kind, parser::ImportKind::Function(_)))
+                .count() as u32;
+
+            // Walk through defined functions of this module and re-rewrite
+            // their bodies using the corrected index maps.
+            for (old_idx, &type_idx) in module.functions.iter().enumerate() {
+                let old_func_idx = import_func_count + old_idx as u32;
+                let param_count = module
+                    .types
+                    .get(type_idx as usize)
+                    .map(|ty| ty.params.len() as u32)
+                    .unwrap_or(0);
+
+                let body =
+                    merger::extract_function_body(module, old_idx, param_count, &index_maps)?;
+
+                // Find and replace the corresponding MergedFunction entry.
+                if let Some(mf) = merged
+                    .functions
+                    .iter_mut()
+                    .find(|f| f.origin == (comp_idx, mod_idx, old_func_idx))
+                {
+                    mf.body = body;
+                }
+            }
+        }
+
+        log::info!(
+            "Wired {} adapter(s) into {} source module(s)",
+            adapters.len(),
+            affected_modules.len()
+        );
+
+        Ok(())
     }
 
     /// Encode the merged module to binary

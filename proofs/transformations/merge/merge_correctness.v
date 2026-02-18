@@ -15,7 +15,7 @@ Import ListNotations.
 
 Lemma merge_types_length :
   forall input,
-    length (mod_types (merge_modules input)) = total_space_count input TypeIdx.
+    length (mod_types (merge_modules input SharedMemory)) = total_space_count input TypeIdx.
 Proof.
   intro input.
   unfold merge_modules, total_space_count, space_count_of_module. simpl.
@@ -51,7 +51,7 @@ Qed.
 
 Lemma count_func_imports_flat_map :
   forall input,
-    count_func_imports (merge_modules input)
+    count_func_imports (merge_modules input SharedMemory)
     = fold_left (fun acc sm => acc + count_func_imports (snd sm)) input 0.
 Proof.
   intro input.
@@ -61,7 +61,7 @@ Qed.
 
 Lemma merge_funcs_length :
   forall input,
-    count_func_imports (merge_modules input) + length (mod_funcs (merge_modules input))
+    count_func_imports (merge_modules input SharedMemory) + length (mod_funcs (merge_modules input SharedMemory))
     = total_space_count input FuncIdx.
 Proof.
   intro input.
@@ -74,7 +74,7 @@ Qed.
 
 Lemma count_table_imports_flat_map :
   forall input,
-    count_table_imports (merge_modules input)
+    count_table_imports (merge_modules input SharedMemory)
     = fold_left (fun acc sm => acc + count_table_imports (snd sm)) input 0.
 Proof.
   intro input.
@@ -84,7 +84,7 @@ Qed.
 
 Lemma merge_tables_length :
   forall input,
-    count_table_imports (merge_modules input) + length (mod_tables (merge_modules input))
+    count_table_imports (merge_modules input SharedMemory) + length (mod_tables (merge_modules input SharedMemory))
     = total_space_count input TableIdx.
 Proof.
   intro input.
@@ -97,7 +97,7 @@ Qed.
 
 Lemma count_mem_imports_flat_map :
   forall input,
-    count_mem_imports (merge_modules input)
+    count_mem_imports (merge_modules input SharedMemory)
     = fold_left (fun acc sm => acc + count_mem_imports (snd sm)) input 0.
 Proof.
   intro input.
@@ -107,7 +107,7 @@ Qed.
 
 (* SharedMemory mode produces exactly 1 defined memory in the merged module *)
 Lemma merge_mems_count : forall input,
-    length (mod_mems (merge_modules input)) = 1.
+    length (mod_mems (merge_modules input SharedMemory)) = 1.
 Proof.
   intro input. unfold merge_modules. simpl.
   apply sum_space_counts_mems_shared.
@@ -141,7 +141,7 @@ Qed.
 
 Lemma count_global_imports_flat_map :
   forall input,
-    count_global_imports (merge_modules input)
+    count_global_imports (merge_modules input SharedMemory)
     = fold_left (fun acc sm => acc + count_global_imports (snd sm)) input 0.
 Proof.
   intro input.
@@ -151,7 +151,7 @@ Qed.
 
 Lemma merge_globals_length :
   forall input,
-    count_global_imports (merge_modules input) + length (mod_globals (merge_modules input))
+    count_global_imports (merge_modules input SharedMemory) + length (mod_globals (merge_modules input SharedMemory))
     = total_space_count input GlobalIdx.
 Proof.
   intro input.
@@ -164,7 +164,7 @@ Qed.
 
 Lemma merge_elems_length :
   forall input,
-    length (mod_elems (merge_modules input)) = total_space_count input ElemIdx.
+    length (mod_elems (merge_modules input SharedMemory)) = total_space_count input ElemIdx.
 Proof.
   intro input.
   unfold merge_modules, total_space_count, space_count_of_module. simpl.
@@ -173,7 +173,7 @@ Qed.
 
 Lemma merge_datas_length :
   forall input,
-    length (mod_datas (merge_modules input)) = total_space_count input DataIdx.
+    length (mod_datas (merge_modules input SharedMemory)) = total_space_count input DataIdx.
 Proof.
   intro input.
   unfold merge_modules, total_space_count, space_count_of_module. simpl.
@@ -343,7 +343,7 @@ Qed.
    every lookup produces a valid index in the merged module. *)
 Theorem merge_correctness_constructed :
   forall input,
-    let merged := merge_modules input in
+    let merged := merge_modules input SharedMemory in
     let remaps := gen_all_remaps input SharedMemory in
     forall src m space src_idx fused_idx,
       In (src, m) input ->
@@ -401,7 +401,7 @@ Theorem merge_correctness :
     remaps_injective remaps ->
     remaps_bounded input remaps ->
     mem_remaps_zero remaps ->
-    merged = merge_modules input ->
+    merged = merge_modules input SharedMemory ->
     forall src m space src_idx fused_idx,
       In (src, m) input ->
       lookup_remap remaps space src src_idx = Some fused_idx ->

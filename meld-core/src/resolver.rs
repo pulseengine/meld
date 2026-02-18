@@ -3,8 +3,10 @@
 //! This module handles building the import/export graph between components
 //! and performing topological sort for instantiation order.
 
-use crate::parser::{ComponentExport, ImportKind, ModuleExport, ParsedComponent};
-use crate::{Error, Result};
+use crate::parser::{
+    CanonStringEncoding, ComponentExport, ImportKind, ModuleExport, ParsedComponent,
+};
+use crate::{Error, MemoryStrategy, Result};
 use std::collections::HashMap;
 
 /// Result of dependency resolution
@@ -76,6 +78,14 @@ pub struct AdapterRequirements {
     pub list_copying: bool,
     /// Need resource handle transfer
     pub resource_transfer: bool,
+    /// Caller-side string encoding from canonical lower options
+    pub caller_encoding: Option<CanonStringEncoding>,
+    /// Callee-side string encoding from canonical lift options
+    pub callee_encoding: Option<CanonStringEncoding>,
+    /// Callee's post-return function (component-local core function index)
+    pub callee_post_return: Option<u32>,
+    /// Callee's realloc function (component-local core function index)
+    pub callee_realloc: Option<u32>,
 }
 
 /// Resolution of module-level imports within a component
@@ -97,6 +107,8 @@ pub struct ModuleResolution {
 pub struct Resolver {
     /// Whether to allow unresolved imports
     allow_unresolved: bool,
+    /// Memory strategy (affects crosses_memory detection)
+    memory_strategy: MemoryStrategy,
 }
 
 impl Resolver {
@@ -104,6 +116,15 @@ impl Resolver {
     pub fn new() -> Self {
         Self {
             allow_unresolved: true,
+            memory_strategy: MemoryStrategy::MultiMemory,
+        }
+    }
+
+    /// Create a resolver with a specific memory strategy
+    pub fn with_strategy(memory_strategy: MemoryStrategy) -> Self {
+        Self {
+            allow_unresolved: true,
+            memory_strategy,
         }
     }
 
@@ -111,6 +132,7 @@ impl Resolver {
     pub fn strict() -> Self {
         Self {
             allow_unresolved: false,
+            memory_strategy: MemoryStrategy::MultiMemory,
         }
     }
 
@@ -320,12 +342,17 @@ impl Resolver {
             let to_component = &components[*to_comp];
 
             for (from_mod_idx, from_module) in from_component.core_modules.iter().enumerate() {
-                // Check if this module imports the resolved name
-                let has_import = from_module.imports.iter().any(|imp| {
-                    // Component imports are typically mapped through instances
-                    // For now, check if any import might correspond
-                    imp.name == *import_name || imp.module.contains(import_name)
-                });
+                // Check if this module imports the resolved name.
+                // In the component model, the component-level import name may
+                // appear as the core module import's field name (imp.name) or
+                // as its module name (imp.module) depending on how the
+                // component was lowered.  We use exact equality for both to
+                // avoid false positives from substring matches (e.g. "log"
+                // incorrectly matching "catalog").
+                let has_import = from_module
+                    .imports
+                    .iter()
+                    .any(|imp| imp.name == *import_name || imp.module == *import_name);
 
                 if has_import {
                     // Find the target module that exports this
@@ -334,17 +361,113 @@ impl Resolver {
                             to_module.exports.iter().any(|exp| exp.name == *export_name);
 
                         if has_export {
-                            // Find the exported function's original index
-                            let export_func_idx = to_module
+                            // Find the exported function's original index.
+                            // This should always succeed since has_export is true.
+                            let export_func_idx = match to_module
                                 .exports
                                 .iter()
                                 .find(|exp| exp.name == *export_name)
                                 .map(|exp| exp.index)
-                                .unwrap_or(0);
+                            {
+                                Some(idx) => idx,
+                                None => {
+                                    log::error!(
+                                        "Export '{}' verified present but lookup failed \
+                                         (component {} module {})",
+                                        export_name,
+                                        to_comp,
+                                        to_mod_idx,
+                                    );
+                                    return Err(Error::UnresolvedImport {
+                                        module: format!("component[{}]", to_comp),
+                                        name: export_name.clone(),
+                                    });
+                                }
+                            };
 
-                            // Determine if we need adapters
-                            let crosses_memory = !from_component.core_modules.is_empty()
-                                && !to_component.core_modules.is_empty();
+                            // Determine if this call crosses a memory boundary
+                            let crosses_memory = match self.memory_strategy {
+                                MemoryStrategy::SharedMemory => false,
+                                MemoryStrategy::MultiMemory => {
+                                    let has_memory = |c: &ParsedComponent| {
+                                        c.core_modules.iter().any(|m| {
+                                            !m.memories.is_empty()
+                                                || m.imports.iter().any(|i| {
+                                                    matches!(i.kind, ImportKind::Memory(_))
+                                                })
+                                        })
+                                    };
+                                    has_memory(from_component) && has_memory(to_component)
+                                }
+                            };
+
+                            // Populate canonical requirements from lift/lower options
+                            let mut requirements = AdapterRequirements::default();
+
+                            // Callee side: look up lift options for the exported core function
+                            let callee_lift_map = to_component.lift_options_by_core_func();
+                            if let Some(lift_opts) = callee_lift_map.get(&export_func_idx) {
+                                requirements.callee_encoding = Some(lift_opts.string_encoding);
+                                requirements.callee_post_return = lift_opts.post_return;
+                                requirements.callee_realloc = lift_opts.realloc;
+                            }
+
+                            // Caller side: look up lower options by import func index.
+                            // The Lower entry's func_index is a component function
+                            // index. Try to match it to the component import whose
+                            // name equals import_name by counting function-typed
+                            // imports in order (each function import occupies a
+                            // slot in the component function index space).
+                            let caller_lower_map = from_component.lower_options_by_func();
+                            let mut matched_caller_encoding = None;
+
+                            // Attempt name-based match via component imports
+                            {
+                                let mut comp_func_idx = 0u32;
+                                for comp_import in &from_component.imports {
+                                    if matches!(
+                                        comp_import.ty,
+                                        wasmparser::ComponentTypeRef::Func(_)
+                                    ) {
+                                        if comp_import.name == *import_name {
+                                            if let Some(lower_opts) =
+                                                caller_lower_map.get(&comp_func_idx)
+                                            {
+                                                matched_caller_encoding =
+                                                    Some(lower_opts.string_encoding);
+                                            }
+                                            break;
+                                        }
+                                        comp_func_idx += 1;
+                                    }
+                                }
+                            }
+
+                            // Fall back: if name-based match failed, use the first
+                            // Lower entry. This is correct for single-import
+                            // components (the common case).
+                            if matched_caller_encoding.is_none()
+                                && let Some((_, lower_opts)) = caller_lower_map.iter().next()
+                            {
+                                log::debug!(
+                                    "Using heuristic lower encoding for import '{}' \
+                                     (name-based match not found; {} lower entries)",
+                                    import_name,
+                                    caller_lower_map.len()
+                                );
+                                matched_caller_encoding = Some(lower_opts.string_encoding);
+                            }
+
+                            if let Some(enc) = matched_caller_encoding {
+                                requirements.caller_encoding = Some(enc);
+                            }
+
+                            // Set string_transcoding flag when encodings differ
+                            if let (Some(caller_enc), Some(callee_enc)) =
+                                (requirements.caller_encoding, requirements.callee_encoding)
+                            {
+                                requirements.string_transcoding = caller_enc != callee_enc;
+                            }
 
                             graph.adapter_sites.push(AdapterSite {
                                 from_component: *from_comp,
@@ -355,7 +478,7 @@ impl Resolver {
                                 export_name: export_name.clone(),
                                 export_func_idx,
                                 crosses_memory,
-                                requirements: AdapterRequirements::default(),
+                                requirements,
                             });
                         }
                     }

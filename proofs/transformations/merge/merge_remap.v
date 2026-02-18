@@ -632,7 +632,9 @@ Proof.
   (* r is in one of 7 appended lists, ALL using gen_remaps_for_space
      (including MemIdx in SeparateMemory mode). *)
   repeat (apply in_app_iff in Hin; destruct Hin as [Hin | Hin]).
-  all: solve_non_mem_case.
+  all: apply in_gen_remaps_for_space_fused in Hin;
+       destruct Hin as [?Hfused [?Hspace [?Hsrc ?Hbound]]];
+       rewrite ?Hspace, ?Hsrc; split; [reflexivity | assumption].
 Qed.
 
 (* General strategy-parametric version: combines SharedMemory and SeparateMemory cases.
@@ -650,7 +652,7 @@ Proof.
   - (* SharedMemory *)
     apply in_gen_remaps_for_module_fused_shared in Hin.
     destruct Hin as [Hsrc [Hmem Hnonmem]].
-    repeat split; auto.
+    split; [exact Hsrc|]. split.
     + intros _ Hsp. exact (Hmem Hsp).
     + intros [Habs | Hneq].
       * discriminate.
@@ -658,7 +660,7 @@ Proof.
   - (* SeparateMemory *)
     apply in_gen_remaps_for_module_fused_separate in Hin.
     destruct Hin as [Hsrc Hfused].
-    repeat split; auto.
+    split; [exact Hsrc|]. split.
     + intros Habs. discriminate.
     + intros _. exact Hfused.
 Qed.
