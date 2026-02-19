@@ -506,8 +506,7 @@ impl FactStyleGenerator {
     ) -> Result<(u32, Function)> {
         let target_func = self.resolve_target_function(site, merged)?;
         let type_idx = merged
-            .functions
-            .get(target_func as usize)
+            .defined_func(target_func)
             .map(|f| f.type_idx)
             .unwrap_or(0);
 
