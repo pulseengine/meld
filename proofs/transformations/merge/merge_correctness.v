@@ -240,21 +240,23 @@ Lemma in_gen_remaps_for_module_bound :
 Proof.
   intros src m offsets strategy r Hin.
   unfold gen_remaps_for_module in Hin.
-  (* r must be in one of the 7 appended lists. For SharedMemory, the MemIdx
-     chunk uses gen_remaps_for_space_zero; for SeparateMemory it uses
-     gen_remaps_for_space. All other chunks always use gen_remaps_for_space. *)
-  destruct strategy; simpl in Hin;
-  repeat (apply in_app_iff in Hin; destruct Hin as [Hin | Hin]);
-  (* Non-MemIdx cases and SeparateMemory MemIdx: use in_gen_remaps_for_space_fused *)
-  first
-    [ apply in_gen_remaps_for_space_fused in Hin;
-      destruct Hin as [_ [Hspace [_ Hbound]]];
-      subst; unfold space_count_of_module; exact Hbound
-    | (* SharedMemory MemIdx case: use in_gen_remaps_for_space_zero_fused *)
-      apply in_gen_remaps_for_space_zero_fused in Hin;
-      destruct Hin as [_ [Hspace [_ Hbound]]];
-      subst; unfold space_count_of_module; exact Hbound
-    ].
+  (* r must be in one of the 7 appended lists. Navigate linearly (not
+     exponentially) by peeling off the leftmost list at each step. *)
+  Local Ltac solve_remap_bound :=
+    first
+      [ (* Base case: r is in a gen_remaps_for_space list *)
+        apply in_gen_remaps_for_space_fused in Hin;
+        destruct Hin as [_ [Hspace [_ Hbound]]];
+        subst; unfold space_count_of_module; exact Hbound
+      | (* Base case: r is in a gen_remaps_for_space_zero list *)
+        apply in_gen_remaps_for_space_zero_fused in Hin;
+        destruct Hin as [_ [Hspace [_ Hbound]]];
+        subst; unfold space_count_of_module; exact Hbound
+      | (* Recursive case: peel off leftmost list from ++ *)
+        apply in_app_iff in Hin; destruct Hin as [Hin | Hin];
+        [ solve_remap_bound | solve_remap_bound ]
+      ].
+  destruct strategy; simpl in Hin; solve_remap_bound.
 Qed.
 
 (* -------------------------------------------------------------------------
@@ -763,6 +765,25 @@ Proof.
   apply lookup_gen_all_remaps_aux_unique; auto.
 Qed.
 
+(* Helper: compute_offset at S i is at least compute_offset at i plus the
+   space count of the module at position i. This is used in both SharedMemory
+   and SeparateMemory injectivity proofs to show that modules at different
+   positions have non-overlapping fused index ranges. *)
+Lemma offset_step_bound :
+  forall input space i sm,
+    nth_error input i = Some sm ->
+    compute_offset input space i +
+      space_count_of_module (snd sm) space <=
+      compute_offset input space (S i).
+Proof.
+  intros input space i sm Hnth.
+  unfold compute_offset.
+  rewrite (firstn_S_nth_error _ _ _ Hnth).
+  rewrite fold_left_app. simpl.
+  unfold space_count_of_module.
+  destruct space; simpl; lia.
+Qed.
+
 (* gen_all_remaps with SharedMemory is injective for non-MemIdx spaces:
    distinct source indices map to distinct fused indices within each index space.
    MemIdx is excluded because in SharedMemory mode all MemIdx remaps map to 0,
@@ -816,19 +837,12 @@ Proof.
     { unfold offsets_for_module.
       replace (0 + i1) with i1 by lia.
       replace (0 + i2) with i2 by lia.
-      assert (Hstep: compute_offset input (ir_space r2) i1 +
-                      space_count_of_module m1 (ir_space r2) <=
-                      compute_offset input (ir_space r2) (S i1)).
-      { unfold compute_offset.
-        rewrite (firstn_S_nth_error _ _ _ Hnth1).
-        rewrite fold_left_app. simpl.
-        unfold space_count_of_module.
-        destruct (ir_space r2); simpl; lia. }
-      assert (Hmono: compute_offset input (ir_space r2) (S i1) <=
-                      compute_offset input (ir_space r2) i2).
-      { apply offset_monotonic; try lia.
-        apply nth_error_Some. rewrite Hnth2. discriminate. }
-      lia. }
+      pose proof (offset_step_bound input (ir_space r2) i1 (src1, m1) Hnth1) as Hstep.
+      simpl in Hstep.
+      pose proof (offset_monotonic input (ir_space r2) (S i1) i2) as Hmono.
+      assert (S i1 <= i2) by lia.
+      assert (i2 < length input) by (apply nth_error_Some; rewrite Hnth2; discriminate).
+      specialize (Hmono H H0). lia. }
     lia.
   - (* i1 = i2: same module position *)
     subst i2.
@@ -845,19 +859,12 @@ Proof.
     { unfold offsets_for_module.
       replace (0 + i2) with i2 by lia.
       replace (0 + i1) with i1 by lia.
-      assert (Hstep: compute_offset input (ir_space r2) i2 +
-                      space_count_of_module m2 (ir_space r2) <=
-                      compute_offset input (ir_space r2) (S i2)).
-      { unfold compute_offset.
-        rewrite (firstn_S_nth_error _ _ _ Hnth2).
-        rewrite fold_left_app. simpl.
-        unfold space_count_of_module.
-        destruct (ir_space r2); simpl; lia. }
-      assert (Hmono: compute_offset input (ir_space r2) (S i2) <=
-                      compute_offset input (ir_space r2) i1).
-      { apply offset_monotonic; try lia.
-        apply nth_error_Some. rewrite Hnth1. discriminate. }
-      lia. }
+      pose proof (offset_step_bound input (ir_space r2) i2 (src2, m2) Hnth2) as Hstep.
+      simpl in Hstep.
+      pose proof (offset_monotonic input (ir_space r2) (S i2) i1) as Hmono.
+      assert (S i2 <= i1) by lia.
+      assert (i1 < length input) by (apply nth_error_Some; rewrite Hnth1; discriminate).
+      specialize (Hmono H H0). lia. }
     lia.
 Qed.
 
@@ -926,19 +933,12 @@ Proof.
     { unfold offsets_for_module.
       replace (0 + i1) with i1 by lia.
       replace (0 + i2) with i2 by lia.
-      assert (Hstep: compute_offset input (ir_space r2) i1 +
-                      space_count_of_module m1 (ir_space r2) <=
-                      compute_offset input (ir_space r2) (S i1)).
-      { unfold compute_offset.
-        rewrite (firstn_S_nth_error _ _ _ Hnth1).
-        rewrite fold_left_app. simpl.
-        unfold space_count_of_module.
-        destruct (ir_space r2); simpl; lia. }
-      assert (Hmono: compute_offset input (ir_space r2) (S i1) <=
-                      compute_offset input (ir_space r2) i2).
-      { apply offset_monotonic; try lia.
-        apply nth_error_Some. rewrite Hnth2. discriminate. }
-      lia. }
+      pose proof (offset_step_bound input (ir_space r2) i1 (src1, m1) Hnth1) as Hstep.
+      simpl in Hstep.
+      pose proof (offset_monotonic input (ir_space r2) (S i1) i2) as Hmono.
+      assert (S i1 <= i2) by lia.
+      assert (i2 < length input) by (apply nth_error_Some; rewrite Hnth2; discriminate).
+      specialize (Hmono H H0). lia. }
     lia.
   - (* i1 = i2: same module position *)
     subst i2.
@@ -955,19 +955,12 @@ Proof.
     { unfold offsets_for_module.
       replace (0 + i2) with i2 by lia.
       replace (0 + i1) with i1 by lia.
-      assert (Hstep: compute_offset input (ir_space r2) i2 +
-                      space_count_of_module m2 (ir_space r2) <=
-                      compute_offset input (ir_space r2) (S i2)).
-      { unfold compute_offset.
-        rewrite (firstn_S_nth_error _ _ _ Hnth2).
-        rewrite fold_left_app. simpl.
-        unfold space_count_of_module.
-        destruct (ir_space r2); simpl; lia. }
-      assert (Hmono: compute_offset input (ir_space r2) (S i2) <=
-                      compute_offset input (ir_space r2) i1).
-      { apply offset_monotonic; try lia.
-        apply nth_error_Some. rewrite Hnth1. discriminate. }
-      lia. }
+      pose proof (offset_step_bound input (ir_space r2) i2 (src2, m2) Hnth2) as Hstep.
+      simpl in Hstep.
+      pose proof (offset_monotonic input (ir_space r2) (S i2) i1) as Hmono.
+      assert (S i2 <= i1) by lia.
+      assert (i1 < length input) by (apply nth_error_Some; rewrite Hnth1; discriminate).
+      specialize (Hmono H H0). lia. }
     lia.
 Qed.
 

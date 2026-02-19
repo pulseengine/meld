@@ -21,6 +21,21 @@ use wasm_encoder::{
 
 const WASM_PAGE_SIZE: u64 = 65536;
 
+/// Pre-computed counts of unresolved imports by entity kind.
+///
+/// In the wasm binary, each index space is partitioned as
+/// `[imports | defined entities]`.  These counts record how many
+/// unresolved imports occupy the beginning of each index space so
+/// that all index-map values can be absolute wasm indices rather
+/// than 0-based array positions.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ImportCounts {
+    pub func: u32,
+    pub table: u32,
+    pub memory: u32,
+    pub global: u32,
+}
+
 /// A merged WebAssembly module ready for encoding
 #[derive(Debug, Clone)]
 pub struct MergedModule {
@@ -75,6 +90,11 @@ pub struct MergedModule {
     /// Merged index of each module's cabi_realloc function, if exported
     /// Maps (component_idx, module_idx) -> merged function index
     pub realloc_map: HashMap<(usize, usize), u32>,
+
+    /// Pre-computed counts of unresolved imports for each index space.
+    /// All index-map values are offset by these counts so they represent
+    /// absolute wasm indices rather than 0-based array positions.
+    pub import_counts: ImportCounts,
 }
 
 /// Function type in merged module
@@ -116,6 +136,27 @@ pub struct MergedExport {
     pub name: String,
     pub kind: EncoderExportKind,
     pub index: u32,
+}
+
+impl MergedModule {
+    /// Look up a defined function by its absolute wasm index.
+    /// Returns `None` if the index refers to an imported function.
+    pub fn defined_func(&self, wasm_idx: u32) -> Option<&MergedFunction> {
+        if wasm_idx < self.import_counts.func {
+            None
+        } else {
+            self.functions
+                .get((wasm_idx - self.import_counts.func) as usize)
+        }
+    }
+}
+
+/// Pre-computed mapping from unresolved import identity to its
+/// position in the merged import index space (per entity kind).
+struct UnresolvedImportAssignments {
+    func: HashMap<(usize, usize, String, String), u32>,
+    global: HashMap<(usize, usize, String, String), u32>,
+    table: HashMap<(usize, usize, String, String), u32>,
 }
 
 /// Module merger
@@ -238,6 +279,12 @@ impl Merger {
             None
         };
 
+        // Pre-compute unresolved import counts and assignments so that all
+        // index-map values produced during merging are absolute wasm indices
+        // (offset by the number of unresolved imports in each index space).
+        let (import_counts, unresolved_assignments) =
+            compute_unresolved_import_assignments(graph, shared_memory_plan.as_ref());
+
         let mut merged = MergedModule {
             types: Vec::new(),
             imports: Vec::new(),
@@ -256,6 +303,7 @@ impl Merger {
             global_index_map: HashMap::new(),
             type_index_map: HashMap::new(),
             realloc_map: HashMap::new(),
+            import_counts,
         };
 
         // Process components in topological order
@@ -268,6 +316,7 @@ impl Merger {
                 graph,
                 &mut merged,
                 shared_memory_plan.as_ref(),
+                &unresolved_assignments,
             )?;
         }
 
@@ -290,6 +339,7 @@ impl Merger {
     }
 
     /// Merge a single component into the merged module
+    #[allow(clippy::too_many_arguments)]
     fn merge_component(
         &self,
         comp_idx: usize,
@@ -298,6 +348,7 @@ impl Merger {
         graph: &DependencyGraph,
         merged: &mut MergedModule,
         shared_memory_plan: Option<&SharedMemoryPlan>,
+        unresolved_assignments: &UnresolvedImportAssignments,
     ) -> Result<()> {
         for (mod_idx, module) in component.core_modules.iter().enumerate() {
             self.merge_core_module(
@@ -308,6 +359,7 @@ impl Merger {
                 graph,
                 merged,
                 shared_memory_plan,
+                unresolved_assignments,
             )?;
         }
 
@@ -325,6 +377,7 @@ impl Merger {
         graph: &DependencyGraph,
         merged: &mut MergedModule,
         shared_memory_plan: Option<&SharedMemoryPlan>,
+        unresolved_assignments: &UnresolvedImportAssignments,
     ) -> Result<()> {
         // Merge types
         let type_offset = merged.types.len() as u32;
@@ -393,7 +446,7 @@ impl Merger {
         // Merge tables (defined tables only; imported tables handled below)
         let table_offset = merged.tables.len() as u32;
         for (old_idx, table) in module.tables.iter().enumerate() {
-            let new_idx = table_offset + old_idx as u32;
+            let new_idx = merged.import_counts.table + table_offset + old_idx as u32;
             merged.table_index_map.insert(
                 (comp_idx, mod_idx, import_table_count + old_idx as u32),
                 new_idx,
@@ -404,7 +457,7 @@ impl Merger {
         // Merge globals (defined globals only; imported globals handled below)
         let global_offset = merged.globals.len() as u32;
         for (old_idx, global) in module.globals.iter().enumerate() {
-            let new_idx = global_offset + old_idx as u32;
+            let new_idx = merged.import_counts.global + global_offset + old_idx as u32;
             merged.global_index_map.insert(
                 (comp_idx, mod_idx, import_global_count + old_idx as u32),
                 new_idx,
@@ -458,6 +511,21 @@ impl Merger {
                     }
                 }
 
+                // Map unresolved global imports to their merged import index
+                if let std::collections::hash_map::Entry::Vacant(e) = merged
+                    .global_index_map
+                    .entry((comp_idx, mod_idx, import_global_idx))
+                {
+                    if let Some(&import_index) = unresolved_assignments.global.get(&(
+                        comp_idx,
+                        mod_idx,
+                        imp.module.clone(),
+                        imp.name.clone(),
+                    )) {
+                        e.insert(import_index);
+                    }
+                }
+
                 import_global_idx += 1;
             }
         }
@@ -493,6 +561,21 @@ impl Merger {
                                 .table_index_map
                                 .insert((comp_idx, mod_idx, import_table_idx), target_idx);
                         }
+                    }
+                }
+
+                // Map unresolved table imports to their merged import index
+                if let std::collections::hash_map::Entry::Vacant(e) = merged
+                    .table_index_map
+                    .entry((comp_idx, mod_idx, import_table_idx))
+                {
+                    if let Some(&import_index) = unresolved_assignments.table.get(&(
+                        comp_idx,
+                        mod_idx,
+                        imp.module.clone(),
+                        imp.name.clone(),
+                    )) {
+                        e.insert(import_index);
                     }
                 }
 
@@ -561,16 +644,32 @@ impl Merger {
                     }
                 }
 
+                // Map unresolved function imports to their merged import index
+                if let std::collections::hash_map::Entry::Vacant(e) = merged
+                    .function_index_map
+                    .entry((comp_idx, mod_idx, import_func_idx))
+                {
+                    if let Some(&import_index) = unresolved_assignments.func.get(&(
+                        comp_idx,
+                        mod_idx,
+                        imp.module.clone(),
+                        imp.name.clone(),
+                    )) {
+                        e.insert(import_index);
+                    }
+                }
+
                 import_func_idx += 1;
             }
         }
 
-        // First pass: build all function index mappings
+        // First pass: build all function index mappings.
+        // Values are absolute wasm indices: import_count + array position.
         let func_offset = merged.functions.len() as u32;
         let mut func_type_indices = Vec::new();
 
         for (old_idx, &type_idx) in module.functions.iter().enumerate() {
-            let new_func_idx = func_offset + old_idx as u32;
+            let new_func_idx = merged.import_counts.func + func_offset + old_idx as u32;
             let old_func_idx = import_func_count + old_idx as u32;
 
             merged
@@ -901,12 +1000,7 @@ impl Merger {
             wrapper.instruction(&wasm_encoder::Instruction::End);
 
             // The wrapper's function index = import_func_count + functions.len()
-            let import_func_count = merged
-                .imports
-                .iter()
-                .filter(|i| matches!(i.entity_type, EntityType::Function(_)))
-                .count() as u32;
-            let wrapper_idx = import_func_count + merged.functions.len() as u32;
+            let wrapper_idx = merged.import_counts.func + merged.functions.len() as u32;
 
             merged.functions.push(MergedFunction {
                 type_idx: empty_type_idx,
@@ -1387,6 +1481,84 @@ impl Default for Merger {
     }
 }
 
+/// Pre-compute unresolved import counts and per-import index assignments.
+///
+/// This must exactly mirror the iteration order of `add_unresolved_imports`
+/// so that the assigned indices match the positions imports actually get
+/// in the merged import section.
+fn compute_unresolved_import_assignments(
+    graph: &DependencyGraph,
+    shared_memory_plan: Option<&SharedMemoryPlan>,
+) -> (ImportCounts, UnresolvedImportAssignments) {
+    let mut counts = ImportCounts::default();
+    let mut assignments = UnresolvedImportAssignments {
+        func: HashMap::new(),
+        global: HashMap::new(),
+        table: HashMap::new(),
+    };
+    let mut shared_memory_import_counted = false;
+
+    for unresolved in &graph.unresolved_imports {
+        if let (Some(plan), ImportKind::Memory(_)) = (shared_memory_plan, &unresolved.kind) {
+            if plan.import.is_some() && !shared_memory_import_counted {
+                counts.memory += 1;
+                shared_memory_import_counted = true;
+            }
+            continue;
+        }
+        match &unresolved.kind {
+            ImportKind::Function(_) => {
+                assignments.func.insert(
+                    (
+                        unresolved.component_idx,
+                        unresolved.module_idx,
+                        unresolved.module_name.clone(),
+                        unresolved.field_name.clone(),
+                    ),
+                    counts.func,
+                );
+                counts.func += 1;
+            }
+            ImportKind::Table(_) => {
+                assignments.table.insert(
+                    (
+                        unresolved.component_idx,
+                        unresolved.module_idx,
+                        unresolved.module_name.clone(),
+                        unresolved.field_name.clone(),
+                    ),
+                    counts.table,
+                );
+                counts.table += 1;
+            }
+            ImportKind::Memory(_) => {
+                counts.memory += 1;
+            }
+            ImportKind::Global(_) => {
+                assignments.global.insert(
+                    (
+                        unresolved.component_idx,
+                        unresolved.module_idx,
+                        unresolved.module_name.clone(),
+                        unresolved.field_name.clone(),
+                    ),
+                    counts.global,
+                );
+                counts.global += 1;
+            }
+        }
+    }
+
+    // Trailing shared memory import (same as add_unresolved_imports)
+    if let Some(plan) = shared_memory_plan {
+        if plan.import.is_some() && !shared_memory_import_counted {
+            counts.memory += 1;
+        }
+    }
+
+    (counts, assignments)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1512,6 +1684,7 @@ mod tests {
             global_index_map: HashMap::new(),
             type_index_map: HashMap::new(),
             realloc_map: HashMap::new(),
+            import_counts: ImportCounts::default(),
         };
 
         // Simulate multi-memory merging for module A (comp 0, mod 0)

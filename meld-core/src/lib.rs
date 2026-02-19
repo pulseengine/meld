@@ -310,7 +310,7 @@ impl Fuser {
     ) -> Result<()> {
         use std::collections::HashSet;
 
-        let adapter_base = merged.functions.len() as u32;
+        let adapter_base = merged.import_counts.func + merged.functions.len() as u32;
 
         // For each adapter, update function_index_map to point the source
         // import to the adapter's merged index rather than the direct target.
