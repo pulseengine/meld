@@ -3,6 +3,7 @@
 //! This module handles building the import/export graph between components
 //! and performing topological sort for instantiation order.
 
+use crate::merger::decompose_component_core_func_index;
 use crate::parser::{
     CanonStringEncoding, ComponentExport, ImportKind, ModuleExport, ParsedComponent,
 };
@@ -82,8 +83,11 @@ pub struct AdapterRequirements {
     pub caller_encoding: Option<CanonStringEncoding>,
     /// Callee-side string encoding from canonical lift options
     pub callee_encoding: Option<CanonStringEncoding>,
-    /// Callee's post-return function (component-local core function index)
-    pub callee_post_return: Option<u32>,
+    /// Callee's post-return function, decomposed to (module_idx, module_local_func_idx).
+    /// For multi-module components, the canonical section's PostReturn index is a
+    /// component-level core function index that must be decomposed before lookup
+    /// in function_index_map.
+    pub callee_post_return: Option<(usize, u32)>,
     /// Callee's realloc function (component-local core function index)
     pub callee_realloc: Option<u32>,
 }
@@ -408,7 +412,12 @@ impl Resolver {
                             let callee_lift_map = to_component.lift_options_by_core_func();
                             if let Some(lift_opts) = callee_lift_map.get(&export_func_idx) {
                                 requirements.callee_encoding = Some(lift_opts.string_encoding);
-                                requirements.callee_post_return = lift_opts.post_return;
+                                // Decompose post_return from component-level core function index
+                                // to (module_idx, module_local_func_idx) for correct function_index_map lookup
+                                requirements.callee_post_return =
+                                    lift_opts.post_return.and_then(|pr_idx| {
+                                        decompose_component_core_func_index(to_component, pr_idx)
+                                    });
                                 requirements.callee_realloc = lift_opts.realloc;
                             }
 

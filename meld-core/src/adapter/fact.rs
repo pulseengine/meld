@@ -150,13 +150,14 @@ impl FactStyleGenerator {
             options.returns_pointer_pair = true;
         }
 
-        // Populate post-return from canonical data (remap to merged index)
-        if let Some(post_return_core_idx) = site.requirements.callee_post_return
-            && let Some(&merged_pr_idx) = merged.function_index_map.get(&(
-                site.to_component,
-                site.to_module,
-                post_return_core_idx,
-            ))
+        // Populate post-return from canonical data (remap to merged index).
+        // callee_post_return is pre-decomposed to (module_idx, module_local_func_idx)
+        // by the resolver, so we can look up directly in function_index_map.
+        if let Some((pr_mod_idx, pr_local_idx)) = site.requirements.callee_post_return
+            && let Some(&merged_pr_idx) =
+                merged
+                    .function_index_map
+                    .get(&(site.to_component, pr_mod_idx, pr_local_idx))
         {
             options.callee_post_return = Some(merged_pr_idx);
         }

@@ -1030,7 +1030,7 @@ impl Merger {
 /// Returns `None` if `core_func_idx` exceeds the total number of functions
 /// across all modules (it may refer to a core function created by `canon lower`
 /// or an alias, which lives outside any module's function space).
-fn decompose_component_core_func_index(
+pub(crate) fn decompose_component_core_func_index(
     component: &ParsedComponent,
     core_func_idx: u32,
 ) -> Option<(usize, u32)> {
