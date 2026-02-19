@@ -3,7 +3,8 @@ load("@rules_rocq_rust//rocq:defs.bzl", "rocq_library", "rocq_proof_test")
 package(default_visibility = ["//visibility:public"])
 
 # Split merge_spec into smaller modules to reduce compilation memory usage
-# Dependency chain: merge_defs -> merge_layout -> merge_remap -> merge_correctness
+# Dependency chain: merge_defs -> merge_layout -> merge_remap -> merge_correctness -> merge_bridge
+# merge_resolution depends on all of the above (bridges flat model to import resolution)
 
 rocq_library(
     name = "merge_defs",
@@ -70,6 +71,22 @@ rocq_library(
     include_path = "MeldMerge",
 )
 
+rocq_library(
+    name = "merge_resolution",
+    srcs = ["merge_resolution.v"],
+    deps = [
+        ":merge_defs",
+        ":merge_layout",
+        ":merge_remap",
+        ":merge_correctness",
+        ":merge_bridge",
+        "//proofs/spec:wasm_core",
+        "//proofs/spec:component_model",
+        "//proofs/spec:fusion_types",
+    ],
+    include_path = "MeldMerge",
+)
+
 # Aggregate target for all merge proofs
 filegroup(
     name = "merge_spec",
@@ -79,6 +96,7 @@ filegroup(
         ":merge_remap",
         ":merge_correctness",
         ":merge_bridge",
+        ":merge_resolution",
     ],
 )
 
