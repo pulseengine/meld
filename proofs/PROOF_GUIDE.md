@@ -593,7 +593,7 @@ bazel build //proofs/...
 
 ## Glossary
 
-**Admitted**: A theorem marked as true without proof (Meld has 0 of these!)
+**Admitted**: A theorem marked as true without proof (Meld currently has 4 — see [STATUS.md](STATUS.md) for details)
 
 **Correspondence**: A relation showing two states are equivalent
 
