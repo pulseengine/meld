@@ -14,7 +14,7 @@ use wasm_encoder::{
     CodeSection, Component, ExportKind, ExportSection, Function, FunctionSection, ImportSection,
     Instruction, MemorySection, MemoryType, Module, ModuleSection, TypeSection,
 };
-use wasmtime::{Config, Engine, Instance, Module as RuntimeModule, Store};
+use wasmtime::{Config, Engine, Instance, Linker, Module as RuntimeModule, Store};
 
 /// Build a component containing both core modules (A and B).
 ///
@@ -187,4 +187,153 @@ fn test_cross_module_call_with_different_args() {
         .unwrap();
     let sum = add.call(&mut store, (10, 20)).unwrap();
     assert_eq!(sum, 30, "add(10, 20) should return 30");
+}
+
+// ---------------------------------------------------------------------------
+// Test: unresolved host import + intra-component call
+// ---------------------------------------------------------------------------
+
+/// Module A: defines `add(i32, i32) -> i32`, exports it and `memory`.
+fn build_module_a_provider() -> Module {
+    let mut types = TypeSection::new();
+    // type 0: (i32, i32) -> i32
+    types.ty().function(
+        [wasm_encoder::ValType::I32, wasm_encoder::ValType::I32],
+        [wasm_encoder::ValType::I32],
+    );
+
+    let mut functions = FunctionSection::new();
+    functions.function(0); // add: type 0
+
+    let mut memory = MemorySection::new();
+    memory.memory(MemoryType {
+        minimum: 1,
+        maximum: None,
+        memory64: false,
+        shared: false,
+        page_size_log2: None,
+    });
+
+    let mut exports = ExportSection::new();
+    exports.export("add", ExportKind::Func, 0);
+    exports.export("memory", ExportKind::Memory, 0);
+
+    let mut code = CodeSection::new();
+    let mut add_fn = Function::new([]);
+    add_fn.instruction(&Instruction::LocalGet(0));
+    add_fn.instruction(&Instruction::LocalGet(1));
+    add_fn.instruction(&Instruction::I32Add);
+    add_fn.instruction(&Instruction::End);
+    code.function(&add_fn);
+
+    let mut module = Module::new();
+    module
+        .section(&types)
+        .section(&functions)
+        .section(&memory)
+        .section(&exports)
+        .section(&code);
+    module
+}
+
+/// Module B:
+///   imports `env.get_value() -> i32` (unresolved — provided by host)
+///   imports `A.add(i32, i32) -> i32` (resolved intra-component)
+///   defines `run() -> i32` which calls `add(get_value(), 10)`
+///   exports `run`
+fn build_module_b_with_host_import() -> Module {
+    let mut types = TypeSection::new();
+    // type 0: () -> i32   — signature of imported get_value and of run
+    types.ty().function([], [wasm_encoder::ValType::I32]);
+    // type 1: (i32, i32) -> i32  — signature of imported add
+    types.ty().function(
+        [wasm_encoder::ValType::I32, wasm_encoder::ValType::I32],
+        [wasm_encoder::ValType::I32],
+    );
+
+    let mut imports = ImportSection::new();
+    // Function index 0: host-provided get_value (unresolved)
+    imports.import("env", "get_value", wasm_encoder::EntityType::Function(0));
+    // Function index 1: intra-component add (resolved to module A's export)
+    imports.import("A", "add", wasm_encoder::EntityType::Function(1));
+
+    let mut functions = FunctionSection::new();
+    // Function index 2: run (type 0)
+    functions.function(0);
+
+    let mut exports = ExportSection::new();
+    exports.export("run", ExportKind::Func, 2);
+
+    let mut code = CodeSection::new();
+    let mut run_fn = Function::new([]);
+    // result = add(get_value(), 10)
+    run_fn.instruction(&Instruction::Call(0)); // get_value() -> i32
+    run_fn.instruction(&Instruction::I32Const(10));
+    run_fn.instruction(&Instruction::Call(1)); // add(get_value_result, 10) -> i32
+    run_fn.instruction(&Instruction::End);
+    code.function(&run_fn);
+
+    let mut module = Module::new();
+    module
+        .section(&types)
+        .section(&imports)
+        .section(&functions)
+        .section(&exports)
+        .section(&code);
+    module
+}
+
+/// Regression test for Doubt 5: function_index_map values must be absolute
+/// wasm indices (offset by import count), not 0-based array positions.
+///
+/// Without the fix, module B's `run` would call the wrong function:
+/// `call 0` (get_value) works by coincidence, but `call 1` (add) gets
+/// rewritten to `call 0` (the array position of add), which actually calls
+/// the import `get_value` instead of the defined function `add`.
+#[test]
+fn test_unresolved_import_index_offset() {
+    let mut component = Component::new();
+    component.section(&ModuleSection(&build_module_a_provider()));
+    component.section(&ModuleSection(&build_module_b_with_host_import()));
+    let component_bytes = component.finish();
+
+    let config = FuserConfig {
+        memory_strategy: MemoryStrategy::MultiMemory,
+        attestation: false,
+        ..Default::default()
+    };
+
+    let mut fuser = Fuser::new(config);
+    fuser
+        .add_component_named(&component_bytes, Some("host-import-test"))
+        .unwrap();
+
+    let fused = fuser.fuse().unwrap();
+
+    // The fused module should have one unresolved import (env.get_value).
+    // Set up wasmtime with a Linker to provide that import.
+    let mut engine_config = Config::new();
+    engine_config.wasm_multi_memory(true);
+
+    let engine = Engine::new(&engine_config).unwrap();
+    let module = RuntimeModule::new(&engine, &fused).unwrap();
+    let mut store = Store::new(&engine, ());
+
+    let mut linker = Linker::new(&engine);
+    // Provide get_value() -> 32
+    linker
+        .func_wrap("env", "get_value", || -> i32 { 32 })
+        .unwrap();
+
+    let instance = linker.instantiate(&mut store, &module).unwrap();
+
+    // run() should call add(get_value(), 10) = add(32, 10) = 42
+    let run = instance
+        .get_typed_func::<(), i32>(&mut store, "run")
+        .unwrap();
+    let result = run.call(&mut store, ()).unwrap();
+    assert_eq!(
+        result, 42,
+        "run() should return add(get_value(), 10) = add(32, 10) = 42"
+    );
 }

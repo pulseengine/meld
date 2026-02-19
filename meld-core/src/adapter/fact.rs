@@ -141,7 +141,7 @@ impl FactStyleGenerator {
             site.to_component,
             site.to_module,
             site.export_func_idx,
-        )) && let Some(func) = merged.functions.get(merged_func_idx as usize)
+        )) && let Some(func) = merged.defined_func(merged_func_idx)
             && let Some(func_type) = merged.types.get(func.type_idx as usize)
             && func_type.results.len() == 2
             && func_type.results[0] == wasm_encoder::ValType::I32
@@ -173,10 +173,9 @@ impl FactStyleGenerator {
         let target_func = self.resolve_target_function(site, merged)?;
         let options = self.analyze_call_site(site, merged);
 
-        // Find the target function's type
+        // Find the target function's type (convert wasm index to array position)
         let type_idx = merged
-            .functions
-            .get(target_func as usize)
+            .defined_func(target_func)
             .map(|f| f.type_idx)
             .unwrap_or(0);
 
@@ -258,8 +257,7 @@ impl FactStyleGenerator {
     ) -> Result<(u32, Function)> {
         let target_func = self.resolve_target_function(site, merged)?;
         let type_idx = merged
-            .functions
-            .get(target_func as usize)
+            .defined_func(target_func)
             .map(|f| f.type_idx)
             .unwrap_or(0);
 
@@ -269,15 +267,55 @@ impl FactStyleGenerator {
         let result_types: Vec<wasm_encoder::ValType> =
             func_type.map(|t| t.results.clone()).unwrap_or_default();
 
-        // If memories are the same, just do direct call
+        // If memories are the same, just do direct call (with post-return if needed)
         if options.caller_memory == options.callee_memory {
-            let mut func = Function::new([]);
-            for i in 0..param_count {
-                func.instruction(&Instruction::LocalGet(i as u32));
+            let has_post_return = options.callee_post_return.is_some();
+
+            if has_post_return && result_count > 0 {
+                // Need scratch locals to save results across post-return call
+                let locals: Vec<(u32, wasm_encoder::ValType)> =
+                    result_types.iter().map(|t| (1u32, *t)).collect();
+                let mut func = Function::new(locals);
+                let result_base = param_count as u32;
+
+                for i in 0..param_count {
+                    func.instruction(&Instruction::LocalGet(i as u32));
+                }
+                func.instruction(&Instruction::Call(target_func));
+
+                // Save results to locals (pop in reverse order)
+                for i in (0..result_count).rev() {
+                    func.instruction(&Instruction::LocalSet(result_base + i as u32));
+                }
+
+                // Call post-return with saved results
+                for i in 0..result_count {
+                    func.instruction(&Instruction::LocalGet(result_base + i as u32));
+                }
+                func.instruction(&Instruction::Call(options.callee_post_return.unwrap()));
+
+                // Push saved results back onto stack
+                for i in 0..result_count {
+                    func.instruction(&Instruction::LocalGet(result_base + i as u32));
+                }
+
+                func.instruction(&Instruction::End);
+                return Ok((type_idx, func));
+            } else {
+                let mut func = Function::new([]);
+                for i in 0..param_count {
+                    func.instruction(&Instruction::LocalGet(i as u32));
+                }
+                func.instruction(&Instruction::Call(target_func));
+
+                if has_post_return {
+                    // No results to save, just call post-return
+                    func.instruction(&Instruction::Call(options.callee_post_return.unwrap()));
+                }
+
+                func.instruction(&Instruction::End);
+                return Ok((type_idx, func));
             }
-            func.instruction(&Instruction::Call(target_func));
-            func.instruction(&Instruction::End);
-            return Ok((type_idx, func));
         }
 
         // Only treat first two params as (ptr, len) when callee has realloc —
