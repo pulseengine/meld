@@ -10,6 +10,15 @@
    3. Optionally computing memory layout for address rebasing
 
    This file contains core definitions used by other merge modules.
+
+   IMPORTANT: proof-implementation gap
+   ------------------------------------
+   This model assumes flat concatenation — all imports from every module
+   are preserved in the merged output.  The actual Rust code (merger.rs)
+   resolves cross-component imports and only keeps unresolved ones.
+   See merge_resolution.v for the bridging proof, whose key insight is
+   that import resolution is a refinement of flat concatenation which
+   preserves the remap properties established here.
    ========================================================================= *)
 
 From Stdlib Require Import List ZArith Lia Bool Arith.

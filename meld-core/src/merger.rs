@@ -2,6 +2,22 @@
 //!
 //! This module handles combining multiple core modules into a single module,
 //! reindexing all references (functions, tables, memories, globals).
+//!
+//! # Proof-implementation gap
+//!
+//! The proof model in `merge_defs.v` assumes flat concatenation: every
+//! module's imports are preserved verbatim and index spaces grow by the
+//! full `import_count + defined_count` of each preceding module.
+//!
+//! This code, by contrast, *resolves* cross-component imports against
+//! other modules' exports and only emits genuinely unresolved imports.
+//! [`ImportCounts`] records how many unresolved imports remain so that
+//! `function_index_map` values (and the other index maps) are absolute
+//! wasm indices (`import_count + array_position`), not 0-based offsets.
+//!
+//! `proofs/transformations/merge/merge_resolution.v` bridges the gap by
+//! showing that import resolution is a refinement of flat concatenation
+//! that preserves the remap properties proved in `merge_defs.v`.
 
 // Allow nested ifs for Bazel compatibility (rules_rust doesn't support if-let chains yet)
 #![allow(clippy::collapsible_if)]
