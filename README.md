@@ -1,73 +1,68 @@
+<div align="center">
+
 # Meld
 
-**Static WebAssembly Component Fusion**
+<sup>Static WebAssembly component fusion</sup>
 
-_"In protocol design, perfection has been reached not when there is nothing left to add, but when there is nothing left to take away." — RFC 1925_
+&nbsp;
 
-Meld fuses multiple P2/P3 WebAssembly components into a single core module,
-eliminating the need for runtime linking.
+![Rust](https://img.shields.io/badge/Rust-CE422B?style=flat-square&logo=rust&logoColor=white&labelColor=1a1b27)
+![WebAssembly](https://img.shields.io/badge/WebAssembly-654FF0?style=flat-square&logo=webassembly&logoColor=white&labelColor=1a1b27)
+![Component Model](https://img.shields.io/badge/Component_Model-654FF0?style=flat-square&logoColor=white&labelColor=1a1b27)
+![Formally Verified](https://img.shields.io/badge/Formally_Verified-00C853?style=flat-square&logoColor=white&labelColor=1a1b27)
+![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue?style=flat-square&labelColor=1a1b27)
 
-Part of the **pulseengine toolchain**:
-- **[loom](https://github.com/pulseengine/loom)** - Formally verified WebAssembly optimizer
-- **meld** - Static component fuser (this tool)
+&nbsp;
 
-## The Name
+<h6>
+  <a href="https://github.com/pulseengine/meld">Meld</a>
+  &middot;
+  <a href="https://github.com/pulseengine/loom">Loom</a>
+  &middot;
+  <a href="https://github.com/pulseengine/synth">Synth</a>
+  &middot;
+  <a href="https://github.com/pulseengine/kiln">Kiln</a>
+  &middot;
+  <a href="https://github.com/pulseengine/sigil">Sigil</a>
+</h6>
 
-The word *meld* means to merge or fuse into a unified whole — from metallurgy,
-where metals are melded by heating them together until they become one. This
-captures exactly what the tool does: separate WebAssembly components go in,
-a single cohesive core module comes out.
+</div>
 
-In the pulseengine toolchain, each tool carries a short, evocative name:
-**loom** weaves optimizations together; **meld** fuses components into one.
+&nbsp;
 
-## Why Meld?
+Meld fuses. Loom weaves. Synth transpiles. Kiln fires. Sigil seals.
 
-Today, multiple WebAssembly components can be composed using tools like WAC,
-but they still require runtime linking. This prevents:
+Meld statically fuses multiple WebAssembly P2/P3 components into a single core module, eliminating the need for runtime linking. Import resolution, index-space merging, and canonical ABI adapter generation happen at build time. Every transformation carries mechanized proofs covering parsing, resolution, merging, and adapter correctness.
 
-- Whole-program optimization across component boundaries
-- Using tools like loom to optimize the entire component graph
-- Direct browser execution without a component runtime
-- Efficient native transpilation to embedded targets
+Unlike composition tools that produce linked-but-separate component graphs, Meld produces a single monolithic module suitable for whole-program optimization by Loom and native transpilation by Synth.
 
-Meld solves this by statically linking all components at build time:
-
-```
-P2/P3 Components → meld → Single Module → loom optimize → Browser/Native
-```
-
-## Installation
-
-### From Source (Cargo)
+## Quick Start
 
 ```bash
+# From source (Cargo)
 cargo install --path meld-cli
-```
 
-### From Source (Bazel)
-
-```bash
+# From source (Bazel)
 bazel build //meld-cli:meld
-```
 
-### Pre-built Binaries
-
-Coming soon on GitHub Releases.
-
-## Usage
-
-### Basic Fusion
-
-```bash
 # Fuse two components
 meld fuse component_a.wasm component_b.wasm -o fused.wasm
+```
 
-# Fuse with statistics
-meld fuse --stats component_a.wasm component_b.wasm -o fused.wasm
+### Full Pipeline
 
-# Inspect a component before fusion
-meld inspect component_a.wasm --interfaces
+```bash
+# 1. Build components
+cargo component build --release
+
+# 2. Fuse into single module
+meld fuse composed.wasm -o fused.wasm
+
+# 3. Optimize with Loom
+loom optimize fused.wasm -o optimized.wasm
+
+# 4. Run
+wasmtime run optimized.wasm
 ```
 
 ### Bazel Integration
@@ -75,7 +70,6 @@ meld inspect component_a.wasm --interfaces
 ```starlark
 load("@meld//rules:meld.bzl", "meld_fuse")
 
-# Fuse components built with rules_wasm_component
 meld_fuse(
     name = "my_app",
     components = [
@@ -85,79 +79,23 @@ meld_fuse(
 )
 ```
 
-### Full Pipeline Example
+## How It Works
 
-```bash
-# 1. Build components (e.g., with cargo component)
-cargo component build --release
+1. **Parse** — Extract core modules and type information from components
+2. **Resolve** — Build import/export graph, identify cross-component calls
+3. **Merge** — Combine function/memory/table/global index spaces
+4. **Adapt** — Generate Canonical ABI trampolines for cross-component calls
+5. **Encode** — Output single core WebAssembly module
 
-# 2. Compose components (optional, if using WAC)
-wac compose component_a.wasm component_b.wasm -o composed.wasm
+### Adapter Generation
 
-# 3. Fuse into single module
-meld fuse composed.wasm -o fused.wasm
-
-# 4. Optimize with loom
-loom optimize fused.wasm -o optimized.wasm
-
-# 5. Run in browser or runtime
-wasmtime run optimized.wasm
-```
-
-## Pipeline Architecture
-
-```mermaid
-flowchart TD
-    subgraph BuildTime[Build Time]
-        direction TB
-
-        Sources[Rust/Go/C++ Sources] -->|compile| Components[P2/P3 Components]
-        Components -->|optional| WAC[wac compose]
-        WAC --> Meld
-
-        subgraph Meld[Meld - Static Fuser]
-            direction LR
-            MeldInput[Input Components] --> MeldProcess[Parse, Resolve, Merge, Adapt, Encode]
-            MeldProcess --> MeldOutput[Single Module]
-        end
-
-        MeldOutput --> Loom
-
-        subgraph Loom[loom - Optimizer]
-            direction LR
-            LoomInput[Single Module] --> LoomProcess[Whole-program Optimization]
-            LoomProcess --> LoomOutput[Optimized Module]
-        end
-    end
-
-    LoomOutput --> Runtime
-
-    subgraph Runtime[Runtime]
-        direction TB
-        LoomOutput --> Browser
-        LoomOutput --> Wasmtime
-        LoomOutput --> Wasmer
-        LoomOutput --> Native
-    end
-
-    classDef buildFill fill:#f9f,stroke:#333;
-    classDef runtimeFill fill:#bbf,stroke:#333;
-
-    class BuildTime,Sources,Components,WAC,Meld,Loom buildFill
-    class Runtime,Browser,Wasmtime,Wasmer,Native runtimeFill
-```
+Cross-component calls may require adapters that handle string transcoding (UTF-8, UTF-16, Latin-1), memory copying between component memories, list/array serialization, and resource handle transfer. Meld generates these adapters using techniques inspired by Wasmtime's FACT (Fused Adapter Compiler of Trampolines).
 
 ## Memory Strategies
 
 ### Multi-Memory (Default)
 
-Each component retains its own linear memory. Cross-component calls that
-pass pointers use adapters that allocate in the callee's memory via
-`cabi_realloc` and copy data with `memory.copy`. This is the default
-because shared memory is broken when any component uses `memory.grow`.
-
-Requires multi-memory support in the target runtime (WebAssembly Core
-Spec 3.0 — supported by wasmtime, Chrome, and Firefox).
+Each component retains its own linear memory. Cross-component calls use adapters that allocate in the callee's memory via `cabi_realloc` and copy data with `memory.copy`. Requires multi-memory support (WebAssembly Core Spec 3.0).
 
 ```bash
 meld fuse a.wasm b.wasm -o fused.wasm
@@ -165,9 +103,7 @@ meld fuse a.wasm b.wasm -o fused.wasm
 
 ### Shared Memory (Legacy)
 
-All components share a single linear memory. Simpler and allows direct
-cross-component calls without adapters, but one component's `memory.grow`
-corrupts every other component's address space.
+All components share a single linear memory. Simpler but one component's `memory.grow` corrupts every other component's address space.
 
 ```bash
 meld fuse --memory shared a.wasm b.wasm -o fused.wasm
@@ -175,61 +111,17 @@ meld fuse --memory shared a.wasm b.wasm -o fused.wasm
 
 ## Supply Chain Security
 
-Meld integrates with [wsc](https://github.com/pulseengine/wsc) for supply chain
-attestation. Each fusion operation records:
-
-- Input component hashes
-- Tool version and configuration
-- Transformation metadata
-
-The attestation is embedded in the output module's custom section:
-`wsc.transformation.attestation`
-
-## How It Works
-
-1. **Parse**: Extract core modules and type information from components
-2. **Resolve**: Build import/export graph, identify cross-component calls
-3. **Merge**: Combine function/memory/table/global index spaces
-4. **Adapt**: Generate Canonical ABI trampolines for cross-component calls
-5. **Encode**: Output single core WebAssembly module
-
-### Adapter Generation
-
-Cross-component calls may require adapters that handle:
-- String transcoding (UTF-8 ↔ UTF-16, Latin-1 → UTF-8)
-- Memory copying between component memories
-- List/array serialization
-- Resource handle transfer
-
-Meld generates these adapters using techniques inspired by wasmtime's FACT
-(Fused Adapter Compiler of Trampolines). In multi-memory mode (default),
-adapters allocate in the callee's memory via `cabi_realloc`, copy data with
-`memory.copy`, and call the target. In shared memory mode, cross-component
-calls are resolved to direct function calls with no adapter overhead.
-
-## Limitations
-
-- **Resources**: Resource handle transfer across components is limited
-- **Async**: Async component functions not yet supported
-- **Result copying**: When a callee returns pointers into its own memory,
-  the adapter copies the data back to the caller's memory for the common
-  `(ptr, len)` return pattern; more complex return types are not yet handled
-- **String transcoding**: UTF-8↔UTF-16 and Latin-1→UTF-8 are implemented;
-  UTF-8→Latin-1 is not yet supported
+Meld integrates with [Sigil](https://github.com/pulseengine/sigil) for supply chain attestation. Each fusion operation records input component hashes, tool version and configuration, and transformation metadata. The attestation is embedded in the output module's custom section.
 
 ## Formal Verification
 
-Meld's core transformations are formally verified using Rocq 9.0 (formerly Coq).
-The proofs establish that fusion preserves program semantics — the fused module
-behaves identically to the original composed components.
+Meld's core transformations are formally verified using Rocq 9.0 (formerly Coq). The proofs establish that fusion preserves program semantics — the fused module behaves identically to the original composed components.
 
 Key verified properties:
-- **Merge correctness**: Index remapping preserves function/memory/table references
-- **Resolve correctness**: Topological sort produces valid instantiation order;
-  cycle detection terminates
-- **Adapter correctness**: Generated trampolines preserve call semantics
-- **Forward simulation**: Fused module simulates the original component graph
-  step-by-step
+- **Merge correctness** — Index remapping preserves function/memory/table references
+- **Resolve correctness** — Topological sort produces valid instantiation order; cycle detection terminates
+- **Adapter correctness** — Generated trampolines preserve call semantics
+- **Forward simulation** — Fused module simulates the original component graph step-by-step
 
 Proofs are built via Bazel using [`rules_rocq_rust`](https://github.com/pulseengine/rules_rocq_rust):
 
@@ -238,35 +130,34 @@ bazel build //proofs/transformations/merge:merge_spec
 bazel build //proofs/spec:fusion_spec
 ```
 
-See [`proofs/`](proofs/) for the full proof tree, [`PROOF_GUIDE.md`](proofs/PROOF_GUIDE.md)
-for a beginner-friendly introduction, and [`CLAUDE.md`](CLAUDE.md) for proof engineering guidelines.
+See [`proofs/`](proofs/) for the full proof tree and [`PROOF_GUIDE.md`](proofs/PROOF_GUIDE.md) for an introduction.
+
+> [!NOTE]
+> **Cross-cutting verification** &mdash; Rocq mechanized proofs, Kani bounded model checking, Z3 SMT verification, and Verus Rust verification are used across the PulseEngine toolchain. Sigil attestation chains bind it all together.
+
+## Limitations
+
+- **Resources** — Resource handle transfer across components is limited
+- **Async** — Async component functions not yet supported
+- **String transcoding** — UTF-8/UTF-16 and Latin-1/UTF-8 are implemented; UTF-8/Latin-1 is not yet supported
 
 ## Development
 
 ```bash
-# Build
-cargo build
-
-# Test
-cargo test
-
-# Run with debug logging
+cargo build                # Build
+cargo test                 # Test
+bazel build //...          # Bazel build
 RUST_LOG=debug cargo run -- fuse a.wasm b.wasm -o out.wasm
-
-# Bazel build
-bazel build //...
 ```
-
-## Related Projects
-
-- [WAC](https://github.com/bytecodealliance/wac) - WebAssembly Composition
-- [wit-component](https://github.com/bytecodealliance/wasm-tools) - Component tooling
-- [wasmtime](https://github.com/bytecodealliance/wasmtime) - WASM runtime with FACT
 
 ## License
 
 Apache-2.0
 
-## Contributing
+---
 
-Contributions welcome! Please read the [contributing guidelines](CONTRIBUTING.md) first.
+<div align="center">
+
+<sub>Part of <a href="https://github.com/pulseengine">PulseEngine</a> &mdash; formally verified WebAssembly toolchain for safety-critical systems</sub>
+
+</div>
