@@ -1924,3 +1924,264 @@ mod tests {
         assert_eq!(decompose_component_core_func_index(&component, 7), None);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Kani bounded-verification harnesses
+//
+// These harnesses verify core index-arithmetic properties of the merger using
+// bounded model checking.  They operate on *model functions* that capture the
+// exact same arithmetic as the real code but accept simple numeric inputs
+// instead of full `ParsedComponent`/`MergedModule` structs.
+//
+// Run: `cargo kani --package meld-core`
+// ---------------------------------------------------------------------------
+#[cfg(kani)]
+mod kani_proofs {
+    /// Maximum number of modules Kani will explore.
+    const MAX_MODULES: usize = 4;
+    /// Maximum functions per module (import + defined).
+    const MAX_FUNCS_PER_MODULE: u32 = 10;
+
+    // -- Model functions (mirror merger.rs arithmetic) -----------------------
+
+    /// Model of `decompose_component_core_func_index`.
+    /// Given per-module function counts, find which module owns `index`.
+    fn model_decompose(counts: &[u32], index: u32) -> Option<(usize, u32)> {
+        let mut running: u32 = 0;
+        for (i, &count) in counts.iter().enumerate() {
+            if index < running.saturating_add(count) {
+                return Some((i, index - running));
+            }
+            running = running.saturating_add(count);
+        }
+        None
+    }
+
+    /// Reconstruct a flat index from (module_idx, local_idx).
+    fn model_reconstruct(counts: &[u32], mod_idx: usize, local_idx: u32) -> u32 {
+        let offset: u32 = counts[..mod_idx].iter().copied().sum();
+        offset + local_idx
+    }
+
+    /// Model of `function_index_map` value computation.
+    /// For defined function at `array_position` in module `mod_idx`:
+    ///   absolute_wasm_idx = import_count + cumulative_offset + array_position
+    fn model_absolute_index(
+        import_count: u32,
+        defined_counts: &[u32],
+        mod_idx: usize,
+        array_position: u32,
+    ) -> u32 {
+        let offset: u32 = defined_counts[..mod_idx].iter().copied().sum();
+        import_count + offset + array_position
+    }
+
+    /// Model of `defined_func`: convert absolute wasm index to array position.
+    fn model_defined_func(import_count: u32, wasm_idx: u32) -> Option<u32> {
+        if wasm_idx < import_count {
+            None
+        } else {
+            Some(wasm_idx - import_count)
+        }
+    }
+
+    // -- Harness 1: Decompose ↔ Reconstruct roundtrip -----------------------
+
+    /// For any valid flat index, decompose then reconstruct yields the
+    /// original index, and the local index is within the module's bounds.
+    #[kani::proof]
+    #[kani::unwind(5)]
+    fn check_decompose_roundtrip() {
+        let num_modules: usize = kani::any();
+        kani::assume(num_modules > 0 && num_modules <= MAX_MODULES);
+
+        let mut counts = [0u32; MAX_MODULES];
+        let mut total: u32 = 0;
+        for i in 0..MAX_MODULES {
+            if i < num_modules {
+                counts[i] = kani::any();
+                kani::assume(counts[i] > 0 && counts[i] <= MAX_FUNCS_PER_MODULE);
+                total = total.saturating_add(counts[i]);
+            }
+        }
+        kani::assume(total > 0);
+        kani::assume(total <= (MAX_MODULES as u32) * MAX_FUNCS_PER_MODULE);
+
+        let index: u32 = kani::any();
+        kani::assume(index < total);
+
+        let result = model_decompose(&counts[..num_modules], index);
+        assert!(result.is_some(), "valid index must decompose");
+
+        let (mod_idx, local_idx) = result.unwrap();
+        assert!(mod_idx < num_modules, "module index in range");
+        assert!(local_idx < counts[mod_idx], "local index within module");
+
+        let reconstructed = model_reconstruct(&counts[..num_modules], mod_idx, local_idx);
+        assert_eq!(reconstructed, index, "roundtrip must preserve index");
+    }
+
+    // -- Harness 2: Absolute index is bounded -------------------------------
+
+    /// Every absolute wasm index produced by the index map is strictly less
+    /// than `import_count + total_defined`.
+    #[kani::proof]
+    #[kani::unwind(5)]
+    fn check_function_index_map_bounded() {
+        let num_modules: usize = kani::any();
+        kani::assume(num_modules > 0 && num_modules <= MAX_MODULES);
+
+        let import_count: u32 = kani::any();
+        kani::assume(import_count <= 20);
+
+        let mut defined_counts = [0u32; MAX_MODULES];
+        let mut total_defined: u32 = 0;
+        for i in 0..MAX_MODULES {
+            if i < num_modules {
+                defined_counts[i] = kani::any();
+                kani::assume(defined_counts[i] <= MAX_FUNCS_PER_MODULE);
+                total_defined = total_defined.saturating_add(defined_counts[i]);
+            }
+        }
+        kani::assume(total_defined > 0);
+
+        // Pick an arbitrary module and array position
+        let mod_idx: usize = kani::any();
+        kani::assume(mod_idx < num_modules);
+        let array_pos: u32 = kani::any();
+        kani::assume(array_pos < defined_counts[mod_idx]);
+
+        let abs_idx = model_absolute_index(
+            import_count,
+            &defined_counts[..num_modules],
+            mod_idx,
+            array_pos,
+        );
+
+        assert!(
+            abs_idx < import_count + total_defined,
+            "absolute index must be < import_count + total_defined"
+        );
+        assert!(
+            abs_idx >= import_count,
+            "absolute index of defined func must be >= import_count"
+        );
+    }
+
+    // -- Harness 3: Remap injectivity (no collisions) -----------------------
+
+    /// Two different (mod_idx, local_idx) pairs always produce different
+    /// absolute wasm indices.
+    #[kani::proof]
+    #[kani::unwind(5)]
+    fn check_remap_injective_small() {
+        let num_modules: usize = kani::any();
+        kani::assume(num_modules > 0 && num_modules <= MAX_MODULES);
+
+        let import_count: u32 = kani::any();
+        kani::assume(import_count <= 20);
+
+        let mut defined_counts = [0u32; MAX_MODULES];
+        for i in 0..MAX_MODULES {
+            if i < num_modules {
+                defined_counts[i] = kani::any();
+                kani::assume(defined_counts[i] > 0 && defined_counts[i] <= MAX_FUNCS_PER_MODULE);
+            }
+        }
+
+        // Pick two different (mod_idx, array_pos) pairs
+        let mod_a: usize = kani::any();
+        let pos_a: u32 = kani::any();
+        let mod_b: usize = kani::any();
+        let pos_b: u32 = kani::any();
+        kani::assume(mod_a < num_modules && mod_b < num_modules);
+        kani::assume(pos_a < defined_counts[mod_a] && pos_b < defined_counts[mod_b]);
+        kani::assume(mod_a != mod_b || pos_a != pos_b);
+
+        let idx_a =
+            model_absolute_index(import_count, &defined_counts[..num_modules], mod_a, pos_a);
+        let idx_b =
+            model_absolute_index(import_count, &defined_counts[..num_modules], mod_b, pos_b);
+
+        assert_ne!(
+            idx_a, idx_b,
+            "different source locations must map to different indices"
+        );
+    }
+
+    // -- Harness 4: Absolute index monotonicity -----------------------------
+
+    /// Within a single module, defined function indices are strictly
+    /// increasing with array position.
+    #[kani::proof]
+    #[kani::unwind(5)]
+    fn check_absolute_index_monotonic() {
+        let num_modules: usize = kani::any();
+        kani::assume(num_modules > 0 && num_modules <= MAX_MODULES);
+
+        let import_count: u32 = kani::any();
+        kani::assume(import_count <= 20);
+
+        let mut defined_counts = [0u32; MAX_MODULES];
+        for i in 0..MAX_MODULES {
+            if i < num_modules {
+                defined_counts[i] = kani::any();
+                kani::assume(defined_counts[i] >= 2 && defined_counts[i] <= MAX_FUNCS_PER_MODULE);
+            }
+        }
+
+        let mod_idx: usize = kani::any();
+        kani::assume(mod_idx < num_modules);
+
+        let pos_lo: u32 = kani::any();
+        let pos_hi: u32 = kani::any();
+        kani::assume(pos_lo < pos_hi && pos_hi < defined_counts[mod_idx]);
+
+        let idx_lo = model_absolute_index(
+            import_count,
+            &defined_counts[..num_modules],
+            mod_idx,
+            pos_lo,
+        );
+        let idx_hi = model_absolute_index(
+            import_count,
+            &defined_counts[..num_modules],
+            mod_idx,
+            pos_hi,
+        );
+
+        assert!(
+            idx_lo < idx_hi,
+            "indices must be strictly monotonic within a module"
+        );
+    }
+
+    // -- Harness 5: defined_func roundtrip ----------------------------------
+
+    /// `defined_func(absolute_index(import_count, offset, pos))` returns
+    /// the correct array position, and indices below import_count return None.
+    #[kani::proof]
+    fn check_defined_func_roundtrip() {
+        let import_count: u32 = kani::any();
+        kani::assume(import_count <= 20);
+
+        let total_defined: u32 = kani::any();
+        kani::assume(total_defined > 0 && total_defined <= 40);
+
+        let array_pos: u32 = kani::any();
+        kani::assume(array_pos < total_defined);
+
+        let wasm_idx = import_count + array_pos;
+
+        // defined_func should succeed and return the array position
+        let result = model_defined_func(import_count, wasm_idx);
+        assert_eq!(result, Some(array_pos));
+
+        // Any index below import_count should return None
+        if import_count > 0 {
+            let below: u32 = kani::any();
+            kani::assume(below < import_count);
+            assert_eq!(model_defined_func(import_count, below), None);
+        }
+    }
+}
