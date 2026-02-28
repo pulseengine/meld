@@ -65,3 +65,32 @@ rocq_proof_test(
     deps = [":merger_core_proofs"],
     tags = ["manual", "proofs"],
 )
+
+# Resolver core: index decomposition and function index map
+# Source: meld-core/src/merger.rs (decompose_component_core_func_index, build_function_index_map)
+# Spec: proofs/transformations/merge/{merge_defs,merge_remap}.v
+
+coq_of_rust_library(
+    name = "resolver_core_translated",
+    rust_sources = ["resolver_core.rs"],
+    edition = "2021",
+)
+
+rocq_library(
+    name = "resolver_core",
+    srcs = [":resolver_core_translated"],
+    deps = [":rocq_of_rust_lib"],
+    include_path = "meld",
+    extra_flags = ["-impredicative-set"],
+)
+
+rocq_library(
+    name = "resolver_core_proofs",
+    srcs = ["resolver_core_proofs.v"],
+)
+
+rocq_proof_test(
+    name = "resolver_core_proofs_test",
+    deps = [":resolver_core_proofs"],
+    tags = ["manual", "proofs"],
+)
