@@ -76,6 +76,28 @@ use_repo(rocq_of_rust, "rocq_of_rust_toolchains", "rocq_of_rust_source")
 register_toolchains("@rocq_of_rust_toolchains//:toolchain")
 
 ###############################################################################
+# Verus Verification (SMT-backed Rust verification)
+###############################################################################
+
+# Verus SMT-backed verification for Rust
+# See: https://github.com/pulseengine/rules_verus
+bazel_dep(name = "rules_verus", version = "0.1.0")
+
+# Override to fetch from GitHub (not yet in BCR)
+git_override(
+    module_name = "rules_verus",
+    remote = "https://github.com/pulseengine/rules_verus.git",
+    commit = "6908efc",
+)
+
+# Verus toolchain extension (downloads pre-built release binaries)
+verus = use_extension("@rules_verus//verus:extensions.bzl", "verus")
+verus.toolchain(version = "0.2026.02.15")
+use_repo(verus, "verus_toolchains")
+
+register_toolchains("@verus_toolchains//:all")
+
+###############################################################################
 # Spec Test Suites (WebAssembly 3.0 + Component Model + WASI)
 ###############################################################################
 
