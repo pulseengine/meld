@@ -1,0 +1,17 @@
+load("@rules_verus//verus:defs.bzl", "verus_library", "verus_test")
+
+package(default_visibility = ["//visibility:public"])
+
+# Verus-verified index decomposition for the meld fusion pipeline.
+# Verifies properties of decompose_component_core_func_index from
+# meld-core/src/merger.rs using SMT-backed proofs.
+verus_library(
+    name = "verus_pilot",
+    srcs = ["src/lib.rs"],
+)
+
+verus_test(
+    name = "verus_pilot_test",
+    srcs = ["src/lib.rs"],
+    tags = ["manual", "proofs"],
+)
