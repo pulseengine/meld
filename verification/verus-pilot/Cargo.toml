@@ -1,0 +1,14 @@
+[package]
+name = "verus-pilot"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Verus-verified index arithmetic for meld fusion pipeline"
+
+# This crate is standalone — no dependency on meld-core.
+# It uses nightly Rust (required by Verus) and is not part of
+# the production build.
+
+[dependencies]
+# Verus is invoked as a standalone verifier, not a cargo dependency.
+# The vstd library is provided by the Verus toolchain at verification time.
