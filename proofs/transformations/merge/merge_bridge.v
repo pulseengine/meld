@@ -131,8 +131,7 @@ Lemma instr_list_size_cons :
     instr_size i + instr_list_size rest <= instr_list_size (i :: rest).
 Proof.
   intros i rest. unfold instr_list_size. simpl.
-  pose proof (fold_left_add_ge_base instr_size rest (0 + instr_size i)).
-  pose proof (fold_left_add_ge_base instr_size rest 0).
+  rewrite (fold_left_add_shift instr_size rest (instr_size i)).
   lia.
 Qed.
 
@@ -147,18 +146,8 @@ Proof.
   - reflexivity.
   - unfold instr_list_size. simpl.
     rewrite <- IH. unfold instr_list_size.
-    pose proof (fold_left_add_ge_base instr_size t 0) as Hge.
-    (* Show fold_left (fun acc x => acc + f x) l (0 + n) =
-       n + fold_left (fun acc x => acc + f x) l 0 *)
-    assert (Hshift: forall (l : list instr) n,
-      fold_left (fun acc x => acc + instr_size x) l (0 + n) =
-      n + fold_left (fun acc x => acc + instr_size x) l 0).
-    { clear. intros l. induction l as [|a r IHr]; intro n; simpl.
-      - lia.
-      - replace (0 + n + instr_size a) with (0 + (n + instr_size a)) by lia.
-        replace (0 + instr_size a) with (0 + (instr_size a)) by lia.
-        rewrite IHr. rewrite (IHr (instr_size a)). lia. }
-    rewrite Hshift. lia.
+    rewrite (fold_left_add_shift instr_size t (instr_size h)).
+    lia.
 Qed.
 
 (* Helper: for a single index-referencing instruction, if all relevant
@@ -350,7 +339,7 @@ Proof.
     (* Rewrite the rest by IH (size of rest < n since head has size >= 1) *)
     assert (Hrest: exists rest',
       Forall2 (instr_rewrites (gen_all_remaps input strategy) src) rest rest').
-    { apply (IHn (instr_list_size rest)); try assumption; try lia. }
+    { eapply (IHn (instr_list_size rest)); try lia; eauto. }
     destruct Hrest as [rest' Hrest'].
     (* Rewrite the head instruction i using single_instr_rewritable *)
     inversion Hwf_i as [? Hcall Hcall_ind Hgget Hgset Hreffunc
@@ -467,13 +456,13 @@ Proof.
         specialize (Hblock bt body Heq).
         assert (Hbody_size: instr_list_size body < instr_size i).
         { subst i. simpl. rewrite instr_list_size_eq. lia. }
-        apply (IHn (instr_list_size body)); try assumption; try lia.
+        eapply (IHn (instr_list_size body)); try lia; eauto.
       - (* Loop: apply IH on body, size strictly less *)
         intros bt body Heq.
         specialize (Hloop bt body Heq).
         assert (Hbody_size: instr_list_size body < instr_size i).
         { subst i. simpl. rewrite instr_list_size_eq. lia. }
-        apply (IHn (instr_list_size body)); try assumption; try lia.
+        eapply (IHn (instr_list_size body)); try lia; eauto.
       - (* If: apply IH on both branches *)
         intros bt then_ else_ Heq.
         specialize (Hif bt then_ else_ Heq).
@@ -517,8 +506,7 @@ Theorem gen_all_remaps_enables_rewriting :
                 (func_body f) body'.
 Proof.
   intros input strategy Huniq src m f Hin Hwf Hf_in.
-  apply (instr_list_rewritable (instr_list_size (func_body f))); auto.
-  - apply Hwf. exact Hf_in.
+  eapply (instr_list_rewritable (instr_list_size (func_body f))); eauto.
 Qed.
 
 (* End of merge_bridge *)

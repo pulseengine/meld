@@ -28,9 +28,17 @@ Lemma fold_left_add_split :
     = fold_left (fun acc x => acc + (f x + g x)) l 0.
 Proof.
   intros A f g l.
+  (* Apply fold_left_add_shift exactly 3 times with explicit arguments.
+     Avoid rewrite !fold_left_add_shift which causes exponential proof-term
+     explosion during Qed (17K+ kernel references from unbounded rewriting). *)
   induction l as [|h t IHl]; simpl.
   - lia.
-  - rewrite !fold_left_add_shift. rewrite IHl. lia.
+  - rewrite (fold_left_add_shift f t (f h)).
+    rewrite (fold_left_add_shift g t (g h)).
+    rewrite (fold_left_add_shift (fun x => f x + g x) t (f h + g h)).
+    (* IHl is in context; lia treats fold_left terms as opaque variables
+       and uses IHl to relate them. *)
+    lia.
 Qed.
 
 (* Helper: filter over flat_map distributes as flat_map of filtered sublists.
@@ -109,34 +117,7 @@ Qed.
 Lemma merge_mems_count : forall input,
     length (mod_mems (merge_modules input SharedMemory)) = 1.
 Proof.
-  intro input. unfold merge_modules. simpl.
-  apply sum_space_counts_mems_shared.
-Qed.
-
-(* For SharedMemory mode, all memory remaps target index 0.
-   This matches the Rust implementation (merger.rs lines 350, 932-933)
-   where SharedMemory maps all MemIdx to 0 because all modules share
-   a single merged memory. The Rocq model uses gen_remaps_for_space_zero
-   for the MemIdx chunk in gen_remaps_for_module. *)
-Definition mem_remaps_zero (remaps : remap_table) : Prop :=
-  forall r, In r remaps -> ir_space r = MemIdx -> ir_fused_idx r = 0.
-
-(* gen_all_remaps with SharedMemory produces memory remaps targeting index 0.
-   Proof: any remap r in gen_all_remaps comes from some gen_remaps_for_module
-   call. If ir_space r = MemIdx, then r is from the gen_remaps_for_space_zero
-   chunk, so ir_fused_idx r = 0. *)
-Lemma gen_all_remaps_mem_zero : forall input,
-    mem_remaps_zero (gen_all_remaps input SharedMemory).
-Proof.
-  intro input.
-  unfold mem_remaps_zero, gen_all_remaps.
-  intros r Hin Hspace.
-  (* r comes from some module's remap generation *)
-  apply in_gen_all_remaps_aux in Hin.
-  destruct Hin as [i [src [m [Hnth Hgen]]]].
-  (* From in_gen_remaps_for_module_fused, SharedMemory + MemIdx implies fused_idx = 0 *)
-  pose proof (in_gen_remaps_for_module_fused _ _ _ _ _ Hgen) as [_ [Hmem _]].
-  exact (Hmem eq_refl Hspace).
+  intro input. unfold merge_modules. simpl. reflexivity.
 Qed.
 
 Lemma count_global_imports_flat_map :
@@ -230,33 +211,74 @@ Proof.
       * replace (S start_idx + i') with (start_idx + S i') by lia. exact Hin.
 Qed.
 
+(* For SharedMemory mode, all memory remaps target index 0.
+   This matches the Rust implementation (merger.rs lines 350, 932-933)
+   where SharedMemory maps all MemIdx to 0 because all modules share
+   a single merged memory. The Rocq model uses gen_remaps_for_space_zero
+   for the MemIdx chunk in gen_remaps_for_module. *)
+Definition mem_remaps_zero (remaps : remap_table) : Prop :=
+  forall r, In r remaps -> ir_space r = MemIdx -> ir_fused_idx r = 0.
+
+(* gen_all_remaps with SharedMemory produces memory remaps targeting index 0.
+   Proof: any remap r in gen_all_remaps comes from some gen_remaps_for_module
+   call. If ir_space r = MemIdx, then r is from the gen_remaps_for_space_zero
+   chunk, so ir_fused_idx r = 0. *)
+Lemma gen_all_remaps_mem_zero : forall input,
+    mem_remaps_zero (gen_all_remaps input SharedMemory).
+Proof.
+  intro input.
+  unfold mem_remaps_zero, gen_all_remaps.
+  intros r Hin Hspace.
+  (* r comes from some module's remap generation *)
+  apply in_gen_all_remaps_aux in Hin.
+  destruct Hin as [i [src [m [Hnth Hgen]]]].
+  (* From in_gen_remaps_for_module_fused, SharedMemory + MemIdx implies fused_idx = 0 *)
+  pose proof (in_gen_remaps_for_module_fused _ _ _ _ _ Hgen) as [_ [Hmem _]].
+  exact (Hmem eq_refl Hspace).
+Qed.
+
 (* A remap from gen_remaps_for_module has its source_idx bounded by
    the space count of the module in the corresponding index space.
    This holds for any memory strategy. *)
+
+(* Recursive tactic: peel In _ (... ++ ...) until reaching a leaf,
+   then apply the appropriate base-case lemma. *)
+Ltac solve_remap_bound Hin :=
+  first
+    [ apply in_gen_remaps_for_space_fused in Hin;
+      destruct Hin as [_ [Hspace [_ Hbound]]];
+      rewrite Hspace; simpl; exact Hbound
+    | apply in_gen_remaps_for_space_zero_fused in Hin;
+      destruct Hin as [_ [Hspace [_ Hbound]]];
+      rewrite Hspace; simpl; exact Hbound
+    | apply in_app_iff in Hin; destruct Hin as [Hin | Hin];
+      [ solve_remap_bound Hin | solve_remap_bound Hin ]
+    ].
+
 Lemma in_gen_remaps_for_module_bound :
   forall src m offsets strategy r,
     In r (gen_remaps_for_module src m offsets strategy) ->
     ir_source_idx r < space_count_of_module m (ir_space r).
 Proof.
   intros src m offsets strategy r Hin.
-  unfold gen_remaps_for_module in Hin.
-  (* r must be in one of the 7 appended lists. Navigate linearly (not
-     exponentially) by peeling off the leftmost list at each step. *)
-  Local Ltac solve_remap_bound :=
-    first
-      [ (* Base case: r is in a gen_remaps_for_space list *)
-        apply in_gen_remaps_for_space_fused in Hin;
-        destruct Hin as [_ [Hspace [_ Hbound]]];
-        subst; unfold space_count_of_module; exact Hbound
-      | (* Base case: r is in a gen_remaps_for_space_zero list *)
-        apply in_gen_remaps_for_space_zero_fused in Hin;
-        destruct Hin as [_ [Hspace [_ Hbound]]];
-        subst; unfold space_count_of_module; exact Hbound
-      | (* Recursive case: peel off leftmost list from ++ *)
-        apply in_app_iff in Hin; destruct Hin as [Hin | Hin];
-        [ solve_remap_bound | solve_remap_bound ]
-      ].
-  destruct strategy; simpl in Hin; solve_remap_bound.
+  destruct strategy.
+  - (* SharedMemory *)
+    unfold gen_remaps_for_module in Hin. simpl in Hin.
+    repeat (apply in_app_iff in Hin; destruct Hin as [Hin | Hin]).
+    (* Each goal has Hin : In r (gen_remaps_for_space ...) or
+       In r (gen_remaps_for_space_zero ...).  Extract ir_space = <concrete>,
+       rewrite to expose space_count_of_module to simpl, then close. *)
+    all: first
+      [ apply in_gen_remaps_for_space_fused in Hin
+      | apply in_gen_remaps_for_space_zero_fused in Hin ];
+      destruct Hin as [_ [Hspace [_ Hbound]]];
+      rewrite Hspace; simpl; exact Hbound.
+  - (* SeparateMemory *)
+    unfold gen_remaps_for_module in Hin. simpl in Hin.
+    repeat (apply in_app_iff in Hin; destruct Hin as [Hin | Hin]).
+    all: apply in_gen_remaps_for_space_fused in Hin;
+         destruct Hin as [_ [Hspace [_ Hbound]]];
+         rewrite Hspace; simpl; exact Hbound.
 Qed.
 
 (* -------------------------------------------------------------------------
@@ -293,7 +315,7 @@ Proof.
   { unfold offsets_for_module.
     rewrite <- offset_at_length_eq_total.
     replace (0 + i) with i by lia.
-    apply offset_plus_count_total. exact Hnth. }
+    exact (offset_plus_count_total _ _ _ (src, m) Hnth). }
   (* Case split on strategy and MemIdx *)
   destruct strategy.
   - (* SharedMemory *)
@@ -360,22 +382,22 @@ Theorem merge_correctness_constructed :
       | DataIdx => fused_idx < length (mod_datas merged)
       end.
 Proof.
-  intros input merged remaps src m space src_idx fused_idx Hin Hlookup.
+  (* Eliminate the let-bindings so rewrite can match merge_modules directly *)
+  intros input. cbv zeta.
+  intros src m space src_idx fused_idx Hin Hlookup.
   (* Get the bound on fused_idx *)
   assert (Hbound: fused_idx < total_space_count input space).
   { eapply lookup_fused_idx_bound; eauto. }
   (* Case split on space, using the length lemmas to translate
      total_space_count into the merged module's actual bounds *)
-  destruct space; unfold merged.
-  - (* TypeIdx *)
-    rewrite merge_types_length. exact Hbound.
+  (* Constructor order: FuncIdx, TableIdx, MemIdx, GlobalIdx, TypeIdx, ElemIdx, DataIdx *)
+  destruct space.
   - (* FuncIdx *)
     unfold valid_funcidx. rewrite merge_funcs_length. exact Hbound.
   - (* TableIdx *)
     unfold valid_tableidx. rewrite merge_tables_length. exact Hbound.
   - (* MemIdx — SharedMemory maps all MemIdx to 0; extract from lookup *)
     unfold valid_memidx. rewrite merge_mems_count.
-    unfold remaps in Hlookup.
     unfold lookup_remap in Hlookup.
     destruct (find _ _) as [r|] eqn:Hfind; [|discriminate].
     injection Hlookup as Hfused.
@@ -389,6 +411,8 @@ Proof.
     specialize (Hmz r Hin_r Hspace). subst. lia.
   - (* GlobalIdx *)
     unfold valid_globalidx. rewrite merge_globals_length. exact Hbound.
+  - (* TypeIdx *)
+    rewrite merge_types_length. exact Hbound.
   - (* ElemIdx *)
     rewrite merge_elems_length. exact Hbound.
   - (* DataIdx *)
@@ -438,17 +462,24 @@ Proof.
   specialize (Hbounded r Hin_r).
   rewrite H1 in Hbounded.
   (* Translate total_space_count into merged module bounds *)
+  (* Constructor order: FuncIdx, TableIdx, MemIdx, GlobalIdx, TypeIdx, ElemIdx, DataIdx *)
   destruct space.
-  - rewrite merge_types_length. exact Hbounded.
-  - unfold valid_funcidx. rewrite merge_funcs_length. exact Hbounded.
-  - unfold valid_tableidx. rewrite merge_tables_length. exact Hbounded.
+  - (* FuncIdx *)
+    unfold valid_funcidx. rewrite merge_funcs_length. exact Hbounded.
+  - (* TableIdx *)
+    unfold valid_tableidx. rewrite merge_tables_length. exact Hbounded.
   - (* MemIdx — use SharedMemory mem_remaps_zero property *)
     unfold valid_memidx. rewrite merge_mems_count.
     unfold mem_remaps_zero in Hmzero.
     specialize (Hmzero r Hin_r H1). rewrite Hmzero. lia.
-  - unfold valid_globalidx. rewrite merge_globals_length. exact Hbounded.
-  - rewrite merge_elems_length. exact Hbounded.
-  - rewrite merge_datas_length. exact Hbounded.
+  - (* GlobalIdx *)
+    unfold valid_globalidx. rewrite merge_globals_length. exact Hbounded.
+  - (* TypeIdx *)
+    rewrite merge_types_length. exact Hbounded.
+  - (* ElemIdx *)
+    rewrite merge_elems_length. exact Hbounded.
+  - (* DataIdx *)
+    rewrite merge_datas_length. exact Hbounded.
 Qed.
 
 (* -------------------------------------------------------------------------
@@ -504,7 +535,6 @@ Proof.
   - (* Forward: NoDup (map fst input) -> nth_error injectivity *)
     intros Hnodup i j src1 m1 src2 m2 Hi Hj Hsrc_eq.
     eapply (NoDup_map_nth_error_injective fst); eauto.
-    simpl. exact Hsrc_eq.
   - (* Backward: nth_error injectivity -> NoDup (map fst input) *)
     intro Hinj.
     induction input as [|[src m] rest IH].
@@ -519,7 +549,7 @@ Proof.
         destruct Hin_rest as [j Hj].
         (* (src, m) is at position 0, (src, m') is at position S j *)
         assert (Habs: 0 = S j).
-        { eapply Hinj; simpl; eauto. reflexivity. }
+        { eapply Hinj; simpl; eauto. }
         lia.
       * (* NoDup (map fst rest) *)
         apply IH.
@@ -556,14 +586,15 @@ Lemma find_gen_remaps_for_module_wrong_src :
     (gen_remaps_for_module src2 m offsets strategy) = None.
 Proof.
   intros src1 src2 m space offsets strategy src_idx Hneq.
-  unfold gen_remaps_for_module.
-  destruct strategy; simpl;
-  repeat rewrite find_app;
-  (* Handle both gen_remaps_for_space and gen_remaps_for_space_zero chunks *)
-  repeat first
-    [ rewrite find_gen_remaps_for_space_wrong_src; [|exact Hneq]
-    | rewrite find_gen_remaps_for_space_zero_wrong_src; [|exact Hneq] ];
-  reflexivity.
+  (* All entries in gen_remaps_for_module have ir_source = src2.
+     Since src1 <> src2, find_wrong_source handles the entire list. *)
+  apply find_wrong_source.
+  intros r Hr.
+  apply in_gen_remaps_for_module_fused in Hr.
+  destruct Hr as [Hsrc _]. rewrite Hsrc.
+  intro Habs.
+  destruct Hneq as [Hf | Hs];
+    destruct src1, src2; simpl in *; congruence.
 Qed.
 
 (* Helper: lookup_remap distributes over list append *)
@@ -632,13 +663,8 @@ Lemma lookup_remap_module_wrong_src :
     lookup_remap (gen_remaps_for_module src2 m offsets strategy) space src1 src_idx = None.
 Proof.
   intros src1 src2 m space offsets strategy src_idx Hneq.
-  unfold gen_remaps_for_module.
-  destruct strategy; simpl;
-  repeat rewrite lookup_remap_app;
-  (* Handle both gen_remaps_for_space and gen_remaps_for_space_zero chunks *)
-  repeat first
-    [ rewrite lookup_remap_wrong_src; auto
-    | rewrite lookup_remap_zero_wrong_src; auto ].
+  unfold lookup_remap.
+  rewrite find_gen_remaps_for_module_wrong_src; auto.
 Qed.
 
 (* Helper: lookup_remap succeeds in gen_remaps_for_module for the right source.
@@ -761,8 +787,8 @@ Proof.
   assert (Hbound: src_idx < space_count_of_module m space).
   { unfold space_count_of_module. destruct space; exact Hlt. }
   (* Convert unique_sources to the nth_error injectivity form *)
-  apply unique_sources_nth_error in Hunique.
-  apply lookup_gen_all_remaps_aux_unique; auto.
+  pose proof (proj1 (unique_sources_nth_error input) Hunique) as Huniq_nth.
+  eapply lookup_gen_all_remaps_aux_unique; eauto.
 Qed.
 
 (* Helper: compute_offset at S i is at least compute_offset at i plus the
@@ -825,7 +851,7 @@ Proof.
   (* Rewrite ir_space r1 = ir_space r2 in bounds *)
   rewrite Hspace in Hbound1.
   (* The fused indices are equal *)
-  rewrite Hfused1, Hfused2 in Hfused.
+  rewrite Hfused1, Hfused2, Hspace in Hfused.
   (* Compare module positions i1 and i2 *)
   destruct (Nat.lt_trichotomy i1 i2) as [Hlt | [Heq | Hgt]].
   - (* i1 < i2: contradiction *)
@@ -921,7 +947,7 @@ Proof.
   (* Rewrite ir_space r1 = ir_space r2 in bounds *)
   rewrite Hspace in Hbound1.
   (* The fused indices are equal *)
-  rewrite Hfused1, Hfused2 in Hfused.
+  rewrite Hfused1, Hfused2, Hspace in Hfused.
   (* Compare module positions i1 and i2 *)
   destruct (Nat.lt_trichotomy i1 i2) as [Hlt | [Heq | Hgt]].
   - (* i1 < i2: contradiction *)
@@ -981,11 +1007,14 @@ Theorem remap_injective_separate_memory_lookup :
 Proof.
   intros input remaps Huniq Hremaps space src1 i1 src2 i2 fused Hlookup1 Hlookup2.
   subst remaps.
-  (* Extract the underlying remap entries from the successful lookups *)
-  unfold lookup_remap in Hlookup1, Hlookup2.
+  (* Extract the underlying remap entries from the successful lookups.
+     Unfold one at a time so destruct (find _ _) is unambiguous. *)
+  unfold lookup_remap in Hlookup1.
   destruct (find _ _) as [r1|] eqn:Hfind1; [|discriminate].
-  destruct (find _ (gen_all_remaps input SeparateMemory)) as [r2|] eqn:Hfind2; [|discriminate].
-  injection Hlookup1 as Hfused1. injection Hlookup2 as Hfused2.
+  unfold lookup_remap in Hlookup2.
+  destruct (find _ _) as [r2|] eqn:Hfind2; [|discriminate].
+  assert (Hfused1: ir_fused_idx r1 = fused) by congruence.
+  assert (Hfused2: ir_fused_idx r2 = fused) by congruence.
   (* Extract membership and match conditions from find *)
   apply find_some in Hfind1. destruct Hfind1 as [Hin1 Hmatch1].
   apply find_some in Hfind2. destruct Hfind2 as [Hin2 Hmatch2].
@@ -1012,9 +1041,9 @@ Proof.
   split.
   - (* src1 = src2: from ir_source r1 = ir_source r2 and the match conditions *)
     destruct src1, src2. simpl in *.
-    f_equal; [lia | lia].
+    f_equal; congruence.
   - (* i1 = i2: from ir_source_idx r1 = ir_source_idx r2 *)
-    lia.
+    congruence.
 Qed.
 
 (* End of merge_correctness.
