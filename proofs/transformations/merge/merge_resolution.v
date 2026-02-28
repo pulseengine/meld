@@ -27,8 +27,7 @@
    5. The flat model's instruction rewriting theorem transfers
       (resolved_enables_rewriting)
 
-   IMPORTANT: Some theorems are Admitted pending full mechanization.
-   Each Admitted proof includes a comment explaining the proof strategy.
+   All theorems in this file are fully mechanized (Qed).
    ========================================================================= *)
 
 From Stdlib Require Import List ZArith Lia Bool Arith.
@@ -702,12 +701,10 @@ Qed.
    (2) Module well-formedness (indices in bounds)
    These are exactly what resolved_remap_complete provides.
 
-   This theorem is Admitted because fully constructing the resolved remap
-   table as a Rocq list and proving lookup correctness requires defining
-   the import-to-definition mapping (which depends on the resolver's
-   algorithm). The flat model's proof in merge_bridge.v already shows
-   the structural argument works; this theorem notes the same structure
-   applies to any remap table that is complete. *)
+   The proof uses the flat model's gen_all_remaps as a complete remap
+   table, sidestepping the need to construct a resolved-specific table.
+   This works because gen_all_remaps overapproximates the resolved model
+   (it maps ALL indices, including resolved imports). *)
 Theorem resolved_enables_rewriting :
   forall resolve input strategy,
     resolution_wf input resolve ->

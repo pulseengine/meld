@@ -189,4 +189,191 @@ Definition enumerate_module_sources (cc : composed_component) : list module_sour
     map (fun mi => (comp_idx, mi)) (seq 0 (length (comp_core_modules c)))
   ) (combine components (seq 0 (length components))).
 
+(* =========================================================================
+   Instance Scoping
+
+   The Component Model organizes items into instance scopes. Each component
+   instance has a set of exports derived from the instantiated component's
+   exports. When one component imports from another, the import resolves
+   through instance indirection: the importing component sees an instance
+   index, and the actual item is looked up in that instance's export map.
+
+   This is important for fusion because:
+   1. Import resolution must follow instance indirection
+   2. The fused module needs to correctly map instance-scoped indices
+      to the flat index space of the merged module
+   ========================================================================= *)
+
+(* -------------------------------------------------------------------------
+   Instance Scope
+
+   Maps instance indices to their source module origins and the
+   exports they provide.
+   ------------------------------------------------------------------------- *)
+
+(* An instance scope entry tracks which component and module an
+   instance was created from, along with the exports it provides. *)
+Record instance_scope_entry : Type := mkInstanceScopeEntry {
+  ise_instance_idx : nat;
+  ise_source_component : nat;
+  ise_source_module : nat;
+  (* The exports this instance provides, as (name, kind) pairs.
+     These are a subset of the source module's exports. *)
+  ise_exports : list (wasm_string * component_export_kind);
+}.
+
+(* The instance scope for a composed component *)
+Definition instance_scope := list instance_scope_entry.
+
+(* -------------------------------------------------------------------------
+   Instance Export Resolution
+
+   Given an instance index and an export name, find the corresponding
+   export kind. This models the indirection step in import resolution:
+   the resolver first identifies the target instance, then looks up
+   the named export within that instance.
+   ------------------------------------------------------------------------- *)
+
+Definition resolve_instance_export (scope : instance_scope)
+    (inst_idx : nat) (export_name : wasm_string)
+    : option component_export_kind :=
+  (* Find the instance entry *)
+  match List.find (fun entry => Nat.eqb (ise_instance_idx entry) inst_idx) scope with
+  | Some entry =>
+      (* Find the named export within the instance *)
+      match List.find (fun exp => Nat.eqb (fst exp) export_name)
+                      (ise_exports entry) with
+      | Some (_, kind) => Some kind
+      | None => None
+      end
+  | None => None
+  end.
+
+(* -------------------------------------------------------------------------
+   Instance Scope Well-formedness
+
+   An instance scope is well-formed with respect to a composed component
+   if:
+   1. Every instance references a valid component and module
+   2. Every instance's exports are a subset of its source module's exports
+   3. Instance indices are unique
+   ------------------------------------------------------------------------- *)
+
+(* An instance entry's source is valid within a composed component *)
+Definition instance_source_valid (cc : composed_component)
+    (entry : instance_scope_entry) : Prop :=
+  ise_source_component entry < length (cc_components cc) /\
+  exists comp,
+    nth_error (cc_components cc) (ise_source_component entry) = Some comp /\
+    ise_source_module entry < length (comp_core_modules comp).
+
+(* Helper: check if a component export has a given name and kind *)
+Definition export_matches_name_kind (exp : component_export)
+    (name : wasm_string) (kind : component_export_kind) : bool :=
+  Nat.eqb (cexp_name exp) name &&
+  match cexp_kind exp, kind with
+  | CEFunc _, CEFunc _ => true
+  | CEValue _, CEValue _ => true
+  | CEType, CEType => true
+  | CEInstance, CEInstance => true
+  | CEComponent, CEComponent => true
+  | _, _ => false
+  end.
+
+(* An instance's exports are a subset of its source component's exports.
+   Every (name, kind) pair in the instance's export list must correspond
+   to an export of the source component. *)
+Definition instance_exports_subset (cc : composed_component)
+    (entry : instance_scope_entry) : Prop :=
+  forall name kind,
+    In (name, kind) (ise_exports entry) ->
+    exists comp,
+      nth_error (cc_components cc) (ise_source_component entry) = Some comp /\
+      exists exp,
+        In exp (comp_exports comp) /\
+        export_matches_name_kind exp name kind = true.
+
+(* Instance indices are unique *)
+Definition instance_indices_unique (scope : instance_scope) : Prop :=
+  NoDup (map ise_instance_idx scope).
+
+(* Full well-formedness of an instance scope *)
+Definition instance_scope_wf (cc : composed_component)
+    (scope : instance_scope) : Prop :=
+  (* All sources are valid *)
+  Forall (instance_source_valid cc) scope /\
+  (* All exports are subsets of source exports *)
+  Forall (instance_exports_subset cc) scope /\
+  (* Instance indices are unique *)
+  instance_indices_unique scope.
+
+(* -------------------------------------------------------------------------
+   Instance Scope Properties
+   ------------------------------------------------------------------------- *)
+
+(* Resolution is deterministic: same inputs produce same outputs *)
+Theorem resolve_instance_export_deterministic :
+  forall scope inst_idx name r1 r2,
+    resolve_instance_export scope inst_idx name = Some r1 ->
+    resolve_instance_export scope inst_idx name = Some r2 ->
+    r1 = r2.
+Proof.
+  intros scope inst_idx name r1 r2 H1 H2.
+  rewrite H1 in H2. injection H2. auto.
+Qed.
+
+(* If an instance export resolves, the instance exists in the scope *)
+Theorem resolve_instance_export_implies_instance_exists :
+  forall scope inst_idx name kind,
+    resolve_instance_export scope inst_idx name = Some kind ->
+    exists entry,
+      In entry scope /\
+      ise_instance_idx entry = inst_idx.
+Proof.
+  intros scope inst_idx name kind Hresolve.
+  unfold resolve_instance_export in Hresolve.
+  destruct (List.find (fun entry => Nat.eqb (ise_instance_idx entry) inst_idx)
+                      scope) as [entry |] eqn:Hfind; [| discriminate].
+  apply List.find_some in Hfind.
+  destruct Hfind as [Hin Hpred].
+  apply Nat.eqb_eq in Hpred.
+  exists entry. split; [exact Hin | exact Hpred].
+Qed.
+
+(* In a well-formed instance scope, resolved exports come from the
+   source component's exports *)
+Theorem resolved_export_from_source :
+  forall cc scope inst_idx name kind,
+    instance_scope_wf cc scope ->
+    resolve_instance_export scope inst_idx name = Some kind ->
+    exists entry,
+      In entry scope /\
+      ise_instance_idx entry = inst_idx /\
+      In (name, kind) (ise_exports entry) /\
+      instance_exports_subset cc entry.
+Proof.
+  intros cc scope inst_idx name kind [Hvalid [Hsubset Huniq]] Hresolve.
+  unfold resolve_instance_export in Hresolve.
+  destruct (List.find (fun entry => Nat.eqb (ise_instance_idx entry) inst_idx)
+                      scope) as [entry |] eqn:Hfind_entry; [| discriminate].
+  destruct (List.find (fun exp => Nat.eqb (fst exp) name)
+                      (ise_exports entry))
+    as [[found_name found_kind] |] eqn:Hfind_exp; [| discriminate].
+  injection Hresolve as Hkind_eq. subst kind.
+  apply List.find_some in Hfind_entry.
+  destruct Hfind_entry as [Hin_scope Hpred_inst].
+  apply Nat.eqb_eq in Hpred_inst.
+  apply List.find_some in Hfind_exp.
+  destruct Hfind_exp as [Hin_exports Hpred_name].
+  simpl in Hpred_name.
+  apply Nat.eqb_eq in Hpred_name.
+  subst found_name.
+  exists entry. repeat split.
+  - exact Hin_scope.
+  - exact Hpred_inst.
+  - exact Hin_exports.
+  - (* instance_exports_subset: entry is in scope, so Forall gives us this *)
+    rewrite Forall_forall in Hsubset. exact (Hsubset entry Hin_scope).
+Qed.
+
 (* End of component_model specification *)

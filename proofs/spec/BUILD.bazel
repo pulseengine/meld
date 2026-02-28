@@ -57,3 +57,26 @@ rocq_library(
     ],
     include_path = "MeldSpec",
 )
+
+# Alias handling: outer/inner/core type aliases and resolution chains.
+rocq_library(
+    name = "alias_spec",
+    srcs = ["alias_spec.v"],
+    deps = [
+        ":wasm_core",
+        ":component_model",
+    ],
+    include_path = "MeldSpec",
+)
+
+# P1 intra-component adapter spec: same-component cross-module calls.
+rocq_library(
+    name = "p1_adapter_spec",
+    srcs = ["p1_adapter_spec.v"],
+    deps = [
+        ":wasm_core",
+        ":component_model",
+        ":fusion_types",
+    ],
+    include_path = "MeldSpec",
+)

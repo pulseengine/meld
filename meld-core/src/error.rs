@@ -44,6 +44,10 @@ pub enum Error {
     #[error("circular dependency detected between components")]
     CircularDependency,
 
+    /// Circular dependency detected between modules within a component
+    #[error("circular module dependency in component {component_idx}: {cycle}")]
+    ModuleDependencyCycle { component_idx: usize, cycle: String },
+
     /// Type mismatch during resolution
     #[error("type mismatch: import expects {expected}, but export provides {actual}")]
     TypeMismatch { expected: String, actual: String },

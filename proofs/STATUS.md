@@ -8,8 +8,8 @@ Implementation vs formal verification coverage for the Meld fusion pipeline.
 |--------|-------|
 | Rocq `.v` files | 23 |
 | Rocq lines (total) | 11,082 |
-| Closed proofs (Qed) | 244 |
-| Admitted proofs | 4 |
+| Closed proofs (Qed) | 245 |
+| Admitted proofs | 3 |
 | Rust lines (`meld-core/src`) | 8,218 |
 | Proof-to-code ratio | 1.35x |
 
@@ -21,7 +21,7 @@ Implementation vs formal verification coverage for the Meld fusion pipeline.
 | Resolver | `resolver.rs` | 546 | `resolver/resolver.v`, `resolve/resolve_spec.v` | 1,447 | Covered | Topo sort correctness, dependency resolution soundness, adapter site identification |
 | Merger | `merger.rs` | 2,189 | `merge/*.v` (6 files), `rust_verified/merger_core_proofs.v` | 4,364 | Covered | Index remap injectivity/completeness/boundedness, memory layout disjointness, type/func/table/mem/global/elem/data merge correctness, import resolution refinement |
 | Rewriter | `rewriter.rs` | 979 | `rewriter/rewriter.v` | 7 | Placeholder | — |
-| Adapters | `adapter/*.rs` | 1,638 | `adapter/adapter.v`, `adapter/adapter_spec.v` | 806 | Partial | Canonical ABI specification, string encoding, adapter type correctness. 2 Admitted: roundtrip primitive, crossing semantics preservation |
+| Adapters | `adapter/*.rs` | 1,638 | `adapter/adapter.v`, `adapter/adapter_spec.v` | 806 | Partial | Canonical ABI specification, string encoding, adapter type correctness, crossing adapter semantics preservation. 1 Admitted: roundtrip primitive |
 | Segments | `segments.rs` | 624 | `segments/segments.v` | 25 | Placeholder | Offset map injectivity only |
 | Orchestration | `lib.rs` | 773 | — | — | None | — |
 | Attestation | `attestation.rs` | 411 | `attestation/attestation.v` | 7 | Placeholder | — |
@@ -47,21 +47,17 @@ The spec files (`fusion_spec.v`, `fusion_types.v`, `wasm_semantics.v`, `wasm_cor
 
 Offset computation monotonicity and summation correctness are proved over Rust code translated to Rocq via `rocq-of-rust`. Memory layout disjointness follows from these properties. Coverage is limited to `compute_offsets` and `compute_memory_layout`.
 
-## The 4 Admitted Proofs
+## The 3 Admitted Proofs
 
 ### 1. `lift_lower_roundtrip_primitive` — `adapter_spec.v:322`
 
-States that lowering a canonical value and lifting the result recovers the original. Blocked because `lower_value` and `lift_values` are axiomatized; replacing them with computable definitions would unblock the proof.
+States that lowering a canonical value and lifting the result recovers the original. Blocked because `lower_value` and `lift_values` are axiomatized (`Parameter`); replacing them with computable `Fixpoint` definitions or adding an explicit roundtrip axiom would unblock the proof.
 
-### 2. `crossing_adapter_preserves_semantics` — `adapter_spec.v:798`
-
-States that a cross-memory adapter preserves value semantics when the lift/lower roundtrip holds. Requires careful manipulation of `Forall2`/`combine` structures. Described as straightforward but not yet mechanized.
-
-### 3. `fusion_trap_equivalence` (backward direction) — `fusion_spec.v:682`
+### 2. `fusion_trap_equivalence` (backward direction) — `fusion_spec.v:682`
 
 The forward direction (composed traps imply fused traps) is fully proved. The backward direction is blocked by a modeling gap: `CT_OutOfBounds` requires the memory to be in the active module, but the fused model's `sc_memory_surj` gives an arbitrary source module. Resolution requires either instruction-aware trap conditions or weakening to forward-only simulation.
 
-### 4. `fusion_forward_simulation` (CS_CrossModuleCall case) — `fusion_spec.v:2492`
+### 3. `fusion_forward_simulation` (CS_CrossModuleCall case) — `fusion_spec.v:2492`
 
 The forward simulation lemma is proved for all cases except `CS_CrossModuleCall`. Two gaps prevent closing: (1) `Eval_Call` on the fused state needs the correct stack value, but the hypothesis provides `Call 0` on the target module, not `Call fused_fidx` on the fused state; (2) `ms_src'` is unconstrained in `CS_CrossModuleCall`, so state correspondence cannot be established for the source module.
 
@@ -79,7 +75,8 @@ The forward simulation lemma is proved for all cases except `CS_CrossModuleCall`
 
 ## Next Targets
 
-- Close the 2 `fusion_spec.v` Admitted proofs (trap equivalence backward direction, forward simulation cross-module call).
+- Close the 2 `fusion_spec.v` Admitted proofs (trap equivalence backward direction, forward simulation cross-module call). Both require model changes; see descriptions above.
+- Close `lift_lower_roundtrip_primitive` by replacing `lower_value`/`lift_values` Parameters with computable Fixpoint definitions modeling Canonical ABI encoding.
 - Expand `rocq-of-rust` coverage to import resolution logic.
 - Connect adapter spec to FACT implementation.
 - Add rewriter implementation proofs linking `fusion_types.v` rewrite rules to `rewriter.rs`.

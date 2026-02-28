@@ -315,10 +315,14 @@ Theorem lift_lower_roundtrip_primitive :
     lower_value cvt v = Some vs ->
     lift_values cvt vs = Some v.
 Proof.
-  (* Admitted: closing this requires concrete definitions of lower_value
-     and lift_values. The axiomatized versions make this unprovable until
-     they are replaced with computable definitions. The statement itself
-     is the key specification artifact. *)
+  (* Admitted: UNPROVABLE with current definitions.
+     lower_value and lift_values are declared as Parameter (axioms) with
+     no computational content. Closing this theorem requires either:
+     (a) Replacing the Parameters with concrete Fixpoint definitions that
+         model the Canonical ABI encoding for each component_valtype, or
+     (b) Adding an explicit axiom asserting this roundtrip property.
+     The statement itself serves as the specification artifact that
+     crossing_adapter_preserves_semantics depends on (via its hypothesis). *)
 Admitted.
 
 (* -------------------------------------------------------------------------
@@ -767,10 +771,9 @@ Qed.
    The key property: if the lift/lower roundtrip holds for all result
    types, then the crossing adapter preserves semantics.
 
-   Admitted: closing this requires showing that copy + transcode
-   preserves the byte-level representation that lower_value produces,
-   so that lift_values can reconstruct the original value. This needs
-   a model of memory-level Canonical ABI encoding, which is future work. *)
+   Proof strategy: induction on the Forall2 hypothesis (adapter_v = callee_v
+   for each position), using the equality to reduce each roundtrip obligation
+   to the given roundtrip hypothesis via In membership. *)
 Theorem crossing_adapter_preserves_semantics :
   forall result_types adapter args callee_result adapter_result,
     crosses_memory (af_options adapter) = true ->
@@ -790,11 +793,45 @@ Theorem crossing_adapter_preserves_semantics :
     adapter_preserves_semantics result_types adapter args
                                 callee_result adapter_result.
 Proof.
-  (* Admitted: the proof requires showing that the Forall2 condition
-     (adapter_v = callee_v for each position) combined with the roundtrip
-     hypothesis implies the Forall2 in adapter_preserves_semantics.
-     This is straightforward but requires careful manipulation of the
-     combine/Forall2 structures and the if-then-else in the definition. *)
-Admitted.
+  intros result_types adapter args callee_result adapter_result
+         Hcross Hroundtrip Hlen_adapter Hlen_callee HForall2_eq.
+  (* Unfold the definition; crosses_memory = true makes negb true = false,
+     so the if-then-else takes the else (crossing) branch. *)
+  unfold adapter_preserves_semantics.
+  rewrite Hcross. simpl.
+  (* The else branch requires three conjuncts:
+     (1) length adapter_result = length result_types
+     (2) length callee_result = length result_types
+     (3) Forall2 with the roundtrip property *)
+  split; [exact Hlen_adapter|].
+  split; [exact Hlen_callee|].
+  (* Forall2 goal: strengthen the hypothesis Forall2 (adapter_v = callee_v)
+     to the goal Forall2 (roundtrip property).
+     Revert roundtrip into the goal so the IH carries it. *)
+  clear Hlen_adapter Hlen_callee.
+  revert Hroundtrip.
+  induction HForall2_eq as [| cvt pair rest_types rest_pairs Hpair_eq Htail IH].
+  - (* Base case: both lists empty *)
+    intros _. constructor.
+  - (* Inductive case: cvt :: rest_types, pair :: rest_pairs *)
+    intros Hroundtrip.
+    constructor.
+    + (* Head: show roundtrip property for (cvt, pair) *)
+      destruct pair as [callee_v adapter_v].
+      simpl in Hpair_eq. subst adapter_v.
+      (* Goal: forall core_vals, lower_value cvt callee_v = Some core_vals ->
+               lift_values cvt core_vals = Some callee_v *)
+      intros core_vals Hlower.
+      apply (Hroundtrip cvt callee_v core_vals).
+      * (* In cvt (cvt :: rest_types) *)
+        left. reflexivity.
+      * exact Hlower.
+    + (* Tail: apply IH with roundtrip restricted to rest_types *)
+      apply IH. intros cvt0 v vs Hin Hlower.
+      apply (Hroundtrip cvt0 v vs).
+      * (* In cvt0 (cvt :: rest_types) follows from In cvt0 rest_types *)
+        right. exact Hin.
+      * exact Hlower.
+Qed.
 
 (* End of adapter_spec *)
