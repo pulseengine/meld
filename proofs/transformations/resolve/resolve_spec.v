@@ -1367,4 +1367,232 @@ Proof.
           rewrite Hresolve. simpl. left. reflexivity. }
 Qed.
 
+(* =========================================================================
+   Module-Level Dependency Graph and Cycle Detection
+
+   The existing dependency graph (dependency_graph) operates at the
+   component level: edges represent inter-component dependencies.
+   Within a single component, core modules may also have dependencies
+   (one module imports from another module in the same component).
+
+   This section defines:
+   1. module_dependency_graph: dependency graph among core modules
+      within a single component
+   2. module_acyclic: the property that module dependencies are acyclic
+   3. Theorem: acyclic module dependencies admit a topological sort
+   ========================================================================= *)
+
+(* -------------------------------------------------------------------------
+   Module-Level Dependency Edges
+
+   Within a component, core module A depends on core module B if A
+   imports something that B exports. These are intra-component
+   dependencies, distinct from the inter-component edges in
+   dependency_graph.
+   ------------------------------------------------------------------------- *)
+
+(* A module-level dependency edge: (from_module, to_module) within
+   a single component, meaning from_module imports from to_module *)
+Definition module_dep_edge := (nat * nat)%type.
+
+(* Build module-level dependency edges from a component's core modules.
+   For each import of module i, if it matches an export of module j
+   (where i <> j), add edge (j, i) meaning j must be instantiated
+   before i. *)
+Definition build_module_dep_edges (modules : list core_module_instance)
+    : list module_dep_edge :=
+  let indexed := combine (seq 0 (length modules)) modules in
+  flat_map (fun importer =>
+    let '(i, mod_i) := importer in
+    flat_map (fun exporter =>
+      let '(j, mod_j) := exporter in
+      if Nat.eqb i j then []
+      else
+        (* Check if any import of mod_i matches any export of mod_j *)
+        flat_map (fun imp =>
+          match List.find (fun exp =>
+            Nat.eqb (imp_name imp) (exp_name exp)
+          ) (mod_exports (cmi_module mod_j)) with
+          | Some _ => [(j, i)]  (* j must come before i *)
+          | None => []
+          end
+        ) (mod_imports (cmi_module mod_i))
+    ) indexed
+  ) indexed.
+
+(* -------------------------------------------------------------------------
+   Module Dependency Graph
+
+   Packages the module-level dependency information for a single component.
+   ------------------------------------------------------------------------- *)
+
+Record module_dependency_graph : Type := mkModuleDependencyGraph {
+  mdg_num_modules : nat;
+  mdg_edges : list module_dep_edge;
+}.
+
+(* Build the module dependency graph for a component *)
+Definition build_module_dependency_graph (c : component)
+    : module_dependency_graph :=
+  mkModuleDependencyGraph
+    (length (comp_core_modules c))
+    (build_module_dep_edges (comp_core_modules c)).
+
+(* -------------------------------------------------------------------------
+   Module Acyclicity
+
+   The module dependencies within a component must be acyclic for
+   instantiation to be possible. This reuses the acyclic predicate
+   from the component-level graph.
+   ------------------------------------------------------------------------- *)
+
+(* Module dependencies are acyclic *)
+Definition module_acyclic (mdg : module_dependency_graph) : Prop :=
+  acyclic (mdg_edges mdg).
+
+(* -------------------------------------------------------------------------
+   Module-Level Topological Sort
+
+   If module dependencies are acyclic, a topological ordering of
+   modules exists. This ordering determines the instantiation order
+   of core modules within a component.
+
+   This theorem directly instantiates the general topo_sort_cycle_detection
+   theorem for the module-level graph.
+   ------------------------------------------------------------------------- *)
+
+(* Module-level edges are within bounds *)
+Definition module_edges_valid (mdg : module_dependency_graph) : Prop :=
+  forall e, In e (mdg_edges mdg) ->
+    fst e < mdg_num_modules mdg /\ snd e < mdg_num_modules mdg.
+
+(* Self-loops cannot appear in build_module_dep_edges because we
+   filter out i = j. This means edges always connect distinct modules. *)
+Lemma build_module_dep_edges_no_self_loop :
+  forall modules e,
+    In e (build_module_dep_edges modules) ->
+    fst e <> snd e.
+Proof.
+  intros modules [a b] Hin.
+  simpl. intro Heq. subst b.
+  unfold build_module_dep_edges in Hin.
+  apply in_flat_map in Hin.
+  destruct Hin as [[i mod_i] [Hin_i Hin_inner]].
+  apply in_flat_map in Hin_inner.
+  destruct Hin_inner as [[j mod_j] [Hin_j Hin_edge]].
+  destruct (Nat.eqb i j) eqn:Heq_ij.
+  - (* i = j: empty list, contradiction *)
+    simpl in Hin_edge. destruct Hin_edge.
+  - (* i <> j: edges have the form (j, i) *)
+    apply in_flat_map in Hin_edge.
+    destruct Hin_edge as [imp [_ Hfound]].
+    destruct (List.find _ _) as [exp|] eqn:Hfind.
+    + simpl in Hfound. destruct Hfound as [Hpair | []].
+      injection Hpair as Hj Hi. subst.
+      apply Nat.eqb_neq in Heq_ij. auto.
+    + simpl in Hfound. destruct Hfound.
+Qed.
+
+(* Main theorem: if module dependencies are acyclic and edges are valid,
+   a topological ordering of modules exists *)
+Theorem module_topo_sort_exists :
+  forall (mdg : module_dependency_graph),
+    module_edges_valid mdg ->
+    module_acyclic mdg ->
+    exists order,
+      order_complete (mdg_num_modules mdg) order /\
+      order_respects_deps order (mdg_edges mdg).
+Proof.
+  intros mdg Hvalid Hacyclic.
+  (* Apply the general topo_sort_cycle_detection theorem *)
+  apply topo_sort_cycle_detection; assumption.
+Qed.
+
+(* Converse: if a valid topological order exists for modules, the
+   module dependency graph is acyclic *)
+Theorem module_topo_order_implies_acyclic :
+  forall (mdg : module_dependency_graph) (order : list nat),
+    module_edges_valid mdg ->
+    order_complete (mdg_num_modules mdg) order ->
+    order_respects_deps order (mdg_edges mdg) ->
+    module_acyclic mdg.
+Proof.
+  intros mdg order Hvalid Hcomplete Hrespects.
+  unfold module_acyclic.
+  eapply valid_order_implies_acyclic; eauto.
+Qed.
+
+(* The biconditional: module acyclicity is equivalent to the existence
+   of a topological ordering *)
+Theorem module_acyclic_iff_topo_sort :
+  forall (mdg : module_dependency_graph),
+    module_edges_valid mdg ->
+    (exists order,
+      order_complete (mdg_num_modules mdg) order /\
+      order_respects_deps order (mdg_edges mdg))
+    <-> module_acyclic mdg.
+Proof.
+  intros mdg Hvalid.
+  exact (topo_sort_cycle_detection (mdg_num_modules mdg) (mdg_edges mdg) Hvalid).
+Qed.
+
+(* -------------------------------------------------------------------------
+   Connection to Component-Level Resolution
+
+   The module-level dependency graph within a component connects to
+   the component-level dependency graph: if a component has acyclic
+   module dependencies and the inter-component dependencies are also
+   acyclic, then the entire fusion pipeline can proceed.
+
+   Additionally, the module instantiation order determines the order
+   in which the merger processes core modules from each component.
+   ------------------------------------------------------------------------- *)
+
+(* A component is internally well-ordered if its module dependencies
+   are acyclic and edges reference valid module indices *)
+Definition component_internally_well_ordered (c : component) : Prop :=
+  let mdg := build_module_dependency_graph c in
+  module_edges_valid mdg /\ module_acyclic mdg.
+
+(* All components in a composition are internally well-ordered *)
+Definition all_components_well_ordered (cc : composed_component) : Prop :=
+  Forall component_internally_well_ordered (cc_components cc).
+
+(* A fully well-ordered composition has both inter-component and
+   intra-component acyclicity *)
+Definition composition_fully_ordered
+    (cc : composed_component)
+    (inter_graph : dependency_graph)
+    (intra_graphs : list module_dependency_graph) : Prop :=
+  (* Inter-component dependencies are acyclic *)
+  acyclic (dg_edges inter_graph) /\
+  (* Every component's internal module dependencies are acyclic *)
+  all_components_well_ordered cc /\
+  (* The intra-component graphs match the components *)
+  length intra_graphs = length (cc_components cc) /\
+  Forall2 (fun c mdg =>
+    mdg = build_module_dependency_graph c
+  ) (cc_components cc) intra_graphs.
+
+(* If a composition is fully ordered, every component has a module
+   instantiation order *)
+Theorem fully_ordered_has_module_orders :
+  forall cc inter_graph intra_graphs,
+    composition_fully_ordered cc inter_graph intra_graphs ->
+    Forall (fun c =>
+      let mdg := build_module_dependency_graph c in
+      module_edges_valid mdg ->
+      exists order,
+        order_complete (mdg_num_modules mdg) order /\
+        order_respects_deps order (mdg_edges mdg)
+    ) (cc_components cc).
+Proof.
+  intros cc inter_graph intra_graphs [_ [Hwell_ordered _]].
+  rewrite Forall_forall in Hwell_ordered |- *.
+  intros c Hin Hvalid.
+  specialize (Hwell_ordered c Hin).
+  destruct Hwell_ordered as [_ Hacyclic].
+  apply module_topo_sort_exists; assumption.
+Qed.
+
 (* End of resolve_spec *)

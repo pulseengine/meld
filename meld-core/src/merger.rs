@@ -600,9 +600,14 @@ impl Merger {
         }
 
         // Resolve function imports that have been matched to exports in other
-        // modules (cross-component via adapter_sites, intra-component via
-        // module_resolutions).  This populates function_index_map for imported
-        // function indices so the body rewriter can replace call targets.
+        // modules (cross-component and intra-component via adapter_sites,
+        // remaining intra-component direct calls via module_resolutions).
+        // adapter_sites is checked first because it includes both cross-component
+        // adapters AND intra-component adapters (for module pairs with different
+        // canonical options). module_resolutions is the fallback for
+        // intra-component calls that don't need adapters.
+        // This populates function_index_map for imported function indices so the
+        // body rewriter can replace call targets.
         {
             let mut import_func_idx = 0u32;
             for imp in &module.imports {
@@ -610,7 +615,7 @@ impl Merger {
                     continue;
                 }
 
-                // Cross-component: check adapter_sites
+                // Check adapter_sites first (cross-component + intra-component adapters)
                 let resolved = graph.adapter_sites.iter().find(|site| {
                     site.from_component == comp_idx
                         && site.from_module == mod_idx
@@ -628,7 +633,9 @@ impl Merger {
                     }
                 }
 
-                // Intra-component: check module_resolutions
+                // Intra-component fallback: check module_resolutions for direct
+                // calls that don't need adapters (adapter-needing ones were
+                // already promoted to adapter_sites by the resolver).
                 if !merged
                     .function_index_map
                     .contains_key(&(comp_idx, mod_idx, import_func_idx))
@@ -780,10 +787,28 @@ impl Merger {
                 }
             };
 
-            // Check for duplicate exports
-            if merged.exports.iter().any(|e| e.name == export.name) {
-                // Skip duplicate exports (could also error or prefix)
-                log::warn!("Skipping duplicate export: {}", export.name);
+            // Export deduplication: first-wins strategy.
+            //
+            // When multiple modules export the same name, the first export
+            // (in topological/instantiation order) wins and subsequent
+            // duplicates are silently dropped.  This matches the component
+            // model's semantics where earlier instantiations take priority.
+            //
+            // If this behavior is ever made configurable (e.g. error on
+            // conflict, or prefix with component name), update both this
+            // check and the MergedExport documentation.
+            if let Some(existing) = merged.exports.iter().find(|e| e.name == export.name) {
+                log::warn!(
+                    "Duplicate export \"{}\": keeping {:?} index {} (from earlier module), \
+                     skipping {:?} index {} from component {} module {}",
+                    export.name,
+                    existing.kind,
+                    existing.index,
+                    kind,
+                    old_idx,
+                    comp_idx,
+                    mod_idx,
+                );
                 continue;
             }
 
@@ -908,7 +933,14 @@ impl Merger {
         Ok(())
     }
 
-    /// Add remaining unresolved imports
+    /// Add remaining unresolved imports to the merged module.
+    ///
+    /// **Invariant**: This function MUST iterate `graph.unresolved_imports` in
+    /// exactly the same order as [`compute_unresolved_import_assignments`], and
+    /// must produce the same per-entity-kind position for each import. If these
+    /// two functions diverge, import indices will be silently misaligned,
+    /// producing incorrect wasm output. Debug assertions below verify this
+    /// invariant at development/test time.
     fn add_unresolved_imports(
         &self,
         graph: &DependencyGraph,
@@ -916,6 +948,13 @@ impl Merger {
         shared_memory_plan: Option<&SharedMemoryPlan>,
     ) -> Result<()> {
         let mut shared_memory_import_added = false;
+
+        // Track per-kind positions so we can assert alignment with
+        // compute_unresolved_import_assignments.
+        let mut func_position: u32 = 0;
+        let mut table_position: u32 = 0;
+        let mut memory_position: u32 = 0;
+        let mut global_position: u32 = 0;
 
         for unresolved in &graph.unresolved_imports {
             if let (Some(plan), ImportKind::Memory(_)) = (shared_memory_plan, &unresolved.kind) {
@@ -927,6 +966,7 @@ impl Merger {
                             entity_type: EntityType::Memory(plan.memory),
                         });
                         shared_memory_import_added = true;
+                        memory_position += 1;
                     }
                 }
                 continue;
@@ -934,6 +974,19 @@ impl Merger {
 
             let entity_type = match &unresolved.kind {
                 ImportKind::Function(type_idx) => {
+                    // Verify position is within bounds established by
+                    // compute_unresolved_import_assignments.
+                    debug_assert!(
+                        func_position < merged.import_counts.func,
+                        "add_unresolved_imports: func import position {} exceeds \
+                         pre-computed count {} — iteration order has diverged from \
+                         compute_unresolved_import_assignments",
+                        func_position,
+                        merged.import_counts.func,
+                    );
+
+                    func_position += 1;
+
                     // Remap type index
                     let new_type_idx = *merged
                         .type_index_map
@@ -941,9 +994,36 @@ impl Merger {
                         .unwrap_or(type_idx);
                     EntityType::Function(new_type_idx)
                 }
-                ImportKind::Table(t) => EntityType::Table(convert_table_type(t)),
-                ImportKind::Memory(m) => EntityType::Memory(convert_memory_type(m)),
-                ImportKind::Global(g) => EntityType::Global(convert_global_type(g)),
+                ImportKind::Table(t) => {
+                    debug_assert!(
+                        table_position < merged.import_counts.table,
+                        "add_unresolved_imports: table import position {} exceeds \
+                         pre-computed count {} — iteration order has diverged from \
+                         compute_unresolved_import_assignments",
+                        table_position,
+                        merged.import_counts.table,
+                    );
+                    table_position += 1;
+
+                    EntityType::Table(convert_table_type(t))
+                }
+                ImportKind::Memory(m) => {
+                    memory_position += 1;
+                    EntityType::Memory(convert_memory_type(m))
+                }
+                ImportKind::Global(g) => {
+                    debug_assert!(
+                        global_position < merged.import_counts.global,
+                        "add_unresolved_imports: global import position {} exceeds \
+                         pre-computed count {} — iteration order has diverged from \
+                         compute_unresolved_import_assignments",
+                        global_position,
+                        merged.import_counts.global,
+                    );
+                    global_position += 1;
+
+                    EntityType::Global(convert_global_type(g))
+                }
             };
 
             merged.imports.push(MergedImport {
@@ -961,9 +1041,36 @@ impl Merger {
                         name: name.clone(),
                         entity_type: EntityType::Memory(plan.memory),
                     });
+                    memory_position += 1;
                 }
             }
         }
+
+        // Final totals must match what compute_unresolved_import_assignments produced.
+        debug_assert_eq!(
+            func_position, merged.import_counts.func,
+            "add_unresolved_imports: final func count ({}) != pre-computed ({}). \
+             The iteration order has diverged from compute_unresolved_import_assignments.",
+            func_position, merged.import_counts.func,
+        );
+        debug_assert_eq!(
+            table_position, merged.import_counts.table,
+            "add_unresolved_imports: final table count ({}) != pre-computed ({}). \
+             The iteration order has diverged from compute_unresolved_import_assignments.",
+            table_position, merged.import_counts.table,
+        );
+        debug_assert_eq!(
+            memory_position, merged.import_counts.memory,
+            "add_unresolved_imports: final memory count ({}) != pre-computed ({}). \
+             The iteration order has diverged from compute_unresolved_import_assignments.",
+            memory_position, merged.import_counts.memory,
+        );
+        debug_assert_eq!(
+            global_position, merged.import_counts.global,
+            "add_unresolved_imports: final global count ({}) != pre-computed ({}). \
+             The iteration order has diverged from compute_unresolved_import_assignments.",
+            global_position, merged.import_counts.global,
+        );
 
         Ok(())
     }
@@ -1499,9 +1606,21 @@ impl Default for Merger {
 
 /// Pre-compute unresolved import counts and per-import index assignments.
 ///
-/// This must exactly mirror the iteration order of `add_unresolved_imports`
-/// so that the assigned indices match the positions imports actually get
-/// in the merged import section.
+/// # Import Order Invariant
+///
+/// This function and [`Merger::add_unresolved_imports`] **must** iterate
+/// `graph.unresolved_imports` in exactly the same order and apply the same
+/// skip/dedup logic for shared-memory imports.  The indices assigned here
+/// are used during `merge_core_module` to populate `function_index_map`,
+/// `global_index_map`, and `table_index_map` for unresolved imports.
+/// Later, `add_unresolved_imports` emits the actual import entries at those
+/// same positions.  If the two functions diverge, an import at position N
+/// in the merged section will have a different entity than the index maps
+/// expect, producing silently incorrect wasm output.
+///
+/// `add_unresolved_imports` contains `debug_assert!` checks that verify
+/// the per-kind counts match what this function computed.  These fire in
+/// debug/test builds if the invariant is ever broken.
 fn compute_unresolved_import_assignments(
     graph: &DependencyGraph,
     shared_memory_plan: Option<&SharedMemoryPlan>,
@@ -1922,6 +2041,150 @@ mod tests {
 
         // Index 7 is out of bounds
         assert_eq!(decompose_component_core_func_index(&component, 7), None);
+    }
+
+    /// Verify that `compute_unresolved_import_assignments` and
+    /// `add_unresolved_imports` agree on import counts for a graph with
+    /// mixed unresolved import kinds.
+    ///
+    /// This test constructs a `DependencyGraph` with several unresolved
+    /// imports (function, global, table, memory) and runs the full merge
+    /// pipeline, which triggers the debug assertions inside
+    /// `add_unresolved_imports`.  If the two functions ever diverge in
+    /// iteration order, the assertions will fire and this test will fail.
+    #[test]
+    fn test_import_order_invariant_holds() {
+        use crate::parser::{FuncType, ModuleImport, ParsedComponent};
+        use crate::resolver::{DependencyGraph, UnresolvedImport};
+
+        // Build a single component with one module that has several
+        // unresolved imports of different kinds.
+        let module = CoreModule {
+            index: 0,
+            bytes: Vec::new(),
+            types: vec![FuncType {
+                params: vec![],
+                results: vec![],
+            }],
+            imports: vec![
+                ModuleImport {
+                    module: "env".to_string(),
+                    name: "imported_func".to_string(),
+                    kind: ImportKind::Function(0),
+                },
+                ModuleImport {
+                    module: "env".to_string(),
+                    name: "imported_global".to_string(),
+                    kind: ImportKind::Global(GlobalType {
+                        content_type: ValType::I32,
+                        mutable: false,
+                        init_expr_bytes: Vec::new(),
+                    }),
+                },
+                ModuleImport {
+                    module: "env".to_string(),
+                    name: "imported_table".to_string(),
+                    kind: ImportKind::Table(TableType {
+                        element_type: ValType::Ref(RefType::FUNCREF),
+                        initial: 1,
+                        maximum: None,
+                    }),
+                },
+            ],
+            exports: Vec::new(),
+            functions: Vec::new(),
+            memories: vec![MemoryType {
+                memory64: false,
+                shared: false,
+                initial: 1,
+                maximum: None,
+            }],
+            tables: Vec::new(),
+            globals: Vec::new(),
+            start: None,
+            data_count: None,
+            element_count: 0,
+            custom_sections: Vec::new(),
+            code_section_range: None,
+            global_section_range: None,
+            element_section_range: None,
+            data_section_range: None,
+        };
+
+        let component = ParsedComponent {
+            name: None,
+            core_modules: vec![module],
+            imports: Vec::new(),
+            exports: Vec::new(),
+            types: Vec::new(),
+            instances: Vec::new(),
+            canonical_functions: Vec::new(),
+            original_size: 0,
+            original_hash: String::new(),
+        };
+
+        let graph = DependencyGraph {
+            instantiation_order: vec![0],
+            resolved_imports: HashMap::new(),
+            adapter_sites: Vec::new(),
+            module_resolutions: Vec::new(),
+            unresolved_imports: vec![
+                UnresolvedImport {
+                    component_idx: 0,
+                    module_idx: 0,
+                    module_name: "env".to_string(),
+                    field_name: "imported_func".to_string(),
+                    kind: ImportKind::Function(0),
+                },
+                UnresolvedImport {
+                    component_idx: 0,
+                    module_idx: 0,
+                    module_name: "env".to_string(),
+                    field_name: "imported_global".to_string(),
+                    kind: ImportKind::Global(GlobalType {
+                        content_type: ValType::I32,
+                        mutable: false,
+                        init_expr_bytes: Vec::new(),
+                    }),
+                },
+                UnresolvedImport {
+                    component_idx: 0,
+                    module_idx: 0,
+                    module_name: "env".to_string(),
+                    field_name: "imported_table".to_string(),
+                    kind: ImportKind::Table(TableType {
+                        element_type: ValType::Ref(RefType::FUNCREF),
+                        initial: 1,
+                        maximum: None,
+                    }),
+                },
+            ],
+        };
+
+        let merger = Merger::new(MemoryStrategy::MultiMemory, false);
+        // This will trigger debug_assert! inside add_unresolved_imports
+        // if the import order invariant is broken.
+        let result = merger.merge(&[component], &graph);
+        assert!(result.is_ok(), "merge should succeed: {:?}", result.err());
+
+        let merged = result.unwrap();
+        // Verify the counts match what we expect
+        assert_eq!(merged.import_counts.func, 1, "one unresolved func import");
+        assert_eq!(
+            merged.import_counts.global, 1,
+            "one unresolved global import"
+        );
+        assert_eq!(merged.import_counts.table, 1, "one unresolved table import");
+        assert_eq!(
+            merged.import_counts.memory, 0,
+            "no unresolved memory import"
+        );
+
+        // Verify the actual imports match
+        assert_eq!(merged.imports.len(), 3);
+        assert_eq!(merged.imports[0].name, "imported_func");
+        assert_eq!(merged.imports[1].name, "imported_global");
+        assert_eq!(merged.imports[2].name, "imported_table");
     }
 }
 
