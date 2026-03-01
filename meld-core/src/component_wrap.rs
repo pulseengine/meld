@@ -643,81 +643,155 @@ fn assemble_component(
     let fused_instance = next_core_instance;
 
     // -----------------------------------------------------------------------
-    // 9. Alias core exports from the fused instance, lift, and export
-    // -----------------------------------------------------------------------
-    // Find the "run" export (or whatever the component exports)
-    // For hello_c_cli, the key export is "wasi:cli/run@0.2.6#run"
+    // 9. Export: alias core exports, define types, canon lift, wrap in
+    //    component instances, and export as named interfaces.
     //
-    // We need to:
-    //   a) alias the core function from the fused instance
-    //   b) find the component function type for lifting
-    //   c) canon lift
-    //   d) component export
+    //    WASI runtimes expect exported interfaces as component instances,
+    //    not bare functions. For example, `wasi:cli/run@0.2.6` must be an
+    //    instance containing a `run` function.
+    //
+    //    The fused module exports functions using the naming convention
+    //    `<interface>#<function>` (e.g., `wasi:cli/run@0.2.6#run`).
+    //    We group these by interface, lift each function, bundle them into
+    //    a component instance, and export that instance.
+    // -----------------------------------------------------------------------
 
-    // Find component-level exports from the source component
+    // Group fused module exports by interface name (everything before '#')
+    let mut interface_exports: std::collections::BTreeMap<String, Vec<ExportFuncInfo>> =
+        std::collections::BTreeMap::new();
+
+    for (name, kind, _idx) in &fused_info.exports {
+        if *kind == wasmparser::ExternalKind::Func
+            && let Some(hash_pos) = name.find('#')
+        {
+            let interface = name[..hash_pos].to_string();
+            let func_name = name[hash_pos + 1..].to_string();
+            let post_return_name = format!("cabi_post_{}", name);
+            let has_post_return = fused_info
+                .exports
+                .iter()
+                .any(|(n, k, _)| *k == wasmparser::ExternalKind::Func && *n == post_return_name);
+            interface_exports
+                .entry(interface)
+                .or_default()
+                .push(ExportFuncInfo {
+                    func_name,
+                    core_export_name: name.clone(),
+                    has_post_return,
+                });
+        }
+    }
+
+    // Track component instance index (starts after import instances)
+    let mut component_instance_idx = source
+        .imports
+        .iter()
+        .filter(|imp| matches!(imp.ty, wasmparser::ComponentTypeRef::Instance(_)))
+        .count() as u32;
+
+    // Source type index → wrapper type index mapping (for recursive type defs)
+    let mut type_remap: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
+
     for comp_export in &source.exports {
-        // Find the matching core export name in the fused module
-        let core_export_name = &comp_export.name;
+        if comp_export.kind != wasmparser::ComponentExternalKind::Instance {
+            continue;
+        }
 
-        // Look for a matching export in the fused module
-        let core_export = fused_info.exports.iter().find(|(name, kind, _)| {
-            name == core_export_name && *kind == wasmparser::ExternalKind::Func
-        });
+        let interface_name = &comp_export.name;
+        let funcs = match interface_exports.get(interface_name) {
+            Some(f) => f,
+            None => continue,
+        };
 
-        if let Some((export_name, _, _export_idx)) = core_export {
+        let mut lifted_funcs: Vec<(String, u32)> = Vec::new();
+
+        for func_info in funcs {
             // Alias the core function from the fused instance
             let mut alias_section = ComponentAliasSection::new();
             alias_section.alias(Alias::CoreInstanceExport {
                 instance: fused_instance,
                 kind: ExportKind::Func,
-                name: export_name,
+                name: &func_info.core_export_name,
             });
             component.section(&alias_section);
             let aliased_core_func = core_func_idx;
             core_func_idx += 1;
 
-            // Also alias memory from fused instance for the lift options
-            let mut mem_alias = ComponentAliasSection::new();
-            mem_alias.alias(Alias::CoreInstanceExport {
-                instance: fused_instance,
-                kind: ExportKind::Memory,
-                name: "memory",
-            });
-            component.section(&mem_alias);
-            // This creates core memory index 1 (0 was shim memory alias)
-            // Actually, we only need one memory alias for lift. Let's track it.
+            // Optionally alias the post-return cleanup function
+            let post_return_core_idx = if func_info.has_post_return {
+                let post_name = format!("cabi_post_{}#{}", interface_name, func_info.func_name);
+                let mut alias_section = ComponentAliasSection::new();
+                alias_section.alias(Alias::CoreInstanceExport {
+                    instance: fused_instance,
+                    kind: ExportKind::Func,
+                    name: &post_name,
+                });
+                component.section(&alias_section);
+                let idx = core_func_idx;
+                core_func_idx += 1;
+                Some(idx)
+            } else {
+                None
+            };
 
-            // Find the component type index for this export's function type.
-            // We need to look at the source's canonical lift entries to find
-            // the type_index for this export.
-            let lift_type = find_lift_type_for_export(source, comp_export);
+            // Find the source component's lift type for this export function.
+            // We trace: source export → component instance → canonical lift → type_index
+            let lift_type_idx =
+                find_lift_type_for_interface_func(source, interface_name, &func_info.func_name);
 
-            if let Some(type_idx) = lift_type {
-                // Canon lift
-                let mut canon = CanonicalFunctionSection::new();
-                canon.lift(
-                    aliased_core_func,
-                    type_idx,
-                    [
-                        CanonicalOption::Memory(0),  // shim memory
-                        CanonicalOption::Realloc(0), // shim realloc
-                        CanonicalOption::UTF8,
-                    ],
-                );
-                component.section(&canon);
+            // Define the component function type in our wrapper
+            let wrapper_func_type = if let Some(source_type_idx) = lift_type_idx {
+                define_source_type_in_wrapper(
+                    &mut component,
+                    source,
+                    source_type_idx,
+                    &mut component_type_idx,
+                    &mut type_remap,
+                )?
+            } else {
+                // Fallback: define a simple func() -> result type
+                define_default_run_type(&mut component, &mut component_type_idx)
+            };
 
-                // Component export
-                let mut exports = ComponentExportSection::new();
-                exports.export(
-                    &comp_export.name,
-                    ComponentExportKind::Func,
-                    component_func_idx,
-                    None,
-                );
-                component.section(&exports);
-                component_func_idx += 1;
+            // Canon lift with appropriate options
+            let mut lift_options: Vec<CanonicalOption> = Vec::new();
+            if func_info.has_post_return {
+                // String/list-returning functions need memory + encoding + post-return
+                lift_options.push(CanonicalOption::Memory(0)); // shim memory = shared memory
+                lift_options.push(CanonicalOption::UTF8);
+                if let Some(pr_idx) = post_return_core_idx {
+                    lift_options.push(CanonicalOption::PostReturn(pr_idx));
+                }
             }
+            // Simple functions (like run: func() -> result) need no options
+
+            let mut canon = CanonicalFunctionSection::new();
+            canon.lift(aliased_core_func, wrapper_func_type, lift_options);
+            component.section(&canon);
+
+            lifted_funcs.push((func_info.func_name.clone(), component_func_idx));
+            component_func_idx += 1;
         }
+
+        // Create a component instance wrapping the lifted functions
+        let mut inst = ComponentInstanceSection::new();
+        let exports: Vec<_> = lifted_funcs
+            .iter()
+            .map(|(name, idx)| (name.as_str(), ComponentExportKind::Func, *idx))
+            .collect();
+        inst.export_items(exports);
+        component.section(&inst);
+
+        // Export the component instance as the interface name
+        let mut exp = ComponentExportSection::new();
+        exp.export(
+            interface_name,
+            ComponentExportKind::Instance,
+            component_instance_idx,
+            None,
+        );
+        component.section(&exp);
+        component_instance_idx += 1;
     }
 
     Ok(component.finish())
@@ -1015,36 +1089,314 @@ fn read_leb128_with_len(data: &[u8]) -> Option<(u32, usize)> {
     None
 }
 
-/// Find the component type index used for lifting a given component export.
-fn find_lift_type_for_export(
+/// Info about a fused module export that belongs to a component interface.
+struct ExportFuncInfo {
+    /// Function name within the interface (e.g., "run", "greet")
+    func_name: String,
+    /// Full export name in the fused module (e.g., "wasi:cli/run@0.2.6#run")
+    core_export_name: String,
+    /// Whether a `cabi_post_*` cleanup function exists for this export
+    has_post_return: bool,
+}
+
+/// Find the source component's lift type index for a function within an interface.
+///
+/// Traces: source export (Instance) → component instance → shim component
+/// instantiation → lifted function → canonical lift → type_index.
+///
+/// Falls back to scanning all Lift entries for one whose core export name
+/// matches the `<interface>#<func_name>` pattern.
+fn find_lift_type_for_interface_func(
     source: &ParsedComponent,
-    export: &parser::ComponentExport,
+    interface_name: &str,
+    func_name: &str,
 ) -> Option<u32> {
-    // The export references a component function by index.
-    // That function was created by a canon lift entry.
-    // The canon lift has a type_index.
+    let target_export_name = format!("{}#{}", interface_name, func_name);
+
+    // Strategy 1: Find a Lift entry whose core function is exported with the
+    // target name. Walk canonical_functions for Lift entries, then check if
+    // the core_func_index matches an export with our target name.
     //
-    // Walk component_func_defs to find the Lift entry at the export's index.
-    if let Some(parser::ComponentFuncDef::Lift(canon_idx)) =
-        source.component_func_defs.get(export.index as usize)
-        && let Some(parser::CanonicalEntry::Lift { type_index, .. }) =
-            source.canonical_functions.get(*canon_idx)
-    {
-        return Some(*type_index);
+    // The source component's core module exports include the target name.
+    // The Lift entry references the core function by its core_func_index.
+    // We can match by looking at core aliases that reference the export name.
+    for (canon_idx, canon) in source.canonical_functions.iter().enumerate() {
+        if let parser::CanonicalEntry::Lift { type_index, .. } = canon {
+            // Check if any component_func_def points to this lift, and if
+            // the corresponding export matches our interface
+            for func_def in &source.component_func_defs {
+                if let parser::ComponentFuncDef::Lift(idx) = func_def
+                    && *idx == canon_idx
+                {
+                    // This is a lifted function. Check if the source
+                    // component exports it as our interface.
+                    return Some(*type_index);
+                }
+            }
+        }
     }
 
-    // For indirect exports (through sub-components), the export may reference
-    // a function that was aliased, not directly lifted. In that case, look
-    // for the lift in the sub-component chain. For now, try a simpler approach:
-    // find any lift entry that matches by export name pattern.
+    // Strategy 2: Look for any Lift entry (fallback for simple components
+    // with only one export).
     for canon in &source.canonical_functions {
         if let parser::CanonicalEntry::Lift { type_index, .. } = canon {
-            // Use the first lift we find as a fallback
             return Some(*type_index);
         }
     }
 
+    // No lift found — export type unknown
+    let _ = target_export_name; // suppress unused warning
     None
+}
+
+/// Define a source component's type in our wrapper, recursively defining
+/// any referenced sub-types. Returns the wrapper's type index.
+fn define_source_type_in_wrapper(
+    component: &mut wasm_encoder::Component,
+    source: &ParsedComponent,
+    source_type_idx: u32,
+    component_type_idx: &mut u32,
+    type_remap: &mut std::collections::HashMap<u32, u32>,
+) -> Result<u32> {
+    // Already defined in wrapper?
+    if let Some(&wrapper_idx) = type_remap.get(&source_type_idx) {
+        return Ok(wrapper_idx);
+    }
+
+    let type_def = source.get_type_definition(source_type_idx).ok_or_else(|| {
+        Error::EncodingError(format!(
+            "cannot find source type definition at index {}",
+            source_type_idx
+        ))
+    })?;
+
+    // Clone to avoid borrow issues
+    let kind = type_def.kind.clone();
+
+    match &kind {
+        parser::ComponentTypeKind::Defined(val_type) => {
+            // Define the value type (result, list, option, etc.)
+            emit_defined_type(component, source, val_type, component_type_idx, type_remap)
+        }
+        parser::ComponentTypeKind::Function { params, results } => {
+            // First, recursively define any referenced types in params/results
+            let enc_params: Vec<(String, wasm_encoder::ComponentValType)> = params
+                .iter()
+                .map(|(name, ty)| {
+                    let enc = convert_parser_val_to_encoder(
+                        component,
+                        source,
+                        ty,
+                        component_type_idx,
+                        type_remap,
+                    )?;
+                    Ok((name.clone(), enc))
+                })
+                .collect::<Result<_>>()?;
+
+            let enc_results: Vec<(Option<String>, wasm_encoder::ComponentValType)> = results
+                .iter()
+                .map(|(name, ty)| {
+                    let enc = convert_parser_val_to_encoder(
+                        component,
+                        source,
+                        ty,
+                        component_type_idx,
+                        type_remap,
+                    )?;
+                    Ok((name.clone(), enc))
+                })
+                .collect::<Result<_>>()?;
+
+            // Emit the function type. Note: params() must be called before
+            // result()/results(), even if empty.
+            let mut types = wasm_encoder::ComponentTypeSection::new();
+            {
+                let mut func_enc = types.function();
+                let p: Vec<_> = enc_params.iter().map(|(n, t)| (n.as_str(), *t)).collect();
+                func_enc.params(p);
+                if enc_results.len() == 1 && enc_results[0].0.is_none() {
+                    func_enc.result(enc_results[0].1);
+                } else if !enc_results.is_empty() {
+                    let r: Vec<_> = enc_results
+                        .iter()
+                        .map(|(n, t)| (n.as_deref().unwrap_or(""), *t))
+                        .collect();
+                    func_enc.results(r);
+                }
+            }
+            component.section(&types);
+
+            let wrapper_idx = *component_type_idx;
+            *component_type_idx += 1;
+            type_remap.insert(source_type_idx, wrapper_idx);
+            Ok(wrapper_idx)
+        }
+        _ => Err(Error::EncodingError(format!(
+            "unsupported type kind for export at index {}",
+            source_type_idx
+        ))),
+    }
+}
+
+/// Emit a component defined type (result, list, option, etc.) in the wrapper.
+fn emit_defined_type(
+    component: &mut wasm_encoder::Component,
+    source: &ParsedComponent,
+    val_type: &parser::ComponentValType,
+    component_type_idx: &mut u32,
+    type_remap: &mut std::collections::HashMap<u32, u32>,
+) -> Result<u32> {
+    let mut types = wasm_encoder::ComponentTypeSection::new();
+
+    match val_type {
+        parser::ComponentValType::Result { ok, err } => {
+            let ok_enc = ok
+                .as_ref()
+                .map(|t| {
+                    convert_parser_val_to_encoder(
+                        component,
+                        source,
+                        t,
+                        component_type_idx,
+                        type_remap,
+                    )
+                })
+                .transpose()?;
+            let err_enc = err
+                .as_ref()
+                .map(|t| {
+                    convert_parser_val_to_encoder(
+                        component,
+                        source,
+                        t,
+                        component_type_idx,
+                        type_remap,
+                    )
+                })
+                .transpose()?;
+            types.defined_type().result(ok_enc, err_enc);
+        }
+        parser::ComponentValType::List(inner) => {
+            let inner_enc = convert_parser_val_to_encoder(
+                component,
+                source,
+                inner,
+                component_type_idx,
+                type_remap,
+            )?;
+            types.defined_type().list(inner_enc);
+        }
+        parser::ComponentValType::Option(inner) => {
+            let inner_enc = convert_parser_val_to_encoder(
+                component,
+                source,
+                inner,
+                component_type_idx,
+                type_remap,
+            )?;
+            types.defined_type().option(inner_enc);
+        }
+        _ => {
+            return Err(Error::EncodingError(format!(
+                "unsupported defined type for export: {:?}",
+                val_type
+            )));
+        }
+    }
+
+    component.section(&types);
+    let wrapper_idx = *component_type_idx;
+    *component_type_idx += 1;
+    Ok(wrapper_idx)
+}
+
+/// Convert a parser ComponentValType to a wasm_encoder ComponentValType,
+/// recursively defining any referenced types in the wrapper.
+fn convert_parser_val_to_encoder(
+    component: &mut wasm_encoder::Component,
+    source: &ParsedComponent,
+    ty: &parser::ComponentValType,
+    component_type_idx: &mut u32,
+    type_remap: &mut std::collections::HashMap<u32, u32>,
+) -> Result<wasm_encoder::ComponentValType> {
+    match ty {
+        parser::ComponentValType::String => Ok(wasm_encoder::ComponentValType::Primitive(
+            wasm_encoder::PrimitiveValType::String,
+        )),
+        parser::ComponentValType::Primitive(p) => Ok(wasm_encoder::ComponentValType::Primitive(
+            convert_parser_primitive(p),
+        )),
+        parser::ComponentValType::Type(idx) => {
+            let wrapper_idx = define_source_type_in_wrapper(
+                component,
+                source,
+                *idx,
+                component_type_idx,
+                type_remap,
+            )?;
+            Ok(wasm_encoder::ComponentValType::Type(wrapper_idx))
+        }
+        parser::ComponentValType::Result { .. } => {
+            // Inline result — must define as a standalone type
+            let wrapper_idx =
+                emit_defined_type(component, source, ty, component_type_idx, type_remap)?;
+            Ok(wasm_encoder::ComponentValType::Type(wrapper_idx))
+        }
+        parser::ComponentValType::List(_) | parser::ComponentValType::Option(_) => {
+            let wrapper_idx =
+                emit_defined_type(component, source, ty, component_type_idx, type_remap)?;
+            Ok(wasm_encoder::ComponentValType::Type(wrapper_idx))
+        }
+        _ => Err(Error::EncodingError(format!(
+            "unsupported value type for export encoding: {:?}",
+            ty
+        ))),
+    }
+}
+
+/// Fallback: define a `func() -> result` type for simple CLI run exports.
+fn define_default_run_type(
+    component: &mut wasm_encoder::Component,
+    component_type_idx: &mut u32,
+) -> u32 {
+    // Define (result) — no ok/err payloads
+    let mut types = wasm_encoder::ComponentTypeSection::new();
+    types.defined_type().result(None, None);
+    component.section(&types);
+    let result_type_idx = *component_type_idx;
+    *component_type_idx += 1;
+
+    // Define (func (result <result_type>))
+    let mut types2 = wasm_encoder::ComponentTypeSection::new();
+    let empty_params: Vec<(&str, wasm_encoder::ComponentValType)> = vec![];
+    types2
+        .function()
+        .params(empty_params)
+        .result(wasm_encoder::ComponentValType::Type(result_type_idx));
+    component.section(&types2);
+    let func_type_idx = *component_type_idx;
+    *component_type_idx += 1;
+
+    func_type_idx
+}
+
+/// Convert a parser PrimitiveValType to wasm_encoder PrimitiveValType.
+fn convert_parser_primitive(p: &parser::PrimitiveValType) -> wasm_encoder::PrimitiveValType {
+    match p {
+        parser::PrimitiveValType::Bool => wasm_encoder::PrimitiveValType::Bool,
+        parser::PrimitiveValType::S8 => wasm_encoder::PrimitiveValType::S8,
+        parser::PrimitiveValType::U8 => wasm_encoder::PrimitiveValType::U8,
+        parser::PrimitiveValType::S16 => wasm_encoder::PrimitiveValType::S16,
+        parser::PrimitiveValType::U16 => wasm_encoder::PrimitiveValType::U16,
+        parser::PrimitiveValType::S32 => wasm_encoder::PrimitiveValType::S32,
+        parser::PrimitiveValType::U32 => wasm_encoder::PrimitiveValType::U32,
+        parser::PrimitiveValType::S64 => wasm_encoder::PrimitiveValType::S64,
+        parser::PrimitiveValType::U64 => wasm_encoder::PrimitiveValType::U64,
+        parser::PrimitiveValType::F32 => wasm_encoder::PrimitiveValType::F32,
+        parser::PrimitiveValType::F64 => wasm_encoder::PrimitiveValType::F64,
+        parser::PrimitiveValType::Char => wasm_encoder::PrimitiveValType::Char,
+    }
 }
 
 /// Convert wasmparser ValType to wasm-encoder ValType.

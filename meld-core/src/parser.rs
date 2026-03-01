@@ -378,7 +378,9 @@ pub enum ComponentTypeKind {
     Instance {
         exports: Vec<(String, ComponentTypeRef)>,
     },
-    /// Other type (resource, etc.)
+    /// Defined value type (result, list, option, etc.)
+    Defined(ComponentValType),
+    /// Other type (resource, component, etc.)
     Other,
 }
 
@@ -743,8 +745,24 @@ impl ComponentParser {
                 for ty in reader {
                     let ty = ty?;
                     let kind = match ty {
-                        wasmparser::ComponentType::Defined(_) => ComponentTypeKind::Other,
-                        wasmparser::ComponentType::Func(_) => ComponentTypeKind::Other,
+                        wasmparser::ComponentType::Func(func_type) => {
+                            let params = func_type
+                                .params
+                                .iter()
+                                .map(|(name, ty)| {
+                                    (name.to_string(), convert_wp_component_val_type(ty))
+                                })
+                                .collect();
+                            let results = func_type
+                                .results
+                                .iter()
+                                .map(|(name, ty)| {
+                                    (name.map(String::from), convert_wp_component_val_type(ty))
+                                })
+                                .collect();
+                            ComponentTypeKind::Function { params, results }
+                        }
+                        wasmparser::ComponentType::Defined(dt) => convert_wp_defined_type(&dt),
                         wasmparser::ComponentType::Component(_) => ComponentTypeKind::Other,
                         wasmparser::ComponentType::Instance(_) => ComponentTypeKind::Other,
                         wasmparser::ComponentType::Resource { .. } => ComponentTypeKind::Other,
@@ -1134,6 +1152,103 @@ impl ParsedComponent {
             }
         }
         map
+    }
+
+    /// Look up the type definition at a given component type index.
+    ///
+    /// Returns `Some` only for types defined via `ComponentTypeSection` (i.e.,
+    /// `ComponentTypeDef::Defined`). Returns `None` for import-defined or
+    /// alias-defined types.
+    pub fn get_type_definition(&self, type_idx: u32) -> Option<&ComponentType> {
+        let def = self.component_type_defs.get(type_idx as usize)?;
+        if !matches!(def, ComponentTypeDef::Defined) {
+            return None;
+        }
+        // The Nth Defined entry in component_type_defs corresponds to types[N]
+        let def_offset = self.component_type_defs[..type_idx as usize]
+            .iter()
+            .filter(|d| matches!(d, ComponentTypeDef::Defined))
+            .count();
+        self.types.get(def_offset)
+    }
+}
+
+/// Convert wasmparser's `ComponentValType` to our owned representation.
+fn convert_wp_component_val_type(ty: &wasmparser::ComponentValType) -> ComponentValType {
+    match ty {
+        wasmparser::ComponentValType::Primitive(p) => match p {
+            wasmparser::PrimitiveValType::String => ComponentValType::String,
+            wasmparser::PrimitiveValType::Bool => {
+                ComponentValType::Primitive(PrimitiveValType::Bool)
+            }
+            wasmparser::PrimitiveValType::S8 => ComponentValType::Primitive(PrimitiveValType::S8),
+            wasmparser::PrimitiveValType::U8 => ComponentValType::Primitive(PrimitiveValType::U8),
+            wasmparser::PrimitiveValType::S16 => ComponentValType::Primitive(PrimitiveValType::S16),
+            wasmparser::PrimitiveValType::U16 => ComponentValType::Primitive(PrimitiveValType::U16),
+            wasmparser::PrimitiveValType::S32 => ComponentValType::Primitive(PrimitiveValType::S32),
+            wasmparser::PrimitiveValType::U32 => ComponentValType::Primitive(PrimitiveValType::U32),
+            wasmparser::PrimitiveValType::S64 => ComponentValType::Primitive(PrimitiveValType::S64),
+            wasmparser::PrimitiveValType::U64 => ComponentValType::Primitive(PrimitiveValType::U64),
+            wasmparser::PrimitiveValType::F32 => ComponentValType::Primitive(PrimitiveValType::F32),
+            wasmparser::PrimitiveValType::F64 => ComponentValType::Primitive(PrimitiveValType::F64),
+            wasmparser::PrimitiveValType::Char => {
+                ComponentValType::Primitive(PrimitiveValType::Char)
+            }
+        },
+        wasmparser::ComponentValType::Type(idx) => ComponentValType::Type(*idx),
+    }
+}
+
+/// Convert wasmparser's `ComponentDefinedType` to our `ComponentTypeKind`.
+fn convert_wp_defined_type(dt: &wasmparser::ComponentDefinedType) -> ComponentTypeKind {
+    match dt {
+        wasmparser::ComponentDefinedType::Result { ok, err } => {
+            ComponentTypeKind::Defined(ComponentValType::Result {
+                ok: ok
+                    .as_ref()
+                    .map(|t| Box::new(convert_wp_component_val_type(t))),
+                err: err
+                    .as_ref()
+                    .map(|t| Box::new(convert_wp_component_val_type(t))),
+            })
+        }
+        wasmparser::ComponentDefinedType::List(ty) => ComponentTypeKind::Defined(
+            ComponentValType::List(Box::new(convert_wp_component_val_type(ty))),
+        ),
+        wasmparser::ComponentDefinedType::Option(ty) => ComponentTypeKind::Defined(
+            ComponentValType::Option(Box::new(convert_wp_component_val_type(ty))),
+        ),
+        wasmparser::ComponentDefinedType::Tuple(types) => ComponentTypeKind::Defined(
+            ComponentValType::Tuple(types.iter().map(convert_wp_component_val_type).collect()),
+        ),
+        wasmparser::ComponentDefinedType::Record(fields) => {
+            ComponentTypeKind::Defined(ComponentValType::Record(
+                fields
+                    .iter()
+                    .map(|(name, ty)| (name.to_string(), convert_wp_component_val_type(ty)))
+                    .collect(),
+            ))
+        }
+        wasmparser::ComponentDefinedType::Variant(cases) => {
+            ComponentTypeKind::Defined(ComponentValType::Variant(
+                cases
+                    .iter()
+                    .map(|c| {
+                        (
+                            c.name.to_string(),
+                            c.ty.as_ref().map(convert_wp_component_val_type),
+                        )
+                    })
+                    .collect(),
+            ))
+        }
+        wasmparser::ComponentDefinedType::Own(id) => {
+            ComponentTypeKind::Defined(ComponentValType::Own(*id))
+        }
+        wasmparser::ComponentDefinedType::Borrow(id) => {
+            ComponentTypeKind::Defined(ComponentValType::Borrow(*id))
+        }
+        _ => ComponentTypeKind::Other,
     }
 }
 
