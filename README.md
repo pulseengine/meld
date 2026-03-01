@@ -6,6 +6,7 @@
 
 &nbsp;
 
+[![CI](https://github.com/pulseengine/meld/actions/workflows/ci.yml/badge.svg)](https://github.com/pulseengine/meld/actions/workflows/ci.yml)
 ![Rust](https://img.shields.io/badge/Rust-CE422B?style=flat-square&logo=rust&logoColor=white&labelColor=1a1b27)
 ![WebAssembly](https://img.shields.io/badge/WebAssembly-654FF0?style=flat-square&logo=webassembly&logoColor=white&labelColor=1a1b27)
 ![Component Model](https://img.shields.io/badge/Component_Model-654FF0?style=flat-square&logoColor=white&labelColor=1a1b27)
@@ -32,7 +33,7 @@
 
 Meld fuses. Loom weaves. Synth transpiles. Kiln fires. Sigil seals.
 
-Meld statically fuses multiple WebAssembly P2/P3 components into a single core module, eliminating the need for runtime linking. Import resolution, index-space merging, and canonical ABI adapter generation happen at build time. Every transformation carries mechanized proofs covering parsing, resolution, merging, and adapter correctness.
+Meld statically fuses multiple WebAssembly components into a single core module, eliminating the need for runtime linking. Import resolution, index-space merging, and canonical ABI adapter generation happen at build time. Every transformation carries mechanized proofs covering parsing, resolution, merging, and adapter correctness.
 
 Unlike composition tools that produce linked-but-separate component graphs, Meld produces a single monolithic module suitable for whole-program optimization by Loom and native transpilation by Synth.
 
@@ -115,7 +116,7 @@ Meld integrates with [Sigil](https://github.com/pulseengine/sigil) for supply ch
 
 ## Formal Verification
 
-Meld's core transformations are formally verified using Rocq 9.0 (formerly Coq). The proofs establish that fusion preserves program semantics — the fused module behaves identically to the original composed components.
+Meld's core transformations are formally verified using Rocq. The proofs establish that fusion preserves program semantics — the fused module behaves identically to the original composed components.
 
 Key verified properties:
 - **Merge correctness** — Index remapping preserves function/memory/table references
