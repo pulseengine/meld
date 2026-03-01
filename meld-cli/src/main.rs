@@ -18,7 +18,7 @@
 
 use anyhow::{Context, Result, anyhow};
 use clap::{Parser, Subcommand};
-use meld_core::{Fuser, FuserConfig, FusionStats, MemoryStrategy};
+use meld_core::{Fuser, FuserConfig, FusionStats, MemoryStrategy, OutputFormat};
 use std::fs;
 use std::path::Path;
 use std::time::Instant;
@@ -73,6 +73,10 @@ enum Commands {
         /// Validate output with wasmparser
         #[arg(long)]
         validate: bool,
+
+        /// Output as P2 component instead of core module
+        #[arg(long)]
+        component: bool,
     },
 
     /// Inspect a WebAssembly component
@@ -114,6 +118,7 @@ fn main() -> Result<()> {
             no_attestation,
             preserve_names,
             validate,
+            component,
         }) => {
             fuse_command(
                 inputs,
@@ -124,6 +129,7 @@ fn main() -> Result<()> {
                 no_attestation,
                 preserve_names,
                 validate,
+                component,
             )?;
         }
 
@@ -176,6 +182,7 @@ fn fuse_command(
     no_attestation: bool,
     preserve_names: bool,
     validate: bool,
+    component: bool,
 ) -> Result<()> {
     println!(
         "Meld v{} - Static Component Fusion",
@@ -202,11 +209,17 @@ fn fuse_command(
     }
 
     // Configure fuser
+    let output_format = if component {
+        OutputFormat::Component
+    } else {
+        OutputFormat::CoreModule
+    };
     let config = FuserConfig {
         memory_strategy,
         attestation: !no_attestation,
         address_rebasing: address_rebase,
         preserve_names,
+        output_format,
         ..Default::default()
     };
 

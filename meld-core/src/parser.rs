@@ -10,6 +10,123 @@ use wasmparser::{
     ComponentExternalKind, ComponentTypeRef, ExternalKind, Parser, Payload, ValType as WasmValType,
 };
 
+/// A component-level instance created by `ComponentInstanceSection`.
+///
+/// These describe how sub-components are wired together at the component
+/// level (as opposed to `ComponentInstance` / `InstanceKind` which describe
+/// *core* module instantiation via the core `InstanceSection`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ComponentLevelInstance {
+    /// Instantiate a sub-component with the given arguments.
+    Instantiate {
+        component_index: u32,
+        args: Vec<(String, ComponentExternalKind, u32)>,
+    },
+    /// Synthesized from inline exports.
+    FromExports(Vec<(String, ComponentExternalKind, u32)>),
+}
+
+/// The kind of an outer alias, decoupled from wasmparser's internal type
+/// for API stability.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum OuterAliasKind {
+    /// A core module alias.
+    CoreModule,
+    /// A core type alias.
+    CoreType,
+    /// A component type alias.
+    Type,
+    /// A component alias.
+    Component,
+}
+
+/// An entry from the `ComponentAliasSection`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ComponentAliasEntry {
+    /// Alias an export of a component instance.
+    InstanceExport {
+        kind: ComponentExternalKind,
+        instance_index: u32,
+        name: String,
+    },
+    /// Alias a core export of a core instance.
+    CoreInstanceExport {
+        kind: ExternalKind,
+        instance_index: u32,
+        name: String,
+    },
+    /// Outer alias (references parent component's index spaces).
+    Outer {
+        kind: OuterAliasKind,
+        count: u32,
+        index: u32,
+    },
+}
+
+/// Records what created a core entity, preserving binary section ordering.
+///
+/// In the Component Model binary format, canonical function sections and
+/// component alias sections can interleave arbitrarily. Both allocate from
+/// per-kind entity counters (e.g., core funcs). This enum tracks the
+/// creation order so the resolver can map entity indices back to their
+/// source (a module export vs. a canonical function).
+#[derive(Debug, Clone)]
+pub enum CoreEntityDef {
+    /// A canonical function (Lower, ResourceDrop, ResourceNew, ResourceRep)
+    /// creates a core func. The usize is the index into `canonical_functions`.
+    CanonicalFunction(usize),
+    /// An alias of a core instance export creates a per-kind entity.
+    /// The usize is the index into `component_aliases` (only CoreInstanceExport entries).
+    CoreAlias(usize),
+}
+
+/// Records what created each component-level function index.
+///
+/// The component function index space is populated by imports (Func type),
+/// `canon lift` entries, and `ComponentAlias::InstanceExport { kind: Func }`
+/// entries. These sections interleave in the binary, so we track the
+/// allocation order to reconstruct indices for canon-lower tracing.
+#[derive(Debug, Clone)]
+pub enum ComponentFuncDef {
+    /// A component import with Func type. The usize is the index into `imports`.
+    Import(usize),
+    /// A `canon lift` creates a component function. Index into `canonical_functions`.
+    Lift(usize),
+    /// An `InstanceExport { kind: Func }` alias. Index into `component_aliases`.
+    InstanceExportAlias(usize),
+}
+
+/// Records what created each component-level instance index.
+///
+/// The component instance index space is populated by imports (Instance type),
+/// `ComponentInstanceSection` entries, and `ComponentAlias::InstanceExport { kind: Instance }`
+/// entries. Tracked in binary section order.
+#[derive(Debug, Clone)]
+pub enum ComponentInstanceDef {
+    /// A component import with Instance type. The usize is the index into `imports`.
+    Import(usize),
+    /// A `ComponentInstanceSection` entry. Index into `component_instances`.
+    Instance(usize),
+    /// An `InstanceExport { kind: Instance }` alias. Index into `component_aliases`.
+    InstanceExportAlias(usize),
+}
+
+/// Records what created each component-level type index.
+///
+/// The component type index space is populated by `ComponentTypeSection` entries,
+/// imports with `Type` type refs, and `ComponentAlias::InstanceExport { kind: Type }`
+/// entries. Tracked in binary section order so the resolver can trace
+/// `ResourceDrop { resource: T }` back to a WASI import name.
+#[derive(Debug, Clone)]
+pub enum ComponentTypeDef {
+    /// A component import with Type type ref. The usize is the index into `imports`.
+    Import(usize),
+    /// A `ComponentTypeSection` entry (defined type, resource, etc.).
+    Defined,
+    /// An `InstanceExport { kind: Type }` alias. Index into `component_aliases`.
+    InstanceExportAlias(usize),
+}
+
 /// A parsed WebAssembly component
 #[derive(Debug, Clone)]
 pub struct ParsedComponent {
@@ -34,11 +151,54 @@ pub struct ParsedComponent {
     /// Canonical function entries (lift, lower, resource ops)
     pub canonical_functions: Vec<CanonicalEntry>,
 
+    /// Nested sub-components (from `ComponentSection` payloads)
+    pub sub_components: Vec<ParsedComponent>,
+
+    /// Component-level aliases (from `ComponentAliasSection`)
+    pub component_aliases: Vec<ComponentAliasEntry>,
+
+    /// Component-level instances (from `ComponentInstanceSection`)
+    pub component_instances: Vec<ComponentLevelInstance>,
+
+    /// Ordered sequence of core entity-defining operations.
+    /// Canonical functions create core funcs; core aliases create per-kind
+    /// entities (func/memory/table/global). This preserves the interleaved
+    /// section ordering from the binary, which is needed to map entity
+    /// indices in `FromExports` instances back to source modules.
+    pub core_entity_order: Vec<CoreEntityDef>,
+
+    /// Ordered sequence of component function definitions.
+    /// Tracks what created each component function index (imports, lifts,
+    /// instance-export aliases) in binary section order.
+    pub component_func_defs: Vec<ComponentFuncDef>,
+
+    /// Ordered sequence of component instance definitions.
+    /// Tracks what created each component instance index (imports,
+    /// ComponentInstanceSection entries, instance-export aliases).
+    pub component_instance_defs: Vec<ComponentInstanceDef>,
+
+    /// Ordered sequence of component type definitions.
+    /// Tracks what created each component type index (imports with Type refs,
+    /// ComponentTypeSection entries, instance-export Type aliases).
+    /// Used by the resolver to trace `ResourceDrop` back to WASI import names.
+    pub component_type_defs: Vec<ComponentTypeDef>,
+
     /// Original size in bytes
     pub original_size: usize,
 
     /// SHA-256 hash of original component bytes (hex encoded)
     pub original_hash: String,
+
+    /// Raw bytes of depth-0 component sections needed for P2 wrapping.
+    /// Each entry is `(section_id, raw_bytes)` — specifically:
+    /// - Section ID 6 (ComponentAlias) — type aliases from imported instances
+    /// - Section ID 7 (ComponentType) — component-level type definitions
+    /// - Section ID 10 (ComponentImport) — component-level import declarations
+    ///   These are replayed verbatim into a wrapper component to preserve the
+    ///   original WIT interface without full type reconstruction. The ordering
+    ///   matters because Import sections reference types defined in preceding
+    ///   Type and Alias sections.
+    pub depth_0_sections: Vec<(u8, Vec<u8>)>,
 }
 
 /// A core WebAssembly module extracted from a component
@@ -391,15 +551,61 @@ impl ComponentParser {
             types: Vec::new(),
             instances: Vec::new(),
             canonical_functions: Vec::new(),
+            sub_components: Vec::new(),
+            component_aliases: Vec::new(),
+            component_instances: Vec::new(),
+            core_entity_order: Vec::new(),
+            component_func_defs: Vec::new(),
+            component_instance_defs: Vec::new(),
+            component_type_defs: Vec::new(),
             original_size: bytes.len(),
             original_hash: compute_sha256(bytes),
+            depth_0_sections: Vec::new(),
         };
 
         let parser = Parser::new(0);
 
+        // Depth-aware parsing: track nesting level so that payloads inside
+        // nested ComponentSection are routed to the correct sub-component.
+        let mut depth = 0usize;
+        let mut sub_stack: Vec<ParsedComponent> = Vec::new();
+        // Stop capturing depth_0_sections once we hit the first core module,
+        // so we only replay interface-definition sections (Type, Import, Alias)
+        // and not the wiring sections that reference core instances.
+        let mut seen_core_module = false;
+
         for payload in parser.parse_all(bytes) {
             let payload = payload?;
-            self.handle_payload(payload, &mut component, bytes)?;
+            // Track when we first encounter a core module at depth 0
+            if depth == 0 && matches!(&payload, Payload::ModuleSection { .. }) {
+                seen_core_module = true;
+            }
+            match &payload {
+                Payload::ComponentSection { .. } => {
+                    depth += 1;
+                    sub_stack.push(ParsedComponent::empty());
+                    continue; // don't pass ComponentSection to handle_payload
+                }
+                Payload::End(_) if depth > 0 => {
+                    depth -= 1;
+                    let sub = sub_stack.pop().unwrap();
+                    let parent = if depth > 0 {
+                        sub_stack.last_mut().unwrap()
+                    } else {
+                        &mut component
+                    };
+                    parent.sub_components.push(sub);
+                    continue;
+                }
+                _ => {}
+            }
+            let target = if depth > 0 {
+                sub_stack.last_mut().unwrap()
+            } else {
+                &mut component
+            };
+            let capture_sections = depth == 0 && !seen_core_module;
+            self.handle_payload(payload, target, bytes, capture_sections)?;
         }
 
         if component.core_modules.is_empty() {
@@ -409,12 +615,16 @@ impl ComponentParser {
         Ok(component)
     }
 
-    /// Handle a single payload from the parser
+    /// Handle a single payload from the parser.
+    ///
+    /// `capture_sections`: if true, raw section bytes for Type/Import/Alias
+    /// sections are appended to `depth_0_sections` for P2 component wrapping.
     fn handle_payload(
         &self,
         payload: Payload<'_>,
         component: &mut ParsedComponent,
         _full_bytes: &[u8],
+        capture_sections: bool,
     ) -> Result<()> {
         match payload {
             Payload::Version { .. } => {
@@ -436,8 +646,36 @@ impl ComponentParser {
             }
 
             Payload::ComponentImportSection(reader) => {
+                // Capture raw section bytes at depth 0 for P2 wrapping.
+                // Section ID 10 = ComponentImport in the component binary format.
+                if capture_sections {
+                    let range = reader.range();
+                    component
+                        .depth_0_sections
+                        .push((10, _full_bytes[range.start..range.end].to_vec()));
+                }
                 for import in reader {
                     let import = import?;
+                    let import_idx = component.imports.len();
+                    // Track component-level index allocations from imports
+                    match &import.ty {
+                        wasmparser::ComponentTypeRef::Func(_) => {
+                            component
+                                .component_func_defs
+                                .push(ComponentFuncDef::Import(import_idx));
+                        }
+                        wasmparser::ComponentTypeRef::Instance(_) => {
+                            component
+                                .component_instance_defs
+                                .push(ComponentInstanceDef::Import(import_idx));
+                        }
+                        wasmparser::ComponentTypeRef::Type(..) => {
+                            component
+                                .component_type_defs
+                                .push(ComponentTypeDef::Import(import_idx));
+                        }
+                        _ => {}
+                    }
                     component.imports.push(ComponentImport {
                         name: import.name.0.to_string(),
                         ty: import.ty,
@@ -457,8 +695,9 @@ impl ComponentParser {
             }
 
             Payload::InstanceSection(reader) => {
-                for (idx, instance) in reader.into_iter().enumerate() {
+                for instance in reader {
                     let instance = instance?;
+                    let global_idx = component.instances.len() as u32;
                     let kind = match instance {
                         wasmparser::Instance::Instantiate { module_index, args } => {
                             let parsed_args: Vec<_> = args
@@ -486,13 +725,21 @@ impl ComponentParser {
                         }
                     };
                     component.instances.push(ComponentInstance {
-                        index: idx as u32,
+                        index: global_idx,
                         kind,
                     });
                 }
             }
 
             Payload::ComponentTypeSection(reader) => {
+                // Capture raw section bytes at depth 0 for P2 wrapping.
+                // Section ID 7 = ComponentType in the component binary format.
+                if capture_sections {
+                    let range = reader.range();
+                    component
+                        .depth_0_sections
+                        .push((7, _full_bytes[range.start..range.end].to_vec()));
+                }
                 for ty in reader {
                     let ty = ty?;
                     let kind = match ty {
@@ -503,20 +750,109 @@ impl ComponentParser {
                         wasmparser::ComponentType::Resource { .. } => ComponentTypeKind::Other,
                     };
                     component.types.push(ComponentType { kind });
+                    component
+                        .component_type_defs
+                        .push(ComponentTypeDef::Defined);
                 }
             }
 
             Payload::ComponentCanonicalSection(reader) => {
                 for canon in reader {
                     let canon = canon?;
+                    let creates_core_func = matches!(
+                        &canon,
+                        wasmparser::CanonicalFunction::Lower { .. }
+                            | wasmparser::CanonicalFunction::ResourceNew { .. }
+                            | wasmparser::CanonicalFunction::ResourceDrop { .. }
+                            | wasmparser::CanonicalFunction::ResourceRep { .. }
+                    );
+                    let is_lift = matches!(&canon, wasmparser::CanonicalFunction::Lift { .. });
+                    let canon_idx = component.canonical_functions.len();
                     component
                         .canonical_functions
                         .push(convert_canonical_function(canon));
+                    if creates_core_func {
+                        component
+                            .core_entity_order
+                            .push(CoreEntityDef::CanonicalFunction(canon_idx));
+                    }
+                    if is_lift {
+                        component
+                            .component_func_defs
+                            .push(ComponentFuncDef::Lift(canon_idx));
+                    }
                 }
             }
             Payload::CoreTypeSection(_) => {}
-            Payload::ComponentAliasSection(_) => {}
-            Payload::ComponentSection { .. } => {}
+            Payload::ComponentAliasSection(reader) => {
+                // Capture raw section bytes at depth 0 for P2 wrapping.
+                // Section ID 6 = ComponentAlias. These define type aliases
+                // from imported instances that subsequent Type/Import sections
+                // reference.
+                if capture_sections {
+                    let range = reader.range();
+                    component
+                        .depth_0_sections
+                        .push((6, _full_bytes[range.start..range.end].to_vec()));
+                }
+                for alias in reader {
+                    let alias = alias?;
+                    let entry = convert_component_alias(alias);
+                    if let Some(entry) = entry {
+                        let alias_idx = component.component_aliases.len();
+                        let is_core_instance_export =
+                            matches!(&entry, ComponentAliasEntry::CoreInstanceExport { .. });
+                        // Track component-level index allocations from aliases
+                        match &entry {
+                            ComponentAliasEntry::InstanceExport {
+                                kind: ComponentExternalKind::Func,
+                                ..
+                            } => {
+                                component
+                                    .component_func_defs
+                                    .push(ComponentFuncDef::InstanceExportAlias(alias_idx));
+                            }
+                            ComponentAliasEntry::InstanceExport {
+                                kind: ComponentExternalKind::Instance,
+                                ..
+                            } => {
+                                component
+                                    .component_instance_defs
+                                    .push(ComponentInstanceDef::InstanceExportAlias(alias_idx));
+                            }
+                            ComponentAliasEntry::InstanceExport {
+                                kind: ComponentExternalKind::Type,
+                                ..
+                            } => {
+                                component
+                                    .component_type_defs
+                                    .push(ComponentTypeDef::InstanceExportAlias(alias_idx));
+                            }
+                            _ => {}
+                        }
+                        component.component_aliases.push(entry);
+                        if is_core_instance_export {
+                            component
+                                .core_entity_order
+                                .push(CoreEntityDef::CoreAlias(alias_idx));
+                        }
+                    }
+                }
+            }
+            Payload::ComponentSection { .. } => {
+                // Handled by depth tracking in parse(); should not reach here.
+            }
+            Payload::ComponentInstanceSection(reader) => {
+                for instance in reader {
+                    let instance = instance?;
+                    let inst_idx = component.component_instances.len();
+                    let entry = convert_component_instance(instance);
+                    component
+                        .component_instance_defs
+                        .push(ComponentInstanceDef::Instance(inst_idx));
+                    component.component_instances.push(entry);
+                }
+            }
             Payload::ComponentStartSection { .. } => {}
 
             // Custom sections
@@ -742,6 +1078,30 @@ impl Default for ComponentParser {
 }
 
 impl ParsedComponent {
+    /// Create an empty `ParsedComponent` with no modules, no imports, etc.
+    /// Used as a placeholder when pushing onto the sub-component stack.
+    pub fn empty() -> Self {
+        Self {
+            name: None,
+            core_modules: Vec::new(),
+            imports: Vec::new(),
+            exports: Vec::new(),
+            types: Vec::new(),
+            instances: Vec::new(),
+            canonical_functions: Vec::new(),
+            sub_components: Vec::new(),
+            component_aliases: Vec::new(),
+            component_instances: Vec::new(),
+            core_entity_order: Vec::new(),
+            component_func_defs: Vec::new(),
+            component_instance_defs: Vec::new(),
+            component_type_defs: Vec::new(),
+            original_size: 0,
+            original_hash: String::new(),
+            depth_0_sections: Vec::new(),
+        }
+    }
+
     /// Build a map from core function index → canonical options for Lift entries.
     /// Use this to look up the callee-side encoding, realloc, and post-return
     /// for an exported core function.
@@ -837,6 +1197,71 @@ fn convert_canonical_function(canon: wasmparser::CanonicalFunction) -> Canonical
             CanonicalEntry::ThreadSpawn { func_ty_index }
         }
         wasmparser::CanonicalFunction::ThreadHwConcurrency => CanonicalEntry::ThreadHwConcurrency,
+    }
+}
+
+/// Convert a `wasmparser::ComponentAlias` into our `ComponentAliasEntry`.
+fn convert_component_alias(alias: wasmparser::ComponentAlias<'_>) -> Option<ComponentAliasEntry> {
+    match alias {
+        wasmparser::ComponentAlias::InstanceExport {
+            kind,
+            instance_index,
+            name,
+        } => Some(ComponentAliasEntry::InstanceExport {
+            kind,
+            instance_index,
+            name: name.to_string(),
+        }),
+        wasmparser::ComponentAlias::CoreInstanceExport {
+            kind,
+            instance_index,
+            name,
+        } => Some(ComponentAliasEntry::CoreInstanceExport {
+            kind,
+            instance_index,
+            name: name.to_string(),
+        }),
+        wasmparser::ComponentAlias::Outer { kind, count, index } => {
+            let our_kind = match kind {
+                wasmparser::ComponentOuterAliasKind::CoreModule => OuterAliasKind::CoreModule,
+                wasmparser::ComponentOuterAliasKind::CoreType => OuterAliasKind::CoreType,
+                wasmparser::ComponentOuterAliasKind::Type => OuterAliasKind::Type,
+                wasmparser::ComponentOuterAliasKind::Component => OuterAliasKind::Component,
+            };
+            Some(ComponentAliasEntry::Outer {
+                kind: our_kind,
+                count,
+                index,
+            })
+        }
+    }
+}
+
+/// Convert a `wasmparser::ComponentInstance` into our `ComponentLevelInstance`.
+fn convert_component_instance(
+    instance: wasmparser::ComponentInstance<'_>,
+) -> ComponentLevelInstance {
+    match instance {
+        wasmparser::ComponentInstance::Instantiate {
+            component_index,
+            args,
+        } => {
+            let parsed_args: Vec<_> = args
+                .iter()
+                .map(|arg| (arg.name.to_string(), arg.kind, arg.index))
+                .collect();
+            ComponentLevelInstance::Instantiate {
+                component_index,
+                args: parsed_args,
+            }
+        }
+        wasmparser::ComponentInstance::FromExports(exports) => {
+            let parsed: Vec<_> = exports
+                .iter()
+                .map(|e| (e.name.0.to_string(), e.kind, e.index))
+                .collect();
+            ComponentLevelInstance::FromExports(parsed)
+        }
     }
 }
 
