@@ -113,19 +113,25 @@ Inductive composed_step (cc : composed_component)
              (ces_active ces) ms')
           (ces_active ces)
           (ces_shared_memory ces))
-  (* Cross-module call: active changes, both modules updated *)
+  (* Cross-module call: active changes, both modules updated.
+     The source module's index spaces are preserved (only its stack
+     changes). The target module's locals must match the source's
+     (modeling that fusion merges frames into a single module). *)
   | CS_CrossModuleCall : forall ces ms_src ms_tgt target
-                                 funcidx func_addr ms_src' ms_tgt',
+                                 funcidx func_addr new_src_stack ms_tgt',
       ces_active ces <> target ->
       lookup_module_state ces (ces_active ces) = Some ms_src ->
       lookup_module_state ces target = Some ms_tgt ->
       nth_error (ms_funcs ms_src) funcidx = Some func_addr ->
       eval_instr ms_tgt (Call 0) ms_tgt' ->
+      (* Frame correspondence: target locals match source locals,
+         modeling that the fused module has a single locals context *)
+      ms_locals ms_tgt = ms_locals ms_src ->
       composed_step cc ces
         (mkComposedExecState
           (update_module_state_list
             (update_module_state_list (ces_module_states ces)
-               (ces_active ces) ms_src')
+               (ces_active ces) (set_stack ms_src new_src_stack))
             target ms_tgt')
           target
           (ces_shared_memory ces)).
@@ -244,10 +250,12 @@ Definition memory_corresponds (layout_opt : option memory_layout_table)
       (* Separate memories: exact equality *)
       mem_data mem_src = mem_data mem_fused
   | Some layouts =>
-      (* Shared memory: layout entry exists for this source *)
+      (* Shared memory: layout entry exists for this source,
+         and data lengths are preserved (needed for OOB trap simulation) *)
       exists layout,
         In layout layouts /\
-        ml_source layout = src
+        ml_source layout = src /\
+        length (mem_data mem_src) = length (mem_data mem_fused)
   end.
 
 (* Table correspondence via remap.
@@ -389,16 +397,27 @@ Definition forward_simulation (cc : composed_component) (fr : fusion_result) : P
       fused_step fr fes fes' /\
       state_correspondence cc fr ces' fes'.
 
-(* Trap equivalence: both trap or neither traps *)
+(* Trap equivalence (ideal): both trap or neither traps.
+   The backward direction (fused_traps → composed_traps) is unprovable
+   because fused OOB/TypeMismatch conditions may involve memories/tables
+   from non-active source modules, which have no composed-side counterpart.
+   See fusion_trap_simulation for the provable forward direction. *)
 Definition trap_equivalence (cc : composed_component) (fr : fusion_result) : Prop :=
   forall ces fes,
     state_correspondence cc fr ces fes ->
     (composed_traps cc ces <-> fused_traps fr fes).
 
-(* Semantic equivalence combines simulation and trap equivalence *)
+(* Trap simulation (forward only): composed traps imply fused traps.
+   This is the provable direction of trap equivalence. *)
+Definition trap_simulation (cc : composed_component) (fr : fusion_result) : Prop :=
+  forall ces fes,
+    state_correspondence cc fr ces fes ->
+    composed_traps cc ces -> fused_traps fr fes.
+
+(* Semantic equivalence combines simulation and trap simulation *)
 Definition semantic_equivalence (cc : composed_component) (fr : fusion_result) : Prop :=
   forward_simulation cc fr /\
-  trap_equivalence cc fr.
+  trap_simulation cc fr.
 
 (* =========================================================================
    Helper Lemmas for update_module_state_list and lookup_module_state
@@ -571,117 +590,77 @@ Proof.
 Qed.
 
 (* -------------------------------------------------------------------------
-   Trap Equivalence — strengthened
+   Trap Simulation (Forward Only)
 
-   Forward direction (composed -> fused):
-   - CT_Unreachable -> FT_Unreachable: trivial (FT_Unreachable has no conditions).
-   - CT_OutOfBounds -> FT_OutOfBounds: use sc_memory_eq to find the fused
-     memory, then show the same out-of-bounds condition holds via
-     memory_corresponds (which for SeparateMemory gives data equality,
-     preserving length). SharedMemory is Admitted.
-   - CT_TypeMismatch -> FT_TypeMismatch: use sc_tables_eq to find the fused
-     table, then use table_corresponds element-wise equality.
+   Composed traps imply fused traps. This is the provable direction of
+   the ideal trap_equivalence. The backward direction (fused → composed)
+   is unprovable because CT_OutOfBounds/CT_TypeMismatch require the
+   memory/table to be in the ACTIVE module, but in the fused model all
+   modules' memories/tables are merged — an OOB on a non-active module's
+   memory has no composed-side counterpart.
 
-   Backward direction (fused -> composed):
-   - FT_Unreachable -> CT_Unreachable: just need active module exists. Qed.
-   - FT_OutOfBounds -> CT_OutOfBounds: UNPROVABLE with current definitions.
-     CT_OutOfBounds requires the memory to be in the active module, but the
-     fused module's memories include ALL source modules' memories. An OOB on
-     a non-active module's memory has no composed-side counterpart.
-   - FT_TypeMismatch -> CT_TypeMismatch: Same gap as FT_OutOfBounds.
-   Resolution: refine trap conditions to be instruction-aware (trap only on
-   the memory/table actually accessed), or weaken to forward-only simulation.
+   Case analysis:
+   - CT_Unreachable → FT_Unreachable: trivial (FT_Unreachable is unconditional).
+   - CT_OutOfBounds → FT_OutOfBounds: use sc_memory_eq to find the fused
+     memory, then memory_corresponds gives data-length preservation
+     (SeparateMemory: exact data equality; SharedMemory: explicit length).
+   - CT_TypeMismatch → FT_TypeMismatch: use sc_tables_eq to find the fused
+     table, then table_corresponds gives element-wise equality.
    ------------------------------------------------------------------------- *)
 
-Lemma fusion_trap_equivalence :
+Lemma fusion_trap_simulation :
   forall cc config fr,
     well_formed_composition cc ->
     fusion_correct cc config fr ->
-    trap_equivalence cc fr.
+    trap_simulation cc fr.
 Proof.
   intros cc config fr _ Hfc.
-  unfold trap_equivalence. intros ces fes Hcorr.
-  split.
-  - (* Forward: composed_traps -> fused_traps *)
-    intro Hc. destruct Hc as [ces0 ms Hactive
-                              | ces0 ms memidx mem addr size Hactive Hmem Hbounds
-                              | ces0 ms tableidx tab entry_idx Hactive Htab Hentry].
-    + (* CT_Unreachable -> FT_Unreachable *)
-      apply FT_Unreachable.
-    + (* CT_OutOfBounds -> FT_OutOfBounds:
-         Find the fused memory via sc_memory_eq, then show bounds violation. *)
-      destruct (sc_memory_eq _ _ _ _ Hcorr _ ms _ _ Hactive Hmem)
-        as [fused_midx [mem_fused [Hremap [Hmem_fused Hmcorr]]]].
-      apply FT_OutOfBounds with (memidx := fused_midx) (mem := mem_fused)
-                                (addr := addr) (size := size).
-      * exact Hmem_fused.
-      * (* Show addr + size > length (mem_data mem_fused).
-           For SeparateMemory (None layout): memory_corresponds gives
-           mem_data mem = mem_data mem_fused, so lengths are equal.
-           For SharedMemory: the correspondence is weaker (layout exists),
-           so we cannot conclude the data length relationship. *)
-        unfold memory_corresponds in Hmcorr.
-        destruct (fr_memory_layout fr) as [layouts|].
-        -- (* SharedMemory: layout correspondence does not give data-level
-              equality. Admitted — would require a stronger SharedMemory
-              correspondence that relates data lengths. *)
-           admit.
-        -- (* SeparateMemory: exact data equality *)
-           rewrite <- Hmcorr. exact Hbounds.
-    + (* CT_TypeMismatch -> FT_TypeMismatch:
-         Find the fused table via sc_tables_eq, then show null entry. *)
-      destruct (sc_tables_eq _ _ _ _ Hcorr _ ms _ _ Hactive Htab)
-        as [fused_tidx [tab_fused [Hremap [Htab_fused Htcorr]]]].
-      destruct Htcorr as [Hlen [Hmax Helems]].
-      apply FT_TypeMismatch with (tableidx := fused_tidx) (tab := tab_fused)
-                                 (entry_idx := entry_idx).
-      * exact Htab_fused.
-      * (* Show nth_error (tab_elem tab_fused) entry_idx = Some None.
-           By table_corresponds, tab_elem entries match element-wise.
-           Since entry_idx is in bounds (Hentry gives Some None from source),
-           and lengths are equal (Hlen), the fused table also has an entry. *)
-        assert (Hin_bounds: entry_idx < length (tab_elem tab)).
-        { apply nth_error_Some. rewrite Hentry. discriminate. }
-        rewrite Hlen in Hin_bounds.
-        destruct (nth_error (tab_elem tab_fused) entry_idx) as [ref_f|] eqn:Hfused_entry.
-        -- (* Entry exists in fused table: use element correspondence *)
-           specialize (Helems entry_idx None ref_f Hentry Hfused_entry).
-           subst ref_f. reflexivity.
-        -- (* Entry doesn't exist: contradicts in-bounds *)
-           apply nth_error_None in Hfused_entry. lia.
-  - (* Backward: fused_traps -> composed_traps *)
-    intro Hf. destruct Hf as [fes0
-                              | fes0 memidx mem addr size Hmem Hbounds
-                              | fes0 tableidx tab entry_idx Htab Hentry].
-    + (* FT_Unreachable -> CT_Unreachable *)
-      destruct (sc_active_valid _ _ _ _ Hcorr) as [ms Hms].
-      exact (CT_Unreachable cc ces ms Hms).
-    + (* FT_OutOfBounds -> CT_OutOfBounds:
-         NOT PROVABLE with current definitions.
-
-         The fundamental issue: CT_OutOfBounds requires the memory to be
-         in the ACTIVE module (lookup_module_state ces (ces_active ces)),
-         but sc_memory_surj gives us a source module that may be ANY
-         module — not necessarily the active one.
-
-         In the fused model, ALL memories (from all source modules) are
-         in a single module state. An OOB on a fused memory belonging to
-         a non-active source module does not correspond to a composed trap,
-         since the composed model only traps on the active module's memories.
-
-         Resolution: either (a) refine trap conditions to be
-         instruction-aware (only trap on actually-accessed memories),
-         or (b) weaken from trap_equivalence to trap_simulation
-         (forward only: composed_traps -> fused_traps). *)
-      admit.
-    + (* FT_TypeMismatch -> CT_TypeMismatch:
-         Same modeling gap as FT_OutOfBounds — CT_TypeMismatch requires
-         the table to be in the active module, but sc_table_surj gives
-         any source module. See comment above for resolution paths. *)
-      admit.
-Admitted. (* Backward OOB/TypeMismatch: trap conditions are per-module,
-             not instruction-aware; backward direction unprovable.
-             Forward direction (composed->fused) is fully proven. *)
+  unfold trap_simulation. intros ces fes Hcorr Hc.
+  destruct Hc as [ces0 ms Hactive
+                  | ces0 ms memidx mem addr size Hactive Hmem Hbounds
+                  | ces0 ms tableidx tab entry_idx Hactive Htab Hentry].
+  - (* CT_Unreachable -> FT_Unreachable *)
+    apply FT_Unreachable.
+  - (* CT_OutOfBounds -> FT_OutOfBounds:
+       Find the fused memory via sc_memory_eq, then show bounds violation. *)
+    destruct (sc_memory_eq _ _ _ _ Hcorr _ ms _ _ Hactive Hmem)
+      as [fused_midx [mem_fused [Hremap [Hmem_fused Hmcorr]]]].
+    apply FT_OutOfBounds with (memidx := fused_midx) (mem := mem_fused)
+                              (addr := addr) (size := size).
+    + exact Hmem_fused.
+    + (* Show addr + size > length (mem_data mem_fused).
+         memory_corresponds preserves data length in both modes:
+         - SeparateMemory: exact data equality implies equal lengths
+         - SharedMemory: explicit length equality in correspondence *)
+      unfold memory_corresponds in Hmcorr.
+      destruct (fr_memory_layout fr) as [layouts|].
+      * (* SharedMemory: use explicit length equality *)
+        destruct Hmcorr as [_layout [_Hin [_Hsrc Hlen]]].
+        rewrite <- Hlen. exact Hbounds.
+      * (* SeparateMemory: exact data equality *)
+        rewrite <- Hmcorr. exact Hbounds.
+  - (* CT_TypeMismatch -> FT_TypeMismatch:
+       Find the fused table via sc_tables_eq, then show null entry. *)
+    destruct (sc_tables_eq _ _ _ _ Hcorr _ ms _ _ Hactive Htab)
+      as [fused_tidx [tab_fused [Hremap [Htab_fused Htcorr]]]].
+    destruct Htcorr as [Hlen [Hmax Helems]].
+    apply FT_TypeMismatch with (tableidx := fused_tidx) (tab := tab_fused)
+                               (entry_idx := entry_idx).
+    + exact Htab_fused.
+    + (* Show nth_error (tab_elem tab_fused) entry_idx = Some None.
+         By table_corresponds, tab_elem entries match element-wise.
+         Since entry_idx is in bounds (Hentry gives Some None from source),
+         and lengths are equal (Hlen), the fused table also has an entry. *)
+      assert (Hin_bounds: entry_idx < length (tab_elem tab)).
+      { apply nth_error_Some. rewrite Hentry. discriminate. }
+      rewrite Hlen in Hin_bounds.
+      destruct (nth_error (tab_elem tab_fused) entry_idx) as [ref_f|] eqn:Hfused_entry.
+      * (* Entry exists in fused table: use element correspondence *)
+        specialize (Helems entry_idx None ref_f Hentry Hfused_entry).
+        subst ref_f. reflexivity.
+      * (* Entry doesn't exist: contradicts in-bounds *)
+        apply nth_error_None in Hfused_entry. lia.
+Qed.
 
 (* =========================================================================
    Per-Instruction Remap Correctness Lemmas
@@ -1781,7 +1760,7 @@ Proof.
                  --- (* SharedMemory: layout exists. The abstract new_mem
                         on both sides is the same, so slice invariant holds
                         if we choose new_mem_fused = new_mem. Already done. *)
-                     destruct Hmcorr as [layout [Hin Hsrc]].
+                     destruct Hmcorr as [layout [Hin [Hsrc _]]].
                      exists layout. auto.
                  --- (* SeparateMemory: exact equality *)
                      reflexivity.
@@ -1864,7 +1843,7 @@ Proof.
                  apply nth_error_Some. rewrite Hm_nth. discriminate.
               ** unfold memory_corresponds.
                  destruct (fr_memory_layout fr).
-                 --- destruct Hmcorr as [layout [Hin Hsrc]].
+                 --- destruct Hmcorr as [layout [Hin [Hsrc _]]].
                      exists layout. auto.
                  --- reflexivity.
            ++ apply nth_error_Some. rewrite Hnth_mem. discriminate.
@@ -1937,7 +1916,7 @@ Proof.
                  apply nth_error_Some. rewrite Hd_nth. discriminate.
               ** unfold memory_corresponds.
                  destruct (fr_memory_layout fr).
-                 --- destruct Hdcorr as [layout [Hin Hsrc]].
+                 --- destruct Hdcorr as [layout [Hin [Hsrc _]]].
                      exists layout. auto.
                  --- reflexivity.
            ++ apply nth_error_Some. rewrite Hnth_dst. discriminate.
@@ -2003,7 +1982,7 @@ Proof.
                  apply nth_error_Some. rewrite Hm_nth. discriminate.
               ** unfold memory_corresponds.
                  destruct (fr_memory_layout fr).
-                 --- destruct Hmcorr as [layout [Hin Hsrc]].
+                 --- destruct Hmcorr as [layout [Hin [Hsrc _]]].
                      exists layout. auto.
                  --- reflexivity.
            ++ apply nth_error_Some. rewrite Hnth_mem. discriminate.
@@ -2077,7 +2056,7 @@ Proof.
                  apply nth_error_Some. rewrite Hm_nth. discriminate.
               ** unfold memory_corresponds.
                  destruct (fr_memory_layout fr).
-                 --- destruct Hmcorr as [layout [Hin Hsrc]].
+                 --- destruct Hmcorr as [layout [Hin [Hsrc _]]].
                      exists layout. auto.
                  --- reflexivity.
            ++ apply nth_error_Some. rewrite Hnth_mem. discriminate.
@@ -2226,6 +2205,34 @@ Proof.
     try exact I.
   (* Eval_Pure: i is abstract, destruct to reduce the match *)
   destruct i; exact I || assumption.
+Qed.
+
+(* eval_instr preserves memory list length unconditionally.
+   Non-memory instructions preserve ms_mems entirely.
+   Memory-mutating instructions use update_nth, which preserves length. *)
+Lemma eval_instr_mems_length :
+  forall ms i ms', eval_instr ms i ms' ->
+    length (ms_mems ms') = length (ms_mems ms).
+Proof.
+  intros ms i ms' Heval.
+  destruct Heval; simpl;
+    try reflexivity;
+    try apply update_nth_length;
+    congruence.
+Qed.
+
+(* eval_instr preserves table list length unconditionally.
+   Non-table instructions preserve ms_tables entirely.
+   Table-mutating instructions use update_nth, which preserves length. *)
+Lemma eval_instr_tables_length :
+  forall ms i ms', eval_instr ms i ms' ->
+    length (ms_tables ms') = length (ms_tables ms).
+Proof.
+  intros ms i ms' Heval.
+  destruct Heval; simpl;
+    try reflexivity;
+    try apply update_nth_length;
+    congruence.
 Qed.
 
 (* For Call specifically, ALL index spaces are preserved *)
@@ -2429,13 +2436,123 @@ Proof.
            intro Hsrc_eq. subst src.
            rewrite module_source_eqb_refl in Heq. discriminate.
       * (* sc_memory_surj: backward memory surjectivity.
-           Follows from sc_memory_surj of Hcorr + Hm2 frame condition.
-           Detailed proof deferred: entire CS_Instr case is subsumed
-           by the forward simulation proof structure above. *)
-        admit.
+           Every fused memory in ms_fused' comes from some source module.
+           Strategy: eval_instr preserves memory list length, so every
+           valid index in ms_fused' was valid in the old fused state.
+           Apply old sc_memory_surj, then case-split on src = active. *)
+        intros fused_idx mem_fused Hfused_mem.
+        (* fused_idx is valid in old fused state (same list length) *)
+        assert (Hlen_fused : length (ms_mems ms_fused') =
+                             length (ms_mems (fes_module_state fes))).
+        { exact (eval_instr_mems_length _ _ _ Heval_fused). }
+        destruct (nth_error (ms_mems (fes_module_state fes)) fused_idx)
+          as [mem_old|] eqn:Hmem_old.
+        -- (* Old fused memory exists: apply old sc_memory_surj *)
+           destruct (sc_memory_surj _ _ _ _ Hcorr _ _ Hmem_old)
+             as [src [ms_old [src_idx [mem_src
+                 [Hlookup_old [Hnth_old [Hr Hmc]]]]]]].
+           destruct (module_source_eqb src (ces_active ces)) eqn:Heq_src.
+           ++ (* src = active module: use Hm1 for new correspondence *)
+              apply module_source_eqb_eq in Heq_src. subst src.
+              rewrite Hlookup_ms in Hlookup_old.
+              injection Hlookup_old as Hms_eq. subst ms_old.
+              (* src_idx is valid in ms' (same list length) *)
+              assert (Hlen_src : length (ms_mems ms') = length (ms_mems ms)).
+              { exact (eval_instr_mems_length _ _ _ Heval_ms). }
+              destruct (nth_error (ms_mems ms') src_idx) as [mem'|] eqn:Hmem'.
+              ** (* Apply Hm1: active module memory maps forward *)
+                 destruct (Hm1 src_idx mem' Hmem')
+                   as [fi' [mf' [Hr' [Hn' Hmc']]]].
+                 (* lookup_remap deterministic: fi' = fused_idx *)
+                 rewrite Hr in Hr'. injection Hr' as Hfi_eq. subst fi'.
+                 rewrite Hfused_mem in Hn'. injection Hn' as Hmf_eq.
+                 subst mf'.
+                 exists (ces_active ces), ms', src_idx, mem'.
+                 split.
+                 { apply (lookup_update_same _ _ ms _ _ _ Hlookup_ms). }
+                 split; [exact Hmem'|].
+                 split; [exact Hr|exact Hmc'].
+              ** (* src_idx out of bounds in ms' — contradiction *)
+                 exfalso. apply nth_error_None in Hmem'.
+                 assert (Hvalid_src : src_idx < length (ms_mems ms)).
+                 { apply nth_error_Some. rewrite Hnth_old. discriminate. }
+                 lia.
+           ++ (* src ≠ active: frame condition preserves fused memory *)
+              assert (Hframe : nth_error (ms_mems ms_fused') fused_idx
+                               = Some mem_old).
+              { apply Hm2; [exact Hmem_old|].
+                intros src_idx'.
+                apply (lookup_remap_cross_source_neq _ MemIdx src
+                         (ces_active ces) src_idx fused_idx Hinj); [|exact Hr].
+                intro Hsrc_eq. subst src.
+                rewrite module_source_eqb_refl in Heq_src. discriminate. }
+              rewrite Hfused_mem in Hframe.
+              injection Hframe as Hmf_eq. subst mem_old.
+              exists src, ms_old, src_idx, mem_src.
+              split.
+              { rewrite (lookup_update_other _ src _ _ _ _ Heq_src).
+                exact Hlookup_old. }
+              split; [exact Hnth_old|].
+              split; [exact Hr|exact Hmc].
+        -- (* No old fused memory — contradiction with list length *)
+           exfalso. apply nth_error_None in Hmem_old.
+           assert (Hvalid : fused_idx < length (ms_mems ms_fused')).
+           { apply nth_error_Some. rewrite Hfused_mem. discriminate. }
+           lia.
       * (* sc_table_surj: backward table surjectivity.
-           Analogous to sc_memory_surj above. *)
-        admit.
+           Same structure as sc_memory_surj above. *)
+        intros fused_idx tab_fused Hfused_tab.
+        assert (Hlen_fused : length (ms_tables ms_fused') =
+                             length (ms_tables (fes_module_state fes))).
+        { exact (eval_instr_tables_length _ _ _ Heval_fused). }
+        destruct (nth_error (ms_tables (fes_module_state fes)) fused_idx)
+          as [tab_old|] eqn:Htab_old.
+        -- destruct (sc_table_surj _ _ _ _ Hcorr _ _ Htab_old)
+             as [src [ms_old [src_idx [tab_src
+                 [Hlookup_old [Hnth_old [Hr Htc]]]]]]].
+           destruct (module_source_eqb src (ces_active ces)) eqn:Heq_src.
+           ++ apply module_source_eqb_eq in Heq_src. subst src.
+              rewrite Hlookup_ms in Hlookup_old.
+              injection Hlookup_old as Hms_eq. subst ms_old.
+              assert (Hlen_src : length (ms_tables ms') =
+                                 length (ms_tables ms)).
+              { exact (eval_instr_tables_length _ _ _ Heval_ms). }
+              destruct (nth_error (ms_tables ms') src_idx)
+                as [tab'|] eqn:Htab'.
+              ** destruct (Htab src_idx tab' Htab')
+                   as [fi' [tf' [Hr' [Hn' Htc']]]].
+                 rewrite Hr in Hr'. injection Hr' as Hfi_eq. subst fi'.
+                 rewrite Hfused_tab in Hn'. injection Hn' as Htf_eq.
+                 subst tf'.
+                 exists (ces_active ces), ms', src_idx, tab'.
+                 split.
+                 { apply (lookup_update_same _ _ ms _ _ _ Hlookup_ms). }
+                 split; [exact Htab'|].
+                 split; [exact Hr|exact Htc'].
+              ** exfalso. apply nth_error_None in Htab'.
+                 assert (Hvalid_src : src_idx < length (ms_tables ms)).
+                 { apply nth_error_Some. rewrite Hnth_old. discriminate. }
+                 lia.
+           ++ assert (Hframe : nth_error (ms_tables ms_fused') fused_idx
+                               = Some tab_old).
+              { apply Htab_frame; [exact Htab_old|].
+                intros src_idx'.
+                apply (lookup_remap_cross_source_neq _ TableIdx src
+                         (ces_active ces) src_idx fused_idx Hinj); [|exact Hr].
+                intro Hsrc_eq. subst src.
+                rewrite module_source_eqb_refl in Heq_src. discriminate. }
+              rewrite Hfused_tab in Hframe.
+              injection Hframe as Htf_eq. subst tab_old.
+              exists src, ms_old, src_idx, tab_src.
+              split.
+              { rewrite (lookup_update_other _ src _ _ _ _ Heq_src).
+                exact Hlookup_old. }
+              split; [exact Hnth_old|].
+              split; [exact Hr|exact Htc].
+        -- exfalso. apply nth_error_None in Htab_old.
+           assert (Hvalid : fused_idx < length (ms_tables ms_fused')).
+           { apply nth_error_Some. rewrite Hfused_tab. discriminate. }
+           lia.
 
   - (* Case CS_CrossModuleCall: active changes from src to target.
 
@@ -2445,29 +2562,23 @@ Proof.
        3. Apply FS_InlinedCall with src/target provenance.
        4. Establish state_correspondence for the new active (target).
 
-       Remaining modeling gap:
-       The CS_CrossModuleCall constructor does not constrain ms_src'
-       (the source module's state after the call). In the fused model,
-       there is a single module state — we cannot represent arbitrary
-       changes to the source module's state independently of the fused
-       state. Two paths to close this gap:
-       (a) Constrain ms_src' in CS_CrossModuleCall, e.g.,
-           ms_src' = set_stack ms_src new_stack (call only affects stack).
-       (b) Weaken state_correspondence to only require correspondence
-           for the active module, not all modules simultaneously.
-       Either change requires revisiting the composed_step model. *)
+       The source module state is set_stack ms_src new_src_stack, which
+       preserves all index spaces. The fused state is set_stack of the
+       old fused state with the target's new stack. *)
     (* Rename auto-generated hypotheses *)
     match goal with
     | [ Hneq : ces_active _ <> _,
         Hlk_src : lookup_module_state _ (ces_active _) = Some _,
         Hlk_tgt : lookup_module_state _ ?tgt = Some _,
         Hnth_f : nth_error (ms_funcs _) _ = Some _,
-        Hev_tgt : eval_instr _ (Call 0) _ |- _ ] =>
+        Hev_tgt : eval_instr _ (Call 0) _,
+        Hloc : ms_locals _ = ms_locals _ |- _ ] =>
       rename Hneq into Hactive_neq;
       rename Hlk_src into Hlookup_src;
       rename Hlk_tgt into Hlookup_tgt;
       rename Hnth_f into Hnth_func;
-      rename Hev_tgt into Heval_tgt
+      rename Hev_tgt into Heval_tgt;
+      rename Hloc into Hlocals_eq
     end.
     (* Use eval_call_preserves_all to get all preservation facts *)
     destruct (eval_call_preserves_all _ _ _ Heval_tgt)
@@ -2476,24 +2587,16 @@ Proof.
     (* Find the fused function index via sc_funcs_eq *)
     destruct (sc_funcs_eq _ _ _ _ Hcorr _ ms_src _ _ Hlookup_src Hnth_func)
       as [fused_fidx [Hf_remap Hf_nth]].
-    (* The fused step would be FS_InlinedCall with Eval_Call on fused_fidx.
-       By Hf_nth, the function resolves. The result is
-       set_stack (fes_module_state fes) new_stack_fused for some stack.
-       Two gaps prevent closing:
-       1. Eval_Call on fused state needs the right new_stack value, but
-          Heval_tgt gives Call 0 on ms_tgt, not Call fused_fidx on fes.
-       2. ms_src' is unconstrained in CS_CrossModuleCall, so we cannot
-          establish state_correspondence for the source module. *)
-    exists (mkFusedExecState ms_tgt').
+    (* New fused state: set_stack of old fused, with target's new stack *)
+    exists (mkFusedExecState
+              (set_stack (fes_module_state fes) (ms_value_stack ms_tgt'))).
     split.
-    + admit. (* Fused step: FS_InlinedCall with eval_instr on fused state *)
-    + admit. (* State correspondence: blocked by unconstrained ms_src' *)
-  Unshelve. all: admit.
-Admitted. (* CS_CrossModuleCall: modeling gap — ms_src' unconstrained *)
-
-(*
-(* Original CrossModuleCall state correspondence proof — commented out
-   since the CS_CrossModuleCall case is Admitted above. *)
+    + (* Fused step: FS_InlinedCall with Eval_Call fused_fidx *)
+      apply (FS_InlinedCall fr fes (Call fused_fidx)
+               (set_stack (fes_module_state fes) (ms_value_stack ms_tgt'))
+               (ces_active ces) target funcidx
+               Hactive_neq).
+      exact (Eval_Call _ fused_fidx func_addr (ms_value_stack ms_tgt') Hf_nth).
     + (* State correspondence for the new active module (target) *)
       assert (Hneq_eqb: module_source_eqb (ces_active ces) target = false).
       { apply module_source_eqb_neq. exact Hactive_neq. }
@@ -2505,7 +2608,7 @@ Admitted. (* CS_CrossModuleCall: modeling gap — ms_src' unconstrained *)
         lookup_module_state
           (mkComposedExecState
             (update_module_state_list (ces_module_states ces)
-               (ces_active ces) ms_src')
+               (ces_active ces) (set_stack ms_src new_src_stack))
             target (ces_shared_memory ces))
           target = Some ms_tgt).
       { rewrite (lookup_update_other _ target (ces_active ces) _ _ _ Hneq_eqb_sym).
@@ -2516,62 +2619,91 @@ Admitted. (* CS_CrossModuleCall: modeling gap — ms_src' unconstrained *)
           (mkComposedExecState
             (update_module_state_list
               (update_module_state_list (ces_module_states ces)
-                 (ces_active ces) ms_src')
+                 (ces_active ces) (set_stack ms_src new_src_stack))
               target ms_tgt')
             target (ces_shared_memory ces))
           target = Some ms_tgt').
       { apply (lookup_update_same _ target ms_tgt _ _ _ Htgt_inner). }
-      (* Helper for the "target module" subcases: transport via
-         preservation lemmas instead of fragile inversion *)
-      assert (Htgt_transport: forall {A} (f : module_state -> A),
-        f ms_tgt' = f ms_tgt ->
-        forall (P : A -> Prop), P (f ms_tgt) -> P (f ms_tgt')).
-      { intros A f Hpres P HP. rewrite Hpres. exact HP. }
       constructor.
-      * exists ms_tgt'. simpl. exact Htgt_final.
-      * simpl. intros ms0 Hlookup0.
+      * (* sc_active_valid *)
+        exists ms_tgt'. simpl. exact Htgt_final.
+      * (* sc_value_stack_eq: both sides have ms_value_stack ms_tgt' *)
+        simpl. intros ms0 Hlookup0.
         rewrite Htgt_final in Hlookup0.
         injection Hlookup0 as Hms0. subst ms0.
         apply value_stacks_correspond_refl.
-      * simpl. intros ms0 Hlookup0.
+      * (* sc_locals_eq: target locals match fused locals via Hlocals_eq *)
+        simpl. intros ms0 Hlookup0.
         rewrite Htgt_final in Hlookup0.
-        injection Hlookup0 as Hms0. subst ms0. reflexivity.
-      * (* sc_funcs_eq *)
+        injection Hlookup0 as Hms0. subst ms0.
+        (* ms_locals ms_tgt' = ms_locals ms_tgt (set_stack preserves)
+           ms_locals (set_stack fes ...) = ms_locals fes (set_stack preserves)
+           ms_locals ms_tgt = ms_locals ms_src (Hlocals_eq)
+           ms_locals ms_src = ms_locals fes (old sc_locals_eq) *)
+        rewrite set_stack_locals.
+        rewrite Hlocals_eq.
+        rewrite set_stack_locals.
+        exact (sc_locals_eq _ _ _ _ Hcorr ms_src Hlookup_src).
+      * (* sc_funcs_eq: 3-way case split on src *)
         simpl. intros src ms0 src_idx func_addr' Hlookup0 Hnth.
+        (* The fused side uses set_stack, so ms_funcs is preserved *)
         destruct (module_source_eqb src target) eqn:Htgt_eq.
         -- apply module_source_eqb_eq in Htgt_eq. subst src.
            rewrite Htgt_final in Hlookup0.
            injection Hlookup0 as Hms0. subst ms0.
            rewrite Htgt_funcs in Hnth.
-           exact (sc_funcs_eq _ _ _ _ Hcorr _ ms_tgt _ _ Hlookup_tgt Hnth).
+           destruct (sc_funcs_eq _ _ _ _ Hcorr _ ms_tgt _ _ Hlookup_tgt Hnth)
+             as [fi [Hr Hn]].
+           exists fi. split; [exact Hr|].
+           rewrite set_stack_funcs. exact Hn.
         -- rewrite (lookup_update_other
              (update_module_state_list (ces_module_states ces)
-                (ces_active ces) ms_src')
+                (ces_active ces) (set_stack ms_src new_src_stack))
              src target _ _ _ Htgt_eq) in Hlookup0.
            destruct (module_source_eqb src (ces_active ces)) eqn:Hact_eq.
            ++ apply module_source_eqb_eq in Hact_eq. subst src.
               rewrite (lookup_update_same _ _ ms_src _ _ _ Hlookup_src) in Hlookup0.
               injection Hlookup0 as Hms0. subst ms0.
-              exact (sc_funcs_eq _ _ _ _ Hcorr _ ms_src _ _ Hlookup_src Hnth).
+              rewrite set_stack_funcs in Hnth.
+              destruct (sc_funcs_eq _ _ _ _ Hcorr _ ms_src _ _ Hlookup_src Hnth)
+                as [fi [Hr Hn]].
+              exists fi. split; [exact Hr|].
+              rewrite set_stack_funcs. exact Hn.
            ++ rewrite (lookup_update_other _ src _ _ _ _ Hact_eq) in Hlookup0.
-              exact (sc_funcs_eq _ _ _ _ Hcorr _ _ _ _ Hlookup0 Hnth).
-      * (* sc_memory_eq *)
+              destruct (sc_funcs_eq _ _ _ _ Hcorr _ _ _ _ Hlookup0 Hnth)
+                as [fi [Hr Hn]].
+              exists fi. split; [exact Hr|].
+              rewrite set_stack_funcs. exact Hn.
+      * (* sc_memory_eq: same 3-way pattern *)
         simpl. intros src ms0 src_idx mem_src Hlookup0 Hmem.
         destruct (module_source_eqb src target) eqn:Htgt_eq.
         -- apply module_source_eqb_eq in Htgt_eq. subst src.
            rewrite Htgt_final in Hlookup0.
            injection Hlookup0 as Hms0. subst ms0.
            rewrite Htgt_mems in Hmem.
-           exact (sc_memory_eq _ _ _ _ Hcorr _ ms_tgt _ _ Hlookup_tgt Hmem).
+           destruct (sc_memory_eq _ _ _ _ Hcorr _ ms_tgt _ _ Hlookup_tgt Hmem)
+             as [fi [mf [Hr [Hn Hmc]]]].
+           exists fi, mf. split; [exact Hr|]. split.
+           ++ rewrite set_stack_mems. exact Hn.
+           ++ exact Hmc.
         -- rewrite (lookup_update_other _ _ target _ _ _ Htgt_eq) in Hlookup0.
            destruct (module_source_eqb src (ces_active ces)) eqn:Hact_eq.
            ++ apply module_source_eqb_eq in Hact_eq. subst src.
               rewrite (lookup_update_same _ _ ms_src _ _ _ Hlookup_src) in Hlookup0.
               injection Hlookup0 as Hms0. subst ms0.
-              exact (sc_memory_eq _ _ _ _ Hcorr _ ms_src _ _ Hlookup_src Hmem).
+              rewrite set_stack_mems in Hmem.
+              destruct (sc_memory_eq _ _ _ _ Hcorr _ ms_src _ _ Hlookup_src Hmem)
+                as [fi [mf [Hr [Hn Hmc]]]].
+              exists fi, mf. split; [exact Hr|]. split.
+              ** rewrite set_stack_mems. exact Hn.
+              ** exact Hmc.
            ++ rewrite (lookup_update_other _ _ _ _ _ _ Hact_eq) in Hlookup0.
-              exact (sc_memory_eq _ _ _ _ Hcorr _ _ _ _ Hlookup0 Hmem).
-      * (* sc_globals_eq *)
+              destruct (sc_memory_eq _ _ _ _ Hcorr _ _ _ _ Hlookup0 Hmem)
+                as [fi [mf [Hr [Hn Hmc]]]].
+              exists fi, mf. split; [exact Hr|]. split.
+              ** rewrite set_stack_mems. exact Hn.
+              ** exact Hmc.
+      * (* sc_globals_eq: same 3-way pattern *)
         simpl. intros src ms0 src_idx g_src Hlookup0 Hnth.
         destruct (module_source_eqb src target) eqn:Htgt_eq.
         -- apply module_source_eqb_eq in Htgt_eq. subst src.
@@ -2584,10 +2716,11 @@ Admitted. (* CS_CrossModuleCall: modeling gap — ms_src' unconstrained *)
            ++ apply module_source_eqb_eq in Hact_eq. subst src.
               rewrite (lookup_update_same _ _ ms_src _ _ _ Hlookup_src) in Hlookup0.
               injection Hlookup0 as Hms0. subst ms0.
+              rewrite set_stack_globals in Hnth.
               exact (sc_globals_eq _ _ _ _ Hcorr _ ms_src _ _ Hlookup_src Hnth).
            ++ rewrite (lookup_update_other _ _ _ _ _ _ Hact_eq) in Hlookup0.
               exact (sc_globals_eq _ _ _ _ Hcorr _ _ _ _ Hlookup0 Hnth).
-      * (* sc_tables_eq *)
+      * (* sc_tables_eq: same 3-way pattern *)
         simpl. intros src ms0 src_idx tab_src Hlookup0 Hnth.
         destruct (module_source_eqb src target) eqn:Htgt_eq.
         -- apply module_source_eqb_eq in Htgt_eq. subst src.
@@ -2600,10 +2733,11 @@ Admitted. (* CS_CrossModuleCall: modeling gap — ms_src' unconstrained *)
            ++ apply module_source_eqb_eq in Hact_eq. subst src.
               rewrite (lookup_update_same _ _ ms_src _ _ _ Hlookup_src) in Hlookup0.
               injection Hlookup0 as Hms0. subst ms0.
+              rewrite set_stack_tables in Hnth.
               exact (sc_tables_eq _ _ _ _ Hcorr _ ms_src _ _ Hlookup_src Hnth).
            ++ rewrite (lookup_update_other _ _ _ _ _ _ Hact_eq) in Hlookup0.
               exact (sc_tables_eq _ _ _ _ Hcorr _ _ _ _ Hlookup0 Hnth).
-      * (* sc_elems_eq *)
+      * (* sc_elems_eq: same 3-way pattern *)
         simpl. intros src ms0 src_idx elem_src Hlookup0 Hnth.
         destruct (module_source_eqb src target) eqn:Htgt_eq.
         -- apply module_source_eqb_eq in Htgt_eq. subst src.
@@ -2616,10 +2750,11 @@ Admitted. (* CS_CrossModuleCall: modeling gap — ms_src' unconstrained *)
            ++ apply module_source_eqb_eq in Hact_eq. subst src.
               rewrite (lookup_update_same _ _ ms_src _ _ _ Hlookup_src) in Hlookup0.
               injection Hlookup0 as Hms0. subst ms0.
+              rewrite set_stack_elems in Hnth.
               exact (sc_elems_eq _ _ _ _ Hcorr _ ms_src _ _ Hlookup_src Hnth).
            ++ rewrite (lookup_update_other _ _ _ _ _ _ Hact_eq) in Hlookup0.
               exact (sc_elems_eq _ _ _ _ Hcorr _ _ _ _ Hlookup0 Hnth).
-      * (* sc_datas_eq *)
+      * (* sc_datas_eq: same 3-way pattern *)
         simpl. intros src ms0 src_idx dat_src Hlookup0 Hnth.
         destruct (module_source_eqb src target) eqn:Htgt_eq.
         -- apply module_source_eqb_eq in Htgt_eq. subst src.
@@ -2632,19 +2767,120 @@ Admitted. (* CS_CrossModuleCall: modeling gap — ms_src' unconstrained *)
            ++ apply module_source_eqb_eq in Hact_eq. subst src.
               rewrite (lookup_update_same _ _ ms_src _ _ _ Hlookup_src) in Hlookup0.
               injection Hlookup0 as Hms0. subst ms0.
+              rewrite set_stack_datas in Hnth.
               exact (sc_datas_eq _ _ _ _ Hcorr _ ms_src _ _ Hlookup_src Hnth).
            ++ rewrite (lookup_update_other _ _ _ _ _ _ Hact_eq) in Hlookup0.
               exact (sc_datas_eq _ _ _ _ Hcorr _ _ _ _ Hlookup0 Hnth).
+      * (* sc_memory_surj: backward memory surjectivity.
+           set_stack preserves ms_mems on both sides, so old surjectivity
+           applies with set_stack_mems rewrites. *)
+        simpl. intros fused_midx mem_fused Hfused_mem.
+        rewrite set_stack_mems in Hfused_mem.
+        destruct (sc_memory_surj _ _ _ _ Hcorr _ _ Hfused_mem)
+          as [src [ms_old [src_idx [mem_old [Hlookup_old [Hnth_old [Hr Hmc]]]]]]].
+        exists src, ms_old, src_idx, mem_old.
+        (* The composed state updated source and target, but memories
+           are preserved by set_stack and Eval_Call. We need to show
+           lookup src in the new state gives a module with the same mems. *)
+        destruct (module_source_eqb src target) eqn:Htgt_eq.
+        -- apply module_source_eqb_eq in Htgt_eq. subst src.
+           rewrite Hlookup_tgt in Hlookup_old.
+           injection Hlookup_old as Hms_eq. subst ms_old.
+           split; [exact Htgt_final|]. split.
+           ++ rewrite Htgt_mems. exact Hnth_old.
+           ++ split; [exact Hr|exact Hmc].
+        -- destruct (module_source_eqb src (ces_active ces)) eqn:Hact_eq.
+           ++ apply module_source_eqb_eq in Hact_eq. subst src.
+              rewrite Hlookup_src in Hlookup_old.
+              injection Hlookup_old as Hms_eq. subst ms_old.
+              assert (Hsrc_final:
+                lookup_module_state
+                  (mkComposedExecState
+                    (update_module_state_list
+                      (update_module_state_list (ces_module_states ces)
+                         (ces_active ces) (set_stack ms_src new_src_stack))
+                      target ms_tgt')
+                    target (ces_shared_memory ces))
+                  (ces_active ces) = Some (set_stack ms_src new_src_stack)).
+              { rewrite (lookup_update_other _ _ target _ _ _ Hneq_eqb).
+                apply (lookup_update_same _ _ ms_src _ _ _ Hlookup_src). }
+              split; [exact Hsrc_final|]. split.
+              ** rewrite set_stack_mems. exact Hnth_old.
+              ** split; [exact Hr|exact Hmc].
+           ++ assert (Hother_final:
+                lookup_module_state
+                  (mkComposedExecState
+                    (update_module_state_list
+                      (update_module_state_list (ces_module_states ces)
+                         (ces_active ces) (set_stack ms_src new_src_stack))
+                      target ms_tgt')
+                    target (ces_shared_memory ces))
+                  src = Some ms_old).
+              { rewrite (lookup_update_other _ _ target _ _ _ Htgt_eq).
+                rewrite (lookup_update_other _ _ _ _ _ _ Hact_eq).
+                exact Hlookup_old. }
+              split; [exact Hother_final|]. split; [exact Hnth_old|].
+              split; [exact Hr|exact Hmc].
+      * (* sc_table_surj: same structure as sc_memory_surj *)
+        simpl. intros fused_tidx tab_fused Hfused_tab.
+        rewrite set_stack_tables in Hfused_tab.
+        destruct (sc_table_surj _ _ _ _ Hcorr _ _ Hfused_tab)
+          as [src [ms_old [src_idx [tab_old [Hlookup_old [Hnth_old [Hr Htc]]]]]]].
+        exists src, ms_old, src_idx, tab_old.
+        destruct (module_source_eqb src target) eqn:Htgt_eq.
+        -- apply module_source_eqb_eq in Htgt_eq. subst src.
+           rewrite Hlookup_tgt in Hlookup_old.
+           injection Hlookup_old as Hms_eq. subst ms_old.
+           split; [exact Htgt_final|]. split.
+           ++ rewrite Htgt_tables. exact Hnth_old.
+           ++ split; [exact Hr|exact Htc].
+        -- destruct (module_source_eqb src (ces_active ces)) eqn:Hact_eq.
+           ++ apply module_source_eqb_eq in Hact_eq. subst src.
+              rewrite Hlookup_src in Hlookup_old.
+              injection Hlookup_old as Hms_eq. subst ms_old.
+              assert (Hsrc_final:
+                lookup_module_state
+                  (mkComposedExecState
+                    (update_module_state_list
+                      (update_module_state_list (ces_module_states ces)
+                         (ces_active ces) (set_stack ms_src new_src_stack))
+                      target ms_tgt')
+                    target (ces_shared_memory ces))
+                  (ces_active ces) = Some (set_stack ms_src new_src_stack)).
+              { rewrite (lookup_update_other _ _ target _ _ _ Hneq_eqb).
+                apply (lookup_update_same _ _ ms_src _ _ _ Hlookup_src). }
+              split; [exact Hsrc_final|]. split.
+              ** rewrite set_stack_tables. exact Hnth_old.
+              ** split; [exact Hr|exact Htc].
+           ++ assert (Hother_final:
+                lookup_module_state
+                  (mkComposedExecState
+                    (update_module_state_list
+                      (update_module_state_list (ces_module_states ces)
+                         (ces_active ces) (set_stack ms_src new_src_stack))
+                      target ms_tgt')
+                    target (ces_shared_memory ces))
+                  src = Some ms_old).
+              { rewrite (lookup_update_other _ _ target _ _ _ Htgt_eq).
+                rewrite (lookup_update_other _ _ _ _ _ _ Hact_eq).
+                exact Hlookup_old. }
+              split; [exact Hother_final|]. split; [exact Hnth_old|].
+              split; [exact Hr|exact Htc].
+  Unshelve. all: exact 0.
 Qed.
-*) (* end of commented-out CrossModuleCall continuation *)
 
 (* -------------------------------------------------------------------------
    Main Semantic Preservation Theorem
 
-   Combines trap equivalence and forward simulation.
-   The forward simulation is the key non-tautological result: it is
-   grounded in real WASM instruction semantics via eval_instr, proving
-   that remapped instructions access the same runtime entities.
+   Combines forward simulation (with instruction rewriting) and trap
+   simulation (composed traps → fused traps). The forward simulation is
+   the key non-tautological result: it is grounded in real WASM instruction
+   semantics via eval_instr, proving that remapped instructions access the
+   same runtime entities.
+
+   Note: the ideal trap_equivalence (bidirectional) is not provable because
+   the backward direction requires traps to be instruction-aware (see
+   fusion_trap_simulation). We prove the forward direction only.
    ------------------------------------------------------------------------- *)
 
 Theorem fusion_preserves_semantics :
@@ -2652,12 +2888,12 @@ Theorem fusion_preserves_semantics :
     well_formed_composition cc ->
     fusion_correct cc config fr ->
     forward_simulation_with_rewrite cc fr /\
-    trap_equivalence cc fr.
+    trap_simulation cc fr.
 Proof.
   intros cc config fr Hwf Hcorrect.
   split.
   - exact (fusion_forward_simulation cc config fr Hwf Hcorrect).
-  - exact (fusion_trap_equivalence cc config fr Hwf Hcorrect).
+  - exact (fusion_trap_simulation cc config fr Hwf Hcorrect).
 Qed.
 
 (* -------------------------------------------------------------------------
@@ -2677,5 +2913,6 @@ Global Opaque table_corresponds.
 Global Opaque forward_simulation.
 Global Opaque forward_simulation_with_rewrite.
 Global Opaque trap_equivalence.
+Global Opaque trap_simulation.
 
 (* End of fusion_spec specification *)

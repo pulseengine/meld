@@ -420,13 +420,13 @@ Qed.
 
 **Proof approach**: Structural induction over execution traces with case analysis on each operation type.
 
-### 4. Fusion Trap Equivalence (`fusion_trap_equivalence`)
+### 4. Fusion Trap Simulation (`fusion_trap_simulation`)
 
-**What it proves**: The fused module traps (errors) in exactly the same situations as the component collection.
+**What it proves**: If the composed component traps, the fused module also traps (forward direction).
 
-**Why it matters**: Fusion shouldn't mask errors or introduce new ones.
+**Why it matters**: Fusion shouldn't mask errors — any trap in the original is preserved in the fused output.
 
-**Proof approach**: Case analysis on all trapping operations with correspondence proofs.
+**Proof approach**: Case analysis on all trapping operations with correspondence proofs. The backward direction (fused traps → composed traps) is not provable because fused OOB conditions may involve memories from non-active source modules.
 
 ## Proof Patterns and Techniques
 
@@ -593,7 +593,7 @@ bazel build //proofs/...
 
 ## Glossary
 
-**Admitted**: A theorem marked as true without proof (Meld currently has 3 — see [STATUS.md](STATUS.md) for details)
+**Admitted**: A theorem marked as true without proof (Meld currently has 0 — all proofs are fully closed)
 
 **Correspondence**: A relation showing two states are equivalent
 

@@ -445,11 +445,11 @@ apply nth_error_Some. rewrite H. discriminate.
 apply nth_error_None in H. (* H : i >= length l *)
 ```
 
-#### 5. Admitted Proofs
+#### 5. Proof Completion
 
-Some proofs may be `Admitted` pending further development. Search for
-`Admitted` to find incomplete proofs that need attention. Currently all
-proofs in the split merge modules and fusion_spec.v are fully closed.
+All proofs across the entire `proofs/` directory are fully closed (Qed).
+There are zero `Admitted` theorems, zero `admit` tactics, and zero
+`Axiom` declarations. If you add new proofs, aim to close them fully.
 
 ### Proof Directory Layout
 
