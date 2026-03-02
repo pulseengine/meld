@@ -43,6 +43,7 @@
 
 pub mod adapter;
 pub mod attestation;
+pub mod component_wrap;
 mod error;
 pub mod merger;
 pub mod parser;
@@ -77,6 +78,9 @@ pub struct FuserConfig {
 
     /// Custom section handling
     pub custom_sections: CustomSectionHandling,
+
+    /// Output format: core module (default) or P2 component
+    pub output_format: OutputFormat,
 }
 
 impl Default for FuserConfig {
@@ -87,6 +91,7 @@ impl Default for FuserConfig {
             address_rebasing: false,
             preserve_names: false,
             custom_sections: CustomSectionHandling::Merge,
+            output_format: OutputFormat::CoreModule,
         }
     }
 }
@@ -104,6 +109,16 @@ pub enum MemoryStrategy {
     /// `cabi_realloc` and `memory.copy`. Requires WebAssembly
     /// multi-memory (Core Spec 3.0).
     MultiMemory,
+}
+
+/// Output format for the fused binary
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OutputFormat {
+    /// Output as a core wasm module (default, current behavior)
+    #[default]
+    CoreModule,
+    /// Wrap the fused core module as a P2 component with the original WIT interface
+    Component,
 }
 
 /// How to handle custom sections during fusion
@@ -181,7 +196,8 @@ impl Fuser {
             parsed.name = Some(n.to_string());
         }
 
-        self.components.push(parsed);
+        let flattened = flatten_nested_components(parsed)?;
+        self.components.extend(flattened);
         Ok(())
     }
 
@@ -272,6 +288,14 @@ impl Fuser {
             self.encode_output(&merged, &adapters, &extra_sections)?
         } else {
             output_without_attestation
+        };
+
+        // Optionally wrap the fused core module as a P2 component
+        let output = if self.config.output_format == OutputFormat::Component {
+            log::info!("Wrapping fused module as P2 component");
+            component_wrap::wrap_as_component(&output, &self.components, &graph)?
+        } else {
+            output
         };
 
         stats.output_size = output.len();
@@ -749,6 +773,284 @@ impl Fuser {
             CustomSectionHandling::Drop => "drop",
         }
     }
+}
+
+/// Recursively flatten nested sub-components into a flat `Vec<ParsedComponent>`.
+///
+/// When a composed component contains `ComponentSection` payloads, the parser
+/// collects them as `sub_components`. This function:
+///
+/// 1. Recursively flattens each sub-component (handling arbitrary nesting).
+/// 2. Translates the outer component's `component_instances` and
+///    `component_aliases` wiring into `imports`/`exports` on the
+///    sub-components so the existing cross-component resolver can
+///    handle inter-sub-component connections.
+///
+/// When no sub-components exist, returns the input component as-is
+/// (backward compatible).
+fn flatten_nested_components(mut outer: ParsedComponent) -> Result<Vec<ParsedComponent>> {
+    if outer.sub_components.is_empty() {
+        return Ok(vec![outer]);
+    }
+
+    // Take sub_components out of outer so we can move them and still borrow outer later.
+    let sub_components = std::mem::take(&mut outer.sub_components);
+
+    // Recursively flatten each sub-component
+    let mut flattened_subs: Vec<Vec<ParsedComponent>> = Vec::new();
+    for sub in sub_components {
+        flattened_subs.push(flatten_nested_components(sub)?);
+    }
+
+    // The outer component itself may contain core modules, instances,
+    // canonical functions, etc. If it does, it becomes the first entry
+    // in the flat list (index 0). Sub-component ranges are offset accordingly.
+    let outer_has_content = !outer.core_modules.is_empty();
+    let base_offset = if outer_has_content { 1usize } else { 0usize };
+
+    // Build a mapping from original sub-component index to the range
+    // of indices in the final flat list.
+    let mut sub_index_ranges: Vec<std::ops::Range<usize>> = Vec::new();
+    let mut offset = base_offset;
+    for subs in &flattened_subs {
+        let len = subs.len();
+        sub_index_ranges.push(offset..offset + len);
+        offset += len;
+    }
+
+    // Collect all components into one vec
+    let mut result: Vec<ParsedComponent> = Vec::new();
+
+    // Include the outer component itself if it has core modules
+    if outer_has_content {
+        result.push(outer.clone());
+    }
+
+    for subs in flattened_subs {
+        result.extend(subs);
+    }
+
+    // Propagate the outer component's wiring into the flat sub-components
+    propagate_outer_wiring(&outer, &sub_index_ranges, &mut result)?;
+
+    Ok(result)
+}
+
+/// Translate the outer component's `component_instances` and `component_aliases`
+/// into `imports` and `exports` on the flattened sub-components.
+///
+/// The outer component's `ComponentInstanceSection` describes how sub-components
+/// are wired together (which sub-component's exports satisfy which other
+/// sub-component's imports). We parse this wiring and add matching
+/// `ComponentImport`/`ComponentExport` entries so the existing cross-component
+/// resolver can handle the connections.
+///
+/// The outer component's top-level `imports` (e.g., WASI interfaces) are
+/// propagated to whichever sub-component consumes them.
+fn propagate_outer_wiring(
+    outer: &ParsedComponent,
+    sub_index_ranges: &[std::ops::Range<usize>],
+    result: &mut [ParsedComponent],
+) -> Result<()> {
+    use parser::ComponentLevelInstance;
+    use wasmparser::ComponentExternalKind;
+
+    // Build a map: component-level instance index → info about that instance.
+    // Component instances created by ComponentInstanceSection are numbered
+    // sequentially. Each maps to either an instantiation of a sub-component
+    // or a bag of exports.
+    struct InstanceInfo {
+        /// If this instance was created by instantiating a sub-component,
+        /// this is the sub-component index in the original (pre-flattened)
+        /// sub_components list.
+        sub_component_idx: Option<u32>,
+    }
+
+    let mut instance_infos: Vec<InstanceInfo> = Vec::new();
+    for ci in &outer.component_instances {
+        match ci {
+            ComponentLevelInstance::Instantiate {
+                component_index, ..
+            } => {
+                instance_infos.push(InstanceInfo {
+                    sub_component_idx: Some(*component_index),
+                });
+            }
+            ComponentLevelInstance::FromExports(_) => {
+                instance_infos.push(InstanceInfo {
+                    sub_component_idx: None,
+                });
+            }
+        }
+    }
+
+    // Build alias resolution: some component_aliases reference instance exports.
+    // Track: alias index → (instance_index, export_name, kind)
+    // This helps resolve when an instantiation arg references an aliased item.
+    struct AliasResolution {
+        instance_index: u32,
+        kind: ComponentExternalKind,
+    }
+    let mut alias_resolutions: Vec<Option<AliasResolution>> = Vec::new();
+    for alias in &outer.component_aliases {
+        match alias {
+            parser::ComponentAliasEntry::InstanceExport {
+                kind,
+                instance_index,
+                name: _,
+            } => {
+                alias_resolutions.push(Some(AliasResolution {
+                    instance_index: *instance_index,
+                    kind: *kind,
+                }));
+            }
+            _ => {
+                alias_resolutions.push(None);
+            }
+        }
+    }
+
+    // Now process ComponentInstanceSection entries to wire sub-components together.
+    // When sub-component A is instantiated with an arg that comes from
+    // sub-component B's export, we add a matching import to A and export to B
+    // so the cross-component resolver will wire them.
+    for ci in &outer.component_instances {
+        if let ComponentLevelInstance::Instantiate {
+            component_index,
+            args,
+        } = ci
+        {
+            let target_sub_idx = *component_index as usize;
+            if target_sub_idx >= sub_index_ranges.len() {
+                continue;
+            }
+
+            // The "first" flattened component for this sub-component is the
+            // natural target for adding imports.
+            let target_flat_idx = sub_index_ranges[target_sub_idx].start;
+
+            for (arg_name, arg_kind, arg_index) in args {
+                // The arg references something in the outer component's index
+                // space. For ComponentExternalKind::Instance, arg_index is a
+                // component instance index. Check if it maps to another
+                // sub-component.
+                if *arg_kind == ComponentExternalKind::Instance {
+                    let source_inst_idx = *arg_index as usize;
+                    if source_inst_idx < instance_infos.len()
+                        && let Some(source_sub_idx) =
+                            instance_infos[source_inst_idx].sub_component_idx
+                    {
+                        let source_sub = source_sub_idx as usize;
+                        if source_sub < sub_index_ranges.len() {
+                            let source_flat_idx = sub_index_ranges[source_sub].start;
+
+                            // Add a component-level import to the target so the
+                            // resolver sees it needs something named arg_name.
+                            // Add a matching export to the source.
+                            let import_name = arg_name.clone();
+                            if !result[target_flat_idx]
+                                .imports
+                                .iter()
+                                .any(|i| i.name == import_name)
+                            {
+                                result[target_flat_idx]
+                                    .imports
+                                    .push(parser::ComponentImport {
+                                        name: import_name.clone(),
+                                        ty: wasmparser::ComponentTypeRef::Instance(0),
+                                    });
+                            }
+                            if !result[source_flat_idx]
+                                .exports
+                                .iter()
+                                .any(|e| e.name == import_name)
+                            {
+                                result[source_flat_idx]
+                                    .exports
+                                    .push(parser::ComponentExport {
+                                        name: import_name,
+                                        kind: ComponentExternalKind::Instance,
+                                        index: 0,
+                                    });
+                            }
+                        }
+                    }
+                }
+
+                // For ComponentExternalKind::Component or other kinds, the arg
+                // might reference an alias. Try resolving via alias_resolutions.
+                if *arg_kind == ComponentExternalKind::Component
+                    || *arg_kind == ComponentExternalKind::Func
+                    || *arg_kind == ComponentExternalKind::Type
+                    || *arg_kind == ComponentExternalKind::Value
+                {
+                    // Try alias resolution
+                    let alias_idx = *arg_index as usize;
+                    if alias_idx < alias_resolutions.len()
+                        && let Some(alias_res) = &alias_resolutions[alias_idx]
+                    {
+                        let source_inst_idx = alias_res.instance_index as usize;
+                        if source_inst_idx < instance_infos.len()
+                            && let Some(source_sub_idx) =
+                                instance_infos[source_inst_idx].sub_component_idx
+                        {
+                            let source_sub = source_sub_idx as usize;
+                            if source_sub < sub_index_ranges.len() {
+                                let source_flat_idx = sub_index_ranges[source_sub].start;
+                                let import_name = arg_name.clone();
+                                if !result[target_flat_idx]
+                                    .imports
+                                    .iter()
+                                    .any(|i| i.name == import_name)
+                                {
+                                    result[target_flat_idx]
+                                        .imports
+                                        .push(parser::ComponentImport {
+                                            name: import_name.clone(),
+                                            ty: wasmparser::ComponentTypeRef::Instance(0),
+                                        });
+                                }
+                                if !result[source_flat_idx]
+                                    .exports
+                                    .iter()
+                                    .any(|e| e.name == import_name)
+                                {
+                                    result[source_flat_idx]
+                                        .exports
+                                        .push(parser::ComponentExport {
+                                            name: import_name,
+                                            kind: alias_res.kind,
+                                            index: 0,
+                                        });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Propagate outer-level imports (e.g. WASI) to sub-components that need them.
+    // Sub-components that already have matching imports keep them; we also
+    // propagate to sub-components that have core modules importing names that
+    // look like WASI interfaces but lack a component-level import for them.
+    for outer_import in &outer.imports {
+        for comp in result.iter_mut() {
+            // Check if any core module in this sub-component imports something
+            // that matches this outer import name (common for WASI interfaces).
+            let needs_import = comp.core_modules.iter().any(|m| {
+                m.imports
+                    .iter()
+                    .any(|i| i.module == outer_import.name || i.module.contains(&outer_import.name))
+            });
+            if needs_import && !comp.imports.iter().any(|i| i.name == outer_import.name) {
+                comp.imports.push(outer_import.clone());
+            }
+        }
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]

@@ -5,7 +5,8 @@
 
 use crate::merger::decompose_component_core_func_index;
 use crate::parser::{
-    CanonStringEncoding, ComponentExport, ExportKind, ImportKind, ModuleExport, ParsedComponent,
+    CanonStringEncoding, ComponentAliasEntry, ComponentExport, CoreEntityDef, ExportKind,
+    ImportKind, ModuleExport, ParsedComponent,
 };
 use crate::{Error, MemoryStrategy, Result};
 use std::collections::{HashMap, HashSet};
@@ -67,12 +68,17 @@ pub struct UnresolvedImport {
     pub component_idx: usize,
     /// Module within component containing the import
     pub module_idx: usize,
-    /// Import module name
+    /// Import module name (from the core module's import section — used for lookup)
     pub module_name: String,
-    /// Import field name
+    /// Import field name (from the core module's import section — used for lookup)
     pub field_name: String,
     /// Import kind
     pub kind: ImportKind,
+    /// Display module name for the emitted import (overrides `module_name` in output).
+    /// Set when canonical lower tracing recovers the WASI interface name.
+    pub display_module: Option<String>,
+    /// Display field name for the emitted import (overrides `field_name` in output).
+    pub display_field: Option<String>,
 }
 
 /// A cross-component call that needs an adapter
@@ -136,6 +142,329 @@ pub struct ModuleResolution {
     pub import_name: String,
     /// Export name
     pub export_name: String,
+}
+
+/// Info about a core `Instantiate` instance entry, used during instance-graph resolution.
+struct InstanceInstantiateInfo {
+    module_idx: u32,
+    /// Maps import-module name → source instance index
+    arg_map: HashMap<String, u32>,
+}
+
+/// Source of a core entity: maps per-kind entity index to (module_idx, export_name).
+///
+/// Built by replaying `core_entity_order` from the parser. Canonical functions
+/// allocate core func indices but have no module source; core aliases allocate
+/// per-kind indices and *do* have a module source (via instance → module mapping).
+struct EntityProvenance {
+    func_source: HashMap<u32, (usize, String)>,
+    memory_source: HashMap<u32, (usize, String)>,
+    table_source: HashMap<u32, (usize, String)>,
+    global_source: HashMap<u32, (usize, String)>,
+}
+
+/// Build provenance map by replaying the core entity definition order.
+///
+/// Walks `core_entity_order` and maintains per-kind counters. For each
+/// `CoreAlias` entry, looks up which core instance the alias references,
+/// then maps that instance to a module via `InstanceKind::Instantiate`.
+///
+/// When the alias references a `FromExports` instance instead, we resolve
+/// the indirection: the `FromExports` bag contains `(name, kind, entity_idx)`
+/// entries where `entity_idx` is a previously-allocated core entity index.
+/// We look up that index in the provenance map we're building (since earlier
+/// entries in `core_entity_order` may have already populated it).
+fn build_entity_provenance(component: &ParsedComponent) -> EntityProvenance {
+    use crate::parser::InstanceKind;
+
+    let mut func_idx = 0u32;
+    let mut mem_idx = 0u32;
+    let mut table_idx = 0u32;
+    let mut global_idx = 0u32;
+
+    let mut prov = EntityProvenance {
+        func_source: HashMap::new(),
+        memory_source: HashMap::new(),
+        table_source: HashMap::new(),
+        global_source: HashMap::new(),
+    };
+
+    // Build instance → module mapping for Instantiate instances
+    let instance_to_module: HashMap<u32, u32> = component
+        .instances
+        .iter()
+        .filter_map(|inst| match &inst.kind {
+            InstanceKind::Instantiate { module_idx, .. } => Some((inst.index, *module_idx)),
+            _ => None,
+        })
+        .collect();
+
+    // Build FromExports instance map: instance_index → exports list
+    // The exports contain (name, ExternalKind, entity_idx) where entity_idx
+    // is a previously-allocated per-kind core entity index.
+    let from_exports_map: HashMap<u32, &Vec<(String, wasmparser::ExternalKind, u32)>> = component
+        .instances
+        .iter()
+        .filter_map(|inst| match &inst.kind {
+            InstanceKind::FromExports(exports) => Some((inst.index, exports)),
+            _ => None,
+        })
+        .collect();
+
+    for def in &component.core_entity_order {
+        match def {
+            CoreEntityDef::CanonicalFunction(_) => {
+                // Creates a core func, but NOT from a module
+                func_idx += 1;
+            }
+            CoreEntityDef::CoreAlias(alias_idx) => {
+                if let Some(ComponentAliasEntry::CoreInstanceExport {
+                    kind,
+                    instance_index,
+                    name,
+                }) = component.component_aliases.get(*alias_idx)
+                {
+                    // Try direct Instantiate → module mapping first
+                    let mut resolved_source: Option<(usize, String)> = instance_to_module
+                        .get(instance_index)
+                        .map(|m| (*m as usize, name.clone()));
+
+                    // If not an Instantiate instance, try resolving through FromExports.
+                    // A FromExports bag re-exports entities that were already allocated
+                    // earlier, so we can look up their entity_idx in the provenance
+                    // map we've been building.
+                    if resolved_source.is_none()
+                        && let Some(fe_exports) = from_exports_map.get(instance_index)
+                    {
+                        for (fe_name, fe_kind, fe_entity_idx) in *fe_exports {
+                            if fe_name == name && *fe_kind == *kind {
+                                // Look up this entity_idx in our partially-built provenance
+                                resolved_source = match kind {
+                                    wasmparser::ExternalKind::Func => {
+                                        prov.func_source.get(fe_entity_idx).cloned()
+                                    }
+                                    wasmparser::ExternalKind::Memory => {
+                                        prov.memory_source.get(fe_entity_idx).cloned()
+                                    }
+                                    wasmparser::ExternalKind::Table => {
+                                        prov.table_source.get(fe_entity_idx).cloned()
+                                    }
+                                    wasmparser::ExternalKind::Global => {
+                                        prov.global_source.get(fe_entity_idx).cloned()
+                                    }
+                                    _ => None,
+                                };
+                                break;
+                            }
+                        }
+                    }
+
+                    match kind {
+                        wasmparser::ExternalKind::Func => {
+                            if let Some(source) = resolved_source {
+                                prov.func_source.insert(func_idx, source);
+                            }
+                            func_idx += 1;
+                        }
+                        wasmparser::ExternalKind::Memory => {
+                            if let Some(source) = resolved_source {
+                                prov.memory_source.insert(mem_idx, source);
+                            }
+                            mem_idx += 1;
+                        }
+                        wasmparser::ExternalKind::Table => {
+                            if let Some(source) = resolved_source {
+                                prov.table_source.insert(table_idx, source);
+                            }
+                            table_idx += 1;
+                        }
+                        wasmparser::ExternalKind::Global => {
+                            if let Some(source) = resolved_source {
+                                prov.global_source.insert(global_idx, source);
+                            }
+                            global_idx += 1;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+
+    prov
+}
+
+/// Maps core function entity indices from canonical lowered functions to their
+/// WASI interface names.
+///
+/// Traces the chain: `canon lower { func_index }` → component function →
+/// `InstanceExport { kind: Func }` alias → component instance →
+/// component import. Returns `(wasi_module_name, wasi_field_name)`.
+///
+/// For example, if `canon lower` references component function 7, which was
+/// created by `alias export $wasi:io/streams@0.2.6 "[method]output-stream.check-write"`,
+/// and `$wasi:io/streams@0.2.6` is component instance 3 which came from
+/// component import `"wasi:io/streams@0.2.6"`, then the result is
+/// `("wasi:io/streams@0.2.6", "[method]output-stream.check-write")`.
+fn build_canon_import_names(component: &ParsedComponent) -> HashMap<u32, (String, String)> {
+    use crate::parser::{
+        CanonicalEntry, ComponentFuncDef, ComponentInstanceDef, ComponentTypeDef, CoreEntityDef,
+    };
+
+    // Step 1: Build component instance index → import name mapping.
+    // Component instances created by imports have a WASI interface name.
+    let mut comp_instance_to_import_name: HashMap<u32, String> = HashMap::new();
+    for (inst_idx, def) in component.component_instance_defs.iter().enumerate() {
+        if let ComponentInstanceDef::Import(import_idx) = def
+            && let Some(imp) = component.imports.get(*import_idx)
+        {
+            comp_instance_to_import_name.insert(inst_idx as u32, imp.name.clone());
+        }
+    }
+
+    // Step 2: Build component func index → (instance_index, export_name) for
+    // InstanceExportAlias entries.
+    let mut comp_func_to_instance_export: HashMap<u32, (u32, String)> = HashMap::new();
+    for (func_idx, def) in component.component_func_defs.iter().enumerate() {
+        if let ComponentFuncDef::InstanceExportAlias(alias_idx) = def
+            && let Some(crate::parser::ComponentAliasEntry::InstanceExport {
+                instance_index,
+                name,
+                ..
+            }) = component.component_aliases.get(*alias_idx)
+        {
+            comp_func_to_instance_export.insert(func_idx as u32, (*instance_index, name.clone()));
+        }
+    }
+
+    // Also handle component functions from imports directly (Func-typed imports).
+    let mut comp_func_import_names: HashMap<u32, String> = HashMap::new();
+    for (func_idx, def) in component.component_func_defs.iter().enumerate() {
+        if let ComponentFuncDef::Import(import_idx) = def
+            && let Some(imp) = component.imports.get(*import_idx)
+        {
+            comp_func_import_names.insert(func_idx as u32, imp.name.clone());
+        }
+    }
+
+    // Step 2b: Build component type index → (instance_index, export_name) for
+    // InstanceExportAlias entries. Used to trace ResourceDrop types.
+    let mut comp_type_to_instance_export: HashMap<u32, (u32, String)> = HashMap::new();
+    for (type_idx, def) in component.component_type_defs.iter().enumerate() {
+        if let ComponentTypeDef::InstanceExportAlias(alias_idx) = def
+            && let Some(crate::parser::ComponentAliasEntry::InstanceExport {
+                instance_index,
+                name,
+                ..
+            }) = component.component_aliases.get(*alias_idx)
+        {
+            comp_type_to_instance_export.insert(type_idx as u32, (*instance_index, name.clone()));
+        }
+    }
+
+    // Also handle direct type imports (Type-typed component imports).
+    let mut comp_type_import_names: HashMap<u32, String> = HashMap::new();
+    for (type_idx, def) in component.component_type_defs.iter().enumerate() {
+        if let ComponentTypeDef::Import(import_idx) = def
+            && let Some(imp) = component.imports.get(*import_idx)
+        {
+            comp_type_import_names.insert(type_idx as u32, imp.name.clone());
+        }
+    }
+
+    // Step 3: Walk core_entity_order to find canonical functions and their
+    // core func indices. For each Lower entry, trace to WASI name.
+    let mut result: HashMap<u32, (String, String)> = HashMap::new();
+    let mut core_func_idx = 0u32;
+
+    for def in &component.core_entity_order {
+        match def {
+            CoreEntityDef::CanonicalFunction(canon_idx) => {
+                if let Some(entry) = component.canonical_functions.get(*canon_idx) {
+                    match entry {
+                        CanonicalEntry::Lower { func_index, .. } => {
+                            // Trace func_index to WASI name
+                            if let Some((inst_idx, field_name)) =
+                                comp_func_to_instance_export.get(func_index)
+                            {
+                                // The component function is an alias of an instance export.
+                                // Look up which import the instance came from.
+                                if let Some(module_name) =
+                                    comp_instance_to_import_name.get(inst_idx)
+                                {
+                                    result.insert(
+                                        core_func_idx,
+                                        (module_name.clone(), field_name.clone()),
+                                    );
+                                }
+                            } else if let Some(import_name) = comp_func_import_names.get(func_index)
+                            {
+                                // The component function is a direct Func import.
+                                // Use the import name as both module and field.
+                                result.insert(core_func_idx, (import_name.clone(), String::new()));
+                            }
+                        }
+                        CanonicalEntry::ResourceDrop { resource } => {
+                            // Trace resource type index → WASI module name.
+                            // ResourceDrop references a component type index
+                            // which was typically aliased from an instance export.
+                            if let Some((inst_idx, type_name)) =
+                                comp_type_to_instance_export.get(resource)
+                            {
+                                if let Some(module_name) =
+                                    comp_instance_to_import_name.get(inst_idx)
+                                {
+                                    let field = format!("[resource-drop]{}", type_name);
+                                    result.insert(core_func_idx, (module_name.clone(), field));
+                                }
+                            } else if let Some(import_name) = comp_type_import_names.get(resource) {
+                                // Direct type import — extract resource name
+                                // from the WASI path.
+                                let resource_name = extract_wasi_resource_name(import_name);
+                                let field = format!("[resource-drop]{}", resource_name);
+                                result.insert(core_func_idx, (import_name.clone(), field));
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                core_func_idx += 1;
+            }
+            CoreEntityDef::CoreAlias(alias_idx) => {
+                // Core aliases also allocate per-kind entity indices.
+                // Only func-kind aliases increment the core func counter.
+                if let Some(crate::parser::ComponentAliasEntry::CoreInstanceExport {
+                    kind: wasmparser::ExternalKind::Func,
+                    ..
+                }) = component.component_aliases.get(*alias_idx)
+                {
+                    core_func_idx += 1;
+                }
+            }
+        }
+    }
+
+    result
+}
+
+/// Extract the resource name from a WASI import path.
+///
+/// Examples:
+/// - `"wasi:io/error@0.2.6"` → `"error"`
+/// - `"wasi:io/poll@0.2.6"` → `"poll"`
+/// - `"wasi:io/streams@0.2.6"` → `"streams"`
+/// - `"bare-name"` → `"bare-name"`
+fn extract_wasi_resource_name(import_name: &str) -> &str {
+    // Strip version suffix: "wasi:io/error@0.2.6" → "wasi:io/error"
+    let without_version = match import_name.rfind('@') {
+        Some(pos) => &import_name[..pos],
+        None => import_name,
+    };
+    // Extract after last '/': "wasi:io/error" → "error"
+    match without_version.rfind('/') {
+        Some(pos) => &without_version[pos + 1..],
+        None => without_version,
+    }
 }
 
 /// Dependency resolver
@@ -273,56 +602,306 @@ impl Resolver {
         Ok(())
     }
 
-    /// Resolve module-level imports within each component
+    /// Resolve module-level imports within each component.
+    ///
+    /// Dispatches to `resolve_via_instances` when the component has an
+    /// `InstanceSection` (the ground truth for module wiring), or falls
+    /// back to `resolve_via_flat_names` for simple components without one.
     fn resolve_module_imports(
         &self,
         components: &[ParsedComponent],
         graph: &mut DependencyGraph,
     ) -> Result<()> {
         for (comp_idx, component) in components.iter().enumerate() {
-            // Build export index for this component's modules
-            let mut module_exports: HashMap<(&str, &str), (usize, &ModuleExport)> = HashMap::new();
+            if !component.instances.is_empty() {
+                self.resolve_via_instances(comp_idx, component, graph)?;
+            } else {
+                self.resolve_via_flat_names(comp_idx, component, graph)?;
+            }
+        }
+        Ok(())
+    }
 
-            for (mod_idx, module) in component.core_modules.iter().enumerate() {
-                for export in &module.exports {
-                    // Key is (module name pattern, export name)
-                    // In component model, modules don't have names directly,
-                    // but instances do. For simplicity, we use module index as "name"
-                    let key = ("", export.name.as_str());
-                    module_exports.insert(key, (mod_idx, export));
+    /// Original flat name-matching resolution (fallback for components without InstanceSection).
+    fn resolve_via_flat_names(
+        &self,
+        comp_idx: usize,
+        component: &ParsedComponent,
+        graph: &mut DependencyGraph,
+    ) -> Result<()> {
+        // Build export index for this component's modules
+        let mut module_exports: HashMap<(&str, &str), (usize, &ModuleExport)> = HashMap::new();
+
+        for (mod_idx, module) in component.core_modules.iter().enumerate() {
+            for export in &module.exports {
+                let key = ("", export.name.as_str());
+                module_exports.insert(key, (mod_idx, export));
+            }
+        }
+
+        // Resolve imports within this component
+        for (from_mod_idx, module) in component.core_modules.iter().enumerate() {
+            for import in &module.imports {
+                let key = ("", import.name.as_str());
+                if let Some((to_mod_idx, _)) = module_exports.get(&key) {
+                    if *to_mod_idx != from_mod_idx {
+                        graph.module_resolutions.push(ModuleResolution {
+                            component_idx: comp_idx,
+                            from_module: from_mod_idx,
+                            to_module: *to_mod_idx,
+                            import_name: import.name.clone(),
+                            export_name: import.name.clone(),
+                        });
+                    }
+                } else {
+                    graph.unresolved_imports.push(UnresolvedImport {
+                        component_idx: comp_idx,
+                        module_idx: from_mod_idx,
+                        module_name: import.module.clone(),
+                        field_name: import.name.clone(),
+                        kind: import.kind.clone(),
+                        display_module: None,
+                        display_field: None,
+                    });
                 }
             }
+        }
 
-            // Resolve imports within this component
-            for (from_mod_idx, module) in component.core_modules.iter().enumerate() {
-                for import in &module.imports {
-                    // Try to find a matching export
-                    let key = ("", import.name.as_str());
-                    if let Some((to_mod_idx, _)) = module_exports.get(&key) {
-                        if *to_mod_idx != from_mod_idx {
-                            graph.module_resolutions.push(ModuleResolution {
-                                component_idx: comp_idx,
-                                from_module: from_mod_idx,
-                                to_module: *to_mod_idx,
-                                import_name: import.name.clone(),
-                                export_name: import.name.clone(),
-                            });
+        Ok(())
+    }
+
+    /// Instance-graph-based resolution using the `InstanceSection`.
+    ///
+    /// The `InstanceSection` records how each core instance was created:
+    /// - `Instantiate { module_idx, args }`: the instance instantiates
+    ///   `module_idx` with named arguments, each pointing to another instance.
+    /// - `FromExports(exports)`: the instance is a synthetic bag of exports.
+    ///
+    /// We trace each module's imports through the instance graph to find the
+    /// correct source module, avoiding false matches that the flat name-based
+    /// approach produces.
+    fn resolve_via_instances(
+        &self,
+        comp_idx: usize,
+        component: &ParsedComponent,
+        graph: &mut DependencyGraph,
+    ) -> Result<()> {
+        use crate::parser::{InstanceArg, InstanceKind};
+
+        // Build entity provenance map from the parser's core_entity_order
+        let provenance = build_entity_provenance(component);
+
+        // Build canonical lower → WASI name mapping for renaming ""::N imports
+        let canon_import_names = build_canon_import_names(component);
+
+        // Step 1: Build instance content map.
+        // For each instance, record what module it instantiates and how its
+        // import-module names map to source instances.
+        let mut instantiate_infos: HashMap<u32, InstanceInstantiateInfo> = HashMap::new();
+        let mut from_exports_infos: HashMap<u32, Vec<(String, ExportKind, u32)>> = HashMap::new();
+
+        for inst in &component.instances {
+            match &inst.kind {
+                InstanceKind::Instantiate { module_idx, args } => {
+                    let mut arg_map = HashMap::new();
+                    for (name, arg) in args {
+                        if let InstanceArg::Instance(inst_idx) = arg {
+                            arg_map.insert(name.clone(), *inst_idx);
                         }
-                    } else {
-                        // Unresolved - will need to be imported in final module
+                    }
+                    instantiate_infos.insert(
+                        inst.index,
+                        InstanceInstantiateInfo {
+                            module_idx: *module_idx,
+                            arg_map,
+                        },
+                    );
+                }
+                InstanceKind::FromExports(exports) => {
+                    let mapped: Vec<_> = exports
+                        .iter()
+                        .map(|(name, kind, idx)| {
+                            let export_kind = match kind {
+                                wasmparser::ExternalKind::Func => ExportKind::Function,
+                                wasmparser::ExternalKind::Table => ExportKind::Table,
+                                wasmparser::ExternalKind::Memory => ExportKind::Memory,
+                                wasmparser::ExternalKind::Global => ExportKind::Global,
+                                wasmparser::ExternalKind::Tag => ExportKind::Function,
+                            };
+                            (name.clone(), export_kind, *idx)
+                        })
+                        .collect();
+                    from_exports_infos.insert(inst.index, mapped);
+                }
+            }
+        }
+
+        // Step 2: Build module → instance map (which instance instantiated which module).
+        let mut module_to_instance: HashMap<u32, u32> = HashMap::new();
+        for (inst_idx, info) in &instantiate_infos {
+            module_to_instance.insert(info.module_idx, *inst_idx);
+        }
+
+        // Step 3: For each module's imports, trace through the instance graph.
+        for (from_mod_idx, module) in component.core_modules.iter().enumerate() {
+            let from_mod_u32 = from_mod_idx as u32;
+
+            // Find which instance instantiated this module
+            let inst_idx = match module_to_instance.get(&from_mod_u32) {
+                Some(idx) => *idx,
+                None => {
+                    // Module not instantiated via InstanceSection — all imports unresolved.
+                    for import in &module.imports {
                         graph.unresolved_imports.push(UnresolvedImport {
                             component_idx: comp_idx,
                             module_idx: from_mod_idx,
                             module_name: import.module.clone(),
                             field_name: import.name.clone(),
                             kind: import.kind.clone(),
+                            display_module: None,
+                            display_field: None,
                         });
                     }
+                    continue;
+                }
+            };
+
+            let inst_info = &instantiate_infos[&inst_idx];
+
+            for import in &module.imports {
+                // Find which source instance supplies `import.module`
+                let source_inst_idx = match inst_info.arg_map.get(&import.module) {
+                    Some(idx) => *idx,
+                    None => {
+                        // No arg for this import module → unresolved
+                        graph.unresolved_imports.push(UnresolvedImport {
+                            component_idx: comp_idx,
+                            module_idx: from_mod_idx,
+                            module_name: import.module.clone(),
+                            field_name: import.name.clone(),
+                            kind: import.kind.clone(),
+                            display_module: None,
+                            display_field: None,
+                        });
+                        continue;
+                    }
+                };
+
+                // Trace the source instance to find the actual module export
+                if let Some(resolved) = self.trace_instance_export(
+                    component,
+                    source_inst_idx,
+                    &import.name,
+                    &instantiate_infos,
+                    &from_exports_infos,
+                    &provenance,
+                ) {
+                    let (to_mod_idx, export_name) = resolved;
+                    if to_mod_idx != from_mod_idx {
+                        graph.module_resolutions.push(ModuleResolution {
+                            component_idx: comp_idx,
+                            from_module: from_mod_idx,
+                            to_module: to_mod_idx,
+                            import_name: import.name.clone(),
+                            export_name,
+                        });
+                    }
+                } else {
+                    // Could not trace to a module export. This happens for
+                    // canon-lowered functions and other non-module entities.
+                    //
+                    // For canonical lowered functions (from `canon lower`),
+                    // try to recover the WASI interface name by checking the
+                    // FromExports entity index against canon_import_names.
+                    // The original module_name/field_name are kept for lookup;
+                    // the WASI name goes into display_module/display_field.
+                    let mut display_module = None;
+                    let mut display_field = None;
+
+                    if let Some(fe_exports) = from_exports_infos.get(&source_inst_idx) {
+                        for (name, kind, entity_idx) in fe_exports {
+                            if name == &import.name && *kind == ExportKind::Function {
+                                if let Some((mod_name, field_name)) =
+                                    canon_import_names.get(entity_idx)
+                                {
+                                    display_module = Some(mod_name.clone());
+                                    display_field = Some(field_name.clone());
+                                }
+                                break;
+                            }
+                        }
+                    }
+
+                    graph.unresolved_imports.push(UnresolvedImport {
+                        component_idx: comp_idx,
+                        module_idx: from_mod_idx,
+                        module_name: import.module.clone(),
+                        field_name: import.name.clone(),
+                        kind: import.kind.clone(),
+                        display_module,
+                        display_field,
+                    });
                 }
             }
         }
 
         Ok(())
+    }
+
+    /// Trace an instance to find a named export, returning (module_idx, export_name).
+    ///
+    /// - If the instance is `Instantiate`, look up the instantiated module's
+    ///   exports for the name.
+    /// - If the instance is `FromExports`, use the entity provenance map to
+    ///   resolve the entity index back to its source module. Returns `None`
+    ///   for entities that came from canonical functions (WASI trampolines).
+    fn trace_instance_export(
+        &self,
+        component: &ParsedComponent,
+        instance_idx: u32,
+        export_name: &str,
+        instantiate_infos: &HashMap<u32, InstanceInstantiateInfo>,
+        from_exports_infos: &HashMap<u32, Vec<(String, ExportKind, u32)>>,
+        provenance: &EntityProvenance,
+    ) -> Option<(usize, String)> {
+        // Check if it's an Instantiate instance
+        if let Some(info) = instantiate_infos.get(&instance_idx) {
+            let module_idx = info.module_idx as usize;
+            if module_idx < component.core_modules.len() {
+                let module = &component.core_modules[module_idx];
+                if module.exports.iter().any(|e| e.name == export_name) {
+                    return Some((module_idx, export_name.to_string()));
+                }
+            }
+        }
+
+        // Check if it's a FromExports instance — use provenance to resolve
+        if let Some(exports) = from_exports_infos.get(&instance_idx) {
+            for (name, kind, entity_idx) in exports {
+                if name == export_name {
+                    return match kind {
+                        ExportKind::Function => provenance
+                            .func_source
+                            .get(entity_idx)
+                            .map(|(mod_idx, exp_name)| (*mod_idx, exp_name.clone())),
+                        ExportKind::Memory => provenance
+                            .memory_source
+                            .get(entity_idx)
+                            .map(|(mod_idx, exp_name)| (*mod_idx, exp_name.clone())),
+                        ExportKind::Table => provenance
+                            .table_source
+                            .get(entity_idx)
+                            .map(|(mod_idx, exp_name)| (*mod_idx, exp_name.clone())),
+                        ExportKind::Global => provenance
+                            .global_source
+                            .get(entity_idx)
+                            .map(|(mod_idx, exp_name)| (*mod_idx, exp_name.clone())),
+                    };
+                }
+            }
+        }
+
+        None
     }
 
     /// Build dependency edges for topological sort
@@ -1137,5 +1716,29 @@ mod tests {
             }
             other => panic!("Expected ModuleDependencyCycle, got: {:?}", other),
         }
+    }
+
+    #[test]
+    fn test_extract_wasi_resource_name() {
+        // Standard WASI paths
+        assert_eq!(extract_wasi_resource_name("wasi:io/error@0.2.6"), "error");
+        assert_eq!(extract_wasi_resource_name("wasi:io/poll@0.2.6"), "poll");
+        assert_eq!(
+            extract_wasi_resource_name("wasi:io/streams@0.2.6"),
+            "streams"
+        );
+        assert_eq!(
+            extract_wasi_resource_name("wasi:cli/terminal-input@0.2.6"),
+            "terminal-input"
+        );
+
+        // Without version
+        assert_eq!(extract_wasi_resource_name("wasi:io/error"), "error");
+
+        // Bare name (no slash, no version)
+        assert_eq!(extract_wasi_resource_name("bare-name"), "bare-name");
+
+        // Version but no slash
+        assert_eq!(extract_wasi_resource_name("something@1.0.0"), "something");
     }
 }

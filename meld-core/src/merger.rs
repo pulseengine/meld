@@ -28,7 +28,7 @@ use crate::parser::{
 use crate::resolver::DependencyGraph;
 use crate::rewriter::{IndexMaps, convert_abstract_heap_type, rewrite_function_body};
 use crate::{Error, MemoryStrategy, Result};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use wasm_encoder::{
     ConstExpr, EntityType, ExportKind as EncoderExportKind, Function,
     GlobalType as EncoderGlobalType, MemoryType as EncoderMemoryType, RefType,
@@ -175,6 +175,80 @@ struct UnresolvedImportAssignments {
     table: HashMap<(usize, usize, String, String), u32>,
 }
 
+/// Deduplication metadata for unresolved imports.
+///
+/// Tracks which effective `(module, field)` pairs have already been assigned
+/// an import position and which WASI version string to use for each dedup key.
+struct ImportDedupInfo {
+    /// For each version-normalized `(module, field)` key, the full module name
+    /// with the highest WASI version seen across all occurrences.
+    best_module_version: HashMap<(String, String), String>,
+    /// Entries where dedup was skipped because the function type didn't match
+    /// the first occurrence with the same effective (module, field) key.
+    /// Keyed by (component_idx, module_idx, module_name, field_name).
+    type_mismatch_entries: HashSet<(usize, usize, String, String)>,
+}
+
+/// Strip `@major.minor.patch` version suffix from a WASI module name.
+///
+/// `"wasi:io/error@0.2.0"` → `"wasi:io/error"`; `"env"` → `"env"`
+fn normalize_wasi_module_name(name: &str) -> &str {
+    match name.rfind('@') {
+        Some(pos) if name[..pos].contains(':') => &name[..pos],
+        _ => name,
+    }
+}
+
+/// Compare two semver-like version strings.
+///
+/// `"0.2.6"` > `"0.2.0"`. Falls back to lexicographic comparison when
+/// versions don't parse as numeric triples.
+fn compare_version(a: &str, b: &str) -> std::cmp::Ordering {
+    let parse = |s: &str| -> Vec<u32> { s.split('.').filter_map(|p| p.parse().ok()).collect() };
+    let va = parse(a);
+    let vb = parse(b);
+    va.cmp(&vb)
+}
+
+/// Extract the version suffix from a WASI module name, if any.
+///
+/// `"wasi:io/error@0.2.6"` → `Some("0.2.6")`; `"env"` → `None`
+fn extract_version(name: &str) -> Option<&str> {
+    match name.rfind('@') {
+        Some(pos) if name[..pos].contains(':') => Some(&name[pos + 1..]),
+        _ => None,
+    }
+}
+
+/// Compute the effective `(module, field)` dedup key for an unresolved import.
+///
+/// Uses display names (from canon-lower WASI tracing) when available, falls
+/// back to original core module import names. The module name is then
+/// version-normalized so that `wasi:io/error@0.2.0` and `@0.2.6` map to
+/// the same key.
+fn effective_import_key(unresolved: &crate::resolver::UnresolvedImport) -> (String, String) {
+    let module = unresolved
+        .display_module
+        .as_ref()
+        .unwrap_or(&unresolved.module_name);
+    let field = unresolved
+        .display_field
+        .as_ref()
+        .unwrap_or(&unresolved.field_name);
+    (
+        normalize_wasi_module_name(module).to_string(),
+        field.clone(),
+    )
+}
+
+/// Return the effective module name (with display override) for an unresolved import.
+fn effective_module_name(unresolved: &crate::resolver::UnresolvedImport) -> &str {
+    unresolved
+        .display_module
+        .as_ref()
+        .unwrap_or(&unresolved.module_name)
+}
+
 /// Module merger
 pub struct Merger {
     memory_strategy: MemoryStrategy,
@@ -298,8 +372,8 @@ impl Merger {
         // Pre-compute unresolved import counts and assignments so that all
         // index-map values produced during merging are absolute wasm indices
         // (offset by the number of unresolved imports in each index space).
-        let (import_counts, unresolved_assignments) =
-            compute_unresolved_import_assignments(graph, shared_memory_plan.as_ref());
+        let (import_counts, unresolved_assignments, dedup_info) =
+            compute_unresolved_import_assignments(graph, shared_memory_plan.as_ref(), components);
 
         let mut merged = MergedModule {
             types: Vec::new(),
@@ -337,7 +411,7 @@ impl Merger {
         }
 
         // Handle unresolved imports
-        self.add_unresolved_imports(graph, &mut merged, shared_memory_plan.as_ref())?;
+        self.add_unresolved_imports(graph, &mut merged, shared_memory_plan.as_ref(), &dedup_info)?;
 
         // Handle start functions
         self.resolve_start_functions(components, &mut merged)?;
@@ -354,7 +428,12 @@ impl Merger {
         Ok(merged)
     }
 
-    /// Merge a single component into the merged module
+    /// Merge a single component into the merged module.
+    ///
+    /// Modules within a component are merged in dependency order so that
+    /// target modules (from `module_resolutions`) are processed before the
+    /// modules that import from them.  This ensures `function_index_map`
+    /// entries exist when resolving intra-component imports.
     #[allow(clippy::too_many_arguments)]
     fn merge_component(
         &self,
@@ -366,7 +445,11 @@ impl Merger {
         shared_memory_plan: Option<&SharedMemoryPlan>,
         unresolved_assignments: &UnresolvedImportAssignments,
     ) -> Result<()> {
-        for (mod_idx, module) in component.core_modules.iter().enumerate() {
+        let module_count = component.core_modules.len();
+        let merge_order = Self::compute_module_merge_order(comp_idx, module_count, graph);
+
+        for mod_idx in merge_order {
+            let module = &component.core_modules[mod_idx];
             self.merge_core_module(
                 comp_idx,
                 mod_idx,
@@ -380,6 +463,75 @@ impl Merger {
         }
 
         Ok(())
+    }
+
+    /// Compute the merge order for modules within a component using
+    /// topological sort on `module_resolutions`.
+    ///
+    /// Target modules (those that provide exports) are processed before
+    /// source modules (those that import from them).  When no dependencies
+    /// exist, modules are processed in their original order.
+    fn compute_module_merge_order(
+        comp_idx: usize,
+        module_count: usize,
+        graph: &DependencyGraph,
+    ) -> Vec<usize> {
+        // Build adjacency list: from_module depends on to_module
+        let mut in_degree = vec![0usize; module_count];
+        let mut adj: Vec<Vec<usize>> = vec![Vec::new(); module_count];
+
+        for res in &graph.module_resolutions {
+            if res.component_idx == comp_idx && res.from_module != res.to_module {
+                // to_module must be processed before from_module
+                // Edge: to_module → from_module (to_module comes first)
+                if res.to_module < module_count && res.from_module < module_count {
+                    adj[res.to_module].push(res.from_module);
+                    in_degree[res.from_module] += 1;
+                }
+            }
+        }
+
+        // Deduplicate edges and recount in-degrees
+        let mut in_degree = vec![0usize; module_count];
+        for edges in adj.iter_mut().take(module_count) {
+            edges.sort_unstable();
+            edges.dedup();
+            for &neighbor in edges.iter() {
+                in_degree[neighbor] += 1;
+            }
+        }
+
+        // Kahn's algorithm — use original index as tiebreaker
+        let mut queue: std::collections::BinaryHeap<std::cmp::Reverse<usize>> =
+            std::collections::BinaryHeap::new();
+        for (i, &deg) in in_degree.iter().enumerate().take(module_count) {
+            if deg == 0 {
+                queue.push(std::cmp::Reverse(i));
+            }
+        }
+
+        let mut order = Vec::with_capacity(module_count);
+        while let Some(std::cmp::Reverse(node)) = queue.pop() {
+            order.push(node);
+            for &neighbor in &adj[node] {
+                in_degree[neighbor] -= 1;
+                if in_degree[neighbor] == 0 {
+                    queue.push(std::cmp::Reverse(neighbor));
+                }
+            }
+        }
+
+        // If there's a cycle (shouldn't happen — resolver checks this),
+        // fall back to sequential order for any remaining modules.
+        if order.len() < module_count {
+            for i in 0..module_count {
+                if !order.contains(&i) {
+                    order.push(i);
+                }
+            }
+        }
+
+        order
     }
 
     /// Merge a single core module
@@ -436,15 +588,61 @@ impl Merger {
             let mem_offset = merged.memories.len() as u32;
             let mut next_idx = 0u32;
 
-            // Imported memories
+            // Track which imported memory indices get resolved via module_resolutions
+            // so we can skip creating standalone memories for them.
+            let mut resolved_import_mem_indices: HashSet<u32> = HashSet::new();
+
+            // Pre-scan: identify imported memories that are resolved via
+            // module_resolutions (e.g., Module 1 imports memory from Module 0).
+            {
+                let mut scan_mem_idx = 0u32;
+                for imp in &module.imports {
+                    if !matches!(imp.kind, ImportKind::Memory(_)) {
+                        continue;
+                    }
+                    let intra = graph.module_resolutions.iter().find(|res| {
+                        res.component_idx == comp_idx
+                            && res.from_module == mod_idx
+                            && imp.name == res.import_name
+                    });
+                    if let Some(res) = intra {
+                        let target_module =
+                            &components[res.component_idx].core_modules[res.to_module];
+                        if let Some(export) = target_module
+                            .exports
+                            .iter()
+                            .find(|e| e.name == res.export_name && e.kind == ExportKind::Memory)
+                        {
+                            if let Some(&target_idx) = merged.memory_index_map.get(&(
+                                res.component_idx,
+                                res.to_module,
+                                export.index,
+                            )) {
+                                // Map this imported memory to the target module's memory
+                                merged
+                                    .memory_index_map
+                                    .insert((comp_idx, mod_idx, scan_mem_idx), target_idx);
+                                resolved_import_mem_indices.insert(scan_mem_idx);
+                            }
+                        }
+                    }
+                    scan_mem_idx += 1;
+                }
+            }
+
+            // Imported memories — only create new memories for unresolved ones
+            let mut import_mem_local_idx = 0u32;
             for import in &module.imports {
                 if let ImportKind::Memory(mem) = &import.kind {
-                    let new_idx = mem_offset + next_idx;
-                    merged
-                        .memory_index_map
-                        .insert((comp_idx, mod_idx, next_idx), new_idx);
-                    merged.memories.push(convert_memory_type(mem));
-                    next_idx += 1;
+                    if !resolved_import_mem_indices.contains(&import_mem_local_idx) {
+                        let new_idx = mem_offset + next_idx;
+                        merged
+                            .memory_index_map
+                            .insert((comp_idx, mod_idx, import_mem_local_idx), new_idx);
+                        merged.memories.push(convert_memory_type(mem));
+                        next_idx += 1;
+                    }
+                    import_mem_local_idx += 1;
                 }
             }
 
@@ -941,11 +1139,18 @@ impl Merger {
     /// two functions diverge, import indices will be silently misaligned,
     /// producing incorrect wasm output. Debug assertions below verify this
     /// invariant at development/test time.
+    ///
+    /// **Deduplication**: When multiple unresolved imports share the same
+    /// effective `(module, field)` after WASI version normalization, only the
+    /// first occurrence is emitted. Subsequent duplicates are skipped but their
+    /// assignments (from `compute_unresolved_import_assignments`) already point
+    /// to the same position, so `function_index_map` etc. remain correct.
     fn add_unresolved_imports(
         &self,
         graph: &DependencyGraph,
         merged: &mut MergedModule,
         shared_memory_plan: Option<&SharedMemoryPlan>,
+        dedup_info: &ImportDedupInfo,
     ) -> Result<()> {
         let mut shared_memory_import_added = false;
 
@@ -955,6 +1160,11 @@ impl Merger {
         let mut table_position: u32 = 0;
         let mut memory_position: u32 = 0;
         let mut global_position: u32 = 0;
+
+        // Track already-emitted effective (module, field) per entity kind
+        let mut emitted_func: HashSet<(String, String)> = HashSet::new();
+        let mut emitted_table: HashSet<(String, String)> = HashSet::new();
+        let mut emitted_global: HashSet<(String, String)> = HashSet::new();
 
         for unresolved in &graph.unresolved_imports {
             if let (Some(plan), ImportKind::Memory(_)) = (shared_memory_plan, &unresolved.kind) {
@@ -972,10 +1182,25 @@ impl Merger {
                 continue;
             }
 
-            let entity_type = match &unresolved.kind {
+            let dedup_key = effective_import_key(unresolved);
+
+            match &unresolved.kind {
                 ImportKind::Function(type_idx) => {
-                    // Verify position is within bounds established by
-                    // compute_unresolved_import_assignments.
+                    // Check if this entry was marked as type-mismatched (not safe
+                    // to dedup). If so, always emit even if the dedup_key was seen.
+                    let is_type_mismatch = dedup_info.type_mismatch_entries.contains(&(
+                        unresolved.component_idx,
+                        unresolved.module_idx,
+                        unresolved.module_name.clone(),
+                        unresolved.field_name.clone(),
+                    ));
+                    if !is_type_mismatch && !emitted_func.insert(dedup_key.clone()) {
+                        // Duplicate with matching type — skip emitting. Position
+                        // was already handled by compute_unresolved_import_assignments
+                        // using the same dedup_key → same position logic.
+                        continue;
+                    }
+
                     debug_assert!(
                         func_position < merged.import_counts.func,
                         "add_unresolved_imports: func import position {} exceeds \
@@ -984,7 +1209,6 @@ impl Merger {
                         func_position,
                         merged.import_counts.func,
                     );
-
                     func_position += 1;
 
                     // Remap type index
@@ -992,9 +1216,32 @@ impl Merger {
                         .type_index_map
                         .get(&(unresolved.component_idx, unresolved.module_idx, *type_idx))
                         .unwrap_or(type_idx);
-                    EntityType::Function(new_type_idx)
+
+                    // Use best version module name from dedup_info
+                    let module = dedup_info
+                        .best_module_version
+                        .get(&dedup_key)
+                        .cloned()
+                        .unwrap_or_else(|| {
+                            unresolved
+                                .display_module
+                                .as_ref()
+                                .unwrap_or(&unresolved.module_name)
+                                .clone()
+                        });
+                    let name = dedup_key.1;
+
+                    merged.imports.push(MergedImport {
+                        module,
+                        name,
+                        entity_type: EntityType::Function(new_type_idx),
+                    });
                 }
                 ImportKind::Table(t) => {
+                    if !emitted_table.insert(dedup_key.clone()) {
+                        continue;
+                    }
+
                     debug_assert!(
                         table_position < merged.import_counts.table,
                         "add_unresolved_imports: table import position {} exceeds \
@@ -1005,13 +1252,49 @@ impl Merger {
                     );
                     table_position += 1;
 
-                    EntityType::Table(convert_table_type(t))
+                    let module = dedup_info
+                        .best_module_version
+                        .get(&dedup_key)
+                        .cloned()
+                        .unwrap_or_else(|| {
+                            unresolved
+                                .display_module
+                                .as_ref()
+                                .unwrap_or(&unresolved.module_name)
+                                .clone()
+                        });
+                    let name = dedup_key.1;
+
+                    merged.imports.push(MergedImport {
+                        module,
+                        name,
+                        entity_type: EntityType::Table(convert_table_type(t)),
+                    });
                 }
                 ImportKind::Memory(m) => {
                     memory_position += 1;
-                    EntityType::Memory(convert_memory_type(m))
+
+                    let module = unresolved
+                        .display_module
+                        .as_ref()
+                        .unwrap_or(&unresolved.module_name)
+                        .clone();
+                    let name = unresolved
+                        .display_field
+                        .as_ref()
+                        .unwrap_or(&unresolved.field_name)
+                        .clone();
+                    merged.imports.push(MergedImport {
+                        module,
+                        name,
+                        entity_type: EntityType::Memory(convert_memory_type(m)),
+                    });
                 }
                 ImportKind::Global(g) => {
+                    if !emitted_global.insert(dedup_key.clone()) {
+                        continue;
+                    }
+
                     debug_assert!(
                         global_position < merged.import_counts.global,
                         "add_unresolved_imports: global import position {} exceeds \
@@ -1022,15 +1305,26 @@ impl Merger {
                     );
                     global_position += 1;
 
-                    EntityType::Global(convert_global_type(g))
+                    let module = dedup_info
+                        .best_module_version
+                        .get(&dedup_key)
+                        .cloned()
+                        .unwrap_or_else(|| {
+                            unresolved
+                                .display_module
+                                .as_ref()
+                                .unwrap_or(&unresolved.module_name)
+                                .clone()
+                        });
+                    let name = dedup_key.1;
+
+                    merged.imports.push(MergedImport {
+                        module,
+                        name,
+                        entity_type: EntityType::Global(convert_global_type(g)),
+                    });
                 }
             };
-
-            merged.imports.push(MergedImport {
-                module: unresolved.module_name.clone(),
-                name: unresolved.field_name.clone(),
-                entity_type,
-            });
         }
 
         if let Some(plan) = shared_memory_plan {
@@ -1624,7 +1918,10 @@ impl Default for Merger {
 fn compute_unresolved_import_assignments(
     graph: &DependencyGraph,
     shared_memory_plan: Option<&SharedMemoryPlan>,
-) -> (ImportCounts, UnresolvedImportAssignments) {
+    components: &[ParsedComponent],
+) -> (ImportCounts, UnresolvedImportAssignments, ImportDedupInfo) {
+    use crate::parser::FuncType;
+
     let mut counts = ImportCounts::default();
     let mut assignments = UnresolvedImportAssignments {
         func: HashMap::new(),
@@ -1632,6 +1929,17 @@ fn compute_unresolved_import_assignments(
         table: HashMap::new(),
     };
     let mut shared_memory_import_counted = false;
+
+    // Per-kind dedup: map normalized (module, field) → (first-assigned position, type signature).
+    // The type signature is stored so we can verify type compatibility before deduplicating.
+    let mut seen_func: HashMap<(String, String), (u32, Option<FuncType>)> = HashMap::new();
+    let mut seen_table: HashMap<(String, String), u32> = HashMap::new();
+    let mut seen_global: HashMap<(String, String), u32> = HashMap::new();
+
+    // Track highest version for each dedup key
+    let mut best_module_version: HashMap<(String, String), String> = HashMap::new();
+    // Track entries where type mismatch prevented deduplication
+    let mut type_mismatch_entries: HashSet<(usize, usize, String, String)> = HashSet::new();
 
     for unresolved in &graph.unresolved_imports {
         if let (Some(plan), ImportKind::Memory(_)) = (shared_memory_plan, &unresolved.kind) {
@@ -1641,8 +1949,72 @@ fn compute_unresolved_import_assignments(
             }
             continue;
         }
+
+        let dedup_key = effective_import_key(unresolved);
+        let eff_module = effective_module_name(unresolved);
+
+        // Update best version for this dedup key
+        match best_module_version.entry(dedup_key.clone()) {
+            std::collections::hash_map::Entry::Vacant(e) => {
+                e.insert(eff_module.to_string());
+            }
+            std::collections::hash_map::Entry::Occupied(mut e) => {
+                let existing_ver = extract_version(e.get());
+                let new_ver = extract_version(eff_module);
+                if let (Some(ev), Some(nv)) = (existing_ver, new_ver) {
+                    if compare_version(nv, ev) == std::cmp::Ordering::Greater {
+                        e.insert(eff_module.to_string());
+                    }
+                }
+            }
+        }
+
         match &unresolved.kind {
-            ImportKind::Function(_) => {
+            ImportKind::Function(type_idx) => {
+                // Look up the structural function type for compatibility checking.
+                let func_type = components
+                    .get(unresolved.component_idx)
+                    .and_then(|c| c.core_modules.get(unresolved.module_idx))
+                    .and_then(|m| m.types.get(*type_idx as usize))
+                    .cloned();
+
+                let position = match seen_func.entry(dedup_key) {
+                    std::collections::hash_map::Entry::Occupied(e) => {
+                        let (pos, ref first_type) = *e.get();
+                        // Type compatibility check: only dedup if the function
+                        // signatures match structurally. If they differ, this is
+                        // NOT the same function despite matching (module, field)
+                        // names — allocate a fresh position.
+                        if first_type == &func_type {
+                            pos
+                        } else {
+                            log::warn!(
+                                "Import dedup: type mismatch for {:?} — \
+                                 first={:?}, current={:?}; skipping dedup",
+                                e.key(),
+                                first_type,
+                                func_type,
+                            );
+                            type_mismatch_entries.insert((
+                                unresolved.component_idx,
+                                unresolved.module_idx,
+                                unresolved.module_name.clone(),
+                                unresolved.field_name.clone(),
+                            ));
+                            let pos = counts.func;
+                            counts.func += 1;
+                            pos
+                        }
+                    }
+                    std::collections::hash_map::Entry::Vacant(e) => {
+                        let pos = counts.func;
+                        e.insert((pos, func_type));
+                        counts.func += 1;
+                        pos
+                    }
+                };
+                // Always insert the assignment so merge_core_module lookup works
+                // for every (comp_idx, mod_idx, module_name, field_name) tuple.
                 assignments.func.insert(
                     (
                         unresolved.component_idx,
@@ -1650,11 +2022,19 @@ fn compute_unresolved_import_assignments(
                         unresolved.module_name.clone(),
                         unresolved.field_name.clone(),
                     ),
-                    counts.func,
+                    position,
                 );
-                counts.func += 1;
             }
             ImportKind::Table(_) => {
+                let position = match seen_table.entry(dedup_key) {
+                    std::collections::hash_map::Entry::Occupied(e) => *e.get(),
+                    std::collections::hash_map::Entry::Vacant(e) => {
+                        let pos = counts.table;
+                        e.insert(pos);
+                        counts.table += 1;
+                        pos
+                    }
+                };
                 assignments.table.insert(
                     (
                         unresolved.component_idx,
@@ -1662,14 +2042,22 @@ fn compute_unresolved_import_assignments(
                         unresolved.module_name.clone(),
                         unresolved.field_name.clone(),
                     ),
-                    counts.table,
+                    position,
                 );
-                counts.table += 1;
             }
             ImportKind::Memory(_) => {
                 counts.memory += 1;
             }
             ImportKind::Global(_) => {
+                let position = match seen_global.entry(dedup_key) {
+                    std::collections::hash_map::Entry::Occupied(e) => *e.get(),
+                    std::collections::hash_map::Entry::Vacant(e) => {
+                        let pos = counts.global;
+                        e.insert(pos);
+                        counts.global += 1;
+                        pos
+                    }
+                };
                 assignments.global.insert(
                     (
                         unresolved.component_idx,
@@ -1677,9 +2065,8 @@ fn compute_unresolved_import_assignments(
                         unresolved.module_name.clone(),
                         unresolved.field_name.clone(),
                     ),
-                    counts.global,
+                    position,
                 );
-                counts.global += 1;
             }
         }
     }
@@ -1691,7 +2078,12 @@ fn compute_unresolved_import_assignments(
         }
     }
 
-    (counts, assignments)
+    let dedup_info = ImportDedupInfo {
+        best_module_version,
+        type_mismatch_entries,
+    };
+
+    (counts, assignments, dedup_info)
 }
 
 #[cfg(test)]
@@ -1935,8 +2327,16 @@ mod tests {
             types: Vec::new(),
             instances: Vec::new(),
             canonical_functions: Vec::new(),
+            sub_components: Vec::new(),
+            component_aliases: Vec::new(),
+            component_instances: Vec::new(),
+            core_entity_order: Vec::new(),
+            component_func_defs: Vec::new(),
+            component_instance_defs: Vec::new(),
+            component_type_defs: Vec::new(),
             original_size: 0,
             original_hash: String::new(),
+            depth_0_sections: Vec::new(),
         };
 
         // Function indices 0-4 should all map to (module 0, local idx)
@@ -2015,8 +2415,16 @@ mod tests {
             types: Vec::new(),
             instances: Vec::new(),
             canonical_functions: Vec::new(),
+            sub_components: Vec::new(),
+            component_aliases: Vec::new(),
+            component_instances: Vec::new(),
+            core_entity_order: Vec::new(),
+            component_func_defs: Vec::new(),
+            component_instance_defs: Vec::new(),
+            component_type_defs: Vec::new(),
             original_size: 0,
             original_hash: String::new(),
+            depth_0_sections: Vec::new(),
         };
 
         // Indices 0-2 belong to module A
@@ -2119,8 +2527,16 @@ mod tests {
             types: Vec::new(),
             instances: Vec::new(),
             canonical_functions: Vec::new(),
+            sub_components: Vec::new(),
+            component_aliases: Vec::new(),
+            component_instances: Vec::new(),
+            core_entity_order: Vec::new(),
+            component_func_defs: Vec::new(),
+            component_instance_defs: Vec::new(),
+            component_type_defs: Vec::new(),
             original_size: 0,
             original_hash: String::new(),
+            depth_0_sections: Vec::new(),
         };
 
         let graph = DependencyGraph {
@@ -2135,6 +2551,8 @@ mod tests {
                     module_name: "env".to_string(),
                     field_name: "imported_func".to_string(),
                     kind: ImportKind::Function(0),
+                    display_module: None,
+                    display_field: None,
                 },
                 UnresolvedImport {
                     component_idx: 0,
@@ -2146,6 +2564,8 @@ mod tests {
                         mutable: false,
                         init_expr_bytes: Vec::new(),
                     }),
+                    display_module: None,
+                    display_field: None,
                 },
                 UnresolvedImport {
                     component_idx: 0,
@@ -2157,6 +2577,8 @@ mod tests {
                         initial: 1,
                         maximum: None,
                     }),
+                    display_module: None,
+                    display_field: None,
                 },
             ],
         };
@@ -2185,6 +2607,196 @@ mod tests {
         assert_eq!(merged.imports[0].name, "imported_func");
         assert_eq!(merged.imports[1].name, "imported_global");
         assert_eq!(merged.imports[2].name, "imported_table");
+    }
+
+    // -----------------------------------------------------------------------
+    // Import deduplication utility tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_normalize_wasi_module_name() {
+        // WASI names with version suffix
+        assert_eq!(
+            normalize_wasi_module_name("wasi:io/error@0.2.0"),
+            "wasi:io/error"
+        );
+        assert_eq!(
+            normalize_wasi_module_name("wasi:cli/stderr@0.2.6"),
+            "wasi:cli/stderr"
+        );
+        assert_eq!(
+            normalize_wasi_module_name("wasi:io/streams@0.2.6"),
+            "wasi:io/streams"
+        );
+        // Non-WASI names should be unchanged
+        assert_eq!(normalize_wasi_module_name("env"), "env");
+        assert_eq!(normalize_wasi_module_name(""), "");
+        // Email-like strings (@ without colon) should NOT strip
+        assert_eq!(normalize_wasi_module_name("user@host"), "user@host");
+    }
+
+    #[test]
+    fn test_compare_version() {
+        use std::cmp::Ordering;
+        assert_eq!(compare_version("0.2.6", "0.2.0"), Ordering::Greater);
+        assert_eq!(compare_version("0.2.0", "0.2.6"), Ordering::Less);
+        assert_eq!(compare_version("0.2.6", "0.2.6"), Ordering::Equal);
+        assert_eq!(compare_version("1.0.0", "0.9.9"), Ordering::Greater);
+        assert_eq!(compare_version("0.3.0", "0.2.9"), Ordering::Greater);
+    }
+
+    #[test]
+    fn test_extract_version() {
+        assert_eq!(extract_version("wasi:io/error@0.2.6"), Some("0.2.6"));
+        assert_eq!(extract_version("wasi:io/error@0.2.0"), Some("0.2.0"));
+        assert_eq!(extract_version("env"), None);
+        assert_eq!(extract_version("user@host"), None);
+    }
+
+    #[test]
+    fn test_import_dedup_exact_match() {
+        use crate::resolver::{DependencyGraph, UnresolvedImport};
+
+        // Two imports with identical effective (module, field) should dedup
+        let graph = DependencyGraph {
+            instantiation_order: vec![0],
+            resolved_imports: HashMap::new(),
+            adapter_sites: Vec::new(),
+            module_resolutions: Vec::new(),
+            unresolved_imports: vec![
+                UnresolvedImport {
+                    component_idx: 0,
+                    module_idx: 0,
+                    module_name: "".to_string(),
+                    field_name: "0".to_string(),
+                    kind: ImportKind::Function(0),
+                    display_module: Some("wasi:cli/stderr@0.2.6".to_string()),
+                    display_field: Some("get-stderr".to_string()),
+                },
+                UnresolvedImport {
+                    component_idx: 0,
+                    module_idx: 1,
+                    module_name: "".to_string(),
+                    field_name: "5".to_string(),
+                    kind: ImportKind::Function(0),
+                    display_module: Some("wasi:cli/stderr@0.2.6".to_string()),
+                    display_field: Some("get-stderr".to_string()),
+                },
+            ],
+        };
+
+        let (counts, assignments, _dedup_info) =
+            compute_unresolved_import_assignments(&graph, None, &[]);
+
+        // Should be 1 unique func import, not 2
+        assert_eq!(counts.func, 1, "duplicate imports should be deduplicated");
+
+        // Both assignments should point to the same position (0)
+        assert_eq!(
+            assignments.func[&(0, 0, "".to_string(), "0".to_string())],
+            0
+        );
+        assert_eq!(
+            assignments.func[&(0, 1, "".to_string(), "5".to_string())],
+            0
+        );
+    }
+
+    #[test]
+    fn test_import_dedup_version_mismatch() {
+        use crate::resolver::{DependencyGraph, UnresolvedImport};
+
+        // Two imports for the same WASI function but different versions
+        let graph = DependencyGraph {
+            instantiation_order: vec![0],
+            resolved_imports: HashMap::new(),
+            adapter_sites: Vec::new(),
+            module_resolutions: Vec::new(),
+            unresolved_imports: vec![
+                UnresolvedImport {
+                    component_idx: 0,
+                    module_idx: 0,
+                    module_name: "".to_string(),
+                    field_name: "0".to_string(),
+                    kind: ImportKind::Function(0),
+                    display_module: Some("wasi:io/error@0.2.0".to_string()),
+                    display_field: Some("drop".to_string()),
+                },
+                UnresolvedImport {
+                    component_idx: 0,
+                    module_idx: 1,
+                    module_name: "".to_string(),
+                    field_name: "3".to_string(),
+                    kind: ImportKind::Function(0),
+                    display_module: Some("wasi:io/error@0.2.6".to_string()),
+                    display_field: Some("drop".to_string()),
+                },
+            ],
+        };
+
+        let (counts, assignments, dedup_info) =
+            compute_unresolved_import_assignments(&graph, None, &[]);
+
+        // Should be 1 unique func import (version-normalized key matches)
+        assert_eq!(
+            counts.func, 1,
+            "version-mismatched imports should be deduplicated"
+        );
+
+        // Both assignments point to position 0
+        assert_eq!(
+            assignments.func[&(0, 0, "".to_string(), "0".to_string())],
+            0
+        );
+        assert_eq!(
+            assignments.func[&(0, 1, "".to_string(), "3".to_string())],
+            0
+        );
+
+        // Best version should be the higher one (@0.2.6)
+        let key = ("wasi:io/error".to_string(), "drop".to_string());
+        assert_eq!(dedup_info.best_module_version[&key], "wasi:io/error@0.2.6");
+    }
+
+    #[test]
+    fn test_import_dedup_different_fields_not_deduped() {
+        use crate::resolver::{DependencyGraph, UnresolvedImport};
+
+        // Same module, different field — should NOT dedup
+        let graph = DependencyGraph {
+            instantiation_order: vec![0],
+            resolved_imports: HashMap::new(),
+            adapter_sites: Vec::new(),
+            module_resolutions: Vec::new(),
+            unresolved_imports: vec![
+                UnresolvedImport {
+                    component_idx: 0,
+                    module_idx: 0,
+                    module_name: "".to_string(),
+                    field_name: "0".to_string(),
+                    kind: ImportKind::Function(0),
+                    display_module: Some("wasi:cli/stderr@0.2.6".to_string()),
+                    display_field: Some("get-stderr".to_string()),
+                },
+                UnresolvedImport {
+                    component_idx: 0,
+                    module_idx: 0,
+                    module_name: "".to_string(),
+                    field_name: "1".to_string(),
+                    kind: ImportKind::Function(0),
+                    display_module: Some("wasi:cli/stderr@0.2.6".to_string()),
+                    display_field: Some("write".to_string()),
+                },
+            ],
+        };
+
+        let (counts, _assignments, _dedup_info) =
+            compute_unresolved_import_assignments(&graph, None, &[]);
+
+        assert_eq!(
+            counts.func, 2,
+            "different fields should remain separate imports"
+        );
     }
 }
 

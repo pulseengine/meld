@@ -209,6 +209,7 @@ fn test_multi_memory_separate_memories() {
         address_rebasing: false,
         preserve_names: false,
         custom_sections: meld_core::CustomSectionHandling::Merge,
+        output_format: meld_core::OutputFormat::CoreModule,
     };
 
     let mut fuser = Fuser::new(config);
@@ -258,6 +259,7 @@ fn test_multi_memory_preserves_isolation() {
         address_rebasing: false,
         preserve_names: false,
         custom_sections: meld_core::CustomSectionHandling::Merge,
+        output_format: meld_core::OutputFormat::CoreModule,
     };
 
     let mut fuser = Fuser::new(config);
