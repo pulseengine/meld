@@ -47,3 +47,4 @@ test-output/
 # Coq/Rocq auxiliary files
 *.aux
 *.glob
+.lia.cache
