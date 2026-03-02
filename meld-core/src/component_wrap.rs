@@ -10,10 +10,11 @@
 //! ```text
 //! Fused core module → Component wrapping → P2 Component
 //!                                           ├── Replayed type/import sections
-//!                                           ├── Shim module (memory + realloc)
+//!                                           ├── Stubs module (memory + forwarding funcs)
 //!                                           ├── Fused module (memory imported)
+//!                                           ├── Fixup module (fills indirect table)
 //!                                           ├── canon lower (WASI funcs)
-//!                                           ├── Core instances (shim, fused)
+//!                                           ├── Core instances (stubs, fused, fixup)
 //!                                           ├── canon lift (exports)
 //!                                           └── Component exports
 //! ```
@@ -25,9 +26,12 @@
 //! internally — we can't instantiate it without first lowering imports, and
 //! we can't lower without a memory.
 //!
-//! **Solution**: A tiny shim module provides memory + bump-allocator realloc.
-//! The fused module's memory definition is converted to a memory import that
-//! receives the shim's memory. Both modules share the same memory.
+//! **Solution**: An indirect table pattern (same as wit-component):
+//! 1. A stubs module provides memory + a funcref table + forwarding functions
+//!    that call through the table via `call_indirect`.
+//! 2. The fused module is instantiated with stubs as its imports.
+//! 3. `canon lower` uses the fused module's real `cabi_realloc`.
+//! 4. A fixup module fills the indirect table with the lowered functions.
 
 use crate::parser::{self, ParsedComponent};
 use crate::resolver::DependencyGraph;
@@ -37,7 +41,7 @@ use crate::{Error, Result};
 ///
 /// Uses depth-0 sections from the original component(s) to reconstruct the
 /// component-level type and import declarations, then wires the fused module
-/// through a shim for memory sharing.
+/// through stubs + fixup for memory sharing.
 pub fn wrap_as_component(
     fused_module: &[u8],
     components: &[ParsedComponent],
@@ -52,14 +56,51 @@ pub fn wrap_as_component(
     // Parse the fused module to extract its imports, exports, and memory info
     let fused_info = parse_fused_module(fused_module)?;
 
-    // Build the shim module (provides memory + realloc)
-    let shim_bytes = build_shim_module(fused_info.memory_initial, fused_info.memory_maximum);
+    // Build import_types from each func_import's type_idx
+    let import_types: Vec<(Vec<wasm_encoder::ValType>, Vec<wasm_encoder::ValType>)> = fused_info
+        .func_imports
+        .iter()
+        .map(|(_, _, type_idx)| {
+            fused_info
+                .func_types
+                .get(*type_idx as usize)
+                .cloned()
+                .ok_or_else(|| {
+                    Error::EncodingError(format!("import type index {} out of range", type_idx))
+                })
+        })
+        .collect::<Result<_>>()?;
 
-    // Convert fused module: memory definition → memory import from shim
+    // Build the stubs module (provides memory + forwarding funcs via indirect table)
+    let stubs_bytes = build_stubs_module(
+        fused_info.memory_initial,
+        fused_info.memory_maximum,
+        &import_types,
+    );
+
+    // Build the fixup module (fills indirect table with lowered functions)
+    let fixup_bytes = build_fixup_module(&import_types);
+
+    // Build the caller module (invokes deferred start function after fixup)
+    let caller_bytes = if fused_info.start_func_export.is_some() {
+        Some(build_caller_module())
+    } else {
+        None
+    };
+
+    // Convert fused module: memory definition → memory import from stubs
+    // (also strips start section if present — it's deferred to the caller module)
     let modified_fused = convert_memory_to_import(fused_module, &fused_info)?;
 
     // Assemble the P2 component
-    assemble_component(source, &shim_bytes, &modified_fused, &fused_info)
+    assemble_component(
+        source,
+        &stubs_bytes,
+        &modified_fused,
+        &fixup_bytes,
+        caller_bytes.as_deref(),
+        &fused_info,
+    )
 }
 
 /// Information extracted from the fused core module.
@@ -78,8 +119,13 @@ struct FusedModuleInfo {
     #[allow(dead_code)]
     type_count: u32,
     /// The function types themselves (params, results)
-    #[allow(dead_code)]
     func_types: Vec<(Vec<wasm_encoder::ValType>, Vec<wasm_encoder::ValType>)>,
+    /// Start section function index (if any)
+    start_func: Option<u32>,
+    /// If the fused module has a start section, the export name of the start function.
+    /// Reactor components (libraries) use `_initialize` as a start function that must
+    /// be deferred until after the indirect table is filled.
+    start_func_export: Option<String>,
 }
 
 /// Parse the fused module to extract structural info needed for wrapping.
@@ -93,6 +139,7 @@ fn parse_fused_module(bytes: &[u8]) -> Result<FusedModuleInfo> {
     let mut type_count = 0u32;
     let mut func_types = Vec::new();
     let mut found_memory = false;
+    let mut start_func: Option<u32> = None;
 
     for payload in parser.parse_all(bytes) {
         let payload = payload.map_err(|e| Error::ParseError(e.to_string()))?;
@@ -139,6 +186,9 @@ fn parse_fused_module(bytes: &[u8]) -> Result<FusedModuleInfo> {
                     exports.push((exp.name.to_string(), exp.kind, exp.index));
                 }
             }
+            wasmparser::Payload::StartSection { func, .. } => {
+                start_func = Some(func);
+            }
             _ => {}
         }
     }
@@ -149,6 +199,20 @@ fn parse_fused_module(bytes: &[u8]) -> Result<FusedModuleInfo> {
         ));
     }
 
+    // If there's a start section, find its export name (or assign a synthetic one)
+    let start_func_export = start_func.map(|func_idx| {
+        exports
+            .iter()
+            .find_map(|(name, kind, idx)| {
+                if *kind == wasmparser::ExternalKind::Func && *idx == func_idx {
+                    Some(name.clone())
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_else(|| "$meld_start".to_string())
+    });
+
     Ok(FusedModuleInfo {
         func_imports,
         exports,
@@ -157,81 +221,233 @@ fn parse_fused_module(bytes: &[u8]) -> Result<FusedModuleInfo> {
         memory64,
         type_count,
         func_types,
+        start_func,
+        start_func_export,
     })
 }
 
-/// Build a tiny shim module that provides memory and a bump-allocator realloc.
+/// Build a stubs module with forwarding functions that call through an indirect table.
 ///
-/// ```wasm
-/// (module
-///   (memory (export "memory") <min> <max>)
-///   (global $bump (mut i32) (i32.const 0))
-///   (func (export "realloc") (param i32 i32 i32 i32) (result i32)
-///     global.get $bump
-///     local.get 3  ;; new_size
-///     global.get $bump
-///     i32.add
-///     global.set $bump
-///   )
-/// )
-/// ```
-fn build_shim_module(min_pages: u64, max_pages: Option<u64>) -> Vec<u8> {
+/// Each forwarding function pushes all its parameters, then uses `call_indirect`
+/// through a funcref table. The table starts empty and gets filled by the fixup
+/// module after the fused module is instantiated and `canon lower` can use the
+/// real `cabi_realloc`.
+///
+/// For N imports, the module exports:
+/// - `"memory"` — shared linear memory
+/// - `"$imports"` — funcref table of size N (only if N > 0)
+/// - `"0"` .. `"N-1"` — forwarding functions
+fn build_stubs_module(
+    min_pages: u64,
+    max_pages: Option<u64>,
+    import_types: &[(Vec<wasm_encoder::ValType>, Vec<wasm_encoder::ValType>)],
+) -> Vec<u8> {
+    use wasm_encoder::*;
+
+    let n = import_types.len();
+    let mut module = Module::new();
+
+    if n > 0 {
+        // Deduplicate type signatures → local type indices
+        let mut unique_types: Vec<(Vec<ValType>, Vec<ValType>)> = Vec::new();
+        let mut type_indices: Vec<u32> = Vec::new();
+
+        for (params, results) in import_types {
+            if let Some(idx) = unique_types
+                .iter()
+                .position(|(p, r)| p == params && r == results)
+            {
+                type_indices.push(idx as u32);
+            } else {
+                type_indices.push(unique_types.len() as u32);
+                unique_types.push((params.clone(), results.clone()));
+            }
+        }
+
+        // Type section
+        let mut types = TypeSection::new();
+        for (params, results) in &unique_types {
+            types
+                .ty()
+                .function(params.iter().copied(), results.iter().copied());
+        }
+        module.section(&types);
+
+        // Function section: N forwarding functions
+        let mut functions = FunctionSection::new();
+        for idx in &type_indices {
+            functions.function(*idx);
+        }
+        module.section(&functions);
+
+        // Table section: funcref table of size N
+        let mut tables = TableSection::new();
+        tables.table(TableType {
+            element_type: RefType::FUNCREF,
+            minimum: n as u64,
+            maximum: Some(n as u64),
+            table64: false,
+            shared: false,
+        });
+        module.section(&tables);
+
+        // Memory section
+        let mut memories = MemorySection::new();
+        memories.memory(MemoryType {
+            minimum: min_pages,
+            maximum: max_pages,
+            memory64: false,
+            shared: false,
+            page_size_log2: None,
+        });
+        module.section(&memories);
+
+        // Export section
+        let mut exports = ExportSection::new();
+        exports.export("memory", ExportKind::Memory, 0);
+        exports.export("$imports", ExportKind::Table, 0);
+        for i in 0..n {
+            exports.export(&i.to_string(), ExportKind::Func, i as u32);
+        }
+        module.section(&exports);
+
+        // Code section: N forwarding function bodies
+        let mut code = CodeSection::new();
+        for i in 0..n {
+            let (params, _) = &import_types[i];
+            let mut body = Function::new([]);
+            // Push all parameters
+            for j in 0..params.len() {
+                body.instruction(&Instruction::LocalGet(j as u32));
+            }
+            // Push table slot index and call_indirect
+            body.instruction(&Instruction::I32Const(i as i32));
+            body.instruction(&Instruction::CallIndirect {
+                type_index: type_indices[i],
+                table_index: 0,
+            });
+            body.instruction(&Instruction::End);
+            code.function(&body);
+        }
+        module.section(&code);
+    } else {
+        // No imports: memory only
+        let mut memories = MemorySection::new();
+        memories.memory(MemoryType {
+            minimum: min_pages,
+            maximum: max_pages,
+            memory64: false,
+            shared: false,
+            page_size_log2: None,
+        });
+        module.section(&memories);
+
+        let mut exports = ExportSection::new();
+        exports.export("memory", ExportKind::Memory, 0);
+        module.section(&exports);
+    }
+
+    module.finish()
+}
+
+/// Build a fixup module that fills the indirect table with real lowered functions.
+///
+/// The fixup module imports the `$imports` table and N functions from module `""`,
+/// then uses an active element section to fill `table[0..N-1]` with function refs
+/// to the imported (lowered) functions. This runs as a side effect of instantiation.
+fn build_fixup_module(
+    import_types: &[(Vec<wasm_encoder::ValType>, Vec<wasm_encoder::ValType>)],
+) -> Vec<u8> {
+    use wasm_encoder::*;
+
+    let n = import_types.len();
+    let mut module = Module::new();
+
+    if n == 0 {
+        return module.finish();
+    }
+
+    // Deduplicate type signatures (same mapping as stubs)
+    let mut unique_types: Vec<(Vec<ValType>, Vec<ValType>)> = Vec::new();
+    let mut type_indices: Vec<u32> = Vec::new();
+
+    for (params, results) in import_types {
+        if let Some(idx) = unique_types
+            .iter()
+            .position(|(p, r)| p == params && r == results)
+        {
+            type_indices.push(idx as u32);
+        } else {
+            type_indices.push(unique_types.len() as u32);
+            unique_types.push((params.clone(), results.clone()));
+        }
+    }
+
+    // Type section
+    let mut types = TypeSection::new();
+    for (params, results) in &unique_types {
+        types
+            .ty()
+            .function(params.iter().copied(), results.iter().copied());
+    }
+    module.section(&types);
+
+    // Import section: table + N functions
+    let mut imports = ImportSection::new();
+    imports.import(
+        "",
+        "$imports",
+        EntityType::Table(TableType {
+            element_type: RefType::FUNCREF,
+            minimum: n as u64,
+            maximum: Some(n as u64),
+            table64: false,
+            shared: false,
+        }),
+    );
+    for (i, &ty_idx) in type_indices.iter().enumerate() {
+        imports.import("", &i.to_string(), EntityType::Function(ty_idx));
+    }
+    module.section(&imports);
+
+    // Element section: active segment fills table[0..N-1] with imported func refs
+    let mut elements = ElementSection::new();
+    let func_indices: Vec<u32> = (0..n as u32).collect();
+    let offset = ConstExpr::i32_const(0);
+    elements.segment(ElementSegment {
+        mode: ElementMode::Active {
+            table: Some(0),
+            offset: &offset,
+        },
+        elements: Elements::Functions(func_indices.as_slice().into()),
+    });
+    module.section(&elements);
+
+    module.finish()
+}
+
+/// Build a tiny caller module that invokes a single imported function via its start section.
+///
+/// Used for reactor components where `_initialize` must run after the indirect table
+/// is filled. The caller module imports `""."0"` as a `() -> ()` function and uses
+/// a wasm start section to call it on instantiation.
+fn build_caller_module() -> Vec<u8> {
     use wasm_encoder::*;
 
     let mut module = Module::new();
 
-    // Type section: realloc type (i32, i32, i32, i32) -> i32
+    // Type section: () -> ()
     let mut types = TypeSection::new();
-    types.ty().function([ValType::I32; 4], [ValType::I32]);
+    types.ty().function([], []);
     module.section(&types);
 
-    // Function section
-    let mut functions = FunctionSection::new();
-    functions.function(0); // realloc is type 0
-    module.section(&functions);
+    // Import section: one function
+    let mut imports = ImportSection::new();
+    imports.import("", "0", EntityType::Function(0));
+    module.section(&imports);
 
-    // Memory section
-    let mut memories = MemorySection::new();
-    memories.memory(MemoryType {
-        minimum: min_pages,
-        maximum: max_pages,
-        memory64: false,
-        shared: false,
-        page_size_log2: None,
-    });
-    module.section(&memories);
-
-    // Global section: bump pointer
-    let mut globals = GlobalSection::new();
-    globals.global(
-        wasm_encoder::GlobalType {
-            val_type: ValType::I32,
-            mutable: true,
-            shared: false,
-        },
-        &ConstExpr::i32_const(0),
-    );
-    module.section(&globals);
-
-    // Export section
-    let mut exports = ExportSection::new();
-    exports.export("memory", ExportKind::Memory, 0);
-    exports.export("realloc", ExportKind::Func, 0);
-    module.section(&exports);
-
-    // Code section: realloc body
-    let mut code = CodeSection::new();
-    let mut realloc_body = Function::new([]);
-    // Return current bump pointer, then advance by new_size (param 3)
-    realloc_body.instruction(&Instruction::GlobalGet(0)); // push current bump
-    realloc_body.instruction(&Instruction::LocalGet(3)); // push new_size
-    realloc_body.instruction(&Instruction::GlobalGet(0)); // push current bump again
-    realloc_body.instruction(&Instruction::I32Add); // bump + new_size
-    realloc_body.instruction(&Instruction::GlobalSet(0)); // store new bump
-    // Stack still has original bump value as return
-    realloc_body.instruction(&Instruction::End);
-    code.function(&realloc_body);
-    module.section(&code);
+    // Start section: call import 0
+    module.section(&wasm_encoder::StartSection { function_index: 0 });
 
     module.finish()
 }
@@ -364,13 +580,35 @@ fn convert_memory_to_import(original_bytes: &[u8], info: &FusedModuleInfo) -> Re
                 module.section(&RawSection { id: 6, data: raw });
             }
             wasmparser::Payload::ExportSection(reader) => {
-                let raw = &original_bytes[reader.range().start..reader.range().end];
-                module.section(&RawSection { id: 7, data: raw });
+                // Re-encode the export section to optionally add a synthetic export
+                // for the start function (if it wasn't already exported)
+                let needs_synthetic_start =
+                    info.start_func_export.as_deref() == Some("$meld_start");
+                if needs_synthetic_start {
+                    let mut exports = ExportSection::new();
+                    for exp in reader {
+                        let exp = exp.map_err(|e| Error::ParseError(e.to_string()))?;
+                        let kind = match exp.kind {
+                            wasmparser::ExternalKind::Func => ExportKind::Func,
+                            wasmparser::ExternalKind::Table => ExportKind::Table,
+                            wasmparser::ExternalKind::Memory => ExportKind::Memory,
+                            wasmparser::ExternalKind::Global => ExportKind::Global,
+                            _ => continue,
+                        };
+                        exports.export(exp.name, kind, exp.index);
+                    }
+                    if let Some(start_idx) = info.start_func {
+                        exports.export("$meld_start", ExportKind::Func, start_idx);
+                    }
+                    module.section(&exports);
+                } else {
+                    let raw = &original_bytes[reader.range().start..reader.range().end];
+                    module.section(&RawSection { id: 7, data: raw });
+                }
             }
-            wasmparser::Payload::StartSection { func, .. } => {
-                module.section(&wasm_encoder::StartSection {
-                    function_index: func,
-                });
+            wasmparser::Payload::StartSection { .. } => {
+                // Strip the start section — it will be invoked by a caller module
+                // after the indirect table is filled by the fixup module.
             }
             wasmparser::Payload::ElementSection(reader) => {
                 let raw = &original_bytes[reader.range().start..reader.range().end];
@@ -400,16 +638,19 @@ fn convert_memory_to_import(original_bytes: &[u8], info: &FusedModuleInfo) -> Re
     Ok(module.finish())
 }
 
-/// Assemble the final P2 component from replayed sections + shim + fused module.
+/// Assemble the final P2 component from replayed sections + stubs + fused + fixup + caller.
 fn assemble_component(
     source: &ParsedComponent,
-    shim_bytes: &[u8],
+    stubs_bytes: &[u8],
     fused_bytes: &[u8],
+    fixup_bytes: &[u8],
+    caller_bytes: Option<&[u8]>,
     fused_info: &FusedModuleInfo,
 ) -> Result<Vec<u8>> {
     use wasm_encoder::*;
 
     let mut component = Component::new();
+    let n = fused_info.func_imports.len();
 
     // -----------------------------------------------------------------------
     // 1. Replay depth-0 Type and Import sections from the original component.
@@ -423,34 +664,11 @@ fn assemble_component(
         });
     }
 
-    // Count how many component-level instances were created by imports.
-    // Each import with Instance type creates a component instance.
-    let _import_instance_count = source
-        .imports
-        .iter()
-        .filter(|imp| matches!(imp.ty, wasmparser::ComponentTypeRef::Instance(_)))
-        .count() as u32;
-
     // -----------------------------------------------------------------------
-    // 2. Alias core functions out of each component import instance.
-    //    For each fused module import, we need to trace it back to a component
-    //    instance + function name, then alias that function out.
+    // 2. Resolve fused imports to component instances.
     // -----------------------------------------------------------------------
-
-    // Build a map: (wasi_module, wasi_field) → which component instance index
-    // provides it, based on the original component's import names.
-    //
-    // Component imports like "wasi:io/streams@0.2.6" create component instances.
-    // Functions like "get-stderr" are exports of "wasi:cli/stderr@0.2.6".
-    // The fused module imports are "(wasi:cli/stderr@0.2.6, get-stderr)".
     let instance_map = build_instance_func_map(source);
 
-    // For each fused function import, find which component instance + function
-    // name it corresponds to, then we'll:
-    //   a) alias the function from the component instance
-    //   b) canon lower it with memory/realloc options
-    //
-    // Track: for each fused import → (component_instance_idx, func_name)
     let mut import_resolutions: Vec<(u32, String)> = Vec::new();
     for (module_name, field_name, _type_idx) in &fused_info.func_imports {
         if let Some((inst_idx, func_name)) =
@@ -466,136 +684,92 @@ fn assemble_component(
     }
 
     // -----------------------------------------------------------------------
-    // 3. Core type sections — declare shim and fused module types
+    // 3. Embed core modules (section ID 1 = CoreModule)
     // -----------------------------------------------------------------------
-    // We need core module types for instantiation. However, for simplicity
-    // we can use `ModuleSection` to embed modules directly (which carries
-    // its own type), and use `Instantiate` with named args.
-
-    // -----------------------------------------------------------------------
-    // 4. Embed core modules as raw sections (section ID 1 = CoreModule)
-    // -----------------------------------------------------------------------
-    // Module 0: shim (memory + realloc)
+    // Module 0: stubs (memory + forwarding funcs via indirect table)
     component.section(&RawSection {
-        id: 1, // ComponentSectionId::CoreModule
-        data: shim_bytes,
+        id: 1,
+        data: stubs_bytes,
     });
-    // Module 1: fused module (memory imported from shim)
+    // Module 1: fused module (memory imported from stubs)
     component.section(&RawSection {
-        id: 1, // ComponentSectionId::CoreModule
+        id: 1,
         data: fused_bytes,
     });
+    // Module 2: fixup (fills indirect table on instantiation)
+    component.section(&RawSection {
+        id: 1,
+        data: fixup_bytes,
+    });
+    // Module 3 (optional): caller (invokes deferred start function)
+    let caller_module_idx = if let Some(caller) = caller_bytes {
+        component.section(&RawSection {
+            id: 1,
+            data: caller,
+        });
+        Some(3u32)
+    } else {
+        None
+    };
 
     // -----------------------------------------------------------------------
-    // 5. Instantiate the shim module (no imports needed)
+    // 4. Instantiate the stubs module (no imports needed)
     // -----------------------------------------------------------------------
     let mut core_instances = InstanceSection::new();
     let no_args: Vec<(&str, ModuleArg)> = vec![];
-    core_instances.instantiate(0, no_args); // shim module, no args
+    core_instances.instantiate(0, no_args);
     component.section(&core_instances);
 
     // -----------------------------------------------------------------------
-    // 6. Alias shim exports: memory and realloc
+    // 5. Alias stubs exports: forwarding funcs, table, and memory
     // -----------------------------------------------------------------------
-    // core instance 0 = shim instance
-    // We need: core func "realloc" (for canon lower options)
-    //          core memory "memory" (for canon lower options)
+    // core instance 0 = stubs instance
     //
     // After aliasing:
-    //   core func 0 = shim realloc
-    //   core memory 0 = shim memory
-    let mut aliases = ComponentAliasSection::new();
-    aliases.alias(Alias::CoreInstanceExport {
-        instance: 0,
-        kind: ExportKind::Func,
-        name: "realloc",
-    });
-    // core func index 0 = shim realloc
-    aliases.alias(Alias::CoreInstanceExport {
-        instance: 0,
-        kind: ExportKind::Memory,
-        name: "memory",
-    });
-    // core memory index 0 = shim memory
-    component.section(&aliases);
+    //   core func 0..N-1 = stubs forwarding functions
+    //   core table 0     = indirect funcref table (only if N > 0)
+    //   core memory 0    = shared memory
+    let mut core_func_idx = 0u32;
 
-    // -----------------------------------------------------------------------
-    // 7. For each fused import: either alias+lower a function, or alias a
-    //    type and use canon resource.drop
-    // -----------------------------------------------------------------------
-    // Component func index counter starts after any funcs from imports
-    // (none in our case since we only import instances).
-    let mut component_func_idx = 0u32;
-    // Component type index: tracks type aliases we create for resource-drops.
-    // This starts after all types defined in the replayed depth_0_sections.
-    // Count how many types were defined in the replayed sections.
-    let mut component_type_idx = count_replayed_types(source);
-    // Core func index counter: 0 = shim realloc, then 1..N = lowered/resource-drop
-    let mut core_func_idx = 1u32; // 0 is shim realloc
-
-    for (i, (inst_idx, func_name)) in import_resolutions.iter().enumerate() {
-        let field_name = &fused_info.func_imports[i].1;
-
-        if let Some(type_name) = field_name.strip_prefix("[resource-drop]") {
-            // Resource-drop: alias the TYPE from the instance, then canon resource.drop
-
-            let mut alias_section = ComponentAliasSection::new();
-            alias_section.alias(Alias::InstanceExport {
-                instance: *inst_idx,
-                kind: ComponentExportKind::Type,
-                name: type_name,
+    if n > 0 {
+        let mut aliases = ComponentAliasSection::new();
+        for i in 0..n {
+            aliases.alias(Alias::CoreInstanceExport {
+                instance: 0,
+                kind: ExportKind::Func,
+                name: &i.to_string(),
             });
-            component.section(&alias_section);
-
-            let mut canon = CanonicalFunctionSection::new();
-            canon.resource_drop(component_type_idx);
-            component.section(&canon);
-
-            component_type_idx += 1;
-            core_func_idx += 1;
-        } else {
-            // Regular function: alias from instance, then canon lower
-            let mut alias_section = ComponentAliasSection::new();
-            alias_section.alias(Alias::InstanceExport {
-                instance: *inst_idx,
-                kind: ComponentExportKind::Func,
-                name: func_name,
-            });
-            component.section(&alias_section);
-
-            let mut canon = CanonicalFunctionSection::new();
-            canon.lower(
-                component_func_idx,
-                [
-                    CanonicalOption::Memory(0),  // core memory 0 = shim memory
-                    CanonicalOption::Realloc(0), // core func 0 = shim realloc
-                    CanonicalOption::UTF8,
-                ],
-            );
-            component.section(&canon);
-
-            component_func_idx += 1;
-            core_func_idx += 1;
         }
+        aliases.alias(Alias::CoreInstanceExport {
+            instance: 0,
+            kind: ExportKind::Table,
+            name: "$imports",
+        });
+        aliases.alias(Alias::CoreInstanceExport {
+            instance: 0,
+            kind: ExportKind::Memory,
+            name: "memory",
+        });
+        component.section(&aliases);
+        core_func_idx = n as u32;
+    } else {
+        let mut aliases = ComponentAliasSection::new();
+        aliases.alias(Alias::CoreInstanceExport {
+            instance: 0,
+            kind: ExportKind::Memory,
+            name: "memory",
+        });
+        component.section(&aliases);
     }
 
     // -----------------------------------------------------------------------
-    // 8. Instantiate the fused module with all its imports satisfied
+    // 6. Create FromExports instances for fused module's import namespaces
+    //    using the stubs forwarding functions.
     // -----------------------------------------------------------------------
-    // The fused module (after conversion) expects:
-    //   - N function imports (in order, matching original fused import names)
-    //   - 1 memory import ("meld:shim" "memory")
-    //
-    // We need to build a list of (import_name, core_func/memory_index) pairs.
-    // Core module instantiation uses named args matching the module's imports.
-    //
-    // Strategy: wrap all the lowered funcs + shim memory into a FromExports
-    // instance for each import module name, then instantiate with those.
-
     // Group fused imports by module name
     let mut module_groups: Vec<(String, Vec<(String, u32)>)> = Vec::new();
     for (i, (module_name, field_name, _)) in fused_info.func_imports.iter().enumerate() {
-        let core_idx = i as u32 + 1; // +1 because core func 0 = shim realloc
+        let core_idx = i as u32; // core func i = stubs forwarding func i
         if let Some(group) = module_groups.iter_mut().find(|(m, _)| m == module_name) {
             group.1.push((field_name.clone(), core_idx));
         } else {
@@ -603,8 +777,7 @@ fn assemble_component(
         }
     }
 
-    // Create a FromExports core instance for each import module
-    // Core instance counter: 0 = shim instance, then 1..M = import instances
+    // Core instance counter: 0 = stubs instance, then 1..M = import instances
     let mut next_core_instance = 1u32;
     let mut module_instance_map: Vec<(String, u32)> = Vec::new();
 
@@ -629,7 +802,9 @@ fn assemble_component(
         next_core_instance += 1;
     }
 
-    // Now instantiate the fused module (module 1) with all import instances
+    // -----------------------------------------------------------------------
+    // 7. Instantiate the fused module with stubs as its imports
+    // -----------------------------------------------------------------------
     {
         let mut inst = InstanceSection::new();
         let args: Vec<(&str, ModuleArg)> = module_instance_map
@@ -638,13 +813,160 @@ fn assemble_component(
             .collect();
         inst.instantiate(1, args);
         component.section(&inst);
-        // This is core instance `next_core_instance`, let's call it fused_instance
     }
     let fused_instance = next_core_instance;
+    next_core_instance += 1;
 
     // -----------------------------------------------------------------------
-    // 9. Export: alias core exports, define types, canon lift, wrap in
-    //    component instances, and export as named interfaces.
+    // 8. Alias fused module's cabi_realloc (if we have non-resource-drop imports)
+    // -----------------------------------------------------------------------
+    let has_non_resource_drop = fused_info
+        .func_imports
+        .iter()
+        .any(|(_, field, _)| !field.starts_with("[resource-drop]"));
+
+    let realloc_core_idx = if has_non_resource_drop && n > 0 {
+        let has_realloc = fused_info.exports.iter().any(|(name, kind, _)| {
+            *kind == wasmparser::ExternalKind::Func && name == "cabi_realloc"
+        });
+        if !has_realloc {
+            return Err(Error::EncodingError(
+                "fused module has non-resource-drop imports but no cabi_realloc export".to_string(),
+            ));
+        }
+
+        let mut aliases = ComponentAliasSection::new();
+        aliases.alias(Alias::CoreInstanceExport {
+            instance: fused_instance,
+            kind: ExportKind::Func,
+            name: "cabi_realloc",
+        });
+        component.section(&aliases);
+        let idx = core_func_idx;
+        core_func_idx += 1;
+        Some(idx)
+    } else {
+        None
+    };
+
+    // -----------------------------------------------------------------------
+    // 9. Canon lower ALL imports using the real cabi_realloc
+    // -----------------------------------------------------------------------
+    let mut component_func_idx = 0u32;
+    let mut component_type_idx = count_replayed_types(source);
+    let mut lowered_func_indices: Vec<u32> = Vec::new();
+
+    for (i, (inst_idx, func_name)) in import_resolutions.iter().enumerate() {
+        let field_name = &fused_info.func_imports[i].1;
+
+        if let Some(type_name) = field_name.strip_prefix("[resource-drop]") {
+            // Resource-drop: alias the TYPE from the instance, then canon resource.drop
+            let mut alias_section = ComponentAliasSection::new();
+            alias_section.alias(Alias::InstanceExport {
+                instance: *inst_idx,
+                kind: ComponentExportKind::Type,
+                name: type_name,
+            });
+            component.section(&alias_section);
+
+            let mut canon = CanonicalFunctionSection::new();
+            canon.resource_drop(component_type_idx);
+            component.section(&canon);
+
+            component_type_idx += 1;
+            lowered_func_indices.push(core_func_idx);
+            core_func_idx += 1;
+        } else {
+            // Regular function: alias from instance, then canon lower with real realloc
+            let mut alias_section = ComponentAliasSection::new();
+            alias_section.alias(Alias::InstanceExport {
+                instance: *inst_idx,
+                kind: ComponentExportKind::Func,
+                name: func_name,
+            });
+            component.section(&alias_section);
+
+            let realloc_idx =
+                realloc_core_idx.expect("realloc_core_idx must be set for non-resource-drop");
+            let mut canon = CanonicalFunctionSection::new();
+            canon.lower(
+                component_func_idx,
+                [
+                    CanonicalOption::Memory(0),            // core memory 0
+                    CanonicalOption::Realloc(realloc_idx), // fused module's cabi_realloc
+                    CanonicalOption::UTF8,
+                ],
+            );
+            component.section(&canon);
+
+            component_func_idx += 1;
+            lowered_func_indices.push(core_func_idx);
+            core_func_idx += 1;
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // 10. Instantiate the fixup module to fill the indirect table
+    // -----------------------------------------------------------------------
+    if n > 0 {
+        // Create a FromExports instance with the table + lowered functions
+        let export_names: Vec<String> = (0..n).map(|i| i.to_string()).collect();
+        let mut fixup_exports: Vec<(&str, ExportKind, u32)> = Vec::new();
+        fixup_exports.push(("$imports", ExportKind::Table, 0)); // core table 0
+        for (i, &idx) in lowered_func_indices.iter().enumerate() {
+            fixup_exports.push((&export_names[i], ExportKind::Func, idx));
+        }
+        let mut inst = InstanceSection::new();
+        inst.export_items(fixup_exports);
+        component.section(&inst);
+        let fixup_exports_instance = next_core_instance;
+        next_core_instance += 1;
+
+        // Instantiate fixup module (module 2) — fills the table as a side effect
+        let mut fixup_inst = InstanceSection::new();
+        fixup_inst.instantiate(2, [("", ModuleArg::Instance(fixup_exports_instance))]);
+        component.section(&fixup_inst);
+        next_core_instance += 1;
+    }
+
+    // -----------------------------------------------------------------------
+    // 10b. Instantiate the caller module (invokes deferred start function)
+    // -----------------------------------------------------------------------
+    if let (Some(start_export_name), Some(caller_mod_idx)) =
+        (&fused_info.start_func_export, caller_module_idx)
+    {
+        // Alias the start function from the fused instance
+        let mut aliases = ComponentAliasSection::new();
+        aliases.alias(Alias::CoreInstanceExport {
+            instance: fused_instance,
+            kind: ExportKind::Func,
+            name: start_export_name,
+        });
+        component.section(&aliases);
+        let start_core_func = core_func_idx;
+        core_func_idx += 1;
+
+        // Create a FromExports instance for the caller module
+        let mut inst = InstanceSection::new();
+        inst.export_items([("0", ExportKind::Func, start_core_func)]);
+        component.section(&inst);
+        let caller_exports_instance = next_core_instance;
+        next_core_instance += 1;
+
+        // Instantiate caller — triggers deferred start function via start section
+        let mut caller_inst = InstanceSection::new();
+        caller_inst.instantiate(
+            caller_mod_idx,
+            [("", ModuleArg::Instance(caller_exports_instance))],
+        );
+        component.section(&caller_inst);
+        next_core_instance += 1;
+    }
+    let _ = next_core_instance; // may be unused after this point
+
+    // -----------------------------------------------------------------------
+    // 11. Export: alias core exports, define types, canon lift, wrap in
+    //     component instances, and export as named interfaces.
     //
     //    WASI runtimes expect exported interfaces as component instances,
     //    not bare functions. For example, `wasi:cli/run@0.2.6` must be an
@@ -1478,25 +1800,37 @@ mod tests {
     }
 
     #[test]
-    fn test_build_shim_module_validates() {
-        let shim = build_shim_module(1, None);
-        let mut validator = wasmparser::Validator::new();
+    fn test_build_stubs_module_validates() {
+        use wasm_encoder::ValType;
+        let import_types = vec![
+            (vec![ValType::I32; 4], vec![ValType::I32]), // realloc-like
+            (vec![ValType::I32], vec![]),                // resource-drop-like
+            (vec![ValType::I32, ValType::I32], vec![ValType::I32]), // read-like
+        ];
+        let stubs = build_stubs_module(1, None, &import_types);
+        let mut features = wasmparser::WasmFeatures::default();
+        features |= wasmparser::WasmFeatures::REFERENCE_TYPES;
+        let mut validator = wasmparser::Validator::new_with_features(features);
         validator
-            .validate_all(&shim)
-            .expect("shim module should validate");
+            .validate_all(&stubs)
+            .expect("stubs module should validate");
     }
 
     #[test]
-    fn test_build_shim_module_with_max() {
-        let shim = build_shim_module(2, Some(256));
-        let mut validator = wasmparser::Validator::new();
+    fn test_build_stubs_module_with_max() {
+        use wasm_encoder::ValType;
+        let import_types = vec![(vec![ValType::I32; 4], vec![ValType::I32])];
+        let stubs = build_stubs_module(2, Some(256), &import_types);
+        let mut features = wasmparser::WasmFeatures::default();
+        features |= wasmparser::WasmFeatures::REFERENCE_TYPES;
+        let mut validator = wasmparser::Validator::new_with_features(features);
         validator
-            .validate_all(&shim)
-            .expect("shim module with max should validate");
+            .validate_all(&stubs)
+            .expect("stubs module with max should validate");
 
         // Verify it has the right memory limits
         let parser = wasmparser::Parser::new(0);
-        for payload in parser.parse_all(&shim) {
+        for payload in parser.parse_all(&stubs) {
             if let Ok(wasmparser::Payload::MemorySection(reader)) = payload {
                 for mem in reader {
                     let mem = mem.unwrap();
@@ -1505,5 +1839,54 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn test_build_stubs_module_zero_imports() {
+        let stubs = build_stubs_module(1, None, &[]);
+        let mut validator = wasmparser::Validator::new();
+        validator
+            .validate_all(&stubs)
+            .expect("stubs module with zero imports should validate");
+
+        // Should have memory but no table or functions
+        let parser = wasmparser::Parser::new(0);
+        let mut has_memory = false;
+        let mut has_table = false;
+        for payload in parser.parse_all(&stubs) {
+            match payload {
+                Ok(wasmparser::Payload::MemorySection(_)) => has_memory = true,
+                Ok(wasmparser::Payload::TableSection(_)) => has_table = true,
+                _ => {}
+            }
+        }
+        assert!(has_memory, "stubs should have memory");
+        assert!(!has_table, "stubs with no imports should have no table");
+    }
+
+    #[test]
+    fn test_build_fixup_module_validates() {
+        use wasm_encoder::ValType;
+        let import_types = vec![
+            (vec![ValType::I32; 4], vec![ValType::I32]),
+            (vec![ValType::I32], vec![]),
+        ];
+        let fixup = build_fixup_module(&import_types);
+        let mut features = wasmparser::WasmFeatures::default();
+        features |= wasmparser::WasmFeatures::REFERENCE_TYPES;
+        features |= wasmparser::WasmFeatures::BULK_MEMORY;
+        let mut validator = wasmparser::Validator::new_with_features(features);
+        validator
+            .validate_all(&fixup)
+            .expect("fixup module should validate");
+    }
+
+    #[test]
+    fn test_build_fixup_module_zero_imports() {
+        let fixup = build_fixup_module(&[]);
+        let mut validator = wasmparser::Validator::new();
+        validator
+            .validate_all(&fixup)
+            .expect("empty fixup module should validate");
     }
 }
