@@ -12,6 +12,16 @@ use meld_core::{ComponentParser, Fuser, FuserConfig, MemoryStrategy, OutputForma
 
 const FIXTURES_DIR: &str = "../tests/wit_bindgen/fixtures/release-0.2.0";
 
+/// Returns true if the fixture directory exists; prints skip message and returns false otherwise.
+fn fixtures_available() -> bool {
+    if std::path::Path::new(FIXTURES_DIR).is_dir() {
+        true
+    } else {
+        eprintln!("skipping: fixtures not found at {FIXTURES_DIR}");
+        false
+    }
+}
+
 /// Helper: attempt to parse a component and return structural info.
 struct ComponentInfo {
     name: String,
@@ -82,6 +92,9 @@ fn try_fuse(path: &str, name: &str) -> (bool, usize, String) {
 
 #[test]
 fn test_parse_all_release_components() {
+    if !fixtures_available() {
+        return;
+    }
     let files = [
         "hello_c_cli.wasm",
         "hello_c_debug.wasm",
@@ -138,6 +151,9 @@ fn test_parse_all_release_components() {
 /// "circular module dependency" error during fusion.
 #[test]
 fn test_no_false_cycles_any_component() {
+    if !fixtures_available() {
+        return;
+    }
     let files = [
         "hello_c_cli.wasm",
         "hello_c_debug.wasm",
@@ -180,6 +196,9 @@ fn test_no_false_cycles_any_component() {
 /// For components that fuse successfully, validate the output with wasmparser.
 #[test]
 fn test_fused_output_validates() {
+    if !fixtures_available() {
+        return;
+    }
     let files = [
         "hello_c_cli.wasm",
         "hello_c_debug.wasm",
@@ -270,6 +289,9 @@ fn test_fused_output_validates() {
 /// options (different memories in multi-memory mode).
 #[test]
 fn test_p1_adapter_detection_with_instances() {
+    if !fixtures_available() {
+        return;
+    }
     let files = [
         "hello_c_cli.wasm",
         "hello_c_release.wasm",
@@ -351,6 +373,9 @@ fn test_p1_adapter_detection_with_instances() {
 /// unresolved memory imports getting promoted to standalone memories.
 #[test]
 fn test_reasonable_memory_count() {
+    if !fixtures_available() {
+        return;
+    }
     let files = [
         "hello_c_cli.wasm",
         "hello_c_release.wasm",
@@ -433,6 +458,9 @@ fn test_reasonable_memory_count() {
 /// Write fused output to /tmp for manual and automated runtime testing.
 #[test]
 fn test_write_fused_output_for_runtime() {
+    if !fixtures_available() {
+        return;
+    }
     let files = [
         "hello_c_cli.wasm",
         "hello_c_release.wasm",
@@ -488,6 +516,9 @@ fn test_write_fused_output_for_runtime() {
 /// This test ensures the dedup logic in the merger eliminates all duplicates.
 #[test]
 fn test_no_duplicate_imports() {
+    if !fixtures_available() {
+        return;
+    }
     use std::collections::HashSet;
 
     let files = [
@@ -570,6 +601,9 @@ fn test_no_duplicate_imports() {
 /// adapter sites, and the fused output still validates after adapter wiring.
 #[test]
 fn test_adapter_generation_for_release_components() {
+    if !fixtures_available() {
+        return;
+    }
     let files = [
         "hello_c_cli.wasm",
         "hello_c_debug.wasm",
@@ -637,6 +671,9 @@ fn test_adapter_generation_for_release_components() {
 /// valid indices (function index < total count, memory index < memory count).
 #[test]
 fn test_adapter_call_site_wiring() {
+    if !fixtures_available() {
+        return;
+    }
     let files = [
         "hello_c_cli.wasm",
         "hello_c_release.wasm",
@@ -780,6 +817,9 @@ fn test_adapter_call_site_wiring() {
 /// skipped ResourceDrop entries.
 #[test]
 fn test_no_stale_resource_drop_versions() {
+    if !fixtures_available() {
+        return;
+    }
     let files = [
         "hello_c_cli.wasm",
         "hello_c_debug.wasm",
@@ -857,6 +897,9 @@ fn test_no_stale_resource_drop_versions() {
 /// output is a valid P2 component (not a core module).
 #[test]
 fn test_component_wrap_validates() {
+    if !fixtures_available() {
+        return;
+    }
     let files = [
         "hello_c_cli.wasm",
         "hello_c_debug.wasm",
