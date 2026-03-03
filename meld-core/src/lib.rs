@@ -164,6 +164,9 @@ pub struct FusionStats {
 pub struct Fuser {
     config: FuserConfig,
     components: Vec<ParsedComponent>,
+    /// Original (un-flattened) parsed components, used by component_wrap
+    /// to access depth_0_sections and component_instance_defs.
+    original_components: Vec<ParsedComponent>,
 }
 
 impl Fuser {
@@ -172,6 +175,7 @@ impl Fuser {
         Self {
             config,
             components: Vec::new(),
+            original_components: Vec::new(),
         }
     }
 
@@ -196,6 +200,7 @@ impl Fuser {
             parsed.name = Some(n.to_string());
         }
 
+        self.original_components.push(parsed.clone());
         let flattened = flatten_nested_components(parsed)?;
         self.components.extend(flattened);
         Ok(())
@@ -293,7 +298,12 @@ impl Fuser {
         // Optionally wrap the fused core module as a P2 component
         let output = if self.config.output_format == OutputFormat::Component {
             log::info!("Wrapping fused module as P2 component");
-            component_wrap::wrap_as_component(&output, &self.components, &graph)?
+            component_wrap::wrap_as_component(
+                &output,
+                &self.components,
+                &self.original_components,
+                &graph,
+            )?
         } else {
             output
         };

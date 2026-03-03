@@ -246,6 +246,12 @@ impl FactStyleGenerator {
     /// data with `memory.copy $callee $caller`, then call the target with the
     /// new pointer.  Handles the common `(ptr, len)` pair pattern.
     ///
+    /// When the caller uses the retptr calling convention (extra i32 param,
+    /// void return) and the callee returns a return-area pointer (i32), the
+    /// adapter reads flat results from the callee's return area, copies
+    /// pointed-to data across memories, and writes fixed-up results at the
+    /// caller's retptr.
+    ///
     /// When the target function returns a `(ptr, len)` pair (detected via
     /// `AdapterOptions::returns_pointer_pair`), the adapter also copies the
     /// returned data from callee's memory back to caller's memory using
@@ -257,16 +263,75 @@ impl FactStyleGenerator {
         options: &AdapterOptions,
     ) -> Result<(u32, Function)> {
         let target_func = self.resolve_target_function(site, merged)?;
-        let type_idx = merged
+
+        // --- Determine callee's type (what we call) ---
+        let callee_type_idx = merged
             .defined_func(target_func)
             .map(|f| f.type_idx)
             .unwrap_or(0);
+        let callee_type = merged.types.get(callee_type_idx as usize);
+        let callee_param_count = callee_type.map(|t| t.params.len()).unwrap_or(0);
+        let callee_result_count = callee_type.map(|t| t.results.len()).unwrap_or(0);
+        let callee_result_types: Vec<wasm_encoder::ValType> =
+            callee_type.map(|t| t.results.clone()).unwrap_or_default();
 
-        let func_type = merged.types.get(type_idx as usize);
-        let param_count = func_type.map(|t| t.params.len()).unwrap_or(0);
-        let result_count = func_type.map(|t| t.results.len()).unwrap_or(0);
-        let result_types: Vec<wasm_encoder::ValType> =
-            func_type.map(|t| t.results.clone()).unwrap_or_default();
+        // --- Determine caller's type (what the adapter declares) ---
+        // Use the caller's import type if available; otherwise fall back to callee's type.
+        let caller_type_idx = site
+            .import_func_type_idx
+            .and_then(|local_ti| {
+                merged
+                    .type_index_map
+                    .get(&(site.from_component, site.from_module, local_ti))
+                    .copied()
+            })
+            .unwrap_or(callee_type_idx);
+        let caller_type = merged.types.get(caller_type_idx as usize);
+        let caller_param_count = caller_type
+            .map(|t| t.params.len())
+            .unwrap_or(callee_param_count);
+        let caller_result_count = caller_type
+            .map(|t| t.results.len())
+            .unwrap_or(callee_result_count);
+
+        // --- Detect retptr calling convention ---
+        // The canonical ABI uses retptr when flat results > MAX_FLAT_RESULTS:
+        //   caller (lowered): params..., retptr:i32 → void
+        //   callee (lifted):  params...            → i32 (return area ptr)
+        let uses_retptr = caller_param_count > callee_param_count
+            && caller_result_count == 0
+            && callee_result_count == 1
+            && callee_result_types.first() == Some(&wasm_encoder::ValType::I32);
+
+        log::debug!(
+            "adapter {:?}: caller_type={} ({}p/{}r), callee_type={} ({}p/{}r), retptr={}",
+            site.import_name,
+            caller_type_idx,
+            caller_param_count,
+            caller_result_count,
+            callee_type_idx,
+            callee_param_count,
+            callee_result_count,
+            uses_retptr,
+        );
+
+        if uses_retptr {
+            return self.generate_retptr_adapter(
+                site,
+                merged,
+                options,
+                target_func,
+                caller_type_idx,
+                caller_param_count,
+                callee_param_count,
+            );
+        }
+
+        // --- Non-retptr path: use caller's type for declared signature ---
+        let adapter_type_idx = caller_type_idx;
+        let param_count = callee_param_count;
+        let result_count = callee_result_count;
+        let result_types = callee_result_types;
 
         // If memories are the same, just do direct call (with post-return if needed)
         if options.caller_memory == options.callee_memory {
@@ -301,7 +366,7 @@ impl FactStyleGenerator {
                 }
 
                 func.instruction(&Instruction::End);
-                return Ok((type_idx, func));
+                return Ok((adapter_type_idx, func));
             } else {
                 let mut func = Function::new([]);
                 for i in 0..param_count {
@@ -315,7 +380,7 @@ impl FactStyleGenerator {
                 }
 
                 func.instruction(&Instruction::End);
-                return Ok((type_idx, func));
+                return Ok((adapter_type_idx, func));
             }
         }
 
@@ -337,7 +402,7 @@ impl FactStyleGenerator {
             }
             func.instruction(&Instruction::Call(target_func));
             func.instruction(&Instruction::End);
-            return Ok((type_idx, func));
+            return Ok((adapter_type_idx, func));
         }
 
         // Determine scratch local count for copy operations
@@ -388,7 +453,7 @@ impl FactStyleGenerator {
                     }
                     func.instruction(&Instruction::Call(target_func));
                     func.instruction(&Instruction::End);
-                    return Ok((type_idx, func));
+                    return Ok((adapter_type_idx, func));
                 }
             };
 
@@ -431,7 +496,7 @@ impl FactStyleGenerator {
                 None => {
                     log::warn!("Result copy: no caller realloc, returning callee pointers as-is");
                     func.instruction(&Instruction::End);
-                    return Ok((type_idx, func));
+                    return Ok((adapter_type_idx, func));
                 }
             };
 
@@ -495,7 +560,236 @@ impl FactStyleGenerator {
 
         func.instruction(&Instruction::End);
 
-        Ok((type_idx, func))
+        Ok((adapter_type_idx, func))
+    }
+
+    /// Generate an adapter for the retptr calling convention.
+    ///
+    /// In the canonical ABI, when a function returns heap-allocated types
+    /// (strings, lists, records containing them), the lowered import uses:
+    ///   caller: (params..., retptr: i32) → void
+    /// and the lifted export uses:
+    ///   callee: (params...)               → i32 (return area pointer)
+    ///
+    /// The adapter bridges these conventions:
+    /// 1. Copy ALL input pointer pairs from caller to callee memory
+    /// 2. Call callee with remapped params (excluding retptr)
+    /// 3. Read flat results from callee's return area
+    /// 4. Copy pointed-to data for each result pointer pair to caller memory
+    /// 5. Write fixed-up flat results at caller's retptr
+    /// 6. Call post-return for callee cleanup
+    #[allow(clippy::too_many_arguments)]
+    fn generate_retptr_adapter(
+        &self,
+        site: &AdapterSite,
+        _merged: &MergedModule,
+        options: &AdapterOptions,
+        target_func: u32,
+        caller_type_idx: u32,
+        caller_param_count: usize,
+        callee_param_count: usize,
+    ) -> Result<(u32, Function)> {
+        let retptr_local = (caller_param_count - 1) as u32;
+        let return_area_size = site.requirements.return_area_byte_size.unwrap_or(8);
+
+        let param_ptr_positions = &site.requirements.pointer_pair_positions;
+        let result_ptr_offsets = &site.requirements.result_pointer_pair_offsets;
+        let num_param_pairs = param_ptr_positions.len();
+        let _num_result_pairs = result_ptr_offsets.len();
+
+        log::debug!(
+            "retptr adapter {:?}: caller={}p, callee={}p, return_area={}B, \
+             param_pairs={:?}, result_pairs={:?}",
+            site.import_name,
+            caller_param_count,
+            callee_param_count,
+            return_area_size,
+            param_ptr_positions,
+            result_ptr_offsets,
+        );
+
+        // Scratch locals layout (all i32, after caller params):
+        //   [dest_ptr_0..dest_ptr_N]  (one per param pointer pair)
+        //   [result_ptr]              (return area pointer from callee)
+        //   [data_ptr] [data_len] [caller_new_ptr]  (reused for each result pair)
+        let mut scratch_count: u32 = 0;
+        let dest_ptr_base = caller_param_count as u32;
+        if num_param_pairs > 0 && options.callee_realloc.is_some() {
+            scratch_count += num_param_pairs as u32;
+        }
+        let result_ptr_local = caller_param_count as u32 + scratch_count;
+        scratch_count += 1;
+        let data_ptr_local = caller_param_count as u32 + scratch_count;
+        scratch_count += 1;
+        let data_len_local = caller_param_count as u32 + scratch_count;
+        scratch_count += 1;
+        let caller_new_ptr_local = caller_param_count as u32 + scratch_count;
+        scratch_count += 1;
+
+        let local_decls = vec![(scratch_count, wasm_encoder::ValType::I32)];
+        let mut func = Function::new(local_decls);
+
+        // --- Phase 1: Outbound copy of ALL pointer pairs (caller → callee) ---
+        if !param_ptr_positions.is_empty() && options.callee_realloc.is_some() {
+            let callee_realloc = options.callee_realloc.unwrap();
+
+            for (pair_idx, &ptr_pos) in param_ptr_positions.iter().enumerate() {
+                let len_pos = ptr_pos + 1;
+                let dest_local = dest_ptr_base + pair_idx as u32;
+
+                // Allocate: dest = cabi_realloc(0, 0, 1, len)
+                func.instruction(&Instruction::I32Const(0));
+                func.instruction(&Instruction::I32Const(0));
+                func.instruction(&Instruction::I32Const(1));
+                func.instruction(&Instruction::LocalGet(len_pos));
+                func.instruction(&Instruction::Call(callee_realloc));
+                func.instruction(&Instruction::LocalSet(dest_local));
+
+                // Copy: memory.copy callee_mem caller_mem (dest, src, len)
+                func.instruction(&Instruction::LocalGet(dest_local));
+                func.instruction(&Instruction::LocalGet(ptr_pos));
+                func.instruction(&Instruction::LocalGet(len_pos));
+                func.instruction(&Instruction::MemoryCopy {
+                    src_mem: options.caller_memory,
+                    dst_mem: options.callee_memory,
+                });
+            }
+
+            // Build callee params: for each callee param position, either use
+            // the remapped dest_ptr or the original param value
+            for i in 0..callee_param_count as u32 {
+                if let Some(pair_idx) = param_ptr_positions.iter().position(|&pos| pos == i) {
+                    // This is a pointer param — use remapped dest_ptr
+                    func.instruction(&Instruction::LocalGet(dest_ptr_base + pair_idx as u32));
+                } else {
+                    // Scalar or length param — pass through
+                    func.instruction(&Instruction::LocalGet(i));
+                }
+            }
+        } else {
+            // No pointer pairs to copy — pass callee params directly
+            for i in 0..callee_param_count {
+                func.instruction(&Instruction::LocalGet(i as u32));
+            }
+        }
+
+        // --- Phase 2: Call callee → get return area pointer ---
+        func.instruction(&Instruction::Call(target_func));
+        func.instruction(&Instruction::LocalSet(result_ptr_local));
+
+        // --- Phase 3+4+5: Process return area and write to retptr ---
+        // For each result pointer pair, copy the pointed-to data and fix up.
+        // For scalar values in the return area, copy them as-is.
+        if !result_ptr_offsets.is_empty() && options.caller_realloc.is_some() {
+            let caller_realloc = options.caller_realloc.unwrap();
+
+            // Process each value in the return area
+            let mut byte_offset: u32 = 0;
+            while byte_offset < return_area_size {
+                if result_ptr_offsets.contains(&byte_offset) {
+                    // This is a pointer pair [data_ptr, data_len] — need to copy data
+                    let ptr_offset = byte_offset;
+                    let len_offset = byte_offset + 4;
+
+                    // Load data_ptr and data_len from callee's return area
+                    func.instruction(&Instruction::LocalGet(result_ptr_local));
+                    func.instruction(&Instruction::I32Load(wasm_encoder::MemArg {
+                        offset: ptr_offset as u64,
+                        align: 2,
+                        memory_index: options.callee_memory,
+                    }));
+                    func.instruction(&Instruction::LocalSet(data_ptr_local));
+
+                    func.instruction(&Instruction::LocalGet(result_ptr_local));
+                    func.instruction(&Instruction::I32Load(wasm_encoder::MemArg {
+                        offset: len_offset as u64,
+                        align: 2,
+                        memory_index: options.callee_memory,
+                    }));
+                    func.instruction(&Instruction::LocalSet(data_len_local));
+
+                    // Allocate in caller's memory
+                    func.instruction(&Instruction::I32Const(0));
+                    func.instruction(&Instruction::I32Const(0));
+                    func.instruction(&Instruction::I32Const(1));
+                    func.instruction(&Instruction::LocalGet(data_len_local));
+                    func.instruction(&Instruction::Call(caller_realloc));
+                    func.instruction(&Instruction::LocalSet(caller_new_ptr_local));
+
+                    // Copy data bytes from callee → caller
+                    func.instruction(&Instruction::LocalGet(caller_new_ptr_local));
+                    func.instruction(&Instruction::LocalGet(data_ptr_local));
+                    func.instruction(&Instruction::LocalGet(data_len_local));
+                    func.instruction(&Instruction::MemoryCopy {
+                        src_mem: options.callee_memory,
+                        dst_mem: options.caller_memory,
+                    });
+
+                    // Write fixed-up [new_ptr, data_len] to retptr
+                    func.instruction(&Instruction::LocalGet(retptr_local));
+                    func.instruction(&Instruction::LocalGet(caller_new_ptr_local));
+                    func.instruction(&Instruction::I32Store(wasm_encoder::MemArg {
+                        offset: ptr_offset as u64,
+                        align: 2,
+                        memory_index: options.caller_memory,
+                    }));
+
+                    func.instruction(&Instruction::LocalGet(retptr_local));
+                    func.instruction(&Instruction::LocalGet(data_len_local));
+                    func.instruction(&Instruction::I32Store(wasm_encoder::MemArg {
+                        offset: len_offset as u64,
+                        align: 2,
+                        memory_index: options.caller_memory,
+                    }));
+
+                    byte_offset += 8; // skip both ptr and len
+                } else {
+                    // Scalar value — copy directly from return area to retptr
+                    func.instruction(&Instruction::LocalGet(retptr_local));
+                    func.instruction(&Instruction::LocalGet(result_ptr_local));
+                    func.instruction(&Instruction::I32Load(wasm_encoder::MemArg {
+                        offset: byte_offset as u64,
+                        align: 2,
+                        memory_index: options.callee_memory,
+                    }));
+                    func.instruction(&Instruction::I32Store(wasm_encoder::MemArg {
+                        offset: byte_offset as u64,
+                        align: 2,
+                        memory_index: options.caller_memory,
+                    }));
+
+                    byte_offset += 4;
+                }
+            }
+        } else {
+            // No result pointer pairs — bulk copy the entire return area
+            // (fallback for when we don't have layout info)
+            for offset in (0..return_area_size).step_by(4) {
+                func.instruction(&Instruction::LocalGet(retptr_local));
+                func.instruction(&Instruction::LocalGet(result_ptr_local));
+                func.instruction(&Instruction::I32Load(wasm_encoder::MemArg {
+                    offset: offset as u64,
+                    align: 2,
+                    memory_index: options.callee_memory,
+                }));
+                func.instruction(&Instruction::I32Store(wasm_encoder::MemArg {
+                    offset: offset as u64,
+                    align: 2,
+                    memory_index: options.caller_memory,
+                }));
+            }
+        }
+
+        // --- Phase 6: Call post-return for callee cleanup ---
+        if let Some(post_return_func) = options.callee_post_return {
+            func.instruction(&Instruction::LocalGet(result_ptr_local));
+            func.instruction(&Instruction::Call(post_return_func));
+        }
+
+        // Return void (retptr convention — results written to memory)
+        func.instruction(&Instruction::End);
+
+        Ok((caller_type_idx, func))
     }
 
     /// Generate an adapter with string transcoding

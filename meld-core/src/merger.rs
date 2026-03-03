@@ -825,10 +825,38 @@ impl Merger {
                         site.to_module,
                         site.export_func_idx,
                     )) {
+                        log::debug!(
+                            "Adapter site resolved: comp {} mod {} import {:?} -> func {}",
+                            comp_idx,
+                            mod_idx,
+                            imp.name,
+                            target_idx
+                        );
                         merged
                             .function_index_map
                             .insert((comp_idx, mod_idx, import_func_idx), target_idx);
+                    } else {
+                        log::debug!(
+                            "Adapter site MISS: comp {} mod {} import {:?} -> \
+                             target comp {} mod {} func {} NOT in function_index_map",
+                            comp_idx,
+                            mod_idx,
+                            imp.name,
+                            site.to_component,
+                            site.to_module,
+                            site.export_func_idx
+                        );
                     }
+                } else if imp.module.contains("test:numbers") {
+                    log::debug!(
+                        "NO adapter site for: comp {} mod {} module={:?} name={:?} \
+                         (total sites: {})",
+                        comp_idx,
+                        mod_idx,
+                        imp.module,
+                        imp.name,
+                        graph.adapter_sites.len()
+                    );
                 }
 
                 // Intra-component fallback: check module_resolutions for direct
@@ -1027,6 +1055,22 @@ impl Merger {
         // module-local index. For multi-module components, we decompose the
         // component-level index by accumulating per-module function counts.
         let mut realloc_from_canonical = false;
+
+        // Helper: check if a merged function has the cabi_realloc signature
+        // (i32, i32, i32, i32) -> i32.
+        let is_realloc_sig = |merged: &MergedModule, merged_idx: u32| -> bool {
+            if let Some(func) = merged.defined_func(merged_idx) {
+                if let Some(ty) = merged.types.get(func.type_idx as usize) {
+                    return ty.params.len() == 4
+                        && ty.results.len() == 1
+                        && ty.params.iter().all(|p| *p == wasm_encoder::ValType::I32)
+                        && ty.results[0] == wasm_encoder::ValType::I32;
+                }
+            }
+            // Import functions — accept if we can't verify
+            (merged_idx as usize) < merged.import_counts.func as usize
+        };
+
         for entry in &components[comp_idx].canonical_functions {
             let realloc_idx = match entry {
                 crate::parser::CanonicalEntry::Lift { options, .. } => options.realloc,
@@ -1047,18 +1091,34 @@ impl Merger {
                             target_mod_idx,
                             local_func_idx,
                         )) {
-                            merged.realloc_map.insert((comp_idx, mod_idx), merged_idx);
-                            realloc_from_canonical = true;
-                            log::debug!(
-                                "Found canonical realloc in component {} module {}: \
-                                 component core func {} -> module-local {} -> merged idx {}",
-                                comp_idx,
-                                mod_idx,
-                                core_func_idx,
-                                local_func_idx,
-                                merged_idx
-                            );
-                            break;
+                            // Validate signature: decompose_component_core_func_index
+                            // can produce incorrect mappings for multi-module components
+                            // because the component core function space includes canon
+                            // lower entries that aren't in any module's function space.
+                            if is_realloc_sig(merged, merged_idx) {
+                                merged.realloc_map.insert((comp_idx, mod_idx), merged_idx);
+                                realloc_from_canonical = true;
+                                log::debug!(
+                                    "Found canonical realloc in component {} module {}: \
+                                     component core func {} -> module-local {} -> merged idx {}",
+                                    comp_idx,
+                                    mod_idx,
+                                    core_func_idx,
+                                    local_func_idx,
+                                    merged_idx
+                                );
+                                break;
+                            } else {
+                                log::debug!(
+                                    "Canonical realloc candidate in component {} module {} \
+                                     (core func {} -> local {} -> merged {}) has wrong signature, skipping",
+                                    comp_idx,
+                                    mod_idx,
+                                    core_func_idx,
+                                    local_func_idx,
+                                    merged_idx
+                                );
+                            }
                         }
                     }
                 } else {
@@ -1072,17 +1132,19 @@ impl Merger {
                             .function_index_map
                             .get(&(comp_idx, mod_idx, core_func_idx))
                     {
-                        merged.realloc_map.insert((comp_idx, mod_idx), merged_idx);
-                        realloc_from_canonical = true;
-                        log::debug!(
-                            "Found canonical realloc (direct fallback) in component {} module {}: \
-                             core func {} -> merged idx {}",
-                            comp_idx,
-                            mod_idx,
-                            core_func_idx,
-                            merged_idx
-                        );
-                        break;
+                        if is_realloc_sig(merged, merged_idx) {
+                            merged.realloc_map.insert((comp_idx, mod_idx), merged_idx);
+                            realloc_from_canonical = true;
+                            log::debug!(
+                                "Found canonical realloc (direct fallback) in component {} module {}: \
+                                 core func {} -> merged idx {}",
+                                comp_idx,
+                                mod_idx,
+                                core_func_idx,
+                                merged_idx
+                            );
+                            break;
+                        }
                     }
                 }
             }
@@ -1167,6 +1229,21 @@ impl Merger {
         let mut emitted_global: HashSet<(String, String)> = HashSet::new();
 
         for unresolved in &graph.unresolved_imports {
+            // Skip imports resolved by adapter sites (must match the
+            // filter in compute_unresolved_import_assignments).
+            let resolved_by_adapter = graph.adapter_sites.iter().any(|site| {
+                if site.from_component != unresolved.component_idx {
+                    return false;
+                }
+                let direct = site.from_module == unresolved.module_idx
+                    && site.import_name == unresolved.field_name;
+                let display = unresolved.display_field.as_deref() == Some(&site.import_name);
+                direct || display
+            });
+            if resolved_by_adapter {
+                continue;
+            }
+
             if let (Some(plan), ImportKind::Memory(_)) = (shared_memory_plan, &unresolved.kind) {
                 if let Some((module, name)) = &plan.import {
                     if !shared_memory_import_added {
@@ -1941,7 +2018,30 @@ fn compute_unresolved_import_assignments(
     // Track entries where type mismatch prevented deduplication
     let mut type_mismatch_entries: HashSet<(usize, usize, String, String)> = HashSet::new();
 
+    let mut adapter_skip_count = 0usize;
     for unresolved in &graph.unresolved_imports {
+        // Skip imports that are resolved by adapter sites (cross-component
+        // or per-function interface wiring).  Match on both raw core names
+        // (module_name/field_name) and display names (display_module/display_field)
+        // because indirect-table shim modules use synthetic names (module="",
+        // field="0") while their display names carry the original interface names.
+        let resolved_by_adapter = graph.adapter_sites.iter().any(|site| {
+            if site.from_component != unresolved.component_idx {
+                return false;
+            }
+            // Direct match: same module, field matches import_name
+            let direct = site.from_module == unresolved.module_idx
+                && site.import_name == unresolved.field_name;
+            // Display match: display_field matches import_name (for shim modules
+            // whose raw field is a numeric index)
+            let display = unresolved.display_field.as_deref() == Some(&site.import_name);
+            direct || display
+        });
+        if resolved_by_adapter {
+            adapter_skip_count += 1;
+            continue;
+        }
+
         if let (Some(plan), ImportKind::Memory(_)) = (shared_memory_plan, &unresolved.kind) {
             if plan.import.is_some() && !shared_memory_import_counted {
                 counts.memory += 1;
@@ -2076,6 +2176,18 @@ fn compute_unresolved_import_assignments(
         if plan.import.is_some() && !shared_memory_import_counted {
             counts.memory += 1;
         }
+    }
+
+    if adapter_skip_count > 0 {
+        log::debug!(
+            "compute_unresolved_import_assignments: skipped {} adapter-resolved imports \
+             (remaining: {} func, {} table, {} global, {} memory)",
+            adapter_skip_count,
+            counts.func,
+            counts.table,
+            counts.global,
+            counts.memory
+        );
     }
 
     let dedup_info = ImportDedupInfo {

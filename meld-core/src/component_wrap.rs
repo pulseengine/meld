@@ -45,11 +45,15 @@ use crate::{Error, Result};
 pub fn wrap_as_component(
     fused_module: &[u8],
     components: &[ParsedComponent],
+    original_components: &[ParsedComponent],
     _graph: &DependencyGraph,
 ) -> Result<Vec<u8>> {
-    // Pick the component with the most depth_0_sections (widest interface)
-    let source = components
+    // Pick the component with the most depth_0_sections (widest interface).
+    // Prefer original (un-flattened) components since flattening may drop
+    // the outer shell that carries the depth_0_sections.
+    let source = original_components
         .iter()
+        .chain(components.iter())
         .max_by_key(|c| c.depth_0_sections.len())
         .ok_or(Error::NoComponents)?;
 

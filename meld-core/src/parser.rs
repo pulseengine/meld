@@ -509,6 +509,14 @@ pub struct ComponentParser {
     validate: bool,
 }
 
+/// Check if any sub-component in the tree contains core modules.
+fn has_modules_recursive(component: &ParsedComponent) -> bool {
+    component
+        .sub_components
+        .iter()
+        .any(|sub| !sub.core_modules.is_empty() || has_modules_recursive(sub))
+}
+
 impl ComponentParser {
     /// Create a new parser
     pub fn new() -> Self {
@@ -571,6 +579,9 @@ impl ComponentParser {
         // nested ComponentSection are routed to the correct sub-component.
         let mut depth = 0usize;
         let mut sub_stack: Vec<ParsedComponent> = Vec::new();
+        // Track non-component nesting (ModuleSection) so that their End
+        // payloads don't prematurely pop the component sub_stack.
+        let mut module_nesting = 0usize;
         // Stop capturing depth_0_sections once we hit the first core module,
         // so we only replay interface-definition sections (Type, Import, Alias)
         // and not the wiring sections that reference core instances.
@@ -578,15 +589,29 @@ impl ComponentParser {
 
         for payload in parser.parse_all(bytes) {
             let payload = payload?;
-            // Track when we first encounter a core module at depth 0
-            if depth == 0 && matches!(&payload, Payload::ModuleSection { .. }) {
+            // Track when we first encounter a core module or sub-component at
+            // depth 0.  After this point, sections are wiring (instances,
+            // aliases referencing sub-components) rather than interface
+            // definitions, so we stop capturing depth_0_sections.
+            if depth == 0
+                && matches!(
+                    &payload,
+                    Payload::ModuleSection { .. } | Payload::ComponentSection { .. }
+                )
+            {
                 seen_core_module = true;
             }
+            let is_module_section = matches!(&payload, Payload::ModuleSection { .. });
             match &payload {
                 Payload::ComponentSection { .. } => {
                     depth += 1;
                     sub_stack.push(ParsedComponent::empty());
                     continue; // don't pass ComponentSection to handle_payload
+                }
+                Payload::End(_) if module_nesting > 0 => {
+                    // End of a nested core module — NOT a component.
+                    module_nesting -= 1;
+                    continue;
                 }
                 Payload::End(_) if depth > 0 => {
                     depth -= 1;
@@ -601,6 +626,11 @@ impl ComponentParser {
                 }
                 _ => {}
             }
+            // Skip payloads from nested core modules (TypeSection,
+            // FunctionSection, etc.) — they're handled by parse_core_module.
+            if module_nesting > 0 {
+                continue;
+            }
             let target = if depth > 0 {
                 sub_stack.last_mut().unwrap()
             } else {
@@ -608,9 +638,16 @@ impl ComponentParser {
             };
             let capture_sections = depth == 0 && !seen_core_module;
             self.handle_payload(payload, target, bytes, capture_sections)?;
+            // After handle_payload processes a ModuleSection (calling
+            // parse_core_module which independently parses the module from
+            // its binary range), start skipping the module's inner payloads
+            // that parse_all will yield next.
+            if is_module_section {
+                module_nesting += 1;
+            }
         }
 
-        if component.core_modules.is_empty() {
+        if component.core_modules.is_empty() && !has_modules_recursive(&component) {
             return Err(Error::NoCoreModules);
         }
 
@@ -1170,6 +1207,209 @@ impl ParsedComponent {
             .filter(|d| matches!(d, ComponentTypeDef::Defined))
             .count();
         self.types.get(def_offset)
+    }
+
+    /// Build a map from core function index → (component type index, canonical options)
+    /// for Lift entries. The type index refers to the component function type that
+    /// describes the high-level params/results (needed for computing return area size).
+    pub fn lift_info_by_core_func(
+        &self,
+    ) -> std::collections::HashMap<u32, (u32, &CanonicalOptions)> {
+        let mut map = std::collections::HashMap::new();
+        for entry in &self.canonical_functions {
+            if let CanonicalEntry::Lift {
+                core_func_index,
+                type_index,
+                options,
+            } = entry
+            {
+                map.insert(*core_func_index, (*type_index, options));
+            }
+        }
+        map
+    }
+
+    /// Compute the flat byte size of a component value type's canonical ABI representation.
+    ///
+    /// In the canonical ABI, complex types are "flattened" to sequences of core wasm values.
+    /// This returns the total byte size of that flat representation, used for sizing
+    /// return area buffers in the retptr calling convention.
+    pub fn flat_byte_size(&self, ty: &ComponentValType) -> u32 {
+        match ty {
+            ComponentValType::Primitive(p) => match p {
+                PrimitiveValType::S64 | PrimitiveValType::U64 | PrimitiveValType::F64 => 8,
+                _ => 4,
+            },
+            ComponentValType::String => 8,  // (ptr: i32, len: i32)
+            ComponentValType::List(_) => 8, // (ptr: i32, len: i32)
+            ComponentValType::Record(fields) => {
+                fields.iter().map(|(_, ty)| self.flat_byte_size(ty)).sum()
+            }
+            ComponentValType::Tuple(elems) => elems.iter().map(|ty| self.flat_byte_size(ty)).sum(),
+            ComponentValType::Option(inner) => 4 + self.flat_byte_size(inner),
+            ComponentValType::Result { ok, err } => {
+                let ok_size = ok.as_ref().map(|t| self.flat_byte_size(t)).unwrap_or(0);
+                let err_size = err.as_ref().map(|t| self.flat_byte_size(t)).unwrap_or(0);
+                4 + ok_size.max(err_size)
+            }
+            ComponentValType::Type(idx) => {
+                if let Some(ct) = self.get_type_definition(*idx) {
+                    if let ComponentTypeKind::Defined(inner) = &ct.kind {
+                        self.flat_byte_size(inner)
+                    } else {
+                        4
+                    }
+                } else {
+                    4
+                }
+            }
+            ComponentValType::Variant(cases) => {
+                // discriminant + max case payload
+                let max_payload = cases
+                    .iter()
+                    .filter_map(|(_, ty)| ty.as_ref().map(|t| self.flat_byte_size(t)))
+                    .max()
+                    .unwrap_or(0);
+                4 + max_payload
+            }
+            ComponentValType::Own(_) | ComponentValType::Borrow(_) => 4,
+        }
+    }
+
+    /// Compute the byte size of the return area for a component function's results.
+    pub fn return_area_byte_size(&self, results: &[(Option<String>, ComponentValType)]) -> u32 {
+        results.iter().map(|(_, ty)| self.flat_byte_size(ty)).sum()
+    }
+
+    /// Compute flat core param indices where (ptr, len) pairs start.
+    ///
+    /// In the canonical ABI, `string` and `list<T>` params flatten to
+    /// two consecutive i32 values (pointer, length). This method walks the
+    /// component function type's params and returns the 0-based flat index
+    /// where each such pair begins.
+    pub fn pointer_pair_param_positions(&self, params: &[(String, ComponentValType)]) -> Vec<u32> {
+        let mut positions = Vec::new();
+        let mut flat_idx = 0u32;
+        for (_, ty) in params {
+            self.collect_pointer_positions(ty, flat_idx, &mut positions);
+            flat_idx += self.flat_count(ty);
+        }
+        positions
+    }
+
+    /// Compute flat return-area byte offsets where (ptr, len) pairs start.
+    pub fn pointer_pair_result_offsets(
+        &self,
+        results: &[(Option<String>, ComponentValType)],
+    ) -> Vec<u32> {
+        let mut offsets = Vec::new();
+        let mut byte_offset = 0u32;
+        for (_, ty) in results {
+            self.collect_pointer_byte_offsets(ty, byte_offset, &mut offsets);
+            byte_offset += self.flat_byte_size(ty);
+        }
+        offsets
+    }
+
+    /// Collect flat param indices where pointer pairs start within a type.
+    fn collect_pointer_positions(&self, ty: &ComponentValType, base: u32, out: &mut Vec<u32>) {
+        match ty {
+            ComponentValType::String | ComponentValType::List(_) => {
+                out.push(base);
+            }
+            ComponentValType::Record(fields) => {
+                let mut offset = base;
+                for (_, field_ty) in fields {
+                    self.collect_pointer_positions(field_ty, offset, out);
+                    offset += self.flat_count(field_ty);
+                }
+            }
+            ComponentValType::Tuple(elems) => {
+                let mut offset = base;
+                for elem_ty in elems {
+                    self.collect_pointer_positions(elem_ty, offset, out);
+                    offset += self.flat_count(elem_ty);
+                }
+            }
+            ComponentValType::Type(idx) => {
+                if let Some(ct) = self.get_type_definition(*idx)
+                    && let ComponentTypeKind::Defined(inner) = &ct.kind
+                {
+                    self.collect_pointer_positions(inner, base, out);
+                }
+            }
+            // Scalars, options, results, resources — no pointer pairs at param level
+            _ => {}
+        }
+    }
+
+    /// Collect byte offsets in the return area where pointer pairs start.
+    fn collect_pointer_byte_offsets(&self, ty: &ComponentValType, base: u32, out: &mut Vec<u32>) {
+        match ty {
+            ComponentValType::String | ComponentValType::List(_) => {
+                out.push(base);
+            }
+            ComponentValType::Record(fields) => {
+                let mut offset = base;
+                for (_, field_ty) in fields {
+                    self.collect_pointer_byte_offsets(field_ty, offset, out);
+                    offset += self.flat_byte_size(field_ty);
+                }
+            }
+            ComponentValType::Tuple(elems) => {
+                let mut offset = base;
+                for elem_ty in elems {
+                    self.collect_pointer_byte_offsets(elem_ty, offset, out);
+                    offset += self.flat_byte_size(elem_ty);
+                }
+            }
+            ComponentValType::Type(idx) => {
+                if let Some(ct) = self.get_type_definition(*idx)
+                    && let ComponentTypeKind::Defined(inner) = &ct.kind
+                {
+                    self.collect_pointer_byte_offsets(inner, base, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Count the number of flat core wasm values a component type flattens to.
+    pub fn flat_count(&self, ty: &ComponentValType) -> u32 {
+        match ty {
+            ComponentValType::Primitive(_) => 1, // always 1 core value (i32/i64/f32/f64)
+            ComponentValType::String | ComponentValType::List(_) => 2, // (ptr, len)
+            ComponentValType::Record(fields) => {
+                fields.iter().map(|(_, t)| self.flat_count(t)).sum()
+            }
+            ComponentValType::Tuple(elems) => elems.iter().map(|t| self.flat_count(t)).sum(),
+            ComponentValType::Option(inner) => 1 + self.flat_count(inner),
+            ComponentValType::Result { ok, err } => {
+                let ok_c = ok.as_ref().map(|t| self.flat_count(t)).unwrap_or(0);
+                let err_c = err.as_ref().map(|t| self.flat_count(t)).unwrap_or(0);
+                1 + ok_c.max(err_c)
+            }
+            ComponentValType::Variant(cases) => {
+                let max_c = cases
+                    .iter()
+                    .filter_map(|(_, t)| t.as_ref().map(|t| self.flat_count(t)))
+                    .max()
+                    .unwrap_or(0);
+                1 + max_c
+            }
+            ComponentValType::Type(idx) => {
+                if let Some(ct) = self.get_type_definition(*idx) {
+                    if let ComponentTypeKind::Defined(inner) = &ct.kind {
+                        self.flat_count(inner)
+                    } else {
+                        1
+                    }
+                } else {
+                    1
+                }
+            }
+            ComponentValType::Own(_) | ComponentValType::Borrow(_) => 1,
+        }
     }
 }
 
