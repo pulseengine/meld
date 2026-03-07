@@ -621,4 +621,139 @@ mod tests {
             _ => panic!("expected I32Const"),
         }
     }
+
+    /// SR-10: Active element segment table index is remapped correctly.
+    #[test]
+    fn test_reindex_element_segment_active_remaps_table() {
+        let segment = ParsedElementSegment {
+            mode: ParsedElementSegmentMode::Active {
+                table_index: 0,
+                offset: ParsedConstExpr::I32Const(0),
+            },
+            element_type: RefType::FUNCREF,
+            items: ElementItems_::Functions(vec![0]),
+        };
+
+        let mut maps = IndexMaps::new();
+        maps.tables.insert(0, 3);
+
+        let reindexed = reindex_element_segment(&segment, &maps);
+        match &reindexed.mode {
+            ElementSegmentMode::Active { table_index, .. } => {
+                assert_eq!(*table_index, 3, "table index should be remapped from 0 to 3");
+            }
+            _ => panic!("expected active element segment mode"),
+        }
+    }
+
+    /// SR-10: Function references inside element segments are remapped.
+    #[test]
+    fn test_reindex_element_segment_remaps_function_refs() {
+        let segment = ParsedElementSegment {
+            mode: ParsedElementSegmentMode::Passive,
+            element_type: RefType::FUNCREF,
+            items: ElementItems_::Functions(vec![0, 1, 2]),
+        };
+
+        let mut maps = IndexMaps::new();
+        maps.functions.insert(0, 10);
+        maps.functions.insert(1, 11);
+        maps.functions.insert(2, 12);
+
+        let reindexed = reindex_element_segment(&segment, &maps);
+        match &reindexed.items {
+            ReindexedElementItems::Functions(funcs) => {
+                assert_eq!(funcs, &[10, 11, 12], "function indices should be remapped");
+            }
+            _ => panic!("expected Functions variant in reindexed items"),
+        }
+    }
+
+    /// SR-10: Active data segment memory index is remapped correctly.
+    #[test]
+    fn test_reindex_data_segment_remaps_memory_index() {
+        let segment = ParsedDataSegment {
+            mode: DataSegmentMode_::Active {
+                memory_index: 0,
+                offset: ParsedConstExpr::I32Const(0),
+                offset_value: Some(ConstExprValue::I32(0)),
+            },
+            data: vec![0xAA, 0xBB],
+        };
+
+        let mut maps = IndexMaps::new();
+        maps.memories.insert(0, 2);
+
+        let reindexed = reindex_data_segment(&segment, &maps).unwrap();
+        match &reindexed.mode {
+            ReindexedDataMode::Active { memory_index, .. } => {
+                assert_eq!(*memory_index, 2, "memory index should be remapped from 0 to 2");
+            }
+            _ => panic!("expected active data segment mode"),
+        }
+    }
+
+    /// SR-10 / UCA-M-6: Global index in data segment offset expression is
+    /// remapped. Without this, a `global.get 0` offset could reference the
+    /// wrong global after merging, corrupting the data segment placement.
+    #[test]
+    fn test_reindex_data_segment_global_get_remaps_global() {
+        let segment = ParsedDataSegment {
+            mode: DataSegmentMode_::Active {
+                memory_index: 0,
+                offset: ParsedConstExpr::GlobalGet(0),
+                offset_value: None,
+            },
+            data: vec![0xFF],
+        };
+
+        let mut maps = IndexMaps::new();
+        maps.globals.insert(0, 5);
+
+        let reindexed = reindex_data_segment(&segment, &maps).unwrap();
+        let ReindexedDataMode::Active { offset, .. } = &reindexed.mode else {
+            panic!("expected active data segment mode");
+        };
+
+        // Encode both the actual and expected ConstExpr to compare bytes,
+        // since ConstExpr does not implement PartialEq.
+        let mut actual = Vec::new();
+        offset.encode(&mut actual);
+
+        let mut expected = Vec::new();
+        ConstExpr::global_get(5).encode(&mut expected);
+
+        assert_eq!(actual, expected, "global index in offset should be remapped from 0 to 5");
+    }
+
+    /// SR-10: Concrete type index inside RefNull expressions in element
+    /// segments is remapped through the type index map.
+    #[test]
+    fn test_reindex_element_segment_expression_remaps_ref_null_type() {
+        let segment = ParsedElementSegment {
+            mode: ParsedElementSegmentMode::Passive,
+            element_type: RefType::FUNCREF,
+            items: ElementItems_::Expressions(vec![
+                ParsedConstExpr::RefNull(wasm_encoder::HeapType::Concrete(0)),
+            ]),
+        };
+
+        let mut maps = IndexMaps::new();
+        maps.types.insert(0, 4);
+
+        let reindexed = reindex_element_segment(&segment, &maps);
+        let ReindexedElementItems::Expressions(exprs) = &reindexed.items else {
+            panic!("expected Expressions variant in reindexed items");
+        };
+        assert_eq!(exprs.len(), 1, "should have exactly one expression");
+
+        // Encode both the actual and expected ConstExpr to compare bytes.
+        let mut actual = Vec::new();
+        exprs[0].encode(&mut actual);
+
+        let mut expected = Vec::new();
+        ConstExpr::ref_null(wasm_encoder::HeapType::Concrete(4)).encode(&mut expected);
+
+        assert_eq!(actual, expected, "concrete type index should be remapped from 0 to 4");
+    }
 }

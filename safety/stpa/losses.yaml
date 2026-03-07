@@ -1,0 +1,62 @@
+# STPA Step 1a: Losses
+#
+# A loss involves something of value to stakeholders.
+# Losses define what the analysis aims to prevent.
+#
+# Reference: STPA Handbook (Leveson & Thomas, 2018), Chapter 2
+#
+# System: Meld - Static WebAssembly Component Fusion Tool
+# System boundary: Meld accepts composed P2/P3 WebAssembly components and
+#   produces a single fused core module (or wrapped P2 component). The system
+#   boundary includes all transformation stages (parse, resolve, merge, adapt,
+#   encode) and excludes the runtime environment, upstream compilers, and
+#   downstream tools (Loom, Synth).
+#
+# Stakeholders:
+#   - Developers building safety-critical systems with WebAssembly
+#   - End-users of systems whose behavior depends on correct fusion
+#   - Certification authorities (ISO 26262, DO-178C, IEC 61508)
+#   - PulseEngine toolchain (Loom, Synth, Kiln, Sigil)
+
+losses:
+  - id: L-1
+    title: Loss of semantic correctness
+    description: >
+      The fused module exhibits different observable behavior than the original
+      composed components. Functions return wrong values, calls reach wrong
+      targets, or traps occur where none should.
+    stakeholders: [developers, end-users, certification-authorities]
+
+  - id: L-2
+    title: Loss of memory safety
+    description: >
+      The fused module permits cross-component memory corruption: one
+      component reads or writes another component's linear memory without
+      proper adapter mediation, or adapter-generated code computes incorrect
+      addresses.
+    stakeholders: [developers, end-users]
+
+  - id: L-3
+    title: Loss of supply chain integrity
+    description: >
+      Transformation provenance is lost, falsified, or unverifiable. The
+      output module cannot be traced back to its input components and the
+      exact tool version and configuration that produced it.
+    stakeholders: [developers, certification-authorities]
+
+  - id: L-4
+    title: Loss of build reproducibility
+    description: >
+      Identical inputs (same component binaries, same configuration) produce
+      different output binaries across builds, machines, or toolchain versions.
+      Non-determinism in the fusion pipeline breaks hermetic build guarantees.
+    stakeholders: [developers, certification-authorities]
+
+  - id: L-5
+    title: Loss of certification evidence
+    description: >
+      The transformation cannot be demonstrated correct to a certification
+      authority. Formal proofs do not cover the actual code paths exercised,
+      test coverage is insufficient, or traceability from requirements to
+      implementation is broken.
+    stakeholders: [certification-authorities, developers]

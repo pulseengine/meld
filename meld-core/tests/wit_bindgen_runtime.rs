@@ -17,12 +17,13 @@ use wasmtime_wasi::{WasiCtx, WasiCtxView, WasiView};
 
 const FIXTURES_DIR: &str = "../tests/wit_bindgen/fixtures";
 
-/// Skip tests when fixture files are not present.
-fn fixtures_available() -> bool {
-    if std::path::Path::new(FIXTURES_DIR).is_dir() {
+/// Skip a test when the specific fixture .wasm file is not present.
+fn fixture_exists(name: &str) -> bool {
+    let path = fixture_path(name);
+    if std::path::Path::new(&path).is_file() {
         true
     } else {
-        eprintln!("skipping: wit-bindgen fixtures not found at {FIXTURES_DIR}");
+        eprintln!("skipping: fixture not found at {path}");
         false
     }
 }
@@ -113,7 +114,7 @@ fn run_wasi_component(wasm: &[u8]) -> anyhow::Result<()> {
 
 #[test]
 fn test_fuse_wit_bindgen_numbers() {
-    if !fixtures_available() {
+    if !fixture_exists("numbers") {
         return;
     }
     let fused = fuse_fixture("numbers", OutputFormat::CoreModule).unwrap();
@@ -124,7 +125,7 @@ fn test_fuse_wit_bindgen_numbers() {
 
 #[test]
 fn test_fuse_wit_bindgen_strings() {
-    if !fixtures_available() {
+    if !fixture_exists("strings") {
         return;
     }
     let fused = fuse_fixture("strings", OutputFormat::CoreModule).unwrap();
@@ -135,7 +136,7 @@ fn test_fuse_wit_bindgen_strings() {
 
 #[test]
 fn test_fuse_wit_bindgen_lists() {
-    if !fixtures_available() {
+    if !fixture_exists("lists") {
         return;
     }
     let fused = fuse_fixture("lists", OutputFormat::CoreModule).unwrap();
@@ -146,7 +147,7 @@ fn test_fuse_wit_bindgen_lists() {
 
 #[test]
 fn test_fuse_wit_bindgen_records() {
-    if !fixtures_available() {
+    if !fixture_exists("records") {
         return;
     }
     let fused = fuse_fixture("records", OutputFormat::CoreModule).unwrap();
@@ -161,7 +162,7 @@ fn test_fuse_wit_bindgen_records() {
 
 #[test]
 fn test_fuse_component_wit_bindgen_numbers() {
-    if !fixtures_available() {
+    if !fixture_exists("numbers") {
         return;
     }
     let fused = fuse_fixture("numbers", OutputFormat::Component).unwrap();
@@ -172,7 +173,7 @@ fn test_fuse_component_wit_bindgen_numbers() {
 
 #[test]
 fn test_fuse_component_wit_bindgen_strings() {
-    if !fixtures_available() {
+    if !fixture_exists("strings") {
         return;
     }
     let fused = fuse_fixture("strings", OutputFormat::Component).unwrap();
@@ -183,7 +184,7 @@ fn test_fuse_component_wit_bindgen_strings() {
 
 #[test]
 fn test_fuse_component_wit_bindgen_lists() {
-    if !fixtures_available() {
+    if !fixture_exists("lists") {
         return;
     }
     let fused = fuse_fixture("lists", OutputFormat::Component).unwrap();
@@ -194,7 +195,7 @@ fn test_fuse_component_wit_bindgen_lists() {
 
 #[test]
 fn test_fuse_component_wit_bindgen_records() {
-    if !fixtures_available() {
+    if !fixture_exists("records") {
         return;
     }
     let fused = fuse_fixture("records", OutputFormat::Component).unwrap();
@@ -209,7 +210,7 @@ fn test_fuse_component_wit_bindgen_records() {
 
 #[test]
 fn test_runtime_wit_bindgen_numbers() {
-    if !fixtures_available() {
+    if !fixture_exists("numbers") {
         return;
     }
     let fused = fuse_fixture("numbers", OutputFormat::Component).unwrap();
@@ -218,7 +219,7 @@ fn test_runtime_wit_bindgen_numbers() {
 
 #[test]
 fn test_runtime_wit_bindgen_strings() {
-    if !fixtures_available() {
+    if !fixture_exists("strings") {
         return;
     }
     let fused = fuse_fixture("strings", OutputFormat::Component).unwrap();
@@ -227,7 +228,7 @@ fn test_runtime_wit_bindgen_strings() {
 
 #[test]
 fn test_runtime_wit_bindgen_lists() {
-    if !fixtures_available() {
+    if !fixture_exists("lists") {
         return;
     }
     let fused = fuse_fixture("lists", OutputFormat::Component).unwrap();
@@ -236,7 +237,7 @@ fn test_runtime_wit_bindgen_lists() {
 
 #[test]
 fn test_runtime_wit_bindgen_records() {
-    if !fixtures_available() {
+    if !fixture_exists("records") {
         return;
     }
     let fused = fuse_fixture("records", OutputFormat::Component).unwrap();

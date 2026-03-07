@@ -1960,4 +1960,163 @@ mod tests {
         assert_eq!(convert_val_type(WasmValType::F32), ValType::F32);
         assert_eq!(convert_val_type(WasmValType::F64), ValType::F64);
     }
+
+    // ---------------------------------------------------------------
+    // Canonical ABI sizing tests (SR-3: Correct Canonical ABI element
+    // size computation)
+    // ---------------------------------------------------------------
+
+    /// Build a minimal `ParsedComponent` with no types/modules/imports.
+    /// Sufficient for exercising the sizing functions on inline types.
+    fn empty_parsed_component() -> ParsedComponent {
+        ParsedComponent {
+            name: None,
+            core_modules: vec![],
+            imports: vec![],
+            exports: vec![],
+            types: vec![],
+            instances: vec![],
+            canonical_functions: vec![],
+            sub_components: vec![],
+            component_aliases: vec![],
+            component_instances: vec![],
+            core_entity_order: vec![],
+            component_func_defs: vec![],
+            component_instance_defs: vec![],
+            component_type_defs: vec![],
+            original_size: 0,
+            original_hash: String::new(),
+            depth_0_sections: vec![],
+        }
+    }
+
+    /// SR-3: Verify element_size for every primitive type matches the
+    /// Canonical ABI specification (Core Spec 3.0 / Component Model).
+    #[test]
+    fn test_canonical_abi_element_size_primitive_types() {
+        let pc = empty_parsed_component();
+
+        let cases: &[(PrimitiveValType, u32)] = &[
+            (PrimitiveValType::U8, 1),
+            (PrimitiveValType::U16, 2),
+            (PrimitiveValType::U32, 4),
+            (PrimitiveValType::U64, 8),
+            (PrimitiveValType::S8, 1),
+            (PrimitiveValType::S16, 2),
+            (PrimitiveValType::S32, 4),
+            (PrimitiveValType::S64, 8),
+            (PrimitiveValType::F32, 4),
+            (PrimitiveValType::F64, 8),
+            (PrimitiveValType::Bool, 1),
+        ];
+
+        for (prim, expected) in cases {
+            let ty = ComponentValType::Primitive(*prim);
+            assert_eq!(
+                pc.canonical_abi_element_size(&ty),
+                *expected,
+                "element_size mismatch for {:?}",
+                prim,
+            );
+        }
+    }
+
+    /// SR-3: String is a (ptr: i32, len: i32) pair = 8 bytes, align 4.
+    #[test]
+    fn test_canonical_abi_element_size_string() {
+        let pc = empty_parsed_component();
+        let ty = ComponentValType::String;
+        assert_eq!(pc.canonical_abi_element_size(&ty), 8);
+    }
+
+    /// SR-3 / LS-P-2: A record {u8, string} must include alignment
+    /// padding.  Naive sum would give 1 + 8 = 9, but the string field
+    /// requires align-4, so the layout is:
+    ///   offset 0: u8      (1 byte)
+    ///   offset 1: padding  (3 bytes to reach align 4)
+    ///   offset 4: string   (8 bytes: ptr + len)
+    /// Unpadded size = 12.  Record align = max(1, 4) = 4.
+    /// element_size = align_up(12, 4) = 12.
+    #[test]
+    fn test_canonical_abi_element_size_record_with_padding() {
+        let pc = empty_parsed_component();
+        let ty = ComponentValType::Record(vec![
+            ("a".into(), ComponentValType::Primitive(PrimitiveValType::U8)),
+            ("b".into(), ComponentValType::String),
+        ]);
+        assert_eq!(
+            pc.canonical_abi_element_size(&ty),
+            12,
+            "record {{u8, string}} should be 12 (with alignment padding), not 9",
+        );
+    }
+
+    /// SR-3: A homogeneous record {u32, u32} needs no inter-field
+    /// padding — both fields are align-4 and the first already ends on
+    /// an aligned boundary.  element_size = 8.
+    #[test]
+    fn test_canonical_abi_element_size_record_homogeneous() {
+        let pc = empty_parsed_component();
+        let ty = ComponentValType::Record(vec![
+            ("x".into(), ComponentValType::Primitive(PrimitiveValType::U32)),
+            ("y".into(), ComponentValType::Primitive(PrimitiveValType::U32)),
+        ]);
+        assert_eq!(pc.canonical_abi_element_size(&ty), 8);
+    }
+
+    /// SR-3: Verify canonical_abi_align returns the correct power-of-two
+    /// alignment for each primitive and for compound types.
+    #[test]
+    fn test_canonical_abi_align_values() {
+        let pc = empty_parsed_component();
+
+        // Primitives
+        let prim_cases: &[(PrimitiveValType, u32)] = &[
+            (PrimitiveValType::Bool, 1),
+            (PrimitiveValType::U8, 1),
+            (PrimitiveValType::S8, 1),
+            (PrimitiveValType::U16, 2),
+            (PrimitiveValType::S16, 2),
+            (PrimitiveValType::U32, 4),
+            (PrimitiveValType::S32, 4),
+            (PrimitiveValType::F32, 4),
+            (PrimitiveValType::Char, 4),
+            (PrimitiveValType::U64, 8),
+            (PrimitiveValType::S64, 8),
+            (PrimitiveValType::F64, 8),
+        ];
+        for (prim, expected) in prim_cases {
+            let ty = ComponentValType::Primitive(*prim);
+            assert_eq!(
+                pc.canonical_abi_align(&ty),
+                *expected,
+                "align mismatch for {:?}",
+                prim,
+            );
+        }
+
+        // String — pointer alignment = 4
+        assert_eq!(pc.canonical_abi_align(&ComponentValType::String), 4);
+
+        // List — pointer alignment = 4
+        let list_ty = ComponentValType::List(Box::new(ComponentValType::Primitive(
+            PrimitiveValType::U8,
+        )));
+        assert_eq!(pc.canonical_abi_align(&list_ty), 4);
+
+        // Record inherits max alignment of its fields
+        let record_ty = ComponentValType::Record(vec![
+            ("a".into(), ComponentValType::Primitive(PrimitiveValType::U8)),
+            ("b".into(), ComponentValType::Primitive(PrimitiveValType::U64)),
+        ]);
+        assert_eq!(
+            pc.canonical_abi_align(&record_ty),
+            8,
+            "record {{u8, u64}} align should be max(1, 8) = 8",
+        );
+
+        // Empty record defaults to align 1
+        let empty_record = ComponentValType::Record(vec![]);
+        assert_eq!(pc.canonical_abi_align(&empty_record), 1);
+    }
 }

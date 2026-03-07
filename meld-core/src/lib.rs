@@ -1082,4 +1082,211 @@ mod tests {
         let result = fuser.fuse();
         assert!(matches!(result, Err(Error::NoComponents)));
     }
+
+    /// SR-19: Deterministic output — same input must always produce identical bytes.
+    ///
+    /// This catches non-determinism from HashMap iteration order (LS-CP-2) or any
+    /// other source of randomness in the fusion pipeline. We run the full pipeline
+    /// multiple times with identical input and assert byte-for-byte equality.
+    #[test]
+    fn test_deterministic_output() {
+        use wasm_encoder::{
+            CodeSection, Component, ExportKind, ExportSection, Function, FunctionSection,
+            Instruction, MemorySection, MemoryType, Module as EncoderModule, ModuleSection,
+            TypeSection,
+        };
+
+        /// Build a minimal valid WebAssembly component containing one core module
+        /// with a function, a memory, and exports for both.
+        fn build_minimal_component() -> Vec<u8> {
+            let mut types = TypeSection::new();
+            types.ty().function([], [wasm_encoder::ValType::I32]);
+
+            let mut functions = FunctionSection::new();
+            functions.function(0);
+
+            let mut memory = MemorySection::new();
+            memory.memory(MemoryType {
+                minimum: 1,
+                maximum: None,
+                memory64: false,
+                shared: false,
+                page_size_log2: None,
+            });
+
+            let mut exports = ExportSection::new();
+            exports.export("run", ExportKind::Func, 0);
+            exports.export("memory", ExportKind::Memory, 0);
+
+            let mut code = CodeSection::new();
+            let mut func = Function::new([]);
+            func.instruction(&Instruction::I32Const(42));
+            func.instruction(&Instruction::End);
+            code.function(&func);
+
+            let mut module = EncoderModule::new();
+            module
+                .section(&types)
+                .section(&functions)
+                .section(&memory)
+                .section(&exports)
+                .section(&code);
+
+            let mut component = Component::new();
+            component.section(&ModuleSection(&module));
+            component.finish()
+        }
+
+        let component_bytes = build_minimal_component();
+
+        // Disable attestation: it embeds timestamps and UUIDs which are
+        // intentionally non-deterministic and would mask the HashMap-order
+        // non-determinism we are trying to detect.
+        let config = FuserConfig {
+            attestation: false,
+            ..FuserConfig::default()
+        };
+
+        // Fuse once to get the reference output.
+        let mut reference_fuser = Fuser::new(config.clone());
+        reference_fuser
+            .add_component(&component_bytes)
+            .expect("failed to add component to reference fuser");
+        let reference_output = reference_fuser
+            .fuse()
+            .expect("reference fuse failed");
+
+        // Repeat with fresh Fuser instances. HashMap seeds are randomised per
+        // process but also per HashMap instance, so creating new Fusers (and
+        // therefore new internal HashMaps) on each iteration maximises the
+        // chance of catching iteration-order divergence.
+        for iteration in 0..5 {
+            let mut fuser = Fuser::new(config.clone());
+            fuser
+                .add_component(&component_bytes)
+                .expect("failed to add component");
+            let output = fuser.fuse().expect("fuse failed");
+
+            assert_eq!(
+                reference_output, output,
+                "Fusion output diverged on iteration {} — non-determinism detected (SR-19 / LS-CP-2)",
+                iteration
+            );
+        }
+    }
+
+    /// SR-20 / SC-8: Fail-fast when a core module (not a component) is passed
+    /// to `add_component()`.
+    ///
+    /// The parser must reject core modules immediately with `Error::NotAComponent`
+    /// rather than silently misinterpreting the binary.
+    #[test]
+    fn test_fuser_rejects_core_module_input() {
+        let core_module_bytes = wasm_encoder::Module::new().finish();
+
+        let mut fuser = Fuser::with_defaults();
+        let result = fuser.add_component(&core_module_bytes);
+
+        assert!(
+            matches!(result, Err(Error::NotAComponent)),
+            "expected Error::NotAComponent for a core module, got: {:?}",
+            result
+        );
+    }
+
+    /// SR-20 / SC-9: Fail-fast when address rebasing is requested with
+    /// multi-memory strategy.
+    ///
+    /// Address rebasing only makes sense with shared memory. The fuser must
+    /// reject the incompatible configuration immediately via
+    /// `Error::MemoryStrategyUnsupported`.
+    #[test]
+    fn test_fuser_address_rebasing_requires_shared_memory() {
+        use wasm_encoder::{
+            CodeSection, Component, ExportKind, ExportSection, Function, FunctionSection,
+            Instruction, MemorySection, MemoryType, Module as EncoderModule, ModuleSection,
+            TypeSection,
+        };
+
+        // Build a minimal component so we get past the NoComponents check.
+        let mut types = TypeSection::new();
+        types.ty().function([], [wasm_encoder::ValType::I32]);
+
+        let mut functions = FunctionSection::new();
+        functions.function(0);
+
+        let mut memory = MemorySection::new();
+        memory.memory(MemoryType {
+            minimum: 1,
+            maximum: None,
+            memory64: false,
+            shared: false,
+            page_size_log2: None,
+        });
+
+        let mut exports = ExportSection::new();
+        exports.export("run", ExportKind::Func, 0);
+        exports.export("memory", ExportKind::Memory, 0);
+
+        let mut code = CodeSection::new();
+        let mut func = Function::new([]);
+        func.instruction(&Instruction::I32Const(1));
+        func.instruction(&Instruction::End);
+        code.function(&func);
+
+        let mut module = EncoderModule::new();
+        module
+            .section(&types)
+            .section(&functions)
+            .section(&memory)
+            .section(&exports)
+            .section(&code);
+
+        let mut component = Component::new();
+        component.section(&ModuleSection(&module));
+        let component_bytes = component.finish();
+
+        let config = FuserConfig {
+            memory_strategy: MemoryStrategy::MultiMemory,
+            address_rebasing: true,
+            attestation: false,
+            ..FuserConfig::default()
+        };
+
+        let mut fuser = Fuser::new(config);
+        fuser
+            .add_component(&component_bytes)
+            .expect("add_component should succeed for a valid component");
+
+        let result = fuser.fuse();
+        assert!(
+            matches!(result, Err(Error::MemoryStrategyUnsupported(_))),
+            "expected Error::MemoryStrategyUnsupported when address_rebasing=true with MultiMemory, got: {:?}",
+            result
+        );
+    }
+
+    /// SR-20 / SC-8: Fail-fast on garbage input bytes.
+    ///
+    /// Completely invalid bytes must be rejected immediately rather than
+    /// causing panics or undefined behavior deeper in the pipeline.
+    #[test]
+    fn test_fuser_rejects_invalid_wasm() {
+        let garbage = b"not wasm";
+
+        let mut fuser = Fuser::with_defaults();
+        let result = fuser.add_component(garbage);
+
+        assert!(
+            result.is_err(),
+            "expected an error for garbage input, got Ok(())"
+        );
+
+        // The parser should detect the bad magic number and return InvalidWasm.
+        assert!(
+            matches!(result, Err(Error::InvalidWasm(_))),
+            "expected Error::InvalidWasm for garbage bytes, got: {:?}",
+            result
+        );
+    }
 }

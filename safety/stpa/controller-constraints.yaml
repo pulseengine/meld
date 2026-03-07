@@ -1,0 +1,284 @@
+# STPA Step 3b: Controller Constraints
+#
+# Each UCA is inverted to define a constraint on the controller's behavior.
+# Format: <Controller> must/must not <behavior> [UCA-x]
+#
+# Reference: STPA Handbook (Leveson & Thomas, 2018), Chapter 2
+
+controller-constraints:
+
+  # Parser constraints
+  - id: CC-P-1
+    controller: CTRL-PARSER
+    constraint: >
+      Parser must extract all core modules present in a component,
+      including nested instances
+    ucas: [UCA-P-1]
+    hazards: [H-1, H-3]
+
+  - id: CC-P-2
+    controller: CTRL-PARSER
+    constraint: >
+      Parser must extract all import and export entries from each
+      component
+    ucas: [UCA-P-2]
+    hazards: [H-1, H-5]
+
+  - id: CC-P-3
+    controller: CTRL-PARSER
+    constraint: >
+      Parser must compute canonical_abi_element_size for all types
+      that may appear in cross-component function signatures
+    ucas: [UCA-P-3]
+    hazards: [H-4, H-4.1, H-4.2]
+
+  - id: CC-P-4
+    controller: CTRL-PARSER
+    constraint: >
+      Parser must extract correct type signatures for all functions,
+      including those referencing recursive type groups
+    ucas: [UCA-P-4]
+    hazards: [H-1, H-4]
+
+  - id: CC-P-5
+    controller: CTRL-PARSER
+    constraint: >
+      Parser must compute canonical_abi_element_size with correct
+      alignment padding for record types
+    ucas: [UCA-P-5]
+    hazards: [H-4, H-4.1]
+
+  - id: CC-P-6
+    controller: CTRL-PARSER
+    constraint: >
+      Parser must reject malformed component binaries with a
+      diagnostic error
+    ucas: [UCA-P-6]
+    hazards: [H-1, H-3]
+
+  - id: CC-P-7
+    controller: CTRL-PARSER
+    constraint: >
+      Parser must process sections in the order specified by the
+      WebAssembly binary format
+    ucas: [UCA-P-7]
+    hazards: [H-3, H-3.4]
+
+  - id: CC-P-8
+    controller: CTRL-PARSER
+    constraint: >
+      Parser must process all sections of a component, including
+      code and data sections
+    ucas: [UCA-P-8]
+    hazards: [H-1, H-3]
+
+  # Resolver constraints
+  - id: CC-R-1
+    controller: CTRL-RESOLVER
+    constraint: >
+      Resolver must match every import to its corresponding export
+      when a valid match exists
+    ucas: [UCA-R-1]
+    hazards: [H-1, H-5]
+
+  - id: CC-R-2
+    controller: CTRL-RESOLVER
+    constraint: >
+      Resolver must produce a CopyLayout for every cross-component
+      call whose signature contains pointer types
+    ucas: [UCA-R-2]
+    hazards: [H-4, H-4.2]
+
+  - id: CC-R-3
+    controller: CTRL-RESOLVER
+    constraint: >
+      Resolver must not match an import to an export with a different
+      interface or type
+    ucas: [UCA-R-3]
+    hazards: [H-1]
+
+  - id: CC-R-4
+    controller: CTRL-RESOLVER
+    constraint: >
+      Resolver must compute CopyLayout byte_multiplier consistent with
+      canonical_abi_element_size
+    ucas: [UCA-R-4]
+    hazards: [H-4, H-4.1]
+
+  - id: CC-R-5
+    controller: CTRL-RESOLVER
+    constraint: >
+      Resolver must classify types with inner pointers as Elements
+      copy, not Bulk copy
+    ucas: [UCA-R-5]
+    hazards: [H-4, H-4.2]
+
+  - id: CC-R-6
+    controller: CTRL-RESOLVER
+    constraint: >
+      Resolver must produce an instantiation order where every
+      component appears after all components it depends on
+    ucas: [UCA-R-6]
+    hazards: [H-5, H-1]
+
+  - id: CC-R-7
+    controller: CTRL-RESOLVER
+    constraint: >
+      Resolver must detect dependency cycles and either report an
+      error or apply cycle-tolerant ordering with correct semantics
+    ucas: [UCA-R-7]
+    hazards: [H-5, H-1]
+
+  # Merger constraints
+  - id: CC-M-1
+    controller: CTRL-MERGER
+    constraint: >
+      Merger must include all functions from all components in the
+      merged function section
+    ucas: [UCA-M-1]
+    hazards: [H-1, H-3]
+
+  - id: CC-M-2
+    controller: CTRL-MERGER
+    constraint: >
+      Merger must rewrite every memory-referencing instruction to
+      use the rebased memory index
+    ucas: [UCA-M-2]
+    hazards: [H-2, H-3.2]
+
+  - id: CC-M-3
+    controller: CTRL-MERGER
+    constraint: >
+      Merger must compute function base offsets as cumulative sums
+      of preceding components' function counts (including imports)
+    ucas: [UCA-M-3]
+    hazards: [H-3, H-3.1]
+
+  - id: CC-M-4
+    controller: CTRL-MERGER
+    constraint: >
+      Merger must rewrite call_indirect type indices using the type
+      index offset, not the function index offset
+    ucas: [UCA-M-4]
+    hazards: [H-3, H-3.4]
+
+  - id: CC-M-5
+    controller: CTRL-MERGER
+    constraint: >
+      Merger must rebase data segment offsets using the memory base
+      address, not the function base offset
+    ucas: [UCA-M-5]
+    hazards: [H-2, H-1]
+
+  - id: CC-M-6
+    controller: CTRL-MERGER
+    constraint: >
+      Merger must remap global indices in data/element segment init
+      expressions
+    ucas: [UCA-M-6]
+    hazards: [H-3, H-3.3]
+
+  - id: CC-M-7
+    controller: CTRL-MERGER
+    constraint: >
+      Merger must process components in the same order as the
+      resolver's topological sort
+    ucas: [UCA-M-7]
+    hazards: [H-3, H-5]
+
+  - id: CC-M-8
+    controller: CTRL-MERGER
+    constraint: >
+      Rewriter must visit all instruction types that reference indices,
+      including multi-argument bulk memory instructions
+    ucas: [UCA-M-8]
+    hazards: [H-2, H-3.2]
+
+  # Adapter Generator constraints
+  - id: CC-A-1
+    controller: CTRL-ADAPTER
+    constraint: >
+      Adapter generator must produce an adapter for every cross-component
+      call that passes pointer arguments in multi-memory mode
+    ucas: [UCA-A-1]
+    hazards: [H-2, H-4]
+
+  - id: CC-A-2
+    controller: CTRL-ADAPTER
+    constraint: >
+      Adapter must emit cabi_realloc call to allocate destination buffer
+      before any memory.copy
+    ucas: [UCA-A-2]
+    hazards: [H-2, H-4, H-4.3]
+
+  - id: CC-A-3
+    controller: CTRL-ADAPTER
+    constraint: >
+      Adapter must emit inner pointer fixup loop for every list type
+      whose elements contain pointer fields
+    ucas: [UCA-A-3]
+    hazards: [H-4, H-4.2]
+
+  - id: CC-A-4
+    controller: CTRL-ADAPTER
+    constraint: >
+      Adapter must emit memory.copy with correct source and destination
+      memory indices
+    ucas: [UCA-A-4]
+    hazards: [H-2, H-4]
+
+  - id: CC-A-5
+    controller: CTRL-ADAPTER
+    constraint: >
+      Adapter must compute copy length using the correct
+      canonical_abi_element_size for the list element type
+    ucas: [UCA-A-5]
+    hazards: [H-4, H-4.1]
+
+  - id: CC-A-6
+    controller: CTRL-ADAPTER
+    constraint: >
+      Adapter must call cabi_realloc with the function index of the
+      destination component's allocator
+    ucas: [UCA-A-6]
+    hazards: [H-2, H-4, H-4.3]
+
+  - id: CC-A-7
+    controller: CTRL-ADAPTER
+    constraint: >
+      Adapter must compute inner pointer offsets within record elements
+      using correct alignment rules
+    ucas: [UCA-A-7]
+    hazards: [H-4, H-4.2]
+
+  - id: CC-A-8
+    controller: CTRL-ADAPTER
+    constraint: >
+      String transcoding must correctly handle surrogate pairs in
+      UTF-16 to UTF-8 conversion
+    ucas: [UCA-A-8]
+    hazards: [H-4, H-4.4]
+
+  - id: CC-A-9
+    controller: CTRL-ADAPTER
+    constraint: >
+      Return value lifting must read from the callee's memory, not
+      the caller's memory
+    ucas: [UCA-A-9]
+    hazards: [H-2, H-4]
+
+  - id: CC-A-10
+    controller: CTRL-ADAPTER
+    constraint: >
+      Adapter must emit cabi_realloc before memory.copy in the
+      instruction sequence
+    ucas: [UCA-A-10]
+    hazards: [H-4]
+
+  - id: CC-A-11
+    controller: CTRL-ADAPTER
+    constraint: >
+      Inner pointer fixup loop must iterate over all elements in
+      the list (loop counter must equal element count)
+    ucas: [UCA-A-11]
+    hazards: [H-4, H-4.2]

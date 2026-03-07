@@ -1172,6 +1172,13 @@ impl Resolver {
             in_degree[to] += 1;
         }
 
+        // Sort each adjacency list so that neighbours are visited in
+        // ascending index order.  This guarantees deterministic output
+        // regardless of the order edges were supplied (SR-19 / LS-CP-2).
+        for list in &mut adj {
+            list.sort_unstable();
+        }
+
         // Kahn's algorithm
         let mut queue: Vec<usize> = (0..n).filter(|&i| in_degree[i] == 0).collect();
         let mut result = Vec::with_capacity(n);
@@ -2191,6 +2198,185 @@ mod tests {
         }
     }
 
+    /// Helper: create a `ParsedComponent` with the given component-level
+    /// imports and exports.
+    ///
+    /// Import names go into `component.imports` (matched by the resolver
+    /// against other components' exports).  Export names go into
+    /// `component.exports`.  All other fields use `ParsedComponent::empty()`
+    /// defaults.
+    fn make_component(import_names: &[&str], export_names: &[&str]) -> ParsedComponent {
+        use crate::parser::ComponentImport;
+        use wasmparser::{ComponentExternalKind, ComponentTypeRef};
+
+        let mut comp = ParsedComponent::empty();
+        for name in import_names {
+            comp.imports.push(ComponentImport {
+                name: name.to_string(),
+                ty: ComponentTypeRef::Instance(0),
+            });
+        }
+        for name in export_names {
+            comp.exports.push(ComponentExport {
+                name: name.to_string(),
+                kind: ComponentExternalKind::Instance,
+                index: 0,
+            });
+        }
+        comp
+    }
+
+    /// SR-7: Valid topological instantiation order.
+    /// LS-R-3: Diamond dependency graph.
+    ///
+    /// Four components forming a diamond:
+    ///
+    /// ```text
+    ///       A (0)
+    ///      / \
+    ///   B (1) C (2)
+    ///      \ /
+    ///       D (3)
+    /// ```
+    ///
+    /// A imports from B and C; B and C each import from D.
+    /// Valid instantiation order requires D before {B, C} and {B, C} before A.
+    #[test]
+    fn test_topological_sort_diamond() {
+        let components = vec![
+            make_component(&["iface-b", "iface-c"], &[]),       // A = index 0
+            make_component(&["iface-d"], &["iface-b"]),          // B = index 1
+            make_component(&["iface-d"], &["iface-c"]),          // C = index 2
+            make_component(&[], &["iface-d"]),                   // D = index 3
+        ];
+
+        let resolver = Resolver::new();
+        let graph = resolver.resolve(&components).expect("diamond resolution should succeed");
+
+        let order = &graph.instantiation_order;
+        assert_eq!(order.len(), 4, "all four components must appear in the order");
+
+        // Build position map for order assertions
+        let pos: HashMap<usize, usize> =
+            order.iter().enumerate().map(|(i, &v)| (v, i)).collect();
+
+        // D (3) must come before B (1) and C (2)
+        assert!(
+            pos[&3] < pos[&1],
+            "D (index 3) must be instantiated before B (index 1), got order {:?}",
+            order
+        );
+        assert!(
+            pos[&3] < pos[&2],
+            "D (index 3) must be instantiated before C (index 2), got order {:?}",
+            order
+        );
+
+        // B (1) and C (2) must come before A (0)
+        assert!(
+            pos[&1] < pos[&0],
+            "B (index 1) must be instantiated before A (index 0), got order {:?}",
+            order
+        );
+        assert!(
+            pos[&2] < pos[&0],
+            "C (index 2) must be instantiated before A (index 0), got order {:?}",
+            order
+        );
+
+        // Verify the dependency edges were recorded in resolved_imports
+        assert!(
+            graph.resolved_imports.contains_key(&(0, "iface-b".to_string())),
+            "A's import of iface-b should be resolved"
+        );
+        assert!(
+            graph.resolved_imports.contains_key(&(0, "iface-c".to_string())),
+            "A's import of iface-c should be resolved"
+        );
+        assert!(
+            graph.resolved_imports.contains_key(&(1, "iface-d".to_string())),
+            "B's import of iface-d should be resolved"
+        );
+        assert!(
+            graph.resolved_imports.contains_key(&(2, "iface-d".to_string())),
+            "C's import of iface-d should be resolved"
+        );
+    }
+
+    /// SC-9: Unresolved imports must be reported, not silently dropped.
+    /// LS-R-4: Self-importing component (no provider for the import).
+    ///
+    /// A component imports an interface that no other component exports.
+    /// Under strict mode the resolver must return an `UnresolvedImport` error.
+    #[test]
+    fn test_resolver_unresolved_import_error() {
+        let components = vec![
+            make_component(&["nonexistent-iface"], &[]),
+            make_component(&[], &["some-other-iface"]),
+        ];
+
+        let resolver = Resolver::strict();
+        let result = resolver.resolve(&components);
+
+        assert!(
+            result.is_err(),
+            "strict resolver must reject an import that no component exports"
+        );
+
+        let err = result.unwrap_err();
+        match &err {
+            Error::UnresolvedImport { module, name } => {
+                assert_eq!(module, "component");
+                assert_eq!(
+                    name, "nonexistent-iface",
+                    "error should name the unresolved import"
+                );
+            }
+            other => panic!(
+                "expected Error::UnresolvedImport, got: {:?}",
+                other
+            ),
+        }
+    }
+
+    /// SR-19 / LS-CP-2: Resolver order stability (determinism).
+    ///
+    /// Running the same resolution five times must produce an identical
+    /// instantiation order every time.  Non-determinism here would cause
+    /// downstream merging to produce semantically different modules from
+    /// the same input, violating reproducible builds.
+    #[test]
+    fn test_resolver_preserves_order_stability() {
+        // Use the diamond topology — it has multiple valid topological
+        // orders (B and C are interchangeable), so a non-deterministic
+        // implementation could vary between runs.
+        let components = vec![
+            make_component(&["iface-b", "iface-c"], &[]),       // A = 0
+            make_component(&["iface-d"], &["iface-b"]),          // B = 1
+            make_component(&["iface-d"], &["iface-c"]),          // C = 2
+            make_component(&[], &["iface-d"]),                   // D = 3
+        ];
+
+        let resolver = Resolver::new();
+        let baseline = resolver
+            .resolve(&components)
+            .expect("baseline resolution should succeed")
+            .instantiation_order;
+
+        for iteration in 1..=5 {
+            let order = resolver
+                .resolve(&components)
+                .expect("repeated resolution should succeed")
+                .instantiation_order;
+
+            assert_eq!(
+                order, baseline,
+                "instantiation order diverged on iteration {}: got {:?}, expected {:?}",
+                iteration, order, baseline
+            );
+        }
+    }
+
     #[test]
     fn test_extract_wasi_resource_name() {
         // Standard WASI paths
@@ -2213,5 +2399,198 @@ mod tests {
 
         // Version but no slash
         assert_eq!(extract_wasi_resource_name("something@1.0.0"), "something");
+    }
+
+    // ---------------------------------------------------------------
+    // CopyLayout classification tests (SR-6 / LS-R-2)
+    // ---------------------------------------------------------------
+
+    use crate::parser::{ComponentValType, PrimitiveValType};
+
+    /// Build a minimal `ParsedComponent` with no modules, types, or instances.
+    /// Sufficient for testing `copy_layout` on inline types (no `Type(idx)` references).
+    fn empty_parsed_component() -> ParsedComponent {
+        ParsedComponent {
+            name: None,
+            core_modules: Vec::new(),
+            imports: Vec::new(),
+            exports: Vec::new(),
+            types: Vec::new(),
+            instances: Vec::new(),
+            canonical_functions: Vec::new(),
+            sub_components: Vec::new(),
+            component_aliases: Vec::new(),
+            component_instances: Vec::new(),
+            core_entity_order: Vec::new(),
+            component_func_defs: Vec::new(),
+            component_instance_defs: Vec::new(),
+            component_type_defs: Vec::new(),
+            original_size: 0,
+            original_hash: String::new(),
+            depth_0_sections: Vec::new(),
+        }
+    }
+
+    /// SR-6: list<u32> contains no pointers, so should produce Bulk with
+    /// byte_multiplier = 4 (sizeof(u32)).
+    #[test]
+    fn test_copy_layout_flat_list() {
+        let pc = empty_parsed_component();
+        let ty = ComponentValType::List(Box::new(ComponentValType::Primitive(
+            PrimitiveValType::U32,
+        )));
+        let layout = pc.copy_layout(&ty);
+        match layout {
+            CopyLayout::Bulk { byte_multiplier } => {
+                assert_eq!(byte_multiplier, 4, "u32 element should be 4 bytes");
+            }
+            CopyLayout::Elements { .. } => {
+                panic!("list<u32> should produce Bulk, not Elements");
+            }
+        }
+    }
+
+    /// SR-6: list<string> contains pointer pairs (each string is a (ptr, len) pair),
+    /// so should produce Elements with element_size = 8 and one inner pointer at offset 0.
+    #[test]
+    fn test_copy_layout_string_list() {
+        let pc = empty_parsed_component();
+        let ty = ComponentValType::List(Box::new(ComponentValType::String));
+        let layout = pc.copy_layout(&ty);
+        match layout {
+            CopyLayout::Elements {
+                element_size,
+                inner_pointers,
+            } => {
+                assert_eq!(element_size, 8, "string element is (i32 ptr, i32 len) = 8 bytes");
+                assert_eq!(
+                    inner_pointers.len(),
+                    1,
+                    "one pointer pair per string element"
+                );
+                let (offset, ref inner_layout) = inner_pointers[0];
+                assert_eq!(offset, 0, "string pointer pair starts at byte offset 0");
+                // Inner layout for a string is Bulk { byte_multiplier: 1 }
+                match inner_layout {
+                    CopyLayout::Bulk { byte_multiplier } => {
+                        assert_eq!(*byte_multiplier, 1, "string data is byte-granular");
+                    }
+                    _ => panic!("inner layout for string should be Bulk"),
+                }
+            }
+            CopyLayout::Bulk { .. } => {
+                panic!("list<string> should produce Elements, not Bulk");
+            }
+        }
+    }
+
+    /// SR-6 / LS-R-2: list<record{name: string, value: u32}> MUST produce Elements,
+    /// not Bulk. The record contains a string field which is a (ptr, len) pair.
+    /// Misclassifying this as Bulk would silently corrupt pointer data during
+    /// cross-memory copy.
+    #[test]
+    fn test_copy_layout_record_with_string() {
+        let pc = empty_parsed_component();
+        // record { name: string, value: u32 }
+        let record_ty = ComponentValType::Record(vec![
+            ("name".to_string(), ComponentValType::String),
+            ("value".to_string(), ComponentValType::Primitive(PrimitiveValType::U32)),
+        ]);
+        let ty = ComponentValType::List(Box::new(record_ty));
+        let layout = pc.copy_layout(&ty);
+        match layout {
+            CopyLayout::Elements {
+                element_size,
+                inner_pointers,
+            } => {
+                // Record layout: string at offset 0 (8 bytes: ptr + len, align 4),
+                // then u32 at offset 8 (4 bytes, align 4). Unpadded size = 12.
+                // Alignment = max(4, 4) = 4. Element size = align_up(12, 4) = 12.
+                assert_eq!(element_size, 12, "record{{string, u32}} element should be 12 bytes");
+                assert_eq!(
+                    inner_pointers.len(),
+                    1,
+                    "one pointer pair from the string field"
+                );
+                let (offset, ref inner_layout) = inner_pointers[0];
+                assert_eq!(offset, 0, "string field starts at byte offset 0 in the record");
+                match inner_layout {
+                    CopyLayout::Bulk { byte_multiplier } => {
+                        assert_eq!(*byte_multiplier, 1, "string data is byte-granular");
+                    }
+                    _ => panic!("inner layout for string should be Bulk"),
+                }
+            }
+            CopyLayout::Bulk { .. } => {
+                panic!(
+                    "list<record{{name: string, value: u32}}> MUST produce Elements, not Bulk \
+                     (LS-R-2: pointer-containing record misclassified as Bulk)"
+                );
+            }
+        }
+    }
+
+    /// SR-6: list<list<u8>> contains inner pointer pairs (each inner list is a
+    /// (ptr, len) pair), so should produce Elements.
+    #[test]
+    fn test_copy_layout_nested_list() {
+        let pc = empty_parsed_component();
+        let inner_list = ComponentValType::List(Box::new(ComponentValType::Primitive(
+            PrimitiveValType::U8,
+        )));
+        let ty = ComponentValType::List(Box::new(inner_list));
+        let layout = pc.copy_layout(&ty);
+        match layout {
+            CopyLayout::Elements {
+                element_size,
+                inner_pointers,
+            } => {
+                assert_eq!(element_size, 8, "list element is (i32 ptr, i32 len) = 8 bytes");
+                assert_eq!(
+                    inner_pointers.len(),
+                    1,
+                    "one pointer pair per inner list element"
+                );
+                let (offset, ref inner_layout) = inner_pointers[0];
+                assert_eq!(offset, 0, "inner list pointer pair starts at byte offset 0");
+                // Inner layout for list<u8> is Bulk { byte_multiplier: 1 }
+                match inner_layout {
+                    CopyLayout::Bulk { byte_multiplier } => {
+                        assert_eq!(*byte_multiplier, 1, "list<u8> element is 1 byte");
+                    }
+                    _ => panic!("inner layout for list<u8> should be Bulk"),
+                }
+            }
+            CopyLayout::Bulk { .. } => {
+                panic!("list<list<u8>> should produce Elements, not Bulk");
+            }
+        }
+    }
+
+    /// SR-6: list<record{a: u32, b: u32}> has no pointer-bearing fields,
+    /// so should produce Bulk with byte_multiplier = 8 (two u32 fields).
+    #[test]
+    fn test_copy_layout_flat_record() {
+        let pc = empty_parsed_component();
+        let record_ty = ComponentValType::Record(vec![
+            ("a".to_string(), ComponentValType::Primitive(PrimitiveValType::U32)),
+            ("b".to_string(), ComponentValType::Primitive(PrimitiveValType::U32)),
+        ]);
+        let ty = ComponentValType::List(Box::new(record_ty));
+        let layout = pc.copy_layout(&ty);
+        match layout {
+            CopyLayout::Bulk { byte_multiplier } => {
+                assert_eq!(
+                    byte_multiplier, 8,
+                    "record{{a: u32, b: u32}} should be 8 bytes (4 + 4)"
+                );
+            }
+            CopyLayout::Elements { .. } => {
+                panic!(
+                    "list<record{{a: u32, b: u32}}> should produce Bulk (no pointer fields), \
+                     not Elements"
+                );
+            }
+        }
     }
 }

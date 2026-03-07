@@ -1,0 +1,231 @@
+# Traceability Matrix
+#
+# Maps the full chain: Loss -> Hazard -> Constraint -> UCA -> Scenario -> Requirement
+# and forward: Requirement -> Implementation -> Verification
+#
+# This file is the authoritative record of traceability. A validation tool
+# should check that:
+#   1. Every hazard traces to at least one loss
+#   2. Every constraint traces to at least one hazard
+#   3. Every UCA traces to at least one hazard
+#   4. Every scenario traces to at least one UCA
+#   5. Every requirement traces to at least one constraint or scenario
+#   6. Every requirement has at least one verification method
+#   7. No dangling references (all IDs resolve)
+
+# Reverse traceability: which requirements address each loss
+loss-coverage:
+  L-1:
+    hazards: [H-1, H-2, H-3, H-4, H-5]
+    requirements: [SR-1, SR-2, SR-3, SR-4, SR-5, SR-7, SR-8, SR-9, SR-10, SR-11, SR-12, SR-20]
+  L-2:
+    hazards: [H-2, H-3, H-4]
+    requirements: [SR-6, SR-9, SR-13, SR-14, SR-15, SR-16]
+  L-3:
+    hazards: [H-6]
+    requirements: []
+    gap: "No safety requirements yet for attestation (SC-6)"
+  L-4:
+    hazards: [H-7]
+    requirements: [SR-19]
+  L-5:
+    hazards: []
+    gap: "No explicit hazard for certification evidence loss"
+
+# Forward traceability: requirement -> implementation -> verification evidence
+verification-status:
+  SR-1:
+    implementation-files: [meld-core/src/parser.rs]
+    tests: []
+    proofs: [proofs/parser/]
+    status: not-verified
+
+  SR-2:
+    implementation-files: [meld-core/src/parser.rs]
+    tests: []
+    proofs: [proofs/parser/]
+    status: not-verified
+
+  SR-3:
+    implementation-files: [meld-core/src/parser.rs]
+    tests:
+      - parser::tests::test_canonical_abi_element_size_primitive_types
+      - parser::tests::test_canonical_abi_element_size_string
+      - parser::tests::test_canonical_abi_element_size_record_with_padding
+      - parser::tests::test_canonical_abi_element_size_record_homogeneous
+      - parser::tests::test_canonical_abi_align_values
+    proofs: []
+    status: partial
+
+  SR-4:
+    implementation-files: [meld-core/src/parser.rs]
+    tests: []
+    proofs: []
+    status: not-verified
+
+  SR-5:
+    implementation-files: [meld-core/src/resolver.rs]
+    tests:
+      - resolver::tests::test_resolver_strict_mode
+      - resolver::tests::test_resolver_unresolved_import_error
+    proofs: [proofs/resolver/]
+    status: partial
+
+  SR-6:
+    implementation-files: [meld-core/src/resolver.rs]
+    tests:
+      - resolver::tests::test_copy_layout_flat_list
+      - resolver::tests::test_copy_layout_string_list
+      - resolver::tests::test_copy_layout_record_with_string
+      - resolver::tests::test_copy_layout_nested_list
+      - resolver::tests::test_copy_layout_flat_record
+    proofs: []
+    status: partial
+
+  SR-7:
+    implementation-files: [meld-core/src/resolver.rs]
+    tests:
+      - resolver::tests::test_topological_sort_linear
+      - resolver::tests::test_topological_sort_no_deps
+      - resolver::tests::test_topological_sort_circular_fallback
+      - resolver::tests::test_topological_sort_diamond
+      - resolver::tests::test_resolver_preserves_order_stability
+    proofs: [proofs/resolver/]
+    status: partial
+
+  SR-8:
+    implementation-files: [meld-core/src/merger.rs]
+    tests: []
+    proofs: [proofs/transformations/merge/]
+    status: partial
+
+  SR-9:
+    implementation-files: [meld-core/src/rewriter.rs]
+    tests:
+      - rewriter::tests::test_rewrite_memory_copy_rebased
+      - rewriter::tests::test_rewrite_memory_fill_rebased
+      - rewriter::tests::test_rewrite_memory_init_rebased
+      - rewriter::tests::test_rewrite_memory_size_rebased_const
+      - rewriter::tests::test_rewrite_call_remaps_function_index
+      - rewriter::tests::test_rewrite_call_indirect_remaps_type_and_table
+      - rewriter::tests::test_rewrite_global_get_set_remaps
+      - rewriter::tests::test_rewrite_table_ops_remap
+      - rewriter::tests::test_rewrite_table_copy_remaps_both
+      - rewriter::tests::test_rewrite_memory_copy_remaps_both_memories
+      - rewriter::tests::test_rewrite_memory_load_store_remaps_memory
+      - rewriter::tests::test_rewrite_ref_func_remaps
+    proofs: [proofs/rewriter/]
+    status: partial
+
+  SR-10:
+    implementation-files: [meld-core/src/segments.rs]
+    tests:
+      - segments::tests::test_reindex_data_segment_rebases_offset
+      - segments::tests::test_reindex_const_expr_global_get
+      - segments::tests::test_reindex_const_expr_ref_func
+      - segments::tests::test_reindex_element_segment_active_remaps_table
+      - segments::tests::test_reindex_element_segment_remaps_function_refs
+      - segments::tests::test_reindex_data_segment_remaps_memory_index
+      - segments::tests::test_reindex_data_segment_global_get_remaps_global
+      - segments::tests::test_reindex_element_segment_expression_remaps_ref_null_type
+    proofs: [proofs/segments/]
+    status: partial
+
+  SR-11:
+    implementation-files: [meld-core/src/merger.rs]
+    tests: []
+    proofs: []
+    status: not-verified
+
+  SR-12:
+    implementation-files: [meld-core/src/adapter/fact.rs]
+    tests: []
+    proofs: []
+    status: not-verified
+
+  SR-13:
+    implementation-files: [meld-core/src/adapter/fact.rs]
+    tests: []
+    proofs: []
+    status: not-verified
+
+  SR-14:
+    implementation-files: [meld-core/src/adapter/fact.rs]
+    tests: []
+    proofs: [proofs/adapter/]
+    status: partial
+
+  SR-15:
+    implementation-files: [meld-core/src/adapter/fact.rs]
+    tests: []
+    proofs: []
+    status: not-verified
+
+  SR-16:
+    implementation-files: [meld-core/src/adapter/fact.rs]
+    tests: []
+    proofs: []
+    status: not-verified
+
+  SR-17:
+    implementation-files: [meld-core/src/adapter/fact.rs]
+    tests: []
+    proofs: []
+    status: not-verified
+
+  SR-18:
+    implementation-files: [meld-core/src/adapter/fact.rs]
+    tests: []
+    proofs: []
+    status: not-verified
+
+  SR-19:
+    implementation-files: [meld-core/src/lib.rs]
+    tests:
+      - tests::test_deterministic_output
+      - resolver::tests::test_resolver_preserves_order_stability
+    proofs: []
+    status: partial
+
+  SR-20:
+    implementation-files: [meld-core/src/error.rs]
+    tests:
+      - tests::test_fuser_empty_components_error
+      - tests::test_fuser_rejects_core_module_input
+      - tests::test_fuser_address_rebasing_requires_shared_memory
+      - tests::test_fuser_rejects_invalid_wasm
+    proofs: []
+    status: partial
+
+# Identified gaps
+gaps:
+  - id: GAP-1
+    description: >
+      L-3 (supply chain integrity) has hazard H-6 and constraint SC-6
+      but no safety requirements or verification. Attestation module
+      exists but is not covered by STPA-derived requirements.
+    priority: medium
+    action: >
+      Add SR for attestation correctness; add tests for attestation
+      custom section content.
+
+  - id: GAP-2
+    description: >
+      L-5 (certification evidence) has no hazard. The STPA does not yet
+      model the proof pipeline or the traceability chain as a controlled
+      process.
+    priority: low
+    action: >
+      Consider extending control structure to include the proof
+      pipeline as a controller with feedback to the build system.
+
+  - id: GAP-3
+    description: >
+      SR-6 now has unit tests for CopyLayout classification. SR-12,
+      SR-13, SR-15, SR-16 still have no tests or proofs. These require
+      runtime integration tests with real cross-component calls (wit-bindgen
+      fixtures).
+    priority: high
+    action: >
+      Priority for issue #10 (more wit-bindgen fixtures) and issue #11
+      (Rocq proofs for CopyLayout).
