@@ -99,6 +99,21 @@ pub enum CopyLayout {
     },
 }
 
+/// A pointer pair that is conditional on a discriminant value.
+/// Used for option<string>, result<string, E>, variant types where
+/// the pointer data only exists when the discriminant matches.
+#[derive(Debug, Clone)]
+pub struct ConditionalPointerPair {
+    /// Flat param index (or byte offset for results) of the discriminant
+    pub discriminant_position: u32,
+    /// Value the discriminant must equal for the pointer pair to be active
+    pub discriminant_value: u32,
+    /// Flat param index (or byte offset for results) of the pointer
+    pub ptr_position: u32,
+    /// Copy layout for the pointed-to data
+    pub copy_layout: CopyLayout,
+}
+
 /// Requirements for an adapter function
 #[derive(Debug, Clone, Default)]
 pub struct AdapterRequirements {
@@ -133,6 +148,16 @@ pub struct AdapterRequirements {
     pub param_copy_layouts: Vec<CopyLayout>,
     /// Copy layouts for result pointer pairs (parallel to `result_pointer_pair_offsets`).
     pub result_copy_layouts: Vec<CopyLayout>,
+    /// Conditional pointer pairs inside option/result/variant params.
+    /// Each entry: (discriminant_flat_idx, discriminant_value, ptr_flat_idx, copy_layout).
+    /// The adapter must check the discriminant and only copy when it matches.
+    pub conditional_pointer_pairs: Vec<ConditionalPointerPair>,
+    /// Conditional pointer pairs for return-area values (byte-offset based, retptr path).
+    /// Each entry: (discriminant_byte_offset, discriminant_value, ptr_byte_offset, copy_layout).
+    pub conditional_result_pointer_pairs: Vec<ConditionalPointerPair>,
+    /// Conditional pointer pairs for flat return values (non-retptr path).
+    /// Each entry uses flat indices (like param conditional pairs).
+    pub conditional_result_flat_pairs: Vec<ConditionalPointerPair>,
 }
 
 /// Resolution of module-level imports within a component
@@ -1477,11 +1502,22 @@ impl Resolver {
                                                 );
                                             requirements.result_copy_layouts =
                                                 collect_result_copy_layouts(to_component, results);
+                                            // Collect conditional pointer pairs (option/result/variant)
+                                            requirements.conditional_pointer_pairs =
+                                                to_component.conditional_pointer_pair_positions(comp_params);
+                                            requirements.conditional_result_pointer_pairs =
+                                                to_component.conditional_pointer_pair_result_positions(results);
+                                            requirements.conditional_result_flat_pairs =
+                                                to_component.conditional_pointer_pair_result_flat_positions(results);
                                             log::debug!(
-                                                "layout {:?}: ptr_positions={:?}, result_offsets={:?}",
+                                                "layout {:?}: ptr_positions={:?}, result_offsets={:?}, \
+                                                 cond_pairs={}, cond_result_pairs={}, cond_result_flat={}",
                                                 func_name,
                                                 requirements.pointer_pair_positions,
                                                 requirements.result_pointer_pair_offsets,
+                                                requirements.conditional_pointer_pairs.len(),
+                                                requirements.conditional_result_pointer_pairs.len(),
+                                                requirements.conditional_result_flat_pairs.len(),
                                             );
                                         }
                                     }

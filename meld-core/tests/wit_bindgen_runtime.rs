@@ -344,10 +344,10 @@ fn test_runtime_wit_bindgen_variants() {
         return;
     }
     let fused = fuse_fixture("variants", OutputFormat::Component).unwrap();
-    // Known issue: variant/option/result adapter lowering corrupts string data.
-    // Fusion + validation pass; runtime fails. See issue #14.
+    // Known issue: variant types with non-i32 payloads (f64, etc.) have return area
+    // layout mismatches. Conditional copy for pointer-containing variants works.
     if let Err(e) = run_wasi_component(&fused) {
-        eprintln!("variants: runtime failed (known adapter issue): {e}");
+        eprintln!("variants: runtime failed (known retptr layout issue): {e}");
         return;
     }
 }
@@ -358,12 +358,7 @@ fn test_runtime_wit_bindgen_options() {
         return;
     }
     let fused = fuse_fixture("options", OutputFormat::Component).unwrap();
-    // Known issue: option<string> adapter lowering corrupts string data.
-    // Fusion + validation pass; runtime fails. See issue #14.
-    if let Err(e) = run_wasi_component(&fused) {
-        eprintln!("options: runtime failed (known adapter issue): {e}");
-        return;
-    }
+    run_wasi_component(&fused).expect("options: run() should succeed without trap");
 }
 
 #[test]
@@ -381,10 +376,10 @@ fn test_runtime_wit_bindgen_flavorful() {
         return;
     }
     let fused = fuse_fixture("flavorful", OutputFormat::Component).unwrap();
-    // Known issue: variant/option adapter lowering corrupts string data
-    // in list-in-variant tests. Fusion + validation pass. See issue #14.
+    // Known issue: some flavorful functions still fail due to retptr layout mismatches
+    // with variant types. option<string> conditional copy works.
     if let Err(e) = run_wasi_component(&fused) {
-        eprintln!("flavorful: runtime failed (known adapter issue): {e}");
+        eprintln!("flavorful: runtime failed (known retptr layout issue): {e}");
         return;
     }
 }

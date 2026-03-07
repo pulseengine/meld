@@ -1374,6 +1374,312 @@ impl ParsedComponent {
         }
     }
 
+    /// Collect conditional pointer pairs from params that contain option/result/variant
+    /// types with pointer payloads.
+    pub fn conditional_pointer_pair_positions(
+        &self,
+        params: &[(String, ComponentValType)],
+    ) -> Vec<crate::resolver::ConditionalPointerPair> {
+        let mut out = Vec::new();
+        let mut flat_idx = 0u32;
+        for (_, ty) in params {
+            self.collect_conditional_pointers(ty, flat_idx, &mut out);
+            flat_idx += self.flat_count(ty);
+        }
+        out
+    }
+
+    /// Collect conditional pointer pairs from results using flat indices (non-retptr path).
+    pub fn conditional_pointer_pair_result_flat_positions(
+        &self,
+        results: &[(Option<String>, ComponentValType)],
+    ) -> Vec<crate::resolver::ConditionalPointerPair> {
+        let mut out = Vec::new();
+        let mut flat_idx = 0u32;
+        for (_, ty) in results {
+            self.collect_conditional_pointers(ty, flat_idx, &mut out);
+            flat_idx += self.flat_count(ty);
+        }
+        out
+    }
+
+    /// Collect conditional pointer pairs from results (byte-offset based, for retptr path).
+    pub fn conditional_pointer_pair_result_positions(
+        &self,
+        results: &[(Option<String>, ComponentValType)],
+    ) -> Vec<crate::resolver::ConditionalPointerPair> {
+        let mut out = Vec::new();
+        let mut byte_offset = 0u32;
+        for (_, ty) in results {
+            self.collect_conditional_result_pointers(ty, byte_offset, &mut out);
+            byte_offset += self.flat_byte_size(ty);
+        }
+        out
+    }
+
+    /// Collect conditional pointer pairs for flat params.
+    /// For option<T> where T contains pointers: disc at base, payload at base+1.
+    fn collect_conditional_pointers(
+        &self,
+        ty: &ComponentValType,
+        base: u32,
+        out: &mut Vec<crate::resolver::ConditionalPointerPair>,
+    ) {
+        match ty {
+            ComponentValType::Option(inner) => {
+                // option<T> flattens to [disc, ...T_flat]
+                // disc=1 means Some, payload starts at base+1
+                if self.type_contains_pointers(inner) {
+                    let payload_base = base + 1;
+                    // Collect unconditional pointer pairs from the inner type
+                    // and wrap each as conditional on disc==1
+                    let mut inner_positions = Vec::new();
+                    self.collect_pointer_positions(inner, payload_base, &mut inner_positions);
+                    for ptr_pos in inner_positions {
+                        let layout = self.copy_layout_for_string_or_list_at(inner);
+                        out.push(crate::resolver::ConditionalPointerPair {
+                            discriminant_position: base,
+                            discriminant_value: 1,
+                            ptr_position: ptr_pos,
+                            copy_layout: layout,
+                        });
+                    }
+                    // Also recurse into the inner type for nested conditionals
+                    self.collect_conditional_pointers(inner, payload_base, out);
+                }
+            }
+            ComponentValType::Result { ok, err } => {
+                // result<T,E> flattens to [disc, ...max(T_flat, E_flat)]
+                // disc=0 means Ok(T), disc=1 means Err(E)
+                let payload_base = base + 1;
+                if let Some(ok_ty) = ok {
+                    if self.type_contains_pointers(ok_ty) {
+                        let mut inner_positions = Vec::new();
+                        self.collect_pointer_positions(ok_ty, payload_base, &mut inner_positions);
+                        for ptr_pos in inner_positions {
+                            let layout = self.copy_layout_for_string_or_list_at(ok_ty);
+                            out.push(crate::resolver::ConditionalPointerPair {
+                                discriminant_position: base,
+                                discriminant_value: 0,
+                                ptr_position: ptr_pos,
+                                copy_layout: layout,
+                            });
+                        }
+                        self.collect_conditional_pointers(ok_ty, payload_base, out);
+                    }
+                }
+                if let Some(err_ty) = err {
+                    if self.type_contains_pointers(err_ty) {
+                        let mut inner_positions = Vec::new();
+                        self.collect_pointer_positions(err_ty, payload_base, &mut inner_positions);
+                        for ptr_pos in inner_positions {
+                            let layout = self.copy_layout_for_string_or_list_at(err_ty);
+                            out.push(crate::resolver::ConditionalPointerPair {
+                                discriminant_position: base,
+                                discriminant_value: 1,
+                                ptr_position: ptr_pos,
+                                copy_layout: layout,
+                            });
+                        }
+                        self.collect_conditional_pointers(err_ty, payload_base, out);
+                    }
+                }
+            }
+            ComponentValType::Variant(cases) => {
+                // variant flattens to [disc, ...max(case_payloads)]
+                let payload_base = base + 1;
+                for (case_idx, (_, case_ty)) in cases.iter().enumerate() {
+                    if let Some(ty) = case_ty {
+                        if self.type_contains_pointers(ty) {
+                            let mut inner_positions = Vec::new();
+                            self.collect_pointer_positions(ty, payload_base, &mut inner_positions);
+                            for ptr_pos in inner_positions {
+                                let layout = self.copy_layout_for_string_or_list_at(ty);
+                                out.push(crate::resolver::ConditionalPointerPair {
+                                    discriminant_position: base,
+                                    discriminant_value: case_idx as u32,
+                                    ptr_position: ptr_pos,
+                                    copy_layout: layout,
+                                });
+                            }
+                            self.collect_conditional_pointers(ty, payload_base, out);
+                        }
+                    }
+                }
+            }
+            ComponentValType::Record(fields) => {
+                let mut offset = base;
+                for (_, field_ty) in fields {
+                    self.collect_conditional_pointers(field_ty, offset, out);
+                    offset += self.flat_count(field_ty);
+                }
+            }
+            ComponentValType::Tuple(elems) => {
+                let mut offset = base;
+                for elem_ty in elems {
+                    self.collect_conditional_pointers(elem_ty, offset, out);
+                    offset += self.flat_count(elem_ty);
+                }
+            }
+            ComponentValType::Type(idx) => {
+                if let Some(ct) = self.get_type_definition(*idx)
+                    && let ComponentTypeKind::Defined(inner) = &ct.kind
+                {
+                    self.collect_conditional_pointers(inner, base, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Collect conditional pointer pairs for result byte offsets.
+    fn collect_conditional_result_pointers(
+        &self,
+        ty: &ComponentValType,
+        base: u32,
+        out: &mut Vec<crate::resolver::ConditionalPointerPair>,
+    ) {
+        match ty {
+            ComponentValType::Option(inner) => {
+                // In memory layout: disc (4 bytes aligned), then payload
+                let disc_offset = base;
+                let payload_offset = base + 4; // discriminant is i32
+                if self.type_contains_pointers(inner) {
+                    let mut inner_offsets = Vec::new();
+                    self.collect_pointer_byte_offsets(inner, payload_offset, &mut inner_offsets);
+                    for ptr_off in inner_offsets {
+                        let layout = self.copy_layout_for_string_or_list_at(inner);
+                        out.push(crate::resolver::ConditionalPointerPair {
+                            discriminant_position: disc_offset,
+                            discriminant_value: 1,
+                            ptr_position: ptr_off,
+                            copy_layout: layout,
+                        });
+                    }
+                    self.collect_conditional_result_pointers(inner, payload_offset, out);
+                }
+            }
+            ComponentValType::Result { ok, err } => {
+                let disc_offset = base;
+                let payload_offset = base + 4;
+                if let Some(ok_ty) = ok {
+                    if self.type_contains_pointers(ok_ty) {
+                        let mut inner_offsets = Vec::new();
+                        self.collect_pointer_byte_offsets(ok_ty, payload_offset, &mut inner_offsets);
+                        for ptr_off in inner_offsets {
+                            let layout = self.copy_layout_for_string_or_list_at(ok_ty);
+                            out.push(crate::resolver::ConditionalPointerPair {
+                                discriminant_position: disc_offset,
+                                discriminant_value: 0,
+                                ptr_position: ptr_off,
+                                copy_layout: layout,
+                            });
+                        }
+                        self.collect_conditional_result_pointers(ok_ty, payload_offset, out);
+                    }
+                }
+                if let Some(err_ty) = err {
+                    if self.type_contains_pointers(err_ty) {
+                        let mut inner_offsets = Vec::new();
+                        self.collect_pointer_byte_offsets(err_ty, payload_offset, &mut inner_offsets);
+                        for ptr_off in inner_offsets {
+                            let layout = self.copy_layout_for_string_or_list_at(err_ty);
+                            out.push(crate::resolver::ConditionalPointerPair {
+                                discriminant_position: disc_offset,
+                                discriminant_value: 1,
+                                ptr_position: ptr_off,
+                                copy_layout: layout,
+                            });
+                        }
+                        self.collect_conditional_result_pointers(err_ty, payload_offset, out);
+                    }
+                }
+            }
+            ComponentValType::Variant(cases) => {
+                let disc_offset = base;
+                let payload_offset = base + 4;
+                for (case_idx, (_, case_ty)) in cases.iter().enumerate() {
+                    if let Some(ty) = case_ty {
+                        if self.type_contains_pointers(ty) {
+                            let mut inner_offsets = Vec::new();
+                            self.collect_pointer_byte_offsets(ty, payload_offset, &mut inner_offsets);
+                            for ptr_off in inner_offsets {
+                                let layout = self.copy_layout_for_string_or_list_at(ty);
+                                out.push(crate::resolver::ConditionalPointerPair {
+                                    discriminant_position: disc_offset,
+                                    discriminant_value: case_idx as u32,
+                                    ptr_position: ptr_off,
+                                    copy_layout: layout,
+                                });
+                            }
+                            self.collect_conditional_result_pointers(ty, payload_offset, out);
+                        }
+                    }
+                }
+            }
+            ComponentValType::Record(fields) => {
+                let mut offset = base;
+                for (_, field_ty) in fields {
+                    self.collect_conditional_result_pointers(field_ty, offset, out);
+                    offset += self.flat_byte_size(field_ty);
+                }
+            }
+            ComponentValType::Tuple(elems) => {
+                let mut offset = base;
+                for elem_ty in elems {
+                    self.collect_conditional_result_pointers(elem_ty, offset, out);
+                    offset += self.flat_byte_size(elem_ty);
+                }
+            }
+            ComponentValType::Type(idx) => {
+                if let Some(ct) = self.get_type_definition(*idx)
+                    && let ComponentTypeKind::Defined(inner) = &ct.kind
+                {
+                    self.collect_conditional_result_pointers(inner, base, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Check if a type contains any pointer data (strings, lists).
+    pub fn type_contains_pointers(&self, ty: &ComponentValType) -> bool {
+        match ty {
+            ComponentValType::String | ComponentValType::List(_) => true,
+            ComponentValType::Option(inner) => self.type_contains_pointers(inner),
+            ComponentValType::Result { ok, err } => {
+                ok.as_ref().is_some_and(|t| self.type_contains_pointers(t))
+                    || err
+                        .as_ref()
+                        .is_some_and(|t| self.type_contains_pointers(t))
+            }
+            ComponentValType::Record(fields) => {
+                fields.iter().any(|(_, t)| self.type_contains_pointers(t))
+            }
+            ComponentValType::Tuple(elems) => {
+                elems.iter().any(|t| self.type_contains_pointers(t))
+            }
+            ComponentValType::Variant(cases) => cases
+                .iter()
+                .any(|(_, t)| t.as_ref().is_some_and(|t| self.type_contains_pointers(t))),
+            ComponentValType::Type(idx) => {
+                if let Some(ct) = self.get_type_definition(*idx)
+                    && let ComponentTypeKind::Defined(inner) = &ct.kind
+                {
+                    self.type_contains_pointers(inner)
+                } else {
+                    false
+                }
+            }
+            _ => false,
+        }
+    }
+
+    /// Get the copy layout for a type that is either a string or a list.
+    fn copy_layout_for_string_or_list_at(&self, ty: &ComponentValType) -> crate::resolver::CopyLayout {
+        self.copy_layout(ty)
+    }
+
     /// Count the number of flat core wasm values a component type flattens to.
     pub fn flat_count(&self, ty: &ComponentValType) -> u32 {
         match ty {
