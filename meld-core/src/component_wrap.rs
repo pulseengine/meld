@@ -1120,6 +1120,57 @@ fn assemble_component(
         component_instance_idx += 1;
     }
 
+    // Handle bare function exports (e.g., "run" without an interface wrapper).
+    // These are exported as ComponentExternalKind::Func in the source component
+    // and appear as plain names (no '#' separator) in the fused core module.
+    for comp_export in &source.exports {
+        if comp_export.kind != wasmparser::ComponentExternalKind::Func {
+            continue;
+        }
+
+        let func_name = &comp_export.name;
+
+        // Check that the fused module actually exports this function
+        let has_export = fused_info
+            .exports
+            .iter()
+            .any(|(n, k, _)| *k == wasmparser::ExternalKind::Func && n == func_name);
+        if !has_export {
+            continue;
+        }
+
+        // Alias the core function from the fused instance
+        let mut alias_section = ComponentAliasSection::new();
+        alias_section.alias(Alias::CoreInstanceExport {
+            instance: fused_instance,
+            kind: ExportKind::Func,
+            name: func_name,
+        });
+        component.section(&alias_section);
+        let aliased_core_func = core_func_idx;
+        core_func_idx += 1;
+
+        // Define the function type — use default run type (func() -> void)
+        let wrapper_func_type =
+            define_bare_func_type(&mut component, &mut component_type_idx);
+
+        // Canon lift (bare functions like `run` take no arguments and return nothing)
+        let mut canon = CanonicalFunctionSection::new();
+        canon.lift(aliased_core_func, wrapper_func_type, []);
+        component.section(&canon);
+
+        // Export as a bare function
+        let mut exp = ComponentExportSection::new();
+        exp.export(
+            func_name,
+            ComponentExportKind::Func,
+            component_func_idx,
+            None,
+        );
+        component.section(&exp);
+        component_func_idx += 1;
+    }
+
     Ok(component.finish())
 }
 
@@ -1701,6 +1752,22 @@ fn define_default_run_type(
         .params(empty_params)
         .result(wasm_encoder::ComponentValType::Type(result_type_idx));
     component.section(&types2);
+    let func_type_idx = *component_type_idx;
+    *component_type_idx += 1;
+
+    func_type_idx
+}
+
+/// Define a bare function type: `func()` with no params and no results.
+/// Used for exported functions like `run` that aren't wrapped in an interface.
+fn define_bare_func_type(
+    component: &mut wasm_encoder::Component,
+    component_type_idx: &mut u32,
+) -> u32 {
+    let mut types = wasm_encoder::ComponentTypeSection::new();
+    let empty: Vec<(&str, wasm_encoder::ComponentValType)> = vec![];
+    types.function().params(empty.clone()).results(empty);
+    component.section(&types);
     let func_type_idx = *component_type_idx;
     *component_type_idx += 1;
 
