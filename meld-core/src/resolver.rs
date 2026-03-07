@@ -79,6 +79,26 @@ pub struct AdapterSite {
     pub requirements: AdapterRequirements,
 }
 
+/// Describes how to copy a (ptr, len) value across memories.
+///
+/// In the canonical ABI, `string` and `list<T>` are passed as `(ptr, len)` pairs.
+/// For strings, `len` is the byte count. For lists, `len` is the element count
+/// and the actual byte size is `len * element_byte_size`. Elements may themselves
+/// contain pointers (e.g., `list<string>`), requiring recursive copy.
+#[derive(Debug, Clone)]
+pub enum CopyLayout {
+    /// Bulk copy: `len * byte_multiplier` bytes, no inner pointers.
+    /// Used for strings (multiplier=1) and lists of scalars.
+    Bulk { byte_multiplier: u32 },
+    /// Element-wise copy: `len` elements of `element_size` bytes each.
+    /// `inner_pointers` lists byte offsets within each element where (ptr, len)
+    /// pairs exist, along with their own recursive copy layout.
+    Elements {
+        element_size: u32,
+        inner_pointers: Vec<(u32, CopyLayout)>,
+    },
+}
+
 /// Requirements for an adapter function
 #[derive(Debug, Clone, Default)]
 pub struct AdapterRequirements {
@@ -108,6 +128,11 @@ pub struct AdapterRequirements {
     /// Flat return-area byte offsets where (ptr, len) pairs start for string/list results.
     /// The adapter must copy pointed-to data and fix up pointers at these offsets.
     pub result_pointer_pair_offsets: Vec<u32>,
+    /// Copy layouts for parameter pointer pairs (parallel to `pointer_pair_positions`).
+    /// Describes element sizes and inner pointer structure for correct cross-memory copy.
+    pub param_copy_layouts: Vec<CopyLayout>,
+    /// Copy layouts for result pointer pairs (parallel to `result_pointer_pair_offsets`).
+    pub result_copy_layouts: Vec<CopyLayout>,
 }
 
 /// Resolution of module-level imports within a component
@@ -333,6 +358,65 @@ fn build_core_func_to_module_local(component: &ParsedComponent) -> HashMap<u32, 
         }
     }
     result
+}
+
+/// Collect copy layouts for each pointer pair in function parameters.
+///
+/// Walks the component function type's params, and for each `string` or `list<T>`
+/// param, computes a `CopyLayout` describing how to copy its data across memories.
+fn collect_param_copy_layouts(
+    component: &ParsedComponent,
+    params: &[(String, crate::parser::ComponentValType)],
+) -> Vec<CopyLayout> {
+    let mut layouts = Vec::new();
+    for (_, ty) in params {
+        collect_type_copy_layouts(component, ty, &mut layouts);
+    }
+    layouts
+}
+
+/// Collect copy layouts for each pointer pair in function results.
+fn collect_result_copy_layouts(
+    component: &ParsedComponent,
+    results: &[(Option<String>, crate::parser::ComponentValType)],
+) -> Vec<CopyLayout> {
+    let mut layouts = Vec::new();
+    for (_, ty) in results {
+        collect_type_copy_layouts(component, ty, &mut layouts);
+    }
+    layouts
+}
+
+/// Recursively collect copy layouts for pointer-bearing sub-types.
+fn collect_type_copy_layouts(
+    component: &ParsedComponent,
+    ty: &crate::parser::ComponentValType,
+    out: &mut Vec<CopyLayout>,
+) {
+    use crate::parser::{ComponentTypeKind, ComponentValType};
+    match ty {
+        ComponentValType::String | ComponentValType::List(_) => {
+            out.push(component.copy_layout(ty));
+        }
+        ComponentValType::Record(fields) => {
+            for (_, field_ty) in fields {
+                collect_type_copy_layouts(component, field_ty, out);
+            }
+        }
+        ComponentValType::Tuple(elems) => {
+            for elem_ty in elems {
+                collect_type_copy_layouts(component, elem_ty, out);
+            }
+        }
+        ComponentValType::Type(idx) => {
+            if let Some(ct) = component.get_type_definition(*idx)
+                && let ComponentTypeKind::Defined(inner) = &ct.kind
+            {
+                collect_type_copy_layouts(component, inner, out);
+            }
+        }
+        _ => {} // scalars don't have pointer pairs
+    }
 }
 
 /// Maps core function entity indices from canonical lowered functions to their
@@ -1378,6 +1462,14 @@ impl Resolver {
                                                 .pointer_pair_param_positions(comp_params);
                                             requirements.result_pointer_pair_offsets =
                                                 to_component.pointer_pair_result_offsets(results);
+                                            // Compute copy layouts for each pointer pair
+                                            requirements.param_copy_layouts =
+                                                collect_param_copy_layouts(
+                                                    to_component,
+                                                    comp_params,
+                                                );
+                                            requirements.result_copy_layouts =
+                                                collect_result_copy_layouts(to_component, results);
                                             log::debug!(
                                                 "layout {:?}: ptr_positions={:?}, result_offsets={:?}",
                                                 func_name,

@@ -384,10 +384,12 @@ impl FactStyleGenerator {
             }
         }
 
-        // Only treat first two params as (ptr, len) when callee has realloc —
-        // without realloc we cannot allocate in the callee's memory, so the
-        // params are scalar values that should be passed through directly.
-        let needs_outbound_copy = param_count >= 2 && options.callee_realloc.is_some();
+        // Only treat first two params as (ptr, len) when callee has realloc AND
+        // there are pointer pairs to copy — without realloc we cannot allocate
+        // in the callee's memory.
+        let has_param_pointer_pairs = !site.requirements.pointer_pair_positions.is_empty();
+        let needs_outbound_copy =
+            has_param_pointer_pairs && param_count >= 2 && options.callee_realloc.is_some();
         let needs_result_copy = options.returns_pointer_pair;
 
         // Post-return with scalar results needs scratch locals to save/restore
@@ -405,13 +407,19 @@ impl FactStyleGenerator {
             return Ok((adapter_type_idx, func));
         }
 
-        // Determine scratch local count for copy operations
+        // Compute fixup depth for non-retptr path (each level needs 4 scratch locals)
+        let nonretptr_fixup_depth = if needs_outbound_copy {
+            Self::max_fixup_depth(&site.requirements.param_copy_layouts)
+        } else {
+            0
+        };
+        let inner_fixup_locals: u32 = 4 * nonretptr_fixup_depth;
         let copy_scratch_count: u32 = if needs_outbound_copy && needs_result_copy {
-            4 // dest_ptr + callee_ret_ptr + callee_ret_len + caller_new_ptr
+            4 + inner_fixup_locals // dest_ptr + callee_ret_ptr + callee_ret_len + caller_new_ptr + fixup
         } else if needs_result_copy {
             3 // callee_ret_ptr + callee_ret_len + caller_new_ptr
         } else if needs_outbound_copy {
-            1 // dest_ptr
+            1 + inner_fixup_locals // dest_ptr + fixup
         } else {
             0 // post-return-only path (no copy needed)
         };
@@ -457,22 +465,64 @@ impl FactStyleGenerator {
                 }
             };
 
-            // 1. Allocate in callee's memory: dest_ptr = cabi_realloc(0, 0, 1, len)
+            // Get the byte multiplier from copy layout (default 1 for strings)
+            let byte_mult = site
+                .requirements
+                .param_copy_layouts
+                .first()
+                .map(|cl| match cl {
+                    crate::resolver::CopyLayout::Bulk { byte_multiplier } => *byte_multiplier,
+                    crate::resolver::CopyLayout::Elements { element_size, .. } => *element_size,
+                })
+                .unwrap_or(1);
+
+            // 1. Compute byte_size = len * byte_multiplier
+            //    Allocate in callee's memory: dest_ptr = cabi_realloc(0, 0, align, byte_size)
             func.instruction(&Instruction::I32Const(0)); // original_ptr
             func.instruction(&Instruction::I32Const(0)); // original_size
             func.instruction(&Instruction::I32Const(1)); // alignment
-            func.instruction(&Instruction::LocalGet(1)); // len
+            func.instruction(&Instruction::LocalGet(1)); // len (element count)
+            if byte_mult > 1 {
+                func.instruction(&Instruction::I32Const(byte_mult as i32));
+                func.instruction(&Instruction::I32Mul);
+            }
             func.instruction(&Instruction::Call(callee_realloc));
             func.instruction(&Instruction::LocalSet(dest_ptr_local));
 
-            // 2. Copy data: memory.copy $callee_mem $caller_mem (dest_ptr, src_ptr, len)
+            // 2. Copy data: memory.copy $callee_mem $caller_mem (dest_ptr, src_ptr, byte_size)
             func.instruction(&Instruction::LocalGet(dest_ptr_local)); // dst
             func.instruction(&Instruction::LocalGet(0)); // src (caller ptr)
             func.instruction(&Instruction::LocalGet(1)); // len
+            if byte_mult > 1 {
+                func.instruction(&Instruction::I32Const(byte_mult as i32));
+                func.instruction(&Instruction::I32Mul);
+            }
             func.instruction(&Instruction::MemoryCopy {
                 src_mem: options.caller_memory,
                 dst_mem: options.callee_memory,
             });
+
+            // 2b. Fix up inner pointers if element type contains owned data
+            if let Some(crate::resolver::CopyLayout::Elements {
+                element_size,
+                inner_pointers,
+            }) = site.requirements.param_copy_layouts.first()
+                && !inner_pointers.is_empty()
+            {
+                let fixup_base = dest_ptr_local + 1;
+                Self::emit_inner_pointer_fixup(
+                    &mut func,
+                    inner_pointers,
+                    *element_size,
+                    0,              // src_base = param 0 (caller's original ptr)
+                    dest_ptr_local, // dst_base (callee's copy)
+                    1,              // count = param 1 (len)
+                    options.caller_memory,
+                    options.callee_memory,
+                    callee_realloc,
+                    fixup_base,
+                );
+            }
 
             // 3. Call target with (dest_ptr, len, ...remaining args)
             func.instruction(&Instruction::LocalGet(dest_ptr_local));
@@ -608,10 +658,16 @@ impl FactStyleGenerator {
             result_ptr_offsets,
         );
 
+        // Compute fixup depth: each nesting level needs 4 scratch locals
+        let param_fixup_depth = Self::max_fixup_depth(&site.requirements.param_copy_layouts);
+        let result_fixup_depth = Self::max_fixup_depth(&site.requirements.result_copy_layouts);
+        let max_fixup_depth = param_fixup_depth.max(result_fixup_depth);
+
         // Scratch locals layout (all i32, after caller params):
         //   [dest_ptr_0..dest_ptr_N]  (one per param pointer pair)
         //   [result_ptr]              (return area pointer from callee)
         //   [data_ptr] [data_len] [caller_new_ptr]  (reused for each result pair)
+        //   [loop_idx, inner_ptr, inner_len, new_ptr] × depth  (for nested fixup loops)
         let mut scratch_count: u32 = 0;
         let dest_ptr_base = caller_param_count as u32;
         if num_param_pairs > 0 && options.callee_realloc.is_some() {
@@ -625,6 +681,8 @@ impl FactStyleGenerator {
         scratch_count += 1;
         let caller_new_ptr_local = caller_param_count as u32 + scratch_count;
         scratch_count += 1;
+        let fixup_locals_base = caller_param_count as u32 + scratch_count;
+        scratch_count += 4 * max_fixup_depth; // 4 locals per nesting level
 
         let local_decls = vec![(scratch_count, wasm_encoder::ValType::I32)];
         let mut func = Function::new(local_decls);
@@ -633,26 +691,63 @@ impl FactStyleGenerator {
         if !param_ptr_positions.is_empty() && options.callee_realloc.is_some() {
             let callee_realloc = options.callee_realloc.unwrap();
 
+            let param_layouts = &site.requirements.param_copy_layouts;
             for (pair_idx, &ptr_pos) in param_ptr_positions.iter().enumerate() {
                 let len_pos = ptr_pos + 1;
                 let dest_local = dest_ptr_base + pair_idx as u32;
+                let byte_mult = param_layouts
+                    .get(pair_idx)
+                    .map(|cl| match cl {
+                        crate::resolver::CopyLayout::Bulk { byte_multiplier } => *byte_multiplier,
+                        crate::resolver::CopyLayout::Elements { element_size, .. } => *element_size,
+                    })
+                    .unwrap_or(1);
 
-                // Allocate: dest = cabi_realloc(0, 0, 1, len)
+                // Allocate: dest = cabi_realloc(0, 0, 1, len * byte_mult)
                 func.instruction(&Instruction::I32Const(0));
                 func.instruction(&Instruction::I32Const(0));
                 func.instruction(&Instruction::I32Const(1));
                 func.instruction(&Instruction::LocalGet(len_pos));
+                if byte_mult > 1 {
+                    func.instruction(&Instruction::I32Const(byte_mult as i32));
+                    func.instruction(&Instruction::I32Mul);
+                }
                 func.instruction(&Instruction::Call(callee_realloc));
                 func.instruction(&Instruction::LocalSet(dest_local));
 
-                // Copy: memory.copy callee_mem caller_mem (dest, src, len)
+                // Copy: memory.copy callee_mem caller_mem (dest, src, len * byte_mult)
                 func.instruction(&Instruction::LocalGet(dest_local));
                 func.instruction(&Instruction::LocalGet(ptr_pos));
                 func.instruction(&Instruction::LocalGet(len_pos));
+                if byte_mult > 1 {
+                    func.instruction(&Instruction::I32Const(byte_mult as i32));
+                    func.instruction(&Instruction::I32Mul);
+                }
                 func.instruction(&Instruction::MemoryCopy {
                     src_mem: options.caller_memory,
                     dst_mem: options.callee_memory,
                 });
+
+                // Fix up inner pointers if element type has owned data
+                if let Some(crate::resolver::CopyLayout::Elements {
+                    element_size,
+                    inner_pointers,
+                }) = param_layouts.get(pair_idx)
+                    && !inner_pointers.is_empty()
+                {
+                    Self::emit_inner_pointer_fixup(
+                        &mut func,
+                        inner_pointers,
+                        *element_size,
+                        ptr_pos,    // src_base (caller's original ptr)
+                        dest_local, // dst_base (callee's copy)
+                        len_pos,    // count (element count)
+                        options.caller_memory,
+                        options.callee_memory,
+                        callee_realloc,
+                        fixup_locals_base,
+                    );
+                }
             }
 
             // Build callee params: for each callee param position, either use
@@ -680,16 +775,29 @@ impl FactStyleGenerator {
         // --- Phase 3+4+5: Process return area and write to retptr ---
         // For each result pointer pair, copy the pointed-to data and fix up.
         // For scalar values in the return area, copy them as-is.
+        let result_layouts = &site.requirements.result_copy_layouts;
         if !result_ptr_offsets.is_empty() && options.caller_realloc.is_some() {
             let caller_realloc = options.caller_realloc.unwrap();
 
             // Process each value in the return area
             let mut byte_offset: u32 = 0;
+            let mut result_pair_idx: usize = 0;
             while byte_offset < return_area_size {
                 if result_ptr_offsets.contains(&byte_offset) {
                     // This is a pointer pair [data_ptr, data_len] — need to copy data
                     let ptr_offset = byte_offset;
                     let len_offset = byte_offset + 4;
+                    let byte_mult = result_layouts
+                        .get(result_pair_idx)
+                        .map(|cl| match cl {
+                            crate::resolver::CopyLayout::Bulk { byte_multiplier } => {
+                                *byte_multiplier
+                            }
+                            crate::resolver::CopyLayout::Elements { element_size, .. } => {
+                                *element_size
+                            }
+                        })
+                        .unwrap_or(1);
 
                     // Load data_ptr and data_len from callee's return area
                     func.instruction(&Instruction::LocalGet(result_ptr_local));
@@ -708,11 +816,15 @@ impl FactStyleGenerator {
                     }));
                     func.instruction(&Instruction::LocalSet(data_len_local));
 
-                    // Allocate in caller's memory
+                    // Allocate in caller's memory: data_len * byte_mult bytes
                     func.instruction(&Instruction::I32Const(0));
                     func.instruction(&Instruction::I32Const(0));
                     func.instruction(&Instruction::I32Const(1));
                     func.instruction(&Instruction::LocalGet(data_len_local));
+                    if byte_mult > 1 {
+                        func.instruction(&Instruction::I32Const(byte_mult as i32));
+                        func.instruction(&Instruction::I32Mul);
+                    }
                     func.instruction(&Instruction::Call(caller_realloc));
                     func.instruction(&Instruction::LocalSet(caller_new_ptr_local));
 
@@ -720,10 +832,35 @@ impl FactStyleGenerator {
                     func.instruction(&Instruction::LocalGet(caller_new_ptr_local));
                     func.instruction(&Instruction::LocalGet(data_ptr_local));
                     func.instruction(&Instruction::LocalGet(data_len_local));
+                    if byte_mult > 1 {
+                        func.instruction(&Instruction::I32Const(byte_mult as i32));
+                        func.instruction(&Instruction::I32Mul);
+                    }
                     func.instruction(&Instruction::MemoryCopy {
                         src_mem: options.callee_memory,
                         dst_mem: options.caller_memory,
                     });
+
+                    // Fix up inner pointers in the result (callee → caller direction)
+                    if let Some(crate::resolver::CopyLayout::Elements {
+                        element_size,
+                        inner_pointers,
+                    }) = result_layouts.get(result_pair_idx)
+                        && !inner_pointers.is_empty()
+                    {
+                        Self::emit_inner_pointer_fixup(
+                            &mut func,
+                            inner_pointers,
+                            *element_size,
+                            data_ptr_local,       // src_base (callee's original)
+                            caller_new_ptr_local, // dst_base (caller's copy)
+                            data_len_local,       // count
+                            options.callee_memory,
+                            options.caller_memory,
+                            caller_realloc,
+                            fixup_locals_base,
+                        );
+                    }
 
                     // Write fixed-up [new_ptr, data_len] to retptr
                     func.instruction(&Instruction::LocalGet(retptr_local));
@@ -743,6 +880,7 @@ impl FactStyleGenerator {
                     }));
 
                     byte_offset += 8; // skip both ptr and len
+                    result_pair_idx += 1;
                 } else {
                     // Scalar value — copy directly from return area to retptr
                     func.instruction(&Instruction::LocalGet(retptr_local));
@@ -790,6 +928,195 @@ impl FactStyleGenerator {
         func.instruction(&Instruction::End);
 
         Ok((caller_type_idx, func))
+    }
+
+    /// Compute the maximum nesting depth of inner pointer fixups.
+    /// Each level needs 4 scratch locals (loop_idx, inner_ptr, inner_len, new_ptr).
+    fn max_fixup_depth(layouts: &[crate::resolver::CopyLayout]) -> u32 {
+        fn depth(layout: &crate::resolver::CopyLayout) -> u32 {
+            match layout {
+                crate::resolver::CopyLayout::Bulk { .. } => 0,
+                crate::resolver::CopyLayout::Elements { inner_pointers, .. } => {
+                    if inner_pointers.is_empty() {
+                        0
+                    } else {
+                        1 + inner_pointers
+                            .iter()
+                            .map(|(_, cl)| depth(cl))
+                            .max()
+                            .unwrap_or(0)
+                    }
+                }
+            }
+        }
+        layouts.iter().map(depth).max().unwrap_or(0)
+    }
+
+    /// Emit wasm instructions that fix up inner pointers after a bulk copy.
+    ///
+    /// After bulk-copying `count` elements of `element_size` bytes from one
+    /// memory to another, inner (ptr, len) pairs within each element still
+    /// reference the source memory. This method generates a wasm loop that:
+    /// 1. Iterates over each element
+    /// 2. For each inner pointer pair at a known offset:
+    ///    a. Reads (ptr, len) from the destination copy
+    ///    b. Allocates `len * inner_byte_mult` bytes in the destination memory
+    ///    c. Copies data from source memory to destination memory
+    ///    d. Writes the new pointer back into the destination element
+    ///
+    /// `locals_base` is the first available scratch local index (all i32).
+    /// This method uses 4 scratch locals: [loop_idx, inner_ptr, inner_len, new_ptr].
+    #[allow(clippy::too_many_arguments)]
+    fn emit_inner_pointer_fixup(
+        func: &mut Function,
+        inner_pointers: &[(u32, crate::resolver::CopyLayout)],
+        element_size: u32,
+        _src_base_local: u32, // local holding source array base pointer (reserved for future deep copy)
+        dst_base_local: u32,  // local holding destination array base pointer
+        count_local: u32,     // local holding element count
+        src_mem: u32,
+        dst_mem: u32,
+        realloc_func: u32,
+        locals_base: u32,
+    ) {
+        if inner_pointers.is_empty() {
+            return;
+        }
+        let loop_idx = locals_base;
+        let inner_ptr = locals_base + 1;
+        let inner_len = locals_base + 2;
+        let new_ptr = locals_base + 3;
+
+        // Initialize loop counter to 0
+        func.instruction(&Instruction::I32Const(0));
+        func.instruction(&Instruction::LocalSet(loop_idx));
+
+        // block $exit { loop $cont {
+        func.instruction(&Instruction::Block(wasm_encoder::BlockType::Empty));
+        func.instruction(&Instruction::Loop(wasm_encoder::BlockType::Empty));
+
+        // if loop_idx >= count: break
+        func.instruction(&Instruction::LocalGet(loop_idx));
+        func.instruction(&Instruction::LocalGet(count_local));
+        func.instruction(&Instruction::I32GeU);
+        func.instruction(&Instruction::BrIf(1)); // break to $exit
+
+        // For each inner pointer pair in the element:
+        for (inner_offset, inner_layout) in inner_pointers {
+            let byte_mult = match inner_layout {
+                crate::resolver::CopyLayout::Bulk { byte_multiplier } => *byte_multiplier,
+                crate::resolver::CopyLayout::Elements { element_size, .. } => *element_size,
+            };
+
+            // elem_offset = loop_idx * element_size + inner_offset
+            // Read inner_ptr from dst_base[elem_offset]
+            func.instruction(&Instruction::LocalGet(dst_base_local));
+            func.instruction(&Instruction::LocalGet(loop_idx));
+            func.instruction(&Instruction::I32Const(element_size as i32));
+            func.instruction(&Instruction::I32Mul);
+            func.instruction(&Instruction::I32Add);
+            func.instruction(&Instruction::I32Const(*inner_offset as i32));
+            func.instruction(&Instruction::I32Add);
+            // Now stack has: dst_base + loop_idx * element_size + inner_offset
+            // But we need to load from the SOURCE memory (the pointer values
+            // in the dst copy still point to src memory after bulk copy)
+            func.instruction(&Instruction::I32Load(wasm_encoder::MemArg {
+                offset: 0,
+                align: 2,
+                memory_index: dst_mem,
+            }));
+            func.instruction(&Instruction::LocalSet(inner_ptr));
+
+            // Read inner_len from dst_base[elem_offset + 4]
+            func.instruction(&Instruction::LocalGet(dst_base_local));
+            func.instruction(&Instruction::LocalGet(loop_idx));
+            func.instruction(&Instruction::I32Const(element_size as i32));
+            func.instruction(&Instruction::I32Mul);
+            func.instruction(&Instruction::I32Add);
+            func.instruction(&Instruction::I32Const(*inner_offset as i32 + 4));
+            func.instruction(&Instruction::I32Add);
+            func.instruction(&Instruction::I32Load(wasm_encoder::MemArg {
+                offset: 0,
+                align: 2,
+                memory_index: dst_mem,
+            }));
+            func.instruction(&Instruction::LocalSet(inner_len));
+
+            // Allocate inner data in dst memory: new_ptr = realloc(0, 0, 1, inner_len * byte_mult)
+            func.instruction(&Instruction::I32Const(0));
+            func.instruction(&Instruction::I32Const(0));
+            func.instruction(&Instruction::I32Const(1));
+            func.instruction(&Instruction::LocalGet(inner_len));
+            if byte_mult > 1 {
+                func.instruction(&Instruction::I32Const(byte_mult as i32));
+                func.instruction(&Instruction::I32Mul);
+            }
+            func.instruction(&Instruction::Call(realloc_func));
+            func.instruction(&Instruction::LocalSet(new_ptr));
+
+            // Copy data from src memory to dst memory
+            // memory.copy dst_mem src_mem (new_ptr, inner_ptr, inner_len * byte_mult)
+            func.instruction(&Instruction::LocalGet(new_ptr));
+            func.instruction(&Instruction::LocalGet(inner_ptr));
+            func.instruction(&Instruction::LocalGet(inner_len));
+            if byte_mult > 1 {
+                func.instruction(&Instruction::I32Const(byte_mult as i32));
+                func.instruction(&Instruction::I32Mul);
+            }
+            func.instruction(&Instruction::MemoryCopy { src_mem, dst_mem });
+
+            // Recursively fix up inner-inner pointers if the inner layout
+            // itself has pointer pairs (e.g., list<list<string>>).
+            if let crate::resolver::CopyLayout::Elements {
+                element_size: inner_elem_size,
+                inner_pointers: inner_inner,
+            } = inner_layout
+                && !inner_inner.is_empty()
+            {
+                // Use the next set of 4 scratch locals for the recursive level
+                Self::emit_inner_pointer_fixup(
+                    func,
+                    inner_inner,
+                    *inner_elem_size,
+                    inner_ptr, // src_base: the original source ptr
+                    new_ptr,   // dst_base: the newly allocated copy
+                    inner_len, // count: element count
+                    src_mem,
+                    dst_mem,
+                    realloc_func,
+                    locals_base + 4, // next level gets next 4 scratch locals
+                );
+            }
+
+            // Write new_ptr back to dst element
+            func.instruction(&Instruction::LocalGet(dst_base_local));
+            func.instruction(&Instruction::LocalGet(loop_idx));
+            func.instruction(&Instruction::I32Const(element_size as i32));
+            func.instruction(&Instruction::I32Mul);
+            func.instruction(&Instruction::I32Add);
+            func.instruction(&Instruction::I32Const(*inner_offset as i32));
+            func.instruction(&Instruction::I32Add);
+            func.instruction(&Instruction::LocalGet(new_ptr));
+            func.instruction(&Instruction::I32Store(wasm_encoder::MemArg {
+                offset: 0,
+                align: 2,
+                memory_index: dst_mem,
+            }));
+            // len stays the same — no need to update it
+        }
+
+        // Increment loop counter
+        func.instruction(&Instruction::LocalGet(loop_idx));
+        func.instruction(&Instruction::I32Const(1));
+        func.instruction(&Instruction::I32Add);
+        func.instruction(&Instruction::LocalSet(loop_idx));
+
+        // Continue loop
+        func.instruction(&Instruction::Br(0)); // br $cont
+
+        // }} end loop, end block
+        func.instruction(&Instruction::End); // end loop
+        func.instruction(&Instruction::End); // end block
     }
 
     /// Generate an adapter with string transcoding

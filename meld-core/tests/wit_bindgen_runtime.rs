@@ -225,10 +225,7 @@ fn test_runtime_wit_bindgen_strings() {
     run_wasi_component(&fused).expect("strings: run() should succeed without trap");
 }
 
-// Lists require element-size-aware allocation (len * sizeof(element)) and
-// recursive pointer copying for nested types (list<string>, list<list<T>>).
 #[test]
-#[ignore = "needs element-size-aware list adapter and recursive pointer copy"]
 fn test_runtime_wit_bindgen_lists() {
     if !fixtures_available() {
         return;

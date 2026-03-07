@@ -1411,6 +1411,215 @@ impl ParsedComponent {
             ComponentValType::Own(_) | ComponentValType::Borrow(_) => 1,
         }
     }
+
+    /// Canonical ABI alignment of a value type in linear memory.
+    pub fn canonical_abi_align(&self, ty: &ComponentValType) -> u32 {
+        match ty {
+            ComponentValType::Primitive(p) => match p {
+                PrimitiveValType::Bool | PrimitiveValType::S8 | PrimitiveValType::U8 => 1,
+                PrimitiveValType::S16 | PrimitiveValType::U16 => 2,
+                PrimitiveValType::S32
+                | PrimitiveValType::U32
+                | PrimitiveValType::F32
+                | PrimitiveValType::Char => 4,
+                PrimitiveValType::S64 | PrimitiveValType::U64 | PrimitiveValType::F64 => 8,
+            },
+            ComponentValType::String | ComponentValType::List(_) => 4, // ptr alignment
+            ComponentValType::Record(fields) => fields
+                .iter()
+                .map(|(_, t)| self.canonical_abi_align(t))
+                .max()
+                .unwrap_or(1),
+            ComponentValType::Tuple(elems) => elems
+                .iter()
+                .map(|t| self.canonical_abi_align(t))
+                .max()
+                .unwrap_or(1),
+            ComponentValType::Variant(cases) => {
+                let max_payload = cases
+                    .iter()
+                    .filter_map(|(_, t)| t.as_ref().map(|t| self.canonical_abi_align(t)))
+                    .max()
+                    .unwrap_or(1);
+                4u32.max(max_payload) // discriminant is i32
+            }
+            ComponentValType::Option(inner) => 4u32.max(self.canonical_abi_align(inner)),
+            ComponentValType::Result { ok, err } => {
+                let oa = ok
+                    .as_ref()
+                    .map(|t| self.canonical_abi_align(t))
+                    .unwrap_or(1);
+                let ea = err
+                    .as_ref()
+                    .map(|t| self.canonical_abi_align(t))
+                    .unwrap_or(1);
+                4u32.max(oa).max(ea)
+            }
+            ComponentValType::Type(idx) => {
+                if let Some(ct) = self.get_type_definition(*idx)
+                    && let ComponentTypeKind::Defined(inner) = &ct.kind
+                {
+                    return self.canonical_abi_align(inner);
+                }
+                4
+            }
+            ComponentValType::Own(_) | ComponentValType::Borrow(_) => 4,
+        }
+    }
+
+    /// Canonical ABI byte size of a value type in linear memory (NOT flat size).
+    ///
+    /// This is the size of one element when stored in a list's backing buffer.
+    /// Includes alignment padding between fields but NOT trailing padding
+    /// (that's handled by `canonical_abi_element_size`).
+    fn canonical_abi_size_unpadded(&self, ty: &ComponentValType) -> u32 {
+        match ty {
+            ComponentValType::Primitive(p) => match p {
+                PrimitiveValType::Bool | PrimitiveValType::S8 | PrimitiveValType::U8 => 1,
+                PrimitiveValType::S16 | PrimitiveValType::U16 => 2,
+                PrimitiveValType::S32
+                | PrimitiveValType::U32
+                | PrimitiveValType::F32
+                | PrimitiveValType::Char => 4,
+                PrimitiveValType::S64 | PrimitiveValType::U64 | PrimitiveValType::F64 => 8,
+            },
+            ComponentValType::String | ComponentValType::List(_) => 8, // (ptr: i32, len: i32)
+            ComponentValType::Record(fields) => {
+                let mut size = 0u32;
+                for (_, field_ty) in fields {
+                    let align = self.canonical_abi_align(field_ty);
+                    size = align_up(size, align);
+                    size += self.canonical_abi_size_unpadded(field_ty);
+                }
+                size
+            }
+            ComponentValType::Tuple(elems) => {
+                let mut size = 0u32;
+                for elem_ty in elems {
+                    let align = self.canonical_abi_align(elem_ty);
+                    size = align_up(size, align);
+                    size += self.canonical_abi_size_unpadded(elem_ty);
+                }
+                size
+            }
+            ComponentValType::Variant(cases) => {
+                let max_payload = cases
+                    .iter()
+                    .filter_map(|(_, t)| t.as_ref().map(|t| self.canonical_abi_element_size(t)))
+                    .max()
+                    .unwrap_or(0);
+                4 + max_payload // discriminant + largest case
+            }
+            ComponentValType::Option(inner) => 4 + self.canonical_abi_element_size(inner),
+            ComponentValType::Result { ok, err } => {
+                let ok_s = ok
+                    .as_ref()
+                    .map(|t| self.canonical_abi_element_size(t))
+                    .unwrap_or(0);
+                let err_s = err
+                    .as_ref()
+                    .map(|t| self.canonical_abi_element_size(t))
+                    .unwrap_or(0);
+                4 + ok_s.max(err_s)
+            }
+            ComponentValType::Type(idx) => {
+                if let Some(ct) = self.get_type_definition(*idx)
+                    && let ComponentTypeKind::Defined(inner) = &ct.kind
+                {
+                    return self.canonical_abi_size_unpadded(inner);
+                }
+                4
+            }
+            ComponentValType::Own(_) | ComponentValType::Borrow(_) => 4,
+        }
+    }
+
+    /// Canonical ABI element size — the stride when stored in a list.
+    /// This is `align_up(size, align)`.
+    pub fn canonical_abi_element_size(&self, ty: &ComponentValType) -> u32 {
+        let size = self.canonical_abi_size_unpadded(ty);
+        let align = self.canonical_abi_align(ty);
+        align_up(size, align)
+    }
+
+    /// Build a `CopyLayout` describing how to copy a (ptr, len) value
+    /// of the given type across memories.
+    pub fn copy_layout(&self, ty: &ComponentValType) -> crate::resolver::CopyLayout {
+        use crate::resolver::CopyLayout;
+        match ty {
+            ComponentValType::String => CopyLayout::Bulk { byte_multiplier: 1 },
+            ComponentValType::List(inner) => {
+                let element_size = self.canonical_abi_element_size(inner);
+                let inner_ptrs = self.element_inner_pointers(inner, 0);
+                if inner_ptrs.is_empty() {
+                    CopyLayout::Bulk {
+                        byte_multiplier: element_size,
+                    }
+                } else {
+                    CopyLayout::Elements {
+                        element_size,
+                        inner_pointers: inner_ptrs,
+                    }
+                }
+            }
+            // For non-list/string types, treat as bulk with 1x multiplier
+            _ => CopyLayout::Bulk { byte_multiplier: 1 },
+        }
+    }
+
+    /// Find inner (ptr, len) pairs within an element type at the given base offset.
+    /// Returns Vec<(byte_offset, CopyLayout)> for each pointer pair found.
+    fn element_inner_pointers(
+        &self,
+        ty: &ComponentValType,
+        base: u32,
+    ) -> Vec<(u32, crate::resolver::CopyLayout)> {
+        let mut result = Vec::new();
+        match ty {
+            ComponentValType::String => {
+                result.push((
+                    base,
+                    crate::resolver::CopyLayout::Bulk { byte_multiplier: 1 },
+                ));
+            }
+            ComponentValType::List(inner) => {
+                result.push((base, self.copy_layout(ty)));
+                // The list itself is a pointer pair — don't recurse further here
+                let _ = inner;
+            }
+            ComponentValType::Record(fields) => {
+                let mut offset = base;
+                for (_, field_ty) in fields {
+                    let align = self.canonical_abi_align(field_ty);
+                    offset = align_up(offset, align);
+                    result.extend(self.element_inner_pointers(field_ty, offset));
+                    offset += self.canonical_abi_size_unpadded(field_ty);
+                }
+            }
+            ComponentValType::Tuple(elems) => {
+                let mut offset = base;
+                for elem_ty in elems {
+                    let align = self.canonical_abi_align(elem_ty);
+                    offset = align_up(offset, align);
+                    result.extend(self.element_inner_pointers(elem_ty, offset));
+                    offset += self.canonical_abi_size_unpadded(elem_ty);
+                }
+            }
+            ComponentValType::Type(idx) => {
+                if let Some(ct) = self.get_type_definition(*idx)
+                    && let ComponentTypeKind::Defined(inner) = &ct.kind
+                {
+                    return self.element_inner_pointers(inner, base);
+                }
+            }
+            _ => {} // scalars, options, results — no pointer pairs
+        }
+        result
+    }
+}
+
+fn align_up(size: u32, align: u32) -> u32 {
+    (size + align - 1) & !(align - 1)
 }
 
 /// Convert wasmparser's `ComponentValType` to our owned representation.
