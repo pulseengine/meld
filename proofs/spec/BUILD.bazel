@@ -80,3 +80,12 @@ rocq_library(
     ],
     include_path = "MeldSpec",
 )
+
+# CopyLayout and ConditionalPointerPair specification.
+# Defines types and well-formedness predicates for cross-memory copy layouts
+# used by the FACT adapter generator.
+rocq_library(
+    name = "copy_layout_spec",
+    srcs = ["copy_layout_spec.v"],
+    include_path = "MeldCopyLayout",
+)
