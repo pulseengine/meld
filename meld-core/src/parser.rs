@@ -1277,8 +1277,23 @@ impl ParsedComponent {
     }
 
     /// Compute the byte size of the return area for a component function's results.
+    ///
+    /// The return area uses the canonical ABI memory layout (with alignment),
+    /// not the flat (stack) representation. Results are stored as a tuple.
     pub fn return_area_byte_size(&self, results: &[(Option<String>, ComponentValType)]) -> u32 {
-        results.iter().map(|(_, ty)| self.flat_byte_size(ty)).sum()
+        let mut size = 0u32;
+        for (_, ty) in results {
+            let align = self.canonical_abi_align(ty);
+            size = align_up(size, align);
+            size += self.canonical_abi_size_unpadded(ty);
+        }
+        // Align final size to the max alignment of the tuple
+        let max_align = results
+            .iter()
+            .map(|(_, ty)| self.canonical_abi_align(ty))
+            .max()
+            .unwrap_or(1);
+        align_up(size, max_align)
     }
 
     /// Compute flat core param indices where (ptr, len) pairs start.
@@ -1297,7 +1312,10 @@ impl ParsedComponent {
         positions
     }
 
-    /// Compute flat return-area byte offsets where (ptr, len) pairs start.
+    /// Compute return-area byte offsets where (ptr, len) pairs start.
+    ///
+    /// Uses canonical ABI memory layout offsets (with alignment), matching
+    /// how the callee stores results in the return area.
     pub fn pointer_pair_result_offsets(
         &self,
         results: &[(Option<String>, ComponentValType)],
@@ -1305,8 +1323,10 @@ impl ParsedComponent {
         let mut offsets = Vec::new();
         let mut byte_offset = 0u32;
         for (_, ty) in results {
+            let align = self.canonical_abi_align(ty);
+            byte_offset = align_up(byte_offset, align);
             self.collect_pointer_byte_offsets(ty, byte_offset, &mut offsets);
-            byte_offset += self.flat_byte_size(ty);
+            byte_offset += self.canonical_abi_size_unpadded(ty);
         }
         offsets
     }
@@ -1344,6 +1364,7 @@ impl ParsedComponent {
     }
 
     /// Collect byte offsets in the return area where pointer pairs start.
+    /// Uses canonical ABI memory layout offsets (with alignment).
     fn collect_pointer_byte_offsets(&self, ty: &ComponentValType, base: u32, out: &mut Vec<u32>) {
         match ty {
             ComponentValType::String | ComponentValType::List(_) => {
@@ -1352,15 +1373,19 @@ impl ParsedComponent {
             ComponentValType::Record(fields) => {
                 let mut offset = base;
                 for (_, field_ty) in fields {
+                    let align = self.canonical_abi_align(field_ty);
+                    offset = align_up(offset, align);
                     self.collect_pointer_byte_offsets(field_ty, offset, out);
-                    offset += self.flat_byte_size(field_ty);
+                    offset += self.canonical_abi_size_unpadded(field_ty);
                 }
             }
             ComponentValType::Tuple(elems) => {
                 let mut offset = base;
                 for elem_ty in elems {
+                    let align = self.canonical_abi_align(elem_ty);
+                    offset = align_up(offset, align);
                     self.collect_pointer_byte_offsets(elem_ty, offset, out);
-                    offset += self.flat_byte_size(elem_ty);
+                    offset += self.canonical_abi_size_unpadded(elem_ty);
                 }
             }
             ComponentValType::Type(idx) => {
@@ -1372,6 +1397,314 @@ impl ParsedComponent {
             }
             _ => {}
         }
+    }
+
+    /// Collect conditional pointer pairs from params that contain option/result/variant
+    /// types with pointer payloads.
+    pub fn conditional_pointer_pair_positions(
+        &self,
+        params: &[(String, ComponentValType)],
+    ) -> Vec<crate::resolver::ConditionalPointerPair> {
+        let mut out = Vec::new();
+        let mut flat_idx = 0u32;
+        for (_, ty) in params {
+            self.collect_conditional_pointers(ty, flat_idx, &mut out);
+            flat_idx += self.flat_count(ty);
+        }
+        out
+    }
+
+    /// Collect conditional pointer pairs from results using flat indices (non-retptr path).
+    pub fn conditional_pointer_pair_result_flat_positions(
+        &self,
+        results: &[(Option<String>, ComponentValType)],
+    ) -> Vec<crate::resolver::ConditionalPointerPair> {
+        let mut out = Vec::new();
+        let mut flat_idx = 0u32;
+        for (_, ty) in results {
+            self.collect_conditional_pointers(ty, flat_idx, &mut out);
+            flat_idx += self.flat_count(ty);
+        }
+        out
+    }
+
+    /// Collect conditional pointer pairs from results (byte-offset based, for retptr path).
+    /// Uses canonical ABI memory layout offsets.
+    pub fn conditional_pointer_pair_result_positions(
+        &self,
+        results: &[(Option<String>, ComponentValType)],
+    ) -> Vec<crate::resolver::ConditionalPointerPair> {
+        let mut out = Vec::new();
+        let mut byte_offset = 0u32;
+        for (_, ty) in results {
+            let align = self.canonical_abi_align(ty);
+            byte_offset = align_up(byte_offset, align);
+            self.collect_conditional_result_pointers(ty, byte_offset, &mut out);
+            byte_offset += self.canonical_abi_size_unpadded(ty);
+        }
+        out
+    }
+
+    /// Collect conditional pointer pairs for flat params.
+    /// For option<T> where T contains pointers: disc at base, payload at base+1.
+    fn collect_conditional_pointers(
+        &self,
+        ty: &ComponentValType,
+        base: u32,
+        out: &mut Vec<crate::resolver::ConditionalPointerPair>,
+    ) {
+        match ty {
+            ComponentValType::Option(inner) if self.type_contains_pointers(inner) => {
+                // option<T> flattens to [disc, ...T_flat]
+                // disc=1 means Some, payload starts at base+1
+                let payload_base = base + 1;
+                // Collect unconditional pointer pairs from the inner type
+                // and wrap each as conditional on disc==1
+                let mut inner_positions = Vec::new();
+                self.collect_pointer_positions(inner, payload_base, &mut inner_positions);
+                for ptr_pos in inner_positions {
+                    let layout = self.copy_layout_for_string_or_list_at(inner);
+                    out.push(crate::resolver::ConditionalPointerPair {
+                        discriminant_position: base,
+                        discriminant_value: 1,
+                        ptr_position: ptr_pos,
+                        copy_layout: layout,
+                    });
+                }
+                // Also recurse into the inner type for nested conditionals
+                self.collect_conditional_pointers(inner, payload_base, out);
+            }
+            ComponentValType::Result { ok, err } => {
+                // result<T,E> flattens to [disc, ...max(T_flat, E_flat)]
+                // disc=0 means Ok(T), disc=1 means Err(E)
+                let payload_base = base + 1;
+                if let Some(ok_ty) = ok
+                    && self.type_contains_pointers(ok_ty)
+                {
+                    let mut inner_positions = Vec::new();
+                    self.collect_pointer_positions(ok_ty, payload_base, &mut inner_positions);
+                    for ptr_pos in inner_positions {
+                        let layout = self.copy_layout_for_string_or_list_at(ok_ty);
+                        out.push(crate::resolver::ConditionalPointerPair {
+                            discriminant_position: base,
+                            discriminant_value: 0,
+                            ptr_position: ptr_pos,
+                            copy_layout: layout,
+                        });
+                    }
+                    self.collect_conditional_pointers(ok_ty, payload_base, out);
+                }
+                if let Some(err_ty) = err
+                    && self.type_contains_pointers(err_ty)
+                {
+                    let mut inner_positions = Vec::new();
+                    self.collect_pointer_positions(err_ty, payload_base, &mut inner_positions);
+                    for ptr_pos in inner_positions {
+                        let layout = self.copy_layout_for_string_or_list_at(err_ty);
+                        out.push(crate::resolver::ConditionalPointerPair {
+                            discriminant_position: base,
+                            discriminant_value: 1,
+                            ptr_position: ptr_pos,
+                            copy_layout: layout,
+                        });
+                    }
+                    self.collect_conditional_pointers(err_ty, payload_base, out);
+                }
+            }
+            ComponentValType::Variant(cases) => {
+                // variant flattens to [disc, ...max(case_payloads)]
+                let payload_base = base + 1;
+                for (case_idx, (_, case_ty)) in cases.iter().enumerate() {
+                    if let Some(ty) = case_ty
+                        && self.type_contains_pointers(ty)
+                    {
+                        let mut inner_positions = Vec::new();
+                        self.collect_pointer_positions(ty, payload_base, &mut inner_positions);
+                        for ptr_pos in inner_positions {
+                            let layout = self.copy_layout_for_string_or_list_at(ty);
+                            out.push(crate::resolver::ConditionalPointerPair {
+                                discriminant_position: base,
+                                discriminant_value: case_idx as u32,
+                                ptr_position: ptr_pos,
+                                copy_layout: layout,
+                            });
+                        }
+                        self.collect_conditional_pointers(ty, payload_base, out);
+                    }
+                }
+            }
+            ComponentValType::Record(fields) => {
+                let mut offset = base;
+                for (_, field_ty) in fields {
+                    self.collect_conditional_pointers(field_ty, offset, out);
+                    offset += self.flat_count(field_ty);
+                }
+            }
+            ComponentValType::Tuple(elems) => {
+                let mut offset = base;
+                for elem_ty in elems {
+                    self.collect_conditional_pointers(elem_ty, offset, out);
+                    offset += self.flat_count(elem_ty);
+                }
+            }
+            ComponentValType::Type(idx) => {
+                if let Some(ct) = self.get_type_definition(*idx)
+                    && let ComponentTypeKind::Defined(inner) = &ct.kind
+                {
+                    self.collect_conditional_pointers(inner, base, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Collect conditional pointer pairs for result byte offsets.
+    fn collect_conditional_result_pointers(
+        &self,
+        ty: &ComponentValType,
+        base: u32,
+        out: &mut Vec<crate::resolver::ConditionalPointerPair>,
+    ) {
+        match ty {
+            ComponentValType::Option(inner) if self.type_contains_pointers(inner) => {
+                // In memory layout: disc (4 bytes aligned), then payload
+                let disc_offset = base;
+                let payload_offset = base + 4; // discriminant is i32
+                let mut inner_offsets = Vec::new();
+                self.collect_pointer_byte_offsets(inner, payload_offset, &mut inner_offsets);
+                for ptr_off in inner_offsets {
+                    let layout = self.copy_layout_for_string_or_list_at(inner);
+                    out.push(crate::resolver::ConditionalPointerPair {
+                        discriminant_position: disc_offset,
+                        discriminant_value: 1,
+                        ptr_position: ptr_off,
+                        copy_layout: layout,
+                    });
+                }
+                self.collect_conditional_result_pointers(inner, payload_offset, out);
+            }
+            ComponentValType::Result { ok, err } => {
+                let disc_offset = base;
+                let payload_offset = base + 4;
+                if let Some(ok_ty) = ok
+                    && self.type_contains_pointers(ok_ty)
+                {
+                    let mut inner_offsets = Vec::new();
+                    self.collect_pointer_byte_offsets(ok_ty, payload_offset, &mut inner_offsets);
+                    for ptr_off in inner_offsets {
+                        let layout = self.copy_layout_for_string_or_list_at(ok_ty);
+                        out.push(crate::resolver::ConditionalPointerPair {
+                            discriminant_position: disc_offset,
+                            discriminant_value: 0,
+                            ptr_position: ptr_off,
+                            copy_layout: layout,
+                        });
+                    }
+                    self.collect_conditional_result_pointers(ok_ty, payload_offset, out);
+                }
+                if let Some(err_ty) = err
+                    && self.type_contains_pointers(err_ty)
+                {
+                    let mut inner_offsets = Vec::new();
+                    self.collect_pointer_byte_offsets(err_ty, payload_offset, &mut inner_offsets);
+                    for ptr_off in inner_offsets {
+                        let layout = self.copy_layout_for_string_or_list_at(err_ty);
+                        out.push(crate::resolver::ConditionalPointerPair {
+                            discriminant_position: disc_offset,
+                            discriminant_value: 1,
+                            ptr_position: ptr_off,
+                            copy_layout: layout,
+                        });
+                    }
+                    self.collect_conditional_result_pointers(err_ty, payload_offset, out);
+                }
+            }
+            ComponentValType::Variant(cases) => {
+                let disc_offset = base;
+                let payload_offset = base + 4;
+                for (case_idx, (_, case_ty)) in cases.iter().enumerate() {
+                    if let Some(ty) = case_ty
+                        && self.type_contains_pointers(ty)
+                    {
+                        let mut inner_offsets = Vec::new();
+                        self.collect_pointer_byte_offsets(ty, payload_offset, &mut inner_offsets);
+                        for ptr_off in inner_offsets {
+                            let layout = self.copy_layout_for_string_or_list_at(ty);
+                            out.push(crate::resolver::ConditionalPointerPair {
+                                discriminant_position: disc_offset,
+                                discriminant_value: case_idx as u32,
+                                ptr_position: ptr_off,
+                                copy_layout: layout,
+                            });
+                        }
+                        self.collect_conditional_result_pointers(ty, payload_offset, out);
+                    }
+                }
+            }
+            ComponentValType::Record(fields) => {
+                let mut offset = base;
+                for (_, field_ty) in fields {
+                    let align = self.canonical_abi_align(field_ty);
+                    offset = align_up(offset, align);
+                    self.collect_conditional_result_pointers(field_ty, offset, out);
+                    offset += self.canonical_abi_size_unpadded(field_ty);
+                }
+            }
+            ComponentValType::Tuple(elems) => {
+                let mut offset = base;
+                for elem_ty in elems {
+                    let align = self.canonical_abi_align(elem_ty);
+                    offset = align_up(offset, align);
+                    self.collect_conditional_result_pointers(elem_ty, offset, out);
+                    offset += self.canonical_abi_size_unpadded(elem_ty);
+                }
+            }
+            ComponentValType::Type(idx) => {
+                if let Some(ct) = self.get_type_definition(*idx)
+                    && let ComponentTypeKind::Defined(inner) = &ct.kind
+                {
+                    self.collect_conditional_result_pointers(inner, base, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Check if a type contains any pointer data (strings, lists).
+    pub fn type_contains_pointers(&self, ty: &ComponentValType) -> bool {
+        match ty {
+            ComponentValType::String | ComponentValType::List(_) => true,
+            ComponentValType::Option(inner) => self.type_contains_pointers(inner),
+            ComponentValType::Result { ok, err } => {
+                ok.as_ref().is_some_and(|t| self.type_contains_pointers(t))
+                    || err.as_ref().is_some_and(|t| self.type_contains_pointers(t))
+            }
+            ComponentValType::Record(fields) => {
+                fields.iter().any(|(_, t)| self.type_contains_pointers(t))
+            }
+            ComponentValType::Tuple(elems) => elems.iter().any(|t| self.type_contains_pointers(t)),
+            ComponentValType::Variant(cases) => cases
+                .iter()
+                .any(|(_, t)| t.as_ref().is_some_and(|t| self.type_contains_pointers(t))),
+            ComponentValType::Type(idx) => {
+                if let Some(ct) = self.get_type_definition(*idx)
+                    && let ComponentTypeKind::Defined(inner) = &ct.kind
+                {
+                    self.type_contains_pointers(inner)
+                } else {
+                    false
+                }
+            }
+            _ => false,
+        }
+    }
+
+    /// Get the copy layout for a type that is either a string or a list.
+    fn copy_layout_for_string_or_list_at(
+        &self,
+        ty: &ComponentValType,
+    ) -> crate::resolver::CopyLayout {
+        self.copy_layout(ty)
     }
 
     /// Count the number of flat core wasm values a component type flattens to.
@@ -1959,5 +2292,178 @@ mod tests {
         assert_eq!(convert_val_type(WasmValType::I64), ValType::I64);
         assert_eq!(convert_val_type(WasmValType::F32), ValType::F32);
         assert_eq!(convert_val_type(WasmValType::F64), ValType::F64);
+    }
+
+    // ---------------------------------------------------------------
+    // Canonical ABI sizing tests (SR-3: Correct Canonical ABI element
+    // size computation)
+    // ---------------------------------------------------------------
+
+    /// Build a minimal `ParsedComponent` with no types/modules/imports.
+    /// Sufficient for exercising the sizing functions on inline types.
+    fn empty_parsed_component() -> ParsedComponent {
+        ParsedComponent {
+            name: None,
+            core_modules: vec![],
+            imports: vec![],
+            exports: vec![],
+            types: vec![],
+            instances: vec![],
+            canonical_functions: vec![],
+            sub_components: vec![],
+            component_aliases: vec![],
+            component_instances: vec![],
+            core_entity_order: vec![],
+            component_func_defs: vec![],
+            component_instance_defs: vec![],
+            component_type_defs: vec![],
+            original_size: 0,
+            original_hash: String::new(),
+            depth_0_sections: vec![],
+        }
+    }
+
+    /// SR-3: Verify element_size for every primitive type matches the
+    /// Canonical ABI specification (Core Spec 3.0 / Component Model).
+    #[test]
+    fn test_canonical_abi_element_size_primitive_types() {
+        let pc = empty_parsed_component();
+
+        let cases: &[(PrimitiveValType, u32)] = &[
+            (PrimitiveValType::U8, 1),
+            (PrimitiveValType::U16, 2),
+            (PrimitiveValType::U32, 4),
+            (PrimitiveValType::U64, 8),
+            (PrimitiveValType::S8, 1),
+            (PrimitiveValType::S16, 2),
+            (PrimitiveValType::S32, 4),
+            (PrimitiveValType::S64, 8),
+            (PrimitiveValType::F32, 4),
+            (PrimitiveValType::F64, 8),
+            (PrimitiveValType::Bool, 1),
+        ];
+
+        for (prim, expected) in cases {
+            let ty = ComponentValType::Primitive(*prim);
+            assert_eq!(
+                pc.canonical_abi_element_size(&ty),
+                *expected,
+                "element_size mismatch for {:?}",
+                prim,
+            );
+        }
+    }
+
+    /// SR-3: String is a (ptr: i32, len: i32) pair = 8 bytes, align 4.
+    #[test]
+    fn test_canonical_abi_element_size_string() {
+        let pc = empty_parsed_component();
+        let ty = ComponentValType::String;
+        assert_eq!(pc.canonical_abi_element_size(&ty), 8);
+    }
+
+    /// SR-3 / LS-P-2: A record {u8, string} must include alignment
+    /// padding.  Naive sum would give 1 + 8 = 9, but the string field
+    /// requires align-4, so the layout is:
+    ///   offset 0: u8      (1 byte)
+    ///   offset 1: padding  (3 bytes to reach align 4)
+    ///   offset 4: string   (8 bytes: ptr + len)
+    /// Unpadded size = 12.  Record align = max(1, 4) = 4.
+    /// element_size = align_up(12, 4) = 12.
+    #[test]
+    fn test_canonical_abi_element_size_record_with_padding() {
+        let pc = empty_parsed_component();
+        let ty = ComponentValType::Record(vec![
+            (
+                "a".into(),
+                ComponentValType::Primitive(PrimitiveValType::U8),
+            ),
+            ("b".into(), ComponentValType::String),
+        ]);
+        assert_eq!(
+            pc.canonical_abi_element_size(&ty),
+            12,
+            "record {{u8, string}} should be 12 (with alignment padding), not 9",
+        );
+    }
+
+    /// SR-3: A homogeneous record {u32, u32} needs no inter-field
+    /// padding — both fields are align-4 and the first already ends on
+    /// an aligned boundary.  element_size = 8.
+    #[test]
+    fn test_canonical_abi_element_size_record_homogeneous() {
+        let pc = empty_parsed_component();
+        let ty = ComponentValType::Record(vec![
+            (
+                "x".into(),
+                ComponentValType::Primitive(PrimitiveValType::U32),
+            ),
+            (
+                "y".into(),
+                ComponentValType::Primitive(PrimitiveValType::U32),
+            ),
+        ]);
+        assert_eq!(pc.canonical_abi_element_size(&ty), 8);
+    }
+
+    /// SR-3: Verify canonical_abi_align returns the correct power-of-two
+    /// alignment for each primitive and for compound types.
+    #[test]
+    fn test_canonical_abi_align_values() {
+        let pc = empty_parsed_component();
+
+        // Primitives
+        let prim_cases: &[(PrimitiveValType, u32)] = &[
+            (PrimitiveValType::Bool, 1),
+            (PrimitiveValType::U8, 1),
+            (PrimitiveValType::S8, 1),
+            (PrimitiveValType::U16, 2),
+            (PrimitiveValType::S16, 2),
+            (PrimitiveValType::U32, 4),
+            (PrimitiveValType::S32, 4),
+            (PrimitiveValType::F32, 4),
+            (PrimitiveValType::Char, 4),
+            (PrimitiveValType::U64, 8),
+            (PrimitiveValType::S64, 8),
+            (PrimitiveValType::F64, 8),
+        ];
+        for (prim, expected) in prim_cases {
+            let ty = ComponentValType::Primitive(*prim);
+            assert_eq!(
+                pc.canonical_abi_align(&ty),
+                *expected,
+                "align mismatch for {:?}",
+                prim,
+            );
+        }
+
+        // String — pointer alignment = 4
+        assert_eq!(pc.canonical_abi_align(&ComponentValType::String), 4);
+
+        // List — pointer alignment = 4
+        let list_ty =
+            ComponentValType::List(Box::new(ComponentValType::Primitive(PrimitiveValType::U8)));
+        assert_eq!(pc.canonical_abi_align(&list_ty), 4);
+
+        // Record inherits max alignment of its fields
+        let record_ty = ComponentValType::Record(vec![
+            (
+                "a".into(),
+                ComponentValType::Primitive(PrimitiveValType::U8),
+            ),
+            (
+                "b".into(),
+                ComponentValType::Primitive(PrimitiveValType::U64),
+            ),
+        ]);
+        assert_eq!(
+            pc.canonical_abi_align(&record_ty),
+            8,
+            "record {{u8, u64}} align should be max(1, 8) = 8",
+        );
+
+        // Empty record defaults to align 1
+        let empty_record = ComponentValType::Record(vec![]);
+        assert_eq!(pc.canonical_abi_align(&empty_record), 1);
     }
 }

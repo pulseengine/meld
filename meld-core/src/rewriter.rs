@@ -904,6 +904,250 @@ mod tests {
         ));
     }
 
+    /// Helper to create an IndexMaps with known remappings for completeness tests:
+    /// function 0→5, memory 0→2, table 0→3, global 0→7, type 0→4
+    fn make_test_maps() -> IndexMaps {
+        let mut maps = IndexMaps::new();
+        maps.functions.insert(0, 5);
+        maps.memories.insert(0, 2);
+        maps.tables.insert(0, 3);
+        maps.globals.insert(0, 7);
+        maps.types.insert(0, 4);
+        maps
+    }
+
+    // --- SR-9 completeness tests ---
+
+    #[test]
+    fn test_rewrite_call_remaps_function_index() {
+        let maps = make_test_maps();
+        let instrs = rewrite_operator(Operator::Call { function_index: 0 }, &maps).unwrap();
+        assert_eq!(instrs.len(), 1);
+        assert!(
+            matches!(instrs[0], Instruction::Call(5)),
+            "Call should remap function index 0→5, got {:?}",
+            instrs[0]
+        );
+    }
+
+    #[test]
+    fn test_rewrite_call_indirect_remaps_type_and_table() {
+        // Addresses UCA-M-4: both type_index and table_index must be remapped
+        let maps = make_test_maps();
+        let instrs = rewrite_operator(
+            Operator::CallIndirect {
+                type_index: 0,
+                table_index: 0,
+            },
+            &maps,
+        )
+        .unwrap();
+        assert_eq!(instrs.len(), 1);
+        match &instrs[0] {
+            Instruction::CallIndirect {
+                type_index,
+                table_index,
+            } => {
+                assert_eq!(*type_index, 4, "CallIndirect type_index should remap 0→4");
+                assert_eq!(*table_index, 3, "CallIndirect table_index should remap 0→3");
+            }
+            other => panic!("Expected CallIndirect, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_rewrite_global_get_set_remaps() {
+        let maps = make_test_maps();
+
+        let get_instrs = rewrite_operator(Operator::GlobalGet { global_index: 0 }, &maps).unwrap();
+        assert_eq!(get_instrs.len(), 1);
+        assert!(
+            matches!(get_instrs[0], Instruction::GlobalGet(7)),
+            "GlobalGet should remap global index 0→7, got {:?}",
+            get_instrs[0]
+        );
+
+        let set_instrs = rewrite_operator(Operator::GlobalSet { global_index: 0 }, &maps).unwrap();
+        assert_eq!(set_instrs.len(), 1);
+        assert!(
+            matches!(set_instrs[0], Instruction::GlobalSet(7)),
+            "GlobalSet should remap global index 0→7, got {:?}",
+            set_instrs[0]
+        );
+    }
+
+    #[test]
+    fn test_rewrite_table_ops_remap() {
+        let maps = make_test_maps();
+
+        // TableGet
+        let instrs = rewrite_operator(Operator::TableGet { table: 0 }, &maps).unwrap();
+        assert_eq!(instrs.len(), 1);
+        assert!(
+            matches!(instrs[0], Instruction::TableGet(3)),
+            "TableGet should remap table index 0→3, got {:?}",
+            instrs[0]
+        );
+
+        // TableSet
+        let instrs = rewrite_operator(Operator::TableSet { table: 0 }, &maps).unwrap();
+        assert_eq!(instrs.len(), 1);
+        assert!(
+            matches!(instrs[0], Instruction::TableSet(3)),
+            "TableSet should remap table index 0→3, got {:?}",
+            instrs[0]
+        );
+
+        // TableGrow
+        let instrs = rewrite_operator(Operator::TableGrow { table: 0 }, &maps).unwrap();
+        assert_eq!(instrs.len(), 1);
+        assert!(
+            matches!(instrs[0], Instruction::TableGrow(3)),
+            "TableGrow should remap table index 0→3, got {:?}",
+            instrs[0]
+        );
+
+        // TableSize
+        let instrs = rewrite_operator(Operator::TableSize { table: 0 }, &maps).unwrap();
+        assert_eq!(instrs.len(), 1);
+        assert!(
+            matches!(instrs[0], Instruction::TableSize(3)),
+            "TableSize should remap table index 0→3, got {:?}",
+            instrs[0]
+        );
+
+        // TableFill
+        let instrs = rewrite_operator(Operator::TableFill { table: 0 }, &maps).unwrap();
+        assert_eq!(instrs.len(), 1);
+        assert!(
+            matches!(instrs[0], Instruction::TableFill(3)),
+            "TableFill should remap table index 0→3, got {:?}",
+            instrs[0]
+        );
+    }
+
+    #[test]
+    fn test_rewrite_table_copy_remaps_both() {
+        let mut maps = make_test_maps();
+        // Add a second table mapping to verify both src and dst are independent
+        maps.tables.insert(1, 9);
+
+        let instrs = rewrite_operator(
+            Operator::TableCopy {
+                dst_table: 0,
+                src_table: 1,
+            },
+            &maps,
+        )
+        .unwrap();
+        assert_eq!(instrs.len(), 1);
+        match &instrs[0] {
+            Instruction::TableCopy {
+                src_table,
+                dst_table,
+            } => {
+                assert_eq!(*src_table, 9, "TableCopy src_table should remap 1→9");
+                assert_eq!(*dst_table, 3, "TableCopy dst_table should remap 0→3");
+            }
+            other => panic!("Expected TableCopy, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_rewrite_memory_copy_remaps_both_memories() {
+        // Directly tests loss scenario LS-M-2: rewriter must remap BOTH
+        // src_mem and dst_mem in memory.copy.
+        let mut maps = make_test_maps();
+        // Add a second memory mapping so we can distinguish src vs dst
+        maps.memories.insert(1, 8);
+
+        let instrs = rewrite_operator(
+            Operator::MemoryCopy {
+                dst_mem: 0,
+                src_mem: 1,
+            },
+            &maps,
+        )
+        .unwrap();
+
+        // Without address rebasing, should produce a single MemoryCopy instruction
+        assert_eq!(instrs.len(), 1);
+        match &instrs[0] {
+            Instruction::MemoryCopy { src_mem, dst_mem } => {
+                assert_eq!(*src_mem, 8, "MemoryCopy src_mem should remap 1→8");
+                assert_eq!(*dst_mem, 2, "MemoryCopy dst_mem should remap 0→2");
+            }
+            other => panic!("Expected MemoryCopy, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_rewrite_memory_load_store_remaps_memory() {
+        let maps = make_test_maps();
+
+        // I32Load with memory index 0 should remap to memory index 2
+        let instrs = rewrite_operator(
+            Operator::I32Load {
+                memarg: WpMemArg {
+                    align: 2,
+                    max_align: 2,
+                    offset: 0,
+                    memory: 0,
+                },
+            },
+            &maps,
+        )
+        .unwrap();
+        assert_eq!(instrs.len(), 1);
+        match &instrs[0] {
+            Instruction::I32Load(ma) => {
+                assert_eq!(
+                    ma.memory_index, 2,
+                    "I32Load memarg.memory_index should remap 0→2"
+                );
+            }
+            other => panic!("Expected I32Load, got {:?}", other),
+        }
+
+        // I32Store with memory index 0 should remap to memory index 2
+        let instrs = rewrite_operator(
+            Operator::I32Store {
+                memarg: WpMemArg {
+                    align: 2,
+                    max_align: 2,
+                    offset: 4,
+                    memory: 0,
+                },
+            },
+            &maps,
+        )
+        .unwrap();
+        assert_eq!(instrs.len(), 1);
+        match &instrs[0] {
+            Instruction::I32Store(ma) => {
+                assert_eq!(
+                    ma.memory_index, 2,
+                    "I32Store memarg.memory_index should remap 0→2"
+                );
+                assert_eq!(ma.offset, 4, "I32Store memarg.offset should be preserved");
+            }
+            other => panic!("Expected I32Store, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_rewrite_ref_func_remaps() {
+        let maps = make_test_maps();
+
+        let instrs = rewrite_operator(Operator::RefFunc { function_index: 0 }, &maps).unwrap();
+        assert_eq!(instrs.len(), 1);
+        assert!(
+            matches!(instrs[0], Instruction::RefFunc(5)),
+            "RefFunc should remap function index 0→5, got {:?}",
+            instrs[0]
+        );
+    }
+
     #[test]
     fn test_convert_abstract_heap_type_all_variants() {
         // Verify all 14 AbstractHeapType variants are handled correctly

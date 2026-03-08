@@ -1,0 +1,435 @@
+# STPA Step 3: Unsafe Control Actions (UCAs)
+#
+# An Unsafe Control Action is a control action that, in a particular context
+# and worst-case environment, will lead to a hazard.
+#
+# Four types (provably complete):
+#   1. Not providing the control action leads to a hazard
+#   2. Providing the control action leads to a hazard
+#   3. Providing too early, too late, or in the wrong order
+#   4. Control action lasts too long or is stopped too soon
+#
+# UCA format: <Source> <Type> <Control Action> <Context> [<Hazards>]
+#
+# Reference: STPA Handbook (Leveson & Thomas, 2018), Chapter 2
+
+# ============================================================================
+# Parser UCAs
+# ============================================================================
+parser-ucas:
+  control-action: "Parse and extract component structure"
+  controller: CTRL-PARSER
+
+  not-providing:
+    - id: UCA-P-1
+      description: >
+        Parser does not extract a core module that exists in the component
+        when the component contains multiple core modules
+      context: Component contains multiple core modules (nested instances)
+      hazards: [H-1, H-3]
+      rationale: >
+        Missing a core module means its functions are absent from the fused
+        output. Calls targeting those functions will fail or be misrouted.
+
+    - id: UCA-P-2
+      description: >
+        Parser does not extract an import or export entry when the component
+        declares cross-instance imports/exports
+      context: Component has imports that should be resolved by another component
+      hazards: [H-1, H-5]
+      rationale: >
+        Missing imports/exports prevents the resolver from matching them,
+        leaving calls unresolved or incorrectly resolved.
+
+    - id: UCA-P-3
+      description: >
+        Parser does not compute Canonical ABI element size for a type that
+        contains inner pointers (e.g., list<string>, list<list<u8>>)
+      context: Component has function signatures with compound list types
+      hazards: [H-4, H-4.1, H-4.2]
+      rationale: >
+        Without correct element size, the adapter generator cannot compute
+        copy lengths or determine whether inner pointer fixup is needed.
+
+  providing:
+    - id: UCA-P-4
+      description: >
+        Parser extracts an incorrect type signature for a function
+      context: >
+        Component uses type indices that reference a recursive type group
+        or alias chain
+      hazards: [H-1, H-4]
+      rationale: >
+        Wrong type signature causes the adapter to generate incorrect
+        lifting/lowering code or causes call_indirect type mismatch traps.
+
+    - id: UCA-P-5
+      description: >
+        Parser computes incorrect canonical_abi_element_size for a record
+        type with alignment padding
+      context: Record type has fields with different alignments
+      hazards: [H-4, H-4.1]
+      rationale: >
+        Incorrect element size causes memory.copy to copy too few or too
+        many bytes, corrupting adjacent data.
+
+    - id: UCA-P-6
+      description: >
+        Parser reports a component as valid when it contains malformed
+        sections
+      context: Input bytes are a corrupted or adversarial component binary
+      hazards: [H-1, H-3]
+      rationale: >
+        Accepting malformed input propagates errors through the entire
+        pipeline. Downstream stages operate on inconsistent data.
+
+  too-early-too-late:
+    - id: UCA-P-7
+      description: >
+        Parser processes sections out of the order specified by the
+        WebAssembly binary format, causing type indices to be resolved
+        before the type section is fully parsed
+      context: Component binary has standard section ordering
+      hazards: [H-3, H-3.4]
+      rationale: >
+        Out-of-order parsing could assign wrong type indices to functions,
+        propagating through merge and adapter generation.
+
+  stopped-too-soon:
+    - id: UCA-P-8
+      description: >
+        Parser stops processing a component before reaching the code
+        section or data section
+      context: Component binary is well-formed but large
+      hazards: [H-1, H-3]
+      rationale: >
+        Missing code bodies or data segments means the fused module lacks
+        function implementations or initialized memory.
+
+# ============================================================================
+# Resolver UCAs
+# ============================================================================
+resolver-ucas:
+  control-action: "Resolve dependencies and compute instantiation order"
+  controller: CTRL-RESOLVER
+
+  not-providing:
+    - id: UCA-R-1
+      description: >
+        Resolver does not match an import to its corresponding export when
+        a valid match exists
+      context: >
+        Two components where component A imports an interface that
+        component B exports, with matching names and types
+      hazards: [H-1, H-5]
+      rationale: >
+        Unresolved import means the call site has no target. The fused
+        module will trap or reference a nonexistent function.
+
+    - id: UCA-R-2
+      description: >
+        Resolver does not produce a CopyLayout for a cross-component call
+        that passes pointer-containing arguments
+      context: >
+        Cross-component function signature includes string, list, or record
+        with inner pointers
+      hazards: [H-4, H-4.2]
+      rationale: >
+        Without CopyLayout, the adapter generator cannot determine whether
+        bulk copy or element-wise copy with pointer fixup is needed.
+
+  providing:
+    - id: UCA-R-3
+      description: >
+        Resolver matches an import to the wrong export (name collision
+        across components)
+      context: >
+        Multiple components export functions with the same interface name
+        but different semantics
+      hazards: [H-1]
+      rationale: >
+        Binding to the wrong export causes the caller to invoke a function
+        with different behavior than intended.
+
+    - id: UCA-R-4
+      description: >
+        Resolver computes CopyLayout with incorrect byte_multiplier for
+        a list type
+      context: >
+        List element type has alignment padding (e.g., record with mixed
+        field sizes)
+      hazards: [H-4, H-4.1]
+      rationale: >
+        Wrong byte_multiplier causes the adapter to allocate and copy the
+        wrong number of bytes for the list payload.
+
+    - id: UCA-R-5
+      description: >
+        Resolver classifies a pointer-containing type as Bulk copy when
+        it requires Elements copy with inner pointer fixup
+      context: >
+        List element type contains string or nested list fields
+      hazards: [H-4, H-4.2]
+      rationale: >
+        Bulk copy without pointer fixup leaves inner pointers referencing
+        the source memory, causing use-after-copy corruption.
+
+  too-early-too-late:
+    - id: UCA-R-6
+      description: >
+        Resolver produces an instantiation order where a component appears
+        before a component it depends on
+      context: >
+        Three or more components with a transitive dependency chain
+      hazards: [H-5, H-1]
+      rationale: >
+        Wrong order means exports are not yet available when imports are
+        bound, potentially binding to uninitialized or absent functions.
+
+    - id: UCA-R-7
+      description: >
+        Resolver does not detect a dependency cycle and produces an
+        arbitrary order
+      context: Components have circular imports
+      hazards: [H-5, H-1]
+      rationale: >
+        Silent cycle non-detection can produce an order where some
+        components observe uninitialized state.
+
+  stopped-too-soon: []
+    # N/A: Resolution is a batch computation, not a continuous process
+
+# ============================================================================
+# Merger UCAs
+# ============================================================================
+merger-ucas:
+  control-action: "Merge index spaces and rewrite instructions"
+  controller: CTRL-MERGER
+
+  not-providing:
+    - id: UCA-M-1
+      description: >
+        Merger does not include a function from a component in the merged
+        function section
+      context: Component has internal (non-exported, non-imported) functions
+      hazards: [H-1, H-3]
+      rationale: >
+        Missing function causes call instructions targeting it to reference
+        a wrong or nonexistent function in the merged module.
+
+    - id: UCA-M-2
+      description: >
+        Merger does not rewrite a memory instruction (load/store) to use
+        the rebased memory index
+      context: Multi-memory mode with more than one component
+      hazards: [H-2, H-3.2]
+      rationale: >
+        Unrewritten memory instruction accesses the wrong component's
+        memory, violating isolation.
+
+  providing:
+    - id: UCA-M-3
+      description: >
+        Merger computes incorrect function base offset for a component
+      context: >
+        Three or more components where the second component has imported
+        functions that affect the base offset calculation
+      hazards: [H-3, H-3.1]
+      rationale: >
+        Wrong base offset shifts all function indices for that component,
+        misdirecting every call.
+
+    - id: UCA-M-4
+      description: >
+        Merger rewrites a call_indirect type index using function index
+        offset instead of type index offset
+      context: Component uses indirect calls via function tables
+      hazards: [H-3, H-3.4]
+      rationale: >
+        Wrong type index causes call_indirect to trap with type mismatch
+        or, worse, call a function with a compatible but wrong signature.
+
+    - id: UCA-M-5
+      description: >
+        Merger rebases data segment offset using function base offset
+        instead of memory base offset
+      context: >
+        Component has active data segments with i32.const offset
+        expressions
+      hazards: [H-2, H-1]
+      rationale: >
+        Data written to wrong address in memory, corrupting initialized
+        state.
+
+    - id: UCA-M-6
+      description: >
+        Merger does not remap global.get/global.set indices in init
+        expressions of data or element segments
+      context: >
+        Component uses global.get in data segment offset expression
+      hazards: [H-3, H-3.3]
+      rationale: >
+        Unrewritten global reference reads from the wrong global, placing
+        data at the wrong memory offset.
+
+  too-early-too-late:
+    - id: UCA-M-7
+      description: >
+        Merger processes components in a different order than the resolver's
+        topological sort
+      context: >
+        Resolver produces a specific instantiation order that affects base
+        offset calculation
+      hazards: [H-3, H-5]
+      rationale: >
+        Processing in wrong order produces different base offsets than what
+        the adapter generator expects, causing index mismatches.
+
+  stopped-too-soon:
+    - id: UCA-M-8
+      description: >
+        Rewriter does not visit all instruction types that reference
+        indices (e.g., misses memory.copy's two memory arguments)
+      context: >
+        Component uses bulk memory instructions (memory.copy, memory.init,
+        memory.fill)
+      hazards: [H-2, H-3.2]
+      rationale: >
+        Unrewritten memory arguments cause bulk operations to read/write
+        the wrong memory.
+
+# ============================================================================
+# Adapter Generator UCAs
+# ============================================================================
+adapter-ucas:
+  control-action: "Generate Canonical ABI adapter trampolines"
+  controller: CTRL-ADAPTER
+
+  not-providing:
+    - id: UCA-A-1
+      description: >
+        Adapter generator does not produce an adapter for a cross-component
+        call that passes pointer arguments in multi-memory mode
+      context: >
+        Cross-component call has string or list parameters with source and
+        destination in different memories
+      hazards: [H-2, H-4]
+      rationale: >
+        Without adapter, the callee receives pointers into the caller's
+        memory which it cannot access, causing traps or silent corruption.
+
+    - id: UCA-A-2
+      description: >
+        Adapter does not emit cabi_realloc call to allocate destination
+        buffer before memory.copy
+      context: Callee's memory has no pre-allocated space for the argument
+      hazards: [H-2, H-4, H-4.3]
+      rationale: >
+        Copying to unallocated memory corrupts the callee's heap or
+        overwrites existing data.
+
+    - id: UCA-A-3
+      description: >
+        Adapter does not emit inner pointer fixup loop for list elements
+        containing pointers
+      context: >
+        List<string> or list<record-with-strings> argument in
+        cross-component call
+      hazards: [H-4, H-4.2]
+      rationale: >
+        Copied list elements retain pointers into source memory. Callee
+        dereferences them and reads garbage or traps.
+
+  providing:
+    - id: UCA-A-4
+      description: >
+        Adapter emits memory.copy with source and destination memory
+        indices swapped
+      context: >
+        Multi-memory mode, adapter copying argument data from caller to
+        callee
+      hazards: [H-2, H-4]
+      rationale: >
+        Copy goes in wrong direction: either overwrites caller's memory
+        with callee's data, or reads from callee's (uninitialized) memory.
+
+    - id: UCA-A-5
+      description: >
+        Adapter computes copy length as element_count * wrong_element_size
+      context: >
+        List type where canonical_abi_element_size differs from the naive
+        field-size sum due to alignment padding
+      hazards: [H-4, H-4.1]
+      rationale: >
+        Too-small copy truncates elements. Too-large copy reads past the
+        source buffer or wastes destination memory.
+
+    - id: UCA-A-6
+      description: >
+        Adapter calls cabi_realloc with the wrong function index (targets
+        the source component's allocator instead of the destination's)
+      context: >
+        Multi-memory mode with two or more components each exporting
+        cabi_realloc
+      hazards: [H-2, H-4, H-4.3]
+      rationale: >
+        Allocation happens in wrong memory. Subsequent memory.copy writes
+        to an address that doesn't exist in the intended memory.
+
+    - id: UCA-A-7
+      description: >
+        Adapter computes incorrect inner pointer offset within a record
+        element due to alignment miscalculation
+      context: >
+        Record type with fields of different alignments (e.g., u8 followed
+        by pointer-pair for a string)
+      hazards: [H-4, H-4.2]
+      rationale: >
+        Fixup loop reads/writes pointer values at wrong offsets within
+        each element, corrupting non-pointer fields or missing pointer
+        fields entirely.
+
+    - id: UCA-A-8
+      description: >
+        Adapter emits string transcoding that does not handle surrogate
+        pairs correctly in UTF-16 to UTF-8 conversion
+      context: >
+        String argument contains characters outside the Basic Multilingual
+        Plane (codepoints > U+FFFF)
+      hazards: [H-4, H-4.4]
+      rationale: >
+        Surrogate pairs decoded incorrectly produce invalid UTF-8 or wrong
+        characters.
+
+    - id: UCA-A-9
+      description: >
+        Adapter emits return value lifting that reads from the wrong memory
+      context: >
+        Cross-component call returns a string or list (retptr convention)
+      hazards: [H-2, H-4]
+      rationale: >
+        Return value adapter reads result pointer from wrong memory,
+        returning garbage to the caller.
+
+  too-early-too-late:
+    - id: UCA-A-10
+      description: >
+        Adapter emits memory.copy before cabi_realloc returns (instructions
+        in wrong order)
+      context: Any cross-component call with pointer arguments
+      hazards: [H-4]
+      rationale: >
+        Copying before allocation means destination pointer is undefined.
+        Data is written to address 0 or whatever was on the stack.
+
+  stopped-too-soon:
+    - id: UCA-A-11
+      description: >
+        Recursive inner pointer fixup loop terminates before processing
+        all elements in the list
+      context: >
+        List with many elements where fixup loop counter is incorrect
+      hazards: [H-4, H-4.2]
+      rationale: >
+        Later elements retain stale source-memory pointers. Callee
+        dereferences them and reads wrong data.

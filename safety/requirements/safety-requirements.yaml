@@ -1,0 +1,410 @@
+# Safety Requirements
+#
+# Derived from STPA controller constraints and loss scenarios.
+# Each requirement traces back to the STPA artifacts it addresses.
+#
+# Status values: draft | reviewed | approved | implemented | verified
+#
+# Verification methods:
+#   - test: automated test (unit, integration, or property-based)
+#   - proof: Rocq mechanized proof
+#   - inspection: manual code review
+#   - analysis: static analysis or model checking
+
+requirements:
+
+  # ==========================================================================
+  # Parsing requirements (from CC-P-* and LS-P-*)
+  # ==========================================================================
+
+  - id: SR-1
+    title: Complete core module extraction
+    description: >
+      The parser shall extract all core modules from a component,
+      including those nested within component instances at any depth.
+    derives-from:
+      constraints: [CC-P-1]
+      scenarios: [LS-P-1]
+    verification:
+      - method: test
+        description: >
+          Test with component containing 2+ nested instances; verify
+          all core modules appear in parser output
+      - method: proof
+        description: >
+          Parser completeness proof (proofs/parser/)
+    status: draft
+    implementation: meld-core/src/parser.rs
+
+  - id: SR-2
+    title: Complete import/export extraction
+    description: >
+      The parser shall extract every import and export entry declared
+      by a component, preserving names, types, and kind.
+    derives-from:
+      constraints: [CC-P-2]
+      scenarios: []
+    verification:
+      - method: test
+        description: >
+          Round-trip test: parse component, verify import/export counts
+          match wasmparser's independent count
+    status: draft
+    implementation: meld-core/src/parser.rs
+
+  - id: SR-3
+    title: Correct Canonical ABI element size computation
+    description: >
+      canonical_abi_element_size shall return the correctly aligned
+      element size for all Canonical ABI types, including records with
+      heterogeneous field alignments.
+    derives-from:
+      constraints: [CC-P-3, CC-P-5]
+      scenarios: [LS-P-2]
+    verification:
+      - method: test
+        description: >
+          Property-based test with random record types; compare output
+          to reference implementation of Component Model elem_size
+      - method: proof
+        description: >
+          Proof that canonical_abi_element_size matches Component Model
+          spec definition (proofs/parser/ or proofs/adapter/)
+    status: draft
+    implementation: meld-core/src/parser.rs
+    spec-reference: "Component Model commit deb0b0a, canonical ABI"
+
+  - id: SR-4
+    title: Reject malformed components
+    description: >
+      The parser shall reject components that do not pass wasmparser
+      validation with feature flags locked to the Component Model
+      baseline spec.
+    derives-from:
+      constraints: [CC-P-6]
+      scenarios: [LS-P-3]
+    verification:
+      - method: test
+        description: >
+          Test with intentionally malformed binaries (truncated, wrong
+          magic, invalid sections); verify parser returns error
+    status: draft
+    implementation: meld-core/src/parser.rs
+
+  # ==========================================================================
+  # Resolution requirements (from CC-R-* and LS-R-*)
+  # ==========================================================================
+
+  - id: SR-5
+    title: Complete and correct import resolution
+    description: >
+      The resolver shall match every import to exactly one export with
+      a matching interface name and compatible type. Ambiguous matches
+      (multiple exports with the same name) shall produce an error.
+    derives-from:
+      constraints: [CC-R-1, CC-R-3]
+      scenarios: [LS-R-1]
+    verification:
+      - method: test
+        description: >
+          Test with unambiguous matches, ambiguous matches, and
+          unresolvable imports; verify correct behavior for each
+      - method: proof
+        description: >
+          Resolver correctness proof (proofs/resolver/)
+    status: draft
+    implementation: meld-core/src/resolver.rs
+
+  - id: SR-6
+    title: Correct CopyLayout classification
+    description: >
+      The resolver shall classify each cross-component call parameter
+      type into the correct CopyLayout. Types with inner pointer fields
+      (strings, lists, records containing pointers) shall be classified
+      as Elements with inner_pointers, not as Bulk.
+    derives-from:
+      constraints: [CC-R-2, CC-R-4, CC-R-5]
+      scenarios: [LS-R-2]
+    verification:
+      - method: test
+        description: >
+          Test CopyLayout for: list<u32> (Bulk), list<string> (Elements),
+          list<record{name:string, val:u32}> (Elements with inner ptrs)
+      - method: proof
+        description: >
+          CopyLayout consistency proof (proofs/adapter/)
+    status: draft
+    implementation: meld-core/src/resolver.rs
+
+  - id: SR-7
+    title: Valid topological instantiation order
+    description: >
+      The resolver shall produce a topological order where every
+      component appears after all components it imports from. Dependency
+      cycles shall be detected and reported as an error (or handled by
+      cycle-tolerant sort with documented semantics).
+    derives-from:
+      constraints: [CC-R-6, CC-R-7]
+      scenarios: [LS-R-3, LS-R-4]
+    verification:
+      - method: test
+        description: >
+          Test with linear chains, diamonds, cycles, and self-imports;
+          verify correct ordering or error
+      - method: proof
+        description: >
+          Topological sort correctness proof (proofs/resolver/)
+    status: draft
+    implementation: meld-core/src/resolver.rs
+
+  # ==========================================================================
+  # Merge requirements (from CC-M-* and LS-M-*)
+  # ==========================================================================
+
+  - id: SR-8
+    title: Correct function base offset calculation
+    description: >
+      The merger shall compute each component's function base offset
+      as the cumulative sum of all preceding components' total function
+      counts (imports + defined functions).
+    derives-from:
+      constraints: [CC-M-3]
+      scenarios: [LS-M-1]
+    verification:
+      - method: test
+        description: >
+          Test with components having different import/defined function
+          ratios; verify base offsets
+      - method: proof
+        description: >
+          Merge layout correctness proof (proofs/transformations/merge/)
+    status: draft
+    implementation: meld-core/src/merger.rs
+
+  - id: SR-9
+    title: Complete instruction index rewriting
+    description: >
+      The rewriter shall remap indices in all instruction types that
+      reference functions, memories, tables, globals, or types. This
+      includes multi-index instructions (memory.copy, memory.init).
+    derives-from:
+      constraints: [CC-M-2, CC-M-4, CC-M-8]
+      scenarios: [LS-M-2, LS-M-3]
+    verification:
+      - method: test
+        description: >
+          Exhaustive test over all Wasm instruction variants that take
+          index operands; verify each is remapped
+      - method: proof
+        description: >
+          Rewriter completeness proof (proofs/rewriter/)
+    status: draft
+    implementation: meld-core/src/rewriter.rs
+
+  - id: SR-10
+    title: Correct segment reindexing
+    description: >
+      The merger shall reindex data segment memory indices, element
+      segment table indices, and global indices in init expressions
+      using the correct per-kind base offset.
+    derives-from:
+      constraints: [CC-M-5, CC-M-6]
+      scenarios: []
+    verification:
+      - method: test
+        description: >
+          Test with components using global.get in data segment offsets;
+          verify remapped indices
+      - method: proof
+        description: >
+          Segment reindexing proof (proofs/segments/)
+    status: draft
+    implementation: meld-core/src/segments.rs
+
+  - id: SR-11
+    title: Component processing order matches resolver order
+    description: >
+      The merger shall process components in the same order as the
+      resolver's topological sort output.
+    derives-from:
+      constraints: [CC-M-7]
+      scenarios: []
+    verification:
+      - method: test
+        description: >
+          Assert merger iteration order matches resolver output order
+    status: draft
+    implementation: meld-core/src/merger.rs
+
+  # ==========================================================================
+  # Adapter requirements (from CC-A-* and LS-A-*)
+  # ==========================================================================
+
+  - id: SR-12
+    title: Adapter generation for all pointer-passing cross-component calls
+    description: >
+      The adapter generator shall produce an adapter function for every
+      resolved cross-component call whose signature includes pointer
+      types (string, list, record with pointer fields) in multi-memory
+      mode.
+    derives-from:
+      constraints: [CC-A-1]
+      scenarios: []
+    verification:
+      - method: test
+        description: >
+          Test that fusion of components with string/list parameters in
+          multi-memory mode produces adapter functions
+    status: draft
+    implementation: meld-core/src/adapter/fact.rs
+
+  - id: SR-13
+    title: Correct cabi_realloc targeting
+    description: >
+      The adapter shall call cabi_realloc using the post-merge function
+      index of the destination component's allocator.
+    derives-from:
+      constraints: [CC-A-2, CC-A-6]
+      scenarios: [LS-A-1]
+    verification:
+      - method: test
+        description: >
+          Runtime test: fuse components, execute cross-component call
+          with list argument, verify callee receives correct data
+    status: draft
+    implementation: meld-core/src/adapter/fact.rs
+
+  - id: SR-14
+    title: Correct memory index usage in adapters
+    description: >
+      The adapter shall use the correct source and destination memory
+      indices for all memory.copy, i32.load, and i32.store instructions.
+      Source = caller's memory, destination = callee's memory for
+      arguments; reversed for return values.
+    derives-from:
+      constraints: [CC-A-4, CC-A-9]
+      scenarios: [LS-A-2, LS-A-4]
+    verification:
+      - method: test
+        description: >
+          Runtime test: fuse components, verify data arrives in correct
+          memory after cross-component call
+      - method: proof
+        description: >
+          Adapter memory index proof (proofs/adapter/)
+    status: draft
+    implementation: meld-core/src/adapter/fact.rs
+
+  - id: SR-15
+    title: Correct list copy length
+    description: >
+      The adapter shall compute list copy byte length as element_count
+      multiplied by canonical_abi_element_size of the element type.
+    derives-from:
+      constraints: [CC-A-5]
+      scenarios: []
+    verification:
+      - method: test
+        description: >
+          Test with list<record> types with known element sizes; verify
+          copy length
+      - method: proof
+        description: >
+          Copy length proof (proofs/adapter/)
+    status: draft
+    implementation: meld-core/src/adapter/fact.rs
+
+  - id: SR-16
+    title: Recursive inner pointer fixup
+    description: >
+      For list types whose elements contain pointer fields, the adapter
+      shall emit a fixup loop that iterates over all elements and adjusts
+      each inner pointer to reference the destination memory. The loop
+      stride shall equal canonical_abi_element_size. The loop shall
+      process exactly element_count iterations.
+    derives-from:
+      constraints: [CC-A-3, CC-A-7, CC-A-11]
+      scenarios: [LS-A-3]
+    verification:
+      - method: test
+        description: >
+          Runtime test with list<string>: fuse, execute, verify all
+          strings are accessible in callee
+      - method: proof
+        description: >
+          Fixup loop termination and correctness proof (proofs/adapter/)
+    status: draft
+    implementation: meld-core/src/adapter/fact.rs
+
+  - id: SR-17
+    title: Correct string transcoding
+    description: >
+      String transcoding adapters shall produce valid output encoding
+      for all valid input, including characters outside the BMP
+      (surrogate pair handling for UTF-16).
+    derives-from:
+      constraints: [CC-A-8]
+      scenarios: []
+    verification:
+      - method: test
+        description: >
+          Test with strings containing BMP and non-BMP characters;
+          verify round-trip correctness
+    status: draft
+    implementation: meld-core/src/adapter/fact.rs
+
+  - id: SR-18
+    title: Adapter instruction ordering
+    description: >
+      The adapter shall emit instructions in the correct order:
+      cabi_realloc before memory.copy, memory.copy before callee
+      function call.
+    derives-from:
+      constraints: [CC-A-10]
+      scenarios: []
+    verification:
+      - method: inspection
+        description: >
+          Code review of adapter emission order
+      - method: test
+        description: >
+          Runtime test exercises the full adapter path
+    status: draft
+    implementation: meld-core/src/adapter/fact.rs
+
+  # ==========================================================================
+  # Cross-cutting requirements
+  # ==========================================================================
+
+  - id: SR-19
+    title: Deterministic output
+    description: >
+      Given identical input component bytes and identical FuserConfig,
+      meld shall produce byte-identical output across invocations.
+    derives-from:
+      constraints: [SC-7]
+      scenarios: [LS-CP-2]
+    verification:
+      - method: test
+        description: >
+          Run fusion twice with same inputs; assert byte-equal outputs
+    status: draft
+    implementation: meld-core/src/lib.rs
+
+  - id: SR-20
+    title: Fail-fast on unresolvable state
+    description: >
+      If any stage encounters an unresolvable error (unresolved import,
+      out-of-bounds index, malformed input), meld shall abort with a
+      diagnostic error. Partial or best-effort output shall not be
+      produced.
+    derives-from:
+      constraints: [SC-8, SC-9]
+      scenarios: []
+    verification:
+      - method: test
+        description: >
+          Test error paths: unresolved imports, malformed binaries,
+          invalid indices
+    status: draft
+    implementation: meld-core/src/error.rs

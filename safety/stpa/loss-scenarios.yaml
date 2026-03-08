@@ -1,0 +1,285 @@
+# STPA Step 4: Loss Scenarios
+#
+# A loss scenario describes the causal factors that can lead to unsafe
+# control actions and to hazards. Two types:
+#   a) Why would UCAs occur? (controller behavior, process model flaws)
+#   b) Why would control actions be improperly executed? (control path,
+#      controlled process)
+#
+# Each scenario traces from causal factor -> UCA -> hazard -> loss.
+#
+# Reference: STPA Handbook (Leveson & Thomas, 2018), Chapter 2
+
+loss-scenarios:
+
+  # ==========================================================================
+  # Parser scenarios
+  # ==========================================================================
+
+  - id: LS-P-1
+    title: Nested component instances not recognized
+    uca: UCA-P-1
+    type: inadequate-control-algorithm
+    scenario: >
+      A component contains multiple nested component instances (each with
+      their own core module). The parser's component traversal does not
+      recurse into nested instances, extracting only the outermost core
+      module. As a result, functions from inner instances are missing from
+      the fused output [UCA-P-1], and calls to those functions are
+      misrouted [H-3] or trap [H-1].
+    causal-factors:
+      - Parser implementation only handles single-instance components
+      - Component Model nesting depth not bounded in parser loop
+
+  - id: LS-P-2
+    title: Canonical ABI size computation ignores alignment padding
+    uca: UCA-P-5
+    type: inadequate-control-algorithm
+    scenario: >
+      A record type has fields {u8, string} where u8 occupies 1 byte and
+      the string pointer-pair requires 4-byte alignment. The
+      canonical_abi_element_size function sums field sizes without padding
+      (1 + 8 = 9) instead of computing the correctly padded size (4 + 8 =
+      12). The adapter generator uses the wrong element size [UCA-P-5],
+      computing incorrect copy lengths [H-4.1].
+    causal-factors:
+      - Alignment rounding not applied between fields
+      - Missing alignment test cases for heterogeneous record types
+
+  - id: LS-P-3
+    title: Malformed component accepted due to wasmparser configuration
+    uca: UCA-P-6
+    type: inadequate-process-model
+    scenario: >
+      The parser instantiates wasmparser::Validator with permissive
+      feature flags that accept proposals not yet standardized. A
+      component using a non-standard extension is accepted as valid. The
+      resolver and merger operate on structures they were not designed to
+      handle [UCA-P-6], producing incorrect index mappings [H-3].
+    causal-factors:
+      - Validator feature flags not locked to Component Model baseline
+      - No integration test with adversarial/malformed inputs
+    process-model-flaw: >
+      Parser believes the component is valid because the validator
+      accepted it, but the validator was configured too permissively.
+
+  # ==========================================================================
+  # Resolver scenarios
+  # ==========================================================================
+
+  - id: LS-R-1
+    title: Import matched to wrong export due to name normalization
+    uca: UCA-R-3
+    type: inadequate-control-algorithm
+    scenario: >
+      Component A imports "wasi:http/handler@0.2.0" and two components
+      (B and C) both export interfaces matching that name. The resolver
+      selects the first match found during iteration, which may be
+      component C instead of the intended component B. The caller invokes
+      the wrong implementation [UCA-R-3], producing different behavior
+      [H-1].
+    causal-factors:
+      - Resolver uses first-match strategy without disambiguation
+      - No error on ambiguous matches
+
+  - id: LS-R-2
+    title: CopyLayout misclassifies pointer-containing record as Bulk
+    uca: UCA-R-5
+    type: inadequate-process-model
+    scenario: >
+      A function parameter is list<record { name: string, value: u32 }>.
+      The resolver's type analysis inspects only the outer list type and
+      determines it can use Bulk copy (byte_multiplier). It does not
+      recurse into the record's fields to discover the string field
+      (pointer pair). The adapter performs a bulk memory.copy [UCA-R-5]
+      without inner pointer fixup [H-4.2]. The callee dereferences
+      string pointers that reference the source memory and reads garbage.
+    causal-factors:
+      - CopyLayout construction does not recurse into record fields
+      - Missing test case for records with pointer fields inside lists
+    process-model-flaw: >
+      Resolver believes the type is a flat byte buffer because it only
+      examined the outermost type structure.
+
+  - id: LS-R-3
+    title: Topological sort produces wrong order with diamond dependencies
+    uca: UCA-R-6
+    type: inadequate-control-algorithm
+    scenario: >
+      Four components form a diamond dependency: A depends on B and C,
+      both B and C depend on D. The topological sort visits B before D
+      because the adjacency list iteration order places B first. Component
+      B is instantiated before D [UCA-R-6], and B's imports from D bind
+      to absent exports [H-5], causing the fused module to trap [H-1].
+    causal-factors:
+      - Topological sort does not enforce total ordering among peers
+      - Adjacency list iteration depends on insertion order
+
+  - id: LS-R-4
+    title: Cycle detection fails on self-importing component
+    uca: UCA-R-7
+    type: inadequate-control-algorithm
+    scenario: >
+      A component imports an interface that it also exports (self-cycle).
+      The cycle detection logic checks for cycles of length >= 2 but not
+      self-loops. The resolver produces an order without error [UCA-R-7],
+      and the component's import binds to its own export before
+      initialization completes [H-5].
+    causal-factors:
+      - Cycle detection skips self-edges in the dependency graph
+      - No test for self-importing components
+
+  # ==========================================================================
+  # Merger scenarios
+  # ==========================================================================
+
+  - id: LS-M-1
+    title: Function base offset does not account for imported functions
+    uca: UCA-M-3
+    type: inadequate-control-algorithm
+    scenario: >
+      Component B has 3 imported functions and 5 defined functions.
+      The merger computes B's function base offset by counting only
+      defined functions from preceding components, ignoring imports.
+      The base offset is too small by the number of imports. All
+      function references in B are shifted incorrectly [UCA-M-3],
+      and calls in B target wrong functions [H-3.1].
+    causal-factors:
+      - Base offset calculation uses defined_function_count instead of
+        total_function_count (imports + defined)
+      - Imports and defined functions share the same index space in
+        WebAssembly but are counted separately in some data structures
+
+  - id: LS-M-2
+    title: Rewriter misses memory index in memory.copy instruction
+    uca: UCA-M-8
+    type: inadequate-control-algorithm
+    scenario: >
+      The rewriter handles memory.load, memory.store, memory.size, and
+      memory.grow by remapping the memory index. However, memory.copy
+      takes two memory indices (source and destination). The rewriter
+      only remaps the first argument, leaving the second as the original
+      per-component index [UCA-M-8]. In multi-memory mode, the copy
+      reads from or writes to the wrong memory [H-3.2, H-2].
+    causal-factors:
+      - memory.copy has unusual two-memory-index encoding
+      - Rewriter instruction visitor does not match on MemoryCopy variant
+
+  - id: LS-M-3
+    title: Element segment type indices remapped with wrong offset
+    uca: UCA-M-4
+    type: inadequate-control-algorithm
+    scenario: >
+      An element segment references function types for call_indirect.
+      The merger applies the function index offset instead of the type
+      index offset when rewriting the element segment's type index
+      [UCA-M-4]. At runtime, call_indirect compares against the wrong
+      type, causing spurious traps [H-3.4].
+    causal-factors:
+      - Element segment reindexing code uses func_base instead of type_base
+      - Element segments and function references share similar syntax
+
+  # ==========================================================================
+  # Adapter scenarios
+  # ==========================================================================
+
+  - id: LS-A-1
+    title: cabi_realloc function index not remapped after merge
+    uca: UCA-A-6
+    type: inadequate-process-model
+    scenario: >
+      The adapter generator records the cabi_realloc function index from
+      the resolver's pre-merge analysis. After merging, function indices
+      are rebased, but the adapter generator uses the stale pre-merge
+      index for cabi_realloc [UCA-A-6]. The adapter calls the wrong
+      function, which may not be an allocator, causing memory corruption
+      [H-4.3] or a trap.
+    causal-factors:
+      - Adapter generation uses resolver output directly without applying
+        index maps from the merger
+      - No assertion that cabi_realloc index is within valid range
+    process-model-flaw: >
+      Adapter generator believes the cabi_realloc index is still valid
+      because it was correct before merging.
+
+  - id: LS-A-2
+    title: Memory indices swapped in cross-memory copy
+    uca: UCA-A-4
+    type: inadequate-control-algorithm
+    scenario: >
+      The adapter copies argument data from caller (memory 0) to callee
+      (memory 1). The code emits memory.copy with src_mem=1 and
+      dst_mem=0 (swapped) [UCA-A-4]. The copy reads uninitialized data
+      from the callee's memory and writes it into the caller's memory,
+      corrupting both [H-2].
+    causal-factors:
+      - Source/destination parameter ordering inconsistency between
+        memory.copy wasm encoding and the adapter's internal API
+      - No runtime test that verifies data actually arrives in callee memory
+
+  - id: LS-A-3
+    title: Inner pointer fixup loop uses wrong element stride
+    uca: UCA-A-7
+    type: inadequate-control-algorithm
+    scenario: >
+      For list<record { name: string, age: u32 }>, the adapter fixup loop
+      must step through elements at stride = canonical_abi_element_size
+      (which includes alignment padding). The loop uses the unpadded sum
+      of field sizes as stride [UCA-A-7]. After the first element, the
+      loop reads pointer fields at incorrect offsets, corrupting the
+      callee's data [H-4.2].
+    causal-factors:
+      - Element stride computed from raw field sizes, not
+        canonical_abi_element_size
+      - canonical_abi_element_size returns correct value but is not used
+        in the fixup loop
+
+  - id: LS-A-4
+    title: Return value pointers read from caller memory instead of callee
+    uca: UCA-A-9
+    type: inadequate-process-model
+    scenario: >
+      A cross-component call returns a string via retptr convention. The
+      adapter reads the (ptr, len) pair from the caller's memory index
+      instead of the callee's memory index [UCA-A-9]. The values at those
+      addresses in the caller's memory are unrelated data, causing the
+      caller to interpret garbage as a string [H-2, H-4].
+    causal-factors:
+      - Return path uses caller_mem_idx variable instead of callee_mem_idx
+      - Asymmetry between argument lowering (caller->callee) and result
+        lifting (callee->caller) is error-prone
+    process-model-flaw: >
+      Adapter generator believes the return pointer is in the caller's
+      memory because the caller is the one who will use the result.
+
+  # ==========================================================================
+  # Control path scenarios (type b: improperly executed control actions)
+  # ==========================================================================
+
+  - id: LS-CP-1
+    title: Rewriter produces invalid wasm encoding
+    type: control-path
+    scenario: >
+      The rewriter correctly determines the new index for an instruction
+      but emits the LEB128 encoding incorrectly (e.g., uses signed
+      encoding where unsigned is required). The wasm binary is malformed,
+      causing validation failure or undefined behavior in the runtime.
+    hazards: [H-1]
+    causal-factors:
+      - LEB128 encoding logic bug
+      - No round-trip validation of rewritten instructions
+
+  - id: LS-CP-2
+    title: Hash map iteration order causes non-deterministic output
+    type: control-path
+    scenario: >
+      The merger or resolver iterates over a HashMap to emit exports or
+      resolve imports. HashMap iteration order is non-deterministic across
+      runs (Rust's default hasher uses randomization). The output module
+      contains sections in different orders [H-7], breaking
+      reproducibility [L-4].
+    hazards: [H-7]
+    causal-factors:
+      - Use of HashMap instead of BTreeMap or IndexMap for order-sensitive
+        data
+      - No byte-level reproducibility test

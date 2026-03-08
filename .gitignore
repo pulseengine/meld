@@ -44,6 +44,9 @@ test-output/
 # Claude local files
 .claude/
 
+# Nix / direnv
+.direnv/
+
 # Coq/Rocq auxiliary files
 *.aux
 *.glob

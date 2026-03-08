@@ -1,0 +1,167 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://pulseengine.eu/schemas/stpa/v1",
+  "title": "STPA Artifact Schema",
+  "description": "Schema for validating STPA YAML artifacts (losses, hazards, constraints, UCAs, scenarios, requirements)",
+
+  "$defs": {
+    "id-pattern": {
+      "type": "string",
+      "pattern": "^[A-Z]+-[A-Z]*-?[0-9]+(\\.[0-9]+)?$",
+      "description": "Artifact ID: PREFIX-NUMBER or PREFIX-LETTER-NUMBER (e.g., L-1, H-3.2, UCA-P-4, SR-12)"
+    },
+
+    "id-ref-list": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/id-pattern" },
+      "minItems": 1,
+      "description": "List of artifact ID references"
+    },
+
+    "status": {
+      "type": "string",
+      "enum": ["draft", "reviewed", "approved", "implemented", "verified"],
+      "description": "Lifecycle status of the artifact"
+    },
+
+    "loss": {
+      "type": "object",
+      "properties": {
+        "id": { "$ref": "#/$defs/id-pattern" },
+        "title": { "type": "string", "minLength": 1 },
+        "description": { "type": "string" },
+        "stakeholders": {
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      },
+      "required": ["id", "title"],
+      "additionalProperties": false
+    },
+
+    "hazard": {
+      "type": "object",
+      "properties": {
+        "id": { "$ref": "#/$defs/id-pattern" },
+        "title": { "type": "string", "minLength": 1 },
+        "description": { "type": "string" },
+        "losses": { "$ref": "#/$defs/id-ref-list" }
+      },
+      "required": ["id", "title", "losses"],
+      "additionalProperties": false
+    },
+
+    "sub-hazard": {
+      "type": "object",
+      "properties": {
+        "id": { "$ref": "#/$defs/id-pattern" },
+        "parent": { "$ref": "#/$defs/id-pattern" },
+        "title": { "type": "string", "minLength": 1 },
+        "description": { "type": "string" }
+      },
+      "required": ["id", "parent", "title"],
+      "additionalProperties": false
+    },
+
+    "system-constraint": {
+      "type": "object",
+      "properties": {
+        "id": { "$ref": "#/$defs/id-pattern" },
+        "title": { "type": "string", "minLength": 1 },
+        "description": { "type": "string" },
+        "hazards": { "$ref": "#/$defs/id-ref-list" },
+        "spec-baseline": { "type": "string" }
+      },
+      "required": ["id", "title", "hazards"],
+      "additionalProperties": false
+    },
+
+    "uca": {
+      "type": "object",
+      "properties": {
+        "id": { "$ref": "#/$defs/id-pattern" },
+        "description": { "type": "string", "minLength": 1 },
+        "context": { "type": "string" },
+        "hazards": { "$ref": "#/$defs/id-ref-list" },
+        "rationale": { "type": "string" }
+      },
+      "required": ["id", "description", "hazards"],
+      "additionalProperties": false
+    },
+
+    "loss-scenario": {
+      "type": "object",
+      "properties": {
+        "id": { "$ref": "#/$defs/id-pattern" },
+        "title": { "type": "string", "minLength": 1 },
+        "uca": { "$ref": "#/$defs/id-pattern" },
+        "type": {
+          "type": "string",
+          "enum": [
+            "inadequate-control-algorithm",
+            "inadequate-process-model",
+            "controller-failure",
+            "unsafe-control-input",
+            "control-path",
+            "controlled-process"
+          ]
+        },
+        "scenario": { "type": "string" },
+        "hazards": { "$ref": "#/$defs/id-ref-list" },
+        "causal-factors": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "process-model-flaw": { "type": "string" }
+      },
+      "required": ["id", "title", "scenario"],
+      "additionalProperties": false
+    },
+
+    "verification-method": {
+      "type": "object",
+      "properties": {
+        "method": {
+          "type": "string",
+          "enum": ["test", "proof", "inspection", "analysis"]
+        },
+        "description": { "type": "string" }
+      },
+      "required": ["method"],
+      "additionalProperties": false
+    },
+
+    "requirement": {
+      "type": "object",
+      "properties": {
+        "id": { "$ref": "#/$defs/id-pattern" },
+        "title": { "type": "string", "minLength": 1 },
+        "description": { "type": "string" },
+        "derives-from": {
+          "type": "object",
+          "properties": {
+            "constraints": {
+              "type": "array",
+              "items": { "$ref": "#/$defs/id-pattern" }
+            },
+            "scenarios": {
+              "type": "array",
+              "items": { "$ref": "#/$defs/id-pattern" }
+            }
+          },
+          "additionalProperties": false
+        },
+        "verification": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/verification-method" },
+          "minItems": 1
+        },
+        "status": { "$ref": "#/$defs/status" },
+        "implementation": { "type": "string" },
+        "spec-reference": { "type": "string" }
+      },
+      "required": ["id", "title", "description", "verification", "status"],
+      "additionalProperties": false
+    }
+  }
+}

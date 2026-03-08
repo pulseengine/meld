@@ -1,0 +1,93 @@
+# STPA Step 1c: System-Level Constraints
+#
+# A system-level constraint specifies conditions or behaviors that need to
+# be satisfied to prevent hazards (and ultimately prevent losses).
+#
+# Format: <System> & <Condition to Enforce> & <Link to Hazards>
+# Each constraint is the inversion of a hazard.
+#
+# Reference: STPA Handbook (Leveson & Thomas, 2018), Chapter 2
+
+system-constraints:
+  - id: SC-1
+    title: Fused module must preserve observable behavior of the original composition
+    description: >
+      For every possible execution, the fused module must produce the same
+      observable behavior (return values, traps, side effects) as running
+      the original composed components through a conformant runtime.
+    hazards: [H-1]
+
+  - id: SC-2
+    title: Component memory isolation must be maintained in the fused module
+    description: >
+      In multi-memory mode, each component's code must only access its own
+      linear memory unless mediated by a correctly generated adapter. No
+      instruction in component A may reference component B's memory index.
+    hazards: [H-2]
+
+  - id: SC-3
+    title: All index references must be correctly remapped after merging
+    description: >
+      Every function, memory, table, global, and type index in the fused
+      module must point to the correct entity. Index remapping must account
+      for all reference sites: instructions, init expressions, element
+      segments, data segments, and export entries.
+    hazards: [H-3]
+
+  - id: SC-4
+    title: Generated adapters must correctly implement the Canonical ABI
+    description: >
+      Every adapter function must faithfully implement the lifting and
+      lowering operations specified by the Component Model Canonical ABI.
+      This includes correct allocation, copy sizes, string transcoding,
+      list element sizing, and recursive pointer fixup.
+    hazards: [H-4]
+    spec-baseline: "Component Model commit deb0b0a"
+
+  - id: SC-5
+    title: Dependency resolution must produce a valid instantiation order
+    description: >
+      The resolver must compute a topological order such that every
+      component is instantiated after all components it imports from. If
+      a cycle exists, it must be detected and reported as an error (or
+      handled by the cycle-tolerant sort with correct semantics).
+    hazards: [H-5]
+
+  - id: SC-6
+    title: Transformation provenance must be complete and accurate
+    description: >
+      When attestation is enabled, the output module's custom section must
+      contain: cryptographic hashes of all input components, meld version,
+      all configuration parameters, and a timestamp. The attestation must
+      be verifiable by Sigil.
+    hazards: [H-6]
+
+  - id: SC-7
+    title: Fusion must be deterministic for identical inputs
+    description: >
+      Given the same input component bytes and the same FuserConfig, meld
+      must produce byte-identical output. No internal data structure
+      iteration order, timestamp, or environment-dependent value may
+      influence the output bytes.
+    hazards: [H-7]
+
+  # Mitigation constraints (what to do if a hazard occurs)
+  - id: SC-8
+    title: >
+      If index remapping cannot be verified, fusion must fail with a
+      diagnostic error
+    description: >
+      If the merger detects an index that cannot be remapped (e.g., an
+      out-of-bounds reference in the input component), fusion must abort
+      with a clear error message identifying the component, section, and
+      index. Partial or best-effort output must not be produced.
+    hazards: [H-3, H-1]
+
+  - id: SC-9
+    title: >
+      If an import cannot be resolved, fusion must fail with a diagnostic
+      error
+    description: >
+      Unresolved imports must be reported as errors. Meld must not silently
+      drop imports or substitute default implementations.
+    hazards: [H-1, H-5]

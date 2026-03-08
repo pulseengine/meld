@@ -22,7 +22,7 @@ cargo install wit-bindgen-cli
 wit-bindgen test --languages rust --artifacts artifacts tests/runtime
 
 # Copy fixtures to meld
-for test in numbers strings lists records; do
+for test in numbers strings lists records variants options many-arguments flavorful; do
   cp "artifacts/${test}/composed-runner.rs-test.rs.wasm" \
      "/path/to/meld/tests/wit_bindgen/fixtures/${test}.wasm"
 done
@@ -64,6 +64,10 @@ fixtures/{test}.wasm  (composed component)
 | `strings` | String passing across component boundaries |
 | `lists` | List/array handling |
 | `records` | Struct-like composite types |
+| `variants` | Variant, enum, option, result types |
+| `options` | Option<T> with string payloads, nested options |
+| `many-arguments` | Functions with 16 parameters (spilling) |
+| `flavorful` | Mixed types: lists in records/variants, typedefs |
 
 ## Notes
 

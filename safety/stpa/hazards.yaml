@@ -1,0 +1,142 @@
+# STPA Step 1b: System-Level Hazards
+#
+# A hazard is a system state or set of conditions that, together with a
+# particular set of worst-case environmental conditions, will lead to a loss.
+#
+# Format: <System> & <Unsafe Condition> & <Link to Losses>
+#
+# Reference: STPA Handbook (Leveson & Thomas, 2018), Chapter 2
+# Hazards are system states, not component failures or environmental states.
+# Keep to ~7-10 system-level hazards; refine into sub-hazards as needed.
+
+hazards:
+  - id: H-1
+    title: Fused module produces different observable behavior than the original composition
+    description: >
+      Meld produces a fused module whose execution semantics diverge from
+      the composed component graph. This includes wrong return values, calls
+      dispatched to incorrect functions, missing or spurious traps, or
+      incorrect control flow.
+    losses: [L-1]
+
+  - id: H-2
+    title: Cross-component memory access violates isolation boundaries
+    description: >
+      Meld produces a fused module where one component's code can read from
+      or write to another component's linear memory without going through
+      a correctly generated adapter. In multi-memory mode, this means
+      instructions reference the wrong memory index. In shared-memory mode,
+      this means address ranges overlap or rebase incorrectly.
+    losses: [L-1, L-2]
+
+  - id: H-3
+    title: Index remapping produces references to incorrect entities
+    description: >
+      During merger, function/memory/table/global/type indices are rebased
+      incorrectly, causing instructions in the fused module to reference
+      the wrong entity. A call instruction targets the wrong function, a
+      memory.load uses the wrong memory, or a table.get accesses the wrong
+      table.
+    losses: [L-1, L-2]
+
+  - id: H-4
+    title: Adapter generates incorrect Canonical ABI trampoline code
+    description: >
+      The generated adapter function for a cross-component call does not
+      correctly implement the Canonical ABI lifting/lowering. This includes
+      incorrect memory allocation via cabi_realloc, wrong copy sizes or
+      offsets, incorrect string transcoding, incorrect list element sizing,
+      or missing recursive pointer fixup.
+    losses: [L-1, L-2]
+
+  - id: H-5
+    title: Dependency resolution produces incorrect instantiation order
+    description: >
+      The resolver computes an incorrect topological order of component
+      instantiation, causing a component to be instantiated before a
+      component it depends on. This can cause imports to bind to the wrong
+      exports or initialization to observe uninitialized state.
+    losses: [L-1]
+
+  - id: H-6
+    title: Transformation provenance is lost or falsified
+    description: >
+      The attestation custom section is missing, contains incorrect input
+      hashes, records the wrong tool version, or omits configuration
+      parameters that affected the transformation. Downstream verification
+      by Sigil cannot confirm the transformation chain.
+    losses: [L-3]
+
+  - id: H-7
+    title: Output is non-deterministic for identical inputs
+    description: >
+      The fusion pipeline produces different output bytes when given the
+      same input components and configuration. Sources include iteration
+      over hash maps with non-deterministic order, timestamp-dependent
+      behavior, or ASLR-dependent pointer comparisons.
+    losses: [L-4]
+
+# Sub-hazards: optional refinement for complex hazards
+sub-hazards:
+  # Refinements of H-3 (index remapping)
+  - id: H-3.1
+    parent: H-3
+    title: Function index offset computed incorrectly
+    description: >
+      The base offset for a component's function indices in the merged
+      index space is wrong, shifting all function references by an
+      incorrect amount.
+
+  - id: H-3.2
+    parent: H-3
+    title: Memory index not remapped in multi-memory mode
+    description: >
+      An instruction that references a memory (load, store, memory.size,
+      memory.grow, memory.copy, memory.fill, memory.init) retains its
+      original per-component memory index instead of being remapped to the
+      merged memory index space.
+
+  - id: H-3.3
+    parent: H-3
+    title: Global index remapping misses imported globals
+    description: >
+      Imported globals are renumbered during merge but references to them
+      in init expressions or instructions are not updated.
+
+  - id: H-3.4
+    parent: H-3
+    title: Type index remapping misses call_indirect signatures
+    description: >
+      Type indices used in call_indirect instructions or table element
+      segments are not updated after type section merging.
+
+  # Refinements of H-4 (adapter generation)
+  - id: H-4.1
+    parent: H-4
+    title: Adapter computes wrong byte length for list copy
+    description: >
+      The adapter multiplies element count by incorrect element size when
+      computing the byte length argument to memory.copy for list types.
+
+  - id: H-4.2
+    parent: H-4
+    title: Adapter omits recursive inner pointer fixup
+    description: >
+      For list elements containing pointers (strings, nested lists), the
+      adapter copies raw bytes but does not walk the element structure to
+      fixup inner pointers that reference the source memory.
+
+  - id: H-4.3
+    parent: H-4
+    title: Adapter allocates in wrong component memory
+    description: >
+      The adapter calls cabi_realloc in the source component's memory
+      instead of the destination component's memory (or vice versa),
+      causing the allocated buffer to be inaccessible to the callee.
+
+  - id: H-4.4
+    parent: H-4
+    title: String transcoding produces incorrect UTF-8/UTF-16 conversion
+    description: >
+      The adapter's string transcoding logic miscounts code units, does not
+      handle surrogate pairs correctly, or produces invalid UTF-8 sequences.

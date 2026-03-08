@@ -1,0 +1,214 @@
+# STPA Step 2: Control Structure
+#
+# A hierarchical control structure is a system model composed of feedback
+# control loops. It captures functional relationships and interactions.
+#
+# Meld is a build-time tool. Its control structure models the transformation
+# pipeline where each stage controls the data flowing to the next stage.
+# The "controlled process" is the WebAssembly transformation itself.
+#
+# Reference: STPA Handbook (Leveson & Thomas, 2018), Chapter 2
+#
+# See control-structure-diagram.md for the Mermaid visualization.
+
+controllers:
+  - id: CTRL-BUILD
+    name: Build System / Developer
+    type: human-and-automated
+    description: >
+      The developer or build system (Bazel, Cargo) that invokes meld with
+      a specific configuration. Selects input components, memory strategy,
+      output format, and attestation settings.
+    control-actions:
+      - ca: CA-BUILD-1
+        target: CTRL-CLI
+        action: Invoke meld with configuration and input components
+      - ca: CA-BUILD-2
+        target: CTRL-CLI
+        action: Select memory strategy (multi-memory or shared)
+      - ca: CA-BUILD-3
+        target: CTRL-CLI
+        action: Select output format (CoreModule or Component)
+    feedback:
+      - from: CTRL-CLI
+        info: Exit code, error messages, fusion statistics
+    process-model:
+      - Input components are valid P2/P3 components
+      - Selected memory strategy is compatible with target runtime
+      - Output format matches downstream tool expectations
+
+  - id: CTRL-CLI
+    name: Meld CLI
+    type: automated
+    description: >
+      The meld binary that orchestrates the fusion pipeline. Parses CLI
+      arguments, constructs FuserConfig, invokes the Fuser, and writes
+      output.
+    control-actions:
+      - ca: CA-CLI-1
+        target: CTRL-PARSER
+        action: Submit component bytes for parsing
+      - ca: CA-CLI-2
+        target: CTRL-RESOLVER
+        action: Initiate dependency resolution
+      - ca: CA-CLI-3
+        target: CTRL-MERGER
+        action: Initiate index-space merging
+      - ca: CA-CLI-4
+        target: CTRL-ADAPTER
+        action: Initiate adapter generation
+      - ca: CA-CLI-5
+        target: PROC-ENCODE
+        action: Initiate output encoding
+    feedback:
+      - from: CTRL-PARSER
+        info: Parsed component structures, validation errors
+      - from: CTRL-RESOLVER
+        info: Resolved dependency graph, unresolved imports
+      - from: CTRL-MERGER
+        info: Merged module, index maps
+      - from: CTRL-ADAPTER
+        info: Generated adapter functions, adapter statistics
+      - from: PROC-ENCODE
+        info: Output bytes, validation result
+    process-model:
+      - All components parsed successfully
+      - All imports resolved
+      - Index spaces merged without conflict
+      - Adapters generated for all cross-component calls
+
+  - id: CTRL-PARSER
+    name: Parser
+    type: automated
+    description: >
+      Reads WebAssembly component binaries using wasmparser. Extracts core
+      modules, types, functions, memories, tables, globals, imports, exports,
+      and Canonical ABI metadata (canonical_abi_size, canonical_abi_align,
+      canonical_abi_element_size).
+    source-file: meld-core/src/parser.rs
+    control-actions:
+      - ca: CA-PARSE-1
+        target: PROC-COMPONENT
+        action: Validate component binary format
+      - ca: CA-PARSE-2
+        target: PROC-COMPONENT
+        action: Extract core modules and type information
+      - ca: CA-PARSE-3
+        target: PROC-COMPONENT
+        action: Compute Canonical ABI element sizes and alignments
+    feedback:
+      - from: PROC-COMPONENT
+        info: Parsed sections, type definitions, import/export maps
+    process-model:
+      - Input bytes are a valid WebAssembly component
+      - All sections are parsed in order
+      - Type indices in the component are consistent
+
+  - id: CTRL-RESOLVER
+    name: Resolver
+    type: automated
+    description: >
+      Builds the dependency graph from parsed components. Matches imports
+      to exports, computes topological sort for instantiation order,
+      detects cycles, and determines CopyLayout for cross-component data
+      transfer.
+    source-file: meld-core/src/resolver.rs
+    control-actions:
+      - ca: CA-RESOLVE-1
+        target: PROC-DEPGRAPH
+        action: Match component imports to component exports
+      - ca: CA-RESOLVE-2
+        target: PROC-DEPGRAPH
+        action: Compute topological instantiation order
+      - ca: CA-RESOLVE-3
+        target: PROC-DEPGRAPH
+        action: Determine CopyLayout for each cross-component call
+    feedback:
+      - from: PROC-DEPGRAPH
+        info: Resolved import/export pairs, instantiation order, CopyLayouts
+    process-model:
+      - All import names have a matching export in some component
+      - The dependency graph is a DAG (or cycles are handled)
+      - CopyLayout correctly reflects the type structure
+
+  - id: CTRL-MERGER
+    name: Merger
+    type: automated
+    description: >
+      Combines the index spaces of all components into a single module.
+      Computes base offsets for each component's functions, memories,
+      tables, globals, and types. Rewrites all instructions via the
+      Rewriter to update indices.
+    source-file: meld-core/src/merger.rs
+    control-actions:
+      - ca: CA-MERGE-1
+        target: PROC-INDEXSPACE
+        action: Compute base offsets for each component's index space
+      - ca: CA-MERGE-2
+        target: PROC-INDEXSPACE
+        action: Rewrite all instructions with remapped indices
+      - ca: CA-MERGE-3
+        target: PROC-INDEXSPACE
+        action: Reindex data segments and element segments
+    feedback:
+      - from: PROC-INDEXSPACE
+        info: Index maps (old index -> new index), merged sections
+    process-model:
+      - Base offsets are computed as cumulative sums
+      - Every instruction referencing an index is visited by the rewriter
+      - Segment offsets are rebased to the correct memory
+
+  - id: CTRL-ADAPTER
+    name: Adapter Generator (FACT)
+    type: automated
+    description: >
+      Generates Canonical ABI adapter functions (trampolines) for
+      cross-component calls. Handles memory allocation via cabi_realloc,
+      data copying via memory.copy, string transcoding, list element
+      sizing, and recursive inner pointer fixup.
+    source-file: meld-core/src/adapter/fact.rs
+    control-actions:
+      - ca: CA-ADAPT-1
+        target: PROC-TRAMPOLINE
+        action: Generate adapter function for a resolved import/export pair
+      - ca: CA-ADAPT-2
+        target: PROC-TRAMPOLINE
+        action: Emit memory allocation via cabi_realloc in callee memory
+      - ca: CA-ADAPT-3
+        target: PROC-TRAMPOLINE
+        action: Emit data copy via memory.copy between memories
+      - ca: CA-ADAPT-4
+        target: PROC-TRAMPOLINE
+        action: Emit recursive inner pointer fixup loop
+      - ca: CA-ADAPT-5
+        target: PROC-TRAMPOLINE
+        action: Emit string transcoding (UTF-8/UTF-16, Latin-1/UTF-8)
+    feedback:
+      - from: PROC-TRAMPOLINE
+        info: Generated wasm instructions, adapter function index
+    process-model:
+      - Source and destination memory indices are correct
+      - Element sizes match the Canonical ABI specification
+      - Inner pointer offsets are correctly computed with alignment
+      - cabi_realloc function index is correct for the callee component
+
+controlled-processes:
+  - id: PROC-COMPONENT
+    name: Component Binary Data
+    description: Raw WebAssembly component bytes being parsed
+
+  - id: PROC-DEPGRAPH
+    name: Dependency Graph
+    description: Import/export resolution and instantiation ordering
+
+  - id: PROC-INDEXSPACE
+    name: Merged Index Space
+    description: Combined function/memory/table/global/type index space
+
+  - id: PROC-TRAMPOLINE
+    name: Adapter Trampoline Code
+    description: Generated WebAssembly instructions for cross-component calls
+
+  - id: PROC-ENCODE
+    name: Output Encoding
+    description: Serialization of the fused module to WebAssembly binary

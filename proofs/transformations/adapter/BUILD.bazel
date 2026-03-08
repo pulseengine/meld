@@ -18,3 +18,20 @@ rocq_proof_test(
     deps = [":adapter_spec"],
     tags = ["manual", "proofs"],
 )
+
+# CopyLayout and pointer fixup proofs: well-formedness, conditional copy
+# correctness, copy completeness, and memory safety.
+rocq_library(
+    name = "copy_layout_proofs",
+    srcs = ["copy_layout_proofs.v"],
+    deps = [
+        "//proofs/spec:copy_layout_spec",
+    ],
+    include_path = "MeldAdapter",
+)
+
+rocq_proof_test(
+    name = "copy_layout_proofs_test",
+    deps = [":copy_layout_proofs"],
+    tags = ["manual", "proofs"],
+)

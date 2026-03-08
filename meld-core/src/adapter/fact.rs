@@ -388,16 +388,31 @@ impl FactStyleGenerator {
         // there are pointer pairs to copy — without realloc we cannot allocate
         // in the callee's memory.
         let has_param_pointer_pairs = !site.requirements.pointer_pair_positions.is_empty();
+        let has_conditional_pairs = !site.requirements.conditional_pointer_pairs.is_empty();
         let needs_outbound_copy =
             has_param_pointer_pairs && param_count >= 2 && options.callee_realloc.is_some();
+        let needs_conditional_copy = has_conditional_pairs && options.callee_realloc.is_some();
         let needs_result_copy = options.returns_pointer_pair;
+        let has_conditional_result_pairs =
+            !site.requirements.conditional_result_flat_pairs.is_empty();
+        let needs_conditional_result_copy =
+            !needs_result_copy && has_conditional_result_pairs && options.caller_realloc.is_some();
 
         // Post-return with scalar results needs scratch locals to save/restore
         let needs_post_return_save =
             !needs_result_copy && options.callee_post_return.is_some() && result_count > 0;
 
+        // We need result-save locals for post-return AND/OR conditional result copy
+        let needs_result_save =
+            (needs_post_return_save || needs_conditional_result_copy) && result_count > 0;
+
         // If no copying and no post-return save needed, direct call
-        if !needs_outbound_copy && !needs_result_copy && !needs_post_return_save {
+        if !needs_outbound_copy
+            && !needs_conditional_copy
+            && !needs_result_copy
+            && !needs_conditional_result_copy
+            && !needs_post_return_save
+        {
             let mut func = Function::new([]);
             for i in 0..param_count {
                 func.instruction(&Instruction::LocalGet(i as u32));
@@ -420,17 +435,19 @@ impl FactStyleGenerator {
             3 // callee_ret_ptr + callee_ret_len + caller_new_ptr
         } else if needs_outbound_copy {
             1 + inner_fixup_locals // dest_ptr + fixup
+        } else if needs_conditional_copy || needs_conditional_result_copy {
+            1 // dest_ptr for conditional copy (param or result side)
         } else {
             0 // post-return-only path (no copy needed)
         };
 
-        // Build local declarations: copy scratch (i32) + post-return save (typed)
+        // Build local declarations: copy scratch (i32) + result save (typed)
         let mut local_decls: Vec<(u32, wasm_encoder::ValType)> = Vec::new();
         if copy_scratch_count > 0 {
             local_decls.push((copy_scratch_count, wasm_encoder::ValType::I32));
         }
-        let post_return_base = param_count as u32 + copy_scratch_count;
-        if needs_post_return_save {
+        let result_save_base = param_count as u32 + copy_scratch_count;
+        if needs_result_save {
             for ty in &result_types {
                 local_decls.push((1, *ty));
             }
@@ -531,6 +548,70 @@ impl FactStyleGenerator {
                 func.instruction(&Instruction::LocalGet(i as u32));
             }
             func.instruction(&Instruction::Call(target_func));
+        } else if needs_conditional_copy {
+            // Conditional copy for option/result/variant params.
+            // For each conditional pointer pair, check the discriminant and
+            // copy the pointed-to data if the variant is active.
+            let callee_realloc = options.callee_realloc.unwrap();
+
+            // We need scratch locals: one dest_ptr per conditional pair
+            // These were NOT allocated in the main scratch pool above,
+            // so we extend the function with extra locals.
+            // NOTE: We handle this by modifying the params in-place using
+            // local.set on the original param slots.
+            for cond in &site.requirements.conditional_pointer_pairs {
+                let disc_local = cond.discriminant_position;
+                let ptr_local = cond.ptr_position;
+                let len_local = cond.ptr_position + 1;
+                let byte_mult = match &cond.copy_layout {
+                    crate::resolver::CopyLayout::Bulk { byte_multiplier } => *byte_multiplier,
+                    crate::resolver::CopyLayout::Elements { element_size, .. } => *element_size,
+                };
+
+                // if (disc == expected_value) { copy and replace ptr }
+                func.instruction(&Instruction::LocalGet(disc_local));
+                func.instruction(&Instruction::I32Const(cond.discriminant_value as i32));
+                func.instruction(&Instruction::I32Eq);
+                func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+
+                // Allocate: new_ptr = cabi_realloc(0, 0, 1, len * byte_mult)
+                func.instruction(&Instruction::I32Const(0));
+                func.instruction(&Instruction::I32Const(0));
+                func.instruction(&Instruction::I32Const(1));
+                func.instruction(&Instruction::LocalGet(len_local));
+                if byte_mult > 1 {
+                    func.instruction(&Instruction::I32Const(byte_mult as i32));
+                    func.instruction(&Instruction::I32Mul);
+                }
+                func.instruction(&Instruction::Call(callee_realloc));
+                // Save as dest_ptr (reuse a scratch local)
+                func.instruction(&Instruction::LocalSet(dest_ptr_local));
+
+                // Copy: memory.copy callee caller (dest, src, len * byte_mult)
+                func.instruction(&Instruction::LocalGet(dest_ptr_local));
+                func.instruction(&Instruction::LocalGet(ptr_local));
+                func.instruction(&Instruction::LocalGet(len_local));
+                if byte_mult > 1 {
+                    func.instruction(&Instruction::I32Const(byte_mult as i32));
+                    func.instruction(&Instruction::I32Mul);
+                }
+                func.instruction(&Instruction::MemoryCopy {
+                    src_mem: options.caller_memory,
+                    dst_mem: options.callee_memory,
+                });
+
+                // Replace the original ptr with the new ptr in callee memory
+                func.instruction(&Instruction::LocalGet(dest_ptr_local));
+                func.instruction(&Instruction::LocalSet(ptr_local));
+
+                func.instruction(&Instruction::End); // end if
+            }
+
+            // Pass all args through (with modified ptr values)
+            for i in 0..param_count {
+                func.instruction(&Instruction::LocalGet(i as u32));
+            }
+            func.instruction(&Instruction::Call(target_func));
         } else {
             // No outbound copy — pass args through directly
             for i in 0..param_count {
@@ -586,25 +667,83 @@ impl FactStyleGenerator {
             func.instruction(&Instruction::LocalGet(callee_ret_len_local));
         }
 
-        // Post-return for non-result-copy case (callee returned scalars)
-        if !needs_result_copy && let Some(post_return_func) = options.callee_post_return {
-            if result_count > 0 {
+        // Post-return and/or conditional result copy for non-result-copy case
+        if !needs_result_copy
+            && (needs_conditional_result_copy || options.callee_post_return.is_some())
+        {
+            if result_count > 0 && needs_result_save {
                 // Save return values to scratch locals (pop in reverse order)
                 for i in (0..result_count).rev() {
-                    func.instruction(&Instruction::LocalSet(post_return_base + i as u32));
+                    func.instruction(&Instruction::LocalSet(result_save_base + i as u32));
                 }
-                // Pass saved return values to cabi_post_return
-                for i in 0..result_count {
-                    func.instruction(&Instruction::LocalGet(post_return_base + i as u32));
+            }
+
+            // Call post-return with callee's original return values
+            if let Some(post_return_func) = options.callee_post_return {
+                if result_count > 0 && needs_result_save {
+                    for i in 0..result_count {
+                        func.instruction(&Instruction::LocalGet(result_save_base + i as u32));
+                    }
                 }
                 func.instruction(&Instruction::Call(post_return_func));
-                // Push return values back onto the stack for the caller
-                for i in 0..result_count {
-                    func.instruction(&Instruction::LocalGet(post_return_base + i as u32));
+            }
+
+            // Conditional result copy: fix up pointer pairs in callee results
+            if needs_conditional_result_copy && result_count > 0 {
+                let caller_realloc = options.caller_realloc.unwrap();
+                for cond in &site.requirements.conditional_result_flat_pairs {
+                    let disc_local = result_save_base + cond.discriminant_position;
+                    let ptr_local = result_save_base + cond.ptr_position;
+                    let len_local = result_save_base + cond.ptr_position + 1;
+                    let byte_mult = match &cond.copy_layout {
+                        crate::resolver::CopyLayout::Bulk { byte_multiplier } => *byte_multiplier,
+                        crate::resolver::CopyLayout::Elements { element_size, .. } => *element_size,
+                    };
+
+                    // if (disc == expected_value) { allocate in caller, copy, replace ptr }
+                    func.instruction(&Instruction::LocalGet(disc_local));
+                    func.instruction(&Instruction::I32Const(cond.discriminant_value as i32));
+                    func.instruction(&Instruction::I32Eq);
+                    func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+
+                    // Allocate in caller memory
+                    func.instruction(&Instruction::I32Const(0));
+                    func.instruction(&Instruction::I32Const(0));
+                    func.instruction(&Instruction::I32Const(1));
+                    func.instruction(&Instruction::LocalGet(len_local));
+                    if byte_mult > 1 {
+                        func.instruction(&Instruction::I32Const(byte_mult as i32));
+                        func.instruction(&Instruction::I32Mul);
+                    }
+                    func.instruction(&Instruction::Call(caller_realloc));
+                    func.instruction(&Instruction::LocalSet(dest_ptr_local));
+
+                    // Copy from callee memory to caller memory
+                    func.instruction(&Instruction::LocalGet(dest_ptr_local));
+                    func.instruction(&Instruction::LocalGet(ptr_local));
+                    func.instruction(&Instruction::LocalGet(len_local));
+                    if byte_mult > 1 {
+                        func.instruction(&Instruction::I32Const(byte_mult as i32));
+                        func.instruction(&Instruction::I32Mul);
+                    }
+                    func.instruction(&Instruction::MemoryCopy {
+                        src_mem: options.callee_memory,
+                        dst_mem: options.caller_memory,
+                    });
+
+                    // Replace ptr with caller's copy
+                    func.instruction(&Instruction::LocalGet(dest_ptr_local));
+                    func.instruction(&Instruction::LocalSet(ptr_local));
+
+                    func.instruction(&Instruction::End); // end if
                 }
-            } else {
-                // No results — just call post-return
-                func.instruction(&Instruction::Call(post_return_func));
+            }
+
+            // Push (modified) return values back onto the stack
+            if result_count > 0 && needs_result_save {
+                for i in 0..result_count {
+                    func.instruction(&Instruction::LocalGet(result_save_base + i as u32));
+                }
             }
         }
 
@@ -647,24 +786,20 @@ impl FactStyleGenerator {
         let num_param_pairs = param_ptr_positions.len();
         let _num_result_pairs = result_ptr_offsets.len();
 
-        log::debug!(
-            "retptr adapter {:?}: caller={}p, callee={}p, return_area={}B, \
-             param_pairs={:?}, result_pairs={:?}",
-            site.import_name,
-            caller_param_count,
-            callee_param_count,
-            return_area_size,
-            param_ptr_positions,
-            result_ptr_offsets,
-        );
-
         // Compute fixup depth: each nesting level needs 4 scratch locals
         let param_fixup_depth = Self::max_fixup_depth(&site.requirements.param_copy_layouts);
         let result_fixup_depth = Self::max_fixup_depth(&site.requirements.result_copy_layouts);
         let max_fixup_depth = param_fixup_depth.max(result_fixup_depth);
 
+        let has_cond_param_pairs = !site.requirements.conditional_pointer_pairs.is_empty();
+        let has_cond_result_pairs = !site
+            .requirements
+            .conditional_result_pointer_pairs
+            .is_empty();
+
         // Scratch locals layout (all i32, after caller params):
         //   [dest_ptr_0..dest_ptr_N]  (one per param pointer pair)
+        //   [cond_dest_ptr]           (reused for conditional param/result copies)
         //   [result_ptr]              (return area pointer from callee)
         //   [data_ptr] [data_len] [caller_new_ptr]  (reused for each result pair)
         //   [loop_idx, inner_ptr, inner_len, new_ptr] × depth  (for nested fixup loops)
@@ -672,6 +807,10 @@ impl FactStyleGenerator {
         let dest_ptr_base = caller_param_count as u32;
         if num_param_pairs > 0 && options.callee_realloc.is_some() {
             scratch_count += num_param_pairs as u32;
+        }
+        let cond_dest_ptr_local = caller_param_count as u32 + scratch_count;
+        if has_cond_param_pairs || has_cond_result_pairs {
+            scratch_count += 1;
         }
         let result_ptr_local = caller_param_count as u32 + scratch_count;
         scratch_count += 1;
@@ -688,9 +827,10 @@ impl FactStyleGenerator {
         let mut func = Function::new(local_decls);
 
         // --- Phase 1: Outbound copy of ALL pointer pairs (caller → callee) ---
-        if !param_ptr_positions.is_empty() && options.callee_realloc.is_some() {
-            let callee_realloc = options.callee_realloc.unwrap();
-
+        if let Some(callee_realloc) = options
+            .callee_realloc
+            .filter(|_| !param_ptr_positions.is_empty())
+        {
             let param_layouts = &site.requirements.param_copy_layouts;
             for (pair_idx, &ptr_pos) in param_ptr_positions.iter().enumerate() {
                 let len_pos = ptr_pos + 1;
@@ -749,20 +889,67 @@ impl FactStyleGenerator {
                     );
                 }
             }
+        }
 
-            // Build callee params: for each callee param position, either use
-            // the remapped dest_ptr or the original param value
+        // --- Phase 1b: Conditional param copy (option/result/variant params) ---
+        if let Some(callee_realloc) = options.callee_realloc.filter(|_| has_cond_param_pairs) {
+            for cond in &site.requirements.conditional_pointer_pairs {
+                let disc_local = cond.discriminant_position;
+                let ptr_local = cond.ptr_position;
+                let len_local = cond.ptr_position + 1;
+                let byte_mult = match &cond.copy_layout {
+                    crate::resolver::CopyLayout::Bulk { byte_multiplier } => *byte_multiplier,
+                    crate::resolver::CopyLayout::Elements { element_size, .. } => *element_size,
+                };
+
+                func.instruction(&Instruction::LocalGet(disc_local));
+                func.instruction(&Instruction::I32Const(cond.discriminant_value as i32));
+                func.instruction(&Instruction::I32Eq);
+                func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+
+                // Allocate in callee memory
+                func.instruction(&Instruction::I32Const(0));
+                func.instruction(&Instruction::I32Const(0));
+                func.instruction(&Instruction::I32Const(1));
+                func.instruction(&Instruction::LocalGet(len_local));
+                if byte_mult > 1 {
+                    func.instruction(&Instruction::I32Const(byte_mult as i32));
+                    func.instruction(&Instruction::I32Mul);
+                }
+                func.instruction(&Instruction::Call(callee_realloc));
+                func.instruction(&Instruction::LocalSet(cond_dest_ptr_local));
+
+                // Copy from caller to callee memory
+                func.instruction(&Instruction::LocalGet(cond_dest_ptr_local));
+                func.instruction(&Instruction::LocalGet(ptr_local));
+                func.instruction(&Instruction::LocalGet(len_local));
+                if byte_mult > 1 {
+                    func.instruction(&Instruction::I32Const(byte_mult as i32));
+                    func.instruction(&Instruction::I32Mul);
+                }
+                func.instruction(&Instruction::MemoryCopy {
+                    src_mem: options.caller_memory,
+                    dst_mem: options.callee_memory,
+                });
+
+                // Replace ptr with callee's copy
+                func.instruction(&Instruction::LocalGet(cond_dest_ptr_local));
+                func.instruction(&Instruction::LocalSet(ptr_local));
+
+                func.instruction(&Instruction::End);
+            }
+        }
+
+        // Push callee params (after all pointer remapping)
+        if !param_ptr_positions.is_empty() && options.callee_realloc.is_some() {
             for i in 0..callee_param_count as u32 {
                 if let Some(pair_idx) = param_ptr_positions.iter().position(|&pos| pos == i) {
-                    // This is a pointer param — use remapped dest_ptr
                     func.instruction(&Instruction::LocalGet(dest_ptr_base + pair_idx as u32));
                 } else {
-                    // Scalar or length param — pass through
                     func.instruction(&Instruction::LocalGet(i));
                 }
             }
         } else {
-            // No pointer pairs to copy — pass callee params directly
             for i in 0..callee_param_count {
                 func.instruction(&Instruction::LocalGet(i as u32));
             }
@@ -776,9 +963,10 @@ impl FactStyleGenerator {
         // For each result pointer pair, copy the pointed-to data and fix up.
         // For scalar values in the return area, copy them as-is.
         let result_layouts = &site.requirements.result_copy_layouts;
-        if !result_ptr_offsets.is_empty() && options.caller_realloc.is_some() {
-            let caller_realloc = options.caller_realloc.unwrap();
-
+        if let Some(caller_realloc) = options
+            .caller_realloc
+            .filter(|_| !result_ptr_offsets.is_empty())
+        {
             // Process each value in the return area
             let mut byte_offset: u32 = 0;
             let mut result_pair_idx: usize = 0;
@@ -901,20 +1089,89 @@ impl FactStyleGenerator {
             }
         } else {
             // No result pointer pairs — bulk copy the entire return area
-            // (fallback for when we don't have layout info)
-            for offset in (0..return_area_size).step_by(4) {
-                func.instruction(&Instruction::LocalGet(retptr_local));
+            func.instruction(&Instruction::LocalGet(retptr_local)); // dst
+            func.instruction(&Instruction::LocalGet(result_ptr_local)); // src
+            func.instruction(&Instruction::I32Const(return_area_size as i32)); // size
+            func.instruction(&Instruction::MemoryCopy {
+                src_mem: options.callee_memory,
+                dst_mem: options.caller_memory,
+            });
+        }
+
+        // --- Phase 5b: Conditional result copy (option/result/variant in return area) ---
+        if let Some(caller_realloc) = options.caller_realloc.filter(|_| has_cond_result_pairs) {
+            for cond in &site.requirements.conditional_result_pointer_pairs {
+                let disc_offset = cond.discriminant_position;
+                let ptr_offset = cond.ptr_position;
+                let len_offset = cond.ptr_position + 4;
+                let byte_mult = match &cond.copy_layout {
+                    crate::resolver::CopyLayout::Bulk { byte_multiplier } => *byte_multiplier,
+                    crate::resolver::CopyLayout::Elements { element_size, .. } => *element_size,
+                };
+
+                // Load discriminant from callee's return area
                 func.instruction(&Instruction::LocalGet(result_ptr_local));
                 func.instruction(&Instruction::I32Load(wasm_encoder::MemArg {
-                    offset: offset as u64,
+                    offset: disc_offset as u64,
                     align: 2,
                     memory_index: options.callee_memory,
                 }));
+                func.instruction(&Instruction::I32Const(cond.discriminant_value as i32));
+                func.instruction(&Instruction::I32Eq);
+                func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+
+                // Load ptr and len from callee's return area
+                func.instruction(&Instruction::LocalGet(result_ptr_local));
+                func.instruction(&Instruction::I32Load(wasm_encoder::MemArg {
+                    offset: ptr_offset as u64,
+                    align: 2,
+                    memory_index: options.callee_memory,
+                }));
+                func.instruction(&Instruction::LocalSet(data_ptr_local));
+
+                func.instruction(&Instruction::LocalGet(result_ptr_local));
+                func.instruction(&Instruction::I32Load(wasm_encoder::MemArg {
+                    offset: len_offset as u64,
+                    align: 2,
+                    memory_index: options.callee_memory,
+                }));
+                func.instruction(&Instruction::LocalSet(data_len_local));
+
+                // Allocate in caller memory
+                func.instruction(&Instruction::I32Const(0));
+                func.instruction(&Instruction::I32Const(0));
+                func.instruction(&Instruction::I32Const(1));
+                func.instruction(&Instruction::LocalGet(data_len_local));
+                if byte_mult > 1 {
+                    func.instruction(&Instruction::I32Const(byte_mult as i32));
+                    func.instruction(&Instruction::I32Mul);
+                }
+                func.instruction(&Instruction::Call(caller_realloc));
+                func.instruction(&Instruction::LocalSet(caller_new_ptr_local));
+
+                // Copy data from callee → caller
+                func.instruction(&Instruction::LocalGet(caller_new_ptr_local));
+                func.instruction(&Instruction::LocalGet(data_ptr_local));
+                func.instruction(&Instruction::LocalGet(data_len_local));
+                if byte_mult > 1 {
+                    func.instruction(&Instruction::I32Const(byte_mult as i32));
+                    func.instruction(&Instruction::I32Mul);
+                }
+                func.instruction(&Instruction::MemoryCopy {
+                    src_mem: options.callee_memory,
+                    dst_mem: options.caller_memory,
+                });
+
+                // Write fixed-up ptr to caller's retptr
+                func.instruction(&Instruction::LocalGet(retptr_local));
+                func.instruction(&Instruction::LocalGet(caller_new_ptr_local));
                 func.instruction(&Instruction::I32Store(wasm_encoder::MemArg {
-                    offset: offset as u64,
+                    offset: ptr_offset as u64,
                     align: 2,
                     memory_index: options.caller_memory,
                 }));
+
+                func.instruction(&Instruction::End);
             }
         }
 
