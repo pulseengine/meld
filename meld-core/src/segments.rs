@@ -640,7 +640,10 @@ mod tests {
         let reindexed = reindex_element_segment(&segment, &maps);
         match &reindexed.mode {
             ElementSegmentMode::Active { table_index, .. } => {
-                assert_eq!(*table_index, 3, "table index should be remapped from 0 to 3");
+                assert_eq!(
+                    *table_index, 3,
+                    "table index should be remapped from 0 to 3"
+                );
             }
             _ => panic!("expected active element segment mode"),
         }
@@ -687,7 +690,10 @@ mod tests {
         let reindexed = reindex_data_segment(&segment, &maps).unwrap();
         match &reindexed.mode {
             ReindexedDataMode::Active { memory_index, .. } => {
-                assert_eq!(*memory_index, 2, "memory index should be remapped from 0 to 2");
+                assert_eq!(
+                    *memory_index, 2,
+                    "memory index should be remapped from 0 to 2"
+                );
             }
             _ => panic!("expected active data segment mode"),
         }
@@ -723,7 +729,10 @@ mod tests {
         let mut expected = Vec::new();
         ConstExpr::global_get(5).encode(&mut expected);
 
-        assert_eq!(actual, expected, "global index in offset should be remapped from 0 to 5");
+        assert_eq!(
+            actual, expected,
+            "global index in offset should be remapped from 0 to 5"
+        );
     }
 
     /// SR-10: Concrete type index inside RefNull expressions in element
@@ -733,9 +742,9 @@ mod tests {
         let segment = ParsedElementSegment {
             mode: ParsedElementSegmentMode::Passive,
             element_type: RefType::FUNCREF,
-            items: ElementItems_::Expressions(vec![
-                ParsedConstExpr::RefNull(wasm_encoder::HeapType::Concrete(0)),
-            ]),
+            items: ElementItems_::Expressions(vec![ParsedConstExpr::RefNull(
+                wasm_encoder::HeapType::Concrete(0),
+            )]),
         };
 
         let mut maps = IndexMaps::new();
@@ -754,6 +763,9 @@ mod tests {
         let mut expected = Vec::new();
         ConstExpr::ref_null(wasm_encoder::HeapType::Concrete(4)).encode(&mut expected);
 
-        assert_eq!(actual, expected, "concrete type index should be remapped from 0 to 4");
+        assert_eq!(
+            actual, expected,
+            "concrete type index should be remapped from 0 to 4"
+        );
     }
 }

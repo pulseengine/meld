@@ -1503,12 +1503,18 @@ impl Resolver {
                                             requirements.result_copy_layouts =
                                                 collect_result_copy_layouts(to_component, results);
                                             // Collect conditional pointer pairs (option/result/variant)
-                                            requirements.conditional_pointer_pairs =
-                                                to_component.conditional_pointer_pair_positions(comp_params);
+                                            requirements.conditional_pointer_pairs = to_component
+                                                .conditional_pointer_pair_positions(comp_params);
                                             requirements.conditional_result_pointer_pairs =
-                                                to_component.conditional_pointer_pair_result_positions(results);
+                                                to_component
+                                                    .conditional_pointer_pair_result_positions(
+                                                        results,
+                                                    );
                                             requirements.conditional_result_flat_pairs =
-                                                to_component.conditional_pointer_pair_result_flat_positions(results);
+                                                to_component
+                                                    .conditional_pointer_pair_result_flat_positions(
+                                                        results,
+                                                    );
                                             log::debug!(
                                                 "layout {:?}: ptr_positions={:?}, result_offsets={:?}, \
                                                  cond_pairs={}, cond_result_pairs={}, cond_result_flat={}",
@@ -2280,21 +2286,26 @@ mod tests {
     #[test]
     fn test_topological_sort_diamond() {
         let components = vec![
-            make_component(&["iface-b", "iface-c"], &[]),       // A = index 0
-            make_component(&["iface-d"], &["iface-b"]),          // B = index 1
-            make_component(&["iface-d"], &["iface-c"]),          // C = index 2
-            make_component(&[], &["iface-d"]),                   // D = index 3
+            make_component(&["iface-b", "iface-c"], &[]), // A = index 0
+            make_component(&["iface-d"], &["iface-b"]),   // B = index 1
+            make_component(&["iface-d"], &["iface-c"]),   // C = index 2
+            make_component(&[], &["iface-d"]),            // D = index 3
         ];
 
         let resolver = Resolver::new();
-        let graph = resolver.resolve(&components).expect("diamond resolution should succeed");
+        let graph = resolver
+            .resolve(&components)
+            .expect("diamond resolution should succeed");
 
         let order = &graph.instantiation_order;
-        assert_eq!(order.len(), 4, "all four components must appear in the order");
+        assert_eq!(
+            order.len(),
+            4,
+            "all four components must appear in the order"
+        );
 
         // Build position map for order assertions
-        let pos: HashMap<usize, usize> =
-            order.iter().enumerate().map(|(i, &v)| (v, i)).collect();
+        let pos: HashMap<usize, usize> = order.iter().enumerate().map(|(i, &v)| (v, i)).collect();
 
         // D (3) must come before B (1) and C (2)
         assert!(
@@ -2322,19 +2333,27 @@ mod tests {
 
         // Verify the dependency edges were recorded in resolved_imports
         assert!(
-            graph.resolved_imports.contains_key(&(0, "iface-b".to_string())),
+            graph
+                .resolved_imports
+                .contains_key(&(0, "iface-b".to_string())),
             "A's import of iface-b should be resolved"
         );
         assert!(
-            graph.resolved_imports.contains_key(&(0, "iface-c".to_string())),
+            graph
+                .resolved_imports
+                .contains_key(&(0, "iface-c".to_string())),
             "A's import of iface-c should be resolved"
         );
         assert!(
-            graph.resolved_imports.contains_key(&(1, "iface-d".to_string())),
+            graph
+                .resolved_imports
+                .contains_key(&(1, "iface-d".to_string())),
             "B's import of iface-d should be resolved"
         );
         assert!(
-            graph.resolved_imports.contains_key(&(2, "iface-d".to_string())),
+            graph
+                .resolved_imports
+                .contains_key(&(2, "iface-d".to_string())),
             "C's import of iface-d should be resolved"
         );
     }
@@ -2368,10 +2387,7 @@ mod tests {
                     "error should name the unresolved import"
                 );
             }
-            other => panic!(
-                "expected Error::UnresolvedImport, got: {:?}",
-                other
-            ),
+            other => panic!("expected Error::UnresolvedImport, got: {:?}", other),
         }
     }
 
@@ -2387,10 +2403,10 @@ mod tests {
         // orders (B and C are interchangeable), so a non-deterministic
         // implementation could vary between runs.
         let components = vec![
-            make_component(&["iface-b", "iface-c"], &[]),       // A = 0
-            make_component(&["iface-d"], &["iface-b"]),          // B = 1
-            make_component(&["iface-d"], &["iface-c"]),          // C = 2
-            make_component(&[], &["iface-d"]),                   // D = 3
+            make_component(&["iface-b", "iface-c"], &[]), // A = 0
+            make_component(&["iface-d"], &["iface-b"]),   // B = 1
+            make_component(&["iface-d"], &["iface-c"]),   // C = 2
+            make_component(&[], &["iface-d"]),            // D = 3
         ];
 
         let resolver = Resolver::new();
@@ -2472,9 +2488,8 @@ mod tests {
     #[test]
     fn test_copy_layout_flat_list() {
         let pc = empty_parsed_component();
-        let ty = ComponentValType::List(Box::new(ComponentValType::Primitive(
-            PrimitiveValType::U32,
-        )));
+        let ty =
+            ComponentValType::List(Box::new(ComponentValType::Primitive(PrimitiveValType::U32)));
         let layout = pc.copy_layout(&ty);
         match layout {
             CopyLayout::Bulk { byte_multiplier } => {
@@ -2498,7 +2513,10 @@ mod tests {
                 element_size,
                 inner_pointers,
             } => {
-                assert_eq!(element_size, 8, "string element is (i32 ptr, i32 len) = 8 bytes");
+                assert_eq!(
+                    element_size, 8,
+                    "string element is (i32 ptr, i32 len) = 8 bytes"
+                );
                 assert_eq!(
                     inner_pointers.len(),
                     1,
@@ -2530,7 +2548,10 @@ mod tests {
         // record { name: string, value: u32 }
         let record_ty = ComponentValType::Record(vec![
             ("name".to_string(), ComponentValType::String),
-            ("value".to_string(), ComponentValType::Primitive(PrimitiveValType::U32)),
+            (
+                "value".to_string(),
+                ComponentValType::Primitive(PrimitiveValType::U32),
+            ),
         ]);
         let ty = ComponentValType::List(Box::new(record_ty));
         let layout = pc.copy_layout(&ty);
@@ -2542,14 +2563,20 @@ mod tests {
                 // Record layout: string at offset 0 (8 bytes: ptr + len, align 4),
                 // then u32 at offset 8 (4 bytes, align 4). Unpadded size = 12.
                 // Alignment = max(4, 4) = 4. Element size = align_up(12, 4) = 12.
-                assert_eq!(element_size, 12, "record{{string, u32}} element should be 12 bytes");
+                assert_eq!(
+                    element_size, 12,
+                    "record{{string, u32}} element should be 12 bytes"
+                );
                 assert_eq!(
                     inner_pointers.len(),
                     1,
                     "one pointer pair from the string field"
                 );
                 let (offset, ref inner_layout) = inner_pointers[0];
-                assert_eq!(offset, 0, "string field starts at byte offset 0 in the record");
+                assert_eq!(
+                    offset, 0,
+                    "string field starts at byte offset 0 in the record"
+                );
                 match inner_layout {
                     CopyLayout::Bulk { byte_multiplier } => {
                         assert_eq!(*byte_multiplier, 1, "string data is byte-granular");
@@ -2571,9 +2598,8 @@ mod tests {
     #[test]
     fn test_copy_layout_nested_list() {
         let pc = empty_parsed_component();
-        let inner_list = ComponentValType::List(Box::new(ComponentValType::Primitive(
-            PrimitiveValType::U8,
-        )));
+        let inner_list =
+            ComponentValType::List(Box::new(ComponentValType::Primitive(PrimitiveValType::U8)));
         let ty = ComponentValType::List(Box::new(inner_list));
         let layout = pc.copy_layout(&ty);
         match layout {
@@ -2581,7 +2607,10 @@ mod tests {
                 element_size,
                 inner_pointers,
             } => {
-                assert_eq!(element_size, 8, "list element is (i32 ptr, i32 len) = 8 bytes");
+                assert_eq!(
+                    element_size, 8,
+                    "list element is (i32 ptr, i32 len) = 8 bytes"
+                );
                 assert_eq!(
                     inner_pointers.len(),
                     1,
@@ -2609,8 +2638,14 @@ mod tests {
     fn test_copy_layout_flat_record() {
         let pc = empty_parsed_component();
         let record_ty = ComponentValType::Record(vec![
-            ("a".to_string(), ComponentValType::Primitive(PrimitiveValType::U32)),
-            ("b".to_string(), ComponentValType::Primitive(PrimitiveValType::U32)),
+            (
+                "a".to_string(),
+                ComponentValType::Primitive(PrimitiveValType::U32),
+            ),
+            (
+                "b".to_string(),
+                ComponentValType::Primitive(PrimitiveValType::U32),
+            ),
         ]);
         let ty = ComponentValType::List(Box::new(record_ty));
         let layout = pc.copy_layout(&ty);

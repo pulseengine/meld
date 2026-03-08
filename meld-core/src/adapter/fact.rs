@@ -391,8 +391,7 @@ impl FactStyleGenerator {
         let has_conditional_pairs = !site.requirements.conditional_pointer_pairs.is_empty();
         let needs_outbound_copy =
             has_param_pointer_pairs && param_count >= 2 && options.callee_realloc.is_some();
-        let needs_conditional_copy =
-            has_conditional_pairs && options.callee_realloc.is_some();
+        let needs_conditional_copy = has_conditional_pairs && options.callee_realloc.is_some();
         let needs_result_copy = options.returns_pointer_pair;
         let has_conditional_result_pairs =
             !site.requirements.conditional_result_flat_pairs.is_empty();
@@ -669,7 +668,9 @@ impl FactStyleGenerator {
         }
 
         // Post-return and/or conditional result copy for non-result-copy case
-        if !needs_result_copy && (needs_conditional_result_copy || options.callee_post_return.is_some()) {
+        if !needs_result_copy
+            && (needs_conditional_result_copy || options.callee_post_return.is_some())
+        {
             if result_count > 0 && needs_result_save {
                 // Save return values to scratch locals (pop in reverse order)
                 for i in (0..result_count).rev() {
@@ -791,8 +792,10 @@ impl FactStyleGenerator {
         let max_fixup_depth = param_fixup_depth.max(result_fixup_depth);
 
         let has_cond_param_pairs = !site.requirements.conditional_pointer_pairs.is_empty();
-        let has_cond_result_pairs = !site.requirements.conditional_result_pointer_pairs.is_empty();
-
+        let has_cond_result_pairs = !site
+            .requirements
+            .conditional_result_pointer_pairs
+            .is_empty();
 
         // Scratch locals layout (all i32, after caller params):
         //   [dest_ptr_0..dest_ptr_N]  (one per param pointer pair)
@@ -824,9 +827,10 @@ impl FactStyleGenerator {
         let mut func = Function::new(local_decls);
 
         // --- Phase 1: Outbound copy of ALL pointer pairs (caller → callee) ---
-        if !param_ptr_positions.is_empty() && options.callee_realloc.is_some() {
-            let callee_realloc = options.callee_realloc.unwrap();
-
+        if let Some(callee_realloc) = options
+            .callee_realloc
+            .filter(|_| !param_ptr_positions.is_empty())
+        {
             let param_layouts = &site.requirements.param_copy_layouts;
             for (pair_idx, &ptr_pos) in param_ptr_positions.iter().enumerate() {
                 let len_pos = ptr_pos + 1;
@@ -885,12 +889,10 @@ impl FactStyleGenerator {
                     );
                 }
             }
-
         }
 
         // --- Phase 1b: Conditional param copy (option/result/variant params) ---
-        if has_cond_param_pairs && options.callee_realloc.is_some() {
-            let callee_realloc = options.callee_realloc.unwrap();
+        if let Some(callee_realloc) = options.callee_realloc.filter(|_| has_cond_param_pairs) {
             for cond in &site.requirements.conditional_pointer_pairs {
                 let disc_local = cond.discriminant_position;
                 let ptr_local = cond.ptr_position;
@@ -961,9 +963,10 @@ impl FactStyleGenerator {
         // For each result pointer pair, copy the pointed-to data and fix up.
         // For scalar values in the return area, copy them as-is.
         let result_layouts = &site.requirements.result_copy_layouts;
-        if !result_ptr_offsets.is_empty() && options.caller_realloc.is_some() {
-            let caller_realloc = options.caller_realloc.unwrap();
-
+        if let Some(caller_realloc) = options
+            .caller_realloc
+            .filter(|_| !result_ptr_offsets.is_empty())
+        {
             // Process each value in the return area
             let mut byte_offset: u32 = 0;
             let mut result_pair_idx: usize = 0;
@@ -1086,8 +1089,8 @@ impl FactStyleGenerator {
             }
         } else {
             // No result pointer pairs — bulk copy the entire return area
-            func.instruction(&Instruction::LocalGet(retptr_local));       // dst
-            func.instruction(&Instruction::LocalGet(result_ptr_local));   // src
+            func.instruction(&Instruction::LocalGet(retptr_local)); // dst
+            func.instruction(&Instruction::LocalGet(result_ptr_local)); // src
             func.instruction(&Instruction::I32Const(return_area_size as i32)); // size
             func.instruction(&Instruction::MemoryCopy {
                 src_mem: options.callee_memory,
@@ -1096,8 +1099,7 @@ impl FactStyleGenerator {
         }
 
         // --- Phase 5b: Conditional result copy (option/result/variant in return area) ---
-        if has_cond_result_pairs && options.caller_realloc.is_some() {
-            let caller_realloc = options.caller_realloc.unwrap();
+        if let Some(caller_realloc) = options.caller_realloc.filter(|_| has_cond_result_pairs) {
             for cond in &site.requirements.conditional_result_pointer_pairs {
                 let disc_offset = cond.discriminant_position;
                 let ptr_offset = cond.ptr_position;

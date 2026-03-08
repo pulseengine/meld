@@ -948,19 +948,10 @@ mod tests {
                 type_index,
                 table_index,
             } => {
-                assert_eq!(
-                    *type_index, 4,
-                    "CallIndirect type_index should remap 0→4"
-                );
-                assert_eq!(
-                    *table_index, 3,
-                    "CallIndirect table_index should remap 0→3"
-                );
+                assert_eq!(*type_index, 4, "CallIndirect type_index should remap 0→4");
+                assert_eq!(*table_index, 3, "CallIndirect table_index should remap 0→3");
             }
-            other => panic!(
-                "Expected CallIndirect, got {:?}",
-                other
-            ),
+            other => panic!("Expected CallIndirect, got {:?}", other),
         }
     }
 
@@ -968,8 +959,7 @@ mod tests {
     fn test_rewrite_global_get_set_remaps() {
         let maps = make_test_maps();
 
-        let get_instrs =
-            rewrite_operator(Operator::GlobalGet { global_index: 0 }, &maps).unwrap();
+        let get_instrs = rewrite_operator(Operator::GlobalGet { global_index: 0 }, &maps).unwrap();
         assert_eq!(get_instrs.len(), 1);
         assert!(
             matches!(get_instrs[0], Instruction::GlobalGet(7)),
@@ -977,8 +967,7 @@ mod tests {
             get_instrs[0]
         );
 
-        let set_instrs =
-            rewrite_operator(Operator::GlobalSet { global_index: 0 }, &maps).unwrap();
+        let set_instrs = rewrite_operator(Operator::GlobalSet { global_index: 0 }, &maps).unwrap();
         assert_eq!(set_instrs.len(), 1);
         assert!(
             matches!(set_instrs[0], Instruction::GlobalSet(7)),
@@ -1057,19 +1046,10 @@ mod tests {
                 src_table,
                 dst_table,
             } => {
-                assert_eq!(
-                    *src_table, 9,
-                    "TableCopy src_table should remap 1→9"
-                );
-                assert_eq!(
-                    *dst_table, 3,
-                    "TableCopy dst_table should remap 0→3"
-                );
+                assert_eq!(*src_table, 9, "TableCopy src_table should remap 1→9");
+                assert_eq!(*dst_table, 3, "TableCopy dst_table should remap 0→3");
             }
-            other => panic!(
-                "Expected TableCopy, got {:?}",
-                other
-            ),
+            other => panic!("Expected TableCopy, got {:?}", other),
         }
     }
 
@@ -1094,19 +1074,10 @@ mod tests {
         assert_eq!(instrs.len(), 1);
         match &instrs[0] {
             Instruction::MemoryCopy { src_mem, dst_mem } => {
-                assert_eq!(
-                    *src_mem, 8,
-                    "MemoryCopy src_mem should remap 1→8"
-                );
-                assert_eq!(
-                    *dst_mem, 2,
-                    "MemoryCopy dst_mem should remap 0→2"
-                );
+                assert_eq!(*src_mem, 8, "MemoryCopy src_mem should remap 1→8");
+                assert_eq!(*dst_mem, 2, "MemoryCopy dst_mem should remap 0→2");
             }
-            other => panic!(
-                "Expected MemoryCopy, got {:?}",
-                other
-            ),
+            other => panic!("Expected MemoryCopy, got {:?}", other),
         }
     }
 
@@ -1158,10 +1129,7 @@ mod tests {
                     ma.memory_index, 2,
                     "I32Store memarg.memory_index should remap 0→2"
                 );
-                assert_eq!(
-                    ma.offset, 4,
-                    "I32Store memarg.offset should be preserved"
-                );
+                assert_eq!(ma.offset, 4, "I32Store memarg.offset should be preserved");
             }
             other => panic!("Expected I32Store, got {:?}", other),
         }
@@ -1171,8 +1139,7 @@ mod tests {
     fn test_rewrite_ref_func_remaps() {
         let maps = make_test_maps();
 
-        let instrs =
-            rewrite_operator(Operator::RefFunc { function_index: 0 }, &maps).unwrap();
+        let instrs = rewrite_operator(Operator::RefFunc { function_index: 0 }, &maps).unwrap();
         assert_eq!(instrs.len(), 1);
         assert!(
             matches!(instrs[0], Instruction::RefFunc(5)),

@@ -1151,8 +1151,7 @@ fn assemble_component(
         core_func_idx += 1;
 
         // Define the function type — use default run type (func() -> void)
-        let wrapper_func_type =
-            define_bare_func_type(&mut component, &mut component_type_idx);
+        let wrapper_func_type = define_bare_func_type(&mut component, &mut component_type_idx);
 
         // Canon lift (bare functions like `run` take no arguments and return nothing)
         let mut canon = CanonicalFunctionSection::new();

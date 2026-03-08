@@ -314,11 +314,9 @@ impl Fuser {
             "Fusion complete: {} components → {} bytes ({}% of input)",
             stats.components_fused,
             stats.output_size,
-            if stats.input_size > 0 {
-                (stats.output_size * 100) / stats.input_size
-            } else {
-                100
-            }
+            (stats.output_size * 100)
+                .checked_div(stats.input_size)
+                .unwrap_or(100)
         );
 
         Ok((output, stats))
@@ -1152,9 +1150,7 @@ mod tests {
         reference_fuser
             .add_component(&component_bytes)
             .expect("failed to add component to reference fuser");
-        let reference_output = reference_fuser
-            .fuse()
-            .expect("reference fuse failed");
+        let reference_output = reference_fuser.fuse().expect("reference fuse failed");
 
         // Repeat with fresh Fuser instances. HashMap seeds are randomised per
         // process but also per HashMap instance, so creating new Fusers (and
