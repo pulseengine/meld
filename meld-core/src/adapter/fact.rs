@@ -1086,21 +1086,13 @@ impl FactStyleGenerator {
             }
         } else {
             // No result pointer pairs — bulk copy the entire return area
-            // (fallback for when we don't have layout info)
-            for offset in (0..return_area_size).step_by(4) {
-                func.instruction(&Instruction::LocalGet(retptr_local));
-                func.instruction(&Instruction::LocalGet(result_ptr_local));
-                func.instruction(&Instruction::I32Load(wasm_encoder::MemArg {
-                    offset: offset as u64,
-                    align: 2,
-                    memory_index: options.callee_memory,
-                }));
-                func.instruction(&Instruction::I32Store(wasm_encoder::MemArg {
-                    offset: offset as u64,
-                    align: 2,
-                    memory_index: options.caller_memory,
-                }));
-            }
+            func.instruction(&Instruction::LocalGet(retptr_local));       // dst
+            func.instruction(&Instruction::LocalGet(result_ptr_local));   // src
+            func.instruction(&Instruction::I32Const(return_area_size as i32)); // size
+            func.instruction(&Instruction::MemoryCopy {
+                src_mem: options.callee_memory,
+                dst_mem: options.caller_memory,
+            });
         }
 
         // --- Phase 5b: Conditional result copy (option/result/variant in return area) ---

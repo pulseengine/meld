@@ -1277,8 +1277,23 @@ impl ParsedComponent {
     }
 
     /// Compute the byte size of the return area for a component function's results.
+    ///
+    /// The return area uses the canonical ABI memory layout (with alignment),
+    /// not the flat (stack) representation. Results are stored as a tuple.
     pub fn return_area_byte_size(&self, results: &[(Option<String>, ComponentValType)]) -> u32 {
-        results.iter().map(|(_, ty)| self.flat_byte_size(ty)).sum()
+        let mut size = 0u32;
+        for (_, ty) in results {
+            let align = self.canonical_abi_align(ty);
+            size = align_up(size, align);
+            size += self.canonical_abi_size_unpadded(ty);
+        }
+        // Align final size to the max alignment of the tuple
+        let max_align = results
+            .iter()
+            .map(|(_, ty)| self.canonical_abi_align(ty))
+            .max()
+            .unwrap_or(1);
+        align_up(size, max_align)
     }
 
     /// Compute flat core param indices where (ptr, len) pairs start.
@@ -1297,7 +1312,10 @@ impl ParsedComponent {
         positions
     }
 
-    /// Compute flat return-area byte offsets where (ptr, len) pairs start.
+    /// Compute return-area byte offsets where (ptr, len) pairs start.
+    ///
+    /// Uses canonical ABI memory layout offsets (with alignment), matching
+    /// how the callee stores results in the return area.
     pub fn pointer_pair_result_offsets(
         &self,
         results: &[(Option<String>, ComponentValType)],
@@ -1305,8 +1323,10 @@ impl ParsedComponent {
         let mut offsets = Vec::new();
         let mut byte_offset = 0u32;
         for (_, ty) in results {
+            let align = self.canonical_abi_align(ty);
+            byte_offset = align_up(byte_offset, align);
             self.collect_pointer_byte_offsets(ty, byte_offset, &mut offsets);
-            byte_offset += self.flat_byte_size(ty);
+            byte_offset += self.canonical_abi_size_unpadded(ty);
         }
         offsets
     }
@@ -1344,6 +1364,7 @@ impl ParsedComponent {
     }
 
     /// Collect byte offsets in the return area where pointer pairs start.
+    /// Uses canonical ABI memory layout offsets (with alignment).
     fn collect_pointer_byte_offsets(&self, ty: &ComponentValType, base: u32, out: &mut Vec<u32>) {
         match ty {
             ComponentValType::String | ComponentValType::List(_) => {
@@ -1352,15 +1373,19 @@ impl ParsedComponent {
             ComponentValType::Record(fields) => {
                 let mut offset = base;
                 for (_, field_ty) in fields {
+                    let align = self.canonical_abi_align(field_ty);
+                    offset = align_up(offset, align);
                     self.collect_pointer_byte_offsets(field_ty, offset, out);
-                    offset += self.flat_byte_size(field_ty);
+                    offset += self.canonical_abi_size_unpadded(field_ty);
                 }
             }
             ComponentValType::Tuple(elems) => {
                 let mut offset = base;
                 for elem_ty in elems {
+                    let align = self.canonical_abi_align(elem_ty);
+                    offset = align_up(offset, align);
                     self.collect_pointer_byte_offsets(elem_ty, offset, out);
-                    offset += self.flat_byte_size(elem_ty);
+                    offset += self.canonical_abi_size_unpadded(elem_ty);
                 }
             }
             ComponentValType::Type(idx) => {
@@ -1404,6 +1429,7 @@ impl ParsedComponent {
     }
 
     /// Collect conditional pointer pairs from results (byte-offset based, for retptr path).
+    /// Uses canonical ABI memory layout offsets.
     pub fn conditional_pointer_pair_result_positions(
         &self,
         results: &[(Option<String>, ComponentValType)],
@@ -1411,8 +1437,10 @@ impl ParsedComponent {
         let mut out = Vec::new();
         let mut byte_offset = 0u32;
         for (_, ty) in results {
+            let align = self.canonical_abi_align(ty);
+            byte_offset = align_up(byte_offset, align);
             self.collect_conditional_result_pointers(ty, byte_offset, &mut out);
-            byte_offset += self.flat_byte_size(ty);
+            byte_offset += self.canonical_abi_size_unpadded(ty);
         }
         out
     }
@@ -1620,15 +1648,19 @@ impl ParsedComponent {
             ComponentValType::Record(fields) => {
                 let mut offset = base;
                 for (_, field_ty) in fields {
+                    let align = self.canonical_abi_align(field_ty);
+                    offset = align_up(offset, align);
                     self.collect_conditional_result_pointers(field_ty, offset, out);
-                    offset += self.flat_byte_size(field_ty);
+                    offset += self.canonical_abi_size_unpadded(field_ty);
                 }
             }
             ComponentValType::Tuple(elems) => {
                 let mut offset = base;
                 for elem_ty in elems {
+                    let align = self.canonical_abi_align(elem_ty);
+                    offset = align_up(offset, align);
                     self.collect_conditional_result_pointers(elem_ty, offset, out);
-                    offset += self.flat_byte_size(elem_ty);
+                    offset += self.canonical_abi_size_unpadded(elem_ty);
                 }
             }
             ComponentValType::Type(idx) => {

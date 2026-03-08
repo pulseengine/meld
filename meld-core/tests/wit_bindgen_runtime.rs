@@ -344,12 +344,7 @@ fn test_runtime_wit_bindgen_variants() {
         return;
     }
     let fused = fuse_fixture("variants", OutputFormat::Component).unwrap();
-    // Known issue: variant types with non-i32 payloads (f64, etc.) have return area
-    // layout mismatches. Conditional copy for pointer-containing variants works.
-    if let Err(e) = run_wasi_component(&fused) {
-        eprintln!("variants: runtime failed (known retptr layout issue): {e}");
-        return;
-    }
+    run_wasi_component(&fused).expect("variants: run() should succeed without trap");
 }
 
 #[test]
@@ -376,10 +371,9 @@ fn test_runtime_wit_bindgen_flavorful() {
         return;
     }
     let fused = fuse_fixture("flavorful", OutputFormat::Component).unwrap();
-    // Known issue: some flavorful functions still fail due to retptr layout mismatches
-    // with variant types. option<string> conditional copy works.
+    // Known issue: some flavorful functions still fail due to complex type
+    // adapter bugs. Track separately from the retptr layout fix.
     if let Err(e) = run_wasi_component(&fused) {
-        eprintln!("flavorful: runtime failed (known retptr layout issue): {e}");
-        return;
+        eprintln!("flavorful: runtime failed (known issue): {e}");
     }
 }
