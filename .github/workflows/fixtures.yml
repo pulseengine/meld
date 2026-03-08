@@ -1,0 +1,96 @@
+name: Update wit-bindgen Fixtures
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Weekly on Monday at 06:00 UTC
+    - cron: '0 6 * * 1'
+
+env:
+  CARGO_TERM_COLOR: always
+  WIT_BINDGEN_VERSION: "0.52.0"
+
+jobs:
+  update-fixtures:
+    name: Generate wit-bindgen fixtures
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-wasip2
+
+      - name: Install wasmtime
+        uses: bytecodealliance/actions/wasmtime/setup@v1
+
+      - name: Install wit-bindgen CLI
+        run: cargo install wit-bindgen-cli@${{ env.WIT_BINDGEN_VERSION }}
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+          key: ${{ runner.os }}-fixtures-${{ env.WIT_BINDGEN_VERSION }}
+          restore-keys: ${{ runner.os }}-fixtures-
+
+      - name: Clone wit-bindgen
+        run: |
+          git clone --depth 1 --branch v${{ env.WIT_BINDGEN_VERSION }} \
+            https://github.com/bytecodealliance/wit-bindgen /tmp/wit-bindgen
+
+      - name: Generate test artifacts
+        working-directory: /tmp/wit-bindgen
+        run: wit-bindgen test --languages rust --artifacts artifacts tests/runtime
+
+      - name: Copy fixtures
+        run: |
+          tests=(numbers strings lists records variants options many-arguments flavorful)
+          for test in "${tests[@]}"; do
+            src="/tmp/wit-bindgen/artifacts/${test}/composed-runner.rs-test.rs.wasm"
+            dst="tests/wit_bindgen/fixtures/${test}.wasm"
+            if [ -f "$src" ]; then
+              cp "$src" "$dst"
+              echo "Copied ${test}.wasm"
+            else
+              echo "::warning::Artifact not found: ${src}"
+            fi
+          done
+
+      - name: Check for changes
+        id: diff
+        run: |
+          # Force-add ignores .gitignore rules so the wasm files show up in diff
+          git add --force tests/wit_bindgen/fixtures/*.wasm
+          if git diff --cached --quiet; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create pull request
+        if: steps.diff.outputs.changed == 'true'
+        uses: peter-evans/create-pull-request@v6
+        with:
+          commit-message: "fix(tests): update wit-bindgen fixtures to v${{ env.WIT_BINDGEN_VERSION }}"
+          branch: ci/update-wit-bindgen-fixtures
+          title: "Update wit-bindgen test fixtures"
+          body: |
+            Automated update of wit-bindgen test fixtures.
+
+            - wit-bindgen version: `v${{ env.WIT_BINDGEN_VERSION }}`
+            - Generated via `wit-bindgen test --languages rust --artifacts`
+
+            Fixtures updated:
+            `numbers`, `strings`, `lists`, `records`, `variants`, `options`, `many-arguments`, `flavorful`
+          add-paths: tests/wit_bindgen/fixtures/*.wasm
+          labels: ci
+          delete-branch: true
