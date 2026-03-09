@@ -16,11 +16,11 @@
 # Reverse traceability: which requirements address each loss
 loss-coverage:
   L-1:
-    hazards: [H-1, H-2, H-3, H-4, H-5, H-8, H-9, H-10]
-    requirements: [SR-1, SR-2, SR-3, SR-4, SR-5, SR-7, SR-8, SR-9, SR-10, SR-11, SR-12, SR-20, SR-21, SR-22, SR-23, SR-26]
+    hazards: [H-1, H-2, H-3, H-4, H-5]
+    requirements: [SR-1, SR-2, SR-3, SR-4, SR-5, SR-7, SR-8, SR-9, SR-10, SR-11, SR-12, SR-20]
   L-2:
-    hazards: [H-2, H-3, H-4, H-9]
-    requirements: [SR-6, SR-9, SR-13, SR-14, SR-15, SR-16, SR-22, SR-24]
+    hazards: [H-2, H-3, H-4]
+    requirements: [SR-6, SR-9, SR-13, SR-14, SR-15, SR-16]
   L-3:
     hazards: [H-6]
     requirements: []
@@ -59,11 +59,9 @@ verification-status:
 
   SR-4:
     implementation-files: [meld-core/src/parser.rs]
-    tests:
-      - tests::test_fuser_rejects_invalid_wasm
-      - tests::test_fuser_rejects_core_module_input
+    tests: []
     proofs: []
-    status: partial
+    status: not-verified
 
   SR-5:
     implementation-files: [meld-core/src/resolver.rs]
@@ -141,15 +139,17 @@ verification-status:
 
   SR-12:
     implementation-files: [meld-core/src/adapter/fact.rs]
-    tests: []
+    tests:
+      - adapter_safety::test_sr12_adapter_generation_for_string_param
     proofs: []
-    status: not-verified
+    status: partial
 
   SR-13:
     implementation-files: [meld-core/src/adapter/fact.rs]
-    tests: []
+    tests:
+      - adapter_safety::test_sr13_cabi_realloc_targets_correct_memory
     proofs: []
-    status: not-verified
+    status: partial
 
   SR-14:
     implementation-files: [meld-core/src/adapter/fact.rs]
@@ -159,15 +159,17 @@ verification-status:
 
   SR-15:
     implementation-files: [meld-core/src/adapter/fact.rs]
-    tests: []
+    tests:
+      - adapter_safety::test_sr15_list_copy_length
     proofs: []
-    status: not-verified
+    status: partial
 
   SR-16:
     implementation-files: [meld-core/src/adapter/fact.rs]
-    tests: []
+    tests:
+      - adapter_safety::test_sr16_inner_pointer_fixup_list_string
     proofs: []
-    status: not-verified
+    status: partial
 
   SR-17:
     implementation-files: [meld-core/src/adapter/fact.rs]
@@ -199,51 +201,6 @@ verification-status:
     proofs: []
     status: partial
 
-  SR-21:
-    implementation-files: [meld-core/src/component_wrap.rs]
-    tests: []
-    proofs: []
-    status: not-verified
-
-  SR-22:
-    implementation-files: [meld-core/src/adapter/fact.rs]
-    tests:
-      - wit_bindgen_runtime::test_runtime_wit_bindgen_options
-      - wit_bindgen_runtime::test_runtime_wit_bindgen_variants
-      - wit_bindgen_runtime::test_runtime_wit_bindgen_flavorful
-    proofs: []
-    status: partial
-
-  SR-23:
-    implementation-files: [meld-core/src/merger.rs]
-    tests: []
-    proofs: []
-    status: not-verified
-
-  SR-24:
-    implementation-files:
-      - meld-core/src/parser.rs
-      - meld-core/src/resolver.rs
-      - meld-core/src/adapter/fact.rs
-    tests:
-      - wit_bindgen_runtime::test_runtime_wit_bindgen_variants
-      - wit_bindgen_runtime::test_runtime_wit_bindgen_flavorful
-    proofs: []
-    status: partial
-
-  SR-25:
-    implementation-files: [meld-core/src/adapter/fact.rs]
-    tests: []
-    proofs: []
-    status: not-verified
-
-  SR-26:
-    implementation-files: [meld-core/src/parser.rs]
-    tests:
-      - wit_bindgen_runtime::test_runtime_wit_bindgen_flavorful
-    proofs: []
-    status: partial
-
 # Identified gaps
 gaps:
   - id: GAP-1
@@ -268,42 +225,12 @@ gaps:
 
   - id: GAP-3
     description: >
-      SR-6 has unit tests for CopyLayout. SR-12, SR-13, SR-15, SR-16 still
-      lack direct tests or proofs. SR-22 and SR-24 now have runtime coverage
-      via wit-bindgen fixtures (options, variants, flavorful). SR-12/13/15/16
-      require additional targeted runtime tests.
-    priority: high
-    action: >
-      Add targeted runtime tests for adapter generation (SR-12), cabi_realloc
-      targeting (SR-13), list copy length (SR-15), and inner pointer fixup
-      (SR-16). Issue #11 (Rocq proofs for CopyLayout) remains open.
-
-  - id: GAP-4
-    description: >
-      SR-21 (P2 component wrapping) and SR-23 (import dedup type safety)
-      have no tests or proofs. These require the multi-memory WASI import
-      lowering fix (plan: Fix Multi-Memory WASI Import Lowering) before
-      they can be verified.
-    priority: high
-    action: >
-      Implement multi-memory WASI import lowering fix, then add runtime
-      tests for P2 wrapping in multi-memory mode.
-
-  - id: GAP-5
-    description: >
-      SR-25 (resource handle pass-through) has no tests. Resource-using
-      components are not yet covered by wit-bindgen fixtures.
+      SR-6 has CopyLayout unit tests. SR-12, SR-13, SR-15, SR-16 now have
+      runtime integration tests in adapter_safety.rs exercising adapter
+      generation, cabi_realloc targeting, list copy length, and inner
+      pointer fixup. These requirements still lack Rocq proofs.
     priority: medium
     action: >
-      Add wit-bindgen fixture with resource types; verify handle
-      pass-through in runtime test.
-
-  - id: GAP-6
-    description: >
-      CTRL-WRAPPER controller added to STPA but component_wrap.rs is not
-      yet covered by formal proofs. Given the complexity of P2 component
-      assembly, this is a significant verification gap.
-    priority: medium
-    action: >
-      Consider adding Rocq proofs for component wrapper correctness,
-      particularly for canon lower memory/realloc index selection.
+      Add Rocq proofs for adapter correctness (issue #11). Consider
+      expanding runtime tests with wit-bindgen fixtures for broader
+      coverage of edge cases.
