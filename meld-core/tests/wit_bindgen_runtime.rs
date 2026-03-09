@@ -206,6 +206,17 @@ fn test_fuse_wit_bindgen_flavorful() {
         .expect("flavorful: fused core module should validate");
 }
 
+#[test]
+fn test_fuse_wit_bindgen_resources() {
+    if !fixture_exists("resources") {
+        return;
+    }
+    let fused = fuse_fixture("resources", OutputFormat::CoreModule).unwrap();
+    wasmparser::Validator::new()
+        .validate_all(&fused)
+        .expect("resources: fused core module should validate");
+}
+
 // ---------------------------------------------------------------------------
 // Fusion as Component tests
 // ---------------------------------------------------------------------------
@@ -298,6 +309,17 @@ fn test_fuse_component_wit_bindgen_flavorful() {
         .expect("flavorful: fused component should validate");
 }
 
+#[test]
+fn test_fuse_component_wit_bindgen_resources() {
+    if !fixture_exists("resources") {
+        return;
+    }
+    let fused = fuse_fixture("resources", OutputFormat::Component).unwrap();
+    wasmparser::Validator::new()
+        .validate_all(&fused)
+        .expect("resources: fused component should validate");
+}
+
 // ---------------------------------------------------------------------------
 // Runtime execution tests (fuse as Component, run through wasmtime + WASI)
 // ---------------------------------------------------------------------------
@@ -372,4 +394,13 @@ fn test_runtime_wit_bindgen_flavorful() {
     }
     let fused = fuse_fixture("flavorful", OutputFormat::Component).unwrap();
     run_wasi_component(&fused).expect("flavorful: run() should succeed without trap");
+}
+
+#[test]
+fn test_runtime_wit_bindgen_resources() {
+    if !fixture_exists("resources") {
+        return;
+    }
+    let fused = fuse_fixture("resources", OutputFormat::Component).unwrap();
+    run_wasi_component(&fused).expect("resources: run() should succeed without trap");
 }
