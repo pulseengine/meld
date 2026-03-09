@@ -99,6 +99,24 @@ pub enum CopyLayout {
     },
 }
 
+/// Describes a single scalar slot in the return area's canonical ABI layout.
+///
+/// The return area lays out values according to the canonical ABI memory format
+/// (with alignment and padding), not the flat (stack) format. Each scalar slot
+/// has a byte offset, byte size, and the wasm value type needed for correct
+/// load/store instructions (e.g., `i64.load`/`i64.store` for 8-byte values).
+#[derive(Debug, Clone)]
+pub struct ReturnAreaSlot {
+    /// Byte offset within the return area
+    pub byte_offset: u32,
+    /// Byte size of this slot (1, 2, 4, or 8)
+    pub byte_size: u32,
+    /// Whether this is a pointer pair (ptr, len) that needs cross-memory copy.
+    /// If true, the adapter handles this via the pointer-pair copy path.
+    /// If false, the adapter copies this as a scalar value.
+    pub is_pointer_pair: bool,
+}
+
 /// A pointer pair that is conditional on a discriminant value.
 /// Used for option<string>, result<string, E>, variant types where
 /// the pointer data only exists when the discriminant matches.
@@ -112,6 +130,11 @@ pub struct ConditionalPointerPair {
     pub ptr_position: u32,
     /// Copy layout for the pointed-to data
     pub copy_layout: CopyLayout,
+    /// Byte size of the discriminant in memory (1, 2, or 4).
+    /// Used by the adapter to select the correct load instruction
+    /// (I32Load8U, I32Load16U, I32Load) for byte-offset-based paths.
+    /// For flat (stack) paths, this is always 4 (i32).
+    pub discriminant_byte_size: u32,
 }
 
 /// Requirements for an adapter function
@@ -158,6 +181,11 @@ pub struct AdapterRequirements {
     /// Conditional pointer pairs for flat return values (non-retptr path).
     /// Each entry uses flat indices (like param conditional pairs).
     pub conditional_result_flat_pairs: Vec<ConditionalPointerPair>,
+    /// Layout of scalar (non-pointer-pair) slots in the return area.
+    /// Each entry describes a contiguous value at a specific byte offset with its size.
+    /// Used by the adapter to emit correctly-sized load/store instructions (e.g.,
+    /// `i64.load`/`i64.store` for 8-byte values like f64/i64).
+    pub return_area_slots: Vec<ReturnAreaSlot>,
 }
 
 /// Resolution of module-level imports within a component
@@ -1515,16 +1543,8 @@ impl Resolver {
                                                     .conditional_pointer_pair_result_flat_positions(
                                                         results,
                                                     );
-                                            log::debug!(
-                                                "layout {:?}: ptr_positions={:?}, result_offsets={:?}, \
-                                                 cond_pairs={}, cond_result_pairs={}, cond_result_flat={}",
-                                                func_name,
-                                                requirements.pointer_pair_positions,
-                                                requirements.result_pointer_pair_offsets,
-                                                requirements.conditional_pointer_pairs.len(),
-                                                requirements.conditional_result_pointer_pairs.len(),
-                                                requirements.conditional_result_flat_pairs.len(),
-                                            );
+                                            requirements.return_area_slots =
+                                                to_component.return_area_slots(results);
                                         }
                                     }
 
