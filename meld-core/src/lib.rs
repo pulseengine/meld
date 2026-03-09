@@ -303,6 +303,8 @@ impl Fuser {
                 &self.components,
                 &self.original_components,
                 &graph,
+                &merged,
+                self.config.memory_strategy,
             )?
         } else {
             output
