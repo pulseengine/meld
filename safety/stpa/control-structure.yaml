@@ -192,6 +192,37 @@ controllers:
       - Inner pointer offsets are correctly computed with alignment
       - cabi_realloc function index is correct for the callee component
 
+  - id: CTRL-WRAPPER
+    name: Component Wrapper
+    type: automated
+    description: >
+      Wraps a fused core module as a P2 component. Builds a stubs module
+      with memories and indirect table, converts fused module memories to
+      imports, assembles the component with canonical lower/lift operations,
+      and resolves import names to component-level instances.
+    source-file: meld-core/src/component_wrap.rs
+    control-actions:
+      - ca: CA-WRAP-1
+        target: PROC-ENCODE
+        action: Build stubs module with memories and indirect function table
+      - ca: CA-WRAP-2
+        target: PROC-ENCODE
+        action: Convert fused module memories to imports from stubs
+      - ca: CA-WRAP-3
+        target: PROC-ENCODE
+        action: Assemble P2 component with canon lower/lift operations
+      - ca: CA-WRAP-4
+        target: PROC-ENCODE
+        action: Resolve suffixed import names to component instances
+    feedback:
+      - from: PROC-ENCODE
+        info: Assembled component bytes, validation result
+    process-model:
+      - Stubs module types match fused module import types
+      - Memory indices in canon lower match importing component's memory
+      - cabi_realloc indices in canon lower match importing component's allocator
+      - All import names resolve to valid component instances
+
 controlled-processes:
   - id: PROC-COMPONENT
     name: Component Binary Data

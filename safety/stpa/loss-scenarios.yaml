@@ -283,3 +283,88 @@ loss-scenarios:
       - Use of HashMap instead of BTreeMap or IndexMap for order-sensitive
         data
       - No byte-level reproducibility test
+
+  # ==========================================================================
+  # Additional adapter scenarios (discovered during gap analysis)
+  # ==========================================================================
+
+  - id: LS-A-5
+    title: Conditional pointer not checked for option/result/variant
+    uca: UCA-A-12
+    type: inadequate-control-algorithm
+    scenario: >
+      A cross-component call passes option<string> with value None. The
+      adapter does not check the discriminant (0 = None, 1 = Some). It
+      unconditionally copies 8 bytes as a (ptr, len) pair from after the
+      discriminant. These bytes are uninitialized or belong to other data.
+      The callee interprets them as a valid string pointer and traps or
+      reads garbage [H-9]. Conversely, when the value is Some(string),
+      an adapter that always skips the copy leaves the callee with a
+      null pointer [H-4].
+    causal-factors:
+      - Adapter generator does not receive conditional_pointer_pairs from
+        resolver
+      - No if/end block emitted around pointer copy instructions
+      - Missing test case for option<string> with None value
+
+  - id: LS-A-6
+    title: Retptr layout incorrect for variant return types
+    uca: UCA-A-13
+    type: inadequate-control-algorithm
+    scenario: >
+      A cross-component call returns result<string, error-code> via retptr
+      convention. The return area has slots: [discriminant: 1 byte at
+      offset 0] [payload: 8 bytes at offset 4 due to alignment]. The
+      adapter copies the return area as a flat sequence of i32 values
+      (4 bytes each), missing the alignment gap between discriminant and
+      payload. The callee reads the payload at the wrong offset [H-4.5],
+      interpreting garbage as a string pointer.
+    causal-factors:
+      - Adapter uses flat_byte_size / 4 as number of i32 slots instead
+        of computing per-slot layout from canonical ABI alignment rules
+      - Return area slot offsets not communicated from resolver to adapter
+      - Missing test case for variant retptr with alignment padding
+
+  # ==========================================================================
+  # Merger scenario (discovered during gap analysis)
+  # ==========================================================================
+
+  - id: LS-M-4
+    title: Import dedup conflates type-incompatible imports
+    uca: UCA-M-9
+    type: inadequate-control-algorithm
+    scenario: >
+      Component A imports wasi:cli/environment.get-environment with type
+      () -> list<(string, string)>. Component B imports the same function
+      but with a different type index in the merged module. The merger
+      deduplicates them into a single import using component A's type.
+      Component B's call uses the wrong type, causing a type mismatch
+      trap or silent argument corruption [H-10].
+    causal-factors:
+      - Dedup key is (module, field) without considering type signature
+      - In multi-memory mode, same function may need different per-component
+        canon lower with different memory/realloc
+
+  # ==========================================================================
+  # Wrapper scenario (discovered during gap analysis)
+  # ==========================================================================
+
+  - id: LS-W-1
+    title: Wrapper hardcodes Memory(0) for all WASI import lowering
+    uca: UCA-W-2
+    type: inadequate-process-model
+    scenario: >
+      A fused module has two memories (memory 0 for component A, memory 1
+      for component B). The wrapper lowers all WASI imports with
+      CanonicalOption::Memory(0). Component B calls get-environment which
+      writes results to memory 0. Component B's code then reads the retptr
+      from memory 1, where no data was written. The pointer is out of
+      bounds or points to uninitialized data, causing a trap [H-8, H-2].
+    causal-factors:
+      - component_wrap.rs hardcodes CanonicalOption::Memory(0) at line 899
+      - No per-import metadata (memory index, realloc index) passed from
+        merger to wrapper
+      - Single-memory assumption baked into stubs module construction
+    process-model-flaw: >
+      Wrapper assumes all imports use memory 0 because the original
+      single-component wrapping only had one memory.

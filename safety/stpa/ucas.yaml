@@ -106,6 +106,31 @@ parser-ucas:
         Missing code bodies or data segments means the fused module lacks
         function implementations or initialized memory.
 
+    - id: UCA-P-9
+      description: >
+        Parser does not track component type index space entries from imports,
+        aliases, and exports (only tracks ComponentTypeSection entries)
+      context: >
+        Component defines types via imports, instance export aliases, and
+        component exports in addition to the type section
+      hazards: [H-1, H-3, H-4]
+      rationale: >
+        Type index mapping is off by the number of non-section type entries.
+        All subsequent type lookups reference wrong types, causing incorrect
+        adapter generation.
+
+    - id: UCA-P-10
+      description: >
+        Parser does not handle Enum, Primitive, and Flags component defined
+        types in convert_wp_defined_type
+      context: >
+        Component uses enum, primitive, or flags types in function signatures
+      hazards: [H-1, H-4]
+      rationale: >
+        Unrecognized types mapped to Other, causing flat_count and
+        pointer_pair_positions to return wrong values. Adapter generates
+        incorrect copy code.
+
 # ============================================================================
 # Resolver UCAs
 # ============================================================================
@@ -137,6 +162,29 @@ resolver-ucas:
       rationale: >
         Without CopyLayout, the adapter generator cannot determine whether
         bulk copy or element-wise copy with pointer fixup is needed.
+
+    - id: UCA-R-8
+      description: >
+        Resolver does not produce conditional_pointer_pairs for option/result
+        types containing pointer fields
+      context: >
+        Cross-component function signature includes option<string> or
+        result<string, error-code>
+      hazards: [H-9]
+      rationale: >
+        Without conditional pointer pair info, the adapter cannot emit
+        discriminant checks before pointer copy.
+
+    - id: UCA-R-9
+      description: >
+        Resolver does not compute return_area_slots for retptr return types
+        with variant payloads
+      context: >
+        Cross-component function returns a variant type via retptr convention
+      hazards: [H-4, H-4.5]
+      rationale: >
+        Without per-slot size info, the adapter uses uniform 4-byte copy
+        which is incorrect for 8-byte (f64/i64) or sub-word slots.
 
   providing:
     - id: UCA-R-3
@@ -227,6 +275,18 @@ merger-ucas:
         Unrewritten memory instruction accesses the wrong component's
         memory, violating isolation.
 
+    - id: UCA-M-10
+      description: >
+        Merger does not export per-component cabi_realloc in multi-memory
+        mode
+      context: >
+        Multi-memory mode with two or more components, each with own
+        cabi_realloc
+      hazards: [H-8, H-4.3]
+      rationale: >
+        P2 wrapper cannot find the correct cabi_realloc for each
+        component's imports. All canon lower operations use wrong allocator.
+
   providing:
     - id: UCA-M-3
       description: >
@@ -271,6 +331,18 @@ merger-ucas:
       rationale: >
         Unrewritten global reference reads from the wrong global, placing
         data at the wrong memory offset.
+
+    - id: UCA-M-9
+      description: >
+        Merger deduplicates function imports with same module:field name
+        but different type signatures
+      context: >
+        Two components import the same WASI function but with different
+        type indices after merge
+      hazards: [H-10, H-1]
+      rationale: >
+        One component's call uses the wrong type signature, causing
+        type mismatch trap or silent argument misinterpretation.
 
   too-early-too-late:
     - id: UCA-M-7
@@ -411,6 +483,29 @@ adapter-ucas:
         Return value adapter reads result pointer from wrong memory,
         returning garbage to the caller.
 
+    - id: UCA-A-12
+      description: >
+        Adapter does not check discriminant before copying pointer data
+        for option/result/variant types
+      context: >
+        Cross-component call passes option<string> where the value is None
+      hazards: [H-9, H-4]
+      rationale: >
+        Adapter copies garbage bytes as if they were a valid (ptr, len) pair.
+        Callee dereferences invalid pointer, causing trap or corruption.
+
+    - id: UCA-A-13
+      description: >
+        Adapter copies retptr return values using incorrect byte offsets
+        or sizes for variant types with alignment padding
+      context: >
+        Cross-component call returns a variant with f64/i64 payload via retptr
+      hazards: [H-4, H-4.5]
+      rationale: >
+        Flat byte size differs from canonical ABI memory layout due to
+        alignment padding. Adapter copies wrong number of bytes or at
+        wrong offsets, corrupting the return value.
+
   too-early-too-late:
     - id: UCA-A-10
       description: >
@@ -433,3 +528,49 @@ adapter-ucas:
       rationale: >
         Later elements retain stale source-memory pointers. Callee
         dereferences them and reads wrong data.
+
+
+# ============================================================================
+# Wrapper UCAs
+# ============================================================================
+wrapper-ucas:
+  control-action: "Wrap fused core module as P2 component"
+  controller: CTRL-WRAPPER
+
+  not-providing:
+    - id: UCA-W-1
+      description: >
+        Wrapper does not convert all memories to imports from stubs module
+        in multi-memory mode
+      context: >
+        Fused module has N memories (one per component), N > 1
+      hazards: [H-8, H-2]
+      rationale: >
+        Non-imported memories are not accessible to the stubs module.
+        Canon lower cannot reference the correct memory for each component.
+
+  providing:
+    - id: UCA-W-2
+      description: >
+        Wrapper uses Memory(0) for all canon lower operations regardless
+        of which component's import is being lowered
+      context: >
+        Multi-memory mode, component 1's WASI import needs Memory(1)
+      hazards: [H-8, H-2]
+      rationale: >
+        Lowered function writes retptr to memory 0 but component 1's code
+        reads from memory 1. Pointer is out of bounds in the wrong memory.
+
+    - id: UCA-W-3
+      description: >
+        Wrapper stubs module function types do not match fused module
+        import types
+      context: >
+        Fused module imports have been modified by adapter generation
+      hazards: [H-8, H-1]
+      rationale: >
+        Type mismatch between stubs exports and fused imports causes
+        validation failure or call_indirect trap.
+
+  too-early-too-late: []
+  stopped-too-soon: []

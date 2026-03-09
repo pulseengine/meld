@@ -91,3 +91,32 @@ system-constraints:
       Unresolved imports must be reported as errors. Meld must not silently
       drop imports or substitute default implementations.
     hazards: [H-1, H-5]
+
+  - id: SC-10
+    title: P2 component wrapping must produce a valid component
+    description: >
+      When wrapping a fused core module as a P2 component, the wrapper must
+      produce a component that passes wasm-tools validate. All canonical
+      lowerings must reference the correct memory and cabi_realloc for
+      the importing component. All type references in the assembled
+      component must be consistent.
+    hazards: [H-8]
+
+  - id: SC-11
+    title: Conditional pointer copy must check discriminant before copying pointer data
+    description: >
+      For option, result, and variant types in cross-component calls, the
+      adapter must check the discriminant value before deciding whether to
+      copy pointer data. Pointer copy must only occur when the discriminant
+      indicates a variant case that contains pointer fields.
+    hazards: [H-9]
+
+  - id: SC-12
+    title: Import deduplication must not conflate type-incompatible imports
+    description: >
+      When deduplicating function imports during merge, imports with the
+      same module:field name but different type signatures must not be
+      merged into a single import slot. In multi-memory mode, imports
+      from different components must be kept separate even if they share
+      the same name.
+    hazards: [H-10]
