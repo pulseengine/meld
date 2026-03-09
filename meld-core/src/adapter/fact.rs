@@ -303,18 +303,6 @@ impl FactStyleGenerator {
             && callee_result_count == 1
             && callee_result_types.first() == Some(&wasm_encoder::ValType::I32);
 
-        log::debug!(
-            "adapter {:?}: caller_type={} ({}p/{}r), callee_type={} ({}p/{}r), retptr={}",
-            site.import_name,
-            caller_type_idx,
-            caller_param_count,
-            caller_result_count,
-            callee_type_idx,
-            callee_param_count,
-            callee_result_count,
-            uses_retptr,
-        );
-
         if uses_retptr {
             return self.generate_retptr_adapter(
                 site,
@@ -961,20 +949,23 @@ impl FactStyleGenerator {
 
         // --- Phase 3+4+5: Process return area and write to retptr ---
         // For each result pointer pair, copy the pointed-to data and fix up.
-        // For scalar values in the return area, copy them as-is.
+        // For scalar values in the return area, copy them using correctly-sized
+        // load/store instructions based on the canonical ABI memory layout.
         let result_layouts = &site.requirements.result_copy_layouts;
+        let return_area_slots = &site.requirements.return_area_slots;
         if let Some(caller_realloc) = options
             .caller_realloc
             .filter(|_| !result_ptr_offsets.is_empty())
         {
-            // Process each value in the return area
-            let mut byte_offset: u32 = 0;
+            // Walk return area slots from the canonical ABI layout.
+            // Pointer-pair slots trigger cross-memory data copy + fixup.
+            // Scalar slots are copied with correctly-sized load/store.
             let mut result_pair_idx: usize = 0;
-            while byte_offset < return_area_size {
-                if result_ptr_offsets.contains(&byte_offset) {
+            for slot in return_area_slots {
+                if slot.is_pointer_pair {
                     // This is a pointer pair [data_ptr, data_len] — need to copy data
-                    let ptr_offset = byte_offset;
-                    let len_offset = byte_offset + 4;
+                    let ptr_offset = slot.byte_offset;
+                    let len_offset = slot.byte_offset + 4;
                     let byte_mult = result_layouts
                         .get(result_pair_idx)
                         .map(|cl| match cl {
@@ -1067,24 +1058,63 @@ impl FactStyleGenerator {
                         memory_index: options.caller_memory,
                     }));
 
-                    byte_offset += 8; // skip both ptr and len
                     result_pair_idx += 1;
                 } else {
-                    // Scalar value — copy directly from return area to retptr
+                    // Scalar value — copy with correctly-sized load/store
+                    let byte_offset = slot.byte_offset;
                     func.instruction(&Instruction::LocalGet(retptr_local));
                     func.instruction(&Instruction::LocalGet(result_ptr_local));
-                    func.instruction(&Instruction::I32Load(wasm_encoder::MemArg {
-                        offset: byte_offset as u64,
-                        align: 2,
-                        memory_index: options.callee_memory,
-                    }));
-                    func.instruction(&Instruction::I32Store(wasm_encoder::MemArg {
-                        offset: byte_offset as u64,
-                        align: 2,
-                        memory_index: options.caller_memory,
-                    }));
-
-                    byte_offset += 4;
+                    match slot.byte_size {
+                        8 => {
+                            func.instruction(&Instruction::I64Load(wasm_encoder::MemArg {
+                                offset: byte_offset as u64,
+                                align: 3, // 2^3 = 8
+                                memory_index: options.callee_memory,
+                            }));
+                            func.instruction(&Instruction::I64Store(wasm_encoder::MemArg {
+                                offset: byte_offset as u64,
+                                align: 3,
+                                memory_index: options.caller_memory,
+                            }));
+                        }
+                        2 => {
+                            func.instruction(&Instruction::I32Load16U(wasm_encoder::MemArg {
+                                offset: byte_offset as u64,
+                                align: 1, // 2^1 = 2
+                                memory_index: options.callee_memory,
+                            }));
+                            func.instruction(&Instruction::I32Store16(wasm_encoder::MemArg {
+                                offset: byte_offset as u64,
+                                align: 1,
+                                memory_index: options.caller_memory,
+                            }));
+                        }
+                        1 => {
+                            func.instruction(&Instruction::I32Load8U(wasm_encoder::MemArg {
+                                offset: byte_offset as u64,
+                                align: 0, // 2^0 = 1
+                                memory_index: options.callee_memory,
+                            }));
+                            func.instruction(&Instruction::I32Store8(wasm_encoder::MemArg {
+                                offset: byte_offset as u64,
+                                align: 0,
+                                memory_index: options.caller_memory,
+                            }));
+                        }
+                        _ => {
+                            // 4 bytes (i32/f32) or fallback
+                            func.instruction(&Instruction::I32Load(wasm_encoder::MemArg {
+                                offset: byte_offset as u64,
+                                align: 2, // 2^2 = 4
+                                memory_index: options.callee_memory,
+                            }));
+                            func.instruction(&Instruction::I32Store(wasm_encoder::MemArg {
+                                offset: byte_offset as u64,
+                                align: 2,
+                                memory_index: options.caller_memory,
+                            }));
+                        }
+                    }
                 }
             }
         } else {
@@ -1109,13 +1139,25 @@ impl FactStyleGenerator {
                     crate::resolver::CopyLayout::Elements { element_size, .. } => *element_size,
                 };
 
-                // Load discriminant from callee's return area
+                // Load discriminant from callee's return area using correct byte width
                 func.instruction(&Instruction::LocalGet(result_ptr_local));
-                func.instruction(&Instruction::I32Load(wasm_encoder::MemArg {
-                    offset: disc_offset as u64,
-                    align: 2,
-                    memory_index: options.callee_memory,
-                }));
+                match cond.discriminant_byte_size {
+                    1 => func.instruction(&Instruction::I32Load8U(wasm_encoder::MemArg {
+                        offset: disc_offset as u64,
+                        align: 0,
+                        memory_index: options.callee_memory,
+                    })),
+                    2 => func.instruction(&Instruction::I32Load16U(wasm_encoder::MemArg {
+                        offset: disc_offset as u64,
+                        align: 1,
+                        memory_index: options.callee_memory,
+                    })),
+                    _ => func.instruction(&Instruction::I32Load(wasm_encoder::MemArg {
+                        offset: disc_offset as u64,
+                        align: 2,
+                        memory_index: options.callee_memory,
+                    })),
+                };
                 func.instruction(&Instruction::I32Const(cond.discriminant_value as i32));
                 func.instruction(&Instruction::I32Eq);
                 func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
@@ -2311,12 +2353,6 @@ impl AdapterGenerator for FactStyleGenerator {
         let mut adapters = Vec::new();
 
         for (idx, site) in graph.adapter_sites.iter().enumerate() {
-            log::debug!(
-                "Generating adapter for {} -> {}",
-                site.import_name,
-                site.export_name
-            );
-
             let adapter = self.generate_adapter(site, merged, idx)?;
             adapters.push(adapter);
         }

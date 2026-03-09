@@ -371,9 +371,5 @@ fn test_runtime_wit_bindgen_flavorful() {
         return;
     }
     let fused = fuse_fixture("flavorful", OutputFormat::Component).unwrap();
-    // Known issue: some flavorful functions still fail due to complex type
-    // adapter bugs. Track separately from the retptr layout fix.
-    if let Err(e) = run_wasi_component(&fused) {
-        eprintln!("flavorful: runtime failed (known issue): {e}");
-    }
+    run_wasi_component(&fused).expect("flavorful: run() should succeed without trap");
 }

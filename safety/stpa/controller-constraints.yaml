@@ -282,3 +282,95 @@ controller-constraints:
       the list (loop counter must equal element count)
     ucas: [UCA-A-11]
     hazards: [H-4, H-4.2]
+
+  - id: CC-A-12
+    controller: CTRL-ADAPTER
+    constraint: >
+      Adapter must check discriminant value before copying pointer data
+      for option, result, and variant types
+    ucas: [UCA-A-12]
+    hazards: [H-9, H-4]
+
+  - id: CC-A-13
+    controller: CTRL-ADAPTER
+    constraint: >
+      Adapter must use correct per-slot byte sizes and offsets when copying
+      retptr return values for variant types with alignment padding
+    ucas: [UCA-A-13]
+    hazards: [H-4, H-4.5]
+
+  # Parser constraints (additional)
+  - id: CC-P-9
+    controller: CTRL-PARSER
+    constraint: >
+      Parser must track all component type index space entries including
+      those from imports, aliases, and exports, not only type section entries
+    ucas: [UCA-P-9]
+    hazards: [H-1, H-3, H-4]
+
+  - id: CC-P-10
+    controller: CTRL-PARSER
+    constraint: >
+      Parser must handle Enum, Primitive, and Flags component defined types
+      in type conversion, not map them to Other
+    ucas: [UCA-P-10]
+    hazards: [H-1, H-4]
+
+  # Resolver constraints (additional)
+  - id: CC-R-8
+    controller: CTRL-RESOLVER
+    constraint: >
+      Resolver must produce conditional_pointer_pairs for all option, result,
+      and variant types that may contain pointer fields
+    ucas: [UCA-R-8]
+    hazards: [H-9]
+
+  - id: CC-R-9
+    controller: CTRL-RESOLVER
+    constraint: >
+      Resolver must compute return_area_slots with correct byte offsets and
+      sizes for retptr return types including variant payloads
+    ucas: [UCA-R-9]
+    hazards: [H-4, H-4.5]
+
+  # Merger constraints (additional)
+  - id: CC-M-9
+    controller: CTRL-MERGER
+    constraint: >
+      Merger must not deduplicate function imports with same module:field
+      name but different type signatures
+    ucas: [UCA-M-9]
+    hazards: [H-10, H-1]
+
+  - id: CC-M-10
+    controller: CTRL-MERGER
+    constraint: >
+      Merger must export per-component cabi_realloc functions in multi-memory
+      mode so the P2 wrapper can reference the correct allocator per import
+    ucas: [UCA-M-10]
+    hazards: [H-8, H-4.3]
+
+  # Wrapper constraints
+  - id: CC-W-1
+    controller: CTRL-WRAPPER
+    constraint: >
+      Wrapper must convert all memories to imports from stubs module in
+      multi-memory mode, not just the first memory
+    ucas: [UCA-W-1]
+    hazards: [H-8, H-2]
+
+  - id: CC-W-2
+    controller: CTRL-WRAPPER
+    constraint: >
+      Wrapper must use the correct Memory(N) in canon lower for each import,
+      matching the importing component's memory index
+    ucas: [UCA-W-2]
+    hazards: [H-8, H-2]
+
+  - id: CC-W-3
+    controller: CTRL-WRAPPER
+    constraint: >
+      Wrapper stubs module function types must exactly match the fused
+      module's import types
+    ucas: [UCA-W-3]
+    hazards: [H-8, H-1]

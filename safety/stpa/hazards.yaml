@@ -140,3 +140,57 @@ sub-hazards:
     description: >
       The adapter's string transcoding logic miscounts code units, does not
       handle surrogate pairs correctly, or produces invalid UTF-8 sequences.
+
+  - id: H-4.5
+    parent: H-4
+    title: Retptr layout incorrect for variant payloads with alignment padding
+    description: >
+      The adapter copies return values via retptr using incorrect byte offsets
+      or sizes for variant types whose payload contains f64/i64 or other types
+      requiring alignment padding. The flat_byte_size used for copy does not
+      match the canonical ABI memory layout (which includes alignment padding
+      between discriminant and payload).
+
+  # Refinements of H-3 (additional)
+  - id: H-3.5
+    parent: H-3
+    title: Start function index not remapped after merge
+    description: >
+      If a component defines a start function, its function index is not
+      remapped to the merged index space. The fused module's start section
+      references a wrong function or an out-of-bounds index.
+
+  # ============================================================================
+  # Additional system-level hazards (discovered during gap analysis)
+  # ============================================================================
+  - id: H-8
+    title: Component wrapping produces invalid P2 component
+    description: >
+      When OutputFormat::Component is selected, the P2 wrapper produces a
+      component that fails validation or has incorrect canonical lowering/
+      lifting. This includes wrong memory indices in canon lower, missing
+      or incorrect cabi_realloc references, type mismatches between the
+      stubs module and the fused module, or incorrect import resolution
+      in the assembled component.
+    losses: [L-1]
+
+  - id: H-9
+    title: Conditional pointer copy corrupts data for variant/option/result types
+    description: >
+      The adapter performs or omits pointer data copy for option, result,
+      or variant types without checking the discriminant value. When the
+      discriminant indicates "none" or an error case with no pointer payload,
+      the adapter copies garbage bytes as if they were valid pointer data.
+      When the discriminant indicates a pointer-containing payload, the
+      adapter skips the copy.
+    losses: [L-1, L-2]
+
+  - id: H-10
+    title: Import deduplication conflates type-incompatible imports
+    description: >
+      During merge, function imports from different components with the same
+      module:field name but different type signatures are deduplicated into
+      a single import. The merged module uses one type signature for both,
+      causing a type mismatch trap or silent misinterpretation of arguments
+      at the call site of one component.
+    losses: [L-1]

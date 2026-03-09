@@ -408,3 +408,121 @@ requirements:
           invalid indices
     status: draft
     implementation: meld-core/src/error.rs
+
+  # ==========================================================================
+  # Requirements from gap analysis (SR-21 through SR-26)
+  # ==========================================================================
+
+  - id: SR-21
+    title: Valid P2 component wrapping
+    description: >
+      When OutputFormat::Component is selected, the wrapper shall produce
+      a P2 component that passes wasm-tools validate. In multi-memory mode,
+      each canon lower shall reference the correct memory index and
+      cabi_realloc for the importing component. The stubs module shall
+      define all memories needed by the fused module.
+    derives-from:
+      constraints: [CC-W-1, CC-W-2, CC-W-3]
+      scenarios: [LS-W-1]
+    verification:
+      - method: test
+        description: >
+          Fuse multi-component fixture with OutputFormat::Component,
+          validate with wasm-tools, run through wasmtime
+    status: draft
+    implementation: meld-core/src/component_wrap.rs
+
+  - id: SR-22
+    title: Conditional pointer copy for option/result/variant types
+    description: >
+      The adapter shall check the discriminant value of option, result,
+      and variant types before copying pointer data. Pointer copy shall
+      only occur when the discriminant indicates a variant case that
+      contains pointer fields. When the discriminant indicates no pointer
+      payload, the adapter shall skip the pointer copy entirely.
+    derives-from:
+      constraints: [CC-A-12]
+      scenarios: [LS-A-5]
+    verification:
+      - method: test
+        description: >
+          Runtime test: fuse components passing option<string> with
+          both Some and None values; verify correct behavior for each
+    status: implemented
+    implementation: meld-core/src/adapter/fact.rs
+
+  - id: SR-23
+    title: Import deduplication type safety
+    description: >
+      The merger shall not deduplicate function imports that have the same
+      module:field name but different type signatures. In multi-memory mode,
+      imports from different components shall be kept separate even if they
+      share the same name, to allow per-component canon lower configuration.
+    derives-from:
+      constraints: [CC-M-9, CC-M-10]
+      scenarios: [LS-M-4]
+    verification:
+      - method: test
+        description: >
+          Fuse two components importing same WASI function, verify separate
+          import slots in multi-memory mode
+    status: draft
+    implementation: meld-core/src/merger.rs
+
+  - id: SR-24
+    title: Correct retptr layout for variant return types
+    description: >
+      The adapter shall copy retptr return values using the correct
+      canonical ABI layout (byte offsets and sizes) for each slot,
+      accounting for alignment padding in variant payloads. Return area
+      slot metadata (offset, size, is_pointer_pair) shall be computed by
+      the resolver and used by the adapter for per-slot copy instructions.
+    derives-from:
+      constraints: [CC-A-13, CC-R-9]
+      scenarios: [LS-A-6]
+    verification:
+      - method: test
+        description: >
+          Runtime test: fuse components returning variant types with
+          f64/i64 payloads via retptr; verify correct values
+    status: implemented
+    implementation:
+      - meld-core/src/parser.rs
+      - meld-core/src/resolver.rs
+      - meld-core/src/adapter/fact.rs
+
+  - id: SR-25
+    title: Resource handle pass-through
+    description: >
+      The adapter shall pass resource handles through cross-component calls
+      without modification (no pointer copy or fixup). Resource drop
+      functions shall be forwarded directly.
+    derives-from:
+      constraints: [CC-A-1]
+      scenarios: []
+    verification:
+      - method: test
+        description: >
+          Runtime test with resource-using components; verify handles
+          are valid after cross-component calls
+    status: draft
+    implementation: meld-core/src/adapter/fact.rs
+
+  - id: SR-26
+    title: Complete component type index tracking
+    description: >
+      The parser shall track all entries in the component type index space
+      including types defined in the type section, types introduced by
+      imports, instance export aliases, and component exports. The type
+      index mapping (get_type_definition) shall correctly resolve any
+      valid type index to its definition.
+    derives-from:
+      constraints: [CC-P-9, CC-P-10]
+      scenarios: []
+    verification:
+      - method: test
+        description: >
+          Test with component using types from imports, aliases, and
+          exports; verify correct type index resolution
+    status: implemented
+    implementation: meld-core/src/parser.rs

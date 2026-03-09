@@ -125,6 +125,9 @@ pub enum ComponentTypeDef {
     Defined,
     /// An `InstanceExport { kind: Type }` alias. Index into `component_aliases`.
     InstanceExportAlias(usize),
+    /// A type created by a component export with a type annotation `(type (eq N))`.
+    /// The u32 is the target type index that this type equals.
+    ExportAlias(u32),
 }
 
 /// A parsed WebAssembly component
@@ -725,6 +728,23 @@ impl ComponentParser {
             Payload::ComponentExportSection(reader) => {
                 for export in reader {
                     let export = export?;
+                    // Component exports with type annotations create new type indices
+                    // when the export kind is Type. Track these in component_type_defs.
+                    if export.kind == ComponentExternalKind::Type {
+                        if let Some(wasmparser::ComponentTypeRef::Type(
+                            wasmparser::TypeBounds::Eq(target_idx),
+                        )) = export.ty
+                        {
+                            component
+                                .component_type_defs
+                                .push(ComponentTypeDef::ExportAlias(target_idx));
+                        } else {
+                            // SubResource or no type annotation — still allocates a type index
+                            component
+                                .component_type_defs
+                                .push(ComponentTypeDef::ExportAlias(export.index));
+                        }
+                    }
                     component.exports.push(ComponentExport {
                         name: export.name.0.to_string(),
                         kind: export.kind,
@@ -1193,20 +1213,31 @@ impl ParsedComponent {
 
     /// Look up the type definition at a given component type index.
     ///
-    /// Returns `Some` only for types defined via `ComponentTypeSection` (i.e.,
-    /// `ComponentTypeDef::Defined`). Returns `None` for import-defined or
-    /// alias-defined types.
+    /// Follows `ExportAlias` chains to resolve type aliases created by
+    /// component exports with `(type (eq N))` annotations. Returns `None`
+    /// for import-defined or instance-export-alias types that cannot be
+    /// resolved locally.
     pub fn get_type_definition(&self, type_idx: u32) -> Option<&ComponentType> {
-        let def = self.component_type_defs.get(type_idx as usize)?;
-        if !matches!(def, ComponentTypeDef::Defined) {
-            return None;
+        let mut idx = type_idx;
+        // Follow ExportAlias chains (bounded to prevent infinite loops)
+        for _ in 0..self.component_type_defs.len() {
+            let def = self.component_type_defs.get(idx as usize)?;
+            match def {
+                ComponentTypeDef::Defined => {
+                    // The Nth Defined entry in component_type_defs corresponds to types[N]
+                    let def_offset = self.component_type_defs[..idx as usize]
+                        .iter()
+                        .filter(|d| matches!(d, ComponentTypeDef::Defined))
+                        .count();
+                    return self.types.get(def_offset);
+                }
+                ComponentTypeDef::ExportAlias(target) => {
+                    idx = *target;
+                }
+                _ => return None,
+            }
         }
-        // The Nth Defined entry in component_type_defs corresponds to types[N]
-        let def_offset = self.component_type_defs[..type_idx as usize]
-            .iter()
-            .filter(|d| matches!(d, ComponentTypeDef::Defined))
-            .count();
-        self.types.get(def_offset)
+        None
     }
 
     /// Build a map from core function index → (component type index, canonical options)
@@ -1294,6 +1325,235 @@ impl ParsedComponent {
             .max()
             .unwrap_or(1);
         align_up(size, max_align)
+    }
+
+    /// Compute the layout of all slots in the return area.
+    ///
+    /// Each slot describes a contiguous value in the canonical ABI memory layout
+    /// with its byte offset, byte size, and whether it is a pointer pair.
+    /// The adapter uses this to emit correctly-sized load/store instructions
+    /// (e.g., `i64.load`/`i64.store` for 8-byte f64/i64 values).
+    pub fn return_area_slots(
+        &self,
+        results: &[(Option<String>, ComponentValType)],
+    ) -> Vec<crate::resolver::ReturnAreaSlot> {
+        let mut slots = Vec::new();
+        let mut byte_offset = 0u32;
+        for (_, ty) in results {
+            let align = self.canonical_abi_align(ty);
+            byte_offset = align_up(byte_offset, align);
+            self.collect_return_area_type_slots(ty, byte_offset, &mut slots);
+            byte_offset += self.canonical_abi_size_unpadded(ty);
+        }
+        slots
+    }
+
+    /// Recursively collect return area slots for a single type at a given base offset.
+    fn collect_return_area_type_slots(
+        &self,
+        ty: &ComponentValType,
+        base: u32,
+        out: &mut Vec<crate::resolver::ReturnAreaSlot>,
+    ) {
+        use crate::resolver::ReturnAreaSlot;
+        match ty {
+            ComponentValType::Primitive(p) => {
+                let size = match p {
+                    PrimitiveValType::Bool | PrimitiveValType::S8 | PrimitiveValType::U8 => 1,
+                    PrimitiveValType::S16 | PrimitiveValType::U16 => 2,
+                    PrimitiveValType::S32
+                    | PrimitiveValType::U32
+                    | PrimitiveValType::F32
+                    | PrimitiveValType::Char => 4,
+                    PrimitiveValType::S64 | PrimitiveValType::U64 | PrimitiveValType::F64 => 8,
+                };
+                out.push(ReturnAreaSlot {
+                    byte_offset: base,
+                    byte_size: size,
+                    is_pointer_pair: false,
+                });
+            }
+            ComponentValType::String | ComponentValType::List(_) => {
+                // Pointer pair: (ptr: i32, len: i32) = 8 bytes
+                out.push(ReturnAreaSlot {
+                    byte_offset: base,
+                    byte_size: 8,
+                    is_pointer_pair: true,
+                });
+            }
+            ComponentValType::Record(fields) => {
+                let mut offset = base;
+                for (_, field_ty) in fields {
+                    let align = self.canonical_abi_align(field_ty);
+                    offset = align_up(offset, align);
+                    self.collect_return_area_type_slots(field_ty, offset, out);
+                    offset += self.canonical_abi_size_unpadded(field_ty);
+                }
+            }
+            ComponentValType::Tuple(elems) => {
+                let mut offset = base;
+                for elem_ty in elems {
+                    let align = self.canonical_abi_align(elem_ty);
+                    offset = align_up(offset, align);
+                    self.collect_return_area_type_slots(elem_ty, offset, out);
+                    offset += self.canonical_abi_size_unpadded(elem_ty);
+                }
+            }
+            ComponentValType::Variant(cases) => {
+                // Discriminant
+                let ds = disc_size(cases.len());
+                out.push(ReturnAreaSlot {
+                    byte_offset: base,
+                    byte_size: ds,
+                    is_pointer_pair: false,
+                });
+                // Payload: union of all case payloads at aligned offset.
+                // We emit the max-size payload as a single opaque slot.
+                let max_case_align = cases
+                    .iter()
+                    .filter_map(|(_, t)| t.as_ref().map(|t| self.canonical_abi_align(t)))
+                    .max()
+                    .unwrap_or(1);
+                let payload_offset = align_up(ds, max_case_align);
+                let max_payload = cases
+                    .iter()
+                    .filter_map(|(_, t)| t.as_ref().map(|t| self.canonical_abi_element_size(t)))
+                    .max()
+                    .unwrap_or(0);
+                if max_payload > 0 {
+                    // Emit payload as 4-byte or 8-byte aligned chunks.
+                    // Since variant payloads are a union, we can't know the exact
+                    // type at this point. Copy as the widest natural chunks.
+                    let chunk_size = if max_case_align >= 8 { 8 } else { 4 };
+                    let mut off = 0u32;
+                    while off < max_payload {
+                        let remaining = max_payload - off;
+                        let sz = if remaining >= chunk_size {
+                            chunk_size
+                        } else if remaining >= 4 {
+                            4
+                        } else if remaining >= 2 {
+                            2
+                        } else {
+                            1
+                        };
+                        out.push(ReturnAreaSlot {
+                            byte_offset: base + payload_offset + off,
+                            byte_size: sz,
+                            is_pointer_pair: false,
+                        });
+                        off += sz;
+                    }
+                }
+            }
+            ComponentValType::Option(inner) => {
+                // Discriminant (1 byte for 2 cases)
+                let ds = disc_size(2);
+                out.push(ReturnAreaSlot {
+                    byte_offset: base,
+                    byte_size: ds,
+                    is_pointer_pair: false,
+                });
+                // Payload at aligned offset
+                let payload_align = self.canonical_abi_align(inner);
+                let payload_offset = align_up(ds, payload_align);
+                let payload_size = self.canonical_abi_element_size(inner);
+                if payload_size > 0 {
+                    let chunk_size = if payload_align >= 8 { 8 } else { 4 };
+                    let mut off = 0u32;
+                    while off < payload_size {
+                        let remaining = payload_size - off;
+                        let sz = if remaining >= chunk_size {
+                            chunk_size
+                        } else if remaining >= 4 {
+                            4
+                        } else if remaining >= 2 {
+                            2
+                        } else {
+                            1
+                        };
+                        out.push(ReturnAreaSlot {
+                            byte_offset: base + payload_offset + off,
+                            byte_size: sz,
+                            is_pointer_pair: false,
+                        });
+                        off += sz;
+                    }
+                }
+            }
+            ComponentValType::Result { ok, err } => {
+                // Discriminant (1 byte for 2 cases)
+                let ds = disc_size(2);
+                out.push(ReturnAreaSlot {
+                    byte_offset: base,
+                    byte_size: ds,
+                    is_pointer_pair: false,
+                });
+                // Payload: union of ok/err at aligned offset
+                let ok_align = ok
+                    .as_ref()
+                    .map(|t| self.canonical_abi_align(t))
+                    .unwrap_or(1);
+                let err_align = err
+                    .as_ref()
+                    .map(|t| self.canonical_abi_align(t))
+                    .unwrap_or(1);
+                let max_case_align = ok_align.max(err_align);
+                let payload_offset = align_up(ds, max_case_align);
+                let ok_s = ok
+                    .as_ref()
+                    .map(|t| self.canonical_abi_element_size(t))
+                    .unwrap_or(0);
+                let err_s = err
+                    .as_ref()
+                    .map(|t| self.canonical_abi_element_size(t))
+                    .unwrap_or(0);
+                let max_payload = ok_s.max(err_s);
+                if max_payload > 0 {
+                    let chunk_size = if max_case_align >= 8 { 8 } else { 4 };
+                    let mut off = 0u32;
+                    while off < max_payload {
+                        let remaining = max_payload - off;
+                        let sz = if remaining >= chunk_size {
+                            chunk_size
+                        } else if remaining >= 4 {
+                            4
+                        } else if remaining >= 2 {
+                            2
+                        } else {
+                            1
+                        };
+                        out.push(ReturnAreaSlot {
+                            byte_offset: base + payload_offset + off,
+                            byte_size: sz,
+                            is_pointer_pair: false,
+                        });
+                        off += sz;
+                    }
+                }
+            }
+            ComponentValType::Type(idx) => {
+                if let Some(ct) = self.get_type_definition(*idx)
+                    && let ComponentTypeKind::Defined(inner) = &ct.kind
+                {
+                    self.collect_return_area_type_slots(inner, base, out);
+                } else {
+                    // Fallback: treat as i32
+                    out.push(ReturnAreaSlot {
+                        byte_offset: base,
+                        byte_size: 4,
+                        is_pointer_pair: false,
+                    });
+                }
+            }
+            ComponentValType::Own(_) | ComponentValType::Borrow(_) => {
+                out.push(ReturnAreaSlot {
+                    byte_offset: base,
+                    byte_size: 4,
+                    is_pointer_pair: false,
+                });
+            }
+        }
     }
 
     /// Compute flat core param indices where (ptr, len) pairs start.
@@ -1457,9 +1717,8 @@ impl ParsedComponent {
             ComponentValType::Option(inner) if self.type_contains_pointers(inner) => {
                 // option<T> flattens to [disc, ...T_flat]
                 // disc=1 means Some, payload starts at base+1
+                // In flat representation, discriminant is always i32 (4 bytes)
                 let payload_base = base + 1;
-                // Collect unconditional pointer pairs from the inner type
-                // and wrap each as conditional on disc==1
                 let mut inner_positions = Vec::new();
                 self.collect_pointer_positions(inner, payload_base, &mut inner_positions);
                 for ptr_pos in inner_positions {
@@ -1469,9 +1728,9 @@ impl ParsedComponent {
                         discriminant_value: 1,
                         ptr_position: ptr_pos,
                         copy_layout: layout,
+                        discriminant_byte_size: 4,
                     });
                 }
-                // Also recurse into the inner type for nested conditionals
                 self.collect_conditional_pointers(inner, payload_base, out);
             }
             ComponentValType::Result { ok, err } => {
@@ -1490,6 +1749,7 @@ impl ParsedComponent {
                             discriminant_value: 0,
                             ptr_position: ptr_pos,
                             copy_layout: layout,
+                            discriminant_byte_size: 4,
                         });
                     }
                     self.collect_conditional_pointers(ok_ty, payload_base, out);
@@ -1506,6 +1766,7 @@ impl ParsedComponent {
                             discriminant_value: 1,
                             ptr_position: ptr_pos,
                             copy_layout: layout,
+                            discriminant_byte_size: 4,
                         });
                     }
                     self.collect_conditional_pointers(err_ty, payload_base, out);
@@ -1527,6 +1788,7 @@ impl ParsedComponent {
                                 discriminant_value: case_idx as u32,
                                 ptr_position: ptr_pos,
                                 copy_layout: layout,
+                                discriminant_byte_size: 4,
                             });
                         }
                         self.collect_conditional_pointers(ty, payload_base, out);
@@ -1567,9 +1829,11 @@ impl ParsedComponent {
     ) {
         match ty {
             ComponentValType::Option(inner) if self.type_contains_pointers(inner) => {
-                // In memory layout: disc (4 bytes aligned), then payload
+                // In memory layout: disc (disc_size bytes), aligned gap, then payload
                 let disc_offset = base;
-                let payload_offset = base + 4; // discriminant is i32
+                let ds = disc_size(2);
+                let payload_align = self.canonical_abi_align(inner);
+                let payload_offset = base + align_up(ds, payload_align);
                 let mut inner_offsets = Vec::new();
                 self.collect_pointer_byte_offsets(inner, payload_offset, &mut inner_offsets);
                 for ptr_off in inner_offsets {
@@ -1579,13 +1843,24 @@ impl ParsedComponent {
                         discriminant_value: 1,
                         ptr_position: ptr_off,
                         copy_layout: layout,
+                        discriminant_byte_size: ds,
                     });
                 }
                 self.collect_conditional_result_pointers(inner, payload_offset, out);
             }
             ComponentValType::Result { ok, err } => {
                 let disc_offset = base;
-                let payload_offset = base + 4;
+                let ds = disc_size(2);
+                let ok_align = ok
+                    .as_ref()
+                    .map(|t| self.canonical_abi_align(t))
+                    .unwrap_or(1);
+                let err_align = err
+                    .as_ref()
+                    .map(|t| self.canonical_abi_align(t))
+                    .unwrap_or(1);
+                let max_case_align = ok_align.max(err_align);
+                let payload_offset = base + align_up(ds, max_case_align);
                 if let Some(ok_ty) = ok
                     && self.type_contains_pointers(ok_ty)
                 {
@@ -1598,6 +1873,7 @@ impl ParsedComponent {
                             discriminant_value: 0,
                             ptr_position: ptr_off,
                             copy_layout: layout,
+                            discriminant_byte_size: ds,
                         });
                     }
                     self.collect_conditional_result_pointers(ok_ty, payload_offset, out);
@@ -1614,6 +1890,7 @@ impl ParsedComponent {
                             discriminant_value: 1,
                             ptr_position: ptr_off,
                             copy_layout: layout,
+                            discriminant_byte_size: ds,
                         });
                     }
                     self.collect_conditional_result_pointers(err_ty, payload_offset, out);
@@ -1621,7 +1898,13 @@ impl ParsedComponent {
             }
             ComponentValType::Variant(cases) => {
                 let disc_offset = base;
-                let payload_offset = base + 4;
+                let ds = disc_size(cases.len());
+                let max_case_align = cases
+                    .iter()
+                    .filter_map(|(_, t)| t.as_ref().map(|t| self.canonical_abi_align(t)))
+                    .max()
+                    .unwrap_or(1);
+                let payload_offset = base + align_up(ds, max_case_align);
                 for (case_idx, (_, case_ty)) in cases.iter().enumerate() {
                     if let Some(ty) = case_ty
                         && self.type_contains_pointers(ty)
@@ -1635,6 +1918,7 @@ impl ParsedComponent {
                                 discriminant_value: case_idx as u32,
                                 ptr_position: ptr_off,
                                 copy_layout: layout,
+                                discriminant_byte_size: ds,
                             });
                         }
                         self.collect_conditional_result_pointers(ty, payload_offset, out);
@@ -1769,15 +2053,20 @@ impl ParsedComponent {
                 .max()
                 .unwrap_or(1),
             ComponentValType::Variant(cases) => {
-                let max_payload = cases
+                let ds = disc_size(cases.len());
+                let max_case_align = cases
                     .iter()
                     .filter_map(|(_, t)| t.as_ref().map(|t| self.canonical_abi_align(t)))
                     .max()
                     .unwrap_or(1);
-                4u32.max(max_payload) // discriminant is i32
+                ds.max(max_case_align)
             }
-            ComponentValType::Option(inner) => 4u32.max(self.canonical_abi_align(inner)),
+            ComponentValType::Option(inner) => {
+                // option has 2 cases → disc_size = 1
+                disc_size(2).max(self.canonical_abi_align(inner))
+            }
             ComponentValType::Result { ok, err } => {
+                // result has 2 cases → disc_size = 1
                 let oa = ok
                     .as_ref()
                     .map(|t| self.canonical_abi_align(t))
@@ -1786,7 +2075,7 @@ impl ParsedComponent {
                     .as_ref()
                     .map(|t| self.canonical_abi_align(t))
                     .unwrap_or(1);
-                4u32.max(oa).max(ea)
+                disc_size(2).max(oa).max(ea)
             }
             ComponentValType::Type(idx) => {
                 if let Some(ct) = self.get_type_definition(*idx)
@@ -1836,15 +2125,35 @@ impl ParsedComponent {
                 size
             }
             ComponentValType::Variant(cases) => {
+                let ds = disc_size(cases.len());
+                let max_case_align = cases
+                    .iter()
+                    .filter_map(|(_, t)| t.as_ref().map(|t| self.canonical_abi_align(t)))
+                    .max()
+                    .unwrap_or(1);
                 let max_payload = cases
                     .iter()
                     .filter_map(|(_, t)| t.as_ref().map(|t| self.canonical_abi_element_size(t)))
                     .max()
                     .unwrap_or(0);
-                4 + max_payload // discriminant + largest case
+                align_up(ds, max_case_align) + max_payload
             }
-            ComponentValType::Option(inner) => 4 + self.canonical_abi_element_size(inner),
+            ComponentValType::Option(inner) => {
+                let ds = disc_size(2);
+                let payload_align = self.canonical_abi_align(inner);
+                align_up(ds, payload_align) + self.canonical_abi_element_size(inner)
+            }
             ComponentValType::Result { ok, err } => {
+                let ds = disc_size(2);
+                let ok_align = ok
+                    .as_ref()
+                    .map(|t| self.canonical_abi_align(t))
+                    .unwrap_or(1);
+                let err_align = err
+                    .as_ref()
+                    .map(|t| self.canonical_abi_align(t))
+                    .unwrap_or(1);
+                let max_case_align = ok_align.max(err_align);
                 let ok_s = ok
                     .as_ref()
                     .map(|t| self.canonical_abi_element_size(t))
@@ -1853,7 +2162,7 @@ impl ParsedComponent {
                     .as_ref()
                     .map(|t| self.canonical_abi_element_size(t))
                     .unwrap_or(0);
-                4 + ok_s.max(err_s)
+                align_up(ds, max_case_align) + ok_s.max(err_s)
             }
             ComponentValType::Type(idx) => {
                 if let Some(ct) = self.get_type_definition(*idx)
@@ -1955,6 +2264,22 @@ fn align_up(size: u32, align: u32) -> u32 {
     (size + align - 1) & !(align - 1)
 }
 
+/// Canonical ABI discriminant byte size for a variant-like type with `num_cases` cases.
+///
+/// Per the Component Model spec:
+/// - ≤ 2^8 cases → 1 byte (u8)
+/// - ≤ 2^16 cases → 2 bytes (u16)
+/// - otherwise → 4 bytes (u32)
+fn disc_size(num_cases: usize) -> u32 {
+    if num_cases <= 0x100 {
+        1
+    } else if num_cases <= 0x1_0000 {
+        2
+    } else {
+        4
+    }
+}
+
 /// Convert wasmparser's `ComponentValType` to our owned representation.
 fn convert_wp_component_val_type(ty: &wasmparser::ComponentValType) -> ComponentValType {
     match ty {
@@ -2030,7 +2355,33 @@ fn convert_wp_defined_type(dt: &wasmparser::ComponentDefinedType) -> ComponentTy
         wasmparser::ComponentDefinedType::Borrow(id) => {
             ComponentTypeKind::Defined(ComponentValType::Borrow(*id))
         }
-        _ => ComponentTypeKind::Other,
+        wasmparser::ComponentDefinedType::Primitive(p) => {
+            // A defined type that aliases a primitive (e.g., `type list-typedef = string`)
+            ComponentTypeKind::Defined(convert_wp_component_val_type(
+                &wasmparser::ComponentValType::Primitive(*p),
+            ))
+        }
+        wasmparser::ComponentDefinedType::Enum(cases) => {
+            // An enum is a variant where all cases have no payload
+            ComponentTypeKind::Defined(ComponentValType::Variant(
+                cases.iter().map(|name| (name.to_string(), None)).collect(),
+            ))
+        }
+        wasmparser::ComponentDefinedType::Flags(names) => {
+            // Flags are represented as a record of bools in the canonical ABI.
+            // For flat counting and pointer analysis, we use a record representation.
+            ComponentTypeKind::Defined(ComponentValType::Record(
+                names
+                    .iter()
+                    .map(|name| {
+                        (
+                            name.to_string(),
+                            ComponentValType::Primitive(PrimitiveValType::Bool),
+                        )
+                    })
+                    .collect(),
+            ))
+        }
     }
 }
 
@@ -2465,5 +2816,167 @@ mod tests {
         // Empty record defaults to align 1
         let empty_record = ComponentValType::Record(vec![]);
         assert_eq!(pc.canonical_abi_align(&empty_record), 1);
+    }
+
+    #[test]
+    fn test_disc_size_values() {
+        // ≤ 256 cases → 1 byte
+        assert_eq!(disc_size(0), 1);
+        assert_eq!(disc_size(1), 1);
+        assert_eq!(disc_size(2), 1); // option, result
+        assert_eq!(disc_size(256), 1);
+        // 257..65536 → 2 bytes
+        assert_eq!(disc_size(257), 2);
+        assert_eq!(disc_size(65536), 2);
+        // > 65536 → 4 bytes
+        assert_eq!(disc_size(65537), 4);
+    }
+
+    #[test]
+    fn test_canonical_abi_variant_layout() {
+        let pc = empty_parsed_component();
+
+        // option<bool>: disc_size=1, max_case_align=1, payload_offset=1
+        // size_unpadded = align_up(1,1) + element_size(bool) = 1 + 1 = 2
+        // align = max(1,1) = 1
+        // element_size = align_up(2,1) = 2
+        let opt_bool = ComponentValType::Option(Box::new(ComponentValType::Primitive(
+            PrimitiveValType::Bool,
+        )));
+        assert_eq!(pc.canonical_abi_align(&opt_bool), 1);
+        assert_eq!(pc.canonical_abi_element_size(&opt_bool), 2);
+
+        // option<u32>: disc_size=1, max_case_align=4, payload_offset=4
+        // size_unpadded = align_up(1,4) + element_size(u32) = 4 + 4 = 8
+        // align = max(1,4) = 4
+        // element_size = align_up(8,4) = 8
+        let opt_u32 =
+            ComponentValType::Option(Box::new(ComponentValType::Primitive(PrimitiveValType::U32)));
+        assert_eq!(pc.canonical_abi_align(&opt_u32), 4);
+        assert_eq!(pc.canonical_abi_element_size(&opt_u32), 8);
+
+        // option<f64>: disc_size=1, max_case_align=8, payload_offset=8
+        // size_unpadded = align_up(1,8) + element_size(f64) = 8 + 8 = 16
+        // align = max(1,8) = 8
+        // element_size = align_up(16,8) = 16
+        let opt_f64 =
+            ComponentValType::Option(Box::new(ComponentValType::Primitive(PrimitiveValType::F64)));
+        assert_eq!(pc.canonical_abi_align(&opt_f64), 8);
+        assert_eq!(pc.canonical_abi_element_size(&opt_f64), 16);
+
+        // option<string>: disc_size=1, max_case_align=4, payload_offset=4
+        // size_unpadded = align_up(1,4) + element_size(string) = 4 + 8 = 12
+        // align = max(1,4) = 4
+        // element_size = align_up(12,4) = 12
+        let opt_string = ComponentValType::Option(Box::new(ComponentValType::String));
+        assert_eq!(pc.canonical_abi_align(&opt_string), 4);
+        assert_eq!(pc.canonical_abi_element_size(&opt_string), 12);
+
+        // result<string, u32>: disc_size=1, max_case_align=4, payload_offset=4
+        // size_unpadded = align_up(1,4) + max(element_size(string)=8, element_size(u32)=4) = 4+8 = 12
+        // align = max(1,4,4) = 4
+        // element_size = align_up(12,4) = 12
+        let res_str_u32 = ComponentValType::Result {
+            ok: Some(Box::new(ComponentValType::String)),
+            err: Some(Box::new(ComponentValType::Primitive(PrimitiveValType::U32))),
+        };
+        assert_eq!(pc.canonical_abi_align(&res_str_u32), 4);
+        assert_eq!(pc.canonical_abi_element_size(&res_str_u32), 12);
+
+        // variant { a: u8, b: f64 } (2 cases): disc_size=1, max_case_align=8
+        // payload_offset = align_up(1,8) = 8
+        // size_unpadded = 8 + max(element_size(u8)=1, element_size(f64)=8) = 8+8 = 16
+        // align = max(1,8) = 8
+        // element_size = align_up(16,8) = 16
+        let variant_f64 = ComponentValType::Variant(vec![
+            (
+                "a".into(),
+                Some(ComponentValType::Primitive(PrimitiveValType::U8)),
+            ),
+            (
+                "b".into(),
+                Some(ComponentValType::Primitive(PrimitiveValType::F64)),
+            ),
+        ]);
+        assert_eq!(pc.canonical_abi_align(&variant_f64), 8);
+        assert_eq!(pc.canonical_abi_element_size(&variant_f64), 16);
+
+        // variant { a: u8, b: u16 } (2 cases): disc_size=1, max_case_align=2
+        // payload_offset = align_up(1,2) = 2
+        // size_unpadded = 2 + max(element_size(u8)=1, element_size(u16)=2) = 2+2 = 4
+        // align = max(1,2) = 2
+        // element_size = align_up(4,2) = 4
+        let variant_small = ComponentValType::Variant(vec![
+            (
+                "a".into(),
+                Some(ComponentValType::Primitive(PrimitiveValType::U8)),
+            ),
+            (
+                "b".into(),
+                Some(ComponentValType::Primitive(PrimitiveValType::U16)),
+            ),
+        ]);
+        assert_eq!(pc.canonical_abi_align(&variant_small), 2);
+        assert_eq!(pc.canonical_abi_element_size(&variant_small), 4);
+
+        // result<(), ()>: disc_size=1, no payloads
+        // size_unpadded = align_up(1,1) + 0 = 1
+        // align = max(1,1,1) = 1
+        // element_size = align_up(1,1) = 1
+        let res_unit = ComponentValType::Result {
+            ok: None,
+            err: None,
+        };
+        assert_eq!(pc.canonical_abi_align(&res_unit), 1);
+        assert_eq!(pc.canonical_abi_element_size(&res_unit), 1);
+    }
+
+    #[test]
+    fn test_conditional_result_pointer_offsets_variant_f64() {
+        let pc = empty_parsed_component();
+
+        // variant { none, some: string } (like option<string> but explicit)
+        // disc_size=1, max_case_align=4 (string align), payload_offset=align_up(1,4)=4
+        // The pointer pair for string should be at byte offset 4 (not hardcoded 4)
+        let results: Vec<(Option<String>, ComponentValType)> = vec![(
+            None,
+            ComponentValType::Variant(vec![
+                ("none".into(), None),
+                ("some".into(), Some(ComponentValType::String)),
+            ]),
+        )];
+        let pairs = pc.conditional_pointer_pair_result_positions(&results);
+        assert_eq!(pairs.len(), 1, "should find 1 conditional pointer pair");
+        assert_eq!(pairs[0].discriminant_position, 0);
+        assert_eq!(pairs[0].discriminant_value, 1); // case "some" = index 1
+        assert_eq!(
+            pairs[0].ptr_position, 4,
+            "pointer should be at offset 4 (align_up(1,4))"
+        );
+
+        // variant { a: f64, b: string } — max_case_align = max(8, 4) = 8
+        // disc_size=1, payload_offset = align_up(1, 8) = 8
+        let results_f64: Vec<(Option<String>, ComponentValType)> = vec![(
+            None,
+            ComponentValType::Variant(vec![
+                (
+                    "a".into(),
+                    Some(ComponentValType::Primitive(PrimitiveValType::F64)),
+                ),
+                ("b".into(), Some(ComponentValType::String)),
+            ]),
+        )];
+        let pairs_f64 = pc.conditional_pointer_pair_result_positions(&results_f64);
+        assert_eq!(
+            pairs_f64.len(),
+            1,
+            "should find 1 conditional pointer pair for string case"
+        );
+        assert_eq!(pairs_f64[0].discriminant_position, 0);
+        assert_eq!(pairs_f64[0].discriminant_value, 1); // case "b" = index 1
+        assert_eq!(
+            pairs_f64[0].ptr_position, 8,
+            "pointer should be at offset 8 (align_up(1,8)) not 4"
+        );
     }
 }

@@ -111,6 +111,16 @@ pub struct MergedModule {
     /// All index-map values are offset by these counts so they represent
     /// absolute wasm indices rather than 0-based array positions.
     pub import_counts: ImportCounts,
+
+    /// For each emitted function import (by position), the merged memory index
+    /// that the importing component uses. Used by component_wrap to select the
+    /// correct CanonicalOption::Memory(N) per import.
+    pub import_memory_indices: Vec<u32>,
+
+    /// For each emitted function import (by position), the merged function index
+    /// of the component's cabi_realloc. Used by component_wrap to select the
+    /// correct CanonicalOption::Realloc(N) per import.
+    pub import_realloc_indices: Vec<Option<u32>>,
 }
 
 /// Function type in merged module
@@ -175,14 +185,23 @@ struct UnresolvedImportAssignments {
     table: HashMap<(usize, usize, String, String), u32>,
 }
 
+/// Dedup key type for unresolved imports.
+///
+/// In multi-memory mode, each component gets its own import slot even for
+/// the same `(module, field)`, because each needs a different canon lower
+/// with Memory(N) and Realloc(N). The optional `usize` is the component
+/// index — `Some(comp_idx)` in multi-memory mode, `None` in shared-memory
+/// mode (preserving existing dedup behavior).
+type DedupKey = (String, String, Option<usize>);
+
 /// Deduplication metadata for unresolved imports.
 ///
 /// Tracks which effective `(module, field)` pairs have already been assigned
 /// an import position and which WASI version string to use for each dedup key.
 struct ImportDedupInfo {
-    /// For each version-normalized `(module, field)` key, the full module name
-    /// with the highest WASI version seen across all occurrences.
-    best_module_version: HashMap<(String, String), String>,
+    /// For each dedup key, the full module name with the highest WASI version
+    /// seen across all occurrences.
+    best_module_version: HashMap<DedupKey, String>,
     /// Entries where dedup was skipped because the function type didn't match
     /// the first occurrence with the same effective (module, field) key.
     /// Keyed by (component_idx, module_idx, module_name, field_name).
@@ -373,7 +392,12 @@ impl Merger {
         // index-map values produced during merging are absolute wasm indices
         // (offset by the number of unresolved imports in each index space).
         let (import_counts, unresolved_assignments, dedup_info) =
-            compute_unresolved_import_assignments(graph, shared_memory_plan.as_ref(), components);
+            compute_unresolved_import_assignments(
+                graph,
+                shared_memory_plan.as_ref(),
+                components,
+                self.memory_strategy,
+            );
 
         let mut merged = MergedModule {
             types: Vec::new(),
@@ -394,6 +418,8 @@ impl Merger {
             type_index_map: HashMap::new(),
             realloc_map: HashMap::new(),
             import_counts,
+            import_memory_indices: Vec::new(),
+            import_realloc_indices: Vec::new(),
         };
 
         // Process components in topological order
@@ -1171,6 +1197,26 @@ impl Merger {
             }
         }
 
+        // In multi-memory mode, export per-component cabi_realloc and memories
+        // so the P2 wrapper can reference the correct allocator and memory per import.
+        if self.memory_strategy == MemoryStrategy::MultiMemory && comp_idx > 0 {
+            // Export cabi_realloc$N for this component
+            if let Some(&realloc_idx) = merged.realloc_map.get(&(comp_idx, mod_idx)) {
+                let export_name = format!("cabi_realloc${}", comp_idx);
+                if !merged.exports.iter().any(|e| e.name == export_name) {
+                    merged.exports.push(MergedExport {
+                        name: export_name,
+                        kind: EncoderExportKind::Func,
+                        index: realloc_idx,
+                    });
+                }
+            }
+
+            // Note: memory$N exports are NOT needed on the fused module.
+            // The P2 wrapper's stubs module provides all memories with
+            // the $N naming convention. The fused module imports them.
+        }
+
         // Merge custom sections
         for (name, data) in &module.custom_sections {
             merged.custom_sections.push((name.clone(), data.clone()));
@@ -1223,10 +1269,15 @@ impl Merger {
         let mut memory_position: u32 = 0;
         let mut global_position: u32 = 0;
 
-        // Track already-emitted effective (module, field) per entity kind
-        let mut emitted_func: HashSet<(String, String)> = HashSet::new();
-        let mut emitted_table: HashSet<(String, String)> = HashSet::new();
-        let mut emitted_global: HashSet<(String, String)> = HashSet::new();
+        // Track already-emitted dedup keys per entity kind (includes component
+        // dimension in multi-memory mode so each component gets its own slot).
+        let mut emitted_func: HashSet<DedupKey> = HashSet::new();
+        let mut emitted_table: HashSet<DedupKey> = HashSet::new();
+        let mut emitted_global: HashSet<DedupKey> = HashSet::new();
+
+        // Track base (module, field) names already emitted for function imports
+        // so we can suffix duplicates in multi-memory mode.
+        let mut emitted_base_func: HashSet<(String, String)> = HashSet::new();
 
         for unresolved in &graph.unresolved_imports {
             // Skip imports resolved by adapter sites (must match the
@@ -1259,7 +1310,13 @@ impl Merger {
                 continue;
             }
 
-            let dedup_key = effective_import_key(unresolved);
+            let (eff_module_norm, eff_field) = effective_import_key(unresolved);
+            let comp_dim = if self.memory_strategy == MemoryStrategy::MultiMemory {
+                Some(unresolved.component_idx)
+            } else {
+                None
+            };
+            let dedup_key: DedupKey = (eff_module_norm, eff_field, comp_dim);
 
             match &unresolved.kind {
                 ImportKind::Function(type_idx) => {
@@ -1306,7 +1363,24 @@ impl Merger {
                                 .unwrap_or(&unresolved.module_name)
                                 .clone()
                         });
-                    let name = dedup_key.1;
+
+                    // In multi-memory mode, suffix the field name with $comp_idx
+                    // when a different component already emitted the same base name.
+                    // This ensures unique (module, field) pairs in the wasm binary.
+                    let base_key = (dedup_key.0.clone(), dedup_key.1.clone());
+                    let needs_suffix = self.memory_strategy == MemoryStrategy::MultiMemory
+                        && !emitted_base_func.insert(base_key);
+                    let name = if needs_suffix {
+                        format!("{}${}", dedup_key.1, unresolved.component_idx)
+                    } else {
+                        dedup_key.1.clone()
+                    };
+
+                    // Populate per-import metadata for component_wrap
+                    let mem_idx = component_memory_index(merged, unresolved.component_idx);
+                    let realloc_idx = component_realloc_index(merged, unresolved.component_idx);
+                    merged.import_memory_indices.push(mem_idx);
+                    merged.import_realloc_indices.push(realloc_idx);
 
                     merged.imports.push(MergedImport {
                         module,
@@ -1340,7 +1414,7 @@ impl Merger {
                                 .unwrap_or(&unresolved.module_name)
                                 .clone()
                         });
-                    let name = dedup_key.1;
+                    let name = dedup_key.1.clone();
 
                     merged.imports.push(MergedImport {
                         module,
@@ -1393,7 +1467,7 @@ impl Merger {
                                 .unwrap_or(&unresolved.module_name)
                                 .clone()
                         });
-                    let name = dedup_key.1;
+                    let name = dedup_key.1.clone();
 
                     merged.imports.push(MergedImport {
                         module,
@@ -1976,6 +2050,26 @@ impl Default for Merger {
 }
 
 /// Pre-compute unresolved import counts and per-import index assignments.
+/// Find the merged memory index for a component's first defined memory.
+fn component_memory_index(merged: &MergedModule, comp_idx: usize) -> u32 {
+    for (&(ci, _mi, mem_i), &merged_idx) in &merged.memory_index_map {
+        if ci == comp_idx && mem_i == 0 {
+            return merged_idx;
+        }
+    }
+    0 // fallback: memory 0
+}
+
+/// Find the merged function index of a component's cabi_realloc.
+fn component_realloc_index(merged: &MergedModule, comp_idx: usize) -> Option<u32> {
+    for (&(ci, _mi), &merged_idx) in &merged.realloc_map {
+        if ci == comp_idx {
+            return Some(merged_idx);
+        }
+    }
+    None
+}
+
 ///
 /// # Import Order Invariant
 ///
@@ -1996,6 +2090,7 @@ fn compute_unresolved_import_assignments(
     graph: &DependencyGraph,
     shared_memory_plan: Option<&SharedMemoryPlan>,
     components: &[ParsedComponent],
+    memory_strategy: MemoryStrategy,
 ) -> (ImportCounts, UnresolvedImportAssignments, ImportDedupInfo) {
     use crate::parser::FuncType;
 
@@ -2007,14 +2102,15 @@ fn compute_unresolved_import_assignments(
     };
     let mut shared_memory_import_counted = false;
 
-    // Per-kind dedup: map normalized (module, field) → (first-assigned position, type signature).
-    // The type signature is stored so we can verify type compatibility before deduplicating.
-    let mut seen_func: HashMap<(String, String), (u32, Option<FuncType>)> = HashMap::new();
-    let mut seen_table: HashMap<(String, String), u32> = HashMap::new();
-    let mut seen_global: HashMap<(String, String), u32> = HashMap::new();
+    // Per-kind dedup: map dedup key → (first-assigned position, type signature).
+    // In multi-memory mode the key includes the component index so each
+    // component gets its own import slot for per-component canon lower.
+    let mut seen_func: HashMap<DedupKey, (u32, Option<FuncType>)> = HashMap::new();
+    let mut seen_table: HashMap<DedupKey, u32> = HashMap::new();
+    let mut seen_global: HashMap<DedupKey, u32> = HashMap::new();
 
     // Track highest version for each dedup key
-    let mut best_module_version: HashMap<(String, String), String> = HashMap::new();
+    let mut best_module_version: HashMap<DedupKey, String> = HashMap::new();
     // Track entries where type mismatch prevented deduplication
     let mut type_mismatch_entries: HashSet<(usize, usize, String, String)> = HashSet::new();
 
@@ -2050,7 +2146,13 @@ fn compute_unresolved_import_assignments(
             continue;
         }
 
-        let dedup_key = effective_import_key(unresolved);
+        let (eff_module_norm, eff_field) = effective_import_key(unresolved);
+        let comp_dim = if memory_strategy == MemoryStrategy::MultiMemory {
+            Some(unresolved.component_idx)
+        } else {
+            None
+        };
+        let dedup_key: DedupKey = (eff_module_norm, eff_field, comp_dim);
         let eff_module = effective_module_name(unresolved);
 
         // Update best version for this dedup key
@@ -2324,6 +2426,8 @@ mod tests {
             type_index_map: HashMap::new(),
             realloc_map: HashMap::new(),
             import_counts: ImportCounts::default(),
+            import_memory_indices: Vec::new(),
+            import_realloc_indices: Vec::new(),
         };
 
         // Simulate multi-memory merging for module A (comp 0, mod 0)
@@ -2798,7 +2902,7 @@ mod tests {
         };
 
         let (counts, assignments, _dedup_info) =
-            compute_unresolved_import_assignments(&graph, None, &[]);
+            compute_unresolved_import_assignments(&graph, None, &[], MemoryStrategy::SharedMemory);
 
         // Should be 1 unique func import, not 2
         assert_eq!(counts.func, 1, "duplicate imports should be deduplicated");
@@ -2847,7 +2951,7 @@ mod tests {
         };
 
         let (counts, assignments, dedup_info) =
-            compute_unresolved_import_assignments(&graph, None, &[]);
+            compute_unresolved_import_assignments(&graph, None, &[], MemoryStrategy::SharedMemory);
 
         // Should be 1 unique func import (version-normalized key matches)
         assert_eq!(
@@ -2866,7 +2970,8 @@ mod tests {
         );
 
         // Best version should be the higher one (@0.2.6)
-        let key = ("wasi:io/error".to_string(), "drop".to_string());
+        // In SharedMemory mode, dedup key has None as the component dimension
+        let key = ("wasi:io/error".to_string(), "drop".to_string(), None);
         assert_eq!(dedup_info.best_module_version[&key], "wasi:io/error@0.2.6");
     }
 
@@ -2903,7 +3008,7 @@ mod tests {
         };
 
         let (counts, _assignments, _dedup_info) =
-            compute_unresolved_import_assignments(&graph, None, &[]);
+            compute_unresolved_import_assignments(&graph, None, &[], MemoryStrategy::SharedMemory);
 
         assert_eq!(
             counts.func, 2,

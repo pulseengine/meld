@@ -33,9 +33,10 @@
 //! 3. `canon lower` uses the fused module's real `cabi_realloc`.
 //! 4. A fixup module fills the indirect table with the lowered functions.
 
+use crate::merger::MergedModule;
 use crate::parser::{self, ParsedComponent};
 use crate::resolver::DependencyGraph;
-use crate::{Error, Result};
+use crate::{Error, MemoryStrategy, Result};
 
 /// Wrap fused core module bytes as a P2 component.
 ///
@@ -47,6 +48,8 @@ pub fn wrap_as_component(
     components: &[ParsedComponent],
     original_components: &[ParsedComponent],
     _graph: &DependencyGraph,
+    merged: &MergedModule,
+    memory_strategy: MemoryStrategy,
 ) -> Result<Vec<u8>> {
     // Pick the component with the most depth_0_sections (widest interface).
     // Prefer original (un-flattened) components since flattening may drop
@@ -76,11 +79,7 @@ pub fn wrap_as_component(
         .collect::<Result<_>>()?;
 
     // Build the stubs module (provides memory + forwarding funcs via indirect table)
-    let stubs_bytes = build_stubs_module(
-        fused_info.memory_initial,
-        fused_info.memory_maximum,
-        &import_types,
-    );
+    let stubs_bytes = build_stubs_module(&fused_info.memories, &import_types);
 
     // Build the fixup module (fills indirect table with lowered functions)
     let fixup_bytes = build_fixup_module(&import_types);
@@ -104,6 +103,8 @@ pub fn wrap_as_component(
         &fixup_bytes,
         caller_bytes.as_deref(),
         &fused_info,
+        merged,
+        memory_strategy,
     )
 }
 
@@ -113,12 +114,8 @@ struct FusedModuleInfo {
     func_imports: Vec<(String, String, u32)>,
     /// Exports: (name, kind, index)
     exports: Vec<(String, wasmparser::ExternalKind, u32)>,
-    /// Memory initial pages
-    memory_initial: u64,
-    /// Memory maximum pages
-    memory_maximum: Option<u64>,
-    /// Whether memory is 64-bit
-    memory64: bool,
+    /// All memories: (initial_pages, max_pages, memory64)
+    memories: Vec<(u64, Option<u64>, bool)>,
     /// Number of function types in the type section
     #[allow(dead_code)]
     type_count: u32,
@@ -137,12 +134,9 @@ fn parse_fused_module(bytes: &[u8]) -> Result<FusedModuleInfo> {
     let parser = wasmparser::Parser::new(0);
     let mut func_imports = Vec::new();
     let mut exports = Vec::new();
-    let mut memory_initial = 1u64;
-    let mut memory_maximum = None;
-    let mut memory64 = false;
+    let mut memories: Vec<(u64, Option<u64>, bool)> = Vec::new();
     let mut type_count = 0u32;
     let mut func_types = Vec::new();
-    let mut found_memory = false;
     let mut start_func: Option<u32> = None;
 
     for payload in parser.parse_all(bytes) {
@@ -176,12 +170,7 @@ fn parse_fused_module(bytes: &[u8]) -> Result<FusedModuleInfo> {
             wasmparser::Payload::MemorySection(reader) => {
                 for mem in reader {
                     let mem = mem.map_err(|e| Error::ParseError(e.to_string()))?;
-                    if !found_memory {
-                        memory_initial = mem.initial;
-                        memory_maximum = mem.maximum;
-                        memory64 = mem.memory64;
-                        found_memory = true;
-                    }
+                    memories.push((mem.initial, mem.maximum, mem.memory64));
                 }
             }
             wasmparser::Payload::ExportSection(reader) => {
@@ -197,12 +186,11 @@ fn parse_fused_module(bytes: &[u8]) -> Result<FusedModuleInfo> {
         }
     }
 
-    if !found_memory {
+    if memories.is_empty() {
         return Err(Error::EncodingError(
             "fused module has no memory section".to_string(),
         ));
     }
-
     // If there's a start section, find its export name (or assign a synthetic one)
     let start_func_export = start_func.map(|func_idx| {
         exports
@@ -220,9 +208,7 @@ fn parse_fused_module(bytes: &[u8]) -> Result<FusedModuleInfo> {
     Ok(FusedModuleInfo {
         func_imports,
         exports,
-        memory_initial,
-        memory_maximum,
-        memory64,
+        memories,
         type_count,
         func_types,
         start_func,
@@ -242,10 +228,14 @@ fn parse_fused_module(bytes: &[u8]) -> Result<FusedModuleInfo> {
 /// - `"$imports"` — funcref table of size N (only if N > 0)
 /// - `"0"` .. `"N-1"` — forwarding functions
 fn build_stubs_module(
-    min_pages: u64,
-    max_pages: Option<u64>,
+    all_memories: &[(u64, Option<u64>, bool)],
     import_types: &[(Vec<wasm_encoder::ValType>, Vec<wasm_encoder::ValType>)],
 ) -> Vec<u8> {
+    let (min_pages, max_pages) = if all_memories.is_empty() {
+        (1u64, None)
+    } else {
+        (all_memories[0].0, all_memories[0].1)
+    };
     use wasm_encoder::*;
 
     let n = import_types.len();
@@ -295,20 +285,44 @@ fn build_stubs_module(
         });
         module.section(&tables);
 
-        // Memory section
-        let mut memories = MemorySection::new();
-        memories.memory(MemoryType {
-            minimum: min_pages,
-            maximum: max_pages,
-            memory64: false,
-            shared: false,
-            page_size_log2: None,
-        });
-        module.section(&memories);
+        // Memory section — one memory per component
+        let mut mem_section = MemorySection::new();
+        for (i, &(init, max, m64)) in all_memories.iter().enumerate() {
+            if i == 0 {
+                mem_section.memory(MemoryType {
+                    minimum: min_pages,
+                    maximum: max_pages,
+                    memory64: m64,
+                    shared: false,
+                    page_size_log2: None,
+                });
+            } else {
+                mem_section.memory(MemoryType {
+                    minimum: init,
+                    maximum: max,
+                    memory64: m64,
+                    shared: false,
+                    page_size_log2: None,
+                });
+            }
+        }
+        if all_memories.is_empty() {
+            mem_section.memory(MemoryType {
+                minimum: min_pages,
+                maximum: max_pages,
+                memory64: false,
+                shared: false,
+                page_size_log2: None,
+            });
+        }
+        module.section(&mem_section);
 
-        // Export section
+        // Export section — all memories + table + forwarding funcs
         let mut exports = ExportSection::new();
         exports.export("memory", ExportKind::Memory, 0);
+        for i in 1..all_memories.len() {
+            exports.export(&format!("memory${}", i), ExportKind::Memory, i as u32);
+        }
         exports.export("$imports", ExportKind::Table, 0);
         for i in 0..n {
             exports.export(&i.to_string(), ExportKind::Func, i as u32);
@@ -335,19 +349,33 @@ fn build_stubs_module(
         }
         module.section(&code);
     } else {
-        // No imports: memory only
-        let mut memories = MemorySection::new();
-        memories.memory(MemoryType {
-            minimum: min_pages,
-            maximum: max_pages,
-            memory64: false,
-            shared: false,
-            page_size_log2: None,
-        });
-        module.section(&memories);
+        // No imports: memories only
+        let mut mem_section = MemorySection::new();
+        for &(init, max, m64) in all_memories {
+            mem_section.memory(MemoryType {
+                minimum: init,
+                maximum: max,
+                memory64: m64,
+                shared: false,
+                page_size_log2: None,
+            });
+        }
+        if all_memories.is_empty() {
+            mem_section.memory(MemoryType {
+                minimum: 1,
+                maximum: None,
+                memory64: false,
+                shared: false,
+                page_size_log2: None,
+            });
+        }
+        module.section(&mem_section);
 
         let mut exports = ExportSection::new();
         exports.export("memory", ExportKind::Memory, 0);
+        for i in 1..all_memories.len() {
+            exports.export(&format!("memory${}", i), ExportKind::Memory, i as u32);
+        }
         module.section(&exports);
     }
 
@@ -511,60 +539,54 @@ fn convert_memory_to_import(original_bytes: &[u8], info: &FusedModuleInfo) -> Re
                     let entity = convert_type_ref(imp.ty)?;
                     imports.import(imp.module, imp.name, entity);
                 }
-                // Append memory import at the end (after all function imports)
-                imports.import(
-                    "meld:shim",
-                    "memory",
-                    EntityType::Memory(MemoryType {
-                        minimum: info.memory_initial,
-                        maximum: info.memory_maximum,
-                        memory64: info.memory64,
-                        shared: false,
-                        page_size_log2: None,
-                    }),
-                );
-                module.section(&imports);
-                wrote_imports = true;
-            }
-            wasmparser::Payload::MemorySection(reader) => {
-                // Skip the first memory (now imported), keep any others
-                let mut memories = MemorySection::new();
-                let mut skipped_first = false;
-                for mem in reader {
-                    let mem = mem.map_err(|e| Error::ParseError(e.to_string()))?;
-                    if !skipped_first {
-                        skipped_first = true;
-                        continue; // Skip first memory — now imported
-                    }
-                    memories.memory(MemoryType {
-                        minimum: mem.initial,
-                        maximum: mem.maximum,
-                        memory64: mem.memory64,
-                        shared: mem.shared,
-                        page_size_log2: None,
-                    });
-                }
-                if !memories.is_empty() {
-                    module.section(&memories);
-                }
-                // Memory is now imported instead of defined
-            }
-            // For all other sections, copy them raw
-            wasmparser::Payload::FunctionSection(reader) => {
-                // If there was no import section, add one with just the memory
-                if !wrote_imports {
-                    let mut imports = ImportSection::new();
+                // Append ALL memory imports at the end (after all function imports)
+                for (i, &(init, max, m64)) in info.memories.iter().enumerate() {
+                    let name = if i == 0 {
+                        "memory".to_string()
+                    } else {
+                        format!("memory${}", i)
+                    };
                     imports.import(
                         "meld:shim",
-                        "memory",
+                        &name,
                         EntityType::Memory(MemoryType {
-                            minimum: info.memory_initial,
-                            maximum: info.memory_maximum,
-                            memory64: info.memory64,
+                            minimum: init,
+                            maximum: max,
+                            memory64: m64,
                             shared: false,
                             page_size_log2: None,
                         }),
                     );
+                }
+                module.section(&imports);
+                wrote_imports = true;
+            }
+            wasmparser::Payload::MemorySection(_reader) => {
+                // Skip entire memory section — all memories are now imports
+            }
+            // For all other sections, copy them raw
+            wasmparser::Payload::FunctionSection(reader) => {
+                // If there was no import section, add one with all memories
+                if !wrote_imports {
+                    let mut imports = ImportSection::new();
+                    for (i, &(init, max, m64)) in info.memories.iter().enumerate() {
+                        let name = if i == 0 {
+                            "memory".to_string()
+                        } else {
+                            format!("memory${}", i)
+                        };
+                        imports.import(
+                            "meld:shim",
+                            &name,
+                            EntityType::Memory(MemoryType {
+                                minimum: init,
+                                maximum: max,
+                                memory64: m64,
+                                shared: false,
+                                page_size_log2: None,
+                            }),
+                        );
+                    }
                     module.section(&imports);
                     wrote_imports = true;
                 }
@@ -643,6 +665,7 @@ fn convert_memory_to_import(original_bytes: &[u8], info: &FusedModuleInfo) -> Re
 }
 
 /// Assemble the final P2 component from replayed sections + stubs + fused + fixup + caller.
+#[allow(clippy::too_many_arguments)]
 fn assemble_component(
     source: &ParsedComponent,
     stubs_bytes: &[u8],
@@ -650,6 +673,8 @@ fn assemble_component(
     fixup_bytes: &[u8],
     caller_bytes: Option<&[u8]>,
     fused_info: &FusedModuleInfo,
+    merged: &MergedModule,
+    memory_strategy: MemoryStrategy,
 ) -> Result<Vec<u8>> {
     use wasm_encoder::*;
 
@@ -725,15 +750,18 @@ fn assemble_component(
     component.section(&core_instances);
 
     // -----------------------------------------------------------------------
-    // 5. Alias stubs exports: forwarding funcs, table, and memory
+    // 5. Alias stubs exports: forwarding funcs, table, and all memories
     // -----------------------------------------------------------------------
     // core instance 0 = stubs instance
     //
     // After aliasing:
-    //   core func 0..N-1 = stubs forwarding functions
-    //   core table 0     = indirect funcref table (only if N > 0)
-    //   core memory 0    = shared memory
+    //   core func 0..N-1     = stubs forwarding functions
+    //   core table 0         = indirect funcref table (only if N > 0)
+    //   core memory 0..M-1   = per-component memories
+    let num_memories = fused_info.memories.len().max(1);
     let mut core_func_idx = 0u32;
+    // Track core memory indices for use in canon lower/lift
+    let mut memory_core_indices: Vec<u32> = Vec::new();
 
     if n > 0 {
         let mut aliases = ComponentAliasSection::new();
@@ -749,20 +777,39 @@ fn assemble_component(
             kind: ExportKind::Table,
             name: "$imports",
         });
-        aliases.alias(Alias::CoreInstanceExport {
-            instance: 0,
-            kind: ExportKind::Memory,
-            name: "memory",
-        });
+        // Alias all memories from stubs.
+        // Core aliases go into per-kind index spaces, so memory aliases
+        // start at core memory 0 regardless of how many func/table aliases exist.
+        for i in 0..num_memories {
+            let mem_name = if i == 0 {
+                "memory".to_string()
+            } else {
+                format!("memory${}", i)
+            };
+            aliases.alias(Alias::CoreInstanceExport {
+                instance: 0,
+                kind: ExportKind::Memory,
+                name: &mem_name,
+            });
+            memory_core_indices.push(i as u32);
+        }
         component.section(&aliases);
         core_func_idx = n as u32;
     } else {
         let mut aliases = ComponentAliasSection::new();
-        aliases.alias(Alias::CoreInstanceExport {
-            instance: 0,
-            kind: ExportKind::Memory,
-            name: "memory",
-        });
+        for i in 0..num_memories {
+            let mem_name = if i == 0 {
+                "memory".to_string()
+            } else {
+                format!("memory${}", i)
+            };
+            aliases.alias(Alias::CoreInstanceExport {
+                instance: 0,
+                kind: ExportKind::Memory,
+                name: &mem_name,
+            });
+            memory_core_indices.push(i as u32);
+        }
         component.section(&aliases);
     }
 
@@ -797,10 +844,23 @@ fn assemble_component(
         next_core_instance += 1;
     }
 
-    // Create a FromExports instance for the "meld:shim" module (memory)
+    // Create a FromExports instance for the "meld:shim" module (all memories)
     {
         let mut inst = InstanceSection::new();
-        inst.export_items([("memory", ExportKind::Memory, 0u32)]);
+        let mut mem_exports: Vec<(String, ExportKind, u32)> = Vec::new();
+        for (i, &core_mem_idx) in memory_core_indices.iter().enumerate() {
+            let name = if i == 0 {
+                "memory".to_string()
+            } else {
+                format!("memory${}", i)
+            };
+            mem_exports.push((name, ExportKind::Memory, core_mem_idx));
+        }
+        let exports_ref: Vec<(&str, ExportKind, u32)> = mem_exports
+            .iter()
+            .map(|(n, k, i)| (n.as_str(), *k, *i))
+            .collect();
+        inst.export_items(exports_ref);
         component.section(&inst);
         module_instance_map.push(("meld:shim".to_string(), next_core_instance));
         next_core_instance += 1;
@@ -822,14 +882,25 @@ fn assemble_component(
     next_core_instance += 1;
 
     // -----------------------------------------------------------------------
-    // 8. Alias fused module's cabi_realloc (if we have non-resource-drop imports)
+    // 8. Alias fused module's cabi_realloc(s) (if we have non-resource-drop imports)
+    //
+    // In multi-memory mode, each component may have its own cabi_realloc:
+    //   - cabi_realloc   (component 0)
+    //   - cabi_realloc$1 (component 1)
+    //   - cabi_realloc$2 (component 2)
+    //   ...
+    // We alias all of them and track core func indices per-memory.
     // -----------------------------------------------------------------------
     let has_non_resource_drop = fused_info
         .func_imports
         .iter()
         .any(|(_, field, _)| !field.starts_with("[resource-drop]"));
 
-    let realloc_core_idx = if has_non_resource_drop && n > 0 {
+    // realloc_core_indices[memory_idx] = core func idx of that component's cabi_realloc
+    let mut realloc_core_indices: Vec<Option<u32>> = vec![None; num_memories];
+
+    if has_non_resource_drop && n > 0 {
+        // Alias cabi_realloc for component 0
         let has_realloc = fused_info.exports.iter().any(|(name, kind, _)| {
             *kind == wasmparser::ExternalKind::Func && name == "cabi_realloc"
         });
@@ -846,15 +917,43 @@ fn assemble_component(
             name: "cabi_realloc",
         });
         component.section(&aliases);
-        let idx = core_func_idx;
+        realloc_core_indices[0] = Some(core_func_idx);
         core_func_idx += 1;
-        Some(idx)
-    } else {
-        None
-    };
+
+        // In multi-memory mode, alias per-component cabi_realloc$N
+        if memory_strategy == MemoryStrategy::MultiMemory {
+            for i in 1..num_memories {
+                let realloc_name = format!("cabi_realloc${}", i);
+                let has_it = fused_info.exports.iter().any(|(name, kind, _)| {
+                    *kind == wasmparser::ExternalKind::Func && *name == realloc_name
+                });
+                if has_it {
+                    let mut aliases = ComponentAliasSection::new();
+                    aliases.alias(Alias::CoreInstanceExport {
+                        instance: fused_instance,
+                        kind: ExportKind::Func,
+                        name: &realloc_name,
+                    });
+                    component.section(&aliases);
+                    realloc_core_indices[i] = Some(core_func_idx);
+                    core_func_idx += 1;
+                } else {
+                    // Fall back to component 0's realloc
+                    realloc_core_indices[i] = realloc_core_indices[0];
+                }
+            }
+        }
+    }
 
     // -----------------------------------------------------------------------
-    // 9. Canon lower ALL imports using the real cabi_realloc
+    // 9. Canon lower ALL imports using per-component memory + realloc
+    //
+    // In multi-memory mode, each import uses the memory and cabi_realloc
+    // belonging to the component that originally imported it:
+    //   CanonicalOption::Memory(memory_core_indices[mem_idx])
+    //   CanonicalOption::Realloc(realloc_core_indices[mem_idx])
+    //
+    // In shared-memory mode, all imports use Memory(0) and the single realloc.
     // -----------------------------------------------------------------------
     let mut component_func_idx = 0u32;
     let mut component_type_idx = count_replayed_types(source);
@@ -863,8 +962,13 @@ fn assemble_component(
     for (i, (inst_idx, func_name)) in import_resolutions.iter().enumerate() {
         let field_name = &fused_info.func_imports[i].1;
 
-        if let Some(type_name) = field_name.strip_prefix("[resource-drop]") {
-            // Resource-drop: alias the TYPE from the instance, then canon resource.drop
+        if field_name.starts_with("[resource-drop]") {
+            // Resource-drop: alias the TYPE from the instance, then canon resource.drop.
+            // Use func_name (from resolve_import_to_instance) which has $N suffix
+            // stripped, then strip the [resource-drop] prefix to get the type name.
+            let type_name = func_name
+                .strip_prefix("[resource-drop]")
+                .unwrap_or(func_name);
             let mut alias_section = ComponentAliasSection::new();
             alias_section.alias(Alias::InstanceExport {
                 instance: *inst_idx,
@@ -881,7 +985,8 @@ fn assemble_component(
             lowered_func_indices.push(core_func_idx);
             core_func_idx += 1;
         } else {
-            // Regular function: alias from instance, then canon lower with real realloc
+            // Regular function: alias from instance, then canon lower with correct
+            // memory and realloc for the importing component.
             let mut alias_section = ComponentAliasSection::new();
             alias_section.alias(Alias::InstanceExport {
                 instance: *inst_idx,
@@ -890,14 +995,30 @@ fn assemble_component(
             });
             component.section(&alias_section);
 
-            let realloc_idx =
-                realloc_core_idx.expect("realloc_core_idx must be set for non-resource-drop");
+            // Determine which memory and realloc to use for this import
+            let mem_idx = if memory_strategy == MemoryStrategy::MultiMemory {
+                merged.import_memory_indices.get(i).copied().unwrap_or(0) as usize
+            } else {
+                0
+            };
+
+            let core_mem = memory_core_indices
+                .get(mem_idx)
+                .copied()
+                .unwrap_or(memory_core_indices[0]);
+
+            let realloc_idx = realloc_core_indices
+                .get(mem_idx)
+                .and_then(|r| *r)
+                .or_else(|| realloc_core_indices[0])
+                .expect("realloc_core_idx must be set for non-resource-drop");
+
             let mut canon = CanonicalFunctionSection::new();
             canon.lower(
                 component_func_idx,
                 [
-                    CanonicalOption::Memory(0),            // core memory 0
-                    CanonicalOption::Realloc(realloc_idx), // fused module's cabi_realloc
+                    CanonicalOption::Memory(core_mem),
+                    CanonicalOption::Realloc(realloc_idx),
                     CanonicalOption::UTF8,
                 ],
             );
@@ -1224,6 +1345,11 @@ fn build_instance_func_map(
 }
 
 /// Extended lookup that handles both aliased functions and resource-drops.
+///
+/// In multi-memory mode, the fused module may have suffixed field names like
+/// `get-environment$1` to distinguish imports from different components that
+/// share the same WASI function. We strip the `$N` suffix before looking up
+/// the original component instance.
 fn resolve_import_to_instance(
     source: &ParsedComponent,
     module_name: &str,
@@ -1235,13 +1361,34 @@ fn resolve_import_to_instance(
         return Some(result.clone());
     }
 
+    // Strip $N suffix and retry (multi-memory mode uses suffixed field names)
+    let base_field = if let Some(dollar_pos) = field_name.rfind('$') {
+        let suffix = &field_name[dollar_pos + 1..];
+        if suffix.chars().all(|c| c.is_ascii_digit()) {
+            Some(&field_name[..dollar_pos])
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    if let Some(base) = base_field
+        && let Some(result) = instance_func_map.get(&(module_name, base))
+    {
+        return Some(result.clone());
+    }
+
     // Fall back to module name matching (for resource-drops and other fields
-    // not explicitly in the alias list)
+    // not explicitly in the alias list).
+    // Use base field name (without suffix) for the returned name so the component
+    // runtime can find the actual function.
+    let resolved_name = base_field.unwrap_or(field_name);
     for (inst_idx, def) in source.component_instance_defs.iter().enumerate() {
         if let parser::ComponentInstanceDef::Import(import_idx) = def {
             let import = &source.imports[*import_idx];
             if import.name == module_name {
-                return Some((inst_idx as u32, field_name.to_string()));
+                return Some((inst_idx as u32, resolved_name.to_string()));
             }
         }
     }
@@ -1877,7 +2024,8 @@ mod tests {
             (vec![ValType::I32], vec![]),                // resource-drop-like
             (vec![ValType::I32, ValType::I32], vec![ValType::I32]), // read-like
         ];
-        let stubs = build_stubs_module(1, None, &import_types);
+        let memories = vec![(1u64, None, false)];
+        let stubs = build_stubs_module(&memories, &import_types);
         let mut features = wasmparser::WasmFeatures::default();
         features |= wasmparser::WasmFeatures::REFERENCE_TYPES;
         let mut validator = wasmparser::Validator::new_with_features(features);
@@ -1890,7 +2038,8 @@ mod tests {
     fn test_build_stubs_module_with_max() {
         use wasm_encoder::ValType;
         let import_types = vec![(vec![ValType::I32; 4], vec![ValType::I32])];
-        let stubs = build_stubs_module(2, Some(256), &import_types);
+        let memories = vec![(2u64, Some(256u64), false)];
+        let stubs = build_stubs_module(&memories, &import_types);
         let mut features = wasmparser::WasmFeatures::default();
         features |= wasmparser::WasmFeatures::REFERENCE_TYPES;
         let mut validator = wasmparser::Validator::new_with_features(features);
@@ -1913,7 +2062,8 @@ mod tests {
 
     #[test]
     fn test_build_stubs_module_zero_imports() {
-        let stubs = build_stubs_module(1, None, &[]);
+        let memories = vec![(1u64, None, false)];
+        let stubs = build_stubs_module(&memories, &[]);
         let mut validator = wasmparser::Validator::new();
         validator
             .validate_all(&stubs)
