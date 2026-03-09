@@ -288,7 +288,7 @@ impl Fuser {
             let mut attestation_stats = stats.clone();
             attestation_stats.output_size = output_without_attestation.len();
             let (section_name, payload) =
-                self.build_attestation_payload(&output_without_attestation, &attestation_stats);
+                self.build_attestation_payload(&output_without_attestation, &attestation_stats)?;
             let extra_sections = vec![(section_name, payload)];
             self.encode_output(&merged, &adapters, &extra_sections)?
         } else {
@@ -610,21 +610,26 @@ impl Fuser {
         &self,
         output_bytes: &[u8],
         stats: &FusionStats,
-    ) -> (&'static str, Vec<u8>) {
+    ) -> Result<(&'static str, Vec<u8>)> {
         #[cfg(feature = "attestation")]
         {
             let attestation = self.build_wsc_attestation(output_bytes, stats);
             let payload = attestation
                 .to_json_compact()
-                .unwrap_or_else(|_| "{}".to_string())
+                .map_err(|e| {
+                    Error::EncodingError(format!("attestation serialization failed: {e}"))
+                })?
                 .into_bytes();
-            (wsc_attestation::TRANSFORMATION_ATTESTATION_SECTION, payload)
+            Ok((wsc_attestation::TRANSFORMATION_ATTESTATION_SECTION, payload))
         }
 
         #[cfg(not(feature = "attestation"))]
         {
             let attestation = self.build_attestation(output_bytes, stats);
-            (FUSION_ATTESTATION_SECTION, attestation.to_bytes())
+            let bytes = attestation.to_bytes().map_err(|e| {
+                Error::EncodingError(format!("attestation serialization failed: {e}"))
+            })?;
+            Ok((FUSION_ATTESTATION_SECTION, bytes))
         }
     }
 
@@ -705,6 +710,10 @@ impl Fuser {
             "custom_sections".to_string(),
             serde_json::json!(self.custom_sections_label()),
         );
+        tool_parameters.insert(
+            "output_format".to_string(),
+            serde_json::json!(self.output_format_label()),
+        );
 
         let mut metadata = HashMap::new();
         metadata.insert(
@@ -781,6 +790,14 @@ impl Fuser {
             CustomSectionHandling::Merge => "merge",
             CustomSectionHandling::Prefix => "prefix",
             CustomSectionHandling::Drop => "drop",
+        }
+    }
+
+    #[cfg(feature = "attestation")]
+    fn output_format_label(&self) -> &'static str {
+        match self.config.output_format {
+            OutputFormat::CoreModule => "core-module",
+            OutputFormat::Component => "component",
         }
     }
 }

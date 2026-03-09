@@ -23,8 +23,7 @@ loss-coverage:
     requirements: [SR-6, SR-9, SR-13, SR-14, SR-15, SR-16]
   L-3:
     hazards: [H-6]
-    requirements: []
-    gap: "No safety requirements yet for attestation (SC-6)"
+    requirements: [SR-27, SR-28, SR-29, SR-30]
   L-4:
     hazards: [H-7]
     requirements: [SR-19]
@@ -201,17 +200,64 @@ verification-status:
     proofs: []
     status: partial
 
+  SR-27:
+    description: >
+      Input hash integrity: attestation must record SHA-256 hashes that
+      match independently computed digests of input component bytes.
+    implementation-files: [meld-core/src/attestation.rs]
+    tests:
+      - attestation::tests::test_sr27_input_hash_integrity
+    proofs: []
+    status: partial
+
+  SR-28:
+    description: >
+      Config completeness: every FuserConfig field must be recorded in
+      the attestation metadata so auditors can reconstruct exact build
+      configuration.
+    implementation-files: [meld-core/src/attestation.rs, meld-core/src/lib.rs]
+    tests:
+      - attestation::tests::test_sr28_config_completeness
+    proofs: []
+    status: partial
+
+  SR-29:
+    description: >
+      Attestation round-trip: serialization to JSON and back must
+      preserve all fields intact and non-empty. Serialization errors
+      must propagate (not silently produce empty payloads).
+    implementation-files: [meld-core/src/attestation.rs]
+    tests:
+      - attestation::tests::test_sr29_attestation_round_trip
+      - attestation::tests::test_to_bytes_returns_result
+    proofs: []
+    status: partial
+
+  SR-30:
+    description: >
+      Output hash integrity: attestation must record a SHA-256 hash of
+      the fused output bytes that matches an independently computed
+      digest.
+    implementation-files: [meld-core/src/attestation.rs]
+    tests:
+      - attestation::tests::test_sr30_output_hash_integrity
+    proofs: []
+    status: partial
+
 # Identified gaps
 gaps:
   - id: GAP-1
     description: >
-      L-3 (supply chain integrity) has hazard H-6 and constraint SC-6
-      but no safety requirements or verification. Attestation module
-      exists but is not covered by STPA-derived requirements.
-    priority: medium
+      L-3 (supply chain integrity) has hazard H-6 and constraint SC-6.
+      Safety requirements SR-27 through SR-30 now cover input/output
+      hash integrity, config completeness, and attestation round-trip.
+      The silent-failure bug in to_bytes() has been fixed to return
+      Result. Remaining gap: Rocq proofs for attestation properties.
+    priority: low
     action: >
-      Add SR for attestation correctness; add tests for attestation
-      custom section content.
+      Add Rocq proofs for attestation correctness properties.
+      Consider adding an integration test that verifies the attestation
+      custom section is present in the fused output.
 
   - id: GAP-2
     description: >

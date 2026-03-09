@@ -53,7 +53,7 @@ jobs:
 
       - name: Copy fixtures
         run: |
-          tests=(numbers strings lists records variants options many-arguments flavorful)
+          tests=(numbers strings lists records variants options many-arguments flavorful resources)
           for test in "${tests[@]}"; do
             src="/tmp/wit-bindgen/artifacts/${test}/composed-runner.rs-test.rs.wasm"
             dst="tests/wit_bindgen/fixtures/${test}.wasm"
@@ -90,7 +90,7 @@ jobs:
             - Generated via `wit-bindgen test --languages rust --artifacts`
 
             Fixtures updated:
-            `numbers`, `strings`, `lists`, `records`, `variants`, `options`, `many-arguments`, `flavorful`
+            `numbers`, `strings`, `lists`, `records`, `variants`, `options`, `many-arguments`, `flavorful`, `resources`
           add-paths: tests/wit_bindgen/fixtures/*.wasm
           labels: ci
           delete-branch: true
