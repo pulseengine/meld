@@ -1,7 +1,11 @@
 # Cross-Toolchain Consistency Hazards
 #
-# The PulseEngine toolchain has a unique property: three tools independently
-# implement aspects of the WebAssembly Component Model Canonical ABI.
+# Multiple tools in any WebAssembly component toolchain independently implement
+# aspects of the Component Model Canonical ABI. This is true for PulseEngine
+# (Meld, Kiln, Synth) and equally for the Bytecode Alliance ecosystem
+# (wasmtime, wit-bindgen, wit-component, wasm-tools, jco). The consistency
+# challenge is inherent to the component model ecosystem, not unique to any
+# single toolchain.
 #
 # At build time:
 #   Meld     — computes CopyLayout, generates adapters with element sizes
@@ -17,6 +21,15 @@
 #
 # The PulseEngine approach (separate tools, each formally verified) requires
 # explicit consistency verification between tools.
+#
+# The BA ecosystem mitigates this with shared crates (wit-parser,
+# wit-component) that centralize canonical ABI layout computation. But
+# the RFC's lower-component would add yet another independent implementation,
+# and runtimes like WAMR, Wazero, and Gravity each have their own.
+#
+# PulseEngine's approach: shared test fixtures (wit-bindgen composed-runner)
+# as executable conformance tests across all tool paths, plus shared Rocq
+# specs for the canonical ABI layout rules.
 #
 # Relation to gale: Gale is below the consistency boundary — it provides
 # kernel primitives (semaphores, threads, scheduling) that Kiln uses, but
