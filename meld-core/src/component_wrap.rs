@@ -2109,4 +2109,327 @@ mod tests {
             .validate_all(&fixup)
             .expect("empty fixup module should validate");
     }
+
+    // -----------------------------------------------------------------------
+    // Multi-memory stubs module tests
+    // -----------------------------------------------------------------------
+
+    /// Verify that build_stubs_module with multiple memories creates the
+    /// correct number of memory exports with $N naming convention.
+    #[test]
+    fn test_build_stubs_module_multi_memory_exports() {
+        use wasm_encoder::ValType;
+
+        let memories = vec![
+            (1u64, None, false),        // component 0: memory
+            (2u64, None, false),        // component 1: memory$1
+            (4u64, Some(16u64), false), // component 2: memory$2
+        ];
+        let import_types = vec![
+            (vec![ValType::I32], vec![]), // one import
+            (vec![ValType::I32], vec![]), // another import
+        ];
+        let stubs = build_stubs_module(&memories, &import_types);
+
+        // Validate the module
+        let mut features = wasmparser::WasmFeatures::default();
+        features |= wasmparser::WasmFeatures::REFERENCE_TYPES;
+        features |= wasmparser::WasmFeatures::MULTI_MEMORY;
+        let mut validator = wasmparser::Validator::new_with_features(features);
+        validator
+            .validate_all(&stubs)
+            .expect("multi-memory stubs module should validate");
+
+        // Parse exports to verify memory naming
+        let parser = wasmparser::Parser::new(0);
+        let mut memory_exports: Vec<String> = Vec::new();
+        let mut memory_count = 0u32;
+        for payload in parser.parse_all(&stubs) {
+            match payload {
+                Ok(wasmparser::Payload::MemorySection(reader)) => {
+                    memory_count = reader.count();
+                }
+                Ok(wasmparser::Payload::ExportSection(reader)) => {
+                    for export in reader {
+                        let export = export.unwrap();
+                        if export.kind == wasmparser::ExternalKind::Memory {
+                            memory_exports.push(export.name.to_string());
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // Should have 3 memories defined
+        assert_eq!(memory_count, 3, "stubs module should define 3 memories");
+
+        // Should export "memory", "memory$1", "memory$2"
+        assert_eq!(
+            memory_exports.len(),
+            3,
+            "should export 3 memories, got: {:?}",
+            memory_exports
+        );
+        assert!(
+            memory_exports.contains(&"memory".to_string()),
+            "should export 'memory'"
+        );
+        assert!(
+            memory_exports.contains(&"memory$1".to_string()),
+            "should export 'memory$1'"
+        );
+        assert!(
+            memory_exports.contains(&"memory$2".to_string()),
+            "should export 'memory$2'"
+        );
+    }
+
+    /// Verify that build_stubs_module with a single memory only exports
+    /// "memory" (no $N suffix).
+    #[test]
+    fn test_build_stubs_module_single_memory_no_suffix() {
+        use wasm_encoder::ValType;
+
+        let memories = vec![(1u64, None, false)];
+        let import_types = vec![(vec![ValType::I32], vec![])];
+        let stubs = build_stubs_module(&memories, &import_types);
+
+        let parser = wasmparser::Parser::new(0);
+        let mut memory_exports: Vec<String> = Vec::new();
+        for payload in parser.parse_all(&stubs) {
+            if let Ok(wasmparser::Payload::ExportSection(reader)) = payload {
+                for export in reader {
+                    let export = export.unwrap();
+                    if export.kind == wasmparser::ExternalKind::Memory {
+                        memory_exports.push(export.name.to_string());
+                    }
+                }
+            }
+        }
+
+        assert_eq!(
+            memory_exports.len(),
+            1,
+            "single memory should produce exactly one memory export"
+        );
+        assert_eq!(
+            memory_exports[0], "memory",
+            "single memory should export as 'memory' without suffix"
+        );
+    }
+
+    /// Verify that build_stubs_module preserves memory64 and max limits
+    /// for each memory in multi-memory mode.
+    #[test]
+    fn test_build_stubs_module_multi_memory_limits_preserved() {
+        use wasm_encoder::ValType;
+
+        let memories = vec![
+            (1u64, Some(100u64), false), // component 0
+            (4u64, Some(256u64), true),  // component 1 (memory64)
+        ];
+        let import_types = vec![(vec![ValType::I32; 4], vec![ValType::I32])];
+        let stubs = build_stubs_module(&memories, &import_types);
+
+        let mut features = wasmparser::WasmFeatures::default();
+        features |= wasmparser::WasmFeatures::REFERENCE_TYPES;
+        features |= wasmparser::WasmFeatures::MULTI_MEMORY;
+        features |= wasmparser::WasmFeatures::MEMORY64;
+        let mut validator = wasmparser::Validator::new_with_features(features);
+        validator
+            .validate_all(&stubs)
+            .expect("multi-memory stubs with memory64 should validate");
+
+        let parser = wasmparser::Parser::new(0);
+        let mut parsed_memories: Vec<(u64, Option<u64>, bool)> = Vec::new();
+        for payload in parser.parse_all(&stubs) {
+            if let Ok(wasmparser::Payload::MemorySection(reader)) = payload {
+                for mem in reader {
+                    let mem = mem.unwrap();
+                    parsed_memories.push((mem.initial, mem.maximum, mem.memory64));
+                }
+            }
+        }
+
+        assert_eq!(parsed_memories.len(), 2);
+        // Memory 0
+        assert_eq!(parsed_memories[0].0, 1, "memory 0 initial");
+        assert_eq!(parsed_memories[0].1, Some(100), "memory 0 max");
+        assert!(!parsed_memories[0].2, "memory 0 not memory64");
+        // Memory 1
+        assert_eq!(parsed_memories[1].0, 4, "memory 1 initial");
+        assert_eq!(parsed_memories[1].1, Some(256), "memory 1 max");
+        assert!(parsed_memories[1].2, "memory 1 is memory64");
+    }
+
+    // -----------------------------------------------------------------------
+    // resolve_import_to_instance $N suffix stripping tests
+    // -----------------------------------------------------------------------
+
+    /// Verify that resolve_import_to_instance strips $N suffixes when the
+    /// direct lookup fails. This is the core mechanism that allows multi-memory
+    /// mode's suffixed field names to resolve back to the original instance.
+    #[test]
+    fn test_resolve_import_to_instance_strips_suffix() {
+        use crate::parser::{ComponentImport, ComponentInstanceDef};
+        use wasmparser::ComponentTypeRef;
+
+        // Build a source component with one import "wasi:cli/stderr"
+        // that creates component instance 0.
+        let source = ParsedComponent {
+            name: None,
+            core_modules: Vec::new(),
+            imports: vec![ComponentImport {
+                name: "wasi:cli/stderr@0.2.6".to_string(),
+                ty: ComponentTypeRef::Instance(0),
+            }],
+            exports: Vec::new(),
+            types: Vec::new(),
+            instances: Vec::new(),
+            canonical_functions: Vec::new(),
+            sub_components: Vec::new(),
+            component_aliases: Vec::new(),
+            component_instances: Vec::new(),
+            core_entity_order: Vec::new(),
+            component_func_defs: Vec::new(),
+            component_instance_defs: vec![ComponentInstanceDef::Import(0)],
+            component_type_defs: Vec::new(),
+            original_size: 0,
+            original_hash: String::new(),
+            depth_0_sections: Vec::new(),
+        };
+
+        // Build an instance_func_map with the base field name (no suffix)
+        let mut instance_func_map = std::collections::HashMap::new();
+        instance_func_map.insert(
+            ("wasi:cli/stderr@0.2.6", "get-stderr"),
+            (0u32, "get-stderr".to_string()),
+        );
+
+        // Direct lookup: should succeed
+        let direct = resolve_import_to_instance(
+            &source,
+            "wasi:cli/stderr@0.2.6",
+            "get-stderr",
+            &instance_func_map,
+        );
+        assert!(direct.is_some(), "direct lookup should succeed");
+        assert_eq!(direct.unwrap().1, "get-stderr");
+
+        // Suffixed lookup: "get-stderr$1" should strip $1 and find "get-stderr"
+        let suffixed = resolve_import_to_instance(
+            &source,
+            "wasi:cli/stderr@0.2.6",
+            "get-stderr$1",
+            &instance_func_map,
+        );
+        assert!(
+            suffixed.is_some(),
+            "suffixed lookup should succeed by stripping $1"
+        );
+        assert_eq!(
+            suffixed.unwrap().1,
+            "get-stderr",
+            "resolved name should be the base name without suffix"
+        );
+    }
+
+    /// Verify that non-numeric suffixes after $ are NOT stripped.
+    /// "get-stderr$abc" should not match "get-stderr".
+    #[test]
+    fn test_resolve_import_to_instance_non_numeric_suffix_not_stripped() {
+        use crate::parser::{ComponentImport, ComponentInstanceDef};
+        use wasmparser::ComponentTypeRef;
+
+        let source = ParsedComponent {
+            name: None,
+            core_modules: Vec::new(),
+            imports: vec![ComponentImport {
+                name: "wasi:cli/stderr@0.2.6".to_string(),
+                ty: ComponentTypeRef::Instance(0),
+            }],
+            exports: Vec::new(),
+            types: Vec::new(),
+            instances: Vec::new(),
+            canonical_functions: Vec::new(),
+            sub_components: Vec::new(),
+            component_aliases: Vec::new(),
+            component_instances: Vec::new(),
+            core_entity_order: Vec::new(),
+            component_func_defs: Vec::new(),
+            component_instance_defs: vec![ComponentInstanceDef::Import(0)],
+            component_type_defs: Vec::new(),
+            original_size: 0,
+            original_hash: String::new(),
+            depth_0_sections: Vec::new(),
+        };
+
+        let mut instance_func_map = std::collections::HashMap::new();
+        instance_func_map.insert(
+            ("wasi:cli/stderr@0.2.6", "get-stderr"),
+            (0u32, "get-stderr".to_string()),
+        );
+
+        // Non-numeric suffix: should fall back to module-name matching, which
+        // will find the import but use the field name directly (not stripped).
+        // The key observation: $abc is not numeric, so the suffix-stripping
+        // branch does NOT fire.
+        let result = resolve_import_to_instance(
+            &source,
+            "wasi:cli/stderr@0.2.6",
+            "get-stderr$abc",
+            &instance_func_map,
+        );
+
+        // The function should fall through to the module-name matching fallback.
+        // It should succeed (because the module name matches the import name)
+        // and return the original field name unchanged (since $abc is not numeric).
+        assert!(result.is_some(), "module-name fallback should match");
+        assert_eq!(
+            result.unwrap().1,
+            "get-stderr$abc",
+            "non-numeric suffix should not be stripped"
+        );
+    }
+
+    /// Verify that resolve_import_to_instance returns None for unknown modules.
+    #[test]
+    fn test_resolve_import_to_instance_unknown_module() {
+        use crate::parser::{ComponentImport, ComponentInstanceDef};
+        use wasmparser::ComponentTypeRef;
+
+        let source = ParsedComponent {
+            name: None,
+            core_modules: Vec::new(),
+            imports: vec![ComponentImport {
+                name: "wasi:cli/stderr@0.2.6".to_string(),
+                ty: ComponentTypeRef::Instance(0),
+            }],
+            exports: Vec::new(),
+            types: Vec::new(),
+            instances: Vec::new(),
+            canonical_functions: Vec::new(),
+            sub_components: Vec::new(),
+            component_aliases: Vec::new(),
+            component_instances: Vec::new(),
+            core_entity_order: Vec::new(),
+            component_func_defs: Vec::new(),
+            component_instance_defs: vec![ComponentInstanceDef::Import(0)],
+            component_type_defs: Vec::new(),
+            original_size: 0,
+            original_hash: String::new(),
+            depth_0_sections: Vec::new(),
+        };
+
+        let instance_func_map = std::collections::HashMap::new();
+
+        let result = resolve_import_to_instance(
+            &source,
+            "wasi:unknown/thing@0.2.6",
+            "something$1",
+            &instance_func_map,
+        );
+        assert!(result.is_none(), "unknown module should not resolve");
+    }
 }

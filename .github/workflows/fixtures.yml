@@ -53,15 +53,16 @@ jobs:
 
       - name: Copy fixtures
         run: |
-          tests=(numbers strings lists records variants options many-arguments flavorful resources)
+          tests=(numbers strings lists records variants options many-arguments flavorful resources results lists-alias strings-alias strings-simple fixed-length-lists)
           for test in "${tests[@]}"; do
-            src="/tmp/wit-bindgen/artifacts/${test}/composed-runner.rs-test.rs.wasm"
+            # Find the composed artifact (filename varies per fixture)
+            src=$(find "/tmp/wit-bindgen/artifacts/${test}" -name 'composed-*.wasm' -print -quit 2>/dev/null)
             dst="tests/wit_bindgen/fixtures/${test}.wasm"
-            if [ -f "$src" ]; then
+            if [ -n "$src" ] && [ -f "$src" ]; then
               cp "$src" "$dst"
-              echo "Copied ${test}.wasm"
+              echo "Copied ${test}.wasm (from $(basename "$src"))"
             else
-              echo "::warning::Artifact not found: ${src}"
+              echo "::warning::Artifact not found for ${test}"
             fi
           done
 
@@ -90,7 +91,7 @@ jobs:
             - Generated via `wit-bindgen test --languages rust --artifacts`
 
             Fixtures updated:
-            `numbers`, `strings`, `lists`, `records`, `variants`, `options`, `many-arguments`, `flavorful`, `resources`
+            `numbers`, `strings`, `lists`, `records`, `variants`, `options`, `many-arguments`, `flavorful`, `resources`, `results`, `lists-alias`, `strings-alias`, `strings-simple`, `fixed-length-lists`
           add-paths: tests/wit_bindgen/fixtures/*.wasm
           labels: ci
           delete-branch: true
