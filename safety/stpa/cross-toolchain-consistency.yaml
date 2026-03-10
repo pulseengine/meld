@@ -1,0 +1,162 @@
+# Cross-Toolchain Consistency Hazards
+#
+# The PulseEngine toolchain has a unique property: three tools independently
+# implement aspects of the WebAssembly Component Model Canonical ABI.
+#
+# At build time:
+#   Meld     — computes CopyLayout, generates adapters with element sizes
+#   Synth    — computes canonical ABI layout for import/export dispatch
+#
+# At runtime:
+#   Kiln     — computes canonical ABI layout for lift/lower operations
+#
+# If ANY two of these disagree on the layout of a type, data is silently
+# corrupted at the boundary. This is a cross-tool consistency hazard that
+# the BA RFC #46 does not address (because the RFC assumes a single tool
+# chain where lower-component and the host runtime are co-developed).
+#
+# The PulseEngine approach (separate tools, each formally verified) requires
+# explicit consistency verification between tools.
+#
+# Relation to gale: Gale is below the consistency boundary — it provides
+# kernel primitives (semaphores, threads, scheduling) that Kiln uses, but
+# does not interpret WebAssembly types. Gale's STPA is about kernel
+# correctness (P1-P10 semaphore properties), not ABI consistency.
+
+consistency-hazards:
+  - id: XH-1
+    title: Canonical ABI element size disagreement (Meld ↔ Kiln)
+    description: >
+      Meld's parser.rs:canonical_abi_element_size() and Kiln's
+      kiln-component canonical_abi compute different element sizes for
+      the same component type. When Kiln runs a meld-fused P2 component,
+      the adapter's allocated buffer size (computed by Meld) disagrees
+      with the lift/lower's expected buffer size (computed by Kiln).
+    tools: [meld, kiln]
+    affected-types:
+      - "list<tuple<...>> where alignment padding is non-trivial"
+      - "record with mixed-size fields"
+      - "variant with differently-sized payloads"
+    verification:
+      - method: test
+        description: >
+          Shared wit-bindgen composed-runner fixtures: fuse with Meld,
+          run with Kiln. If roundtrip data is correct, element sizes agree.
+      - method: proof
+        description: >
+          Both tools should derive element size from the same spec
+          formalization (Component Model canonical ABI spec, commit deb0b0a).
+
+  - id: XH-2
+    title: Canonical ABI element size disagreement (Meld ↔ Synth)
+    description: >
+      Meld's canonical_abi_element_size() and Synth's synth-abi crate
+      compute different element sizes. When Synth AOT-compiles a
+      meld-fused module, the compiled import dispatch passes arguments
+      with wrong offsets.
+    tools: [meld, synth]
+    verification:
+      - method: test
+        description: >
+          Shared fixtures: fuse with Meld, compile with Synth, run on
+          Renode emulator. Roundtrip correctness validates consistency.
+      - method: proof
+        description: >
+          Synth's Rocq proofs should reference the same spec definitions
+          as Meld's proofs in proofs/spec/.
+
+  - id: XH-3
+    title: Canonical ABI element size disagreement (Synth ↔ Kiln)
+    description: >
+      Synth's synth-abi and Kiln's kiln-component compute different
+      element sizes. When Synth-compiled code calls a Kiln-hosted
+      function (via __meld_dispatch_import), argument layout disagrees.
+    tools: [synth, kiln]
+    verification:
+      - method: test
+        description: >
+          End-to-end: compile with Synth, run on Kiln/Gale. Validate
+          cross-boundary calls pass correct data.
+
+  - id: XH-4
+    title: String encoding disagreement across tools
+    description: >
+      Meld, Kiln, and Synth each implement string transcoding (UTF-8,
+      UTF-16, Latin-1). If encoding boundaries are handled differently
+      (e.g., surrogate pair handling, BOM treatment, NUL termination),
+      strings are corrupted at tool boundaries.
+    tools: [meld, kiln, synth]
+    verification:
+      - method: test
+        description: >
+          wit-bindgen strings fixture covers multi-byte UTF-8, Latin-1,
+          and boundary characters. Must pass through all three tool paths.
+
+  - id: XH-5
+    title: Record field alignment disagreement across tools
+    description: >
+      The canonical ABI specifies that record fields are laid out with
+      alignment(field) = canonical_abi_align(field_type) and padding
+      between fields. If any tool computes align_up differently, field
+      offsets diverge.
+    tools: [meld, kiln, synth]
+    verification:
+      - method: test
+        description: >
+          wit-bindgen records fixture with mixed-alignment fields
+          (u8, u32, u64, f32, f64) must roundtrip correctly.
+      - method: proof
+        description: >
+          Shared Rocq spec for align_up and canonical_abi_align.
+          All three tools should derive from this spec.
+
+mitigation-strategy:
+  description: >
+    The primary mitigation is shared test fixtures (wit-bindgen
+    composed-runner components) that exercise all canonical ABI type
+    families through all tool paths. The fixtures act as executable
+    conformance tests: if data roundtrips correctly through
+    Meld→Kiln, Meld→Synth→Kiln, and Synth→Kiln, the tools agree.
+
+    The secondary mitigation is shared Rocq specifications in
+    proofs/spec/ that formalize the canonical ABI layout rules.
+    Each tool's proofs should derive from these shared specs,
+    providing a formal guarantee of consistency.
+
+    The tertiary mitigation is keeping canonical ABI implementation
+    code as small and self-contained as possible in each tool, so
+    that the shared spec can be mechanically checked against each
+    implementation.
+
+  shared-fixtures:
+    - name: numbers
+      types: [u8, u16, u32, u64, s8, s16, s32, s64, f32, f64]
+      status: passing (meld)
+
+    - name: strings
+      types: [string]
+      status: passing (meld)
+
+    - name: lists
+      types: ["list<u8>", "list<u32>", "list<string>", "list<list<string>>", "list<tuple<u8,u32,u8>>"]
+      status: passing (meld)
+
+    - name: records
+      types: [record, tuple]
+      status: passing (meld)
+
+    - name: variants
+      types: [variant, enum, option, result, flags]
+      status: planned (#10)
+
+    - name: resources
+      types: [own, borrow]
+      status: planned (#10)
+
+  coverage-matrix:
+    meld-core-module: [numbers, strings, lists, records]
+    meld-component: [numbers, strings, lists, records]
+    meld-runtime-wasmtime: [numbers, strings, lists, records]
+    kiln-runtime: []  # TODO: run shared fixtures through kiln
+    synth-aot: []     # TODO: compile and run on renode
+    synth-kiln-bridge: []  # TODO: end-to-end AOT→runtime
