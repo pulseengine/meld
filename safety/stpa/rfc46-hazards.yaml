@@ -1,0 +1,295 @@
+# STPA Analysis: Bytecode Alliance RFC #46
+# "Propose tools and APIs for lowering components to core modules"
+#
+# This file captures losses, hazards, and unsafe control actions introduced
+# by the RFC's expanded scope beyond Meld's current system boundary.
+#
+# Prefix convention: RL- (RFC Loss), RH- (RFC Hazard), UCA-R* (RFC UCA)
+#
+# Reference: bytecodealliance/rfcs#46 (dicej, 2026)
+# Analysis: 2026-03-10
+
+# ---------------------------------------------------------------------------
+# Losses unique to RFC scope (beyond Meld's L-1 through L-5)
+# ---------------------------------------------------------------------------
+losses:
+  - id: RL-1
+    title: Loss of async correctness
+    description: >
+      The embedded CM runtime (compiled from Rust) manages resource tables,
+      stream/future I/O, and task bookkeeping inside the lowered module.
+      Bugs in this runtime cause silent state corruption, deadlocks, or
+      incorrect async sequencing between guest components.
+    stakeholders: [developers, end-users]
+    rfc-section: "lower-component / CM Runtime"
+    meld-relevance: >
+      Not applicable to current P2 scope. Meld is P2-first because the P3
+      ecosystem tools (wit-bindgen, runtime stack-switching) aren't available
+      yet — not because of timeline distance. Gale and kiln are already being
+      prepared for P3. This hazard becomes relevant when P3 tooling lands.
+
+  - id: RL-2
+    title: Loss of fiber isolation
+    description: >
+      Host-provided fiber intrinsics (create, suspend, resume) can violate
+      control flow integrity if the lowered module misuses them or if the
+      host implements them incorrectly. Stack corruption, dangling fiber
+      references, or cross-fiber state leaks.
+    stakeholders: [developers, end-users]
+    rfc-section: "Host C API for Lowered Components"
+    meld-relevance: >
+      Out of current P2 scope. Becomes relevant with P3 support. When
+      stack-switching or fibers are needed, Meld's approach should prefer
+      wasm-native stack switching (Core Spec proposal) over host intrinsics
+      to maintain the self-contained output property.
+
+  - id: RL-3
+    title: Loss of host/guest type safety at invocation boundary
+    description: >
+      host-wit-bindgen generates incorrect bindings, or lower-component
+      embeds wrong type metadata, causing host-to-guest and guest-to-host
+      calls to silently misinterpret arguments or return values.
+    stakeholders: [developers, end-users]
+    rfc-section: "host-wit-bindgen + Host C API for Embedder Bindings"
+    meld-relevance: >
+      Partially mapped to H-8 (component wrapping). The host bindings
+      generation is owned by syn/kiln in PulseEngine, not Meld.
+
+  - id: RL-4
+    title: Loss of portability
+    description: >
+      The Host C API is underspecified or implementations diverge across
+      runtimes (Wasmtime, WAMR, Wazero, browser). The same lowered module
+      behaves differently depending on which runtime hosts it.
+    stakeholders: [developers, end-users]
+    rfc-section: "Host C API for Embedder Bindings"
+    meld-relevance: >
+      Not applicable — Meld's output is standard core wasm or P2 component.
+      No custom host API required.
+
+  - id: RL-5
+    title: Loss of code size efficiency
+    description: >
+      For multiply-instantiated modules, function duplication causes
+      significant binary bloat. Batteries-included languages (Python, etc.)
+      without dead-code elimination multiply the output size by the instance
+      count.
+    stakeholders: [developers, end-users]
+    rfc-section: "Multiply-instantiated Modules"
+    meld-relevance: >
+      Same open question applies to Meld. Not yet handled; start with
+      reject, add duplication when needed.
+
+# ---------------------------------------------------------------------------
+# Hazards unique to RFC scope
+# ---------------------------------------------------------------------------
+hazards:
+  - id: RH-1
+    title: Embedded CM runtime corrupts resource table state
+    description: >
+      The Rust-compiled CM runtime manages resource handles, waitables,
+      streams, and futures in guest-side tables. Off-by-one in table
+      indexing, use-after-free of resource handle, or race in task
+      bookkeeping corrupts internal state silently.
+    losses: [RL-1]
+
+  - id: RH-2
+    title: Fiber intrinsic misuse causes stack corruption
+    description: >
+      The generated module calls fiber_create/fiber_suspend/fiber_resume
+      in incorrect order or with wrong parameters. The host runtime corrupts
+      the call stack, produces dangling fiber references, or leaks memory.
+    losses: [RL-2]
+
+  - id: RH-3
+    title: Type metadata in lowered module doesn't match actual signatures
+    description: >
+      lower-component embeds type metadata that host-wit-bindgen reads.
+      If metadata is inconsistent with actual flattened function signatures,
+      the host passes wrong-sized arguments or reads wrong return types.
+    losses: [RL-3]
+
+  - id: RH-4
+    title: Host C API implementation diverges across runtimes
+    description: >
+      The C API semantics are ambiguous (fiber lifetime, memory ownership
+      of buffers, error signaling). Different runtimes implement different
+      behaviors, causing the same lowered module to behave inconsistently.
+    losses: [RL-4]
+
+  - id: RH-5
+    title: Function duplication for multiply-instantiated modules breaks sharing
+    description: >
+      When the same module is instantiated N times, duplicating functions
+      changes semantics — leaf functions that should share state (globals,
+      memory) get independent copies with independent state.
+    losses: [RL-1, RL-5]
+
+  - id: RH-6
+    title: Guest-to-guest stream I/O deadlocks or corrupts data
+    description: >
+      Two guest components communicating via streams/futures through the
+      embedded CM runtime deadlock if scheduling is non-preemptive, or
+      corrupt data if buffers are shared across concurrent tasks.
+    losses: [RL-1]
+
+# ---------------------------------------------------------------------------
+# Unsafe Control Actions — RFC-specific controllers
+# ---------------------------------------------------------------------------
+ucas:
+  # --- Embedded CM Runtime ---
+  - id: UCA-RT-1
+    controller: "CM Runtime (embedded)"
+    description: >
+      Runtime allocates resource handle but doesn't initialize table entry,
+      leaving a dangling reference that subsequent operations dereference.
+    context: "Resource creation during component-to-component call"
+    hazards: [RH-1]
+    type: not-providing
+
+  - id: UCA-RT-2
+    controller: "CM Runtime (embedded)"
+    description: >
+      Runtime drops resource handle while it is still referenced by an
+      active stream or future, causing use-after-free on next I/O.
+    context: "Resource cleanup during async task completion"
+    hazards: [RH-1, RH-6]
+    type: too-early
+
+  - id: UCA-RT-3
+    controller: "CM Runtime (embedded)"
+    description: >
+      Runtime allows concurrent access to non-thread-safe stream buffer
+      from multiple tasks without synchronization.
+    context: "Multi-task stream I/O with shared buffer"
+    hazards: [RH-6]
+    type: providing-causes-hazard
+
+  - id: UCA-RT-4
+    controller: "CM Runtime (embedded)"
+    description: >
+      Runtime task scheduler starves one component indefinitely, causing
+      apparent hang or timeout in the starved component's callers.
+    context: "Task scheduling with multiple async components"
+    hazards: [RH-6]
+    type: too-late
+
+  # --- Fiber Manager (host) ---
+  - id: UCA-FM-1
+    controller: "Fiber Manager (host intrinsic)"
+    description: >
+      Host creates fiber with insufficient stack size for the guest code
+      that will execute on it, causing stack overflow during execution.
+    context: "Fiber creation for async component call"
+    hazards: [RH-2]
+    type: providing-causes-hazard
+
+  - id: UCA-FM-2
+    controller: "Fiber Manager (host intrinsic)"
+    description: >
+      Host resumes an already-completed fiber, reading from freed stack
+      memory or corrupting execution state.
+    context: "Fiber resume after task completion"
+    hazards: [RH-2]
+    type: providing-causes-hazard
+
+  - id: UCA-FM-3
+    controller: "Fiber Manager (host intrinsic)"
+    description: >
+      Host does not resume a suspended fiber that is waiting for I/O
+      completion, causing a permanent resource leak and logical deadlock.
+    context: "Fiber suspension waiting for stream data"
+    hazards: [RH-6]
+    type: not-providing
+
+  - id: UCA-FM-4
+    controller: "Fiber Manager (host intrinsic)"
+    description: >
+      Host reads fiber-local state from the wrong fiber context, causing
+      one component to observe another component's internal state.
+    context: "Fiber-local state access during context switch"
+    hazards: [RH-2]
+    type: providing-causes-hazard
+
+  # --- host-wit-bindgen (maps to syn/kiln in PulseEngine) ---
+  - id: UCA-HB-1
+    controller: "host-wit-bindgen"
+    description: >
+      Generated host bindings use wrong memory index for multi-memory
+      module, reading from or writing to the wrong component's memory.
+    context: "Host calling guest export that takes pointer arguments"
+    hazards: [RH-3]
+    type: providing-causes-hazard
+    pulseengine-owner: syn/kiln
+
+  - id: UCA-HB-2
+    controller: "host-wit-bindgen"
+    description: >
+      Generated host bindings don't validate string encoding at the
+      host/guest boundary, passing invalid UTF-8 into guest memory.
+    context: "Host passing string argument to guest function"
+    hazards: [RH-3]
+    type: not-providing
+    pulseengine-owner: syn/kiln
+
+  - id: UCA-HB-3
+    controller: "host-wit-bindgen"
+    description: >
+      Generated host bindings read type metadata from wrong custom section
+      offset, misinterpreting function signatures.
+    context: "Host bindings initialization / module inspection"
+    hazards: [RH-3]
+    type: providing-causes-hazard
+    pulseengine-owner: syn/kiln
+
+  - id: UCA-HB-4
+    controller: "host-wit-bindgen"
+    description: >
+      Generated host bindings assume single-memory module when the lowered
+      module uses multi-memory, causing all memory operations to target
+      memory 0 regardless of which component owns the data.
+    context: "Host reading return values from guest export"
+    hazards: [RH-3]
+    type: providing-causes-hazard
+    pulseengine-owner: syn/kiln
+
+# ---------------------------------------------------------------------------
+# Open questions mapped to hazards
+# ---------------------------------------------------------------------------
+open-questions:
+  - question: "How to handle multiply-instantiated modules?"
+    rfc-options:
+      - option: reject
+        hazard-profile: "None (safe default)"
+        coverage: "Limited — excludes valid components"
+      - option: duplicate-functions
+        hazard-profile: "RH-5 (shared state semantics change), RL-5 (bloat)"
+        coverage: "Full but potentially expensive"
+      - option: multi-module-output
+        hazard-profile: "New hazard: external linker becomes controller; metadata format misspecification → H-5 equivalent"
+        coverage: "Full but requires new tooling contract"
+    recommendation: >
+      Start with reject (fail-fast). Add duplication when real-world
+      components require it. Multi-module output introduces too much
+      new trust surface.
+
+  - question: "Who does type checking at invocation boundary?"
+    rfc-options:
+      - option: lower-component
+        hazard-profile: "Validation runs in sandboxed wasm — contained. But performance cost on every call."
+      - option: host-wit-bindgen
+        hazard-profile: "Static type guarantees from target language. But trust boundary crossed — host must be correct."
+    recommendation: >
+      Split: fusion-time validation in meld (resolver + merger verify
+      type compatibility). Static host bindings in syn/kiln. Runtime
+      validation only for dynamic/untrusted inputs.
+
+  - question: "Thread-local state: module vs host?"
+    rfc-options:
+      - option: module-side
+        hazard-profile: "Larger wasm module, but bugs contained in sandbox."
+      - option: host-side
+        hazard-profile: "Smaller module, but host TLS bugs affect all instances."
+    recommendation: >
+      Module-side is safer (sandboxed). Matches Meld philosophy of
+      self-contained output.
