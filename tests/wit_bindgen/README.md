@@ -22,9 +22,9 @@ cargo install wit-bindgen-cli
 wit-bindgen test --languages rust --artifacts artifacts tests/runtime
 
 # Copy fixtures to meld
-for test in numbers strings lists records variants options many-arguments flavorful resources; do
-  cp "artifacts/${test}/composed-runner.rs-test.rs.wasm" \
-     "/path/to/meld/tests/wit_bindgen/fixtures/${test}.wasm"
+for test in numbers strings lists records variants options many-arguments flavorful resources results lists-alias strings-alias strings-simple fixed-length-lists; do
+  src=$(find "artifacts/${test}" -name 'composed-*.wasm' -print -quit)
+  cp "$src" "/path/to/meld/tests/wit_bindgen/fixtures/${test}.wasm"
 done
 ```
 
@@ -69,6 +69,11 @@ fixtures/{test}.wasm  (composed component)
 | `many-arguments` | Functions with 16 parameters (spilling) |
 | `flavorful` | Mixed types: lists in records/variants, typedefs |
 | `resources` | Resource handle (own/borrow) pass-through across components |
+| `results` | Result<T,E> error handling patterns across boundaries |
+| `lists-alias` | List types via type aliases (regression for layout bugs) |
+| `strings-alias` | String types via type aliases |
+| `strings-simple` | Minimal string passing baseline |
+| `fixed-length-lists` | Fixed-length list types (bounded arrays) |
 
 ## Notes
 

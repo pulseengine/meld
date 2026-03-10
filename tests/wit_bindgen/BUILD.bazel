@@ -34,6 +34,11 @@ WIT_BINDGEN_TESTS = [
     "many-arguments",
     "flavorful",
     "resources",
+    "results",
+    "lists-alias",
+    "strings-alias",
+    "strings-simple",
+    "fixed-length-lists",
 ]
 
 # Fuse composed component with meld

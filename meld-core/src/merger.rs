@@ -3015,6 +3015,549 @@ mod tests {
             "different fields should remain separate imports"
         );
     }
+
+    // -----------------------------------------------------------------------
+    // Multi-memory WASI import lowering tests
+    // -----------------------------------------------------------------------
+
+    /// In MultiMemory mode, the same (module, field) from two different
+    /// components must get separate import slots (different DedupKey because
+    /// the component dimension differs). Each slot gets its own canon lower
+    /// with the correct Memory(N) and Realloc(N).
+    #[test]
+    fn test_multi_memory_dedup_separates_components() {
+        use crate::resolver::{DependencyGraph, UnresolvedImport};
+
+        let graph = DependencyGraph {
+            instantiation_order: vec![0, 1],
+            resolved_imports: HashMap::new(),
+            adapter_sites: Vec::new(),
+            module_resolutions: Vec::new(),
+            unresolved_imports: vec![
+                UnresolvedImport {
+                    component_idx: 0,
+                    module_idx: 0,
+                    module_name: "".to_string(),
+                    field_name: "0".to_string(),
+                    kind: ImportKind::Function(0),
+                    display_module: Some("wasi:cli/stderr@0.2.6".to_string()),
+                    display_field: Some("get-stderr".to_string()),
+                },
+                UnresolvedImport {
+                    component_idx: 1,
+                    module_idx: 0,
+                    module_name: "".to_string(),
+                    field_name: "0".to_string(),
+                    kind: ImportKind::Function(0),
+                    display_module: Some("wasi:cli/stderr@0.2.6".to_string()),
+                    display_field: Some("get-stderr".to_string()),
+                },
+            ],
+        };
+
+        let (counts, assignments, _dedup_info) =
+            compute_unresolved_import_assignments(&graph, None, &[], MemoryStrategy::MultiMemory);
+
+        // MultiMemory: same (module, field) from different components -> 2 slots
+        assert_eq!(
+            counts.func, 2,
+            "multi-memory mode must allocate separate import slots per component"
+        );
+
+        // Each component's import should map to a distinct position
+        let pos_comp0 = assignments.func[&(0, 0, "".to_string(), "0".to_string())];
+        let pos_comp1 = assignments.func[&(1, 0, "".to_string(), "0".to_string())];
+        assert_ne!(
+            pos_comp0, pos_comp1,
+            "component 0 and component 1 must have different import positions"
+        );
+    }
+
+    /// In SharedMemory mode, the same (module, field) from two different
+    /// components should still deduplicate to a single import slot (the
+    /// component dimension is None).
+    #[test]
+    fn test_shared_memory_dedup_merges_components() {
+        use crate::resolver::{DependencyGraph, UnresolvedImport};
+
+        let graph = DependencyGraph {
+            instantiation_order: vec![0, 1],
+            resolved_imports: HashMap::new(),
+            adapter_sites: Vec::new(),
+            module_resolutions: Vec::new(),
+            unresolved_imports: vec![
+                UnresolvedImport {
+                    component_idx: 0,
+                    module_idx: 0,
+                    module_name: "".to_string(),
+                    field_name: "0".to_string(),
+                    kind: ImportKind::Function(0),
+                    display_module: Some("wasi:cli/stderr@0.2.6".to_string()),
+                    display_field: Some("get-stderr".to_string()),
+                },
+                UnresolvedImport {
+                    component_idx: 1,
+                    module_idx: 0,
+                    module_name: "".to_string(),
+                    field_name: "0".to_string(),
+                    kind: ImportKind::Function(0),
+                    display_module: Some("wasi:cli/stderr@0.2.6".to_string()),
+                    display_field: Some("get-stderr".to_string()),
+                },
+            ],
+        };
+
+        let (counts, assignments, _dedup_info) =
+            compute_unresolved_import_assignments(&graph, None, &[], MemoryStrategy::SharedMemory);
+
+        // SharedMemory: same effective key -> 1 slot (deduped)
+        assert_eq!(
+            counts.func, 1,
+            "shared-memory mode must deduplicate same (module, field) across components"
+        );
+
+        // Both assignments point to the same position
+        let pos_comp0 = assignments.func[&(0, 0, "".to_string(), "0".to_string())];
+        let pos_comp1 = assignments.func[&(1, 0, "".to_string(), "0".to_string())];
+        assert_eq!(
+            pos_comp0, pos_comp1,
+            "deduplicated imports must share the same position"
+        );
+    }
+
+    /// Verify that `add_unresolved_imports` populates `import_memory_indices`
+    /// and `import_realloc_indices` with per-component values. Component 0's
+    /// import should reference memory 0, component 1's import should reference
+    /// memory 1.
+    #[test]
+    fn test_import_memory_and_realloc_indices_populated() {
+        use crate::parser::{FuncType, ModuleExport, ModuleImport, ParsedComponent};
+        use crate::resolver::{DependencyGraph, UnresolvedImport};
+
+        // Build two components, each with one module. Each module has:
+        // - 1 unresolved func import (WASI-like)
+        // - 1 memory
+        // - 1 cabi_realloc export
+        let make_module = |idx: usize| -> CoreModule {
+            CoreModule {
+                index: 0,
+                bytes: Vec::new(),
+                types: vec![
+                    // type 0: () -> ()  (for the unresolved import)
+                    FuncType {
+                        params: vec![],
+                        results: vec![],
+                    },
+                    // type 1: (i32, i32, i32, i32) -> i32  (cabi_realloc)
+                    FuncType {
+                        params: vec![ValType::I32, ValType::I32, ValType::I32, ValType::I32],
+                        results: vec![ValType::I32],
+                    },
+                ],
+                imports: vec![ModuleImport {
+                    module: "".to_string(),
+                    name: format!("{}", idx),
+                    kind: ImportKind::Function(0),
+                }],
+                exports: vec![ModuleExport {
+                    name: "cabi_realloc".to_string(),
+                    kind: ExportKind::Function,
+                    index: 1, // defined func 0 = func idx 1 (after 1 import)
+                }],
+                functions: vec![1], // one defined function with type 1 (cabi_realloc sig)
+                memories: vec![MemoryType {
+                    memory64: false,
+                    shared: false,
+                    initial: 1,
+                    maximum: None,
+                }],
+                tables: Vec::new(),
+                globals: Vec::new(),
+                start: None,
+                data_count: None,
+                element_count: 0,
+                custom_sections: Vec::new(),
+                code_section_range: None,
+                global_section_range: None,
+                element_section_range: None,
+                data_section_range: None,
+            }
+        };
+
+        let make_component = |idx: usize| -> ParsedComponent {
+            ParsedComponent {
+                name: None,
+                core_modules: vec![make_module(idx)],
+                imports: Vec::new(),
+                exports: Vec::new(),
+                types: Vec::new(),
+                instances: Vec::new(),
+                canonical_functions: Vec::new(),
+                sub_components: Vec::new(),
+                component_aliases: Vec::new(),
+                component_instances: Vec::new(),
+                core_entity_order: Vec::new(),
+                component_func_defs: Vec::new(),
+                component_instance_defs: Vec::new(),
+                component_type_defs: Vec::new(),
+                original_size: 0,
+                original_hash: String::new(),
+                depth_0_sections: Vec::new(),
+            }
+        };
+
+        let components = vec![make_component(0), make_component(1)];
+
+        let graph = DependencyGraph {
+            instantiation_order: vec![0, 1],
+            resolved_imports: HashMap::new(),
+            adapter_sites: Vec::new(),
+            module_resolutions: Vec::new(),
+            unresolved_imports: vec![
+                UnresolvedImport {
+                    component_idx: 0,
+                    module_idx: 0,
+                    module_name: "".to_string(),
+                    field_name: "0".to_string(),
+                    kind: ImportKind::Function(0),
+                    display_module: Some("wasi:cli/stderr@0.2.6".to_string()),
+                    display_field: Some("get-stderr".to_string()),
+                },
+                UnresolvedImport {
+                    component_idx: 1,
+                    module_idx: 0,
+                    module_name: "".to_string(),
+                    field_name: "0".to_string(),
+                    kind: ImportKind::Function(0),
+                    display_module: Some("wasi:cli/stderr@0.2.6".to_string()),
+                    display_field: Some("get-stderr".to_string()),
+                },
+            ],
+        };
+
+        let merger = Merger::new(MemoryStrategy::MultiMemory, false);
+        let merged = merger
+            .merge(&components, &graph)
+            .expect("merge should succeed");
+
+        // Should have 2 function imports (one per component)
+        assert_eq!(
+            merged.import_counts.func, 2,
+            "multi-memory: two func imports"
+        );
+
+        // import_memory_indices should have one entry per func import
+        assert_eq!(
+            merged.import_memory_indices.len(),
+            2,
+            "should have memory index for each func import"
+        );
+
+        // Component 0's memory index and component 1's should differ
+        // (each component's memory is separate in multi-memory mode)
+        let mem_idx_0 = merged.import_memory_indices[0];
+        let mem_idx_1 = merged.import_memory_indices[1];
+        assert_ne!(
+            mem_idx_0, mem_idx_1,
+            "components must reference different memories: comp0={}, comp1={}",
+            mem_idx_0, mem_idx_1,
+        );
+
+        // import_realloc_indices should also have one entry per func import
+        assert_eq!(
+            merged.import_realloc_indices.len(),
+            2,
+            "should have realloc index for each func import"
+        );
+
+        // Both components define cabi_realloc, so both should be Some
+        assert!(
+            merged.import_realloc_indices[0].is_some(),
+            "component 0 should have a realloc index"
+        );
+        assert!(
+            merged.import_realloc_indices[1].is_some(),
+            "component 1 should have a realloc index"
+        );
+
+        // The realloc indices should be different (different merged functions)
+        assert_ne!(
+            merged.import_realloc_indices[0], merged.import_realloc_indices[1],
+            "each component's realloc should map to a different merged function"
+        );
+    }
+
+    /// Verify that in multi-memory mode, merging generates `cabi_realloc$N`
+    /// exports for component indices > 0.
+    #[test]
+    fn test_cabi_realloc_suffixed_exports_generated() {
+        use crate::parser::{FuncType, ModuleExport, ModuleImport, ParsedComponent};
+        use crate::resolver::{DependencyGraph, UnresolvedImport};
+
+        let make_module = |idx: usize| -> CoreModule {
+            CoreModule {
+                index: 0,
+                bytes: Vec::new(),
+                types: vec![
+                    FuncType {
+                        params: vec![],
+                        results: vec![],
+                    },
+                    FuncType {
+                        params: vec![ValType::I32, ValType::I32, ValType::I32, ValType::I32],
+                        results: vec![ValType::I32],
+                    },
+                ],
+                imports: vec![ModuleImport {
+                    module: "".to_string(),
+                    name: format!("{}", idx),
+                    kind: ImportKind::Function(0),
+                }],
+                exports: vec![ModuleExport {
+                    name: "cabi_realloc".to_string(),
+                    kind: ExportKind::Function,
+                    index: 1, // defined func 0 = wasm idx 1 (after 1 import)
+                }],
+                functions: vec![1], // cabi_realloc signature
+                memories: vec![MemoryType {
+                    memory64: false,
+                    shared: false,
+                    initial: 1,
+                    maximum: None,
+                }],
+                tables: Vec::new(),
+                globals: Vec::new(),
+                start: None,
+                data_count: None,
+                element_count: 0,
+                custom_sections: Vec::new(),
+                code_section_range: None,
+                global_section_range: None,
+                element_section_range: None,
+                data_section_range: None,
+            }
+        };
+
+        let make_component = |idx: usize| -> ParsedComponent {
+            ParsedComponent {
+                name: None,
+                core_modules: vec![make_module(idx)],
+                imports: Vec::new(),
+                exports: Vec::new(),
+                types: Vec::new(),
+                instances: Vec::new(),
+                canonical_functions: Vec::new(),
+                sub_components: Vec::new(),
+                component_aliases: Vec::new(),
+                component_instances: Vec::new(),
+                core_entity_order: Vec::new(),
+                component_func_defs: Vec::new(),
+                component_instance_defs: Vec::new(),
+                component_type_defs: Vec::new(),
+                original_size: 0,
+                original_hash: String::new(),
+                depth_0_sections: Vec::new(),
+            }
+        };
+
+        let components = vec![make_component(0), make_component(1), make_component(2)];
+
+        let graph = DependencyGraph {
+            instantiation_order: vec![0, 1, 2],
+            resolved_imports: HashMap::new(),
+            adapter_sites: Vec::new(),
+            module_resolutions: Vec::new(),
+            unresolved_imports: vec![
+                UnresolvedImport {
+                    component_idx: 0,
+                    module_idx: 0,
+                    module_name: "".to_string(),
+                    field_name: "0".to_string(),
+                    kind: ImportKind::Function(0),
+                    display_module: Some("wasi:io/error@0.2.6".to_string()),
+                    display_field: Some("drop".to_string()),
+                },
+                UnresolvedImport {
+                    component_idx: 1,
+                    module_idx: 0,
+                    module_name: "".to_string(),
+                    field_name: "0".to_string(),
+                    kind: ImportKind::Function(0),
+                    display_module: Some("wasi:io/error@0.2.6".to_string()),
+                    display_field: Some("drop".to_string()),
+                },
+                UnresolvedImport {
+                    component_idx: 2,
+                    module_idx: 0,
+                    module_name: "".to_string(),
+                    field_name: "0".to_string(),
+                    kind: ImportKind::Function(0),
+                    display_module: Some("wasi:io/error@0.2.6".to_string()),
+                    display_field: Some("drop".to_string()),
+                },
+            ],
+        };
+
+        let merger = Merger::new(MemoryStrategy::MultiMemory, false);
+        let merged = merger
+            .merge(&components, &graph)
+            .expect("merge should succeed");
+
+        // Component 0's cabi_realloc should be exported as "cabi_realloc" (plain)
+        let has_plain = merged.exports.iter().any(|e| e.name == "cabi_realloc");
+        assert!(has_plain, "component 0 should export plain cabi_realloc");
+
+        // Component 1 should get cabi_realloc$1
+        let has_suffixed_1 = merged.exports.iter().any(|e| e.name == "cabi_realloc$1");
+        assert!(has_suffixed_1, "component 1 should export cabi_realloc$1");
+
+        // Component 2 should get cabi_realloc$2
+        let has_suffixed_2 = merged.exports.iter().any(|e| e.name == "cabi_realloc$2");
+        assert!(has_suffixed_2, "component 2 should export cabi_realloc$2");
+
+        // The suffixed exports should point to different function indices
+        let realloc_1_idx = merged
+            .exports
+            .iter()
+            .find(|e| e.name == "cabi_realloc$1")
+            .unwrap()
+            .index;
+        let realloc_2_idx = merged
+            .exports
+            .iter()
+            .find(|e| e.name == "cabi_realloc$2")
+            .unwrap()
+            .index;
+        assert_ne!(
+            realloc_1_idx, realloc_2_idx,
+            "cabi_realloc$1 and cabi_realloc$2 must point to different functions"
+        );
+    }
+
+    /// Verify that in SharedMemory mode, no `cabi_realloc$N` suffixed
+    /// exports are generated (only the plain `cabi_realloc` is present).
+    #[test]
+    fn test_shared_memory_no_suffixed_realloc_exports() {
+        use crate::parser::{FuncType, ModuleExport, ModuleImport, ParsedComponent};
+        use crate::resolver::{DependencyGraph, UnresolvedImport};
+
+        let make_module = |idx: usize| -> CoreModule {
+            CoreModule {
+                index: 0,
+                bytes: Vec::new(),
+                types: vec![
+                    FuncType {
+                        params: vec![],
+                        results: vec![],
+                    },
+                    FuncType {
+                        params: vec![ValType::I32, ValType::I32, ValType::I32, ValType::I32],
+                        results: vec![ValType::I32],
+                    },
+                ],
+                imports: vec![ModuleImport {
+                    module: "".to_string(),
+                    name: format!("{}", idx),
+                    kind: ImportKind::Function(0),
+                }],
+                exports: vec![ModuleExport {
+                    name: "cabi_realloc".to_string(),
+                    kind: ExportKind::Function,
+                    index: 1,
+                }],
+                functions: vec![1],
+                memories: vec![MemoryType {
+                    memory64: false,
+                    shared: false,
+                    initial: 1,
+                    maximum: None,
+                }],
+                tables: Vec::new(),
+                globals: Vec::new(),
+                start: None,
+                data_count: None,
+                element_count: 0,
+                custom_sections: Vec::new(),
+                code_section_range: None,
+                global_section_range: None,
+                element_section_range: None,
+                data_section_range: None,
+            }
+        };
+
+        let make_component = |idx: usize| -> ParsedComponent {
+            ParsedComponent {
+                name: None,
+                core_modules: vec![make_module(idx)],
+                imports: Vec::new(),
+                exports: Vec::new(),
+                types: Vec::new(),
+                instances: Vec::new(),
+                canonical_functions: Vec::new(),
+                sub_components: Vec::new(),
+                component_aliases: Vec::new(),
+                component_instances: Vec::new(),
+                core_entity_order: Vec::new(),
+                component_func_defs: Vec::new(),
+                component_instance_defs: Vec::new(),
+                component_type_defs: Vec::new(),
+                original_size: 0,
+                original_hash: String::new(),
+                depth_0_sections: Vec::new(),
+            }
+        };
+
+        let components = vec![make_component(0), make_component(1)];
+
+        let graph = DependencyGraph {
+            instantiation_order: vec![0, 1],
+            resolved_imports: HashMap::new(),
+            adapter_sites: Vec::new(),
+            module_resolutions: Vec::new(),
+            unresolved_imports: vec![
+                UnresolvedImport {
+                    component_idx: 0,
+                    module_idx: 0,
+                    module_name: "".to_string(),
+                    field_name: "0".to_string(),
+                    kind: ImportKind::Function(0),
+                    display_module: Some("wasi:io/error@0.2.6".to_string()),
+                    display_field: Some("drop".to_string()),
+                },
+                UnresolvedImport {
+                    component_idx: 1,
+                    module_idx: 0,
+                    module_name: "".to_string(),
+                    field_name: "0".to_string(),
+                    kind: ImportKind::Function(0),
+                    display_module: Some("wasi:io/error@0.2.6".to_string()),
+                    display_field: Some("drop".to_string()),
+                },
+            ],
+        };
+
+        let merger = Merger::new(MemoryStrategy::SharedMemory, false);
+        let merged = merger
+            .merge(&components, &graph)
+            .expect("merge should succeed");
+
+        // SharedMemory should NOT produce cabi_realloc$1
+        let has_suffixed = merged
+            .exports
+            .iter()
+            .any(|e| e.name.starts_with("cabi_realloc$"));
+        assert!(
+            !has_suffixed,
+            "shared-memory mode must not generate cabi_realloc$N exports, \
+             but found: {:?}",
+            merged
+                .exports
+                .iter()
+                .filter(|e| e.name.starts_with("cabi_realloc$"))
+                .map(|e| &e.name)
+                .collect::<Vec<_>>()
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
