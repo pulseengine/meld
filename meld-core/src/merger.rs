@@ -376,12 +376,38 @@ impl Merger {
         }))
     }
 
+    /// Check that no component instantiates the same core module more than once.
+    ///
+    /// The merger's index-space merging model assumes each module index appears
+    /// at most once in the instantiation order. Multiply-instantiated modules
+    /// would produce duplicate function/memory/table entries with conflicting
+    /// index offsets, causing silent data corruption (LS-M-5, SR-31).
+    fn check_no_duplicate_instantiations(components: &[ParsedComponent]) -> Result<()> {
+        for (comp_idx, component) in components.iter().enumerate() {
+            let mut seen_modules = std::collections::HashSet::new();
+            for instance in &component.instances {
+                if let crate::parser::InstanceKind::Instantiate { module_idx, .. } = &instance.kind
+                {
+                    if !seen_modules.insert(*module_idx) {
+                        return Err(Error::DuplicateModuleInstantiation {
+                            component_idx: comp_idx,
+                            module_idx: *module_idx,
+                        });
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Merge components into a single module
     pub fn merge(
         &self,
         components: &[ParsedComponent],
         graph: &DependencyGraph,
     ) -> Result<MergedModule> {
+        Self::check_no_duplicate_instantiations(components)?;
+
         let shared_memory_plan = if self.memory_strategy == MemoryStrategy::SharedMemory {
             self.compute_shared_memory_plan(components)?
         } else {
@@ -3557,6 +3583,90 @@ mod tests {
                 .map(|e| &e.name)
                 .collect::<Vec<_>>()
         );
+    }
+
+    // -- SR-31: Multiply-instantiated module detection -------------------------
+
+    /// Helper to build a minimal ParsedComponent with given instances.
+    fn make_component_with_instances(
+        instances: Vec<crate::parser::ComponentInstance>,
+    ) -> ParsedComponent {
+        ParsedComponent {
+            name: None,
+            core_modules: vec![],
+            imports: vec![],
+            exports: vec![],
+            types: vec![],
+            instances,
+            canonical_functions: vec![],
+            sub_components: vec![],
+            component_aliases: vec![],
+            component_instances: vec![],
+            core_entity_order: vec![],
+            component_func_defs: vec![],
+            component_instance_defs: vec![],
+            component_type_defs: vec![],
+            original_size: 0,
+            original_hash: String::new(),
+            depth_0_sections: vec![],
+        }
+    }
+
+    #[test]
+    fn test_duplicate_module_instantiation_rejected() {
+        let comp = make_component_with_instances(vec![
+            crate::parser::ComponentInstance {
+                index: 0,
+                kind: crate::parser::InstanceKind::Instantiate {
+                    module_idx: 0,
+                    args: vec![],
+                },
+            },
+            crate::parser::ComponentInstance {
+                index: 1,
+                kind: crate::parser::InstanceKind::Instantiate {
+                    module_idx: 0, // duplicate!
+                    args: vec![],
+                },
+            },
+        ]);
+        let result = Merger::check_no_duplicate_instantiations(&[comp]);
+        assert!(result.is_err());
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(
+            err_msg.contains("instantiates core module 0 more than once"),
+            "Error should mention duplicate module: {}",
+            err_msg
+        );
+    }
+
+    #[test]
+    fn test_single_instantiation_accepted() {
+        let comp = make_component_with_instances(vec![
+            crate::parser::ComponentInstance {
+                index: 0,
+                kind: crate::parser::InstanceKind::Instantiate {
+                    module_idx: 0,
+                    args: vec![],
+                },
+            },
+            crate::parser::ComponentInstance {
+                index: 1,
+                kind: crate::parser::InstanceKind::Instantiate {
+                    module_idx: 1, // different module — OK
+                    args: vec![],
+                },
+            },
+        ]);
+        let result = Merger::check_no_duplicate_instantiations(&[comp]);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_no_instances_accepted() {
+        let comp = make_component_with_instances(vec![]);
+        let result = Merger::check_no_duplicate_instantiations(&[comp]);
+        assert!(result.is_ok());
     }
 }
 
