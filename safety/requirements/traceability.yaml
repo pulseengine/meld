@@ -12,15 +12,17 @@
 #   5. Every requirement traces to at least one constraint or scenario
 #   6. Every requirement has at least one verification method
 #   7. No dangling references (all IDs resolve)
+#
+# Last updated: 2026-03-14
 
 # Reverse traceability: which requirements address each loss
 loss-coverage:
   L-1:
-    hazards: [H-1, H-2, H-3, H-4, H-5]
-    requirements: [SR-1, SR-2, SR-3, SR-4, SR-5, SR-7, SR-8, SR-9, SR-10, SR-11, SR-12, SR-20]
+    hazards: [H-1, H-2, H-3, H-4, H-5, H-8, H-9, H-10]
+    requirements: [SR-1, SR-2, SR-3, SR-4, SR-5, SR-7, SR-8, SR-9, SR-10, SR-11, SR-12, SR-20, SR-21, SR-22, SR-23, SR-24, SR-25, SR-26, SR-31]
   L-2:
     hazards: [H-2, H-3, H-4]
-    requirements: [SR-6, SR-9, SR-13, SR-14, SR-15, SR-16]
+    requirements: [SR-6, SR-9, SR-13, SR-14, SR-15, SR-16, SR-31]
   L-3:
     hazards: [H-6]
     requirements: [SR-27, SR-28, SR-29, SR-30]
@@ -35,15 +37,19 @@ loss-coverage:
 verification-status:
   SR-1:
     implementation-files: [meld-core/src/parser.rs]
-    tests: []
+    tests:
+      - nested_component::test_parse_composed_component_structure
     proofs: [proofs/parser/]
-    status: not-verified
+    status: partial
+    note: "Structure test exists; no count-based completeness verification"
 
   SR-2:
     implementation-files: [meld-core/src/parser.rs]
-    tests: []
+    tests:
+      - release_components::test_no_duplicate_imports
     proofs: [proofs/parser/]
-    status: not-verified
+    status: partial
+    note: "Dedup test exists; no round-trip count verification"
 
   SR-3:
     implementation-files: [meld-core/src/parser.rs]
@@ -58,9 +64,14 @@ verification-status:
 
   SR-4:
     implementation-files: [meld-core/src/parser.rs]
-    tests: []
+    tests:
+      - parser::tests::test_parser_rejects_core_module
+      - parser::tests::test_parser_rejects_invalid_wasm
+      - tests::test_fuser_rejects_core_module_input
+      - tests::test_fuser_rejects_invalid_wasm
     proofs: []
-    status: not-verified
+    status: partial
+    note: "Magic/truncated tested; malformed section tests still needed"
 
   SR-5:
     implementation-files: [meld-core/src/resolver.rs]
@@ -132,9 +143,13 @@ verification-status:
 
   SR-11:
     implementation-files: [meld-core/src/merger.rs]
-    tests: []
+    tests:
+      - resolver::tests::test_topological_sort_linear
+      - resolver::tests::test_topological_sort_diamond
+      - resolver::tests::test_resolver_preserves_order_stability
     proofs: []
-    status: not-verified
+    status: partial
+    note: "Topological sort tests verify ordering; merger iteration order is implicitly tested via integration tests"
 
   SR-12:
     implementation-files: [meld-core/src/adapter/fact.rs]
@@ -175,12 +190,14 @@ verification-status:
     tests: []
     proofs: []
     status: not-verified
+    note: "CRITICAL GAP: No UTF-16, CompactUTF16, or surrogate pair tests"
 
   SR-18:
     implementation-files: [meld-core/src/adapter/fact.rs]
     tests: []
     proofs: []
     status: not-verified
+    note: "Implicitly tested by runtime adapter tests; no binary instruction ordering verification"
 
   SR-19:
     implementation-files: [meld-core/src/lib.rs]
@@ -200,10 +217,69 @@ verification-status:
     proofs: []
     status: partial
 
+  SR-21:
+    implementation-files: [meld-core/src/component_wrap.rs]
+    tests:
+      - component_wrap::tests::test_build_stubs_module_multi_memory_exports
+      - component_wrap::tests::test_build_stubs_module_single_memory_no_suffix
+      - component_wrap::tests::test_build_stubs_module_multi_memory_limits_preserved
+      - component_wrap::tests::test_resolve_import_to_instance_strips_suffix
+      - component_wrap::tests::test_resolve_import_to_instance_non_numeric_suffix_not_stripped
+      - component_wrap::tests::test_resolve_import_to_instance_unknown_module
+      - wit_bindgen_runtime::test_fuse_component_wit_bindgen_flavorful
+      - wit_bindgen_runtime::test_runtime_wit_bindgen_flavorful
+    proofs: []
+    status: partial
+    note: "Multi-memory wrapping implemented and tested. Flavorful runtime test validates end-to-end."
+
+  SR-22:
+    implementation-files: [meld-core/src/adapter/fact.rs]
+    tests:
+      - wit_bindgen_runtime::test_runtime_wit_bindgen_options
+      - wit_bindgen_runtime::test_runtime_wit_bindgen_variants
+      - wit_bindgen_runtime::test_runtime_wit_bindgen_flavorful
+    proofs: []
+    status: implemented
+
+  SR-23:
+    implementation-files: [meld-core/src/merger.rs]
+    tests:
+      - merger::tests::test_multi_memory_dedup_separates_components
+      - merger::tests::test_shared_memory_dedup_merges_components
+      - merger::tests::test_import_memory_and_realloc_indices_populated
+      - merger::tests::test_cabi_realloc_suffixed_exports_generated
+      - merger::tests::test_shared_memory_no_suffixed_realloc_exports
+    proofs: []
+    status: partial
+    note: "Component-aware dedup implemented and tested with 5 targeted unit tests."
+
+  SR-24:
+    implementation-files:
+      - meld-core/src/parser.rs
+      - meld-core/src/resolver.rs
+      - meld-core/src/adapter/fact.rs
+    tests:
+      - wit_bindgen_runtime::test_runtime_wit_bindgen_flavorful
+      - wit_bindgen_runtime::test_runtime_wit_bindgen_variants
+    proofs: []
+    status: implemented
+
+  SR-25:
+    implementation-files: [meld-core/src/adapter/fact.rs, meld-core/src/component_wrap.rs]
+    tests:
+      - wit_bindgen_runtime::test_fuse_wit_bindgen_resources
+    proofs: []
+    status: partial
+    note: "Core module fusion works. P2 wrapping blocked on [resource-new]/[resource-rep]/[export] support."
+
+  SR-26:
+    implementation-files: [meld-core/src/parser.rs]
+    tests:
+      - wit_bindgen_runtime::test_runtime_wit_bindgen_flavorful
+    proofs: []
+    status: implemented
+
   SR-27:
-    description: >
-      Input hash integrity: attestation must record SHA-256 hashes that
-      match independently computed digests of input component bytes.
     implementation-files: [meld-core/src/attestation.rs]
     tests:
       - attestation::tests::test_sr27_input_hash_integrity
@@ -211,10 +287,6 @@ verification-status:
     status: partial
 
   SR-28:
-    description: >
-      Config completeness: every FuserConfig field must be recorded in
-      the attestation metadata so auditors can reconstruct exact build
-      configuration.
     implementation-files: [meld-core/src/attestation.rs, meld-core/src/lib.rs]
     tests:
       - attestation::tests::test_sr28_config_completeness
@@ -222,10 +294,6 @@ verification-status:
     status: partial
 
   SR-29:
-    description: >
-      Attestation round-trip: serialization to JSON and back must
-      preserve all fields intact and non-empty. Serialization errors
-      must propagate (not silently produce empty payloads).
     implementation-files: [meld-core/src/attestation.rs]
     tests:
       - attestation::tests::test_sr29_attestation_round_trip
@@ -234,15 +302,38 @@ verification-status:
     status: partial
 
   SR-30:
-    description: >
-      Output hash integrity: attestation must record a SHA-256 hash of
-      the fused output bytes that matches an independently computed
-      digest.
     implementation-files: [meld-core/src/attestation.rs]
     tests:
       - attestation::tests::test_sr30_output_hash_integrity
     proofs: []
     status: partial
+
+  SR-31:
+    implementation-files: [meld-core/src/merger.rs]
+    tests: []
+    proofs: []
+    status: not-verified
+    note: "CRITICAL: No detection of multiply-instantiated modules. Silent corruption risk."
+
+# wit-bindgen fixture coverage (14 fixtures × 3 levels = 42 integration tests)
+wit-bindgen-fixtures:
+  passing-all-3-levels:
+    - numbers
+    - strings
+    - lists
+    - records
+    - variants
+    - options
+    - many-arguments
+    - flavorful
+    - results
+    - lists-alias
+    - strings-alias
+    - strings-simple
+  core-module-only:
+    - resources  # P2 wrapping blocked on resource handles (SR-25)
+  graceful-degradation:
+    - fixed-length-lists  # Parser doesn't support 0x67 encoding
 
 # Identified gaps
 gaps:
@@ -256,8 +347,6 @@ gaps:
     priority: low
     action: >
       Add Rocq proofs for attestation correctness properties.
-      Consider adding an integration test that verifies the attestation
-      custom section is present in the fused output.
 
   - id: GAP-2
     description: >
@@ -271,12 +360,60 @@ gaps:
 
   - id: GAP-3
     description: >
-      SR-6 has CopyLayout unit tests. SR-12, SR-13, SR-15, SR-16 now have
-      runtime integration tests in adapter_safety.rs exercising adapter
-      generation, cabi_realloc targeting, list copy length, and inner
-      pointer fixup. These requirements still lack Rocq proofs.
+      Adapter requirements SR-6, SR-12-16 have unit and runtime tests
+      but lack Rocq proofs. 14 wit-bindgen fixtures (12 passing all 3
+      levels) provide broad coverage but not formal guarantees.
     priority: medium
     action: >
-      Add Rocq proofs for adapter correctness (issue #11). Consider
-      expanding runtime tests with wit-bindgen fixtures for broader
-      coverage of edge cases.
+      Add Rocq proofs for adapter correctness (issue #11).
+
+  - id: GAP-4
+    description: >
+      SR-21 (P2 wrapping) and SR-23 (import dedup) are now implemented
+      with targeted unit tests and runtime validation via flavorful fixture.
+    priority: closed
+    status: resolved
+
+  - id: GAP-5
+    description: >
+      SR-25 (resource handles) has partial support — core module fusion
+      works but P2 wrapping fails. Resources fixture exists but only
+      passes core module validation level. Wrapper needs [resource-new],
+      [resource-rep], [export]-prefixed module support.
+    priority: high
+    action: >
+      Implement resource support in component_wrap.rs.
+
+  - id: GAP-6
+    description: >
+      CTRL-WRAPPER (component_wrap.rs) has no Rocq proofs. Unit tests
+      exist for stubs module, fixup module, and suffix stripping.
+    priority: medium
+    action: >
+      Add Rocq proofs for wrapper correctness properties.
+
+  - id: GAP-7
+    description: >
+      Multiply-instantiated modules (SR-31) have no detection. The
+      merger silently produces corrupt output when the same core module
+      is instantiated more than once. BA RFC #46 discussion (cfallin)
+      identifies this as a fundamental component model capability that
+      must be handled correctly, not just rejected.
+    priority: critical
+    action: >
+      Immediate: fail-fast rejection in merger. Strategic: multi-module
+      component output per cfallin's "simple component" proposal.
+    references:
+      - "BA RFC #46 discussion, cfallin 2026-03-10"
+      - "safety/stpa/weighted-gap-analysis.md GAP-P2-1"
+
+  - id: GAP-8
+    description: >
+      SR-17 (string transcoding) has zero test coverage for non-UTF-8
+      encodings. No UTF-16, CompactUTF16, or surrogate pair tests exist.
+      Cross-toolchain hazard XH-4 (string encoding disagreement) is
+      unmitigated for non-UTF-8 paths.
+    priority: high
+    action: >
+      Add transcoding tests with UTF-16 canonical option. Consider
+      building a custom fixture with mixed string encodings.

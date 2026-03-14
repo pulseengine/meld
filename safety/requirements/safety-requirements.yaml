@@ -526,3 +526,30 @@ requirements:
           exports; verify correct type index resolution
     status: implemented
     implementation: meld-core/src/parser.rs
+
+  # ==========================================================================
+  # Requirements from weighted gap analysis (SR-31+)
+  # ==========================================================================
+
+  - id: SR-31
+    title: Multiply-instantiated module detection
+    description: >
+      The merger shall detect when the same core module is instantiated
+      more than once within a component and return a diagnostic error.
+      Silent production of corrupt output shall not occur. Future work
+      may support multi-module component output (per cfallin's "simple
+      component" proposal), but until then, fail-fast rejection is
+      required.
+    derives-from:
+      constraints: [SC-8, SC-9]
+      scenarios: [LS-M-5]
+    verification:
+      - method: test
+        description: >
+          Test with component that instantiates the same core module
+          twice; verify merger returns an error
+    status: draft
+    implementation: meld-core/src/merger.rs
+    references:
+      - "BA RFC #46 discussion: cfallin on multiply-instantiated modules"
+      - "safety/stpa/rfc46-comparative-analysis.md section 4 Q1"

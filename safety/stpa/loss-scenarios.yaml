@@ -368,3 +368,34 @@ loss-scenarios:
     process-model-flaw: >
       Wrapper assumes all imports use memory 0 because the original
       single-component wrapping only had one memory.
+    status: fixed
+    fix: >
+      Multi-memory WASI import lowering (PR #20). Per-import Memory(N)
+      and Realloc(N) via import_memory_indices/import_realloc_indices.
+
+  - id: LS-M-5
+    title: Multiply-instantiated module produces corrupt merged output
+    uca: UCA-M-9
+    type: inadequate-process-model
+    scenario: >
+      A component instantiates the same core module twice (e.g., a shared
+      utility module used by two sub-components). The merger processes the
+      module index twice in its instantiation loop, creating duplicate
+      function/memory/table entries. The second instance's functions receive
+      index offsets computed from the first instance's space, but reference
+      the first instance's memory. Cross-instance calls silently access
+      wrong memory regions. Data corruption occurs without any error or
+      trap [H-1, H-2, H-3].
+    causal-factors:
+      - Merger iterates instantiation_order without checking for duplicate
+        module indices
+      - No validation that each core module is instantiated at most once
+      - Index maps (function_index_map, memory_index_map) silently
+        overwrite entries for duplicate module indices
+    process-model-flaw: >
+      Merger assumes each module index appears at most once in the
+      instantiation order. The component model spec allows multiple
+      instantiations of the same module (with different import wiring),
+      but the merger's index-space merging model does not account for this.
+    status: open
+    priority: critical

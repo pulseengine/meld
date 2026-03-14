@@ -144,32 +144,65 @@ mitigation-strategy:
   shared-fixtures:
     - name: numbers
       types: [u8, u16, u32, u64, s8, s16, s32, s64, f32, f64]
-      status: passing (meld)
+      status: passing (meld, all 3 levels)
 
     - name: strings
       types: [string]
-      status: passing (meld)
+      status: passing (meld, all 3 levels)
 
     - name: lists
       types: ["list<u8>", "list<u32>", "list<string>", "list<list<string>>", "list<tuple<u8,u32,u8>>"]
-      status: passing (meld)
+      status: passing (meld, all 3 levels)
 
     - name: records
       types: [record, tuple]
-      status: passing (meld)
+      status: passing (meld, all 3 levels)
 
     - name: variants
       types: [variant, enum, option, result, flags]
-      status: planned (#10)
+      status: passing (meld, all 3 levels)
+
+    - name: options
+      types: ["option<string>", "option<option<string>>"]
+      status: passing (meld, all 3 levels)
+
+    - name: many-arguments
+      types: [16-param functions, spilling]
+      status: passing (meld, all 3 levels)
+
+    - name: flavorful
+      types: [mixed — lists in records, variants, typedefs, flags, enums]
+      status: passing (meld, all 3 levels)
+
+    - name: results
+      types: ["result<T,E>", error handling]
+      status: passing (meld, all 3 levels)
+
+    - name: lists-alias
+      types: [list via type alias]
+      status: passing (meld, all 3 levels)
+
+    - name: strings-alias
+      types: [string via type alias]
+      status: passing (meld, all 3 levels)
+
+    - name: strings-simple
+      types: [string — minimal baseline]
+      status: passing (meld, all 3 levels)
 
     - name: resources
       types: [own, borrow]
-      status: planned (#10)
+      status: core-module-only (meld — P2 wrapping blocked on SR-25)
+
+    - name: fixed-length-lists
+      types: [fixed-length list]
+      status: graceful-degradation (parser doesn't support 0x67 encoding)
 
   coverage-matrix:
-    meld-core-module: [numbers, strings, lists, records]
-    meld-component: [numbers, strings, lists, records]
-    meld-runtime-wasmtime: [numbers, strings, lists, records]
+    # 14 fixtures, last updated 2026-03-14
+    meld-core-module: [numbers, strings, lists, records, variants, options, many-arguments, flavorful, resources, results, lists-alias, strings-alias, strings-simple, fixed-length-lists]
+    meld-component: [numbers, strings, lists, records, variants, options, many-arguments, flavorful, results, lists-alias, strings-alias, strings-simple]
+    meld-runtime-wasmtime: [numbers, strings, lists, records, variants, options, many-arguments, flavorful, results, lists-alias, strings-alias, strings-simple]
     kiln-runtime: []  # TODO: run shared fixtures through kiln
     synth-aot: []     # TODO: compile and run on renode
     synth-kiln-bridge: []  # TODO: end-to-end AOT→runtime
