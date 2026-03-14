@@ -296,8 +296,8 @@ fn rewrite_operator(op: Operator<'_>, maps: &IndexMaps) -> Result<Vec<Instructio
         // Constants
         I32Const { value } => Instruction::I32Const(value),
         I64Const { value } => Instruction::I64Const(value),
-        F32Const { value } => Instruction::F32Const(f32::from_bits(value.bits())),
-        F64Const { value } => Instruction::F64Const(f64::from_bits(value.bits())),
+        F32Const { value } => Instruction::F32Const(f32::from_bits(value.bits()).into()),
+        F64Const { value } => Instruction::F64Const(f64::from_bits(value.bits()).into()),
 
         // Comparison operators
         I32Eqz => Instruction::I32Eqz,

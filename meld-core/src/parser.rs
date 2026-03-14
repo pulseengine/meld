@@ -393,6 +393,7 @@ pub enum ComponentValType {
     Primitive(PrimitiveValType),
     String,
     List(Box<ComponentValType>),
+    FixedSizeList(Box<ComponentValType>, u32),
     Record(Vec<(String, ComponentValType)>),
     Variant(Vec<(String, Option<ComponentValType>)>),
     Tuple(Vec<ComponentValType>),
@@ -475,6 +476,8 @@ pub enum CanonicalEntry {
     ThreadSpawn { func_ty_index: u32 },
     /// Query hardware thread concurrency
     ThreadHwConcurrency,
+    /// Unsupported canonical function (P3 async, stream, future, etc.)
+    Unsupported,
 }
 
 /// Component instance
@@ -552,7 +555,9 @@ impl ComponentParser {
         }
 
         if self.validate {
-            let mut validator = wasmparser::Validator::new();
+            let features =
+                wasmparser::WasmFeatures::default() | wasmparser::WasmFeatures::CM_FIXED_SIZE_LIST;
+            let mut validator = wasmparser::Validator::new_with_features(features);
             validator.validate_all(bytes)?;
         }
 
@@ -811,11 +816,9 @@ impl ComponentParser {
                                 })
                                 .collect();
                             let results = func_type
-                                .results
+                                .result
                                 .iter()
-                                .map(|(name, ty)| {
-                                    (name.map(String::from), convert_wp_component_val_type(ty))
-                                })
+                                .map(|ty| (None, convert_wp_component_val_type(ty)))
                                 .collect();
                             ComponentTypeKind::Function { params, results }
                         }
@@ -1303,6 +1306,7 @@ impl ParsedComponent {
                     .unwrap_or(0);
                 4 + max_payload
             }
+            ComponentValType::FixedSizeList(elem, len) => self.flat_byte_size(elem) * len,
             ComponentValType::Own(_) | ComponentValType::Borrow(_) => 4,
         }
     }
@@ -1546,6 +1550,15 @@ impl ParsedComponent {
                     });
                 }
             }
+            ComponentValType::FixedSizeList(elem, len) => {
+                // Inline fixed-size list: lay out each element sequentially
+                let elem_size = self.canonical_abi_element_size(elem);
+                let mut offset = base;
+                for _ in 0..*len {
+                    self.collect_return_area_type_slots(elem, offset, out);
+                    offset += elem_size;
+                }
+            }
             ComponentValType::Own(_) | ComponentValType::Borrow(_) => {
                 out.push(ReturnAreaSlot {
                     byte_offset: base,
@@ -1597,6 +1610,15 @@ impl ParsedComponent {
             ComponentValType::String | ComponentValType::List(_) => {
                 out.push(base);
             }
+            ComponentValType::FixedSizeList(elem, len) => {
+                // Inline: each element is flattened sequentially
+                let elem_flat = self.flat_count(elem);
+                let mut offset = base;
+                for _ in 0..*len {
+                    self.collect_pointer_positions(elem, offset, out);
+                    offset += elem_flat;
+                }
+            }
             ComponentValType::Record(fields) => {
                 let mut offset = base;
                 for (_, field_ty) in fields {
@@ -1629,6 +1651,15 @@ impl ParsedComponent {
         match ty {
             ComponentValType::String | ComponentValType::List(_) => {
                 out.push(base);
+            }
+            ComponentValType::FixedSizeList(elem, len) => {
+                // Inline: each element laid out at stride = element_size
+                let elem_size = self.canonical_abi_element_size(elem);
+                let mut offset = base;
+                for _ in 0..*len {
+                    self.collect_pointer_byte_offsets(elem, offset, out);
+                    offset += elem_size;
+                }
             }
             ComponentValType::Record(fields) => {
                 let mut offset = base;
@@ -1795,6 +1826,14 @@ impl ParsedComponent {
                     }
                 }
             }
+            ComponentValType::FixedSizeList(elem, len) => {
+                let elem_flat = self.flat_count(elem);
+                let mut offset = base;
+                for _ in 0..*len {
+                    self.collect_conditional_pointers(elem, offset, out);
+                    offset += elem_flat;
+                }
+            }
             ComponentValType::Record(fields) => {
                 let mut offset = base;
                 for (_, field_ty) in fields {
@@ -1925,6 +1964,14 @@ impl ParsedComponent {
                     }
                 }
             }
+            ComponentValType::FixedSizeList(elem, len) => {
+                let elem_size = self.canonical_abi_element_size(elem);
+                let mut offset = base;
+                for _ in 0..*len {
+                    self.collect_conditional_result_pointers(elem, offset, out);
+                    offset += elem_size;
+                }
+            }
             ComponentValType::Record(fields) => {
                 let mut offset = base;
                 for (_, field_ty) in fields {
@@ -1958,6 +2005,7 @@ impl ParsedComponent {
     pub fn type_contains_pointers(&self, ty: &ComponentValType) -> bool {
         match ty {
             ComponentValType::String | ComponentValType::List(_) => true,
+            ComponentValType::FixedSizeList(elem, _) => self.type_contains_pointers(elem),
             ComponentValType::Option(inner) => self.type_contains_pointers(inner),
             ComponentValType::Result { ok, err } => {
                 ok.as_ref().is_some_and(|t| self.type_contains_pointers(t))
@@ -2025,6 +2073,7 @@ impl ParsedComponent {
                     1
                 }
             }
+            ComponentValType::FixedSizeList(elem, len) => self.flat_count(elem) * len,
             ComponentValType::Own(_) | ComponentValType::Borrow(_) => 1,
         }
     }
@@ -2042,6 +2091,7 @@ impl ParsedComponent {
                 PrimitiveValType::S64 | PrimitiveValType::U64 | PrimitiveValType::F64 => 8,
             },
             ComponentValType::String | ComponentValType::List(_) => 4, // ptr alignment
+            ComponentValType::FixedSizeList(elem, _) => self.canonical_abi_align(elem),
             ComponentValType::Record(fields) => fields
                 .iter()
                 .map(|(_, t)| self.canonical_abi_align(t))
@@ -2106,6 +2156,10 @@ impl ParsedComponent {
                 PrimitiveValType::S64 | PrimitiveValType::U64 | PrimitiveValType::F64 => 8,
             },
             ComponentValType::String | ComponentValType::List(_) => 8, // (ptr: i32, len: i32)
+            ComponentValType::FixedSizeList(elem, len) => {
+                // Inline: element_size (padded stride) * length
+                self.canonical_abi_element_size(elem) * len
+            }
             ComponentValType::Record(fields) => {
                 let mut size = 0u32;
                 for (_, field_ty) in fields {
@@ -2229,6 +2283,15 @@ impl ParsedComponent {
                 // The list itself is a pointer pair — don't recurse further here
                 let _ = inner;
             }
+            ComponentValType::FixedSizeList(elem, len) => {
+                // Inline: recurse into each element
+                let elem_size = self.canonical_abi_element_size(elem);
+                let mut offset = base;
+                for _ in 0..*len {
+                    result.extend(self.element_inner_pointers(elem, offset));
+                    offset += elem_size;
+                }
+            }
             ComponentValType::Record(fields) => {
                 let mut offset = base;
                 for (_, field_ty) in fields {
@@ -2300,6 +2363,10 @@ fn convert_wp_component_val_type(ty: &wasmparser::ComponentValType) -> Component
             wasmparser::PrimitiveValType::F64 => ComponentValType::Primitive(PrimitiveValType::F64),
             wasmparser::PrimitiveValType::Char => {
                 ComponentValType::Primitive(PrimitiveValType::Char)
+            }
+            wasmparser::PrimitiveValType::ErrorContext => {
+                // P3 error context type — treat as opaque i32 handle
+                ComponentValType::Primitive(PrimitiveValType::U32)
             }
         },
         wasmparser::ComponentValType::Type(idx) => ComponentValType::Type(*idx),
@@ -2382,6 +2449,12 @@ fn convert_wp_defined_type(dt: &wasmparser::ComponentDefinedType) -> ComponentTy
                     .collect(),
             ))
         }
+        wasmparser::ComponentDefinedType::FixedSizeList(ty, len) => ComponentTypeKind::Defined(
+            ComponentValType::FixedSizeList(Box::new(convert_wp_component_val_type(ty)), *len),
+        ),
+        // P3 async types — not yet supported by the fuser
+        wasmparser::ComponentDefinedType::Future(_)
+        | wasmparser::ComponentDefinedType::Stream(_) => ComponentTypeKind::Other,
     }
 }
 
@@ -2408,6 +2481,10 @@ fn convert_canonical_options(options: &[wasmparser::CanonicalOption]) -> Canonic
             wasmparser::CanonicalOption::PostReturn(idx) => {
                 result.post_return = Some(*idx);
             }
+            // P3 async canonical options — ignored for fusion
+            wasmparser::CanonicalOption::Async
+            | wasmparser::CanonicalOption::Callback(_)
+            | wasmparser::CanonicalOption::CoreType(_) => {}
         }
     }
     result
@@ -2441,10 +2518,11 @@ fn convert_canonical_function(canon: wasmparser::CanonicalFunction) -> Canonical
         wasmparser::CanonicalFunction::ResourceRep { resource } => {
             CanonicalEntry::ResourceRep { resource }
         }
-        wasmparser::CanonicalFunction::ThreadSpawn { func_ty_index } => {
+        wasmparser::CanonicalFunction::ThreadSpawnRef { func_ty_index } => {
             CanonicalEntry::ThreadSpawn { func_ty_index }
         }
-        wasmparser::CanonicalFunction::ThreadHwConcurrency => CanonicalEntry::ThreadHwConcurrency,
+        // P3 async/stream/future/error-context canonical functions — not yet supported
+        _ => CanonicalEntry::Unsupported,
     }
 }
 
@@ -2978,5 +3056,237 @@ mod tests {
             pairs_f64[0].ptr_position, 8,
             "pointer should be at offset 8 (align_up(1,8)) not 4"
         );
+    }
+
+    // ---------------------------------------------------------------
+    // SR-17: String encoding canonical option parsing
+    //
+    // These tests verify that the parser correctly identifies string
+    // encoding canonical options from component binary format. The
+    // canonical ABI defines three string encodings:
+    //
+    //   1. UTF-8 (default) — variable-length, 1-4 bytes per code point
+    //   2. UTF-16 — fixed 2 bytes per code unit, surrogate pairs for
+    //      code points >= U+10000
+    //   3. CompactUTF16 (latin1+utf16) — 1 byte per char for Latin-1
+    //      range, falls back to UTF-16 for wider chars
+    //
+    // The parser must correctly set CanonicalOptions.string_encoding
+    // based on wasmparser::CanonicalOption::UTF8/UTF16/CompactUTF16.
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_sr17_canonical_options_utf8_explicit() {
+        // Explicitly setting UTF8 should produce Utf8 (same as default)
+        let opts = convert_canonical_options(&[wasmparser::CanonicalOption::UTF8]);
+        assert_eq!(
+            opts.string_encoding,
+            CanonStringEncoding::Utf8,
+            "SR-17: explicit UTF8 option should produce Utf8 encoding"
+        );
+    }
+
+    #[test]
+    fn test_sr17_canonical_options_utf16() {
+        let opts = convert_canonical_options(&[wasmparser::CanonicalOption::UTF16]);
+        assert_eq!(
+            opts.string_encoding,
+            CanonStringEncoding::Utf16,
+            "SR-17: UTF16 option should produce Utf16 encoding"
+        );
+    }
+
+    #[test]
+    fn test_sr17_canonical_options_compact_utf16() {
+        let opts = convert_canonical_options(&[wasmparser::CanonicalOption::CompactUTF16]);
+        assert_eq!(
+            opts.string_encoding,
+            CanonStringEncoding::CompactUtf16,
+            "SR-17: CompactUTF16 option should produce CompactUtf16 encoding"
+        );
+    }
+
+    #[test]
+    fn test_sr17_canonical_options_default_is_utf8() {
+        // When no string encoding option is specified, default is UTF-8
+        // (per the canonical ABI spec).
+        let opts = convert_canonical_options(&[
+            wasmparser::CanonicalOption::Memory(0),
+            wasmparser::CanonicalOption::Realloc(1),
+        ]);
+        assert_eq!(
+            opts.string_encoding,
+            CanonStringEncoding::Utf8,
+            "SR-17: default encoding (no explicit option) should be Utf8"
+        );
+    }
+
+    #[test]
+    fn test_sr17_canonical_options_encoding_with_memory_and_realloc() {
+        // Verify encoding is correctly parsed alongside other canonical options
+        let opts = convert_canonical_options(&[
+            wasmparser::CanonicalOption::UTF16,
+            wasmparser::CanonicalOption::Memory(2),
+            wasmparser::CanonicalOption::Realloc(5),
+            wasmparser::CanonicalOption::PostReturn(10),
+        ]);
+        assert_eq!(
+            opts.string_encoding,
+            CanonStringEncoding::Utf16,
+            "SR-17: UTF16 encoding with other options"
+        );
+        assert_eq!(opts.memory, Some(2));
+        assert_eq!(opts.realloc, Some(5));
+        assert_eq!(opts.post_return, Some(10));
+    }
+
+    #[test]
+    fn test_sr17_canonical_options_last_encoding_wins() {
+        // If multiple encoding options are present (unusual but valid per parser),
+        // the last one wins because convert_canonical_options overwrites.
+        let opts = convert_canonical_options(&[
+            wasmparser::CanonicalOption::UTF8,
+            wasmparser::CanonicalOption::UTF16,
+        ]);
+        assert_eq!(
+            opts.string_encoding,
+            CanonStringEncoding::Utf16,
+            "SR-17: last encoding option should win when multiple specified"
+        );
+    }
+
+    #[test]
+    fn test_sr17_canonical_function_lift_utf16_encoding() {
+        // Verify that a canon lift with UTF-16 encoding correctly propagates
+        // the encoding to the CanonicalEntry.
+        let canon = wasmparser::CanonicalFunction::Lift {
+            core_func_index: 0,
+            type_index: 0,
+            options: vec![
+                wasmparser::CanonicalOption::UTF16,
+                wasmparser::CanonicalOption::Memory(0),
+                wasmparser::CanonicalOption::Realloc(0),
+            ]
+            .into_boxed_slice(),
+        };
+        let entry = convert_canonical_function(canon);
+        match entry {
+            CanonicalEntry::Lift { options, .. } => {
+                assert_eq!(
+                    options.string_encoding,
+                    CanonStringEncoding::Utf16,
+                    "SR-17: lifted function should carry UTF-16 encoding"
+                );
+            }
+            _ => panic!("Expected CanonicalEntry::Lift"),
+        }
+    }
+
+    #[test]
+    fn test_sr17_canonical_function_lower_compact_utf16_encoding() {
+        // Verify that a canon lower with CompactUTF16 correctly propagates.
+        let canon = wasmparser::CanonicalFunction::Lower {
+            func_index: 0,
+            options: vec![
+                wasmparser::CanonicalOption::CompactUTF16,
+                wasmparser::CanonicalOption::Memory(0),
+                wasmparser::CanonicalOption::Realloc(0),
+            ]
+            .into_boxed_slice(),
+        };
+        let entry = convert_canonical_function(canon);
+        match entry {
+            CanonicalEntry::Lower { options, .. } => {
+                assert_eq!(
+                    options.string_encoding,
+                    CanonStringEncoding::CompactUtf16,
+                    "SR-17: lowered function should carry CompactUTF16 encoding"
+                );
+            }
+            _ => panic!("Expected CanonicalEntry::Lower"),
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // SR-17: Canonical ABI element sizes for string-related types
+    //
+    // Strings and lists are stored as (ptr: i32, len: i32) = 8 bytes
+    // regardless of the string encoding. The encoding affects the
+    // interpretation of the data at the pointer address, not the
+    // size of the (ptr, len) pair itself.
+    //
+    // However, when transcoding, the *element size* for the pointed-to
+    // data differs:
+    //   - UTF-8:  variable (1-4 bytes per code point)
+    //   - UTF-16: 2 bytes per code unit
+    //   - Latin-1: 1 byte per character
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_sr17_string_canonical_abi_size_is_8() {
+        // A string type is always stored as (ptr: i32, len: i32) = 8 bytes
+        // in the canonical ABI, regardless of encoding.
+        let pc = empty_parsed_component();
+        let ty = ComponentValType::String;
+        assert_eq!(
+            pc.canonical_abi_element_size(&ty),
+            8,
+            "SR-17: string element size should be 8 (ptr + len) regardless of encoding"
+        );
+    }
+
+    #[test]
+    fn test_sr17_string_copy_layout_is_bulk_byte_multiplier_1() {
+        // CopyLayout for a string: Bulk { byte_multiplier: 1 }.
+        // This means: copy `len * 1` bytes from the source memory.
+        // The byte_multiplier is 1 because len IS the byte count for UTF-8.
+        //
+        // NOTE: This layout is used for the cross-memory copy step BEFORE
+        // transcoding. When encodings differ, the adapter must also run
+        // the transcoding loop. The copy_layout only describes the raw
+        // data copy, not the encoding transformation.
+        let pc = empty_parsed_component();
+        let ty = ComponentValType::String;
+        let layout = pc.copy_layout(&ty);
+        match layout {
+            crate::resolver::CopyLayout::Bulk { byte_multiplier } => {
+                assert_eq!(
+                    byte_multiplier, 1,
+                    "SR-17: string copy layout byte_multiplier should be 1"
+                );
+            }
+            crate::resolver::CopyLayout::Elements { .. } => {
+                panic!("SR-17: string should produce Bulk layout, not Elements");
+            }
+        }
+    }
+
+    #[test]
+    fn test_sr17_list_string_copy_layout_has_inner_pointers() {
+        // list<string> has inner pointer pairs that need recursive fixup.
+        // Each string element is (ptr: i32, len: i32) = 8 bytes, and each
+        // element's pointed-to data must also be copied across memories.
+        let pc = empty_parsed_component();
+        let ty = ComponentValType::List(Box::new(ComponentValType::String));
+        let layout = pc.copy_layout(&ty);
+        match layout {
+            crate::resolver::CopyLayout::Elements {
+                element_size,
+                inner_pointers,
+            } => {
+                assert_eq!(
+                    element_size, 8,
+                    "SR-17: list<string> element should be 8 bytes"
+                );
+                assert_eq!(
+                    inner_pointers.len(),
+                    1,
+                    "SR-17: list<string> should have 1 inner pointer pair per element"
+                );
+            }
+            crate::resolver::CopyLayout::Bulk { .. } => {
+                panic!("SR-17: list<string> should produce Elements layout, not Bulk");
+            }
+        }
     }
 }

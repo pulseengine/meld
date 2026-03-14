@@ -1,0 +1,40 @@
+project:
+  name: meld
+  version: "0.2.0"
+  description: >
+    Static component fusion tool for WebAssembly. Takes composed P2/P3
+    components and fuses them into a single core wasm module, eliminating
+    the need for runtime linking.
+  schemas:
+    - common
+    - stpa
+    - aspice
+    - dev
+
+sources:
+  - path: safety/stpa
+    format: stpa-yaml
+  - path: safety/requirements
+    format: generic-yaml
+
+docs:
+  - docs
+
+commits:
+  format: trailers
+  trailers:
+    trace: "Trace"
+  exempt-types: []
+
+externals:
+  kiln:
+    git: https://github.com/pulseengine/kiln.git
+    path: /Volumes/Home/git/pulseengine/kiln
+    ref: main
+    prefix: kiln
+
+  synth:
+    git: https://github.com/pulseengine/synth.git
+    path: /Volumes/Home/git/pulseengine/synth
+    ref: main
+    prefix: synth

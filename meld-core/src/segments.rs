@@ -44,8 +44,8 @@ impl ParsedConstExpr {
         match self {
             ParsedConstExpr::I32Const(v) => ConstExpr::i32_const(*v),
             ParsedConstExpr::I64Const(v) => ConstExpr::i64_const(*v),
-            ParsedConstExpr::F32Const(v) => ConstExpr::f32_const(*v),
-            ParsedConstExpr::F64Const(v) => ConstExpr::f64_const(*v),
+            ParsedConstExpr::F32Const(v) => ConstExpr::f32_const((*v).into()),
+            ParsedConstExpr::F64Const(v) => ConstExpr::f64_const((*v).into()),
             ParsedConstExpr::V128Const(v) => ConstExpr::v128_const(*v),
             ParsedConstExpr::RefNull(ht) => ConstExpr::ref_null(*ht),
             ParsedConstExpr::RefFunc(idx) => ConstExpr::ref_func(*idx),

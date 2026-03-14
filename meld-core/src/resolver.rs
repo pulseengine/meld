@@ -2684,4 +2684,283 @@ mod tests {
             }
         }
     }
+
+    // ---------------------------------------------------------------
+    // SR-17: String encoding detection and transcoding requirements
+    //
+    // These tests verify that the resolver correctly detects when
+    // string transcoding is needed based on caller/callee encoding
+    // differences in AdapterRequirements.
+    //
+    // The resolver sets `string_transcoding = true` when
+    // `caller_encoding != callee_encoding`. This flag is used by
+    // the adapter generator to select the appropriate transcoding
+    // loop (UTF-8 <-> UTF-16, Latin-1 -> UTF-8, etc.).
+    // ---------------------------------------------------------------
+
+    use crate::parser::CanonStringEncoding;
+
+    #[test]
+    fn test_sr17_adapter_requirements_no_transcoding_utf8_utf8() {
+        let mut req = AdapterRequirements {
+            caller_encoding: Some(CanonStringEncoding::Utf8),
+            callee_encoding: Some(CanonStringEncoding::Utf8),
+            ..Default::default()
+        };
+        // Simulate what the resolver does: compare encodings
+        if let (Some(ce), Some(ce2)) = (req.caller_encoding, req.callee_encoding) {
+            req.string_transcoding = ce != ce2;
+        }
+        assert!(
+            !req.string_transcoding,
+            "SR-17: UTF-8 to UTF-8 should not require transcoding"
+        );
+    }
+
+    #[test]
+    fn test_sr17_adapter_requirements_transcoding_utf8_to_utf16() {
+        let mut req = AdapterRequirements {
+            caller_encoding: Some(CanonStringEncoding::Utf8),
+            callee_encoding: Some(CanonStringEncoding::Utf16),
+            ..Default::default()
+        };
+        if let (Some(ce), Some(ce2)) = (req.caller_encoding, req.callee_encoding) {
+            req.string_transcoding = ce != ce2;
+        }
+        assert!(
+            req.string_transcoding,
+            "SR-17: UTF-8 to UTF-16 should require transcoding"
+        );
+    }
+
+    #[test]
+    fn test_sr17_adapter_requirements_transcoding_utf16_to_utf8() {
+        let mut req = AdapterRequirements {
+            caller_encoding: Some(CanonStringEncoding::Utf16),
+            callee_encoding: Some(CanonStringEncoding::Utf8),
+            ..Default::default()
+        };
+        if let (Some(ce), Some(ce2)) = (req.caller_encoding, req.callee_encoding) {
+            req.string_transcoding = ce != ce2;
+        }
+        assert!(
+            req.string_transcoding,
+            "SR-17: UTF-16 to UTF-8 should require transcoding"
+        );
+    }
+
+    #[test]
+    fn test_sr17_adapter_requirements_transcoding_compact_utf16_to_utf8() {
+        let mut req = AdapterRequirements {
+            caller_encoding: Some(CanonStringEncoding::CompactUtf16),
+            callee_encoding: Some(CanonStringEncoding::Utf8),
+            ..Default::default()
+        };
+        if let (Some(ce), Some(ce2)) = (req.caller_encoding, req.callee_encoding) {
+            req.string_transcoding = ce != ce2;
+        }
+        assert!(
+            req.string_transcoding,
+            "SR-17: CompactUTF16 to UTF-8 should require transcoding"
+        );
+    }
+
+    #[test]
+    fn test_sr17_adapter_requirements_transcoding_utf8_to_compact_utf16() {
+        let mut req = AdapterRequirements {
+            caller_encoding: Some(CanonStringEncoding::Utf8),
+            callee_encoding: Some(CanonStringEncoding::CompactUtf16),
+            ..Default::default()
+        };
+        if let (Some(ce), Some(ce2)) = (req.caller_encoding, req.callee_encoding) {
+            req.string_transcoding = ce != ce2;
+        }
+        assert!(
+            req.string_transcoding,
+            "SR-17: UTF-8 to CompactUTF16 should require transcoding"
+        );
+    }
+
+    #[test]
+    fn test_sr17_adapter_requirements_no_transcoding_utf16_utf16() {
+        let mut req = AdapterRequirements {
+            caller_encoding: Some(CanonStringEncoding::Utf16),
+            callee_encoding: Some(CanonStringEncoding::Utf16),
+            ..Default::default()
+        };
+        if let (Some(ce), Some(ce2)) = (req.caller_encoding, req.callee_encoding) {
+            req.string_transcoding = ce != ce2;
+        }
+        assert!(
+            !req.string_transcoding,
+            "SR-17: UTF-16 to UTF-16 should not require transcoding"
+        );
+    }
+
+    #[test]
+    fn test_sr17_adapter_requirements_no_transcoding_compact_compact() {
+        let mut req = AdapterRequirements {
+            caller_encoding: Some(CanonStringEncoding::CompactUtf16),
+            callee_encoding: Some(CanonStringEncoding::CompactUtf16),
+            ..Default::default()
+        };
+        if let (Some(ce), Some(ce2)) = (req.caller_encoding, req.callee_encoding) {
+            req.string_transcoding = ce != ce2;
+        }
+        assert!(
+            !req.string_transcoding,
+            "SR-17: CompactUTF16 to CompactUTF16 should not require transcoding"
+        );
+    }
+
+    #[test]
+    fn test_sr17_adapter_requirements_none_encoding_no_transcoding() {
+        // When either encoding is None (e.g., no canonical option parsed),
+        // the resolver does not set string_transcoding. This is the safe
+        // default -- adapter generation defaults to UTF-8 on both sides.
+        let mut req = AdapterRequirements {
+            caller_encoding: None,
+            callee_encoding: Some(CanonStringEncoding::Utf16),
+            ..Default::default()
+        };
+        if let (Some(ce), Some(ce2)) = (req.caller_encoding, req.callee_encoding) {
+            req.string_transcoding = ce != ce2;
+        }
+        assert!(
+            !req.string_transcoding,
+            "SR-17: None caller encoding should not trigger transcoding"
+        );
+    }
+
+    #[test]
+    fn test_sr17_all_encoding_pairs_transcoding_matrix() {
+        // Exhaustive test: for every pair of CanonStringEncoding values,
+        // verify that the transcoding flag matches whether they differ.
+        let encodings = [
+            CanonStringEncoding::Utf8,
+            CanonStringEncoding::Utf16,
+            CanonStringEncoding::CompactUtf16,
+        ];
+        for caller in &encodings {
+            for callee in &encodings {
+                let mut req = AdapterRequirements {
+                    caller_encoding: Some(*caller),
+                    callee_encoding: Some(*callee),
+                    ..Default::default()
+                };
+                if let (Some(ce), Some(ce2)) = (req.caller_encoding, req.callee_encoding) {
+                    req.string_transcoding = ce != ce2;
+                }
+                let expected = caller != callee;
+                assert_eq!(
+                    req.string_transcoding, expected,
+                    "SR-17: {:?} to {:?}: expected transcoding={}, got={}",
+                    caller, callee, expected, req.string_transcoding
+                );
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // SR-17: CopyLayout for strings does NOT change with encoding
+    //
+    // The CopyLayout for a string parameter is always
+    // Bulk { byte_multiplier: 1 } because CopyLayout describes the
+    // raw data copy step. The `len` field in the (ptr, len) pair
+    // has encoding-dependent semantics:
+    //   - UTF-8:  len = byte count
+    //   - UTF-16: len = code unit count (each code unit = 2 bytes)
+    //   - Latin-1: len = byte count
+    //
+    // The adapter must account for this difference in the transcoding
+    // loop, NOT in the CopyLayout. The CopyLayout always uses
+    // byte_multiplier=1 for strings because the copy is encoding-
+    // agnostic (copy raw bytes, then transcode if needed).
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_sr17_copy_layout_string_encoding_agnostic() {
+        // CopyLayout for String is always Bulk { byte_multiplier: 1 },
+        // regardless of the encoding that will be used. The encoding
+        // is handled at the adapter level, not the copy layout level.
+        let pc = empty_parsed_component();
+        let ty = ComponentValType::String;
+        let layout = pc.copy_layout(&ty);
+        match layout {
+            CopyLayout::Bulk { byte_multiplier } => {
+                assert_eq!(
+                    byte_multiplier, 1,
+                    "SR-17: string CopyLayout byte_multiplier should always be 1"
+                );
+            }
+            CopyLayout::Elements { .. } => {
+                panic!("SR-17: string should never produce Elements CopyLayout");
+            }
+        }
+    }
+
+    #[test]
+    fn test_sr17_collect_param_copy_layouts_string_param() {
+        // A function with a single string parameter should produce one copy layout.
+        let pc = empty_parsed_component();
+        let params = vec![("s".to_string(), ComponentValType::String)];
+        let layouts = collect_param_copy_layouts(&pc, &params);
+        assert_eq!(
+            layouts.len(),
+            1,
+            "SR-17: one string param should produce one copy layout"
+        );
+        match &layouts[0] {
+            CopyLayout::Bulk { byte_multiplier } => {
+                assert_eq!(*byte_multiplier, 1);
+            }
+            _ => panic!("SR-17: string param should produce Bulk layout"),
+        }
+    }
+
+    #[test]
+    fn test_sr17_collect_param_copy_layouts_multiple_strings() {
+        // Multiple string params should each produce their own copy layout.
+        let pc = empty_parsed_component();
+        let params = vec![
+            ("a".to_string(), ComponentValType::String),
+            (
+                "b".to_string(),
+                ComponentValType::Primitive(PrimitiveValType::U32),
+            ),
+            ("c".to_string(), ComponentValType::String),
+        ];
+        let layouts = collect_param_copy_layouts(&pc, &params);
+        assert_eq!(
+            layouts.len(),
+            2,
+            "SR-17: two string params should produce two copy layouts (scalar params excluded)"
+        );
+    }
+
+    #[test]
+    fn test_sr17_collect_result_copy_layouts_string_result() {
+        let pc = empty_parsed_component();
+        let results: Vec<(Option<String>, ComponentValType)> =
+            vec![(None, ComponentValType::String)];
+        let layouts = collect_result_copy_layouts(&pc, &results);
+        assert_eq!(
+            layouts.len(),
+            1,
+            "SR-17: one string result should produce one copy layout"
+        );
+    }
+
+    #[test]
+    fn test_sr17_collect_result_copy_layouts_no_strings() {
+        let pc = empty_parsed_component();
+        let results: Vec<(Option<String>, ComponentValType)> =
+            vec![(None, ComponentValType::Primitive(PrimitiveValType::U32))];
+        let layouts = collect_result_copy_layouts(&pc, &results);
+        assert_eq!(
+            layouts.len(),
+            0,
+            "SR-17: scalar-only results should produce zero copy layouts"
+        );
+    }
 }

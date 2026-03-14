@@ -76,6 +76,15 @@ pub enum Error {
     #[error("canonical ABI error: {0}")]
     CanonicalAbi(String),
 
+    /// Same core module instantiated more than once in a component
+    #[error(
+        "component {component_idx} instantiates core module {module_idx} more than once (multiply-instantiated modules are not yet supported)"
+    )]
+    DuplicateModuleInstantiation {
+        component_idx: usize,
+        module_idx: u32,
+    },
+
     /// I/O error
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),

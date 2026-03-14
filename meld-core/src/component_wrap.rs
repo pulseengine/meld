@@ -129,6 +129,41 @@ struct FusedModuleInfo {
     start_func_export: Option<String>,
 }
 
+/// How a fused module import should be resolved in the P2 wrapper.
+#[derive(Debug, Clone)]
+enum ImportResolution {
+    /// Import resolves to a function on a component import instance.
+    /// Used for WASI and other externally-imported interfaces.
+    Instance {
+        instance_idx: u32,
+        func_name: String,
+    },
+    /// Import requires a locally-defined resource type.
+    ///
+    /// `[export]`-prefixed modules (e.g., `[export]imports`, `[export]exports`)
+    /// provide `canon resource.drop/new/rep` for resources whose lifecycle is
+    /// managed by the component model runtime. Non-`[export]` modules that contain
+    /// resource drops for internal inter-component resources also use this variant.
+    LocalResource {
+        /// The canon resource operation: "drop", "new", or "rep"
+        operation: ResourceOp,
+        /// The resource type name (e.g., "y", "x", "kebab-case")
+        resource_name: String,
+        /// The `[export]`-stripped module name used to find the dtor export.
+        /// For `[export]imports`, this is `"imports"`.
+        /// For plain `exports`, this is `"exports"`.
+        interface_name: String,
+    },
+}
+
+/// A canonical resource operation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ResourceOp {
+    Drop,
+    New,
+    Rep,
+}
+
 /// Parse the fused module to extract structural info needed for wrapping.
 fn parse_fused_module(bytes: &[u8]) -> Result<FusedModuleInfo> {
     let parser = wasmparser::Parser::new(0);
@@ -694,22 +729,63 @@ fn assemble_component(
     }
 
     // -----------------------------------------------------------------------
-    // 2. Resolve fused imports to component instances.
+    // 2. Resolve fused imports to component instances or local resources.
+    //
+    //    Imports fall into three categories:
+    //    A. `[export]`-prefixed modules: local resource table management
+    //       (resource.drop/new/rep for component-defined resources)
+    //    B. Non-WASI modules with unresolvable resource drops: internal
+    //       inter-component resource lifecycle
+    //    C. Everything else: WASI and other external imports resolved to
+    //       component import instances
     // -----------------------------------------------------------------------
     let instance_map = build_instance_func_map(source);
 
-    let mut import_resolutions: Vec<(u32, String)> = Vec::new();
+    let mut import_resolutions: Vec<ImportResolution> = Vec::new();
     for (module_name, field_name, _type_idx) in &fused_info.func_imports {
+        // Category A: [export]-prefixed modules provide canon resource operations
+        if let Some(inner_module) = module_name.strip_prefix("[export]") {
+            let (op, resource_name) = parse_resource_field(field_name).ok_or_else(|| {
+                Error::EncodingError(format!(
+                    "[export]-prefixed import has unexpected field name: {}::{}",
+                    module_name, field_name
+                ))
+            })?;
+            import_resolutions.push(ImportResolution::LocalResource {
+                operation: op,
+                resource_name,
+                interface_name: inner_module.to_string(),
+            });
+            continue;
+        }
+
+        // Category C: try resolving to a component import instance
         if let Some((inst_idx, func_name)) =
             resolve_import_to_instance(source, module_name, field_name, &instance_map)
         {
-            import_resolutions.push((inst_idx, func_name));
-        } else {
-            return Err(Error::EncodingError(format!(
-                "cannot resolve fused import {}::{} to a component instance",
-                module_name, field_name
-            )));
+            import_resolutions.push(ImportResolution::Instance {
+                instance_idx: inst_idx,
+                func_name,
+            });
+            continue;
         }
+
+        // Category B: unresolvable resource drop — treat as a local resource
+        if let Some((op, resource_name)) = parse_resource_field(field_name)
+            && op == ResourceOp::Drop
+        {
+            import_resolutions.push(ImportResolution::LocalResource {
+                operation: op,
+                resource_name,
+                interface_name: module_name.clone(),
+            });
+            continue;
+        }
+
+        return Err(Error::EncodingError(format!(
+            "cannot resolve fused import {}::{} to a component instance",
+            module_name, field_name
+        )));
     }
 
     // -----------------------------------------------------------------------
@@ -891,15 +967,16 @@ fn assemble_component(
     //   ...
     // We alias all of them and track core func indices per-memory.
     // -----------------------------------------------------------------------
-    let has_non_resource_drop = fused_info
-        .func_imports
-        .iter()
-        .any(|(_, field, _)| !field.starts_with("[resource-drop]"));
+    let has_non_resource_op = fused_info.func_imports.iter().any(|(_, field, _)| {
+        !field.starts_with("[resource-drop]")
+            && !field.starts_with("[resource-new]")
+            && !field.starts_with("[resource-rep]")
+    });
 
     // realloc_core_indices[memory_idx] = core func idx of that component's cabi_realloc
     let mut realloc_core_indices: Vec<Option<u32>> = vec![None; num_memories];
 
-    if has_non_resource_drop && n > 0 {
+    if has_non_resource_op && n > 0 {
         // Alias cabi_realloc for component 0
         let has_realloc = fused_info.exports.iter().any(|(name, kind, _)| {
             *kind == wasmparser::ExternalKind::Func && name == "cabi_realloc"
@@ -946,87 +1023,158 @@ fn assemble_component(
     }
 
     // -----------------------------------------------------------------------
-    // 9. Canon lower ALL imports using per-component memory + realloc
+    // 9. Canon lower / resource operations for ALL imports
     //
-    // In multi-memory mode, each import uses the memory and cabi_realloc
-    // belonging to the component that originally imported it:
-    //   CanonicalOption::Memory(memory_core_indices[mem_idx])
-    //   CanonicalOption::Realloc(realloc_core_indices[mem_idx])
+    // Three kinds of imports:
+    //   a) Instance — alias func from component instance, canon lower
+    //   b) Instance resource-drop — alias type from component instance,
+    //      canon resource.drop
+    //   c) LocalResource — define resource type (with dtor from fused
+    //      module), then canon resource.drop/new/rep
     //
-    // In shared-memory mode, all imports use Memory(0) and the single realloc.
+    // In multi-memory mode, each regular import uses the memory and
+    // cabi_realloc belonging to the component that originally imported it.
     // -----------------------------------------------------------------------
     let mut component_func_idx = 0u32;
     let mut component_type_idx = count_replayed_types(source);
     let mut lowered_func_indices: Vec<u32> = Vec::new();
 
-    for (i, (inst_idx, func_name)) in import_resolutions.iter().enumerate() {
-        let field_name = &fused_info.func_imports[i].1;
+    // Cache: (interface_name, resource_name) → component type index.
+    // Each unique local resource gets exactly one type definition.
+    let mut local_resource_types: std::collections::HashMap<(String, String), u32> =
+        std::collections::HashMap::new();
 
-        if field_name.starts_with("[resource-drop]") {
-            // Resource-drop: alias the TYPE from the instance, then canon resource.drop.
-            // Use func_name (from resolve_import_to_instance) which has $N suffix
-            // stripped, then strip the [resource-drop] prefix to get the type name.
-            let type_name = func_name
-                .strip_prefix("[resource-drop]")
-                .unwrap_or(func_name);
-            let mut alias_section = ComponentAliasSection::new();
-            alias_section.alias(Alias::InstanceExport {
-                instance: *inst_idx,
-                kind: ComponentExportKind::Type,
-                name: type_name,
-            });
-            component.section(&alias_section);
+    for (i, resolution) in import_resolutions.iter().enumerate() {
+        match resolution {
+            ImportResolution::Instance {
+                instance_idx,
+                func_name,
+            } => {
+                let field_name = &fused_info.func_imports[i].1;
 
-            let mut canon = CanonicalFunctionSection::new();
-            canon.resource_drop(component_type_idx);
-            component.section(&canon);
+                if field_name.starts_with("[resource-drop]") {
+                    // Resource-drop from an external instance: alias the TYPE
+                    // from the instance, then canon resource.drop.
+                    let type_name = func_name
+                        .strip_prefix("[resource-drop]")
+                        .unwrap_or(func_name);
+                    let mut alias_section = ComponentAliasSection::new();
+                    alias_section.alias(Alias::InstanceExport {
+                        instance: *instance_idx,
+                        kind: ComponentExportKind::Type,
+                        name: type_name,
+                    });
+                    component.section(&alias_section);
 
-            component_type_idx += 1;
-            lowered_func_indices.push(core_func_idx);
-            core_func_idx += 1;
-        } else {
-            // Regular function: alias from instance, then canon lower with correct
-            // memory and realloc for the importing component.
-            let mut alias_section = ComponentAliasSection::new();
-            alias_section.alias(Alias::InstanceExport {
-                instance: *inst_idx,
-                kind: ComponentExportKind::Func,
-                name: func_name,
-            });
-            component.section(&alias_section);
+                    let mut canon = CanonicalFunctionSection::new();
+                    canon.resource_drop(component_type_idx);
+                    component.section(&canon);
 
-            // Determine which memory and realloc to use for this import
-            let mem_idx = if memory_strategy == MemoryStrategy::MultiMemory {
-                merged.import_memory_indices.get(i).copied().unwrap_or(0) as usize
-            } else {
-                0
-            };
+                    component_type_idx += 1;
+                    lowered_func_indices.push(core_func_idx);
+                    core_func_idx += 1;
+                } else {
+                    // Regular function: alias from instance, then canon lower
+                    // with correct memory and realloc for the importing component.
+                    let mut alias_section = ComponentAliasSection::new();
+                    alias_section.alias(Alias::InstanceExport {
+                        instance: *instance_idx,
+                        kind: ComponentExportKind::Func,
+                        name: func_name,
+                    });
+                    component.section(&alias_section);
 
-            let core_mem = memory_core_indices
-                .get(mem_idx)
-                .copied()
-                .unwrap_or(memory_core_indices[0]);
+                    let mem_idx = if memory_strategy == MemoryStrategy::MultiMemory {
+                        merged.import_memory_indices.get(i).copied().unwrap_or(0) as usize
+                    } else {
+                        0
+                    };
 
-            let realloc_idx = realloc_core_indices
-                .get(mem_idx)
-                .and_then(|r| *r)
-                .or_else(|| realloc_core_indices[0])
-                .expect("realloc_core_idx must be set for non-resource-drop");
+                    let core_mem = memory_core_indices
+                        .get(mem_idx)
+                        .copied()
+                        .unwrap_or(memory_core_indices[0]);
 
-            let mut canon = CanonicalFunctionSection::new();
-            canon.lower(
-                component_func_idx,
-                [
-                    CanonicalOption::Memory(core_mem),
-                    CanonicalOption::Realloc(realloc_idx),
-                    CanonicalOption::UTF8,
-                ],
-            );
-            component.section(&canon);
+                    let realloc_idx = realloc_core_indices
+                        .get(mem_idx)
+                        .and_then(|r| *r)
+                        .or_else(|| realloc_core_indices[0])
+                        .expect("realloc_core_idx must be set for non-resource-drop");
 
-            component_func_idx += 1;
-            lowered_func_indices.push(core_func_idx);
-            core_func_idx += 1;
+                    let mut canon = CanonicalFunctionSection::new();
+                    canon.lower(
+                        component_func_idx,
+                        [
+                            CanonicalOption::Memory(core_mem),
+                            CanonicalOption::Realloc(realloc_idx),
+                            CanonicalOption::UTF8,
+                        ],
+                    );
+                    component.section(&canon);
+
+                    component_func_idx += 1;
+                    lowered_func_indices.push(core_func_idx);
+                    core_func_idx += 1;
+                }
+            }
+
+            ImportResolution::LocalResource {
+                operation,
+                resource_name,
+                interface_name,
+            } => {
+                // Get or create the resource type for this (interface, resource) pair.
+                let res_type_key = (interface_name.clone(), resource_name.clone());
+                let res_type_idx = if let Some(&existing) = local_resource_types.get(&res_type_key)
+                {
+                    existing
+                } else {
+                    // Define a new resource type. The destructor is exported from
+                    // the fused module as `<interface>#[dtor]<resource>`.
+                    let dtor_export_name = format!("{}#[dtor]{}", interface_name, resource_name);
+                    let has_dtor = fused_info.exports.iter().any(|(n, k, _)| {
+                        *k == wasmparser::ExternalKind::Func && *n == dtor_export_name
+                    });
+
+                    let dtor_core_func = if has_dtor {
+                        // Alias the destructor from the fused instance
+                        let mut aliases = ComponentAliasSection::new();
+                        aliases.alias(Alias::CoreInstanceExport {
+                            instance: fused_instance,
+                            kind: ExportKind::Func,
+                            name: &dtor_export_name,
+                        });
+                        component.section(&aliases);
+                        let idx = core_func_idx;
+                        core_func_idx += 1;
+                        Some(idx)
+                    } else {
+                        None
+                    };
+
+                    // Define: (type (resource (rep i32) (dtor ...)))
+                    let mut types = ComponentTypeSection::new();
+                    types.ty().resource(ValType::I32, dtor_core_func);
+                    component.section(&types);
+
+                    let idx = component_type_idx;
+                    component_type_idx += 1;
+                    local_resource_types.insert(res_type_key, idx);
+                    idx
+                };
+
+                // Emit the canon resource operation
+                let mut canon = CanonicalFunctionSection::new();
+                match operation {
+                    ResourceOp::Drop => canon.resource_drop(res_type_idx),
+                    ResourceOp::New => canon.resource_new(res_type_idx),
+                    ResourceOp::Rep => canon.resource_rep(res_type_idx),
+                };
+                component.section(&canon);
+
+                lowered_func_indices.push(core_func_idx);
+                core_func_idx += 1;
+            }
         }
     }
 
@@ -1739,13 +1887,11 @@ fn define_source_type_in_wrapper(
                 let p: Vec<_> = enc_params.iter().map(|(n, t)| (n.as_str(), *t)).collect();
                 func_enc.params(p);
                 if enc_results.len() == 1 && enc_results[0].0.is_none() {
-                    func_enc.result(enc_results[0].1);
+                    func_enc.result(Some(enc_results[0].1));
                 } else if !enc_results.is_empty() {
-                    let r: Vec<_> = enc_results
-                        .iter()
-                        .map(|(n, t)| (n.as_deref().unwrap_or(""), *t))
-                        .collect();
-                    func_enc.results(r);
+                    // Component model now only supports a single anonymous result;
+                    // emit the first result type.
+                    func_enc.result(Some(enc_results[0].1));
                 }
             }
             component.section(&types);
@@ -1810,6 +1956,16 @@ fn emit_defined_type(
             )?;
             types.defined_type().list(inner_enc);
         }
+        parser::ComponentValType::FixedSizeList(elem, len) => {
+            let elem_enc = convert_parser_val_to_encoder(
+                component,
+                source,
+                elem,
+                component_type_idx,
+                type_remap,
+            )?;
+            types.defined_type().fixed_size_list(elem_enc, *len);
+        }
         parser::ComponentValType::Option(inner) => {
             let inner_enc = convert_parser_val_to_encoder(
                 component,
@@ -1866,7 +2022,9 @@ fn convert_parser_val_to_encoder(
                 emit_defined_type(component, source, ty, component_type_idx, type_remap)?;
             Ok(wasm_encoder::ComponentValType::Type(wrapper_idx))
         }
-        parser::ComponentValType::List(_) | parser::ComponentValType::Option(_) => {
+        parser::ComponentValType::List(_)
+        | parser::ComponentValType::FixedSizeList(_, _)
+        | parser::ComponentValType::Option(_) => {
             let wrapper_idx =
                 emit_defined_type(component, source, ty, component_type_idx, type_remap)?;
             Ok(wasm_encoder::ComponentValType::Type(wrapper_idx))
@@ -1896,7 +2054,7 @@ fn define_default_run_type(
     types2
         .function()
         .params(empty_params)
-        .result(wasm_encoder::ComponentValType::Type(result_type_idx));
+        .result(Some(wasm_encoder::ComponentValType::Type(result_type_idx)));
     component.section(&types2);
     let func_type_idx = *component_type_idx;
     *component_type_idx += 1;
@@ -1912,7 +2070,7 @@ fn define_bare_func_type(
 ) -> u32 {
     let mut types = wasm_encoder::ComponentTypeSection::new();
     let empty: Vec<(&str, wasm_encoder::ComponentValType)> = vec![];
-    types.function().params(empty.clone()).results(empty);
+    types.function().params(empty).result(None);
     component.section(&types);
     let func_type_idx = *component_type_idx;
     *component_type_idx += 1;
@@ -1954,6 +2112,37 @@ fn convert_val_type(ty: wasmparser::ValType) -> wasm_encoder::ValType {
             }
         }
     }
+}
+
+/// Parse a resource-related field name into a (ResourceOp, resource_name) pair.
+///
+/// Field names follow the convention `[resource-drop]NAME`, `[resource-new]NAME`,
+/// or `[resource-rep]NAME`. The `$N` suffix (multi-memory deduplication) is
+/// stripped before matching.
+///
+/// Returns `None` if the field doesn't match any resource operation prefix.
+fn parse_resource_field(field_name: &str) -> Option<(ResourceOp, String)> {
+    // Strip $N suffix if present (multi-memory deduplication)
+    let base = if let Some(dollar_pos) = field_name.rfind('$') {
+        let suffix = &field_name[dollar_pos + 1..];
+        if suffix.chars().all(|c| c.is_ascii_digit()) {
+            &field_name[..dollar_pos]
+        } else {
+            field_name
+        }
+    } else {
+        field_name
+    };
+
+    let prefixes: &[(&str, ResourceOp)] = &[
+        ("[resource-drop]", ResourceOp::Drop),
+        ("[resource-new]", ResourceOp::New),
+        ("[resource-rep]", ResourceOp::Rep),
+    ];
+    prefixes.iter().find_map(|(prefix, op)| {
+        base.strip_prefix(prefix)
+            .map(|name| (op.clone(), name.to_string()))
+    })
 }
 
 /// Convert wasmparser TypeRef to wasm-encoder EntityType.
