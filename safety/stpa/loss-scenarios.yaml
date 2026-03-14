@@ -19,6 +19,7 @@ loss-scenarios:
   - id: LS-P-1
     title: Nested component instances not recognized
     uca: UCA-P-1
+    hazards: [H-1, H-3]
     type: inadequate-control-algorithm
     scenario: >
       A component contains multiple nested component instances (each with
@@ -34,6 +35,7 @@ loss-scenarios:
   - id: LS-P-2
     title: Canonical ABI size computation ignores alignment padding
     uca: UCA-P-5
+    hazards: [H-4, H-4.1]
     type: inadequate-control-algorithm
     scenario: >
       A record type has fields {u8, string} where u8 occupies 1 byte and
@@ -49,6 +51,7 @@ loss-scenarios:
   - id: LS-P-3
     title: Malformed component accepted due to wasmparser configuration
     uca: UCA-P-6
+    hazards: [H-1, H-3]
     type: inadequate-process-model
     scenario: >
       The parser instantiates wasmparser::Validator with permissive
@@ -70,6 +73,7 @@ loss-scenarios:
   - id: LS-R-1
     title: Import matched to wrong export due to name normalization
     uca: UCA-R-3
+    hazards: [H-1]
     type: inadequate-control-algorithm
     scenario: >
       Component A imports "wasi:http/handler@0.2.0" and two components
@@ -85,6 +89,7 @@ loss-scenarios:
   - id: LS-R-2
     title: CopyLayout misclassifies pointer-containing record as Bulk
     uca: UCA-R-5
+    hazards: [H-4, H-4.2]
     type: inadequate-process-model
     scenario: >
       A function parameter is list<record { name: string, value: u32 }>.
@@ -104,6 +109,7 @@ loss-scenarios:
   - id: LS-R-3
     title: Topological sort produces wrong order with diamond dependencies
     uca: UCA-R-6
+    hazards: [H-5, H-1]
     type: inadequate-control-algorithm
     scenario: >
       Four components form a diamond dependency: A depends on B and C,
@@ -118,6 +124,7 @@ loss-scenarios:
   - id: LS-R-4
     title: Cycle detection fails on self-importing component
     uca: UCA-R-7
+    hazards: [H-5, H-1]
     type: inadequate-control-algorithm
     scenario: >
       A component imports an interface that it also exports (self-cycle).
@@ -136,6 +143,7 @@ loss-scenarios:
   - id: LS-M-1
     title: Function base offset does not account for imported functions
     uca: UCA-M-3
+    hazards: [H-3, H-3.1]
     type: inadequate-control-algorithm
     scenario: >
       Component B has 3 imported functions and 5 defined functions.
@@ -153,6 +161,7 @@ loss-scenarios:
   - id: LS-M-2
     title: Rewriter misses memory index in memory.copy instruction
     uca: UCA-M-8
+    hazards: [H-2, H-3.2]
     type: inadequate-control-algorithm
     scenario: >
       The rewriter handles memory.load, memory.store, memory.size, and
@@ -168,6 +177,7 @@ loss-scenarios:
   - id: LS-M-3
     title: Element segment type indices remapped with wrong offset
     uca: UCA-M-4
+    hazards: [H-3, H-3.4]
     type: inadequate-control-algorithm
     scenario: >
       An element segment references function types for call_indirect.
@@ -186,6 +196,7 @@ loss-scenarios:
   - id: LS-A-1
     title: cabi_realloc function index not remapped after merge
     uca: UCA-A-6
+    hazards: [H-2, H-4, H-4.3]
     type: inadequate-process-model
     scenario: >
       The adapter generator records the cabi_realloc function index from
@@ -205,6 +216,7 @@ loss-scenarios:
   - id: LS-A-2
     title: Memory indices swapped in cross-memory copy
     uca: UCA-A-4
+    hazards: [H-2, H-4]
     type: inadequate-control-algorithm
     scenario: >
       The adapter copies argument data from caller (memory 0) to callee
@@ -220,6 +232,7 @@ loss-scenarios:
   - id: LS-A-3
     title: Inner pointer fixup loop uses wrong element stride
     uca: UCA-A-7
+    hazards: [H-4, H-4.2]
     type: inadequate-control-algorithm
     scenario: >
       For list<record { name: string, age: u32 }>, the adapter fixup loop
@@ -237,6 +250,7 @@ loss-scenarios:
   - id: LS-A-4
     title: Return value pointers read from caller memory instead of callee
     uca: UCA-A-9
+    hazards: [H-2, H-4]
     type: inadequate-process-model
     scenario: >
       A cross-component call returns a string via retptr convention. The
@@ -291,6 +305,7 @@ loss-scenarios:
   - id: LS-A-5
     title: Conditional pointer not checked for option/result/variant
     uca: UCA-A-12
+    hazards: [H-9, H-4]
     type: inadequate-control-algorithm
     scenario: >
       A cross-component call passes option<string> with value None. The
@@ -310,6 +325,7 @@ loss-scenarios:
   - id: LS-A-6
     title: Retptr layout incorrect for variant return types
     uca: UCA-A-13
+    hazards: [H-4, H-4.5]
     type: inadequate-control-algorithm
     scenario: >
       A cross-component call returns result<string, error-code> via retptr
@@ -332,6 +348,7 @@ loss-scenarios:
   - id: LS-M-4
     title: Import dedup conflates type-incompatible imports
     uca: UCA-M-9
+    hazards: [H-10, H-1]
     type: inadequate-control-algorithm
     scenario: >
       Component A imports wasi:cli/environment.get-environment with type
@@ -352,6 +369,7 @@ loss-scenarios:
   - id: LS-W-1
     title: Wrapper hardcodes Memory(0) for all WASI import lowering
     uca: UCA-W-2
+    hazards: [H-8, H-2]
     type: inadequate-process-model
     scenario: >
       A fused module has two memories (memory 0 for component A, memory 1
@@ -376,6 +394,7 @@ loss-scenarios:
   - id: LS-M-5
     title: Multiply-instantiated module produces corrupt merged output
     uca: UCA-M-9
+    hazards: [H-10, H-1]
     type: inadequate-process-model
     scenario: >
       A component instantiates the same core module twice (e.g., a shared

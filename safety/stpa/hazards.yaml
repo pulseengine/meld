@@ -76,6 +76,38 @@ hazards:
       behavior, or ASLR-dependent pointer comparisons.
     losses: [L-4]
 
+  - id: H-8
+    title: Component wrapping produces invalid P2 component
+    description: >
+      When OutputFormat::Component is selected, the P2 wrapper produces a
+      component that fails validation or has incorrect canonical lowering/
+      lifting. This includes wrong memory indices in canon lower, missing
+      or incorrect cabi_realloc references, type mismatches between the
+      stubs module and the fused module, or incorrect import resolution
+      in the assembled component.
+    losses: [L-1]
+
+  - id: H-9
+    title: Conditional pointer copy corrupts data for variant/option/result types
+    description: >
+      The adapter performs or omits pointer data copy for option, result,
+      or variant types without checking the discriminant value. When the
+      discriminant indicates "none" or an error case with no pointer payload,
+      the adapter copies garbage bytes as if they were valid pointer data.
+      When the discriminant indicates a pointer-containing payload, the
+      adapter skips the copy.
+    losses: [L-1, L-2]
+
+  - id: H-10
+    title: Import deduplication conflates type-incompatible imports
+    description: >
+      During merge, function imports from different components with the same
+      module:field name but different type signatures are deduplicated into
+      a single import. The merged module uses one type signature for both,
+      causing a type mismatch trap or silent misinterpretation of arguments
+      at the call site of one component.
+    losses: [L-1]
+
 # Sub-hazards: optional refinement for complex hazards
 sub-hazards:
   # Refinements of H-3 (index remapping)
@@ -159,38 +191,3 @@ sub-hazards:
       If a component defines a start function, its function index is not
       remapped to the merged index space. The fused module's start section
       references a wrong function or an out-of-bounds index.
-
-  # ============================================================================
-  # Additional system-level hazards (discovered during gap analysis)
-  # ============================================================================
-  - id: H-8
-    title: Component wrapping produces invalid P2 component
-    description: >
-      When OutputFormat::Component is selected, the P2 wrapper produces a
-      component that fails validation or has incorrect canonical lowering/
-      lifting. This includes wrong memory indices in canon lower, missing
-      or incorrect cabi_realloc references, type mismatches between the
-      stubs module and the fused module, or incorrect import resolution
-      in the assembled component.
-    losses: [L-1]
-
-  - id: H-9
-    title: Conditional pointer copy corrupts data for variant/option/result types
-    description: >
-      The adapter performs or omits pointer data copy for option, result,
-      or variant types without checking the discriminant value. When the
-      discriminant indicates "none" or an error case with no pointer payload,
-      the adapter copies garbage bytes as if they were valid pointer data.
-      When the discriminant indicates a pointer-containing payload, the
-      adapter skips the copy.
-    losses: [L-1, L-2]
-
-  - id: H-10
-    title: Import deduplication conflates type-incompatible imports
-    description: >
-      During merge, function imports from different components with the same
-      module:field name but different type signatures are deduplicated into
-      a single import. The merged module uses one type signature for both,
-      causing a type mismatch trap or silent misinterpretation of arguments
-      at the call site of one component.
-    losses: [L-1]
