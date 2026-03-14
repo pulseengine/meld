@@ -1767,3 +1767,292 @@ fn test_sr16_inner_pointer_fixup_list_string() {
         "SR-16: run() should return 697 (sum of bytes of 'Hi' + 'World')"
     );
 }
+
+// ===========================================================================
+// SR-17: String transcoding — UTF-8 caller to UTF-16 callee
+// ===========================================================================
+
+/// Build a callee P2 component that exports a string function with UTF-16 encoding.
+///
+/// The callee's core function reads UTF-16 code units from memory and sums them.
+/// The component-level type is `(func (param "s" string) (result u32))`.
+/// The canon lift uses **UTF-16** encoding, so the core function receives
+/// (ptr, code_unit_count) and reads 16-bit values from memory[ptr].
+///
+/// Core function: sum_utf16(ptr: i32, len: i32) -> i32
+///   Sums all UTF-16 code units as u16 values: total += load16u(ptr + i*2)
+fn build_callee_utf16_string_component() -> Vec<u8> {
+    let core_module = {
+        let mut types = TypeSection::new();
+        // type 0: (i32, i32, i32, i32) -> i32 -- cabi_realloc
+        types.ty().function(
+            [
+                wasm_encoder::ValType::I32,
+                wasm_encoder::ValType::I32,
+                wasm_encoder::ValType::I32,
+                wasm_encoder::ValType::I32,
+            ],
+            [wasm_encoder::ValType::I32],
+        );
+        // type 1: (i32, i32) -> i32 -- process-string (ptr, code_unit_count) -> sum
+        types.ty().function(
+            [wasm_encoder::ValType::I32, wasm_encoder::ValType::I32],
+            [wasm_encoder::ValType::I32],
+        );
+
+        let mut functions = FunctionSection::new();
+        functions.function(0); // func 0: cabi_realloc
+        functions.function(1); // func 1: process-string
+
+        let mut memory = MemorySection::new();
+        memory.memory(MemoryType {
+            minimum: 1,
+            maximum: None,
+            memory64: false,
+            shared: false,
+            page_size_log2: None,
+        });
+
+        let mut globals = GlobalSection::new();
+        globals.global(
+            GlobalType {
+                val_type: wasm_encoder::ValType::I32,
+                mutable: true,
+                shared: false,
+            },
+            &ConstExpr::i32_const(1024),
+        );
+
+        let mut exports = ExportSection::new();
+        exports.export("cabi_realloc", ExportKind::Func, 0);
+        exports.export("test:api/api#process-string", ExportKind::Func, 1);
+        exports.export("memory", ExportKind::Memory, 0);
+
+        let mut code = CodeSection::new();
+
+        // func 0: cabi_realloc
+        {
+            let mut f = Function::new([]);
+            emit_cabi_realloc(&mut f, 0);
+            code.function(&f);
+        }
+
+        // func 1: process-string(ptr: i32, code_unit_count: i32) -> i32
+        // Sums all UTF-16 code units (u16 values) from memory.
+        // This reads 16-bit values: for each i in 0..code_unit_count,
+        //   sum += mem16[ptr + i * 2]
+        {
+            // locals: param 0=ptr, param 1=len, local 2=sum, local 3=index
+            let mut f = Function::new(vec![(2, wasm_encoder::ValType::I32)]);
+            f.instruction(&Instruction::Block(wasm_encoder::BlockType::Empty));
+            f.instruction(&Instruction::Loop(wasm_encoder::BlockType::Empty));
+
+            // if index >= len, break
+            f.instruction(&Instruction::LocalGet(3));
+            f.instruction(&Instruction::LocalGet(1));
+            f.instruction(&Instruction::I32GeU);
+            f.instruction(&Instruction::BrIf(1));
+
+            // sum += load_u16(memory 0, ptr + index * 2)
+            f.instruction(&Instruction::LocalGet(0));
+            f.instruction(&Instruction::LocalGet(3));
+            f.instruction(&Instruction::I32Const(1));
+            f.instruction(&Instruction::I32Shl); // index * 2
+            f.instruction(&Instruction::I32Add);
+            f.instruction(&Instruction::I32Load16U(wasm_encoder::MemArg {
+                offset: 0,
+                align: 1, // 2-byte alignment
+                memory_index: 0,
+            }));
+            f.instruction(&Instruction::LocalGet(2));
+            f.instruction(&Instruction::I32Add);
+            f.instruction(&Instruction::LocalSet(2));
+
+            // index += 1
+            f.instruction(&Instruction::LocalGet(3));
+            f.instruction(&Instruction::I32Const(1));
+            f.instruction(&Instruction::I32Add);
+            f.instruction(&Instruction::LocalSet(3));
+
+            f.instruction(&Instruction::Br(0));
+            f.instruction(&Instruction::End); // loop
+            f.instruction(&Instruction::End); // block
+
+            f.instruction(&Instruction::LocalGet(2));
+            f.instruction(&Instruction::End);
+            code.function(&f);
+        }
+
+        let mut module = Module::new();
+        module
+            .section(&types)
+            .section(&functions)
+            .section(&memory)
+            .section(&globals)
+            .section(&exports)
+            .section(&code);
+        module
+    };
+
+    // --- Build P2 component with UTF-16 canon lift ---
+    let mut component = Component::new();
+
+    // 1. Embed core module
+    component.section(&ModuleSection(&core_module));
+
+    // 2. Define component function type: (func (param "s" string) (result u32))
+    {
+        let mut types = ComponentTypeSection::new();
+        types
+            .function()
+            .params([(
+                "s",
+                wasm_encoder::ComponentValType::Primitive(wasm_encoder::PrimitiveValType::String),
+            )])
+            .result(wasm_encoder::ComponentValType::Primitive(
+                wasm_encoder::PrimitiveValType::U32,
+            ));
+        component.section(&types);
+    }
+
+    // 3. Instantiate core module
+    {
+        let mut inst = InstanceSection::new();
+        let no_args: Vec<(&str, ModuleArg)> = vec![];
+        inst.instantiate(0, no_args);
+        component.section(&inst);
+    }
+
+    // 4. Alias core exports
+    {
+        let mut aliases = ComponentAliasSection::new();
+        aliases.alias(Alias::CoreInstanceExport {
+            instance: 0,
+            kind: ExportKind::Func,
+            name: "cabi_realloc",
+        });
+        component.section(&aliases);
+    }
+    {
+        let mut aliases = ComponentAliasSection::new();
+        aliases.alias(Alias::CoreInstanceExport {
+            instance: 0,
+            kind: ExportKind::Func,
+            name: "test:api/api#process-string",
+        });
+        component.section(&aliases);
+    }
+    {
+        let mut aliases = ComponentAliasSection::new();
+        aliases.alias(Alias::CoreInstanceExport {
+            instance: 0,
+            kind: ExportKind::Memory,
+            name: "memory",
+        });
+        component.section(&aliases);
+    }
+
+    // 5. Canon lift with **UTF-16** encoding
+    //    Core func 1 expects UTF-16 data: (ptr, code_unit_count) -> sum
+    {
+        let mut canon = CanonicalFunctionSection::new();
+        canon.lift(
+            1, // core func index: process-string
+            0, // component type index
+            [
+                CanonicalOption::UTF16, // <-- UTF-16 encoding
+                CanonicalOption::Memory(0),
+                CanonicalOption::Realloc(0),
+            ],
+        );
+        component.section(&canon);
+    }
+
+    // 6. Export the lifted function
+    {
+        let mut exp = ComponentExportSection::new();
+        exp.export("test:api/api", ComponentExportKind::Func, 0, None);
+        component.section(&exp);
+    }
+
+    component.finish()
+}
+
+/// SR-17: Verify UTF-8 to UTF-16 string transcoding in cross-component calls.
+///
+/// The caller has "Hello" as UTF-8 bytes [72, 101, 108, 108, 111] in memory.
+/// The callee lifts with UTF-16 encoding, so it reads 16-bit code units.
+/// The adapter must transcode: each ASCII byte becomes a UTF-16 code unit.
+///
+/// For "Hello" (all ASCII), each byte maps 1:1 to a UTF-16 code unit:
+///   UTF-16 code units: [0x0048, 0x0065, 0x006C, 0x006C, 0x006F]
+///   = [72, 101, 108, 108, 111]
+///
+/// Sum of code units = 72 + 101 + 108 + 108 + 111 = 500
+///
+/// This tests the core of SR-17: the adapter's UTF-8 to UTF-16 transcoding
+/// loop correctly decodes each UTF-8 byte and encodes it as a UTF-16 code unit
+/// in the callee's memory.
+#[test]
+fn test_sr17_utf8_to_utf16_string_transcoding() {
+    let callee = build_callee_utf16_string_component();
+    let caller = build_caller_string_component(); // reuse UTF-8 caller from SR-12
+
+    let config = FuserConfig {
+        memory_strategy: MemoryStrategy::MultiMemory,
+        attestation: false,
+        address_rebasing: false,
+        preserve_names: false,
+        custom_sections: meld_core::CustomSectionHandling::Drop,
+        output_format: meld_core::OutputFormat::CoreModule,
+    };
+
+    let mut fuser = Fuser::new(config);
+    fuser
+        .add_component_named(&callee, Some("callee-utf16"))
+        .expect("callee component should parse");
+    fuser
+        .add_component_named(&caller, Some("caller-utf8"))
+        .expect("caller component should parse");
+
+    let (fused, stats) = fuser.fuse_with_stats().expect("fusion should succeed");
+
+    eprintln!(
+        "SR-17 UTF-8->UTF-16: {} bytes, {} funcs, {} adapters, {} imports resolved",
+        stats.output_size, stats.total_functions, stats.adapter_functions, stats.imports_resolved,
+    );
+
+    // The fusion should produce at least one adapter for the transcoding call
+    assert!(
+        stats.adapter_functions > 0,
+        "SR-17: expected adapter functions for UTF-8 to UTF-16 transcoding, got 0"
+    );
+
+    // Validate the fused output
+    let mut validator = wasmparser::Validator::new();
+    validator
+        .validate_all(&fused)
+        .expect("SR-17: fused output should validate");
+
+    // Run through wasmtime
+    let mut engine_config = Config::new();
+    engine_config.wasm_multi_memory(true);
+
+    let engine = Engine::new(&engine_config).unwrap();
+    let module = RuntimeModule::new(&engine, &fused).unwrap();
+    let mut store = Store::new(&engine, ());
+    let instance = Instance::new(&mut store, &module, &[]).unwrap();
+
+    let run = instance
+        .get_typed_func::<(), i32>(&mut store, "run")
+        .expect("SR-17: fused module should export 'run'");
+    let result = run.call(&mut store, ()).unwrap();
+
+    // "Hello" in UTF-8 = [72, 101, 108, 108, 111]
+    // Transcoded to UTF-16 code units: [72, 101, 108, 108, 111] (ASCII maps 1:1)
+    // Sum = 500
+    assert_eq!(
+        result, 500,
+        "SR-17: run() should return 500 (sum of UTF-16 code units for 'Hello')"
+    );
+}
