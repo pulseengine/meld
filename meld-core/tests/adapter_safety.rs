@@ -192,9 +192,9 @@ fn build_callee_string_component() -> Vec<u8> {
                 "s",
                 wasm_encoder::ComponentValType::Primitive(wasm_encoder::PrimitiveValType::String),
             )])
-            .result(wasm_encoder::ComponentValType::Primitive(
+            .result(Some(wasm_encoder::ComponentValType::Primitive(
                 wasm_encoder::PrimitiveValType::U32,
-            ));
+            )));
         component.section(&types);
     }
 
@@ -386,9 +386,9 @@ fn build_caller_string_component() -> Vec<u8> {
                 "s",
                 wasm_encoder::ComponentValType::Primitive(wasm_encoder::PrimitiveValType::String),
             )])
-            .result(wasm_encoder::ComponentValType::Primitive(
+            .result(Some(wasm_encoder::ComponentValType::Primitive(
                 wasm_encoder::PrimitiveValType::U32,
-            ));
+            )));
         component.section(&types);
     }
 
@@ -596,9 +596,9 @@ fn build_callee_realloc_verify_component() -> Vec<u8> {
                 "s",
                 wasm_encoder::ComponentValType::Primitive(wasm_encoder::PrimitiveValType::String),
             )])
-            .result(wasm_encoder::ComponentValType::Primitive(
+            .result(Some(wasm_encoder::ComponentValType::Primitive(
                 wasm_encoder::PrimitiveValType::U32,
-            ));
+            )));
         component.section(&types);
     }
 
@@ -777,9 +777,9 @@ fn build_caller_realloc_verify_component() -> Vec<u8> {
                 "s",
                 wasm_encoder::ComponentValType::Primitive(wasm_encoder::PrimitiveValType::String),
             )])
-            .result(wasm_encoder::ComponentValType::Primitive(
+            .result(Some(wasm_encoder::ComponentValType::Primitive(
                 wasm_encoder::PrimitiveValType::U32,
-            ));
+            )));
         component.section(&types);
     }
 
@@ -998,9 +998,9 @@ fn build_callee_list_u32_component() -> Vec<u8> {
         types
             .function()
             .params([("items", wasm_encoder::ComponentValType::Type(0))])
-            .result(wasm_encoder::ComponentValType::Primitive(
+            .result(Some(wasm_encoder::ComponentValType::Primitive(
                 wasm_encoder::PrimitiveValType::U32,
-            ));
+            )));
         component.section(&types);
     }
 
@@ -1192,9 +1192,9 @@ fn build_caller_list_u32_component() -> Vec<u8> {
         types
             .function()
             .params([("items", wasm_encoder::ComponentValType::Type(0))])
-            .result(wasm_encoder::ComponentValType::Primitive(
+            .result(Some(wasm_encoder::ComponentValType::Primitive(
                 wasm_encoder::PrimitiveValType::U32,
-            ));
+            )));
         component.section(&types);
     }
 
@@ -1466,9 +1466,9 @@ fn build_callee_list_string_component() -> Vec<u8> {
         types
             .function()
             .params([("items", wasm_encoder::ComponentValType::Type(0))])
-            .result(wasm_encoder::ComponentValType::Primitive(
+            .result(Some(wasm_encoder::ComponentValType::Primitive(
                 wasm_encoder::PrimitiveValType::U32,
-            ));
+            )));
         component.section(&types);
     }
 
@@ -1679,9 +1679,9 @@ fn build_caller_list_string_component() -> Vec<u8> {
         types
             .function()
             .params([("items", wasm_encoder::ComponentValType::Type(0))])
-            .result(wasm_encoder::ComponentValType::Primitive(
+            .result(Some(wasm_encoder::ComponentValType::Primitive(
                 wasm_encoder::PrimitiveValType::U32,
-            ));
+            )));
         component.section(&types);
     }
 
@@ -1909,9 +1909,9 @@ fn build_callee_utf16_string_component() -> Vec<u8> {
                 "s",
                 wasm_encoder::ComponentValType::Primitive(wasm_encoder::PrimitiveValType::String),
             )])
-            .result(wasm_encoder::ComponentValType::Primitive(
+            .result(Some(wasm_encoder::ComponentValType::Primitive(
                 wasm_encoder::PrimitiveValType::U32,
-            ));
+            )));
         component.section(&types);
     }
 

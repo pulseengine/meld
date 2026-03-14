@@ -1938,8 +1938,8 @@ fn create_global_init(val_type: &ValType) -> ConstExpr {
     match val_type {
         ValType::I32 => ConstExpr::i32_const(0),
         ValType::I64 => ConstExpr::i64_const(0),
-        ValType::F32 => ConstExpr::f32_const(0.0),
-        ValType::F64 => ConstExpr::f64_const(0.0),
+        ValType::F32 => ConstExpr::f32_const(0.0_f32.into()),
+        ValType::F64 => ConstExpr::f64_const(0.0_f64.into()),
         ValType::V128 => ConstExpr::v128_const(0),
         ValType::Ref(rt) => ConstExpr::ref_null(rt.heap_type),
     }
@@ -1979,10 +1979,10 @@ fn convert_init_expr(
         wasmparser::Operator::I32Const { value } => ConstExpr::i32_const(value),
         wasmparser::Operator::I64Const { value } => ConstExpr::i64_const(value),
         wasmparser::Operator::F32Const { value } => {
-            ConstExpr::f32_const(f32::from_bits(value.bits()))
+            ConstExpr::f32_const(f32::from_bits(value.bits()).into())
         }
         wasmparser::Operator::F64Const { value } => {
-            ConstExpr::f64_const(f64::from_bits(value.bits()))
+            ConstExpr::f64_const(f64::from_bits(value.bits()).into())
         }
         wasmparser::Operator::V128Const { value } => {
             ConstExpr::v128_const(i128::from_le_bytes(*value.bytes()))

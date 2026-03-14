@@ -393,6 +393,7 @@ pub enum ComponentValType {
     Primitive(PrimitiveValType),
     String,
     List(Box<ComponentValType>),
+    FixedSizeList(Box<ComponentValType>, u32),
     Record(Vec<(String, ComponentValType)>),
     Variant(Vec<(String, Option<ComponentValType>)>),
     Tuple(Vec<ComponentValType>),
@@ -475,6 +476,8 @@ pub enum CanonicalEntry {
     ThreadSpawn { func_ty_index: u32 },
     /// Query hardware thread concurrency
     ThreadHwConcurrency,
+    /// Unsupported canonical function (P3 async, stream, future, etc.)
+    Unsupported,
 }
 
 /// Component instance
@@ -552,7 +555,9 @@ impl ComponentParser {
         }
 
         if self.validate {
-            let mut validator = wasmparser::Validator::new();
+            let features =
+                wasmparser::WasmFeatures::default() | wasmparser::WasmFeatures::CM_FIXED_SIZE_LIST;
+            let mut validator = wasmparser::Validator::new_with_features(features);
             validator.validate_all(bytes)?;
         }
 
@@ -811,11 +816,9 @@ impl ComponentParser {
                                 })
                                 .collect();
                             let results = func_type
-                                .results
+                                .result
                                 .iter()
-                                .map(|(name, ty)| {
-                                    (name.map(String::from), convert_wp_component_val_type(ty))
-                                })
+                                .map(|ty| (None, convert_wp_component_val_type(ty)))
                                 .collect();
                             ComponentTypeKind::Function { params, results }
                         }
@@ -1303,6 +1306,7 @@ impl ParsedComponent {
                     .unwrap_or(0);
                 4 + max_payload
             }
+            ComponentValType::FixedSizeList(elem, len) => self.flat_byte_size(elem) * len,
             ComponentValType::Own(_) | ComponentValType::Borrow(_) => 4,
         }
     }
@@ -1546,6 +1550,15 @@ impl ParsedComponent {
                     });
                 }
             }
+            ComponentValType::FixedSizeList(elem, len) => {
+                // Inline fixed-size list: lay out each element sequentially
+                let elem_size = self.canonical_abi_element_size(elem);
+                let mut offset = base;
+                for _ in 0..*len {
+                    self.collect_return_area_type_slots(elem, offset, out);
+                    offset += elem_size;
+                }
+            }
             ComponentValType::Own(_) | ComponentValType::Borrow(_) => {
                 out.push(ReturnAreaSlot {
                     byte_offset: base,
@@ -1597,6 +1610,15 @@ impl ParsedComponent {
             ComponentValType::String | ComponentValType::List(_) => {
                 out.push(base);
             }
+            ComponentValType::FixedSizeList(elem, len) => {
+                // Inline: each element is flattened sequentially
+                let elem_flat = self.flat_count(elem);
+                let mut offset = base;
+                for _ in 0..*len {
+                    self.collect_pointer_positions(elem, offset, out);
+                    offset += elem_flat;
+                }
+            }
             ComponentValType::Record(fields) => {
                 let mut offset = base;
                 for (_, field_ty) in fields {
@@ -1629,6 +1651,15 @@ impl ParsedComponent {
         match ty {
             ComponentValType::String | ComponentValType::List(_) => {
                 out.push(base);
+            }
+            ComponentValType::FixedSizeList(elem, len) => {
+                // Inline: each element laid out at stride = element_size
+                let elem_size = self.canonical_abi_element_size(elem);
+                let mut offset = base;
+                for _ in 0..*len {
+                    self.collect_pointer_byte_offsets(elem, offset, out);
+                    offset += elem_size;
+                }
             }
             ComponentValType::Record(fields) => {
                 let mut offset = base;
@@ -1795,6 +1826,14 @@ impl ParsedComponent {
                     }
                 }
             }
+            ComponentValType::FixedSizeList(elem, len) => {
+                let elem_flat = self.flat_count(elem);
+                let mut offset = base;
+                for _ in 0..*len {
+                    self.collect_conditional_pointers(elem, offset, out);
+                    offset += elem_flat;
+                }
+            }
             ComponentValType::Record(fields) => {
                 let mut offset = base;
                 for (_, field_ty) in fields {
@@ -1925,6 +1964,14 @@ impl ParsedComponent {
                     }
                 }
             }
+            ComponentValType::FixedSizeList(elem, len) => {
+                let elem_size = self.canonical_abi_element_size(elem);
+                let mut offset = base;
+                for _ in 0..*len {
+                    self.collect_conditional_result_pointers(elem, offset, out);
+                    offset += elem_size;
+                }
+            }
             ComponentValType::Record(fields) => {
                 let mut offset = base;
                 for (_, field_ty) in fields {
@@ -1958,6 +2005,7 @@ impl ParsedComponent {
     pub fn type_contains_pointers(&self, ty: &ComponentValType) -> bool {
         match ty {
             ComponentValType::String | ComponentValType::List(_) => true,
+            ComponentValType::FixedSizeList(elem, _) => self.type_contains_pointers(elem),
             ComponentValType::Option(inner) => self.type_contains_pointers(inner),
             ComponentValType::Result { ok, err } => {
                 ok.as_ref().is_some_and(|t| self.type_contains_pointers(t))
@@ -2025,6 +2073,7 @@ impl ParsedComponent {
                     1
                 }
             }
+            ComponentValType::FixedSizeList(elem, len) => self.flat_count(elem) * len,
             ComponentValType::Own(_) | ComponentValType::Borrow(_) => 1,
         }
     }
@@ -2042,6 +2091,7 @@ impl ParsedComponent {
                 PrimitiveValType::S64 | PrimitiveValType::U64 | PrimitiveValType::F64 => 8,
             },
             ComponentValType::String | ComponentValType::List(_) => 4, // ptr alignment
+            ComponentValType::FixedSizeList(elem, _) => self.canonical_abi_align(elem),
             ComponentValType::Record(fields) => fields
                 .iter()
                 .map(|(_, t)| self.canonical_abi_align(t))
@@ -2106,6 +2156,10 @@ impl ParsedComponent {
                 PrimitiveValType::S64 | PrimitiveValType::U64 | PrimitiveValType::F64 => 8,
             },
             ComponentValType::String | ComponentValType::List(_) => 8, // (ptr: i32, len: i32)
+            ComponentValType::FixedSizeList(elem, len) => {
+                // Inline: element_size (padded stride) * length
+                self.canonical_abi_element_size(elem) * len
+            }
             ComponentValType::Record(fields) => {
                 let mut size = 0u32;
                 for (_, field_ty) in fields {
@@ -2229,6 +2283,15 @@ impl ParsedComponent {
                 // The list itself is a pointer pair — don't recurse further here
                 let _ = inner;
             }
+            ComponentValType::FixedSizeList(elem, len) => {
+                // Inline: recurse into each element
+                let elem_size = self.canonical_abi_element_size(elem);
+                let mut offset = base;
+                for _ in 0..*len {
+                    result.extend(self.element_inner_pointers(elem, offset));
+                    offset += elem_size;
+                }
+            }
             ComponentValType::Record(fields) => {
                 let mut offset = base;
                 for (_, field_ty) in fields {
@@ -2300,6 +2363,10 @@ fn convert_wp_component_val_type(ty: &wasmparser::ComponentValType) -> Component
             wasmparser::PrimitiveValType::F64 => ComponentValType::Primitive(PrimitiveValType::F64),
             wasmparser::PrimitiveValType::Char => {
                 ComponentValType::Primitive(PrimitiveValType::Char)
+            }
+            wasmparser::PrimitiveValType::ErrorContext => {
+                // P3 error context type — treat as opaque i32 handle
+                ComponentValType::Primitive(PrimitiveValType::U32)
             }
         },
         wasmparser::ComponentValType::Type(idx) => ComponentValType::Type(*idx),
@@ -2382,6 +2449,12 @@ fn convert_wp_defined_type(dt: &wasmparser::ComponentDefinedType) -> ComponentTy
                     .collect(),
             ))
         }
+        wasmparser::ComponentDefinedType::FixedSizeList(ty, len) => ComponentTypeKind::Defined(
+            ComponentValType::FixedSizeList(Box::new(convert_wp_component_val_type(ty)), *len),
+        ),
+        // P3 async types — not yet supported by the fuser
+        wasmparser::ComponentDefinedType::Future(_)
+        | wasmparser::ComponentDefinedType::Stream(_) => ComponentTypeKind::Other,
     }
 }
 
@@ -2408,6 +2481,10 @@ fn convert_canonical_options(options: &[wasmparser::CanonicalOption]) -> Canonic
             wasmparser::CanonicalOption::PostReturn(idx) => {
                 result.post_return = Some(*idx);
             }
+            // P3 async canonical options — ignored for fusion
+            wasmparser::CanonicalOption::Async
+            | wasmparser::CanonicalOption::Callback(_)
+            | wasmparser::CanonicalOption::CoreType(_) => {}
         }
     }
     result
@@ -2441,10 +2518,11 @@ fn convert_canonical_function(canon: wasmparser::CanonicalFunction) -> Canonical
         wasmparser::CanonicalFunction::ResourceRep { resource } => {
             CanonicalEntry::ResourceRep { resource }
         }
-        wasmparser::CanonicalFunction::ThreadSpawn { func_ty_index } => {
+        wasmparser::CanonicalFunction::ThreadSpawnRef { func_ty_index } => {
             CanonicalEntry::ThreadSpawn { func_ty_index }
         }
-        wasmparser::CanonicalFunction::ThreadHwConcurrency => CanonicalEntry::ThreadHwConcurrency,
+        // P3 async/stream/future/error-context canonical functions — not yet supported
+        _ => CanonicalEntry::Unsupported,
     }
 }
 

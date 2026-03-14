@@ -1887,13 +1887,11 @@ fn define_source_type_in_wrapper(
                 let p: Vec<_> = enc_params.iter().map(|(n, t)| (n.as_str(), *t)).collect();
                 func_enc.params(p);
                 if enc_results.len() == 1 && enc_results[0].0.is_none() {
-                    func_enc.result(enc_results[0].1);
+                    func_enc.result(Some(enc_results[0].1));
                 } else if !enc_results.is_empty() {
-                    let r: Vec<_> = enc_results
-                        .iter()
-                        .map(|(n, t)| (n.as_deref().unwrap_or(""), *t))
-                        .collect();
-                    func_enc.results(r);
+                    // Component model now only supports a single anonymous result;
+                    // emit the first result type.
+                    func_enc.result(Some(enc_results[0].1));
                 }
             }
             component.section(&types);
@@ -1958,6 +1956,16 @@ fn emit_defined_type(
             )?;
             types.defined_type().list(inner_enc);
         }
+        parser::ComponentValType::FixedSizeList(elem, len) => {
+            let elem_enc = convert_parser_val_to_encoder(
+                component,
+                source,
+                elem,
+                component_type_idx,
+                type_remap,
+            )?;
+            types.defined_type().fixed_size_list(elem_enc, *len);
+        }
         parser::ComponentValType::Option(inner) => {
             let inner_enc = convert_parser_val_to_encoder(
                 component,
@@ -2014,7 +2022,9 @@ fn convert_parser_val_to_encoder(
                 emit_defined_type(component, source, ty, component_type_idx, type_remap)?;
             Ok(wasm_encoder::ComponentValType::Type(wrapper_idx))
         }
-        parser::ComponentValType::List(_) | parser::ComponentValType::Option(_) => {
+        parser::ComponentValType::List(_)
+        | parser::ComponentValType::FixedSizeList(_, _)
+        | parser::ComponentValType::Option(_) => {
             let wrapper_idx =
                 emit_defined_type(component, source, ty, component_type_idx, type_remap)?;
             Ok(wasm_encoder::ComponentValType::Type(wrapper_idx))
@@ -2044,7 +2054,7 @@ fn define_default_run_type(
     types2
         .function()
         .params(empty_params)
-        .result(wasm_encoder::ComponentValType::Type(result_type_idx));
+        .result(Some(wasm_encoder::ComponentValType::Type(result_type_idx)));
     component.section(&types2);
     let func_type_idx = *component_type_idx;
     *component_type_idx += 1;
@@ -2060,7 +2070,7 @@ fn define_bare_func_type(
 ) -> u32 {
     let mut types = wasm_encoder::ComponentTypeSection::new();
     let empty: Vec<(&str, wasm_encoder::ComponentValType)> = vec![];
-    types.function().params(empty.clone()).results(empty);
+    types.function().params(empty).result(None);
     component.section(&types);
     let func_type_idx = *component_type_idx;
     *component_type_idx += 1;
