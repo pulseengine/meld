@@ -407,6 +407,22 @@ pub enum ComponentValType {
     Type(u32),
 }
 
+/// Position of a resource-typed parameter or result in the flat ABI layout.
+///
+/// Used by the adapter generator to emit `[resource-rep]` (handle → representation)
+/// or `[resource-new]` (representation → handle) calls at the correct positions.
+#[derive(Debug, Clone)]
+pub struct ResourcePosition {
+    /// Index in the flat (stack) ABI layout (e.g., param 0, 1, 2…)
+    pub flat_idx: u32,
+    /// Byte offset in the canonical ABI memory layout (for return-area results)
+    pub byte_offset: u32,
+    /// `true` for `own<R>`, `false` for `borrow<R>`
+    pub is_owned: bool,
+    /// Component-level type index of the resource
+    pub resource_type_id: u32,
+}
+
 /// Primitive value types in the Component Model
 #[derive(Debug, Clone, Copy)]
 pub enum PrimitiveValType {
@@ -1567,6 +1583,139 @@ impl ParsedComponent {
                 });
             }
         }
+    }
+
+    /// Resolve a `ComponentValType` to its resource type, if any.
+    ///
+    /// Returns `Some((resource_type_id, is_owned))` for `Own(T)`, `Borrow(T)`,
+    /// and `Type(idx)` that resolves to a `Defined(Own(T))` or `Defined(Borrow(T))`.
+    fn resolve_to_resource(&self, ty: &ComponentValType) -> Option<(u32, bool)> {
+        match ty {
+            ComponentValType::Own(id) => Some((*id, true)),
+            ComponentValType::Borrow(id) => Some((*id, false)),
+            ComponentValType::Type(idx) => {
+                // Follow type definition chain
+                if let Some(ct) = self.get_type_definition(*idx)
+                    && let ComponentTypeKind::Defined(inner) = &ct.kind
+                {
+                    match inner {
+                        ComponentValType::Own(id) => Some((*id, true)),
+                        ComponentValType::Borrow(id) => Some((*id, false)),
+                        _ => None,
+                    }
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// Identify resource-typed parameters and their flat-ABI positions.
+    ///
+    /// For each `own<R>` or `borrow<R>` parameter (including through `Type(idx)`
+    /// indirection), returns a `ResourcePosition` with the flat param index and
+    /// resource type ID. Used by the adapter to emit `[resource-rep]` calls that
+    /// convert handles to representations.
+    pub fn resource_param_positions(
+        &self,
+        params: &[(String, ComponentValType)],
+    ) -> Vec<ResourcePosition> {
+        let mut positions = Vec::new();
+        let mut flat_idx = 0u32;
+        for (_, ty) in params {
+            if let Some((resource_type_id, is_owned)) = self.resolve_to_resource(ty) {
+                positions.push(ResourcePosition {
+                    flat_idx,
+                    byte_offset: 0, // not used for params
+                    is_owned,
+                    resource_type_id,
+                });
+            }
+            flat_idx += self.flat_count(ty);
+        }
+        positions
+    }
+
+    /// Identify resource-typed results and their flat-ABI / byte-offset positions.
+    ///
+    /// Returns both the flat index (for non-retptr results) and the canonical ABI
+    /// byte offset (for retptr return-area results). Used by the adapter to emit
+    /// `[resource-new]` calls that convert representations to handles.
+    pub fn resource_result_positions(
+        &self,
+        results: &[(Option<String>, ComponentValType)],
+    ) -> Vec<ResourcePosition> {
+        let mut positions = Vec::new();
+        let mut flat_idx = 0u32;
+        let mut byte_offset = 0u32;
+        for (_, ty) in results {
+            let align = self.canonical_abi_align(ty);
+            byte_offset = align_up(byte_offset, align);
+            if let Some((resource_type_id, is_owned)) = self.resolve_to_resource(ty) {
+                positions.push(ResourcePosition {
+                    flat_idx,
+                    byte_offset,
+                    is_owned,
+                    resource_type_id,
+                });
+            }
+            flat_idx += self.flat_count(ty);
+            byte_offset += self.canonical_abi_size_unpadded(ty);
+        }
+        positions
+    }
+
+    /// Resolve a component type index to `(module_name, type_name)` for resource ops.
+    ///
+    /// Traces the type index through `component_type_defs` and `component_aliases`
+    /// to find the WASI interface module name and the resource's exported name.
+    /// Returns `None` if the type cannot be traced to an import.
+    pub fn resolve_resource_type(&self, type_id: u32) -> Option<(String, String)> {
+        // Build instance → import name map
+        let mut comp_instance_to_import: std::collections::HashMap<u32, String> =
+            std::collections::HashMap::new();
+        for (inst_idx, def) in self.component_instance_defs.iter().enumerate() {
+            if let ComponentInstanceDef::Import(import_idx) = def
+                && let Some(imp) = self.imports.get(*import_idx)
+            {
+                comp_instance_to_import.insert(inst_idx as u32, imp.name.clone());
+            }
+        }
+
+        if let Some(def) = self.component_type_defs.get(type_id as usize) {
+            match def {
+                ComponentTypeDef::InstanceExportAlias(alias_idx) => {
+                    if let Some(ComponentAliasEntry::InstanceExport {
+                        instance_index,
+                        name,
+                        ..
+                    }) = self.component_aliases.get(*alias_idx)
+                        && let Some(module_name) = comp_instance_to_import.get(instance_index)
+                    {
+                        return Some((module_name.clone(), name.clone()));
+                    }
+                }
+                ComponentTypeDef::Import(import_idx) => {
+                    if let Some(imp) = self.imports.get(*import_idx) {
+                        // Extract resource name from WASI path:
+                        // "wasi:io/error@0.2.6" → "error"
+                        let without_version = imp
+                            .name
+                            .rfind('@')
+                            .map(|pos| &imp.name[..pos])
+                            .unwrap_or(&imp.name);
+                        let resource_name = without_version
+                            .rfind('/')
+                            .map(|pos| &without_version[pos + 1..])
+                            .unwrap_or(without_version);
+                        return Some((imp.name.clone(), resource_name.to_string()));
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
     }
 
     /// Compute flat core param indices where (ptr, len) pairs start.

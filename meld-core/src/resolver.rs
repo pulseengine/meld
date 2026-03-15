@@ -137,6 +137,24 @@ pub struct ConditionalPointerPair {
     pub discriminant_byte_size: u32,
 }
 
+/// A resolved resource operation for adapter generation.
+///
+/// Maps a resource-typed parameter or result to the `(module, field)` import
+/// pair for the corresponding `[resource-rep]` or `[resource-new]` function.
+#[derive(Debug, Clone)]
+pub struct ResolvedResourceOp {
+    /// Index in the flat (stack) ABI layout
+    pub flat_idx: u32,
+    /// Byte offset in the canonical ABI memory layout (for return-area results)
+    pub byte_offset: u32,
+    /// `true` for `own<R>`, `false` for `borrow<R>`
+    pub is_owned: bool,
+    /// Import module name (e.g., `"[export]test:resources/resources"`)
+    pub import_module: String,
+    /// Import field name (e.g., `"[resource-rep]y"`)
+    pub import_field: String,
+}
+
 /// Requirements for an adapter function
 #[derive(Debug, Clone, Default)]
 pub struct AdapterRequirements {
@@ -186,6 +204,12 @@ pub struct AdapterRequirements {
     /// Used by the adapter to emit correctly-sized load/store instructions (e.g.,
     /// `i64.load`/`i64.store` for 8-byte values like f64/i64).
     pub return_area_slots: Vec<ReturnAreaSlot>,
+    /// Resource-typed parameters needing handle→representation conversion.
+    /// The adapter calls `[resource-rep]` for each before forwarding to callee.
+    pub resource_params: Vec<ResolvedResourceOp>,
+    /// Resource-typed results needing representation→handle conversion.
+    /// The adapter calls `[resource-new]` for each before returning to caller.
+    pub resource_results: Vec<ResolvedResourceOp>,
 }
 
 /// Resolution of module-level imports within a component
@@ -596,10 +620,40 @@ fn build_canon_import_names(component: &ParsedComponent) -> HashMap<u32, (String
                                     result.insert(core_func_idx, (module_name.clone(), field));
                                 }
                             } else if let Some(import_name) = comp_type_import_names.get(resource) {
-                                // Direct type import — extract resource name
-                                // from the WASI path.
                                 let resource_name = extract_wasi_resource_name(import_name);
                                 let field = format!("[resource-drop]{}", resource_name);
+                                result.insert(core_func_idx, (import_name.clone(), field));
+                            }
+                        }
+                        CanonicalEntry::ResourceNew { resource } => {
+                            if let Some((inst_idx, type_name)) =
+                                comp_type_to_instance_export.get(resource)
+                            {
+                                if let Some(module_name) =
+                                    comp_instance_to_import_name.get(inst_idx)
+                                {
+                                    let field = format!("[resource-new]{}", type_name);
+                                    result.insert(core_func_idx, (module_name.clone(), field));
+                                }
+                            } else if let Some(import_name) = comp_type_import_names.get(resource) {
+                                let resource_name = extract_wasi_resource_name(import_name);
+                                let field = format!("[resource-new]{}", resource_name);
+                                result.insert(core_func_idx, (import_name.clone(), field));
+                            }
+                        }
+                        CanonicalEntry::ResourceRep { resource } => {
+                            if let Some((inst_idx, type_name)) =
+                                comp_type_to_instance_export.get(resource)
+                            {
+                                if let Some(module_name) =
+                                    comp_instance_to_import_name.get(inst_idx)
+                                {
+                                    let field = format!("[resource-rep]{}", type_name);
+                                    result.insert(core_func_idx, (module_name.clone(), field));
+                                }
+                            } else if let Some(import_name) = comp_type_import_names.get(resource) {
+                                let resource_name = extract_wasi_resource_name(import_name);
+                                let field = format!("[resource-rep]{}", resource_name);
                                 result.insert(core_func_idx, (import_name.clone(), field));
                             }
                         }
@@ -643,6 +697,162 @@ fn extract_wasi_resource_name(import_name: &str) -> &str {
         Some(pos) => &without_version[pos + 1..],
         None => without_version,
     }
+}
+
+/// Build a map from resource type ID → `(module, field)` for resource canonical
+/// functions (`[resource-rep]`, `[resource-new]`) in a component.
+///
+/// This works by:
+/// 1. Scanning canonical functions to find ResourceRep/ResourceNew entries and
+///    their core func indices.
+/// 2. Scanning `FromExports` core instances to find which field name each core
+///    func index is exported as (e.g., `"[resource-new]x"`).
+/// 3. Scanning `Instantiate` core instances to find which module name each
+///    `FromExports` instance provides (e.g., `"[export]exports"`).
+fn build_resource_type_to_import(
+    component: &ParsedComponent,
+) -> HashMap<(u32, &'static str), (String, String)> {
+    use crate::parser::{CanonicalEntry, CoreEntityDef, InstanceKind};
+
+    // Step 1: Build resource_type → (core_func_idx, kind) from canonical functions
+    let mut resource_core_funcs: Vec<(u32, u32, &'static str)> = Vec::new(); // (resource_type, core_func_idx, kind)
+    let mut core_func_idx = 0u32;
+    for def in &component.core_entity_order {
+        match def {
+            CoreEntityDef::CanonicalFunction(canon_idx) => {
+                if let Some(entry) = component.canonical_functions.get(*canon_idx) {
+                    match entry {
+                        CanonicalEntry::ResourceRep { resource } => {
+                            resource_core_funcs.push((*resource, core_func_idx, "[resource-rep]"));
+                        }
+                        CanonicalEntry::ResourceNew { resource } => {
+                            resource_core_funcs.push((*resource, core_func_idx, "[resource-new]"));
+                        }
+                        _ => {}
+                    }
+                }
+                core_func_idx += 1;
+            }
+            CoreEntityDef::CoreAlias(alias_idx) => {
+                if let Some(crate::parser::ComponentAliasEntry::CoreInstanceExport {
+                    kind: wasmparser::ExternalKind::Func,
+                    ..
+                }) = component.component_aliases.get(*alias_idx)
+                {
+                    core_func_idx += 1;
+                }
+            }
+        }
+    }
+
+    if resource_core_funcs.is_empty() {
+        return HashMap::new();
+    }
+
+    // Step 2: Build core_func_idx → (instance_idx, field_name) from FromExports instances.
+    // A FromExports instance maps field names to core entity indices.
+    let mut core_func_to_field: HashMap<u32, (u32, String)> = HashMap::new(); // core_func_idx → (instance_idx, field_name)
+    for inst in &component.instances {
+        if let InstanceKind::FromExports(exports) = &inst.kind {
+            for (name, kind, index) in exports {
+                if *kind == wasmparser::ExternalKind::Func {
+                    core_func_to_field.insert(*index, (inst.index, name.clone()));
+                }
+            }
+        }
+    }
+
+    // Step 3: Build instance_idx → module_name from Instantiate args.
+    // When a core module is instantiated, args map (module_name → Instance(idx)).
+    let mut instance_to_module: HashMap<u32, String> = HashMap::new();
+    for inst in &component.instances {
+        if let InstanceKind::Instantiate { args, .. } = &inst.kind {
+            for (module_name, arg) in args {
+                if let crate::parser::InstanceArg::Instance(inst_idx) = arg {
+                    instance_to_module.insert(*inst_idx, module_name.clone());
+                }
+            }
+        }
+    }
+
+    // Step 4: Combine: resource_type → (module_name, field_name)
+    let mut map = HashMap::new();
+    for (resource_type, cf_idx, kind) in &resource_core_funcs {
+        if let Some((from_exports_idx, field_name)) = core_func_to_field.get(cf_idx)
+            && let Some(module_name) = instance_to_module.get(from_exports_idx)
+        {
+            map.insert(
+                (*resource_type, *kind),
+                (module_name.clone(), field_name.clone()),
+            );
+        }
+    }
+
+    // Step 5: Infer missing operations from existing ones.
+    //
+    // The component model's `canon lift` handles resource conversions
+    // internally, so a component may have ResourceNew for a type but not
+    // ResourceRep (or vice versa). If the adapter needs the missing one,
+    // we can infer it: same module name, same resource name, different
+    // prefix ("[resource-new]" vs "[resource-rep]").
+    let known_types: Vec<u32> = map.keys().map(|&(rt, _)| rt).collect();
+    for rt in known_types {
+        let has_rep = map.contains_key(&(rt, "[resource-rep]"));
+        let has_new = map.contains_key(&(rt, "[resource-new]"));
+
+        if has_new && !has_rep {
+            if let Some((module, field)) = map.get(&(rt, "[resource-new]")).cloned()
+                && let Some(name) = field.strip_prefix("[resource-new]")
+            {
+                let rep_field = format!("[resource-rep]{}", name);
+                map.insert((rt, "[resource-rep]"), (module, rep_field));
+            }
+        } else if has_rep
+            && !has_new
+            && let Some((module, field)) = map.get(&(rt, "[resource-rep]")).cloned()
+            && let Some(name) = field.strip_prefix("[resource-rep]")
+        {
+            let new_field = format!("[resource-new]{}", name);
+            map.insert((rt, "[resource-new]"), (module, new_field));
+        }
+    }
+
+    map
+}
+
+/// Resolve resource positions to `(module, field)` import pairs.
+///
+/// Uses `build_resource_type_to_import` to map resource type IDs found in
+/// function signatures to their `[resource-rep]` or `[resource-new]` core
+/// import names. The `field_prefix` selects which canonical function kind
+/// to look up: `"[resource-rep]"` for params, `"[resource-new]"` for results.
+fn resolve_resource_positions(
+    resource_map: &HashMap<(u32, &'static str), (String, String)>,
+    positions: &[crate::parser::ResourcePosition],
+    field_prefix: &'static str,
+) -> Vec<ResolvedResourceOp> {
+    let mut resolved = Vec::new();
+    for pos in positions {
+        if let Some((module_name, field_name)) =
+            resource_map.get(&(pos.resource_type_id, field_prefix))
+        {
+            resolved.push(ResolvedResourceOp {
+                flat_idx: pos.flat_idx,
+                byte_offset: pos.byte_offset,
+                is_owned: pos.is_owned,
+                import_module: module_name.clone(),
+                import_field: field_name.clone(),
+            });
+        } else {
+            log::debug!(
+                "Could not resolve resource type {} for {} at flat_idx {}",
+                pos.resource_type_id,
+                field_prefix,
+                pos.flat_idx,
+            );
+        }
+    }
+    resolved
 }
 
 /// Dependency resolver
@@ -728,7 +938,106 @@ impl Resolver {
         // module_resolutions entries to adapter_sites.
         self.identify_intra_component_adapter_sites(components, &mut graph)?;
 
+        // Synthesize missing resource imports.
+        //
+        // The component model's `canon lift` handles `resource.rep` and
+        // `resource.new` internally, so a component binary may lack an
+        // explicit `ResourceRep` or `ResourceNew` canonical function even
+        // though the adapter needs one.  Detect missing resource imports and
+        // add them as synthetic unresolved imports so the merger includes them.
+        Self::synthesize_missing_resource_imports(components, &mut graph);
+
         Ok(graph)
+    }
+
+    /// Add synthetic unresolved imports for `[resource-rep]` / `[resource-new]`
+    /// functions that adapters need but no source core module imports directly.
+    ///
+    /// For each adapter site, check whether the resource operations it needs
+    /// already exist as unresolved imports (meaning some core module imports
+    /// them). If not, add a synthetic unresolved import so the merger includes
+    /// them in the fused module's import list.
+    fn synthesize_missing_resource_imports(
+        components: &[ParsedComponent],
+        graph: &mut DependencyGraph,
+    ) {
+        use std::collections::HashSet;
+
+        // Collect all (module, field) pairs from adapter requirements
+        let mut needed: Vec<(String, String, usize)> = Vec::new(); // (module, field, callee_comp_idx)
+        for site in &graph.adapter_sites {
+            for op in &site.requirements.resource_params {
+                needed.push((
+                    op.import_module.clone(),
+                    op.import_field.clone(),
+                    site.to_component,
+                ));
+            }
+            for op in &site.requirements.resource_results {
+                needed.push((
+                    op.import_module.clone(),
+                    op.import_field.clone(),
+                    site.to_component,
+                ));
+            }
+        }
+
+        if needed.is_empty() {
+            return;
+        }
+
+        // Check which (module, field) pairs already exist as unresolved imports
+        let existing: HashSet<(String, String)> = graph
+            .unresolved_imports
+            .iter()
+            .filter(|u| matches!(u.kind, ImportKind::Function(_)))
+            .map(|u| {
+                let module = u.display_module.as_deref().unwrap_or(&u.module_name);
+                let field = u.display_field.as_deref().unwrap_or(&u.field_name);
+                (module.to_string(), field.to_string())
+            })
+            .collect();
+
+        let mut added: HashSet<(String, String)> = HashSet::new();
+        for (module, field, callee_comp_idx) in &needed {
+            let key = (module.clone(), field.clone());
+            if existing.contains(&key) || added.contains(&key) {
+                continue;
+            }
+
+            // Find a function type index for (i32) -> (i32) in the callee's
+            // first core module. This is the canonical type for resource ops.
+            let comp = &components[*callee_comp_idx];
+            let i32_to_i32 = comp
+                .core_modules
+                .first()
+                .and_then(|m| {
+                    m.types.iter().position(|t| {
+                        t.params == [wasm_encoder::ValType::I32]
+                            && t.results == [wasm_encoder::ValType::I32]
+                    })
+                })
+                .unwrap_or(0) as u32;
+
+            log::debug!(
+                "Synthesizing resource import ({}, {}) for component {}",
+                module,
+                field,
+                callee_comp_idx
+            );
+
+            graph.unresolved_imports.push(UnresolvedImport {
+                component_idx: *callee_comp_idx,
+                module_idx: 0,
+                module_name: module.clone(),
+                field_name: field.clone(),
+                kind: ImportKind::Function(i32_to_i32),
+                display_module: Some(module.clone()),
+                display_field: Some(field.clone()),
+            });
+
+            added.insert(key);
+        }
     }
 
     /// Build an index of all exports across components
@@ -1454,6 +1763,7 @@ impl Resolver {
                         );
                         let mut per_func_matched = false;
                         let callee_lift_info = to_component.lift_info_by_core_func();
+                        let callee_resource_map = build_resource_type_to_import(to_component);
                         // Provenance-based maps for correct core func index lookup.
                         // These account for interleaved canon lower / alias entries.
                         let callee_export_to_core = build_module_export_to_core_func(to_component);
@@ -1545,6 +1855,21 @@ impl Resolver {
                                                     );
                                             requirements.return_area_slots =
                                                 to_component.return_area_slots(results);
+                                            // Collect resource-typed params and results
+                                            requirements.resource_params =
+                                                resolve_resource_positions(
+                                                    &callee_resource_map,
+                                                    &to_component
+                                                        .resource_param_positions(comp_params),
+                                                    "[resource-rep]",
+                                                );
+                                            requirements.resource_results =
+                                                resolve_resource_positions(
+                                                    &callee_resource_map,
+                                                    &to_component
+                                                        .resource_result_positions(results),
+                                                    "[resource-new]",
+                                                );
                                         }
                                     }
 
