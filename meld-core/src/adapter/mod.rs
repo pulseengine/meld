@@ -123,6 +123,25 @@ pub struct AdapterOptions {
     /// Post-return function index in merged module (if any).
     /// Called after results have been copied back, to allow callee cleanup.
     pub callee_post_return: Option<u32>,
+
+    /// Resource borrow params needing handle→representation conversion.
+    /// Each entry: `(flat_param_idx, merged_func_idx of [resource-rep])`.
+    ///
+    /// Per the canonical ABI spec, `borrow<T>` params where T is defined by
+    /// the callee receive the **representation** (raw pointer), not the handle.
+    /// The `lower_borrow` function has `if cx.inst is t.rt.impl: return rep`.
+    /// So the adapter must call `[resource-rep]R(handle)` to convert before
+    /// forwarding to the callee's core function.
+    ///
+    /// `own<T>` params always receive a **handle** (table index) because
+    /// `lower_own` unconditionally creates a handle entry. The callee's core
+    /// function calls `from_handle` / `[resource-rep]` internally, so the
+    /// adapter must NOT convert own params.
+    ///
+    /// Results are never converted by the adapter — the callee's core function
+    /// already calls `[resource-new]R` internally for own results, and borrows
+    /// cannot appear in results.
+    pub resource_rep_calls: Vec<(u32, u32)>,
 }
 
 impl Default for AdapterOptions {
@@ -136,6 +155,7 @@ impl Default for AdapterOptions {
             callee_realloc: None,
             returns_pointer_pair: false,
             callee_post_return: None,
+            resource_rep_calls: Vec::new(),
         }
     }
 }

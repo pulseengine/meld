@@ -40,6 +40,27 @@ fn alignment_for_encoding(encoding: StringEncoding) -> i32 {
     }
 }
 
+/// Build a lookup from `(module, field)` → merged function index for resource imports.
+///
+/// Scans the merged module's imports to find `[resource-rep]` function imports
+/// and records their merged function indices.
+fn build_resource_import_map(
+    merged: &MergedModule,
+) -> std::collections::HashMap<(String, String), u32> {
+    use wasm_encoder::EntityType;
+    let mut map = std::collections::HashMap::new();
+    let mut func_idx = 0u32;
+    for imp in &merged.imports {
+        if matches!(imp.entity_type, EntityType::Function(_)) {
+            if imp.name.starts_with("[resource-rep]") {
+                map.insert((imp.module.clone(), imp.name.clone()), func_idx);
+            }
+            func_idx += 1;
+        }
+    }
+    map
+}
+
 /// FACT-style adapter generator
 pub struct FactStyleGenerator {
     #[allow(dead_code)]
@@ -58,6 +79,7 @@ impl FactStyleGenerator {
         site: &AdapterSite,
         merged: &MergedModule,
         _adapter_idx: usize,
+        resource_imports: &std::collections::HashMap<(String, String), u32>,
     ) -> Result<AdapterFunction> {
         let name = format!(
             "$adapter_{}_{}_to_{}_{}",
@@ -65,7 +87,7 @@ impl FactStyleGenerator {
         );
 
         // Determine adapter options based on call site
-        let options = self.analyze_call_site(site, merged);
+        let options = self.analyze_call_site(site, merged, resource_imports);
 
         // Generate the adapter function body
         let (type_idx, body) = if site.crosses_memory && options.needs_transcoding() {
@@ -73,7 +95,7 @@ impl FactStyleGenerator {
         } else if site.crosses_memory {
             self.generate_memory_copy_adapter(site, merged, &options)?
         } else {
-            self.generate_direct_adapter(site, merged)?
+            self.generate_direct_adapter(site, merged, &options)?
         };
 
         Ok(AdapterFunction {
@@ -89,7 +111,12 @@ impl FactStyleGenerator {
     }
 
     /// Analyze a call site to determine adapter options
-    fn analyze_call_site(&self, site: &AdapterSite, merged: &MergedModule) -> AdapterOptions {
+    fn analyze_call_site(
+        &self,
+        site: &AdapterSite,
+        merged: &MergedModule,
+        resource_imports: &std::collections::HashMap<(String, String), u32>,
+    ) -> AdapterOptions {
         let mut options = AdapterOptions::default();
 
         // Determine memory indices
@@ -162,6 +189,35 @@ impl FactStyleGenerator {
             options.callee_post_return = Some(merged_pr_idx);
         }
 
+        // Resolve resource BORROW params → [resource-rep] merged function indices.
+        //
+        // Per the canonical ABI spec, `borrow<T>` params where T is defined by
+        // the callee receive the representation (raw pointer), not the handle.
+        // The adapter must call resource.rep(handle) → rep for these.
+        //
+        // `own<T>` params receive the handle directly — the callee's core
+        // function calls from_handle/resource.rep internally, so the adapter
+        // must NOT convert them (that would cause double conversion).
+        //
+        // Results are never converted — own results have resource.new called
+        // by the callee's core function, and borrows cannot appear in results.
+        for op in &site.requirements.resource_params {
+            if op.is_owned {
+                continue; // own<T>: callee handles conversion internally
+            }
+            if let Some(&func_idx) =
+                resource_imports.get(&(op.import_module.clone(), op.import_field.clone()))
+            {
+                options.resource_rep_calls.push((op.flat_idx, func_idx));
+            } else {
+                log::debug!(
+                    "Resource rep import not found: ({}, {})",
+                    op.import_module,
+                    op.import_field
+                );
+            }
+        }
+
         options
     }
 
@@ -170,9 +226,9 @@ impl FactStyleGenerator {
         &self,
         site: &AdapterSite,
         merged: &MergedModule,
+        options: &AdapterOptions,
     ) -> Result<(u32, Function)> {
         let target_func = self.resolve_target_function(site, merged)?;
-        let options = self.analyze_call_site(site, merged);
 
         // Find the target function's type (convert wasm index to array position)
         let type_idx = merged
@@ -186,36 +242,45 @@ impl FactStyleGenerator {
         let result_types: Vec<wasm_encoder::ValType> =
             func_type.map(|t| t.results.clone()).unwrap_or_default();
 
-        // If post-return is specified, we need scratch locals to save results
         let has_post_return = options.callee_post_return.is_some();
+        let has_resource_ops = !options.resource_rep_calls.is_empty();
 
-        if has_post_return && result_count > 0 {
-            // Need locals to save results across the post-return call
-            let locals: Vec<(u32, wasm_encoder::ValType)> =
-                result_types.iter().map(|t| (1u32, *t)).collect();
-            let mut func = Function::new(locals);
+        if has_resource_ops || (has_post_return && result_count > 0) {
+            let mut locals: Vec<(u32, wasm_encoder::ValType)> = Vec::new();
             let result_base = param_count as u32;
+            if has_post_return && result_count > 0 {
+                locals.extend(result_types.iter().map(|t| (1u32, *t)));
+            }
+            let mut func = Function::new(locals);
 
-            // Load all parameters and call target
+            // Phase 0: Convert borrow resource handles → representations
+            for &(param_idx, rep_func) in &options.resource_rep_calls {
+                func.instruction(&Instruction::LocalGet(param_idx));
+                func.instruction(&Instruction::Call(rep_func));
+                func.instruction(&Instruction::LocalSet(param_idx));
+            }
+
             for i in 0..param_count {
                 func.instruction(&Instruction::LocalGet(i as u32));
             }
             func.instruction(&Instruction::Call(target_func));
 
-            // Save results to locals (pop in reverse order)
-            for i in (0..result_count).rev() {
-                func.instruction(&Instruction::LocalSet(result_base + i as u32));
-            }
-
-            // Call post-return with the saved results
-            for i in 0..result_count {
-                func.instruction(&Instruction::LocalGet(result_base + i as u32));
-            }
-            func.instruction(&Instruction::Call(options.callee_post_return.unwrap()));
-
-            // Push saved results back onto stack
-            for i in 0..result_count {
-                func.instruction(&Instruction::LocalGet(result_base + i as u32));
+            if has_post_return && result_count > 0 {
+                // Save results to locals (pop in reverse order)
+                for i in (0..result_count).rev() {
+                    func.instruction(&Instruction::LocalSet(result_base + i as u32));
+                }
+                // Call post-return with saved results
+                for i in 0..result_count {
+                    func.instruction(&Instruction::LocalGet(result_base + i as u32));
+                }
+                func.instruction(&Instruction::Call(options.callee_post_return.unwrap()));
+                // Push saved results back onto stack
+                for i in 0..result_count {
+                    func.instruction(&Instruction::LocalGet(result_base + i as u32));
+                }
+            } else if has_post_return {
+                func.instruction(&Instruction::Call(options.callee_post_return.unwrap()));
             }
 
             func.instruction(&Instruction::End);
@@ -230,7 +295,6 @@ impl FactStyleGenerator {
             func.instruction(&Instruction::Call(target_func));
 
             if has_post_return {
-                // No results to save, just call post-return
                 func.instruction(&Instruction::Call(options.callee_post_return.unwrap()));
             }
 
@@ -324,33 +388,41 @@ impl FactStyleGenerator {
         // If memories are the same, just do direct call (with post-return if needed)
         if options.caller_memory == options.callee_memory {
             let has_post_return = options.callee_post_return.is_some();
+            let has_resource_ops = !options.resource_rep_calls.is_empty();
 
-            if has_post_return && result_count > 0 {
-                // Need scratch locals to save results across post-return call
-                let locals: Vec<(u32, wasm_encoder::ValType)> =
-                    result_types.iter().map(|t| (1u32, *t)).collect();
-                let mut func = Function::new(locals);
+            if has_resource_ops || (has_post_return && result_count > 0) {
+                let mut locals: Vec<(u32, wasm_encoder::ValType)> = Vec::new();
                 let result_base = param_count as u32;
+                if has_post_return && result_count > 0 {
+                    locals.extend(result_types.iter().map(|t| (1u32, *t)));
+                }
+                let mut func = Function::new(locals);
+
+                // Phase 0: Convert borrow resource handles → representations
+                for &(param_idx, rep_func) in &options.resource_rep_calls {
+                    func.instruction(&Instruction::LocalGet(param_idx));
+                    func.instruction(&Instruction::Call(rep_func));
+                    func.instruction(&Instruction::LocalSet(param_idx));
+                }
 
                 for i in 0..param_count {
                     func.instruction(&Instruction::LocalGet(i as u32));
                 }
                 func.instruction(&Instruction::Call(target_func));
 
-                // Save results to locals (pop in reverse order)
-                for i in (0..result_count).rev() {
-                    func.instruction(&Instruction::LocalSet(result_base + i as u32));
-                }
-
-                // Call post-return with saved results
-                for i in 0..result_count {
-                    func.instruction(&Instruction::LocalGet(result_base + i as u32));
-                }
-                func.instruction(&Instruction::Call(options.callee_post_return.unwrap()));
-
-                // Push saved results back onto stack
-                for i in 0..result_count {
-                    func.instruction(&Instruction::LocalGet(result_base + i as u32));
+                if has_post_return && result_count > 0 {
+                    for i in (0..result_count).rev() {
+                        func.instruction(&Instruction::LocalSet(result_base + i as u32));
+                    }
+                    for i in 0..result_count {
+                        func.instruction(&Instruction::LocalGet(result_base + i as u32));
+                    }
+                    func.instruction(&Instruction::Call(options.callee_post_return.unwrap()));
+                    for i in 0..result_count {
+                        func.instruction(&Instruction::LocalGet(result_base + i as u32));
+                    }
+                } else if has_post_return {
+                    func.instruction(&Instruction::Call(options.callee_post_return.unwrap()));
                 }
 
                 func.instruction(&Instruction::End);
@@ -363,7 +435,6 @@ impl FactStyleGenerator {
                 func.instruction(&Instruction::Call(target_func));
 
                 if has_post_return {
-                    // No results to save, just call post-return
                     func.instruction(&Instruction::Call(options.callee_post_return.unwrap()));
                 }
 
@@ -390,16 +461,19 @@ impl FactStyleGenerator {
         let needs_post_return_save =
             !needs_result_copy && options.callee_post_return.is_some() && result_count > 0;
 
-        // We need result-save locals for post-return AND/OR conditional result copy
+        // We need result-save locals for post-return or conditional result copy.
         let needs_result_save =
             (needs_post_return_save || needs_conditional_result_copy) && result_count > 0;
 
-        // If no copying and no post-return save needed, direct call
+        let has_resource_ops = !options.resource_rep_calls.is_empty();
+
+        // If no copying, no post-return save, and no resource ops needed, direct call
         if !needs_outbound_copy
             && !needs_conditional_copy
             && !needs_result_copy
             && !needs_conditional_result_copy
             && !needs_post_return_save
+            && !has_resource_ops
         {
             let mut func = Function::new([]);
             for i in 0..param_count {
@@ -442,6 +516,13 @@ impl FactStyleGenerator {
         }
 
         let mut func = Function::new(local_decls);
+
+        // Phase 0: Convert borrow resource handles → representations
+        for &(param_idx, rep_func) in &options.resource_rep_calls {
+            func.instruction(&Instruction::LocalGet(param_idx));
+            func.instruction(&Instruction::Call(rep_func));
+            func.instruction(&Instruction::LocalSet(param_idx));
+        }
 
         // Assign scratch local indices (after params)
         let base = param_count as u32;
@@ -655,7 +736,7 @@ impl FactStyleGenerator {
             func.instruction(&Instruction::LocalGet(callee_ret_len_local));
         }
 
-        // Post-return and/or conditional result copy for non-result-copy case
+        // Post-return and/or conditional result copy
         if !needs_result_copy
             && (needs_conditional_result_copy || options.callee_post_return.is_some())
         {
@@ -814,6 +895,13 @@ impl FactStyleGenerator {
         let local_decls = vec![(scratch_count, wasm_encoder::ValType::I32)];
         let mut func = Function::new(local_decls);
 
+        // Phase 0: Convert borrow resource handles → representations
+        for &(param_idx, rep_func) in &options.resource_rep_calls {
+            func.instruction(&Instruction::LocalGet(param_idx));
+            func.instruction(&Instruction::Call(rep_func));
+            func.instruction(&Instruction::LocalSet(param_idx));
+        }
+
         // --- Phase 1: Outbound copy of ALL pointer pairs (caller → callee) ---
         if let Some(callee_realloc) = options
             .callee_realloc
@@ -953,6 +1041,7 @@ impl FactStyleGenerator {
         // load/store instructions based on the canonical ABI memory layout.
         let result_layouts = &site.requirements.result_copy_layouts;
         let return_area_slots = &site.requirements.return_area_slots;
+
         if let Some(caller_realloc) = options
             .caller_realloc
             .filter(|_| !result_ptr_offsets.is_empty())
@@ -1461,6 +1550,13 @@ impl FactStyleGenerator {
             }
         }
         let mut func = Function::new(local_decls);
+
+        // Phase 0: Convert borrow resource handles → representations
+        for &(param_idx, rep_func) in &options.resource_rep_calls {
+            func.instruction(&Instruction::LocalGet(param_idx));
+            func.instruction(&Instruction::Call(rep_func));
+            func.instruction(&Instruction::LocalSet(param_idx));
+        }
 
         // Generate transcoding logic based on encoding pair
 
@@ -2350,10 +2446,11 @@ impl AdapterGenerator for FactStyleGenerator {
         merged: &MergedModule,
         graph: &DependencyGraph,
     ) -> Result<Vec<AdapterFunction>> {
+        let resource_imports = build_resource_import_map(merged);
         let mut adapters = Vec::new();
 
         for (idx, site) in graph.adapter_sites.iter().enumerate() {
-            let adapter = self.generate_adapter(site, merged, idx)?;
+            let adapter = self.generate_adapter(site, merged, idx, &resource_imports)?;
             adapters.push(adapter);
         }
 

@@ -580,29 +580,11 @@ fn test_runtime_wit_bindgen_resources() {
     if !fixture_exists("resources") {
         return;
     }
-    // SR-25: P2 wrapping now handles resource types. Component fusion and
-    // validation work. Runtime execution may still fail due to adapter-level
-    // issues with resource pointer alignment (separate from wrapping).
+    // SR-25: Resource handle translation in cross-component adapters.
+    // The adapter calls [resource-rep] to convert handles → representations
+    // for params. Results are passed through as-is (the callee core function
+    // already calls [resource-new] internally).
     let fused = fuse_fixture("resources", OutputFormat::Component)
         .expect("resources: component fusion should succeed");
-    match run_wasi_component(&fused) {
-        Ok(()) => {}
-        Err(e) => {
-            let msg = format!("{e:?}");
-            // Known issue: the fused adapter code has alignment issues with
-            // resource pointer data. This is a core fusion / adapter bug,
-            // not a P2 wrapping issue (SR-25 covers wrapping only).
-            if msg.contains("misaligned")
-                || msg.contains("unreachable")
-                || msg.contains("wasm trap")
-            {
-                eprintln!(
-                    "resources: runtime execution failed (adapter alignment issue, \
-                     not a wrapping bug): {e}"
-                );
-            } else {
-                panic!("resources: unexpected runtime error: {msg}");
-            }
-        }
-    }
+    run_wasi_component(&fused).expect("resources: runtime execution should succeed");
 }
