@@ -870,6 +870,7 @@ impl Merger {
                     site.from_component == comp_idx
                         && site.from_module == mod_idx
                         && (imp.name == site.import_name || imp.module == site.import_name)
+                        && (imp.module == site.import_module || imp.name == site.import_module)
                 });
                 if let Some(site) = resolved {
                     if let Some(&target_idx) = merged.function_index_map.get(&(
