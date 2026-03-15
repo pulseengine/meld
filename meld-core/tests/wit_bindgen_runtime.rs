@@ -588,3 +588,142 @@ fn test_runtime_wit_bindgen_resources() {
         .expect("resources: component fusion should succeed");
     run_wasi_component(&fused).expect("resources: runtime execution should succeed");
 }
+
+// ---------------------------------------------------------------------------
+// New fixture tests (issue #1 coverage expansion)
+// ---------------------------------------------------------------------------
+
+macro_rules! runtime_test {
+    ($name:ident, $fixture:expr) => {
+        #[test]
+        fn $name() {
+            if !fixture_exists($fixture) {
+                return;
+            }
+            let fused = fuse_fixture($fixture, OutputFormat::Component)
+                .expect(concat!($fixture, ": component fusion should succeed"));
+            run_wasi_component(&fused)
+                .expect(concat!($fixture, ": runtime execution should succeed"));
+        }
+    };
+}
+
+macro_rules! fuse_only_test {
+    ($name:ident, $fixture:expr) => {
+        #[test]
+        fn $name() {
+            if !fixture_exists($fixture) {
+                return;
+            }
+            fuse_fixture($fixture, OutputFormat::CoreModule)
+                .expect(concat!($fixture, ": core module fusion should succeed"));
+        }
+    };
+}
+
+// Resource fixtures — stress-test SR-25 borrow/own handle translation
+runtime_test!(test_runtime_wit_bindgen_resource_borrow, "resource-borrow");
+runtime_test!(
+    test_runtime_wit_bindgen_resource_alias_redux,
+    "resource_alias_redux"
+);
+runtime_test!(
+    test_runtime_wit_bindgen_resource_into_inner,
+    "resource_into_inner"
+);
+runtime_test!(
+    test_runtime_wit_bindgen_owned_resource_deref_mut,
+    "owned-resource-deref-mut"
+);
+// with-and-resources: adapter codegen produces empty stack (same as resource_alias)
+fuse_only_test!(
+    test_fuse_wit_bindgen_with_and_resources,
+    "with-and-resources"
+);
+
+// Resource fixtures — known failures (graceful degradation)
+// resource_alias: adapter codegen produces empty stack (type mismatch)
+// resource_aggregates: own<T> handle leak (handle != 0 assertion)
+// resource_floats: borrow handle not converted in 3-component chain (align 8)
+// resource_borrow_in_record: borrow<T> inside record not detected as flat param
+// resource_with_lists: data corruption in resource+list combination
+// ownership: resource ownership transfer issue
+// xcrate: resource handle lookup failure in 3-component chain
+fuse_only_test!(test_fuse_wit_bindgen_resource_alias, "resource_alias");
+fuse_only_test!(
+    test_fuse_wit_bindgen_resource_aggregates,
+    "resource_aggregates"
+);
+fuse_only_test!(test_fuse_wit_bindgen_resource_floats, "resource_floats");
+fuse_only_test!(
+    test_fuse_wit_bindgen_resource_borrow_in_record,
+    "resource_borrow_in_record"
+);
+fuse_only_test!(
+    test_fuse_wit_bindgen_resource_with_lists,
+    "resource_with_lists"
+);
+fuse_only_test!(test_fuse_wit_bindgen_ownership, "ownership");
+fuse_only_test!(test_fuse_wit_bindgen_xcrate, "xcrate");
+
+// resource-import-and-export: core fusion works, P2 wrapping fails on toplevel-import
+fuse_only_test!(
+    test_fuse_wit_bindgen_resource_import_and_export,
+    "resource-import-and-export"
+);
+
+// Type composition and misc fixtures
+runtime_test!(test_runtime_wit_bindgen_demo, "demo");
+runtime_test!(test_runtime_wit_bindgen_gated_features, "gated-features");
+runtime_test!(
+    test_runtime_wit_bindgen_symbol_conflicts,
+    "symbol-conflicts"
+);
+runtime_test!(test_runtime_wit_bindgen_unused_types, "unused-types");
+runtime_test!(
+    test_runtime_wit_bindgen_package_with_version,
+    "package-with-version"
+);
+
+// versions: wrong function dispatched across versioned interfaces
+fuse_only_test!(test_fuse_wit_bindgen_versions, "versions");
+
+// Rust binding-specific fixtures (still valid fusion targets)
+runtime_test!(
+    test_runtime_wit_bindgen_alternative_bitflags,
+    "alternative-bitflags"
+);
+runtime_test!(test_runtime_wit_bindgen_custom_derives, "custom-derives");
+runtime_test!(
+    test_runtime_wit_bindgen_disable_custom_section,
+    "disable-custom-section-link-helpers"
+);
+runtime_test!(
+    test_runtime_wit_bindgen_other_dependencies,
+    "other-dependencies"
+);
+runtime_test!(test_runtime_wit_bindgen_raw_strings, "raw-strings");
+runtime_test!(test_runtime_wit_bindgen_skip, "skip");
+runtime_test!(
+    test_runtime_wit_bindgen_type_section_suffix,
+    "type_section_suffix"
+);
+
+// with: P2 wrapper resource type encoding issue
+fuse_only_test!(test_fuse_wit_bindgen_with, "with");
+
+runtime_test!(
+    test_runtime_wit_bindgen_with_only_affects_imports,
+    "with-only-affects-imports"
+);
+runtime_test!(
+    test_runtime_wit_bindgen_with_option_generate,
+    "with-option-generate"
+);
+runtime_test!(test_runtime_wit_bindgen_with_types, "with-types");
+
+// run-ctors-once-workaround: no `run` export (different entry point, not a meld issue)
+fuse_only_test!(
+    test_fuse_wit_bindgen_run_ctors_once,
+    "run-ctors-once-workaround"
+);
