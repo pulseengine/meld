@@ -635,21 +635,18 @@ runtime_test!(
     test_runtime_wit_bindgen_owned_resource_deref_mut,
     "owned-resource-deref-mut"
 );
-// with-and-resources: adapter codegen produces empty stack (same as resource_alias)
-fuse_only_test!(
-    test_fuse_wit_bindgen_with_and_resources,
+runtime_test!(
+    test_runtime_wit_bindgen_with_and_resources,
     "with-and-resources"
 );
+runtime_test!(test_runtime_wit_bindgen_resource_alias, "resource_alias");
 
 // Resource fixtures — known failures (graceful degradation)
-// resource_alias: adapter codegen produces empty stack (type mismatch)
 // resource_aggregates: own<T> handle leak (handle != 0 assertion)
-// resource_floats: borrow handle not converted in 3-component chain (align 8)
+// resource_floats: 3-component resource chain — wrong resource table for [resource-rep]
 // resource_borrow_in_record: borrow<T> inside record not detected as flat param
 // resource_with_lists: data corruption in resource+list combination
 // ownership: resource ownership transfer issue
-// xcrate: resource handle lookup failure in 3-component chain
-fuse_only_test!(test_fuse_wit_bindgen_resource_alias, "resource_alias");
 fuse_only_test!(
     test_fuse_wit_bindgen_resource_aggregates,
     "resource_aggregates"
@@ -664,7 +661,7 @@ fuse_only_test!(
     "resource_with_lists"
 );
 fuse_only_test!(test_fuse_wit_bindgen_ownership, "ownership");
-fuse_only_test!(test_fuse_wit_bindgen_xcrate, "xcrate");
+runtime_test!(test_runtime_wit_bindgen_xcrate, "xcrate");
 
 // resource-import-and-export: core fusion works, P2 wrapping fails on toplevel-import
 fuse_only_test!(
@@ -685,8 +682,7 @@ runtime_test!(
     "package-with-version"
 );
 
-// versions: wrong function dispatched across versioned interfaces
-fuse_only_test!(test_fuse_wit_bindgen_versions, "versions");
+runtime_test!(test_runtime_wit_bindgen_versions, "versions");
 
 // Rust binding-specific fixtures (still valid fusion targets)
 runtime_test!(

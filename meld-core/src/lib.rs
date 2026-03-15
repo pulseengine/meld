@@ -366,7 +366,9 @@ impl Fuser {
                 if !matches!(imp.kind, parser::ImportKind::Function(_)) {
                     continue;
                 }
-                if imp.name == site.import_name || imp.module == site.import_name {
+                if (imp.name == site.import_name || imp.module == site.import_name)
+                    && (imp.module == site.import_module || imp.name == site.import_module)
+                {
                     merged
                         .function_index_map
                         .insert((comp_idx, mod_idx, import_func_idx), adapter_merged_idx);

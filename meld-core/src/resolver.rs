@@ -57,8 +57,11 @@ pub struct AdapterSite {
     pub from_component: usize,
     /// Source module index within component
     pub from_module: usize,
-    /// Import being resolved
+    /// Import being resolved (bare function name, e.g., "roundtrip-u8")
     pub import_name: String,
+    /// Caller's core import module name (e.g., "test:dep/test@0.1.0").
+    /// Used to disambiguate when multiple interfaces export the same function name.
+    pub import_module: String,
     /// Caller's import function type index (module-local) in from_module's type section.
     /// Used so the adapter's declared type matches what the caller expects to call.
     pub import_func_type_idx: Option<u32>,
@@ -1169,6 +1172,7 @@ impl Resolver {
                             from_component: unresolved.component_idx,
                             from_module: unresolved.module_idx,
                             import_name: unresolved.field_name.clone(),
+                            import_module: unresolved.module_name.clone(),
                             import_func_type_idx: None,
                             to_component: target_comp,
                             to_module: target_mod,
@@ -1915,6 +1919,7 @@ impl Resolver {
                                         from_component: *from_comp,
                                         from_module: from_mod_idx,
                                         import_name: (*func_name).to_string(),
+                                        import_module: import_name.clone(),
                                         import_func_type_idx: caller_import_type_idx,
                                         to_component: *to_comp,
                                         to_module: to_mod_idx,
@@ -1975,13 +1980,14 @@ impl Resolver {
                             let mut requirements = AdapterRequirements::default();
 
                             // Callee side: use provenance-based lookup for correct
-                            // component-level core func index.
-                            let callee_lift_map = to_component.lift_options_by_core_func();
+                            // component-level core func index, including type index
+                            // for layout/resource detection.
+                            let callee_lift_map = to_component.lift_info_by_core_func();
                             let fb_export_to_core = build_module_export_to_core_func(to_component);
                             let fb_core_to_local = build_core_func_to_module_local(to_component);
                             let fb_comp_core_idx =
                                 fb_export_to_core.get(&(to_mod_idx, export_name.clone()));
-                            if let Some(lift_opts) =
+                            if let Some((comp_type_idx, lift_opts)) =
                                 fb_comp_core_idx.and_then(|idx| callee_lift_map.get(idx))
                             {
                                 requirements.callee_encoding = Some(lift_opts.string_encoding);
@@ -1989,6 +1995,49 @@ impl Resolver {
                                     .post_return
                                     .and_then(|pr_idx| fb_core_to_local.get(&pr_idx).copied());
                                 requirements.callee_realloc = lift_opts.realloc;
+
+                                // Populate layout and resource info from component
+                                // function type (mirrors per-function path).
+                                if let Some(ct) = to_component.get_type_definition(*comp_type_idx)
+                                    && let ComponentTypeKind::Function {
+                                        params: comp_params,
+                                        results,
+                                    } = &ct.kind
+                                {
+                                    let size = to_component.return_area_byte_size(results);
+                                    if size > 4 {
+                                        requirements.return_area_byte_size = Some(size);
+                                    }
+                                    requirements.pointer_pair_positions =
+                                        to_component.pointer_pair_param_positions(comp_params);
+                                    requirements.result_pointer_pair_offsets =
+                                        to_component.pointer_pair_result_offsets(results);
+                                    requirements.param_copy_layouts =
+                                        collect_param_copy_layouts(to_component, comp_params);
+                                    requirements.result_copy_layouts =
+                                        collect_result_copy_layouts(to_component, results);
+                                    requirements.conditional_pointer_pairs = to_component
+                                        .conditional_pointer_pair_positions(comp_params);
+                                    requirements.conditional_result_pointer_pairs = to_component
+                                        .conditional_pointer_pair_result_positions(results);
+                                    requirements.conditional_result_flat_pairs = to_component
+                                        .conditional_pointer_pair_result_flat_positions(results);
+                                    requirements.return_area_slots =
+                                        to_component.return_area_slots(results);
+
+                                    let callee_resource_map =
+                                        build_resource_type_to_import(to_component);
+                                    requirements.resource_params = resolve_resource_positions(
+                                        &callee_resource_map,
+                                        &to_component.resource_param_positions(comp_params),
+                                        "[resource-rep]",
+                                    );
+                                    requirements.resource_results = resolve_resource_positions(
+                                        &callee_resource_map,
+                                        &to_component.resource_result_positions(results),
+                                        "[resource-new]",
+                                    );
+                                }
                             }
 
                             // Caller side: look up lower options by import func index.
@@ -2052,6 +2101,7 @@ impl Resolver {
                                 from_component: *from_comp,
                                 from_module: from_mod_idx,
                                 import_name: import_name.clone(),
+                                import_module: import_name.clone(),
                                 import_func_type_idx: fallback_import_type_idx,
                                 to_component: *to_comp,
                                 to_module: to_mod_idx,
@@ -2245,6 +2295,7 @@ impl Resolver {
                 from_component: res.component_idx,
                 from_module: res.from_module,
                 import_name: res.import_name.clone(),
+                import_module: res.import_name.clone(),
                 import_func_type_idx: None,
                 to_component: res.component_idx, // same component
                 to_module: res.to_module,
