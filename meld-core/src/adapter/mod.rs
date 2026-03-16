@@ -124,24 +124,33 @@ pub struct AdapterOptions {
     /// Called after results have been copied back, to allow callee cleanup.
     pub callee_post_return: Option<u32>,
 
-    /// Resource borrow params needing handle→representation conversion.
-    /// Each entry: `(flat_param_idx, merged_func_idx of [resource-rep])`.
+    /// Resource borrow params needing handle conversion.
     ///
-    /// Per the canonical ABI spec, `borrow<T>` params where T is defined by
-    /// the callee receive the **representation** (raw pointer), not the handle.
-    /// The `lower_borrow` function has `if cx.inst is t.rt.impl: return rep`.
-    /// So the adapter must call `[resource-rep]R(handle)` to convert before
-    /// forwarding to the callee's core function.
+    /// Per the canonical ABI, `borrow<T>` params need different handling
+    /// depending on who defines the resource:
     ///
-    /// `own<T>` params always receive a **handle** (table index) because
-    /// `lower_own` unconditionally creates a handle entry. The callee's core
-    /// function calls `from_handle` / `[resource-rep]` internally, so the
-    /// adapter must NOT convert own params.
+    /// - **Callee defines T**: adapter calls `[resource-rep](handle) → rep`
+    ///   and passes rep to callee (which expects raw pointer via identity lift).
     ///
-    /// Results are never converted by the adapter — the callee's core function
-    /// already calls `[resource-new]R` internally for own results, and borrows
-    /// cannot appear in results.
-    pub resource_rep_calls: Vec<(u32, u32)>,
+    /// - **Neither defines T** (3-component chain): adapter calls caller's
+    ///   `[resource-rep](handle) → rep`, then callee's `[resource-new](rep) → new_handle`,
+    ///   and passes new_handle to callee (which expects a handle in its own table).
+    ///
+    /// `own<T>` params are never converted (callee calls from_handle internally).
+    pub resource_rep_calls: Vec<ResourceBorrowTransfer>,
+}
+
+/// Describes how to transfer a `borrow<T>` handle across an adapter boundary.
+#[derive(Debug, Clone)]
+pub struct ResourceBorrowTransfer {
+    /// The flat parameter index holding the handle
+    pub param_idx: u32,
+    /// Merged function index of `[resource-rep]` to convert handle → rep
+    pub rep_func: u32,
+    /// If the callee doesn't define the resource, the merged function index
+    /// of `[resource-new]` to convert rep → new handle in callee's table.
+    /// None when the callee defines the resource (rep is passed directly).
+    pub new_func: Option<u32>,
 }
 
 impl Default for AdapterOptions {

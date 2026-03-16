@@ -650,8 +650,7 @@ fuse_only_test!(
     test_fuse_wit_bindgen_resource_aggregates,
     "resource_aggregates"
 );
-// resource_floats: 3-component chain — adapter uses callee's [resource-rep] but handle
-// is in caller's resource table (needs caller-side resource map lookup)
+// resource_floats: 3-component borrow forwarding needs caller→callee handle transfer
 fuse_only_test!(test_fuse_wit_bindgen_resource_floats, "resource_floats");
 fuse_only_test!(
     test_fuse_wit_bindgen_resource_borrow_in_record,
