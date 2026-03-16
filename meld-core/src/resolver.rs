@@ -820,6 +820,40 @@ fn build_resource_type_to_import(
         }
     }
 
+    // Step 6: Propagate entries through resource type aliases.
+    //
+    // Function parameter types may reference a resource via an ExportAlias
+    // (e.g., Borrow(24) where type 24 is ExportAlias(25)). The canonical
+    // ResourceRep/ResourceNew entries use the target type (25). We need
+    // the map to also contain the alias source so resolve_resource_positions
+    // can find the import for either type ID.
+    let known_resource_types: Vec<u32> = map
+        .keys()
+        .map(|&(rt, _)| rt)
+        .collect::<std::collections::HashSet<_>>()
+        .into_iter()
+        .collect();
+    for (idx, def) in component.component_type_defs.iter().enumerate() {
+        if let crate::parser::ComponentTypeDef::ExportAlias(target) = def {
+            let alias_id = idx as u32;
+            let target_id = *target;
+            for kind in &["[resource-rep]", "[resource-new]"] {
+                if known_resource_types.contains(&target_id) && !map.contains_key(&(alias_id, kind))
+                {
+                    if let Some(entry) = map.get(&(target_id, kind)).cloned() {
+                        map.insert((alias_id, kind), entry);
+                    }
+                }
+                if known_resource_types.contains(&alias_id) && !map.contains_key(&(target_id, kind))
+                {
+                    if let Some(entry) = map.get(&(alias_id, kind)).cloned() {
+                        map.insert((target_id, kind), entry);
+                    }
+                }
+            }
+        }
+    }
+
     map
 }
 
