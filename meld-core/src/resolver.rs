@@ -870,9 +870,25 @@ fn resolve_resource_positions(
 ) -> Vec<ResolvedResourceOp> {
     let mut resolved = Vec::new();
     for pos in positions {
-        if let Some((module_name, field_name)) =
-            resource_map.get(&(pos.resource_type_id, field_prefix))
-        {
+        // Try exact match first
+        let entry = resource_map
+            .get(&(pos.resource_type_id, field_prefix))
+            .or_else(|| {
+                // Fallback: the resource type ID from the function signature may differ
+                // from the canonical entry's type ID (e.g., imported type 24 vs defined
+                // type 25). If there's exactly one resource with this prefix, use it.
+                let candidates: Vec<_> = resource_map
+                    .iter()
+                    .filter(|((_, k), _)| *k == field_prefix)
+                    .map(|(_, v)| v)
+                    .collect();
+                if candidates.len() == 1 {
+                    Some(candidates[0])
+                } else {
+                    None
+                }
+            });
+        if let Some((module_name, field_name)) = entry {
             resolved.push(ResolvedResourceOp {
                 flat_idx: pos.flat_idx,
                 byte_offset: pos.byte_offset,
