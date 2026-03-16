@@ -838,17 +838,17 @@ fn build_resource_type_to_import(
             let alias_id = idx as u32;
             let target_id = *target;
             for kind in &["[resource-rep]", "[resource-new]"] {
-                if known_resource_types.contains(&target_id) && !map.contains_key(&(alias_id, kind))
+                if known_resource_types.contains(&target_id)
+                    && !map.contains_key(&(alias_id, kind))
+                    && let Some(entry) = map.get(&(target_id, kind)).cloned()
                 {
-                    if let Some(entry) = map.get(&(target_id, kind)).cloned() {
-                        map.insert((alias_id, kind), entry);
-                    }
+                    map.insert((alias_id, kind), entry);
                 }
-                if known_resource_types.contains(&alias_id) && !map.contains_key(&(target_id, kind))
+                if known_resource_types.contains(&alias_id)
+                    && !map.contains_key(&(target_id, kind))
+                    && let Some(entry) = map.get(&(alias_id, kind)).cloned()
                 {
-                    if let Some(entry) = map.get(&(alias_id, kind)).cloned() {
-                        map.insert((target_id, kind), entry);
-                    }
+                    map.insert((target_id, kind), entry);
                 }
             }
         }
