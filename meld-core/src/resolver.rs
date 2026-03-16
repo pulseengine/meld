@@ -156,6 +156,12 @@ pub struct ResolvedResourceOp {
     pub import_module: String,
     /// Import field name (e.g., `"[resource-rep]y"`)
     pub import_field: String,
+    /// Whether the callee defines this resource type. When false, the adapter
+    /// must use the caller's `[resource-rep]` (to extract the rep from the
+    /// caller's handle table) followed by the callee's `[resource-new]` (to
+    /// create a handle in the callee's table). When true, the adapter only
+    /// needs the callee's `[resource-rep]` (which returns rep directly).
+    pub callee_defines_resource: bool,
 }
 
 /// Requirements for an adapter function
@@ -209,7 +215,12 @@ pub struct AdapterRequirements {
     pub return_area_slots: Vec<ReturnAreaSlot>,
     /// Resource-typed parameters needing handle→representation conversion.
     /// The adapter calls `[resource-rep]` for each before forwarding to callee.
+    /// These are resolved against the CALLEE's resource map.
     pub resource_params: Vec<ResolvedResourceOp>,
+    /// Caller-side resource params. When `callee_defines_resource` is false
+    /// for a param, the adapter should use the caller's `[resource-rep]` instead
+    /// of the callee's. Indexed by the same flat_idx as `resource_params`.
+    pub caller_resource_params: Vec<ResolvedResourceOp>,
     /// Resource-typed results needing representation→handle conversion.
     /// The adapter calls `[resource-new]` for each before returning to caller.
     pub resource_results: Vec<ResolvedResourceOp>,
@@ -867,6 +878,7 @@ fn resolve_resource_positions(
     resource_map: &HashMap<(u32, &'static str), (String, String)>,
     positions: &[crate::parser::ResourcePosition],
     field_prefix: &'static str,
+    callee_type_defs: &[crate::parser::ComponentTypeDef],
 ) -> Vec<ResolvedResourceOp> {
     let mut resolved = Vec::new();
     for pos in positions {
@@ -889,12 +901,20 @@ fn resolve_resource_positions(
                 }
             });
         if let Some((module_name, field_name)) = entry {
+            // Check if the callee defines this resource type.
+            // Import(_) means the callee imports the resource from another component.
+            // Defined means the callee's own type section defines it.
+            let callee_defines_resource = callee_type_defs
+                .get(pos.resource_type_id as usize)
+                .map(|def| !matches!(def, crate::parser::ComponentTypeDef::Import(_)))
+                .unwrap_or(true); // default to true (SR-25 behavior)
             resolved.push(ResolvedResourceOp {
                 flat_idx: pos.flat_idx,
                 byte_offset: pos.byte_offset,
                 is_owned: pos.is_owned,
                 import_module: module_name.clone(),
                 import_field: field_name.clone(),
+                callee_defines_resource,
             });
         } else {
             log::debug!(
@@ -1818,6 +1838,7 @@ impl Resolver {
                         let mut per_func_matched = false;
                         let callee_lift_info = to_component.lift_info_by_core_func();
                         let callee_resource_map = build_resource_type_to_import(to_component);
+                        let caller_resource_map = build_resource_type_to_import(from_component);
                         // Provenance-based maps for correct core func index lookup.
                         // These account for interleaved canon lower / alias entries.
                         let callee_export_to_core = build_module_export_to_core_func(to_component);
@@ -1916,6 +1937,7 @@ impl Resolver {
                                                     &to_component
                                                         .resource_param_positions(comp_params),
                                                     "[resource-rep]",
+                                                    &to_component.component_type_defs,
                                                 );
                                             requirements.resource_results =
                                                 resolve_resource_positions(
@@ -1923,6 +1945,16 @@ impl Resolver {
                                                     &to_component
                                                         .resource_result_positions(results),
                                                     "[resource-new]",
+                                                    &to_component.component_type_defs,
+                                                );
+                                            // Caller-side resource params for 3-component chains
+                                            requirements.caller_resource_params =
+                                                resolve_resource_positions(
+                                                    &caller_resource_map,
+                                                    &to_component
+                                                        .resource_param_positions(comp_params),
+                                                    "[resource-rep]",
+                                                    &from_component.component_type_defs,
                                                 );
                                         }
                                     }
@@ -2081,12 +2113,24 @@ impl Resolver {
                                         &callee_resource_map,
                                         &to_component.resource_param_positions(comp_params),
                                         "[resource-rep]",
+                                        &to_component.component_type_defs,
                                     );
                                     requirements.resource_results = resolve_resource_positions(
                                         &callee_resource_map,
                                         &to_component.resource_result_positions(results),
                                         "[resource-new]",
+                                        &to_component.component_type_defs,
                                     );
+                                    // Caller-side resource params for 3-component chains
+                                    let caller_resource_map =
+                                        build_resource_type_to_import(from_component);
+                                    requirements.caller_resource_params =
+                                        resolve_resource_positions(
+                                            &caller_resource_map,
+                                            &to_component.resource_param_positions(comp_params),
+                                            "[resource-rep]",
+                                            &from_component.component_type_defs,
+                                        );
                                 }
                             }
 

@@ -42,23 +42,42 @@ fn alignment_for_encoding(encoding: StringEncoding) -> i32 {
 
 /// Build a lookup from `(module, field)` → merged function index for resource imports.
 ///
-/// Scans the merged module's imports to find `[resource-rep]` function imports
-/// and records their merged function indices.
-fn build_resource_import_map(
+/// Scans the merged module's imports to find `[resource-rep]` and `[resource-new]`
+/// function imports and records their merged function indices.
+fn build_resource_import_maps(
     merged: &MergedModule,
-) -> std::collections::HashMap<(String, String), u32> {
+) -> (
+    std::collections::HashMap<(String, String), u32>,
+    std::collections::HashMap<(String, String), u32>,
+) {
     use wasm_encoder::EntityType;
-    let mut map = std::collections::HashMap::new();
+    let mut rep_map = std::collections::HashMap::new();
+    let mut new_map = std::collections::HashMap::new();
     let mut func_idx = 0u32;
     for imp in &merged.imports {
         if matches!(imp.entity_type, EntityType::Function(_)) {
             if imp.name.starts_with("[resource-rep]") {
-                map.insert((imp.module.clone(), imp.name.clone()), func_idx);
+                rep_map.insert((imp.module.clone(), imp.name.clone()), func_idx);
+            } else if imp.name.starts_with("[resource-new]") {
+                new_map.insert((imp.module.clone(), imp.name.clone()), func_idx);
             }
             func_idx += 1;
         }
     }
-    map
+    (rep_map, new_map)
+}
+
+/// Emit Phase 0: convert borrow resource handles for each `ResourceBorrowTransfer`.
+fn emit_resource_borrow_phase0(func: &mut Function, transfers: &[super::ResourceBorrowTransfer]) {
+    for t in transfers {
+        func.instruction(&Instruction::LocalGet(t.param_idx));
+        func.instruction(&Instruction::Call(t.rep_func));
+        if let Some(new_func) = t.new_func {
+            // 3-component chain: rep → new handle in callee's table
+            func.instruction(&Instruction::Call(new_func));
+        }
+        func.instruction(&Instruction::LocalSet(t.param_idx));
+    }
 }
 
 /// FACT-style adapter generator
@@ -79,7 +98,8 @@ impl FactStyleGenerator {
         site: &AdapterSite,
         merged: &MergedModule,
         _adapter_idx: usize,
-        resource_imports: &std::collections::HashMap<(String, String), u32>,
+        resource_rep_imports: &std::collections::HashMap<(String, String), u32>,
+        resource_new_imports: &std::collections::HashMap<(String, String), u32>,
     ) -> Result<AdapterFunction> {
         let name = format!(
             "$adapter_{}_{}_to_{}_{}",
@@ -87,7 +107,8 @@ impl FactStyleGenerator {
         );
 
         // Determine adapter options based on call site
-        let options = self.analyze_call_site(site, merged, resource_imports);
+        let options =
+            self.analyze_call_site(site, merged, resource_rep_imports, resource_new_imports);
 
         // Generate the adapter function body
         let (type_idx, body) = if site.crosses_memory && options.needs_transcoding() {
@@ -115,7 +136,8 @@ impl FactStyleGenerator {
         &self,
         site: &AdapterSite,
         merged: &MergedModule,
-        resource_imports: &std::collections::HashMap<(String, String), u32>,
+        resource_rep_imports: &std::collections::HashMap<(String, String), u32>,
+        resource_new_imports: &std::collections::HashMap<(String, String), u32>,
     ) -> AdapterOptions {
         let mut options = AdapterOptions::default();
 
@@ -201,20 +223,82 @@ impl FactStyleGenerator {
         //
         // Results are never converted — own results have resource.new called
         // by the callee's core function, and borrows cannot appear in results.
+        // Build caller resource params index by flat_idx for quick lookup
+        let caller_ops: std::collections::HashMap<u32, &crate::resolver::ResolvedResourceOp> = site
+            .requirements
+            .caller_resource_params
+            .iter()
+            .map(|op| (op.flat_idx, op))
+            .collect();
+
         for op in &site.requirements.resource_params {
             if op.is_owned {
                 continue; // own<T>: callee handles conversion internally
             }
-            if let Some(&func_idx) =
-                resource_imports.get(&(op.import_module.clone(), op.import_field.clone()))
-            {
-                options.resource_rep_calls.push((op.flat_idx, func_idx));
+
+            if op.callee_defines_resource {
+                // 2-component case: callee defines the resource.
+                // Use callee's [resource-rep] which returns rep directly.
+                if let Some(&rep_func) =
+                    resource_rep_imports.get(&(op.import_module.clone(), op.import_field.clone()))
+                {
+                    options
+                        .resource_rep_calls
+                        .push(super::ResourceBorrowTransfer {
+                            param_idx: op.flat_idx,
+                            rep_func,
+                            new_func: None,
+                        });
+                }
             } else {
-                log::debug!(
-                    "Resource rep import not found: ({}, {})",
-                    op.import_module,
-                    op.import_field
-                );
+                // 3-component case: callee doesn't define the resource.
+                // Use caller's [resource-rep] to convert handle → rep,
+                // then callee's [resource-new] to create handle in callee's table.
+                //
+                // Find the caller's [resource-rep] by matching the resource name
+                // from the callee's import field (e.g., "float" from "[resource-rep]float").
+                let resource_name = op
+                    .import_field
+                    .strip_prefix("[resource-rep]")
+                    .unwrap_or(&op.import_field);
+
+                // Look for a [resource-rep]<name> import from a DIFFERENT module than callee's
+                let caller_rep = resource_rep_imports
+                    .iter()
+                    .find(|((module, field), _)| {
+                        field.ends_with(resource_name)
+                            && field.starts_with("[resource-rep]")
+                            && *module != op.import_module
+                    })
+                    .or_else(|| {
+                        // Fallback: try caller_resource_params if available
+                        caller_ops.get(&op.flat_idx).and_then(|caller_op| {
+                            resource_rep_imports.get_key_value(&(
+                                caller_op.import_module.clone(),
+                                caller_op.import_field.clone(),
+                            ))
+                        })
+                    });
+
+                if let Some((_, &rep_func)) = caller_rep {
+                    let new_field = op.import_field.replace("[resource-rep]", "[resource-new]");
+                    let new_func = resource_new_imports
+                        .get(&(op.import_module.clone(), new_field))
+                        .copied();
+                    options
+                        .resource_rep_calls
+                        .push(super::ResourceBorrowTransfer {
+                            param_idx: op.flat_idx,
+                            rep_func,
+                            new_func,
+                        });
+                } else {
+                    log::debug!(
+                        "No caller resource rep found for {} at flat_idx {}",
+                        resource_name,
+                        op.flat_idx
+                    );
+                }
             }
         }
 
@@ -253,12 +337,8 @@ impl FactStyleGenerator {
             }
             let mut func = Function::new(locals);
 
-            // Phase 0: Convert borrow resource handles → representations
-            for &(param_idx, rep_func) in &options.resource_rep_calls {
-                func.instruction(&Instruction::LocalGet(param_idx));
-                func.instruction(&Instruction::Call(rep_func));
-                func.instruction(&Instruction::LocalSet(param_idx));
-            }
+            // Phase 0: Convert borrow resource handles
+            emit_resource_borrow_phase0(&mut func, &options.resource_rep_calls);
 
             for i in 0..param_count {
                 func.instruction(&Instruction::LocalGet(i as u32));
@@ -398,12 +478,8 @@ impl FactStyleGenerator {
                 }
                 let mut func = Function::new(locals);
 
-                // Phase 0: Convert borrow resource handles → representations
-                for &(param_idx, rep_func) in &options.resource_rep_calls {
-                    func.instruction(&Instruction::LocalGet(param_idx));
-                    func.instruction(&Instruction::Call(rep_func));
-                    func.instruction(&Instruction::LocalSet(param_idx));
-                }
+                // Phase 0: Convert borrow resource handles
+                emit_resource_borrow_phase0(&mut func, &options.resource_rep_calls);
 
                 for i in 0..param_count {
                     func.instruction(&Instruction::LocalGet(i as u32));
@@ -517,12 +593,8 @@ impl FactStyleGenerator {
 
         let mut func = Function::new(local_decls);
 
-        // Phase 0: Convert borrow resource handles → representations
-        for &(param_idx, rep_func) in &options.resource_rep_calls {
-            func.instruction(&Instruction::LocalGet(param_idx));
-            func.instruction(&Instruction::Call(rep_func));
-            func.instruction(&Instruction::LocalSet(param_idx));
-        }
+        // Phase 0: Convert borrow resource handles
+        emit_resource_borrow_phase0(&mut func, &options.resource_rep_calls);
 
         // Assign scratch local indices (after params)
         let base = param_count as u32;
@@ -895,12 +967,8 @@ impl FactStyleGenerator {
         let local_decls = vec![(scratch_count, wasm_encoder::ValType::I32)];
         let mut func = Function::new(local_decls);
 
-        // Phase 0: Convert borrow resource handles → representations
-        for &(param_idx, rep_func) in &options.resource_rep_calls {
-            func.instruction(&Instruction::LocalGet(param_idx));
-            func.instruction(&Instruction::Call(rep_func));
-            func.instruction(&Instruction::LocalSet(param_idx));
-        }
+        // Phase 0: Convert borrow resource handles
+        emit_resource_borrow_phase0(&mut func, &options.resource_rep_calls);
 
         // --- Phase 1: Outbound copy of ALL pointer pairs (caller → callee) ---
         if let Some(callee_realloc) = options
@@ -1551,12 +1619,8 @@ impl FactStyleGenerator {
         }
         let mut func = Function::new(local_decls);
 
-        // Phase 0: Convert borrow resource handles → representations
-        for &(param_idx, rep_func) in &options.resource_rep_calls {
-            func.instruction(&Instruction::LocalGet(param_idx));
-            func.instruction(&Instruction::Call(rep_func));
-            func.instruction(&Instruction::LocalSet(param_idx));
-        }
+        // Phase 0: Convert borrow resource handles
+        emit_resource_borrow_phase0(&mut func, &options.resource_rep_calls);
 
         // Generate transcoding logic based on encoding pair
 
@@ -2446,11 +2510,17 @@ impl AdapterGenerator for FactStyleGenerator {
         merged: &MergedModule,
         graph: &DependencyGraph,
     ) -> Result<Vec<AdapterFunction>> {
-        let resource_imports = build_resource_import_map(merged);
+        let (resource_rep_imports, resource_new_imports) = build_resource_import_maps(merged);
         let mut adapters = Vec::new();
 
         for (idx, site) in graph.adapter_sites.iter().enumerate() {
-            let adapter = self.generate_adapter(site, merged, idx, &resource_imports)?;
+            let adapter = self.generate_adapter(
+                site,
+                merged,
+                idx,
+                &resource_rep_imports,
+                &resource_new_imports,
+            )?;
             adapters.push(adapter);
         }
 
