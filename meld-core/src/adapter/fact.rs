@@ -44,12 +44,9 @@ fn alignment_for_encoding(encoding: StringEncoding) -> i32 {
 ///
 /// Scans the merged module's imports to find `[resource-rep]` and `[resource-new]`
 /// function imports and records their merged function indices.
-fn build_resource_import_maps(
-    merged: &MergedModule,
-) -> (
-    std::collections::HashMap<(String, String), u32>,
-    std::collections::HashMap<(String, String), u32>,
-) {
+type ResourceImportMap = std::collections::HashMap<(String, String), u32>;
+
+fn build_resource_import_maps(merged: &MergedModule) -> (ResourceImportMap, ResourceImportMap) {
     use wasm_encoder::EntityType;
     let mut rep_map = std::collections::HashMap::new();
     let mut new_map = std::collections::HashMap::new();
