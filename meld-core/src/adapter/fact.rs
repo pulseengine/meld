@@ -770,63 +770,62 @@ impl FactStyleGenerator {
             }
 
             // 2c. Fix up inner resource handles if element type contains borrow<T>
-            if !options.inner_resource_fixups.is_empty() {
-                if let Some(crate::resolver::CopyLayout::Elements { element_size, .. }) =
+            if !options.inner_resource_fixups.is_empty()
+                && let Some(crate::resolver::CopyLayout::Elements { element_size, .. }) =
                     site.requirements.param_copy_layouts.first()
-                {
-                    let element_size = *element_size;
-                    // Use inner_fixup_locals for loop counter
-                    let loop_idx = dest_ptr_local + 1 + inner_fixup_locals;
-                    func.instruction(&Instruction::I32Const(0));
-                    func.instruction(&Instruction::LocalSet(loop_idx));
-                    // block $exit { loop $cont {
-                    func.instruction(&Instruction::Block(wasm_encoder::BlockType::Empty));
-                    func.instruction(&Instruction::Loop(wasm_encoder::BlockType::Empty));
-                    // if loop_idx >= len: break
+            {
+                let element_size = *element_size;
+                // Use inner_fixup_locals for loop counter
+                let loop_idx = dest_ptr_local + 1 + inner_fixup_locals;
+                func.instruction(&Instruction::I32Const(0));
+                func.instruction(&Instruction::LocalSet(loop_idx));
+                // block $exit { loop $cont {
+                func.instruction(&Instruction::Block(wasm_encoder::BlockType::Empty));
+                func.instruction(&Instruction::Loop(wasm_encoder::BlockType::Empty));
+                // if loop_idx >= len: break
+                func.instruction(&Instruction::LocalGet(loop_idx));
+                func.instruction(&Instruction::LocalGet(1)); // len
+                func.instruction(&Instruction::I32GeU);
+                func.instruction(&Instruction::BrIf(1));
+                for &(byte_offset, rep_func) in &options.inner_resource_fixups {
+                    // addr = dest_ptr + loop_idx * element_size + byte_offset
+                    // i32.store needs [addr, value] on stack.
+                    // Emit: addr, addr, i32.load → handle, call rep → rep, i32.store
+                    // First push addr for the store:
+                    func.instruction(&Instruction::LocalGet(dest_ptr_local));
                     func.instruction(&Instruction::LocalGet(loop_idx));
-                    func.instruction(&Instruction::LocalGet(1)); // len
-                    func.instruction(&Instruction::I32GeU);
-                    func.instruction(&Instruction::BrIf(1));
-                    for &(byte_offset, rep_func) in &options.inner_resource_fixups {
-                        // addr = dest_ptr + loop_idx * element_size + byte_offset
-                        // i32.store needs [addr, value] on stack.
-                        // Emit: addr, addr, i32.load → handle, call rep → rep, i32.store
-                        // First push addr for the store:
-                        func.instruction(&Instruction::LocalGet(dest_ptr_local));
-                        func.instruction(&Instruction::LocalGet(loop_idx));
-                        func.instruction(&Instruction::I32Const(element_size as i32));
-                        func.instruction(&Instruction::I32Mul);
-                        func.instruction(&Instruction::I32Add);
-                        // Stack: [addr_for_store]
-                        // Now load handle from same addr using offset
-                        func.instruction(&Instruction::LocalGet(dest_ptr_local));
-                        func.instruction(&Instruction::LocalGet(loop_idx));
-                        func.instruction(&Instruction::I32Const(element_size as i32));
-                        func.instruction(&Instruction::I32Mul);
-                        func.instruction(&Instruction::I32Add);
-                        func.instruction(&Instruction::I32Load(wasm_encoder::MemArg {
-                            offset: byte_offset as u64,
-                            align: 2,
-                            memory_index: options.callee_memory,
-                        }));
-                        // Stack: [addr_for_store, handle]
-                        func.instruction(&Instruction::Call(rep_func));
-                        // Stack: [addr_for_store, rep]
-                        func.instruction(&Instruction::I32Store(wasm_encoder::MemArg {
-                            offset: byte_offset as u64,
-                            align: 2,
-                            memory_index: options.callee_memory,
-                        }));
-                    }
-                    // loop_idx++
-                    func.instruction(&Instruction::LocalGet(loop_idx));
-                    func.instruction(&Instruction::I32Const(1));
+                    func.instruction(&Instruction::I32Const(element_size as i32));
+                    func.instruction(&Instruction::I32Mul);
                     func.instruction(&Instruction::I32Add);
-                    func.instruction(&Instruction::LocalSet(loop_idx));
-                    func.instruction(&Instruction::Br(0));
-                    func.instruction(&Instruction::End); // loop
-                    func.instruction(&Instruction::End); // block
+                    // Stack: [addr_for_store]
+                    // Now load handle from same addr using offset
+                    func.instruction(&Instruction::LocalGet(dest_ptr_local));
+                    func.instruction(&Instruction::LocalGet(loop_idx));
+                    func.instruction(&Instruction::I32Const(element_size as i32));
+                    func.instruction(&Instruction::I32Mul);
+                    func.instruction(&Instruction::I32Add);
+                    func.instruction(&Instruction::I32Load(wasm_encoder::MemArg {
+                        offset: byte_offset as u64,
+                        align: 2,
+                        memory_index: options.callee_memory,
+                    }));
+                    // Stack: [addr_for_store, handle]
+                    func.instruction(&Instruction::Call(rep_func));
+                    // Stack: [addr_for_store, rep]
+                    func.instruction(&Instruction::I32Store(wasm_encoder::MemArg {
+                        offset: byte_offset as u64,
+                        align: 2,
+                        memory_index: options.callee_memory,
+                    }));
                 }
+                // loop_idx++
+                func.instruction(&Instruction::LocalGet(loop_idx));
+                func.instruction(&Instruction::I32Const(1));
+                func.instruction(&Instruction::I32Add);
+                func.instruction(&Instruction::LocalSet(loop_idx));
+                func.instruction(&Instruction::Br(0));
+                func.instruction(&Instruction::End); // loop
+                func.instruction(&Instruction::End); // block
             }
 
             // 3. Call target with (dest_ptr, len, ...remaining args)
