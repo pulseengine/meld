@@ -140,6 +140,10 @@ pub struct AdapterOptions {
     pub resource_rep_calls: Vec<ResourceBorrowTransfer>,
     /// Resource own<T> results needing rep→handle conversion (3-component chains).
     pub resource_new_calls: Vec<ResourceOwnResultTransfer>,
+    /// Resolved inner resource handles for list elements.
+    /// Each entry: (byte_offset_in_element, merged_func_idx of [resource-rep]).
+    /// Used after bulk list copy to convert handles in callee memory.
+    pub inner_resource_fixups: Vec<(u32, u32)>,
 }
 
 /// Describes how to transfer a `borrow<T>` handle across an adapter boundary.
@@ -179,6 +183,7 @@ impl Default for AdapterOptions {
             callee_post_return: None,
             resource_rep_calls: Vec::new(),
             resource_new_calls: Vec::new(),
+            inner_resource_fixups: Vec::new(),
         }
     }
 }

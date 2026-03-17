@@ -653,10 +653,11 @@ fuse_only_test!(
 // resource_floats: adapter produces correct rep→new_handle chain, but P2 wrapper
 // resource type mismatch between [resource-new] and [resource-rep] for intermediate
 fuse_only_test!(test_fuse_wit_bindgen_resource_floats, "resource_floats");
-fuse_only_test!(
-    test_fuse_wit_bindgen_resource_borrow_in_record,
+runtime_test!(
+    test_runtime_wit_bindgen_resource_borrow_in_record,
     "resource_borrow_in_record"
 );
+// resource_with_lists: string data corruption in resource+list combo
 fuse_only_test!(
     test_fuse_wit_bindgen_resource_with_lists,
     "resource_with_lists"
