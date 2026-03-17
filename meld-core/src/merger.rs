@@ -1373,7 +1373,7 @@ impl Merger {
                         if let Some(rn) = eff_field.strip_prefix("[resource-rep]") {
                             if let Some(&idx) =
                                 merged.resource_rep_by_component.values().find(|&&idx| {
-                                    merged.imports.get(idx as usize).map_or(false, |imp| {
+                                    merged.imports.get(idx as usize).is_some_and(|imp| {
                                         imp.name.starts_with("[resource-rep]")
                                             && imp.name.ends_with(rn)
                                     })
@@ -1386,7 +1386,7 @@ impl Merger {
                         } else if let Some(rn) = eff_field.strip_prefix("[resource-new]") {
                             if let Some(&idx) =
                                 merged.resource_new_by_component.values().find(|&&idx| {
-                                    merged.imports.get(idx as usize).map_or(false, |imp| {
+                                    merged.imports.get(idx as usize).is_some_and(|imp| {
                                         imp.name.starts_with("[resource-new]")
                                             && imp.name.ends_with(rn)
                                     })
