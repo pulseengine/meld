@@ -1053,6 +1053,13 @@ impl Resolver {
                     site.to_component,
                 ));
             }
+            // For 3-component chains: synthesize callee's [resource-new].
+            for op in &site.requirements.resource_params {
+                if !op.is_owned && !op.callee_defines_resource {
+                    let new_field = op.import_field.replace("[resource-rep]", "[resource-new]");
+                    needed.push((op.import_module.clone(), new_field, site.to_component));
+                }
+            }
         }
 
         if needed.is_empty() {
