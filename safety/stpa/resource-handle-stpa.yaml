@@ -1,0 +1,1078 @@
+# STPA Analysis: Resource Handle Management in Meld
+#
+# Systematic analysis of all failure modes for resource types (own<T>, borrow<T>)
+# in the static component fusion pipeline.
+#
+# Context: The Component Model's resource types use handle tables per component
+# instance. When meld fuses multiple components into a single core module, the
+# adapter layer must correctly translate handles between the original
+# component-instance tables and the fused module's shared execution environment.
+# The canonical ABI spec (commit deb0b0a) defines lift_own, lower_own,
+# lift_borrow, lower_borrow, resource.new, resource.rep, and resource.drop
+# with precise semantics around handle table management, borrow tracking
+# (num_lends), and destructor invocation.
+#
+# Analysis date: 2026-03-16
+# Author: STPA analysis agent
+# Spec baseline: Component Model commit deb0b0a, Canonical ABI
+# Source files:
+#   - meld-core/src/parser.rs (resource_param_positions, resource_result_positions, resolve_to_resource)
+#   - meld-core/src/resolver.rs (ResolvedResourceOp, build_resource_type_to_import, resolve_resource_positions)
+#   - meld-core/src/adapter/mod.rs (ResourceBorrowTransfer, AdapterOptions.resource_rep_calls)
+#   - meld-core/src/adapter/fact.rs (Phase 0, emit_resource_borrow_phase0, analyze_call_site)
+#   - meld-core/src/component_wrap.rs (ImportResolution::LocalResource, resource.drop/new/rep)
+
+# =============================================================================
+# New Hazard: Resource Handle Mismanagement
+# =============================================================================
+
+hazards:
+  - id: H-11
+    title: Resource handle translation produces incorrect or leaked handles
+    description: >
+      Meld produces a fused module where resource handles (own<T>, borrow<T>)
+      are not correctly translated across component boundaries. This includes:
+      passing raw handles where representations are expected (or vice versa),
+      leaking handles that are never dropped, creating handles in the wrong
+      component's table, or failing to invoke destructors for owned resources.
+      The canonical ABI requires precise handle↔representation conversion
+      depending on whether the callee is the resource's implementation component.
+    losses: [L-1, L-2]
+
+sub-hazards:
+  - id: H-11.1
+    parent: H-11
+    title: Borrow handle passed as raw representation to non-impl callee
+    description: >
+      The adapter passes a borrow<T> handle value directly to a callee that
+      does NOT define T. Per the canonical ABI, lower_borrow creates a new
+      borrowed handle in the destination's table when cx.inst is NOT t.rt.impl.
+      Passing the raw handle means the callee interprets it as a handle index
+      in its own table, which may point to a different resource or be out of
+      bounds, causing a trap or silent wrong-resource access.
+
+  - id: H-11.2
+    parent: H-11
+    title: Own handle converted when callee should receive it unchanged
+    description: >
+      The adapter applies resource.rep to an own<T> handle before passing it
+      to the callee. Per the canonical ABI, lower_own returns the raw rep only
+      when cx.inst IS t.rt.impl. The callee's core function calls from_handle/
+      resource.rep internally. If the adapter pre-converts, the callee
+      double-converts and receives a garbage value.
+
+  - id: H-11.3
+    parent: H-11
+    title: Own handle leaked in resource table (never dropped/freed)
+    description: >
+      When an own<T> handle is transferred across components, the source
+      component should remove it (lift_own). In the fused module, if the
+      adapter passes the handle but does not arrange for removal from the
+      source table (no resource.drop call on the source side), the source
+      table grows unboundedly. In short-lived tests this is benign, but in
+      long-running systems it constitutes a resource leak leading to table
+      overflow (MAX_LENGTH = 2^28 - 1) and eventual trap.
+
+  - id: H-11.4
+    parent: H-11
+    title: Resource.rep called on wrong handle table
+    description: >
+      In a 3-component chain (A→B→C), the adapter needs to call the CALLER's
+      resource.rep (to extract rep from caller's handle table) followed by the
+      CALLEE's resource.new (to create a handle in callee's table). If the
+      adapter calls the callee's resource.rep instead, it looks up the handle
+      index in the wrong table, returning an unrelated rep or trapping.
+
+  - id: H-11.5
+    parent: H-11
+    title: Resource inside aggregate type (record, tuple, option, variant) not detected
+    description: >
+      The parser's resource_param_positions and resource_result_positions only
+      inspect top-level function parameters. A borrow<T> or own<T> nested
+      inside a record, tuple, option<own<T>>, result<borrow<T>, E>, or
+      variant is NOT detected. The adapter passes the aggregate type by value
+      or pointer without converting the embedded resource handle, violating
+      the canonical ABI lifting/lowering rules.
+
+  - id: H-11.6
+    parent: H-11
+    title: Resource result (own<T>) not converted via resource.new for caller
+    description: >
+      The resolver collects resource_results (own<T> return values needing
+      rep→handle conversion via resource.new), but the adapter generator
+      (fact.rs) never processes them. The callee's core function returns a
+      raw rep, and the adapter passes it unchanged to the caller. If the
+      caller is not the resource's impl component, the caller interprets the
+      rep as a handle index, which may be out of bounds or point to a wrong
+      resource in the caller's table.
+
+  - id: H-11.7
+    parent: H-11
+    title: Resource type identity mismatch due to aliasing
+    description: >
+      Resource types use object identity in the canonical ABI. When a resource
+      type is imported/re-exported through multiple components, the type ID
+      in one component may differ from the ID in another due to aliasing
+      (ExportAlias). The resolver's build_resource_type_to_import has Step 6
+      (alias propagation) but uses a single-pass approach that may miss
+      multi-level alias chains (A→B→C where A aliases B which aliases C).
+
+  - id: H-11.8
+    parent: H-11
+    title: Destructor not forwarded for locally-defined resources in P2 wrapper
+    description: >
+      When the P2 wrapper defines a local resource type, it must connect the
+      destructor (dtor) to the fused module's exported dtor function. If the
+      dtor export name format does not match (e.g., naming convention mismatch
+      between component's export alias and the wrapper's expected format),
+      the resource type is created without a destructor. Dropping the resource
+      silently succeeds without cleanup, leaking the underlying representation.
+
+# =============================================================================
+# Unsafe Control Actions: Resource Handling
+# =============================================================================
+
+resource-ucas:
+  control-action: "Generate resource handle translation in adapter trampolines"
+  controller: CTRL-ADAPTER
+
+  not-providing:
+    - id: UCA-A-14
+      description: >
+        Adapter generator does not emit resource.rep conversion for borrow<T>
+        parameter when the callee defines T and expects raw representation
+      context: >
+        2-component call where callee defines the resource type and the
+        function takes borrow<T> parameter
+      hazards: [H-11, H-11.1]
+      rationale: >
+        Per canonical ABI lower_borrow: when cx.inst IS t.rt.impl, return v
+        (the rep) directly. Without conversion, callee receives a handle index
+        from the caller's table, not the raw pointer/representation it expects.
+
+    - id: UCA-A-15
+      description: >
+        Adapter generator does not emit resource.rep→resource.new chain for
+        borrow<T> parameter in 3-component chain (caller→adapter→callee,
+        neither defines T)
+      context: >
+        3-component chain A→B→C where resource T is defined by component D,
+        and the current call passes borrow<T> from A to C
+      hazards: [H-11, H-11.4]
+      rationale: >
+        The caller's handle table maps caller-local handles to reps. The
+        callee's table is separate. The adapter must (1) call caller's
+        resource.rep to extract rep from caller's table, then (2) call
+        callee's resource.new to create a new handle in callee's table.
+        Missing either step causes wrong-table lookup.
+
+    - id: UCA-A-16
+      description: >
+        Adapter generator does not detect resource types nested inside
+        record, tuple, option, result, or variant parameters
+      context: >
+        Cross-component function takes record { name: string, handle: borrow<T> }
+        or option<own<T>> or tuple<borrow<T>, u32>
+      hazards: [H-11, H-11.5]
+      rationale: >
+        resource_param_positions only checks top-level ComponentValType via
+        resolve_to_resource. It does not recurse into Defined(Record(...)),
+        Defined(Tuple(...)), Defined(Option(...)), etc. to find nested
+        Own(T)/Borrow(T) values. The inner handle is passed as a raw i32
+        without conversion.
+
+    - id: UCA-A-17
+      description: >
+        Adapter generator does not emit resource.new conversion for own<T>
+        return values when the caller does not define T
+      context: >
+        Cross-component call returns own<T> and caller is NOT the impl
+        component for T
+      hazards: [H-11, H-11.6]
+      rationale: >
+        Per canonical ABI lower_own: when cx.inst is NOT t.rt.impl, a new
+        ResourceHandle is created in the caller's table. The callee's core
+        function returns a rep, and the adapter must call resource.new to
+        wrap it in the caller's table. The resolver populates resource_results
+        but fact.rs never reads them — the rep flows through unchanged.
+
+    - id: UCA-A-18
+      description: >
+        Adapter generator does not arrange for destruction of source-side
+        own<T> handle after cross-component transfer
+      context: >
+        Cross-component call passes own<T> parameter (ownership transfer)
+      hazards: [H-11, H-11.3]
+      rationale: >
+        Per canonical ABI lift_own: the handle is removed from the source's
+        table. In the fused module, the adapter must ensure the source-side
+        handle entry is freed (resource.drop on source side without invoking
+        dtor, since ownership is transferring not destroying). Currently the
+        adapter passes the handle through and the source-side entry persists,
+        leaking table slots.
+
+  providing:
+    - id: UCA-A-19
+      description: >
+        Adapter converts own<T> parameter via resource.rep when callee should
+        receive handle unchanged
+      context: >
+        Cross-component call passes own<T> to callee that is NOT the impl
+        component for T (callee will call resource.rep internally)
+      hazards: [H-11, H-11.2]
+      rationale: >
+        The current code correctly skips own<T> in the resource_rep_calls
+        loop (is_owned continue). However, if this guard is accidentally
+        removed or the is_owned classification is wrong, double conversion
+        occurs. This UCA documents the invariant.
+
+    - id: UCA-A-20
+      description: >
+        Adapter calls callee's resource.rep instead of caller's resource.rep
+        in 3-component chain
+      context: >
+        3-component chain where borrow<T> passes from A to C, T defined
+        by component B which is neither A nor C
+      hazards: [H-11, H-11.4]
+      rationale: >
+        callee_defines_resource is false, so the code enters the 3-component
+        path. The resource.rep import lookup uses field.ends_with(resource_name)
+        with module != op.import_module. If multiple resource.rep imports
+        match (e.g., same resource name in different interfaces), the wrong
+        one may be selected. The first-match strategy is non-deterministic
+        when multiple candidates exist (HashMap iteration order).
+
+    - id: UCA-A-21
+      description: >
+        Adapter emits resource.new with wrong resource type index in P2
+        wrapper for imported resource
+      context: >
+        Component imports a resource type from another component and the
+        P2 wrapper must define that resource type locally
+      hazards: [H-11, H-11.7, H-8]
+      rationale: >
+        Component_wrap.rs tracks component_type_idx as a running counter.
+        If resource type aliasing is not correctly followed (e.g., aliased
+        type index differs from the canonical type index used by resource.new),
+        the wrapper defines the wrong resource type and all handle operations
+        reference the wrong table.
+
+  too-early-too-late:
+    - id: UCA-A-22
+      description: >
+        Adapter emits resource.rep AFTER passing parameters to callee
+        instead of BEFORE
+      context: >
+        Cross-component call with borrow<T> parameter in multi-memory mode
+        where both resource conversion and memory copy are needed
+      hazards: [H-11, H-11.1]
+      rationale: >
+        Phase 0 (resource conversion) must run before Phase 1 (memory copy)
+        and Phase 2 (callee call). If instruction ordering is wrong, the
+        callee receives an unconverted handle. Current code emits Phase 0
+        first (line 338, 479, 594, 968, 1620 in fact.rs), but this ordering
+        invariant is fragile — any refactoring that moves Phase 0 after the
+        call instruction would silently break correctness.
+
+  stopped-too-soon:
+    - id: UCA-A-23
+      description: >
+        Resource type alias chain resolution stops at first level, missing
+        multi-level alias chains
+      context: >
+        Resource type aliased through two or more levels (ExportAlias(A) →
+        ExportAlias(B) → ResourceType)
+      hazards: [H-11, H-11.7]
+      rationale: >
+        build_resource_type_to_import Step 6 iterates component_type_defs
+        once, propagating entries from target to alias and vice versa. If
+        the alias chain has depth > 1 (A → B → C), a single pass may only
+        propagate C → B, leaving A unresolved. A second pass or transitive
+        closure is needed.
+
+# =============================================================================
+# Parser UCAs for Resource Handling
+# =============================================================================
+
+resource-parser-ucas:
+  control-action: "Parse and extract resource type information"
+  controller: CTRL-PARSER
+
+  not-providing:
+    - id: UCA-P-11
+      description: >
+        Parser does not detect resource types nested inside aggregate types
+        (records, tuples, options, results, variants)
+      context: >
+        Function signature includes record { handle: borrow<T>, data: u32 }
+        or option<own<T>>
+      hazards: [H-11, H-11.5]
+      rationale: >
+        resolve_to_resource only matches top-level Own(T), Borrow(T), and
+        Type(idx) that directly resolves to Own/Borrow. It does not recurse
+        into Defined(Record(...)), Defined(Tuple(...)), etc. This means
+        resource_param_positions returns empty for functions where all
+        resource handles are inside aggregate types.
+
+    - id: UCA-P-12
+      description: >
+        Parser does not track resource type provenance (which component
+        instance defines each resource type)
+      context: >
+        Multiple components define different resource types with the same name
+        (e.g., both component A and component B define a resource named "handle")
+      hazards: [H-11, H-11.7, H-1]
+      rationale: >
+        Resource type identity in the canonical ABI is by object identity,
+        not by name. Two resources named "handle" from different components
+        are distinct types. The parser uses u32 type indices which are
+        component-local. The resolver must correctly map these to distinct
+        resource types, but without provenance tracking, name collisions
+        can cause misidentification.
+
+  providing:
+    - id: UCA-P-13
+      description: >
+        Parser reports incorrect flat_count for resource types, causing
+        flat_idx calculation to be wrong for subsequent parameters
+      context: >
+        Function with mixed resource and non-resource parameters, e.g.,
+        (borrow<T>, string, own<U>)
+      hazards: [H-11, H-4]
+      rationale: >
+        Resources have flat_count = 1 (a single i32 handle). If flat_count
+        incorrectly returns 0 or 2 for a resource type, all subsequent
+        parameter positions are shifted, causing the adapter to convert the
+        wrong parameter slot.
+
+# =============================================================================
+# Wrapper UCAs for Resource Handling
+# =============================================================================
+
+resource-wrapper-ucas:
+  control-action: "Emit resource type definitions and canon builtins in P2 wrapper"
+  controller: CTRL-WRAPPER
+
+  not-providing:
+    - id: UCA-W-4
+      description: >
+        Wrapper does not resolve toplevel resource type imports (resource
+        imported at the component level, not inside an interface)
+      context: >
+        Component imports a bare resource type at the top level, not nested
+        inside a named interface instance
+      hazards: [H-8, H-11]
+      rationale: >
+        resolve_import_to_instance builds its lookup map from
+        ComponentAliasEntry::InstanceExport entries. A toplevel resource
+        import does not create an InstanceExport alias, so the lookup fails.
+        This is the root cause of the resource-import-and-export fixture
+        failure.
+
+    - id: UCA-W-5
+      description: >
+        Wrapper does not emit resource.rep or resource.new canon builtins
+        for imported resources that the fused module's adapters need
+      context: >
+        Fused module imports [resource-rep]X and [resource-new]X functions
+        that the P2 wrapper must provide via canon builtins
+      hazards: [H-8, H-11]
+      rationale: >
+        The wrapper handles [resource-drop] specially (lines 1055-1075 of
+        component_wrap.rs) but routes [resource-rep] and [resource-new]
+        through the normal instance resolution path. If the fused module
+        imports these from an [export]-prefixed module, they are handled by
+        the LocalResource path. But if they come from a non-[export] module,
+        they fall through to resolve_import_to_instance which may fail.
+
+  providing:
+    - id: UCA-W-6
+      description: >
+        Wrapper defines resource type with wrong destructor (dtor connects
+        to wrong function or no function)
+      context: >
+        Component defines a resource with destructor, fused module exports
+        the dtor under a name that does not match the wrapper's expected
+        format "{interface}#[dtor]{resource}"
+      hazards: [H-8, H-11, H-11.8]
+      rationale: >
+        The naming convention for destructor exports is an implementation
+        detail of wit-bindgen. If a component is compiled with a different
+        tool or a different naming convention, the wrapper will not find the
+        dtor export and will create the resource type without a destructor.
+        Resources dropped by the runtime will not be cleaned up.
+
+# =============================================================================
+# Loss Scenarios for Resource Handle UCAs
+# =============================================================================
+
+loss-scenarios:
+  - id: LS-RH-1
+    title: Borrow handle passed as-is to impl component without resource.rep
+    uca: UCA-A-14
+    hazards: [H-11, H-11.1]
+    type: inadequate-control-algorithm
+    scenario: >
+      Component A calls component B's function f(borrow<T>) where B defines T.
+      The adapter should call B's [resource-rep](handle) to extract the raw
+      representation, then pass the rep to B's core function (which expects rep
+      via the lower_borrow identity path). Instead, the adapter passes the
+      handle index directly. B's core function interprets the handle index as
+      a memory address (rep), reading from an arbitrary low address and
+      returning garbage or trapping on out-of-bounds access [H-11.1, H-1].
+    causal-factors:
+      - resource_rep_calls is empty because build_resource_import_maps did not
+        find matching [resource-rep] import in merged module
+      - Fallback resolver path does not populate resource_params
+      - resolve_resource_positions returned empty due to unresolved type ID
+
+  - id: LS-RH-2
+    title: 3-component chain uses wrong resource.rep table
+    uca: UCA-A-20
+    hazards: [H-11, H-11.4]
+    type: inadequate-control-algorithm
+    scenario: >
+      Components A, B, C form a chain. A passes borrow<T> to C via an adapter.
+      T is defined by B. Both A and B have [resource-rep] imports in the merged
+      module. The adapter's first-match lookup (field.ends_with(resource_name)
+      && module != callee's module) selects B's [resource-rep] instead of A's.
+      B's resource.rep looks up the handle in B's table, not A's. The handle
+      index from A is invalid in B's table, causing a trap or returning an
+      unrelated representation [H-11.4]. This is the root cause of the
+      resource_floats fixture failure.
+    causal-factors:
+      - resource_rep_imports HashMap iteration order is non-deterministic
+      - .find() returns first match, not necessarily the correct one
+      - No assertion that the matched [resource-rep] belongs to the caller's
+        component, only that it differs from the callee's module name
+    process-model-flaw: >
+      The adapter generator assumes there is exactly one [resource-rep] import
+      per resource name from a non-callee module. With 3+ components, there
+      may be multiple, and the correct one is the caller's.
+
+  - id: LS-RH-3
+    title: Own<T> result not wrapped in caller's handle table
+    uca: UCA-A-17
+    hazards: [H-11, H-11.6]
+    type: inadequate-control-algorithm
+    scenario: >
+      Component A calls component B's function that returns own<T>. B's core
+      function returns a raw representation (rep). Per the canonical ABI,
+      lower_own should create a ResourceHandle(T, rep, own=True) in A's handle
+      table when A is NOT T's impl. The adapter passes rep through unchanged.
+      A receives the rep as if it were a handle index, attempts to look it up
+      in its table, and traps (out of bounds) or reads a wrong entry
+      [H-11.6]. This is likely contributing to the resource_aggregates
+      fixture failure.
+    causal-factors:
+      - resource_results is populated by the resolver but never consumed by
+        fact.rs analyze_call_site
+      - No Phase N in the adapter handles own<T> result conversion
+      - Comment in fact.rs states "Results are never converted" which is
+        incorrect for cross-component own<T> returns
+
+  - id: LS-RH-4
+    title: Borrow<T> inside record not converted
+    uca: UCA-A-16
+    hazards: [H-11, H-11.5]
+    type: inadequate-process-model
+    scenario: >
+      A function takes record { name: string, handle: borrow<T> }. The
+      parser's resource_param_positions iterates top-level params and calls
+      resolve_to_resource on each. The record type resolves to Defined(Record),
+      not Own/Borrow, so resolve_to_resource returns None. The handle field
+      inside the record is never detected. The adapter copies the record's
+      bytes across memories (if it crosses memories) but does not convert
+      the handle field from caller-table index to callee-table index. The
+      callee reads the handle field and interprets the caller's handle index
+      as its own, which may be invalid or refer to a different resource
+      [H-11.5]. This is the root cause of the resource_borrow_in_record
+      fixture failure.
+    causal-factors:
+      - resolve_to_resource does not recurse into record/tuple/variant fields
+      - resource_param_positions treats the entire record as a single non-resource
+        entity
+      - No nested resource detection in CopyLayout computation
+    process-model-flaw: >
+      The parser assumes resource types only appear as top-level function
+      parameters, never nested inside aggregate types. The Component Model
+      spec allows borrow<T> and own<T> anywhere a value type is accepted,
+      including inside records, tuples, options, results, and variants.
+
+  - id: LS-RH-5
+    title: Own handle leaks in resource table during ownership transfer
+    uca: UCA-A-18
+    hazards: [H-11, H-11.3]
+    type: inadequate-control-algorithm
+    scenario: >
+      Component A calls a function with own<T> parameter, transferring
+      ownership to component B. Per the canonical ABI, lift_own removes the
+      handle from A's table. In the fused module, the adapter passes the
+      handle through without calling resource.drop on A's side (no transfer
+      semantics). A's table entry persists but A has logically given up
+      ownership. If A later attempts to drop the handle, a double-free trap
+      occurs. If A never drops it, the table entry leaks. Over many calls,
+      the table fills to MAX_LENGTH (2^28 - 1) and traps [H-11.3].
+      This is related to the ownership fixture failure.
+    causal-factors:
+      - Adapter treats own<T> as passthrough (skips is_owned in resource loop)
+      - No mechanism to call resource.drop on source side without invoking dtor
+      - Component Model spec requires "detach without dtor" which is not
+        available as a single canon op
+
+  - id: LS-RH-6
+    title: P2 wrapper cannot resolve toplevel resource import
+    uca: UCA-W-4
+    hazards: [H-8, H-11]
+    type: inadequate-process-model
+    scenario: >
+      Component has a toplevel resource type import (not inside an interface).
+      The fused module imports [resource-drop]X, [resource-rep]X, and
+      [resource-new]X from a module name that does not correspond to any
+      component instance. The wrapper's resolve_import_to_instance fails to
+      find a matching instance. The wrapper falls through to the error path:
+      "cannot resolve fused import ... to a component instance" [H-8].
+      This is the root cause of the resource-import-and-export fixture failure.
+    causal-factors:
+      - build_instance_func_map only indexes ComponentAliasEntry::InstanceExport
+        entries with kind Func
+      - Toplevel resource imports create resource canon builtins without a
+        containing interface instance
+      - Category C fallback in import resolution only handles [resource-drop],
+        not [resource-rep] or [resource-new]
+    process-model-flaw: >
+      The wrapper assumes all non-[export]-prefixed resource operations resolve
+      through instance aliases. Toplevel resource imports are a valid pattern
+      but not modeled in the instance resolution logic.
+
+  - id: LS-RH-7
+    title: Resource + list combination corrupts data
+    uca: UCA-A-16
+    hazards: [H-11, H-11.5, H-4]
+    type: inadequate-control-algorithm
+    scenario: >
+      A function takes list<own<T>> or returns a record { items: list<string>,
+      handle: own<T> }. The list copy adapter handles the list<string> pointer
+      pair correctly but treats the own<T> field as a plain i32 without
+      resource handle conversion. After cross-memory copy, the handle value
+      copied to callee's memory references the caller's table, not the
+      callee's. The callee attempts to use the handle and either traps or
+      accesses the wrong resource [H-11.5]. If the function returns both
+      list data and resource handles via retptr, the retptr copy logic
+      handles pointer pairs for list fields but ignores the resource handle
+      slot. This is the root cause of the resource_with_lists fixture failure.
+    causal-factors:
+      - CopyLayout computation does not track resource fields within elements
+      - Return area slot classification treats resource handles as plain i32 values
+      - No "resource pair" concept analogous to "pointer pair"
+
+  - id: LS-RH-8
+    title: Alias chain depth > 1 not resolved for resource types
+    uca: UCA-A-23
+    hazards: [H-11, H-11.7]
+    type: inadequate-control-algorithm
+    scenario: >
+      Component C imports resource T from B, which imported T from A (the
+      impl). In C's component_type_defs: type 10 = ExportAlias(type 8),
+      type 8 = ExportAlias(type 5), type 5 = resource T. The canonical
+      function ResourceRep is defined for type 5. build_resource_type_to_import
+      Step 6 iterates once: it propagates type 5 → type 8, but type 10 is
+      not yet connected to type 5. After the single pass, the function
+      signature that uses Borrow(type 10) cannot find the [resource-rep]
+      import. resolve_resource_positions returns empty, and no resource
+      conversion is emitted [H-11.7].
+    causal-factors:
+      - Step 6 single-pass propagation assumes depth-1 alias chains
+      - No transitive closure computation for alias chains
+      - No error when resolve_resource_positions fails to find a match
+
+# =============================================================================
+# Gap Analysis: Existing SRs vs New UCAs
+# =============================================================================
+
+gap-analysis:
+  covered-by-existing-sr:
+    - uca: UCA-A-14
+      sr: SR-25
+      coverage: partial
+      note: >
+        SR-25 ("Resource handle pass-through") is misnamed — it was originally
+        written for simple pass-through but the implementation actually does
+        Phase 0 borrow conversion. The SR text says "pass resource handles
+        through without modification" which contradicts the actual behavior
+        and the canonical ABI requirement. SR-25 needs to be rewritten to
+        accurately describe the borrow→rep conversion.
+
+    - uca: UCA-A-15
+      sr: SR-25
+      coverage: partial
+      note: >
+        SR-25 does not mention the 3-component chain case at all. The
+        implementation handles it (rep_func + new_func in ResourceBorrowTransfer)
+        but the requirement does not specify the expected behavior.
+
+    - uca: UCA-A-19
+      sr: SR-25
+      coverage: covered
+      note: >
+        The code correctly skips own<T> in the resource conversion loop
+        (is_owned continue guard in analyze_call_site line 232-233).
+
+  not-covered-needs-new-sr:
+    - uca: UCA-A-16
+      gap: >
+        No SR covers resource types nested inside aggregate types. This is a
+        fundamental gap in the parser's resource detection capability.
+      fixture-failures: [resource_borrow_in_record, resource_with_lists]
+
+    - uca: UCA-A-17
+      gap: >
+        No SR covers own<T> result conversion. resource_results is collected
+        but never consumed. This violates the canonical ABI for cross-component
+        own<T> returns.
+      fixture-failures: [resource_aggregates]
+
+    - uca: UCA-A-18
+      gap: >
+        No SR covers own<T> ownership transfer (source-side handle cleanup).
+        The handle leak is a known limitation documented in MEMORY.md but
+        not formalized as a safety requirement.
+      fixture-failures: [ownership]
+
+    - uca: UCA-A-20
+      gap: >
+        No SR covers the disambiguation of resource.rep imports in multi-
+        component chains. The first-match strategy is non-deterministic.
+      fixture-failures: [resource_floats]
+
+    - uca: UCA-P-11
+      gap: >
+        No SR requires recursive resource detection in aggregate types.
+      fixture-failures: [resource_borrow_in_record]
+
+    - uca: UCA-W-4
+      gap: >
+        No SR covers toplevel resource import resolution in the P2 wrapper.
+      fixture-failures: [resource-import-and-export]
+
+    - uca: UCA-A-23
+      gap: >
+        No SR requires transitive closure for resource type alias resolution.
+      fixture-failures: []  # No known fixture failure, but latent risk
+
+# =============================================================================
+# Recommended New/Updated Safety Requirements
+# =============================================================================
+
+requirements:
+  - id: SR-25
+    type: requirement
+    title: Correct borrow<T> handle conversion in adapters
+    description: >
+      The adapter shall convert borrow<T> handles to raw representations
+      before passing them to the callee, per the canonical ABI lower_borrow
+      semantics. When the callee defines T (callee_defines_resource = true),
+      the adapter shall call [resource-rep](handle) → rep and pass rep. When
+      neither caller nor callee defines T (3-component chain), the adapter
+      shall call the CALLER's [resource-rep](handle) → rep, then the CALLEE's
+      [resource-new](rep) → new_handle, and pass new_handle. Own<T> parameters
+      shall NOT be converted (callee handles conversion internally).
+    status: implemented
+    tags: [stpa-derived, resource-handling]
+    links:
+      - type: derives-from
+        target: CC-A-14
+      - type: derives-from
+        target: CC-A-15
+      - type: derives-from
+        target: LS-RH-1
+      - type: derives-from
+        target: LS-RH-2
+    fields:
+      implementation:
+        - meld-core/src/adapter/fact.rs
+        - meld-core/src/adapter/mod.rs
+      spec-reference: "Canonical ABI lower_borrow: if cx.inst is t.rt.impl return v"
+      verification-method: test
+      verification-description: >
+        Runtime test with 2-component borrow<T> call (callee defines T) and
+        3-component borrow<T> chain; verify correct rep/handle conversion.
+
+  - id: SR-32
+    type: requirement
+    title: Recursive resource detection in aggregate types
+    description: >
+      The parser shall detect own<T> and borrow<T> values nested at any depth
+      inside record, tuple, option, result, and variant types. For each
+      detected resource, the parser shall report its byte offset within the
+      aggregate and its flat ABI position. The adapter shall convert all
+      detected resource handles, whether top-level or nested.
+    status: draft
+    tags: [stpa-derived, resource-handling]
+    links:
+      - type: derives-from
+        target: CC-A-16
+      - type: derives-from
+        target: CC-P-11
+      - type: derives-from
+        target: LS-RH-4
+      - type: derives-from
+        target: LS-RH-7
+    fields:
+      implementation:
+        - meld-core/src/parser.rs
+        - meld-core/src/adapter/fact.rs
+      spec-reference: "Component Model MVP: value types include own<T> and borrow<T> at any position"
+      verification-method: test
+      verification-description: >
+        Runtime test with record { name: string, handle: borrow<T> },
+        option<own<T>>, and list<own<T>>. Verify all inner handles are
+        correctly converted across component boundaries.
+
+  - id: SR-33
+    type: requirement
+    title: Own<T> result conversion via resource.new
+    description: >
+      When a cross-component call returns own<T> and the caller is NOT the
+      implementation component for T, the adapter shall call [resource-new](rep)
+      to create a handle in the caller's handle table and return the handle
+      index to the caller. The resolver's resource_results data shall be
+      consumed by the adapter generator.
+    status: draft
+    tags: [stpa-derived, resource-handling]
+    links:
+      - type: derives-from
+        target: CC-A-17
+      - type: derives-from
+        target: LS-RH-3
+    fields:
+      implementation:
+        - meld-core/src/adapter/fact.rs
+      spec-reference: "Canonical ABI lower_own: if cx.inst is NOT t.rt.impl, create handle"
+      verification-method: test
+      verification-description: >
+        Runtime test with function returning own<T> across component boundary.
+        Verify caller receives a valid handle (not raw rep) and can use it
+        in subsequent calls.
+
+  - id: SR-34
+    type: requirement
+    title: Own<T> parameter ownership transfer semantics
+    description: >
+      When own<T> is passed as a parameter in a cross-component call, the
+      adapter shall ensure the source component's handle table entry is
+      freed (ownership transferred, not leaked). The destructor shall NOT
+      be invoked during transfer — only the handle table entry is removed.
+      If the canonical "detach without dtor" operation is not available,
+      the adapter shall use resource.drop with a no-op dtor or document
+      the handle leak as a known limitation with a maximum table size bound.
+    status: draft
+    tags: [stpa-derived, resource-handling]
+    links:
+      - type: derives-from
+        target: CC-A-18
+      - type: derives-from
+        target: LS-RH-5
+    fields:
+      implementation:
+        - meld-core/src/adapter/fact.rs
+      spec-reference: "Canonical ABI lift_own: h = cx.inst.handles.remove(i)"
+      verification-method: test
+      verification-description: >
+        Runtime test with own<T> parameter transfer. Verify source handle
+        is freed and destination can use the resource. Verify no double-free
+        on subsequent drop.
+
+  - id: SR-35
+    type: requirement
+    title: Deterministic resource.rep import disambiguation
+    description: >
+      In multi-component chains, the adapter shall select the correct
+      [resource-rep] import by matching the caller's component identity,
+      not by first-match string suffix. The disambiguation shall be
+      deterministic regardless of HashMap iteration order.
+    status: draft
+    tags: [stpa-derived, resource-handling]
+    links:
+      - type: derives-from
+        target: CC-A-20
+      - type: derives-from
+        target: LS-RH-2
+    fields:
+      implementation:
+        - meld-core/src/adapter/fact.rs
+      verification-method: test
+      verification-description: >
+        Test with 3-component chain where two non-callee components have
+        [resource-rep] imports for the same resource name. Verify the
+        adapter selects the caller's import, not an arbitrary one.
+
+  - id: SR-36
+    type: requirement
+    title: Transitive resource type alias resolution
+    description: >
+      build_resource_type_to_import shall resolve resource type aliases
+      transitively, handling alias chains of arbitrary depth. The resolution
+      shall compute the transitive closure so that Borrow(alias_N) correctly
+      maps to the canonical [resource-rep] import regardless of how many
+      ExportAlias levels separate the function parameter's type ID from the
+      canonical ResourceRep entry's type ID.
+    status: draft
+    tags: [stpa-derived, resource-handling]
+    links:
+      - type: derives-from
+        target: CC-A-23
+      - type: derives-from
+        target: LS-RH-8
+    fields:
+      implementation:
+        - meld-core/src/resolver.rs
+      verification-method: test
+      verification-description: >
+        Test with component having 3-level alias chain for resource type.
+        Verify resolve_resource_positions returns correct import pair.
+
+  - id: SR-37
+    type: requirement
+    title: Toplevel resource import resolution in P2 wrapper
+    description: >
+      The P2 wrapper shall resolve resource type imports that appear at
+      the component level (not inside a named interface instance). This
+      includes generating the appropriate resource type definition, canon
+      resource.new, canon resource.rep, and canon resource.drop for the
+      toplevel resource. The wrapper shall not fail with "cannot resolve
+      fused import" for valid resource import patterns.
+    status: draft
+    tags: [stpa-derived, resource-handling]
+    links:
+      - type: derives-from
+        target: CC-W-4
+      - type: derives-from
+        target: LS-RH-6
+    fields:
+      implementation:
+        - meld-core/src/component_wrap.rs
+      verification-method: test
+      verification-description: >
+        Test with resource-import-and-export fixture. Verify P2 wrapping
+        succeeds and the component passes wasm-tools validate.
+
+  - id: SR-38
+    type: requirement
+    title: Correct destructor binding for locally-defined resources
+    description: >
+      When the P2 wrapper defines a local resource type, it shall bind the
+      destructor to the correct fused module export function. The naming
+      convention shall handle both wit-bindgen format ("{interface}#[dtor]{resource}")
+      and alternative formats. If no destructor export is found, the wrapper
+      shall emit a diagnostic warning (not silently omit the destructor).
+    status: draft
+    tags: [stpa-derived, resource-handling]
+    links:
+      - type: derives-from
+        target: CC-W-6
+      - type: derives-from
+        target: LS-RH-6
+    fields:
+      implementation:
+        - meld-core/src/component_wrap.rs
+      verification-method: test
+      verification-description: >
+        Test with component defining resource with destructor. Verify
+        wrapper connects dtor export. Test with missing dtor export and
+        verify warning is emitted.
+
+# =============================================================================
+# Controller Constraints for Resource Handling
+# =============================================================================
+
+controller-constraints:
+  # Adapter constraints
+  - id: CC-A-14
+    controller: CTRL-ADAPTER
+    constraint: >
+      Adapter must emit resource.rep conversion for borrow<T> parameters when
+      the callee defines T (2-component case)
+    ucas: [UCA-A-14]
+    hazards: [H-11, H-11.1]
+
+  - id: CC-A-15
+    controller: CTRL-ADAPTER
+    constraint: >
+      Adapter must emit resource.rep→resource.new chain for borrow<T> parameters
+      in 3-component chains (neither caller nor callee defines T)
+    ucas: [UCA-A-15]
+    hazards: [H-11, H-11.4]
+
+  - id: CC-A-16
+    controller: CTRL-ADAPTER
+    constraint: >
+      Adapter must detect and convert resource handles nested inside aggregate
+      types (record, tuple, option, result, variant)
+    ucas: [UCA-A-16]
+    hazards: [H-11, H-11.5]
+
+  - id: CC-A-17
+    controller: CTRL-ADAPTER
+    constraint: >
+      Adapter must emit resource.new for own<T> return values when the caller
+      does not define T
+    ucas: [UCA-A-17]
+    hazards: [H-11, H-11.6]
+
+  - id: CC-A-18
+    controller: CTRL-ADAPTER
+    constraint: >
+      Adapter must arrange for source-side handle cleanup when own<T> ownership
+      is transferred across component boundaries
+    ucas: [UCA-A-18]
+    hazards: [H-11, H-11.3]
+
+  - id: CC-A-19
+    controller: CTRL-ADAPTER
+    constraint: >
+      Adapter must NOT convert own<T> parameters via resource.rep (callee
+      handles conversion internally)
+    ucas: [UCA-A-19]
+    hazards: [H-11, H-11.2]
+
+  - id: CC-A-20
+    controller: CTRL-ADAPTER
+    constraint: >
+      Adapter must select the caller's resource.rep import (not an arbitrary
+      match) when disambiguating in multi-component chains
+    ucas: [UCA-A-20]
+    hazards: [H-11, H-11.4]
+
+  - id: CC-A-21
+    controller: CTRL-ADAPTER
+    constraint: >
+      Adapter must emit Phase 0 (resource conversion) before Phase 1 (memory
+      copy) and Phase 2 (callee call)
+    ucas: [UCA-A-22]
+    hazards: [H-11, H-11.1]
+
+  - id: CC-A-22
+    controller: CTRL-ADAPTER
+    constraint: >
+      Resource type alias chains must be resolved transitively, not just to
+      depth 1
+    ucas: [UCA-A-23]
+    hazards: [H-11, H-11.7]
+
+  # Parser constraints
+  - id: CC-P-11
+    controller: CTRL-PARSER
+    constraint: >
+      Parser must detect resource types (own<T>, borrow<T>) nested at any
+      depth inside aggregate value types
+    ucas: [UCA-P-11]
+    hazards: [H-11, H-11.5]
+
+  - id: CC-P-12
+    controller: CTRL-PARSER
+    constraint: >
+      Parser must track resource type provenance to distinguish same-named
+      resources from different components
+    ucas: [UCA-P-12]
+    hazards: [H-11, H-11.7, H-1]
+
+  - id: CC-P-13
+    controller: CTRL-PARSER
+    constraint: >
+      Parser must compute correct flat_count (= 1) for all resource types
+    ucas: [UCA-P-13]
+    hazards: [H-11, H-4]
+
+  # Wrapper constraints
+  - id: CC-W-4
+    controller: CTRL-WRAPPER
+    constraint: >
+      Wrapper must resolve toplevel resource type imports that are not
+      inside a named interface instance
+    ucas: [UCA-W-4]
+    hazards: [H-8, H-11]
+
+  - id: CC-W-5
+    controller: CTRL-WRAPPER
+    constraint: >
+      Wrapper must emit resource.rep and resource.new canon builtins for
+      all imported resources the fused module depends on
+    ucas: [UCA-W-5]
+    hazards: [H-8, H-11]
+
+  - id: CC-W-6
+    controller: CTRL-WRAPPER
+    constraint: >
+      Wrapper must bind destructors to correct fused module exports when
+      defining local resource types
+    ucas: [UCA-W-6]
+    hazards: [H-8, H-11, H-11.8]
+
+# =============================================================================
+# Fixture Failure → UCA Mapping
+# =============================================================================
+
+fixture-failure-mapping:
+  - fixture: resource_floats
+    failure-mode: "3-component borrow forwarding uses wrong resource.rep table"
+    primary-uca: UCA-A-20
+    secondary-ucas: [UCA-A-15]
+    loss-scenario: LS-RH-2
+    root-cause: >
+      First-match strategy in analyze_call_site selects wrong [resource-rep]
+      import when multiple candidates exist from different components.
+    recommended-sr: SR-35
+
+  - fixture: resource_aggregates
+    failure-mode: "own<T> handle assertion failure — rep misinterpreted as handle"
+    primary-uca: UCA-A-17
+    secondary-ucas: [UCA-A-18]
+    loss-scenario: LS-RH-3
+    root-cause: >
+      Adapter does not call [resource-new] on own<T> return values. Callee
+      returns rep, caller interprets it as handle index.
+    recommended-sr: SR-33
+
+  - fixture: ownership
+    failure-mode: "Resource ownership transfer trap"
+    primary-uca: UCA-A-18
+    secondary-ucas: [UCA-A-17]
+    loss-scenario: LS-RH-5
+    root-cause: >
+      Adapter does not clean up source-side handle table entry when own<T>
+      ownership transfers. Handle leaks lead to double-free or stale handle
+      access.
+    recommended-sr: SR-34
+
+  - fixture: resource_borrow_in_record
+    failure-mode: "borrow<T> inside record not converted"
+    primary-uca: UCA-A-16
+    secondary-ucas: [UCA-P-11]
+    loss-scenario: LS-RH-4
+    root-cause: >
+      resource_param_positions does not recurse into record fields to detect
+      borrow<T>. Handle passes through without conversion.
+    recommended-sr: SR-32
+
+  - fixture: resource_with_lists
+    failure-mode: "Data corruption in resource+list combination"
+    primary-uca: UCA-A-16
+    secondary-ucas: [UCA-A-17]
+    loss-scenario: LS-RH-7
+    root-cause: >
+      CopyLayout and resource detection are independent subsystems. Neither
+      handles the intersection: resource handles inside list elements or
+      alongside list pointer pairs in return areas.
+    recommended-sr: SR-32
+
+  - fixture: resource-import-and-export
+    failure-mode: "P2 wrapper cannot resolve toplevel resource import"
+    primary-uca: UCA-W-4
+    secondary-ucas: [UCA-W-5]
+    loss-scenario: LS-RH-6
+    root-cause: >
+      resolve_import_to_instance does not handle resource imports at the
+      component level (outside of named interface instances). Fallback
+      Category C only covers [resource-drop], not [resource-rep]/[resource-new].
+    recommended-sr: SR-37
