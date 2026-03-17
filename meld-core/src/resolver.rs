@@ -96,9 +96,12 @@ pub enum CopyLayout {
     /// Element-wise copy: `len` elements of `element_size` bytes each.
     /// `inner_pointers` lists byte offsets within each element where (ptr, len)
     /// pairs exist, along with their own recursive copy layout.
+    /// `inner_resources` lists byte offsets of resource handles that need
+    /// conversion after bulk copy.
     Elements {
         element_size: u32,
         inner_pointers: Vec<(u32, CopyLayout)>,
+        inner_resources: Vec<(u32, u32, bool)>, // (byte_offset, resource_type_id, is_owned)
     },
 }
 
@@ -3009,6 +3012,7 @@ mod tests {
             CopyLayout::Elements {
                 element_size,
                 inner_pointers,
+                ..
             } => {
                 assert_eq!(
                     element_size, 8,
@@ -3056,6 +3060,7 @@ mod tests {
             CopyLayout::Elements {
                 element_size,
                 inner_pointers,
+                ..
             } => {
                 // Record layout: string at offset 0 (8 bytes: ptr + len, align 4),
                 // then u32 at offset 8 (4 bytes, align 4). Unpadded size = 12.
@@ -3103,6 +3108,7 @@ mod tests {
             CopyLayout::Elements {
                 element_size,
                 inner_pointers,
+                ..
             } => {
                 assert_eq!(
                     element_size, 8,

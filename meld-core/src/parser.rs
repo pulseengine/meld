@@ -2396,7 +2396,8 @@ impl ParsedComponent {
             ComponentValType::List(inner) => {
                 let element_size = self.canonical_abi_element_size(inner);
                 let inner_ptrs = self.element_inner_pointers(inner, 0);
-                if inner_ptrs.is_empty() {
+                let inner_res = self.element_inner_resources(inner, 0);
+                if inner_ptrs.is_empty() && inner_res.is_empty() {
                     CopyLayout::Bulk {
                         byte_multiplier: element_size,
                     }
@@ -2404,6 +2405,7 @@ impl ParsedComponent {
                     CopyLayout::Elements {
                         element_size,
                         inner_pointers: inner_ptrs,
+                        inner_resources: inner_res,
                     }
                 }
             }
@@ -2467,6 +2469,47 @@ impl ParsedComponent {
                 }
             }
             _ => {} // scalars, options, results — no pointer pairs
+        }
+        result
+    }
+
+    /// Find resource handles embedded within a composite type's memory layout.
+    /// Returns `(byte_offset, resource_type_id, is_owned)` for each resource found.
+    fn element_inner_resources(&self, ty: &ComponentValType, base: u32) -> Vec<(u32, u32, bool)> {
+        let mut result = Vec::new();
+        match ty {
+            ComponentValType::Own(id) => {
+                result.push((base, *id, true));
+            }
+            ComponentValType::Borrow(id) => {
+                result.push((base, *id, false));
+            }
+            ComponentValType::Record(fields) => {
+                let mut offset = base;
+                for (_, field_ty) in fields {
+                    let align = self.canonical_abi_align(field_ty);
+                    offset = align_up(offset, align);
+                    result.extend(self.element_inner_resources(field_ty, offset));
+                    offset += self.canonical_abi_size_unpadded(field_ty);
+                }
+            }
+            ComponentValType::Tuple(elems) => {
+                let mut offset = base;
+                for elem_ty in elems {
+                    let align = self.canonical_abi_align(elem_ty);
+                    offset = align_up(offset, align);
+                    result.extend(self.element_inner_resources(elem_ty, offset));
+                    offset += self.canonical_abi_size_unpadded(elem_ty);
+                }
+            }
+            ComponentValType::Type(idx) => {
+                if let Some(ct) = self.get_type_definition(*idx)
+                    && let ComponentTypeKind::Defined(inner) = &ct.kind
+                {
+                    return self.element_inner_resources(inner, base);
+                }
+            }
+            _ => {} // scalars, strings, lists, options, variants — skip
         }
         result
     }
@@ -3422,6 +3465,7 @@ mod tests {
             crate::resolver::CopyLayout::Elements {
                 element_size,
                 inner_pointers,
+                ..
             } => {
                 assert_eq!(
                     element_size, 8,

@@ -351,6 +351,29 @@ impl FactStyleGenerator {
             }
         }
 
+        // Resolve inner resource handles from param copy layouts.
+        // When list elements contain borrow<T>, the adapter must convert
+        // each handle after bulk-copying the list data to callee memory.
+        for layout in &site.requirements.param_copy_layouts {
+            if let crate::resolver::CopyLayout::Elements {
+                inner_resources, ..
+            } = layout
+            {
+                for &(byte_offset, _resource_type_id, is_owned) in inner_resources {
+                    if is_owned {
+                        continue; // own<T> in lists — callee handles internally
+                    }
+                    // Find any [resource-rep] import for borrow handles.
+                    // For 2-component (callee defines), use callee's rep.
+                    // For 3-component, would need caller's rep + callee's new.
+                    // For now, find ANY matching [resource-rep] import.
+                    if let Some(&rep_func) = resource_rep_imports.values().next() {
+                        options.inner_resource_fixups.push((byte_offset, rep_func));
+                    }
+                }
+            }
+        }
+
         options
     }
 
@@ -600,6 +623,8 @@ impl FactStyleGenerator {
 
         let has_resource_ops = !options.resource_rep_calls.is_empty();
 
+        let has_inner_resource_fixups = !options.inner_resource_fixups.is_empty();
+
         // If no copying, no post-return save, and no resource ops needed, direct call
         if !needs_outbound_copy
             && !needs_conditional_copy
@@ -607,6 +632,7 @@ impl FactStyleGenerator {
             && !needs_conditional_result_copy
             && !needs_post_return_save
             && !has_resource_ops
+            && !has_inner_resource_fixups
         {
             let mut func = Function::new([]);
             for i in 0..param_count {
@@ -624,14 +650,17 @@ impl FactStyleGenerator {
             0
         };
         let inner_fixup_locals: u32 = 4 * nonretptr_fixup_depth;
+        let inner_resource_locals: u32 = if has_inner_resource_fixups { 1 } else { 0 }; // loop counter
         let copy_scratch_count: u32 = if needs_outbound_copy && needs_result_copy {
-            4 + inner_fixup_locals // dest_ptr + callee_ret_ptr + callee_ret_len + caller_new_ptr + fixup
+            4 + inner_fixup_locals + inner_resource_locals
         } else if needs_result_copy {
             3 // callee_ret_ptr + callee_ret_len + caller_new_ptr
         } else if needs_outbound_copy {
-            1 + inner_fixup_locals // dest_ptr + fixup
+            1 + inner_fixup_locals + inner_resource_locals // dest_ptr + fixup + resource loop
         } else if needs_conditional_copy || needs_conditional_result_copy {
             1 // dest_ptr for conditional copy (param or result side)
+        } else if has_inner_resource_fixups {
+            1 + inner_resource_locals // dest_ptr + resource loop counter
         } else {
             0 // post-return-only path (no copy needed)
         };
@@ -721,6 +750,7 @@ impl FactStyleGenerator {
             if let Some(crate::resolver::CopyLayout::Elements {
                 element_size,
                 inner_pointers,
+                ..
             }) = site.requirements.param_copy_layouts.first()
                 && !inner_pointers.is_empty()
             {
@@ -737,6 +767,65 @@ impl FactStyleGenerator {
                     callee_realloc,
                     fixup_base,
                 );
+            }
+
+            // 2c. Fix up inner resource handles if element type contains borrow<T>
+            if !options.inner_resource_fixups.is_empty()
+                && let Some(crate::resolver::CopyLayout::Elements { element_size, .. }) =
+                    site.requirements.param_copy_layouts.first()
+            {
+                let element_size = *element_size;
+                // Use inner_fixup_locals for loop counter
+                let loop_idx = dest_ptr_local + 1 + inner_fixup_locals;
+                func.instruction(&Instruction::I32Const(0));
+                func.instruction(&Instruction::LocalSet(loop_idx));
+                // block $exit { loop $cont {
+                func.instruction(&Instruction::Block(wasm_encoder::BlockType::Empty));
+                func.instruction(&Instruction::Loop(wasm_encoder::BlockType::Empty));
+                // if loop_idx >= len: break
+                func.instruction(&Instruction::LocalGet(loop_idx));
+                func.instruction(&Instruction::LocalGet(1)); // len
+                func.instruction(&Instruction::I32GeU);
+                func.instruction(&Instruction::BrIf(1));
+                for &(byte_offset, rep_func) in &options.inner_resource_fixups {
+                    // addr = dest_ptr + loop_idx * element_size + byte_offset
+                    // i32.store needs [addr, value] on stack.
+                    // Emit: addr, addr, i32.load → handle, call rep → rep, i32.store
+                    // First push addr for the store:
+                    func.instruction(&Instruction::LocalGet(dest_ptr_local));
+                    func.instruction(&Instruction::LocalGet(loop_idx));
+                    func.instruction(&Instruction::I32Const(element_size as i32));
+                    func.instruction(&Instruction::I32Mul);
+                    func.instruction(&Instruction::I32Add);
+                    // Stack: [addr_for_store]
+                    // Now load handle from same addr using offset
+                    func.instruction(&Instruction::LocalGet(dest_ptr_local));
+                    func.instruction(&Instruction::LocalGet(loop_idx));
+                    func.instruction(&Instruction::I32Const(element_size as i32));
+                    func.instruction(&Instruction::I32Mul);
+                    func.instruction(&Instruction::I32Add);
+                    func.instruction(&Instruction::I32Load(wasm_encoder::MemArg {
+                        offset: byte_offset as u64,
+                        align: 2,
+                        memory_index: options.callee_memory,
+                    }));
+                    // Stack: [addr_for_store, handle]
+                    func.instruction(&Instruction::Call(rep_func));
+                    // Stack: [addr_for_store, rep]
+                    func.instruction(&Instruction::I32Store(wasm_encoder::MemArg {
+                        offset: byte_offset as u64,
+                        align: 2,
+                        memory_index: options.callee_memory,
+                    }));
+                }
+                // loop_idx++
+                func.instruction(&Instruction::LocalGet(loop_idx));
+                func.instruction(&Instruction::I32Const(1));
+                func.instruction(&Instruction::I32Add);
+                func.instruction(&Instruction::LocalSet(loop_idx));
+                func.instruction(&Instruction::Br(0));
+                func.instruction(&Instruction::End); // loop
+                func.instruction(&Instruction::End); // block
             }
 
             // 3. Call target with (dest_ptr, len, ...remaining args)
@@ -1020,6 +1109,9 @@ impl FactStyleGenerator {
         scratch_count += 1;
         let fixup_locals_base = caller_param_count as u32 + scratch_count;
         scratch_count += 4 * max_fixup_depth; // 4 locals per nesting level
+        if !options.inner_resource_fixups.is_empty() {
+            scratch_count += 1; // resource loop counter
+        }
 
         let local_decls = vec![(scratch_count, wasm_encoder::ValType::I32)];
         let mut func = Function::new(local_decls);
@@ -1073,6 +1165,7 @@ impl FactStyleGenerator {
                 if let Some(crate::resolver::CopyLayout::Elements {
                     element_size,
                     inner_pointers,
+                    ..
                 }) = param_layouts.get(pair_idx)
                     && !inner_pointers.is_empty()
                 {
@@ -1088,6 +1181,59 @@ impl FactStyleGenerator {
                         callee_realloc,
                         fixup_locals_base,
                     );
+                }
+
+                // Fix up inner resource handles after bulk copy
+                if let Some(crate::resolver::CopyLayout::Elements {
+                    element_size,
+                    inner_resources,
+                    ..
+                }) = param_layouts.get(pair_idx)
+                    && !inner_resources.is_empty()
+                    && !options.inner_resource_fixups.is_empty()
+                {
+                    let element_size = *element_size;
+                    let res_loop_idx = fixup_locals_base + 4 * max_fixup_depth;
+                    func.instruction(&Instruction::I32Const(0));
+                    func.instruction(&Instruction::LocalSet(res_loop_idx));
+                    func.instruction(&Instruction::Block(wasm_encoder::BlockType::Empty));
+                    func.instruction(&Instruction::Loop(wasm_encoder::BlockType::Empty));
+                    func.instruction(&Instruction::LocalGet(res_loop_idx));
+                    func.instruction(&Instruction::LocalGet(len_pos));
+                    func.instruction(&Instruction::I32GeU);
+                    func.instruction(&Instruction::BrIf(1));
+                    for &(byte_offset, rep_func) in &options.inner_resource_fixups {
+                        // Push addr for store
+                        func.instruction(&Instruction::LocalGet(dest_local));
+                        func.instruction(&Instruction::LocalGet(res_loop_idx));
+                        func.instruction(&Instruction::I32Const(element_size as i32));
+                        func.instruction(&Instruction::I32Mul);
+                        func.instruction(&Instruction::I32Add);
+                        // Load handle
+                        func.instruction(&Instruction::LocalGet(dest_local));
+                        func.instruction(&Instruction::LocalGet(res_loop_idx));
+                        func.instruction(&Instruction::I32Const(element_size as i32));
+                        func.instruction(&Instruction::I32Mul);
+                        func.instruction(&Instruction::I32Add);
+                        func.instruction(&Instruction::I32Load(wasm_encoder::MemArg {
+                            offset: byte_offset as u64,
+                            align: 2,
+                            memory_index: options.callee_memory,
+                        }));
+                        func.instruction(&Instruction::Call(rep_func));
+                        func.instruction(&Instruction::I32Store(wasm_encoder::MemArg {
+                            offset: byte_offset as u64,
+                            align: 2,
+                            memory_index: options.callee_memory,
+                        }));
+                    }
+                    func.instruction(&Instruction::LocalGet(res_loop_idx));
+                    func.instruction(&Instruction::I32Const(1));
+                    func.instruction(&Instruction::I32Add);
+                    func.instruction(&Instruction::LocalSet(res_loop_idx));
+                    func.instruction(&Instruction::Br(0));
+                    func.instruction(&Instruction::End);
+                    func.instruction(&Instruction::End);
                 }
             }
         }
@@ -1238,6 +1384,7 @@ impl FactStyleGenerator {
                     if let Some(crate::resolver::CopyLayout::Elements {
                         element_size,
                         inner_pointers,
+                        ..
                     }) = result_layouts.get(result_pair_idx)
                         && !inner_pointers.is_empty()
                     {
@@ -1583,6 +1730,7 @@ impl FactStyleGenerator {
             if let crate::resolver::CopyLayout::Elements {
                 element_size: inner_elem_size,
                 inner_pointers: inner_inner,
+                ..
             } = inner_layout
                 && !inner_inner.is_empty()
             {
