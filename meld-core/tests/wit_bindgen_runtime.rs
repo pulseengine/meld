@@ -650,7 +650,8 @@ fuse_only_test!(
     test_fuse_wit_bindgen_resource_aggregates,
     "resource_aggregates"
 );
-// resource_floats: 3-component borrow forwarding needs caller→callee handle transfer
+// resource_floats: adapter produces correct rep→new_handle chain, but P2 wrapper
+// resource type mismatch between [resource-new] and [resource-rep] for intermediate
 fuse_only_test!(test_fuse_wit_bindgen_resource_floats, "resource_floats");
 fuse_only_test!(
     test_fuse_wit_bindgen_resource_borrow_in_record,

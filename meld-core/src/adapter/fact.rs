@@ -220,14 +220,6 @@ impl FactStyleGenerator {
         //
         // Results are never converted — own results have resource.new called
         // by the callee's core function, and borrows cannot appear in results.
-        // Build caller resource params index by flat_idx for quick lookup
-        let caller_ops: std::collections::HashMap<u32, &crate::resolver::ResolvedResourceOp> = site
-            .requirements
-            .caller_resource_params
-            .iter()
-            .map(|op| (op.flat_idx, op))
-            .collect();
-
         for op in &site.requirements.resource_params {
             if op.is_owned {
                 continue; // own<T>: callee handles conversion internally
@@ -249,51 +241,66 @@ impl FactStyleGenerator {
                 }
             } else {
                 // 3-component case: callee doesn't define the resource.
-                // Use caller's [resource-rep] to convert handle → rep,
-                // then callee's [resource-new] to create handle in callee's table.
-                //
-                // Find the caller's [resource-rep] by matching the resource name
-                // from the callee's import field (e.g., "float" from "[resource-rep]float").
+                // Use caller's [resource-rep] + callee's [resource-new].
                 let resource_name = op
                     .import_field
                     .strip_prefix("[resource-rep]")
                     .unwrap_or(&op.import_field);
 
-                // Look for a [resource-rep]<name> import from a DIFFERENT module than callee's
-                let caller_rep = resource_rep_imports
-                    .iter()
-                    .find(|((module, field), _)| {
-                        field.ends_with(resource_name)
-                            && field.starts_with("[resource-rep]")
-                            && *module != op.import_module
+                // Primary: per-component map from MergedModule
+                let caller_rep_func = merged
+                    .resource_rep_by_component
+                    .get(&(site.from_component, resource_name.to_string()))
+                    .copied()
+                    .or_else(|| {
+                        // Fallback: find any [resource-rep] for this resource name
+                        // that isn't the callee's (different component index).
+                        merged
+                            .resource_rep_by_component
+                            .iter()
+                            .find(|((comp, rn), _)| {
+                                rn == resource_name && *comp != site.to_component
+                            })
+                            .map(|(_, &idx)| idx)
                     })
                     .or_else(|| {
-                        // Fallback: try caller_resource_params if available
-                        caller_ops.get(&op.flat_idx).and_then(|caller_op| {
-                            resource_rep_imports.get_key_value(&(
-                                caller_op.import_module.clone(),
-                                caller_op.import_field.clone(),
-                            ))
-                        })
+                        // Last resort: flat map with different module heuristic
+                        resource_rep_imports
+                            .iter()
+                            .find(|((module, field), _)| {
+                                field.ends_with(resource_name)
+                                    && field.starts_with("[resource-rep]")
+                                    && *module != op.import_module
+                            })
+                            .map(|(_, &idx)| idx)
                     });
 
-                if let Some((_, &rep_func)) = caller_rep {
-                    let new_field = op.import_field.replace("[resource-rep]", "[resource-new]");
-                    let new_func = resource_new_imports
-                        .get(&(op.import_module.clone(), new_field))
-                        .copied();
+                let callee_new_func = merged
+                    .resource_new_by_component
+                    .get(&(site.to_component, resource_name.to_string()))
+                    .copied()
+                    .or_else(|| {
+                        let new_field = op.import_field.replace("[resource-rep]", "[resource-new]");
+                        resource_new_imports
+                            .get(&(op.import_module.clone(), new_field))
+                            .copied()
+                    });
+
+                if let Some(rep_func) = caller_rep_func {
                     options
                         .resource_rep_calls
                         .push(super::ResourceBorrowTransfer {
                             param_idx: op.flat_idx,
                             rep_func,
-                            new_func,
+                            new_func: callee_new_func,
                         });
                 } else {
-                    log::debug!(
-                        "No caller resource rep found for {} at flat_idx {}",
+                    log::warn!(
+                        "3-component borrow: no caller [resource-rep] for '{}' \
+                         (from_comp={}, to_comp={})",
                         resource_name,
-                        op.flat_idx
+                        site.from_component,
+                        site.to_component,
                     );
                 }
             }

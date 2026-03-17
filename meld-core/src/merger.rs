@@ -121,6 +121,14 @@ pub struct MergedModule {
     /// of the component's cabi_realloc. Used by component_wrap to select the
     /// correct CanonicalOption::Realloc(N) per import.
     pub import_realloc_indices: Vec<Option<u32>>,
+
+    /// Maps (component_idx, resource_name) → merged function index for [resource-rep].
+    /// Used by adapter generation to find the correct component's [resource-rep]
+    /// in multi-component chains where multiple components have the same resource.
+    pub resource_rep_by_component: HashMap<(usize, String), u32>,
+
+    /// Maps (component_idx, resource_name) → merged function index for [resource-new].
+    pub resource_new_by_component: HashMap<(usize, String), u32>,
 }
 
 /// Function type in merged module
@@ -446,6 +454,8 @@ impl Merger {
             import_counts,
             import_memory_indices: Vec::new(),
             import_realloc_indices: Vec::new(),
+            resource_rep_by_component: HashMap::new(),
+            resource_new_by_component: HashMap::new(),
         };
 
         // Process components in topological order
@@ -1356,9 +1366,37 @@ impl Merger {
                         unresolved.field_name.clone(),
                     ));
                     if !is_type_mismatch && !emitted_func.insert(dedup_key.clone()) {
-                        // Duplicate with matching type — skip emitting. Position
-                        // was already handled by compute_unresolved_import_assignments
-                        // using the same dedup_key → same position logic.
+                        // Duplicate with matching type — skip emitting.
+                        // Still record per-component resource tracking: find the
+                        // func index already assigned to this resource name.
+                        let eff_field = &dedup_key.1;
+                        if let Some(rn) = eff_field.strip_prefix("[resource-rep]") {
+                            if let Some(&idx) =
+                                merged.resource_rep_by_component.values().find(|&&idx| {
+                                    merged.imports.get(idx as usize).map_or(false, |imp| {
+                                        imp.name.starts_with("[resource-rep]")
+                                            && imp.name.ends_with(rn)
+                                    })
+                                })
+                            {
+                                merged
+                                    .resource_rep_by_component
+                                    .insert((unresolved.component_idx, rn.to_string()), idx);
+                            }
+                        } else if let Some(rn) = eff_field.strip_prefix("[resource-new]") {
+                            if let Some(&idx) =
+                                merged.resource_new_by_component.values().find(|&&idx| {
+                                    merged.imports.get(idx as usize).map_or(false, |imp| {
+                                        imp.name.starts_with("[resource-new]")
+                                            && imp.name.ends_with(rn)
+                                    })
+                                })
+                            {
+                                merged
+                                    .resource_new_by_component
+                                    .insert((unresolved.component_idx, rn.to_string()), idx);
+                            }
+                        }
                         continue;
                     }
 
@@ -1414,6 +1452,19 @@ impl Merger {
                         name,
                         entity_type: EntityType::Function(new_type_idx),
                     });
+
+                    // Track per-component resource import indices.
+                    let merged_func_idx = func_position - 1;
+                    let eff_field = &dedup_key.1;
+                    if let Some(rn) = eff_field.strip_prefix("[resource-rep]") {
+                        merged
+                            .resource_rep_by_component
+                            .insert((unresolved.component_idx, rn.to_string()), merged_func_idx);
+                    } else if let Some(rn) = eff_field.strip_prefix("[resource-new]") {
+                        merged
+                            .resource_new_by_component
+                            .insert((unresolved.component_idx, rn.to_string()), merged_func_idx);
+                    }
                 }
                 ImportKind::Table(t) => {
                     if !emitted_table.insert(dedup_key.clone()) {
@@ -2455,6 +2506,8 @@ mod tests {
             import_counts: ImportCounts::default(),
             import_memory_indices: Vec::new(),
             import_realloc_indices: Vec::new(),
+            resource_rep_by_component: HashMap::new(),
+            resource_new_by_component: HashMap::new(),
         };
 
         // Simulate multi-memory merging for module A (comp 0, mod 0)
