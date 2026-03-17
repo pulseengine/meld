@@ -138,6 +138,8 @@ pub struct AdapterOptions {
     ///
     /// `own<T>` params are never converted (callee calls from_handle internally).
     pub resource_rep_calls: Vec<ResourceBorrowTransfer>,
+    /// Resource own<T> results needing rep→handle conversion (3-component chains).
+    pub resource_new_calls: Vec<ResourceOwnResultTransfer>,
 }
 
 /// Describes how to transfer a `borrow<T>` handle across an adapter boundary.
@@ -153,6 +155,17 @@ pub struct ResourceBorrowTransfer {
     pub new_func: Option<u32>,
 }
 
+/// Describes how to convert an `own<T>` result via `[resource-new]`.
+#[derive(Debug, Clone)]
+pub struct ResourceOwnResultTransfer {
+    /// Flat result index (non-retptr path)
+    pub position: u32,
+    /// Byte offset in return area (retptr path)
+    pub byte_offset: u32,
+    /// Merged function index of `[resource-new]`
+    pub new_func: u32,
+}
+
 impl Default for AdapterOptions {
     fn default() -> Self {
         Self {
@@ -165,6 +178,7 @@ impl Default for AdapterOptions {
             returns_pointer_pair: false,
             callee_post_return: None,
             resource_rep_calls: Vec::new(),
+            resource_new_calls: Vec::new(),
         }
     }
 }

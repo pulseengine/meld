@@ -77,6 +77,22 @@ fn emit_resource_borrow_phase0(func: &mut Function, transfers: &[super::Resource
     }
 }
 
+/// Emit Phase R: convert own<T> results via [resource-new] for 3-component chains.
+/// Results are in locals starting at `result_base`. For each result that needs
+/// conversion, load from local, call resource.new, store back.
+fn emit_resource_new_results(
+    func: &mut Function,
+    transfers: &[super::ResourceOwnResultTransfer],
+    result_base: u32,
+) {
+    for t in transfers {
+        let local_idx = result_base + t.position;
+        func.instruction(&Instruction::LocalGet(local_idx));
+        func.instruction(&Instruction::Call(t.new_func));
+        func.instruction(&Instruction::LocalSet(local_idx));
+    }
+}
+
 /// FACT-style adapter generator
 pub struct FactStyleGenerator {
     #[allow(dead_code)]
@@ -218,8 +234,6 @@ impl FactStyleGenerator {
         // function calls from_handle/resource.rep internally, so the adapter
         // must NOT convert them (that would cause double conversion).
         //
-        // Results are never converted — own results have resource.new called
-        // by the callee's core function, and borrows cannot appear in results.
         for op in &site.requirements.resource_params {
             if op.is_owned {
                 continue; // own<T>: callee handles conversion internally
@@ -306,6 +320,37 @@ impl FactStyleGenerator {
             }
         }
 
+        // Resolve own<T> results that need [resource-new] conversion.
+        // Only for 3-component chains where callee doesn't define the resource.
+        // When the callee defines it, the P2 wrapper handles lift/lower.
+        for op in &site.requirements.resource_results {
+            if !op.is_owned || op.callee_defines_resource {
+                continue;
+            }
+            let resource_name = op
+                .import_field
+                .strip_prefix("[resource-new]")
+                .unwrap_or(&op.import_field);
+            let new_func = merged
+                .resource_new_by_component
+                .get(&(site.from_component, resource_name.to_string()))
+                .copied()
+                .or_else(|| {
+                    resource_new_imports
+                        .get(&(op.import_module.clone(), op.import_field.clone()))
+                        .copied()
+                });
+            if let Some(new_func) = new_func {
+                options
+                    .resource_new_calls
+                    .push(super::ResourceOwnResultTransfer {
+                        position: op.flat_idx,
+                        byte_offset: op.byte_offset,
+                        new_func,
+                    });
+            }
+        }
+
         options
     }
 
@@ -332,11 +377,13 @@ impl FactStyleGenerator {
 
         let has_post_return = options.callee_post_return.is_some();
         let has_resource_ops = !options.resource_rep_calls.is_empty();
+        let has_result_resource_ops = !options.resource_new_calls.is_empty();
+        let needs_result_locals = (has_post_return || has_result_resource_ops) && result_count > 0;
 
-        if has_resource_ops || (has_post_return && result_count > 0) {
+        if has_resource_ops || has_result_resource_ops || (has_post_return && result_count > 0) {
             let mut locals: Vec<(u32, wasm_encoder::ValType)> = Vec::new();
             let result_base = param_count as u32;
-            if has_post_return && result_count > 0 {
+            if needs_result_locals {
                 locals.extend(result_types.iter().map(|t| (1u32, *t)));
             }
             let mut func = Function::new(locals);
@@ -349,16 +396,22 @@ impl FactStyleGenerator {
             }
             func.instruction(&Instruction::Call(target_func));
 
-            if has_post_return && result_count > 0 {
+            if needs_result_locals {
                 // Save results to locals (pop in reverse order)
                 for i in (0..result_count).rev() {
                     func.instruction(&Instruction::LocalSet(result_base + i as u32));
                 }
+
+                // Phase R: Convert own<T> results via resource.new
+                emit_resource_new_results(&mut func, &options.resource_new_calls, result_base);
+
                 // Call post-return with saved results
-                for i in 0..result_count {
-                    func.instruction(&Instruction::LocalGet(result_base + i as u32));
+                if has_post_return {
+                    for i in 0..result_count {
+                        func.instruction(&Instruction::LocalGet(result_base + i as u32));
+                    }
+                    func.instruction(&Instruction::Call(options.callee_post_return.unwrap()));
                 }
-                func.instruction(&Instruction::Call(options.callee_post_return.unwrap()));
                 // Push saved results back onto stack
                 for i in 0..result_count {
                     func.instruction(&Instruction::LocalGet(result_base + i as u32));
