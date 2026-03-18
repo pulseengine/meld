@@ -662,7 +662,7 @@ fuse_only_test!(
     test_fuse_wit_bindgen_resource_with_lists,
     "resource_with_lists"
 );
-fuse_only_test!(test_fuse_wit_bindgen_ownership, "ownership");
+runtime_test!(test_runtime_wit_bindgen_ownership, "ownership");
 runtime_test!(test_runtime_wit_bindgen_xcrate, "xcrate");
 
 // resource-import-and-export: core fusion works, P2 wrapping fails on toplevel-import
