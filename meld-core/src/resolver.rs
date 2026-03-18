@@ -1156,15 +1156,6 @@ impl Resolver {
     }
 
     /// Resolve component-level imports against exports
-    fn resolve_component_imports(
-        &self,
-        components: &[ParsedComponent],
-        export_index: &HashMap<String, Vec<(usize, &ComponentExport)>>,
-        graph: &mut DependencyGraph,
-    ) -> Result<()> {
-        self.resolve_component_imports_with_hints(components, export_index, graph, &HashMap::new())
-    }
-
     fn resolve_component_imports_with_hints(
         &self,
         components: &[ParsedComponent],
