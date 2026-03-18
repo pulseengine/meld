@@ -888,6 +888,7 @@ fn propagate_outer_wiring(
     // Component instances created by ComponentInstanceSection are numbered
     // sequentially. Each maps to either an instantiation of a sub-component
     // or a bag of exports.
+    #[derive(Clone)]
     struct InstanceInfo {
         /// If this instance was created by instantiating a sub-component,
         /// this is the sub-component index in the original (pre-flattened)
@@ -895,21 +896,50 @@ fn propagate_outer_wiring(
         sub_component_idx: Option<u32>,
     }
 
-    let mut instance_infos: Vec<InstanceInfo> = Vec::new();
-    for ci in &outer.component_instances {
-        match ci {
-            ComponentLevelInstance::Instantiate {
-                component_index, ..
-            } => {
-                instance_infos.push(InstanceInfo {
-                    sub_component_idx: Some(*component_index),
-                });
+    // Build instance info map indexed by ABSOLUTE instance index (not just
+    // ComponentInstanceSection position). This handles imports, instantiations,
+    // and alias-created instances.
+    let mut instance_infos: std::collections::HashMap<u32, InstanceInfo> =
+        std::collections::HashMap::new();
+    for (abs_idx, def) in outer.component_instance_defs.iter().enumerate() {
+        match def {
+            parser::ComponentInstanceDef::Instance(ci_idx) => {
+                if let Some(ci) = outer.component_instances.get(*ci_idx) {
+                    match ci {
+                        ComponentLevelInstance::Instantiate {
+                            component_index, ..
+                        } => {
+                            instance_infos.insert(
+                                abs_idx as u32,
+                                InstanceInfo {
+                                    sub_component_idx: Some(*component_index),
+                                },
+                            );
+                        }
+                        ComponentLevelInstance::FromExports(_) => {
+                            instance_infos.insert(
+                                abs_idx as u32,
+                                InstanceInfo {
+                                    sub_component_idx: None,
+                                },
+                            );
+                        }
+                    }
+                }
             }
-            ComponentLevelInstance::FromExports(_) => {
-                instance_infos.push(InstanceInfo {
-                    sub_component_idx: None,
-                });
+            parser::ComponentInstanceDef::InstanceExportAlias(alias_idx) => {
+                // Chase alias: inherit the source instance's sub_component_idx
+                // so instantiation args referencing this alias are correctly wired.
+                if let Some(parser::ComponentAliasEntry::InstanceExport {
+                    instance_index, ..
+                }) = outer.component_aliases.get(*alias_idx)
+                {
+                    if let Some(info) = instance_infos.get(instance_index).cloned() {
+                        instance_infos.insert(abs_idx as u32, info);
+                    }
+                }
             }
+            parser::ComponentInstanceDef::Import(_) => {}
         }
     }
 
@@ -964,10 +994,8 @@ fn propagate_outer_wiring(
                 // component instance index. Check if it maps to another
                 // sub-component.
                 if *arg_kind == ComponentExternalKind::Instance {
-                    let source_inst_idx = *arg_index as usize;
-                    if source_inst_idx < instance_infos.len()
-                        && let Some(source_sub_idx) =
-                            instance_infos[source_inst_idx].sub_component_idx
+                    if let Some(info) = instance_infos.get(arg_index)
+                        && let Some(source_sub_idx) = info.sub_component_idx
                     {
                         let source_sub = source_sub_idx as usize;
                         if source_sub < sub_index_ranges.len() {
@@ -1018,10 +1046,8 @@ fn propagate_outer_wiring(
                     if alias_idx < alias_resolutions.len()
                         && let Some(alias_res) = &alias_resolutions[alias_idx]
                     {
-                        let source_inst_idx = alias_res.instance_index as usize;
-                        if source_inst_idx < instance_infos.len()
-                            && let Some(source_sub_idx) =
-                                instance_infos[source_inst_idx].sub_component_idx
+                        if let Some(info) = instance_infos.get(&alias_res.instance_index)
+                            && let Some(source_sub_idx) = info.sub_component_idx
                         {
                             let source_sub = source_sub_idx as usize;
                             if source_sub < sub_index_ranges.len() {
