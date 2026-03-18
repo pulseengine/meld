@@ -664,11 +664,15 @@ fuse_only_test!(
 fuse_only_test!(test_fuse_wit_bindgen_ownership, "ownership");
 runtime_test!(test_runtime_wit_bindgen_xcrate, "xcrate");
 
-// resource-import-and-export: core fusion works, P2 wrapping fails on toplevel-import
-fuse_only_test!(
-    test_fuse_wit_bindgen_resource_import_and_export,
-    "resource-import-and-export"
-);
+// resource-import-and-export: P2 wrapping works; runtime blocked on SR-33 (own<T> result)
+#[test]
+fn test_fuse_wit_bindgen_resource_import_and_export() {
+    if !fixture_exists("resource-import-and-export") {
+        return;
+    }
+    fuse_fixture("resource-import-and-export", OutputFormat::Component)
+        .expect("resource-import-and-export: component fusion should succeed");
+}
 
 // Type composition and misc fixtures
 runtime_test!(test_runtime_wit_bindgen_demo, "demo");

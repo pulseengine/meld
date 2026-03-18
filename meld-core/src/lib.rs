@@ -888,6 +888,7 @@ fn propagate_outer_wiring(
     // Component instances created by ComponentInstanceSection are numbered
     // sequentially. Each maps to either an instantiation of a sub-component
     // or a bag of exports.
+    #[derive(Clone)]
     struct InstanceInfo {
         /// If this instance was created by instantiating a sub-component,
         /// this is the sub-component index in the original (pre-flattened)
@@ -895,21 +896,47 @@ fn propagate_outer_wiring(
         sub_component_idx: Option<u32>,
     }
 
-    let mut instance_infos: Vec<InstanceInfo> = Vec::new();
-    for ci in &outer.component_instances {
-        match ci {
-            ComponentLevelInstance::Instantiate {
-                component_index, ..
-            } => {
-                instance_infos.push(InstanceInfo {
-                    sub_component_idx: Some(*component_index),
-                });
+    let mut instance_infos: std::collections::HashMap<u32, InstanceInfo> =
+        std::collections::HashMap::new();
+    for (abs_idx, def) in outer.component_instance_defs.iter().enumerate() {
+        match def {
+            parser::ComponentInstanceDef::Instance(ci_idx) => {
+                if let Some(ci) = outer.component_instances.get(*ci_idx) {
+                    match ci {
+                        ComponentLevelInstance::Instantiate {
+                            component_index, ..
+                        } => {
+                            instance_infos.insert(
+                                abs_idx as u32,
+                                InstanceInfo {
+                                    sub_component_idx: Some(*component_index),
+                                },
+                            );
+                        }
+                        ComponentLevelInstance::FromExports(_) => {
+                            instance_infos.insert(
+                                abs_idx as u32,
+                                InstanceInfo {
+                                    sub_component_idx: None,
+                                },
+                            );
+                        }
+                    }
+                }
             }
-            ComponentLevelInstance::FromExports(_) => {
-                instance_infos.push(InstanceInfo {
-                    sub_component_idx: None,
-                });
+            parser::ComponentInstanceDef::InstanceExportAlias(alias_idx) => {
+                // Chase alias: inherit the source instance's sub_component_idx
+                // so instantiation args referencing this alias are correctly wired.
+                if let Some(parser::ComponentAliasEntry::InstanceExport {
+                    instance_index, ..
+                }) = outer.component_aliases.get(*alias_idx)
+                {
+                    if let Some(info) = instance_infos.get(instance_index).cloned() {
+                        instance_infos.insert(abs_idx as u32, info);
+                    }
+                }
             }
+            parser::ComponentInstanceDef::Import(_) => {}
         }
     }
 
@@ -919,6 +946,9 @@ fn propagate_outer_wiring(
     struct AliasResolution {
         instance_index: u32,
         kind: ComponentExternalKind,
+        /// The actual export name from the source instance (may differ from
+        /// the arg name used in the instantiation wiring).
+        export_name: String,
     }
     let mut alias_resolutions: Vec<Option<AliasResolution>> = Vec::new();
     for alias in &outer.component_aliases {
@@ -926,11 +956,12 @@ fn propagate_outer_wiring(
             parser::ComponentAliasEntry::InstanceExport {
                 kind,
                 instance_index,
-                name: _,
+                name,
             } => {
                 alias_resolutions.push(Some(AliasResolution {
                     instance_index: *instance_index,
                     kind: *kind,
+                    export_name: name.clone(),
                 }));
             }
             _ => {
@@ -964,10 +995,8 @@ fn propagate_outer_wiring(
                 // component instance index. Check if it maps to another
                 // sub-component.
                 if *arg_kind == ComponentExternalKind::Instance {
-                    let source_inst_idx = *arg_index as usize;
-                    if source_inst_idx < instance_infos.len()
-                        && let Some(source_sub_idx) =
-                            instance_infos[source_inst_idx].sub_component_idx
+                    if let Some(info) = instance_infos.get(arg_index)
+                        && let Some(source_sub_idx) = info.sub_component_idx
                     {
                         let source_sub = source_sub_idx as usize;
                         if source_sub < sub_index_ranges.len() {
@@ -1006,22 +1035,43 @@ fn propagate_outer_wiring(
                     }
                 }
 
-                // For ComponentExternalKind::Component or other kinds, the arg
-                // might reference an alias. Try resolving via alias_resolutions.
-                if *arg_kind == ComponentExternalKind::Component
-                    || *arg_kind == ComponentExternalKind::Func
+                // For Func/Type/Component/Value kinds, arg_index is in the
+                // per-kind index space, not the alias section. Trace through
+                // component_func_defs / component_type_defs to find the alias.
+                if *arg_kind == ComponentExternalKind::Func
                     || *arg_kind == ComponentExternalKind::Type
+                    || *arg_kind == ComponentExternalKind::Component
                     || *arg_kind == ComponentExternalKind::Value
                 {
-                    // Try alias resolution
-                    let alias_idx = *arg_index as usize;
-                    if alias_idx < alias_resolutions.len()
+                    let resolved_alias_idx = match *arg_kind {
+                        ComponentExternalKind::Func => outer
+                            .component_func_defs
+                            .get(*arg_index as usize)
+                            .and_then(|def| {
+                                if let parser::ComponentFuncDef::InstanceExportAlias(ai) = def {
+                                    Some(*ai)
+                                } else {
+                                    None
+                                }
+                            }),
+                        ComponentExternalKind::Type => outer
+                            .component_type_defs
+                            .get(*arg_index as usize)
+                            .and_then(|def| {
+                                if let parser::ComponentTypeDef::InstanceExportAlias(ai) = def {
+                                    Some(*ai)
+                                } else {
+                                    None
+                                }
+                            }),
+                        _ => Some(*arg_index as usize),
+                    };
+                    if let Some(alias_idx) = resolved_alias_idx
+                        && alias_idx < alias_resolutions.len()
                         && let Some(alias_res) = &alias_resolutions[alias_idx]
                     {
-                        let source_inst_idx = alias_res.instance_index as usize;
-                        if source_inst_idx < instance_infos.len()
-                            && let Some(source_sub_idx) =
-                                instance_infos[source_inst_idx].sub_component_idx
+                        if let Some(info) = instance_infos.get(&alias_res.instance_index)
+                            && let Some(source_sub_idx) = info.sub_component_idx
                         {
                             let source_sub = source_sub_idx as usize;
                             if source_sub < sub_index_ranges.len() {
@@ -1047,10 +1097,37 @@ fn propagate_outer_wiring(
                                     result[source_flat_idx]
                                         .exports
                                         .push(parser::ComponentExport {
-                                            name: import_name,
+                                            name: import_name.clone(),
                                             kind: alias_res.kind,
                                             index: 0,
                                         });
+                                }
+                                // When the wiring renames an export (arg_name
+                                // differs from the alias's export_name), add a
+                                // synthetic core module export so the adapter
+                                // site finder can locate the function by
+                                // import_name.
+                                if import_name != alias_res.export_name {
+                                    for m in &mut result[source_flat_idx].core_modules {
+                                        if let Some(original) = m
+                                            .exports
+                                            .iter()
+                                            .find(|e| {
+                                                e.name == alias_res.export_name
+                                                    && e.kind == parser::ExportKind::Function
+                                            })
+                                            .cloned()
+                                        {
+                                            if !m.exports.iter().any(|e| e.name == import_name) {
+                                                m.exports.push(parser::ModuleExport {
+                                                    name: import_name,
+                                                    kind: original.kind,
+                                                    index: original.index,
+                                                });
+                                            }
+                                            break;
+                                        }
+                                    }
                                 }
                             }
                         }
