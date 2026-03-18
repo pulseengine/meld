@@ -651,12 +651,14 @@ impl FactStyleGenerator {
         };
         let inner_fixup_locals: u32 = 4 * nonretptr_fixup_depth;
         let inner_resource_locals: u32 = if has_inner_resource_fixups { 1 } else { 0 }; // loop counter
+        let num_param_pairs = site.requirements.pointer_pair_positions.len() as u32;
         let copy_scratch_count: u32 = if needs_outbound_copy && needs_result_copy {
-            4 + inner_fixup_locals + inner_resource_locals
+            num_param_pairs.max(1) + 3 + inner_fixup_locals + inner_resource_locals
         } else if needs_result_copy {
             3 // callee_ret_ptr + callee_ret_len + caller_new_ptr
         } else if needs_outbound_copy {
-            1 + inner_fixup_locals + inner_resource_locals // dest_ptr + fixup + resource loop
+            let num_pairs = site.requirements.pointer_pair_positions.len() as u32;
+            num_pairs.max(1) + inner_fixup_locals + inner_resource_locals
         } else if needs_conditional_copy || needs_conditional_result_copy {
             1 // dest_ptr for conditional copy (param or result side)
         } else if has_inner_resource_fixups {
@@ -709,65 +711,68 @@ impl FactStyleGenerator {
                 }
             };
 
-            // Get the byte multiplier from copy layout (default 1 for strings)
-            let byte_mult = site
-                .requirements
-                .param_copy_layouts
-                .first()
-                .map(|cl| match cl {
-                    crate::resolver::CopyLayout::Bulk { byte_multiplier } => *byte_multiplier,
-                    crate::resolver::CopyLayout::Elements { element_size, .. } => *element_size,
-                })
-                .unwrap_or(1);
+            // Copy ALL pointer pairs from caller to callee memory.
+            let param_ptr_positions = &site.requirements.pointer_pair_positions;
+            let param_layouts = &site.requirements.param_copy_layouts;
+            for (pair_idx, &ptr_pos) in param_ptr_positions.iter().enumerate() {
+                let len_pos = ptr_pos + 1;
+                let dest_local = dest_ptr_local + pair_idx as u32;
+                let byte_mult = param_layouts
+                    .get(pair_idx)
+                    .map(|cl| match cl {
+                        crate::resolver::CopyLayout::Bulk { byte_multiplier } => *byte_multiplier,
+                        crate::resolver::CopyLayout::Elements { element_size, .. } => *element_size,
+                    })
+                    .unwrap_or(1);
 
-            // 1. Compute byte_size = len * byte_multiplier
-            //    Allocate in callee's memory: dest_ptr = cabi_realloc(0, 0, align, byte_size)
-            func.instruction(&Instruction::I32Const(0)); // original_ptr
-            func.instruction(&Instruction::I32Const(0)); // original_size
-            func.instruction(&Instruction::I32Const(1)); // alignment
-            func.instruction(&Instruction::LocalGet(1)); // len (element count)
-            if byte_mult > 1 {
-                func.instruction(&Instruction::I32Const(byte_mult as i32));
-                func.instruction(&Instruction::I32Mul);
-            }
-            func.instruction(&Instruction::Call(callee_realloc));
-            func.instruction(&Instruction::LocalSet(dest_ptr_local));
+                // Allocate: dest = cabi_realloc(0, 0, 1, len * byte_mult)
+                func.instruction(&Instruction::I32Const(0));
+                func.instruction(&Instruction::I32Const(0));
+                func.instruction(&Instruction::I32Const(1));
+                func.instruction(&Instruction::LocalGet(len_pos));
+                if byte_mult > 1 {
+                    func.instruction(&Instruction::I32Const(byte_mult as i32));
+                    func.instruction(&Instruction::I32Mul);
+                }
+                func.instruction(&Instruction::Call(callee_realloc));
+                func.instruction(&Instruction::LocalSet(dest_local));
 
-            // 2. Copy data: memory.copy $callee_mem $caller_mem (dest_ptr, src_ptr, byte_size)
-            func.instruction(&Instruction::LocalGet(dest_ptr_local)); // dst
-            func.instruction(&Instruction::LocalGet(0)); // src (caller ptr)
-            func.instruction(&Instruction::LocalGet(1)); // len
-            if byte_mult > 1 {
-                func.instruction(&Instruction::I32Const(byte_mult as i32));
-                func.instruction(&Instruction::I32Mul);
-            }
-            func.instruction(&Instruction::MemoryCopy {
-                src_mem: options.caller_memory,
-                dst_mem: options.callee_memory,
-            });
+                // Copy: memory.copy callee_mem caller_mem (dest, src, len * byte_mult)
+                func.instruction(&Instruction::LocalGet(dest_local));
+                func.instruction(&Instruction::LocalGet(ptr_pos));
+                func.instruction(&Instruction::LocalGet(len_pos));
+                if byte_mult > 1 {
+                    func.instruction(&Instruction::I32Const(byte_mult as i32));
+                    func.instruction(&Instruction::I32Mul);
+                }
+                func.instruction(&Instruction::MemoryCopy {
+                    src_mem: options.caller_memory,
+                    dst_mem: options.callee_memory,
+                });
 
-            // 2b. Fix up inner pointers if element type contains owned data
-            if let Some(crate::resolver::CopyLayout::Elements {
-                element_size,
-                inner_pointers,
-                ..
-            }) = site.requirements.param_copy_layouts.first()
-                && !inner_pointers.is_empty()
-            {
-                let fixup_base = dest_ptr_local + 1;
-                Self::emit_inner_pointer_fixup(
-                    &mut func,
+                // Fix up inner pointers if element type contains owned data
+                if let Some(crate::resolver::CopyLayout::Elements {
+                    element_size,
                     inner_pointers,
-                    *element_size,
-                    0,              // src_base = param 0 (caller's original ptr)
-                    dest_ptr_local, // dst_base (callee's copy)
-                    1,              // count = param 1 (len)
-                    options.caller_memory,
-                    options.callee_memory,
-                    callee_realloc,
-                    fixup_base,
-                );
-            }
+                    ..
+                }) = param_layouts.get(pair_idx)
+                    && !inner_pointers.is_empty()
+                {
+                    let fixup_base = dest_ptr_local + num_param_pairs.max(1);
+                    Self::emit_inner_pointer_fixup(
+                        &mut func,
+                        inner_pointers,
+                        *element_size,
+                        ptr_pos,    // src_base (caller's original ptr)
+                        dest_local, // dst_base (callee's copy)
+                        len_pos,    // count
+                        options.caller_memory,
+                        options.callee_memory,
+                        callee_realloc,
+                        fixup_base,
+                    );
+                }
+            } // end for each pointer pair
 
             // 2c. Fix up inner resource handles if element type contains borrow<T>
             if !options.inner_resource_fixups.is_empty()
@@ -775,8 +780,7 @@ impl FactStyleGenerator {
                     site.requirements.param_copy_layouts.first()
             {
                 let element_size = *element_size;
-                // Use inner_fixup_locals for loop counter
-                let loop_idx = dest_ptr_local + 1 + inner_fixup_locals;
+                let loop_idx = dest_ptr_local + num_param_pairs.max(1) + inner_fixup_locals;
                 func.instruction(&Instruction::I32Const(0));
                 func.instruction(&Instruction::LocalSet(loop_idx));
                 // block $exit { loop $cont {
@@ -828,11 +832,14 @@ impl FactStyleGenerator {
                 func.instruction(&Instruction::End); // block
             }
 
-            // 3. Call target with (dest_ptr, len, ...remaining args)
-            func.instruction(&Instruction::LocalGet(dest_ptr_local));
-            func.instruction(&Instruction::LocalGet(1)); // len
-            for i in 2..param_count {
-                func.instruction(&Instruction::LocalGet(i as u32));
+            // 3. Call target with remapped pointer pairs
+            for i in 0..param_count as u32 {
+                if let Some(pair_idx) = param_ptr_positions.iter().position(|&pos| pos == i) {
+                    // Replace pointer with allocated copy in callee memory
+                    func.instruction(&Instruction::LocalGet(dest_ptr_local + pair_idx as u32));
+                } else {
+                    func.instruction(&Instruction::LocalGet(i));
+                }
             }
             func.instruction(&Instruction::Call(target_func));
         } else if needs_conditional_copy {
