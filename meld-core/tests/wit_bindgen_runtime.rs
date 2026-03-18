@@ -650,8 +650,8 @@ fuse_only_test!(
     test_fuse_wit_bindgen_resource_aggregates,
     "resource_aggregates"
 );
-// resource_floats: adapter produces correct rep→new_handle chain, but P2 wrapper
-// resource type mismatch between [resource-new] and [resource-rep] for intermediate
+// resource_floats: P2 wrapper per-component types correct, but adapter's
+// resource.new creates handle in wrong type (3-component handle routing)
 fuse_only_test!(test_fuse_wit_bindgen_resource_floats, "resource_floats");
 runtime_test!(
     test_runtime_wit_bindgen_resource_borrow_in_record,
