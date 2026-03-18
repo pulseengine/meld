@@ -167,6 +167,8 @@ pub struct Fuser {
     /// Original (un-flattened) parsed components, used by component_wrap
     /// to access depth_0_sections and component_instance_defs.
     original_components: Vec<ParsedComponent>,
+    /// Directed wiring hints from composition graph.
+    wiring_hints: WiringHints,
 }
 
 impl Fuser {
@@ -176,6 +178,7 @@ impl Fuser {
             config,
             components: Vec::new(),
             original_components: Vec::new(),
+            wiring_hints: std::collections::HashMap::new(),
         }
     }
 
@@ -201,7 +204,13 @@ impl Fuser {
         }
 
         self.original_components.push(parsed.clone());
-        let flattened = flatten_nested_components(parsed)?;
+        let (flattened, hints) = flatten_nested_components(parsed)?;
+        // Adjust wiring hint indices by current component count
+        let offset = self.components.len();
+        for ((importer, name), exporter) in hints {
+            self.wiring_hints
+                .insert((importer + offset, name), exporter + offset);
+        }
         self.components.extend(flattened);
         Ok(())
     }
@@ -247,7 +256,7 @@ impl Fuser {
             self.components.len()
         );
         let resolver = Resolver::with_strategy(self.config.memory_strategy);
-        let graph = resolver.resolve(&self.components)?;
+        let graph = resolver.resolve_with_hints(&self.components, &self.wiring_hints)?;
         stats.imports_resolved = graph.resolved_imports.len();
 
         // Step 2: Merge modules
@@ -817,9 +826,11 @@ impl Fuser {
 ///
 /// When no sub-components exist, returns the input component as-is
 /// (backward compatible).
-fn flatten_nested_components(mut outer: ParsedComponent) -> Result<Vec<ParsedComponent>> {
+fn flatten_nested_components(
+    mut outer: ParsedComponent,
+) -> Result<(Vec<ParsedComponent>, WiringHints)> {
     if outer.sub_components.is_empty() {
-        return Ok(vec![outer]);
+        return Ok((vec![outer], std::collections::HashMap::new()));
     }
 
     // Take sub_components out of outer so we can move them and still borrow outer later.
@@ -827,8 +838,12 @@ fn flatten_nested_components(mut outer: ParsedComponent) -> Result<Vec<ParsedCom
 
     // Recursively flatten each sub-component
     let mut flattened_subs: Vec<Vec<ParsedComponent>> = Vec::new();
+    let mut child_hints: WiringHints = std::collections::HashMap::new();
     for sub in sub_components {
-        flattened_subs.push(flatten_nested_components(sub)?);
+        let (flat, hints) = flatten_nested_components(sub)?;
+        // Child hints are relative to their own flat list; we'll adjust later
+        child_hints.extend(hints);
+        flattened_subs.push(flat);
     }
 
     // The outer component itself may contain core modules, instances,
@@ -860,9 +875,9 @@ fn flatten_nested_components(mut outer: ParsedComponent) -> Result<Vec<ParsedCom
     }
 
     // Propagate the outer component's wiring into the flat sub-components
-    propagate_outer_wiring(&outer, &sub_index_ranges, &mut result)?;
+    let wiring_hints = propagate_outer_wiring(&outer, &sub_index_ranges, &mut result)?;
 
-    Ok(result)
+    Ok((result, wiring_hints))
 }
 
 /// Translate the outer component's `component_instances` and `component_aliases`
@@ -876,14 +891,19 @@ fn flatten_nested_components(mut outer: ParsedComponent) -> Result<Vec<ParsedCom
 ///
 /// The outer component's top-level `imports` (e.g., WASI interfaces) are
 /// propagated to whichever sub-component consumes them.
+/// Directed resolution hints from the composition graph.
+/// Maps (importer_flat_idx, interface_name) → exporter_flat_idx.
+type WiringHints = std::collections::HashMap<(usize, String), usize>;
+
 #[allow(clippy::collapsible_if)]
 fn propagate_outer_wiring(
     outer: &ParsedComponent,
     sub_index_ranges: &[std::ops::Range<usize>],
     result: &mut [ParsedComponent],
-) -> Result<()> {
+) -> Result<WiringHints> {
     use parser::ComponentLevelInstance;
     use wasmparser::ComponentExternalKind;
+    let mut wiring_hints: WiringHints = std::collections::HashMap::new();
 
     // Build a map: component-level instance index → info about that instance.
     // Component instances created by ComponentInstanceSection are numbered
@@ -1028,11 +1048,13 @@ fn propagate_outer_wiring(
                                 result[source_flat_idx]
                                     .exports
                                     .push(parser::ComponentExport {
-                                        name: import_name,
+                                        name: import_name.clone(),
                                         kind: ComponentExternalKind::Instance,
                                         index: 0,
                                     });
                             }
+                            // Record directed wiring hint
+                            wiring_hints.insert((target_flat_idx, import_name), source_flat_idx);
                         }
                     }
                 }
@@ -1118,6 +1140,11 @@ fn propagate_outer_wiring(
                                             index: 0,
                                         });
                                 }
+                                // Record directed wiring hint
+                                wiring_hints.insert(
+                                    (target_flat_idx, import_name.clone()),
+                                    source_flat_idx,
+                                );
                                 // When the wiring renames an export (arg_name differs
                                 // from alias export_name), add a synthetic core module
                                 // export so the adapter site finder can locate the
@@ -1171,7 +1198,7 @@ fn propagate_outer_wiring(
         }
     }
 
-    Ok(())
+    Ok(wiring_hints)
 }
 
 #[cfg(test)]

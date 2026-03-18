@@ -966,6 +966,14 @@ impl Resolver {
 
     /// Resolve dependencies between components
     pub fn resolve(&self, components: &[ParsedComponent]) -> Result<DependencyGraph> {
+        self.resolve_with_hints(components, &HashMap::new())
+    }
+
+    pub fn resolve_with_hints(
+        &self,
+        components: &[ParsedComponent],
+        wiring_hints: &HashMap<(usize, String), usize>,
+    ) -> Result<DependencyGraph> {
         let mut graph = DependencyGraph {
             instantiation_order: Vec::new(),
             resolved_imports: HashMap::new(),
@@ -977,8 +985,13 @@ impl Resolver {
         // Build export index
         let export_index = self.build_export_index(components);
 
-        // Resolve component-level imports
-        self.resolve_component_imports(components, &export_index, &mut graph)?;
+        // Resolve component-level imports using wiring hints for directed resolution
+        self.resolve_component_imports_with_hints(
+            components,
+            &export_index,
+            &mut graph,
+            wiring_hints,
+        )?;
 
         // Resolve module-level imports within each component
         self.resolve_module_imports(components, &mut graph)?;
@@ -1149,14 +1162,31 @@ impl Resolver {
         export_index: &HashMap<String, Vec<(usize, &ComponentExport)>>,
         graph: &mut DependencyGraph,
     ) -> Result<()> {
+        self.resolve_component_imports_with_hints(components, export_index, graph, &HashMap::new())
+    }
+
+    fn resolve_component_imports_with_hints(
+        &self,
+        components: &[ParsedComponent],
+        export_index: &HashMap<String, Vec<(usize, &ComponentExport)>>,
+        graph: &mut DependencyGraph,
+        wiring_hints: &HashMap<(usize, String), usize>,
+    ) -> Result<()> {
         for (comp_idx, component) in components.iter().enumerate() {
             for import in &component.imports {
                 // Look for a matching export
                 if let Some(exports) = export_index.get(&import.name) {
-                    // Find an export from a different component
-                    if let Some((export_comp_idx, _export)) =
-                        exports.iter().find(|(idx, _)| *idx != comp_idx)
-                    {
+                    // Check directed wiring hints first (from composition DAG)
+                    let hinted = wiring_hints.get(&(comp_idx, import.name.clone()));
+                    let resolved = if let Some(&target) = hinted {
+                        exports.iter().find(|(idx, _)| *idx == target)
+                    } else {
+                        None
+                    };
+                    // Fallback: first export from a different component
+                    let resolved =
+                        resolved.or_else(|| exports.iter().find(|(idx, _)| *idx != comp_idx));
+                    if let Some((export_comp_idx, _export)) = resolved {
                         graph.resolved_imports.insert(
                             (comp_idx, import.name.clone()),
                             (*export_comp_idx, import.name.clone()),
