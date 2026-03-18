@@ -950,6 +950,7 @@ fn propagate_outer_wiring(
     struct AliasResolution {
         instance_index: u32,
         kind: ComponentExternalKind,
+        export_name: String,
     }
     let mut alias_resolutions: Vec<Option<AliasResolution>> = Vec::new();
     for alias in &outer.component_aliases {
@@ -957,11 +958,12 @@ fn propagate_outer_wiring(
             parser::ComponentAliasEntry::InstanceExport {
                 kind,
                 instance_index,
-                name: _,
+                name,
             } => {
                 alias_resolutions.push(Some(AliasResolution {
                     instance_index: *instance_index,
                     kind: *kind,
+                    export_name: name.clone(),
                 }));
             }
             _ => {
@@ -1035,15 +1037,52 @@ fn propagate_outer_wiring(
                     }
                 }
 
-                // For ComponentExternalKind::Component or other kinds, the arg
-                // might reference an alias. Try resolving via alias_resolutions.
+                // For other kinds, the arg references an alias. For Func/Type,
+                // arg_index is a per-kind index into component_func_defs/component_type_defs
+                // which may contain an InstanceExportAlias pointing to the actual alias.
                 if *arg_kind == ComponentExternalKind::Component
                     || *arg_kind == ComponentExternalKind::Func
                     || *arg_kind == ComponentExternalKind::Type
                     || *arg_kind == ComponentExternalKind::Value
                 {
-                    // Try alias resolution
-                    let alias_idx = *arg_index as usize;
+                    // Resolve per-kind index to alias index
+                    let alias_idx = match arg_kind {
+                        ComponentExternalKind::Func => {
+                            // Component func defs track how each func was created
+                            outer
+                                .component_func_defs
+                                .get(*arg_index as usize)
+                                .and_then(|def| {
+                                    if let parser::ComponentFuncDef::InstanceExportAlias(ai) = def {
+                                        Some(*ai)
+                                    } else {
+                                        None
+                                    }
+                                })
+                        }
+                        ComponentExternalKind::Type => outer
+                            .component_type_defs
+                            .get(*arg_index as usize)
+                            .and_then(|def| {
+                                if let parser::ComponentTypeDef::InstanceExportAlias(ai) = def {
+                                    Some(*ai)
+                                } else {
+                                    None
+                                }
+                            }),
+                        _ => {
+                            // For Component/Value, arg_index might be direct alias
+                            if (*arg_index as usize) < alias_resolutions.len() {
+                                Some(*arg_index as usize)
+                            } else {
+                                None
+                            }
+                        }
+                    };
+                    let alias_idx = match alias_idx {
+                        Some(idx) => idx,
+                        None => continue,
+                    };
                     if alias_idx < alias_resolutions.len()
                         && let Some(alias_res) = &alias_resolutions[alias_idx]
                     {
@@ -1074,10 +1113,36 @@ fn propagate_outer_wiring(
                                     result[source_flat_idx]
                                         .exports
                                         .push(parser::ComponentExport {
-                                            name: import_name,
+                                            name: import_name.clone(),
                                             kind: alias_res.kind,
                                             index: 0,
                                         });
+                                }
+                                // When the wiring renames an export (arg_name differs
+                                // from alias export_name), add a synthetic core module
+                                // export so the adapter site finder can locate the
+                                // function by import_name.
+                                if import_name != alias_res.export_name {
+                                    for m in &mut result[source_flat_idx].core_modules {
+                                        if let Some(original) = m
+                                            .exports
+                                            .iter()
+                                            .find(|e| {
+                                                e.name == alias_res.export_name
+                                                    && e.kind == parser::ExportKind::Function
+                                            })
+                                            .cloned()
+                                        {
+                                            if !m.exports.iter().any(|e| e.name == import_name) {
+                                                m.exports.push(parser::ModuleExport {
+                                                    name: import_name,
+                                                    kind: original.kind,
+                                                    index: original.index,
+                                                });
+                                            }
+                                            break;
+                                        }
+                                    }
                                 }
                             }
                         }
