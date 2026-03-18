@@ -876,6 +876,7 @@ fn flatten_nested_components(mut outer: ParsedComponent) -> Result<Vec<ParsedCom
 ///
 /// The outer component's top-level `imports` (e.g., WASI interfaces) are
 /// propagated to whichever sub-component consumes them.
+#[allow(clippy::collapsible_if)]
 fn propagate_outer_wiring(
     outer: &ParsedComponent,
     sub_index_ranges: &[std::ops::Range<usize>],
