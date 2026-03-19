@@ -826,6 +826,24 @@ fn build_resource_type_to_import(
         }
     }
 
+    // Step 4b: If Step 4 produced nothing but resource_core_funcs was non-empty,
+    // fall through to core module import scanning as a last resort.
+    if map.is_empty() && !resource_core_funcs.is_empty() {
+        for module in &component.core_modules {
+            for imp in &module.imports {
+                if matches!(&imp.kind, crate::parser::ImportKind::Function(_)) {
+                    if imp.name.starts_with("[resource-rep]") {
+                        map.entry((0u32, "[resource-rep]"))
+                            .or_insert((imp.module.clone(), imp.name.clone()));
+                    } else if imp.name.starts_with("[resource-new]") {
+                        map.entry((0u32, "[resource-new]"))
+                            .or_insert((imp.module.clone(), imp.name.clone()));
+                    }
+                }
+            }
+        }
+    }
+
     // Step 5: Infer missing operations from existing ones.
     //
     // The component model's `canon lift` handles resource conversions
