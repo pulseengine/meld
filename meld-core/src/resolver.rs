@@ -763,6 +763,27 @@ fn build_resource_type_to_import(
     }
 
     if resource_core_funcs.is_empty() {
+        // Fallback: for components that IMPORT resources (no canonical entries),
+        // scan core module imports for [resource-rep]/[resource-new] patterns.
+        // Use resource_type_id = 0 as sentinel; the single-candidate fallback
+        // in resolve_resource_positions handles the type ID mismatch.
+        let mut map = HashMap::new();
+        for module in &component.core_modules {
+            for imp in &module.imports {
+                if matches!(&imp.kind, crate::parser::ImportKind::Function(_)) {
+                    if imp.name.starts_with("[resource-rep]") {
+                        map.entry((0u32, "[resource-rep]"))
+                            .or_insert((imp.module.clone(), imp.name.clone()));
+                    } else if imp.name.starts_with("[resource-new]") {
+                        map.entry((0u32, "[resource-new]"))
+                            .or_insert((imp.module.clone(), imp.name.clone()));
+                    }
+                }
+            }
+        }
+        if !map.is_empty() {
+            return map;
+        }
         return HashMap::new();
     }
 
@@ -867,7 +888,6 @@ fn build_resource_type_to_import(
             }
         }
     }
-
     map
 }
 
