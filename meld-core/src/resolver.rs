@@ -930,16 +930,13 @@ fn resolve_resource_positions(
                 // Fallback: the resource type ID from the function signature may differ
                 // from the canonical entry's type ID (e.g., imported type 24 vs defined
                 // type 25). If there's exactly one resource with this prefix, use it.
-                let candidates: Vec<_> = resource_map
+                // Use the first matching entry regardless of count — Step 6
+                // alias propagation may create multiple entries that all point
+                // to the same underlying import.
+                resource_map
                     .iter()
-                    .filter(|((_, k), _)| *k == field_prefix)
+                    .find(|((_, k), _)| *k == field_prefix)
                     .map(|(_, v)| v)
-                    .collect();
-                if candidates.len() == 1 {
-                    Some(candidates[0])
-                } else {
-                    None
-                }
             });
         if let Some((module_name, field_name)) = entry {
             // Check if the callee truly defines this resource (has ownership of the
