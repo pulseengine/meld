@@ -657,7 +657,6 @@ runtime_test!(
     test_runtime_wit_bindgen_resource_borrow_in_record,
     "resource_borrow_in_record"
 );
-// resource_with_lists: wiring correct (DAG hints), but 3-component resource type mismatch
 fuse_only_test!(
     test_fuse_wit_bindgen_resource_with_lists,
     "resource_with_lists"

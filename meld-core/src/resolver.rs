@@ -942,13 +942,21 @@ fn resolve_resource_positions(
                 }
             });
         if let Some((module_name, field_name)) = entry {
-            // Check if the callee defines this resource type.
-            // Import(_) means the callee imports the resource from another component.
-            // Defined means the callee's own type section defines it.
-            let callee_defines_resource = callee_type_defs
-                .get(pos.resource_type_id as usize)
-                .map(|def| !matches!(def, crate::parser::ComponentTypeDef::Import(_)))
-                .unwrap_or(true); // default to true (SR-25 behavior)
+            // Check if the callee truly defines this resource (has ownership of the
+            // underlying representation). A callee that re-exports a resource from
+            // another component has a Defined type entry but doesn't own the rep.
+            // Use the sentinel check: if the map entry was resolved via sentinel type 0
+            // (Step 4b fallback), the callee doesn't define the resource.
+            let used_sentinel = resource_map.contains_key(&(0u32, field_prefix))
+                && !resource_map.contains_key(&(pos.resource_type_id, field_prefix));
+            let callee_defines_resource = if used_sentinel {
+                false // Step 4b fallback means callee imports the resource
+            } else {
+                callee_type_defs
+                    .get(pos.resource_type_id as usize)
+                    .map(|def| !matches!(def, crate::parser::ComponentTypeDef::Import(_)))
+                    .unwrap_or(true)
+            };
             resolved.push(ResolvedResourceOp {
                 flat_idx: pos.flat_idx,
                 byte_offset: pos.byte_offset,
@@ -1107,11 +1115,28 @@ impl Resolver {
                     site.to_component,
                 ));
             }
-            // For 3-component chains: synthesize callee's [resource-new].
+            // For 3-component chains: synthesize callee's [resource-new] for borrow params.
             for op in &site.requirements.resource_params {
                 if !op.is_owned && !op.callee_defines_resource {
                     let new_field = op.import_field.replace("[resource-rep]", "[resource-new]");
                     needed.push((op.import_module.clone(), new_field, site.to_component));
+                }
+            }
+            // For 3-component chains: synthesize CALLER's [resource-new] for own results.
+            // When callee doesn't define the resource, own<T> results need resource.new
+            // in the caller's table.
+            for op in &site.requirements.resource_results {
+                if op.is_owned && !op.callee_defines_resource {
+                    let new_field = if op.import_field.starts_with("[resource-new]") {
+                        op.import_field.clone()
+                    } else {
+                        op.import_field.replace("[resource-rep]", "[resource-new]")
+                    };
+                    needed.push((
+                        op.import_module.clone(),
+                        new_field,
+                        site.from_component, // CALLER's component
+                    ));
                 }
             }
         }
