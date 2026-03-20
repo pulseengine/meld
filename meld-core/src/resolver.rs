@@ -920,6 +920,7 @@ fn resolve_resource_positions(
     positions: &[crate::parser::ResourcePosition],
     field_prefix: &'static str,
     callee_type_defs: &[crate::parser::ComponentTypeDef],
+    callee_is_reexporter: bool,
 ) -> Vec<ResolvedResourceOp> {
     let mut resolved = Vec::new();
     for pos in positions {
@@ -944,15 +945,21 @@ fn resolve_resource_positions(
             // another component has a Defined type entry but doesn't own the rep.
             // Use the sentinel check: if the map entry was resolved via sentinel type 0
             // (Step 4b fallback), the callee doesn't define the resource.
-            let used_sentinel = resource_map.contains_key(&(0u32, field_prefix))
-                && !resource_map.contains_key(&(pos.resource_type_id, field_prefix));
-            let callee_defines_resource = if used_sentinel {
-                false // Step 4b fallback means callee imports the resource
+            // If callee also imports the same interface, it re-exports → doesn't define.
+            let callee_defines_resource = if callee_is_reexporter {
+                false
             } else {
-                callee_type_defs
-                    .get(pos.resource_type_id as usize)
-                    .map(|def| !matches!(def, crate::parser::ComponentTypeDef::Import(_)))
-                    .unwrap_or(true)
+                // Sentinel check + type_defs check for non-reexporters
+                let used_sentinel = resource_map.contains_key(&(0u32, field_prefix))
+                    && !resource_map.contains_key(&(pos.resource_type_id, field_prefix));
+                if used_sentinel {
+                    false
+                } else {
+                    callee_type_defs
+                        .get(pos.resource_type_id as usize)
+                        .map(|def| !matches!(def, crate::parser::ComponentTypeDef::Import(_)))
+                        .unwrap_or(true)
+                }
             };
             resolved.push(ResolvedResourceOp {
                 flat_idx: pos.flat_idx,
@@ -1900,6 +1907,13 @@ impl Resolver {
                         }
                     };
 
+                    // Check if the callee also imports the same interface
+                    // (i.e., it re-exports from another component). In that case,
+                    // it doesn't "define" the resource — a downstream component does.
+                    let callee_is_reexporter = graph
+                        .resolved_imports
+                        .contains_key(&(*to_comp, import_name.clone()));
+
                     // Try per-function interface matching first.
                     //
                     // In wit-bindgen composed components, a component-level
@@ -2029,6 +2043,7 @@ impl Resolver {
                                                         .resource_param_positions(comp_params),
                                                     "[resource-rep]",
                                                     &to_component.component_type_defs,
+                                                    callee_is_reexporter,
                                                 );
                                             requirements.resource_results =
                                                 resolve_resource_positions(
@@ -2037,6 +2052,7 @@ impl Resolver {
                                                         .resource_result_positions(results),
                                                     "[resource-new]",
                                                     &to_component.component_type_defs,
+                                                    callee_is_reexporter,
                                                 );
                                             // Caller-side resource params for 3-component chains
                                             requirements.caller_resource_params =
@@ -2046,6 +2062,7 @@ impl Resolver {
                                                         .resource_param_positions(comp_params),
                                                     "[resource-rep]",
                                                     &from_component.component_type_defs,
+                                                    true, // caller never defines
                                                 );
                                         }
                                     }
@@ -2200,17 +2217,22 @@ impl Resolver {
 
                                     let callee_resource_map =
                                         build_resource_type_to_import(to_component);
+                                    let fb_callee_reexporter = graph
+                                        .resolved_imports
+                                        .contains_key(&(*to_comp, import_name.clone()));
                                     requirements.resource_params = resolve_resource_positions(
                                         &callee_resource_map,
                                         &to_component.resource_param_positions(comp_params),
                                         "[resource-rep]",
                                         &to_component.component_type_defs,
+                                        fb_callee_reexporter,
                                     );
                                     requirements.resource_results = resolve_resource_positions(
                                         &callee_resource_map,
                                         &to_component.resource_result_positions(results),
                                         "[resource-new]",
                                         &to_component.component_type_defs,
+                                        fb_callee_reexporter,
                                     );
                                     // Caller-side resource params for 3-component chains
                                     let caller_resource_map =
@@ -2221,6 +2243,7 @@ impl Resolver {
                                             &to_component.resource_param_positions(comp_params),
                                             "[resource-rep]",
                                             &from_component.component_type_defs,
+                                            true,
                                         );
                                 }
                             }
