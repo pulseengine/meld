@@ -617,9 +617,13 @@ impl FactStyleGenerator {
         let needs_post_return_save =
             !needs_result_copy && options.callee_post_return.is_some() && result_count > 0;
 
-        // We need result-save locals for post-return or conditional result copy.
+        let has_result_resource_ops = !options.resource_new_calls.is_empty();
+
+        // We need result-save locals for post-return, conditional result copy,
+        // or resource result conversion.
         let needs_result_save =
-            (needs_post_return_save || needs_conditional_result_copy) && result_count > 0;
+            (needs_post_return_save || needs_conditional_result_copy || has_result_resource_ops)
+                && result_count > 0;
 
         let has_resource_ops = !options.resource_rep_calls.is_empty();
 
@@ -633,6 +637,7 @@ impl FactStyleGenerator {
             && !needs_post_return_save
             && !has_resource_ops
             && !has_inner_resource_fixups
+            && !has_result_resource_ops
         {
             let mut func = Function::new([]);
             for i in 0..param_count {
@@ -963,13 +968,18 @@ impl FactStyleGenerator {
 
         // Post-return and/or conditional result copy
         if !needs_result_copy
-            && (needs_conditional_result_copy || options.callee_post_return.is_some())
+            && (needs_conditional_result_copy
+                || options.callee_post_return.is_some()
+                || has_result_resource_ops)
         {
             if result_count > 0 && needs_result_save {
                 // Save return values to scratch locals (pop in reverse order)
                 for i in (0..result_count).rev() {
                     func.instruction(&Instruction::LocalSet(result_save_base + i as u32));
                 }
+
+                // Phase R: Convert own<T> results via resource.new
+                emit_resource_new_results(&mut func, &options.resource_new_calls, result_save_base);
             }
 
             // Call post-return with callee's original return values
