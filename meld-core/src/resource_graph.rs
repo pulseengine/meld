@@ -223,18 +223,16 @@ impl ResourceGraph {
         let mut defines_cache = HashMap::new();
         let mut definer_cache = HashMap::new();
 
-        // First pass: check Defines edges
+        // Collect components with Defines edges (candidates, may include re-exporters)
+        let mut defines_candidates: HashMap<(usize, String, String), bool> = HashMap::new();
         for ((iface, rn), &resource_node) in &resource_nodes {
-            let mut definer = None;
             for edge in graph.edges_directed(resource_node, petgraph::Direction::Incoming) {
                 if matches!(edge.weight(), GraphEdge::Defines)
                     && let GraphNode::Component(idx) = graph[edge.source()]
                 {
-                    defines_cache.insert((idx, iface.clone(), rn.clone()), true);
-                    definer = Some(idx);
+                    defines_candidates.insert((idx, iface.clone(), rn.clone()), true);
                 }
             }
-            definer_cache.insert((iface.clone(), rn.clone()), definer);
         }
 
         // Second pass: use ResolvesTo edges for definer detection.
@@ -242,18 +240,60 @@ impl ResourceGraph {
         // exports but doesn't import (no outgoing ResolvesTo for this interface).
         // This handles cases where canonical_functions is empty after flattening.
         for ((_from_comp, import_name), (to_comp, _)) in resolved_imports {
-            let to_also_imports = resolved_imports.contains_key(&(*to_comp, import_name.clone()));
-            if !to_also_imports {
+            // Check if to_comp also imports an interface that involves the same
+            // resource name. A component that imports "test:X/test" (with float)
+            // AND exports "exports" (with float) is a re-exporter even though
+            // the interface names differ.
+            let to_also_imports_resource = resolved_imports.keys().any(|(comp, iname)| {
+                *comp == *to_comp
+                    && resource_nodes.keys().any(|(ri, _)| {
+                        ri == iname || ri.strip_prefix("[export]") == Some(iname.as_str())
+                    })
+            });
+            if !to_also_imports_resource {
+                // Terminal exporter — true definer
                 for (iface, rn) in resource_nodes.keys() {
                     let iface_matches = iface == import_name
                         || iface.strip_prefix("[export]") == Some(import_name.as_str());
                     if iface_matches {
-                        defines_cache
-                            .entry((*to_comp, iface.clone(), rn.clone()))
-                            .or_insert(true);
-                        definer_cache
-                            .entry((iface.clone(), rn.clone()))
-                            .or_insert(Some(*to_comp));
+                        defines_cache.insert((*to_comp, iface.clone(), rn.clone()), true);
+                        definer_cache.insert((iface.clone(), rn.clone()), Some(*to_comp));
+                    }
+                }
+            }
+        }
+
+        // Merge: candidates from first pass that weren't overridden by second pass
+        for ((idx, iface, rn), _) in &defines_candidates {
+            defines_cache
+                .entry((*idx, iface.clone(), rn.clone()))
+                .or_insert(true);
+            definer_cache
+                .entry((iface.clone(), rn.clone()))
+                .or_insert(Some(*idx));
+        }
+
+        // Remove defines entries for components that also import resources
+        // (they're re-exporters even if they have canonical ResourceRep).
+        for ((from_comp, import_name), _) in resolved_imports {
+            let comp_imports_resource = resource_nodes.keys().any(|(ri, _)| {
+                ri == import_name || ri.strip_prefix("[export]") == Some(import_name.as_str())
+            });
+            if comp_imports_resource {
+                // from_comp imports a resource interface — check if it's also marked as definer
+                let keys_to_check: Vec<_> = defines_cache
+                    .keys()
+                    .filter(|(idx, _, _)| *idx == *from_comp)
+                    .cloned()
+                    .collect();
+                for key in keys_to_check {
+                    // Only remove if the component imports a DIFFERENT resource interface
+                    // (same-interface import/export is not re-exporting)
+                    defines_cache.remove(&key);
+                    if let Some(entry) = definer_cache.get_mut(&(key.1.clone(), key.2.clone())) {
+                        if *entry == Some(*from_comp) {
+                            *entry = None;
+                        }
                     }
                 }
             }
