@@ -273,22 +273,35 @@ impl ResourceGraph {
                 .or_insert(Some(*idx));
         }
 
-        // Remove defines entries for components that also import resources
-        // (they're re-exporters even if they have canonical ResourceRep).
+        // Remove defines entries for components that also import the SAME
+        // resource interface (they're re-exporters, not definers).
+        // Only remove entries whose interface matches the imported one.
         for (from_comp, import_name) in resolved_imports.keys() {
-            let comp_imports_resource = resource_nodes.keys().any(|(ri, _)| {
-                ri == import_name || ri.strip_prefix("[export]") == Some(import_name.as_str())
-            });
-            if comp_imports_resource {
-                // from_comp imports a resource interface — check if it's also marked as definer
-                let keys_to_check: Vec<_> = defines_cache
+            let matching_resource_ifaces: Vec<_> = resource_nodes
+                .keys()
+                .filter(|(ri, _)| {
+                    ri == import_name
+                        || ri.strip_prefix("[export]") == Some(import_name.as_str())
+                        || import_name.strip_prefix("[export]") == Some(ri.as_str())
+                })
+                .cloned()
+                .collect();
+            for (ri, rn) in &matching_resource_ifaces {
+                // Check all interface name variants for this resource
+                let keys_to_remove: Vec<_> = defines_cache
                     .keys()
-                    .filter(|(idx, _, _)| *idx == *from_comp)
+                    .filter(|(idx, iface, r)| {
+                        *idx == *from_comp
+                            && r == rn
+                            && (iface == ri
+                                || iface.strip_prefix("[export]") == Some(ri.as_str())
+                                || ri.strip_prefix("[export]") == Some(iface.as_str())
+                                || iface == import_name
+                                || iface.strip_prefix("[export]") == Some(import_name.as_str()))
+                    })
                     .cloned()
                     .collect();
-                for key in keys_to_check {
-                    // Only remove if the component imports a DIFFERENT resource interface
-                    // (same-interface import/export is not re-exporting)
+                for key in keys_to_remove {
                     defines_cache.remove(&key);
                     if let Some(entry) = definer_cache.get_mut(&(key.1.clone(), key.2.clone()))
                         && *entry == Some(*from_comp)
@@ -310,19 +323,53 @@ impl ResourceGraph {
 
     /// Does the given component define (own) the resource?
     /// A defining component has canonical ResourceRep entries.
+    /// Tries both bare and `[export]`-prefixed interface name variants.
     pub fn defines_resource(&self, comp_idx: usize, interface: &str, resource_name: &str) -> bool {
-        self.defines_cache
-            .get(&(comp_idx, interface.to_string(), resource_name.to_string()))
-            .copied()
-            .unwrap_or(false)
+        let rn = resource_name.to_string();
+        // Try exact match first
+        if let Some(&v) = self
+            .defines_cache
+            .get(&(comp_idx, interface.to_string(), rn.clone()))
+        {
+            return v;
+        }
+        // Try with [export] prefix added
+        if let Some(&v) =
+            self.defines_cache
+                .get(&(comp_idx, format!("[export]{}", interface), rn.clone()))
+        {
+            return v;
+        }
+        // Try with [export] prefix stripped
+        if let Some(stripped) = interface.strip_prefix("[export]")
+            && let Some(&v) = self
+                .defines_cache
+                .get(&(comp_idx, stripped.to_string(), rn))
+        {
+            return v;
+        }
+        false
     }
 
     /// Which component defines the given resource? Returns None if unknown.
+    /// Tries both bare and `[export]`-prefixed interface name variants.
     pub fn resource_definer(&self, interface: &str, resource_name: &str) -> Option<usize> {
-        self.definer_cache
-            .get(&(interface.to_string(), resource_name.to_string()))
-            .copied()
-            .flatten()
+        let rn = resource_name.to_string();
+        if let Some(&v) = self.definer_cache.get(&(interface.to_string(), rn.clone())) {
+            return v;
+        }
+        if let Some(&v) = self
+            .definer_cache
+            .get(&(format!("[export]{}", interface), rn.clone()))
+        {
+            return v;
+        }
+        if let Some(stripped) = interface.strip_prefix("[export]")
+            && let Some(&v) = self.definer_cache.get(&(stripped.to_string(), rn))
+        {
+            return v;
+        }
+        None
     }
 
     /// Is the component a re-exporter for the resource?

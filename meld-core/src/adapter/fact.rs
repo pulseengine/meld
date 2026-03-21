@@ -77,9 +77,11 @@ fn emit_resource_borrow_phase0(func: &mut Function, transfers: &[super::Resource
     }
 }
 
-/// Emit Phase R: convert own<T> results via [resource-new] for 3-component chains.
-/// Results are in locals starting at `result_base`. For each result that needs
-/// conversion, load from local, call resource.new, store back.
+/// Emit Phase R: convert own<T> results via resource.rep then resource.new.
+///
+/// The callee returned a handle. To transfer to the caller's table:
+///   1. `resource.rep(handle)` on callee's type extracts the representation
+///   2. `resource.new(rep)` on caller's type mints a fresh handle
 fn emit_resource_new_results(
     func: &mut Function,
     transfers: &[super::ResourceOwnResultTransfer],
@@ -88,6 +90,7 @@ fn emit_resource_new_results(
     for t in transfers {
         let local_idx = result_base + t.position;
         func.instruction(&Instruction::LocalGet(local_idx));
+        func.instruction(&Instruction::Call(t.rep_func));
         func.instruction(&Instruction::Call(t.new_func));
         func.instruction(&Instruction::LocalSet(local_idx));
     }
@@ -320,9 +323,13 @@ impl FactStyleGenerator {
             }
         }
 
-        // Resolve own<T> results that need [resource-new] conversion.
+        // Resolve own<T> results that need [resource-rep] + [resource-new].
         // Only for 3-component chains where callee doesn't define the resource.
         // When the callee defines it, the P2 wrapper handles lift/lower.
+        //
+        // The callee returns a handle. To transfer to the caller:
+        //   1. resource.rep (callee) extracts the representation
+        //   2. resource.new (caller) creates a handle in the caller's table
         for op in &site.requirements.resource_results {
             if !op.is_owned || op.callee_defines_resource {
                 continue;
@@ -331,6 +338,8 @@ impl FactStyleGenerator {
                 .import_field
                 .strip_prefix("[resource-new]")
                 .unwrap_or(&op.import_field);
+
+            // Caller's [resource-new] (rep → caller handle)
             let new_func = merged
                 .resource_new_by_component
                 .get(&(site.from_component, resource_name.to_string()))
@@ -340,12 +349,44 @@ impl FactStyleGenerator {
                         .get(&(op.import_module.clone(), op.import_field.clone()))
                         .copied()
                 });
-            if let Some(new_func) = new_func {
+
+            // Callee's [resource-rep] (callee handle → rep)
+            let rep_field = format!("[resource-rep]{}", resource_name);
+            let rep_func = merged
+                .resource_rep_by_component
+                .get(&(site.to_component, resource_name.to_string()))
+                .copied()
+                .or_else(|| {
+                    resource_rep_imports
+                        .get(&(op.import_module.clone(), rep_field.clone()))
+                        .copied()
+                });
+
+            if let (Some(rep_func), Some(new_func)) = (rep_func, new_func) {
                 options
                     .resource_new_calls
                     .push(super::ResourceOwnResultTransfer {
                         position: op.flat_idx,
                         byte_offset: op.byte_offset,
+                        rep_func,
+                        new_func,
+                    });
+            } else if let Some(new_func) = new_func {
+                log::warn!(
+                    "own<T> result transfer: no callee [resource-rep] for '{}' \
+                     (from={}, to={}), falling back to new-only",
+                    resource_name,
+                    site.from_component,
+                    site.to_component,
+                );
+                // Fallback: use new_func as both rep and new (may be wrong but
+                // avoids a hard failure for fixtures that don't need rep)
+                options
+                    .resource_new_calls
+                    .push(super::ResourceOwnResultTransfer {
+                        position: op.flat_idx,
+                        byte_offset: op.byte_offset,
+                        rep_func: new_func,
                         new_func,
                     });
             }
