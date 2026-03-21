@@ -264,7 +264,7 @@ impl ResourceGraph {
         }
 
         // Merge: candidates from first pass that weren't overridden by second pass
-        for ((idx, iface, rn), _) in &defines_candidates {
+        for (idx, iface, rn) in defines_candidates.keys() {
             defines_cache
                 .entry((*idx, iface.clone(), rn.clone()))
                 .or_insert(true);
@@ -275,7 +275,7 @@ impl ResourceGraph {
 
         // Remove defines entries for components that also import resources
         // (they're re-exporters even if they have canonical ResourceRep).
-        for ((from_comp, import_name), _) in resolved_imports {
+        for (from_comp, import_name) in resolved_imports.keys() {
             let comp_imports_resource = resource_nodes.keys().any(|(ri, _)| {
                 ri == import_name || ri.strip_prefix("[export]") == Some(import_name.as_str())
             });
@@ -290,10 +290,10 @@ impl ResourceGraph {
                     // Only remove if the component imports a DIFFERENT resource interface
                     // (same-interface import/export is not re-exporting)
                     defines_cache.remove(&key);
-                    if let Some(entry) = definer_cache.get_mut(&(key.1.clone(), key.2.clone())) {
-                        if *entry == Some(*from_comp) {
-                            *entry = None;
-                        }
+                    if let Some(entry) = definer_cache.get_mut(&(key.1.clone(), key.2.clone()))
+                        && *entry == Some(*from_comp)
+                    {
+                        *entry = None;
                     }
                 }
             }
