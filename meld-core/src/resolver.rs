@@ -1141,6 +1141,19 @@ impl Resolver {
                         new_field,
                         site.from_component, // CALLER's component
                     ));
+                    // Also synthesize caller's [resource-rep] to match its [resource-new]
+                    // so both get the same resource type in the P2 wrapper.
+                    let rep_field = if op.import_field.starts_with("[resource-new]") {
+                        op.import_field.replace("[resource-new]", "[resource-rep]")
+                    } else {
+                        format!(
+                            "[resource-rep]{}",
+                            op.import_field
+                                .strip_prefix("[resource-new]")
+                                .unwrap_or(&op.import_field)
+                        )
+                    };
+                    needed.push((op.import_module.clone(), rep_field, site.from_component));
                 }
             }
         }
@@ -1149,21 +1162,23 @@ impl Resolver {
             return;
         }
 
-        // Check which (module, field) pairs already exist as unresolved imports
-        let existing: HashSet<(String, String)> = graph
+        // Check which (module, field, component) triples already exist.
+        // In multi-memory mode, the same (module, field) from different components
+        // are separate imports with different resource types.
+        let existing: HashSet<(String, String, usize)> = graph
             .unresolved_imports
             .iter()
             .filter(|u| matches!(u.kind, ImportKind::Function(_)))
             .map(|u| {
                 let module = u.display_module.as_deref().unwrap_or(&u.module_name);
                 let field = u.display_field.as_deref().unwrap_or(&u.field_name);
-                (module.to_string(), field.to_string())
+                (module.to_string(), field.to_string(), u.component_idx)
             })
             .collect();
 
-        let mut added: HashSet<(String, String)> = HashSet::new();
+        let mut added: HashSet<(String, String, usize)> = HashSet::new();
         for (module, field, callee_comp_idx) in &needed {
-            let key = (module.clone(), field.clone());
+            let key = (module.clone(), field.clone(), *callee_comp_idx);
             if existing.contains(&key) || added.contains(&key) {
                 continue;
             }
