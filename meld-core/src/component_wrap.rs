@@ -1039,13 +1039,9 @@ fn assemble_component(
     let mut component_type_idx = count_replayed_types(source);
     let mut lowered_func_indices: Vec<u32> = Vec::new();
 
-    // Cache: (memory_idx, interface_name, resource_name) → component type index.
-    // Each unique (component, interface, resource) triple gets its own type
-    // definition. The memory index serves as a component identity proxy —
-    // each component has its own linear memory in multi-memory mode.
-    // SR-37: Without the memory index, 3+ component chains share one resource
-    // type across components, causing "handle used with wrong type" at runtime.
-    let mut local_resource_types: std::collections::HashMap<(u32, String, String), u32> =
+    // Cache: (interface_name, resource_name) → component type index.
+    // All components sharing the same interface get the same resource type.
+    let mut local_resource_types: std::collections::HashMap<(String, String), u32> =
         std::collections::HashMap::new();
 
     for (i, resolution) in import_resolutions.iter().enumerate() {
@@ -1132,24 +1128,7 @@ fn assemble_component(
                 // memory index as component identity. Category B imports (bare module drops)
                 // reuse an existing type for the same (interface, resource) — they find
                 // the first matching entry regardless of memory index.
-                let is_export_import = fused_info
-                    .func_imports
-                    .get(i)
-                    .map(|(m, _, _)| m.starts_with("[export]"))
-                    .unwrap_or(false);
-                let mem_idx = if is_export_import && memory_strategy == MemoryStrategy::MultiMemory
-                {
-                    merged.import_memory_indices.get(i).copied().unwrap_or(0)
-                } else {
-                    // Category B: find existing type for this (interface, resource)
-                    // from any component. Check all memory indices.
-                    local_resource_types
-                        .keys()
-                        .find(|(_, iface, res)| iface == interface_name && res == resource_name)
-                        .map(|(m, _, _)| *m)
-                        .unwrap_or(0)
-                };
-                let res_type_key = (mem_idx, interface_name.clone(), resource_name.clone());
+                let res_type_key = (interface_name.clone(), resource_name.clone());
                 let res_type_idx = if let Some(&existing) = local_resource_types.get(&res_type_key)
                 {
                     existing
