@@ -36,3 +36,5 @@ wasmparser.workspace = true
 [dev-dependencies]
 # For testing with WAT files
 wasmprinter.workspace = true
+# For building test modules
+wasm-encoder.workspace = true

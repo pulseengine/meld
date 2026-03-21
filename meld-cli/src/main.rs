@@ -77,6 +77,10 @@ enum Commands {
         /// Output as P2 component instead of core module
         #[arg(long)]
         component: bool,
+
+        /// Write a JSON import map to the given path (for synth/kiln integration)
+        #[arg(long, value_name = "PATH")]
+        emit_import_map: Option<String>,
     },
 
     /// Inspect a WebAssembly component
@@ -119,6 +123,7 @@ fn main() -> Result<()> {
             preserve_names,
             validate,
             component,
+            emit_import_map,
         }) => {
             fuse_command(
                 inputs,
@@ -130,6 +135,7 @@ fn main() -> Result<()> {
                 preserve_names,
                 validate,
                 component,
+                emit_import_map,
             )?;
         }
 
@@ -183,6 +189,7 @@ fn fuse_command(
     preserve_names: bool,
     validate: bool,
     component: bool,
+    emit_import_map: Option<String>,
 ) -> Result<()> {
     println!(
         "Meld v{} - Static Component Fusion",
@@ -268,6 +275,14 @@ fn fuse_command(
 
     // Write output
     fs::write(&output, &fused_bytes).with_context(|| format!("Failed to write {}", output))?;
+
+    // Emit import map if requested
+    if let Some(ref map_path) = emit_import_map {
+        write_import_map(&fused_bytes, map_path)
+            .with_context(|| format!("Failed to write import map to {}", map_path))?;
+        println!();
+        println!("Import map: {}", map_path);
+    }
 
     println!();
     println!("Output: {} ({} bytes)", output, fused_bytes.len());
@@ -420,6 +435,41 @@ fn inspect_command(input: String, show_types: bool, show_interfaces: bool) -> Re
     Ok(())
 }
 
+/// Write a JSON import map listing all function imports in the fused module.
+///
+/// The output is consumed by downstream tools (synth/kiln) to wire up host
+/// imports when instantiating the fused core module.
+fn write_import_map(wasm_bytes: &[u8], path: &str) -> Result<()> {
+    use wasmparser::{Parser, Payload};
+
+    let mut imports = Vec::new();
+    let mut func_index: u32 = 0;
+
+    let parser = Parser::new(0);
+    for payload in parser.parse_all(wasm_bytes) {
+        let payload = payload.context("Parse error while reading imports")?;
+        if let Payload::ImportSection(reader) = payload {
+            for import in reader {
+                let import = import.context("Failed to read import entry")?;
+                if matches!(import.ty, wasmparser::TypeRef::Func(_)) {
+                    imports.push(serde_json::json!({
+                        "index": func_index,
+                        "module": import.module,
+                        "name": import.name,
+                    }));
+                    func_index += 1;
+                }
+            }
+        }
+    }
+
+    let map = serde_json::json!({ "imports": imports });
+    let json = serde_json::to_string_pretty(&map).context("Failed to serialize import map")?;
+    fs::write(path, json).with_context(|| format!("Failed to write {}", path))?;
+
+    Ok(())
+}
+
 /// Validate WASM bytes
 fn validate_wasm(bytes: &[u8]) -> Result<()> {
     use wasmparser::{Parser, Payload, Validator};
@@ -473,5 +523,77 @@ mod tests {
     fn test_cli_verbose() {
         let cli = Cli::parse_from(["meld", "-v", "version"]);
         assert!(cli.verbose);
+    }
+
+    #[test]
+    fn test_cli_emit_import_map_arg() {
+        let cli = Cli::try_parse_from([
+            "meld",
+            "fuse",
+            "a.wasm",
+            "-o",
+            "out.wasm",
+            "--emit-import-map",
+            "/tmp/imports.json",
+        ]);
+        assert!(cli.is_ok());
+        if let Some(Commands::Fuse {
+            emit_import_map, ..
+        }) = cli.unwrap().command
+        {
+            assert_eq!(emit_import_map, Some("/tmp/imports.json".to_string()));
+        } else {
+            panic!("Expected Fuse command");
+        }
+    }
+
+    #[test]
+    fn test_write_import_map() {
+        // Build a minimal core module with two function imports
+        use wasm_encoder::{ImportSection, Module, TypeSection, ValType};
+
+        let mut module = Module::new();
+
+        let mut types = TypeSection::new();
+        types.ty().function(vec![ValType::I32], vec![]);
+        types.ty().function(vec![], vec![ValType::I32]);
+        module.section(&types);
+
+        let mut imports = ImportSection::new();
+        imports.import(
+            "wasi:cli/exit@0.2.6",
+            "exit",
+            wasm_encoder::EntityType::Function(0),
+        );
+        imports.import(
+            "wasi:io/streams@0.2.6",
+            "[method]output-stream.write",
+            wasm_encoder::EntityType::Function(1),
+        );
+        module.section(&imports);
+
+        let wasm_bytes = module.finish();
+
+        let dir = std::env::temp_dir().join("meld_test_import_map");
+        let _ = std::fs::create_dir_all(&dir);
+        let map_path = dir.join("test_imports.json");
+
+        write_import_map(&wasm_bytes, map_path.to_str().unwrap()).unwrap();
+
+        let contents = std::fs::read_to_string(&map_path).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&contents).unwrap();
+
+        let arr = parsed["imports"].as_array().unwrap();
+        assert_eq!(arr.len(), 2);
+
+        assert_eq!(arr[0]["index"], 0);
+        assert_eq!(arr[0]["module"], "wasi:cli/exit@0.2.6");
+        assert_eq!(arr[0]["name"], "exit");
+
+        assert_eq!(arr[1]["index"], 1);
+        assert_eq!(arr[1]["module"], "wasi:io/streams@0.2.6");
+        assert_eq!(arr[1]["name"], "[method]output-stream.write");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -1237,6 +1237,7 @@ dependencies = [
  "log",
  "meld-core",
  "serde_json",
+ "wasm-encoder 0.230.0",
  "wasmparser 0.230.0",
  "wasmprinter 0.230.0",
 ]
