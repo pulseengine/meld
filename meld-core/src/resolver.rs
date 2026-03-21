@@ -2090,6 +2090,30 @@ impl Resolver {
                                                     &from_component.component_type_defs,
                                                     true, // caller never defines
                                                 );
+
+                                            // Graph-based override for callee_defines_resource.
+                                            // The graph uses the composition DAG to find the
+                                            // terminal exporter (definer) — more reliable than
+                                            // checking canonical_functions after flattening.
+                                            if let Some(ref rg) = graph.resource_graph {
+                                                let iface = import_name.as_str();
+                                                for op in &mut requirements.resource_params {
+                                                    let rn = op
+                                                        .import_field
+                                                        .strip_prefix("[resource-rep]")
+                                                        .unwrap_or(&op.import_field);
+                                                    op.callee_defines_resource =
+                                                        rg.defines_resource(*to_comp, iface, rn);
+                                                }
+                                                for op in &mut requirements.resource_results {
+                                                    let rn = op
+                                                        .import_field
+                                                        .strip_prefix("[resource-new]")
+                                                        .unwrap_or(&op.import_field);
+                                                    op.callee_defines_resource =
+                                                        rg.defines_resource(*to_comp, iface, rn);
+                                                }
+                                            }
                                         }
                                     }
 
@@ -2271,6 +2295,27 @@ impl Resolver {
                                             &from_component.component_type_defs,
                                             true,
                                         );
+
+                                    // Graph-based override for fallback path
+                                    if let Some(ref rg) = graph.resource_graph {
+                                        let iface = import_name.as_str();
+                                        for op in &mut requirements.resource_params {
+                                            let rn = op
+                                                .import_field
+                                                .strip_prefix("[resource-rep]")
+                                                .unwrap_or(&op.import_field);
+                                            op.callee_defines_resource =
+                                                rg.defines_resource(*to_comp, iface, rn);
+                                        }
+                                        for op in &mut requirements.resource_results {
+                                            let rn = op
+                                                .import_field
+                                                .strip_prefix("[resource-new]")
+                                                .unwrap_or(&op.import_field);
+                                            op.callee_defines_resource =
+                                                rg.defines_resource(*to_comp, iface, rn);
+                                        }
+                                    }
                                 }
                             }
 

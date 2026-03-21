@@ -215,10 +215,15 @@ impl ResourceGraph {
             }
         }
 
-        // Build caches
+        // Build caches using composition DAG.
+        // A component DEFINES a resource if:
+        // 1. It has a Defines edge to the resource node (canonical ResourceRep), OR
+        // 2. It exports the resource's interface but does NOT import it
+        //    (terminal exporter in the composition chain = the definer).
         let mut defines_cache = HashMap::new();
         let mut definer_cache = HashMap::new();
 
+        // First pass: check Defines edges
         for ((iface, rn), &resource_node) in &resource_nodes {
             let mut definer = None;
             for edge in graph.edges_directed(resource_node, petgraph::Direction::Incoming) {
@@ -230,6 +235,38 @@ impl ResourceGraph {
                 }
             }
             definer_cache.insert((iface.clone(), rn.clone()), definer);
+        }
+
+        // Second pass: use ResolvesTo edges for definer detection.
+        // For each interface, find the terminal component — the one that
+        // exports but doesn't import (no outgoing ResolvesTo for this interface).
+        // This handles cases where canonical_functions is empty after flattening.
+        for ((from_comp, import_name), (to_comp, _)) in resolved_imports {
+            // to_comp exports this interface. Check if to_comp also imports it.
+            let to_also_imports = resolved_imports.contains_key(&(*to_comp, import_name.clone()));
+            if !to_also_imports {
+                // to_comp is the terminal exporter (definer) for this interface.
+                // Mark all resources from this interface as defined by to_comp.
+                for ((iface, rn), _) in &resource_nodes {
+                    // Match if the interface contains this import name
+                    // (handles [export]X prefix stripping)
+                    let iface_matches = iface == import_name
+                        || iface.strip_prefix("[export]") == Some(import_name.as_str());
+                    if iface_matches {
+                        if !defines_cache.contains_key(&(*to_comp, iface.clone(), rn.clone())) {
+                            defines_cache.insert((*to_comp, iface.clone(), rn.clone()), true);
+                        }
+                        if definer_cache
+                            .get(&(iface.clone(), rn.clone()))
+                            .copied()
+                            .flatten()
+                            .is_none()
+                        {
+                            definer_cache.insert((iface.clone(), rn.clone()), Some(*to_comp));
+                        }
+                    }
+                }
+            }
         }
 
         ResourceGraph {
