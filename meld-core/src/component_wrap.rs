@@ -1039,9 +1039,11 @@ fn assemble_component(
     let mut component_type_idx = count_replayed_types(source);
     let mut lowered_func_indices: Vec<u32> = Vec::new();
 
-    // Cache: (interface_name, resource_name) → component type index.
-    // All components sharing the same interface get the same resource type.
-    let mut local_resource_types: std::collections::HashMap<(String, String), u32> =
+    // Cache: resource_name → component type index.
+    // ALL interfaces sharing the same resource name get the same type.
+    // This is correct because different interface names (imports, exports,
+    // test:X/test) may reference the same underlying resource type.
+    let mut local_resource_types: std::collections::HashMap<String, u32> =
         std::collections::HashMap::new();
 
     for (i, resolution) in import_resolutions.iter().enumerate() {
@@ -1128,7 +1130,7 @@ fn assemble_component(
                 // memory index as component identity. Category B imports (bare module drops)
                 // reuse an existing type for the same (interface, resource) — they find
                 // the first matching entry regardless of memory index.
-                let res_type_key = (interface_name.clone(), resource_name.clone());
+                let res_type_key = resource_name.clone();
                 let res_type_idx = if let Some(&existing) = local_resource_types.get(&res_type_key)
                 {
                     existing
