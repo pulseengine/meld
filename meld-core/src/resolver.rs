@@ -26,6 +26,10 @@ pub struct DependencyGraph {
     /// module pairs with different canonical options)
     pub adapter_sites: Vec<AdapterSite>,
 
+    /// Resource ownership graph for determining which component defines
+    /// which resource and how handles should be routed.
+    pub resource_graph: Option<crate::resource_graph::ResourceGraph>,
+
     /// Module-level resolution within components
     pub module_resolutions: Vec<ModuleResolution>,
 }
@@ -1030,6 +1034,7 @@ impl Resolver {
             unresolved_imports: Vec::new(),
             adapter_sites: Vec::new(),
             module_resolutions: Vec::new(),
+            resource_graph: None,
         };
 
         // Build export index
@@ -1085,6 +1090,12 @@ impl Resolver {
         // though the adapter needs one.  Detect missing resource imports and
         // add them as synthetic unresolved imports so the merger includes them.
         Self::synthesize_missing_resource_imports(components, &mut graph);
+
+        // Build resource ownership graph
+        graph.resource_graph = Some(crate::resource_graph::ResourceGraph::build(
+            &graph.resolved_imports,
+            components,
+        ));
 
         Ok(graph)
     }
