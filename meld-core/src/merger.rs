@@ -2840,6 +2840,7 @@ mod tests {
             resolved_imports: HashMap::new(),
             adapter_sites: Vec::new(),
             module_resolutions: Vec::new(),
+            resource_graph: None,
             unresolved_imports: vec![
                 UnresolvedImport {
                     component_idx: 0,
@@ -2959,6 +2960,7 @@ mod tests {
             resolved_imports: HashMap::new(),
             adapter_sites: Vec::new(),
             module_resolutions: Vec::new(),
+            resource_graph: None,
             unresolved_imports: vec![
                 UnresolvedImport {
                     component_idx: 0,
@@ -3008,6 +3010,7 @@ mod tests {
             resolved_imports: HashMap::new(),
             adapter_sites: Vec::new(),
             module_resolutions: Vec::new(),
+            resource_graph: None,
             unresolved_imports: vec![
                 UnresolvedImport {
                     component_idx: 0,
@@ -3065,6 +3068,7 @@ mod tests {
             resolved_imports: HashMap::new(),
             adapter_sites: Vec::new(),
             module_resolutions: Vec::new(),
+            resource_graph: None,
             unresolved_imports: vec![
                 UnresolvedImport {
                     component_idx: 0,
@@ -3113,6 +3117,7 @@ mod tests {
             resolved_imports: HashMap::new(),
             adapter_sites: Vec::new(),
             module_resolutions: Vec::new(),
+            resource_graph: None,
             unresolved_imports: vec![
                 UnresolvedImport {
                     component_idx: 0,
@@ -3165,6 +3170,7 @@ mod tests {
             resolved_imports: HashMap::new(),
             adapter_sites: Vec::new(),
             module_resolutions: Vec::new(),
+            resource_graph: None,
             unresolved_imports: vec![
                 UnresolvedImport {
                     component_idx: 0,
@@ -3293,6 +3299,7 @@ mod tests {
             resolved_imports: HashMap::new(),
             adapter_sites: Vec::new(),
             module_resolutions: Vec::new(),
+            resource_graph: None,
             unresolved_imports: vec![
                 UnresolvedImport {
                     component_idx: 0,
@@ -3447,6 +3454,7 @@ mod tests {
             resolved_imports: HashMap::new(),
             adapter_sites: Vec::new(),
             module_resolutions: Vec::new(),
+            resource_graph: None,
             unresolved_imports: vec![
                 UnresolvedImport {
                     component_idx: 0,
@@ -3594,6 +3602,7 @@ mod tests {
             resolved_imports: HashMap::new(),
             adapter_sites: Vec::new(),
             module_resolutions: Vec::new(),
+            resource_graph: None,
             unresolved_imports: vec![
                 UnresolvedImport {
                     component_idx: 0,

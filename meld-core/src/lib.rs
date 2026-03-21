@@ -48,6 +48,7 @@ mod error;
 pub mod merger;
 pub mod parser;
 pub mod resolver;
+pub mod resource_graph;
 pub mod rewriter;
 pub mod segments;
 
