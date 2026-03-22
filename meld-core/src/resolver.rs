@@ -2113,8 +2113,12 @@ impl Resolver {
                                                         .unwrap_or(&op.import_field);
                                                     if rg.defines_resource(*to_comp, iface, rn) {
                                                         op.callee_defines_resource = true;
-                                                    } else if rg.is_reexporter(*to_comp, iface, rn)
+                                                    } else if rg
+                                                        .resource_definer(iface, rn)
+                                                        .is_some()
                                                     {
+                                                        // Graph knows about this resource and says
+                                                        // this component is NOT the definer.
                                                         op.callee_defines_resource = false;
                                                     }
                                                 }
@@ -2125,7 +2129,9 @@ impl Resolver {
                                                         .unwrap_or(&op.import_field);
                                                     if rg.defines_resource(*to_comp, iface, rn) {
                                                         op.callee_defines_resource = true;
-                                                    } else if rg.is_reexporter(*to_comp, iface, rn)
+                                                    } else if rg
+                                                        .resource_definer(iface, rn)
+                                                        .is_some()
                                                     {
                                                         op.callee_defines_resource = false;
                                                     }
@@ -2324,7 +2330,7 @@ impl Resolver {
                                                 .unwrap_or(&op.import_field);
                                             if rg.defines_resource(*to_comp, iface, rn) {
                                                 op.callee_defines_resource = true;
-                                            } else if rg.is_reexporter(*to_comp, iface, rn) {
+                                            } else if rg.resource_definer(iface, rn).is_some() {
                                                 op.callee_defines_resource = false;
                                             }
                                         }
@@ -2335,7 +2341,7 @@ impl Resolver {
                                                 .unwrap_or(&op.import_field);
                                             if rg.defines_resource(*to_comp, iface, rn) {
                                                 op.callee_defines_resource = true;
-                                            } else if rg.is_reexporter(*to_comp, iface, rn) {
+                                            } else if rg.resource_definer(iface, rn).is_some() {
                                                 op.callee_defines_resource = false;
                                             }
                                         }
