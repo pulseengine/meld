@@ -67,6 +67,19 @@ interface soft-start-stop {
     terminate: func();
 }
 
+/// Per-component worlds (for wrapping individual core modules)
+world anti-pinch-v2-component {
+    export anti-pinch-v2;
+}
+
+world motor-driver-v2-component {
+    export motor-driver-v2;
+}
+
+world soft-start-stop-component {
+    export soft-start-stop;
+}
+
 /// World for the composed anti-pinch system
 world antipinch-system {
     export anti-pinch-v2;
