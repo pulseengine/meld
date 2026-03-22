@@ -1073,6 +1073,13 @@ impl Resolver {
         // Topological sort
         graph.instantiation_order = self.topological_sort(components.len(), &dependencies)?;
 
+        // Build resource ownership graph BEFORE identifying adapter sites
+        // so that the graph-based callee_defines_resource override can query it.
+        graph.resource_graph = Some(crate::resource_graph::ResourceGraph::build(
+            &graph.resolved_imports,
+            components,
+        ));
+
         // Identify adapter sites (cross-component)
         self.identify_adapter_sites(components, &mut graph)?;
 
@@ -1090,12 +1097,6 @@ impl Resolver {
         // though the adapter needs one.  Detect missing resource imports and
         // add them as synthetic unresolved imports so the merger includes them.
         Self::synthesize_missing_resource_imports(components, &mut graph);
-
-        // Build resource ownership graph
-        graph.resource_graph = Some(crate::resource_graph::ResourceGraph::build(
-            &graph.resolved_imports,
-            components,
-        ));
 
         Ok(graph)
     }
@@ -2092,9 +2093,9 @@ impl Resolver {
                                                 );
 
                                             // Graph-based override for callee_defines_resource.
-                                            // The graph uses the composition DAG to find the
-                                            // terminal exporter (definer) — more reliable than
-                                            // checking canonical_functions after flattening.
+                                            // Only UPGRADE (false→true) or DOWNGRADE (true→false)
+                                            // when the graph has a definitive answer. If the graph
+                                            // has no entry, leave the heuristic value unchanged.
                                             if let Some(ref rg) = graph.resource_graph {
                                                 let iface = import_name.as_str();
                                                 for op in &mut requirements.resource_params {
@@ -2102,16 +2103,24 @@ impl Resolver {
                                                         .import_field
                                                         .strip_prefix("[resource-rep]")
                                                         .unwrap_or(&op.import_field);
-                                                    op.callee_defines_resource =
-                                                        rg.defines_resource(*to_comp, iface, rn);
+                                                    if rg.defines_resource(*to_comp, iface, rn) {
+                                                        op.callee_defines_resource = true;
+                                                    } else if rg.is_reexporter(*to_comp, iface, rn)
+                                                    {
+                                                        op.callee_defines_resource = false;
+                                                    }
                                                 }
                                                 for op in &mut requirements.resource_results {
                                                     let rn = op
                                                         .import_field
                                                         .strip_prefix("[resource-new]")
                                                         .unwrap_or(&op.import_field);
-                                                    op.callee_defines_resource =
-                                                        rg.defines_resource(*to_comp, iface, rn);
+                                                    if rg.defines_resource(*to_comp, iface, rn) {
+                                                        op.callee_defines_resource = true;
+                                                    } else if rg.is_reexporter(*to_comp, iface, rn)
+                                                    {
+                                                        op.callee_defines_resource = false;
+                                                    }
                                                 }
                                             }
                                         }
@@ -2296,7 +2305,8 @@ impl Resolver {
                                             true,
                                         );
 
-                                    // Graph-based override for fallback path
+                                    // Graph-based override for fallback path.
+                                    // Only change when the graph has a definitive answer.
                                     if let Some(ref rg) = graph.resource_graph {
                                         let iface = import_name.as_str();
                                         for op in &mut requirements.resource_params {
@@ -2304,16 +2314,22 @@ impl Resolver {
                                                 .import_field
                                                 .strip_prefix("[resource-rep]")
                                                 .unwrap_or(&op.import_field);
-                                            op.callee_defines_resource =
-                                                rg.defines_resource(*to_comp, iface, rn);
+                                            if rg.defines_resource(*to_comp, iface, rn) {
+                                                op.callee_defines_resource = true;
+                                            } else if rg.is_reexporter(*to_comp, iface, rn) {
+                                                op.callee_defines_resource = false;
+                                            }
                                         }
                                         for op in &mut requirements.resource_results {
                                             let rn = op
                                                 .import_field
                                                 .strip_prefix("[resource-new]")
                                                 .unwrap_or(&op.import_field);
-                                            op.callee_defines_resource =
-                                                rg.defines_resource(*to_comp, iface, rn);
+                                            if rg.defines_resource(*to_comp, iface, rn) {
+                                                op.callee_defines_resource = true;
+                                            } else if rg.is_reexporter(*to_comp, iface, rn) {
+                                                op.callee_defines_resource = false;
+                                            }
                                         }
                                     }
                                 }

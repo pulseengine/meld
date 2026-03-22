@@ -159,14 +159,20 @@ pub struct ResourceBorrowTransfer {
     pub new_func: Option<u32>,
 }
 
-/// Describes how to convert an `own<T>` result via `[resource-new]`.
+/// Describes how to convert an `own<T>` result via `[resource-rep]` then `[resource-new]`.
+///
+/// The callee returns a handle. To transfer to the caller's table:
+///   1. `resource.rep(handle)` on callee's type extracts the representation
+///   2. `resource.new(rep)` on caller's type mints a fresh handle
 #[derive(Debug, Clone)]
 pub struct ResourceOwnResultTransfer {
     /// Flat result index (non-retptr path)
     pub position: u32,
     /// Byte offset in return area (retptr path)
     pub byte_offset: u32,
-    /// Merged function index of `[resource-new]`
+    /// Merged function index of callee's `[resource-rep]` (handle → rep)
+    pub rep_func: u32,
+    /// Merged function index of caller's `[resource-new]` (rep → handle)
     pub new_func: u32,
 }
 

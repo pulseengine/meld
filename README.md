@@ -7,6 +7,7 @@
 &nbsp;
 
 [![CI](https://github.com/pulseengine/meld/actions/workflows/ci.yml/badge.svg)](https://github.com/pulseengine/meld/actions/workflows/ci.yml)
+[![codecov](https://codecov.io/gh/pulseengine/meld/graph/badge.svg)](https://codecov.io/gh/pulseengine/meld)
 ![Rust](https://img.shields.io/badge/Rust-CE422B?style=flat-square&logo=rust&logoColor=white&labelColor=1a1b27)
 ![WebAssembly](https://img.shields.io/badge/WebAssembly-654FF0?style=flat-square&logo=webassembly&logoColor=white&labelColor=1a1b27)
 ![Component Model](https://img.shields.io/badge/Component_Model-654FF0?style=flat-square&logoColor=white&labelColor=1a1b27)
