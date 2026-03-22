@@ -220,6 +220,25 @@ pub struct AdapterRequirements {
     /// Used by the adapter to emit correctly-sized load/store instructions (e.g.,
     /// `i64.load`/`i64.store` for 8-byte values like f64/i64).
     pub return_area_slots: Vec<ReturnAreaSlot>,
+    /// Byte size of the callee's params area when using params-ptr convention.
+    /// Computed from the component function type's flat param layout.
+    /// Set when total flat params > MAX_FLAT_PARAMS (16).
+    pub params_area_byte_size: Option<u32>,
+    /// Maximum alignment of the params area (for cabi_realloc).
+    pub params_area_max_align: u32,
+    /// Byte offsets in the params area where (ptr, len) pairs start.
+    /// These pointer pairs need cross-memory copy and fixup.
+    pub params_area_pointer_pair_offsets: Vec<u32>,
+    /// Copy layouts for params-area pointer pairs (parallel to
+    /// `params_area_pointer_pair_offsets`).
+    pub params_area_copy_layouts: Vec<CopyLayout>,
+    /// Layout of all slots in the params area (for params-ptr convention).
+    /// Used to identify scalar and pointer-pair slots for copying.
+    pub params_area_slots: Vec<ReturnAreaSlot>,
+    /// Resource-typed values at byte offsets within the params-ptr buffer.
+    /// Used by the params-ptr adapter to convert borrow handles to representations.
+    /// Includes resources nested inside records, tuples, variants, options, results.
+    pub params_area_resource_positions: Vec<ResolvedResourceOp>,
     /// Resource-typed parameters needing handle→representation conversion.
     /// The adapter calls `[resource-rep]` for each before forwarding to callee.
     /// These are resolved against the CALLEE's resource map.
@@ -2070,6 +2089,38 @@ impl Resolver {
                                                     );
                                             requirements.return_area_slots =
                                                 to_component.return_area_slots(results);
+                                            // Detect params-ptr convention (flat params > 16)
+                                            let total_flat =
+                                                to_component.total_flat_params(comp_params);
+                                            if total_flat > 16 {
+                                                let psize =
+                                                    to_component.params_area_byte_size(comp_params);
+                                                requirements.params_area_byte_size = Some(psize);
+                                                requirements.params_area_max_align =
+                                                    to_component.params_area_max_align(comp_params);
+                                                requirements.params_area_pointer_pair_offsets =
+                                                    to_component.pointer_pair_params_byte_offsets(
+                                                        comp_params,
+                                                    );
+                                                requirements.params_area_copy_layouts =
+                                                    collect_param_copy_layouts(
+                                                        to_component,
+                                                        comp_params,
+                                                    );
+                                                requirements.params_area_slots =
+                                                    to_component.params_area_slots(comp_params);
+                                                requirements.params_area_resource_positions =
+                                                    resolve_resource_positions(
+                                                        &callee_resource_map,
+                                                        &to_component
+                                                            .resource_params_area_positions(
+                                                                comp_params,
+                                                            ),
+                                                        "[resource-rep]",
+                                                        &to_component.component_type_defs,
+                                                        callee_is_reexporter,
+                                                    );
+                                            }
                                             // Collect resource-typed params and results
                                             requirements.resource_params =
                                                 resolve_resource_positions(
@@ -2288,11 +2339,39 @@ impl Resolver {
                                     requirements.return_area_slots =
                                         to_component.return_area_slots(results);
 
+                                    // Detect params-ptr convention (flat params > 16)
+                                    let total_flat = to_component.total_flat_params(comp_params);
+                                    if total_flat > 16 {
+                                        let psize = to_component.params_area_byte_size(comp_params);
+                                        requirements.params_area_byte_size = Some(psize);
+                                        requirements.params_area_max_align =
+                                            to_component.params_area_max_align(comp_params);
+                                        requirements.params_area_pointer_pair_offsets =
+                                            to_component
+                                                .pointer_pair_params_byte_offsets(comp_params);
+                                        requirements.params_area_copy_layouts =
+                                            collect_param_copy_layouts(to_component, comp_params);
+                                        requirements.params_area_slots =
+                                            to_component.params_area_slots(comp_params);
+                                    }
+
                                     let callee_resource_map =
                                         build_resource_type_to_import(to_component);
                                     let fb_callee_reexporter = graph
                                         .resolved_imports
                                         .contains_key(&(*to_comp, import_name.clone()));
+                                    // Params-area resource positions (for params-ptr adapter)
+                                    if requirements.params_area_byte_size.is_some() {
+                                        requirements.params_area_resource_positions =
+                                            resolve_resource_positions(
+                                                &callee_resource_map,
+                                                &to_component
+                                                    .resource_params_area_positions(comp_params),
+                                                "[resource-rep]",
+                                                &to_component.component_type_defs,
+                                                fb_callee_reexporter,
+                                            );
+                                    }
                                     requirements.resource_params = resolve_resource_positions(
                                         &callee_resource_map,
                                         &to_component.resource_param_positions(comp_params),

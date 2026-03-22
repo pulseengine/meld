@@ -1365,6 +1365,84 @@ impl ParsedComponent {
         align_up(size, max_align)
     }
 
+    /// Compute the total number of flat (core wasm) params for a component function's params.
+    ///
+    /// If this exceeds MAX_FLAT_PARAMS (16), the canonical ABI uses the params-ptr
+    /// calling convention: a single i32 pointer to a buffer in linear memory.
+    pub fn total_flat_params(&self, params: &[(String, ComponentValType)]) -> u32 {
+        params.iter().map(|(_, ty)| self.flat_count(ty)).sum()
+    }
+
+    /// Compute the byte size of the params area for a component function's params.
+    ///
+    /// The params area uses the canonical ABI memory layout (with alignment),
+    /// matching `return_area_byte_size` but for parameters. Used when the canonical
+    /// ABI employs params-ptr lowering (flat param count > MAX_FLAT_PARAMS = 16).
+    pub fn params_area_byte_size(&self, params: &[(String, ComponentValType)]) -> u32 {
+        let mut size = 0u32;
+        for (_, ty) in params {
+            let align = self.canonical_abi_align(ty);
+            size = align_up(size, align);
+            size += self.canonical_abi_size_unpadded(ty);
+        }
+        // Align final size to the max alignment of the tuple
+        let max_align = params
+            .iter()
+            .map(|(_, ty)| self.canonical_abi_align(ty))
+            .max()
+            .unwrap_or(1);
+        align_up(size, max_align)
+    }
+
+    /// Compute the maximum alignment of the params area.
+    pub fn params_area_max_align(&self, params: &[(String, ComponentValType)]) -> u32 {
+        params
+            .iter()
+            .map(|(_, ty)| self.canonical_abi_align(ty))
+            .max()
+            .unwrap_or(1)
+    }
+
+    /// Compute byte offsets in the params area where (ptr, len) pairs start.
+    ///
+    /// Uses canonical ABI memory layout offsets (with alignment), matching
+    /// how params are stored in the params-ptr buffer. Mirrors
+    /// `pointer_pair_result_offsets` but for parameters.
+    pub fn pointer_pair_params_byte_offsets(
+        &self,
+        params: &[(String, ComponentValType)],
+    ) -> Vec<u32> {
+        let mut offsets = Vec::new();
+        let mut byte_offset = 0u32;
+        for (_, ty) in params {
+            let align = self.canonical_abi_align(ty);
+            byte_offset = align_up(byte_offset, align);
+            self.collect_pointer_byte_offsets(ty, byte_offset, &mut offsets);
+            byte_offset += self.canonical_abi_size_unpadded(ty);
+        }
+        offsets
+    }
+
+    /// Compute the layout of all slots in the params area.
+    ///
+    /// Each slot describes a contiguous value in the canonical ABI memory layout
+    /// with its byte offset, byte size, and whether it is a pointer pair.
+    /// Mirrors `return_area_slots` but for parameters.
+    pub fn params_area_slots(
+        &self,
+        params: &[(String, ComponentValType)],
+    ) -> Vec<crate::resolver::ReturnAreaSlot> {
+        let mut slots = Vec::new();
+        let mut byte_offset = 0u32;
+        for (_, ty) in params {
+            let align = self.canonical_abi_align(ty);
+            byte_offset = align_up(byte_offset, align);
+            self.collect_return_area_type_slots(ty, byte_offset, &mut slots);
+            byte_offset += self.canonical_abi_size_unpadded(ty);
+        }
+        slots
+    }
+
     /// Compute the layout of all slots in the return area.
     ///
     /// Each slot describes a contiguous value in the canonical ABI memory layout
@@ -1653,6 +1731,136 @@ impl ParsedComponent {
             flat_idx += self.flat_count(ty);
         }
         positions
+    }
+
+    /// Identify resource-typed parameters at their canonical ABI byte offsets
+    /// within the params-ptr buffer.
+    ///
+    /// Walks the full type structure (records, tuples, variants, options, results)
+    /// to find all `own<R>` and `borrow<R>` values and their byte offsets in the
+    /// canonical ABI memory layout. Used by the params-ptr adapter to emit
+    /// `[resource-rep]` calls for borrow handles inside the buffer.
+    pub fn resource_params_area_positions(
+        &self,
+        params: &[(String, ComponentValType)],
+    ) -> Vec<ResourcePosition> {
+        let mut positions = Vec::new();
+        let mut byte_offset = 0u32;
+        for (_, ty) in params {
+            let align = self.canonical_abi_align(ty);
+            byte_offset = align_up(byte_offset, align);
+            self.collect_resource_byte_positions(ty, byte_offset, &mut positions);
+            byte_offset += self.canonical_abi_size_unpadded(ty);
+        }
+        positions
+    }
+
+    /// Recursively collect resource handle byte offsets within a type's
+    /// canonical ABI memory layout.
+    fn collect_resource_byte_positions(
+        &self,
+        ty: &ComponentValType,
+        base: u32,
+        out: &mut Vec<ResourcePosition>,
+    ) {
+        match ty {
+            ComponentValType::Own(id) => {
+                out.push(ResourcePosition {
+                    flat_idx: 0, // not meaningful for byte-offset based access
+                    byte_offset: base,
+                    is_owned: true,
+                    resource_type_id: *id,
+                });
+            }
+            ComponentValType::Borrow(id) => {
+                out.push(ResourcePosition {
+                    flat_idx: 0,
+                    byte_offset: base,
+                    is_owned: false,
+                    resource_type_id: *id,
+                });
+            }
+            ComponentValType::Record(fields) => {
+                let mut offset = base;
+                for (_, field_ty) in fields {
+                    let align = self.canonical_abi_align(field_ty);
+                    offset = align_up(offset, align);
+                    self.collect_resource_byte_positions(field_ty, offset, out);
+                    offset += self.canonical_abi_size_unpadded(field_ty);
+                }
+            }
+            ComponentValType::Tuple(elems) => {
+                let mut offset = base;
+                for elem_ty in elems {
+                    let align = self.canonical_abi_align(elem_ty);
+                    offset = align_up(offset, align);
+                    self.collect_resource_byte_positions(elem_ty, offset, out);
+                    offset += self.canonical_abi_size_unpadded(elem_ty);
+                }
+            }
+            ComponentValType::Option(inner) => {
+                // discriminant (1-4 bytes) + payload
+                let disc_size = 1u32; // option discriminant is always 1 byte
+                let payload_align = self.canonical_abi_align(inner);
+                let payload_offset = align_up(base + disc_size, payload_align);
+                // Only collect when discriminant == 1 (Some)
+                // The adapter must check the discriminant at runtime
+                self.collect_resource_byte_positions(inner, payload_offset, out);
+            }
+            ComponentValType::Result { ok, err } => {
+                let disc_size = 1u32;
+                let ok_align = ok
+                    .as_ref()
+                    .map(|t| self.canonical_abi_align(t))
+                    .unwrap_or(1);
+                let err_align = err
+                    .as_ref()
+                    .map(|t| self.canonical_abi_align(t))
+                    .unwrap_or(1);
+                let payload_align = ok_align.max(err_align);
+                let payload_offset = align_up(base + disc_size, payload_align);
+                if let Some(ok_ty) = ok {
+                    self.collect_resource_byte_positions(ok_ty, payload_offset, out);
+                }
+                if let Some(err_ty) = err {
+                    self.collect_resource_byte_positions(err_ty, payload_offset, out);
+                }
+            }
+            ComponentValType::Variant(cases) => {
+                let disc_size = if cases.len() <= 256 { 1u32 } else { 4 };
+                let payload_align = cases
+                    .iter()
+                    .filter_map(|(_, t)| t.as_ref().map(|t| self.canonical_abi_align(t)))
+                    .max()
+                    .unwrap_or(1);
+                let payload_offset = align_up(base + disc_size, payload_align);
+                for (_, case_ty) in cases {
+                    if let Some(ty) = case_ty {
+                        self.collect_resource_byte_positions(ty, payload_offset, out);
+                    }
+                }
+            }
+            ComponentValType::Type(idx) => {
+                if let Some(ct) = self.get_type_definition(*idx)
+                    && let ComponentTypeKind::Defined(inner) = &ct.kind
+                {
+                    self.collect_resource_byte_positions(inner, base, out);
+                }
+            }
+            // Lists contain resource handles but they're in a separate memory area,
+            // not in the params buffer itself. The adapter handles list resource
+            // conversion separately via inner_resource_fixups.
+            ComponentValType::List(_) | ComponentValType::String => {}
+            ComponentValType::FixedSizeList(elem, len) => {
+                let elem_size = self.canonical_abi_element_size(elem);
+                let mut offset = base;
+                for _ in 0..*len {
+                    self.collect_resource_byte_positions(elem, offset, out);
+                    offset += elem_size;
+                }
+            }
+            _ => {} // primitives
+        }
     }
 
     /// Identify resource-typed results and their flat-ABI / byte-offset positions.
