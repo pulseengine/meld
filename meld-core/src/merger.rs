@@ -2633,6 +2633,7 @@ mod tests {
             original_size: 0,
             original_hash: String::new(),
             depth_0_sections: Vec::new(),
+            p3_async_features: Vec::new(),
         };
 
         // Function indices 0-4 should all map to (module 0, local idx)
@@ -2721,6 +2722,7 @@ mod tests {
             original_size: 0,
             original_hash: String::new(),
             depth_0_sections: Vec::new(),
+            p3_async_features: Vec::new(),
         };
 
         // Indices 0-2 belong to module A
@@ -2833,6 +2835,7 @@ mod tests {
             original_size: 0,
             original_hash: String::new(),
             depth_0_sections: Vec::new(),
+            p3_async_features: Vec::new(),
         };
 
         let graph = DependencyGraph {
@@ -3289,6 +3292,7 @@ mod tests {
                 original_size: 0,
                 original_hash: String::new(),
                 depth_0_sections: Vec::new(),
+                p3_async_features: Vec::new(),
             }
         };
 
@@ -3444,6 +3448,7 @@ mod tests {
                 original_size: 0,
                 original_hash: String::new(),
                 depth_0_sections: Vec::new(),
+                p3_async_features: Vec::new(),
             }
         };
 
@@ -3592,6 +3597,7 @@ mod tests {
                 original_size: 0,
                 original_hash: String::new(),
                 depth_0_sections: Vec::new(),
+                p3_async_features: Vec::new(),
             }
         };
 
@@ -3672,6 +3678,7 @@ mod tests {
             original_size: 0,
             original_hash: String::new(),
             depth_0_sections: vec![],
+            p3_async_features: vec![],
         }
     }
 

@@ -240,6 +240,29 @@ impl Fuser {
             ));
         }
 
+        // Reject P3 async components — meld cannot yet fuse them correctly.
+        // Collect all detected features across all components for a single
+        // actionable error message.
+        let mut p3_details: Vec<String> = Vec::new();
+        for (idx, comp) in self.components.iter().enumerate() {
+            if !comp.p3_async_features.is_empty() {
+                let default_name = format!("component {idx}");
+                let comp_name = comp.name.as_deref().unwrap_or(&default_name);
+                // Deduplicate features within a single component
+                let mut feats = comp.p3_async_features.clone();
+                feats.sort();
+                feats.dedup();
+                p3_details.push(format!("'{comp_name}' uses: {}", feats.join(", ")));
+            }
+        }
+        if !p3_details.is_empty() {
+            return Err(Error::P3AsyncNotSupported(format!(
+                "{}. P3 async features (stream, future, async lift/lower, task builtins) \
+                 are not yet supported by meld. Use P2 components or wait for meld P3 support.",
+                p3_details.join("; ")
+            )));
+        }
+
         let mut stats = FusionStats {
             components_fused: self.components.len(),
             ..Default::default()
