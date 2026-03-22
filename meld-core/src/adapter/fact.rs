@@ -77,20 +77,38 @@ fn emit_resource_borrow_phase0(func: &mut Function, transfers: &[super::Resource
     }
 }
 
-/// Emit Phase R: convert own<T> results via resource.rep then resource.new.
+/// Emit Phase R-rep: extract representations from own<T> result handles.
 ///
-/// The callee returned a handle. To transfer to the caller's table:
-///   1. `resource.rep(handle)` on callee's type extracts the representation
-///   2. `resource.new(rep)` on caller's type mints a fresh handle
+/// Calls `resource.rep(handle)` for each own result, storing the rep in
+/// scratch locals starting at `scratch_base`. The original handle locals
+/// are NOT modified — post_return still needs them to drop the callee's handles.
+fn emit_resource_rep_results(
+    func: &mut Function,
+    transfers: &[super::ResourceOwnResultTransfer],
+    result_base: u32,
+    scratch_base: u32,
+) {
+    for (i, t) in transfers.iter().enumerate() {
+        let local_idx = result_base + t.position;
+        func.instruction(&Instruction::LocalGet(local_idx));
+        func.instruction(&Instruction::Call(t.rep_func));
+        func.instruction(&Instruction::LocalSet(scratch_base + i as u32));
+    }
+}
+
+/// Emit Phase R-new: mint fresh handles from extracted representations.
+///
+/// Calls `resource.new(rep)` for each own result, reading from scratch locals
+/// and storing the new handle back into the result locals.
 fn emit_resource_new_results(
     func: &mut Function,
     transfers: &[super::ResourceOwnResultTransfer],
     result_base: u32,
+    scratch_base: u32,
 ) {
-    for t in transfers {
+    for (i, t) in transfers.iter().enumerate() {
         let local_idx = result_base + t.position;
-        func.instruction(&Instruction::LocalGet(local_idx));
-        func.instruction(&Instruction::Call(t.rep_func));
+        func.instruction(&Instruction::LocalGet(scratch_base + i as u32));
         func.instruction(&Instruction::Call(t.new_func));
         func.instruction(&Instruction::LocalSet(local_idx));
     }
@@ -324,12 +342,8 @@ impl FactStyleGenerator {
         }
 
         // Resolve own<T> results that need [resource-rep] + [resource-new].
-        // Only for 3-component chains where callee doesn't define the resource.
-        // When the callee defines it, the P2 wrapper handles lift/lower.
-        //
-        // The callee returns a handle. To transfer to the caller:
-        //   1. resource.rep (callee) extracts the representation
-        //   2. resource.new (caller) creates a handle in the caller's table
+        // When callee_defines_resource is true, the P2 wrapper's canon lift/lower
+        // handles the conversion — the adapter passes the handle directly.
         for op in &site.requirements.resource_results {
             if !op.is_owned || op.callee_defines_resource {
                 continue;
@@ -443,12 +457,21 @@ impl FactStyleGenerator {
         let has_resource_ops = !options.resource_rep_calls.is_empty();
         let has_result_resource_ops = !options.resource_new_calls.is_empty();
         let needs_result_locals = (has_post_return || has_result_resource_ops) && result_count > 0;
+        let scratch_count = options.resource_new_calls.len();
 
         if has_resource_ops || has_result_resource_ops || (has_post_return && result_count > 0) {
             let mut locals: Vec<(u32, wasm_encoder::ValType)> = Vec::new();
             let result_base = param_count as u32;
             if needs_result_locals {
                 locals.extend(result_types.iter().map(|t| (1u32, *t)));
+            }
+            // Scratch locals for intermediate rep values (one i32 per own<T> result)
+            let scratch_base = result_base + result_count as u32;
+            if scratch_count > 0 {
+                locals.extend(std::iter::repeat_n(
+                    (1u32, wasm_encoder::ValType::I32),
+                    scratch_count,
+                ));
             }
             let mut func = Function::new(locals);
 
@@ -466,16 +489,30 @@ impl FactStyleGenerator {
                     func.instruction(&Instruction::LocalSet(result_base + i as u32));
                 }
 
-                // Phase R: Convert own<T> results via resource.new
-                emit_resource_new_results(&mut func, &options.resource_new_calls, result_base);
+                // Phase R-rep: extract representations while handles are still alive
+                emit_resource_rep_results(
+                    &mut func,
+                    &options.resource_new_calls,
+                    result_base,
+                    scratch_base,
+                );
 
-                // Call post-return with saved results
+                // Call post-return with original handles (drops callee's handles)
                 if has_post_return {
                     for i in 0..result_count {
                         func.instruction(&Instruction::LocalGet(result_base + i as u32));
                     }
                     func.instruction(&Instruction::Call(options.callee_post_return.unwrap()));
                 }
+
+                // Phase R-new: mint fresh handles from reps
+                emit_resource_new_results(
+                    &mut func,
+                    &options.resource_new_calls,
+                    result_base,
+                    scratch_base,
+                );
+
                 // Push saved results back onto stack
                 for i in 0..result_count {
                     func.instruction(&Instruction::LocalGet(result_base + i as u32));
@@ -723,6 +760,12 @@ impl FactStyleGenerator {
             for ty in &result_types {
                 local_decls.push((1, *ty));
             }
+        }
+        // Scratch locals for Phase R-rep intermediate rep values (one i32 per own<T> result)
+        let own_result_scratch_count = options.resource_new_calls.len();
+        let own_result_scratch_base = result_save_base + result_count as u32;
+        if own_result_scratch_count > 0 {
+            local_decls.push((own_result_scratch_count as u32, wasm_encoder::ValType::I32));
         }
 
         let mut func = Function::new(local_decls);
@@ -1019,11 +1062,16 @@ impl FactStyleGenerator {
                     func.instruction(&Instruction::LocalSet(result_save_base + i as u32));
                 }
 
-                // Phase R: Convert own<T> results via resource.new
-                emit_resource_new_results(&mut func, &options.resource_new_calls, result_save_base);
+                // Phase R-rep: extract representations while handles are still alive
+                emit_resource_rep_results(
+                    &mut func,
+                    &options.resource_new_calls,
+                    result_save_base,
+                    own_result_scratch_base,
+                );
             }
 
-            // Call post-return with callee's original return values
+            // Call post-return with callee's original handles (drops them)
             if let Some(post_return_func) = options.callee_post_return {
                 if result_count > 0 && needs_result_save {
                     for i in 0..result_count {
@@ -1031,6 +1079,16 @@ impl FactStyleGenerator {
                     }
                 }
                 func.instruction(&Instruction::Call(post_return_func));
+            }
+
+            // Phase R-new: mint fresh handles from reps (after post_return dropped originals)
+            if result_count > 0 && needs_result_save && has_result_resource_ops {
+                emit_resource_new_results(
+                    &mut func,
+                    &options.resource_new_calls,
+                    result_save_base,
+                    own_result_scratch_base,
+                );
             }
 
             // Conditional result copy: fix up pointer pairs in callee results
