@@ -286,19 +286,14 @@ impl ResourceGraph {
                 })
                 .cloned()
                 .collect();
-            for (ri, rn) in &matching_resource_ifaces {
+            for (_ri, rn) in &matching_resource_ifaces {
                 // Check all interface name variants for this resource
+                // A component that imports a resource cannot be its definer,
+                // regardless of what interface name it exports under. Remove
+                // ALL defines entries for this component + resource name.
                 let keys_to_remove: Vec<_> = defines_cache
                     .keys()
-                    .filter(|(idx, iface, r)| {
-                        *idx == *from_comp
-                            && r == rn
-                            && (iface == ri
-                                || iface.strip_prefix("[export]") == Some(ri.as_str())
-                                || ri.strip_prefix("[export]") == Some(iface.as_str())
-                                || iface == import_name
-                                || iface.strip_prefix("[export]") == Some(import_name.as_str()))
-                    })
+                    .filter(|(idx, _iface, r)| *idx == *from_comp && r == rn)
                     .cloned()
                     .collect();
                 for key in keys_to_remove {
