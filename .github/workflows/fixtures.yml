@@ -8,7 +8,7 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  WIT_BINDGEN_VERSION: "0.52.0"
+  WIT_BINDGEN_VERSION: "0.54.0"
 
 jobs:
   update-fixtures:
