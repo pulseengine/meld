@@ -144,6 +144,21 @@ pub struct AdapterOptions {
     /// Each entry: (byte_offset_in_element, merged_func_idx of [resource-rep]).
     /// Used after bulk list copy to convert handles in callee memory.
     pub inner_resource_fixups: Vec<(u32, u32)>,
+    /// Resource borrow handles inside the params-ptr buffer that need
+    /// handle→rep conversion. Each entry contains the byte offset within the
+    /// buffer and the merged function index of `[resource-rep]`.
+    pub params_area_borrow_fixups: Vec<ParamsAreaResourceFixup>,
+}
+
+/// Describes a resource handle inside the params-ptr buffer that needs conversion.
+#[derive(Debug, Clone)]
+pub struct ParamsAreaResourceFixup {
+    /// Byte offset within the params buffer
+    pub byte_offset: u32,
+    /// Merged function index of `[resource-rep]` to convert handle → rep
+    pub rep_func: u32,
+    /// Whether this is an own<T> (true) or borrow<T> (false)
+    pub is_owned: bool,
 }
 
 /// Describes how to transfer a `borrow<T>` handle across an adapter boundary.
@@ -190,6 +205,7 @@ impl Default for AdapterOptions {
             resource_rep_calls: Vec::new(),
             resource_new_calls: Vec::new(),
             inner_resource_fixups: Vec::new(),
+            params_area_borrow_fixups: Vec::new(),
         }
     }
 }

@@ -429,6 +429,31 @@ impl FactStyleGenerator {
             }
         }
 
+        // Resolve resource handles inside the params-ptr buffer.
+        // For borrow<T> where callee defines T, the adapter must convert
+        // handle → rep at the byte offset within the buffer.
+        for op in &site.requirements.params_area_resource_positions {
+            if op.is_owned {
+                continue; // own<T>: callee calls resource.rep internally
+            }
+
+            if op.callee_defines_resource {
+                // 2-component: use callee's [resource-rep]
+                if let Some(&rep_func) =
+                    resource_rep_imports.get(&(op.import_module.clone(), op.import_field.clone()))
+                {
+                    options
+                        .params_area_borrow_fixups
+                        .push(super::ParamsAreaResourceFixup {
+                            byte_offset: op.byte_offset,
+                            rep_func,
+                            is_owned: false,
+                        });
+                }
+            }
+            // 3-component chains for params-area borrows could be added here
+        }
+
         options
     }
 
@@ -615,6 +640,29 @@ impl FactStyleGenerator {
                 caller_param_count,
                 callee_param_count,
             );
+        }
+
+        // --- Detect params-ptr calling convention ---
+        // The canonical ABI uses params-ptr when flat params > MAX_FLAT_PARAMS (16):
+        //   caller (lowered): (params_ptr: i32) → result...
+        //   callee (lifted):  (params_ptr: i32) → result...
+        // Both sides use a single i32 pointer to a buffer in linear memory.
+        // When memories differ, the adapter must copy the buffer across.
+        let uses_params_ptr = site.requirements.params_area_byte_size.is_some();
+
+        if uses_params_ptr && options.caller_memory != options.callee_memory {
+            log::debug!(
+                "params-ptr adapter: generating for import={} (buffer={}B, {} ptr pairs, {} borrow fixups)",
+                site.import_name,
+                site.requirements.params_area_byte_size.unwrap_or(0),
+                site.requirements.params_area_pointer_pair_offsets.len(),
+                site.requirements
+                    .params_area_resource_positions
+                    .iter()
+                    .filter(|p| !p.is_owned && p.callee_defines_resource)
+                    .count(),
+            );
+            return self.generate_params_ptr_adapter(site, options, target_func, caller_type_idx);
         }
 
         // --- Non-retptr path: use caller's type for declared signature ---
@@ -1153,6 +1201,295 @@ impl FactStyleGenerator {
         func.instruction(&Instruction::End);
 
         Ok((adapter_type_idx, func))
+    }
+
+    /// Generate an adapter for the params-ptr calling convention.
+    ///
+    /// When flat param count > MAX_FLAT_PARAMS (16), the canonical ABI stores all
+    /// params in a buffer in linear memory. Both caller and callee use:
+    ///   (params_ptr: i32) → result...
+    ///
+    /// The adapter bridges different memories:
+    /// 1. Allocate buffer in callee's memory via cabi_realloc
+    /// 2. Bulk copy the params buffer from caller to callee memory
+    /// 3. Fix up any (ptr, len) pairs inside the buffer — copy pointed-to data
+    ///    from caller memory to callee memory and update the pointers
+    /// 4. Call callee with new pointer
+    /// 5. Return the result(s)
+    fn generate_params_ptr_adapter(
+        &self,
+        site: &AdapterSite,
+        options: &AdapterOptions,
+        target_func: u32,
+        caller_type_idx: u32,
+    ) -> Result<(u32, Function)> {
+        let params_area_size = site.requirements.params_area_byte_size.unwrap_or(0);
+        let params_area_align = site.requirements.params_area_max_align.max(1);
+        let ptr_pair_offsets = &site.requirements.params_area_pointer_pair_offsets;
+        let copy_layouts = &site.requirements.params_area_copy_layouts;
+
+        let callee_realloc = options.callee_realloc.unwrap_or_else(|| {
+            log::warn!("params-ptr adapter: no callee realloc, buffer copy may fail");
+            0
+        });
+
+        // Check if any list copy layouts contain inner resources (borrow handles)
+        let has_inner_resources = copy_layouts.iter().any(|cl| {
+            matches!(cl,
+                crate::resolver::CopyLayout::Elements { inner_resources, .. }
+                if !inner_resources.is_empty()
+            )
+        });
+
+        // Local layout:
+        //   0: params_ptr (the function parameter — pointer to caller's memory)
+        //   1: callee_ptr (allocated pointer in callee's memory)
+        //   2..2+N: dest_ptr for each pointer pair copy
+        //   2+N: loop_counter (if inner resources need fixup)
+        let num_ptr_pairs = ptr_pair_offsets.len() as u32;
+        let loop_counter_count = if has_inner_resources { 1u32 } else { 0 };
+        let scratch_count = 1 + num_ptr_pairs + loop_counter_count; // callee_ptr + per-pair dest ptrs + loop counter
+
+        // Post-return needs result save locals
+        let has_post_return = options.callee_post_return.is_some();
+        // For params-ptr, the results come from the callee directly.
+
+        let mut local_decls: Vec<(u32, wasm_encoder::ValType)> = Vec::new();
+        if scratch_count > 0 {
+            local_decls.push((scratch_count, wasm_encoder::ValType::I32));
+        }
+
+        // We don't know result count from here, so we handle post-return simply:
+        // if there's a post-return, we'll save and restore results.
+        // But for params-ptr functions with resource results, result count should be 1 (i32).
+        // For simplicity: if has_post_return, add 1 i32 result save local.
+        let result_save_base = 1 + scratch_count; // after params_ptr(0) + scratch
+        if has_post_return {
+            local_decls.push((1, wasm_encoder::ValType::I32));
+        }
+
+        let mut func = Function::new(local_decls);
+
+        let params_ptr_local: u32 = 0;
+        let callee_ptr_local: u32 = 1;
+        let pair_dest_base: u32 = 2;
+
+        // --- Phase 1: Allocate buffer in callee's memory ---
+        // callee_ptr = cabi_realloc(0, 0, align, size)
+        func.instruction(&Instruction::I32Const(0)); // original_ptr
+        func.instruction(&Instruction::I32Const(0)); // original_size
+        func.instruction(&Instruction::I32Const(params_area_align as i32)); // alignment
+        func.instruction(&Instruction::I32Const(params_area_size as i32)); // new_size
+        func.instruction(&Instruction::Call(callee_realloc));
+        func.instruction(&Instruction::LocalSet(callee_ptr_local));
+
+        // --- Phase 2: Bulk copy the entire params buffer ---
+        // memory.copy $callee_mem $caller_mem (callee_ptr, params_ptr, size)
+        func.instruction(&Instruction::LocalGet(callee_ptr_local)); // dst
+        func.instruction(&Instruction::LocalGet(params_ptr_local)); // src
+        func.instruction(&Instruction::I32Const(params_area_size as i32)); // size
+        func.instruction(&Instruction::MemoryCopy {
+            src_mem: options.caller_memory,
+            dst_mem: options.callee_memory,
+        });
+
+        // --- Phase 3: Fix up pointer pairs inside the buffer ---
+        // For each (ptr, len) pair in the params buffer:
+        //   1. Read ptr and len from callee's copy of the buffer
+        //   2. Compute byte_size from len and the copy layout's byte_multiplier
+        //   3. Allocate in callee's memory: new_ptr = cabi_realloc(0, 0, 1, byte_size)
+        //   4. Copy data from caller's memory at old_ptr to callee's memory at new_ptr
+        //   5. Write new_ptr back into callee's buffer at the same offset
+        for (pair_idx, &byte_offset) in ptr_pair_offsets.iter().enumerate() {
+            let dest_local = pair_dest_base + pair_idx as u32;
+            let byte_mult = copy_layouts
+                .get(pair_idx)
+                .map(|cl| match cl {
+                    crate::resolver::CopyLayout::Bulk { byte_multiplier } => *byte_multiplier,
+                    crate::resolver::CopyLayout::Elements { element_size, .. } => *element_size,
+                })
+                .unwrap_or(1);
+
+            // Read old_ptr from callee's buffer: i32.load callee_mem (callee_ptr + byte_offset)
+            // Read old_len from callee's buffer: i32.load callee_mem (callee_ptr + byte_offset + 4)
+
+            // Allocate: new_ptr = cabi_realloc(0, 0, 1, len * byte_mult)
+            func.instruction(&Instruction::I32Const(0));
+            func.instruction(&Instruction::I32Const(0));
+            func.instruction(&Instruction::I32Const(1));
+            // Load len from callee's buffer
+            func.instruction(&Instruction::LocalGet(callee_ptr_local));
+            func.instruction(&Instruction::I32Load(wasm_encoder::MemArg {
+                offset: (byte_offset + 4) as u64,
+                align: 2,
+                memory_index: options.callee_memory,
+            }));
+            if byte_mult > 1 {
+                func.instruction(&Instruction::I32Const(byte_mult as i32));
+                func.instruction(&Instruction::I32Mul);
+            }
+            func.instruction(&Instruction::Call(callee_realloc));
+            func.instruction(&Instruction::LocalSet(dest_local));
+
+            // Copy data: memory.copy callee caller (new_ptr, old_ptr, len * byte_mult)
+            func.instruction(&Instruction::LocalGet(dest_local)); // dst (in callee mem)
+            // Load old_ptr from callee's buffer (this was copied from caller's buffer,
+            // so it points into caller's memory)
+            func.instruction(&Instruction::LocalGet(callee_ptr_local));
+            func.instruction(&Instruction::I32Load(wasm_encoder::MemArg {
+                offset: byte_offset as u64,
+                align: 2,
+                memory_index: options.callee_memory,
+            })); // src (in caller mem)
+            // Load len from callee's buffer
+            func.instruction(&Instruction::LocalGet(callee_ptr_local));
+            func.instruction(&Instruction::I32Load(wasm_encoder::MemArg {
+                offset: (byte_offset + 4) as u64,
+                align: 2,
+                memory_index: options.callee_memory,
+            }));
+            if byte_mult > 1 {
+                func.instruction(&Instruction::I32Const(byte_mult as i32));
+                func.instruction(&Instruction::I32Mul);
+            }
+            func.instruction(&Instruction::MemoryCopy {
+                src_mem: options.caller_memory,
+                dst_mem: options.callee_memory,
+            });
+
+            // Write new_ptr back into callee's buffer at byte_offset
+            func.instruction(&Instruction::LocalGet(callee_ptr_local));
+            func.instruction(&Instruction::LocalGet(dest_local));
+            func.instruction(&Instruction::I32Store(wasm_encoder::MemArg {
+                offset: byte_offset as u64,
+                align: 2,
+                memory_index: options.callee_memory,
+            }));
+
+            // Fix up inner resource handles in list elements.
+            // After bulk copy, borrow handles in the list data still reference
+            // the caller's resource table. Convert each borrow handle → rep.
+            if let Some(crate::resolver::CopyLayout::Elements {
+                element_size,
+                inner_resources,
+                ..
+            }) = copy_layouts.get(pair_idx)
+                && !inner_resources.is_empty()
+            {
+                let element_size = *element_size;
+                let loop_local = pair_dest_base + num_ptr_pairs;
+
+                // Initialize loop counter to 0
+                func.instruction(&Instruction::I32Const(0));
+                func.instruction(&Instruction::LocalSet(loop_local));
+
+                // block $exit { loop $cont {
+                func.instruction(&Instruction::Block(wasm_encoder::BlockType::Empty));
+                func.instruction(&Instruction::Loop(wasm_encoder::BlockType::Empty));
+
+                // if loop_counter >= len: break
+                func.instruction(&Instruction::LocalGet(loop_local));
+                // Load len from callee's buffer
+                func.instruction(&Instruction::LocalGet(callee_ptr_local));
+                func.instruction(&Instruction::I32Load(wasm_encoder::MemArg {
+                    offset: (byte_offset + 4) as u64,
+                    align: 2,
+                    memory_index: options.callee_memory,
+                }));
+                func.instruction(&Instruction::I32GeU);
+                func.instruction(&Instruction::BrIf(1)); // break to $exit
+
+                for &(res_byte_offset, _resource_type_id, is_owned) in inner_resources {
+                    if is_owned {
+                        continue; // own<T>: callee handles internally
+                    }
+                    // Find [resource-rep] for this resource
+                    if let Some(&rep_func) = options
+                        .params_area_borrow_fixups
+                        .first()
+                        .map(|f| &f.rep_func)
+                        .or_else(|| options.resource_rep_calls.first().map(|t| &t.rep_func))
+                    {
+                        // addr = dest_ptr + loop_counter * element_size + res_byte_offset
+                        // Push addr for store
+                        func.instruction(&Instruction::LocalGet(dest_local));
+                        func.instruction(&Instruction::LocalGet(loop_local));
+                        func.instruction(&Instruction::I32Const(element_size as i32));
+                        func.instruction(&Instruction::I32Mul);
+                        func.instruction(&Instruction::I32Add);
+                        // Load handle from same addr + offset
+                        func.instruction(&Instruction::LocalGet(dest_local));
+                        func.instruction(&Instruction::LocalGet(loop_local));
+                        func.instruction(&Instruction::I32Const(element_size as i32));
+                        func.instruction(&Instruction::I32Mul);
+                        func.instruction(&Instruction::I32Add);
+                        func.instruction(&Instruction::I32Load(wasm_encoder::MemArg {
+                            offset: res_byte_offset as u64,
+                            align: 2,
+                            memory_index: options.callee_memory,
+                        }));
+                        // Call [resource-rep](handle) → rep
+                        func.instruction(&Instruction::Call(rep_func));
+                        // Store rep back
+                        func.instruction(&Instruction::I32Store(wasm_encoder::MemArg {
+                            offset: res_byte_offset as u64,
+                            align: 2,
+                            memory_index: options.callee_memory,
+                        }));
+                    }
+                }
+
+                // loop_counter++
+                func.instruction(&Instruction::LocalGet(loop_local));
+                func.instruction(&Instruction::I32Const(1));
+                func.instruction(&Instruction::I32Add);
+                func.instruction(&Instruction::LocalSet(loop_local));
+                func.instruction(&Instruction::Br(0)); // continue to $cont
+                func.instruction(&Instruction::End); // end loop
+                func.instruction(&Instruction::End); // end block
+            }
+        }
+
+        // --- Phase 3.5: Convert borrow resource handles inside the buffer ---
+        // For borrow<T> where callee defines T, the adapter must convert
+        // handle → rep by calling [resource-rep] and writing the rep back.
+        for fixup in &options.params_area_borrow_fixups {
+            // Stack: callee_ptr (for i32.store dest)
+            func.instruction(&Instruction::LocalGet(callee_ptr_local));
+            // Load handle from callee's buffer at byte_offset
+            func.instruction(&Instruction::LocalGet(callee_ptr_local));
+            func.instruction(&Instruction::I32Load(wasm_encoder::MemArg {
+                offset: fixup.byte_offset as u64,
+                align: 2,
+                memory_index: options.callee_memory,
+            }));
+            // Call [resource-rep](handle) → rep
+            func.instruction(&Instruction::Call(fixup.rep_func));
+            // Store rep back at the same offset
+            func.instruction(&Instruction::I32Store(wasm_encoder::MemArg {
+                offset: fixup.byte_offset as u64,
+                align: 2,
+                memory_index: options.callee_memory,
+            }));
+        }
+
+        // --- Phase 4: Call callee with the new pointer ---
+        func.instruction(&Instruction::LocalGet(callee_ptr_local));
+        func.instruction(&Instruction::Call(target_func));
+
+        // --- Phase 5: Handle post-return if needed ---
+        if has_post_return {
+            // Save result (assume i32)
+            func.instruction(&Instruction::LocalSet(result_save_base));
+            // Call post-return (no args for params-ptr convention post-return)
+            func.instruction(&Instruction::Call(options.callee_post_return.unwrap()));
+            // Push result back
+            func.instruction(&Instruction::LocalGet(result_save_base));
+        }
+
+        func.instruction(&Instruction::End);
+
+        Ok((caller_type_idx, func))
     }
 
     /// Generate an adapter for the retptr calling convention.

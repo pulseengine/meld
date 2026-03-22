@@ -642,12 +642,11 @@ runtime_test!(
 runtime_test!(test_runtime_wit_bindgen_resource_alias, "resource_alias");
 
 // Resource fixtures — known failures (graceful degradation)
-// resource_aggregates: own<T> handle leak (handle != 0 assertion)
 // resource_borrow_in_record: borrow<T> inside record not detected as flat param
 // resource_with_lists: data corruption in resource+list combination
 // ownership: resource ownership transfer issue
-fuse_only_test!(
-    test_fuse_wit_bindgen_resource_aggregates,
+runtime_test!(
+    test_runtime_wit_bindgen_resource_aggregates,
     "resource_aggregates"
 );
 fuse_only_test!(test_fuse_wit_bindgen_resource_floats, "resource_floats");
