@@ -85,6 +85,10 @@ pub enum Error {
         module_idx: u32,
     },
 
+    /// P3 async component model features are not yet supported
+    #[error("P3 async component features not supported: {0}")]
+    P3AsyncNotSupported(String),
+
     /// I/O error
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),

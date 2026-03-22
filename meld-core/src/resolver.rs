@@ -3171,6 +3171,7 @@ mod tests {
             original_size: 0,
             original_hash: String::new(),
             depth_0_sections: Vec::new(),
+            p3_async_features: Vec::new(),
         }
     }
 

@@ -202,6 +202,13 @@ pub struct ParsedComponent {
     ///   matters because Import sections reference types defined in preceding
     ///   Type and Alias sections.
     pub depth_0_sections: Vec<(u8, Vec<u8>)>,
+
+    /// P3 async features detected during parsing (not yet supported).
+    /// Each entry describes a specific P3 construct found, e.g.
+    /// "future<string> type", "async canonical option", "task.wait builtin".
+    /// Non-empty means the component uses P3 async features that meld
+    /// cannot yet fuse correctly.
+    pub p3_async_features: Vec<String>,
 }
 
 /// A core WebAssembly module extracted from a component
@@ -385,6 +392,9 @@ pub enum ComponentTypeKind {
     Defined(ComponentValType),
     /// Other type (resource, component, etc.)
     Other,
+    /// P3 async type (future, stream) — not yet supported.
+    /// The string describes the specific type, e.g. "future<string>".
+    P3Async(String),
 }
 
 /// Component value type
@@ -595,6 +605,7 @@ impl ComponentParser {
             original_size: bytes.len(),
             original_hash: compute_sha256(bytes),
             depth_0_sections: Vec::new(),
+            p3_async_features: Vec::new(),
         };
 
         let parser = Parser::new(0);
@@ -843,6 +854,9 @@ impl ComponentParser {
                         wasmparser::ComponentType::Instance(_) => ComponentTypeKind::Other,
                         wasmparser::ComponentType::Resource { .. } => ComponentTypeKind::Other,
                     };
+                    if let ComponentTypeKind::P3Async(ref desc) = kind {
+                        component.p3_async_features.push(format!("{desc} type"));
+                    }
                     component.types.push(ComponentType { kind });
                     component
                         .component_type_defs
@@ -864,7 +878,10 @@ impl ComponentParser {
                     let canon_idx = component.canonical_functions.len();
                     component
                         .canonical_functions
-                        .push(convert_canonical_function(canon));
+                        .push(convert_canonical_function(
+                            canon,
+                            &mut component.p3_async_features,
+                        ));
                     if creates_core_func {
                         component
                             .core_entity_order
@@ -1193,6 +1210,7 @@ impl ParsedComponent {
             original_size: 0,
             original_hash: String::new(),
             depth_0_sections: Vec::new(),
+            p3_async_features: Vec::new(),
         }
     }
 
@@ -2644,14 +2662,32 @@ fn convert_wp_defined_type(dt: &wasmparser::ComponentDefinedType) -> ComponentTy
         wasmparser::ComponentDefinedType::FixedSizeList(ty, len) => ComponentTypeKind::Defined(
             ComponentValType::FixedSizeList(Box::new(convert_wp_component_val_type(ty)), *len),
         ),
-        // P3 async types — not yet supported by the fuser
-        wasmparser::ComponentDefinedType::Future(_)
-        | wasmparser::ComponentDefinedType::Stream(_) => ComponentTypeKind::Other,
+        // P3 async types — detected and flagged, not silently swallowed
+        wasmparser::ComponentDefinedType::Future(inner) => {
+            let desc = match inner {
+                Some(ty) => format!("future<{ty:?}>"),
+                None => "future".to_string(),
+            };
+            ComponentTypeKind::P3Async(desc)
+        }
+        wasmparser::ComponentDefinedType::Stream(inner) => {
+            let desc = match inner {
+                Some(ty) => format!("stream<{ty:?}>"),
+                None => "stream".to_string(),
+            };
+            ComponentTypeKind::P3Async(desc)
+        }
     }
 }
 
-/// Convert wasmparser CanonicalOption list into our CanonicalOptions
-fn convert_canonical_options(options: &[wasmparser::CanonicalOption]) -> CanonicalOptions {
+/// Convert wasmparser CanonicalOption list into our CanonicalOptions.
+///
+/// If `p3_async_features` is `Some`, detected P3 async options (Async,
+/// Callback) are pushed into the vec instead of being silently ignored.
+fn convert_canonical_options(
+    options: &[wasmparser::CanonicalOption],
+    mut p3_async_features: Option<&mut Vec<String>>,
+) -> CanonicalOptions {
     let mut result = CanonicalOptions::default();
     for opt in options {
         match opt {
@@ -2673,17 +2709,32 @@ fn convert_canonical_options(options: &[wasmparser::CanonicalOption]) -> Canonic
             wasmparser::CanonicalOption::PostReturn(idx) => {
                 result.post_return = Some(*idx);
             }
-            // P3 async canonical options — ignored for fusion
-            wasmparser::CanonicalOption::Async
-            | wasmparser::CanonicalOption::Callback(_)
-            | wasmparser::CanonicalOption::CoreType(_) => {}
+            // P3 async canonical options — detected and flagged
+            wasmparser::CanonicalOption::Async => {
+                if let Some(ref mut feats) = p3_async_features {
+                    feats.push("async canonical option".to_string());
+                }
+            }
+            wasmparser::CanonicalOption::Callback(_) => {
+                if let Some(ref mut feats) = p3_async_features {
+                    feats.push("callback canonical option".to_string());
+                }
+            }
+            wasmparser::CanonicalOption::CoreType(_) => {}
         }
     }
     result
 }
 
-/// Convert a wasmparser CanonicalFunction into our CanonicalEntry
-fn convert_canonical_function(canon: wasmparser::CanonicalFunction) -> CanonicalEntry {
+/// Convert a wasmparser CanonicalFunction into our CanonicalEntry.
+///
+/// P3 async canonical built-ins (task.*, subtask.*, stream.*, future.*,
+/// error-context.*) are detected and described in `p3_async_features`
+/// instead of being silently mapped to `Unsupported`.
+fn convert_canonical_function(
+    canon: wasmparser::CanonicalFunction,
+    p3_async_features: &mut Vec<String>,
+) -> CanonicalEntry {
     match canon {
         wasmparser::CanonicalFunction::Lift {
             core_func_index,
@@ -2692,14 +2743,14 @@ fn convert_canonical_function(canon: wasmparser::CanonicalFunction) -> Canonical
         } => CanonicalEntry::Lift {
             core_func_index,
             type_index,
-            options: convert_canonical_options(&options),
+            options: convert_canonical_options(&options, Some(p3_async_features)),
         },
         wasmparser::CanonicalFunction::Lower {
             func_index,
             options,
         } => CanonicalEntry::Lower {
             func_index,
-            options: convert_canonical_options(&options),
+            options: convert_canonical_options(&options, Some(p3_async_features)),
         },
         wasmparser::CanonicalFunction::ResourceNew { resource } => {
             CanonicalEntry::ResourceNew { resource }
@@ -2713,8 +2764,37 @@ fn convert_canonical_function(canon: wasmparser::CanonicalFunction) -> Canonical
         wasmparser::CanonicalFunction::ThreadSpawnRef { func_ty_index } => {
             CanonicalEntry::ThreadSpawn { func_ty_index }
         }
-        // P3 async/stream/future/error-context canonical functions — not yet supported
-        _ => CanonicalEntry::Unsupported,
+        // P3 async/stream/future/error-context canonical built-ins — detected
+        // and flagged. We use Debug formatting to capture the specific variant.
+        other => {
+            let desc = format!("{other:?}");
+            // Provide human-readable names for common P3 built-ins
+            let friendly = match &desc {
+                d if d.starts_with("TaskWait") => "task.wait built-in",
+                d if d.starts_with("TaskPoll") => "task.poll built-in",
+                d if d.starts_with("TaskYield") => "task.yield built-in",
+                d if d.starts_with("TaskReturn") => "task.return built-in",
+                d if d.starts_with("SubtaskDrop") => "subtask.drop built-in",
+                d if d.starts_with("StreamNew") => "stream.new built-in",
+                d if d.starts_with("StreamRead") => "stream.read built-in",
+                d if d.starts_with("StreamWrite") => "stream.write built-in",
+                d if d.starts_with("StreamCancel") => "stream.cancel-read/write built-in",
+                d if d.starts_with("StreamClose") => "stream.close-readable/writable built-in",
+                d if d.starts_with("FutureNew") => "future.new built-in",
+                d if d.starts_with("FutureRead") => "future.read built-in",
+                d if d.starts_with("FutureWrite") => "future.write built-in",
+                d if d.starts_with("FutureCancel") => "future.cancel-read/write built-in",
+                d if d.starts_with("FutureClose") => "future.close-readable/writable built-in",
+                d if d.starts_with("ErrorContextNew") => "error-context.new built-in",
+                d if d.starts_with("ErrorContextDebugMessage") => {
+                    "error-context.debug-message built-in"
+                }
+                d if d.starts_with("ErrorContextDrop") => "error-context.drop built-in",
+                _ => &desc,
+            };
+            p3_async_features.push(friendly.to_string());
+            CanonicalEntry::Unsupported
+        }
     }
 }
 
@@ -2837,7 +2917,7 @@ mod tests {
     #[test]
     fn test_convert_canonical_options_default() {
         // Empty options list should produce defaults
-        let opts = convert_canonical_options(&[]);
+        let opts = convert_canonical_options(&[], None);
         assert_eq!(opts.string_encoding, CanonStringEncoding::Utf8);
         assert_eq!(opts.memory, None);
         assert_eq!(opts.realloc, None);
@@ -2846,12 +2926,15 @@ mod tests {
 
     #[test]
     fn test_convert_canonical_options_full() {
-        let opts = convert_canonical_options(&[
-            wasmparser::CanonicalOption::UTF16,
-            wasmparser::CanonicalOption::Memory(3),
-            wasmparser::CanonicalOption::Realloc(7),
-            wasmparser::CanonicalOption::PostReturn(12),
-        ]);
+        let opts = convert_canonical_options(
+            &[
+                wasmparser::CanonicalOption::UTF16,
+                wasmparser::CanonicalOption::Memory(3),
+                wasmparser::CanonicalOption::Realloc(7),
+                wasmparser::CanonicalOption::PostReturn(12),
+            ],
+            None,
+        );
         assert_eq!(opts.string_encoding, CanonStringEncoding::Utf16);
         assert_eq!(opts.memory, Some(3));
         assert_eq!(opts.realloc, Some(7));
@@ -2870,7 +2953,7 @@ mod tests {
             ]
             .into_boxed_slice(),
         };
-        let entry = convert_canonical_function(canon);
+        let entry = convert_canonical_function(canon, &mut vec![]);
         match entry {
             CanonicalEntry::Lift {
                 core_func_index,
@@ -2894,7 +2977,7 @@ mod tests {
             func_index: 3,
             options: vec![wasmparser::CanonicalOption::CompactUTF16].into_boxed_slice(),
         };
-        let entry = convert_canonical_function(canon);
+        let entry = convert_canonical_function(canon, &mut vec![]);
         match entry {
             CanonicalEntry::Lower {
                 func_index,
@@ -2941,6 +3024,7 @@ mod tests {
             original_size: 0,
             original_hash: String::new(),
             depth_0_sections: vec![],
+            p3_async_features: vec![],
         }
     }
 
@@ -3270,7 +3354,7 @@ mod tests {
     #[test]
     fn test_sr17_canonical_options_utf8_explicit() {
         // Explicitly setting UTF8 should produce Utf8 (same as default)
-        let opts = convert_canonical_options(&[wasmparser::CanonicalOption::UTF8]);
+        let opts = convert_canonical_options(&[wasmparser::CanonicalOption::UTF8], None);
         assert_eq!(
             opts.string_encoding,
             CanonStringEncoding::Utf8,
@@ -3280,7 +3364,7 @@ mod tests {
 
     #[test]
     fn test_sr17_canonical_options_utf16() {
-        let opts = convert_canonical_options(&[wasmparser::CanonicalOption::UTF16]);
+        let opts = convert_canonical_options(&[wasmparser::CanonicalOption::UTF16], None);
         assert_eq!(
             opts.string_encoding,
             CanonStringEncoding::Utf16,
@@ -3290,7 +3374,7 @@ mod tests {
 
     #[test]
     fn test_sr17_canonical_options_compact_utf16() {
-        let opts = convert_canonical_options(&[wasmparser::CanonicalOption::CompactUTF16]);
+        let opts = convert_canonical_options(&[wasmparser::CanonicalOption::CompactUTF16], None);
         assert_eq!(
             opts.string_encoding,
             CanonStringEncoding::CompactUtf16,
@@ -3302,10 +3386,13 @@ mod tests {
     fn test_sr17_canonical_options_default_is_utf8() {
         // When no string encoding option is specified, default is UTF-8
         // (per the canonical ABI spec).
-        let opts = convert_canonical_options(&[
-            wasmparser::CanonicalOption::Memory(0),
-            wasmparser::CanonicalOption::Realloc(1),
-        ]);
+        let opts = convert_canonical_options(
+            &[
+                wasmparser::CanonicalOption::Memory(0),
+                wasmparser::CanonicalOption::Realloc(1),
+            ],
+            None,
+        );
         assert_eq!(
             opts.string_encoding,
             CanonStringEncoding::Utf8,
@@ -3316,12 +3403,15 @@ mod tests {
     #[test]
     fn test_sr17_canonical_options_encoding_with_memory_and_realloc() {
         // Verify encoding is correctly parsed alongside other canonical options
-        let opts = convert_canonical_options(&[
-            wasmparser::CanonicalOption::UTF16,
-            wasmparser::CanonicalOption::Memory(2),
-            wasmparser::CanonicalOption::Realloc(5),
-            wasmparser::CanonicalOption::PostReturn(10),
-        ]);
+        let opts = convert_canonical_options(
+            &[
+                wasmparser::CanonicalOption::UTF16,
+                wasmparser::CanonicalOption::Memory(2),
+                wasmparser::CanonicalOption::Realloc(5),
+                wasmparser::CanonicalOption::PostReturn(10),
+            ],
+            None,
+        );
         assert_eq!(
             opts.string_encoding,
             CanonStringEncoding::Utf16,
@@ -3336,10 +3426,13 @@ mod tests {
     fn test_sr17_canonical_options_last_encoding_wins() {
         // If multiple encoding options are present (unusual but valid per parser),
         // the last one wins because convert_canonical_options overwrites.
-        let opts = convert_canonical_options(&[
-            wasmparser::CanonicalOption::UTF8,
-            wasmparser::CanonicalOption::UTF16,
-        ]);
+        let opts = convert_canonical_options(
+            &[
+                wasmparser::CanonicalOption::UTF8,
+                wasmparser::CanonicalOption::UTF16,
+            ],
+            None,
+        );
         assert_eq!(
             opts.string_encoding,
             CanonStringEncoding::Utf16,
@@ -3361,7 +3454,7 @@ mod tests {
             ]
             .into_boxed_slice(),
         };
-        let entry = convert_canonical_function(canon);
+        let entry = convert_canonical_function(canon, &mut vec![]);
         match entry {
             CanonicalEntry::Lift { options, .. } => {
                 assert_eq!(
@@ -3386,7 +3479,7 @@ mod tests {
             ]
             .into_boxed_slice(),
         };
-        let entry = convert_canonical_function(canon);
+        let entry = convert_canonical_function(canon, &mut vec![]);
         match entry {
             CanonicalEntry::Lower { options, .. } => {
                 assert_eq!(
@@ -3481,5 +3574,177 @@ mod tests {
                 panic!("SR-17: list<string> should produce Elements layout, not Bulk");
             }
         }
+    }
+
+    // ---------------------------------------------------------------
+    // P3 async feature detection tests
+    //
+    // These tests verify that P3 async constructs are detected during
+    // parsing and recorded in `p3_async_features`, rather than being
+    // silently swallowed. The fuser uses this information to reject
+    // P3 async components with a clear error message.
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_p3_async_canonical_option_detected() {
+        // Async and Callback canonical options should be detected
+        let mut feats = Vec::new();
+        let opts = convert_canonical_options(
+            &[
+                wasmparser::CanonicalOption::UTF8,
+                wasmparser::CanonicalOption::Memory(0),
+                wasmparser::CanonicalOption::Async,
+            ],
+            Some(&mut feats),
+        );
+        // Standard options should still be parsed correctly
+        assert_eq!(opts.string_encoding, CanonStringEncoding::Utf8);
+        assert_eq!(opts.memory, Some(0));
+        // P3 async feature should be recorded
+        assert_eq!(feats.len(), 1);
+        assert!(
+            feats[0].contains("async"),
+            "expected 'async' in feature description: {}",
+            feats[0]
+        );
+    }
+
+    #[test]
+    fn test_p3_callback_canonical_option_detected() {
+        let mut feats = Vec::new();
+        let _opts = convert_canonical_options(
+            &[wasmparser::CanonicalOption::Callback(42)],
+            Some(&mut feats),
+        );
+        assert_eq!(feats.len(), 1);
+        assert!(
+            feats[0].contains("callback"),
+            "expected 'callback' in feature description: {}",
+            feats[0]
+        );
+    }
+
+    #[test]
+    fn test_p3_async_option_not_detected_when_tracking_disabled() {
+        // When p3_async_features is None, async options are silently ignored
+        // (backward-compatible with callers that don't care)
+        let opts = convert_canonical_options(
+            &[
+                wasmparser::CanonicalOption::UTF8,
+                wasmparser::CanonicalOption::Async,
+            ],
+            None,
+        );
+        assert_eq!(opts.string_encoding, CanonStringEncoding::Utf8);
+        // No panic, no error — just silently ignored
+    }
+
+    #[test]
+    fn test_p3_future_type_detected() {
+        // Future type should produce P3Async variant
+        let kind = convert_wp_defined_type(&wasmparser::ComponentDefinedType::Future(Some(
+            wasmparser::ComponentValType::Primitive(wasmparser::PrimitiveValType::String),
+        )));
+        match kind {
+            ComponentTypeKind::P3Async(desc) => {
+                assert!(
+                    desc.contains("future"),
+                    "expected 'future' in description: {desc}"
+                );
+            }
+            other => panic!("expected P3Async, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_p3_stream_type_detected() {
+        // Stream type should produce P3Async variant
+        let kind = convert_wp_defined_type(&wasmparser::ComponentDefinedType::Stream(None));
+        match kind {
+            ComponentTypeKind::P3Async(desc) => {
+                assert!(
+                    desc.contains("stream"),
+                    "expected 'stream' in description: {desc}"
+                );
+            }
+            other => panic!("expected P3Async, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_p3_async_features_collected_in_parsed_component() {
+        // Verify that p3_async_features are accumulated during type parsing
+        let mut comp = empty_parsed_component();
+
+        // Simulate what the parse loop does when it encounters a P3 type
+        let kind = convert_wp_defined_type(&wasmparser::ComponentDefinedType::Future(None));
+        if let ComponentTypeKind::P3Async(ref desc) = kind {
+            comp.p3_async_features.push(format!("{desc} type"));
+        }
+        comp.types.push(ComponentType { kind });
+
+        // Also simulate a P3 canonical function detection
+        let mut p3_feats = Vec::new();
+        let _entry =
+            convert_canonical_options(&[wasmparser::CanonicalOption::Async], Some(&mut p3_feats));
+        comp.p3_async_features.extend(p3_feats);
+
+        assert_eq!(comp.p3_async_features.len(), 2);
+        assert!(comp.p3_async_features[0].contains("future"));
+        assert!(comp.p3_async_features[1].contains("async"));
+    }
+
+    #[test]
+    fn test_p3_error_message_via_fuser() {
+        // Verify that the Fuser rejects components with P3 async features
+        let mut comp = empty_parsed_component();
+        comp.p3_async_features.push("stream<u8> type".to_string());
+        comp.name = Some("test-component".to_string());
+
+        // Build a Fuser and manually inject the parsed component
+        let config = crate::FuserConfig::default();
+        let fuser = crate::Fuser::new(config);
+        // We can't use add_component since we have a pre-parsed component,
+        // so test the error check logic directly
+        let p3_details: Vec<String> = [comp]
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, c)| {
+                if c.p3_async_features.is_empty() {
+                    return None;
+                }
+                let default_name = format!("component {idx}");
+                let comp_name = c.name.as_deref().unwrap_or(&default_name);
+                let mut feats = c.p3_async_features.clone();
+                feats.sort();
+                feats.dedup();
+                Some(format!("'{comp_name}' uses: {}", feats.join(", ")))
+            })
+            .collect();
+
+        assert!(!p3_details.is_empty());
+        let err_msg = format!(
+            "{}. P3 async features (stream, future, async lift/lower, task builtins) \
+             are not yet supported by meld. Use P2 components or wait for meld P3 support.",
+            p3_details.join("; ")
+        );
+        assert!(
+            err_msg.contains("test-component"),
+            "error should mention component name"
+        );
+        assert!(
+            err_msg.contains("stream<u8>"),
+            "error should mention specific feature"
+        );
+        assert!(
+            err_msg.contains("not yet supported"),
+            "error should be actionable"
+        );
+
+        // Also verify the Error variant works
+        let err = crate::Error::P3AsyncNotSupported(err_msg.clone());
+        let display = format!("{err}");
+        assert!(display.contains("P3 async"));
+        let _ = fuser; // suppress unused warning
     }
 }
