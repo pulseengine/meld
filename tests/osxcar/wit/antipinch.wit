@@ -1,0 +1,75 @@
+/// OSxCAR Anti-Pinch Window Control — WIT Interface Definitions
+///
+/// Reconstructed from jco-transpiled component JS bindings.
+/// Source: https://osxcar.de/insights/demonstration/
+/// Built with wit-bindgen-c 0.46.0 / wit-component 0.244.0
+
+package aptiv:antipinch@0.1.0;
+
+/// Anti-pinch controller — detects pinch forces via motor current measurement
+interface anti-pinch-v2 {
+    record step-input {
+        motorcurrentfunctiona: f64,
+        up-request: bool,
+        down-request: bool,
+        rpwm-duc-in: f32,
+        lpwm-duc-in: f32,
+    }
+
+    record step-output {
+        stop: bool,
+        dir-up-out: bool,
+        dir-down-out: bool,
+        stalldetection: bool,
+        pinchenable: bool,
+        pinchdetection: bool,
+    }
+
+    initialize: func();
+    step: func(input: step-input) -> step-output;
+    terminate: func();
+}
+
+/// Motor driver — simulates window motor with realistic current behavior
+interface motor-driver-v2 {
+    record step-input {
+        obstacleposition: f64,
+        r-pwm: f32,
+        l-pwm: f32,
+    }
+
+    record step-output {
+        motorcurrenta: f64,
+        motorspeedrps: f64,
+        motorpositionmm: f64,
+    }
+
+    initialize: func();
+    step: func(input: step-input) -> step-output;
+    terminate: func();
+}
+
+/// Soft start/stop — smooth acceleration/deceleration via PWM ramps
+interface soft-start-stop {
+    record step-input {
+        dirup: bool,
+        dirdown: bool,
+        stop: bool,
+    }
+
+    record step-output {
+        rpwm-duc: f32,
+        lpwm-duc: f32,
+    }
+
+    initialize: func();
+    step: func(input: step-input) -> step-output;
+    terminate: func();
+}
+
+/// World for the composed anti-pinch system
+world antipinch-system {
+    export anti-pinch-v2;
+    export motor-driver-v2;
+    export soft-start-stop;
+}
