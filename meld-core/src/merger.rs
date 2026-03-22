@@ -1236,16 +1236,25 @@ impl Merger {
 
         // In multi-memory mode, export per-component cabi_realloc and memories
         // so the P2 wrapper can reference the correct allocator and memory per import.
-        if self.memory_strategy == MemoryStrategy::MultiMemory && comp_idx > 0 {
-            // Export cabi_realloc$N for this component
-            if let Some(&realloc_idx) = merged.realloc_map.get(&(comp_idx, mod_idx)) {
-                let export_name = format!("cabi_realloc${}", comp_idx);
-                if !merged.exports.iter().any(|e| e.name == export_name) {
-                    merged.exports.push(MergedExport {
-                        name: export_name,
-                        kind: EncoderExportKind::Func,
-                        index: realloc_idx,
-                    });
+        if self.memory_strategy == MemoryStrategy::MultiMemory {
+            // Export cabi_realloc$N using the MEMORY INDEX as suffix (not comp_idx).
+            // The P2 wrapper looks up cabi_realloc$N by memory index, so these must match.
+            let mem_idx = merged
+                .memory_index_map
+                .get(&(comp_idx, mod_idx, 0))
+                .copied();
+            if let (Some(mem_idx), Some(&realloc_idx)) =
+                (mem_idx, merged.realloc_map.get(&(comp_idx, mod_idx)))
+            {
+                if mem_idx > 0 {
+                    let export_name = format!("cabi_realloc${}", mem_idx);
+                    if !merged.exports.iter().any(|e| e.name == export_name) {
+                        merged.exports.push(MergedExport {
+                            name: export_name,
+                            kind: EncoderExportKind::Func,
+                            index: realloc_idx,
+                        });
+                    }
                 }
             }
 
