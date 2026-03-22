@@ -1138,7 +1138,15 @@ impl Resolver {
                     needed.push((op.import_module.clone(), new_field, site.to_component));
                 }
             }
-            // For 3-component chains: synthesize CALLER's [resource-new] for own results.
+            // For 3-component chains: synthesize callee's [resource-rep] for own results.
+            // The adapter calls resource.rep on the callee's handle before resource.new.
+            for op in &site.requirements.resource_results {
+                if op.is_owned && !op.callee_defines_resource {
+                    let rep_field = op.import_field.replace("[resource-new]", "[resource-rep]");
+                    needed.push((op.import_module.clone(), rep_field, site.to_component));
+                }
+            }
+            // Synthesize CALLER's [resource-new] for own results.
             // When callee doesn't define the resource, own<T> results need resource.new
             // in the caller's table.
             for op in &site.requirements.resource_results {
