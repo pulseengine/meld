@@ -169,6 +169,8 @@ pub struct ResolvedResourceOp {
     /// create a handle in the callee's table). When true, the adapter only
     /// needs the callee's `[resource-rep]` (which returns rep directly).
     pub callee_defines_resource: bool,
+    /// Set when an upstream adapter already converted this borrow to rep.
+    pub caller_already_converted: bool,
 }
 
 /// Requirements for an adapter function
@@ -991,6 +993,7 @@ fn resolve_resource_positions(
                 import_module: module_name.clone(),
                 import_field: field_name.clone(),
                 callee_defines_resource,
+                caller_already_converted: false,
             });
         } else {
             log::debug!(
@@ -1107,6 +1110,46 @@ impl Resolver {
         // This must run after identify_adapter_sites and may promote some
         // module_resolutions entries to adapter_sites.
         self.identify_intra_component_adapter_sites(components, &mut graph)?;
+
+        // Fix double borrow conversion: when adapter A→B converts borrow<R>
+        // handle→rep for function F, and adapter B→C also has borrow<R> for
+        // the SAME function F (B forwards the call), B→C must skip resource.rep
+        // because B passes the rep directly (no canon lift/lower in fused module).
+        //
+        // Detection: for each adapter site B→C with borrow params, check if
+        // there's an adapter A→B where to_component=B AND the function name
+        // matches AND that A→B also converts borrow<R>.
+        {
+            use std::collections::HashSet;
+            // Collect (to_component, function_name) pairs where borrow conversion happens
+            let mut converts_borrow_for: HashSet<(usize, String)> = HashSet::new();
+            for site in &graph.adapter_sites {
+                if site
+                    .requirements
+                    .resource_params
+                    .iter()
+                    .any(|op| !op.is_owned && op.callee_defines_resource)
+                {
+                    converts_borrow_for.insert((site.to_component, site.export_name.clone()));
+                }
+            }
+            // Mark downstream adapters where from_component received converted borrows
+            // for the same function name
+            if !converts_borrow_for.is_empty() {
+                for site in &mut graph.adapter_sites {
+                    // Check if from_component received converted borrows for this function
+                    if converts_borrow_for
+                        .contains(&(site.from_component, site.import_name.clone()))
+                    {
+                        for op in &mut site.requirements.resource_params {
+                            if !op.is_owned && op.callee_defines_resource {
+                                op.caller_already_converted = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
 
         // Synthesize missing resource imports.
         //

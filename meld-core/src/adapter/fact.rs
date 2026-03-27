@@ -261,10 +261,11 @@ impl FactStyleGenerator {
             }
 
             if op.callee_defines_resource {
-                // 2-component case: callee defines the resource.
-                // Use callee's [resource-rep] which returns rep directly.
-                if let Some(&rep_func) =
-                    resource_rep_imports.get(&(op.import_module.clone(), op.import_field.clone()))
+                // Callee defines the resource — convert handle→rep.
+                // Skip if upstream adapter already converted (avoids double resource.rep).
+                if !op.caller_already_converted
+                    && let Some(&rep_func) = resource_rep_imports
+                        .get(&(op.import_module.clone(), op.import_field.clone()))
                 {
                     options
                         .resource_rep_calls
