@@ -1692,8 +1692,8 @@ fn count_type_imports_in_section(data: &[u8]) -> u32 {
     //     name: ComponentName (encoded as string)
     //     ty: ComponentTypeRef (tag + index)
     //
-    // ComponentTypeRef tags:
-    //   0x01 = Module, 0x02 = Func, 0x03 = Value, 0x04 = Type, 0x05 = Instance, 0x06 = Component
+    // ComponentTypeRef tags (externdesc per binary format spec):
+    //   0x00+0x11 = Module, 0x01 = Func, 0x02 = Value, 0x03 = Type, 0x04 = Component, 0x05 = Instance
     //
     // Type imports (tag 0x04) allocate a type index.
     let mut count = 0u32;
@@ -1728,8 +1728,8 @@ fn count_type_imports_in_section(data: &[u8]) -> u32 {
         let ty_tag = data[pos];
         pos += 1;
         // Skip the index (LEB128) and optional bounds for Type
-        if ty_tag == 0x04 {
-            // Type: has bounds tag + index
+        if ty_tag == 0x03 {
+            // Type (externdesc 0x03): has bounds tag + index
             if pos < data.len() {
                 let _bounds_tag = data[pos];
                 pos += 1;
