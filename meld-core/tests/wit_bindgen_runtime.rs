@@ -641,29 +641,25 @@ runtime_test!(
 );
 runtime_test!(test_runtime_wit_bindgen_resource_alias, "resource_alias");
 
-// Resource fixtures — known failures (graceful degradation)
-// resource_borrow_in_record: borrow<T> inside record not detected as flat param
-// resource_with_lists: data corruption in resource+list combination
-// ownership: resource ownership transfer issue
+// Resource fixtures — all promoted to runtime tests with per-component resource types
 runtime_test!(
     test_runtime_wit_bindgen_resource_aggregates,
     "resource_aggregates"
 );
-fuse_only_test!(test_fuse_wit_bindgen_resource_floats, "resource_floats");
+runtime_test!(test_runtime_wit_bindgen_resource_floats, "resource_floats");
 runtime_test!(
     test_runtime_wit_bindgen_resource_borrow_in_record,
     "resource_borrow_in_record"
 );
-fuse_only_test!(
-    test_fuse_wit_bindgen_resource_with_lists,
+runtime_test!(
+    test_runtime_wit_bindgen_resource_with_lists,
     "resource_with_lists"
 );
 runtime_test!(test_runtime_wit_bindgen_ownership, "ownership");
 runtime_test!(test_runtime_wit_bindgen_xcrate, "xcrate");
 
-// resource-import-and-export: core fusion works, P2 wrapping fails on toplevel-import
-fuse_only_test!(
-    test_fuse_wit_bindgen_resource_import_and_export,
+runtime_test!(
+    test_runtime_wit_bindgen_resource_import_and_export,
     "resource-import-and-export"
 );
 
