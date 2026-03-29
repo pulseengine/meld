@@ -32,6 +32,9 @@ pub struct DependencyGraph {
 
     /// Module-level resolution within components
     pub module_resolutions: Vec<ModuleResolution>,
+
+    /// Component indices that re-export resources (need per-component handle tables).
+    pub reexporter_components: Vec<usize>,
 }
 
 /// An import that couldn't be resolved within the component set
@@ -1057,6 +1060,7 @@ impl Resolver {
             adapter_sites: Vec::new(),
             module_resolutions: Vec::new(),
             resource_graph: None,
+            reexporter_components: Vec::new(),
         };
 
         // Build export index
@@ -1149,6 +1153,32 @@ impl Resolver {
                     }
                 }
             }
+
+            // Note: previously a broad "reexporter" detection was here, but it was
+            // incorrect. A re-exporting component forwards borrow handles WITHOUT
+            // calling resource.rep. Only the narrow name-matching detection above
+            // (which catches A→B→C chains where B receives converted borrows for
+            // the same function) is correct.
+        }
+
+        // Identify re-exporter components: those targeted by adapter sites with
+        // callee_defines_resource=false (they re-export resources from other components).
+        {
+            let mut reexporter_set: std::collections::HashSet<usize> =
+                std::collections::HashSet::new();
+            for site in &graph.adapter_sites {
+                for op in &site.requirements.resource_params {
+                    if !op.callee_defines_resource {
+                        reexporter_set.insert(site.to_component);
+                    }
+                }
+                for op in &site.requirements.resource_results {
+                    if !op.callee_defines_resource {
+                        reexporter_set.insert(site.to_component);
+                    }
+                }
+            }
+            graph.reexporter_components = reexporter_set.into_iter().collect();
         }
 
         // Synthesize missing resource imports.
@@ -1198,6 +1228,17 @@ impl Resolver {
                 if !op.is_owned && !op.callee_defines_resource {
                     let new_field = op.import_field.replace("[resource-rep]", "[resource-new]");
                     needed.push((op.import_module.clone(), new_field, site.to_component));
+                }
+            }
+            // For 3-component chains: synthesize CALLER's [resource-rep] for borrow params.
+            // The adapter calls resource.rep on the caller's handle before resource.new.
+            for op in &site.requirements.resource_params {
+                if !op.is_owned && !op.callee_defines_resource {
+                    needed.push((
+                        op.import_module.clone(),
+                        op.import_field.clone(),
+                        site.from_component,
+                    ));
                 }
             }
             // For 3-component chains: synthesize callee's [resource-rep] for own results.

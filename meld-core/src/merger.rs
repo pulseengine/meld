@@ -1378,32 +1378,43 @@ impl Merger {
                         // Duplicate with matching type — skip emitting.
                         // Still record per-component resource tracking: find the
                         // func index already assigned to this resource name.
+                        // Strip $N dedup suffix from resource name.
                         let eff_field = &dedup_key.1;
+                        let strip_suffix2 = |s: &str| -> String {
+                            if let Some(pos) = s.rfind('$') {
+                                if s[pos + 1..].chars().all(|c| c.is_ascii_digit()) {
+                                    return s[..pos].to_string();
+                                }
+                            }
+                            s.to_string()
+                        };
                         if let Some(rn) = eff_field.strip_prefix("[resource-rep]") {
+                            let clean_rn = strip_suffix2(rn);
                             if let Some(&idx) =
                                 merged.resource_rep_by_component.values().find(|&&idx| {
                                     merged.imports.get(idx as usize).is_some_and(|imp| {
                                         imp.name.starts_with("[resource-rep]")
-                                            && imp.name.ends_with(rn)
+                                            && imp.name.ends_with(&clean_rn)
                                     })
                                 })
                             {
                                 merged
                                     .resource_rep_by_component
-                                    .insert((unresolved.component_idx, rn.to_string()), idx);
+                                    .insert((unresolved.component_idx, clean_rn), idx);
                             }
                         } else if let Some(rn) = eff_field.strip_prefix("[resource-new]") {
+                            let clean_rn = strip_suffix2(rn);
                             if let Some(&idx) =
                                 merged.resource_new_by_component.values().find(|&&idx| {
                                     merged.imports.get(idx as usize).is_some_and(|imp| {
                                         imp.name.starts_with("[resource-new]")
-                                            && imp.name.ends_with(rn)
+                                            && imp.name.ends_with(&clean_rn)
                                     })
                                 })
                             {
                                 merged
                                     .resource_new_by_component
-                                    .insert((unresolved.component_idx, rn.to_string()), idx);
+                                    .insert((unresolved.component_idx, clean_rn), idx);
                             }
                         }
                         continue;
@@ -1463,16 +1474,28 @@ impl Merger {
                     });
 
                     // Track per-component resource import indices.
+                    // Strip $N dedup suffix from resource name so adapter lookups
+                    // (which use the clean name) find the right function.
                     let merged_func_idx = func_position - 1;
                     let eff_field = &dedup_key.1;
+                    let strip_suffix = |s: &str| -> String {
+                        if let Some(pos) = s.rfind('$') {
+                            if s[pos + 1..].chars().all(|c| c.is_ascii_digit()) {
+                                return s[..pos].to_string();
+                            }
+                        }
+                        s.to_string()
+                    };
                     if let Some(rn) = eff_field.strip_prefix("[resource-rep]") {
-                        merged
-                            .resource_rep_by_component
-                            .insert((unresolved.component_idx, rn.to_string()), merged_func_idx);
+                        merged.resource_rep_by_component.insert(
+                            (unresolved.component_idx, strip_suffix(rn)),
+                            merged_func_idx,
+                        );
                     } else if let Some(rn) = eff_field.strip_prefix("[resource-new]") {
-                        merged
-                            .resource_new_by_component
-                            .insert((unresolved.component_idx, rn.to_string()), merged_func_idx);
+                        merged.resource_new_by_component.insert(
+                            (unresolved.component_idx, strip_suffix(rn)),
+                            merged_func_idx,
+                        );
                     }
                 }
                 ImportKind::Table(t) => {
@@ -2853,6 +2876,7 @@ mod tests {
             adapter_sites: Vec::new(),
             module_resolutions: Vec::new(),
             resource_graph: None,
+            reexporter_components: Vec::new(),
             unresolved_imports: vec![
                 UnresolvedImport {
                     component_idx: 0,
@@ -2973,6 +2997,7 @@ mod tests {
             adapter_sites: Vec::new(),
             module_resolutions: Vec::new(),
             resource_graph: None,
+            reexporter_components: Vec::new(),
             unresolved_imports: vec![
                 UnresolvedImport {
                     component_idx: 0,
@@ -3023,6 +3048,7 @@ mod tests {
             adapter_sites: Vec::new(),
             module_resolutions: Vec::new(),
             resource_graph: None,
+            reexporter_components: Vec::new(),
             unresolved_imports: vec![
                 UnresolvedImport {
                     component_idx: 0,
@@ -3081,6 +3107,7 @@ mod tests {
             adapter_sites: Vec::new(),
             module_resolutions: Vec::new(),
             resource_graph: None,
+            reexporter_components: Vec::new(),
             unresolved_imports: vec![
                 UnresolvedImport {
                     component_idx: 0,
@@ -3130,6 +3157,7 @@ mod tests {
             adapter_sites: Vec::new(),
             module_resolutions: Vec::new(),
             resource_graph: None,
+            reexporter_components: Vec::new(),
             unresolved_imports: vec![
                 UnresolvedImport {
                     component_idx: 0,
@@ -3183,6 +3211,7 @@ mod tests {
             adapter_sites: Vec::new(),
             module_resolutions: Vec::new(),
             resource_graph: None,
+            reexporter_components: Vec::new(),
             unresolved_imports: vec![
                 UnresolvedImport {
                     component_idx: 0,
@@ -3313,6 +3342,7 @@ mod tests {
             adapter_sites: Vec::new(),
             module_resolutions: Vec::new(),
             resource_graph: None,
+            reexporter_components: Vec::new(),
             unresolved_imports: vec![
                 UnresolvedImport {
                     component_idx: 0,
@@ -3469,6 +3499,7 @@ mod tests {
             adapter_sites: Vec::new(),
             module_resolutions: Vec::new(),
             resource_graph: None,
+            reexporter_components: Vec::new(),
             unresolved_imports: vec![
                 UnresolvedImport {
                     component_idx: 0,
@@ -3618,6 +3649,7 @@ mod tests {
             adapter_sites: Vec::new(),
             module_resolutions: Vec::new(),
             resource_graph: None,
+            reexporter_components: Vec::new(),
             unresolved_imports: vec![
                 UnresolvedImport {
                     component_idx: 0,
