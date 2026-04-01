@@ -1581,6 +1581,20 @@ impl Resolver {
             }
         }
 
+        // Reject multiply-instantiated modules before building the
+        // module→instance map, which would silently drop duplicates.
+        {
+            let mut seen_modules = HashSet::new();
+            for info in instantiate_infos.values() {
+                if !seen_modules.insert(info.module_idx) {
+                    return Err(Error::DuplicateModuleInstantiation {
+                        component_idx: comp_idx,
+                        module_idx: info.module_idx,
+                    });
+                }
+            }
+        }
+
         // Step 2: Build module → instance map (which instance instantiated which module).
         let mut module_to_instance: HashMap<u32, u32> = HashMap::new();
         for (inst_idx, info) in &instantiate_infos {
@@ -3773,5 +3787,70 @@ mod tests {
             0,
             "SR-17: scalar-only results should produce zero copy layouts"
         );
+    }
+
+    // ---------------------------------------------------------------
+    // Multiply-instantiated module rejection (issue #24)
+    // ---------------------------------------------------------------
+
+    use crate::parser::{ComponentInstance, InstanceKind};
+
+    #[test]
+    fn test_multiply_instantiated_module_rejected() {
+        let mut comp = empty_parsed_component();
+        comp.instances = vec![
+            ComponentInstance {
+                index: 0,
+                kind: InstanceKind::Instantiate {
+                    module_idx: 0,
+                    args: vec![],
+                },
+            },
+            ComponentInstance {
+                index: 1,
+                kind: InstanceKind::Instantiate {
+                    module_idx: 0, // duplicate — same module
+                    args: vec![],
+                },
+            },
+        ];
+
+        let resolver = Resolver::new();
+        let result = resolver.resolve(&[comp]);
+        assert!(
+            result.is_err(),
+            "should reject multiply-instantiated module"
+        );
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(
+            err_msg.contains("instantiates core module 0 more than once"),
+            "error should identify the duplicate module: {}",
+            err_msg
+        );
+    }
+
+    #[test]
+    fn test_distinct_module_instantiations_accepted() {
+        let mut comp = empty_parsed_component();
+        comp.instances = vec![
+            ComponentInstance {
+                index: 0,
+                kind: InstanceKind::Instantiate {
+                    module_idx: 0,
+                    args: vec![],
+                },
+            },
+            ComponentInstance {
+                index: 1,
+                kind: InstanceKind::Instantiate {
+                    module_idx: 1,
+                    args: vec![],
+                },
+            },
+        ];
+
+        let resolver = Resolver::new();
+        let result = resolver.resolve(&[comp]);
+        assert!(result.is_ok(), "distinct modules should be accepted");
     }
 }
