@@ -31,7 +31,7 @@ use crate::{Error, MemoryStrategy, Result};
 use std::collections::{HashMap, HashSet};
 use wasm_encoder::{
     ConstExpr, EntityType, ExportKind as EncoderExportKind, Function,
-    GlobalType as EncoderGlobalType, MemoryType as EncoderMemoryType, RefType,
+    GlobalType as EncoderGlobalType, Instruction, MemoryType as EncoderMemoryType, RefType,
     TableType as EncoderTableType, ValType,
 };
 
@@ -129,6 +129,31 @@ pub struct MergedModule {
 
     /// Maps (component_idx, resource_name) → merged function index for [resource-new].
     pub resource_new_by_component: HashMap<(usize, String), u32>,
+
+    /// Per-component handle table info for re-exporters.
+    pub handle_tables: HashMap<usize, HandleTableInfo>,
+}
+
+/// Per-component resource handle table allocated in a re-exporter's linear memory.
+///
+/// Handles are 4-byte-aligned memory addresses into an i32 array, satisfying
+/// wit-bindgen's `ResourceTable` alignment check (`value & 3 == 0`).
+#[derive(Debug, Clone)]
+pub struct HandleTableInfo {
+    /// Merged memory index for this component
+    pub memory_idx: u32,
+    /// Merged global index for the next-allocation pointer
+    pub next_ptr_global: u32,
+    /// Base address in linear memory where the table starts
+    pub table_base_addr: u32,
+    /// Number of entry slots
+    pub capacity: u32,
+    /// Merged function index of ht_new (store rep, return handle)
+    pub new_func: u32,
+    /// Merged function index of ht_rep (load rep from handle)
+    pub rep_func: u32,
+    /// Merged function index of ht_drop (zero out entry)
+    pub drop_func: u32,
 }
 
 /// Function type in merged module
@@ -408,6 +433,164 @@ impl Merger {
         Ok(())
     }
 
+    /// Allocate per-component handle tables for re-exporter components.
+    ///
+    /// For each re-exporter, grows its memory by 1 page and places a handle
+    /// table at the start of the new page. Adds a mutable global for the
+    /// next-allocation pointer and generates ht_new/ht_rep/ht_drop functions.
+    fn allocate_handle_tables(graph: &DependencyGraph, merged: &mut MergedModule) -> Result<()> {
+        // Handle table capacity: 256 entries = 1024 bytes (fits in 1 page)
+        const HT_CAPACITY: u32 = 256;
+        const ENTRY_SIZE: u32 = 4; // i32
+
+        for &comp_idx in &graph.reexporter_components {
+            // Find merged memory index for this component's memory 0
+            let memory_idx = match merged.memory_index_map.get(&(comp_idx, 0, 0)) {
+                Some(&idx) => idx,
+                None => continue, // No memory — skip (shouldn't happen for real components)
+            };
+
+            // Determine table base: grow memory by 1 page, place table at start of new page
+            let mem_slot = (memory_idx - merged.import_counts.memory) as usize;
+            let current_pages = if mem_slot < merged.memories.len() {
+                merged.memories[mem_slot].minimum
+            } else {
+                continue;
+            };
+            let table_base_addr = (current_pages * WASM_PAGE_SIZE) as u32;
+
+            // Grow memory by 1 page to accommodate the handle table
+            merged.memories[mem_slot].minimum += 1;
+            if let Some(max) = merged.memories[mem_slot].maximum {
+                if max < merged.memories[mem_slot].minimum {
+                    merged.memories[mem_slot].maximum = Some(merged.memories[mem_slot].minimum);
+                }
+            }
+
+            // Add mutable i32 global for next-allocation pointer.
+            // Start at base+4 to skip slot 0 (handle=0 means "no handle").
+            let next_ptr_global = merged.import_counts.global + merged.globals.len() as u32;
+            merged.globals.push(MergedGlobal {
+                ty: EncoderGlobalType {
+                    val_type: ValType::I32,
+                    mutable: true,
+                    shared: false,
+                },
+                init_expr: ConstExpr::i32_const((table_base_addr + ENTRY_SIZE) as i32),
+            });
+
+            // Register or reuse the function types we need:
+            //   ht_new:  (i32) -> (i32)
+            //   ht_rep:  (i32) -> (i32)
+            //   ht_drop: (i32) -> ()
+            let type_i32_to_i32 =
+                Self::find_or_add_type(&mut merged.types, &[ValType::I32], &[ValType::I32]);
+            let type_i32_to_void = Self::find_or_add_type(&mut merged.types, &[ValType::I32], &[]);
+
+            let mem_arg = wasm_encoder::MemArg {
+                offset: 0,
+                align: 2, // 4-byte aligned
+                memory_index: memory_idx,
+            };
+
+            // Generate ht_new: store rep at next_ptr, return next_ptr, advance by 4
+            let new_func_idx = merged.import_counts.func + merged.functions.len() as u32;
+            {
+                let mut body = Function::new([(1, ValType::I32)]); // local $handle
+                body.instruction(&Instruction::GlobalGet(next_ptr_global));
+                body.instruction(&Instruction::LocalSet(1)); // handle = next_ptr
+                body.instruction(&Instruction::LocalGet(1)); // [handle]
+                body.instruction(&Instruction::LocalGet(0)); // [handle, rep]
+                body.instruction(&Instruction::I32Store(mem_arg)); // mem[handle] = rep
+                body.instruction(&Instruction::LocalGet(1)); // [handle]
+                body.instruction(&Instruction::I32Const(ENTRY_SIZE as i32));
+                body.instruction(&Instruction::I32Add);
+                body.instruction(&Instruction::GlobalSet(next_ptr_global)); // next_ptr += 4
+                body.instruction(&Instruction::LocalGet(1)); // return handle
+                body.instruction(&Instruction::End);
+                merged.functions.push(MergedFunction {
+                    type_idx: type_i32_to_i32,
+                    body,
+                    origin: (comp_idx, 0, u32::MAX), // synthetic
+                });
+            }
+
+            // Generate ht_rep: return mem[handle]
+            let rep_func_idx = merged.import_counts.func + merged.functions.len() as u32;
+            {
+                let mut body = Function::new([]);
+                body.instruction(&Instruction::LocalGet(0)); // [handle]
+                body.instruction(&Instruction::I32Load(mem_arg)); // mem[handle] -> rep
+                body.instruction(&Instruction::End);
+                merged.functions.push(MergedFunction {
+                    type_idx: type_i32_to_i32,
+                    body,
+                    origin: (comp_idx, 0, u32::MAX),
+                });
+            }
+
+            // Generate ht_drop: mem[handle] = 0
+            let drop_func_idx = merged.import_counts.func + merged.functions.len() as u32;
+            {
+                let mut body = Function::new([]);
+                body.instruction(&Instruction::LocalGet(0)); // [handle]
+                body.instruction(&Instruction::I32Const(0));
+                body.instruction(&Instruction::I32Store(mem_arg)); // mem[handle] = 0
+                body.instruction(&Instruction::End);
+                merged.functions.push(MergedFunction {
+                    type_idx: type_i32_to_void,
+                    body,
+                    origin: (comp_idx, 0, u32::MAX),
+                });
+            }
+
+            merged.handle_tables.insert(
+                comp_idx,
+                HandleTableInfo {
+                    memory_idx,
+                    next_ptr_global,
+                    table_base_addr,
+                    capacity: HT_CAPACITY,
+                    new_func: new_func_idx,
+                    rep_func: rep_func_idx,
+                    drop_func: drop_func_idx,
+                },
+            );
+
+            log::info!(
+                "handle table for component {}: memory={}, base=0x{:x}, global={}, funcs=({},{},{})",
+                comp_idx,
+                memory_idx,
+                table_base_addr,
+                next_ptr_global,
+                new_func_idx,
+                rep_func_idx,
+                drop_func_idx,
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Find an existing function type or add a new one, returning its index.
+    fn find_or_add_type(
+        types: &mut Vec<MergedFuncType>,
+        params: &[ValType],
+        results: &[ValType],
+    ) -> u32 {
+        for (i, ty) in types.iter().enumerate() {
+            if ty.params == params && ty.results == results {
+                return i as u32;
+            }
+        }
+        let idx = types.len() as u32;
+        types.push(MergedFuncType {
+            params: params.to_vec(),
+            results: results.to_vec(),
+        });
+        idx
+    }
+
     /// Merge components into a single module
     pub fn merge(
         &self,
@@ -456,6 +639,7 @@ impl Merger {
             import_realloc_indices: Vec::new(),
             resource_rep_by_component: HashMap::new(),
             resource_new_by_component: HashMap::new(),
+            handle_tables: HashMap::new(),
         };
 
         // Process components in topological order
@@ -477,6 +661,11 @@ impl Merger {
 
         // Handle start functions
         self.resolve_start_functions(components, &mut merged)?;
+
+        // Allocate per-component handle tables for re-exporter components.
+        if !graph.reexporter_components.is_empty() {
+            Self::allocate_handle_tables(graph, &mut merged)?;
+        }
 
         if let Some(plan) = shared_memory_plan {
             if plan.import.is_none() {
@@ -2517,6 +2706,7 @@ mod tests {
             import_realloc_indices: Vec::new(),
             resource_rep_by_component: HashMap::new(),
             resource_new_by_component: HashMap::new(),
+            handle_tables: HashMap::new(),
         };
 
         // Simulate multi-memory merging for module A (comp 0, mod 0)
@@ -2853,6 +3043,7 @@ mod tests {
             adapter_sites: Vec::new(),
             module_resolutions: Vec::new(),
             resource_graph: None,
+            reexporter_components: Vec::new(),
             unresolved_imports: vec![
                 UnresolvedImport {
                     component_idx: 0,
@@ -2973,6 +3164,7 @@ mod tests {
             adapter_sites: Vec::new(),
             module_resolutions: Vec::new(),
             resource_graph: None,
+            reexporter_components: Vec::new(),
             unresolved_imports: vec![
                 UnresolvedImport {
                     component_idx: 0,
@@ -3023,6 +3215,7 @@ mod tests {
             adapter_sites: Vec::new(),
             module_resolutions: Vec::new(),
             resource_graph: None,
+            reexporter_components: Vec::new(),
             unresolved_imports: vec![
                 UnresolvedImport {
                     component_idx: 0,
@@ -3081,6 +3274,7 @@ mod tests {
             adapter_sites: Vec::new(),
             module_resolutions: Vec::new(),
             resource_graph: None,
+            reexporter_components: Vec::new(),
             unresolved_imports: vec![
                 UnresolvedImport {
                     component_idx: 0,
@@ -3130,6 +3324,7 @@ mod tests {
             adapter_sites: Vec::new(),
             module_resolutions: Vec::new(),
             resource_graph: None,
+            reexporter_components: Vec::new(),
             unresolved_imports: vec![
                 UnresolvedImport {
                     component_idx: 0,
@@ -3183,6 +3378,7 @@ mod tests {
             adapter_sites: Vec::new(),
             module_resolutions: Vec::new(),
             resource_graph: None,
+            reexporter_components: Vec::new(),
             unresolved_imports: vec![
                 UnresolvedImport {
                     component_idx: 0,
@@ -3313,6 +3509,7 @@ mod tests {
             adapter_sites: Vec::new(),
             module_resolutions: Vec::new(),
             resource_graph: None,
+            reexporter_components: Vec::new(),
             unresolved_imports: vec![
                 UnresolvedImport {
                     component_idx: 0,
@@ -3469,6 +3666,7 @@ mod tests {
             adapter_sites: Vec::new(),
             module_resolutions: Vec::new(),
             resource_graph: None,
+            reexporter_components: Vec::new(),
             unresolved_imports: vec![
                 UnresolvedImport {
                     component_idx: 0,
@@ -3618,6 +3816,7 @@ mod tests {
             adapter_sites: Vec::new(),
             module_resolutions: Vec::new(),
             resource_graph: None,
+            reexporter_components: Vec::new(),
             unresolved_imports: vec![
                 UnresolvedImport {
                     component_idx: 0,
