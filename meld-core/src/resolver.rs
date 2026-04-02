@@ -32,6 +32,9 @@ pub struct DependencyGraph {
 
     /// Module-level resolution within components
     pub module_resolutions: Vec<ModuleResolution>,
+
+    /// Component indices that re-export resources (need per-component handle tables).
+    pub reexporter_components: Vec<usize>,
 }
 
 /// An import that couldn't be resolved within the component set
@@ -1057,6 +1060,7 @@ impl Resolver {
             adapter_sites: Vec::new(),
             module_resolutions: Vec::new(),
             resource_graph: None,
+            reexporter_components: Vec::new(),
         };
 
         // Build export index
@@ -1149,6 +1153,25 @@ impl Resolver {
                     }
                 }
             }
+        }
+
+        // Identify re-exporter components: those targeted by adapter sites with
+        // callee_defines_resource=false (they re-export resources defined elsewhere).
+        {
+            let mut reexporter_set: HashSet<usize> = HashSet::new();
+            for site in &graph.adapter_sites {
+                for op in &site.requirements.resource_params {
+                    if !op.callee_defines_resource {
+                        reexporter_set.insert(site.to_component);
+                    }
+                }
+                for op in &site.requirements.resource_results {
+                    if !op.callee_defines_resource {
+                        reexporter_set.insert(site.to_component);
+                    }
+                }
+            }
+            graph.reexporter_components = reexporter_set.into_iter().collect();
         }
 
         // Synthesize missing resource imports.
