@@ -671,13 +671,14 @@ runtime_test!(
     test_runtime_wit_bindgen_resource_aggregates,
     "resource_aggregates"
 );
-// 3-component chain: needs handle table wiring fix (epic #69, #75)
+// 3-component chain: merger deduplicates [export] resource imports across
+// components, causing resource type identity mismatch at runtime (H-11.7).
+// Needs per-component resource import dedup in merger to fix.
 fuse_only_test!(test_fuse_wit_bindgen_resource_floats, "resource_floats");
 runtime_test!(
     test_runtime_wit_bindgen_resource_borrow_in_record,
     "resource_borrow_in_record"
 );
-// 3-component chain: needs handle table wiring fix (epic #69, #75)
 fuse_only_test!(
     test_fuse_wit_bindgen_resource_with_lists,
     "resource_with_lists"
@@ -685,7 +686,6 @@ fuse_only_test!(
 runtime_test!(test_runtime_wit_bindgen_ownership, "ownership");
 runtime_test!(test_runtime_wit_bindgen_xcrate, "xcrate");
 
-// 3-component chain: needs handle table wiring fix (epic #69, #75)
 fuse_only_test!(
     test_fuse_wit_bindgen_resource_import_and_export,
     "resource-import-and-export"
