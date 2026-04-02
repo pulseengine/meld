@@ -671,9 +671,8 @@ runtime_test!(
     test_runtime_wit_bindgen_resource_aggregates,
     "resource_aggregates"
 );
-// 3-component chain: merger deduplicates [export] resource imports across
-// components, causing resource type identity mismatch at runtime (H-11.7).
-// Needs per-component resource import dedup in merger to fix.
+// 3-component chain: resource type mismatch fixed (H-11.8), but handle
+// table values still trap in wit-bindgen's ResourceTable slab code.
 fuse_only_test!(test_fuse_wit_bindgen_resource_floats, "resource_floats");
 runtime_test!(
     test_runtime_wit_bindgen_resource_borrow_in_record,
