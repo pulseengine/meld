@@ -169,6 +169,8 @@ pub struct MergedImport {
     pub module: String,
     pub name: String,
     pub entity_type: EntityType,
+    /// Source component index (for routing resource imports to handle tables)
+    pub component_idx: Option<usize>,
 }
 
 /// Function in merged module
@@ -556,6 +558,23 @@ impl Merger {
                     drop_func: drop_func_idx,
                 },
             );
+
+            // Export handle table functions so the P2 wrapper can alias them.
+            merged.exports.push(MergedExport {
+                name: format!("$ht_new_{}", comp_idx),
+                kind: EncoderExportKind::Func,
+                index: new_func_idx,
+            });
+            merged.exports.push(MergedExport {
+                name: format!("$ht_rep_{}", comp_idx),
+                kind: EncoderExportKind::Func,
+                index: rep_func_idx,
+            });
+            merged.exports.push(MergedExport {
+                name: format!("$ht_drop_{}", comp_idx),
+                kind: EncoderExportKind::Func,
+                index: drop_func_idx,
+            });
 
             log::info!(
                 "handle table for component {}: memory={}, base=0x{:x}, global={}, funcs=({},{},{})",
@@ -1537,6 +1556,7 @@ impl Merger {
                             module: module.clone(),
                             name: name.clone(),
                             entity_type: EntityType::Memory(plan.memory),
+                            component_idx: None,
                         });
                         shared_memory_import_added = true;
                         memory_position += 1;
@@ -1649,6 +1669,7 @@ impl Merger {
                         module,
                         name,
                         entity_type: EntityType::Function(new_type_idx),
+                        component_idx: Some(unresolved.component_idx),
                     });
 
                     // Track per-component resource import indices.
@@ -1696,6 +1717,7 @@ impl Merger {
                         module,
                         name,
                         entity_type: EntityType::Table(convert_table_type(t)),
+                        component_idx: Some(unresolved.component_idx),
                     });
                 }
                 ImportKind::Memory(m) => {
@@ -1715,6 +1737,7 @@ impl Merger {
                         module,
                         name,
                         entity_type: EntityType::Memory(convert_memory_type(m)),
+                        component_idx: Some(unresolved.component_idx),
                     });
                 }
                 ImportKind::Global(g) => {
@@ -1749,6 +1772,7 @@ impl Merger {
                         module,
                         name,
                         entity_type: EntityType::Global(convert_global_type(g)),
+                        component_idx: Some(unresolved.component_idx),
                     });
                 }
             };
@@ -1761,6 +1785,7 @@ impl Merger {
                         module: module.clone(),
                         name: name.clone(),
                         entity_type: EntityType::Memory(plan.memory),
+                        component_idx: None,
                     });
                     memory_position += 1;
                 }
