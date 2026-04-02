@@ -772,7 +772,7 @@ impl Fuser {
             serde_json::json!(stats.imports_resolved),
         );
         let size_reduction = if stats.input_size > 0 {
-            ((stats.input_size - stats.output_size) as f64 / stats.input_size as f64) * 100.0
+            ((stats.input_size as f64 - stats.output_size as f64) / stats.input_size as f64) * 100.0
         } else {
             0.0
         };
