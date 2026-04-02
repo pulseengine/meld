@@ -153,6 +153,8 @@ enum ImportResolution {
         /// For `[export]imports`, this is `"imports"`.
         /// For plain `exports`, this is `"exports"`.
         interface_name: String,
+        /// Source component index (used for handle table routing)
+        component_idx: Option<usize>,
     },
 }
 
@@ -742,7 +744,15 @@ fn assemble_component(
     let instance_map = build_instance_func_map(source);
 
     let mut import_resolutions: Vec<ImportResolution> = Vec::new();
-    for (module_name, field_name, _type_idx) in &fused_info.func_imports {
+    for (import_idx, (module_name, field_name, _type_idx)) in
+        fused_info.func_imports.iter().enumerate()
+    {
+        // Look up the source component_idx from the merged import metadata
+        let comp_idx = merged
+            .imports
+            .get(import_idx)
+            .and_then(|imp| imp.component_idx);
+
         // Category A: [export]-prefixed modules provide canon resource operations
         if let Some(inner_module) = module_name.strip_prefix("[export]") {
             let (op, resource_name) = parse_resource_field(field_name).ok_or_else(|| {
@@ -755,6 +765,7 @@ fn assemble_component(
                 operation: op,
                 resource_name,
                 interface_name: inner_module.to_string(),
+                component_idx: comp_idx,
             });
             continue;
         }
@@ -778,6 +789,7 @@ fn assemble_component(
                 operation: op,
                 resource_name,
                 interface_name: module_name.clone(),
+                component_idx: comp_idx,
             });
             continue;
         }
@@ -1124,60 +1136,82 @@ fn assemble_component(
                 operation,
                 resource_name,
                 interface_name,
+                component_idx,
             } => {
-                // Get or create the resource type for this (interface, resource) pair.
-                // Each interface gets its own resource type, so e.g. imports/float
-                // and exports/float have separate handle tables.
-                let res_type_key = (interface_name.clone(), resource_name.clone());
-                let res_type_idx = if let Some(&existing) = local_resource_types.get(&res_type_key)
-                {
-                    existing
-                } else {
-                    // Define a new resource type. The destructor is exported from
-                    // the fused module as `<interface>#[dtor]<resource>`.
-                    let dtor_export_name = format!("{}#[dtor]{}", interface_name, resource_name);
-                    let has_dtor = fused_info.exports.iter().any(|(n, k, _)| {
-                        *k == wasmparser::ExternalKind::Func && *n == dtor_export_name
-                    });
+                // Check if this import belongs to a re-exporter with a handle table.
+                // If so, route to the handle table function instead of canon resource ops.
+                let ht_info = component_idx.and_then(|ci| merged.handle_tables.get(&ci));
 
-                    let dtor_core_func = if has_dtor {
-                        // Alias the destructor from the fused instance
-                        let mut aliases = ComponentAliasSection::new();
-                        aliases.alias(Alias::CoreInstanceExport {
-                            instance: fused_instance,
-                            kind: ExportKind::Func,
-                            name: &dtor_export_name,
-                        });
-                        component.section(&aliases);
-                        let idx = core_func_idx;
-                        core_func_idx += 1;
-                        Some(idx)
-                    } else {
-                        None
+                if let Some(ht) = ht_info {
+                    // Route to handle table function exported from fused module
+                    let export_name = match operation {
+                        ResourceOp::New => format!("$ht_new_{}", component_idx.unwrap()),
+                        ResourceOp::Rep => format!("$ht_rep_{}", component_idx.unwrap()),
+                        ResourceOp::Drop => format!("$ht_drop_{}", component_idx.unwrap()),
                     };
+                    let _ = ht; // suppress unused warning
 
-                    // Define: (type (resource (rep i32) (dtor ...)))
-                    let mut types = ComponentTypeSection::new();
-                    types.ty().resource(ValType::I32, dtor_core_func);
-                    component.section(&types);
+                    let mut aliases = ComponentAliasSection::new();
+                    aliases.alias(Alias::CoreInstanceExport {
+                        instance: fused_instance,
+                        kind: ExportKind::Func,
+                        name: &export_name,
+                    });
+                    component.section(&aliases);
 
-                    let idx = component_type_idx;
-                    component_type_idx += 1;
-                    local_resource_types.insert(res_type_key, idx);
-                    idx
-                };
+                    lowered_func_indices.push(core_func_idx);
+                    core_func_idx += 1;
+                } else {
+                    // Standard path: define resource type and use canon resource ops
+                    let res_type_key = (interface_name.clone(), resource_name.clone());
+                    let res_type_idx =
+                        if let Some(&existing) = local_resource_types.get(&res_type_key) {
+                            existing
+                        } else {
+                            // Define a new resource type. The destructor is exported from
+                            // the fused module as `<interface>#[dtor]<resource>`.
+                            let dtor_export_name =
+                                format!("{}#[dtor]{}", interface_name, resource_name);
+                            let has_dtor = fused_info.exports.iter().any(|(n, k, _)| {
+                                *k == wasmparser::ExternalKind::Func && *n == dtor_export_name
+                            });
 
-                // Emit the canon resource operation
-                let mut canon = CanonicalFunctionSection::new();
-                match operation {
-                    ResourceOp::Drop => canon.resource_drop(res_type_idx),
-                    ResourceOp::New => canon.resource_new(res_type_idx),
-                    ResourceOp::Rep => canon.resource_rep(res_type_idx),
-                };
-                component.section(&canon);
+                            let dtor_core_func = if has_dtor {
+                                let mut aliases = ComponentAliasSection::new();
+                                aliases.alias(Alias::CoreInstanceExport {
+                                    instance: fused_instance,
+                                    kind: ExportKind::Func,
+                                    name: &dtor_export_name,
+                                });
+                                component.section(&aliases);
+                                let idx = core_func_idx;
+                                core_func_idx += 1;
+                                Some(idx)
+                            } else {
+                                None
+                            };
 
-                lowered_func_indices.push(core_func_idx);
-                core_func_idx += 1;
+                            let mut types = ComponentTypeSection::new();
+                            types.ty().resource(ValType::I32, dtor_core_func);
+                            component.section(&types);
+
+                            let idx = component_type_idx;
+                            component_type_idx += 1;
+                            local_resource_types.insert(res_type_key, idx);
+                            idx
+                        };
+
+                    let mut canon = CanonicalFunctionSection::new();
+                    match operation {
+                        ResourceOp::Drop => canon.resource_drop(res_type_idx),
+                        ResourceOp::New => canon.resource_new(res_type_idx),
+                        ResourceOp::Rep => canon.resource_rep(res_type_idx),
+                    };
+                    component.section(&canon);
+
+                    lowered_func_indices.push(core_func_idx);
+                    core_func_idx += 1;
+                }
             }
         }
     }
