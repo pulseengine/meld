@@ -12,6 +12,7 @@
 use meld_core::{CustomSectionHandling, Fuser, FuserConfig, MemoryStrategy, OutputFormat};
 use wasmtime::component::{Component, Linker, ResourceTable};
 use wasmtime::{Config, Engine, Store};
+use wasmtime_wasi::p2::bindings::sync::Command;
 use wasmtime_wasi::{WasiCtx, WasiCtxView, WasiView};
 
 const FIXTURES_DIR: &str = "../tests/wit_bindgen/fixtures";
@@ -77,8 +78,8 @@ fn fuse_fixture(name: &str, output_format: OutputFormat) -> anyhow::Result<Vec<u
 
 /// Load a fused P2 component into wasmtime with WASI and call `run()`.
 ///
-/// Supports both `wasi:cli/run` command components and components that
-/// export a bare `run` function (wit-bindgen test fixtures).
+/// Uses the typed `Command` API to invoke `wasi:cli/run#run`, which is
+/// the standard entry point for command components.
 fn run_wasi_component(wasm: &[u8]) -> anyhow::Result<()> {
     let mut engine_config = Config::new();
     engine_config.wasm_component_model(true);
@@ -101,15 +102,11 @@ fn run_wasi_component(wasm: &[u8]) -> anyhow::Result<()> {
         },
     );
 
-    let instance = linker.instantiate(&mut store, &component)?;
-
-    let func = instance
-        .get_func(&mut store, "run")
-        .ok_or_else(|| anyhow::anyhow!("no `run` export found"))?;
-
-    let mut results = [];
-    func.call(&mut store, &[], &mut results)?;
-    func.post_return(&mut store)?;
+    let command = Command::instantiate(&mut store, &component, &linker)?;
+    command
+        .wasi_cli_run()
+        .call_run(&mut store)?
+        .map_err(|()| anyhow::anyhow!("wasi:cli/run returned error"))?;
 
     Ok(())
 }
