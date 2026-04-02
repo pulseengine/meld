@@ -1051,11 +1051,14 @@ fn assemble_component(
     let mut component_type_idx = count_replayed_types(source);
     let mut lowered_func_indices: Vec<u32> = Vec::new();
 
-    // Cache: (interface_name, resource_name) → component type index.
-    // Each interface gets its own resource type, giving per-component handle
-    // tables. This is required for 3-component chains where an intermediary
-    // re-exports a resource — the importer and exporter need separate tables.
-    let mut local_resource_types: std::collections::HashMap<(String, String), u32> =
+    // Cache: (component_idx, interface_name, resource_name) → component type index.
+    //
+    // When re-exporter handle tables are active, each component needs its own
+    // resource type to avoid wasmtime's handle type validation rejecting handles
+    // that cross component boundaries (H-11.7, UCA-A-21). Without handle tables
+    // (2-component chains), all components share one type per (interface, resource).
+    let has_handle_tables = !merged.handle_tables.is_empty();
+    let mut local_resource_types: std::collections::HashMap<(Option<usize>, String, String), u32> =
         std::collections::HashMap::new();
 
     for (i, resolution) in import_resolutions.iter().enumerate() {
@@ -1162,8 +1165,15 @@ fn assemble_component(
                     lowered_func_indices.push(core_func_idx);
                     core_func_idx += 1;
                 } else {
-                    // Standard path: define resource type and use canon resource ops
-                    let res_type_key = (interface_name.clone(), resource_name.clone());
+                    // Standard path: define resource type and use canon resource ops.
+                    // Per-component keying when handle tables are active prevents
+                    // type reuse across components that need separate handle tables.
+                    let comp_key = if has_handle_tables {
+                        *component_idx
+                    } else {
+                        None
+                    };
+                    let res_type_key = (comp_key, interface_name.clone(), resource_name.clone());
                     let res_type_idx =
                         if let Some(&existing) = local_resource_types.get(&res_type_key) {
                             existing

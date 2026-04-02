@@ -119,6 +119,23 @@ sub-hazards:
 
   - id: H-11.8
     parent: H-11
+    title: Resource import dedup merges per-component resource types
+    description: >
+      The merger deduplicates [export]-prefixed resource imports (resource.new,
+      resource.rep, resource.drop) across components when they share the same
+      (module, field) name. In 3-component chains (definer → re-exporter →
+      runner), the definer and runner may both import [resource-rep]float under
+      [export]test:resource-floats/test. The merger emits only one import, and
+      the P2 wrapper creates one canonical resource type for it. At runtime,
+      wasmtime rejects handles with "used with the wrong type" because the
+      definer's and runner's handles are in different per-type tables but the
+      wrapper routes them through the same type.
+      Fix: the merger must emit per-component [export] resource imports (with
+      $N suffixes) when handle tables are active, so each component gets its
+      own canonical resource type in the P2 wrapper.
+
+  - id: H-11.9
+    parent: H-11
     title: Destructor not forwarded for locally-defined resources in P2 wrapper
     description: >
       When the P2 wrapper defines a local resource type, it must connect the
