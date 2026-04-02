@@ -673,6 +673,9 @@ runtime_test!(
 );
 // 3-component chain: resource type mismatch fixed (H-11.8), but handle
 // table values still trap in wit-bindgen's ResourceTable slab code.
+// 3-component chain: adapter function body references wrong import (H-11.8).
+// The adapter calls resource.rep with comp 0's type instead of comp 5's type,
+// AND the adapter's call signature doesn't match (f64 param vs i32 expected).
 fuse_only_test!(test_fuse_wit_bindgen_resource_floats, "resource_floats");
 runtime_test!(
     test_runtime_wit_bindgen_resource_borrow_in_record,

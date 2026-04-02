@@ -1673,16 +1673,22 @@ impl Merger {
                     });
 
                     // Track per-component resource import indices.
+                    // Strip $N suffix (multi-memory dedup) from the resource name
+                    // so the adapter can look up by bare name (e.g., "float" not "float$5").
                     let merged_func_idx = func_position - 1;
                     let eff_field = &dedup_key.1;
                     if let Some(rn) = eff_field.strip_prefix("[resource-rep]") {
-                        merged
-                            .resource_rep_by_component
-                            .insert((unresolved.component_idx, rn.to_string()), merged_func_idx);
+                        let bare_rn = rn.rsplit_once('$').map_or(rn, |(base, _)| base);
+                        merged.resource_rep_by_component.insert(
+                            (unresolved.component_idx, bare_rn.to_string()),
+                            merged_func_idx,
+                        );
                     } else if let Some(rn) = eff_field.strip_prefix("[resource-new]") {
-                        merged
-                            .resource_new_by_component
-                            .insert((unresolved.component_idx, rn.to_string()), merged_func_idx);
+                        let bare_rn = rn.rsplit_once('$').map_or(rn, |(base, _)| base);
+                        merged.resource_new_by_component.insert(
+                            (unresolved.component_idx, bare_rn.to_string()),
+                            merged_func_idx,
+                        );
                     }
                 }
                 ImportKind::Table(t) => {
