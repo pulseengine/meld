@@ -1237,6 +1237,21 @@ impl Resolver {
                     needed.push((op.import_module.clone(), new_field, site.to_component));
                 }
             }
+            // Synthesize CALLER's [resource-rep] and [resource-new] so the P2
+            // wrapper creates a per-component resource type for the caller.
+            // Without this, the caller reuses the callee's resource type and
+            // wasmtime rejects handles with "used with the wrong type" (H-11.8).
+            for op in &site.requirements.resource_params {
+                if op.callee_defines_resource && site.from_component != site.to_component {
+                    needed.push((
+                        op.import_module.clone(),
+                        op.import_field.clone(),
+                        site.from_component,
+                    ));
+                    let new_field = op.import_field.replace("[resource-rep]", "[resource-new]");
+                    needed.push((op.import_module.clone(), new_field, site.from_component));
+                }
+            }
             // For 3-component chains: synthesize callee's [resource-rep] for own results.
             // The adapter calls resource.rep on the callee's handle before resource.new.
             for op in &site.requirements.resource_results {
