@@ -1141,9 +1141,14 @@ fn assemble_component(
                 interface_name,
                 component_idx,
             } => {
-                // Check if this import belongs to a re-exporter with a handle table.
-                // If so, route to the handle table function instead of canon resource ops.
-                let ht_info = component_idx.and_then(|ci| merged.handle_tables.get(&ci));
+                // Check if this import belongs to a re-exporter with a handle table
+                // AND the interface is the re-exporter's own export interface.
+                // Only `[export]exports` uses the handle table — other interfaces
+                // (like `[export]imports` or `[export]test:…`) are for resources
+                // the re-exporter CONSUMES, which use canonical resource types.
+                let ht_info = component_idx
+                    .and_then(|ci| merged.handle_tables.get(&ci))
+                    .filter(|_| interface_name == "exports");
 
                 if let Some(ht) = ht_info {
                     // Route to handle table function exported from fused module
@@ -1166,9 +1171,11 @@ fn assemble_component(
                     core_func_idx += 1;
                 } else {
                     // Standard path: define resource type and use canon resource ops.
-                    // Per-component keying when handle tables are active prevents
-                    // type reuse across components that need separate handle tables.
-                    let comp_key = if has_handle_tables {
+                    // Per-component keying only for "exports" interface when handle
+                    // tables are active. Other interfaces (like "imports") are shared
+                    // resources that must use the same canonical resource type across
+                    // all components that reference them.
+                    let comp_key = if has_handle_tables && interface_name == "exports" {
                         *component_idx
                     } else {
                         None
