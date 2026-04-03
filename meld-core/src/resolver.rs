@@ -1825,7 +1825,7 @@ impl Resolver {
         if let Some(exports) = from_exports_infos.get(&instance_idx) {
             for (name, kind, entity_idx) in exports {
                 if name == export_name {
-                    return match kind {
+                    let result = match kind {
                         ExportKind::Function => provenance
                             .func_source
                             .get(entity_idx)
@@ -1843,6 +1843,15 @@ impl Resolver {
                             .get(entity_idx)
                             .map(|(mod_idx, exp_name)| (*mod_idx, exp_name.clone())),
                     };
+                    log::debug!(
+                        "trace_instance_export: inst {} export '{}' ({:?}) entity_idx {} -> {:?}",
+                        instance_idx,
+                        export_name,
+                        kind,
+                        entity_idx,
+                        result
+                    );
+                    return result;
                 }
             }
         }

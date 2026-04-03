@@ -440,6 +440,7 @@ impl Merger {
     /// For each re-exporter, grows its memory by 1 page and places a handle
     /// table at the start of the new page. Adds a mutable global for the
     /// next-allocation pointer and generates ht_new/ht_rep/ht_drop functions.
+    #[allow(dead_code)]
     fn allocate_handle_tables(graph: &DependencyGraph, merged: &mut MergedModule) -> Result<()> {
         // Handle table capacity: 256 entries = 1024 bytes (fits in 1 page)
         const HT_CAPACITY: u32 = 256;
@@ -592,6 +593,7 @@ impl Merger {
     }
 
     /// Find an existing function type or add a new one, returning its index.
+    #[allow(dead_code)]
     fn find_or_add_type(
         types: &mut Vec<MergedFuncType>,
         params: &[ValType],
@@ -681,10 +683,12 @@ impl Merger {
         // Handle start functions
         self.resolve_start_functions(components, &mut merged)?;
 
-        // Allocate per-component handle tables for re-exporter components.
-        if !graph.reexporter_components.is_empty() {
-            Self::allocate_handle_tables(graph, &mut merged)?;
-        }
+        // Handle table allocation disabled: with resource-name-only keying,
+        // all components share one canonical resource type per resource name.
+        // The wasmtime runtime manages handle tables — no custom tables needed.
+        // if !graph.reexporter_components.is_empty() {
+        //     Self::allocate_handle_tables(graph, &mut merged)?;
+        // }
 
         if let Some(plan) = shared_memory_plan {
             if plan.import.is_none() {
@@ -1156,9 +1160,33 @@ impl Merger {
                                 res.to_module,
                                 export.index,
                             )) {
+                                log::debug!(
+                                    "intra-comp func resolve: comp {} mod {} import {}({}) -> comp {} mod {} export {}[{}] = merged {}",
+                                    comp_idx,
+                                    mod_idx,
+                                    imp.name,
+                                    import_func_idx,
+                                    res.component_idx,
+                                    res.to_module,
+                                    res.export_name,
+                                    export.index,
+                                    target_idx,
+                                );
                                 merged
                                     .function_index_map
                                     .insert((comp_idx, mod_idx, import_func_idx), target_idx);
+                            } else {
+                                log::warn!(
+                                    "intra-comp func resolve MISS: comp {} mod {} import {}({}) -> comp {} mod {} export {}[{}] NOT IN function_index_map",
+                                    comp_idx,
+                                    mod_idx,
+                                    imp.name,
+                                    import_func_idx,
+                                    res.component_idx,
+                                    res.to_module,
+                                    res.export_name,
+                                    export.index,
+                                );
                             }
                         }
                     }
@@ -1175,7 +1203,25 @@ impl Merger {
                         imp.module.clone(),
                         imp.name.clone(),
                     )) {
+                        log::debug!(
+                            "unresolved func assign: comp {} mod {} import {}::{}({}) = merged import {}",
+                            comp_idx,
+                            mod_idx,
+                            imp.module,
+                            imp.name,
+                            import_func_idx,
+                            import_index,
+                        );
                         e.insert(import_index);
+                    } else {
+                        log::warn!(
+                            "UNMAPPED func import: comp {} mod {} import {}::{}({})",
+                            comp_idx,
+                            mod_idx,
+                            imp.module,
+                            imp.name,
+                            import_func_idx,
+                        );
                     }
                 }
 
