@@ -153,7 +153,8 @@ enum ImportResolution {
         /// For `[export]imports`, this is `"imports"`.
         /// For plain `exports`, this is `"exports"`.
         interface_name: String,
-        /// Source component index (used for handle table routing)
+        /// Source component index (reserved for future handle table routing)
+        #[allow(dead_code)]
         component_idx: Option<usize>,
     },
 }
@@ -1051,14 +1052,12 @@ fn assemble_component(
     let mut component_type_idx = count_replayed_types(source);
     let mut lowered_func_indices: Vec<u32> = Vec::new();
 
-    // Cache: (component_idx, interface_name, resource_name) → component type index.
-    //
-    // When re-exporter handle tables are active, each component needs its own
-    // resource type to avoid wasmtime's handle type validation rejecting handles
-    // that cross component boundaries (H-11.7, UCA-A-21). Without handle tables
-    // (2-component chains), all components share one type per (interface, resource).
-    let has_handle_tables = !merged.handle_tables.is_empty();
-    let mut local_resource_types: std::collections::HashMap<(Option<usize>, String, String), u32> =
+    // Cache: resource_name → component type index.
+    // All components share one canonical resource type per resource name,
+    // regardless of interface. Re-exporters import and export the same
+    // resource under different interface names (imports, exports, test:…/test)
+    // but must share one wasmtime handle table.
+    let mut local_resource_types: std::collections::HashMap<String, u32> =
         std::collections::HashMap::new();
 
     for (i, resolution) in import_resolutions.iter().enumerate() {
@@ -1139,48 +1138,13 @@ fn assemble_component(
                 operation,
                 resource_name,
                 interface_name,
-                component_idx,
+                component_idx: _,
             } => {
-                // Check if this import belongs to a re-exporter with a handle table
-                // AND the interface is the re-exporter's own export interface.
-                // Only `[export]exports` uses the handle table — other interfaces
-                // (like `[export]imports` or `[export]test:…`) are for resources
-                // the re-exporter CONSUMES, which use canonical resource types.
-                let ht_info = component_idx
-                    .and_then(|ci| merged.handle_tables.get(&ci))
-                    .filter(|_| interface_name == "exports");
-
-                if let Some(ht) = ht_info {
-                    // Route to handle table function exported from fused module
-                    let export_name = match operation {
-                        ResourceOp::New => format!("$ht_new_{}", component_idx.unwrap()),
-                        ResourceOp::Rep => format!("$ht_rep_{}", component_idx.unwrap()),
-                        ResourceOp::Drop => format!("$ht_drop_{}", component_idx.unwrap()),
-                    };
-                    let _ = ht; // suppress unused warning
-
-                    let mut aliases = ComponentAliasSection::new();
-                    aliases.alias(Alias::CoreInstanceExport {
-                        instance: fused_instance,
-                        kind: ExportKind::Func,
-                        name: &export_name,
-                    });
-                    component.section(&aliases);
-
-                    lowered_func_indices.push(core_func_idx);
-                    core_func_idx += 1;
-                } else {
-                    // Standard path: define resource type and use canon resource ops.
-                    // Per-component keying only for "exports" interface when handle
-                    // tables are active. Other interfaces (like "imports") are shared
-                    // resources that must use the same canonical resource type across
-                    // all components that reference them.
-                    let comp_key = if has_handle_tables && interface_name == "exports" {
-                        *component_idx
-                    } else {
-                        None
-                    };
-                    let res_type_key = (comp_key, interface_name.clone(), resource_name.clone());
+                {
+                    // All components share one canonical resource type per
+                    // resource name. Re-exporters forward handles through the
+                    // same wasmtime-managed handle table as the definer.
+                    let res_type_key = resource_name.clone();
                     let res_type_idx =
                         if let Some(&existing) = local_resource_types.get(&res_type_key) {
                             existing

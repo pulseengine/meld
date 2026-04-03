@@ -440,6 +440,7 @@ impl Merger {
     /// For each re-exporter, grows its memory by 1 page and places a handle
     /// table at the start of the new page. Adds a mutable global for the
     /// next-allocation pointer and generates ht_new/ht_rep/ht_drop functions.
+    #[allow(dead_code)]
     fn allocate_handle_tables(graph: &DependencyGraph, merged: &mut MergedModule) -> Result<()> {
         // Handle table capacity: 256 entries = 1024 bytes (fits in 1 page)
         const HT_CAPACITY: u32 = 256;
@@ -592,6 +593,7 @@ impl Merger {
     }
 
     /// Find an existing function type or add a new one, returning its index.
+    #[allow(dead_code)]
     fn find_or_add_type(
         types: &mut Vec<MergedFuncType>,
         params: &[ValType],
@@ -681,10 +683,12 @@ impl Merger {
         // Handle start functions
         self.resolve_start_functions(components, &mut merged)?;
 
-        // Allocate per-component handle tables for re-exporter components.
-        if !graph.reexporter_components.is_empty() {
-            Self::allocate_handle_tables(graph, &mut merged)?;
-        }
+        // Handle table allocation disabled: with resource-name-only keying,
+        // all components share one canonical resource type per resource name.
+        // The wasmtime runtime manages handle tables — no custom tables needed.
+        // if !graph.reexporter_components.is_empty() {
+        //     Self::allocate_handle_tables(graph, &mut merged)?;
+        // }
 
         if let Some(plan) = shared_memory_plan {
             if plan.import.is_none() {
@@ -1156,9 +1160,33 @@ impl Merger {
                                 res.to_module,
                                 export.index,
                             )) {
+                                log::debug!(
+                                    "intra-comp func resolve: comp {} mod {} import {}({}) -> comp {} mod {} export {}[{}] = merged {}",
+                                    comp_idx,
+                                    mod_idx,
+                                    imp.name,
+                                    import_func_idx,
+                                    res.component_idx,
+                                    res.to_module,
+                                    res.export_name,
+                                    export.index,
+                                    target_idx,
+                                );
                                 merged
                                     .function_index_map
                                     .insert((comp_idx, mod_idx, import_func_idx), target_idx);
+                            } else {
+                                log::warn!(
+                                    "intra-comp func resolve MISS: comp {} mod {} import {}({}) -> comp {} mod {} export {}[{}] NOT IN function_index_map",
+                                    comp_idx,
+                                    mod_idx,
+                                    imp.name,
+                                    import_func_idx,
+                                    res.component_idx,
+                                    res.to_module,
+                                    res.export_name,
+                                    export.index,
+                                );
                             }
                         }
                     }
@@ -1175,7 +1203,25 @@ impl Merger {
                         imp.module.clone(),
                         imp.name.clone(),
                     )) {
+                        log::debug!(
+                            "unresolved func assign: comp {} mod {} import {}::{}({}) = merged import {}",
+                            comp_idx,
+                            mod_idx,
+                            imp.module,
+                            imp.name,
+                            import_func_idx,
+                            import_index,
+                        );
                         e.insert(import_index);
+                    } else {
+                        log::warn!(
+                            "UNMAPPED func import: comp {} mod {} import {}::{}({})",
+                            comp_idx,
+                            mod_idx,
+                            imp.module,
+                            imp.name,
+                            import_func_idx,
+                        );
                     }
                 }
 
@@ -1284,33 +1330,27 @@ impl Merger {
                 }
             };
 
-            // Export deduplication: first-wins strategy.
-            //
-            // When multiple modules export the same name, the first export
-            // (in topological/instantiation order) wins and subsequent
-            // duplicates are silently dropped.  This matches the component
-            // model's semantics where earlier instantiations take priority.
-            //
-            // If this behavior is ever made configurable (e.g. error on
-            // conflict, or prefix with component name), update both this
-            // check and the MergedExport documentation.
-            if let Some(existing) = merged.exports.iter().find(|e| e.name == export.name) {
-                log::warn!(
-                    "Duplicate export \"{}\": keeping {:?} index {} (from earlier module), \
-                     skipping {:?} index {} from component {} module {}",
-                    export.name,
-                    existing.kind,
-                    existing.index,
-                    kind,
-                    old_idx,
-                    comp_idx,
-                    mod_idx,
-                );
-                continue;
-            }
+            // Export deduplication: in multi-memory mode, suffix duplicate
+            // export names with the component index. Each component's shim
+            // module exports numeric function names ("0", "1", ...) and a
+            // "$imports" table that must remain distinct — deduplication
+            // would wire the fixup module to the wrong component's indirect
+            // table. In shared-memory mode, first-wins dedup is correct
+            // since all components share one memory.
+            let export_name = if self.memory_strategy == MemoryStrategy::MultiMemory
+                && merged.exports.iter().any(|e| e.name == export.name)
+            {
+                format!("{}${}", export.name, comp_idx)
+            } else if self.memory_strategy != MemoryStrategy::MultiMemory
+                && merged.exports.iter().any(|e| e.name == export.name)
+            {
+                continue; // first-wins dedup in shared-memory mode
+            } else {
+                export.name.clone()
+            };
 
             merged.exports.push(MergedExport {
-                name: export.name.clone(),
+                name: export_name,
                 kind,
                 index: old_idx,
             });

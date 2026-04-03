@@ -1428,8 +1428,19 @@ impl Resolver {
     ) -> Result<()> {
         for (comp_idx, component) in components.iter().enumerate() {
             if !component.instances.is_empty() {
+                log::debug!(
+                    "resolve_module_imports: comp {} using resolve_via_instances ({} instances, {} modules)",
+                    comp_idx,
+                    component.instances.len(),
+                    component.core_modules.len()
+                );
                 self.resolve_via_instances(comp_idx, component, graph)?;
             } else {
+                log::debug!(
+                    "resolve_module_imports: comp {} using resolve_via_flat_names ({} modules)",
+                    comp_idx,
+                    component.core_modules.len()
+                );
                 self.resolve_via_flat_names(comp_idx, component, graph)?;
             }
         }
@@ -1692,6 +1703,13 @@ impl Resolver {
                             && let Some(to_mod_idx) =
                                 find_module_with_export(component, &import.name, from_mod_idx)
                         {
+                            log::debug!(
+                                "comp {} mod {} __main_module__::{} → mod {}",
+                                comp_idx,
+                                from_mod_idx,
+                                import.name,
+                                to_mod_idx
+                            );
                             graph.module_resolutions.push(ModuleResolution {
                                 component_idx: comp_idx,
                                 from_module: from_mod_idx,
@@ -1807,7 +1825,7 @@ impl Resolver {
         if let Some(exports) = from_exports_infos.get(&instance_idx) {
             for (name, kind, entity_idx) in exports {
                 if name == export_name {
-                    return match kind {
+                    let result = match kind {
                         ExportKind::Function => provenance
                             .func_source
                             .get(entity_idx)
@@ -1825,6 +1843,15 @@ impl Resolver {
                             .get(entity_idx)
                             .map(|(mod_idx, exp_name)| (*mod_idx, exp_name.clone())),
                     };
+                    log::debug!(
+                        "trace_instance_export: inst {} export '{}' ({:?}) entity_idx {} -> {:?}",
+                        instance_idx,
+                        export_name,
+                        kind,
+                        entity_idx,
+                        result
+                    );
+                    return result;
                 }
             }
         }

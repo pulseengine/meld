@@ -671,10 +671,8 @@ runtime_test!(
     test_runtime_wit_bindgen_resource_aggregates,
     "resource_aggregates"
 );
-// 3-component chain: resource type mismatch fixed (H-11.8), but handle
-// table values still trap in wit-bindgen's ResourceTable slab code.
-// 3-component: resource type identity fixed, but handle table values
-// trap in wit-bindgen's ResourceTable slab (unreachable in re-exporter code).
+// 3-component chain: resource type identity fully unified, but leaf's
+// allocator traps when called from the intermediate's code path.
 fuse_only_test!(test_fuse_wit_bindgen_resource_floats, "resource_floats");
 runtime_test!(
     test_runtime_wit_bindgen_resource_borrow_in_record,
