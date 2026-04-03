@@ -1284,33 +1284,27 @@ impl Merger {
                 }
             };
 
-            // Export deduplication: first-wins strategy.
-            //
-            // When multiple modules export the same name, the first export
-            // (in topological/instantiation order) wins and subsequent
-            // duplicates are silently dropped.  This matches the component
-            // model's semantics where earlier instantiations take priority.
-            //
-            // If this behavior is ever made configurable (e.g. error on
-            // conflict, or prefix with component name), update both this
-            // check and the MergedExport documentation.
-            if let Some(existing) = merged.exports.iter().find(|e| e.name == export.name) {
-                log::warn!(
-                    "Duplicate export \"{}\": keeping {:?} index {} (from earlier module), \
-                     skipping {:?} index {} from component {} module {}",
-                    export.name,
-                    existing.kind,
-                    existing.index,
-                    kind,
-                    old_idx,
-                    comp_idx,
-                    mod_idx,
-                );
-                continue;
-            }
+            // Export deduplication: in multi-memory mode, suffix duplicate
+            // export names with the component index. Each component's shim
+            // module exports numeric function names ("0", "1", ...) and a
+            // "$imports" table that must remain distinct — deduplication
+            // would wire the fixup module to the wrong component's indirect
+            // table. In shared-memory mode, first-wins dedup is correct
+            // since all components share one memory.
+            let export_name = if self.memory_strategy == MemoryStrategy::MultiMemory
+                && merged.exports.iter().any(|e| e.name == export.name)
+            {
+                format!("{}${}", export.name, comp_idx)
+            } else if self.memory_strategy != MemoryStrategy::MultiMemory
+                && merged.exports.iter().any(|e| e.name == export.name)
+            {
+                continue; // first-wins dedup in shared-memory mode
+            } else {
+                export.name.clone()
+            };
 
             merged.exports.push(MergedExport {
-                name: export.name.clone(),
+                name: export_name,
                 kind,
                 index: old_idx,
             });
