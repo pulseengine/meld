@@ -1174,19 +1174,10 @@ impl Resolver {
             graph.reexporter_components = reexporter_set.into_iter().collect();
         }
 
-        // For adapters FROM a re-exporter TO the resource definer: the
-        // re-exporter's generated code already extracts rep via its handle
-        // table (ht_rep). The downstream adapter must not call resource.rep
-        // again, or it would double-extract.
-        for site in &mut graph.adapter_sites {
-            if graph.reexporter_components.contains(&site.from_component) {
-                for op in &mut site.requirements.resource_params {
-                    if !op.is_owned && op.callee_defines_resource {
-                        op.caller_already_converted = true;
-                    }
-                }
-            }
-        }
+        // Note: the re-exporter caller_already_converted logic (from PR #81)
+        // was removed because handle tables are disabled. With canonical
+        // resource types, the re-exporter passes handles (not reps) and the
+        // downstream adapter MUST call resource.rep to convert.
 
         // Synthesize missing resource imports.
         //
