@@ -671,8 +671,8 @@ runtime_test!(
     test_runtime_wit_bindgen_resource_aggregates,
     "resource_aggregates"
 );
-// 3-component chain: resource type identity fully unified, but leaf's
-// allocator traps when called from the intermediate's code path.
+// 3-component chain: resource.rep conversion now works, but leaf's internal
+// ResourceTable::get returns None — needs further adapter investigation.
 fuse_only_test!(test_fuse_wit_bindgen_resource_floats, "resource_floats");
 runtime_test!(
     test_runtime_wit_bindgen_resource_borrow_in_record,
