@@ -702,6 +702,113 @@ fn build_canon_import_names(component: &ParsedComponent) -> HashMap<u32, (String
                                 result.insert(core_func_idx, (import_name.clone(), field));
                             }
                         }
+                        // P3 task/async canonical builtins. These are runtime
+                        // intrinsics that need proper display names so the
+                        // merger emits them with the correct module/field
+                        // instead of raw fixup module names (""/"0").
+                        CanonicalEntry::TaskReturn { .. } => {
+                            // task.return is emitted under [export]<iface> or
+                            // [export]$root. The exact field name comes from
+                            // the inner module's import; we can't recover it
+                            // here, but the inner module already has the right
+                            // import name. Mark it so the merger skips fixup.
+                            // We use a sentinel module "$root" with a generic field.
+                            result.insert(
+                                core_func_idx,
+                                (
+                                    "$root".to_string(),
+                                    format!("[task-return]{}", core_func_idx),
+                                ),
+                            );
+                        }
+                        CanonicalEntry::TaskCancel => {
+                            result.insert(
+                                core_func_idx,
+                                ("[export]$root".to_string(), "[task-cancel]".to_string()),
+                            );
+                        }
+                        CanonicalEntry::BackpressureInc => {
+                            result.insert(
+                                core_func_idx,
+                                ("$root".to_string(), "[backpressure-inc]".to_string()),
+                            );
+                        }
+                        CanonicalEntry::BackpressureDec => {
+                            result.insert(
+                                core_func_idx,
+                                ("$root".to_string(), "[backpressure-dec]".to_string()),
+                            );
+                        }
+                        CanonicalEntry::ContextGet(slot) => {
+                            result.insert(
+                                core_func_idx,
+                                ("$root".to_string(), format!("[context-get-{}]", slot)),
+                            );
+                        }
+                        CanonicalEntry::ContextSet(slot) => {
+                            result.insert(
+                                core_func_idx,
+                                ("$root".to_string(), format!("[context-set-{}]", slot)),
+                            );
+                        }
+                        CanonicalEntry::WaitableJoin => {
+                            result.insert(
+                                core_func_idx,
+                                ("$root".to_string(), "[waitable-join]".to_string()),
+                            );
+                        }
+                        CanonicalEntry::WaitableSetNew => {
+                            result.insert(
+                                core_func_idx,
+                                ("$root".to_string(), "[waitable-set-new]".to_string()),
+                            );
+                        }
+                        CanonicalEntry::WaitableSetDrop => {
+                            result.insert(
+                                core_func_idx,
+                                ("$root".to_string(), "[waitable-set-drop]".to_string()),
+                            );
+                        }
+                        CanonicalEntry::WaitableSetPoll { .. } => {
+                            result.insert(
+                                core_func_idx,
+                                ("$root".to_string(), "[waitable-set-poll]".to_string()),
+                            );
+                        }
+                        CanonicalEntry::WaitableSetWait { .. } => {
+                            result.insert(
+                                core_func_idx,
+                                ("$root".to_string(), "[waitable-set-wait]".to_string()),
+                            );
+                        }
+                        CanonicalEntry::SubtaskDrop => {
+                            result.insert(
+                                core_func_idx,
+                                ("$root".to_string(), "[subtask-drop]".to_string()),
+                            );
+                        }
+                        CanonicalEntry::SubtaskCancel { .. } => {
+                            result.insert(
+                                core_func_idx,
+                                ("$root".to_string(), "[subtask-cancel]".to_string()),
+                            );
+                        }
+                        CanonicalEntry::ThreadYield { .. } => {
+                            result.insert(
+                                core_func_idx,
+                                ("$root".to_string(), "[thread-yield]".to_string()),
+                            );
+                        }
+                        CanonicalEntry::ResourceDropAsync { resource } => {
+                            if let Some((inst_idx, type_name)) =
+                                comp_type_to_instance_export.get(resource)
+                                && let Some(module_name) =
+                                    comp_instance_to_import_name.get(inst_idx)
+                            {
+                                let field = format!("[resource-drop-async]{}", type_name);
+                                result.insert(core_func_idx, (module_name.clone(), field));
+                            }
+                        }
                         _ => {}
                     }
                 }
@@ -2145,18 +2252,29 @@ impl Resolver {
                                     _ => None,
                                 });
 
+                            // P3 async exports use `[async-lift]` prefix on the
+                            // core module export name. Try matching both with and
+                            // without the prefix.
+                            let async_qualified = format!("[async-lift]{}", qualified);
+
                             for (to_mod_idx, to_module) in
                                 to_component.core_modules.iter().enumerate()
                             {
                                 if let Some(export) = to_module.exports.iter().find(|exp| {
-                                    exp.name == qualified && exp.kind == ExportKind::Function
+                                    exp.kind == ExportKind::Function
+                                        && (exp.name == qualified || exp.name == async_qualified)
                                 }) {
                                     found = true;
                                     let mut requirements = AdapterRequirements::default();
                                     // Use provenance-based reverse map for correct
                                     // component-level core func index lookup.
-                                    let comp_core_idx =
-                                        callee_export_to_core.get(&(to_mod_idx, qualified.clone()));
+                                    // Try the actual export name first, then the plain qualified name.
+                                    let comp_core_idx = callee_export_to_core
+                                        .get(&(to_mod_idx, export.name.clone()))
+                                        .or_else(|| {
+                                            callee_export_to_core
+                                                .get(&(to_mod_idx, qualified.clone()))
+                                        });
                                     let lift_info =
                                         comp_core_idx.and_then(|idx| callee_lift_info.get(idx));
                                     if comp_core_idx.is_some() && lift_info.is_none() {

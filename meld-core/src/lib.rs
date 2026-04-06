@@ -240,27 +240,16 @@ impl Fuser {
             ));
         }
 
-        // Reject P3 async components — meld cannot yet fuse them correctly.
-        // Collect all detected features across all components for a single
-        // actionable error message.
-        let mut p3_details: Vec<String> = Vec::new();
+        // Log P3 async feature usage (informational, no longer a rejection).
         for (idx, comp) in self.components.iter().enumerate() {
             if !comp.p3_async_features.is_empty() {
                 let default_name = format!("component {idx}");
                 let comp_name = comp.name.as_deref().unwrap_or(&default_name);
-                // Deduplicate features within a single component
-                let mut feats = comp.p3_async_features.clone();
-                feats.sort();
-                feats.dedup();
-                p3_details.push(format!("'{comp_name}' uses: {}", feats.join(", ")));
+                log::info!(
+                    "P3 async types in '{comp_name}': {}",
+                    comp.p3_async_features.join(", ")
+                );
             }
-        }
-        if !p3_details.is_empty() {
-            return Err(Error::P3AsyncNotSupported(format!(
-                "{}. P3 async features (stream, future, async lift/lower, task builtins) \
-                 are not yet supported by meld. Use P2 components or wait for meld P3 support.",
-                p3_details.join("; ")
-            )));
         }
 
         let mut stats = FusionStats {
@@ -375,18 +364,83 @@ impl Fuser {
         adapters: &[adapter::AdapterFunction],
         graph: &resolver::DependencyGraph,
     ) -> Result<()> {
-        use std::collections::HashSet;
+        use std::collections::{HashMap, HashSet};
+        use wasm_encoder::{Function, Instruction, ValType};
 
-        let adapter_base = merged.import_counts.func + merged.functions.len() as u32;
+        let original_func_count = merged.functions.len() as u32;
+        let func_base = merged.import_counts.func;
+
+        // Pre-scan: identify adapters needing P3 async widening wrappers.
+        // A wrapper is needed when the caller's import type has wider result
+        // types than the adapter's (e.g., caller expects i64, adapter returns
+        // i32 task handle). Wrappers are placed in merged.functions BEFORE the
+        // adapters, so we must pre-count them to compute correct adapter indices.
+        struct WrapperInfo {
+            adapter_offset: usize,
+            comp_idx: usize,
+            mod_idx: usize,
+            caller_type_idx: u32,
+        }
+        let mut wrapper_infos: Vec<WrapperInfo> = Vec::new();
+
+        for (adapter_offset, (adapter, site)) in
+            adapters.iter().zip(graph.adapter_sites.iter()).enumerate()
+        {
+            if let Some(local_ti) = site.import_func_type_idx
+                && let Some(&caller_ti) =
+                    merged
+                        .type_index_map
+                        .get(&(site.from_component, site.from_module, local_ti))
+                && caller_ti != adapter.type_idx
+            {
+                let caller_type = &merged.types[caller_ti as usize];
+                let adapter_type = &merged.types[adapter.type_idx as usize];
+                // Only wrap when there is actual result widening (i32→i64)
+                let has_widening = caller_type.params.len() == adapter_type.params.len()
+                    && caller_type.results.len() == adapter_type.results.len()
+                    && caller_type
+                        .results
+                        .iter()
+                        .zip(adapter_type.results.iter())
+                        .any(|(c, a)| *a == ValType::I32 && *c == ValType::I64);
+                if has_widening {
+                    wrapper_infos.push(WrapperInfo {
+                        adapter_offset,
+                        comp_idx: site.from_component,
+                        mod_idx: site.from_module,
+                        caller_type_idx: caller_ti,
+                    });
+                }
+            }
+        }
+
+        let num_wrappers = wrapper_infos.len() as u32;
+
+        // Adapter base accounts for wrappers prepended into merged.functions.
+        // Layout: [imports] [original funcs] [wrappers] [adapters]
+        let adapter_base = func_base + original_func_count + num_wrappers;
+
+        // Map adapter_offset → wrapper merged index for adapters that have wrappers.
+        let mut adapter_to_wrapper: HashMap<usize, u32> = HashMap::new();
+        for (wi, info) in wrapper_infos.iter().enumerate() {
+            adapter_to_wrapper.insert(
+                info.adapter_offset,
+                func_base + original_func_count + wi as u32,
+            );
+        }
 
         // For each adapter, update function_index_map to point the source
-        // import to the adapter's merged index rather than the direct target.
+        // import to the wrapper (if one exists) or the adapter's merged index.
         let mut affected_modules: HashSet<(usize, usize)> = HashSet::new();
 
         for (adapter_offset, (adapter, site)) in
             adapters.iter().zip(graph.adapter_sites.iter()).enumerate()
         {
-            let adapter_merged_idx = adapter_base + adapter_offset as u32;
+            let target_idx = if let Some(&wrapper_idx) = adapter_to_wrapper.get(&adapter_offset) {
+                wrapper_idx
+            } else {
+                adapter_base + adapter_offset as u32
+            };
             let comp_idx = adapter.source_component;
             let mod_idx = adapter.source_module;
             let module = &self.components[comp_idx].core_modules[mod_idx];
@@ -404,7 +458,7 @@ impl Fuser {
                 {
                     merged
                         .function_index_map
-                        .insert((comp_idx, mod_idx, import_func_idx), adapter_merged_idx);
+                        .insert((comp_idx, mod_idx, import_func_idx), target_idx);
                     affected_modules.insert((comp_idx, mod_idx));
                     found = true;
                     break;
@@ -420,6 +474,33 @@ impl Fuser {
                     mod_idx
                 );
             }
+        }
+
+        // Create wrapper functions for P3 async type widening.
+        for info in &wrapper_infos {
+            let adapter_merged_idx = adapter_base + info.adapter_offset as u32;
+            let caller_type = &merged.types[info.caller_type_idx as usize];
+            let adapter_type = &merged.types[adapters[info.adapter_offset].type_idx as usize];
+
+            let mut body = Function::new([]);
+            for i in 0..caller_type.params.len() {
+                body.instruction(&Instruction::LocalGet(i as u32));
+            }
+            body.instruction(&Instruction::Call(adapter_merged_idx));
+            for (caller_r, adapter_r) in caller_type.results.iter().zip(adapter_type.results.iter())
+            {
+                if *adapter_r == ValType::I32 && *caller_r == ValType::I64 {
+                    body.instruction(&Instruction::I64ExtendI32U);
+                }
+            }
+            body.instruction(&Instruction::End);
+
+            merged.functions.push(merger::MergedFunction {
+                type_idx: info.caller_type_idx,
+                body,
+                origin: (info.comp_idx, info.mod_idx, u32::MAX),
+            });
+            affected_modules.insert((info.comp_idx, info.mod_idx));
         }
 
         // Re-rewrite function bodies for every module that had an import
