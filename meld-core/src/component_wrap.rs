@@ -168,6 +168,25 @@ enum ImportResolution {
         /// The specific P3 canonical operation to emit.
         op: P3BuiltinOp,
     },
+    /// Import resolves to an internal P3 async cross-component call.
+    ///
+    /// The fused module exports `[async-lift]<iface>#<func>` and
+    /// `[callback][async-lift]<iface>#<func>`. The wrapper creates
+    /// `canon lift ... async (callback ...)` → `canon lower` to provide
+    /// a synchronous import to the fused core module.
+    AsyncLiftLower {
+        /// The async-lift export name in the fused module
+        async_lift_export: String,
+        /// The callback export name in the fused module
+        callback_export: String,
+        /// Index of the source component that exports this async function
+        /// (used to look up the correct component-level type)
+        source_comp_idx: usize,
+        /// The interface name (e.g., "compute:concurrent/tasks@1.0.0")
+        interface_name: String,
+        /// The function name (e.g., "collatz-steps")
+        func_name: String,
+    },
 }
 
 /// A canonical resource operation.
@@ -896,6 +915,38 @@ fn assemble_component(
             continue;
         }
 
+        // Category P3-async: internal async cross-component call.
+        // The fused module exports [async-lift]<iface>#<func> for functions
+        // that were canon-lifted with `async` in the original component.
+        // We provide these via canon lift async + canon lower.
+        {
+            let async_lift_name = format!("[async-lift]{}#{}", module_name, field_name);
+            let callback_name = format!("[callback][async-lift]{}#{}", module_name, field_name);
+            let has_async_lift = fused_info
+                .exports
+                .iter()
+                .any(|(n, k, _)| *k == wasmparser::ExternalKind::Func && *n == async_lift_name);
+            if has_async_lift {
+                // Find which component exports this async function
+                let source_comp = all_components
+                    .iter()
+                    .position(|c| {
+                        c.core_modules
+                            .iter()
+                            .any(|m| m.exports.iter().any(|e| e.name == async_lift_name))
+                    })
+                    .unwrap_or(0);
+                import_resolutions.push(ImportResolution::AsyncLiftLower {
+                    async_lift_export: async_lift_name,
+                    callback_export: callback_name,
+                    source_comp_idx: source_comp,
+                    interface_name: module_name.clone(),
+                    func_name: field_name.to_string(),
+                });
+                continue;
+            }
+        }
+
         return Err(Error::EncodingError(format!(
             "cannot resolve fused import {}::{} to a component instance",
             module_name, field_name
@@ -1166,6 +1217,87 @@ fn assemble_component(
     let mut local_resource_types: std::collections::HashMap<String, u32> =
         std::collections::HashMap::new();
 
+    // Pre-define component function types for async lift/lower imports.
+    // Match the correct Lift entry by comparing its flattened core type
+    // with the actual core import type from the fused module.
+    let mut async_func_types: std::collections::HashMap<usize, u32> =
+        std::collections::HashMap::new();
+    for (i, resolution) in import_resolutions.iter().enumerate() {
+        if let ImportResolution::AsyncLiftLower {
+            source_comp_idx, ..
+        } = resolution
+        {
+            let inner_comp = &all_components[*source_comp_idx];
+            let import_type_idx = fused_info.func_imports[i].2;
+            let core_type = fused_info
+                .func_types
+                .get(import_type_idx as usize)
+                .cloned()
+                .unwrap_or_default();
+
+            // Search Lift entries for one whose flattened type matches
+            // the core import type (params and results).
+            let mut found = false;
+            for canon in &inner_comp.canonical_functions {
+                if let parser::CanonicalEntry::Lift {
+                    type_index,
+                    options,
+                    ..
+                } = canon
+                {
+                    if !options.async_ {
+                        continue;
+                    }
+                    if let Some(type_def) = inner_comp.get_type_definition(*type_index)
+                        && let parser::ComponentTypeKind::Function { params, results } =
+                            &type_def.kind
+                    {
+                        // Flatten params
+                        let flat_params: Vec<wasm_encoder::ValType> = params
+                            .iter()
+                            .flat_map(|(_, cvt)| flat_component_val_type_resolved(cvt, inner_comp))
+                            .collect();
+                        // Flatten results
+                        let flat_results: Vec<wasm_encoder::ValType> = results
+                            .iter()
+                            .flat_map(|(_, cvt)| flat_component_val_type_resolved(cvt, inner_comp))
+                            .collect();
+                        // Check direct match or retptr convention:
+                        // If flat_results > 1, canon lower uses a retptr param
+                        // and returns nothing.
+                        let direct_match =
+                            flat_params == core_type.0 && flat_results == core_type.1;
+                        let retptr_match = flat_results.len() > 1 && {
+                            let mut expected_params = flat_params.clone();
+                            expected_params.push(wasm_encoder::ValType::I32); // retptr
+                            expected_params == core_type.0 && core_type.1.is_empty()
+                        };
+                        if direct_match || retptr_match {
+                            let mut inner_remap = std::collections::HashMap::new();
+                            let wrapper_type = define_source_type_in_wrapper(
+                                &mut component,
+                                inner_comp,
+                                *type_index,
+                                &mut component_type_idx,
+                                &mut inner_remap,
+                            )?;
+                            async_func_types.insert(i, wrapper_type);
+                            found = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            if !found {
+                log::warn!(
+                    "no matching async Lift found for import {}::{}",
+                    fused_info.func_imports[i].0,
+                    fused_info.func_imports[i].1,
+                );
+            }
+        }
+    }
+
     for (i, resolution) in import_resolutions.iter().enumerate() {
         match resolution {
             ImportResolution::Instance {
@@ -1299,6 +1431,108 @@ fn assemble_component(
                     lowered_func_indices.push(core_func_idx);
                     core_func_idx += 1;
                 }
+            }
+
+            ImportResolution::AsyncLiftLower {
+                async_lift_export,
+                callback_export,
+                interface_name,
+                func_name,
+                ..
+            } => {
+                // Alias the [async-lift] core function from the fused instance
+                let mut alias_section = ComponentAliasSection::new();
+                alias_section.alias(Alias::CoreInstanceExport {
+                    instance: fused_instance,
+                    kind: ExportKind::Func,
+                    name: async_lift_export,
+                });
+                component.section(&alias_section);
+                let async_lift_core_idx = core_func_idx;
+                core_func_idx += 1;
+
+                // Alias the [callback] core function
+                let has_callback = fused_info
+                    .exports
+                    .iter()
+                    .any(|(n, k, _)| *k == wasmparser::ExternalKind::Func && n == callback_export);
+                let callback_core_idx = if has_callback {
+                    let mut alias_section = ComponentAliasSection::new();
+                    alias_section.alias(Alias::CoreInstanceExport {
+                        instance: fused_instance,
+                        kind: ExportKind::Func,
+                        name: callback_export,
+                    });
+                    component.section(&alias_section);
+                    let idx = core_func_idx;
+                    core_func_idx += 1;
+                    Some(idx)
+                } else {
+                    None
+                };
+
+                // Use the pre-defined component function type.
+                // If type matching failed, return an error.
+                let comp_func_type = *async_func_types.get(&i).ok_or_else(|| {
+                    Error::EncodingError(format!(
+                        "cannot find component type for async import {}::{}",
+                        interface_name, func_name
+                    ))
+                })?;
+
+                // Alias realloc (needed for both lift and lower)
+                let realloc_name = "cabi_realloc";
+                let has_realloc = fused_info
+                    .exports
+                    .iter()
+                    .any(|(n, k, _)| *k == wasmparser::ExternalKind::Func && *n == realloc_name);
+                let realloc_core_idx = if has_realloc {
+                    let mut alias_section = ComponentAliasSection::new();
+                    alias_section.alias(Alias::CoreInstanceExport {
+                        instance: fused_instance,
+                        kind: ExportKind::Func,
+                        name: realloc_name,
+                    });
+                    component.section(&alias_section);
+                    let idx = core_func_idx;
+                    core_func_idx += 1;
+                    Some(idx)
+                } else {
+                    None
+                };
+
+                // canon lift ... async (callback N) (realloc N)
+                let mut lift_options = vec![
+                    CanonicalOption::Memory(memory_core_indices[0]),
+                    CanonicalOption::UTF8,
+                    CanonicalOption::Async,
+                ];
+                if let Some(cb_idx) = callback_core_idx {
+                    lift_options.push(CanonicalOption::Callback(cb_idx));
+                }
+                if let Some(realloc_idx) = realloc_core_idx {
+                    lift_options.push(CanonicalOption::Realloc(realloc_idx));
+                }
+                let mut canon = CanonicalFunctionSection::new();
+                canon.lift(async_lift_core_idx, comp_func_type, lift_options);
+                component.section(&canon);
+                let lifted_func_idx = component_func_idx;
+                component_func_idx += 1;
+
+                // canon lower (blocking synchronous call for the caller)
+                let mut lower_options = vec![
+                    CanonicalOption::Memory(memory_core_indices[0]),
+                    CanonicalOption::UTF8,
+                ];
+                if let Some(realloc_idx) = realloc_core_idx {
+                    lower_options.push(CanonicalOption::Realloc(realloc_idx));
+                }
+                let mut canon = CanonicalFunctionSection::new();
+                canon.lower(lifted_func_idx, lower_options);
+                component.section(&canon);
+
+                lowered_func_indices.push(core_func_idx);
+                core_func_idx += 1;
             }
 
             ImportResolution::TaskBuiltin { op } => {

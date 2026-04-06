@@ -1087,9 +1087,12 @@ impl Merger {
                     continue;
                 }
 
-                // Check adapter_sites first (cross-component + intra-component adapters)
+                // Check adapter_sites first (cross-component + intra-component adapters).
+                // Skip async-lifted sites — their imports stay unresolved so the
+                // component wrapper can provide them via canon lift/lower.
                 let resolved = graph.adapter_sites.iter().find(|site| {
-                    site.from_component == comp_idx
+                    !site.is_async_lift
+                        && site.from_component == comp_idx
                         && site.from_module == mod_idx
                         && (imp.name == site.import_name || imp.module == site.import_name)
                         && (imp.module == site.import_module || imp.name == site.import_module)
@@ -1576,7 +1579,11 @@ impl Merger {
         for unresolved in &graph.unresolved_imports {
             // Skip imports resolved by adapter sites (must match the
             // filter in compute_unresolved_import_assignments).
+            // Async-lifted sites are excluded — their imports stay unresolved.
             let resolved_by_adapter = graph.adapter_sites.iter().any(|site| {
+                if site.is_async_lift {
+                    return false;
+                }
                 if site.from_component != unresolved.component_idx {
                     return false;
                 }
@@ -2469,6 +2476,11 @@ fn compute_unresolved_import_assignments(
         // because indirect-table shim modules use synthetic names (module="",
         // field="0") while their display names carry the original interface names.
         let resolved_by_adapter = graph.adapter_sites.iter().any(|site| {
+            // Async-lifted sites are NOT fused — their imports stay unresolved
+            // so the component wrapper handles them via canon lift/lower.
+            if site.is_async_lift {
+                return false;
+            }
             if site.from_component != unresolved.component_idx {
                 return false;
             }

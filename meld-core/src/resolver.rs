@@ -85,6 +85,11 @@ pub struct AdapterSite {
     /// Whether this crosses a memory boundary
     pub crosses_memory: bool,
 
+    /// Whether the callee export is an async-lifted function (P3).
+    /// When true, fusion must preserve the component-model async boundary
+    /// rather than generating a direct adapter call.
+    pub is_async_lift: bool,
+
     /// Adapter requirements (string transcoding, etc.)
     pub requirements: AdapterRequirements,
 }
@@ -1605,6 +1610,7 @@ impl Resolver {
                             export_name: export.name.clone(),
                             export_func_idx: export.index,
                             crosses_memory: false,
+                            is_async_lift: export.name.starts_with("[async-lift]"),
                             requirements: AdapterRequirements::default(),
                         });
                         edges.push((target_comp, unresolved.component_idx));
@@ -2477,6 +2483,7 @@ impl Resolver {
                                         requirements.string_transcoding = ce != ce2;
                                     }
 
+                                    let is_async = export.name.starts_with("[async-lift]");
                                     graph.adapter_sites.push(AdapterSite {
                                         from_component: *from_comp,
                                         from_module: from_mod_idx,
@@ -2485,9 +2492,10 @@ impl Resolver {
                                         import_func_type_idx: caller_import_type_idx,
                                         to_component: *to_comp,
                                         to_module: to_mod_idx,
-                                        export_name: qualified.clone(),
+                                        export_name: export.name.clone(),
                                         export_func_idx: export.index,
                                         crosses_memory,
+                                        is_async_lift: is_async,
                                         requirements,
                                     });
                                     per_func_matched = true;
@@ -2749,6 +2757,7 @@ impl Resolver {
                                 export_name: export_name.clone(),
                                 export_func_idx,
                                 crosses_memory,
+                                is_async_lift: export_name.starts_with("[async-lift]"),
                                 requirements,
                             });
                         }
@@ -2943,6 +2952,7 @@ impl Resolver {
                 export_name: res.export_name.clone(),
                 export_func_idx,
                 crosses_memory,
+                is_async_lift: res.export_name.starts_with("[async-lift]"),
                 requirements,
             });
 
