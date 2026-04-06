@@ -449,9 +449,12 @@ fn write_import_map(wasm_bytes: &[u8], path: &str) -> Result<()> {
     for payload in parser.parse_all(wasm_bytes) {
         let payload = payload.context("Parse error while reading imports")?;
         if let Payload::ImportSection(reader) = payload {
-            for import in reader {
+            for import in reader.into_imports() {
                 let import = import.context("Failed to read import entry")?;
-                if matches!(import.ty, wasmparser::TypeRef::Func(_)) {
+                if matches!(
+                    import.ty,
+                    wasmparser::TypeRef::Func(_) | wasmparser::TypeRef::FuncExact(_)
+                ) {
                     imports.push(serde_json::json!({
                         "index": func_index,
                         "module": import.module,

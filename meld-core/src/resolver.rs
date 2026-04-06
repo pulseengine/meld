@@ -1626,6 +1626,7 @@ impl Resolver {
                                 wasmparser::ExternalKind::Memory => ExportKind::Memory,
                                 wasmparser::ExternalKind::Global => ExportKind::Global,
                                 wasmparser::ExternalKind::Tag => ExportKind::Function,
+                                wasmparser::ExternalKind::FuncExact => ExportKind::Function,
                             };
                             (name.clone(), export_kind, *idx)
                         })

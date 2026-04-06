@@ -581,8 +581,9 @@ impl ComponentParser {
         }
 
         if self.validate {
-            let features =
-                wasmparser::WasmFeatures::default() | wasmparser::WasmFeatures::CM_FIXED_SIZE_LIST;
+            let features = wasmparser::WasmFeatures::default()
+                | wasmparser::WasmFeatures::CM_FIXED_LENGTH_LISTS
+                | wasmparser::WasmFeatures::CM_ASYNC;
             let mut validator = wasmparser::Validator::new_with_features(features);
             validator.validate_all(bytes)?;
         }
@@ -1042,10 +1043,11 @@ impl ComponentParser {
                 }
 
                 Payload::ImportSection(reader) => {
-                    for import in reader {
+                    for import in reader.into_imports() {
                         let import = import?;
                         let kind = match import.ty {
-                            wasmparser::TypeRef::Func(idx) => ImportKind::Function(idx),
+                            wasmparser::TypeRef::Func(idx)
+                            | wasmparser::TypeRef::FuncExact(idx) => ImportKind::Function(idx),
                             wasmparser::TypeRef::Table(t) => ImportKind::Table(TableType {
                                 element_type: convert_ref_type(t.element_type),
                                 initial: t.initial,
@@ -1129,7 +1131,8 @@ impl ComponentParser {
                     for export in reader {
                         let export = export?;
                         let kind = match export.kind {
-                            wasmparser::ExternalKind::Func => ExportKind::Function,
+                            wasmparser::ExternalKind::Func
+                            | wasmparser::ExternalKind::FuncExact => ExportKind::Function,
                             wasmparser::ExternalKind::Table => ExportKind::Table,
                             wasmparser::ExternalKind::Memory => ExportKind::Memory,
                             wasmparser::ExternalKind::Global => ExportKind::Global,
@@ -2867,7 +2870,7 @@ fn convert_wp_defined_type(dt: &wasmparser::ComponentDefinedType) -> ComponentTy
                     .collect(),
             ))
         }
-        wasmparser::ComponentDefinedType::FixedSizeList(ty, len) => ComponentTypeKind::Defined(
+        wasmparser::ComponentDefinedType::FixedLengthList(ty, len) => ComponentTypeKind::Defined(
             ComponentValType::FixedSizeList(Box::new(convert_wp_component_val_type(ty)), *len),
         ),
         // P3 async types — detected and flagged, not silently swallowed
@@ -2884,6 +2887,9 @@ fn convert_wp_defined_type(dt: &wasmparser::ComponentDefinedType) -> ComponentTy
                 None => "stream".to_string(),
             };
             ComponentTypeKind::P3Async(desc)
+        }
+        wasmparser::ComponentDefinedType::Map(key_ty, val_ty) => {
+            ComponentTypeKind::P3Async(format!("map<{key_ty:?}, {val_ty:?}>"))
         }
     }
 }
@@ -2929,6 +2935,7 @@ fn convert_canonical_options(
                 }
             }
             wasmparser::CanonicalOption::CoreType(_) => {}
+            wasmparser::CanonicalOption::Gc => {}
         }
     }
     result

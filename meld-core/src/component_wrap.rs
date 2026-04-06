@@ -198,7 +198,7 @@ fn parse_fused_module(bytes: &[u8]) -> Result<FusedModuleInfo> {
                 }
             }
             wasmparser::Payload::ImportSection(reader) => {
-                for imp in reader {
+                for imp in reader.into_imports() {
                     let imp = imp.map_err(|e| Error::ParseError(e.to_string()))?;
                     if let wasmparser::TypeRef::Func(type_idx) = imp.ty {
                         func_imports.push((imp.module.to_string(), imp.name.to_string(), type_idx));
@@ -572,7 +572,7 @@ fn convert_memory_to_import(original_bytes: &[u8], info: &FusedModuleInfo) -> Re
             wasmparser::Payload::ImportSection(reader) => {
                 let mut imports = ImportSection::new();
                 // Re-emit all original imports
-                for imp in reader {
+                for imp in reader.into_imports() {
                     let imp = imp.map_err(|e| Error::ParseError(e.to_string()))?;
                     let entity = convert_type_ref(imp.ty)?;
                     imports.import(imp.module, imp.name, entity);
@@ -1983,7 +1983,7 @@ fn emit_defined_type(
                 component_type_idx,
                 type_remap,
             )?;
-            types.defined_type().fixed_size_list(elem_enc, *len);
+            types.defined_type().fixed_length_list(elem_enc, *len);
         }
         parser::ComponentValType::Option(inner) => {
             let inner_enc = convert_parser_val_to_encoder(
@@ -2201,6 +2201,7 @@ fn convert_type_ref(ty: wasmparser::TypeRef) -> Result<wasm_encoder::EntityType>
         wasmparser::TypeRef::Tag(_) => Err(Error::UnsupportedFeature(
             "exception handling tags".to_string(),
         )),
+        wasmparser::TypeRef::FuncExact(idx) => Ok(wasm_encoder::EntityType::Function(idx)),
     }
 }
 

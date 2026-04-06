@@ -421,7 +421,7 @@ fn test_reasonable_memory_count() {
                     memory_count += reader.count();
                 }
                 Ok(wasmparser::Payload::ImportSection(reader)) => {
-                    for imp in reader.into_iter().flatten() {
+                    for imp in reader.into_imports().flatten() {
                         if matches!(imp.ty, wasmparser::TypeRef::Memory(_)) {
                             memory_count += 1;
                         }
@@ -568,7 +568,7 @@ fn test_no_duplicate_imports() {
 
         for payload in parser.parse_all(&fused) {
             if let Ok(wasmparser::Payload::ImportSection(reader)) = payload {
-                for imp in reader.into_iter().flatten() {
+                for imp in reader.into_imports().flatten() {
                     let key = (imp.module.to_string(), imp.name.to_string());
                     if !seen.insert(key.clone()) {
                         duplicates.push(key);
@@ -721,7 +721,7 @@ fn test_adapter_call_site_wiring() {
         for payload in parser.parse_all(&fused) {
             match payload {
                 Ok(wasmparser::Payload::ImportSection(reader)) => {
-                    for imp in reader.into_iter().flatten() {
+                    for imp in reader.into_imports().flatten() {
                         match imp.ty {
                             wasmparser::TypeRef::Func(_) => import_func_count += 1,
                             wasmparser::TypeRef::Memory(_) => import_mem_count += 1,
@@ -866,7 +866,7 @@ fn test_no_stale_resource_drop_versions() {
 
         for payload in parser.parse_all(&fused) {
             if let Ok(wasmparser::Payload::ImportSection(reader)) = payload {
-                for imp in reader.into_iter().flatten() {
+                for imp in reader.into_imports().flatten() {
                     // Check for resource-drop imports with exactly @0.2.0
                     // (the stale adapter version). Exclude pre-release
                     // versions like @0.2.0-rc-* which are legitimate.

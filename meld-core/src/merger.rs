@@ -2330,7 +2330,7 @@ fn convert_init_expr(
                     shared,
                     ty: convert_abstract_heap_type(ty),
                 },
-                wasmparser::HeapType::Concrete(idx) => {
+                wasmparser::HeapType::Concrete(idx) | wasmparser::HeapType::Exact(idx) => {
                     let old_idx = idx.as_module_index().unwrap_or(0);
                     let new_idx = merged
                         .type_index_map
