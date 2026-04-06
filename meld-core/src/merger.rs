@@ -1719,16 +1719,16 @@ impl Merger {
                     let eff_field = &dedup_key.1;
                     if let Some(rn) = eff_field.strip_prefix("[resource-rep]") {
                         let bare_rn = rn.rsplit_once('$').map_or(rn, |(base, _)| base);
-                        merged.resource_rep_by_component.insert(
-                            (unresolved.component_idx, bare_rn.to_string()),
-                            merged_func_idx,
-                        );
+                        merged
+                            .resource_rep_by_component
+                            .entry((unresolved.component_idx, bare_rn.to_string()))
+                            .or_insert(merged_func_idx);
                     } else if let Some(rn) = eff_field.strip_prefix("[resource-new]") {
                         let bare_rn = rn.rsplit_once('$').map_or(rn, |(base, _)| base);
-                        merged.resource_new_by_component.insert(
-                            (unresolved.component_idx, bare_rn.to_string()),
-                            merged_func_idx,
-                        );
+                        merged
+                            .resource_new_by_component
+                            .entry((unresolved.component_idx, bare_rn.to_string()))
+                            .or_insert(merged_func_idx);
                     }
                 }
                 ImportKind::Table(t) => {

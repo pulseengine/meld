@@ -2279,37 +2279,39 @@ impl Resolver {
                                                 );
 
                                             // Graph-based override for callee_defines_resource.
-                                            // Only UPGRADE (false→true) or DOWNGRADE (true→false)
-                                            // when the graph has a definitive answer. If the graph
-                                            // has no entry, leave the heuristic value unchanged.
+                                            // Only DOWNGRADE (true→false) when the graph has a
+                                            // definitive answer that the callee does NOT define
+                                            // the resource. Never UPGRADE (false→true) — the
+                                            // heuristic's type_defs check (Import vs Defined) is
+                                            // authoritative for that direction, and upgrading
+                                            // would break re-exporters whose ResourceRep makes
+                                            // the graph think they define the resource.
                                             if let Some(ref rg) = graph.resource_graph {
                                                 let iface = import_name.as_str();
                                                 for op in &mut requirements.resource_params {
+                                                    if !op.callee_defines_resource {
+                                                        continue;
+                                                    }
                                                     let rn = op
                                                         .import_field
                                                         .strip_prefix("[resource-rep]")
                                                         .unwrap_or(&op.import_field);
-                                                    if rg.defines_resource(*to_comp, iface, rn) {
-                                                        op.callee_defines_resource = true;
-                                                    } else if rg
-                                                        .resource_definer(iface, rn)
-                                                        .is_some()
+                                                    if !rg.defines_resource(*to_comp, iface, rn)
+                                                        && rg.resource_definer(iface, rn).is_some()
                                                     {
-                                                        // Graph knows about this resource and says
-                                                        // this component is NOT the definer.
                                                         op.callee_defines_resource = false;
                                                     }
                                                 }
                                                 for op in &mut requirements.resource_results {
+                                                    if !op.callee_defines_resource {
+                                                        continue;
+                                                    }
                                                     let rn = op
                                                         .import_field
                                                         .strip_prefix("[resource-new]")
                                                         .unwrap_or(&op.import_field);
-                                                    if rg.defines_resource(*to_comp, iface, rn) {
-                                                        op.callee_defines_resource = true;
-                                                    } else if rg
-                                                        .resource_definer(iface, rn)
-                                                        .is_some()
+                                                    if !rg.defines_resource(*to_comp, iface, rn)
+                                                        && rg.resource_definer(iface, rn).is_some()
                                                     {
                                                         op.callee_defines_resource = false;
                                                     }
@@ -2525,29 +2527,34 @@ impl Resolver {
                                             true,
                                         );
 
-                                    // Graph-based override for fallback path.
-                                    // Only change when the graph has a definitive answer.
+                                    // Graph-based override for fallback path (downgrade only).
                                     if let Some(ref rg) = graph.resource_graph {
                                         let iface = import_name.as_str();
                                         for op in &mut requirements.resource_params {
+                                            if !op.callee_defines_resource {
+                                                continue;
+                                            }
                                             let rn = op
                                                 .import_field
                                                 .strip_prefix("[resource-rep]")
                                                 .unwrap_or(&op.import_field);
-                                            if rg.defines_resource(*to_comp, iface, rn) {
-                                                op.callee_defines_resource = true;
-                                            } else if rg.resource_definer(iface, rn).is_some() {
+                                            if !rg.defines_resource(*to_comp, iface, rn)
+                                                && rg.resource_definer(iface, rn).is_some()
+                                            {
                                                 op.callee_defines_resource = false;
                                             }
                                         }
                                         for op in &mut requirements.resource_results {
+                                            if !op.callee_defines_resource {
+                                                continue;
+                                            }
                                             let rn = op
                                                 .import_field
                                                 .strip_prefix("[resource-new]")
                                                 .unwrap_or(&op.import_field);
-                                            if rg.defines_resource(*to_comp, iface, rn) {
-                                                op.callee_defines_resource = true;
-                                            } else if rg.resource_definer(iface, rn).is_some() {
+                                            if !rg.defines_resource(*to_comp, iface, rn)
+                                                && rg.resource_definer(iface, rn).is_some()
+                                            {
                                                 op.callee_defines_resource = false;
                                             }
                                         }
