@@ -1519,13 +1519,30 @@ fn assemble_component(
                 let lifted_func_idx = component_func_idx;
                 component_func_idx += 1;
 
-                // canon lower (blocking synchronous call for the caller)
-                let mut lower_options = vec![
-                    CanonicalOption::Memory(memory_core_indices[0]),
-                    CanonicalOption::UTF8,
-                ];
-                if let Some(realloc_idx) = realloc_core_idx {
-                    lower_options.push(CanonicalOption::Realloc(realloc_idx));
+                // canon lower (blocking synchronous call for the caller).
+                // Use the caller's memory for data passing. The caller's
+                // component index is encoded in the fused import's component
+                // origin.  For now, find the memory from the import's position
+                // in the merged module — imports from the same component share
+                // a memory.  Use minimal options (matching unfused pattern):
+                // only add memory+realloc+encoding when the function needs them.
+                let import_type_idx = fused_info.func_imports[i].2;
+                let core_type = fused_info
+                    .func_types
+                    .get(import_type_idx as usize)
+                    .cloned()
+                    .unwrap_or_default();
+                // Needs memory if there are string/list params (>1 flat result or >2 flat params
+                // with pointer-like patterns) or if this is an async function with memory.
+                let needs_memory_on_lower =
+                    core_type.0.len() > 2 || core_type.1.len() > 1 || core_type.1.is_empty();
+                let mut lower_options: Vec<CanonicalOption> = Vec::new();
+                if needs_memory_on_lower {
+                    lower_options.push(CanonicalOption::Memory(memory_core_indices[0]));
+                    lower_options.push(CanonicalOption::UTF8);
+                    if let Some(realloc_idx) = realloc_core_idx {
+                        lower_options.push(CanonicalOption::Realloc(realloc_idx));
+                    }
                 }
                 let mut canon = CanonicalFunctionSection::new();
                 canon.lower(lifted_func_idx, lower_options);
