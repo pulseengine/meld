@@ -401,7 +401,7 @@ fn parse_const_expr_with_value(
                     shared,
                     ty: convert_abstract_heap_type(ty),
                 },
-                wasmparser::HeapType::Concrete(idx) => {
+                wasmparser::HeapType::Concrete(idx) | wasmparser::HeapType::Exact(idx) => {
                     // Preserve the concrete type index. It will be remapped
                     // later during reindexing if needed. For initial parsing,
                     // extract the module-level index.

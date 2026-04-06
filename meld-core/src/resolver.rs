@@ -85,6 +85,11 @@ pub struct AdapterSite {
     /// Whether this crosses a memory boundary
     pub crosses_memory: bool,
 
+    /// Whether the callee export is an async-lifted function (P3).
+    /// When true, fusion must preserve the component-model async boundary
+    /// rather than generating a direct adapter call.
+    pub is_async_lift: bool,
+
     /// Adapter requirements (string transcoding, etc.)
     pub requirements: AdapterRequirements,
 }
@@ -700,6 +705,113 @@ fn build_canon_import_names(component: &ParsedComponent) -> HashMap<u32, (String
                                 let resource_name = extract_wasi_resource_name(import_name);
                                 let field = format!("[resource-rep]{}", resource_name);
                                 result.insert(core_func_idx, (import_name.clone(), field));
+                            }
+                        }
+                        // P3 task/async canonical builtins. These are runtime
+                        // intrinsics that need proper display names so the
+                        // merger emits them with the correct module/field
+                        // instead of raw fixup module names (""/"0").
+                        CanonicalEntry::TaskReturn { .. } => {
+                            // task.return is emitted under [export]<iface> or
+                            // [export]$root. The exact field name comes from
+                            // the inner module's import; we can't recover it
+                            // here, but the inner module already has the right
+                            // import name. Mark it so the merger skips fixup.
+                            // We use a sentinel module "$root" with a generic field.
+                            result.insert(
+                                core_func_idx,
+                                (
+                                    "$root".to_string(),
+                                    format!("[task-return]{}", core_func_idx),
+                                ),
+                            );
+                        }
+                        CanonicalEntry::TaskCancel => {
+                            result.insert(
+                                core_func_idx,
+                                ("[export]$root".to_string(), "[task-cancel]".to_string()),
+                            );
+                        }
+                        CanonicalEntry::BackpressureInc => {
+                            result.insert(
+                                core_func_idx,
+                                ("$root".to_string(), "[backpressure-inc]".to_string()),
+                            );
+                        }
+                        CanonicalEntry::BackpressureDec => {
+                            result.insert(
+                                core_func_idx,
+                                ("$root".to_string(), "[backpressure-dec]".to_string()),
+                            );
+                        }
+                        CanonicalEntry::ContextGet(slot) => {
+                            result.insert(
+                                core_func_idx,
+                                ("$root".to_string(), format!("[context-get-{}]", slot)),
+                            );
+                        }
+                        CanonicalEntry::ContextSet(slot) => {
+                            result.insert(
+                                core_func_idx,
+                                ("$root".to_string(), format!("[context-set-{}]", slot)),
+                            );
+                        }
+                        CanonicalEntry::WaitableJoin => {
+                            result.insert(
+                                core_func_idx,
+                                ("$root".to_string(), "[waitable-join]".to_string()),
+                            );
+                        }
+                        CanonicalEntry::WaitableSetNew => {
+                            result.insert(
+                                core_func_idx,
+                                ("$root".to_string(), "[waitable-set-new]".to_string()),
+                            );
+                        }
+                        CanonicalEntry::WaitableSetDrop => {
+                            result.insert(
+                                core_func_idx,
+                                ("$root".to_string(), "[waitable-set-drop]".to_string()),
+                            );
+                        }
+                        CanonicalEntry::WaitableSetPoll { .. } => {
+                            result.insert(
+                                core_func_idx,
+                                ("$root".to_string(), "[waitable-set-poll]".to_string()),
+                            );
+                        }
+                        CanonicalEntry::WaitableSetWait { .. } => {
+                            result.insert(
+                                core_func_idx,
+                                ("$root".to_string(), "[waitable-set-wait]".to_string()),
+                            );
+                        }
+                        CanonicalEntry::SubtaskDrop => {
+                            result.insert(
+                                core_func_idx,
+                                ("$root".to_string(), "[subtask-drop]".to_string()),
+                            );
+                        }
+                        CanonicalEntry::SubtaskCancel { .. } => {
+                            result.insert(
+                                core_func_idx,
+                                ("$root".to_string(), "[subtask-cancel]".to_string()),
+                            );
+                        }
+                        CanonicalEntry::ThreadYield { .. } => {
+                            result.insert(
+                                core_func_idx,
+                                ("$root".to_string(), "[thread-yield]".to_string()),
+                            );
+                        }
+                        CanonicalEntry::ResourceDropAsync { resource } => {
+                            if let Some((inst_idx, type_name)) =
+                                comp_type_to_instance_export.get(resource)
+                                && let Some(module_name) =
+                                    comp_instance_to_import_name.get(inst_idx)
+                            {
+                                let field = format!("[resource-drop-async]{}", type_name);
+                                result.insert(core_func_idx, (module_name.clone(), field));
                             }
                         }
                         _ => {}
@@ -1498,6 +1610,7 @@ impl Resolver {
                             export_name: export.name.clone(),
                             export_func_idx: export.index,
                             crosses_memory: false,
+                            is_async_lift: export.name.starts_with("[async-lift]"),
                             requirements: AdapterRequirements::default(),
                         });
                         edges.push((target_comp, unresolved.component_idx));
@@ -1626,6 +1739,7 @@ impl Resolver {
                                 wasmparser::ExternalKind::Memory => ExportKind::Memory,
                                 wasmparser::ExternalKind::Global => ExportKind::Global,
                                 wasmparser::ExternalKind::Tag => ExportKind::Function,
+                                wasmparser::ExternalKind::FuncExact => ExportKind::Function,
                             };
                             (name.clone(), export_kind, *idx)
                         })
@@ -2144,18 +2258,29 @@ impl Resolver {
                                     _ => None,
                                 });
 
+                            // P3 async exports use `[async-lift]` prefix on the
+                            // core module export name. Try matching both with and
+                            // without the prefix.
+                            let async_qualified = format!("[async-lift]{}", qualified);
+
                             for (to_mod_idx, to_module) in
                                 to_component.core_modules.iter().enumerate()
                             {
                                 if let Some(export) = to_module.exports.iter().find(|exp| {
-                                    exp.name == qualified && exp.kind == ExportKind::Function
+                                    exp.kind == ExportKind::Function
+                                        && (exp.name == qualified || exp.name == async_qualified)
                                 }) {
                                     found = true;
                                     let mut requirements = AdapterRequirements::default();
                                     // Use provenance-based reverse map for correct
                                     // component-level core func index lookup.
-                                    let comp_core_idx =
-                                        callee_export_to_core.get(&(to_mod_idx, qualified.clone()));
+                                    // Try the actual export name first, then the plain qualified name.
+                                    let comp_core_idx = callee_export_to_core
+                                        .get(&(to_mod_idx, export.name.clone()))
+                                        .or_else(|| {
+                                            callee_export_to_core
+                                                .get(&(to_mod_idx, qualified.clone()))
+                                        });
                                     let lift_info =
                                         comp_core_idx.and_then(|idx| callee_lift_info.get(idx));
                                     if comp_core_idx.is_some() && lift_info.is_none() {
@@ -2279,37 +2404,39 @@ impl Resolver {
                                                 );
 
                                             // Graph-based override for callee_defines_resource.
-                                            // Only UPGRADE (false→true) or DOWNGRADE (true→false)
-                                            // when the graph has a definitive answer. If the graph
-                                            // has no entry, leave the heuristic value unchanged.
+                                            // Only DOWNGRADE (true→false) when the graph has a
+                                            // definitive answer that the callee does NOT define
+                                            // the resource. Never UPGRADE (false→true) — the
+                                            // heuristic's type_defs check (Import vs Defined) is
+                                            // authoritative for that direction, and upgrading
+                                            // would break re-exporters whose ResourceRep makes
+                                            // the graph think they define the resource.
                                             if let Some(ref rg) = graph.resource_graph {
                                                 let iface = import_name.as_str();
                                                 for op in &mut requirements.resource_params {
+                                                    if !op.callee_defines_resource {
+                                                        continue;
+                                                    }
                                                     let rn = op
                                                         .import_field
                                                         .strip_prefix("[resource-rep]")
                                                         .unwrap_or(&op.import_field);
-                                                    if rg.defines_resource(*to_comp, iface, rn) {
-                                                        op.callee_defines_resource = true;
-                                                    } else if rg
-                                                        .resource_definer(iface, rn)
-                                                        .is_some()
+                                                    if !rg.defines_resource(*to_comp, iface, rn)
+                                                        && rg.resource_definer(iface, rn).is_some()
                                                     {
-                                                        // Graph knows about this resource and says
-                                                        // this component is NOT the definer.
                                                         op.callee_defines_resource = false;
                                                     }
                                                 }
                                                 for op in &mut requirements.resource_results {
+                                                    if !op.callee_defines_resource {
+                                                        continue;
+                                                    }
                                                     let rn = op
                                                         .import_field
                                                         .strip_prefix("[resource-new]")
                                                         .unwrap_or(&op.import_field);
-                                                    if rg.defines_resource(*to_comp, iface, rn) {
-                                                        op.callee_defines_resource = true;
-                                                    } else if rg
-                                                        .resource_definer(iface, rn)
-                                                        .is_some()
+                                                    if !rg.defines_resource(*to_comp, iface, rn)
+                                                        && rg.resource_definer(iface, rn).is_some()
                                                     {
                                                         op.callee_defines_resource = false;
                                                     }
@@ -2356,6 +2483,7 @@ impl Resolver {
                                         requirements.string_transcoding = ce != ce2;
                                     }
 
+                                    let is_async = export.name.starts_with("[async-lift]");
                                     graph.adapter_sites.push(AdapterSite {
                                         from_component: *from_comp,
                                         from_module: from_mod_idx,
@@ -2364,9 +2492,10 @@ impl Resolver {
                                         import_func_type_idx: caller_import_type_idx,
                                         to_component: *to_comp,
                                         to_module: to_mod_idx,
-                                        export_name: qualified.clone(),
+                                        export_name: export.name.clone(),
                                         export_func_idx: export.index,
                                         crosses_memory,
+                                        is_async_lift: is_async,
                                         requirements,
                                     });
                                     per_func_matched = true;
@@ -2525,29 +2654,34 @@ impl Resolver {
                                             true,
                                         );
 
-                                    // Graph-based override for fallback path.
-                                    // Only change when the graph has a definitive answer.
+                                    // Graph-based override for fallback path (downgrade only).
                                     if let Some(ref rg) = graph.resource_graph {
                                         let iface = import_name.as_str();
                                         for op in &mut requirements.resource_params {
+                                            if !op.callee_defines_resource {
+                                                continue;
+                                            }
                                             let rn = op
                                                 .import_field
                                                 .strip_prefix("[resource-rep]")
                                                 .unwrap_or(&op.import_field);
-                                            if rg.defines_resource(*to_comp, iface, rn) {
-                                                op.callee_defines_resource = true;
-                                            } else if rg.resource_definer(iface, rn).is_some() {
+                                            if !rg.defines_resource(*to_comp, iface, rn)
+                                                && rg.resource_definer(iface, rn).is_some()
+                                            {
                                                 op.callee_defines_resource = false;
                                             }
                                         }
                                         for op in &mut requirements.resource_results {
+                                            if !op.callee_defines_resource {
+                                                continue;
+                                            }
                                             let rn = op
                                                 .import_field
                                                 .strip_prefix("[resource-new]")
                                                 .unwrap_or(&op.import_field);
-                                            if rg.defines_resource(*to_comp, iface, rn) {
-                                                op.callee_defines_resource = true;
-                                            } else if rg.resource_definer(iface, rn).is_some() {
+                                            if !rg.defines_resource(*to_comp, iface, rn)
+                                                && rg.resource_definer(iface, rn).is_some()
+                                            {
                                                 op.callee_defines_resource = false;
                                             }
                                         }
@@ -2623,6 +2757,7 @@ impl Resolver {
                                 export_name: export_name.clone(),
                                 export_func_idx,
                                 crosses_memory,
+                                is_async_lift: export_name.starts_with("[async-lift]"),
                                 requirements,
                             });
                         }
@@ -2817,6 +2952,7 @@ impl Resolver {
                 export_name: res.export_name.clone(),
                 export_func_idx,
                 crosses_memory,
+                is_async_lift: res.export_name.starts_with("[async-lift]"),
                 requirements,
             });
 

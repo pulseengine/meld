@@ -626,7 +626,7 @@ fn convert_ref_type(rt: wasmparser::RefType, maps: &IndexMaps) -> Result<wasm_en
 /// modules, so this error should never occur for well-formed inputs.
 fn convert_heap_type(ht: wasmparser::HeapType, maps: &IndexMaps) -> Result<wasm_encoder::HeapType> {
     match ht {
-        wasmparser::HeapType::Concrete(idx) => {
+        wasmparser::HeapType::Concrete(idx) | wasmparser::HeapType::Exact(idx) => {
             // Extract the module-level type index and remap it.
             // wasmparser's UnpackedIndex can be Module(u32), RecGroup(u32), or
             // Id(CoreTypeId). Only Module indices are valid here -- RecGroup and

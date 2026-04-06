@@ -105,6 +105,7 @@ pub fn wrap_as_component(
         &fused_info,
         merged,
         memory_strategy,
+        components,
     )
 }
 
@@ -157,6 +158,35 @@ enum ImportResolution {
         #[allow(dead_code)]
         component_idx: Option<usize>,
     },
+    /// Import resolves to a P3 task/async canonical built-in.
+    ///
+    /// These are emitted as `canon task.return`, `canon context.get`, etc.
+    /// They appear in the fused module as imports from `[export]<iface>` modules
+    /// (for `[task-return]`) or from `$root` (for runtime builtins like
+    /// `[context-get-0]`, `[waitable-set-new]`, etc.).
+    TaskBuiltin {
+        /// The specific P3 canonical operation to emit.
+        op: P3BuiltinOp,
+    },
+    /// Import resolves to an internal P3 async cross-component call.
+    ///
+    /// The fused module exports `[async-lift]<iface>#<func>` and
+    /// `[callback][async-lift]<iface>#<func>`. The wrapper creates
+    /// `canon lift ... async (callback ...)` → `canon lower` to provide
+    /// a synchronous import to the fused core module.
+    AsyncLiftLower {
+        /// The async-lift export name in the fused module
+        async_lift_export: String,
+        /// The callback export name in the fused module
+        callback_export: String,
+        /// Index of the source component that exports this async function
+        /// (used to look up the correct component-level type)
+        source_comp_idx: usize,
+        /// The interface name (e.g., "compute:concurrent/tasks@1.0.0")
+        interface_name: String,
+        /// The function name (e.g., "collatz-steps")
+        func_name: String,
+    },
 }
 
 /// A canonical resource operation.
@@ -165,6 +195,44 @@ enum ResourceOp {
     Drop,
     New,
     Rep,
+}
+
+/// A P3 task/async canonical built-in operation.
+///
+/// Each variant corresponds to a `canon` instruction in the component model
+/// for P3 async primitives. The fused core module imports these as regular
+/// functions; the component wrapper re-emits them as canonical operations.
+#[derive(Debug, Clone)]
+enum P3BuiltinOp {
+    /// `canon task.return` — return a result from a lifted async export.
+    /// The associated `CanonicalEntry::TaskReturn` from one of the parsed
+    /// components provides the result type and options.
+    TaskReturn {
+        /// `(component_index, canon_index)` into the all_components array
+        /// and that component's canonical_functions, for recovering the
+        /// result type and options.
+        source_location: Option<(usize, usize)>,
+    },
+    /// `canon task.cancel` — acknowledge cancellation of the current task.
+    TaskCancel,
+    /// `canon context.get <slot>` — get task-local context slot.
+    ContextGet(u32),
+    /// `canon context.set <slot>` — set task-local context slot.
+    ContextSet(u32),
+    /// `canon waitable.join` — add an item to a waitable-set.
+    WaitableJoin,
+    /// `canon waitable-set.new` — create a waitable-set pseudo-resource.
+    WaitableSetNew,
+    /// `canon waitable-set.drop` — dispose a waitable-set pseudo-resource.
+    WaitableSetDrop,
+    /// `canon waitable-set.poll` — non-blocking check on a waitable-set.
+    WaitableSetPoll,
+    /// `canon backpressure.inc` — increment the backpressure counter.
+    BackpressureInc,
+    /// `canon backpressure.dec` — decrement the backpressure counter.
+    BackpressureDec,
+    /// `canon subtask.drop` — drop a completed subtask.
+    SubtaskDrop,
 }
 
 /// Parse the fused module to extract structural info needed for wrapping.
@@ -198,7 +266,7 @@ fn parse_fused_module(bytes: &[u8]) -> Result<FusedModuleInfo> {
                 }
             }
             wasmparser::Payload::ImportSection(reader) => {
-                for imp in reader {
+                for imp in reader.into_imports() {
                     let imp = imp.map_err(|e| Error::ParseError(e.to_string()))?;
                     if let wasmparser::TypeRef::Func(type_idx) = imp.ty {
                         func_imports.push((imp.module.to_string(), imp.name.to_string(), type_idx));
@@ -572,7 +640,7 @@ fn convert_memory_to_import(original_bytes: &[u8], info: &FusedModuleInfo) -> Re
             wasmparser::Payload::ImportSection(reader) => {
                 let mut imports = ImportSection::new();
                 // Re-emit all original imports
-                for imp in reader {
+                for imp in reader.into_imports() {
                     let imp = imp.map_err(|e| Error::ParseError(e.to_string()))?;
                     let entity = convert_type_ref(imp.ty)?;
                     imports.import(imp.module, imp.name, entity);
@@ -713,6 +781,7 @@ fn assemble_component(
     fused_info: &FusedModuleInfo,
     merged: &MergedModule,
     memory_strategy: MemoryStrategy,
+    all_components: &[ParsedComponent],
 ) -> Result<Vec<u8>> {
     use wasm_encoder::*;
 
@@ -755,7 +824,34 @@ fn assemble_component(
             .and_then(|imp| imp.component_idx);
 
         // Category A: [export]-prefixed modules provide canon resource operations
-        if let Some(inner_module) = module_name.strip_prefix("[export]") {
+        //             OR P3 task built-ins ([task-return], [task-cancel], etc.)
+        if let Some(_inner_module) = module_name.strip_prefix("[export]") {
+            // Check for P3 task built-in first (before resource ops)
+            if let Some(p3_op) = parse_p3_builtin_field(field_name) {
+                // For task-return, find the matching source canon entry by
+                // comparing the core function type signature. Use the source
+                // component index from the merged import metadata to narrow
+                // the search.
+                let op = match p3_op {
+                    P3BuiltinOp::TaskReturn { .. } => {
+                        let import_ty = fused_info
+                            .func_types
+                            .get(*_type_idx as usize)
+                            .cloned()
+                            .unwrap_or_default();
+                        let location =
+                            find_task_return_for_import(all_components, comp_idx, &import_ty);
+                        P3BuiltinOp::TaskReturn {
+                            source_location: location,
+                        }
+                    }
+                    other => other,
+                };
+                import_resolutions.push(ImportResolution::TaskBuiltin { op });
+                continue;
+            }
+
+            let inner_module = module_name.strip_prefix("[export]").unwrap();
             let (op, resource_name) = parse_resource_field(field_name).ok_or_else(|| {
                 Error::EncodingError(format!(
                     "[export]-prefixed import has unexpected field name: {}::{}",
@@ -768,6 +864,30 @@ fn assemble_component(
                 interface_name: inner_module.to_string(),
                 component_idx: comp_idx,
             });
+            continue;
+        }
+
+        // Category P3-root: $root-prefixed P3 runtime builtins
+        // (e.g., $root::[context-get-0], $root::[waitable-set-new])
+        if module_name == "$root"
+            && let Some(p3_op) = parse_p3_builtin_field(field_name)
+        {
+            let op = match p3_op {
+                P3BuiltinOp::TaskReturn { .. } => {
+                    let import_ty = fused_info
+                        .func_types
+                        .get(*_type_idx as usize)
+                        .cloned()
+                        .unwrap_or_default();
+                    let location =
+                        find_task_return_for_import(all_components, comp_idx, &import_ty);
+                    P3BuiltinOp::TaskReturn {
+                        source_location: location,
+                    }
+                }
+                other => other,
+            };
+            import_resolutions.push(ImportResolution::TaskBuiltin { op });
             continue;
         }
 
@@ -793,6 +913,38 @@ fn assemble_component(
                 component_idx: comp_idx,
             });
             continue;
+        }
+
+        // Category P3-async: internal async cross-component call.
+        // The fused module exports [async-lift]<iface>#<func> for functions
+        // that were canon-lifted with `async` in the original component.
+        // We provide these via canon lift async + canon lower.
+        {
+            let async_lift_name = format!("[async-lift]{}#{}", module_name, field_name);
+            let callback_name = format!("[callback][async-lift]{}#{}", module_name, field_name);
+            let has_async_lift = fused_info
+                .exports
+                .iter()
+                .any(|(n, k, _)| *k == wasmparser::ExternalKind::Func && *n == async_lift_name);
+            if has_async_lift {
+                // Find which component exports this async function
+                let source_comp = all_components
+                    .iter()
+                    .position(|c| {
+                        c.core_modules
+                            .iter()
+                            .any(|m| m.exports.iter().any(|e| e.name == async_lift_name))
+                    })
+                    .unwrap_or(0);
+                import_resolutions.push(ImportResolution::AsyncLiftLower {
+                    async_lift_export: async_lift_name,
+                    callback_export: callback_name,
+                    source_comp_idx: source_comp,
+                    interface_name: module_name.clone(),
+                    func_name: field_name.to_string(),
+                });
+                continue;
+            }
         }
 
         return Err(Error::EncodingError(format!(
@@ -984,6 +1136,7 @@ fn assemble_component(
         !field.starts_with("[resource-drop]")
             && !field.starts_with("[resource-new]")
             && !field.starts_with("[resource-rep]")
+            && !is_p3_builtin_field(field)
     });
 
     // realloc_core_indices[memory_idx] = core func idx of that component's cabi_realloc
@@ -1052,6 +1205,10 @@ fn assemble_component(
     let mut component_type_idx = count_replayed_types(source);
     let mut lowered_func_indices: Vec<u32> = Vec::new();
 
+    // Source type index → wrapper type index mapping (for recursive type defs).
+    // Shared between import resolution (P3 task-return types) and export lifting.
+    let mut type_remap: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
+
     // Cache: resource_name → component type index.
     // All components share one canonical resource type per resource name,
     // regardless of interface. Re-exporters import and export the same
@@ -1059,6 +1216,87 @@ fn assemble_component(
     // but must share one wasmtime handle table.
     let mut local_resource_types: std::collections::HashMap<String, u32> =
         std::collections::HashMap::new();
+
+    // Pre-define component function types for async lift/lower imports.
+    // Match the correct Lift entry by comparing its flattened core type
+    // with the actual core import type from the fused module.
+    let mut async_func_types: std::collections::HashMap<usize, u32> =
+        std::collections::HashMap::new();
+    for (i, resolution) in import_resolutions.iter().enumerate() {
+        if let ImportResolution::AsyncLiftLower {
+            source_comp_idx, ..
+        } = resolution
+        {
+            let inner_comp = &all_components[*source_comp_idx];
+            let import_type_idx = fused_info.func_imports[i].2;
+            let core_type = fused_info
+                .func_types
+                .get(import_type_idx as usize)
+                .cloned()
+                .unwrap_or_default();
+
+            // Search Lift entries for one whose flattened type matches
+            // the core import type (params and results).
+            let mut found = false;
+            for canon in &inner_comp.canonical_functions {
+                if let parser::CanonicalEntry::Lift {
+                    type_index,
+                    options,
+                    ..
+                } = canon
+                {
+                    if !options.async_ {
+                        continue;
+                    }
+                    if let Some(type_def) = inner_comp.get_type_definition(*type_index)
+                        && let parser::ComponentTypeKind::Function { params, results } =
+                            &type_def.kind
+                    {
+                        // Flatten params
+                        let flat_params: Vec<wasm_encoder::ValType> = params
+                            .iter()
+                            .flat_map(|(_, cvt)| flat_component_val_type_resolved(cvt, inner_comp))
+                            .collect();
+                        // Flatten results
+                        let flat_results: Vec<wasm_encoder::ValType> = results
+                            .iter()
+                            .flat_map(|(_, cvt)| flat_component_val_type_resolved(cvt, inner_comp))
+                            .collect();
+                        // Check direct match or retptr convention:
+                        // If flat_results > 1, canon lower uses a retptr param
+                        // and returns nothing.
+                        let direct_match =
+                            flat_params == core_type.0 && flat_results == core_type.1;
+                        let retptr_match = flat_results.len() > 1 && {
+                            let mut expected_params = flat_params.clone();
+                            expected_params.push(wasm_encoder::ValType::I32); // retptr
+                            expected_params == core_type.0 && core_type.1.is_empty()
+                        };
+                        if direct_match || retptr_match {
+                            let mut inner_remap = std::collections::HashMap::new();
+                            let wrapper_type = define_source_type_in_wrapper(
+                                &mut component,
+                                inner_comp,
+                                *type_index,
+                                &mut component_type_idx,
+                                &mut inner_remap,
+                            )?;
+                            async_func_types.insert(i, wrapper_type);
+                            found = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            if !found {
+                log::warn!(
+                    "no matching async Lift found for import {}::{}",
+                    fused_info.func_imports[i].0,
+                    fused_info.func_imports[i].1,
+                );
+            }
+        }
+    }
 
     for (i, resolution) in import_resolutions.iter().enumerate() {
         match resolution {
@@ -1194,6 +1432,220 @@ fn assemble_component(
                     core_func_idx += 1;
                 }
             }
+
+            ImportResolution::AsyncLiftLower {
+                async_lift_export,
+                callback_export,
+                interface_name,
+                func_name,
+                ..
+            } => {
+                // Alias the [async-lift] core function from the fused instance
+                let mut alias_section = ComponentAliasSection::new();
+                alias_section.alias(Alias::CoreInstanceExport {
+                    instance: fused_instance,
+                    kind: ExportKind::Func,
+                    name: async_lift_export,
+                });
+                component.section(&alias_section);
+                let async_lift_core_idx = core_func_idx;
+                core_func_idx += 1;
+
+                // Alias the [callback] core function
+                let has_callback = fused_info
+                    .exports
+                    .iter()
+                    .any(|(n, k, _)| *k == wasmparser::ExternalKind::Func && n == callback_export);
+                let callback_core_idx = if has_callback {
+                    let mut alias_section = ComponentAliasSection::new();
+                    alias_section.alias(Alias::CoreInstanceExport {
+                        instance: fused_instance,
+                        kind: ExportKind::Func,
+                        name: callback_export,
+                    });
+                    component.section(&alias_section);
+                    let idx = core_func_idx;
+                    core_func_idx += 1;
+                    Some(idx)
+                } else {
+                    None
+                };
+
+                // Use the pre-defined component function type.
+                // If type matching failed, return an error.
+                let comp_func_type = *async_func_types.get(&i).ok_or_else(|| {
+                    Error::EncodingError(format!(
+                        "cannot find component type for async import {}::{}",
+                        interface_name, func_name
+                    ))
+                })?;
+
+                // Alias realloc (needed for both lift and lower)
+                let realloc_name = "cabi_realloc";
+                let has_realloc = fused_info
+                    .exports
+                    .iter()
+                    .any(|(n, k, _)| *k == wasmparser::ExternalKind::Func && *n == realloc_name);
+                let realloc_core_idx = if has_realloc {
+                    let mut alias_section = ComponentAliasSection::new();
+                    alias_section.alias(Alias::CoreInstanceExport {
+                        instance: fused_instance,
+                        kind: ExportKind::Func,
+                        name: realloc_name,
+                    });
+                    component.section(&alias_section);
+                    let idx = core_func_idx;
+                    core_func_idx += 1;
+                    Some(idx)
+                } else {
+                    None
+                };
+
+                // canon lift ... async (callback N) (realloc N)
+                let mut lift_options = vec![
+                    CanonicalOption::Memory(memory_core_indices[0]),
+                    CanonicalOption::UTF8,
+                    CanonicalOption::Async,
+                ];
+                if let Some(cb_idx) = callback_core_idx {
+                    lift_options.push(CanonicalOption::Callback(cb_idx));
+                }
+                if let Some(realloc_idx) = realloc_core_idx {
+                    lift_options.push(CanonicalOption::Realloc(realloc_idx));
+                }
+                let mut canon = CanonicalFunctionSection::new();
+                canon.lift(async_lift_core_idx, comp_func_type, lift_options);
+                component.section(&canon);
+                let lifted_func_idx = component_func_idx;
+                component_func_idx += 1;
+
+                // canon lower (blocking synchronous call for the caller).
+                // Use the caller's memory for data passing. The caller's
+                // component index is encoded in the fused import's component
+                // origin.  For now, find the memory from the import's position
+                // in the merged module — imports from the same component share
+                // a memory.  Use minimal options (matching unfused pattern):
+                // only add memory+realloc+encoding when the function needs them.
+                let import_type_idx = fused_info.func_imports[i].2;
+                let core_type = fused_info
+                    .func_types
+                    .get(import_type_idx as usize)
+                    .cloned()
+                    .unwrap_or_default();
+                // Needs memory if there are string/list params (>1 flat result or >2 flat params
+                // with pointer-like patterns) or if this is an async function with memory.
+                let needs_memory_on_lower =
+                    core_type.0.len() > 2 || core_type.1.len() > 1 || core_type.1.is_empty();
+                let mut lower_options: Vec<CanonicalOption> = Vec::new();
+                if needs_memory_on_lower {
+                    lower_options.push(CanonicalOption::Memory(memory_core_indices[0]));
+                    lower_options.push(CanonicalOption::UTF8);
+                    if let Some(realloc_idx) = realloc_core_idx {
+                        lower_options.push(CanonicalOption::Realloc(realloc_idx));
+                    }
+                }
+                let mut canon = CanonicalFunctionSection::new();
+                canon.lower(lifted_func_idx, lower_options);
+                component.section(&canon);
+
+                lowered_func_indices.push(core_func_idx);
+                core_func_idx += 1;
+            }
+
+            ImportResolution::TaskBuiltin { op } => {
+                let mut canon = CanonicalFunctionSection::new();
+                match op {
+                    P3BuiltinOp::TaskReturn {
+                        source_location, ..
+                    } => {
+                        // Recover the result type and options from the matching
+                        // component's canonical function entry, if available.
+                        let (result_ty, options, source_comp) = source_location
+                            .as_ref()
+                            .and_then(|(comp_idx, canon_idx)| {
+                                let comp = all_components.get(*comp_idx)?;
+                                let entry = comp.canonical_functions.get(*canon_idx)?;
+                                match entry {
+                                    parser::CanonicalEntry::TaskReturn { result, options } => {
+                                        Some((result.clone(), options.clone(), Some(comp)))
+                                    }
+                                    _ => None,
+                                }
+                            })
+                            .unwrap_or_else(|| (None, parser::CanonicalOptions::default(), None));
+
+                        // Use the source component for type resolution if available,
+                        // otherwise fall back to the wrapper source component.
+                        let type_source = source_comp.unwrap_or(source);
+                        let enc_result = result_ty
+                            .as_ref()
+                            .map(|cvt| {
+                                convert_parser_val_to_encoder(
+                                    &mut component,
+                                    type_source,
+                                    cvt,
+                                    &mut component_type_idx,
+                                    &mut type_remap,
+                                )
+                            })
+                            .transpose()?;
+
+                        let mut enc_options: Vec<CanonicalOption> = Vec::new();
+                        if let Some(mem) = options.memory {
+                            enc_options
+                                .push(CanonicalOption::Memory(memory_core_indices[mem as usize]));
+                        }
+                        match options.string_encoding {
+                            parser::CanonStringEncoding::Utf8 => {
+                                enc_options.push(CanonicalOption::UTF8);
+                            }
+                            parser::CanonStringEncoding::Utf16 => {
+                                enc_options.push(CanonicalOption::UTF16);
+                            }
+                            parser::CanonStringEncoding::CompactUtf16 => {
+                                enc_options.push(CanonicalOption::CompactUTF16);
+                            }
+                        }
+                        canon.task_return(enc_result, enc_options);
+                    }
+                    P3BuiltinOp::TaskCancel => {
+                        canon.task_cancel();
+                    }
+                    P3BuiltinOp::ContextGet(slot) => {
+                        canon.context_get(*slot);
+                    }
+                    P3BuiltinOp::ContextSet(slot) => {
+                        canon.context_set(*slot);
+                    }
+                    P3BuiltinOp::WaitableJoin => {
+                        canon.waitable_join();
+                    }
+                    P3BuiltinOp::WaitableSetNew => {
+                        canon.waitable_set_new();
+                    }
+                    P3BuiltinOp::WaitableSetDrop => {
+                        canon.waitable_set_drop();
+                    }
+                    P3BuiltinOp::WaitableSetPoll => {
+                        // waitable-set.poll requires async flag and memory index.
+                        // Default: async_=false, memory=0
+                        canon.waitable_set_poll(false, memory_core_indices[0]);
+                    }
+                    P3BuiltinOp::BackpressureInc => {
+                        canon.backpressure_inc();
+                    }
+                    P3BuiltinOp::BackpressureDec => {
+                        canon.backpressure_dec();
+                    }
+                    P3BuiltinOp::SubtaskDrop => {
+                        canon.subtask_drop();
+                    }
+                }
+                component.section(&canon);
+
+                lowered_func_indices.push(core_func_idx);
+                core_func_idx += 1;
+            }
         }
     }
 
@@ -1303,9 +1755,6 @@ fn assemble_component(
         .filter(|imp| matches!(imp.ty, wasmparser::ComponentTypeRef::Instance(_)))
         .count() as u32;
 
-    // Source type index → wrapper type index mapping (for recursive type defs)
-    let mut type_remap: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
-
     for comp_export in &source.exports {
         if comp_export.kind != wasmparser::ComponentExternalKind::Instance {
             continue;
@@ -1348,17 +1797,17 @@ fn assemble_component(
                 None
             };
 
-            // Find the source component's lift type for this export function.
-            // We trace: source export → component instance → canonical lift → type_index
-            let lift_type_idx =
+            // Find the source component's lift type and canonical options for
+            // this export function.
+            let lift_info =
                 find_lift_type_for_interface_func(source, interface_name, &func_info.func_name);
 
             // Define the component function type in our wrapper
-            let wrapper_func_type = if let Some(source_type_idx) = lift_type_idx {
+            let wrapper_func_type = if let Some((source_type_idx, _)) = &lift_info {
                 define_source_type_in_wrapper(
                     &mut component,
                     source,
-                    source_type_idx,
+                    *source_type_idx,
                     &mut component_type_idx,
                     &mut type_remap,
                 )?
@@ -1377,7 +1826,46 @@ fn assemble_component(
                     lift_options.push(CanonicalOption::PostReturn(pr_idx));
                 }
             }
-            // Simple functions (like run: func() -> result) need no options
+            // Propagate P3 async/callback from source component's canon lift
+            if let Some((_, ref source_opts)) = lift_info {
+                if source_opts.async_ {
+                    lift_options.push(CanonicalOption::Async);
+                    // async requires memory
+                    if !lift_options
+                        .iter()
+                        .any(|o| matches!(o, CanonicalOption::Memory(_)))
+                    {
+                        lift_options.push(CanonicalOption::Memory(0));
+                    }
+                    if !lift_options.iter().any(|o| {
+                        matches!(
+                            o,
+                            CanonicalOption::UTF8
+                                | CanonicalOption::UTF16
+                                | CanonicalOption::CompactUTF16
+                        )
+                    }) {
+                        lift_options.push(CanonicalOption::UTF8);
+                    }
+                }
+                if source_opts.callback.is_some() {
+                    // Callback function is exported from the fused module as
+                    // [callback][async-lift]<interface>#<func>
+                    let cb_name = format!(
+                        "[callback][async-lift]{}#{}",
+                        interface_name, func_info.func_name
+                    );
+                    let mut alias_section = ComponentAliasSection::new();
+                    alias_section.alias(Alias::CoreInstanceExport {
+                        instance: fused_instance,
+                        kind: ExportKind::Func,
+                        name: &cb_name,
+                    });
+                    component.section(&alias_section);
+                    lift_options.push(CanonicalOption::Callback(core_func_idx));
+                    core_func_idx += 1;
+                }
+            }
 
             let mut canon = CanonicalFunctionSection::new();
             canon.lift(aliased_core_func, wrapper_func_type, lift_options);
@@ -1779,6 +2267,172 @@ fn read_leb128_with_len(data: &[u8]) -> Option<(u32, usize)> {
     None
 }
 
+/// Find a `TaskReturn` entry for a given fused module import.
+///
+/// Uses the source component index (from merged import metadata) to
+/// search the correct component first, then falls back to all components.
+/// Matches by comparing the flat core type of each TaskReturn's result
+/// against the import's core function parameters.
+///
+/// Returns `(component_index, canon_index)`.
+fn find_task_return_for_import(
+    all_components: &[ParsedComponent],
+    source_comp_idx: Option<usize>,
+    import_type: &(Vec<wasm_encoder::ValType>, Vec<wasm_encoder::ValType>),
+) -> Option<(usize, usize)> {
+    let import_params = &import_type.0;
+
+    // Helper: search one component for a matching TaskReturn
+    let search_comp = |comp_idx: usize, comp: &ParsedComponent| -> Option<(usize, usize)> {
+        for (canon_idx, entry) in comp.canonical_functions.iter().enumerate() {
+            if let parser::CanonicalEntry::TaskReturn { result, .. } = entry {
+                let expected_params = flat_task_return_params_resolved(result.as_ref(), comp);
+                if expected_params == *import_params {
+                    return Some((comp_idx, canon_idx));
+                }
+            }
+        }
+        None
+    };
+
+    // Prefer the source component if known
+    if let Some(src_idx) = source_comp_idx
+        && let Some(comp) = all_components.get(src_idx)
+        && let Some(result) = search_comp(src_idx, comp)
+    {
+        return Some(result);
+    }
+
+    // Search all components
+    for (comp_idx, comp) in all_components.iter().enumerate() {
+        if let Some(result) = search_comp(comp_idx, comp) {
+            return Some(result);
+        }
+    }
+
+    // Fallback: return the first TaskReturn entry from any component
+    for (comp_idx, comp) in all_components.iter().enumerate() {
+        for (canon_idx, entry) in comp.canonical_functions.iter().enumerate() {
+            if matches!(entry, parser::CanonicalEntry::TaskReturn { .. }) {
+                return Some((comp_idx, canon_idx));
+            }
+        }
+    }
+
+    None
+}
+
+/// Compute flat task.return params with Type(idx) resolution.
+///
+/// Unlike `flat_task_return_params`, this version resolves `Type(idx)`
+/// references using the component's type definitions.
+fn flat_task_return_params_resolved(
+    result: Option<&parser::ComponentValType>,
+    comp: &ParsedComponent,
+) -> Vec<wasm_encoder::ValType> {
+    match result {
+        None => vec![],
+        Some(ty) => flat_component_val_type_resolved(ty, comp),
+    }
+}
+
+/// Compute flat core representation with Type(idx) resolution.
+fn flat_component_val_type_resolved(
+    ty: &parser::ComponentValType,
+    comp: &ParsedComponent,
+) -> Vec<wasm_encoder::ValType> {
+    use wasm_encoder::ValType;
+    match ty {
+        parser::ComponentValType::Type(idx) => {
+            // Resolve the type index to its definition
+            if let Some(type_def) = comp.get_type_definition(*idx) {
+                match &type_def.kind {
+                    parser::ComponentTypeKind::Defined(inner) => {
+                        flat_component_val_type_resolved(inner, comp)
+                    }
+                    _ => vec![ValType::I32], // function types etc. → handle
+                }
+            } else {
+                vec![ValType::I32] // unknown → default i32
+            }
+        }
+        parser::ComponentValType::Record(fields) => {
+            let mut params = Vec::new();
+            for (_, field_ty) in fields {
+                params.extend(flat_component_val_type_resolved(field_ty, comp));
+            }
+            params
+        }
+        parser::ComponentValType::Tuple(elems) => {
+            let mut params = Vec::new();
+            for elem in elems {
+                params.extend(flat_component_val_type_resolved(elem, comp));
+            }
+            params
+        }
+        parser::ComponentValType::List(_) | parser::ComponentValType::FixedSizeList(_, _) => {
+            vec![ValType::I32, ValType::I32]
+        }
+        parser::ComponentValType::String => vec![ValType::I32, ValType::I32],
+        parser::ComponentValType::Option(inner) => {
+            let mut params = vec![ValType::I32]; // discriminant
+            params.extend(flat_component_val_type_resolved(inner, comp));
+            params
+        }
+        parser::ComponentValType::Result { ok, err } => {
+            let ok_flat = ok
+                .as_ref()
+                .map(|t| flat_component_val_type_resolved(t, comp))
+                .unwrap_or_default();
+            let err_flat = err
+                .as_ref()
+                .map(|t| flat_component_val_type_resolved(t, comp))
+                .unwrap_or_default();
+            let mut params = vec![ValType::I32]; // discriminant
+            let longer = if ok_flat.len() >= err_flat.len() {
+                &ok_flat
+            } else {
+                &err_flat
+            };
+            params.extend_from_slice(longer);
+            params
+        }
+        parser::ComponentValType::Variant(cases) => {
+            let mut params = vec![ValType::I32]; // discriminant
+            let mut max_flat: Vec<ValType> = Vec::new();
+            for (_, case_ty) in cases {
+                if let Some(ct) = case_ty {
+                    let case_flat = flat_component_val_type_resolved(ct, comp);
+                    if case_flat.len() > max_flat.len() {
+                        max_flat = case_flat;
+                    }
+                }
+            }
+            params.extend(max_flat);
+            params
+        }
+        // Simple/primitive types
+        parser::ComponentValType::Primitive(p) => vec![match p {
+            parser::PrimitiveValType::Bool
+            | parser::PrimitiveValType::U8
+            | parser::PrimitiveValType::S8
+            | parser::PrimitiveValType::U16
+            | parser::PrimitiveValType::S16
+            | parser::PrimitiveValType::U32
+            | parser::PrimitiveValType::S32
+            | parser::PrimitiveValType::Char => wasm_encoder::ValType::I32,
+            parser::PrimitiveValType::U64 | parser::PrimitiveValType::S64 => {
+                wasm_encoder::ValType::I64
+            }
+            parser::PrimitiveValType::F32 => wasm_encoder::ValType::F32,
+            parser::PrimitiveValType::F64 => wasm_encoder::ValType::F64,
+        }],
+        parser::ComponentValType::Own(_) | parser::ComponentValType::Borrow(_) => {
+            vec![wasm_encoder::ValType::I32]
+        }
+    }
+}
+
 /// Info about a fused module export that belongs to a component interface.
 struct ExportFuncInfo {
     /// Function name within the interface (e.g., "run", "greet")
@@ -1796,11 +2450,13 @@ struct ExportFuncInfo {
 ///
 /// Falls back to scanning all Lift entries for one whose core export name
 /// matches the `<interface>#<func_name>` pattern.
+/// Returns (type_index, canonical_options) for the source component's lift
+/// entry that matches the given interface function.
 fn find_lift_type_for_interface_func(
     source: &ParsedComponent,
     interface_name: &str,
     func_name: &str,
-) -> Option<u32> {
+) -> Option<(u32, parser::CanonicalOptions)> {
     let target_export_name = format!("{}#{}", interface_name, func_name);
 
     // Strategy 1: Find a Lift entry whose core function is exported with the
@@ -1811,7 +2467,12 @@ fn find_lift_type_for_interface_func(
     // The Lift entry references the core function by its core_func_index.
     // We can match by looking at core aliases that reference the export name.
     for (canon_idx, canon) in source.canonical_functions.iter().enumerate() {
-        if let parser::CanonicalEntry::Lift { type_index, .. } = canon {
+        if let parser::CanonicalEntry::Lift {
+            type_index,
+            options,
+            ..
+        } = canon
+        {
             // Check if any component_func_def points to this lift, and if
             // the corresponding export matches our interface
             for func_def in &source.component_func_defs {
@@ -1820,7 +2481,7 @@ fn find_lift_type_for_interface_func(
                 {
                     // This is a lifted function. Check if the source
                     // component exports it as our interface.
-                    return Some(*type_index);
+                    return Some((*type_index, options.clone()));
                 }
             }
         }
@@ -1829,8 +2490,13 @@ fn find_lift_type_for_interface_func(
     // Strategy 2: Look for any Lift entry (fallback for simple components
     // with only one export).
     for canon in &source.canonical_functions {
-        if let parser::CanonicalEntry::Lift { type_index, .. } = canon {
-            return Some(*type_index);
+        if let parser::CanonicalEntry::Lift {
+            type_index,
+            options,
+            ..
+        } = canon
+        {
+            return Some((*type_index, options.clone()));
         }
     }
 
@@ -1983,7 +2649,7 @@ fn emit_defined_type(
                 component_type_idx,
                 type_remap,
             )?;
-            types.defined_type().fixed_size_list(elem_enc, *len);
+            types.defined_type().fixed_length_list(elem_enc, *len);
         }
         parser::ComponentValType::Option(inner) => {
             let inner_enc = convert_parser_val_to_encoder(
@@ -1994,6 +2660,58 @@ fn emit_defined_type(
                 type_remap,
             )?;
             types.defined_type().option(inner_enc);
+        }
+        parser::ComponentValType::Record(fields) => {
+            let enc_fields: Vec<(&str, wasm_encoder::ComponentValType)> = fields
+                .iter()
+                .map(|(name, ty)| {
+                    let enc = convert_parser_val_to_encoder(
+                        component,
+                        source,
+                        ty,
+                        component_type_idx,
+                        type_remap,
+                    )?;
+                    Ok((name.as_str(), enc))
+                })
+                .collect::<Result<_>>()?;
+            types.defined_type().record(enc_fields);
+        }
+        parser::ComponentValType::Tuple(elems) => {
+            let enc_elems: Vec<wasm_encoder::ComponentValType> = elems
+                .iter()
+                .map(|ty| {
+                    convert_parser_val_to_encoder(
+                        component,
+                        source,
+                        ty,
+                        component_type_idx,
+                        type_remap,
+                    )
+                })
+                .collect::<Result<_>>()?;
+            types.defined_type().tuple(enc_elems);
+        }
+        parser::ComponentValType::Variant(cases) => {
+            let enc_cases: Vec<(&str, Option<wasm_encoder::ComponentValType>)> = cases
+                .iter()
+                .map(|(name, ty)| {
+                    let enc = ty
+                        .as_ref()
+                        .map(|t| {
+                            convert_parser_val_to_encoder(
+                                component,
+                                source,
+                                t,
+                                component_type_idx,
+                                type_remap,
+                            )
+                        })
+                        .transpose()?;
+                    Ok((name.as_str(), enc))
+                })
+                .collect::<Result<_>>()?;
+            types.defined_type().variant(enc_cases);
         }
         _ => {
             return Err(Error::EncodingError(format!(
@@ -2043,7 +2761,10 @@ fn convert_parser_val_to_encoder(
         }
         parser::ComponentValType::List(_)
         | parser::ComponentValType::FixedSizeList(_, _)
-        | parser::ComponentValType::Option(_) => {
+        | parser::ComponentValType::Option(_)
+        | parser::ComponentValType::Record(_)
+        | parser::ComponentValType::Tuple(_)
+        | parser::ComponentValType::Variant(_) => {
             let wrapper_idx =
                 emit_defined_type(component, source, ty, component_type_idx, type_remap)?;
             Ok(wasm_encoder::ComponentValType::Type(wrapper_idx))
@@ -2164,6 +2885,72 @@ fn parse_resource_field(field_name: &str) -> Option<(ResourceOp, String)> {
     })
 }
 
+/// Parse a P3 task/async built-in field name into a `P3BuiltinOp`.
+///
+/// Recognizes field names like `[task-return]is-prime`, `[task-cancel]`,
+/// `[context-get-0]`, `[waitable-set-new]`, `[backpressure-inc]`, etc.
+///
+/// The `$N` suffix (multi-memory deduplication) is stripped before matching.
+///
+/// Returns `None` if the field doesn't match any P3 built-in prefix.
+fn parse_p3_builtin_field(field_name: &str) -> Option<P3BuiltinOp> {
+    // Strip $N suffix if present (multi-memory deduplication)
+    let base = if let Some(dollar_pos) = field_name.rfind('$') {
+        let suffix = &field_name[dollar_pos + 1..];
+        if suffix.chars().all(|c| c.is_ascii_digit()) {
+            &field_name[..dollar_pos]
+        } else {
+            field_name
+        }
+    } else {
+        field_name
+    };
+
+    // [task-return]<name> — return a result from an async export
+    if base.starts_with("[task-return]") {
+        return Some(P3BuiltinOp::TaskReturn {
+            source_location: None,
+        });
+    }
+
+    // Exact-match builtins (no trailing name)
+    match base {
+        "[task-cancel]" => return Some(P3BuiltinOp::TaskCancel),
+        "[waitable-join]" => return Some(P3BuiltinOp::WaitableJoin),
+        "[waitable-set-new]" => return Some(P3BuiltinOp::WaitableSetNew),
+        "[waitable-set-drop]" => return Some(P3BuiltinOp::WaitableSetDrop),
+        "[waitable-set-poll]" => return Some(P3BuiltinOp::WaitableSetPoll),
+        "[backpressure-inc]" => return Some(P3BuiltinOp::BackpressureInc),
+        "[backpressure-dec]" => return Some(P3BuiltinOp::BackpressureDec),
+        "[subtask-drop]" => return Some(P3BuiltinOp::SubtaskDrop),
+        _ => {}
+    }
+
+    // [context-get-N] and [context-set-N] — slot index encoded in the name
+    if let Some(rest) = base.strip_prefix("[context-get-")
+        && let Some(idx_str) = rest.strip_suffix(']')
+        && let Ok(slot) = idx_str.parse::<u32>()
+    {
+        return Some(P3BuiltinOp::ContextGet(slot));
+    }
+    if let Some(rest) = base.strip_prefix("[context-set-")
+        && let Some(idx_str) = rest.strip_suffix(']')
+        && let Ok(slot) = idx_str.parse::<u32>()
+    {
+        return Some(P3BuiltinOp::ContextSet(slot));
+    }
+
+    None
+}
+
+/// Check whether a field name is a P3 task/async built-in.
+///
+/// Used to distinguish P3 fields from resource operations when processing
+/// `[export]`-prefixed imports.
+fn is_p3_builtin_field(field_name: &str) -> bool {
+    parse_p3_builtin_field(field_name).is_some()
+}
+
 /// Convert wasmparser TypeRef to wasm-encoder EntityType.
 fn convert_type_ref(ty: wasmparser::TypeRef) -> Result<wasm_encoder::EntityType> {
     match ty {
@@ -2201,6 +2988,7 @@ fn convert_type_ref(ty: wasmparser::TypeRef) -> Result<wasm_encoder::EntityType>
         wasmparser::TypeRef::Tag(_) => Err(Error::UnsupportedFeature(
             "exception handling tags".to_string(),
         )),
+        wasmparser::TypeRef::FuncExact(idx) => Ok(wasm_encoder::EntityType::Function(idx)),
     }
 }
 

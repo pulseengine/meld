@@ -666,8 +666,10 @@ impl FactStyleGenerator {
             return self.generate_params_ptr_adapter(site, options, target_func, caller_type_idx);
         }
 
-        // --- Non-retptr path: use caller's type for declared signature ---
-        let adapter_type_idx = caller_type_idx;
+        // --- Non-retptr path: use callee's type so body is valid ---
+        // wire_adapter_indices generates a widening wrapper if caller expects
+        // wider result types (P3 async i64 vs i32).
+        let adapter_type_idx = callee_type_idx;
         let param_count = callee_param_count;
         let result_count = callee_result_count;
         let result_types = callee_result_types;
@@ -3173,6 +3175,25 @@ impl AdapterGenerator for FactStyleGenerator {
         let mut adapters = Vec::new();
 
         for (idx, site) in graph.adapter_sites.iter().enumerate() {
+            if site.is_async_lift {
+                // Async adapter sites are preserved as component-level canon
+                // lift/lower pairs. Generate a dummy (unreachable) adapter to
+                // maintain 1:1 correspondence with adapter_sites.
+                let mut body = Function::new([]);
+                body.instruction(&Instruction::Unreachable);
+                body.instruction(&Instruction::End);
+                adapters.push(AdapterFunction {
+                    name: format!("$async_stub_{}", idx),
+                    type_idx: 0,
+                    body,
+                    source_component: site.from_component,
+                    source_module: site.from_module,
+                    target_component: site.to_component,
+                    target_module: site.to_module,
+                    target_function: 0,
+                });
+                continue;
+            }
             let adapter = self.generate_adapter(
                 site,
                 merged,

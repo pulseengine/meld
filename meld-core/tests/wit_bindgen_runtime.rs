@@ -442,7 +442,7 @@ fn test_fuse_component_wit_bindgen_fixed_length_lists() {
     let fused = fuse_fixture("fixed-length-lists", OutputFormat::Component)
         .expect("fixed-length-lists: component fusion should succeed");
     let features =
-        wasmparser::WasmFeatures::default() | wasmparser::WasmFeatures::CM_FIXED_SIZE_LIST;
+        wasmparser::WasmFeatures::default() | wasmparser::WasmFeatures::CM_FIXED_LENGTH_LISTS;
     wasmparser::Validator::new_with_features(features)
         .validate_all(&fused)
         .expect("fixed-length-lists: fused component should validate");

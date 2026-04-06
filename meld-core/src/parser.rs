@@ -465,6 +465,8 @@ pub struct CanonicalOptions {
     pub memory: Option<u32>,
     pub realloc: Option<u32>,
     pub post_return: Option<u32>,
+    pub async_: bool,
+    pub callback: Option<u32>,
 }
 
 impl Default for CanonicalOptions {
@@ -474,6 +476,8 @@ impl Default for CanonicalOptions {
             memory: None,
             realloc: None,
             post_return: None,
+            async_: false,
+            callback: None,
         }
     }
 }
@@ -498,11 +502,78 @@ pub enum CanonicalEntry {
     ResourceDrop { resource: u32 },
     /// Get representation of a resource handle
     ResourceRep { resource: u32 },
-    /// Spawn a new thread
+    /// Spawn a new thread (via ref)
     ThreadSpawn { func_ty_index: u32 },
     /// Query hardware thread concurrency
     ThreadHwConcurrency,
-    /// Unsupported canonical function (P3 async, stream, future, etc.)
+    /// Async drop of a resource handle
+    ResourceDropAsync { resource: u32 },
+    /// Increment backpressure counter
+    BackpressureInc,
+    /// Decrement backpressure counter
+    BackpressureDec,
+    /// Return a result from a lifted async export
+    TaskReturn {
+        result: Option<ComponentValType>,
+        options: CanonicalOptions,
+    },
+    /// Acknowledge cancellation of the current task
+    TaskCancel,
+    /// Get task-local context slot
+    ContextGet(u32),
+    /// Set task-local context slot
+    ContextSet(u32),
+    /// Yield control to the host
+    ThreadYield { cancellable: bool },
+    /// Drop a completed subtask
+    SubtaskDrop,
+    /// Cancel an in-progress subtask
+    SubtaskCancel { async_: bool },
+    /// Create a new stream handle
+    StreamNew { ty: u32 },
+    /// Read from a stream
+    StreamRead { ty: u32, options: CanonicalOptions },
+    /// Write to a stream
+    StreamWrite { ty: u32, options: CanonicalOptions },
+    /// Cancel an in-progress stream read
+    StreamCancelRead { ty: u32, async_: bool },
+    /// Cancel an in-progress stream write
+    StreamCancelWrite { ty: u32, async_: bool },
+    /// Drop the readable end of a stream
+    StreamDropReadable { ty: u32 },
+    /// Drop the writable end of a stream
+    StreamDropWritable { ty: u32 },
+    /// Create a new future handle
+    FutureNew { ty: u32 },
+    /// Read from a future
+    FutureRead { ty: u32, options: CanonicalOptions },
+    /// Write to a future
+    FutureWrite { ty: u32, options: CanonicalOptions },
+    /// Cancel an in-progress future read
+    FutureCancelRead { ty: u32, async_: bool },
+    /// Cancel an in-progress future write
+    FutureCancelWrite { ty: u32, async_: bool },
+    /// Drop the readable end of a future
+    FutureDropReadable { ty: u32 },
+    /// Drop the writable end of a future
+    FutureDropWritable { ty: u32 },
+    /// Create a new error-context with a debug message
+    ErrorContextNew { options: CanonicalOptions },
+    /// Get the debug message for an error-context
+    ErrorContextDebugMessage { options: CanonicalOptions },
+    /// Drop an error-context
+    ErrorContextDrop,
+    /// Create a new waitable-set
+    WaitableSetNew,
+    /// Block on the next item within a waitable-set
+    WaitableSetWait { cancellable: bool, memory: u32 },
+    /// Check if any items are ready within a waitable-set
+    WaitableSetPoll { cancellable: bool, memory: u32 },
+    /// Drop a waitable-set
+    WaitableSetDrop,
+    /// Add an item to a waitable-set
+    WaitableJoin,
+    /// Unsupported canonical function (thread.index, thread.*indirect, etc.)
     Unsupported,
 }
 
@@ -581,8 +652,9 @@ impl ComponentParser {
         }
 
         if self.validate {
-            let features =
-                wasmparser::WasmFeatures::default() | wasmparser::WasmFeatures::CM_FIXED_SIZE_LIST;
+            let features = wasmparser::WasmFeatures::default()
+                | wasmparser::WasmFeatures::CM_FIXED_LENGTH_LISTS
+                | wasmparser::WasmFeatures::CM_ASYNC;
             let mut validator = wasmparser::Validator::new_with_features(features);
             validator.validate_all(bytes)?;
         }
@@ -867,13 +939,8 @@ impl ComponentParser {
             Payload::ComponentCanonicalSection(reader) => {
                 for canon in reader {
                     let canon = canon?;
-                    let creates_core_func = matches!(
-                        &canon,
-                        wasmparser::CanonicalFunction::Lower { .. }
-                            | wasmparser::CanonicalFunction::ResourceNew { .. }
-                            | wasmparser::CanonicalFunction::ResourceDrop { .. }
-                            | wasmparser::CanonicalFunction::ResourceRep { .. }
-                    );
+                    let creates_core_func =
+                        !matches!(&canon, wasmparser::CanonicalFunction::Lift { .. });
                     let is_lift = matches!(&canon, wasmparser::CanonicalFunction::Lift { .. });
                     let canon_idx = component.canonical_functions.len();
                     component
@@ -1042,10 +1109,11 @@ impl ComponentParser {
                 }
 
                 Payload::ImportSection(reader) => {
-                    for import in reader {
+                    for import in reader.into_imports() {
                         let import = import?;
                         let kind = match import.ty {
-                            wasmparser::TypeRef::Func(idx) => ImportKind::Function(idx),
+                            wasmparser::TypeRef::Func(idx)
+                            | wasmparser::TypeRef::FuncExact(idx) => ImportKind::Function(idx),
                             wasmparser::TypeRef::Table(t) => ImportKind::Table(TableType {
                                 element_type: convert_ref_type(t.element_type),
                                 initial: t.initial,
@@ -1129,7 +1197,8 @@ impl ComponentParser {
                     for export in reader {
                         let export = export?;
                         let kind = match export.kind {
-                            wasmparser::ExternalKind::Func => ExportKind::Function,
+                            wasmparser::ExternalKind::Func
+                            | wasmparser::ExternalKind::FuncExact => ExportKind::Function,
                             wasmparser::ExternalKind::Table => ExportKind::Table,
                             wasmparser::ExternalKind::Memory => ExportKind::Memory,
                             wasmparser::ExternalKind::Global => ExportKind::Global,
@@ -2867,7 +2936,7 @@ fn convert_wp_defined_type(dt: &wasmparser::ComponentDefinedType) -> ComponentTy
                     .collect(),
             ))
         }
-        wasmparser::ComponentDefinedType::FixedSizeList(ty, len) => ComponentTypeKind::Defined(
+        wasmparser::ComponentDefinedType::FixedLengthList(ty, len) => ComponentTypeKind::Defined(
             ComponentValType::FixedSizeList(Box::new(convert_wp_component_val_type(ty)), *len),
         ),
         // P3 async types — detected and flagged, not silently swallowed
@@ -2885,16 +2954,20 @@ fn convert_wp_defined_type(dt: &wasmparser::ComponentDefinedType) -> ComponentTy
             };
             ComponentTypeKind::P3Async(desc)
         }
+        wasmparser::ComponentDefinedType::Map(key_ty, val_ty) => {
+            ComponentTypeKind::P3Async(format!("map<{key_ty:?}, {val_ty:?}>"))
+        }
     }
 }
 
 /// Convert wasmparser CanonicalOption list into our CanonicalOptions.
 ///
-/// If `p3_async_features` is `Some`, detected P3 async options (Async,
-/// Callback) are pushed into the vec instead of being silently ignored.
+/// The `_p3_async_features` parameter is retained for call-site
+/// compatibility but is no longer used — async/callback options are
+/// now stored directly in `CanonicalOptions`.
 fn convert_canonical_options(
     options: &[wasmparser::CanonicalOption],
-    mut p3_async_features: Option<&mut Vec<String>>,
+    _p3_async_features: Option<&mut Vec<String>>,
 ) -> CanonicalOptions {
     let mut result = CanonicalOptions::default();
     for opt in options {
@@ -2917,18 +2990,14 @@ fn convert_canonical_options(
             wasmparser::CanonicalOption::PostReturn(idx) => {
                 result.post_return = Some(*idx);
             }
-            // P3 async canonical options — detected and flagged
             wasmparser::CanonicalOption::Async => {
-                if let Some(ref mut feats) = p3_async_features {
-                    feats.push("async canonical option".to_string());
-                }
+                result.async_ = true;
             }
-            wasmparser::CanonicalOption::Callback(_) => {
-                if let Some(ref mut feats) = p3_async_features {
-                    feats.push("callback canonical option".to_string());
-                }
+            wasmparser::CanonicalOption::Callback(idx) => {
+                result.callback = Some(*idx);
             }
             wasmparser::CanonicalOption::CoreType(_) => {}
+            wasmparser::CanonicalOption::Gc => {}
         }
     }
     result
@@ -2972,35 +3041,101 @@ fn convert_canonical_function(
         wasmparser::CanonicalFunction::ThreadSpawnRef { func_ty_index } => {
             CanonicalEntry::ThreadSpawn { func_ty_index }
         }
-        // P3 async/stream/future/error-context canonical built-ins — detected
-        // and flagged. We use Debug formatting to capture the specific variant.
+        wasmparser::CanonicalFunction::ResourceDropAsync { resource } => {
+            CanonicalEntry::ResourceDropAsync { resource }
+        }
+        wasmparser::CanonicalFunction::BackpressureInc => CanonicalEntry::BackpressureInc,
+        wasmparser::CanonicalFunction::BackpressureDec => CanonicalEntry::BackpressureDec,
+        wasmparser::CanonicalFunction::TaskReturn { result, options } => {
+            CanonicalEntry::TaskReturn {
+                result: result.as_ref().map(convert_wp_component_val_type),
+                options: convert_canonical_options(&options, None),
+            }
+        }
+        wasmparser::CanonicalFunction::TaskCancel => CanonicalEntry::TaskCancel,
+        wasmparser::CanonicalFunction::ContextGet(idx) => CanonicalEntry::ContextGet(idx),
+        wasmparser::CanonicalFunction::ContextSet(idx) => CanonicalEntry::ContextSet(idx),
+        wasmparser::CanonicalFunction::ThreadYield { cancellable } => {
+            CanonicalEntry::ThreadYield { cancellable }
+        }
+        wasmparser::CanonicalFunction::SubtaskDrop => CanonicalEntry::SubtaskDrop,
+        wasmparser::CanonicalFunction::SubtaskCancel { async_ } => {
+            CanonicalEntry::SubtaskCancel { async_ }
+        }
+        wasmparser::CanonicalFunction::StreamNew { ty } => CanonicalEntry::StreamNew { ty },
+        wasmparser::CanonicalFunction::StreamRead { ty, options } => CanonicalEntry::StreamRead {
+            ty,
+            options: convert_canonical_options(&options, None),
+        },
+        wasmparser::CanonicalFunction::StreamWrite { ty, options } => CanonicalEntry::StreamWrite {
+            ty,
+            options: convert_canonical_options(&options, None),
+        },
+        wasmparser::CanonicalFunction::StreamCancelRead { ty, async_ } => {
+            CanonicalEntry::StreamCancelRead { ty, async_ }
+        }
+        wasmparser::CanonicalFunction::StreamCancelWrite { ty, async_ } => {
+            CanonicalEntry::StreamCancelWrite { ty, async_ }
+        }
+        wasmparser::CanonicalFunction::StreamDropReadable { ty } => {
+            CanonicalEntry::StreamDropReadable { ty }
+        }
+        wasmparser::CanonicalFunction::StreamDropWritable { ty } => {
+            CanonicalEntry::StreamDropWritable { ty }
+        }
+        wasmparser::CanonicalFunction::FutureNew { ty } => CanonicalEntry::FutureNew { ty },
+        wasmparser::CanonicalFunction::FutureRead { ty, options } => CanonicalEntry::FutureRead {
+            ty,
+            options: convert_canonical_options(&options, None),
+        },
+        wasmparser::CanonicalFunction::FutureWrite { ty, options } => CanonicalEntry::FutureWrite {
+            ty,
+            options: convert_canonical_options(&options, None),
+        },
+        wasmparser::CanonicalFunction::FutureCancelRead { ty, async_ } => {
+            CanonicalEntry::FutureCancelRead { ty, async_ }
+        }
+        wasmparser::CanonicalFunction::FutureCancelWrite { ty, async_ } => {
+            CanonicalEntry::FutureCancelWrite { ty, async_ }
+        }
+        wasmparser::CanonicalFunction::FutureDropReadable { ty } => {
+            CanonicalEntry::FutureDropReadable { ty }
+        }
+        wasmparser::CanonicalFunction::FutureDropWritable { ty } => {
+            CanonicalEntry::FutureDropWritable { ty }
+        }
+        wasmparser::CanonicalFunction::ErrorContextNew { options } => {
+            CanonicalEntry::ErrorContextNew {
+                options: convert_canonical_options(&options, None),
+            }
+        }
+        wasmparser::CanonicalFunction::ErrorContextDebugMessage { options } => {
+            CanonicalEntry::ErrorContextDebugMessage {
+                options: convert_canonical_options(&options, None),
+            }
+        }
+        wasmparser::CanonicalFunction::ErrorContextDrop => CanonicalEntry::ErrorContextDrop,
+        wasmparser::CanonicalFunction::WaitableSetNew => CanonicalEntry::WaitableSetNew,
+        wasmparser::CanonicalFunction::WaitableSetWait {
+            cancellable,
+            memory,
+        } => CanonicalEntry::WaitableSetWait {
+            cancellable,
+            memory,
+        },
+        wasmparser::CanonicalFunction::WaitableSetPoll {
+            cancellable,
+            memory,
+        } => CanonicalEntry::WaitableSetPoll {
+            cancellable,
+            memory,
+        },
+        wasmparser::CanonicalFunction::WaitableSetDrop => CanonicalEntry::WaitableSetDrop,
+        wasmparser::CanonicalFunction::WaitableJoin => CanonicalEntry::WaitableJoin,
+        // Truly unsupported variants (thread.index, thread.*indirect, etc.)
         other => {
             let desc = format!("{other:?}");
-            // Provide human-readable names for common P3 built-ins
-            let friendly = match &desc {
-                d if d.starts_with("TaskWait") => "task.wait built-in",
-                d if d.starts_with("TaskPoll") => "task.poll built-in",
-                d if d.starts_with("TaskYield") => "task.yield built-in",
-                d if d.starts_with("TaskReturn") => "task.return built-in",
-                d if d.starts_with("SubtaskDrop") => "subtask.drop built-in",
-                d if d.starts_with("StreamNew") => "stream.new built-in",
-                d if d.starts_with("StreamRead") => "stream.read built-in",
-                d if d.starts_with("StreamWrite") => "stream.write built-in",
-                d if d.starts_with("StreamCancel") => "stream.cancel-read/write built-in",
-                d if d.starts_with("StreamClose") => "stream.close-readable/writable built-in",
-                d if d.starts_with("FutureNew") => "future.new built-in",
-                d if d.starts_with("FutureRead") => "future.read built-in",
-                d if d.starts_with("FutureWrite") => "future.write built-in",
-                d if d.starts_with("FutureCancel") => "future.cancel-read/write built-in",
-                d if d.starts_with("FutureClose") => "future.close-readable/writable built-in",
-                d if d.starts_with("ErrorContextNew") => "error-context.new built-in",
-                d if d.starts_with("ErrorContextDebugMessage") => {
-                    "error-context.debug-message built-in"
-                }
-                d if d.starts_with("ErrorContextDrop") => "error-context.drop built-in",
-                _ => &desc,
-            };
-            p3_async_features.push(friendly.to_string());
+            p3_async_features.push(desc);
             CanonicalEntry::Unsupported
         }
     }
@@ -3795,47 +3930,33 @@ mod tests {
 
     #[test]
     fn test_p3_async_canonical_option_detected() {
-        // Async and Callback canonical options should be detected
-        let mut feats = Vec::new();
+        // Async canonical option should be stored in CanonicalOptions
         let opts = convert_canonical_options(
             &[
                 wasmparser::CanonicalOption::UTF8,
                 wasmparser::CanonicalOption::Memory(0),
                 wasmparser::CanonicalOption::Async,
             ],
-            Some(&mut feats),
+            None,
         );
         // Standard options should still be parsed correctly
         assert_eq!(opts.string_encoding, CanonStringEncoding::Utf8);
         assert_eq!(opts.memory, Some(0));
-        // P3 async feature should be recorded
-        assert_eq!(feats.len(), 1);
-        assert!(
-            feats[0].contains("async"),
-            "expected 'async' in feature description: {}",
-            feats[0]
-        );
+        // P3 async option should be stored directly
+        assert!(opts.async_);
+        assert_eq!(opts.callback, None);
     }
 
     #[test]
     fn test_p3_callback_canonical_option_detected() {
-        let mut feats = Vec::new();
-        let _opts = convert_canonical_options(
-            &[wasmparser::CanonicalOption::Callback(42)],
-            Some(&mut feats),
-        );
-        assert_eq!(feats.len(), 1);
-        assert!(
-            feats[0].contains("callback"),
-            "expected 'callback' in feature description: {}",
-            feats[0]
-        );
+        let opts = convert_canonical_options(&[wasmparser::CanonicalOption::Callback(42)], None);
+        assert_eq!(opts.callback, Some(42));
     }
 
     #[test]
-    fn test_p3_async_option_not_detected_when_tracking_disabled() {
-        // When p3_async_features is None, async options are silently ignored
-        // (backward-compatible with callers that don't care)
+    fn test_p3_async_option_stored_regardless_of_tracking() {
+        // Async option is always stored in CanonicalOptions, regardless
+        // of the p3_async_features parameter.
         let opts = convert_canonical_options(
             &[
                 wasmparser::CanonicalOption::UTF8,
@@ -3844,7 +3965,7 @@ mod tests {
             None,
         );
         assert_eq!(opts.string_encoding, CanonStringEncoding::Utf8);
-        // No panic, no error — just silently ignored
+        assert!(opts.async_);
     }
 
     #[test]
@@ -3881,7 +4002,9 @@ mod tests {
 
     #[test]
     fn test_p3_async_features_collected_in_parsed_component() {
-        // Verify that p3_async_features are accumulated during type parsing
+        // Verify that p3_async_features are accumulated during type parsing.
+        // Only P3 async *types* (future, stream, map) push to p3_async_features
+        // now; async/callback canonical options are stored in CanonicalOptions.
         let mut comp = empty_parsed_component();
 
         // Simulate what the parse loop does when it encounters a P3 type
@@ -3891,15 +4014,12 @@ mod tests {
         }
         comp.types.push(ComponentType { kind });
 
-        // Also simulate a P3 canonical function detection
-        let mut p3_feats = Vec::new();
-        let _entry =
-            convert_canonical_options(&[wasmparser::CanonicalOption::Async], Some(&mut p3_feats));
-        comp.p3_async_features.extend(p3_feats);
-
-        assert_eq!(comp.p3_async_features.len(), 2);
+        assert_eq!(comp.p3_async_features.len(), 1);
         assert!(comp.p3_async_features[0].contains("future"));
-        assert!(comp.p3_async_features[1].contains("async"));
+
+        // Async canonical option is now stored directly, not in p3_async_features
+        let opts = convert_canonical_options(&[wasmparser::CanonicalOption::Async], None);
+        assert!(opts.async_);
     }
 
     #[test]
