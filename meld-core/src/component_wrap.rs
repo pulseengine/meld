@@ -1376,19 +1376,53 @@ fn assemble_component(
                 operation,
                 resource_name,
                 interface_name,
-                component_idx: _,
+                component_idx,
             } => {
-                {
-                    // All components share one canonical resource type per
-                    // resource name. Re-exporters forward handles through the
-                    // same wasmtime-managed handle table as the definer.
+                // Check if this component has handle table exports
+                // ($ht_new_N, $ht_rep_N, $ht_drop_N) for re-exporter routing.
+                let ht_export = component_idx.and_then(|cidx| {
+                    let name = match operation {
+                        ResourceOp::New => format!("$ht_new_{}", cidx),
+                        ResourceOp::Rep => format!("$ht_rep_{}", cidx),
+                        ResourceOp::Drop => format!("$ht_drop_{}", cidx),
+                    };
+                    if fused_info
+                        .exports
+                        .iter()
+                        .any(|(n, k, _)| *k == wasmparser::ExternalKind::Func && *n == name)
+                    {
+                        Some(name)
+                    } else {
+                        None
+                    }
+                });
+
+                if let Some(ht_name) = ht_export {
+                    // Re-exporter: alias the handle table function directly
+                    // from the fused instance instead of using canon resource ops.
+                    log::debug!(
+                        "using ht export {} for {:?} comp {:?}",
+                        ht_name,
+                        operation,
+                        component_idx
+                    );
+                    let mut aliases = ComponentAliasSection::new();
+                    aliases.alias(Alias::CoreInstanceExport {
+                        instance: fused_instance,
+                        kind: ExportKind::Func,
+                        name: &ht_name,
+                    });
+                    component.section(&aliases);
+
+                    lowered_func_indices.push(core_func_idx);
+                    core_func_idx += 1;
+                } else {
+                    // Standard path: canonical resource operations.
                     let res_type_key = resource_name.clone();
                     let res_type_idx =
                         if let Some(&existing) = local_resource_types.get(&res_type_key) {
                             existing
                         } else {
-                            // Define a new resource type. The destructor is exported from
-                            // the fused module as `<interface>#[dtor]<resource>`.
                             let dtor_export_name =
                                 format!("{}#[dtor]{}", interface_name, resource_name);
                             let has_dtor = fused_info.exports.iter().any(|(n, k, _)| {

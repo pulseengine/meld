@@ -683,12 +683,97 @@ impl Merger {
         // Handle start functions
         self.resolve_start_functions(components, &mut merged)?;
 
-        // Handle table allocation disabled: with resource-name-only keying,
-        // all components share one canonical resource type per resource name.
-        // The wasmtime runtime manages handle tables — no custom tables needed.
-        // if !graph.reexporter_components.is_empty() {
-        //     Self::allocate_handle_tables(graph, &mut merged)?;
-        // }
+        // Allocate per-component handle tables for re-exporter components.
+        // These are needed for 3-component resource chains where the
+        // re-exporter's wit-bindgen code expects 4-byte-aligned memory
+        // pointers as handles, not sequential canonical ABI handles.
+        if !graph.reexporter_components.is_empty() {
+            Self::allocate_handle_tables(graph, &mut merged)?;
+
+            // Remap re-exporter's resource.rep/new/drop imports to handle table
+            // functions, then re-rewrite affected function bodies so call
+            // instructions pick up the corrected indices.
+            let mut affected_modules: Vec<(usize, usize)> = Vec::new();
+            for (&comp_idx, ht) in &merged.handle_tables {
+                let component = &components[comp_idx];
+                for (mod_idx, module) in component.core_modules.iter().enumerate() {
+                    let mut import_func_idx = 0u32;
+                    let mut changed = false;
+                    for imp in &module.imports {
+                        if !matches!(imp.kind, crate::parser::ImportKind::Function(_)) {
+                            continue;
+                        }
+                        if imp.name.starts_with("[resource-rep]") {
+                            merged
+                                .function_index_map
+                                .insert((comp_idx, mod_idx, import_func_idx), ht.rep_func);
+                            changed = true;
+                        } else if imp.name.starts_with("[resource-new]") {
+                            merged
+                                .function_index_map
+                                .insert((comp_idx, mod_idx, import_func_idx), ht.new_func);
+                            changed = true;
+                        } else if imp.name.starts_with("[resource-drop]") {
+                            merged
+                                .function_index_map
+                                .insert((comp_idx, mod_idx, import_func_idx), ht.drop_func);
+                            changed = true;
+                        }
+                        import_func_idx += 1;
+                    }
+                    if changed {
+                        affected_modules.push((comp_idx, mod_idx));
+                    }
+                }
+            }
+
+            // Re-rewrite function bodies for modules that had resource imports
+            // redirected to handle table functions.
+            for &(comp_idx, mod_idx) in &affected_modules {
+                let module = &components[comp_idx].core_modules[mod_idx];
+                let index_maps = build_index_maps_for_module(
+                    comp_idx,
+                    mod_idx,
+                    module,
+                    &merged,
+                    self.memory_strategy,
+                    false, // address_rebasing
+                    0u64,  // memory_base_offset
+                    false, // memory64
+                    None,  // memory_initial_pages
+                );
+                let import_func_count = module
+                    .imports
+                    .iter()
+                    .filter(|i| matches!(i.kind, ImportKind::Function(_)))
+                    .count() as u32;
+
+                for (old_idx, &type_idx) in module.functions.iter().enumerate() {
+                    let old_func_idx = import_func_count + old_idx as u32;
+                    let param_count = module
+                        .types
+                        .get(type_idx as usize)
+                        .map(|ty| ty.params.len() as u32)
+                        .unwrap_or(0);
+
+                    let body = extract_function_body(module, old_idx, param_count, &index_maps)?;
+
+                    if let Some(mf) = merged
+                        .functions
+                        .iter_mut()
+                        .find(|f| f.origin == (comp_idx, mod_idx, old_func_idx))
+                    {
+                        mf.body = body;
+                    }
+                }
+                log::info!(
+                    "re-rewrote {} functions in component {} module {} for handle table routing",
+                    module.functions.len(),
+                    comp_idx,
+                    mod_idx,
+                );
+            }
+        }
 
         if let Some(plan) = shared_memory_plan {
             if plan.import.is_none() {

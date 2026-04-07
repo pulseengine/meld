@@ -263,17 +263,27 @@ impl FactStyleGenerator {
             if op.callee_defines_resource {
                 // Callee defines the resource — convert handle→rep.
                 // Skip if upstream adapter already converted (avoids double resource.rep).
-                if !op.caller_already_converted
-                    && let Some(&rep_func) = resource_rep_imports
-                        .get(&(op.import_module.clone(), op.import_field.clone()))
-                {
-                    options
-                        .resource_rep_calls
-                        .push(super::ResourceBorrowTransfer {
-                            param_idx: op.flat_idx,
-                            rep_func,
-                            new_func: None,
+                if !op.caller_already_converted {
+                    // If the caller has a handle table, use ht_rep to extract rep
+                    // from the memory-pointer handle. Otherwise use canonical resource.rep.
+                    let rep_func = merged
+                        .handle_tables
+                        .get(&site.from_component)
+                        .map(|ht| ht.rep_func)
+                        .or_else(|| {
+                            resource_rep_imports
+                                .get(&(op.import_module.clone(), op.import_field.clone()))
+                                .copied()
                         });
+                    if let Some(rep_func) = rep_func {
+                        options
+                            .resource_rep_calls
+                            .push(super::ResourceBorrowTransfer {
+                                param_idx: op.flat_idx,
+                                rep_func,
+                                new_func: None,
+                            });
+                    }
                 }
             } else {
                 // 3-component case: callee doesn't define the resource.
@@ -311,10 +321,18 @@ impl FactStyleGenerator {
                             .map(|(_, &idx)| idx)
                     });
 
+                // For re-exporter callees with handle tables, use ht_new
+                // which returns memory-pointer handles that wit-bindgen expects.
                 let callee_new_func = merged
-                    .resource_new_by_component
-                    .get(&(site.to_component, resource_name.to_string()))
-                    .copied()
+                    .handle_tables
+                    .get(&site.to_component)
+                    .map(|ht| ht.new_func)
+                    .or_else(|| {
+                        merged
+                            .resource_new_by_component
+                            .get(&(site.to_component, resource_name.to_string()))
+                            .copied()
+                    })
                     .or_else(|| {
                         let new_field = op.import_field.replace("[resource-rep]", "[resource-new]");
                         resource_new_imports
@@ -365,12 +383,19 @@ impl FactStyleGenerator {
                         .copied()
                 });
 
-            // Callee's [resource-rep] (callee handle → rep)
+            // Callee's [resource-rep] (callee handle → rep).
+            // For re-exporter callees with handle tables, use ht_rep.
             let rep_field = format!("[resource-rep]{}", resource_name);
             let rep_func = merged
-                .resource_rep_by_component
-                .get(&(site.to_component, resource_name.to_string()))
-                .copied()
+                .handle_tables
+                .get(&site.to_component)
+                .map(|ht| ht.rep_func)
+                .or_else(|| {
+                    merged
+                        .resource_rep_by_component
+                        .get(&(site.to_component, resource_name.to_string()))
+                        .copied()
+                })
                 .or_else(|| {
                     resource_rep_imports
                         .get(&(op.import_module.clone(), rep_field.clone()))
