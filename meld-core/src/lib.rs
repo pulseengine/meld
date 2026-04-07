@@ -386,9 +386,6 @@ impl Fuser {
         for (adapter_offset, (adapter, site)) in
             adapters.iter().zip(graph.adapter_sites.iter()).enumerate()
         {
-            if site.is_async_lift {
-                continue;
-            }
             if let Some(local_ti) = site.import_func_type_idx
                 && let Some(&caller_ti) =
                     merged
@@ -439,10 +436,6 @@ impl Fuser {
         for (adapter_offset, (adapter, site)) in
             adapters.iter().zip(graph.adapter_sites.iter()).enumerate()
         {
-            // Skip async-lifted sites — their imports stay unresolved.
-            if site.is_async_lift {
-                continue;
-            }
             let target_idx = if let Some(&wrapper_idx) = adapter_to_wrapper.get(&adapter_offset) {
                 wrapper_idx
             } else {

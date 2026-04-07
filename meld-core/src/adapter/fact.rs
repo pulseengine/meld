@@ -3188,6 +3188,249 @@ impl FactStyleGenerator {
                 ))
             })
     }
+
+    /// Generate a callback-driving adapter for P3 async cross-component calls.
+    ///
+    /// Instead of canon lift/lower (which triggers call_might_be_recursive),
+    /// the adapter drives the callee's [async-lift] + [callback] loop directly
+    /// in core wasm. The protocol:
+    ///   1. Call [async-lift] entry → packed i32 (EXIT/WAIT/YIELD)
+    ///   2. Loop: poll waitable-set, call [callback] with events
+    ///   3. After EXIT, call [task-get-result] host import for result
+    fn generate_async_callback_adapter(
+        &self,
+        site: &AdapterSite,
+        merged: &MergedModule,
+    ) -> Result<AdapterFunction> {
+        let name = format!(
+            "$async_adapter_{}_to_{}",
+            site.from_component, site.to_component
+        );
+
+        // Find the [async-lift] entry function's merged index
+        let async_lift_func = self.resolve_target_function(site, merged)?;
+
+        // Find the [callback] function's merged index by deriving its export name
+        let callback_export_name = format!("[callback]{}", site.export_name);
+        let callback_func = merged
+            .exports
+            .iter()
+            .find(|e| e.kind == wasm_encoder::ExportKind::Func && e.name == callback_export_name)
+            .map(|e| e.index)
+            .ok_or_else(|| {
+                crate::error::Error::EncodingError(format!(
+                    "async adapter: cannot find callback export '{}' for '{}'",
+                    callback_export_name, site.export_name,
+                ))
+            })?;
+
+        // Find the waitable-set-poll host import. It's an unresolved import
+        // from $root with name [waitable-set-poll] (possibly with $N suffix).
+        let wsp_func = merged
+            .imports
+            .iter()
+            .enumerate()
+            .find(|(_, imp)| imp.name.starts_with("[waitable-set-poll]"))
+            .map(|(i, _)| i as u32)
+            .ok_or_else(|| {
+                crate::error::Error::EncodingError(
+                    "async adapter: cannot find [waitable-set-poll] import".to_string(),
+                )
+            })?;
+
+        // Determine the caller's type (what the caller expects to call)
+        let caller_type_idx = site
+            .import_func_type_idx
+            .and_then(|local_ti| {
+                merged
+                    .type_index_map
+                    .get(&(site.from_component, site.from_module, local_ti))
+                    .copied()
+            })
+            .unwrap_or(0);
+
+        let caller_type = merged
+            .types
+            .get(caller_type_idx as usize)
+            .cloned()
+            .unwrap_or_else(|| crate::merger::MergedFuncType {
+                params: Vec::new(),
+                results: Vec::new(),
+            });
+        let caller_param_count = caller_type.params.len();
+        let _caller_result_count = caller_type.results.len();
+
+        // Find callee's memory index for the event buffer scratch space
+        let callee_memory = crate::merger::component_memory_index(merged, site.to_component);
+
+        // Build the adapter function body
+        //
+        // Locals layout:
+        //   0..caller_param_count: params from caller
+        //   caller_param_count+0: $packed (i32) — packed return from entry/callback
+        //   caller_param_count+1: $code (i32) — unpacked callback code
+        //   caller_param_count+2: $payload (i32) — unpacked payload (waitable set idx)
+        //   caller_param_count+3: $event_code (i32)
+        //   caller_param_count+4: $p1 (i32)
+        //   caller_param_count+5: $p2 (i32)
+        let l_packed = caller_param_count as u32;
+        let l_code = l_packed + 1;
+        let l_payload = l_packed + 2;
+        let l_event_code = l_packed + 3;
+        let l_p1 = l_packed + 4;
+        let l_p2 = l_packed + 5;
+
+        let mut body = Function::new([(6, wasm_encoder::ValType::I32)]);
+
+        // Step 1: Call [async-lift] entry with caller's params
+        for i in 0..caller_param_count {
+            body.instruction(&Instruction::LocalGet(i as u32));
+        }
+        body.instruction(&Instruction::Call(async_lift_func));
+        body.instruction(&Instruction::LocalSet(l_packed));
+
+        // Unpack: code = packed & 0xF, payload = packed >> 4
+        body.instruction(&Instruction::LocalGet(l_packed));
+        body.instruction(&Instruction::I32Const(0xF));
+        body.instruction(&Instruction::I32And);
+        body.instruction(&Instruction::LocalSet(l_code));
+        body.instruction(&Instruction::LocalGet(l_packed));
+        body.instruction(&Instruction::I32Const(4));
+        body.instruction(&Instruction::I32ShrU);
+        body.instruction(&Instruction::LocalSet(l_payload));
+
+        // Step 2: Callback-driving loop
+        // block $exit
+        //   loop $drive
+        //     if code == EXIT(0): break
+        //     if code == WAIT(2): call waitable-set-poll
+        //     call callback(event_code, p1, p2)
+        //     unpack result
+        //     br $drive
+        //   end
+        // end
+        body.instruction(&Instruction::Block(wasm_encoder::BlockType::Empty));
+        body.instruction(&Instruction::Loop(wasm_encoder::BlockType::Empty));
+
+        // if code == 0 (EXIT): br $exit (block index 1)
+        body.instruction(&Instruction::LocalGet(l_code));
+        body.instruction(&Instruction::I32Eqz);
+        body.instruction(&Instruction::BrIf(1)); // break to $exit block
+
+        // if code == 2 (WAIT): call waitable-set-poll(payload, event_ptr)
+        // Use scratch space at address 0 in callee memory for the 3xi32 event tuple
+        // (This is safe because the callee isn't running — we're driving it)
+        body.instruction(&Instruction::LocalGet(l_code));
+        body.instruction(&Instruction::I32Const(2));
+        body.instruction(&Instruction::I32Eq);
+        body.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+        {
+            // waitable-set-poll(set_handle, event_ptr) → i32
+            body.instruction(&Instruction::LocalGet(l_payload));
+            body.instruction(&Instruction::I32Const(0)); // event result ptr (scratch)
+            body.instruction(&Instruction::Call(wsp_func));
+            body.instruction(&Instruction::Drop); // drop poll return value
+
+            // Read event tuple from scratch memory: [event_code, p1, p2] at addr 0
+            let mem_arg = wasm_encoder::MemArg {
+                offset: 0,
+                align: 2,
+                memory_index: callee_memory,
+            };
+            body.instruction(&Instruction::I32Const(0));
+            body.instruction(&Instruction::I32Load(mem_arg));
+            body.instruction(&Instruction::LocalSet(l_event_code));
+
+            let mem_arg_4 = wasm_encoder::MemArg {
+                offset: 4,
+                align: 2,
+                memory_index: callee_memory,
+            };
+            body.instruction(&Instruction::I32Const(0));
+            body.instruction(&Instruction::I32Load(mem_arg_4));
+            body.instruction(&Instruction::LocalSet(l_p1));
+
+            let mem_arg_8 = wasm_encoder::MemArg {
+                offset: 8,
+                align: 2,
+                memory_index: callee_memory,
+            };
+            body.instruction(&Instruction::I32Const(0));
+            body.instruction(&Instruction::I32Load(mem_arg_8));
+            body.instruction(&Instruction::LocalSet(l_p2));
+        }
+        body.instruction(&Instruction::Else);
+        {
+            // YIELD(1): set event to (NONE, 0, 0)
+            body.instruction(&Instruction::I32Const(0));
+            body.instruction(&Instruction::LocalSet(l_event_code));
+            body.instruction(&Instruction::I32Const(0));
+            body.instruction(&Instruction::LocalSet(l_p1));
+            body.instruction(&Instruction::I32Const(0));
+            body.instruction(&Instruction::LocalSet(l_p2));
+        }
+        body.instruction(&Instruction::End); // end if WAIT/YIELD
+
+        // Call callback(event_code, p1, p2) → packed i32
+        body.instruction(&Instruction::LocalGet(l_event_code));
+        body.instruction(&Instruction::LocalGet(l_p1));
+        body.instruction(&Instruction::LocalGet(l_p2));
+        body.instruction(&Instruction::Call(callback_func));
+        body.instruction(&Instruction::LocalSet(l_packed));
+
+        // Unpack new result
+        body.instruction(&Instruction::LocalGet(l_packed));
+        body.instruction(&Instruction::I32Const(0xF));
+        body.instruction(&Instruction::I32And);
+        body.instruction(&Instruction::LocalSet(l_code));
+        body.instruction(&Instruction::LocalGet(l_packed));
+        body.instruction(&Instruction::I32Const(4));
+        body.instruction(&Instruction::I32ShrU);
+        body.instruction(&Instruction::LocalSet(l_payload));
+
+        body.instruction(&Instruction::Br(0)); // br $drive (loop)
+        body.instruction(&Instruction::End); // end loop
+        body.instruction(&Instruction::End); // end block
+
+        // Step 3: After EXIT, return result to caller.
+        // For now, return default values. The task-get-result host intrinsic
+        // will be added when we have the host API finalized.
+        // TODO: call [task-get-result]N to retrieve stored result
+        for result_ty in &caller_type.results {
+            match result_ty {
+                wasm_encoder::ValType::I32 => {
+                    body.instruction(&Instruction::I32Const(0));
+                }
+                wasm_encoder::ValType::I64 => {
+                    body.instruction(&Instruction::I64Const(0));
+                }
+                wasm_encoder::ValType::F32 => {
+                    body.instruction(&Instruction::F32Const(0.0_f32.into()));
+                }
+                wasm_encoder::ValType::F64 => {
+                    body.instruction(&Instruction::F64Const(0.0_f64.into()));
+                }
+                _ => {
+                    body.instruction(&Instruction::I32Const(0));
+                }
+            }
+        }
+
+        body.instruction(&Instruction::End);
+
+        let target_func = self.resolve_target_function(site, merged)?;
+
+        Ok(AdapterFunction {
+            name,
+            type_idx: caller_type_idx,
+            body,
+            source_component: site.from_component,
+            source_module: site.from_module,
+            target_component: site.to_component,
+            target_module: site.to_module,
+            target_function: target_func,
+        })
+    }
 }
 
 impl AdapterGenerator for FactStyleGenerator {
@@ -3201,22 +3444,8 @@ impl AdapterGenerator for FactStyleGenerator {
 
         for (idx, site) in graph.adapter_sites.iter().enumerate() {
             if site.is_async_lift {
-                // Async adapter sites are preserved as component-level canon
-                // lift/lower pairs. Generate a dummy (unreachable) adapter to
-                // maintain 1:1 correspondence with adapter_sites.
-                let mut body = Function::new([]);
-                body.instruction(&Instruction::Unreachable);
-                body.instruction(&Instruction::End);
-                adapters.push(AdapterFunction {
-                    name: format!("$async_stub_{}", idx),
-                    type_idx: 0,
-                    body,
-                    source_component: site.from_component,
-                    source_module: site.from_module,
-                    target_component: site.to_component,
-                    target_module: site.to_module,
-                    target_function: 0,
-                });
+                let adapter = self.generate_async_callback_adapter(site, merged)?;
+                adapters.push(adapter);
                 continue;
             }
             let adapter = self.generate_adapter(

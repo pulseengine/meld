@@ -1173,11 +1173,8 @@ impl Merger {
                 }
 
                 // Check adapter_sites first (cross-component + intra-component adapters).
-                // Skip async-lifted sites — their imports stay unresolved so the
-                // component wrapper can provide them via canon lift/lower.
                 let resolved = graph.adapter_sites.iter().find(|site| {
-                    !site.is_async_lift
-                        && site.from_component == comp_idx
+                    site.from_component == comp_idx
                         && site.from_module == mod_idx
                         && (imp.name == site.import_name || imp.module == site.import_name)
                         && (imp.module == site.import_module || imp.name == site.import_module)
@@ -1664,11 +1661,7 @@ impl Merger {
         for unresolved in &graph.unresolved_imports {
             // Skip imports resolved by adapter sites (must match the
             // filter in compute_unresolved_import_assignments).
-            // Async-lifted sites are excluded — their imports stay unresolved.
             let resolved_by_adapter = graph.adapter_sites.iter().any(|site| {
-                if site.is_async_lift {
-                    return false;
-                }
                 if site.from_component != unresolved.component_idx {
                     return false;
                 }
@@ -2490,7 +2483,7 @@ impl Default for Merger {
 
 /// Pre-compute unresolved import counts and per-import index assignments.
 /// Find the merged memory index for a component's first defined memory.
-fn component_memory_index(merged: &MergedModule, comp_idx: usize) -> u32 {
+pub(crate) fn component_memory_index(merged: &MergedModule, comp_idx: usize) -> u32 {
     for (&(ci, _mi, mem_i), &merged_idx) in &merged.memory_index_map {
         if ci == comp_idx && mem_i == 0 {
             return merged_idx;
@@ -2561,11 +2554,6 @@ fn compute_unresolved_import_assignments(
         // because indirect-table shim modules use synthetic names (module="",
         // field="0") while their display names carry the original interface names.
         let resolved_by_adapter = graph.adapter_sites.iter().any(|site| {
-            // Async-lifted sites are NOT fused — their imports stay unresolved
-            // so the component wrapper handles them via canon lift/lower.
-            if site.is_async_lift {
-                return false;
-            }
             if site.from_component != unresolved.component_idx {
                 return false;
             }
