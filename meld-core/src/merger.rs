@@ -146,6 +146,13 @@ pub struct TaskReturnShimInfo {
     pub shim_func: u32,
     /// Global indices for each result value (in param order)
     pub result_globals: Vec<(u32, ValType)>,
+    /// Source component index
+    pub component_idx: usize,
+    /// Fused import name (e.g., "[task-return]0")
+    pub import_name: String,
+    /// Original function name (e.g., "fibonacci") — extracted from the
+    /// original component's core module import before renumbering.
+    pub original_func_name: String,
 }
 
 /// Per-component resource handle table allocated in a re-exporter's linear memory.

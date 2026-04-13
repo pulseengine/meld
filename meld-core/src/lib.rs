@@ -591,7 +591,7 @@ impl Fuser {
         merged: &mut merger::MergedModule,
         graph: &resolver::DependencyGraph,
     ) -> Result<()> {
-        use std::collections::HashSet;
+        use std::collections::{HashMap, HashSet};
 
         // Collect component indices that have internal async adapter sites
         let async_callee_components: HashSet<usize> = graph
@@ -605,9 +605,40 @@ impl Fuser {
             return Ok(());
         }
 
+        // Build mapping: fused import name → original function name.
+        // The original component's core module has imports like "[task-return]fibonacci".
+        // After fusion, these become "[task-return]2" (renumbered by core_func_idx).
+        // We need the original name to match with async adapter site export names.
+        //
+        // Strategy: for each async callee component, collect the task-return
+        // import names from the ORIGINAL core module (which have function names).
+        // Order matters — the Nth task-return import becomes [task-return]N in
+        // the fused module (via build_canon_import_names).
+        let mut task_return_original_names: HashMap<(usize, usize), String> = HashMap::new();
+        for &comp_idx in &async_callee_components {
+            let component = &self.components[comp_idx];
+            let mut tr_idx = 0usize;
+            for module in &component.core_modules {
+                for module_imp in &module.imports {
+                    if matches!(module_imp.kind, parser::ImportKind::Function(_))
+                        && module_imp.name.starts_with("[task-return]")
+                    {
+                        let func_name = module_imp
+                            .name
+                            .strip_prefix("[task-return]")
+                            .unwrap_or(&module_imp.name)
+                            .to_string();
+                        task_return_original_names.insert((comp_idx, tr_idx), func_name);
+                        tr_idx += 1;
+                    }
+                }
+            }
+        }
+
         // Find task.return imports belonging to async callee components
         // and generate shims for them.
         let mut affected_modules: HashSet<(usize, usize)> = HashSet::new();
+        let mut tr_counter_per_comp: HashMap<usize, usize> = HashMap::new();
 
         for (import_idx, imp) in merged.imports.iter().enumerate() {
             if !imp.name.starts_with("[task-return]") {
@@ -618,6 +649,15 @@ impl Fuser {
                 Some(idx) if async_callee_components.contains(&idx) => idx,
                 _ => continue,
             };
+
+            // Track the task-return index per component to recover the
+            // original function name from the mapping built above.
+            let tr_idx = tr_counter_per_comp.entry(comp_idx).or_insert(0);
+            let original_func_name = task_return_original_names
+                .get(&(comp_idx, *tr_idx))
+                .cloned()
+                .unwrap_or_default();
+            *tr_counter_per_comp.get_mut(&comp_idx).unwrap() += 1;
 
             // Get the import's function type to know the param signature.
             let import_type = match &imp.entity_type {
@@ -715,6 +755,9 @@ impl Fuser {
                 merger::TaskReturnShimInfo {
                     shim_func: shim_func_idx,
                     result_globals,
+                    component_idx: comp_idx,
+                    import_name: imp.name.clone(),
+                    original_func_name: original_func_name.clone(),
                 },
             );
 

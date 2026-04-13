@@ -3410,19 +3410,84 @@ impl FactStyleGenerator {
         //
         // Find the matching shim by looking for task_return_shims entries
         // belonging to the callee component.
-        let shim_info = merged.task_return_shims.values().find(|info| {
-            // Match shim whose result types align with caller's expected results
-            info.result_globals.len() == caller_type.results.len()
-                && info
-                    .result_globals
-                    .iter()
-                    .zip(caller_type.results.iter())
-                    .all(|((_, gt), ct)| gt == ct)
-        });
+        // Match by function name: extract the func name from the
+        // async-lift export name (after the last '#') and find the
+        // shim with the matching original_func_name.
+        let adapter_func_name = site
+            .export_name
+            .rsplit_once('#')
+            .map(|(_, name)| name)
+            .unwrap_or(&site.export_name);
+
+        let shim_info = merged
+            .task_return_shims
+            .values()
+            .find(|info| {
+                info.component_idx == site.to_component
+                    && info.original_func_name == adapter_func_name
+            })
+            .or_else(|| {
+                // Fallback: match by type signature if name matching fails
+                merged.task_return_shims.values().find(|info| {
+                    info.component_idx == site.to_component
+                        && info.result_globals.len() == caller_type.results.len()
+                        && info
+                            .result_globals
+                            .iter()
+                            .zip(caller_type.results.iter())
+                            .all(|((_, gt), ct)| gt == ct)
+                })
+            });
+
+        // Detect retptr convention: caller has more params than callee
+        // and returns void — the last caller param is the result pointer.
+        let uses_retptr = caller_type.results.is_empty() && caller_param_count > callee_param_count;
+        let caller_memory = crate::merger::component_memory_index(merged, site.from_component);
 
         if let Some(info) = shim_info {
-            for (global_idx, _) in &info.result_globals {
-                body.instruction(&Instruction::GlobalGet(*global_idx));
+            if uses_retptr {
+                // Write shim globals to the retptr address in caller memory
+                let retptr_local = (callee_param_count) as u32; // last caller param
+                let mut offset = 0u32;
+                for (global_idx, val_ty) in &info.result_globals {
+                    body.instruction(&Instruction::LocalGet(retptr_local));
+                    body.instruction(&Instruction::GlobalGet(*global_idx));
+                    let mem_arg = wasm_encoder::MemArg {
+                        offset: offset as u64,
+                        align: match val_ty {
+                            wasm_encoder::ValType::I64 | wasm_encoder::ValType::F64 => 3,
+                            _ => 2,
+                        },
+                        memory_index: caller_memory,
+                    };
+                    match val_ty {
+                        wasm_encoder::ValType::I32 => {
+                            body.instruction(&Instruction::I32Store(mem_arg));
+                            offset += 4;
+                        }
+                        wasm_encoder::ValType::I64 => {
+                            body.instruction(&Instruction::I64Store(mem_arg));
+                            offset += 8;
+                        }
+                        wasm_encoder::ValType::F32 => {
+                            body.instruction(&Instruction::F32Store(mem_arg));
+                            offset += 4;
+                        }
+                        wasm_encoder::ValType::F64 => {
+                            body.instruction(&Instruction::F64Store(mem_arg));
+                            offset += 8;
+                        }
+                        _ => {
+                            body.instruction(&Instruction::I32Store(mem_arg));
+                            offset += 4;
+                        }
+                    }
+                }
+            } else {
+                // Push result values onto the stack
+                for (global_idx, _) in &info.result_globals {
+                    body.instruction(&Instruction::GlobalGet(*global_idx));
+                }
             }
         } else {
             // Fallback: return default values if no matching shim found
