@@ -1321,7 +1321,7 @@ impl Merger {
                         );
                         e.insert(import_index);
                     } else {
-                        log::warn!(
+                        log::debug!(
                             "UNMAPPED func import: comp {} mod {} import {}::{}({})",
                             comp_idx,
                             mod_idx,
