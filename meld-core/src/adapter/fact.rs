@@ -3263,6 +3263,15 @@ impl FactStyleGenerator {
         // Find callee's memory index for the event buffer scratch space
         let callee_memory = crate::merger::component_memory_index(merged, site.to_component);
 
+        // Determine the [async-lift] entry's param count from its type.
+        // The caller may have extra params (e.g., retptr for multi-value results)
+        // that shouldn't be passed to the callee.
+        let callee_param_count = merged
+            .defined_func(async_lift_func)
+            .and_then(|f| merged.types.get(f.type_idx as usize))
+            .map(|t| t.params.len())
+            .unwrap_or(caller_param_count);
+
         // Build the adapter function body
         //
         // Locals layout:
@@ -3282,8 +3291,9 @@ impl FactStyleGenerator {
 
         let mut body = Function::new([(6, wasm_encoder::ValType::I32)]);
 
-        // Step 1: Call [async-lift] entry with caller's params
-        for i in 0..caller_param_count {
+        // Step 1: Call [async-lift] entry with callee's params
+        // (skip retptr if caller has more params than callee)
+        for i in 0..callee_param_count {
             body.instruction(&Instruction::LocalGet(i as u32));
         }
         body.instruction(&Instruction::Call(async_lift_func));
@@ -3392,26 +3402,47 @@ impl FactStyleGenerator {
         body.instruction(&Instruction::End); // end loop
         body.instruction(&Instruction::End); // end block
 
-        // Step 3: After EXIT, return result to caller.
-        // For now, return default values. The task-get-result host intrinsic
-        // will be added when we have the host API finalized.
-        // TODO: call [task-get-result]N to retrieve stored result
-        for result_ty in &caller_type.results {
-            match result_ty {
-                wasm_encoder::ValType::I32 => {
-                    body.instruction(&Instruction::I32Const(0));
-                }
-                wasm_encoder::ValType::I64 => {
-                    body.instruction(&Instruction::I64Const(0));
-                }
-                wasm_encoder::ValType::F32 => {
-                    body.instruction(&Instruction::F32Const(0.0_f32.into()));
-                }
-                wasm_encoder::ValType::F64 => {
-                    body.instruction(&Instruction::F64Const(0.0_f64.into()));
-                }
-                _ => {
-                    body.instruction(&Instruction::I32Const(0));
+        // Step 3: After EXIT, read result values from shim globals.
+        //
+        // The task.return shim (generated in step 2.5) stored the result
+        // values to globals when the callee called task.return during the
+        // callback loop. Read them back and return to the caller.
+        //
+        // Find the matching shim by looking for task_return_shims entries
+        // belonging to the callee component.
+        let shim_info = merged.task_return_shims.values().find(|info| {
+            // Match shim whose result types align with caller's expected results
+            info.result_globals.len() == caller_type.results.len()
+                && info
+                    .result_globals
+                    .iter()
+                    .zip(caller_type.results.iter())
+                    .all(|((_, gt), ct)| gt == ct)
+        });
+
+        if let Some(info) = shim_info {
+            for (global_idx, _) in &info.result_globals {
+                body.instruction(&Instruction::GlobalGet(*global_idx));
+            }
+        } else {
+            // Fallback: return default values if no matching shim found
+            for result_ty in &caller_type.results {
+                match result_ty {
+                    wasm_encoder::ValType::I32 => {
+                        body.instruction(&Instruction::I32Const(0));
+                    }
+                    wasm_encoder::ValType::I64 => {
+                        body.instruction(&Instruction::I64Const(0));
+                    }
+                    wasm_encoder::ValType::F32 => {
+                        body.instruction(&Instruction::F32Const(0.0_f32.into()));
+                    }
+                    wasm_encoder::ValType::F64 => {
+                        body.instruction(&Instruction::F64Const(0.0_f64.into()));
+                    }
+                    _ => {
+                        body.instruction(&Instruction::I32Const(0));
+                    }
                 }
             }
         }

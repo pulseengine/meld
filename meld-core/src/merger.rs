@@ -132,6 +132,20 @@ pub struct MergedModule {
 
     /// Per-component handle table info for re-exporters.
     pub handle_tables: HashMap<usize, HandleTableInfo>,
+
+    /// Task.return shim info: maps merged import index of [task-return]N
+    /// to the global indices where the shim stores result values.
+    /// Used by the callback-driving adapter to read results after EXIT.
+    pub task_return_shims: HashMap<u32, TaskReturnShimInfo>,
+}
+
+/// Info about a generated task.return shim function.
+#[derive(Debug, Clone)]
+pub struct TaskReturnShimInfo {
+    /// Merged function index of the shim
+    pub shim_func: u32,
+    /// Global indices for each result value (in param order)
+    pub result_globals: Vec<(u32, ValType)>,
 }
 
 /// Per-component resource handle table allocated in a re-exporter's linear memory.
@@ -594,7 +608,7 @@ impl Merger {
 
     /// Find an existing function type or add a new one, returning its index.
     #[allow(dead_code)]
-    fn find_or_add_type(
+    pub(crate) fn find_or_add_type(
         types: &mut Vec<MergedFuncType>,
         params: &[ValType],
         results: &[ValType],
@@ -661,6 +675,7 @@ impl Merger {
             resource_rep_by_component: HashMap::new(),
             resource_new_by_component: HashMap::new(),
             handle_tables: HashMap::new(),
+            task_return_shims: HashMap::new(),
         };
 
         // Process components in topological order
@@ -2863,6 +2878,7 @@ mod tests {
             resource_rep_by_component: HashMap::new(),
             resource_new_by_component: HashMap::new(),
             handle_tables: HashMap::new(),
+            task_return_shims: HashMap::new(),
         };
 
         // Simulate multi-memory merging for module A (comp 0, mod 0)
