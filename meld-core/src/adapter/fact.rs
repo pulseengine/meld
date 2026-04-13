@@ -3289,7 +3289,8 @@ impl FactStyleGenerator {
         let l_p1 = l_packed + 4;
         let l_p2 = l_packed + 5;
 
-        let mut body = Function::new([(6, wasm_encoder::ValType::I32)]);
+        // 6 locals for callback loop + 3 for string copy (src_ptr, src_len, dst_ptr)
+        let mut body = Function::new([(9, wasm_encoder::ValType::I32)]);
 
         // Step 1: Call [async-lift] entry with callee's params
         // (skip retptr if caller has more params than callee)
@@ -3444,42 +3445,112 @@ impl FactStyleGenerator {
         let uses_retptr = caller_type.results.is_empty() && caller_param_count > callee_param_count;
         let caller_memory = crate::merger::component_memory_index(merged, site.from_component);
 
+        // Find caller's cabi_realloc for cross-memory string copying
+        let caller_realloc = crate::merger::component_realloc_index(merged, site.from_component);
+
         if let Some(info) = shim_info {
             if uses_retptr {
-                // Write shim globals to the retptr address in caller memory
-                let retptr_local = (callee_param_count) as u32; // last caller param
-                let mut offset = 0u32;
-                for (global_idx, val_ty) in &info.result_globals {
-                    body.instruction(&Instruction::LocalGet(retptr_local));
-                    body.instruction(&Instruction::GlobalGet(*global_idx));
-                    let mem_arg = wasm_encoder::MemArg {
-                        offset: offset as u64,
-                        align: match val_ty {
-                            wasm_encoder::ValType::I64 | wasm_encoder::ValType::F64 => 3,
-                            _ => 2,
-                        },
+                // Retptr convention: write results to caller's return area.
+                // For (ptr, len) pairs that reference callee memory, copy
+                // the data to caller memory first.
+                let retptr_local = callee_param_count as u32;
+
+                // Check if this is a pointer pair: exactly 2 i32 globals
+                // and memories differ (cross-memory copy needed).
+                let is_ptr_len_pair = info.result_globals.len() == 2
+                    && info
+                        .result_globals
+                        .iter()
+                        .all(|(_, t)| *t == wasm_encoder::ValType::I32)
+                    && callee_memory != caller_memory
+                    && caller_realloc.is_some();
+
+                if is_ptr_len_pair {
+                    let realloc_func = caller_realloc.unwrap();
+                    let (ptr_global, _) = info.result_globals[0];
+                    let (len_global, _) = info.result_globals[1];
+
+                    // Allocate in caller memory: cabi_realloc(0, 0, 1, len) → new_ptr
+                    // locals: l_packed+6 = src_ptr, l_packed+7 = src_len, l_packed+8 = dst_ptr
+                    let l_src_ptr = l_p2 + 1;
+                    let l_src_len = l_p2 + 2;
+                    let l_dst_ptr = l_p2 + 3;
+
+                    // Read source ptr and len from shim globals
+                    body.instruction(&Instruction::GlobalGet(ptr_global));
+                    body.instruction(&Instruction::LocalSet(l_src_ptr));
+                    body.instruction(&Instruction::GlobalGet(len_global));
+                    body.instruction(&Instruction::LocalSet(l_src_len));
+
+                    // Allocate in caller memory
+                    body.instruction(&Instruction::I32Const(0)); // old_ptr
+                    body.instruction(&Instruction::I32Const(0)); // old_size
+                    body.instruction(&Instruction::I32Const(1)); // align
+                    body.instruction(&Instruction::LocalGet(l_src_len)); // new_size
+                    body.instruction(&Instruction::Call(realloc_func));
+                    body.instruction(&Instruction::LocalSet(l_dst_ptr));
+
+                    // Copy from callee memory to caller memory
+                    body.instruction(&Instruction::LocalGet(l_dst_ptr)); // dst
+                    body.instruction(&Instruction::LocalGet(l_src_ptr)); // src
+                    body.instruction(&Instruction::LocalGet(l_src_len)); // len
+                    body.instruction(&Instruction::MemoryCopy {
+                        dst_mem: caller_memory,
+                        src_mem: callee_memory,
+                    });
+
+                    // Write (new_ptr, len) to retptr
+                    let mem_arg_0 = wasm_encoder::MemArg {
+                        offset: 0,
+                        align: 2,
                         memory_index: caller_memory,
                     };
-                    match val_ty {
-                        wasm_encoder::ValType::I32 => {
-                            body.instruction(&Instruction::I32Store(mem_arg));
-                            offset += 4;
-                        }
-                        wasm_encoder::ValType::I64 => {
-                            body.instruction(&Instruction::I64Store(mem_arg));
-                            offset += 8;
-                        }
-                        wasm_encoder::ValType::F32 => {
-                            body.instruction(&Instruction::F32Store(mem_arg));
-                            offset += 4;
-                        }
-                        wasm_encoder::ValType::F64 => {
-                            body.instruction(&Instruction::F64Store(mem_arg));
-                            offset += 8;
-                        }
-                        _ => {
-                            body.instruction(&Instruction::I32Store(mem_arg));
-                            offset += 4;
+                    let mem_arg_4 = wasm_encoder::MemArg {
+                        offset: 4,
+                        align: 2,
+                        memory_index: caller_memory,
+                    };
+                    body.instruction(&Instruction::LocalGet(retptr_local));
+                    body.instruction(&Instruction::LocalGet(l_dst_ptr));
+                    body.instruction(&Instruction::I32Store(mem_arg_0));
+                    body.instruction(&Instruction::LocalGet(retptr_local));
+                    body.instruction(&Instruction::LocalGet(l_src_len));
+                    body.instruction(&Instruction::I32Store(mem_arg_4));
+                } else {
+                    // Non-pointer results: write globals directly to retptr
+                    let mut offset = 0u32;
+                    for (global_idx, val_ty) in &info.result_globals {
+                        body.instruction(&Instruction::LocalGet(retptr_local));
+                        body.instruction(&Instruction::GlobalGet(*global_idx));
+                        let mem_arg = wasm_encoder::MemArg {
+                            offset: offset as u64,
+                            align: match val_ty {
+                                wasm_encoder::ValType::I64 | wasm_encoder::ValType::F64 => 3,
+                                _ => 2,
+                            },
+                            memory_index: caller_memory,
+                        };
+                        match val_ty {
+                            wasm_encoder::ValType::I32 => {
+                                body.instruction(&Instruction::I32Store(mem_arg));
+                                offset += 4;
+                            }
+                            wasm_encoder::ValType::I64 => {
+                                body.instruction(&Instruction::I64Store(mem_arg));
+                                offset += 8;
+                            }
+                            wasm_encoder::ValType::F32 => {
+                                body.instruction(&Instruction::F32Store(mem_arg));
+                                offset += 4;
+                            }
+                            wasm_encoder::ValType::F64 => {
+                                body.instruction(&Instruction::F64Store(mem_arg));
+                                offset += 8;
+                            }
+                            _ => {
+                                body.instruction(&Instruction::I32Store(mem_arg));
+                                offset += 4;
+                            }
                         }
                     }
                 }
