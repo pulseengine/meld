@@ -3301,6 +3301,14 @@ impl FactStyleGenerator {
             && callee_realloc.is_some();
 
         if has_param_copies {
+            log::debug!(
+                "async adapter param copy: export={} crosses_memory={} positions={:?} callee_mem={} caller_mem={}",
+                site.export_name,
+                site.crosses_memory,
+                site.requirements.pointer_pair_positions,
+                callee_memory,
+                caller_memory,
+            );
             let realloc = callee_realloc.unwrap();
             // For each (ptr, len) pair in the params, allocate in callee
             // memory and copy the data from caller memory.
