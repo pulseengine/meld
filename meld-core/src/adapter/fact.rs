@@ -3511,6 +3511,21 @@ impl FactStyleGenerator {
             .map(|(_, name)| name)
             .unwrap_or(&site.export_name);
 
+        log::debug!(
+            "async adapter shim lookup: func_name='{}' to_comp={} shims={:?}",
+            adapter_func_name,
+            site.to_component,
+            merged
+                .task_return_shims
+                .values()
+                .map(|s| (
+                    s.component_idx,
+                    s.original_func_name.as_str(),
+                    s.result_globals.iter().map(|(g, _)| *g).collect::<Vec<_>>()
+                ))
+                .collect::<Vec<_>>(),
+        );
+
         let shim_info = merged
             .task_return_shims
             .values()

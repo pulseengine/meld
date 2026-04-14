@@ -773,14 +773,17 @@ impl Fuser {
                 },
             );
 
+            let shim = &merged.task_return_shims[&(import_idx as u32)];
             log::info!(
-                "task.return shim: import {} '{}' → shim func {} with {} globals",
+                "task.return shim: import {} '{}' orig='{}' → shim func {} globals {:?}",
                 import_idx,
                 imp.name,
-                shim_func_idx,
-                merged.task_return_shims[&(import_idx as u32)]
-                    .result_globals
-                    .len(),
+                shim.original_func_name,
+                shim.shim_func,
+                shim.result_globals
+                    .iter()
+                    .map(|(g, _)| *g)
+                    .collect::<Vec<_>>(),
             );
         }
 
@@ -819,6 +822,35 @@ impl Fuser {
                     .find(|f| f.origin == (comp_idx, mod_idx, old_func_idx))
                 {
                     mf.body = body;
+                }
+            }
+        }
+
+        // Patch element segments: replace task.return import references
+        // with shim function references. This ensures that indirect calls
+        // through element-segment-initialized tables call the shim instead
+        // of the (stub) import.
+        if !merged.task_return_shims.is_empty() {
+            // Build a map: import merged index → shim func index
+            let mut import_to_shim: HashMap<u32, u32> = HashMap::new();
+            for (import_idx, shim_info) in &merged.task_return_shims {
+                import_to_shim.insert(*import_idx, shim_info.shim_func);
+            }
+
+            for elem in &mut merged.elements {
+                if let crate::segments::ReindexedElementItems::Functions(ref mut indices) =
+                    elem.items
+                {
+                    for idx in indices.iter_mut() {
+                        if let Some(&shim_idx) = import_to_shim.get(idx) {
+                            log::debug!(
+                                "element segment: replaced import {} with shim {}",
+                                idx,
+                                shim_idx,
+                            );
+                            *idx = shim_idx;
+                        }
+                    }
                 }
             }
         }
