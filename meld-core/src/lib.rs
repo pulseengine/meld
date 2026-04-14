@@ -718,8 +718,8 @@ impl Fuser {
                 origin: (comp_idx, 0, u32::MAX),
             });
 
-            // Remap the task.return import to the shim in function_index_map
-            // for all modules of this component
+            // Remap the task.return import to the shim in function_index_map.
+            // Only match direct imports with the fused name.
             let component = &self.components[comp_idx];
             for (mod_idx, module) in component.core_modules.iter().enumerate() {
                 let mut func_idx = 0u32;

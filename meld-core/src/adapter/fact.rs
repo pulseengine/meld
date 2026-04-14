@@ -3260,8 +3260,9 @@ impl FactStyleGenerator {
         let caller_param_count = caller_type.params.len();
         let _caller_result_count = caller_type.results.len();
 
-        // Find callee's memory index for the event buffer scratch space
+        // Find memory indices for cross-memory operations
         let callee_memory = crate::merger::component_memory_index(merged, site.to_component);
+        let caller_memory = crate::merger::component_memory_index(merged, site.from_component);
 
         // Determine the [async-lift] entry's param count from its type.
         // The caller may have extra params (e.g., retptr for multi-value results)
@@ -3289,8 +3290,47 @@ impl FactStyleGenerator {
         let l_p1 = l_packed + 4;
         let l_p2 = l_packed + 5;
 
-        // 6 locals for callback loop + 3 for string copy (src_ptr, src_len, dst_ptr)
-        let mut body = Function::new([(9, wasm_encoder::ValType::I32)]);
+        // 6 locals for callback loop + 4 for string copy (src_ptr, src_len, dst_ptr, new_ptr)
+        let mut body = Function::new([(10, wasm_encoder::ValType::I32)]);
+
+        // Step 0.5: Copy string/list params from caller to callee memory
+        // if the call crosses a memory boundary and has pointer pair params.
+        let callee_realloc = crate::merger::component_realloc_index(merged, site.to_component);
+        let has_param_copies = site.crosses_memory
+            && !site.requirements.pointer_pair_positions.is_empty()
+            && callee_realloc.is_some();
+
+        if has_param_copies {
+            let realloc = callee_realloc.unwrap();
+            // For each (ptr, len) pair in the params, allocate in callee
+            // memory and copy the data from caller memory.
+            for &ptr_pos in &site.requirements.pointer_pair_positions {
+                let ptr_local = ptr_pos;
+                let len_local = ptr_local + 1;
+                let l_new_ptr = l_p2 + 4; // reuse scratch local
+
+                // Allocate in callee memory: cabi_realloc(0, 0, 1, len)
+                body.instruction(&Instruction::I32Const(0));
+                body.instruction(&Instruction::I32Const(0));
+                body.instruction(&Instruction::I32Const(1));
+                body.instruction(&Instruction::LocalGet(len_local));
+                body.instruction(&Instruction::Call(realloc));
+                body.instruction(&Instruction::LocalSet(l_new_ptr));
+
+                // Copy from caller memory to callee memory
+                body.instruction(&Instruction::LocalGet(l_new_ptr)); // dst
+                body.instruction(&Instruction::LocalGet(ptr_local)); // src
+                body.instruction(&Instruction::LocalGet(len_local)); // len
+                body.instruction(&Instruction::MemoryCopy {
+                    dst_mem: callee_memory,
+                    src_mem: caller_memory,
+                });
+
+                // Replace the ptr param with the new callee-memory ptr
+                body.instruction(&Instruction::LocalGet(l_new_ptr));
+                body.instruction(&Instruction::LocalSet(ptr_local));
+            }
+        }
 
         // Step 1: Call [async-lift] entry with callee's params
         // (skip retptr if caller has more params than callee)
@@ -3443,7 +3483,6 @@ impl FactStyleGenerator {
         // Detect retptr convention: caller has more params than callee
         // and returns void — the last caller param is the result pointer.
         let uses_retptr = caller_type.results.is_empty() && caller_param_count > callee_param_count;
-        let caller_memory = crate::merger::component_memory_index(merged, site.from_component);
 
         // Find caller's cabi_realloc for cross-memory string copying
         let caller_realloc = crate::merger::component_realloc_index(merged, site.from_component);
