@@ -459,6 +459,7 @@ fn write_import_map(wasm_bytes: &[u8], path: &str) -> Result<()> {
                         "index": func_index,
                         "module": import.module,
                         "name": import.name,
+                        "kind": classify_import(import.module, import.name),
                     }));
                     func_index += 1;
                 }
@@ -473,33 +474,45 @@ fn write_import_map(wasm_bytes: &[u8], path: &str) -> Result<()> {
     Ok(())
 }
 
-/// Validate WASM bytes
-fn validate_wasm(bytes: &[u8]) -> Result<()> {
-    use wasmparser::{Parser, Payload, Validator};
-
-    let mut validator = Validator::new();
-    let parser = Parser::new(0);
-
-    for payload in parser.parse_all(bytes) {
-        let payload = payload.context("Parse error during validation")?;
-
-        // Validate each payload
-        match &payload {
-            Payload::Version {
-                num,
-                encoding,
-                range,
-            } => {
-                validator
-                    .version(*num, *encoding, range)
-                    .context("Invalid version")?;
-            }
-            _ => {
-                // Other payloads validated through the parser
-            }
-        }
+/// Classify a fused module import by its module/name pattern.
+fn classify_import(module: &str, name: &str) -> &'static str {
+    // Resource operations (can appear under any module)
+    if name.starts_with("[resource-drop]")
+        || name.starts_with("[resource-new]")
+        || name.starts_with("[resource-rep]")
+    {
+        return "resource";
     }
+    // P3 async builtins from $root or [export]$root
+    if (module == "$root" || module == "[export]$root")
+        && (name.starts_with("[task-return]")
+            || name.starts_with("[context-")
+            || name.starts_with("[waitable-")
+            || name.starts_with("[task-cancel]")
+            || name.starts_with("[backpressure-")
+            || name.starts_with("[subtask-"))
+    {
+        return "p3-builtin";
+    }
+    // WASI imports
+    if module.starts_with("wasi:") {
+        return "wasi";
+    }
+    "function"
+}
 
+/// Validate WASM bytes (supports both core modules and components)
+fn validate_wasm(bytes: &[u8]) -> Result<()> {
+    use wasmparser::Validator;
+
+    let features = wasmparser::WasmFeatures::default()
+        | wasmparser::WasmFeatures::COMPONENT_MODEL
+        | wasmparser::WasmFeatures::MULTI_MEMORY
+        | wasmparser::WasmFeatures::CM_ASYNC
+        | wasmparser::WasmFeatures::CM_FIXED_LENGTH_LISTS;
+
+    let mut validator = Validator::new_with_features(features);
+    validator.validate_all(bytes).context("Validation failed")?;
     Ok(())
 }
 

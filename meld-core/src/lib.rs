@@ -279,6 +279,15 @@ impl Fuser {
         stats.total_functions = merged.functions.len();
         stats.total_exports = merged.exports.len();
 
+        // Step 2.5: Generate task.return shims for internal fused async calls.
+        //
+        // For each [task-return]N import used by an internal async callee,
+        // generate a shim that stores result values to globals. The
+        // callback-driving adapter (generated next) reads these globals
+        // after EXIT. Must run BEFORE adapter generation so shim info
+        // is available to the async adapter.
+        self.generate_task_return_shims(&mut merged, &graph)?;
+
         // Step 3: Generate adapters
         log::info!("Generating adapters");
         let adapter_config = AdapterConfig {
@@ -386,9 +395,6 @@ impl Fuser {
         for (adapter_offset, (adapter, site)) in
             adapters.iter().zip(graph.adapter_sites.iter()).enumerate()
         {
-            if site.is_async_lift {
-                continue;
-            }
             if let Some(local_ti) = site.import_func_type_idx
                 && let Some(&caller_ti) =
                     merged
@@ -439,10 +445,6 @@ impl Fuser {
         for (adapter_offset, (adapter, site)) in
             adapters.iter().zip(graph.adapter_sites.iter()).enumerate()
         {
-            // Skip async-lifted sites — their imports stay unresolved.
-            if site.is_async_lift {
-                continue;
-            }
             let target_idx = if let Some(&wrapper_idx) = adapter_to_wrapper.get(&adapter_offset) {
                 wrapper_idx
             } else {
@@ -575,6 +577,239 @@ impl Fuser {
             adapters.len(),
             affected_modules.len()
         );
+
+        Ok(())
+    }
+
+    /// Generate task.return shim functions for internal fused async calls.
+    ///
+    /// For each [task-return]N import used by an internal async callee,
+    /// generates a shim function that stores result params to globals.
+    /// The callback-driving adapter reads these globals after EXIT.
+    fn generate_task_return_shims(
+        &self,
+        merged: &mut merger::MergedModule,
+        graph: &resolver::DependencyGraph,
+    ) -> Result<()> {
+        use std::collections::{HashMap, HashSet};
+
+        // Collect component indices that have internal async adapter sites
+        let async_callee_components: HashSet<usize> = graph
+            .adapter_sites
+            .iter()
+            .filter(|site| site.is_async_lift)
+            .map(|site| site.to_component)
+            .collect();
+
+        if async_callee_components.is_empty() {
+            return Ok(());
+        }
+
+        // Build mapping: fused import name → original function name.
+        // The original component's core module has imports like "[task-return]fibonacci".
+        // After fusion, these become "[task-return]2" (renumbered by core_func_idx).
+        // We need the original name to match with async adapter site export names.
+        //
+        // Strategy: for each async callee component, collect the task-return
+        // import names from the ORIGINAL core module (which have function names).
+        // Order matters — the Nth task-return import becomes [task-return]N in
+        // the fused module (via build_canon_import_names).
+        let mut task_return_original_names: HashMap<(usize, usize), String> = HashMap::new();
+        for &comp_idx in &async_callee_components {
+            let component = &self.components[comp_idx];
+            let mut tr_idx = 0usize;
+            for module in &component.core_modules {
+                for module_imp in &module.imports {
+                    if matches!(module_imp.kind, parser::ImportKind::Function(_))
+                        && module_imp.name.starts_with("[task-return]")
+                    {
+                        let func_name = module_imp
+                            .name
+                            .strip_prefix("[task-return]")
+                            .unwrap_or(&module_imp.name)
+                            .to_string();
+                        task_return_original_names.insert((comp_idx, tr_idx), func_name);
+                        tr_idx += 1;
+                    }
+                }
+            }
+        }
+
+        // Find task.return imports belonging to async callee components
+        // and generate shims for them.
+        let mut affected_modules: HashSet<(usize, usize)> = HashSet::new();
+        let mut tr_counter_per_comp: HashMap<usize, usize> = HashMap::new();
+
+        for (import_idx, imp) in merged.imports.iter().enumerate() {
+            if !imp.name.starts_with("[task-return]") {
+                continue;
+            }
+            // Check if this import belongs to an internal async callee
+            let comp_idx = match imp.component_idx {
+                Some(idx) if async_callee_components.contains(&idx) => idx,
+                _ => continue,
+            };
+
+            // Track the task-return index per component to recover the
+            // original function name from the mapping built above.
+            let tr_idx = tr_counter_per_comp.entry(comp_idx).or_insert(0);
+            let original_func_name = task_return_original_names
+                .get(&(comp_idx, *tr_idx))
+                .cloned()
+                .unwrap_or_default();
+            *tr_counter_per_comp.get_mut(&comp_idx).unwrap() += 1;
+
+            // Get the import's function type to know the param signature.
+            let import_type = match &imp.entity_type {
+                wasm_encoder::EntityType::Function(type_idx) => {
+                    merged.types.get(*type_idx as usize).cloned()
+                }
+                _ => continue,
+            };
+            let import_type = match import_type {
+                Some(t) => t,
+                None => continue,
+            };
+
+            // Generate globals for each param (the result values)
+            let mut result_globals = Vec::new();
+            for param_ty in &import_type.params {
+                let global_idx = merged.import_counts.global + merged.globals.len() as u32;
+                merged.globals.push(merger::MergedGlobal {
+                    ty: wasm_encoder::GlobalType {
+                        val_type: *param_ty,
+                        mutable: true,
+                        shared: false,
+                    },
+                    init_expr: match param_ty {
+                        wasm_encoder::ValType::I32 => wasm_encoder::ConstExpr::i32_const(0),
+                        wasm_encoder::ValType::I64 => wasm_encoder::ConstExpr::i64_const(0),
+                        wasm_encoder::ValType::F32 => {
+                            wasm_encoder::ConstExpr::f32_const(0.0_f32.into())
+                        }
+                        wasm_encoder::ValType::F64 => {
+                            wasm_encoder::ConstExpr::f64_const(0.0_f64.into())
+                        }
+                        _ => wasm_encoder::ConstExpr::i32_const(0),
+                    },
+                });
+                result_globals.push((global_idx, *param_ty));
+            }
+
+            // Generate shim function: stores each param to its global
+            let shim_func_idx = merged.import_counts.func + merged.functions.len() as u32;
+            let _type_idx = import_type.params.len(); // find or create type
+            let shim_type = merger::Merger::find_or_add_type(
+                &mut merged.types,
+                &import_type.params,
+                &[], // void return
+            );
+
+            let mut body = wasm_encoder::Function::new([]);
+            for (i, (global_idx, _)) in result_globals.iter().enumerate() {
+                body.instruction(&wasm_encoder::Instruction::LocalGet(i as u32));
+                body.instruction(&wasm_encoder::Instruction::GlobalSet(*global_idx));
+            }
+            body.instruction(&wasm_encoder::Instruction::End);
+
+            merged.functions.push(merger::MergedFunction {
+                type_idx: shim_type,
+                body,
+                origin: (comp_idx, 0, u32::MAX),
+            });
+
+            // Remap the task.return import to the shim in function_index_map
+            // for all modules of this component
+            let component = &self.components[comp_idx];
+            for (mod_idx, module) in component.core_modules.iter().enumerate() {
+                let mut func_idx = 0u32;
+                for module_imp in &module.imports {
+                    if !matches!(module_imp.kind, parser::ImportKind::Function(_)) {
+                        continue;
+                    }
+                    if module_imp.name == imp.name
+                        || (module_imp.name.starts_with("[task-return]")
+                            && merged
+                                .imports
+                                .get(
+                                    *merged
+                                        .function_index_map
+                                        .get(&(comp_idx, mod_idx, func_idx))
+                                        .unwrap_or(&u32::MAX)
+                                        as usize,
+                                )
+                                .is_some_and(|m| m.name == imp.name))
+                    {
+                        merged
+                            .function_index_map
+                            .insert((comp_idx, mod_idx, func_idx), shim_func_idx);
+                        affected_modules.insert((comp_idx, mod_idx));
+                    }
+                    func_idx += 1;
+                }
+            }
+
+            // Store shim info for the adapter to use
+            merged.task_return_shims.insert(
+                import_idx as u32,
+                merger::TaskReturnShimInfo {
+                    shim_func: shim_func_idx,
+                    result_globals,
+                    component_idx: comp_idx,
+                    import_name: imp.name.clone(),
+                    original_func_name: original_func_name.clone(),
+                },
+            );
+
+            log::info!(
+                "task.return shim: import {} '{}' → shim func {} with {} globals",
+                import_idx,
+                imp.name,
+                shim_func_idx,
+                merged.task_return_shims[&(import_idx as u32)]
+                    .result_globals
+                    .len(),
+            );
+        }
+
+        // Re-rewrite function bodies for affected modules
+        for &(comp_idx, mod_idx) in &affected_modules {
+            let module = &self.components[comp_idx].core_modules[mod_idx];
+            let index_maps = merger::build_index_maps_for_module(
+                comp_idx,
+                mod_idx,
+                module,
+                merged,
+                self.config.memory_strategy,
+                self.config.address_rebasing,
+                0u64,
+                false,
+                None,
+            );
+            let import_func_count = module
+                .imports
+                .iter()
+                .filter(|i| matches!(i.kind, parser::ImportKind::Function(_)))
+                .count() as u32;
+
+            for (old_idx, &type_idx) in module.functions.iter().enumerate() {
+                let old_func_idx = import_func_count + old_idx as u32;
+                let param_count = module
+                    .types
+                    .get(type_idx as usize)
+                    .map(|ty| ty.params.len() as u32)
+                    .unwrap_or(0);
+                let body =
+                    merger::extract_function_body(module, old_idx, param_count, &index_maps)?;
+                if let Some(mf) = merged
+                    .functions
+                    .iter_mut()
+                    .find(|f| f.origin == (comp_idx, mod_idx, old_func_idx))
+                {
+                    mf.body = body;
+                }
+            }
+        }
 
         Ok(())
     }

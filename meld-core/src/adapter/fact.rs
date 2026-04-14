@@ -263,17 +263,27 @@ impl FactStyleGenerator {
             if op.callee_defines_resource {
                 // Callee defines the resource — convert handle→rep.
                 // Skip if upstream adapter already converted (avoids double resource.rep).
-                if !op.caller_already_converted
-                    && let Some(&rep_func) = resource_rep_imports
-                        .get(&(op.import_module.clone(), op.import_field.clone()))
-                {
-                    options
-                        .resource_rep_calls
-                        .push(super::ResourceBorrowTransfer {
-                            param_idx: op.flat_idx,
-                            rep_func,
-                            new_func: None,
+                if !op.caller_already_converted {
+                    // If the caller has a handle table, use ht_rep to extract rep
+                    // from the memory-pointer handle. Otherwise use canonical resource.rep.
+                    let rep_func = merged
+                        .handle_tables
+                        .get(&site.from_component)
+                        .map(|ht| ht.rep_func)
+                        .or_else(|| {
+                            resource_rep_imports
+                                .get(&(op.import_module.clone(), op.import_field.clone()))
+                                .copied()
                         });
+                    if let Some(rep_func) = rep_func {
+                        options
+                            .resource_rep_calls
+                            .push(super::ResourceBorrowTransfer {
+                                param_idx: op.flat_idx,
+                                rep_func,
+                                new_func: None,
+                            });
+                    }
                 }
             } else {
                 // 3-component case: callee doesn't define the resource.
@@ -311,10 +321,18 @@ impl FactStyleGenerator {
                             .map(|(_, &idx)| idx)
                     });
 
+                // For re-exporter callees with handle tables, use ht_new
+                // which returns memory-pointer handles that wit-bindgen expects.
                 let callee_new_func = merged
-                    .resource_new_by_component
-                    .get(&(site.to_component, resource_name.to_string()))
-                    .copied()
+                    .handle_tables
+                    .get(&site.to_component)
+                    .map(|ht| ht.new_func)
+                    .or_else(|| {
+                        merged
+                            .resource_new_by_component
+                            .get(&(site.to_component, resource_name.to_string()))
+                            .copied()
+                    })
                     .or_else(|| {
                         let new_field = op.import_field.replace("[resource-rep]", "[resource-new]");
                         resource_new_imports
@@ -365,12 +383,19 @@ impl FactStyleGenerator {
                         .copied()
                 });
 
-            // Callee's [resource-rep] (callee handle → rep)
+            // Callee's [resource-rep] (callee handle → rep).
+            // For re-exporter callees with handle tables, use ht_rep.
             let rep_field = format!("[resource-rep]{}", resource_name);
             let rep_func = merged
-                .resource_rep_by_component
-                .get(&(site.to_component, resource_name.to_string()))
-                .copied()
+                .handle_tables
+                .get(&site.to_component)
+                .map(|ht| ht.rep_func)
+                .or_else(|| {
+                    merged
+                        .resource_rep_by_component
+                        .get(&(site.to_component, resource_name.to_string()))
+                        .copied()
+                })
                 .or_else(|| {
                     resource_rep_imports
                         .get(&(op.import_module.clone(), rep_field.clone()))
@@ -3163,6 +3188,416 @@ impl FactStyleGenerator {
                 ))
             })
     }
+
+    /// Generate a callback-driving adapter for P3 async cross-component calls.
+    ///
+    /// Instead of canon lift/lower (which triggers call_might_be_recursive),
+    /// the adapter drives the callee's [async-lift] + [callback] loop directly
+    /// in core wasm. The protocol:
+    ///   1. Call [async-lift] entry → packed i32 (EXIT/WAIT/YIELD)
+    ///   2. Loop: poll waitable-set, call [callback] with events
+    ///   3. After EXIT, call [task-get-result] host import for result
+    fn generate_async_callback_adapter(
+        &self,
+        site: &AdapterSite,
+        merged: &MergedModule,
+    ) -> Result<AdapterFunction> {
+        let name = format!(
+            "$async_adapter_{}_to_{}",
+            site.from_component, site.to_component
+        );
+
+        // Find the [async-lift] entry function's merged index
+        let async_lift_func = self.resolve_target_function(site, merged)?;
+
+        // Find the [callback] function's merged index by deriving its export name
+        let callback_export_name = format!("[callback]{}", site.export_name);
+        let callback_func = merged
+            .exports
+            .iter()
+            .find(|e| e.kind == wasm_encoder::ExportKind::Func && e.name == callback_export_name)
+            .map(|e| e.index)
+            .ok_or_else(|| {
+                crate::error::Error::EncodingError(format!(
+                    "async adapter: cannot find callback export '{}' for '{}'",
+                    callback_export_name, site.export_name,
+                ))
+            })?;
+
+        // Find the waitable-set-poll host import. It's an unresolved import
+        // from $root with name [waitable-set-poll] (possibly with $N suffix).
+        let wsp_func = merged
+            .imports
+            .iter()
+            .enumerate()
+            .find(|(_, imp)| imp.name.starts_with("[waitable-set-poll]"))
+            .map(|(i, _)| i as u32)
+            .ok_or_else(|| {
+                crate::error::Error::EncodingError(
+                    "async adapter: cannot find [waitable-set-poll] import".to_string(),
+                )
+            })?;
+
+        // Determine the caller's type (what the caller expects to call)
+        let caller_type_idx = site
+            .import_func_type_idx
+            .and_then(|local_ti| {
+                merged
+                    .type_index_map
+                    .get(&(site.from_component, site.from_module, local_ti))
+                    .copied()
+            })
+            .unwrap_or(0);
+
+        let caller_type = merged
+            .types
+            .get(caller_type_idx as usize)
+            .cloned()
+            .unwrap_or_else(|| crate::merger::MergedFuncType {
+                params: Vec::new(),
+                results: Vec::new(),
+            });
+        let caller_param_count = caller_type.params.len();
+        let _caller_result_count = caller_type.results.len();
+
+        // Find callee's memory index for the event buffer scratch space
+        let callee_memory = crate::merger::component_memory_index(merged, site.to_component);
+
+        // Determine the [async-lift] entry's param count from its type.
+        // The caller may have extra params (e.g., retptr for multi-value results)
+        // that shouldn't be passed to the callee.
+        let callee_param_count = merged
+            .defined_func(async_lift_func)
+            .and_then(|f| merged.types.get(f.type_idx as usize))
+            .map(|t| t.params.len())
+            .unwrap_or(caller_param_count);
+
+        // Build the adapter function body
+        //
+        // Locals layout:
+        //   0..caller_param_count: params from caller
+        //   caller_param_count+0: $packed (i32) — packed return from entry/callback
+        //   caller_param_count+1: $code (i32) — unpacked callback code
+        //   caller_param_count+2: $payload (i32) — unpacked payload (waitable set idx)
+        //   caller_param_count+3: $event_code (i32)
+        //   caller_param_count+4: $p1 (i32)
+        //   caller_param_count+5: $p2 (i32)
+        let l_packed = caller_param_count as u32;
+        let l_code = l_packed + 1;
+        let l_payload = l_packed + 2;
+        let l_event_code = l_packed + 3;
+        let l_p1 = l_packed + 4;
+        let l_p2 = l_packed + 5;
+
+        // 6 locals for callback loop + 3 for string copy (src_ptr, src_len, dst_ptr)
+        let mut body = Function::new([(9, wasm_encoder::ValType::I32)]);
+
+        // Step 1: Call [async-lift] entry with callee's params
+        // (skip retptr if caller has more params than callee)
+        for i in 0..callee_param_count {
+            body.instruction(&Instruction::LocalGet(i as u32));
+        }
+        body.instruction(&Instruction::Call(async_lift_func));
+        body.instruction(&Instruction::LocalSet(l_packed));
+
+        // Unpack: code = packed & 0xF, payload = packed >> 4
+        body.instruction(&Instruction::LocalGet(l_packed));
+        body.instruction(&Instruction::I32Const(0xF));
+        body.instruction(&Instruction::I32And);
+        body.instruction(&Instruction::LocalSet(l_code));
+        body.instruction(&Instruction::LocalGet(l_packed));
+        body.instruction(&Instruction::I32Const(4));
+        body.instruction(&Instruction::I32ShrU);
+        body.instruction(&Instruction::LocalSet(l_payload));
+
+        // Step 2: Callback-driving loop
+        // block $exit
+        //   loop $drive
+        //     if code == EXIT(0): break
+        //     if code == WAIT(2): call waitable-set-poll
+        //     call callback(event_code, p1, p2)
+        //     unpack result
+        //     br $drive
+        //   end
+        // end
+        body.instruction(&Instruction::Block(wasm_encoder::BlockType::Empty));
+        body.instruction(&Instruction::Loop(wasm_encoder::BlockType::Empty));
+
+        // if code == 0 (EXIT): br $exit (block index 1)
+        body.instruction(&Instruction::LocalGet(l_code));
+        body.instruction(&Instruction::I32Eqz);
+        body.instruction(&Instruction::BrIf(1)); // break to $exit block
+
+        // if code == 2 (WAIT): call waitable-set-poll(payload, event_ptr)
+        // Use scratch space at address 0 in callee memory for the 3xi32 event tuple
+        // (This is safe because the callee isn't running — we're driving it)
+        body.instruction(&Instruction::LocalGet(l_code));
+        body.instruction(&Instruction::I32Const(2));
+        body.instruction(&Instruction::I32Eq);
+        body.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+        {
+            // waitable-set-poll(set_handle, event_ptr) → i32
+            body.instruction(&Instruction::LocalGet(l_payload));
+            body.instruction(&Instruction::I32Const(0)); // event result ptr (scratch)
+            body.instruction(&Instruction::Call(wsp_func));
+            body.instruction(&Instruction::Drop); // drop poll return value
+
+            // Read event tuple from scratch memory: [event_code, p1, p2] at addr 0
+            let mem_arg = wasm_encoder::MemArg {
+                offset: 0,
+                align: 2,
+                memory_index: callee_memory,
+            };
+            body.instruction(&Instruction::I32Const(0));
+            body.instruction(&Instruction::I32Load(mem_arg));
+            body.instruction(&Instruction::LocalSet(l_event_code));
+
+            let mem_arg_4 = wasm_encoder::MemArg {
+                offset: 4,
+                align: 2,
+                memory_index: callee_memory,
+            };
+            body.instruction(&Instruction::I32Const(0));
+            body.instruction(&Instruction::I32Load(mem_arg_4));
+            body.instruction(&Instruction::LocalSet(l_p1));
+
+            let mem_arg_8 = wasm_encoder::MemArg {
+                offset: 8,
+                align: 2,
+                memory_index: callee_memory,
+            };
+            body.instruction(&Instruction::I32Const(0));
+            body.instruction(&Instruction::I32Load(mem_arg_8));
+            body.instruction(&Instruction::LocalSet(l_p2));
+        }
+        body.instruction(&Instruction::Else);
+        {
+            // YIELD(1): set event to (NONE, 0, 0)
+            body.instruction(&Instruction::I32Const(0));
+            body.instruction(&Instruction::LocalSet(l_event_code));
+            body.instruction(&Instruction::I32Const(0));
+            body.instruction(&Instruction::LocalSet(l_p1));
+            body.instruction(&Instruction::I32Const(0));
+            body.instruction(&Instruction::LocalSet(l_p2));
+        }
+        body.instruction(&Instruction::End); // end if WAIT/YIELD
+
+        // Call callback(event_code, p1, p2) → packed i32
+        body.instruction(&Instruction::LocalGet(l_event_code));
+        body.instruction(&Instruction::LocalGet(l_p1));
+        body.instruction(&Instruction::LocalGet(l_p2));
+        body.instruction(&Instruction::Call(callback_func));
+        body.instruction(&Instruction::LocalSet(l_packed));
+
+        // Unpack new result
+        body.instruction(&Instruction::LocalGet(l_packed));
+        body.instruction(&Instruction::I32Const(0xF));
+        body.instruction(&Instruction::I32And);
+        body.instruction(&Instruction::LocalSet(l_code));
+        body.instruction(&Instruction::LocalGet(l_packed));
+        body.instruction(&Instruction::I32Const(4));
+        body.instruction(&Instruction::I32ShrU);
+        body.instruction(&Instruction::LocalSet(l_payload));
+
+        body.instruction(&Instruction::Br(0)); // br $drive (loop)
+        body.instruction(&Instruction::End); // end loop
+        body.instruction(&Instruction::End); // end block
+
+        // Step 3: After EXIT, read result values from shim globals.
+        //
+        // The task.return shim (generated in step 2.5) stored the result
+        // values to globals when the callee called task.return during the
+        // callback loop. Read them back and return to the caller.
+        //
+        // Find the matching shim by looking for task_return_shims entries
+        // belonging to the callee component.
+        // Match by function name: extract the func name from the
+        // async-lift export name (after the last '#') and find the
+        // shim with the matching original_func_name.
+        let adapter_func_name = site
+            .export_name
+            .rsplit_once('#')
+            .map(|(_, name)| name)
+            .unwrap_or(&site.export_name);
+
+        let shim_info = merged
+            .task_return_shims
+            .values()
+            .find(|info| {
+                info.component_idx == site.to_component
+                    && info.original_func_name == adapter_func_name
+            })
+            .or_else(|| {
+                // Fallback: match by type signature if name matching fails
+                merged.task_return_shims.values().find(|info| {
+                    info.component_idx == site.to_component
+                        && info.result_globals.len() == caller_type.results.len()
+                        && info
+                            .result_globals
+                            .iter()
+                            .zip(caller_type.results.iter())
+                            .all(|((_, gt), ct)| gt == ct)
+                })
+            });
+
+        // Detect retptr convention: caller has more params than callee
+        // and returns void — the last caller param is the result pointer.
+        let uses_retptr = caller_type.results.is_empty() && caller_param_count > callee_param_count;
+        let caller_memory = crate::merger::component_memory_index(merged, site.from_component);
+
+        // Find caller's cabi_realloc for cross-memory string copying
+        let caller_realloc = crate::merger::component_realloc_index(merged, site.from_component);
+
+        if let Some(info) = shim_info {
+            if uses_retptr {
+                // Retptr convention: write results to caller's return area.
+                // For (ptr, len) pairs that reference callee memory, copy
+                // the data to caller memory first.
+                let retptr_local = callee_param_count as u32;
+
+                // Check if this is a pointer pair: exactly 2 i32 globals
+                // and memories differ (cross-memory copy needed).
+                let is_ptr_len_pair = info.result_globals.len() == 2
+                    && info
+                        .result_globals
+                        .iter()
+                        .all(|(_, t)| *t == wasm_encoder::ValType::I32)
+                    && callee_memory != caller_memory
+                    && caller_realloc.is_some();
+
+                if is_ptr_len_pair {
+                    let realloc_func = caller_realloc.unwrap();
+                    let (ptr_global, _) = info.result_globals[0];
+                    let (len_global, _) = info.result_globals[1];
+
+                    // Allocate in caller memory: cabi_realloc(0, 0, 1, len) → new_ptr
+                    // locals: l_packed+6 = src_ptr, l_packed+7 = src_len, l_packed+8 = dst_ptr
+                    let l_src_ptr = l_p2 + 1;
+                    let l_src_len = l_p2 + 2;
+                    let l_dst_ptr = l_p2 + 3;
+
+                    // Read source ptr and len from shim globals
+                    body.instruction(&Instruction::GlobalGet(ptr_global));
+                    body.instruction(&Instruction::LocalSet(l_src_ptr));
+                    body.instruction(&Instruction::GlobalGet(len_global));
+                    body.instruction(&Instruction::LocalSet(l_src_len));
+
+                    // Allocate in caller memory
+                    body.instruction(&Instruction::I32Const(0)); // old_ptr
+                    body.instruction(&Instruction::I32Const(0)); // old_size
+                    body.instruction(&Instruction::I32Const(1)); // align
+                    body.instruction(&Instruction::LocalGet(l_src_len)); // new_size
+                    body.instruction(&Instruction::Call(realloc_func));
+                    body.instruction(&Instruction::LocalSet(l_dst_ptr));
+
+                    // Copy from callee memory to caller memory
+                    body.instruction(&Instruction::LocalGet(l_dst_ptr)); // dst
+                    body.instruction(&Instruction::LocalGet(l_src_ptr)); // src
+                    body.instruction(&Instruction::LocalGet(l_src_len)); // len
+                    body.instruction(&Instruction::MemoryCopy {
+                        dst_mem: caller_memory,
+                        src_mem: callee_memory,
+                    });
+
+                    // Write (new_ptr, len) to retptr
+                    let mem_arg_0 = wasm_encoder::MemArg {
+                        offset: 0,
+                        align: 2,
+                        memory_index: caller_memory,
+                    };
+                    let mem_arg_4 = wasm_encoder::MemArg {
+                        offset: 4,
+                        align: 2,
+                        memory_index: caller_memory,
+                    };
+                    body.instruction(&Instruction::LocalGet(retptr_local));
+                    body.instruction(&Instruction::LocalGet(l_dst_ptr));
+                    body.instruction(&Instruction::I32Store(mem_arg_0));
+                    body.instruction(&Instruction::LocalGet(retptr_local));
+                    body.instruction(&Instruction::LocalGet(l_src_len));
+                    body.instruction(&Instruction::I32Store(mem_arg_4));
+                } else {
+                    // Non-pointer results: write globals directly to retptr
+                    let mut offset = 0u32;
+                    for (global_idx, val_ty) in &info.result_globals {
+                        body.instruction(&Instruction::LocalGet(retptr_local));
+                        body.instruction(&Instruction::GlobalGet(*global_idx));
+                        let mem_arg = wasm_encoder::MemArg {
+                            offset: offset as u64,
+                            align: match val_ty {
+                                wasm_encoder::ValType::I64 | wasm_encoder::ValType::F64 => 3,
+                                _ => 2,
+                            },
+                            memory_index: caller_memory,
+                        };
+                        match val_ty {
+                            wasm_encoder::ValType::I32 => {
+                                body.instruction(&Instruction::I32Store(mem_arg));
+                                offset += 4;
+                            }
+                            wasm_encoder::ValType::I64 => {
+                                body.instruction(&Instruction::I64Store(mem_arg));
+                                offset += 8;
+                            }
+                            wasm_encoder::ValType::F32 => {
+                                body.instruction(&Instruction::F32Store(mem_arg));
+                                offset += 4;
+                            }
+                            wasm_encoder::ValType::F64 => {
+                                body.instruction(&Instruction::F64Store(mem_arg));
+                                offset += 8;
+                            }
+                            _ => {
+                                body.instruction(&Instruction::I32Store(mem_arg));
+                                offset += 4;
+                            }
+                        }
+                    }
+                }
+            } else {
+                // Push result values onto the stack
+                for (global_idx, _) in &info.result_globals {
+                    body.instruction(&Instruction::GlobalGet(*global_idx));
+                }
+            }
+        } else {
+            // Fallback: return default values if no matching shim found
+            for result_ty in &caller_type.results {
+                match result_ty {
+                    wasm_encoder::ValType::I32 => {
+                        body.instruction(&Instruction::I32Const(0));
+                    }
+                    wasm_encoder::ValType::I64 => {
+                        body.instruction(&Instruction::I64Const(0));
+                    }
+                    wasm_encoder::ValType::F32 => {
+                        body.instruction(&Instruction::F32Const(0.0_f32.into()));
+                    }
+                    wasm_encoder::ValType::F64 => {
+                        body.instruction(&Instruction::F64Const(0.0_f64.into()));
+                    }
+                    _ => {
+                        body.instruction(&Instruction::I32Const(0));
+                    }
+                }
+            }
+        }
+
+        body.instruction(&Instruction::End);
+
+        let target_func = self.resolve_target_function(site, merged)?;
+
+        Ok(AdapterFunction {
+            name,
+            type_idx: caller_type_idx,
+            body,
+            source_component: site.from_component,
+            source_module: site.from_module,
+            target_component: site.to_component,
+            target_module: site.to_module,
+            target_function: target_func,
+        })
+    }
 }
 
 impl AdapterGenerator for FactStyleGenerator {
@@ -3176,22 +3611,8 @@ impl AdapterGenerator for FactStyleGenerator {
 
         for (idx, site) in graph.adapter_sites.iter().enumerate() {
             if site.is_async_lift {
-                // Async adapter sites are preserved as component-level canon
-                // lift/lower pairs. Generate a dummy (unreachable) adapter to
-                // maintain 1:1 correspondence with adapter_sites.
-                let mut body = Function::new([]);
-                body.instruction(&Instruction::Unreachable);
-                body.instruction(&Instruction::End);
-                adapters.push(AdapterFunction {
-                    name: format!("$async_stub_{}", idx),
-                    type_idx: 0,
-                    body,
-                    source_component: site.from_component,
-                    source_module: site.from_module,
-                    target_component: site.to_component,
-                    target_module: site.to_module,
-                    target_function: 0,
-                });
+                let adapter = self.generate_async_callback_adapter(site, merged)?;
+                adapters.push(adapter);
                 continue;
             }
             let adapter = self.generate_adapter(

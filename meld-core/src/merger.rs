@@ -132,6 +132,27 @@ pub struct MergedModule {
 
     /// Per-component handle table info for re-exporters.
     pub handle_tables: HashMap<usize, HandleTableInfo>,
+
+    /// Task.return shim info: maps merged import index of [task-return]N
+    /// to the global indices where the shim stores result values.
+    /// Used by the callback-driving adapter to read results after EXIT.
+    pub task_return_shims: HashMap<u32, TaskReturnShimInfo>,
+}
+
+/// Info about a generated task.return shim function.
+#[derive(Debug, Clone)]
+pub struct TaskReturnShimInfo {
+    /// Merged function index of the shim
+    pub shim_func: u32,
+    /// Global indices for each result value (in param order)
+    pub result_globals: Vec<(u32, ValType)>,
+    /// Source component index
+    pub component_idx: usize,
+    /// Fused import name (e.g., "[task-return]0")
+    pub import_name: String,
+    /// Original function name (e.g., "fibonacci") — extracted from the
+    /// original component's core module import before renumbering.
+    pub original_func_name: String,
 }
 
 /// Per-component resource handle table allocated in a re-exporter's linear memory.
@@ -594,7 +615,7 @@ impl Merger {
 
     /// Find an existing function type or add a new one, returning its index.
     #[allow(dead_code)]
-    fn find_or_add_type(
+    pub(crate) fn find_or_add_type(
         types: &mut Vec<MergedFuncType>,
         params: &[ValType],
         results: &[ValType],
@@ -661,6 +682,7 @@ impl Merger {
             resource_rep_by_component: HashMap::new(),
             resource_new_by_component: HashMap::new(),
             handle_tables: HashMap::new(),
+            task_return_shims: HashMap::new(),
         };
 
         // Process components in topological order
@@ -683,12 +705,97 @@ impl Merger {
         // Handle start functions
         self.resolve_start_functions(components, &mut merged)?;
 
-        // Handle table allocation disabled: with resource-name-only keying,
-        // all components share one canonical resource type per resource name.
-        // The wasmtime runtime manages handle tables — no custom tables needed.
-        // if !graph.reexporter_components.is_empty() {
-        //     Self::allocate_handle_tables(graph, &mut merged)?;
-        // }
+        // Allocate per-component handle tables for re-exporter components.
+        // These are needed for 3-component resource chains where the
+        // re-exporter's wit-bindgen code expects 4-byte-aligned memory
+        // pointers as handles, not sequential canonical ABI handles.
+        if !graph.reexporter_components.is_empty() {
+            Self::allocate_handle_tables(graph, &mut merged)?;
+
+            // Remap re-exporter's resource.rep/new/drop imports to handle table
+            // functions, then re-rewrite affected function bodies so call
+            // instructions pick up the corrected indices.
+            let mut affected_modules: Vec<(usize, usize)> = Vec::new();
+            for (&comp_idx, ht) in &merged.handle_tables {
+                let component = &components[comp_idx];
+                for (mod_idx, module) in component.core_modules.iter().enumerate() {
+                    let mut import_func_idx = 0u32;
+                    let mut changed = false;
+                    for imp in &module.imports {
+                        if !matches!(imp.kind, crate::parser::ImportKind::Function(_)) {
+                            continue;
+                        }
+                        if imp.name.starts_with("[resource-rep]") {
+                            merged
+                                .function_index_map
+                                .insert((comp_idx, mod_idx, import_func_idx), ht.rep_func);
+                            changed = true;
+                        } else if imp.name.starts_with("[resource-new]") {
+                            merged
+                                .function_index_map
+                                .insert((comp_idx, mod_idx, import_func_idx), ht.new_func);
+                            changed = true;
+                        } else if imp.name.starts_with("[resource-drop]") {
+                            merged
+                                .function_index_map
+                                .insert((comp_idx, mod_idx, import_func_idx), ht.drop_func);
+                            changed = true;
+                        }
+                        import_func_idx += 1;
+                    }
+                    if changed {
+                        affected_modules.push((comp_idx, mod_idx));
+                    }
+                }
+            }
+
+            // Re-rewrite function bodies for modules that had resource imports
+            // redirected to handle table functions.
+            for &(comp_idx, mod_idx) in &affected_modules {
+                let module = &components[comp_idx].core_modules[mod_idx];
+                let index_maps = build_index_maps_for_module(
+                    comp_idx,
+                    mod_idx,
+                    module,
+                    &merged,
+                    self.memory_strategy,
+                    false, // address_rebasing
+                    0u64,  // memory_base_offset
+                    false, // memory64
+                    None,  // memory_initial_pages
+                );
+                let import_func_count = module
+                    .imports
+                    .iter()
+                    .filter(|i| matches!(i.kind, ImportKind::Function(_)))
+                    .count() as u32;
+
+                for (old_idx, &type_idx) in module.functions.iter().enumerate() {
+                    let old_func_idx = import_func_count + old_idx as u32;
+                    let param_count = module
+                        .types
+                        .get(type_idx as usize)
+                        .map(|ty| ty.params.len() as u32)
+                        .unwrap_or(0);
+
+                    let body = extract_function_body(module, old_idx, param_count, &index_maps)?;
+
+                    if let Some(mf) = merged
+                        .functions
+                        .iter_mut()
+                        .find(|f| f.origin == (comp_idx, mod_idx, old_func_idx))
+                    {
+                        mf.body = body;
+                    }
+                }
+                log::info!(
+                    "re-rewrote {} functions in component {} module {} for handle table routing",
+                    module.functions.len(),
+                    comp_idx,
+                    mod_idx,
+                );
+            }
+        }
 
         if let Some(plan) = shared_memory_plan {
             if plan.import.is_none() {
@@ -1088,11 +1195,8 @@ impl Merger {
                 }
 
                 // Check adapter_sites first (cross-component + intra-component adapters).
-                // Skip async-lifted sites — their imports stay unresolved so the
-                // component wrapper can provide them via canon lift/lower.
                 let resolved = graph.adapter_sites.iter().find(|site| {
-                    !site.is_async_lift
-                        && site.from_component == comp_idx
+                    site.from_component == comp_idx
                         && site.from_module == mod_idx
                         && (imp.name == site.import_name || imp.module == site.import_name)
                         && (imp.module == site.import_module || imp.name == site.import_module)
@@ -1217,7 +1321,7 @@ impl Merger {
                         );
                         e.insert(import_index);
                     } else {
-                        log::warn!(
+                        log::debug!(
                             "UNMAPPED func import: comp {} mod {} import {}::{}({})",
                             comp_idx,
                             mod_idx,
@@ -1579,11 +1683,7 @@ impl Merger {
         for unresolved in &graph.unresolved_imports {
             // Skip imports resolved by adapter sites (must match the
             // filter in compute_unresolved_import_assignments).
-            // Async-lifted sites are excluded — their imports stay unresolved.
             let resolved_by_adapter = graph.adapter_sites.iter().any(|site| {
-                if site.is_async_lift {
-                    return false;
-                }
                 if site.from_component != unresolved.component_idx {
                     return false;
                 }
@@ -2405,7 +2505,7 @@ impl Default for Merger {
 
 /// Pre-compute unresolved import counts and per-import index assignments.
 /// Find the merged memory index for a component's first defined memory.
-fn component_memory_index(merged: &MergedModule, comp_idx: usize) -> u32 {
+pub(crate) fn component_memory_index(merged: &MergedModule, comp_idx: usize) -> u32 {
     for (&(ci, _mi, mem_i), &merged_idx) in &merged.memory_index_map {
         if ci == comp_idx && mem_i == 0 {
             return merged_idx;
@@ -2415,7 +2515,7 @@ fn component_memory_index(merged: &MergedModule, comp_idx: usize) -> u32 {
 }
 
 /// Find the merged function index of a component's cabi_realloc.
-fn component_realloc_index(merged: &MergedModule, comp_idx: usize) -> Option<u32> {
+pub(crate) fn component_realloc_index(merged: &MergedModule, comp_idx: usize) -> Option<u32> {
     for (&(ci, _mi), &merged_idx) in &merged.realloc_map {
         if ci == comp_idx {
             return Some(merged_idx);
@@ -2476,11 +2576,6 @@ fn compute_unresolved_import_assignments(
         // because indirect-table shim modules use synthetic names (module="",
         // field="0") while their display names carry the original interface names.
         let resolved_by_adapter = graph.adapter_sites.iter().any(|site| {
-            // Async-lifted sites are NOT fused — their imports stay unresolved
-            // so the component wrapper handles them via canon lift/lower.
-            if site.is_async_lift {
-                return false;
-            }
             if site.from_component != unresolved.component_idx {
                 return false;
             }
@@ -2790,6 +2885,7 @@ mod tests {
             resource_rep_by_component: HashMap::new(),
             resource_new_by_component: HashMap::new(),
             handle_tables: HashMap::new(),
+            task_return_shims: HashMap::new(),
         };
 
         // Simulate multi-memory merging for module A (comp 0, mod 0)
