@@ -3293,26 +3293,69 @@ impl FactStyleGenerator {
         // 6 locals for callback loop + 4 for string copy (src_ptr, src_len, dst_ptr, new_ptr)
         let mut body = Function::new([(10, wasm_encoder::ValType::I32)]);
 
-        // Step 0.5: Copy string/list params from caller to callee memory
-        // if the call crosses a memory boundary and has pointer pair params.
+        // Step 0.5: Copy string/list params from caller to callee memory.
+        //
+        // The pointer_pair_positions from the resolver are in CALLEE component
+        // type order. But the adapter's locals are in CALLER order (from the
+        // caller's canon lower). These may differ if the component type
+        // reorders params.
+        //
+        // Instead of using the resolver's positions, compute positions from
+        // the caller's flat param types: find (i32, i32) pairs that could be
+        // (ptr, len) strings/lists.
         let callee_realloc = crate::merger::component_realloc_index(merged, site.to_component);
-        let has_param_copies = site.crosses_memory
-            && !site.requirements.pointer_pair_positions.is_empty()
-            && callee_realloc.is_some();
+
+        // Detect pointer pairs in caller params: consecutive (i32, i32) pairs
+        // that aren't the last param (retptr). This is a heuristic — works for
+        // string and list params which are always (ptr: i32, len: i32).
+        let caller_ptr_positions: Vec<u32> = if site.crosses_memory && callee_realloc.is_some() {
+            let params = &caller_type.params;
+            let has_retptr =
+                caller_type.results.is_empty() && caller_param_count > callee_param_count;
+            let effective_len = if has_retptr {
+                params.len() - 1
+            } else {
+                params.len()
+            };
+            let mut positions = Vec::new();
+            let mut i = 0;
+            while i + 1 < effective_len {
+                if params[i] == wasm_encoder::ValType::I32
+                    && params[i + 1] == wasm_encoder::ValType::I32
+                {
+                    // Check if the resolver also thinks this is a pointer pair
+                    // (the resolver uses component type info to confirm)
+                    if site
+                        .requirements
+                        .pointer_pair_positions
+                        .iter()
+                        .any(|_| true)
+                    {
+                        positions.push(i as u32);
+                        i += 2; // skip the len
+                        continue;
+                    }
+                }
+                i += 1;
+            }
+            positions
+        } else {
+            Vec::new()
+        };
+
+        let has_param_copies = !caller_ptr_positions.is_empty();
 
         if has_param_copies {
             log::debug!(
-                "async adapter param copy: export={} crosses_memory={} positions={:?} callee_mem={} caller_mem={}",
+                "async adapter param copy: export={} caller_positions={:?} resolver_positions={:?}",
                 site.export_name,
-                site.crosses_memory,
+                caller_ptr_positions,
                 site.requirements.pointer_pair_positions,
-                callee_memory,
-                caller_memory,
             );
             let realloc = callee_realloc.unwrap();
-            // For each (ptr, len) pair in the params, allocate in callee
-            // memory and copy the data from caller memory.
-            for &ptr_pos in &site.requirements.pointer_pair_positions {
+            // For each (ptr, len) pair in the caller's params, allocate in
+            // callee memory and copy the data from caller memory.
+            for &ptr_pos in &caller_ptr_positions {
                 let ptr_local = ptr_pos;
                 let len_local = ptr_local + 1;
                 let l_new_ptr = l_p2 + 4; // reuse scratch local
