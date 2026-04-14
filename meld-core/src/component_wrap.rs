@@ -1337,6 +1337,28 @@ fn assemble_component(
             }
 
             ImportResolution::TaskBuiltin { op } => {
+                // Check if this task.return has a shim export in the fused module.
+                // If so, alias the shim instead of using canonical task.return.
+                if let P3BuiltinOp::TaskReturn { .. } = op {
+                    let shim_name = format!("$task_return_shim_{}", i);
+                    let has_shim = fused_info
+                        .exports
+                        .iter()
+                        .any(|(n, k, _)| *k == wasmparser::ExternalKind::Func && *n == shim_name);
+                    if has_shim {
+                        let mut alias_section = ComponentAliasSection::new();
+                        alias_section.alias(Alias::CoreInstanceExport {
+                            instance: fused_instance,
+                            kind: ExportKind::Func,
+                            name: &shim_name,
+                        });
+                        component.section(&alias_section);
+                        lowered_func_indices.push(core_func_idx);
+                        core_func_idx += 1;
+                        continue;
+                    }
+                }
+
                 let mut canon = CanonicalFunctionSection::new();
                 match op {
                     P3BuiltinOp::TaskReturn {

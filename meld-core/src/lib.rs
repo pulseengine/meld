@@ -718,6 +718,14 @@ impl Fuser {
                 origin: (comp_idx, 0, u32::MAX),
             });
 
+            // Export the shim so the component wrapper can alias it
+            // instead of using canonical task.return.
+            merged.exports.push(merger::MergedExport {
+                name: format!("$task_return_shim_{}", import_idx),
+                kind: wasm_encoder::ExportKind::Func,
+                index: shim_func_idx,
+            });
+
             // Remap the task.return import to the shim in function_index_map.
             // Only match direct imports with the fused name.
             let component = &self.components[comp_idx];

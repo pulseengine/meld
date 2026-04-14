@@ -2516,6 +2516,11 @@ pub(crate) fn component_memory_index(merged: &MergedModule, comp_idx: usize) -> 
 
 /// Find the merged function index of a component's cabi_realloc.
 pub(crate) fn component_realloc_index(merged: &MergedModule, comp_idx: usize) -> Option<u32> {
+    // Prefer module 0's realloc (the main module)
+    if let Some(&idx) = merged.realloc_map.get(&(comp_idx, 0)) {
+        return Some(idx);
+    }
+    // Fallback: any module's realloc for this component
     for (&(ci, _mi), &merged_idx) in &merged.realloc_map {
         if ci == comp_idx {
             return Some(merged_idx);
