@@ -757,6 +757,10 @@ impl Fuser {
                 }
             }
 
+            // Note: intra-component forwarding functions (call_indirect table[N])
+            // for this task.return are handled by the component wrapper, which
+            // provides the shim export ($task_return_shim_N) as the table entry.
+
             // Store shim info for the adapter to use
             merged.task_return_shims.insert(
                 import_idx as u32,
