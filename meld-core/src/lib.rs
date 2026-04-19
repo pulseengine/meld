@@ -605,32 +605,46 @@ impl Fuser {
             return Ok(());
         }
 
-        // Build mapping: fused import name → original function name.
-        // The original component's core module has imports like "[task-return]fibonacci".
-        // After fusion, these become "[task-return]2" (renumbered by core_func_idx).
-        // We need the original name to match with async adapter site export names.
-        //
-        // Strategy: for each async callee component, collect the task-return
-        // import names from the ORIGINAL core module (which have function names).
-        // Order matters — the Nth task-return import becomes [task-return]N in
-        // the fused module (via build_canon_import_names).
-        let mut task_return_original_names: HashMap<(usize, usize), String> = HashMap::new();
+        // Build mapping: (component_idx, func_name) → element segment position.
+        // The main module (mod 0) has task-return imports in a specific order.
+        // The forwarding module mirrors this order. The element segment at
+        // position N has the merged import for the Nth task-return function.
+        // We track positions (among task-return imports only) so we can later
+        // match shim globals to adapter functions.
+        // Build mapping: (comp_idx, func_name) → element segment position.
+        // Only count task-return imports that are resolved INTRA-COMPONENT
+        // (forwarding). Directly-resolved imports don't go through element
+        // segments and are handled by the name-based fallback.
+        let mut func_name_to_elem_position: HashMap<(usize, String), usize> = HashMap::new();
         for &comp_idx in &async_callee_components {
             let component = &self.components[comp_idx];
-            let mut tr_idx = 0usize;
-            for module in &component.core_modules {
+            if let Some(module) = component.core_modules.first() {
+                let mut elem_position = 0usize;
+                let mut func_idx = 0u32;
                 for module_imp in &module.imports {
-                    if matches!(module_imp.kind, parser::ImportKind::Function(_))
-                        && module_imp.name.starts_with("[task-return]")
-                    {
-                        let func_name = module_imp
-                            .name
-                            .strip_prefix("[task-return]")
-                            .unwrap_or(&module_imp.name)
-                            .to_string();
-                        task_return_original_names.insert((comp_idx, tr_idx), func_name);
-                        tr_idx += 1;
+                    if !matches!(module_imp.kind, parser::ImportKind::Function(_)) {
+                        continue;
                     }
+                    if module_imp.name.starts_with("[task-return]") {
+                        // Check if this import is resolved intra-component
+                        // (goes to a forwarding function, not a merged import)
+                        let is_forwarding = merged
+                            .function_index_map
+                            .get(&(comp_idx, 0, func_idx))
+                            .map(|&idx| idx >= merged.import_counts.func)
+                            .unwrap_or(false);
+
+                        if is_forwarding {
+                            let func_name = module_imp
+                                .name
+                                .strip_prefix("[task-return]")
+                                .unwrap_or(&module_imp.name)
+                                .to_string();
+                            func_name_to_elem_position.insert((comp_idx, func_name), elem_position);
+                            elem_position += 1;
+                        }
+                    }
+                    func_idx += 1;
                 }
             }
         }
@@ -638,7 +652,6 @@ impl Fuser {
         // Find task.return imports belonging to async callee components
         // and generate shims for them.
         let mut affected_modules: HashSet<(usize, usize)> = HashSet::new();
-        let mut tr_counter_per_comp: HashMap<usize, usize> = HashMap::new();
 
         for (import_idx, imp) in merged.imports.iter().enumerate() {
             if !imp.name.starts_with("[task-return]") {
@@ -650,14 +663,31 @@ impl Fuser {
                 _ => continue,
             };
 
-            // Track the task-return index per component to recover the
-            // original function name from the mapping built above.
-            let tr_idx = tr_counter_per_comp.entry(comp_idx).or_insert(0);
-            let original_func_name = task_return_original_names
-                .get(&(comp_idx, *tr_idx))
-                .cloned()
-                .unwrap_or_default();
-            *tr_counter_per_comp.get_mut(&comp_idx).unwrap() += 1;
+            // Extract original function name from the component's main
+            // module imports. This is needed for the adapter's fallback
+            // name-based matching (for components without forwarding modules).
+            let mut original_func_name = imp.name.clone();
+            let component = &self.components[comp_idx];
+            if let Some(module) = component.core_modules.first() {
+                let mut fidx = 0u32;
+                for mimp in &module.imports {
+                    if !matches!(mimp.kind, parser::ImportKind::Function(_)) {
+                        continue;
+                    }
+                    if mimp.name.starts_with("[task-return]")
+                        && let Some(&merged_idx) =
+                            merged.function_index_map.get(&(comp_idx, 0, fidx))
+                        && merged_idx == import_idx as u32
+                    {
+                        original_func_name = mimp
+                            .name
+                            .strip_prefix("[task-return]")
+                            .unwrap_or(&mimp.name)
+                            .to_string();
+                    }
+                    fidx += 1;
+                }
+            }
 
             // Get the import's function type to know the param signature.
             let import_type = match &imp.entity_type {
@@ -853,6 +883,55 @@ impl Fuser {
                     }
                 }
             }
+
+            // Build async_result_globals: (comp_idx, func_name) → globals.
+            // For each func_name, find its element segment position, look up
+            // the shim function at that position, and get its globals.
+            let shim_func_to_globals: HashMap<u32, Vec<(u32, wasm_encoder::ValType)>> = merged
+                .task_return_shims
+                .values()
+                .map(|s| (s.shim_func, s.result_globals.clone()))
+                .collect();
+
+            for ((comp_idx, func_name), elem_pos) in &func_name_to_elem_position {
+                // Find the component's $imports table index.
+                // The forwarding module (typically mod 2) defines the table.
+                // Look up via table_index_map.
+                let comp_tables: HashSet<u32> = merged
+                    .table_index_map
+                    .iter()
+                    .filter(|&(&(ci, _, _), _)| ci == *comp_idx)
+                    .map(|(_, &idx)| idx)
+                    .collect();
+
+                // Find the element segment for this component's table
+                for elem in &merged.elements {
+                    let elem_table = match &elem.mode {
+                        crate::segments::ElementSegmentMode::Active { table_index, .. } => {
+                            *table_index
+                        }
+                        _ => continue,
+                    };
+                    if !comp_tables.contains(&elem_table) {
+                        continue;
+                    }
+                    if let crate::segments::ReindexedElementItems::Functions(ref indices) =
+                        elem.items
+                        && let Some(func_idx) = indices.get(*elem_pos)
+                        && let Some(globals) = shim_func_to_globals.get(func_idx)
+                    {
+                        merged
+                            .async_result_globals
+                            .insert((*comp_idx, func_name.clone()), globals.clone());
+                        break;
+                    }
+                }
+            }
+            log::info!(
+                "async_result_globals: {} entries: {:?}",
+                merged.async_result_globals.len(),
+                merged.async_result_globals.keys().collect::<Vec<_>>(),
+            );
         }
 
         Ok(())

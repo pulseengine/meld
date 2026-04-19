@@ -3511,40 +3511,33 @@ impl FactStyleGenerator {
             .map(|(_, name)| name)
             .unwrap_or(&site.export_name);
 
-        log::debug!(
-            "async adapter shim lookup: func_name='{}' to_comp={} shims={:?}",
-            adapter_func_name,
-            site.to_component,
+        // Look up result globals. First try element-segment-based mapping
+        // (correct for components with forwarding modules), then fall back
+        // to name-based matching (for direct task.return calls).
+        let result_globals_direct = merged
+            .async_result_globals
+            .get(&(site.to_component, adapter_func_name.to_string()));
+
+        let shim_info = if let Some(globals) = result_globals_direct {
+            Some(crate::merger::TaskReturnShimInfo {
+                shim_func: 0,
+                result_globals: globals.clone(),
+                component_idx: site.to_component,
+                import_name: String::new(),
+                original_func_name: adapter_func_name.to_string(),
+            })
+        } else {
+            // Fallback: match by component + original function name
             merged
                 .task_return_shims
                 .values()
-                .map(|s| (
-                    s.component_idx,
-                    s.original_func_name.as_str(),
-                    s.result_globals.iter().map(|(g, _)| *g).collect::<Vec<_>>()
-                ))
-                .collect::<Vec<_>>(),
-        );
-
-        let shim_info = merged
-            .task_return_shims
-            .values()
-            .find(|info| {
-                info.component_idx == site.to_component
-                    && info.original_func_name == adapter_func_name
-            })
-            .or_else(|| {
-                // Fallback: match by type signature if name matching fails
-                merged.task_return_shims.values().find(|info| {
+                .find(|info| {
                     info.component_idx == site.to_component
-                        && info.result_globals.len() == caller_type.results.len()
-                        && info
-                            .result_globals
-                            .iter()
-                            .zip(caller_type.results.iter())
-                            .all(|((_, gt), ct)| gt == ct)
+                        && info.original_func_name == adapter_func_name
                 })
-            });
+                .cloned()
+        };
+        let shim_info = shim_info.as_ref();
 
         // Detect retptr convention: caller has more params than callee
         // and returns void — the last caller param is the result pointer.

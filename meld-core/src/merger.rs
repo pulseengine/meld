@@ -137,6 +137,10 @@ pub struct MergedModule {
     /// to the global indices where the shim stores result values.
     /// Used by the callback-driving adapter to read results after EXIT.
     pub task_return_shims: HashMap<u32, TaskReturnShimInfo>,
+
+    /// Maps (component_idx, func_name) → shim globals for async result delivery.
+    /// Built after element segment patching. Used by the callback-driving adapter.
+    pub async_result_globals: HashMap<(usize, String), Vec<(u32, ValType)>>,
 }
 
 /// Info about a generated task.return shim function.
@@ -683,6 +687,7 @@ impl Merger {
             resource_new_by_component: HashMap::new(),
             handle_tables: HashMap::new(),
             task_return_shims: HashMap::new(),
+            async_result_globals: HashMap::new(),
         };
 
         // Process components in topological order
@@ -1041,11 +1046,20 @@ impl Merger {
         // Merge tables (defined tables only; imported tables handled below)
         let table_offset = merged.tables.len() as u32;
         for (old_idx, table) in module.tables.iter().enumerate() {
+            let old_table_idx = import_table_count + old_idx as u32;
             let new_idx = merged.import_counts.table + table_offset + old_idx as u32;
-            merged.table_index_map.insert(
-                (comp_idx, mod_idx, import_table_count + old_idx as u32),
+            log::debug!(
+                "table defined: ({},{},{}) → {} (offset={}, import_count={})",
+                comp_idx,
+                mod_idx,
+                old_table_idx,
                 new_idx,
+                table_offset,
+                merged.import_counts.table,
             );
+            merged
+                .table_index_map
+                .insert((comp_idx, mod_idx, old_table_idx), new_idx);
             merged.tables.push(convert_table_type(table));
         }
 
@@ -2891,6 +2905,7 @@ mod tests {
             resource_new_by_component: HashMap::new(),
             handle_tables: HashMap::new(),
             task_return_shims: HashMap::new(),
+            async_result_globals: HashMap::new(),
         };
 
         // Simulate multi-memory merging for module A (comp 0, mod 0)
