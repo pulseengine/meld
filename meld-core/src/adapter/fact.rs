@@ -132,11 +132,11 @@ fn cabi_size_align(ty: &crate::parser::ComponentValType) -> (u32, u32) {
 /// the (ptr, len) header. Nested lists/records recurse. Other field types
 /// are left as-is (already byte-copied).
 #[allow(clippy::too_many_arguments)]
-#[allow(dead_code)]
 fn emit_patch_nested_indirections(
     body: &mut Function,
     elem_ty: &crate::parser::ComponentValType,
     l_dst_ptr: u32,
+    l_callee_src: u32,
     l_src_len: u32,
     elem_size: u32,
     l_first_scratch: u32,
@@ -151,15 +151,17 @@ fn emit_patch_nested_indirections(
 
     // Locals (caller has reserved scratch starting at l_first_scratch):
     //   l_i        = element index counter
-    //   l_rec_dst  = caller-side pointer to current record (dst memory)
-    //   l_old_ptr  = old src ptr read from header
-    //   l_buf_len  = byte count to copy (len * sub-element size)
+    //   l_rec_dst  = caller-side pointer to current record
+    //   l_rec_src  = callee-side pointer to current record (read source)
+    //   l_old_ptr  = original src ptr (callee address)
+    //   l_buf_len  = byte count to copy
     //   l_new_ptr  = freshly allocated caller buffer
     let l_i = l_first_scratch;
     let l_rec_dst = l_first_scratch + 1;
     let l_old_ptr = l_first_scratch + 2;
     let l_buf_len = l_first_scratch + 3;
     let l_new_ptr = l_first_scratch + 4;
+    let l_rec_src = l_first_scratch + 5;
 
     // i = 0
     body.instruction(&Instruction::I32Const(0));
@@ -184,30 +186,61 @@ fn emit_patch_nested_indirections(
     body.instruction(&Instruction::I32Add);
     body.instruction(&Instruction::LocalSet(l_rec_dst));
 
+    // rec_src = l_callee_src + i * elem_size (in callee memory)
+    body.instruction(&Instruction::LocalGet(l_callee_src));
+    body.instruction(&Instruction::LocalGet(l_i));
+    if elem_size != 1 {
+        body.instruction(&Instruction::I32Const(elem_size as i32));
+        body.instruction(&Instruction::I32Mul);
+    }
+    body.instruction(&Instruction::I32Add);
+    body.instruction(&Instruction::LocalSet(l_rec_src));
+
     for (offset, sub_elem_size) in &indirections {
-        // old_ptr = caller_mem.load(rec_dst + offset)
-        let mem_arg_ptr = wasm_encoder::MemArg {
+        let dst_mem_arg_ptr = wasm_encoder::MemArg {
             offset: *offset as u64,
             align: 2,
             memory_index: caller_memory,
         };
-        let mem_arg_len = wasm_encoder::MemArg {
+        let src_mem_arg_ptr = wasm_encoder::MemArg {
+            offset: *offset as u64,
+            align: 2,
+            memory_index: callee_memory,
+        };
+        let src_mem_arg_len = wasm_encoder::MemArg {
             offset: (*offset + 4) as u64,
             align: 2,
-            memory_index: caller_memory,
+            memory_index: callee_memory,
         };
-        body.instruction(&Instruction::LocalGet(l_rec_dst));
-        body.instruction(&Instruction::I32Load(mem_arg_ptr));
+
+        // Read original (ptr, len) DIRECTLY from callee memory at rec_src.
+        body.instruction(&Instruction::LocalGet(l_rec_src));
+        body.instruction(&Instruction::I32Load(src_mem_arg_ptr));
         body.instruction(&Instruction::LocalSet(l_old_ptr));
 
-        // buf_len = caller_mem.load(rec_dst + offset+4) * sub_elem_size
-        body.instruction(&Instruction::LocalGet(l_rec_dst));
-        body.instruction(&Instruction::I32Load(mem_arg_len));
+        body.instruction(&Instruction::LocalGet(l_rec_src));
+        body.instruction(&Instruction::I32Load(src_mem_arg_len));
         if *sub_elem_size != 1 {
             body.instruction(&Instruction::I32Const(*sub_elem_size as i32));
             body.instruction(&Instruction::I32Mul);
         }
         body.instruction(&Instruction::LocalSet(l_buf_len));
+
+        // Skip the patch if (old_ptr, buf_len) doesn't lie inside the
+        // callee's current linear memory. The memory.copy would otherwise
+        // trap and unwind the whole call. With the skip, frequencies-style
+        // calls return a list whose string pointers still reference the
+        // callee — the runner then panics when it tries to dereference,
+        // but at least the trap path is observable and recoverable.
+        body.instruction(&Instruction::Block(wasm_encoder::BlockType::Empty));
+        body.instruction(&Instruction::LocalGet(l_old_ptr));
+        body.instruction(&Instruction::LocalGet(l_buf_len));
+        body.instruction(&Instruction::I32Add);
+        body.instruction(&Instruction::MemorySize(callee_memory));
+        body.instruction(&Instruction::I32Const(16));
+        body.instruction(&Instruction::I32Shl);
+        body.instruction(&Instruction::I32GtU);
+        body.instruction(&Instruction::BrIf(0));
 
         // new_ptr = realloc(0, 0, 1, buf_len)
         body.instruction(&Instruction::I32Const(0));
@@ -226,10 +259,11 @@ fn emit_patch_nested_indirections(
             src_mem: callee_memory,
         });
 
-        // caller_mem.store(rec_dst + offset, new_ptr)
         body.instruction(&Instruction::LocalGet(l_rec_dst));
         body.instruction(&Instruction::LocalGet(l_new_ptr));
-        body.instruction(&Instruction::I32Store(mem_arg_ptr));
+        body.instruction(&Instruction::I32Store(dst_mem_arg_ptr));
+
+        body.instruction(&Instruction::End); // end sanity block
     }
 
     // i++
@@ -3534,8 +3568,8 @@ impl FactStyleGenerator {
         let l_p2 = l_packed + 5;
 
         // 6 locals for callback loop + 4 for string copy (src_ptr, src_len, dst_ptr, new_ptr)
-        // + 5 for nested indirection patching (i, rec_dst, old_ptr, buf_len, new_ptr)
-        let mut body = Function::new([(15, wasm_encoder::ValType::I32)]);
+        // + 6 for nested indirection patching (i, rec_dst, old_ptr, buf_len, new_ptr, rec_src)
+        let mut body = Function::new([(16, wasm_encoder::ValType::I32)]);
 
         // Step 0.5: Copy string/list params from caller to callee memory.
         //
@@ -3888,25 +3922,19 @@ impl FactStyleGenerator {
                     // (string fields, nested lists), walk each element and
                     // copy each indirect buffer into caller memory, then
                     // patch the (ptr, len) pair stored in the copied record.
-                    //
-                    // NOTE: this patching is currently disabled for nested
-                    // record types — the inner cross-memory string copy
-                    // hits an OOB trap that needs more investigation. With
-                    // patching disabled, calls returning list<record-with-
-                    // string> (e.g., word-frequencies) panic in the runner
-                    // when it tries to dereference unpatched callee pointers.
-                    // Lists of plain types (list<u32>, etc.) do not need
-                    // patching and work correctly via the bulk copy alone.
                     if let Some(elem_ty) = &list_elem_ty {
-                        let indirections = collect_indirections(elem_ty, 0);
-                        if indirections.is_empty() {
-                            // No indirections: bulk copy is sufficient.
-                        } else {
-                            // TODO(#NN): nested patching traps OOB on inner
-                            // memory.copy. Disable until root cause found.
-                            let _ = (l_dst_ptr, elem_size, realloc_func);
-                            let _ = emit_patch_nested_indirections;
-                        }
+                        emit_patch_nested_indirections(
+                            &mut body,
+                            elem_ty,
+                            l_dst_ptr,
+                            l_src_ptr,
+                            l_src_len,
+                            elem_size,
+                            l_p2 + 5,
+                            realloc_func,
+                            caller_memory,
+                            callee_memory,
+                        );
                     }
 
                     // Write (new_ptr, len) to retptr
