@@ -605,6 +605,102 @@ impl Fuser {
             return Ok(());
         }
 
+        // For each async callee component, build:
+        //   - name_to_result: function name → result type (via Lifts)
+        //   - taskreturn_types: ordered list of resolved TaskReturn result
+        //     types (used for greedy ordered claiming when name matching
+        //     fails for shims whose original_func_name couldn't be recovered)
+        let mut comp_func_result_types: HashMap<usize, HashMap<String, parser::ComponentValType>> =
+            HashMap::new();
+        let mut comp_taskreturn_types: HashMap<usize, Vec<parser::ComponentValType>> =
+            HashMap::new();
+        for &comp_idx in &async_callee_components {
+            let comp = &self.components[comp_idx];
+            let mut name_to_result: HashMap<String, parser::ComponentValType> = HashMap::new();
+
+            // Build core_func_index → result type from canonical Lift entries.
+            let mut core_func_to_result: HashMap<u32, parser::ComponentValType> = HashMap::new();
+            for entry in &comp.canonical_functions {
+                if let parser::CanonicalEntry::Lift {
+                    core_func_index,
+                    type_index,
+                    ..
+                } = entry
+                    && let Some(td) = comp.get_type_definition(*type_index)
+                    && let parser::ComponentTypeKind::Function { results, .. } = &td.kind
+                    && let Some((_, ty)) = results.first()
+                {
+                    core_func_to_result.insert(
+                        *core_func_index,
+                        component_wrap::resolve_component_val_type(ty, comp),
+                    );
+                }
+            }
+
+            // Build component-level core func index → core export name.
+            // Walk core_entity_order: each CoreAlias of a Function export
+            // bumps the component core func counter and records the name.
+            // CanonicalFunction entries also bump the counter (with no name).
+            let mut comp_corefn_to_name: HashMap<u32, String> = HashMap::new();
+            let mut corefn_idx = 0u32;
+            for def in &comp.core_entity_order {
+                match def {
+                    parser::CoreEntityDef::CoreAlias(alias_idx) => {
+                        if let Some(parser::ComponentAliasEntry::CoreInstanceExport {
+                            kind: wasmparser::ExternalKind::Func,
+                            name,
+                            ..
+                        }) = comp.component_aliases.get(*alias_idx)
+                        {
+                            comp_corefn_to_name.insert(corefn_idx, name.clone());
+                            corefn_idx += 1;
+                        }
+                    }
+                    parser::CoreEntityDef::CanonicalFunction(canon_idx) => {
+                        if let Some(entry) = comp.canonical_functions.get(*canon_idx)
+                            && !matches!(entry, parser::CanonicalEntry::Lift { .. })
+                        {
+                            corefn_idx += 1;
+                        }
+                    }
+                }
+            }
+
+            // For each Lift, look up the alias name and extract the function
+            // name from `[async-lift]<iface>#<func>` (or just `[async-lift]<func>`).
+            for entry in &comp.canonical_functions {
+                if let parser::CanonicalEntry::Lift {
+                    core_func_index, ..
+                } = entry
+                    && let Some(name) = comp_corefn_to_name.get(core_func_index)
+                    && let Some(rest) = name.strip_prefix("[async-lift]")
+                    && let Some(rt) = core_func_to_result.get(core_func_index)
+                {
+                    let func_name = rest.rsplit_once('#').map(|(_, n)| n).unwrap_or(rest);
+                    name_to_result.insert(func_name.to_string(), rt.clone());
+                }
+            }
+            // Collect ordered TaskReturn types for greedy claiming fallback.
+            let tr_types: Vec<parser::ComponentValType> = comp
+                .canonical_functions
+                .iter()
+                .filter_map(|entry| match entry {
+                    parser::CanonicalEntry::TaskReturn {
+                        result: Some(t), ..
+                    } => Some(component_wrap::resolve_component_val_type(t, comp)),
+                    _ => None,
+                })
+                .collect();
+            comp_taskreturn_types.insert(comp_idx, tr_types);
+
+            log::debug!(
+                "comp {} async-result name→type entries: {}",
+                comp_idx,
+                name_to_result.len()
+            );
+            comp_func_result_types.insert(comp_idx, name_to_result);
+        }
+
         // Build mapping: (component_idx, func_name) → element segment position.
         // The main module (mod 0) has task-return imports in a specific order.
         // The forwarding module mirrors this order. The element segment at
@@ -652,6 +748,9 @@ impl Fuser {
         // Find task.return imports belonging to async callee components
         // and generate shims for them.
         let mut affected_modules: HashSet<(usize, usize)> = HashSet::new();
+        // Per-component cursor into comp_taskreturn_types — advances each
+        // time we need to claim a TaskReturn entry by ordered position.
+        let mut comp_tr_cursor: HashMap<usize, usize> = HashMap::new();
 
         for (import_idx, imp) in merged.imports.iter().enumerate() {
             if !imp.name.starts_with("[task-return]") {
@@ -663,9 +762,18 @@ impl Fuser {
                 _ => continue,
             };
 
-            // Extract original function name from the component's main
-            // module imports. This is needed for the adapter's fallback
-            // name-based matching (for components without forwarding modules).
+            // Extract original function name from the source core module's
+            // `[task-return]<name>` import, used for the adapter's name-based
+            // shim matching and for result-type resolution below.
+            //
+            // The merged FUNCTION index for this import is its position
+            // among function imports in `merged.imports`, NOT its position
+            // in the imports vector overall. Compute it by counting only
+            // function imports up to import_idx.
+            let merged_func_idx = merged.imports[..import_idx]
+                .iter()
+                .filter(|i| matches!(i.entity_type, wasm_encoder::EntityType::Function(_)))
+                .count() as u32;
             let mut original_func_name = imp.name.clone();
             let component = &self.components[comp_idx];
             if let Some(module) = component.core_modules.first() {
@@ -675,9 +783,8 @@ impl Fuser {
                         continue;
                     }
                     if mimp.name.starts_with("[task-return]")
-                        && let Some(&merged_idx) =
-                            merged.function_index_map.get(&(comp_idx, 0, fidx))
-                        && merged_idx == import_idx as u32
+                        && merged.function_index_map.get(&(comp_idx, 0, fidx)).copied()
+                            == Some(merged_func_idx)
                     {
                         original_func_name = mimp
                             .name
@@ -791,6 +898,45 @@ impl Fuser {
             // for this task.return are handled by the component wrapper, which
             // provides the shim export ($task_return_shim_N) as the table entry.
 
+            // Find the WIT result type by matching CanonicalEntry::TaskReturn
+            // entries from the source component against the import's flat
+            // core params. Without this, the adapter treats the result as
+            // opaque bytes and can't compute correct sizes for typed lists.
+            // Resolve result type. First try by name lookup (works for
+            // shims whose source core import was directly mapped to a
+            // merged import). Fall back to ordered claim from the source
+            // component's TaskReturn entries — pick the next entry whose
+            // flat shape matches the import. Greedy ordering gives a
+            // stable per-component pairing for the typical case where
+            // the merger generates shims in source canonical order.
+            let mut result_type = comp_func_result_types
+                .get(&comp_idx)
+                .and_then(|m| m.get(&original_func_name))
+                .cloned();
+            if result_type.is_none()
+                && let Some(tr_list) = comp_taskreturn_types.get(&comp_idx)
+            {
+                let comp = &self.components[comp_idx];
+                let cursor = comp_tr_cursor.entry(comp_idx).or_insert(0);
+                while *cursor < tr_list.len() {
+                    let candidate = &tr_list[*cursor];
+                    *cursor += 1;
+                    let flat =
+                        component_wrap::flat_task_return_params_resolved(Some(candidate), comp);
+                    if flat == import_type.params {
+                        result_type = Some(candidate.clone());
+                        break;
+                    }
+                }
+            }
+            log::debug!(
+                "task.return shim {} '{}' orig='{}' typed={}",
+                import_idx,
+                imp.name,
+                original_func_name,
+                result_type.is_some()
+            );
+
             // Store shim info for the adapter to use
             merged.task_return_shims.insert(
                 import_idx as u32,
@@ -800,6 +946,7 @@ impl Fuser {
                     component_idx: comp_idx,
                     import_name: imp.name.clone(),
                     original_func_name: original_func_name.clone(),
+                    result_type,
                 },
             );
 

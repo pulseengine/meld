@@ -42,6 +42,249 @@ fn alignment_for_encoding(encoding: StringEncoding) -> i32 {
 
 /// Build a lookup from `(module, field)` → merged function index for resource imports.
 ///
+/// Compute Canonical ABI (size, alignment) in bytes for a component value type.
+///
+/// Per Component Model Canonical ABI spec, every type has a fixed lowered
+/// memory layout. List/string lower to a (ptr, len) pair (8 bytes, align 4).
+/// Records pad each field to its alignment, then pad the whole record to
+/// its max field alignment. We use this to compute typed byte counts when
+/// copying lists across component memories.
+///
+/// Assumes `Type(idx)` references have already been resolved (see
+/// `component_wrap::resolve_component_val_type`). Unresolved Type/handle
+/// references fall back to a 4-byte handle-sized layout.
+fn cabi_size_align(ty: &crate::parser::ComponentValType) -> (u32, u32) {
+    use crate::parser::{ComponentValType as CVT, PrimitiveValType as P};
+    fn align_up(n: u32, a: u32) -> u32 {
+        (n + a - 1) & !(a - 1)
+    }
+    match ty {
+        CVT::Primitive(p) => match p {
+            P::Bool | P::S8 | P::U8 => (1, 1),
+            P::S16 | P::U16 => (2, 2),
+            P::S32 | P::U32 | P::F32 | P::Char => (4, 4),
+            P::S64 | P::U64 | P::F64 => (8, 8),
+        },
+        CVT::String => (8, 4),
+        CVT::List(_) => (8, 4),
+        CVT::FixedSizeList(elem, n) => {
+            let (es, ea) = cabi_size_align(elem);
+            (es * n, ea)
+        }
+        CVT::Record(fields) => {
+            let mut size = 0u32;
+            let mut align = 1u32;
+            for (_, fty) in fields {
+                let (fs, fa) = cabi_size_align(fty);
+                size = align_up(size, fa);
+                size += fs;
+                align = align.max(fa);
+            }
+            (align_up(size, align), align)
+        }
+        CVT::Tuple(elems) => {
+            let mut size = 0u32;
+            let mut align = 1u32;
+            for ety in elems {
+                let (es, ea) = cabi_size_align(ety);
+                size = align_up(size, ea);
+                size += es;
+                align = align.max(ea);
+            }
+            (align_up(size, align), align)
+        }
+        CVT::Option(inner) => {
+            let (is, ia) = cabi_size_align(inner);
+            let align = ia.max(1);
+            let body = align_up(1, align) + is;
+            (align_up(body, align), align)
+        }
+        CVT::Result { ok, err } => {
+            let (os, oa) = ok.as_ref().map(|t| cabi_size_align(t)).unwrap_or((0, 1));
+            let (es, ea) = err.as_ref().map(|t| cabi_size_align(t)).unwrap_or((0, 1));
+            let align = oa.max(ea).max(1);
+            let body = align_up(1, align) + os.max(es);
+            (align_up(body, align), align)
+        }
+        CVT::Variant(cases) => {
+            let mut max_size = 0u32;
+            let mut align = 1u32;
+            for (_, case_ty) in cases {
+                if let Some(ct) = case_ty {
+                    let (cs, ca) = cabi_size_align(ct);
+                    max_size = max_size.max(cs);
+                    align = align.max(ca);
+                }
+            }
+            let body = align_up(1, align) + max_size;
+            (align_up(body, align), align)
+        }
+        CVT::Own(_) | CVT::Borrow(_) | CVT::Type(_) => (4, 4),
+    }
+}
+
+/// Walk each element of a copied list and recursively patch up nested
+/// (ptr, len) pairs that still point into callee memory. Allocates fresh
+/// caller-side buffers, copies bytes across, and writes back the new ptr.
+///
+/// For frequencies-style `list<{ string, u32 }>` this scans each 12-byte
+/// record, copies the string at offset 0 into caller memory, and overwrites
+/// the (ptr, len) header. Nested lists/records recurse. Other field types
+/// are left as-is (already byte-copied).
+#[allow(clippy::too_many_arguments)]
+#[allow(dead_code)]
+fn emit_patch_nested_indirections(
+    body: &mut Function,
+    elem_ty: &crate::parser::ComponentValType,
+    l_dst_ptr: u32,
+    l_src_len: u32,
+    elem_size: u32,
+    l_first_scratch: u32,
+    realloc_func: u32,
+    caller_memory: u32,
+    callee_memory: u32,
+) {
+    let indirections = collect_indirections(elem_ty, 0);
+    if indirections.is_empty() {
+        return;
+    }
+
+    // Locals (caller has reserved scratch starting at l_first_scratch):
+    //   l_i        = element index counter
+    //   l_rec_dst  = caller-side pointer to current record (dst memory)
+    //   l_old_ptr  = old src ptr read from header
+    //   l_buf_len  = byte count to copy (len * sub-element size)
+    //   l_new_ptr  = freshly allocated caller buffer
+    let l_i = l_first_scratch;
+    let l_rec_dst = l_first_scratch + 1;
+    let l_old_ptr = l_first_scratch + 2;
+    let l_buf_len = l_first_scratch + 3;
+    let l_new_ptr = l_first_scratch + 4;
+
+    // i = 0
+    body.instruction(&Instruction::I32Const(0));
+    body.instruction(&Instruction::LocalSet(l_i));
+
+    body.instruction(&Instruction::Block(wasm_encoder::BlockType::Empty));
+    body.instruction(&Instruction::Loop(wasm_encoder::BlockType::Empty));
+
+    // if i >= len break
+    body.instruction(&Instruction::LocalGet(l_i));
+    body.instruction(&Instruction::LocalGet(l_src_len));
+    body.instruction(&Instruction::I32GeU);
+    body.instruction(&Instruction::BrIf(1));
+
+    // rec_dst = l_dst_ptr + i * elem_size
+    body.instruction(&Instruction::LocalGet(l_dst_ptr));
+    body.instruction(&Instruction::LocalGet(l_i));
+    if elem_size != 1 {
+        body.instruction(&Instruction::I32Const(elem_size as i32));
+        body.instruction(&Instruction::I32Mul);
+    }
+    body.instruction(&Instruction::I32Add);
+    body.instruction(&Instruction::LocalSet(l_rec_dst));
+
+    for (offset, sub_elem_size) in &indirections {
+        // old_ptr = caller_mem.load(rec_dst + offset)
+        let mem_arg_ptr = wasm_encoder::MemArg {
+            offset: *offset as u64,
+            align: 2,
+            memory_index: caller_memory,
+        };
+        let mem_arg_len = wasm_encoder::MemArg {
+            offset: (*offset + 4) as u64,
+            align: 2,
+            memory_index: caller_memory,
+        };
+        body.instruction(&Instruction::LocalGet(l_rec_dst));
+        body.instruction(&Instruction::I32Load(mem_arg_ptr));
+        body.instruction(&Instruction::LocalSet(l_old_ptr));
+
+        // buf_len = caller_mem.load(rec_dst + offset+4) * sub_elem_size
+        body.instruction(&Instruction::LocalGet(l_rec_dst));
+        body.instruction(&Instruction::I32Load(mem_arg_len));
+        if *sub_elem_size != 1 {
+            body.instruction(&Instruction::I32Const(*sub_elem_size as i32));
+            body.instruction(&Instruction::I32Mul);
+        }
+        body.instruction(&Instruction::LocalSet(l_buf_len));
+
+        // new_ptr = realloc(0, 0, 1, buf_len)
+        body.instruction(&Instruction::I32Const(0));
+        body.instruction(&Instruction::I32Const(0));
+        body.instruction(&Instruction::I32Const(1));
+        body.instruction(&Instruction::LocalGet(l_buf_len));
+        body.instruction(&Instruction::Call(realloc_func));
+        body.instruction(&Instruction::LocalSet(l_new_ptr));
+
+        // memory.copy new_ptr <- old_ptr (cross memory)
+        body.instruction(&Instruction::LocalGet(l_new_ptr));
+        body.instruction(&Instruction::LocalGet(l_old_ptr));
+        body.instruction(&Instruction::LocalGet(l_buf_len));
+        body.instruction(&Instruction::MemoryCopy {
+            dst_mem: caller_memory,
+            src_mem: callee_memory,
+        });
+
+        // caller_mem.store(rec_dst + offset, new_ptr)
+        body.instruction(&Instruction::LocalGet(l_rec_dst));
+        body.instruction(&Instruction::LocalGet(l_new_ptr));
+        body.instruction(&Instruction::I32Store(mem_arg_ptr));
+    }
+
+    // i++
+    body.instruction(&Instruction::LocalGet(l_i));
+    body.instruction(&Instruction::I32Const(1));
+    body.instruction(&Instruction::I32Add);
+    body.instruction(&Instruction::LocalSet(l_i));
+    body.instruction(&Instruction::Br(0));
+
+    body.instruction(&Instruction::End); // end loop
+    body.instruction(&Instruction::End); // end block
+}
+
+/// For a given element type, find every field offset that holds a (ptr, len)
+/// pair that needs cross-memory copying (currently strings and nested lists).
+/// Returns `(byte_offset_within_element, sub_element_size_in_bytes)`.
+fn collect_indirections(ty: &crate::parser::ComponentValType, base_offset: u32) -> Vec<(u32, u32)> {
+    use crate::parser::ComponentValType as CVT;
+    fn align_up(n: u32, a: u32) -> u32 {
+        (n + a - 1) & !(a - 1)
+    }
+    let mut out = Vec::new();
+    match ty {
+        CVT::String => out.push((base_offset, 1)),
+        CVT::List(elem) => {
+            let (es, _) = cabi_size_align(elem);
+            out.push((base_offset, es));
+        }
+        CVT::Record(fields) => {
+            let mut off = 0u32;
+            for (_, fty) in fields {
+                let (fs, fa) = cabi_size_align(fty);
+                off = align_up(off, fa);
+                out.extend(collect_indirections(fty, base_offset + off));
+                off += fs;
+            }
+        }
+        CVT::Tuple(elems) => {
+            let mut off = 0u32;
+            for ety in elems {
+                let (es, ea) = cabi_size_align(ety);
+                off = align_up(off, ea);
+                out.extend(collect_indirections(ety, base_offset + off));
+                off += es;
+            }
+        }
+        // Option/Result/Variant: indirections inside payloads are skipped
+        // for now — supporting them needs reading the discriminant before
+        // walking the body. Keep behaviour conservative until a test case
+        // exercises the path.
+        _ => {}
+    }
+    out
+}
+
 /// Scans the merged module's imports to find `[resource-rep]` and `[resource-new]`
 /// function imports and records their merged function indices.
 type ResourceImportMap = std::collections::HashMap<(String, String), u32>;
@@ -3291,7 +3534,8 @@ impl FactStyleGenerator {
         let l_p2 = l_packed + 5;
 
         // 6 locals for callback loop + 4 for string copy (src_ptr, src_len, dst_ptr, new_ptr)
-        let mut body = Function::new([(10, wasm_encoder::ValType::I32)]);
+        // + 5 for nested indirection patching (i, rec_dst, old_ptr, buf_len, new_ptr)
+        let mut body = Function::new([(15, wasm_encoder::ValType::I32)]);
 
         // Step 0.5: Copy string/list params from caller to callee memory.
         //
@@ -3519,12 +3763,23 @@ impl FactStyleGenerator {
             .get(&(site.to_component, adapter_func_name.to_string()));
 
         let shim_info = if let Some(globals) = result_globals_direct {
+            // Recover the WIT result_type from the underlying shim. The
+            // direct-globals lookup gives us per-(component, func) globals;
+            // find the source shim by matching globals to get its type info.
+            let result_type = merged
+                .task_return_shims
+                .values()
+                .find(|info| {
+                    info.component_idx == site.to_component && info.result_globals == *globals
+                })
+                .and_then(|info| info.result_type.clone());
             Some(crate::merger::TaskReturnShimInfo {
                 shim_func: 0,
                 result_globals: globals.clone(),
                 component_idx: site.to_component,
                 import_name: String::new(),
                 original_func_name: adapter_func_name.to_string(),
+                result_type,
             })
         } else {
             // Fallback: match by component + original function name
@@ -3545,6 +3800,15 @@ impl FactStyleGenerator {
 
         // Find caller's cabi_realloc for cross-memory string copying
         let caller_realloc = crate::merger::component_realloc_index(merged, site.from_component);
+        log::debug!(
+            "async adapter '{}' from={} to={} caller_realloc={:?} callee_mem={} caller_mem={}",
+            adapter_func_name,
+            site.from_component,
+            site.to_component,
+            caller_realloc,
+            callee_memory,
+            caller_memory,
+        );
 
         if let Some(info) = shim_info {
             if uses_retptr {
@@ -3568,11 +3832,26 @@ impl FactStyleGenerator {
                     let (ptr_global, _) = info.result_globals[0];
                     let (len_global, _) = info.result_globals[1];
 
-                    // Allocate in caller memory: cabi_realloc(0, 0, 1, len) → new_ptr
-                    // locals: l_packed+6 = src_ptr, l_packed+7 = src_len, l_packed+8 = dst_ptr
+                    // Determine the per-element byte size and alignment from
+                    // the WIT result type. For string the element is 1 byte;
+                    // for list<u32> it's 4; for list<record{...}> it's the
+                    // record's CABI size (with internal alignment padding).
+                    // Without a known type we fall back to 1 (string-like).
+                    let (elem_size, elem_align, list_elem_ty) = match &info.result_type {
+                        Some(crate::parser::ComponentValType::List(elem))
+                        | Some(crate::parser::ComponentValType::FixedSizeList(elem, _)) => {
+                            let (s, a) = cabi_size_align(elem);
+                            (s, a, Some(elem.as_ref().clone()))
+                        }
+                        Some(crate::parser::ComponentValType::String) => (1, 1, None),
+                        _ => (1, 1, None),
+                    };
+
+                    // locals
                     let l_src_ptr = l_p2 + 1;
                     let l_src_len = l_p2 + 2;
                     let l_dst_ptr = l_p2 + 3;
+                    let l_byte_count = l_p2 + 4;
 
                     // Read source ptr and len from shim globals
                     body.instruction(&Instruction::GlobalGet(ptr_global));
@@ -3580,22 +3859,55 @@ impl FactStyleGenerator {
                     body.instruction(&Instruction::GlobalGet(len_global));
                     body.instruction(&Instruction::LocalSet(l_src_len));
 
-                    // Allocate in caller memory
+                    // byte_count = len * elem_size
+                    body.instruction(&Instruction::LocalGet(l_src_len));
+                    if elem_size != 1 {
+                        body.instruction(&Instruction::I32Const(elem_size as i32));
+                        body.instruction(&Instruction::I32Mul);
+                    }
+                    body.instruction(&Instruction::LocalSet(l_byte_count));
+
+                    // Allocate in caller memory: cabi_realloc(0, 0, align, byte_count)
                     body.instruction(&Instruction::I32Const(0)); // old_ptr
                     body.instruction(&Instruction::I32Const(0)); // old_size
-                    body.instruction(&Instruction::I32Const(1)); // align
-                    body.instruction(&Instruction::LocalGet(l_src_len)); // new_size
+                    body.instruction(&Instruction::I32Const(elem_align as i32));
+                    body.instruction(&Instruction::LocalGet(l_byte_count));
                     body.instruction(&Instruction::Call(realloc_func));
                     body.instruction(&Instruction::LocalSet(l_dst_ptr));
 
                     // Copy from callee memory to caller memory
-                    body.instruction(&Instruction::LocalGet(l_dst_ptr)); // dst
-                    body.instruction(&Instruction::LocalGet(l_src_ptr)); // src
-                    body.instruction(&Instruction::LocalGet(l_src_len)); // len
+                    body.instruction(&Instruction::LocalGet(l_dst_ptr));
+                    body.instruction(&Instruction::LocalGet(l_src_ptr));
+                    body.instruction(&Instruction::LocalGet(l_byte_count));
                     body.instruction(&Instruction::MemoryCopy {
                         dst_mem: caller_memory,
                         src_mem: callee_memory,
                     });
+
+                    // If the list element contains nested indirections
+                    // (string fields, nested lists), walk each element and
+                    // copy each indirect buffer into caller memory, then
+                    // patch the (ptr, len) pair stored in the copied record.
+                    //
+                    // NOTE: this patching is currently disabled for nested
+                    // record types — the inner cross-memory string copy
+                    // hits an OOB trap that needs more investigation. With
+                    // patching disabled, calls returning list<record-with-
+                    // string> (e.g., word-frequencies) panic in the runner
+                    // when it tries to dereference unpatched callee pointers.
+                    // Lists of plain types (list<u32>, etc.) do not need
+                    // patching and work correctly via the bulk copy alone.
+                    if let Some(elem_ty) = &list_elem_ty {
+                        let indirections = collect_indirections(elem_ty, 0);
+                        if indirections.is_empty() {
+                            // No indirections: bulk copy is sufficient.
+                        } else {
+                            // TODO(#NN): nested patching traps OOB on inner
+                            // memory.copy. Disable until root cause found.
+                            let _ = (l_dst_ptr, elem_size, realloc_func);
+                            let _ = emit_patch_nested_indirections;
+                        }
+                    }
 
                     // Write (new_ptr, len) to retptr
                     let mem_arg_0 = wasm_encoder::MemArg {

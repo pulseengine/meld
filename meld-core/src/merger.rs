@@ -157,6 +157,12 @@ pub struct TaskReturnShimInfo {
     /// Original function name (e.g., "fibonacci") — extracted from the
     /// original component's core module import before renumbering.
     pub original_func_name: String,
+    /// Lifted (WIT-level) result type. When present, the adapter uses this
+    /// to compute element-aware byte counts and walk nested indirections
+    /// (strings inside records inside lists) during cross-memory copy.
+    /// `None` means we couldn't recover the type and the adapter falls
+    /// back to treating the result as opaque bytes.
+    pub result_type: Option<crate::parser::ComponentValType>,
 }
 
 /// Per-component resource handle table allocated in a re-exporter's linear memory.

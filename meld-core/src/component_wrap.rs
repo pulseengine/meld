@@ -2128,11 +2128,74 @@ fn find_task_return_for_import(
     None
 }
 
+/// Recursively resolve all `Type(idx)` references in a `ComponentValType`,
+/// inlining the referenced definition. Returns a self-contained type tree
+/// that does not depend on the source component's type table.
+///
+/// Used when storing typed result info for the adapter to use later, since
+/// the adapter only sees the merged module and not the source components.
+pub(crate) fn resolve_component_val_type(
+    ty: &parser::ComponentValType,
+    comp: &ParsedComponent,
+) -> parser::ComponentValType {
+    use parser::ComponentValType as CVT;
+    match ty {
+        CVT::Type(idx) => {
+            if let Some(td) = comp.get_type_definition(*idx) {
+                if let parser::ComponentTypeKind::Defined(inner) = &td.kind {
+                    resolve_component_val_type(inner, comp)
+                } else {
+                    ty.clone()
+                }
+            } else {
+                ty.clone()
+            }
+        }
+        CVT::List(inner) => CVT::List(Box::new(resolve_component_val_type(inner, comp))),
+        CVT::FixedSizeList(inner, n) => {
+            CVT::FixedSizeList(Box::new(resolve_component_val_type(inner, comp)), *n)
+        }
+        CVT::Record(fields) => CVT::Record(
+            fields
+                .iter()
+                .map(|(n, t)| (n.clone(), resolve_component_val_type(t, comp)))
+                .collect(),
+        ),
+        CVT::Tuple(elems) => CVT::Tuple(
+            elems
+                .iter()
+                .map(|t| resolve_component_val_type(t, comp))
+                .collect(),
+        ),
+        CVT::Option(inner) => CVT::Option(Box::new(resolve_component_val_type(inner, comp))),
+        CVT::Result { ok, err } => CVT::Result {
+            ok: ok
+                .as_ref()
+                .map(|t| Box::new(resolve_component_val_type(t, comp))),
+            err: err
+                .as_ref()
+                .map(|t| Box::new(resolve_component_val_type(t, comp))),
+        },
+        CVT::Variant(cases) => CVT::Variant(
+            cases
+                .iter()
+                .map(|(n, t)| {
+                    (
+                        n.clone(),
+                        t.as_ref().map(|t| resolve_component_val_type(t, comp)),
+                    )
+                })
+                .collect(),
+        ),
+        CVT::Primitive(_) | CVT::String | CVT::Own(_) | CVT::Borrow(_) => ty.clone(),
+    }
+}
+
 /// Compute flat task.return params with Type(idx) resolution.
 ///
 /// Unlike `flat_task_return_params`, this version resolves `Type(idx)`
 /// references using the component's type definitions.
-fn flat_task_return_params_resolved(
+pub(crate) fn flat_task_return_params_resolved(
     result: Option<&parser::ComponentValType>,
     comp: &ParsedComponent,
 ) -> Vec<wasm_encoder::ValType> {
