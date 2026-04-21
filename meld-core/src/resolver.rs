@@ -2316,6 +2316,15 @@ impl Resolver {
                                             }
                                             requirements.pointer_pair_positions = to_component
                                                 .pointer_pair_param_positions(comp_params);
+                                            log::debug!(
+                                                "pointer_pair_positions for {}: {:?} (comp_params={:?})",
+                                                *func_name,
+                                                requirements.pointer_pair_positions,
+                                                comp_params
+                                                    .iter()
+                                                    .map(|(n, t)| (n.as_str(), format!("{:?}", t)))
+                                                    .collect::<Vec<_>>(),
+                                            );
                                             requirements.result_pointer_pair_offsets =
                                                 to_component.pointer_pair_result_offsets(results);
                                             // Compute copy layouts for each pointer pair

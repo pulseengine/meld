@@ -605,32 +605,142 @@ impl Fuser {
             return Ok(());
         }
 
-        // Build mapping: fused import name → original function name.
-        // The original component's core module has imports like "[task-return]fibonacci".
-        // After fusion, these become "[task-return]2" (renumbered by core_func_idx).
-        // We need the original name to match with async adapter site export names.
-        //
-        // Strategy: for each async callee component, collect the task-return
-        // import names from the ORIGINAL core module (which have function names).
-        // Order matters — the Nth task-return import becomes [task-return]N in
-        // the fused module (via build_canon_import_names).
-        let mut task_return_original_names: HashMap<(usize, usize), String> = HashMap::new();
+        // For each async callee component, build:
+        //   - name_to_result: function name → result type (via Lifts)
+        //   - taskreturn_types: ordered list of resolved TaskReturn result
+        //     types (used for greedy ordered claiming when name matching
+        //     fails for shims whose original_func_name couldn't be recovered)
+        let mut comp_func_result_types: HashMap<usize, HashMap<String, parser::ComponentValType>> =
+            HashMap::new();
+        let mut comp_taskreturn_types: HashMap<usize, Vec<parser::ComponentValType>> =
+            HashMap::new();
+        for &comp_idx in &async_callee_components {
+            let comp = &self.components[comp_idx];
+            let mut name_to_result: HashMap<String, parser::ComponentValType> = HashMap::new();
+
+            // Build core_func_index → result type from canonical Lift entries.
+            let mut core_func_to_result: HashMap<u32, parser::ComponentValType> = HashMap::new();
+            for entry in &comp.canonical_functions {
+                if let parser::CanonicalEntry::Lift {
+                    core_func_index,
+                    type_index,
+                    ..
+                } = entry
+                    && let Some(td) = comp.get_type_definition(*type_index)
+                    && let parser::ComponentTypeKind::Function { results, .. } = &td.kind
+                    && let Some((_, ty)) = results.first()
+                {
+                    core_func_to_result.insert(
+                        *core_func_index,
+                        component_wrap::resolve_component_val_type(ty, comp),
+                    );
+                }
+            }
+
+            // Build component-level core func index → core export name.
+            // Walk core_entity_order: each CoreAlias of a Function export
+            // bumps the component core func counter and records the name.
+            // CanonicalFunction entries also bump the counter (with no name).
+            let mut comp_corefn_to_name: HashMap<u32, String> = HashMap::new();
+            let mut corefn_idx = 0u32;
+            for def in &comp.core_entity_order {
+                match def {
+                    parser::CoreEntityDef::CoreAlias(alias_idx) => {
+                        if let Some(parser::ComponentAliasEntry::CoreInstanceExport {
+                            kind: wasmparser::ExternalKind::Func,
+                            name,
+                            ..
+                        }) = comp.component_aliases.get(*alias_idx)
+                        {
+                            comp_corefn_to_name.insert(corefn_idx, name.clone());
+                            corefn_idx += 1;
+                        }
+                    }
+                    parser::CoreEntityDef::CanonicalFunction(canon_idx) => {
+                        if let Some(entry) = comp.canonical_functions.get(*canon_idx)
+                            && !matches!(entry, parser::CanonicalEntry::Lift { .. })
+                        {
+                            corefn_idx += 1;
+                        }
+                    }
+                }
+            }
+
+            // For each Lift, look up the alias name and extract the function
+            // name from `[async-lift]<iface>#<func>` (or just `[async-lift]<func>`).
+            for entry in &comp.canonical_functions {
+                if let parser::CanonicalEntry::Lift {
+                    core_func_index, ..
+                } = entry
+                    && let Some(name) = comp_corefn_to_name.get(core_func_index)
+                    && let Some(rest) = name.strip_prefix("[async-lift]")
+                    && let Some(rt) = core_func_to_result.get(core_func_index)
+                {
+                    let func_name = rest.rsplit_once('#').map(|(_, n)| n).unwrap_or(rest);
+                    name_to_result.insert(func_name.to_string(), rt.clone());
+                }
+            }
+            // Collect ordered TaskReturn types for greedy claiming fallback.
+            let tr_types: Vec<parser::ComponentValType> = comp
+                .canonical_functions
+                .iter()
+                .filter_map(|entry| match entry {
+                    parser::CanonicalEntry::TaskReturn {
+                        result: Some(t), ..
+                    } => Some(component_wrap::resolve_component_val_type(t, comp)),
+                    _ => None,
+                })
+                .collect();
+            comp_taskreturn_types.insert(comp_idx, tr_types);
+
+            log::debug!(
+                "comp {} async-result name→type entries: {}",
+                comp_idx,
+                name_to_result.len()
+            );
+            comp_func_result_types.insert(comp_idx, name_to_result);
+        }
+
+        // Build mapping: (component_idx, func_name) → element segment position.
+        // The main module (mod 0) has task-return imports in a specific order.
+        // The forwarding module mirrors this order. The element segment at
+        // position N has the merged import for the Nth task-return function.
+        // We track positions (among task-return imports only) so we can later
+        // match shim globals to adapter functions.
+        // Build mapping: (comp_idx, func_name) → element segment position.
+        // Only count task-return imports that are resolved INTRA-COMPONENT
+        // (forwarding). Directly-resolved imports don't go through element
+        // segments and are handled by the name-based fallback.
+        let mut func_name_to_elem_position: HashMap<(usize, String), usize> = HashMap::new();
         for &comp_idx in &async_callee_components {
             let component = &self.components[comp_idx];
-            let mut tr_idx = 0usize;
-            for module in &component.core_modules {
+            if let Some(module) = component.core_modules.first() {
+                let mut elem_position = 0usize;
+                let mut func_idx = 0u32;
                 for module_imp in &module.imports {
-                    if matches!(module_imp.kind, parser::ImportKind::Function(_))
-                        && module_imp.name.starts_with("[task-return]")
-                    {
-                        let func_name = module_imp
-                            .name
-                            .strip_prefix("[task-return]")
-                            .unwrap_or(&module_imp.name)
-                            .to_string();
-                        task_return_original_names.insert((comp_idx, tr_idx), func_name);
-                        tr_idx += 1;
+                    if !matches!(module_imp.kind, parser::ImportKind::Function(_)) {
+                        continue;
                     }
+                    if module_imp.name.starts_with("[task-return]") {
+                        // Check if this import is resolved intra-component
+                        // (goes to a forwarding function, not a merged import)
+                        let is_forwarding = merged
+                            .function_index_map
+                            .get(&(comp_idx, 0, func_idx))
+                            .map(|&idx| idx >= merged.import_counts.func)
+                            .unwrap_or(false);
+
+                        if is_forwarding {
+                            let func_name = module_imp
+                                .name
+                                .strip_prefix("[task-return]")
+                                .unwrap_or(&module_imp.name)
+                                .to_string();
+                            func_name_to_elem_position.insert((comp_idx, func_name), elem_position);
+                            elem_position += 1;
+                        }
+                    }
+                    func_idx += 1;
                 }
             }
         }
@@ -638,7 +748,9 @@ impl Fuser {
         // Find task.return imports belonging to async callee components
         // and generate shims for them.
         let mut affected_modules: HashSet<(usize, usize)> = HashSet::new();
-        let mut tr_counter_per_comp: HashMap<usize, usize> = HashMap::new();
+        // Per-component cursor into comp_taskreturn_types — advances each
+        // time we need to claim a TaskReturn entry by ordered position.
+        let mut comp_tr_cursor: HashMap<usize, usize> = HashMap::new();
 
         for (import_idx, imp) in merged.imports.iter().enumerate() {
             if !imp.name.starts_with("[task-return]") {
@@ -650,14 +762,39 @@ impl Fuser {
                 _ => continue,
             };
 
-            // Track the task-return index per component to recover the
-            // original function name from the mapping built above.
-            let tr_idx = tr_counter_per_comp.entry(comp_idx).or_insert(0);
-            let original_func_name = task_return_original_names
-                .get(&(comp_idx, *tr_idx))
-                .cloned()
-                .unwrap_or_default();
-            *tr_counter_per_comp.get_mut(&comp_idx).unwrap() += 1;
+            // Extract original function name from the source core module's
+            // `[task-return]<name>` import, used for the adapter's name-based
+            // shim matching and for result-type resolution below.
+            //
+            // The merged FUNCTION index for this import is its position
+            // among function imports in `merged.imports`, NOT its position
+            // in the imports vector overall. Compute it by counting only
+            // function imports up to import_idx.
+            let merged_func_idx = merged.imports[..import_idx]
+                .iter()
+                .filter(|i| matches!(i.entity_type, wasm_encoder::EntityType::Function(_)))
+                .count() as u32;
+            let mut original_func_name = imp.name.clone();
+            let component = &self.components[comp_idx];
+            if let Some(module) = component.core_modules.first() {
+                let mut fidx = 0u32;
+                for mimp in &module.imports {
+                    if !matches!(mimp.kind, parser::ImportKind::Function(_)) {
+                        continue;
+                    }
+                    if mimp.name.starts_with("[task-return]")
+                        && merged.function_index_map.get(&(comp_idx, 0, fidx)).copied()
+                            == Some(merged_func_idx)
+                    {
+                        original_func_name = mimp
+                            .name
+                            .strip_prefix("[task-return]")
+                            .unwrap_or(&mimp.name)
+                            .to_string();
+                    }
+                    fidx += 1;
+                }
+            }
 
             // Get the import's function type to know the param signature.
             let import_type = match &imp.entity_type {
@@ -696,21 +833,94 @@ impl Fuser {
                 result_globals.push((global_idx, *param_ty));
             }
 
-            // Generate shim function: stores each param to its global
+            // Resolve result type early — needed both for shim body (when
+            // we add callee-side stabilization for nested indirections) and
+            // for the TaskReturnShimInfo stored later.
+            let mut early_result_type = comp_func_result_types
+                .get(&comp_idx)
+                .and_then(|m| m.get(&original_func_name))
+                .cloned();
+            if early_result_type.is_none()
+                && let Some(tr_list) = comp_taskreturn_types.get(&comp_idx)
+            {
+                let comp = &self.components[comp_idx];
+                let cursor_peek = comp_tr_cursor.entry(comp_idx).or_insert(0);
+                // Peek without advancing — we'll re-resolve later with the
+                // same cursor state for the canonical TaskReturnShimInfo.
+                let mut peek_cursor = *cursor_peek;
+                while peek_cursor < tr_list.len() {
+                    let candidate = &tr_list[peek_cursor];
+                    peek_cursor += 1;
+                    let flat =
+                        component_wrap::flat_task_return_params_resolved(Some(candidate), comp);
+                    if flat == import_type.params {
+                        early_result_type = Some(candidate.clone());
+                        break;
+                    }
+                }
+            }
+
+            // For lists with indirections (e.g., list<record<string,_>>),
+            // the wit-bindgen Cleanup guard for the records buffer drops
+            // when the async block ends — between EXIT and our adapter
+            // reading globals. To survive that race, the shim deep-copies
+            // both the records buffer and each indirect string into a
+            // stable callee-side allocation, then stores stable pointers
+            // to globals. The adapter's existing cross-mem copy then
+            // operates on stable data.
+            let stabilization = early_result_type.as_ref().and_then(|ty| match ty {
+                parser::ComponentValType::List(elem)
+                | parser::ComponentValType::FixedSizeList(elem, _) => {
+                    let indirections = crate::adapter::fact::collect_indirections(elem, 0);
+                    if indirections.is_empty() {
+                        None
+                    } else {
+                        let (elem_size, elem_align) = crate::adapter::fact::cabi_size_align(elem);
+                        Some((elem_size, elem_align, indirections))
+                    }
+                }
+                _ => None,
+            });
+
+            let (callee_realloc_for_shim, callee_memory_for_shim) = if stabilization.is_some() {
+                (
+                    merger::component_realloc_index(merged, comp_idx),
+                    merger::component_memory_index(merged, comp_idx),
+                )
+            } else {
+                (None, 0)
+            };
+
+            // Generate shim function. Default body: store args to globals.
+            // With stabilization: copy records + strings to stable callee
+            // buffers first, then store stable pointers.
             let shim_func_idx = merged.import_counts.func + merged.functions.len() as u32;
-            let _type_idx = import_type.params.len(); // find or create type
             let shim_type = merger::Merger::find_or_add_type(
                 &mut merged.types,
                 &import_type.params,
                 &[], // void return
             );
 
-            let mut body = wasm_encoder::Function::new([]);
-            for (i, (global_idx, _)) in result_globals.iter().enumerate() {
-                body.instruction(&wasm_encoder::Instruction::LocalGet(i as u32));
-                body.instruction(&wasm_encoder::Instruction::GlobalSet(*global_idx));
-            }
-            body.instruction(&wasm_encoder::Instruction::End);
+            let body = if let (Some((elem_size, elem_align, indirections)), Some(realloc_fn)) =
+                (stabilization.as_ref(), callee_realloc_for_shim)
+            {
+                generate_stabilizing_shim(
+                    &result_globals,
+                    *elem_size,
+                    *elem_align,
+                    indirections,
+                    realloc_fn,
+                    callee_memory_for_shim,
+                )
+            } else {
+                let mut b = wasm_encoder::Function::new([]);
+                for (i, (global_idx, _)) in result_globals.iter().enumerate() {
+                    b.instruction(&wasm_encoder::Instruction::LocalGet(i as u32));
+                    b.instruction(&wasm_encoder::Instruction::GlobalSet(*global_idx));
+                }
+                b.instruction(&wasm_encoder::Instruction::End);
+                b
+            };
 
             merged.functions.push(merger::MergedFunction {
                 type_idx: shim_type,
@@ -718,8 +928,16 @@ impl Fuser {
                 origin: (comp_idx, 0, u32::MAX),
             });
 
-            // Remap the task.return import to the shim in function_index_map
-            // for all modules of this component
+            // Export the shim so the component wrapper can alias it
+            // instead of using canonical task.return.
+            merged.exports.push(merger::MergedExport {
+                name: format!("$task_return_shim_{}", import_idx),
+                kind: wasm_encoder::ExportKind::Func,
+                index: shim_func_idx,
+            });
+
+            // Remap the task.return import to the shim in function_index_map.
+            // Only match direct imports with the fused name.
             let component = &self.components[comp_idx];
             for (mod_idx, module) in component.core_modules.iter().enumerate() {
                 let mut func_idx = 0u32;
@@ -749,6 +967,49 @@ impl Fuser {
                 }
             }
 
+            // Note: intra-component forwarding functions (call_indirect table[N])
+            // for this task.return are handled by the component wrapper, which
+            // provides the shim export ($task_return_shim_N) as the table entry.
+
+            // Find the WIT result type by matching CanonicalEntry::TaskReturn
+            // entries from the source component against the import's flat
+            // core params. Without this, the adapter treats the result as
+            // opaque bytes and can't compute correct sizes for typed lists.
+            // Resolve result type. First try by name lookup (works for
+            // shims whose source core import was directly mapped to a
+            // merged import). Fall back to ordered claim from the source
+            // component's TaskReturn entries — pick the next entry whose
+            // flat shape matches the import. Greedy ordering gives a
+            // stable per-component pairing for the typical case where
+            // the merger generates shims in source canonical order.
+            let mut result_type = comp_func_result_types
+                .get(&comp_idx)
+                .and_then(|m| m.get(&original_func_name))
+                .cloned();
+            if result_type.is_none()
+                && let Some(tr_list) = comp_taskreturn_types.get(&comp_idx)
+            {
+                let comp = &self.components[comp_idx];
+                let cursor = comp_tr_cursor.entry(comp_idx).or_insert(0);
+                while *cursor < tr_list.len() {
+                    let candidate = &tr_list[*cursor];
+                    *cursor += 1;
+                    let flat =
+                        component_wrap::flat_task_return_params_resolved(Some(candidate), comp);
+                    if flat == import_type.params {
+                        result_type = Some(candidate.clone());
+                        break;
+                    }
+                }
+            }
+            log::debug!(
+                "task.return shim {} '{}' orig='{}' typed={}",
+                import_idx,
+                imp.name,
+                original_func_name,
+                result_type.is_some()
+            );
+
             // Store shim info for the adapter to use
             merged.task_return_shims.insert(
                 import_idx as u32,
@@ -758,17 +1019,21 @@ impl Fuser {
                     component_idx: comp_idx,
                     import_name: imp.name.clone(),
                     original_func_name: original_func_name.clone(),
+                    result_type,
                 },
             );
 
+            let shim = &merged.task_return_shims[&(import_idx as u32)];
             log::info!(
-                "task.return shim: import {} '{}' → shim func {} with {} globals",
+                "task.return shim: import {} '{}' orig='{}' → shim func {} globals {:?}",
                 import_idx,
                 imp.name,
-                shim_func_idx,
-                merged.task_return_shims[&(import_idx as u32)]
-                    .result_globals
-                    .len(),
+                shim.original_func_name,
+                shim.shim_func,
+                shim.result_globals
+                    .iter()
+                    .map(|(g, _)| *g)
+                    .collect::<Vec<_>>(),
             );
         }
 
@@ -809,6 +1074,84 @@ impl Fuser {
                     mf.body = body;
                 }
             }
+        }
+
+        // Patch element segments: replace task.return import references
+        // with shim function references. This ensures that indirect calls
+        // through element-segment-initialized tables call the shim instead
+        // of the (stub) import.
+        if !merged.task_return_shims.is_empty() {
+            // Build a map: import merged index → shim func index
+            let mut import_to_shim: HashMap<u32, u32> = HashMap::new();
+            for (import_idx, shim_info) in &merged.task_return_shims {
+                import_to_shim.insert(*import_idx, shim_info.shim_func);
+            }
+
+            for elem in &mut merged.elements {
+                if let crate::segments::ReindexedElementItems::Functions(ref mut indices) =
+                    elem.items
+                {
+                    for idx in indices.iter_mut() {
+                        if let Some(&shim_idx) = import_to_shim.get(idx) {
+                            log::debug!(
+                                "element segment: replaced import {} with shim {}",
+                                idx,
+                                shim_idx,
+                            );
+                            *idx = shim_idx;
+                        }
+                    }
+                }
+            }
+
+            // Build async_result_globals: (comp_idx, func_name) → globals.
+            // For each func_name, find its element segment position, look up
+            // the shim function at that position, and get its globals.
+            let shim_func_to_globals: HashMap<u32, Vec<(u32, wasm_encoder::ValType)>> = merged
+                .task_return_shims
+                .values()
+                .map(|s| (s.shim_func, s.result_globals.clone()))
+                .collect();
+
+            for ((comp_idx, func_name), elem_pos) in &func_name_to_elem_position {
+                // Find the component's $imports table index.
+                // The forwarding module (typically mod 2) defines the table.
+                // Look up via table_index_map.
+                let comp_tables: HashSet<u32> = merged
+                    .table_index_map
+                    .iter()
+                    .filter(|&(&(ci, _, _), _)| ci == *comp_idx)
+                    .map(|(_, &idx)| idx)
+                    .collect();
+
+                // Find the element segment for this component's table
+                for elem in &merged.elements {
+                    let elem_table = match &elem.mode {
+                        crate::segments::ElementSegmentMode::Active { table_index, .. } => {
+                            *table_index
+                        }
+                        _ => continue,
+                    };
+                    if !comp_tables.contains(&elem_table) {
+                        continue;
+                    }
+                    if let crate::segments::ReindexedElementItems::Functions(ref indices) =
+                        elem.items
+                        && let Some(func_idx) = indices.get(*elem_pos)
+                        && let Some(globals) = shim_func_to_globals.get(func_idx)
+                    {
+                        merged
+                            .async_result_globals
+                            .insert((*comp_idx, func_name.clone()), globals.clone());
+                        break;
+                    }
+                }
+            }
+            log::info!(
+                "async_result_globals: {} entries: {:?}",
+                merged.async_result_globals.len(),
+                merged.async_result_globals.keys().collect::<Vec<_>>(),
+            );
         }
 
         Ok(())
@@ -1546,6 +1889,181 @@ fn propagate_outer_wiring(
     }
 
     Ok(wiring_hints)
+}
+
+/// Generate a task.return shim body that deep-copies the records buffer
+/// (and each indirect string) into a stable callee-side allocation before
+/// storing the stabilized pointer to globals.
+///
+/// Why: wit-bindgen's lowering for `list<record-with-string>` allocates
+/// the records buffer via `Cleanup::new`, whose drop guard runs at the
+/// end of the async block — between EXIT and our adapter reading the
+/// globals. The original records buffer is freed and overwritten with
+/// allocator free-list patterns by the time the adapter sees it. This
+/// shim makes a parallel copy that the callee allocator owns, free of
+/// the Cleanup guard.
+///
+/// Shim signature: `(ptr: i32, len: i32) -> ()`.
+/// Body shape (for `list<record { string, ... }>` with one indirection
+/// at offset 0, sub-element size 1):
+/// ```text
+///   byte_count = len * elem_size
+///   stable_records = realloc(0, 0, elem_align, byte_count)
+///   memory.copy stable_records <- ptr, byte_count   ; intra-callee
+///   for i in 0..len:
+///     rec = stable_records + i*elem_size
+///     for each (offset, sub_size) in indirections:
+///       old_str = mem.load(rec + offset)
+///       str_len = mem.load(rec + offset + 4) * sub_size
+///       stable_str = realloc(0, 0, 1, str_len)
+///       memory.copy stable_str <- old_str, str_len   ; intra-callee
+///       mem.store(rec + offset, stable_str)
+///   global[ptr_global] = stable_records
+///   global[len_global] = len
+/// ```
+fn generate_stabilizing_shim(
+    result_globals: &[(u32, wasm_encoder::ValType)],
+    elem_size: u32,
+    elem_align: u32,
+    indirections: &[(u32, u32)],
+    realloc_func: u32,
+    callee_memory: u32,
+) -> wasm_encoder::Function {
+    use wasm_encoder::{BlockType, Function, Instruction};
+
+    // Locals layout (after the 2 i32 params: ptr=0, len=1):
+    //   2 = stable_records
+    //   3 = byte_count
+    //   4 = i
+    //   5 = rec
+    //   6 = old_str
+    //   7 = str_len
+    //   8 = stable_str
+    let l_stable = 2u32;
+    let l_byte_count = 3u32;
+    let l_i = 4u32;
+    let l_rec = 5u32;
+    let l_old_str = 6u32;
+    let l_str_len = 7u32;
+    let l_stable_str = 8u32;
+
+    let mut body = Function::new([(7, wasm_encoder::ValType::I32)]);
+
+    // byte_count = len * elem_size
+    crate::adapter::fact::emit_overflow_guard(&mut body, 1, elem_size);
+    body.instruction(&Instruction::LocalGet(1));
+    body.instruction(&Instruction::I32Const(elem_size as i32));
+    body.instruction(&Instruction::I32Mul);
+    body.instruction(&Instruction::LocalSet(l_byte_count));
+
+    // stable_records = realloc(0, 0, elem_align, byte_count)
+    body.instruction(&Instruction::I32Const(0));
+    body.instruction(&Instruction::I32Const(0));
+    body.instruction(&Instruction::I32Const(elem_align as i32));
+    body.instruction(&Instruction::LocalGet(l_byte_count));
+    crate::adapter::fact::emit_checked_realloc(&mut body, realloc_func, l_stable);
+
+    // memory.copy stable_records <- ptr, byte_count (intra-callee, mem 0)
+    body.instruction(&Instruction::LocalGet(l_stable));
+    body.instruction(&Instruction::LocalGet(0));
+    body.instruction(&Instruction::LocalGet(l_byte_count));
+    body.instruction(&Instruction::MemoryCopy {
+        dst_mem: callee_memory,
+        src_mem: callee_memory,
+    });
+
+    // for i in 0..len: stabilize indirections in record i
+    body.instruction(&Instruction::I32Const(0));
+    body.instruction(&Instruction::LocalSet(l_i));
+    body.instruction(&Instruction::Block(BlockType::Empty));
+    body.instruction(&Instruction::Loop(BlockType::Empty));
+
+    body.instruction(&Instruction::LocalGet(l_i));
+    body.instruction(&Instruction::LocalGet(1));
+    body.instruction(&Instruction::I32GeU);
+    body.instruction(&Instruction::BrIf(1));
+
+    // rec = stable_records + i * elem_size
+    body.instruction(&Instruction::LocalGet(l_stable));
+    body.instruction(&Instruction::LocalGet(l_i));
+    body.instruction(&Instruction::I32Const(elem_size as i32));
+    body.instruction(&Instruction::I32Mul);
+    body.instruction(&Instruction::I32Add);
+    body.instruction(&Instruction::LocalSet(l_rec));
+
+    for (offset, sub_size) in indirections {
+        let mem_arg_ptr = wasm_encoder::MemArg {
+            offset: *offset as u64,
+            align: 2,
+            memory_index: callee_memory,
+        };
+        let mem_arg_len = wasm_encoder::MemArg {
+            offset: (*offset + 4) as u64,
+            align: 2,
+            memory_index: callee_memory,
+        };
+
+        // old_str = mem.load(rec + offset)
+        body.instruction(&Instruction::LocalGet(l_rec));
+        body.instruction(&Instruction::I32Load(mem_arg_ptr));
+        body.instruction(&Instruction::LocalSet(l_old_str));
+
+        // str_len = mem.load(rec + offset + 4) * sub_size
+        // Stash raw (pre-multiply) len in l_str_len for the overflow guard,
+        // then multiply to produce the byte count.
+        body.instruction(&Instruction::LocalGet(l_rec));
+        body.instruction(&Instruction::I32Load(mem_arg_len));
+        body.instruction(&Instruction::LocalSet(l_str_len));
+        crate::adapter::fact::emit_overflow_guard(&mut body, l_str_len, *sub_size);
+        body.instruction(&Instruction::LocalGet(l_str_len));
+        if *sub_size != 1 {
+            body.instruction(&Instruction::I32Const(*sub_size as i32));
+            body.instruction(&Instruction::I32Mul);
+        }
+        body.instruction(&Instruction::LocalSet(l_str_len));
+
+        // stable_str = realloc(0, 0, 1, str_len)
+        body.instruction(&Instruction::I32Const(0));
+        body.instruction(&Instruction::I32Const(0));
+        body.instruction(&Instruction::I32Const(1));
+        body.instruction(&Instruction::LocalGet(l_str_len));
+        crate::adapter::fact::emit_checked_realloc(&mut body, realloc_func, l_stable_str);
+
+        // memory.copy stable_str <- old_str, str_len (intra-callee)
+        body.instruction(&Instruction::LocalGet(l_stable_str));
+        body.instruction(&Instruction::LocalGet(l_old_str));
+        body.instruction(&Instruction::LocalGet(l_str_len));
+        body.instruction(&Instruction::MemoryCopy {
+            dst_mem: callee_memory,
+            src_mem: callee_memory,
+        });
+
+        // mem.store(rec + offset, stable_str)
+        body.instruction(&Instruction::LocalGet(l_rec));
+        body.instruction(&Instruction::LocalGet(l_stable_str));
+        body.instruction(&Instruction::I32Store(mem_arg_ptr));
+    }
+
+    // i++; continue
+    body.instruction(&Instruction::LocalGet(l_i));
+    body.instruction(&Instruction::I32Const(1));
+    body.instruction(&Instruction::I32Add);
+    body.instruction(&Instruction::LocalSet(l_i));
+    body.instruction(&Instruction::Br(0));
+
+    body.instruction(&Instruction::End); // end loop
+    body.instruction(&Instruction::End); // end block
+
+    // Store stable_records to ptr_global, len to len_global.
+    if let [(ptr_global, _), (len_global, _)] = result_globals {
+        body.instruction(&Instruction::LocalGet(l_stable));
+        body.instruction(&Instruction::GlobalSet(*ptr_global));
+        body.instruction(&Instruction::LocalGet(1));
+        body.instruction(&Instruction::GlobalSet(*len_global));
+    }
+
+    body.instruction(&Instruction::End);
+    body
 }
 
 #[cfg(test)]

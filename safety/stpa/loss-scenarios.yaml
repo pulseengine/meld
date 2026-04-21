@@ -341,6 +341,52 @@ loss-scenarios:
       - Return area slot offsets not communicated from resolver to adapter
       - Missing test case for variant retptr with alignment padding
 
+  - id: LS-A-7
+    title: Transcoding adapters emit unchecked i32.mul for realloc size
+    uca: UCA-A-5
+    hazards: [H-2, H-4, H-4.3]
+    type: inadequate-control-algorithm
+    scenario: >
+      A cross-component call passes a string whose length is chosen by an
+      untrusted caller. The transcoding adapters emitted in
+      meld-core/src/adapter/fact.rs at emit_utf8_to_utf16_transcode
+      (lines 2702-2712), emit_utf16_to_utf8_transcode (lines 3010-3020),
+      and emit_latin1_to_utf8_transcode (lines 3335-3344) compute the
+      destination allocation size as LocalGet(len); I32Const(K); I32Mul;
+      Call(cabi_realloc); LocalSet(out_ptr) with K in {2, 3, 2}. The
+      multiplication is performed in 32-bit wrapping arithmetic with no
+      upper-bound check on len and no I32Eqz/BrIf guard on the
+      cabi_realloc return value. For any len > u32::MAX / K the product
+      wraps to a small alloc_size, cabi_realloc returns a short buffer
+      (or null on OOM, which is also unchecked), and the transcode loop
+      proceeds using the untouched full len as its bound, producing an
+      out-of-bounds write into the callee's linear memory [UCA-A-5]. This
+      corrupts callee memory at caller-chosen offsets [H-4.3] and covers
+      address 0 on realloc failure [H-2]. Violates WebAssembly Component
+      Model Canonical ABI (commit deb0b0a) Section 3.10 "Canonical
+      Built-in Definitions", which requires the host to trap when
+      realloc returns 0, and WebAssembly Core Specification Release 3.0
+      Section 4.4.1 which defines i32.mul as modulo 2^32. Detected by
+      Kani harness
+      meld-core::adapter::fact::tests::kani_transcode_alloc_size_no_overflow_guard
+      (counterexample at any len > u32::MAX / K) and PoC byte-scan
+      meld-core::adapter::fact::tests::poc_transcode_adapter_emits_unchecked_mul
+      which asserts presence of (a) I32Eqz/BrIf after the cabi_realloc
+      Call and (b) a len upper-bound check before I32Mul; both
+      assertions fail on the current emitter.
+    causal-factors:
+      - Allocation size computed via I32Mul without widening len to i64
+        or bounding len < u32::MAX / K before the multiply
+      - cabi_realloc return value stored directly into out_ptr with no
+        I32Eqz/BrIf trap on null
+      - Transcode loop bound is the untouched caller-supplied len, so a
+        wrapped alloc_size does not shrink the number of bytes written
+      - No emitter-level test asserting that every transcode adapter
+        emits both the overflow guard and the realloc-null guard
+    related-cve: CVE-2026-27572
+    status: approved
+    priority: critical
+
   # ==========================================================================
   # Merger scenario (discovered during gap analysis)
   # ==========================================================================

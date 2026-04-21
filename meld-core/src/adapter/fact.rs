@@ -42,6 +42,320 @@ fn alignment_for_encoding(encoding: StringEncoding) -> i32 {
 
 /// Build a lookup from `(module, field)` → merged function index for resource imports.
 ///
+/// Emit a safe `cabi_realloc` call: traps via `unreachable` if the returned
+/// pointer is 0 (OOM). Caller must have pushed the 4 realloc arguments onto
+/// the stack (`old_ptr`, `old_size`, `align`, `new_size`) immediately before
+/// calling this helper. After the call, the (checked, non-null) pointer is
+/// stored in `result_local`.
+///
+/// This is the fix for LS-A-7 leg (b): an unchecked realloc return lets the
+/// transcode/copy loop write into callee memory offset 0 on OOM.
+pub(crate) fn emit_checked_realloc(body: &mut Function, realloc_func: u32, result_local: u32) {
+    body.instruction(&Instruction::Call(realloc_func));
+    body.instruction(&Instruction::LocalSet(result_local));
+    body.instruction(&Instruction::LocalGet(result_local));
+    body.instruction(&Instruction::I32Eqz);
+    body.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+    body.instruction(&Instruction::Unreachable);
+    body.instruction(&Instruction::End);
+}
+
+/// Emit an overflow guard: traps via `unreachable` if `len_local * k` would
+/// wrap in 32-bit unsigned arithmetic. Caller supplies the local holding the
+/// untrusted length and the constant multiplier `k`. No-op when `k <= 1`.
+///
+/// This is the fix for LS-A-7 leg (a): `i32.mul` is modulo 2^32, so a large
+/// caller-chosen `len` can wrap to a small allocation size while the copy
+/// loop still writes the full `len * k` bytes, producing an OOB write into
+/// callee memory.
+pub(crate) fn emit_overflow_guard(body: &mut Function, len_local: u32, k: u32) {
+    if k <= 1 {
+        return;
+    }
+    body.instruction(&Instruction::LocalGet(len_local));
+    body.instruction(&Instruction::I32Const((u32::MAX / k) as i32));
+    body.instruction(&Instruction::I32GtU);
+    body.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+    body.instruction(&Instruction::Unreachable);
+    body.instruction(&Instruction::End);
+}
+
+/// Compute Canonical ABI (size, alignment) in bytes for a component value type.
+///
+/// Per Component Model Canonical ABI spec, every type has a fixed lowered
+/// memory layout. List/string lower to a (ptr, len) pair (8 bytes, align 4).
+/// Records pad each field to its alignment, then pad the whole record to
+/// its max field alignment. We use this to compute typed byte counts when
+/// copying lists across component memories.
+///
+/// Assumes `Type(idx)` references have already been resolved (see
+/// `component_wrap::resolve_component_val_type`). Unresolved Type/handle
+/// references fall back to a 4-byte handle-sized layout.
+pub(crate) fn cabi_size_align(ty: &crate::parser::ComponentValType) -> (u32, u32) {
+    use crate::parser::{ComponentValType as CVT, PrimitiveValType as P};
+    fn align_up(n: u32, a: u32) -> u32 {
+        (n + a - 1) & !(a - 1)
+    }
+    match ty {
+        CVT::Primitive(p) => match p {
+            P::Bool | P::S8 | P::U8 => (1, 1),
+            P::S16 | P::U16 => (2, 2),
+            P::S32 | P::U32 | P::F32 | P::Char => (4, 4),
+            P::S64 | P::U64 | P::F64 => (8, 8),
+        },
+        CVT::String => (8, 4),
+        CVT::List(_) => (8, 4),
+        CVT::FixedSizeList(elem, n) => {
+            let (es, ea) = cabi_size_align(elem);
+            (es * n, ea)
+        }
+        CVT::Record(fields) => {
+            let mut size = 0u32;
+            let mut align = 1u32;
+            for (_, fty) in fields {
+                let (fs, fa) = cabi_size_align(fty);
+                size = align_up(size, fa);
+                size += fs;
+                align = align.max(fa);
+            }
+            (align_up(size, align), align)
+        }
+        CVT::Tuple(elems) => {
+            let mut size = 0u32;
+            let mut align = 1u32;
+            for ety in elems {
+                let (es, ea) = cabi_size_align(ety);
+                size = align_up(size, ea);
+                size += es;
+                align = align.max(ea);
+            }
+            (align_up(size, align), align)
+        }
+        CVT::Option(inner) => {
+            let (is, ia) = cabi_size_align(inner);
+            let align = ia.max(1);
+            let body = align_up(1, align) + is;
+            (align_up(body, align), align)
+        }
+        CVT::Result { ok, err } => {
+            let (os, oa) = ok.as_ref().map(|t| cabi_size_align(t)).unwrap_or((0, 1));
+            let (es, ea) = err.as_ref().map(|t| cabi_size_align(t)).unwrap_or((0, 1));
+            let align = oa.max(ea).max(1);
+            let body = align_up(1, align) + os.max(es);
+            (align_up(body, align), align)
+        }
+        CVT::Variant(cases) => {
+            let mut max_size = 0u32;
+            let mut align = 1u32;
+            for (_, case_ty) in cases {
+                if let Some(ct) = case_ty {
+                    let (cs, ca) = cabi_size_align(ct);
+                    max_size = max_size.max(cs);
+                    align = align.max(ca);
+                }
+            }
+            let body = align_up(1, align) + max_size;
+            (align_up(body, align), align)
+        }
+        CVT::Own(_) | CVT::Borrow(_) | CVT::Type(_) => (4, 4),
+    }
+}
+
+/// Walk each element of a copied list and recursively patch up nested
+/// (ptr, len) pairs that still point into callee memory. Allocates fresh
+/// caller-side buffers, copies bytes across, and writes back the new ptr.
+///
+/// For frequencies-style `list<{ string, u32 }>` this scans each 12-byte
+/// record, copies the string at offset 0 into caller memory, and overwrites
+/// the (ptr, len) header. Nested lists/records recurse. Other field types
+/// are left as-is (already byte-copied).
+#[allow(clippy::too_many_arguments)]
+fn emit_patch_nested_indirections(
+    body: &mut Function,
+    elem_ty: &crate::parser::ComponentValType,
+    l_dst_ptr: u32,
+    l_callee_src: u32,
+    l_src_len: u32,
+    elem_size: u32,
+    l_first_scratch: u32,
+    realloc_func: u32,
+    caller_memory: u32,
+    callee_memory: u32,
+) {
+    let indirections = collect_indirections(elem_ty, 0);
+    if indirections.is_empty() {
+        return;
+    }
+
+    // Locals (caller has reserved scratch starting at l_first_scratch):
+    //   l_i        = element index counter
+    //   l_rec_dst  = caller-side pointer to current record
+    //   l_rec_src  = callee-side pointer to current record (read source)
+    //   l_old_ptr  = original src ptr (callee address)
+    //   l_buf_len  = byte count to copy
+    //   l_new_ptr  = freshly allocated caller buffer
+    let l_i = l_first_scratch;
+    let l_rec_dst = l_first_scratch + 1;
+    let l_old_ptr = l_first_scratch + 2;
+    let l_buf_len = l_first_scratch + 3;
+    let l_new_ptr = l_first_scratch + 4;
+    let l_rec_src = l_first_scratch + 5;
+
+    // i = 0
+    body.instruction(&Instruction::I32Const(0));
+    body.instruction(&Instruction::LocalSet(l_i));
+
+    body.instruction(&Instruction::Block(wasm_encoder::BlockType::Empty));
+    body.instruction(&Instruction::Loop(wasm_encoder::BlockType::Empty));
+
+    // if i >= len break
+    body.instruction(&Instruction::LocalGet(l_i));
+    body.instruction(&Instruction::LocalGet(l_src_len));
+    body.instruction(&Instruction::I32GeU);
+    body.instruction(&Instruction::BrIf(1));
+
+    // rec_dst = l_dst_ptr + i * elem_size
+    body.instruction(&Instruction::LocalGet(l_dst_ptr));
+    body.instruction(&Instruction::LocalGet(l_i));
+    if elem_size != 1 {
+        body.instruction(&Instruction::I32Const(elem_size as i32));
+        body.instruction(&Instruction::I32Mul);
+    }
+    body.instruction(&Instruction::I32Add);
+    body.instruction(&Instruction::LocalSet(l_rec_dst));
+
+    // rec_src = l_callee_src + i * elem_size (in callee memory)
+    body.instruction(&Instruction::LocalGet(l_callee_src));
+    body.instruction(&Instruction::LocalGet(l_i));
+    if elem_size != 1 {
+        body.instruction(&Instruction::I32Const(elem_size as i32));
+        body.instruction(&Instruction::I32Mul);
+    }
+    body.instruction(&Instruction::I32Add);
+    body.instruction(&Instruction::LocalSet(l_rec_src));
+
+    for (offset, sub_elem_size) in &indirections {
+        let dst_mem_arg_ptr = wasm_encoder::MemArg {
+            offset: *offset as u64,
+            align: 2,
+            memory_index: caller_memory,
+        };
+        let src_mem_arg_ptr = wasm_encoder::MemArg {
+            offset: *offset as u64,
+            align: 2,
+            memory_index: callee_memory,
+        };
+        let src_mem_arg_len = wasm_encoder::MemArg {
+            offset: (*offset + 4) as u64,
+            align: 2,
+            memory_index: callee_memory,
+        };
+
+        // Read original (ptr, len) DIRECTLY from callee memory at rec_src.
+        body.instruction(&Instruction::LocalGet(l_rec_src));
+        body.instruction(&Instruction::I32Load(src_mem_arg_ptr));
+        body.instruction(&Instruction::LocalSet(l_old_ptr));
+
+        body.instruction(&Instruction::LocalGet(l_rec_src));
+        body.instruction(&Instruction::I32Load(src_mem_arg_len));
+        if *sub_elem_size != 1 {
+            body.instruction(&Instruction::I32Const(*sub_elem_size as i32));
+            body.instruction(&Instruction::I32Mul);
+        }
+        body.instruction(&Instruction::LocalSet(l_buf_len));
+
+        // Skip patch if (old_ptr, buf_len) doesn't fit in callee mem — guards
+        // against garbage values triggering an unrecoverable trap.
+        body.instruction(&Instruction::Block(wasm_encoder::BlockType::Empty));
+        body.instruction(&Instruction::LocalGet(l_old_ptr));
+        body.instruction(&Instruction::LocalGet(l_buf_len));
+        body.instruction(&Instruction::I32Add);
+        body.instruction(&Instruction::MemorySize(callee_memory));
+        body.instruction(&Instruction::I32Const(16));
+        body.instruction(&Instruction::I32Shl);
+        body.instruction(&Instruction::I32GtU);
+        body.instruction(&Instruction::BrIf(0));
+
+        // new_ptr = realloc(0, 0, 1, buf_len) in caller memory
+        body.instruction(&Instruction::I32Const(0));
+        body.instruction(&Instruction::I32Const(0));
+        body.instruction(&Instruction::I32Const(1));
+        body.instruction(&Instruction::LocalGet(l_buf_len));
+        emit_checked_realloc(body, realloc_func, l_new_ptr);
+
+        // memory.copy new_ptr <- old_ptr (callee → caller)
+        body.instruction(&Instruction::LocalGet(l_new_ptr));
+        body.instruction(&Instruction::LocalGet(l_old_ptr));
+        body.instruction(&Instruction::LocalGet(l_buf_len));
+        body.instruction(&Instruction::MemoryCopy {
+            dst_mem: caller_memory,
+            src_mem: callee_memory,
+        });
+
+        // caller_mem.store(rec_dst + offset, new_ptr)
+        body.instruction(&Instruction::LocalGet(l_rec_dst));
+        body.instruction(&Instruction::LocalGet(l_new_ptr));
+        body.instruction(&Instruction::I32Store(dst_mem_arg_ptr));
+
+        body.instruction(&Instruction::End);
+    }
+
+    // i++
+    body.instruction(&Instruction::LocalGet(l_i));
+    body.instruction(&Instruction::I32Const(1));
+    body.instruction(&Instruction::I32Add);
+    body.instruction(&Instruction::LocalSet(l_i));
+    body.instruction(&Instruction::Br(0));
+
+    body.instruction(&Instruction::End); // end loop
+    body.instruction(&Instruction::End); // end block
+}
+
+/// For a given element type, find every field offset that holds a (ptr, len)
+/// pair that needs cross-memory copying (currently strings and nested lists).
+/// Returns `(byte_offset_within_element, sub_element_size_in_bytes)`.
+pub(crate) fn collect_indirections(
+    ty: &crate::parser::ComponentValType,
+    base_offset: u32,
+) -> Vec<(u32, u32)> {
+    use crate::parser::ComponentValType as CVT;
+    fn align_up(n: u32, a: u32) -> u32 {
+        (n + a - 1) & !(a - 1)
+    }
+    let mut out = Vec::new();
+    match ty {
+        CVT::String => out.push((base_offset, 1)),
+        CVT::List(elem) => {
+            let (es, _) = cabi_size_align(elem);
+            out.push((base_offset, es));
+        }
+        CVT::Record(fields) => {
+            let mut off = 0u32;
+            for (_, fty) in fields {
+                let (fs, fa) = cabi_size_align(fty);
+                off = align_up(off, fa);
+                out.extend(collect_indirections(fty, base_offset + off));
+                off += fs;
+            }
+        }
+        CVT::Tuple(elems) => {
+            let mut off = 0u32;
+            for ety in elems {
+                let (es, ea) = cabi_size_align(ety);
+                off = align_up(off, ea);
+                out.extend(collect_indirections(ety, base_offset + off));
+                off += es;
+            }
+        }
+        // Option/Result/Variant: indirections inside payloads are skipped
+        // for now — supporting them needs reading the discriminant before
+        // walking the body. Keep behaviour conservative until a test case
+        // exercises the path.
+        _ => {}
+    }
+    out
+}
+
 /// Scans the merged module's imports to find `[resource-rep]` and `[resource-new]`
 /// function imports and records their merged function indices.
 type ResourceImportMap = std::collections::HashMap<(String, String), u32>;
@@ -891,6 +1205,7 @@ impl FactStyleGenerator {
                     .unwrap_or(1);
 
                 // Allocate: dest = cabi_realloc(0, 0, 1, len * byte_mult)
+                emit_overflow_guard(&mut func, len_pos, byte_mult);
                 func.instruction(&Instruction::I32Const(0));
                 func.instruction(&Instruction::I32Const(0));
                 func.instruction(&Instruction::I32Const(1));
@@ -899,8 +1214,7 @@ impl FactStyleGenerator {
                     func.instruction(&Instruction::I32Const(byte_mult as i32));
                     func.instruction(&Instruction::I32Mul);
                 }
-                func.instruction(&Instruction::Call(callee_realloc));
-                func.instruction(&Instruction::LocalSet(dest_local));
+                emit_checked_realloc(&mut func, callee_realloc, dest_local);
 
                 // Copy: memory.copy callee_mem caller_mem (dest, src, len * byte_mult)
                 func.instruction(&Instruction::LocalGet(dest_local));
@@ -1034,6 +1348,7 @@ impl FactStyleGenerator {
                 func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
 
                 // Allocate: new_ptr = cabi_realloc(0, 0, 1, len * byte_mult)
+                emit_overflow_guard(&mut func, len_local, byte_mult);
                 func.instruction(&Instruction::I32Const(0));
                 func.instruction(&Instruction::I32Const(0));
                 func.instruction(&Instruction::I32Const(1));
@@ -1042,9 +1357,8 @@ impl FactStyleGenerator {
                     func.instruction(&Instruction::I32Const(byte_mult as i32));
                     func.instruction(&Instruction::I32Mul);
                 }
-                func.instruction(&Instruction::Call(callee_realloc));
                 // Save as dest_ptr (reuse a scratch local)
-                func.instruction(&Instruction::LocalSet(dest_ptr_local));
+                emit_checked_realloc(&mut func, callee_realloc, dest_ptr_local);
 
                 // Copy: memory.copy callee caller (dest, src, len * byte_mult)
                 func.instruction(&Instruction::LocalGet(dest_ptr_local));
@@ -1101,8 +1415,7 @@ impl FactStyleGenerator {
             func.instruction(&Instruction::I32Const(0)); // original_size
             func.instruction(&Instruction::I32Const(1)); // alignment
             func.instruction(&Instruction::LocalGet(callee_ret_len_local));
-            func.instruction(&Instruction::Call(caller_realloc));
-            func.instruction(&Instruction::LocalSet(caller_new_ptr_local));
+            emit_checked_realloc(&mut func, caller_realloc, caller_new_ptr_local);
 
             // Copy data from callee's memory to caller's memory:
             //   memory.copy $caller_mem $callee_mem (caller_new_ptr, callee_ret_ptr, len)
@@ -1186,6 +1499,7 @@ impl FactStyleGenerator {
                     func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
 
                     // Allocate in caller memory
+                    emit_overflow_guard(&mut func, len_local, byte_mult);
                     func.instruction(&Instruction::I32Const(0));
                     func.instruction(&Instruction::I32Const(0));
                     func.instruction(&Instruction::I32Const(1));
@@ -1194,8 +1508,7 @@ impl FactStyleGenerator {
                         func.instruction(&Instruction::I32Const(byte_mult as i32));
                         func.instruction(&Instruction::I32Mul);
                     }
-                    func.instruction(&Instruction::Call(caller_realloc));
-                    func.instruction(&Instruction::LocalSet(dest_ptr_local));
+                    emit_checked_realloc(&mut func, caller_realloc, dest_ptr_local);
 
                     // Copy from callee memory to caller memory
                     func.instruction(&Instruction::LocalGet(dest_ptr_local));
@@ -1274,9 +1587,11 @@ impl FactStyleGenerator {
         //   1: callee_ptr (allocated pointer in callee's memory)
         //   2..2+N: dest_ptr for each pointer pair copy
         //   2+N: loop_counter (if inner resources need fixup)
+        //   last: pair_len_local (scratch for per-pair overflow guard)
         let num_ptr_pairs = ptr_pair_offsets.len() as u32;
         let loop_counter_count = if has_inner_resources { 1u32 } else { 0 };
-        let scratch_count = 1 + num_ptr_pairs + loop_counter_count; // callee_ptr + per-pair dest ptrs + loop counter
+        let pair_len_scratch_count = if num_ptr_pairs > 0 { 1u32 } else { 0 };
+        let scratch_count = 1 + num_ptr_pairs + loop_counter_count + pair_len_scratch_count; // callee_ptr + per-pair dest ptrs + loop counter + pair_len
 
         // Post-return needs result save locals
         let has_post_return = options.callee_post_return.is_some();
@@ -1301,6 +1616,10 @@ impl FactStyleGenerator {
         let params_ptr_local: u32 = 0;
         let callee_ptr_local: u32 = 1;
         let pair_dest_base: u32 = 2;
+        // Scratch local holding the length of the current (ptr, len) pair,
+        // used by emit_overflow_guard. Only present when there is at least
+        // one pointer pair.
+        let pair_len_local: u32 = pair_dest_base + num_ptr_pairs + loop_counter_count;
 
         // --- Phase 1: Allocate buffer in callee's memory ---
         // callee_ptr = cabi_realloc(0, 0, align, size)
@@ -1308,8 +1627,7 @@ impl FactStyleGenerator {
         func.instruction(&Instruction::I32Const(0)); // original_size
         func.instruction(&Instruction::I32Const(params_area_align as i32)); // alignment
         func.instruction(&Instruction::I32Const(params_area_size as i32)); // new_size
-        func.instruction(&Instruction::Call(callee_realloc));
-        func.instruction(&Instruction::LocalSet(callee_ptr_local));
+        emit_checked_realloc(&mut func, callee_realloc, callee_ptr_local);
 
         // --- Phase 2: Bulk copy the entire params buffer ---
         // memory.copy $callee_mem $caller_mem (callee_ptr, params_ptr, size)
@@ -1341,23 +1659,27 @@ impl FactStyleGenerator {
             // Read old_ptr from callee's buffer: i32.load callee_mem (callee_ptr + byte_offset)
             // Read old_len from callee's buffer: i32.load callee_mem (callee_ptr + byte_offset + 4)
 
-            // Allocate: new_ptr = cabi_realloc(0, 0, 1, len * byte_mult)
-            func.instruction(&Instruction::I32Const(0));
-            func.instruction(&Instruction::I32Const(0));
-            func.instruction(&Instruction::I32Const(1));
-            // Load len from callee's buffer
+            // Stash len into a scratch local so the overflow guard + realloc
+            // can both reference it without re-loading from memory.
             func.instruction(&Instruction::LocalGet(callee_ptr_local));
             func.instruction(&Instruction::I32Load(wasm_encoder::MemArg {
                 offset: (byte_offset + 4) as u64,
                 align: 2,
                 memory_index: options.callee_memory,
             }));
+            func.instruction(&Instruction::LocalSet(pair_len_local));
+
+            // Allocate: new_ptr = cabi_realloc(0, 0, 1, len * byte_mult)
+            emit_overflow_guard(&mut func, pair_len_local, byte_mult);
+            func.instruction(&Instruction::I32Const(0));
+            func.instruction(&Instruction::I32Const(0));
+            func.instruction(&Instruction::I32Const(1));
+            func.instruction(&Instruction::LocalGet(pair_len_local));
             if byte_mult > 1 {
                 func.instruction(&Instruction::I32Const(byte_mult as i32));
                 func.instruction(&Instruction::I32Mul);
             }
-            func.instruction(&Instruction::Call(callee_realloc));
-            func.instruction(&Instruction::LocalSet(dest_local));
+            emit_checked_realloc(&mut func, callee_realloc, dest_local);
 
             // Copy data: memory.copy callee caller (new_ptr, old_ptr, len * byte_mult)
             func.instruction(&Instruction::LocalGet(dest_local)); // dst (in callee mem)
@@ -1618,6 +1940,7 @@ impl FactStyleGenerator {
                     .unwrap_or(1);
 
                 // Allocate: dest = cabi_realloc(0, 0, 1, len * byte_mult)
+                emit_overflow_guard(&mut func, len_pos, byte_mult);
                 func.instruction(&Instruction::I32Const(0));
                 func.instruction(&Instruction::I32Const(0));
                 func.instruction(&Instruction::I32Const(1));
@@ -1626,8 +1949,7 @@ impl FactStyleGenerator {
                     func.instruction(&Instruction::I32Const(byte_mult as i32));
                     func.instruction(&Instruction::I32Mul);
                 }
-                func.instruction(&Instruction::Call(callee_realloc));
-                func.instruction(&Instruction::LocalSet(dest_local));
+                emit_checked_realloc(&mut func, callee_realloc, dest_local);
 
                 // Copy: memory.copy callee_mem caller_mem (dest, src, len * byte_mult)
                 func.instruction(&Instruction::LocalGet(dest_local));
@@ -1736,6 +2058,7 @@ impl FactStyleGenerator {
                 func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
 
                 // Allocate in callee memory
+                emit_overflow_guard(&mut func, len_local, byte_mult);
                 func.instruction(&Instruction::I32Const(0));
                 func.instruction(&Instruction::I32Const(0));
                 func.instruction(&Instruction::I32Const(1));
@@ -1744,8 +2067,7 @@ impl FactStyleGenerator {
                     func.instruction(&Instruction::I32Const(byte_mult as i32));
                     func.instruction(&Instruction::I32Mul);
                 }
-                func.instruction(&Instruction::Call(callee_realloc));
-                func.instruction(&Instruction::LocalSet(cond_dest_ptr_local));
+                emit_checked_realloc(&mut func, callee_realloc, cond_dest_ptr_local);
 
                 // Copy from caller to callee memory
                 func.instruction(&Instruction::LocalGet(cond_dest_ptr_local));
@@ -1837,6 +2159,7 @@ impl FactStyleGenerator {
                     func.instruction(&Instruction::LocalSet(data_len_local));
 
                     // Allocate in caller's memory: data_len * byte_mult bytes
+                    emit_overflow_guard(&mut func, data_len_local, byte_mult);
                     func.instruction(&Instruction::I32Const(0));
                     func.instruction(&Instruction::I32Const(0));
                     func.instruction(&Instruction::I32Const(1));
@@ -1845,8 +2168,7 @@ impl FactStyleGenerator {
                         func.instruction(&Instruction::I32Const(byte_mult as i32));
                         func.instruction(&Instruction::I32Mul);
                     }
-                    func.instruction(&Instruction::Call(caller_realloc));
-                    func.instruction(&Instruction::LocalSet(caller_new_ptr_local));
+                    emit_checked_realloc(&mut func, caller_realloc, caller_new_ptr_local);
 
                     // Copy data bytes from callee → caller
                     func.instruction(&Instruction::LocalGet(caller_new_ptr_local));
@@ -2022,6 +2344,7 @@ impl FactStyleGenerator {
                 func.instruction(&Instruction::LocalSet(data_len_local));
 
                 // Allocate in caller memory
+                emit_overflow_guard(&mut func, data_len_local, byte_mult);
                 func.instruction(&Instruction::I32Const(0));
                 func.instruction(&Instruction::I32Const(0));
                 func.instruction(&Instruction::I32Const(1));
@@ -2030,8 +2353,7 @@ impl FactStyleGenerator {
                     func.instruction(&Instruction::I32Const(byte_mult as i32));
                     func.instruction(&Instruction::I32Mul);
                 }
-                func.instruction(&Instruction::Call(caller_realloc));
-                func.instruction(&Instruction::LocalSet(caller_new_ptr_local));
+                emit_checked_realloc(&mut func, caller_realloc, caller_new_ptr_local);
 
                 // Copy data from callee → caller
                 func.instruction(&Instruction::LocalGet(caller_new_ptr_local));
@@ -2184,6 +2506,7 @@ impl FactStyleGenerator {
             func.instruction(&Instruction::LocalSet(inner_len));
 
             // Allocate inner data in dst memory: new_ptr = realloc(0, 0, 1, inner_len * byte_mult)
+            emit_overflow_guard(func, inner_len, byte_mult);
             func.instruction(&Instruction::I32Const(0));
             func.instruction(&Instruction::I32Const(0));
             func.instruction(&Instruction::I32Const(1));
@@ -2192,8 +2515,7 @@ impl FactStyleGenerator {
                 func.instruction(&Instruction::I32Const(byte_mult as i32));
                 func.instruction(&Instruction::I32Mul);
             }
-            func.instruction(&Instruction::Call(realloc_func));
-            func.instruction(&Instruction::LocalSet(new_ptr));
+            emit_checked_realloc(func, realloc_func, new_ptr);
 
             // Copy data from src memory to dst memory
             // memory.copy dst_mem src_mem (new_ptr, inner_ptr, inner_len * byte_mult)
@@ -2423,8 +2745,21 @@ impl FactStyleGenerator {
         };
 
         // Step 1: Allocate output buffer = 2 * input_len bytes via cabi_realloc
-        // (each UTF-8 byte produces at most one UTF-16 code unit = 2 bytes)
+        // (each UTF-8 byte produces at most one UTF-16 code unit = 2 bytes).
+        // Guards against the two memory-safety hazards identified in LS-A-7:
+        //   (a) i32.mul is modulo 2^32 — trap if len > u32::MAX/2 before the
+        //       multiply, so alloc_size cannot wrap below the actual required
+        //       byte count that the transcode loop will write.
+        //   (b) cabi_realloc may return 0 on OOM — trap before writing so
+        //       the loop cannot corrupt callee memory at offset 0.
         let callee_align = alignment_for_encoding(options.callee_string_encoding);
+        func.instruction(&Instruction::LocalGet(1)); // input_len
+        func.instruction(&Instruction::I32Const((u32::MAX / 2) as i32));
+        func.instruction(&Instruction::I32GtU);
+        func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+        func.instruction(&Instruction::Unreachable);
+        func.instruction(&Instruction::End);
+
         func.instruction(&Instruction::I32Const(0)); // original_ptr
         func.instruction(&Instruction::I32Const(0)); // original_size
         func.instruction(&Instruction::I32Const(callee_align)); // alignment
@@ -2433,6 +2768,13 @@ impl FactStyleGenerator {
         func.instruction(&Instruction::I32Mul); // alloc_size = 2 * input_len
         func.instruction(&Instruction::Call(callee_realloc));
         func.instruction(&Instruction::LocalSet(out_ptr_local));
+
+        // Trap on null return from cabi_realloc (LS-A-7 leg b).
+        func.instruction(&Instruction::LocalGet(out_ptr_local));
+        func.instruction(&Instruction::I32Eqz);
+        func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+        func.instruction(&Instruction::Unreachable);
+        func.instruction(&Instruction::End);
 
         // Step 2: Initialize loop counters
         func.instruction(&Instruction::I32Const(0));
@@ -2731,8 +3073,17 @@ impl FactStyleGenerator {
         };
 
         // Step 1: Allocate output buffer = 3 * input_code_units bytes
-        // (worst case: all BMP chars in U+0800-U+FFFF → 3 bytes UTF-8 each)
+        // (worst case: all BMP chars in U+0800-U+FFFF → 3 bytes UTF-8 each).
+        // See LS-A-7: guard against i32.mul wrap (leg a) and cabi_realloc
+        // OOM (leg b) before writing into callee memory.
         let callee_align = alignment_for_encoding(options.callee_string_encoding);
+        func.instruction(&Instruction::LocalGet(1)); // input_len
+        func.instruction(&Instruction::I32Const((u32::MAX / 3) as i32));
+        func.instruction(&Instruction::I32GtU);
+        func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+        func.instruction(&Instruction::Unreachable);
+        func.instruction(&Instruction::End);
+
         func.instruction(&Instruction::I32Const(0)); // original_ptr
         func.instruction(&Instruction::I32Const(0)); // original_size
         func.instruction(&Instruction::I32Const(callee_align)); // alignment
@@ -2741,6 +3092,13 @@ impl FactStyleGenerator {
         func.instruction(&Instruction::I32Mul); // alloc_size = 3 * code_units
         func.instruction(&Instruction::Call(callee_realloc));
         func.instruction(&Instruction::LocalSet(out_ptr_local));
+
+        // Trap on null return from cabi_realloc (LS-A-7 leg b).
+        func.instruction(&Instruction::LocalGet(out_ptr_local));
+        func.instruction(&Instruction::I32Eqz);
+        func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+        func.instruction(&Instruction::Unreachable);
+        func.instruction(&Instruction::End);
 
         // Step 2: Initialize loop counters
         func.instruction(&Instruction::I32Const(0));
@@ -3055,8 +3413,17 @@ impl FactStyleGenerator {
             memory_index: options.callee_memory,
         };
 
-        // Step 1: Allocate output buffer = 2 * input_len via cabi_realloc
+        // Step 1: Allocate output buffer = 2 * input_len via cabi_realloc.
+        // See LS-A-7: guard against i32.mul wrap (leg a) and cabi_realloc
+        // OOM (leg b) before writing into callee memory.
         let callee_align = alignment_for_encoding(options.callee_string_encoding);
+        func.instruction(&Instruction::LocalGet(1)); // input_len
+        func.instruction(&Instruction::I32Const((u32::MAX / 2) as i32));
+        func.instruction(&Instruction::I32GtU);
+        func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+        func.instruction(&Instruction::Unreachable);
+        func.instruction(&Instruction::End);
+
         func.instruction(&Instruction::I32Const(0)); // original_ptr
         func.instruction(&Instruction::I32Const(0)); // original_size
         func.instruction(&Instruction::I32Const(callee_align)); // alignment
@@ -3065,6 +3432,13 @@ impl FactStyleGenerator {
         func.instruction(&Instruction::I32Mul); // alloc_size = 2 * input_len
         func.instruction(&Instruction::Call(callee_realloc));
         func.instruction(&Instruction::LocalSet(out_ptr_local));
+
+        // Trap on null return from cabi_realloc (LS-A-7 leg b).
+        func.instruction(&Instruction::LocalGet(out_ptr_local));
+        func.instruction(&Instruction::I32Eqz);
+        func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+        func.instruction(&Instruction::Unreachable);
+        func.instruction(&Instruction::End);
 
         // Step 2: Initialize loop counters
         func.instruction(&Instruction::I32Const(0));
@@ -3260,8 +3634,9 @@ impl FactStyleGenerator {
         let caller_param_count = caller_type.params.len();
         let _caller_result_count = caller_type.results.len();
 
-        // Find callee's memory index for the event buffer scratch space
+        // Find memory indices for cross-memory operations
         let callee_memory = crate::merger::component_memory_index(merged, site.to_component);
+        let caller_memory = crate::merger::component_memory_index(merged, site.from_component);
 
         // Determine the [async-lift] entry's param count from its type.
         // The caller may have extra params (e.g., retptr for multi-value results)
@@ -3289,8 +3664,118 @@ impl FactStyleGenerator {
         let l_p1 = l_packed + 4;
         let l_p2 = l_packed + 5;
 
-        // 6 locals for callback loop + 3 for string copy (src_ptr, src_len, dst_ptr)
-        let mut body = Function::new([(9, wasm_encoder::ValType::I32)]);
+        // 6 locals for callback loop + 4 for string copy (src_ptr, src_len, dst_ptr, new_ptr)
+        // + 6 for nested indirection patching (i, rec_dst, old_ptr, buf_len, new_ptr, rec_src)
+        let mut body = Function::new([(16, wasm_encoder::ValType::I32)]);
+
+        // Step 0.5: Copy string/list params from caller to callee memory.
+        //
+        // The pointer_pair_positions from the resolver are in CALLEE component
+        // type order. But the adapter's locals are in CALLER order (from the
+        // caller's canon lower). These may differ if the component type
+        // reorders params.
+        //
+        // Instead of using the resolver's positions, compute positions from
+        // the caller's flat param types: find (i32, i32) pairs that could be
+        // (ptr, len) strings/lists.
+        let callee_realloc = crate::merger::component_realloc_index(merged, site.to_component);
+
+        // Detect pointer pairs in caller params: consecutive (i32, i32) pairs
+        // that aren't the last param (retptr). This is a heuristic — works for
+        // string and list params which are always (ptr: i32, len: i32).
+        let caller_ptr_positions: Vec<u32> = if site.crosses_memory && callee_realloc.is_some() {
+            let params = &caller_type.params;
+            let has_retptr =
+                caller_type.results.is_empty() && caller_param_count > callee_param_count;
+            let effective_len = if has_retptr {
+                params.len() - 1
+            } else {
+                params.len()
+            };
+            let mut positions = Vec::new();
+            let mut i = 0;
+            while i + 1 < effective_len {
+                if params[i] == wasm_encoder::ValType::I32
+                    && params[i + 1] == wasm_encoder::ValType::I32
+                {
+                    // Check if the resolver also thinks this is a pointer pair
+                    // (the resolver uses component type info to confirm)
+                    if site
+                        .requirements
+                        .pointer_pair_positions
+                        .iter()
+                        .any(|_| true)
+                    {
+                        positions.push(i as u32);
+                        i += 2; // skip the len
+                        continue;
+                    }
+                }
+                i += 1;
+            }
+            positions
+        } else {
+            Vec::new()
+        };
+
+        let has_param_copies = !caller_ptr_positions.is_empty();
+
+        if has_param_copies {
+            log::debug!(
+                "async adapter param copy: export={} caller_positions={:?} resolver_positions={:?}",
+                site.export_name,
+                caller_ptr_positions,
+                site.requirements.pointer_pair_positions,
+            );
+            let realloc = callee_realloc.unwrap();
+            // For each (ptr, len) pair in the caller's params, allocate in
+            // callee memory and copy the data from caller memory. Use the
+            // resolver's param_copy_layouts to get the per-element byte
+            // size so list<u32>/list<u64>/etc. copy the correct total size.
+            let param_layouts = &site.requirements.param_copy_layouts;
+            for (pair_idx, &ptr_pos) in caller_ptr_positions.iter().enumerate() {
+                let ptr_local = ptr_pos;
+                let len_local = ptr_local + 1;
+                let l_new_ptr = l_p2 + 4; // reuse scratch local
+
+                let byte_mult = param_layouts
+                    .get(pair_idx)
+                    .map(|cl| match cl {
+                        crate::resolver::CopyLayout::Bulk { byte_multiplier } => *byte_multiplier,
+                        crate::resolver::CopyLayout::Elements { element_size, .. } => *element_size,
+                    })
+                    .unwrap_or(1);
+
+                // Allocate: cabi_realloc(0, 0, 1, len * byte_mult)
+                emit_overflow_guard(&mut body, len_local, byte_mult);
+                body.instruction(&Instruction::I32Const(0));
+                body.instruction(&Instruction::I32Const(0));
+                body.instruction(&Instruction::I32Const(1));
+                body.instruction(&Instruction::LocalGet(len_local));
+                if byte_mult > 1 {
+                    body.instruction(&Instruction::I32Const(byte_mult as i32));
+                    body.instruction(&Instruction::I32Mul);
+                }
+                emit_checked_realloc(&mut body, realloc, l_new_ptr);
+
+                // Copy: memory.copy new_ptr <- old_ptr, len * byte_mult
+                body.instruction(&Instruction::LocalGet(l_new_ptr));
+                body.instruction(&Instruction::LocalGet(ptr_local));
+                body.instruction(&Instruction::LocalGet(len_local));
+                if byte_mult > 1 {
+                    body.instruction(&Instruction::I32Const(byte_mult as i32));
+                    body.instruction(&Instruction::I32Mul);
+                }
+                body.instruction(&Instruction::MemoryCopy {
+                    dst_mem: callee_memory,
+                    src_mem: caller_memory,
+                });
+
+                // Replace the ptr param with the new callee-memory ptr
+                body.instruction(&Instruction::LocalGet(l_new_ptr));
+                body.instruction(&Instruction::LocalSet(ptr_local));
+            }
+        }
 
         // Step 1: Call [async-lift] entry with callee's params
         // (skip retptr if caller has more params than callee)
@@ -3420,33 +3905,60 @@ impl FactStyleGenerator {
             .map(|(_, name)| name)
             .unwrap_or(&site.export_name);
 
-        let shim_info = merged
-            .task_return_shims
-            .values()
-            .find(|info| {
-                info.component_idx == site.to_component
-                    && info.original_func_name == adapter_func_name
-            })
-            .or_else(|| {
-                // Fallback: match by type signature if name matching fails
-                merged.task_return_shims.values().find(|info| {
-                    info.component_idx == site.to_component
-                        && info.result_globals.len() == caller_type.results.len()
-                        && info
-                            .result_globals
-                            .iter()
-                            .zip(caller_type.results.iter())
-                            .all(|((_, gt), ct)| gt == ct)
+        // Look up result globals. First try element-segment-based mapping
+        // (correct for components with forwarding modules), then fall back
+        // to name-based matching (for direct task.return calls).
+        let result_globals_direct = merged
+            .async_result_globals
+            .get(&(site.to_component, adapter_func_name.to_string()));
+
+        let shim_info = if let Some(globals) = result_globals_direct {
+            // Recover the WIT result_type from the underlying shim. The
+            // direct-globals lookup gives us per-(component, func) globals;
+            // find the source shim by matching globals to get its type info.
+            let result_type = merged
+                .task_return_shims
+                .values()
+                .find(|info| {
+                    info.component_idx == site.to_component && info.result_globals == *globals
                 })
-            });
+                .and_then(|info| info.result_type.clone());
+            Some(crate::merger::TaskReturnShimInfo {
+                shim_func: 0,
+                result_globals: globals.clone(),
+                component_idx: site.to_component,
+                import_name: String::new(),
+                original_func_name: adapter_func_name.to_string(),
+                result_type,
+            })
+        } else {
+            // Fallback: match by component + original function name
+            merged
+                .task_return_shims
+                .values()
+                .find(|info| {
+                    info.component_idx == site.to_component
+                        && info.original_func_name == adapter_func_name
+                })
+                .cloned()
+        };
+        let shim_info = shim_info.as_ref();
 
         // Detect retptr convention: caller has more params than callee
         // and returns void — the last caller param is the result pointer.
         let uses_retptr = caller_type.results.is_empty() && caller_param_count > callee_param_count;
-        let caller_memory = crate::merger::component_memory_index(merged, site.from_component);
 
         // Find caller's cabi_realloc for cross-memory string copying
         let caller_realloc = crate::merger::component_realloc_index(merged, site.from_component);
+        log::debug!(
+            "async adapter '{}' from={} to={} caller_realloc={:?} callee_mem={} caller_mem={}",
+            adapter_func_name,
+            site.from_component,
+            site.to_component,
+            caller_realloc,
+            callee_memory,
+            caller_memory,
+        );
 
         if let Some(info) = shim_info {
             if uses_retptr {
@@ -3470,11 +3982,26 @@ impl FactStyleGenerator {
                     let (ptr_global, _) = info.result_globals[0];
                     let (len_global, _) = info.result_globals[1];
 
-                    // Allocate in caller memory: cabi_realloc(0, 0, 1, len) → new_ptr
-                    // locals: l_packed+6 = src_ptr, l_packed+7 = src_len, l_packed+8 = dst_ptr
+                    // Determine the per-element byte size and alignment from
+                    // the WIT result type. For string the element is 1 byte;
+                    // for list<u32> it's 4; for list<record{...}> it's the
+                    // record's CABI size (with internal alignment padding).
+                    // Without a known type we fall back to 1 (string-like).
+                    let (elem_size, elem_align, list_elem_ty) = match &info.result_type {
+                        Some(crate::parser::ComponentValType::List(elem))
+                        | Some(crate::parser::ComponentValType::FixedSizeList(elem, _)) => {
+                            let (s, a) = cabi_size_align(elem);
+                            (s, a, Some(elem.as_ref().clone()))
+                        }
+                        Some(crate::parser::ComponentValType::String) => (1, 1, None),
+                        _ => (1, 1, None),
+                    };
+
+                    // locals
                     let l_src_ptr = l_p2 + 1;
                     let l_src_len = l_p2 + 2;
                     let l_dst_ptr = l_p2 + 3;
+                    let l_byte_count = l_p2 + 4;
 
                     // Read source ptr and len from shim globals
                     body.instruction(&Instruction::GlobalGet(ptr_global));
@@ -3482,22 +4009,49 @@ impl FactStyleGenerator {
                     body.instruction(&Instruction::GlobalGet(len_global));
                     body.instruction(&Instruction::LocalSet(l_src_len));
 
-                    // Allocate in caller memory
+                    // byte_count = len * elem_size
+                    emit_overflow_guard(&mut body, l_src_len, elem_size);
+                    body.instruction(&Instruction::LocalGet(l_src_len));
+                    if elem_size != 1 {
+                        body.instruction(&Instruction::I32Const(elem_size as i32));
+                        body.instruction(&Instruction::I32Mul);
+                    }
+                    body.instruction(&Instruction::LocalSet(l_byte_count));
+
+                    // Allocate in caller memory: cabi_realloc(0, 0, align, byte_count)
                     body.instruction(&Instruction::I32Const(0)); // old_ptr
                     body.instruction(&Instruction::I32Const(0)); // old_size
-                    body.instruction(&Instruction::I32Const(1)); // align
-                    body.instruction(&Instruction::LocalGet(l_src_len)); // new_size
-                    body.instruction(&Instruction::Call(realloc_func));
-                    body.instruction(&Instruction::LocalSet(l_dst_ptr));
+                    body.instruction(&Instruction::I32Const(elem_align as i32));
+                    body.instruction(&Instruction::LocalGet(l_byte_count));
+                    emit_checked_realloc(&mut body, realloc_func, l_dst_ptr);
 
                     // Copy from callee memory to caller memory
-                    body.instruction(&Instruction::LocalGet(l_dst_ptr)); // dst
-                    body.instruction(&Instruction::LocalGet(l_src_ptr)); // src
-                    body.instruction(&Instruction::LocalGet(l_src_len)); // len
+                    body.instruction(&Instruction::LocalGet(l_dst_ptr));
+                    body.instruction(&Instruction::LocalGet(l_src_ptr));
+                    body.instruction(&Instruction::LocalGet(l_byte_count));
                     body.instruction(&Instruction::MemoryCopy {
                         dst_mem: caller_memory,
                         src_mem: callee_memory,
                     });
+
+                    // If the list element contains nested indirections
+                    // (string fields, nested lists), walk each element and
+                    // copy each indirect buffer into caller memory, then
+                    // patch the (ptr, len) pair stored in the copied record.
+                    if let Some(elem_ty) = &list_elem_ty {
+                        emit_patch_nested_indirections(
+                            &mut body,
+                            elem_ty,
+                            l_dst_ptr,
+                            l_src_ptr,
+                            l_src_len,
+                            elem_size,
+                            l_p2 + 5,
+                            realloc_func,
+                            caller_memory,
+                            callee_memory,
+                        );
+                    }
 
                     // Write (new_ptr, len) to retptr
                     let mem_arg_0 = wasm_encoder::MemArg {
@@ -3863,6 +4417,127 @@ mod tests {
         assert!(
             options.crosses_memory(),
             "SR-17: different memory indices should cross memory boundaries"
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // LS-A-7: Transcoder overflow + null-check guards
+    //
+    // The three transcode emitters must emit, for every generated
+    // adapter:
+    //   (a) an I32GtU check on input_len against u32::MAX/K followed
+    //       by an `if ... unreachable end` trap — prevents i32.mul
+    //       wrapping to a small alloc_size.
+    //   (b) an I32Eqz check on the cabi_realloc return followed by
+    //       `if ... unreachable end` — prevents the transcode loop
+    //       writing to callee memory offset 0 when OOM returns null.
+    //
+    // These byte-scan tests are the PoC referenced in loss-scenarios
+    // LS-A-7. They fail on the unfixed emitter and pass once both
+    // guards are present.
+    // ---------------------------------------------------------------
+
+    /// Return `true` iff the byte-encoded function body `body` contains
+    /// an `i32.eqz; if; unreachable; end` sequence. The `if` block byte
+    /// is 0x04, `unreachable` is 0x00, `end` is 0x0B, `i32.eqz` is 0x45.
+    /// The block type that follows 0x04 is 0x40 (empty block type).
+    #[cfg(test)]
+    fn body_has_eqz_if_unreachable(body: &[u8]) -> bool {
+        // Pattern: 0x45 0x04 0x40 0x00 0x0B
+        body.windows(5).any(|w| w == [0x45, 0x04, 0x40, 0x00, 0x0B])
+    }
+
+    /// Return `true` iff the byte-encoded function body `body` contains
+    /// a `i32.gt_u; if; unreachable; end` sequence.
+    /// Opcodes: i32.gt_u = 0x4B, if = 0x04, block type empty = 0x40,
+    /// unreachable = 0x00, end = 0x0B.
+    #[cfg(test)]
+    fn body_has_gtu_if_unreachable(body: &[u8]) -> bool {
+        body.windows(5).any(|w| w == [0x4B, 0x04, 0x40, 0x00, 0x0B])
+    }
+
+    fn emit_transcode(options: AdapterOptions) -> Vec<u8> {
+        let gen_ = FactStyleGenerator::new(AdapterConfig::default());
+        let mut f = Function::new([(8, wasm_encoder::ValType::I32)]);
+        // param_count=2 matches string param (ptr, len) lowered shape.
+        // target_func=0 is a placeholder — the emitter only uses it for
+        // the tail call, which this test doesn't execute.
+        if options.caller_string_encoding == StringEncoding::Utf8
+            && options.callee_string_encoding == StringEncoding::Utf16
+        {
+            gen_.emit_utf8_to_utf16_transcode(&mut f, 2, 0, &options);
+        } else if options.caller_string_encoding == StringEncoding::Utf16
+            && options.callee_string_encoding == StringEncoding::Utf8
+        {
+            gen_.emit_utf16_to_utf8_transcode(&mut f, 2, 0, &options);
+        } else if options.caller_string_encoding == StringEncoding::Latin1
+            && options.callee_string_encoding == StringEncoding::Utf8
+        {
+            gen_.emit_latin1_to_utf8_transcode(&mut f, 2, 0, &options);
+        } else {
+            panic!("unsupported encoding pair for test");
+        }
+        f.into_raw_body()
+    }
+
+    fn transcode_options(caller: StringEncoding, callee: StringEncoding) -> AdapterOptions {
+        AdapterOptions {
+            caller_string_encoding: caller,
+            callee_string_encoding: callee,
+            caller_memory: 0,
+            callee_memory: 1,
+            callee_realloc: Some(0),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn ls_a_7_utf8_to_utf16_emits_overflow_and_null_guards() {
+        let body = emit_transcode(transcode_options(
+            StringEncoding::Utf8,
+            StringEncoding::Utf16,
+        ));
+        assert!(
+            body_has_gtu_if_unreachable(&body),
+            "LS-A-7: UTF-8→UTF-16 transcoder missing overflow guard \
+             (i32.gt_u; if; unreachable; end) before the i32.mul"
+        );
+        assert!(
+            body_has_eqz_if_unreachable(&body),
+            "LS-A-7: UTF-8→UTF-16 transcoder missing cabi_realloc null \
+             guard (i32.eqz; if; unreachable; end) after the call"
+        );
+    }
+
+    #[test]
+    fn ls_a_7_utf16_to_utf8_emits_overflow_and_null_guards() {
+        let body = emit_transcode(transcode_options(
+            StringEncoding::Utf16,
+            StringEncoding::Utf8,
+        ));
+        assert!(
+            body_has_gtu_if_unreachable(&body),
+            "LS-A-7: UTF-16→UTF-8 transcoder missing overflow guard"
+        );
+        assert!(
+            body_has_eqz_if_unreachable(&body),
+            "LS-A-7: UTF-16→UTF-8 transcoder missing cabi_realloc null guard"
+        );
+    }
+
+    #[test]
+    fn ls_a_7_latin1_to_utf8_emits_overflow_and_null_guards() {
+        let body = emit_transcode(transcode_options(
+            StringEncoding::Latin1,
+            StringEncoding::Utf8,
+        ));
+        assert!(
+            body_has_gtu_if_unreachable(&body),
+            "LS-A-7: Latin-1→UTF-8 transcoder missing overflow guard"
+        );
+        assert!(
+            body_has_eqz_if_unreachable(&body),
+            "LS-A-7: Latin-1→UTF-8 transcoder missing cabi_realloc null guard"
         );
     }
 }
