@@ -1950,6 +1950,7 @@ fn generate_stabilizing_shim(
     let mut body = Function::new([(7, wasm_encoder::ValType::I32)]);
 
     // byte_count = len * elem_size
+    crate::adapter::fact::emit_overflow_guard(&mut body, 1, elem_size);
     body.instruction(&Instruction::LocalGet(1));
     body.instruction(&Instruction::I32Const(elem_size as i32));
     body.instruction(&Instruction::I32Mul);
@@ -1960,8 +1961,7 @@ fn generate_stabilizing_shim(
     body.instruction(&Instruction::I32Const(0));
     body.instruction(&Instruction::I32Const(elem_align as i32));
     body.instruction(&Instruction::LocalGet(l_byte_count));
-    body.instruction(&Instruction::Call(realloc_func));
-    body.instruction(&Instruction::LocalSet(l_stable));
+    crate::adapter::fact::emit_checked_realloc(&mut body, realloc_func, l_stable);
 
     // memory.copy stable_records <- ptr, byte_count (intra-callee, mem 0)
     body.instruction(&Instruction::LocalGet(l_stable));
@@ -2009,8 +2009,13 @@ fn generate_stabilizing_shim(
         body.instruction(&Instruction::LocalSet(l_old_str));
 
         // str_len = mem.load(rec + offset + 4) * sub_size
+        // Stash raw (pre-multiply) len in l_str_len for the overflow guard,
+        // then multiply to produce the byte count.
         body.instruction(&Instruction::LocalGet(l_rec));
         body.instruction(&Instruction::I32Load(mem_arg_len));
+        body.instruction(&Instruction::LocalSet(l_str_len));
+        crate::adapter::fact::emit_overflow_guard(&mut body, l_str_len, *sub_size);
+        body.instruction(&Instruction::LocalGet(l_str_len));
         if *sub_size != 1 {
             body.instruction(&Instruction::I32Const(*sub_size as i32));
             body.instruction(&Instruction::I32Mul);
@@ -2022,8 +2027,7 @@ fn generate_stabilizing_shim(
         body.instruction(&Instruction::I32Const(0));
         body.instruction(&Instruction::I32Const(1));
         body.instruction(&Instruction::LocalGet(l_str_len));
-        body.instruction(&Instruction::Call(realloc_func));
-        body.instruction(&Instruction::LocalSet(l_stable_str));
+        crate::adapter::fact::emit_checked_realloc(&mut body, realloc_func, l_stable_str);
 
         // memory.copy stable_str <- old_str, str_len (intra-callee)
         body.instruction(&Instruction::LocalGet(l_stable_str));

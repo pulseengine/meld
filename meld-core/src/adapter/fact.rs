@@ -42,6 +42,44 @@ fn alignment_for_encoding(encoding: StringEncoding) -> i32 {
 
 /// Build a lookup from `(module, field)` → merged function index for resource imports.
 ///
+/// Emit a safe `cabi_realloc` call: traps via `unreachable` if the returned
+/// pointer is 0 (OOM). Caller must have pushed the 4 realloc arguments onto
+/// the stack (`old_ptr`, `old_size`, `align`, `new_size`) immediately before
+/// calling this helper. After the call, the (checked, non-null) pointer is
+/// stored in `result_local`.
+///
+/// This is the fix for LS-A-7 leg (b): an unchecked realloc return lets the
+/// transcode/copy loop write into callee memory offset 0 on OOM.
+pub(crate) fn emit_checked_realloc(body: &mut Function, realloc_func: u32, result_local: u32) {
+    body.instruction(&Instruction::Call(realloc_func));
+    body.instruction(&Instruction::LocalSet(result_local));
+    body.instruction(&Instruction::LocalGet(result_local));
+    body.instruction(&Instruction::I32Eqz);
+    body.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+    body.instruction(&Instruction::Unreachable);
+    body.instruction(&Instruction::End);
+}
+
+/// Emit an overflow guard: traps via `unreachable` if `len_local * k` would
+/// wrap in 32-bit unsigned arithmetic. Caller supplies the local holding the
+/// untrusted length and the constant multiplier `k`. No-op when `k <= 1`.
+///
+/// This is the fix for LS-A-7 leg (a): `i32.mul` is modulo 2^32, so a large
+/// caller-chosen `len` can wrap to a small allocation size while the copy
+/// loop still writes the full `len * k` bytes, producing an OOB write into
+/// callee memory.
+pub(crate) fn emit_overflow_guard(body: &mut Function, len_local: u32, k: u32) {
+    if k <= 1 {
+        return;
+    }
+    body.instruction(&Instruction::LocalGet(len_local));
+    body.instruction(&Instruction::I32Const((u32::MAX / k) as i32));
+    body.instruction(&Instruction::I32GtU);
+    body.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+    body.instruction(&Instruction::Unreachable);
+    body.instruction(&Instruction::End);
+}
+
 /// Compute Canonical ABI (size, alignment) in bytes for a component value type.
 ///
 /// Per Component Model Canonical ABI spec, every type has a fixed lowered
@@ -243,8 +281,7 @@ fn emit_patch_nested_indirections(
         body.instruction(&Instruction::I32Const(0));
         body.instruction(&Instruction::I32Const(1));
         body.instruction(&Instruction::LocalGet(l_buf_len));
-        body.instruction(&Instruction::Call(realloc_func));
-        body.instruction(&Instruction::LocalSet(l_new_ptr));
+        emit_checked_realloc(body, realloc_func, l_new_ptr);
 
         // memory.copy new_ptr <- old_ptr (callee → caller)
         body.instruction(&Instruction::LocalGet(l_new_ptr));
@@ -1168,6 +1205,7 @@ impl FactStyleGenerator {
                     .unwrap_or(1);
 
                 // Allocate: dest = cabi_realloc(0, 0, 1, len * byte_mult)
+                emit_overflow_guard(&mut func, len_pos, byte_mult);
                 func.instruction(&Instruction::I32Const(0));
                 func.instruction(&Instruction::I32Const(0));
                 func.instruction(&Instruction::I32Const(1));
@@ -1176,8 +1214,7 @@ impl FactStyleGenerator {
                     func.instruction(&Instruction::I32Const(byte_mult as i32));
                     func.instruction(&Instruction::I32Mul);
                 }
-                func.instruction(&Instruction::Call(callee_realloc));
-                func.instruction(&Instruction::LocalSet(dest_local));
+                emit_checked_realloc(&mut func, callee_realloc, dest_local);
 
                 // Copy: memory.copy callee_mem caller_mem (dest, src, len * byte_mult)
                 func.instruction(&Instruction::LocalGet(dest_local));
@@ -1311,6 +1348,7 @@ impl FactStyleGenerator {
                 func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
 
                 // Allocate: new_ptr = cabi_realloc(0, 0, 1, len * byte_mult)
+                emit_overflow_guard(&mut func, len_local, byte_mult);
                 func.instruction(&Instruction::I32Const(0));
                 func.instruction(&Instruction::I32Const(0));
                 func.instruction(&Instruction::I32Const(1));
@@ -1319,9 +1357,8 @@ impl FactStyleGenerator {
                     func.instruction(&Instruction::I32Const(byte_mult as i32));
                     func.instruction(&Instruction::I32Mul);
                 }
-                func.instruction(&Instruction::Call(callee_realloc));
                 // Save as dest_ptr (reuse a scratch local)
-                func.instruction(&Instruction::LocalSet(dest_ptr_local));
+                emit_checked_realloc(&mut func, callee_realloc, dest_ptr_local);
 
                 // Copy: memory.copy callee caller (dest, src, len * byte_mult)
                 func.instruction(&Instruction::LocalGet(dest_ptr_local));
@@ -1378,8 +1415,7 @@ impl FactStyleGenerator {
             func.instruction(&Instruction::I32Const(0)); // original_size
             func.instruction(&Instruction::I32Const(1)); // alignment
             func.instruction(&Instruction::LocalGet(callee_ret_len_local));
-            func.instruction(&Instruction::Call(caller_realloc));
-            func.instruction(&Instruction::LocalSet(caller_new_ptr_local));
+            emit_checked_realloc(&mut func, caller_realloc, caller_new_ptr_local);
 
             // Copy data from callee's memory to caller's memory:
             //   memory.copy $caller_mem $callee_mem (caller_new_ptr, callee_ret_ptr, len)
@@ -1463,6 +1499,7 @@ impl FactStyleGenerator {
                     func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
 
                     // Allocate in caller memory
+                    emit_overflow_guard(&mut func, len_local, byte_mult);
                     func.instruction(&Instruction::I32Const(0));
                     func.instruction(&Instruction::I32Const(0));
                     func.instruction(&Instruction::I32Const(1));
@@ -1471,8 +1508,7 @@ impl FactStyleGenerator {
                         func.instruction(&Instruction::I32Const(byte_mult as i32));
                         func.instruction(&Instruction::I32Mul);
                     }
-                    func.instruction(&Instruction::Call(caller_realloc));
-                    func.instruction(&Instruction::LocalSet(dest_ptr_local));
+                    emit_checked_realloc(&mut func, caller_realloc, dest_ptr_local);
 
                     // Copy from callee memory to caller memory
                     func.instruction(&Instruction::LocalGet(dest_ptr_local));
@@ -1551,9 +1587,11 @@ impl FactStyleGenerator {
         //   1: callee_ptr (allocated pointer in callee's memory)
         //   2..2+N: dest_ptr for each pointer pair copy
         //   2+N: loop_counter (if inner resources need fixup)
+        //   last: pair_len_local (scratch for per-pair overflow guard)
         let num_ptr_pairs = ptr_pair_offsets.len() as u32;
         let loop_counter_count = if has_inner_resources { 1u32 } else { 0 };
-        let scratch_count = 1 + num_ptr_pairs + loop_counter_count; // callee_ptr + per-pair dest ptrs + loop counter
+        let pair_len_scratch_count = if num_ptr_pairs > 0 { 1u32 } else { 0 };
+        let scratch_count = 1 + num_ptr_pairs + loop_counter_count + pair_len_scratch_count; // callee_ptr + per-pair dest ptrs + loop counter + pair_len
 
         // Post-return needs result save locals
         let has_post_return = options.callee_post_return.is_some();
@@ -1578,6 +1616,10 @@ impl FactStyleGenerator {
         let params_ptr_local: u32 = 0;
         let callee_ptr_local: u32 = 1;
         let pair_dest_base: u32 = 2;
+        // Scratch local holding the length of the current (ptr, len) pair,
+        // used by emit_overflow_guard. Only present when there is at least
+        // one pointer pair.
+        let pair_len_local: u32 = pair_dest_base + num_ptr_pairs + loop_counter_count;
 
         // --- Phase 1: Allocate buffer in callee's memory ---
         // callee_ptr = cabi_realloc(0, 0, align, size)
@@ -1585,8 +1627,7 @@ impl FactStyleGenerator {
         func.instruction(&Instruction::I32Const(0)); // original_size
         func.instruction(&Instruction::I32Const(params_area_align as i32)); // alignment
         func.instruction(&Instruction::I32Const(params_area_size as i32)); // new_size
-        func.instruction(&Instruction::Call(callee_realloc));
-        func.instruction(&Instruction::LocalSet(callee_ptr_local));
+        emit_checked_realloc(&mut func, callee_realloc, callee_ptr_local);
 
         // --- Phase 2: Bulk copy the entire params buffer ---
         // memory.copy $callee_mem $caller_mem (callee_ptr, params_ptr, size)
@@ -1618,23 +1659,27 @@ impl FactStyleGenerator {
             // Read old_ptr from callee's buffer: i32.load callee_mem (callee_ptr + byte_offset)
             // Read old_len from callee's buffer: i32.load callee_mem (callee_ptr + byte_offset + 4)
 
-            // Allocate: new_ptr = cabi_realloc(0, 0, 1, len * byte_mult)
-            func.instruction(&Instruction::I32Const(0));
-            func.instruction(&Instruction::I32Const(0));
-            func.instruction(&Instruction::I32Const(1));
-            // Load len from callee's buffer
+            // Stash len into a scratch local so the overflow guard + realloc
+            // can both reference it without re-loading from memory.
             func.instruction(&Instruction::LocalGet(callee_ptr_local));
             func.instruction(&Instruction::I32Load(wasm_encoder::MemArg {
                 offset: (byte_offset + 4) as u64,
                 align: 2,
                 memory_index: options.callee_memory,
             }));
+            func.instruction(&Instruction::LocalSet(pair_len_local));
+
+            // Allocate: new_ptr = cabi_realloc(0, 0, 1, len * byte_mult)
+            emit_overflow_guard(&mut func, pair_len_local, byte_mult);
+            func.instruction(&Instruction::I32Const(0));
+            func.instruction(&Instruction::I32Const(0));
+            func.instruction(&Instruction::I32Const(1));
+            func.instruction(&Instruction::LocalGet(pair_len_local));
             if byte_mult > 1 {
                 func.instruction(&Instruction::I32Const(byte_mult as i32));
                 func.instruction(&Instruction::I32Mul);
             }
-            func.instruction(&Instruction::Call(callee_realloc));
-            func.instruction(&Instruction::LocalSet(dest_local));
+            emit_checked_realloc(&mut func, callee_realloc, dest_local);
 
             // Copy data: memory.copy callee caller (new_ptr, old_ptr, len * byte_mult)
             func.instruction(&Instruction::LocalGet(dest_local)); // dst (in callee mem)
@@ -1895,6 +1940,7 @@ impl FactStyleGenerator {
                     .unwrap_or(1);
 
                 // Allocate: dest = cabi_realloc(0, 0, 1, len * byte_mult)
+                emit_overflow_guard(&mut func, len_pos, byte_mult);
                 func.instruction(&Instruction::I32Const(0));
                 func.instruction(&Instruction::I32Const(0));
                 func.instruction(&Instruction::I32Const(1));
@@ -1903,8 +1949,7 @@ impl FactStyleGenerator {
                     func.instruction(&Instruction::I32Const(byte_mult as i32));
                     func.instruction(&Instruction::I32Mul);
                 }
-                func.instruction(&Instruction::Call(callee_realloc));
-                func.instruction(&Instruction::LocalSet(dest_local));
+                emit_checked_realloc(&mut func, callee_realloc, dest_local);
 
                 // Copy: memory.copy callee_mem caller_mem (dest, src, len * byte_mult)
                 func.instruction(&Instruction::LocalGet(dest_local));
@@ -2013,6 +2058,7 @@ impl FactStyleGenerator {
                 func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
 
                 // Allocate in callee memory
+                emit_overflow_guard(&mut func, len_local, byte_mult);
                 func.instruction(&Instruction::I32Const(0));
                 func.instruction(&Instruction::I32Const(0));
                 func.instruction(&Instruction::I32Const(1));
@@ -2021,8 +2067,7 @@ impl FactStyleGenerator {
                     func.instruction(&Instruction::I32Const(byte_mult as i32));
                     func.instruction(&Instruction::I32Mul);
                 }
-                func.instruction(&Instruction::Call(callee_realloc));
-                func.instruction(&Instruction::LocalSet(cond_dest_ptr_local));
+                emit_checked_realloc(&mut func, callee_realloc, cond_dest_ptr_local);
 
                 // Copy from caller to callee memory
                 func.instruction(&Instruction::LocalGet(cond_dest_ptr_local));
@@ -2114,6 +2159,7 @@ impl FactStyleGenerator {
                     func.instruction(&Instruction::LocalSet(data_len_local));
 
                     // Allocate in caller's memory: data_len * byte_mult bytes
+                    emit_overflow_guard(&mut func, data_len_local, byte_mult);
                     func.instruction(&Instruction::I32Const(0));
                     func.instruction(&Instruction::I32Const(0));
                     func.instruction(&Instruction::I32Const(1));
@@ -2122,8 +2168,7 @@ impl FactStyleGenerator {
                         func.instruction(&Instruction::I32Const(byte_mult as i32));
                         func.instruction(&Instruction::I32Mul);
                     }
-                    func.instruction(&Instruction::Call(caller_realloc));
-                    func.instruction(&Instruction::LocalSet(caller_new_ptr_local));
+                    emit_checked_realloc(&mut func, caller_realloc, caller_new_ptr_local);
 
                     // Copy data bytes from callee → caller
                     func.instruction(&Instruction::LocalGet(caller_new_ptr_local));
@@ -2299,6 +2344,7 @@ impl FactStyleGenerator {
                 func.instruction(&Instruction::LocalSet(data_len_local));
 
                 // Allocate in caller memory
+                emit_overflow_guard(&mut func, data_len_local, byte_mult);
                 func.instruction(&Instruction::I32Const(0));
                 func.instruction(&Instruction::I32Const(0));
                 func.instruction(&Instruction::I32Const(1));
@@ -2307,8 +2353,7 @@ impl FactStyleGenerator {
                     func.instruction(&Instruction::I32Const(byte_mult as i32));
                     func.instruction(&Instruction::I32Mul);
                 }
-                func.instruction(&Instruction::Call(caller_realloc));
-                func.instruction(&Instruction::LocalSet(caller_new_ptr_local));
+                emit_checked_realloc(&mut func, caller_realloc, caller_new_ptr_local);
 
                 // Copy data from callee → caller
                 func.instruction(&Instruction::LocalGet(caller_new_ptr_local));
@@ -2461,6 +2506,7 @@ impl FactStyleGenerator {
             func.instruction(&Instruction::LocalSet(inner_len));
 
             // Allocate inner data in dst memory: new_ptr = realloc(0, 0, 1, inner_len * byte_mult)
+            emit_overflow_guard(func, inner_len, byte_mult);
             func.instruction(&Instruction::I32Const(0));
             func.instruction(&Instruction::I32Const(0));
             func.instruction(&Instruction::I32Const(1));
@@ -2469,8 +2515,7 @@ impl FactStyleGenerator {
                 func.instruction(&Instruction::I32Const(byte_mult as i32));
                 func.instruction(&Instruction::I32Mul);
             }
-            func.instruction(&Instruction::Call(realloc_func));
-            func.instruction(&Instruction::LocalSet(new_ptr));
+            emit_checked_realloc(func, realloc_func, new_ptr);
 
             // Copy data from src memory to dst memory
             // memory.copy dst_mem src_mem (new_ptr, inner_ptr, inner_len * byte_mult)
@@ -3702,6 +3747,7 @@ impl FactStyleGenerator {
                     .unwrap_or(1);
 
                 // Allocate: cabi_realloc(0, 0, 1, len * byte_mult)
+                emit_overflow_guard(&mut body, len_local, byte_mult);
                 body.instruction(&Instruction::I32Const(0));
                 body.instruction(&Instruction::I32Const(0));
                 body.instruction(&Instruction::I32Const(1));
@@ -3710,8 +3756,7 @@ impl FactStyleGenerator {
                     body.instruction(&Instruction::I32Const(byte_mult as i32));
                     body.instruction(&Instruction::I32Mul);
                 }
-                body.instruction(&Instruction::Call(realloc));
-                body.instruction(&Instruction::LocalSet(l_new_ptr));
+                emit_checked_realloc(&mut body, realloc, l_new_ptr);
 
                 // Copy: memory.copy new_ptr <- old_ptr, len * byte_mult
                 body.instruction(&Instruction::LocalGet(l_new_ptr));
@@ -3965,6 +4010,7 @@ impl FactStyleGenerator {
                     body.instruction(&Instruction::LocalSet(l_src_len));
 
                     // byte_count = len * elem_size
+                    emit_overflow_guard(&mut body, l_src_len, elem_size);
                     body.instruction(&Instruction::LocalGet(l_src_len));
                     if elem_size != 1 {
                         body.instruction(&Instruction::I32Const(elem_size as i32));
@@ -3977,8 +4023,7 @@ impl FactStyleGenerator {
                     body.instruction(&Instruction::I32Const(0)); // old_size
                     body.instruction(&Instruction::I32Const(elem_align as i32));
                     body.instruction(&Instruction::LocalGet(l_byte_count));
-                    body.instruction(&Instruction::Call(realloc_func));
-                    body.instruction(&Instruction::LocalSet(l_dst_ptr));
+                    emit_checked_realloc(&mut body, realloc_func, l_dst_ptr);
 
                     // Copy from callee memory to caller memory
                     body.instruction(&Instruction::LocalGet(l_dst_ptr));
