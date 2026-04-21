@@ -283,20 +283,31 @@ pub(crate) fn compute_sha256(bytes: &[u8]) -> String {
     hex::encode(result)
 }
 
-/// Generate a UUID v4
+/// Generate a UUID v4 using the current system clock as entropy.
+///
+/// This is a thin wrapper over [`generate_uuid_from`] that sources entropy
+/// from `SystemTime::now()`. Tests should prefer [`generate_uuid_from`] to
+/// pin the entropy value and keep results deterministic.
 pub(crate) fn generate_uuid() -> String {
-    // Simple UUID v4 generation using random bytes
-    // In production, use a proper UUID crate
-    let mut bytes = [0u8; 16];
-
-    // Use a simple hash of current time as pseudo-random
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
+    generate_uuid_from(now)
+}
+
+/// Generate a UUID v4 from a caller-supplied entropy value.
+///
+/// The entropy is hashed with SHA-256 and the first 16 bytes are used to
+/// fill a UUID v4 shape (with version and variant bits set per RFC 4122).
+/// The algorithm is unchanged from the original `generate_uuid`; this form
+/// exists so callers (and tests) can provide deterministic entropy rather
+/// than depending on the wall clock.
+pub(crate) fn generate_uuid_from(entropy: u128) -> String {
+    let mut bytes = [0u8; 16];
 
     let mut hasher = Sha256::new();
-    hasher.update(now.to_le_bytes());
+    hasher.update(entropy.to_le_bytes());
     let hash = hasher.finalize();
 
     bytes.copy_from_slice(&hash[..16]);
@@ -317,25 +328,33 @@ pub(crate) fn generate_uuid() -> String {
     )
 }
 
-/// Get current timestamp in ISO 8601 format
+/// Get current timestamp in ISO 8601 format using the system clock.
+///
+/// Thin wrapper over [`chrono_timestamp_from`] sourcing seconds-since-epoch
+/// from `SystemTime::now()`. A clock-before-epoch collapses to
+/// `"1970-01-01T00:00:00Z"`.
 pub(crate) fn chrono_timestamp() -> String {
     use std::time::SystemTime;
 
-    let now = SystemTime::now()
+    let secs = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap_or_default();
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    chrono_timestamp_from(secs)
+}
 
-    // Simple ISO 8601 format (without chrono dependency)
-    let secs = now.as_secs();
-    let days_since_epoch = secs / 86400;
-    let secs_today = secs % 86400;
+/// Format `secs` (seconds since Unix epoch) as an ISO 8601 / RFC 3339
+/// UTC timestamp: `YYYY-MM-DDTHH:MM:SSZ`.
+///
+/// Computes a correct proleptic Gregorian date, honoring leap years and
+/// per-month day counts. No external crate dependency.
+pub(crate) fn chrono_timestamp_from(secs: u64) -> String {
+    const SECS_PER_DAY: u64 = 86_400;
 
-    // Approximate date calculation (not accounting for leap years properly)
-    let years = days_since_epoch / 365;
-    let year = 1970 + years;
-    let day_of_year = days_since_epoch % 365;
-    let month = (day_of_year / 30).min(11) + 1;
-    let day = (day_of_year % 30) + 1;
+    let days_since_epoch = secs / SECS_PER_DAY;
+    let secs_today = secs % SECS_PER_DAY;
+
+    let (year, month, day) = civil_from_days(days_since_epoch);
 
     let hour = secs_today / 3600;
     let minute = (secs_today % 3600) / 60;
@@ -345,6 +364,44 @@ pub(crate) fn chrono_timestamp() -> String {
         "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
         year, month, day, hour, minute, second
     )
+}
+
+/// Convert days-since-Unix-epoch to a (year, month, day) triple in the
+/// proleptic Gregorian calendar.
+///
+/// Implements Howard Hinnant's `civil_from_days` algorithm
+/// (http://howardhinnant.github.io/date_algorithms.html#civil_from_days).
+/// Correctly handles leap years and per-month day counts. Returns
+/// 1-indexed `month` (1..=12) and `day` (1..=31).
+fn civil_from_days(days_since_epoch: u64) -> (u64, u64, u64) {
+    // Shift epoch from 1970-01-01 to 0000-03-01 (start of a 400-year cycle
+    // aligned so that February — the leap month — is the last month).
+    // 719_468 = number of days from 0000-03-01 to 1970-01-01.
+    let z = days_since_epoch as i64 + 719_468;
+
+    // 146_097 days per 400-year cycle.
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097) as u64; // day-of-era, [0, 146096]
+
+    // year-of-era, [0, 399]
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe as i64 + era * 400;
+
+    // day-of-year, [0, 365]
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+
+    // March-based month, [0, 11] where 0=March, 11=February.
+    let mp = (5 * doy + 2) / 153;
+
+    // Day of month, [1, 31].
+    let d = doy - (153 * mp + 2) / 5 + 1;
+
+    // Shift month to [1, 12] with January=1; year increments if mp>=10
+    // (i.e. the March-based month rolled past December into Jan/Feb).
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+
+    (y as u64, m, d)
 }
 
 #[cfg(test)]
@@ -409,6 +466,61 @@ mod tests {
         // Should be in ISO 8601 format
         assert!(ts.contains('T'));
         assert!(ts.ends_with('Z'));
+    }
+
+    /// Epoch maps to 1970-01-01T00:00:00Z exactly.
+    #[test]
+    fn test_chrono_timestamp_from_epoch() {
+        assert_eq!(chrono_timestamp_from(0), "1970-01-01T00:00:00Z");
+    }
+
+    /// 2025-01-01T00:00:00Z — 55 years after the epoch, crossing the
+    /// 2024 leap year. The old (365-days-per-year) approximation was
+    /// off by many days here.
+    #[test]
+    fn test_chrono_timestamp_from_2025_new_year() {
+        assert_eq!(chrono_timestamp_from(1_735_689_600), "2025-01-01T00:00:00Z");
+    }
+
+    /// March 1, 2025 (non-leap year): the day after Feb 28. The old
+    /// algorithm would have reported a non-existent "Feb 30".
+    #[test]
+    fn test_chrono_timestamp_from_2025_march_boundary() {
+        assert_eq!(chrono_timestamp_from(1_740_787_200), "2025-03-01T00:00:00Z");
+    }
+
+    /// March 1, 2024 (leap year): the day after Feb 29. Verifies the
+    /// leap-day is accounted for and March starts on the correct day.
+    #[test]
+    fn test_chrono_timestamp_from_2024_leap_march() {
+        assert_eq!(chrono_timestamp_from(1_709_251_200), "2024-03-01T00:00:00Z");
+    }
+
+    /// Pinned output for `generate_uuid_from(0)`. The algorithm is
+    /// SHA-256 of the little-endian bytes of 0u128 (16 zero bytes),
+    /// take the first 16 bytes, then set UUID v4 version (0x40) and
+    /// RFC 4122 variant (0x80) bits. Changing the algorithm should
+    /// either update this expected value intentionally or fail here.
+    #[test]
+    fn test_generate_uuid_from_pinned_zero() {
+        assert_eq!(
+            generate_uuid_from(0),
+            "374708ff-f771-4dd5-979e-c875d56cd228"
+        );
+    }
+
+    /// Different entropy values must produce different UUIDs
+    /// (sanity check — distinct inputs to SHA-256 collide vanishingly
+    /// rarely, so this primarily guards against accidentally ignoring
+    /// the entropy argument).
+    #[test]
+    fn test_generate_uuid_from_distinct_entropy_differs() {
+        let a = generate_uuid_from(0);
+        let b = generate_uuid_from(1);
+        let c = generate_uuid_from(u128::MAX);
+        assert_ne!(a, b);
+        assert_ne!(a, c);
+        assert_ne!(b, c);
     }
 
     /// SR-27: Input hash integrity — the attestation must record a SHA-256 hash
