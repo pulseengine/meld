@@ -3632,24 +3632,43 @@ impl FactStyleGenerator {
             );
             let realloc = callee_realloc.unwrap();
             // For each (ptr, len) pair in the caller's params, allocate in
-            // callee memory and copy the data from caller memory.
-            for &ptr_pos in &caller_ptr_positions {
+            // callee memory and copy the data from caller memory. Use the
+            // resolver's param_copy_layouts to get the per-element byte
+            // size so list<u32>/list<u64>/etc. copy the correct total size.
+            let param_layouts = &site.requirements.param_copy_layouts;
+            for (pair_idx, &ptr_pos) in caller_ptr_positions.iter().enumerate() {
                 let ptr_local = ptr_pos;
                 let len_local = ptr_local + 1;
                 let l_new_ptr = l_p2 + 4; // reuse scratch local
 
-                // Allocate in callee memory: cabi_realloc(0, 0, 1, len)
+                let byte_mult = param_layouts
+                    .get(pair_idx)
+                    .map(|cl| match cl {
+                        crate::resolver::CopyLayout::Bulk { byte_multiplier } => *byte_multiplier,
+                        crate::resolver::CopyLayout::Elements { element_size, .. } => *element_size,
+                    })
+                    .unwrap_or(1);
+
+                // Allocate: cabi_realloc(0, 0, 1, len * byte_mult)
                 body.instruction(&Instruction::I32Const(0));
                 body.instruction(&Instruction::I32Const(0));
                 body.instruction(&Instruction::I32Const(1));
                 body.instruction(&Instruction::LocalGet(len_local));
+                if byte_mult > 1 {
+                    body.instruction(&Instruction::I32Const(byte_mult as i32));
+                    body.instruction(&Instruction::I32Mul);
+                }
                 body.instruction(&Instruction::Call(realloc));
                 body.instruction(&Instruction::LocalSet(l_new_ptr));
 
-                // Copy from caller memory to callee memory
-                body.instruction(&Instruction::LocalGet(l_new_ptr)); // dst
-                body.instruction(&Instruction::LocalGet(ptr_local)); // src
-                body.instruction(&Instruction::LocalGet(len_local)); // len
+                // Copy: memory.copy new_ptr <- old_ptr, len * byte_mult
+                body.instruction(&Instruction::LocalGet(l_new_ptr));
+                body.instruction(&Instruction::LocalGet(ptr_local));
+                body.instruction(&Instruction::LocalGet(len_local));
+                if byte_mult > 1 {
+                    body.instruction(&Instruction::I32Const(byte_mult as i32));
+                    body.instruction(&Instruction::I32Mul);
+                }
                 body.instruction(&Instruction::MemoryCopy {
                     dst_mem: callee_memory,
                     src_mem: caller_memory,
