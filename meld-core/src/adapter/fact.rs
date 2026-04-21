@@ -2700,8 +2700,21 @@ impl FactStyleGenerator {
         };
 
         // Step 1: Allocate output buffer = 2 * input_len bytes via cabi_realloc
-        // (each UTF-8 byte produces at most one UTF-16 code unit = 2 bytes)
+        // (each UTF-8 byte produces at most one UTF-16 code unit = 2 bytes).
+        // Guards against the two memory-safety hazards identified in LS-A-7:
+        //   (a) i32.mul is modulo 2^32 — trap if len > u32::MAX/2 before the
+        //       multiply, so alloc_size cannot wrap below the actual required
+        //       byte count that the transcode loop will write.
+        //   (b) cabi_realloc may return 0 on OOM — trap before writing so
+        //       the loop cannot corrupt callee memory at offset 0.
         let callee_align = alignment_for_encoding(options.callee_string_encoding);
+        func.instruction(&Instruction::LocalGet(1)); // input_len
+        func.instruction(&Instruction::I32Const((u32::MAX / 2) as i32));
+        func.instruction(&Instruction::I32GtU);
+        func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+        func.instruction(&Instruction::Unreachable);
+        func.instruction(&Instruction::End);
+
         func.instruction(&Instruction::I32Const(0)); // original_ptr
         func.instruction(&Instruction::I32Const(0)); // original_size
         func.instruction(&Instruction::I32Const(callee_align)); // alignment
@@ -2710,6 +2723,13 @@ impl FactStyleGenerator {
         func.instruction(&Instruction::I32Mul); // alloc_size = 2 * input_len
         func.instruction(&Instruction::Call(callee_realloc));
         func.instruction(&Instruction::LocalSet(out_ptr_local));
+
+        // Trap on null return from cabi_realloc (LS-A-7 leg b).
+        func.instruction(&Instruction::LocalGet(out_ptr_local));
+        func.instruction(&Instruction::I32Eqz);
+        func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+        func.instruction(&Instruction::Unreachable);
+        func.instruction(&Instruction::End);
 
         // Step 2: Initialize loop counters
         func.instruction(&Instruction::I32Const(0));
@@ -3008,8 +3028,17 @@ impl FactStyleGenerator {
         };
 
         // Step 1: Allocate output buffer = 3 * input_code_units bytes
-        // (worst case: all BMP chars in U+0800-U+FFFF → 3 bytes UTF-8 each)
+        // (worst case: all BMP chars in U+0800-U+FFFF → 3 bytes UTF-8 each).
+        // See LS-A-7: guard against i32.mul wrap (leg a) and cabi_realloc
+        // OOM (leg b) before writing into callee memory.
         let callee_align = alignment_for_encoding(options.callee_string_encoding);
+        func.instruction(&Instruction::LocalGet(1)); // input_len
+        func.instruction(&Instruction::I32Const((u32::MAX / 3) as i32));
+        func.instruction(&Instruction::I32GtU);
+        func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+        func.instruction(&Instruction::Unreachable);
+        func.instruction(&Instruction::End);
+
         func.instruction(&Instruction::I32Const(0)); // original_ptr
         func.instruction(&Instruction::I32Const(0)); // original_size
         func.instruction(&Instruction::I32Const(callee_align)); // alignment
@@ -3018,6 +3047,13 @@ impl FactStyleGenerator {
         func.instruction(&Instruction::I32Mul); // alloc_size = 3 * code_units
         func.instruction(&Instruction::Call(callee_realloc));
         func.instruction(&Instruction::LocalSet(out_ptr_local));
+
+        // Trap on null return from cabi_realloc (LS-A-7 leg b).
+        func.instruction(&Instruction::LocalGet(out_ptr_local));
+        func.instruction(&Instruction::I32Eqz);
+        func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+        func.instruction(&Instruction::Unreachable);
+        func.instruction(&Instruction::End);
 
         // Step 2: Initialize loop counters
         func.instruction(&Instruction::I32Const(0));
@@ -3332,8 +3368,17 @@ impl FactStyleGenerator {
             memory_index: options.callee_memory,
         };
 
-        // Step 1: Allocate output buffer = 2 * input_len via cabi_realloc
+        // Step 1: Allocate output buffer = 2 * input_len via cabi_realloc.
+        // See LS-A-7: guard against i32.mul wrap (leg a) and cabi_realloc
+        // OOM (leg b) before writing into callee memory.
         let callee_align = alignment_for_encoding(options.callee_string_encoding);
+        func.instruction(&Instruction::LocalGet(1)); // input_len
+        func.instruction(&Instruction::I32Const((u32::MAX / 2) as i32));
+        func.instruction(&Instruction::I32GtU);
+        func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+        func.instruction(&Instruction::Unreachable);
+        func.instruction(&Instruction::End);
+
         func.instruction(&Instruction::I32Const(0)); // original_ptr
         func.instruction(&Instruction::I32Const(0)); // original_size
         func.instruction(&Instruction::I32Const(callee_align)); // alignment
@@ -3342,6 +3387,13 @@ impl FactStyleGenerator {
         func.instruction(&Instruction::I32Mul); // alloc_size = 2 * input_len
         func.instruction(&Instruction::Call(callee_realloc));
         func.instruction(&Instruction::LocalSet(out_ptr_local));
+
+        // Trap on null return from cabi_realloc (LS-A-7 leg b).
+        func.instruction(&Instruction::LocalGet(out_ptr_local));
+        func.instruction(&Instruction::I32Eqz);
+        func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+        func.instruction(&Instruction::Unreachable);
+        func.instruction(&Instruction::End);
 
         // Step 2: Initialize loop counters
         func.instruction(&Instruction::I32Const(0));
@@ -4320,6 +4372,127 @@ mod tests {
         assert!(
             options.crosses_memory(),
             "SR-17: different memory indices should cross memory boundaries"
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // LS-A-7: Transcoder overflow + null-check guards
+    //
+    // The three transcode emitters must emit, for every generated
+    // adapter:
+    //   (a) an I32GtU check on input_len against u32::MAX/K followed
+    //       by an `if ... unreachable end` trap — prevents i32.mul
+    //       wrapping to a small alloc_size.
+    //   (b) an I32Eqz check on the cabi_realloc return followed by
+    //       `if ... unreachable end` — prevents the transcode loop
+    //       writing to callee memory offset 0 when OOM returns null.
+    //
+    // These byte-scan tests are the PoC referenced in loss-scenarios
+    // LS-A-7. They fail on the unfixed emitter and pass once both
+    // guards are present.
+    // ---------------------------------------------------------------
+
+    /// Return `true` iff the byte-encoded function body `body` contains
+    /// an `i32.eqz; if; unreachable; end` sequence. The `if` block byte
+    /// is 0x04, `unreachable` is 0x00, `end` is 0x0B, `i32.eqz` is 0x45.
+    /// The block type that follows 0x04 is 0x40 (empty block type).
+    #[cfg(test)]
+    fn body_has_eqz_if_unreachable(body: &[u8]) -> bool {
+        // Pattern: 0x45 0x04 0x40 0x00 0x0B
+        body.windows(5).any(|w| w == [0x45, 0x04, 0x40, 0x00, 0x0B])
+    }
+
+    /// Return `true` iff the byte-encoded function body `body` contains
+    /// a `i32.gt_u; if; unreachable; end` sequence.
+    /// Opcodes: i32.gt_u = 0x4B, if = 0x04, block type empty = 0x40,
+    /// unreachable = 0x00, end = 0x0B.
+    #[cfg(test)]
+    fn body_has_gtu_if_unreachable(body: &[u8]) -> bool {
+        body.windows(5).any(|w| w == [0x4B, 0x04, 0x40, 0x00, 0x0B])
+    }
+
+    fn emit_transcode(options: AdapterOptions) -> Vec<u8> {
+        let gen_ = FactStyleGenerator::new(AdapterConfig::default());
+        let mut f = Function::new([(8, wasm_encoder::ValType::I32)]);
+        // param_count=2 matches string param (ptr, len) lowered shape.
+        // target_func=0 is a placeholder — the emitter only uses it for
+        // the tail call, which this test doesn't execute.
+        if options.caller_string_encoding == StringEncoding::Utf8
+            && options.callee_string_encoding == StringEncoding::Utf16
+        {
+            gen_.emit_utf8_to_utf16_transcode(&mut f, 2, 0, &options);
+        } else if options.caller_string_encoding == StringEncoding::Utf16
+            && options.callee_string_encoding == StringEncoding::Utf8
+        {
+            gen_.emit_utf16_to_utf8_transcode(&mut f, 2, 0, &options);
+        } else if options.caller_string_encoding == StringEncoding::Latin1
+            && options.callee_string_encoding == StringEncoding::Utf8
+        {
+            gen_.emit_latin1_to_utf8_transcode(&mut f, 2, 0, &options);
+        } else {
+            panic!("unsupported encoding pair for test");
+        }
+        f.into_raw_body()
+    }
+
+    fn transcode_options(caller: StringEncoding, callee: StringEncoding) -> AdapterOptions {
+        AdapterOptions {
+            caller_string_encoding: caller,
+            callee_string_encoding: callee,
+            caller_memory: 0,
+            callee_memory: 1,
+            callee_realloc: Some(0),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn ls_a_7_utf8_to_utf16_emits_overflow_and_null_guards() {
+        let body = emit_transcode(transcode_options(
+            StringEncoding::Utf8,
+            StringEncoding::Utf16,
+        ));
+        assert!(
+            body_has_gtu_if_unreachable(&body),
+            "LS-A-7: UTF-8→UTF-16 transcoder missing overflow guard \
+             (i32.gt_u; if; unreachable; end) before the i32.mul"
+        );
+        assert!(
+            body_has_eqz_if_unreachable(&body),
+            "LS-A-7: UTF-8→UTF-16 transcoder missing cabi_realloc null \
+             guard (i32.eqz; if; unreachable; end) after the call"
+        );
+    }
+
+    #[test]
+    fn ls_a_7_utf16_to_utf8_emits_overflow_and_null_guards() {
+        let body = emit_transcode(transcode_options(
+            StringEncoding::Utf16,
+            StringEncoding::Utf8,
+        ));
+        assert!(
+            body_has_gtu_if_unreachable(&body),
+            "LS-A-7: UTF-16→UTF-8 transcoder missing overflow guard"
+        );
+        assert!(
+            body_has_eqz_if_unreachable(&body),
+            "LS-A-7: UTF-16→UTF-8 transcoder missing cabi_realloc null guard"
+        );
+    }
+
+    #[test]
+    fn ls_a_7_latin1_to_utf8_emits_overflow_and_null_guards() {
+        let body = emit_transcode(transcode_options(
+            StringEncoding::Latin1,
+            StringEncoding::Utf8,
+        ));
+        assert!(
+            body_has_gtu_if_unreachable(&body),
+            "LS-A-7: Latin-1→UTF-8 transcoder missing overflow guard"
+        );
+        assert!(
+            body_has_eqz_if_unreachable(&body),
+            "LS-A-7: Latin-1→UTF-8 transcoder missing cabi_realloc null guard"
         );
     }
 }
