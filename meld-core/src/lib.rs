@@ -833,21 +833,94 @@ impl Fuser {
                 result_globals.push((global_idx, *param_ty));
             }
 
-            // Generate shim function: stores each param to its global
+            // Resolve result type early — needed both for shim body (when
+            // we add callee-side stabilization for nested indirections) and
+            // for the TaskReturnShimInfo stored later.
+            let mut early_result_type = comp_func_result_types
+                .get(&comp_idx)
+                .and_then(|m| m.get(&original_func_name))
+                .cloned();
+            if early_result_type.is_none()
+                && let Some(tr_list) = comp_taskreturn_types.get(&comp_idx)
+            {
+                let comp = &self.components[comp_idx];
+                let cursor_peek = comp_tr_cursor.entry(comp_idx).or_insert(0);
+                // Peek without advancing — we'll re-resolve later with the
+                // same cursor state for the canonical TaskReturnShimInfo.
+                let mut peek_cursor = *cursor_peek;
+                while peek_cursor < tr_list.len() {
+                    let candidate = &tr_list[peek_cursor];
+                    peek_cursor += 1;
+                    let flat =
+                        component_wrap::flat_task_return_params_resolved(Some(candidate), comp);
+                    if flat == import_type.params {
+                        early_result_type = Some(candidate.clone());
+                        break;
+                    }
+                }
+            }
+
+            // For lists with indirections (e.g., list<record<string,_>>),
+            // the wit-bindgen Cleanup guard for the records buffer drops
+            // when the async block ends — between EXIT and our adapter
+            // reading globals. To survive that race, the shim deep-copies
+            // both the records buffer and each indirect string into a
+            // stable callee-side allocation, then stores stable pointers
+            // to globals. The adapter's existing cross-mem copy then
+            // operates on stable data.
+            let stabilization = early_result_type.as_ref().and_then(|ty| match ty {
+                parser::ComponentValType::List(elem)
+                | parser::ComponentValType::FixedSizeList(elem, _) => {
+                    let indirections = crate::adapter::fact::collect_indirections(elem, 0);
+                    if indirections.is_empty() {
+                        None
+                    } else {
+                        let (elem_size, elem_align) = crate::adapter::fact::cabi_size_align(elem);
+                        Some((elem_size, elem_align, indirections))
+                    }
+                }
+                _ => None,
+            });
+
+            let (callee_realloc_for_shim, callee_memory_for_shim) = if stabilization.is_some() {
+                (
+                    merger::component_realloc_index(merged, comp_idx),
+                    merger::component_memory_index(merged, comp_idx),
+                )
+            } else {
+                (None, 0)
+            };
+
+            // Generate shim function. Default body: store args to globals.
+            // With stabilization: copy records + strings to stable callee
+            // buffers first, then store stable pointers.
             let shim_func_idx = merged.import_counts.func + merged.functions.len() as u32;
-            let _type_idx = import_type.params.len(); // find or create type
             let shim_type = merger::Merger::find_or_add_type(
                 &mut merged.types,
                 &import_type.params,
                 &[], // void return
             );
 
-            let mut body = wasm_encoder::Function::new([]);
-            for (i, (global_idx, _)) in result_globals.iter().enumerate() {
-                body.instruction(&wasm_encoder::Instruction::LocalGet(i as u32));
-                body.instruction(&wasm_encoder::Instruction::GlobalSet(*global_idx));
-            }
-            body.instruction(&wasm_encoder::Instruction::End);
+            let body = if let (Some((elem_size, elem_align, indirections)), Some(realloc_fn)) =
+                (stabilization.as_ref(), callee_realloc_for_shim)
+            {
+                generate_stabilizing_shim(
+                    &result_globals,
+                    *elem_size,
+                    *elem_align,
+                    indirections,
+                    realloc_fn,
+                    callee_memory_for_shim,
+                )
+            } else {
+                let mut b = wasm_encoder::Function::new([]);
+                for (i, (global_idx, _)) in result_globals.iter().enumerate() {
+                    b.instruction(&wasm_encoder::Instruction::LocalGet(i as u32));
+                    b.instruction(&wasm_encoder::Instruction::GlobalSet(*global_idx));
+                }
+                b.instruction(&wasm_encoder::Instruction::End);
+                b
+            };
 
             merged.functions.push(merger::MergedFunction {
                 type_idx: shim_type,
@@ -1816,6 +1889,177 @@ fn propagate_outer_wiring(
     }
 
     Ok(wiring_hints)
+}
+
+/// Generate a task.return shim body that deep-copies the records buffer
+/// (and each indirect string) into a stable callee-side allocation before
+/// storing the stabilized pointer to globals.
+///
+/// Why: wit-bindgen's lowering for `list<record-with-string>` allocates
+/// the records buffer via `Cleanup::new`, whose drop guard runs at the
+/// end of the async block — between EXIT and our adapter reading the
+/// globals. The original records buffer is freed and overwritten with
+/// allocator free-list patterns by the time the adapter sees it. This
+/// shim makes a parallel copy that the callee allocator owns, free of
+/// the Cleanup guard.
+///
+/// Shim signature: `(ptr: i32, len: i32) -> ()`.
+/// Body shape (for `list<record { string, ... }>` with one indirection
+/// at offset 0, sub-element size 1):
+/// ```text
+///   byte_count = len * elem_size
+///   stable_records = realloc(0, 0, elem_align, byte_count)
+///   memory.copy stable_records <- ptr, byte_count   ; intra-callee
+///   for i in 0..len:
+///     rec = stable_records + i*elem_size
+///     for each (offset, sub_size) in indirections:
+///       old_str = mem.load(rec + offset)
+///       str_len = mem.load(rec + offset + 4) * sub_size
+///       stable_str = realloc(0, 0, 1, str_len)
+///       memory.copy stable_str <- old_str, str_len   ; intra-callee
+///       mem.store(rec + offset, stable_str)
+///   global[ptr_global] = stable_records
+///   global[len_global] = len
+/// ```
+fn generate_stabilizing_shim(
+    result_globals: &[(u32, wasm_encoder::ValType)],
+    elem_size: u32,
+    elem_align: u32,
+    indirections: &[(u32, u32)],
+    realloc_func: u32,
+    callee_memory: u32,
+) -> wasm_encoder::Function {
+    use wasm_encoder::{BlockType, Function, Instruction};
+
+    // Locals layout (after the 2 i32 params: ptr=0, len=1):
+    //   2 = stable_records
+    //   3 = byte_count
+    //   4 = i
+    //   5 = rec
+    //   6 = old_str
+    //   7 = str_len
+    //   8 = stable_str
+    let l_stable = 2u32;
+    let l_byte_count = 3u32;
+    let l_i = 4u32;
+    let l_rec = 5u32;
+    let l_old_str = 6u32;
+    let l_str_len = 7u32;
+    let l_stable_str = 8u32;
+
+    let mut body = Function::new([(7, wasm_encoder::ValType::I32)]);
+
+    // byte_count = len * elem_size
+    body.instruction(&Instruction::LocalGet(1));
+    body.instruction(&Instruction::I32Const(elem_size as i32));
+    body.instruction(&Instruction::I32Mul);
+    body.instruction(&Instruction::LocalSet(l_byte_count));
+
+    // stable_records = realloc(0, 0, elem_align, byte_count)
+    body.instruction(&Instruction::I32Const(0));
+    body.instruction(&Instruction::I32Const(0));
+    body.instruction(&Instruction::I32Const(elem_align as i32));
+    body.instruction(&Instruction::LocalGet(l_byte_count));
+    body.instruction(&Instruction::Call(realloc_func));
+    body.instruction(&Instruction::LocalSet(l_stable));
+
+    // memory.copy stable_records <- ptr, byte_count (intra-callee, mem 0)
+    body.instruction(&Instruction::LocalGet(l_stable));
+    body.instruction(&Instruction::LocalGet(0));
+    body.instruction(&Instruction::LocalGet(l_byte_count));
+    body.instruction(&Instruction::MemoryCopy {
+        dst_mem: callee_memory,
+        src_mem: callee_memory,
+    });
+
+    // for i in 0..len: stabilize indirections in record i
+    body.instruction(&Instruction::I32Const(0));
+    body.instruction(&Instruction::LocalSet(l_i));
+    body.instruction(&Instruction::Block(BlockType::Empty));
+    body.instruction(&Instruction::Loop(BlockType::Empty));
+
+    body.instruction(&Instruction::LocalGet(l_i));
+    body.instruction(&Instruction::LocalGet(1));
+    body.instruction(&Instruction::I32GeU);
+    body.instruction(&Instruction::BrIf(1));
+
+    // rec = stable_records + i * elem_size
+    body.instruction(&Instruction::LocalGet(l_stable));
+    body.instruction(&Instruction::LocalGet(l_i));
+    body.instruction(&Instruction::I32Const(elem_size as i32));
+    body.instruction(&Instruction::I32Mul);
+    body.instruction(&Instruction::I32Add);
+    body.instruction(&Instruction::LocalSet(l_rec));
+
+    for (offset, sub_size) in indirections {
+        let mem_arg_ptr = wasm_encoder::MemArg {
+            offset: *offset as u64,
+            align: 2,
+            memory_index: callee_memory,
+        };
+        let mem_arg_len = wasm_encoder::MemArg {
+            offset: (*offset + 4) as u64,
+            align: 2,
+            memory_index: callee_memory,
+        };
+
+        // old_str = mem.load(rec + offset)
+        body.instruction(&Instruction::LocalGet(l_rec));
+        body.instruction(&Instruction::I32Load(mem_arg_ptr));
+        body.instruction(&Instruction::LocalSet(l_old_str));
+
+        // str_len = mem.load(rec + offset + 4) * sub_size
+        body.instruction(&Instruction::LocalGet(l_rec));
+        body.instruction(&Instruction::I32Load(mem_arg_len));
+        if *sub_size != 1 {
+            body.instruction(&Instruction::I32Const(*sub_size as i32));
+            body.instruction(&Instruction::I32Mul);
+        }
+        body.instruction(&Instruction::LocalSet(l_str_len));
+
+        // stable_str = realloc(0, 0, 1, str_len)
+        body.instruction(&Instruction::I32Const(0));
+        body.instruction(&Instruction::I32Const(0));
+        body.instruction(&Instruction::I32Const(1));
+        body.instruction(&Instruction::LocalGet(l_str_len));
+        body.instruction(&Instruction::Call(realloc_func));
+        body.instruction(&Instruction::LocalSet(l_stable_str));
+
+        // memory.copy stable_str <- old_str, str_len (intra-callee)
+        body.instruction(&Instruction::LocalGet(l_stable_str));
+        body.instruction(&Instruction::LocalGet(l_old_str));
+        body.instruction(&Instruction::LocalGet(l_str_len));
+        body.instruction(&Instruction::MemoryCopy {
+            dst_mem: callee_memory,
+            src_mem: callee_memory,
+        });
+
+        // mem.store(rec + offset, stable_str)
+        body.instruction(&Instruction::LocalGet(l_rec));
+        body.instruction(&Instruction::LocalGet(l_stable_str));
+        body.instruction(&Instruction::I32Store(mem_arg_ptr));
+    }
+
+    // i++; continue
+    body.instruction(&Instruction::LocalGet(l_i));
+    body.instruction(&Instruction::I32Const(1));
+    body.instruction(&Instruction::I32Add);
+    body.instruction(&Instruction::LocalSet(l_i));
+    body.instruction(&Instruction::Br(0));
+
+    body.instruction(&Instruction::End); // end loop
+    body.instruction(&Instruction::End); // end block
+
+    // Store stable_records to ptr_global, len to len_global.
+    if let [(ptr_global, _), (len_global, _)] = result_globals {
+        body.instruction(&Instruction::LocalGet(l_stable));
+        body.instruction(&Instruction::GlobalSet(*ptr_global));
+        body.instruction(&Instruction::LocalGet(1));
+        body.instruction(&Instruction::GlobalSet(*len_global));
+    }
+
+    body.instruction(&Instruction::End);
+    body
 }
 
 #[cfg(test)]

@@ -53,7 +53,7 @@ fn alignment_for_encoding(encoding: StringEncoding) -> i32 {
 /// Assumes `Type(idx)` references have already been resolved (see
 /// `component_wrap::resolve_component_val_type`). Unresolved Type/handle
 /// references fall back to a 4-byte handle-sized layout.
-fn cabi_size_align(ty: &crate::parser::ComponentValType) -> (u32, u32) {
+pub(crate) fn cabi_size_align(ty: &crate::parser::ComponentValType) -> (u32, u32) {
     use crate::parser::{ComponentValType as CVT, PrimitiveValType as P};
     fn align_up(n: u32, a: u32) -> u32 {
         (n + a - 1) & !(a - 1)
@@ -226,12 +226,8 @@ fn emit_patch_nested_indirections(
         }
         body.instruction(&Instruction::LocalSet(l_buf_len));
 
-        // Skip the patch if (old_ptr, buf_len) doesn't lie inside the
-        // callee's current linear memory. The memory.copy would otherwise
-        // trap and unwind the whole call. With the skip, frequencies-style
-        // calls return a list whose string pointers still reference the
-        // callee — the runner then panics when it tries to dereference,
-        // but at least the trap path is observable and recoverable.
+        // Skip patch if (old_ptr, buf_len) doesn't fit in callee mem — guards
+        // against garbage values triggering an unrecoverable trap.
         body.instruction(&Instruction::Block(wasm_encoder::BlockType::Empty));
         body.instruction(&Instruction::LocalGet(l_old_ptr));
         body.instruction(&Instruction::LocalGet(l_buf_len));
@@ -242,7 +238,7 @@ fn emit_patch_nested_indirections(
         body.instruction(&Instruction::I32GtU);
         body.instruction(&Instruction::BrIf(0));
 
-        // new_ptr = realloc(0, 0, 1, buf_len)
+        // new_ptr = realloc(0, 0, 1, buf_len) in caller memory
         body.instruction(&Instruction::I32Const(0));
         body.instruction(&Instruction::I32Const(0));
         body.instruction(&Instruction::I32Const(1));
@@ -250,7 +246,7 @@ fn emit_patch_nested_indirections(
         body.instruction(&Instruction::Call(realloc_func));
         body.instruction(&Instruction::LocalSet(l_new_ptr));
 
-        // memory.copy new_ptr <- old_ptr (cross memory)
+        // memory.copy new_ptr <- old_ptr (callee → caller)
         body.instruction(&Instruction::LocalGet(l_new_ptr));
         body.instruction(&Instruction::LocalGet(l_old_ptr));
         body.instruction(&Instruction::LocalGet(l_buf_len));
@@ -259,11 +255,12 @@ fn emit_patch_nested_indirections(
             src_mem: callee_memory,
         });
 
+        // caller_mem.store(rec_dst + offset, new_ptr)
         body.instruction(&Instruction::LocalGet(l_rec_dst));
         body.instruction(&Instruction::LocalGet(l_new_ptr));
         body.instruction(&Instruction::I32Store(dst_mem_arg_ptr));
 
-        body.instruction(&Instruction::End); // end sanity block
+        body.instruction(&Instruction::End);
     }
 
     // i++
@@ -280,7 +277,10 @@ fn emit_patch_nested_indirections(
 /// For a given element type, find every field offset that holds a (ptr, len)
 /// pair that needs cross-memory copying (currently strings and nested lists).
 /// Returns `(byte_offset_within_element, sub_element_size_in_bytes)`.
-fn collect_indirections(ty: &crate::parser::ComponentValType, base_offset: u32) -> Vec<(u32, u32)> {
+pub(crate) fn collect_indirections(
+    ty: &crate::parser::ComponentValType,
+    base_offset: u32,
+) -> Vec<(u32, u32)> {
     use crate::parser::ComponentValType as CVT;
     fn align_up(n: u32, a: u32) -> u32 {
         (n + a - 1) & !(a - 1)
