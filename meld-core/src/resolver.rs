@@ -275,6 +275,18 @@ pub struct ModuleResolution {
     pub import_name: String,
     /// Export name
     pub export_name: String,
+    /// Import module name (i.e. `import.module` from the source module).
+    ///
+    /// Stored to disambiguate when the source module has multiple imports
+    /// sharing the same `import.name` but coming from different
+    /// `import.module`s (e.g. `wasi:clocks/wall-clock@0.2.0::now` and
+    /// `wasi:clocks/monotonic-clock@0.2.0::now`). The merger matches on
+    /// both `import_name` and `from_import_module` to avoid mis-routing
+    /// one of the two to the resolution belonging to the other.
+    ///
+    /// Empty string when not known (e.g. legacy callers in tests); the
+    /// merger only enforces equality when this field is non-empty.
+    pub from_import_module: String,
 }
 
 /// Info about a core `Instantiate` instance entry, used during instance-graph resolution.
@@ -1663,6 +1675,7 @@ impl Resolver {
                             to_module: *to_mod_idx,
                             import_name: import.name.clone(),
                             export_name: import.name.clone(),
+                            from_import_module: import.module.clone(),
                         });
                     }
                 } else {
@@ -1821,6 +1834,7 @@ impl Resolver {
                                 to_module: to_mod_idx,
                                 import_name: import.name.clone(),
                                 export_name: import.name.clone(),
+                                from_import_module: import.module.clone(),
                             });
                             continue;
                         }
@@ -1855,6 +1869,7 @@ impl Resolver {
                             to_module: to_mod_idx,
                             import_name: import.name.clone(),
                             export_name,
+                            from_import_module: import.module.clone(),
                         });
                     }
                 } else {
@@ -3127,6 +3142,7 @@ mod tests {
                 to_module: 1,
                 import_name: "foo".to_string(),
                 export_name: "foo".to_string(),
+                from_import_module: String::new(),
             },
             ModuleResolution {
                 component_idx: 0,
@@ -3134,6 +3150,7 @@ mod tests {
                 to_module: 2,
                 import_name: "bar".to_string(),
                 export_name: "bar".to_string(),
+                from_import_module: String::new(),
             },
         ];
 
@@ -3151,6 +3168,7 @@ mod tests {
                 to_module: 1,
                 import_name: "foo".to_string(),
                 export_name: "foo".to_string(),
+                from_import_module: String::new(),
             },
             ModuleResolution {
                 component_idx: 0,
@@ -3158,6 +3176,7 @@ mod tests {
                 to_module: 0,
                 import_name: "bar".to_string(),
                 export_name: "bar".to_string(),
+                from_import_module: String::new(),
             },
         ];
 
@@ -3196,6 +3215,7 @@ mod tests {
                 to_module: 1,
                 import_name: "foo".to_string(),
                 export_name: "foo".to_string(),
+                from_import_module: String::new(),
             },
             ModuleResolution {
                 component_idx: 1,
@@ -3203,6 +3223,7 @@ mod tests {
                 to_module: 1,
                 import_name: "a".to_string(),
                 export_name: "a".to_string(),
+                from_import_module: String::new(),
             },
             ModuleResolution {
                 component_idx: 1,
@@ -3210,6 +3231,7 @@ mod tests {
                 to_module: 0,
                 import_name: "b".to_string(),
                 export_name: "b".to_string(),
+                from_import_module: String::new(),
             },
         ];
 
@@ -3233,6 +3255,7 @@ mod tests {
             to_module: 0,
             import_name: "self".to_string(),
             export_name: "self".to_string(),
+            from_import_module: String::new(),
         }];
 
         let result = Resolver::detect_module_cycles(0, 1, &resolutions);
@@ -3256,6 +3279,7 @@ mod tests {
                 to_module: 1,
                 import_name: "a".to_string(),
                 export_name: "a".to_string(),
+                from_import_module: String::new(),
             },
             ModuleResolution {
                 component_idx: 0,
@@ -3263,6 +3287,7 @@ mod tests {
                 to_module: 2,
                 import_name: "b".to_string(),
                 export_name: "b".to_string(),
+                from_import_module: String::new(),
             },
             ModuleResolution {
                 component_idx: 0,
@@ -3270,6 +3295,7 @@ mod tests {
                 to_module: 0,
                 import_name: "c".to_string(),
                 export_name: "c".to_string(),
+                from_import_module: String::new(),
             },
         ];
 

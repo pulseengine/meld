@@ -996,6 +996,8 @@ impl Merger {
                         res.component_idx == comp_idx
                             && res.from_module == mod_idx
                             && imp.name == res.import_name
+                            && (res.from_import_module.is_empty()
+                                || res.from_import_module == imp.module)
                     });
                     if let Some(res) = intra {
                         let target_module =
@@ -1106,6 +1108,8 @@ impl Merger {
                     res.component_idx == comp_idx
                         && res.from_module == mod_idx
                         && imp.name == res.import_name
+                        && (res.from_import_module.is_empty()
+                            || res.from_import_module == imp.module)
                 });
                 if let Some(res) = intra {
                     let target_module = &components[res.component_idx].core_modules[res.to_module];
@@ -1159,6 +1163,8 @@ impl Merger {
                     res.component_idx == comp_idx
                         && res.from_module == mod_idx
                         && imp.name == res.import_name
+                        && (res.from_import_module.is_empty()
+                            || res.from_import_module == imp.module)
                 });
                 if let Some(res) = intra {
                     let target_module = &components[res.component_idx].core_modules[res.to_module];
@@ -1272,6 +1278,8 @@ impl Merger {
                         res.component_idx == comp_idx
                             && res.from_module == mod_idx
                             && imp.name == res.import_name
+                            && (res.from_import_module.is_empty()
+                                || res.from_import_module == imp.module)
                     });
                     if let Some(res) = intra {
                         // Look up the target module's export to find its function index
