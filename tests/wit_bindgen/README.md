@@ -71,3 +71,31 @@ per-fixture status notes.
 - Tests are tagged `manual` - they only run when explicitly requested
 - Phase 2 (TODO): Build from source once `rules_wasm_component` exports `@crates`
 - Baseline: wit-bindgen `v0.52.0` (see `proofs/DECISIONS.md`)
+
+## Opaque-rep variant (resource_floats_opaque.wasm)
+
+Built from the **pulseengine/wit-bindgen fork**, branch
+`feat/opaque-rep-attribute` (commit `236ef4bb` or later). This branch adds
+an opt-in `--opaque-export-resources` flag for the Rust generator that
+emits a stripped-down wrapper for re-exporter resources, sidestepping the
+`Box::into_raw` + `assume(ptr.is_aligned())` debug-assert chain that
+trips the `& 7` alignment trap in the standard `resource_floats` fixture.
+
+```bash
+git clone https://github.com/pulseengine/wit-bindgen /tmp/wit-bindgen-fork
+cd /tmp/wit-bindgen-fork
+git checkout feat/opaque-rep-attribute
+cargo run --release --bin wit-bindgen -- test \
+  --artifacts /tmp/witbg-artifacts \
+  --languages rust \
+  tests/runtime/resource_floats_opaque
+cp /tmp/witbg-artifacts/resource_floats_opaque/composed-runner.rs-intermediate.rs-leaf.rs.wasm \
+   tests/wit_bindgen/fixtures/resource_floats_opaque.wasm
+```
+
+Status: meld fuses cleanly, validates, construct-only path works, but
+construct+drop traps with a memory fault during drop teardown. The fuse
+oracle is the load-bearing test today; the runtime drop bug needs
+explicit inner-handle forwarding in the opaque-rep dtor (wit-bindgen
+generator side) plus per-resource handle table discrimination in meld
+(`merger.rs:739`, `fact.rs:582`).

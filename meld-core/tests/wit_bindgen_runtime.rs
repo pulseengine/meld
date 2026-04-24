@@ -672,6 +672,15 @@ runtime_test!(
     "resource_aggregates"
 );
 fuse_only_test!(test_fuse_wit_bindgen_resource_floats, "resource_floats");
+// Opaque-rep variant from pulseengine/wit-bindgen@feat/opaque-rep-attribute.
+// Fuses cleanly; construct-only runs; construct+drop currently traps with
+// a memory fault during drop teardown — separate meld-side bug exposed
+// (not the original `& 7` alignment trap from the standard fixture). The
+// fuse-only oracle passes today.
+fuse_only_test!(
+    test_fuse_wit_bindgen_resource_floats_opaque,
+    "resource_floats_opaque"
+);
 runtime_test!(
     test_runtime_wit_bindgen_resource_borrow_in_record,
     "resource_borrow_in_record"
