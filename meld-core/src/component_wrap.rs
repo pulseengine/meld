@@ -1305,10 +1305,29 @@ fn assemble_component(
                 });
                 let ht_export: Option<String> = direct.or_else(|| {
                     if *is_definer {
-                        // Definer with no own handle table: must use
-                        // canonical resource ops. Don't borrow another
-                        // component's handle table.
-                        return None;
+                        // Definer with no own handle table: try the
+                        // resource-alias fallback first. When another
+                        // component re-exports THIS resource via `use`
+                        // (intermediate's `use test.{float}` re-exports
+                        // leaf's test.float as exports.float), wasmtime
+                        // unifies both into one canonical type but the
+                        // re-exporter's handle table is the only storage
+                        // that knows the memory-pointer handles. The
+                        // definer's [resource-rep]/[resource-new]/
+                        // [resource-drop] must route through that same
+                        // table or peer components hand it pointers it
+                        // cannot dereference. Match by resource_name only
+                        // since the iface differs across the alias.
+                        let alias_tail = format!("_{}", resource_name);
+                        return fused_info
+                            .exports
+                            .iter()
+                            .find(|(n, k, _)| {
+                                *k == wasmparser::ExternalKind::Func
+                                    && n.starts_with(op_prefix)
+                                    && n.ends_with(&alias_tail)
+                            })
+                            .map(|(n, _, _)| n.clone());
                     }
                     // Consumer-side. If THIS component itself owns a handle
                     // table for the same (iface, rn), this import is its

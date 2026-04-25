@@ -862,9 +862,39 @@ impl Merger {
                             .strip_prefix("[export]")
                             .unwrap_or(iface_with_prefix);
                         let key_target = if iface_with_prefix.starts_with("[export]") {
-                            // Importer's own export — look up by self.
+                            // Importer's own export — look up by self first.
                             let key = (comp_idx, iface.to_string(), rn.to_string());
-                            merged.handle_tables.get(&key)
+                            merged.handle_tables.get(&key).or_else(|| {
+                                // Resource-alias fallback: when a different
+                                // component re-exports THIS resource via
+                                // `use` (e.g., intermediate has `use
+                                // test.{float}` re-exporting leaf's
+                                // test.float as exports.float), wasmtime
+                                // unifies them into one canonical type. The
+                                // re-exporter's handle table is the only
+                                // storage that knows the memory-pointer
+                                // handles minted by ht_new — definer-side
+                                // [resource-*] must route there too, or
+                                // peers will hand it pointers it can't
+                                // dereference. Match by resource_name only
+                                // since the iface differs across the alias.
+                                let found = merged
+                                    .handle_tables
+                                    .iter()
+                                    .find(|((_, _, r), _)| r == rn)
+                                    .map(|(_, ht)| ht);
+                                if found.is_some() {
+                                    log::info!(
+                                        "alias-fallback: comp {} mod {} import {}/{} → ht for resource '{}'",
+                                        comp_idx,
+                                        mod_idx,
+                                        iface,
+                                        imp.name,
+                                        rn,
+                                    );
+                                }
+                                found
+                            })
                         } else {
                             // Consumer-side import. If THIS component itself
                             // re-exports (iface, rn) — has its own handle
