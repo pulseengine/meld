@@ -23,6 +23,27 @@ use crate::resolver::{AdapterSite, DependencyGraph};
 use wasm_encoder::{Function, Instruction};
 
 /// Convert a canonical string encoding from the parser to the adapter's encoding enum
+/// Parse a wit-bindgen-style `(import_module, import_field)` pair to extract
+/// the interface name and (when present) the resource name.
+///
+/// `import_module` may carry the wit-bindgen `[export]` prefix when the
+/// import refers to the importer's own export resource — strip it.
+/// `import_field` looks like `[resource-rep]X`, `[resource-new]X`, or
+/// `[resource-drop]X` for resource helpers; otherwise no resource name
+/// is returned.
+fn parse_resource_import(import_module: &str, import_field: &str) -> (String, Option<String>) {
+    let iface = import_module
+        .strip_prefix("[export]")
+        .unwrap_or(import_module)
+        .to_string();
+    let rn = import_field
+        .strip_prefix("[resource-rep]")
+        .or_else(|| import_field.strip_prefix("[resource-new]"))
+        .or_else(|| import_field.strip_prefix("[resource-drop]"))
+        .map(|s| s.to_string());
+    (iface, rn)
+}
+
 fn canon_to_string_encoding(enc: CanonStringEncoding) -> StringEncoding {
     match enc {
         CanonStringEncoding::Utf8 => StringEncoding::Utf8,
@@ -578,12 +599,19 @@ impl FactStyleGenerator {
                 // Callee defines the resource — convert handle→rep.
                 // Skip if upstream adapter already converted (avoids double resource.rep).
                 if !op.caller_already_converted {
-                    // If the caller has a handle table, use ht_rep to extract rep
-                    // from the memory-pointer handle. Otherwise use canonical resource.rep.
-                    let rep_func = merged
-                        .handle_tables
-                        .get(&site.from_component)
-                        .map(|ht| ht.rep_func)
+                    // If the caller has a handle table for THIS specific
+                    // resource, use ht_rep to extract rep from the memory-
+                    // pointer handle. Otherwise use canonical resource.rep.
+                    let (iface, rn_opt) =
+                        parse_resource_import(&op.import_module, &op.import_field);
+                    let rep_func = rn_opt
+                        .as_deref()
+                        .and_then(|rn| {
+                            merged
+                                .handle_tables
+                                .get(&(site.from_component, iface.to_string(), rn.to_string()))
+                                .map(|ht| ht.rep_func)
+                        })
                         .or_else(|| {
                             resource_rep_imports
                                 .get(&(op.import_module.clone(), op.import_field.clone()))
@@ -637,9 +665,16 @@ impl FactStyleGenerator {
 
                 // For re-exporter callees with handle tables, use ht_new
                 // which returns memory-pointer handles that wit-bindgen expects.
+                // Look up by (to_component, iface, resource_name) so multi-resource
+                // re-exporters route per-resource, not per-component.
+                let (callee_iface, _) = parse_resource_import(&op.import_module, &op.import_field);
                 let callee_new_func = merged
                     .handle_tables
-                    .get(&site.to_component)
+                    .get(&(
+                        site.to_component,
+                        callee_iface.to_string(),
+                        resource_name.to_string(),
+                    ))
                     .map(|ht| ht.new_func)
                     .or_else(|| {
                         merged
@@ -698,11 +733,17 @@ impl FactStyleGenerator {
                 });
 
             // Callee's [resource-rep] (callee handle → rep).
-            // For re-exporter callees with handle tables, use ht_rep.
+            // For re-exporter callees with handle tables, use ht_rep —
+            // per-resource lookup so multi-resource re-exporters work.
+            let (callee_iface_r, _) = parse_resource_import(&op.import_module, &op.import_field);
             let rep_field = format!("[resource-rep]{}", resource_name);
             let rep_func = merged
                 .handle_tables
-                .get(&site.to_component)
+                .get(&(
+                    site.to_component,
+                    callee_iface_r.to_string(),
+                    resource_name.to_string(),
+                ))
                 .map(|ht| ht.rep_func)
                 .or_else(|| {
                     merged

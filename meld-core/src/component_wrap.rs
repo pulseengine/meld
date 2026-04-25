@@ -33,7 +33,7 @@
 //! 3. `canon lower` uses the fused module's real `cabi_realloc`.
 //! 4. A fixup module fills the indirect table with the lowered functions.
 
-use crate::merger::MergedModule;
+use crate::merger::{MergedModule, ht_export_suffix};
 use crate::parser::{self, ParsedComponent};
 use crate::resolver::DependencyGraph;
 use crate::{Error, MemoryStrategy, Result};
@@ -1248,12 +1248,15 @@ fn assemble_component(
                 component_idx,
             } => {
                 // Check if this component has handle table exports
-                // ($ht_new_N, $ht_rep_N, $ht_drop_N) for re-exporter routing.
+                // ($ht_new_{cidx}_{iface}_{rn}, etc.) for re-exporter routing.
+                // The export naming is per-(component, interface, resource);
+                // see meld-core/src/merger.rs::ht_export_suffix.
                 let ht_export = component_idx.and_then(|cidx| {
+                    let suffix = ht_export_suffix(cidx, interface_name, resource_name);
                     let name = match operation {
-                        ResourceOp::New => format!("$ht_new_{}", cidx),
-                        ResourceOp::Rep => format!("$ht_rep_{}", cidx),
-                        ResourceOp::Drop => format!("$ht_drop_{}", cidx),
+                        ResourceOp::New => format!("$ht_new_{}", suffix),
+                        ResourceOp::Rep => format!("$ht_rep_{}", suffix),
+                        ResourceOp::Drop => format!("$ht_drop_{}", suffix),
                     };
                     if fused_info
                         .exports
