@@ -1247,27 +1247,52 @@ fn assemble_component(
                 interface_name,
                 component_idx,
             } => {
-                // Check if this component has handle table exports
-                // ($ht_new_{cidx}_{iface}_{rn}, etc.) for re-exporter routing.
-                // The export naming is per-(component, interface, resource);
-                // see meld-core/src/merger.rs::ht_export_suffix.
-                let ht_export = component_idx.and_then(|cidx| {
-                    let suffix = ht_export_suffix(cidx, interface_name, resource_name);
-                    let name = match operation {
-                        ResourceOp::New => format!("$ht_new_{}", suffix),
-                        ResourceOp::Rep => format!("$ht_rep_{}", suffix),
-                        ResourceOp::Drop => format!("$ht_drop_{}", suffix),
-                    };
-                    if fused_info
-                        .exports
-                        .iter()
-                        .any(|(n, k, _)| *k == wasmparser::ExternalKind::Func && *n == name)
-                    {
-                        Some(name)
-                    } else {
-                        None
-                    }
-                });
+                // Check if any component has a handle table export for this
+                // (interface, resource) — the export naming is per-(component,
+                // interface, resource) so we look first at the importer's own
+                // index, then fall back to ANY component that exports a
+                // handle table for the same (iface, rn). Consumers (like the
+                // runner in a 3-component chain) hold handles allocated by
+                // the re-exporter's ht_new and must drop them through that
+                // same table — even though they don't own a handle table
+                // themselves. See meld-core/src/merger.rs::ht_export_suffix.
+                let op_prefix = match operation {
+                    ResourceOp::New => "$ht_new_",
+                    ResourceOp::Rep => "$ht_rep_",
+                    ResourceOp::Drop => "$ht_drop_",
+                };
+                let ht_export: Option<String> = component_idx
+                    .and_then(|cidx| {
+                        let suffix = ht_export_suffix(cidx, interface_name, resource_name);
+                        let name = format!("{}{}", op_prefix, suffix);
+                        fused_info
+                            .exports
+                            .iter()
+                            .find(|(n, k, _)| *k == wasmparser::ExternalKind::Func && *n == name)
+                            .map(|_| name)
+                    })
+                    .or_else(|| {
+                        // Resource is owned by a different component (e.g. a
+                        // re-exporter); find any handle-table export matching
+                        // _<iface_safe>_<rn>.
+                        let safe_iface: String = interface_name
+                            .chars()
+                            .map(|c| match c {
+                                ':' | '/' | '@' | '.' | '-' => '_',
+                                other => other,
+                            })
+                            .collect();
+                        let tail = format!("_{}_{}", safe_iface, resource_name);
+                        fused_info
+                            .exports
+                            .iter()
+                            .find(|(n, k, _)| {
+                                *k == wasmparser::ExternalKind::Func
+                                    && n.starts_with(op_prefix)
+                                    && n.ends_with(&tail)
+                            })
+                            .map(|(n, _, _)| n.clone())
+                    });
 
                 if let Some(ht_name) = ht_export {
                     // Re-exporter: alias the handle table function directly

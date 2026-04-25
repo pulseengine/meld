@@ -288,6 +288,20 @@ struct ImportDedupInfo {
 /// one identifier. The interface sanitisation replaces ':', '/', '@', '.'
 /// (illegal in WASM export names? all are legal but conventionally avoided)
 /// with '_'.
+/// Strip a trailing `$N` dedup suffix from a resource name. Meld appends
+/// these when multiple components import the same `[resource-*]X` helper —
+/// the canonical resource name (used for handle-table lookup and the
+/// canonical-ABI) doesn't include the suffix.
+pub(crate) fn strip_dollar_suffix(s: &str) -> &str {
+    if let Some(dollar_pos) = s.rfind('$') {
+        let suffix = &s[dollar_pos + 1..];
+        if !suffix.is_empty() && suffix.chars().all(|c| c.is_ascii_digit()) {
+            return &s[..dollar_pos];
+        }
+    }
+    s
+}
+
 pub(crate) fn ht_export_suffix(comp_idx: usize, interface: &str, resource_name: &str) -> String {
     let safe_iface: String = interface
         .chars()
@@ -768,10 +782,12 @@ impl Merger {
             // through any other component's handle table; they must call
             // the natural canonical-ABI handler in their owning component.
             let mut affected_modules: Vec<(usize, usize)> = Vec::new();
-            // Index of which components have handle tables, for fast checks.
-            let comps_with_ht: HashSet<usize> =
-                merged.handle_tables.keys().map(|(c, _, _)| *c).collect();
-            for &comp_idx in &comps_with_ht {
+            // Iterate ALL components, not just those with handle tables.
+            // A pure consumer (e.g. the runner in a 3-component chain) holds
+            // handles allocated by the re-exporter's ht_new and must drop
+            // them through the same handle table — its [resource-drop]
+            // imports also need redirection.
+            for (comp_idx, _component) in components.iter().enumerate() {
                 let component = &components[comp_idx];
                 for (mod_idx, module) in component.core_modules.iter().enumerate() {
                     let mut import_func_idx = 0u32;
@@ -781,7 +797,10 @@ impl Merger {
                             continue;
                         }
                         // Parse: which (iface, resource_name) and which op?
-                        let (op_kind, rn) =
+                        // Strip optional `$N` dedup suffix that meld appends
+                        // when multiple components import the same resource
+                        // helper — the canonical resource name is the same.
+                        let (op_kind, rn_raw) =
                             if let Some(rn) = imp.name.strip_prefix("[resource-rep]") {
                                 (Some("rep"), rn)
                             } else if let Some(rn) = imp.name.strip_prefix("[resource-new]") {
@@ -795,30 +814,36 @@ impl Merger {
                             import_func_idx += 1;
                             continue;
                         }
+                        let rn = strip_dollar_suffix(rn_raw);
                         // Strip [export] prefix from the import module name.
-                        // If present, the importer is the owner; else look up
-                        // the definer via the resource graph.
+                        // If present (importer's own export resource), the
+                        // owner is self. Otherwise the importer is consuming
+                        // a resource from elsewhere — find ANY component that
+                        // has a handle table for (iface, rn). That's the
+                        // re-exporter that allocated the handles being passed
+                        // around; consumers must route their [resource-*]
+                        // calls through that same table to stay consistent.
                         let iface_with_prefix = imp.module.as_str();
                         let iface = iface_with_prefix
                             .strip_prefix("[export]")
                             .unwrap_or(iface_with_prefix);
-                        let owner = if iface_with_prefix.starts_with("[export]") {
-                            // Component's own export — owner is self.
-                            comp_idx
-                        } else if let Some(rg) = graph.resource_graph.as_ref() {
-                            match rg.resource_definer(iface, rn) {
-                                Some(def) => def,
-                                None => {
-                                    import_func_idx += 1;
-                                    continue;
-                                }
-                            }
+                        let key_target = if iface_with_prefix.starts_with("[export]") {
+                            // Importer's own export — look up by self.
+                            let key = (comp_idx, iface.to_string(), rn.to_string());
+                            merged.handle_tables.get(&key)
                         } else {
-                            import_func_idx += 1;
-                            continue;
+                            // Consumer-side import — find any handle table for
+                            // this (iface, rn) regardless of which component
+                            // owns it. In well-formed compositions there's at
+                            // most one re-exporter per resource so this is
+                            // unambiguous.
+                            merged
+                                .handle_tables
+                                .iter()
+                                .find(|((_, i, r), _)| i == iface && r == rn)
+                                .map(|(_, ht)| ht)
                         };
-                        let key = (owner, iface.to_string(), rn.to_string());
-                        if let Some(ht) = merged.handle_tables.get(&key) {
+                        if let Some(ht) = key_target {
                             let target = match op_kind.unwrap() {
                                 "rep" => ht.rep_func,
                                 "new" => ht.new_func,
