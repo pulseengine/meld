@@ -157,6 +157,14 @@ enum ImportResolution {
         /// Source component index (reserved for future handle table routing)
         #[allow(dead_code)]
         component_idx: Option<usize>,
+        /// `true` when the import came from an `[export]`-prefixed module —
+        /// meaning the importer is the DEFINER of the resource (its own
+        /// export). `false` when the importer is a CONSUMER of someone
+        /// else's resource (just calls into it). The two cases route
+        /// differently: definers must use canonical resource ops or their
+        /// own handle table; consumers may fall back to any re-exporter's
+        /// handle table for the same (interface, resource).
+        is_definer: bool,
     },
     /// Import resolves to a P3 task/async canonical built-in.
     ///
@@ -844,6 +852,7 @@ fn assemble_component(
                 resource_name,
                 interface_name: inner_module.to_string(),
                 component_idx: comp_idx,
+                is_definer: true,
             });
             continue;
         }
@@ -892,6 +901,7 @@ fn assemble_component(
                 resource_name,
                 interface_name: module_name.clone(),
                 component_idx: comp_idx,
+                is_definer: false,
             });
             continue;
         }
@@ -1246,53 +1256,77 @@ fn assemble_component(
                 resource_name,
                 interface_name,
                 component_idx,
+                is_definer,
             } => {
-                // Check if any component has a handle table export for this
-                // (interface, resource) — the export naming is per-(component,
-                // interface, resource) so we look first at the importer's own
-                // index, then fall back to ANY component that exports a
-                // handle table for the same (iface, rn). Consumers (like the
-                // runner in a 3-component chain) hold handles allocated by
-                // the re-exporter's ht_new and must drop them through that
-                // same table — even though they don't own a handle table
-                // themselves. See meld-core/src/merger.rs::ht_export_suffix.
+                // Look up a handle table export for this (interface, resource).
+                //
+                // Definers (importer owns the resource — `[export]`-prefixed
+                // import) MUST use either their OWN component's handle table
+                // or canonical resource ops. Falling back to a re-exporter's
+                // ht_new would store the rep in the wrong table; the definer's
+                // own canonical [resource-rep] would later return whatever was
+                // there (a small handle integer, not the actual Box pointer)
+                // and the user code's deref would trap.
+                //
+                // Consumers (importer holds someone else's handle — no
+                // `[export]` prefix) MUST route to whoever allocated the
+                // handle. After fusion that's the re-exporter component, so
+                // fall back to ANY handle table matching (iface, rn).
                 let op_prefix = match operation {
                     ResourceOp::New => "$ht_new_",
                     ResourceOp::Rep => "$ht_rep_",
                     ResourceOp::Drop => "$ht_drop_",
                 };
-                let ht_export: Option<String> = component_idx
-                    .and_then(|cidx| {
-                        let suffix = ht_export_suffix(cidx, interface_name, resource_name);
-                        let name = format!("{}{}", op_prefix, suffix);
-                        fused_info
-                            .exports
-                            .iter()
-                            .find(|(n, k, _)| *k == wasmparser::ExternalKind::Func && *n == name)
-                            .map(|_| name)
-                    })
-                    .or_else(|| {
-                        // Resource is owned by a different component (e.g. a
-                        // re-exporter); find any handle-table export matching
-                        // _<iface_safe>_<rn>.
-                        let safe_iface: String = interface_name
-                            .chars()
-                            .map(|c| match c {
-                                ':' | '/' | '@' | '.' | '-' => '_',
-                                other => other,
-                            })
-                            .collect();
-                        let tail = format!("_{}_{}", safe_iface, resource_name);
-                        fused_info
-                            .exports
-                            .iter()
-                            .find(|(n, k, _)| {
-                                *k == wasmparser::ExternalKind::Func
-                                    && n.starts_with(op_prefix)
-                                    && n.ends_with(&tail)
-                            })
-                            .map(|(n, _, _)| n.clone())
-                    });
+                let direct = component_idx.and_then(|cidx| {
+                    let suffix = ht_export_suffix(cidx, interface_name, resource_name);
+                    let name = format!("{}{}", op_prefix, suffix);
+                    fused_info
+                        .exports
+                        .iter()
+                        .find(|(n, k, _)| *k == wasmparser::ExternalKind::Func && *n == name)
+                        .map(|_| name)
+                });
+                let ht_export: Option<String> = direct.or_else(|| {
+                    if *is_definer {
+                        // Definer with no own handle table: must use
+                        // canonical resource ops. Don't borrow another
+                        // component's handle table.
+                        return None;
+                    }
+                    // Consumer-side. If THIS component itself owns a handle
+                    // table for the same (iface, rn), this import is its
+                    // own inner-component view (e.g. a re-exporter that
+                    // also imports the resource from its leaf). Use
+                    // canonical resource ops, not the re-exporter's table.
+                    let safe_iface: String = interface_name
+                        .chars()
+                        .map(|c| match c {
+                            ':' | '/' | '@' | '.' | '-' => '_',
+                            other => other,
+                        })
+                        .collect();
+                    let tail = format!("_{}_{}", safe_iface, resource_name);
+                    if let Some(cidx) = component_idx {
+                        let self_prefix = format!("$ht_new_{}_{}", cidx, safe_iface);
+                        let owns_for_resource = fused_info.exports.iter().any(|(n, k, _)| {
+                            *k == wasmparser::ExternalKind::Func
+                                && n.starts_with(&self_prefix)
+                                && n.ends_with(&tail)
+                        });
+                        if owns_for_resource {
+                            return None;
+                        }
+                    }
+                    fused_info
+                        .exports
+                        .iter()
+                        .find(|(n, k, _)| {
+                            *k == wasmparser::ExternalKind::Func
+                                && n.starts_with(op_prefix)
+                                && n.ends_with(&tail)
+                        })
+                        .map(|(n, _, _)| n.clone())
+                });
 
                 if let Some(ht_name) = ht_export {
                     // Re-exporter: alias the handle table function directly

@@ -832,16 +832,24 @@ impl Merger {
                             let key = (comp_idx, iface.to_string(), rn.to_string());
                             merged.handle_tables.get(&key)
                         } else {
-                            // Consumer-side import — find any handle table for
-                            // this (iface, rn) regardless of which component
-                            // owns it. In well-formed compositions there's at
-                            // most one re-exporter per resource so this is
-                            // unambiguous.
-                            merged
-                                .handle_tables
-                                .iter()
-                                .find(|((_, i, r), _)| i == iface && r == rn)
-                                .map(|(_, ht)| ht)
+                            // Consumer-side import. If THIS component itself
+                            // re-exports (iface, rn) — has its own handle
+                            // table for the same resource — then this import
+                            // is the inner-component (definer) view, NOT the
+                            // re-exporter view. Use canonical resource ops
+                            // (don't redirect). Otherwise the importer is a
+                            // pure consumer and the handle was minted by the
+                            // re-exporter's ht_new — route through that table.
+                            let self_key = (comp_idx, iface.to_string(), rn.to_string());
+                            if merged.handle_tables.contains_key(&self_key) {
+                                None
+                            } else {
+                                merged
+                                    .handle_tables
+                                    .iter()
+                                    .find(|((_, i, r), _)| i == iface && r == rn)
+                                    .map(|(_, ht)| ht)
+                            }
                         };
                         if let Some(ht) = key_target {
                             let target = match op_kind.unwrap() {
