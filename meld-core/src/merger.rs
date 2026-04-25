@@ -639,18 +639,24 @@ impl Merger {
             // Find the resource's dtor function (if any) so ht_drop can
             // invoke it before zeroing the slot. wit-bindgen-rust emits
             // `<iface>#[dtor]<rn>` as a core export for each component that
-            // owns a Box-backed rep. For the re-exporter that owns this
-            // handle table, the matching dtor is the one whose function
-            // origin component matches `comp_idx` (in the dedup-suffixed
-            // export list, multiple variants exist; we want the one
-            // belonging to comp_idx specifically).
-            let dtor_export_pattern = format!("#[dtor]{}", rn);
+            // owns a Box-backed rep.
+            //
+            // Match by EXACT `<iface>#[dtor]<rn>` (with optional `$N` dedup
+            // suffix tolerance). A previous version used `name.contains(...)`
+            // which collided when one component defines the same resource
+            // name across multiple interfaces (e.g. `resource_floats` has
+            // dtors for `exports#[dtor]float`, `imports#[dtor]float`, and
+            // `test:resource-floats/test#[dtor]float` — the contains-match
+            // picked the first regardless of iface). Exact match plus the
+            // origin-comp filter selects the right dtor unambiguously.
+            let exact_dtor_export = format!("{}#[dtor]{}", iface, rn);
+            let exact_dtor_dollar = format!("{}#[dtor]{}$", iface, rn);
             let dtor_func_idx: Option<u32> = merged
                 .exports
                 .iter()
                 .filter(|e| {
                     matches!(e.kind, EncoderExportKind::Func)
-                        && e.name.contains(&dtor_export_pattern)
+                        && (e.name == exact_dtor_export || e.name.starts_with(&exact_dtor_dollar))
                 })
                 .find_map(|e| {
                     let import_count = merged.import_counts.func;
