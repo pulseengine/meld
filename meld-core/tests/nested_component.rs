@@ -68,6 +68,7 @@ fn test_fuse_composed_p2_component() {
         preserve_names: false,
         custom_sections: meld_core::CustomSectionHandling::Drop,
         output_format: meld_core::OutputFormat::CoreModule,
+        opaque_resources: Vec::new(),
     };
 
     let mut fuser = Fuser::new(config);

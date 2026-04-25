@@ -50,6 +50,7 @@ pub fn wrap_as_component(
     _graph: &DependencyGraph,
     merged: &MergedModule,
     memory_strategy: MemoryStrategy,
+    opaque_resources: &[(String, String)],
 ) -> Result<Vec<u8>> {
     // Pick the component with the most depth_0_sections (widest interface).
     // Prefer original (un-flattened) components since flattening may drop
@@ -106,6 +107,7 @@ pub fn wrap_as_component(
         merged,
         memory_strategy,
         components,
+        opaque_resources,
     )
 }
 
@@ -771,6 +773,10 @@ fn assemble_component(
     merged: &MergedModule,
     memory_strategy: MemoryStrategy,
     all_components: &[ParsedComponent],
+    // Currently consumed only by debug logging — the conditional behavior is
+    // not yet implemented. Threaded through the API so future work can use
+    // it without re-doing the plumbing.
+    _opaque_resources: &[(String, String)],
 ) -> Result<Vec<u8>> {
     use wasm_encoder::*;
 
@@ -1168,12 +1174,23 @@ fn assemble_component(
     // Shared between import resolution (P3 task-return types) and export lifting.
     let mut type_remap: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
 
-    // Cache: resource_name → component type index.
+    // Cache: (Option<component_idx>, resource_name) → component type index.
+    //
+    // STANDARD resources (Box-pattern wit-bindgen): keyed by `(None, name)`.
     // All components share one canonical resource type per resource name,
     // regardless of interface. Re-exporters import and export the same
     // resource under different interface names (imports, exports, test:…/test)
-    // but must share one wasmtime handle table.
-    let mut local_resource_types: std::collections::HashMap<String, u32> =
+    // but must share one wasmtime handle table so Box-pointer reps round-trip
+    // through the re-exporter chain.
+    //
+    // OPAQUE-REP resources (pulseengine/wit-bindgen feat/opaque-rep-attribute):
+    // keyed by `(Some(component_idx), name)`. Each component gets its OWN
+    // wasmtime resource type and table. The opaque-rep pattern relies on
+    // intermediate's small-integer rep being stored in its OWN table —
+    // sharing a table with leaf would mix value spaces (intermediate's rep=1
+    // would be retrieved by leaf as the rep for its own handle=1, then
+    // dereferenced as a Box pointer → trap).
+    let mut local_resource_types: std::collections::HashMap<(Option<usize>, String), u32> =
         std::collections::HashMap::new();
 
     // Pre-define component function types for async lift/lower imports.
@@ -1349,7 +1366,7 @@ fn assemble_component(
                     core_func_idx += 1;
                 } else {
                     // Standard path: canonical resource operations.
-                    let res_type_key = resource_name.clone();
+                    let res_type_key = (None, resource_name.clone());
                     let res_type_idx =
                         if let Some(&existing) = local_resource_types.get(&res_type_key) {
                             existing

@@ -73,6 +73,7 @@ fn try_fuse(path: &str, name: &str) -> (bool, usize, String) {
         preserve_names: false,
         custom_sections: meld_core::CustomSectionHandling::Drop,
         output_format: OutputFormat::CoreModule,
+        opaque_resources: Vec::new(),
     };
 
     let mut fuser = Fuser::new(config);
@@ -230,6 +231,7 @@ fn test_fused_output_validates() {
             preserve_names: false,
             custom_sections: meld_core::CustomSectionHandling::Drop,
             output_format: OutputFormat::CoreModule,
+            opaque_resources: Vec::new(),
         };
 
         let mut fuser = Fuser::new(config);
@@ -321,6 +323,7 @@ fn test_p1_adapter_detection_with_instances() {
             preserve_names: false,
             custom_sections: meld_core::CustomSectionHandling::Drop,
             output_format: OutputFormat::CoreModule,
+            opaque_resources: Vec::new(),
         };
         let mut fuser = Fuser::new(config);
         if fuser.add_component_named(&bytes, Some(file)).is_err() {
@@ -400,6 +403,7 @@ fn test_reasonable_memory_count() {
             preserve_names: false,
             custom_sections: meld_core::CustomSectionHandling::Drop,
             output_format: OutputFormat::CoreModule,
+            opaque_resources: Vec::new(),
         };
 
         let mut fuser = Fuser::new(config);
@@ -485,6 +489,7 @@ fn test_write_fused_output_for_runtime() {
             preserve_names: true,
             custom_sections: meld_core::CustomSectionHandling::Drop,
             output_format: OutputFormat::CoreModule,
+            opaque_resources: Vec::new(),
         };
 
         let mut fuser = Fuser::new(config);
@@ -549,6 +554,7 @@ fn test_no_duplicate_imports() {
             preserve_names: false,
             custom_sections: meld_core::CustomSectionHandling::Drop,
             output_format: OutputFormat::CoreModule,
+            opaque_resources: Vec::new(),
         };
 
         let mut fuser = Fuser::new(config);
@@ -632,6 +638,7 @@ fn test_adapter_generation_for_release_components() {
             preserve_names: false,
             custom_sections: meld_core::CustomSectionHandling::Drop,
             output_format: OutputFormat::CoreModule,
+            opaque_resources: Vec::new(),
         };
 
         let mut fuser = Fuser::new(config);
@@ -698,6 +705,7 @@ fn test_adapter_call_site_wiring() {
             preserve_names: false,
             custom_sections: meld_core::CustomSectionHandling::Drop,
             output_format: OutputFormat::CoreModule,
+            opaque_resources: Vec::new(),
         };
 
         let mut fuser = Fuser::new(config);
@@ -848,6 +856,7 @@ fn test_no_stale_resource_drop_versions() {
             preserve_names: false,
             custom_sections: meld_core::CustomSectionHandling::Drop,
             output_format: OutputFormat::CoreModule,
+            opaque_resources: Vec::new(),
         };
 
         let mut fuser = Fuser::new(config);
@@ -931,6 +940,7 @@ fn test_component_wrap_validates() {
             preserve_names: false,
             custom_sections: meld_core::CustomSectionHandling::Drop,
             output_format: OutputFormat::Component,
+            opaque_resources: Vec::new(),
         };
 
         let mut fuser = Fuser::new(config);

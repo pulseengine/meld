@@ -62,6 +62,7 @@ fn fuse_fixture(name: &str, output_format: OutputFormat) -> anyhow::Result<Vec<u
         preserve_names: false,
         custom_sections: CustomSectionHandling::Drop,
         output_format,
+        opaque_resources: Vec::new(),
     };
 
     let mut fuser = Fuser::new(config);

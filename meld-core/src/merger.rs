@@ -374,6 +374,10 @@ fn effective_module_name(unresolved: &crate::resolver::UnresolvedImport) -> &str
 pub struct Merger {
     memory_strategy: MemoryStrategy,
     address_rebasing: bool,
+    /// (interface, resource_name) tuples marked opaque-rep — skip handle
+    /// table allocation for these resources because their reps are already
+    /// valid integer handles (no Box dereferencing in user code).
+    opaque_resources: Vec<(String, String)>,
 }
 
 #[derive(Debug, Clone)]
@@ -389,7 +393,14 @@ impl Merger {
         Self {
             memory_strategy,
             address_rebasing,
+            opaque_resources: Vec::new(),
         }
+    }
+
+    /// Mark resources as opaque-rep so handle table allocation skips them.
+    pub fn with_opaque_resources(mut self, opaque: Vec<(String, String)>) -> Self {
+        self.opaque_resources = opaque;
+        self
     }
 
     fn compute_shared_memory_plan(
@@ -508,13 +519,36 @@ impl Merger {
     /// table at the start of the new page. Adds a mutable global for the
     /// next-allocation pointer and generates ht_new/ht_rep/ht_drop functions.
     #[allow(dead_code)]
-    fn allocate_handle_tables(graph: &DependencyGraph, merged: &mut MergedModule) -> Result<()> {
+    fn allocate_handle_tables(
+        graph: &DependencyGraph,
+        merged: &mut MergedModule,
+        opaque_resources: &[(String, String)],
+    ) -> Result<()> {
         // Handle table capacity: 256 entries = 1024 bytes (fits in 1 page)
         const HT_CAPACITY: u32 = 256;
         const ENTRY_SIZE: u32 = 4; // i32
 
         for (comp_idx, iface, rn) in &graph.reexporter_resources {
             let comp_idx = *comp_idx;
+            // Opaque-rep resources still get ht_* slots in handle_tables, but
+            // the function bodies are pure identity (no memory storage):
+            //   ht_new(rep)  → rep   (the rep IS the handle)
+            //   ht_rep(h)    → h     (the handle IS the rep)
+            //   ht_drop(h)   → ()    (no cleanup needed)
+            // Path B's redirect routes [resource-*] imports through these
+            // same ht_* functions whether opaque or not, so opaque imports
+            // bypass wasmtime's canonical resource layer entirely (which
+            // would otherwise reject cross-component handle passing for
+            // per-component-typed resources).
+            // Opaque-rep gets the same memory-backed ht_* as standard
+            // resources — the rep storage semantics are the same (ht_new
+            // allocates a fresh handle and stores the rep, ht_rep reads
+            // it back). The DIFFERENCE with --opaque-rep is in the wrapper:
+            // opaque resources use a separate-typed local_resource_types
+            // entry so wasmtime's canonical resource layer doesn't conflate
+            // them with standard Box-pattern reps.
+            let _is_opaque = opaque_resources.iter().any(|(i, r)| i == iface && r == rn);
+
             // Find merged memory index for this component's memory 0
             let memory_idx = match merged.memory_index_map.get(&(comp_idx, 0, 0)) {
                 Some(&idx) => idx,
@@ -765,7 +799,7 @@ impl Merger {
         // re-exporter's wit-bindgen code expects 4-byte-aligned memory
         // pointers as handles, not sequential canonical ABI handles.
         if !graph.reexporter_resources.is_empty() {
-            Self::allocate_handle_tables(graph, &mut merged)?;
+            Self::allocate_handle_tables(graph, &mut merged, &self.opaque_resources)?;
 
             // Remap [resource-*] imports to handle-table functions, with
             // per-resource discrimination. For each component that owns a

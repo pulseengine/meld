@@ -82,6 +82,21 @@ pub struct FuserConfig {
 
     /// Output format: core module (default) or P2 component
     pub output_format: OutputFormat,
+
+    /// Resources whose representation is opaque to wit-bindgen-rust user code
+    /// (constructed by `pulseengine/wit-bindgen feat/opaque-rep-attribute` with
+    /// `--opaque-export-resources`). Each entry is `(interface, resource_name)`.
+    ///
+    /// Opaque-rep resources are routed differently than standard Box-pattern
+    /// resources:
+    /// 1. `merger.rs::allocate_handle_tables` skips them — their reps are
+    ///    already valid integer handles, no parallel handle table needed.
+    /// 2. `component_wrap.rs::local_resource_types` keys them by
+    ///    `(component_idx, resource_name)` rather than `resource_name` alone,
+    ///    giving each component its own wasmtime resource type. This matches
+    ///    the un-fused composition's semantics where each component owns
+    ///    its own resource table.
+    pub opaque_resources: Vec<(String, String)>,
 }
 
 impl Default for FuserConfig {
@@ -93,6 +108,7 @@ impl Default for FuserConfig {
             preserve_names: false,
             custom_sections: CustomSectionHandling::Merge,
             output_format: OutputFormat::CoreModule,
+            opaque_resources: Vec::new(),
         }
     }
 }
@@ -274,7 +290,8 @@ impl Fuser {
 
         // Step 2: Merge modules
         log::info!("Merging {} core modules", stats.modules_merged);
-        let merger = Merger::new(self.config.memory_strategy, self.config.address_rebasing);
+        let merger = Merger::new(self.config.memory_strategy, self.config.address_rebasing)
+            .with_opaque_resources(self.config.opaque_resources.clone());
         let mut merged = merger.merge(&self.components, &graph)?;
         stats.total_functions = merged.functions.len();
         stats.total_exports = merged.exports.len();
@@ -336,6 +353,7 @@ impl Fuser {
                 &graph,
                 &merged,
                 self.config.memory_strategy,
+                &self.config.opaque_resources,
             )?
         } else {
             output

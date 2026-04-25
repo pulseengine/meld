@@ -428,6 +428,7 @@ fn test_sr12_adapter_generation_for_string_param() {
         preserve_names: false,
         custom_sections: meld_core::CustomSectionHandling::Drop,
         output_format: meld_core::OutputFormat::CoreModule,
+        opaque_resources: Vec::new(),
     };
 
     let mut fuser = Fuser::new(config);
@@ -813,6 +814,7 @@ fn test_sr13_cabi_realloc_targets_correct_memory() {
         preserve_names: false,
         custom_sections: meld_core::CustomSectionHandling::Drop,
         output_format: meld_core::OutputFormat::CoreModule,
+        opaque_resources: Vec::new(),
     };
 
     let mut fuser = Fuser::new(config);
@@ -1226,6 +1228,7 @@ fn test_sr15_list_copy_length() {
         preserve_names: false,
         custom_sections: meld_core::CustomSectionHandling::Drop,
         output_format: meld_core::OutputFormat::CoreModule,
+        opaque_resources: Vec::new(),
     };
 
     let mut fuser = Fuser::new(config);
@@ -1719,6 +1722,7 @@ fn test_sr16_inner_pointer_fixup_list_string() {
         preserve_names: false,
         custom_sections: meld_core::CustomSectionHandling::Drop,
         output_format: meld_core::OutputFormat::CoreModule,
+        opaque_resources: Vec::new(),
     };
 
     let mut fuser = Fuser::new(config);
@@ -2005,6 +2009,7 @@ fn test_sr17_utf8_to_utf16_string_transcoding() {
         preserve_names: false,
         custom_sections: meld_core::CustomSectionHandling::Drop,
         output_format: meld_core::OutputFormat::CoreModule,
+        opaque_resources: Vec::new(),
     };
 
     let mut fuser = Fuser::new(config);
