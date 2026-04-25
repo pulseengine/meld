@@ -1332,6 +1332,25 @@ impl Resolver {
                     }
                 }
             }
+
+            // Option A — Phase 1: also allocate per-component handle tables
+            // for the resource's DEFINER component (not just re-exporters).
+            // Each definer needs its own ht so cross-component handle hand-offs
+            // through bridging trampolines (Phase 3 in fact.rs) can translate
+            // (caller_handle → caller_ht_rep → rep → callee_ht_new → callee_handle).
+            // Without per-definer tables, the un-translated handle from one
+            // component reaches another's user code with the wrong layout
+            // (Option::unwrap() on None — the resource_with_lists symptom).
+            if let Some(rg) = graph.resource_graph.as_ref() {
+                let initial: Vec<(usize, String, String)> =
+                    reexporter_resource_set.iter().cloned().collect();
+                for (_re_comp, iface, rn) in initial {
+                    if let Some(definer) = rg.resource_definer(&iface, &rn) {
+                        reexporter_resource_set.insert((definer, iface.clone(), rn.clone()));
+                    }
+                }
+            }
+
             graph.reexporter_components = reexporter_set.into_iter().collect();
             graph.reexporter_resources = reexporter_resource_set.into_iter().collect();
         }
