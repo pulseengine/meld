@@ -617,13 +617,59 @@ impl FactStyleGenerator {
                                 .get(&(op.import_module.clone(), op.import_field.clone()))
                                 .copied()
                         });
+                    // Option A Phase 3: when the callee ALSO has its own ht
+                    // for the same resource (post-Phase-1 per-component-ht),
+                    // bridge by also calling callee.ht_new(rep) so the
+                    // value lands in callee's namespace. Without this the
+                    // caller's memory-pointer handle would be deref'd by
+                    // callee in CALLEE's memory at that offset → garbage
+                    // (the resource_with_lists symptom). Match callee's ht
+                    // by resource_name only (caller iface may differ from
+                    // callee iface via `use` aliasing).
+                    // Only bridge when ALL of:
+                    //   - caller and callee are different components
+                    //   - caller has its OWN ht for the resource (the
+                    //     caller's rep_func came from the ht lookup, not
+                    //     the canonical [resource-rep] fallback)
+                    //   - callee has its own ht too
+                    // Without ALL three, the bridge double-translates or
+                    // converts canonical handles to memory pointers,
+                    // either of which corrupts the value.
+                    let caller_has_ht = rn_opt.as_deref().is_some_and(|rn| {
+                        merged
+                            .handle_tables
+                            .iter()
+                            .any(|((c, _, r), _)| *c == site.from_component && r == rn)
+                    });
+                    let callee_new_func =
+                        if site.from_component != site.to_component && caller_has_ht {
+                            rn_opt.as_deref().and_then(|rn| {
+                                merged
+                                    .handle_tables
+                                    .iter()
+                                    .find(|((c, _, r), _)| *c == site.to_component && r == rn)
+                                    .map(|(_, ht)| ht.new_func)
+                            })
+                        } else {
+                            None
+                        };
                     if let Some(rep_func) = rep_func {
+                        if let Some(new_func) = callee_new_func {
+                            log::info!(
+                                "borrow bridge: rn={:?} from={} to={} caller_rep={} callee_new={}",
+                                rn_opt,
+                                site.from_component,
+                                site.to_component,
+                                rep_func,
+                                new_func,
+                            );
+                        }
                         options
                             .resource_rep_calls
                             .push(super::ResourceBorrowTransfer {
                                 param_idx: op.flat_idx,
                                 rep_func,
-                                new_func: None,
+                                new_func: callee_new_func,
                             });
                     }
                 }
@@ -710,10 +756,63 @@ impl FactStyleGenerator {
         }
 
         // Resolve own<T> results that need [resource-rep] + [resource-new].
-        // When callee_defines_resource is true, the P2 wrapper's canon lift/lower
-        // handles the conversion — the adapter passes the handle directly.
+        //
+        // Three cases:
+        // 1. callee_defines_resource=false (3-component): caller and callee
+        //    have separate tables, bridge via callee.rep + caller.new.
+        // 2. callee_defines_resource=true AND both caller+callee have their
+        //    own ht (post-Option-A-Phase-1): bridge via callee.ht_rep +
+        //    caller.ht_new so the handle ends up in caller's namespace
+        //    (memory-pointer in caller's memory). Without this bridge,
+        //    caller stores callee's memory-pointer handle but later passes
+        //    it back to callee for method calls — works for callee but
+        //    breaks for any caller-side _resource_rep call (cross-memory
+        //    deref of leaf-allocated rep in intermediate's memory →
+        //    Option::unwrap on garbage).
+        // 3. callee_defines_resource=true AND no caller ht: pass through
+        //    (the wrapper's canon lift handles conversion).
         for op in &site.requirements.resource_results {
-            if !op.is_owned || op.callee_defines_resource {
+            if !op.is_owned {
+                continue;
+            }
+            if op.callee_defines_resource {
+                // Case 2 vs 3: only emit a bridge when BOTH sides have ht
+                // for the same (iface, rn). Match by resource_name across
+                // both sides (caller's iface may differ from callee's via
+                // `use` aliasing).
+                let resource_name = op
+                    .import_field
+                    .strip_prefix("[resource-new]")
+                    .or_else(|| op.import_field.strip_prefix("[resource-rep]"))
+                    .unwrap_or(&op.import_field);
+                let callee_ht = merged
+                    .handle_tables
+                    .iter()
+                    .find(|((c, _, r), _)| *c == site.to_component && r == resource_name)
+                    .map(|(_, ht)| (ht.rep_func, ht.new_func));
+                let caller_ht = merged
+                    .handle_tables
+                    .iter()
+                    .find(|((c, _, r), _)| *c == site.from_component && r == resource_name)
+                    .map(|(_, ht)| (ht.rep_func, ht.new_func));
+                if let (Some((rep_func, _)), Some((_, new_func))) = (callee_ht, caller_ht) {
+                    log::info!(
+                        "own<T> bridge: resource '{}' from comp {} (callee) → comp {} (caller); rep={} new={}",
+                        resource_name,
+                        site.to_component,
+                        site.from_component,
+                        rep_func,
+                        new_func,
+                    );
+                    options
+                        .resource_new_calls
+                        .push(super::ResourceOwnResultTransfer {
+                            position: op.flat_idx,
+                            byte_offset: op.byte_offset,
+                            rep_func,
+                            new_func,
+                        });
+                }
                 continue;
             }
             let resource_name = op
