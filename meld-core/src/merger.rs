@@ -636,14 +636,68 @@ impl Merger {
                 });
             }
 
-            // Generate ht_drop: mem[handle] = 0
+            // Find the resource's dtor function (if any) so ht_drop can
+            // invoke it before zeroing the slot. wit-bindgen-rust emits
+            // `<iface>#[dtor]<rn>` as a core export for each component that
+            // owns a Box-backed rep. For the re-exporter that owns this
+            // handle table, the matching dtor is the one whose function
+            // origin component matches `comp_idx` (in the dedup-suffixed
+            // export list, multiple variants exist; we want the one
+            // belonging to comp_idx specifically).
+            let dtor_export_pattern = format!("#[dtor]{}", rn);
+            let dtor_func_idx: Option<u32> = merged
+                .exports
+                .iter()
+                .filter(|e| {
+                    matches!(e.kind, EncoderExportKind::Func)
+                        && e.name.contains(&dtor_export_pattern)
+                })
+                .find_map(|e| {
+                    let import_count = merged.import_counts.func;
+                    if e.index < import_count {
+                        return None;
+                    }
+                    let local_idx = (e.index - import_count) as usize;
+                    let func = merged.functions.get(local_idx)?;
+                    if func.origin.0 == comp_idx {
+                        Some(e.index)
+                    } else {
+                        None
+                    }
+                });
+            if let Some(idx) = dtor_func_idx {
+                log::info!(
+                    "ht_drop for {}/{} in component {} will invoke dtor func {}",
+                    iface,
+                    rn,
+                    comp_idx,
+                    idx,
+                );
+            }
+
+            // Generate ht_drop: load rep, optionally call dtor(rep), zero slot.
+            // Skip the dtor invocation when ht_drop is called with handle=0
+            // (used as a sentinel by the canonical ABI). Using if-then to
+            // avoid double-free if the same handle is dropped twice.
             let drop_func_idx = merged.import_counts.func + merged.functions.len() as u32;
             {
                 let mut body = Function::new([]);
                 body.instruction(&Instruction::LocalGet(0)); // [handle]
+                body.instruction(&Instruction::I32Eqz); // [handle == 0]
+                body.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+                body.instruction(&Instruction::Else);
+                if let Some(dtor_idx) = dtor_func_idx {
+                    // Load the rep stored at this handle slot, then call dtor(rep).
+                    body.instruction(&Instruction::LocalGet(0));
+                    body.instruction(&Instruction::I32Load(mem_arg));
+                    body.instruction(&Instruction::Call(dtor_idx));
+                }
+                // Zero the slot regardless of whether a dtor was called.
+                body.instruction(&Instruction::LocalGet(0));
                 body.instruction(&Instruction::I32Const(0));
-                body.instruction(&Instruction::I32Store(mem_arg)); // mem[handle] = 0
-                body.instruction(&Instruction::End);
+                body.instruction(&Instruction::I32Store(mem_arg));
+                body.instruction(&Instruction::End); // end if
+                body.instruction(&Instruction::End); // end function
                 merged.functions.push(MergedFunction {
                     type_idx: type_i32_to_void,
                     body,
