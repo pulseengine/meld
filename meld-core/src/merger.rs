@@ -904,8 +904,28 @@ impl Merger {
                             // (don't redirect). Otherwise the importer is a
                             // pure consumer and the handle was minted by the
                             // re-exporter's ht_new — route through that table.
-                            let self_key = (comp_idx, iface.to_string(), rn.to_string());
-                            if merged.handle_tables.contains_key(&self_key) {
+                            //
+                            // Same alias-fallback as the definer branch: when
+                            // strict `(i, r)` matches no handle table, fall
+                            // back to matching by resource_name only. This
+                            // catches consumer imports of resources unified
+                            // via `use other-iface.{rn}` (e.g. runner's
+                            // `test:resource-floats/test [resource-drop]float`
+                            // when only `(3, "exports", "float")` ht exists).
+                            //
+                            // Self-owns check: this component owns a handle
+                            // table for the SPECIFIC (iface, rn) pair. We do
+                            // NOT block when the iface differs but the
+                            // resource name is the same — those are
+                            // `use`-aliased resources unified at canon-type
+                            // level, and they SHOULD route through the
+                            // re-exporter's ht.
+                            let self_owns_specific = merged.handle_tables.contains_key(&(
+                                comp_idx,
+                                iface.to_string(),
+                                rn.to_string(),
+                            ));
+                            if self_owns_specific {
                                 None
                             } else {
                                 merged
@@ -913,6 +933,13 @@ impl Merger {
                                     .iter()
                                     .find(|((_, i, r), _)| i == iface && r == rn)
                                     .map(|(_, ht)| ht)
+                                    .or_else(|| {
+                                        merged
+                                            .handle_tables
+                                            .iter()
+                                            .find(|((_, _, r), _)| r == rn)
+                                            .map(|(_, ht)| ht)
+                                    })
                             }
                         };
                         if let Some(ht) = key_target {

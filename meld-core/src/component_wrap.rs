@@ -1203,26 +1203,61 @@ fn assemble_component(
                 let field_name = &fused_info.func_imports[i].1;
 
                 if field_name.starts_with("[resource-drop]") {
-                    // Resource-drop from an external instance: alias the TYPE
-                    // from the instance, then canon resource.drop.
-                    let type_name = func_name
+                    // Resource-drop from an external instance.
+                    //
+                    // First check if a re-exporter handle table exists for
+                    // this resource (any iface, matching by name only). If
+                    // so, alias its ht_drop instead of emitting canonical
+                    // resource.drop — same alias-fallback as LocalResource.
+                    let resource_name = func_name
                         .strip_prefix("[resource-drop]")
                         .unwrap_or(func_name);
-                    let mut alias_section = ComponentAliasSection::new();
-                    alias_section.alias(Alias::InstanceExport {
-                        instance: *instance_idx,
-                        kind: ComponentExportKind::Type,
-                        name: type_name,
-                    });
-                    component.section(&alias_section);
+                    let stripped_rn = crate::merger::strip_dollar_suffix(resource_name);
+                    let alias_tail = format!("_{}", stripped_rn);
+                    let ht_drop_alias = fused_info
+                        .exports
+                        .iter()
+                        .find(|(n, k, _)| {
+                            *k == wasmparser::ExternalKind::Func
+                                && n.starts_with("$ht_drop_")
+                                && n.ends_with(&alias_tail)
+                        })
+                        .map(|(n, _, _)| n.clone());
+                    if let Some(ht_name) = ht_drop_alias {
+                        log::debug!(
+                            "Instance::ResourceDrop alias-fallback: import {} → {}",
+                            field_name,
+                            ht_name
+                        );
+                        let mut aliases = ComponentAliasSection::new();
+                        aliases.alias(Alias::CoreInstanceExport {
+                            instance: fused_instance,
+                            kind: ExportKind::Func,
+                            name: &ht_name,
+                        });
+                        component.section(&aliases);
+                        lowered_func_indices.push(core_func_idx);
+                        core_func_idx += 1;
+                    } else {
+                        let type_name = func_name
+                            .strip_prefix("[resource-drop]")
+                            .unwrap_or(func_name);
+                        let mut alias_section = ComponentAliasSection::new();
+                        alias_section.alias(Alias::InstanceExport {
+                            instance: *instance_idx,
+                            kind: ComponentExportKind::Type,
+                            name: type_name,
+                        });
+                        component.section(&alias_section);
 
-                    let mut canon = CanonicalFunctionSection::new();
-                    canon.resource_drop(component_type_idx);
-                    component.section(&canon);
+                        let mut canon = CanonicalFunctionSection::new();
+                        canon.resource_drop(component_type_idx);
+                        component.section(&canon);
 
-                    component_type_idx += 1;
-                    lowered_func_indices.push(core_func_idx);
-                    core_func_idx += 1;
+                        component_type_idx += 1;
+                        lowered_func_indices.push(core_func_idx);
+                        core_func_idx += 1;
+                    }
                 } else {
                     // Regular function: alias from instance, then canon lower
                     // with correct memory and realloc for the importing component.
@@ -1342,17 +1377,28 @@ fn assemble_component(
                         })
                         .collect();
                     let tail = format!("_{}_{}", safe_iface, resource_name);
+                    let alias_tail = format!("_{}", resource_name);
                     if let Some(cidx) = component_idx {
-                        let self_prefix = format!("$ht_new_{}_{}", cidx, safe_iface);
-                        let owns_for_resource = fused_info.exports.iter().any(|(n, k, _)| {
-                            *k == wasmparser::ExternalKind::Func
-                                && n.starts_with(&self_prefix)
-                                && n.ends_with(&tail)
+                        // Self-owns check: this component owns a handle table
+                        // for the SPECIFIC (iface, resource) pair. Don't
+                        // borrow another component's ht for that exact pair.
+                        // We do NOT block when the iface differs but the
+                        // resource is the same — those are `use`-aliased
+                        // resources unified at canon-type level, and they
+                        // SHOULD route through the re-exporter's ht.
+                        let self_specific = format!(
+                            "$ht_new_{}",
+                            ht_export_suffix(*cidx, interface_name, resource_name)
+                        );
+                        let owns_specific = fused_info.exports.iter().any(|(n, k, _)| {
+                            *k == wasmparser::ExternalKind::Func && *n == self_specific
                         });
-                        if owns_for_resource {
+                        if owns_specific {
                             return None;
                         }
                     }
+                    // Strict iface match first; alias-fallback by resource_name
+                    // only if strict misses (mirrors the definer-side fix).
                     fused_info
                         .exports
                         .iter()
@@ -1362,6 +1408,17 @@ fn assemble_component(
                                 && n.ends_with(&tail)
                         })
                         .map(|(n, _, _)| n.clone())
+                        .or_else(|| {
+                            fused_info
+                                .exports
+                                .iter()
+                                .find(|(n, k, _)| {
+                                    *k == wasmparser::ExternalKind::Func
+                                        && n.starts_with(op_prefix)
+                                        && n.ends_with(&alias_tail)
+                                })
+                                .map(|(n, _, _)| n.clone())
+                        })
                 });
 
                 if let Some(ht_name) = ht_export {
