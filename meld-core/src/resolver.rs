@@ -1351,8 +1351,16 @@ impl Resolver {
                 }
             }
 
-            graph.reexporter_components = reexporter_set.into_iter().collect();
-            graph.reexporter_resources = reexporter_resource_set.into_iter().collect();
+            // Sort for determinism: HashSet iteration order is non-deterministic
+            // and downstream code (HT allocation, wrapper alias-fallback) makes
+            // first-match decisions that depend on this order.
+            let mut reexporter_components: Vec<usize> = reexporter_set.into_iter().collect();
+            reexporter_components.sort_unstable();
+            graph.reexporter_components = reexporter_components;
+            let mut reexporter_resources: Vec<(usize, String, String)> =
+                reexporter_resource_set.into_iter().collect();
+            reexporter_resources.sort_unstable();
+            graph.reexporter_resources = reexporter_resources;
         }
 
         // Note: the re-exporter caller_already_converted logic (from PR #81)

@@ -685,6 +685,20 @@ impl Merger {
             // Skip the dtor invocation when ht_drop is called with handle=0
             // (used as a sentinel by the canonical ABI). Using if-then to
             // avoid double-free if the same handle is dropped twice.
+            //
+            // For re-exporters whose ht stores foreign reps (placed there by
+            // the own bridge), invoking the local dtor on a foreign rep is
+            // undefined behavior — the dtor casts the rep as `*mut
+            // _ThingRep<LocalT>` and Box::from_raw drops what it thinks is a
+            // local box. When the foreign rep is actually a leaf-allocated
+            // box, this misinterprets memory and leads to recursion through
+            // the import drop chain. Suppress the dtor for re-exporter
+            // components whose ht is also fed via own bridges (the standard
+            // Box-pattern wit-bindgen design assumes the rep is always
+            // owned by the component whose ht stores it, but Phase 1's
+            // per-component-ht-for-definers broke that invariant).
+            let invoke_dtor =
+                dtor_func_idx.filter(|_| !graph.reexporter_components.contains(&comp_idx));
             let drop_func_idx = merged.import_counts.func + merged.functions.len() as u32;
             {
                 let mut body = Function::new([]);
@@ -692,7 +706,7 @@ impl Merger {
                 body.instruction(&Instruction::I32Eqz); // [handle == 0]
                 body.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
                 body.instruction(&Instruction::Else);
-                if let Some(dtor_idx) = dtor_func_idx {
+                if let Some(dtor_idx) = invoke_dtor {
                     // Load the rep stored at this handle slot, then call dtor(rep).
                     body.instruction(&Instruction::LocalGet(0));
                     body.instruction(&Instruction::I32Load(mem_arg));

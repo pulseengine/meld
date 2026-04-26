@@ -641,18 +641,37 @@ impl FactStyleGenerator {
                             .iter()
                             .any(|((c, _, r), _)| *c == site.from_component && r == rn)
                     });
-                    let callee_new_func =
-                        if site.from_component != site.to_component && caller_has_ht {
-                            rn_opt.as_deref().and_then(|rn| {
-                                merged
-                                    .handle_tables
-                                    .iter()
-                                    .find(|((c, _, r), _)| *c == site.to_component && r == rn)
-                                    .map(|(_, ht)| ht.new_func)
-                            })
-                        } else {
-                            None
-                        };
+                    // For `[method]/[static]/[constructor]` exported by a
+                    // component that LOCALLY defines the resource, the
+                    // wit-bindgen cabi expects arg0 to be the REP (memory
+                    // pointer to `_ThingRep<T>`). Adding callee.new would
+                    // mint a fresh slot in callee's ht; the slot's address
+                    // gets passed as arg0; the deref reads 4 bytes at the
+                    // slot (the just-stored rep) but Option's discriminant
+                    // is the LOW BYTE of that rep — 0 for typical aligned
+                    // box pointers → Option::unwrap on None.
+                    //
+                    // For top-level functions or when the callee just uses
+                    // the resource (not locally defines it), the cabi
+                    // treats arg0 as a HANDLE — keep callee.new so the
+                    // value lands in callee's namespace.
+                    let is_method_like = site.import_name.starts_with("[method]")
+                        || site.import_name.starts_with("[static]")
+                        || site.import_name.starts_with("[constructor]");
+                    let callee_new_func = if site.from_component != site.to_component
+                        && caller_has_ht
+                        && !is_method_like
+                    {
+                        rn_opt.as_deref().and_then(|rn| {
+                            merged
+                                .handle_tables
+                                .iter()
+                                .find(|((c, _, r), _)| *c == site.to_component && r == rn)
+                                .map(|(_, ht)| ht.new_func)
+                        })
+                    } else {
+                        None
+                    };
                     if let Some(rep_func) = rep_func {
                         if let Some(new_func) = callee_new_func {
                             log::info!(
@@ -735,13 +754,53 @@ impl FactStyleGenerator {
                             .copied()
                     });
 
+                // Distinguish two sub-cases of the 3-component branch:
+                //
+                // (a) Callee's exported function is a `[method]/[static]/
+                //     [constructor]` on a resource the callee LOCALLY
+                //     DEFINES via its own ht. wit-bindgen's `_export_*_cabi`
+                //     wraps the rep in `_ThingRep<T>` and the cabi expects
+                //     arg0 to be the REP (memory pointer). Emit
+                //     `caller.rep` ONLY — callee.new would mint a new
+                //     slot whose address gets passed as the rep, and the
+                //     deref reads adjacent fresh memory → Option=None.
+                //     This is the resource_with_lists `[method]thing.foo`
+                //     case where the re-exporter classification masks the
+                //     fact that the cabi still uses _ThingRep wrapping.
+                //
+                // (b) Top-level functions (no `[method]/[static]/
+                //     [constructor]` prefix) taking borrow<T> on a
+                //     `use`d resource. wit-bindgen's cabi calls
+                //     `Float::from_handle(arg0 as u32)` and treats arg0 as
+                //     a HANDLE. Emit `caller.rep + callee.new` so the
+                //     value lands in callee's namespace as a fresh slot
+                //     index the callee can pass back across downstream
+                //     adapters. This is the resource_floats `add` case.
+                //
+                // Discriminator: function name prefix. Methods/statics/
+                // constructors → case (a); top-level → case (b). Combined
+                // with a sanity check that the callee has SOME ht for the
+                // resource_name (so the rep-only path has somewhere
+                // sensible to derive the rep from).
+                let is_method_like = site.import_name.starts_with("[method]")
+                    || site.import_name.starts_with("[static]")
+                    || site.import_name.starts_with("[constructor]");
+                let callee_has_any_ht = merged
+                    .handle_tables
+                    .iter()
+                    .any(|((c, _, r), _)| *c == site.to_component && r == resource_name);
+                let new_func_for_emit = if is_method_like && callee_has_any_ht {
+                    None
+                } else {
+                    callee_new_func
+                };
                 if let Some(rep_func) = caller_rep_func {
                     options
                         .resource_rep_calls
                         .push(super::ResourceBorrowTransfer {
                             param_idx: op.flat_idx,
                             rep_func,
-                            new_func: callee_new_func,
+                            new_func: new_func_for_emit,
                         });
                 } else {
                     log::warn!(
