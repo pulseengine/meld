@@ -483,7 +483,7 @@ impl FactStyleGenerator {
         let (type_idx, body) = if site.crosses_memory && options.needs_transcoding() {
             self.generate_transcoding_adapter(site, merged, &options)?
         } else if site.crosses_memory {
-            self.generate_memory_copy_adapter(site, merged, &options)?
+            self.generate_memory_copy_adapter(site, merged, &options, resource_rep_imports)?
         } else {
             self.generate_direct_adapter(site, merged, &options)?
         };
@@ -948,21 +948,41 @@ impl FactStyleGenerator {
         // Resolve inner resource handles from param copy layouts.
         // When list elements contain borrow<T>, the adapter must convert
         // each handle after bulk-copying the list data to callee memory.
+        // Each inner resource carries its own pre-resolved (module, field)
+        // for the matching [resource-rep] import (filled in by the
+        // resolver via the callee's resource_type_to_import map). Using
+        // that lookup ensures the right rep_func per resource type even
+        // when the callee imports multiple resources — the previous
+        // `.values().next()` heuristic picked an arbitrary first match
+        // and silently routed handle A through resource B's rep_func.
         for layout in &site.requirements.param_copy_layouts {
             if let crate::resolver::CopyLayout::Elements {
                 inner_resources, ..
             } = layout
             {
-                for &(byte_offset, _resource_type_id, is_owned) in inner_resources {
-                    if is_owned {
+                for inner in inner_resources {
+                    if inner.is_owned {
                         continue; // own<T> in lists — callee handles internally
                     }
-                    // Find any [resource-rep] import for borrow handles.
-                    // For 2-component (callee defines), use callee's rep.
-                    // For 3-component, would need caller's rep + callee's new.
-                    // For now, find ANY matching [resource-rep] import.
-                    if let Some(&rep_func) = resource_rep_imports.values().next() {
-                        options.inner_resource_fixups.push((byte_offset, rep_func));
+                    let rep_func = inner
+                        .rep_import
+                        .as_ref()
+                        .and_then(|key| resource_rep_imports.get(key).copied());
+                    if let Some(rep_func) = rep_func {
+                        options
+                            .inner_resource_fixups
+                            .push((inner.byte_offset, rep_func));
+                    } else {
+                        log::warn!(
+                            "inner-list borrow at offset {} (resource_type_id={}): \
+                             no [resource-rep] import resolved — skipping fixup. \
+                             from={} to={} import_name={:?}",
+                            inner.byte_offset,
+                            inner.resource_type_id,
+                            site.from_component,
+                            site.to_component,
+                            site.import_name,
+                        );
                     }
                 }
             }
@@ -1127,6 +1147,7 @@ impl FactStyleGenerator {
         site: &AdapterSite,
         merged: &MergedModule,
         options: &AdapterOptions,
+        resource_rep_imports: &std::collections::HashMap<(String, String), u32>,
     ) -> Result<(u32, Function)> {
         let target_func = self.resolve_target_function(site, merged)?;
 
@@ -1201,7 +1222,13 @@ impl FactStyleGenerator {
                     .filter(|p| !p.is_owned && p.callee_defines_resource)
                     .count(),
             );
-            return self.generate_params_ptr_adapter(site, options, target_func, caller_type_idx);
+            return self.generate_params_ptr_adapter(
+                site,
+                options,
+                target_func,
+                caller_type_idx,
+                resource_rep_imports,
+            );
         }
 
         // --- Non-retptr path: use callee's type so body is valid ---
@@ -1762,6 +1789,7 @@ impl FactStyleGenerator {
         options: &AdapterOptions,
         target_func: u32,
         caller_type_idx: u32,
+        resource_rep_imports: &std::collections::HashMap<(String, String), u32>,
     ) -> Result<(u32, Function)> {
         let params_area_size = site.requirements.params_area_byte_size.unwrap_or(0);
         let params_area_align = site.requirements.params_area_max_align.max(1);
@@ -1948,17 +1976,22 @@ impl FactStyleGenerator {
                 func.instruction(&Instruction::I32GeU);
                 func.instruction(&Instruction::BrIf(1)); // break to $exit
 
-                for &(res_byte_offset, _resource_type_id, is_owned) in inner_resources {
-                    if is_owned {
+                for inner in inner_resources {
+                    if inner.is_owned {
                         continue; // own<T>: callee handles internally
                     }
-                    // Find [resource-rep] for this resource
-                    if let Some(&rep_func) = options
-                        .params_area_borrow_fixups
-                        .first()
-                        .map(|f| &f.rep_func)
-                        .or_else(|| options.resource_rep_calls.first().map(|t| &t.rep_func))
-                    {
+                    // Use the per-element pre-resolved [resource-rep]
+                    // (filled at site-requirements time via the callee's
+                    // resource_type_to_import map). The previous code
+                    // picked an arbitrary first-fixup which silently
+                    // routed handle A through resource B's rep_func when
+                    // the callee imported >1 resource.
+                    let res_byte_offset = inner.byte_offset;
+                    let rep_func_opt = inner
+                        .rep_import
+                        .as_ref()
+                        .and_then(|key| resource_rep_imports.get(key).copied());
+                    if let Some(rep_func) = rep_func_opt {
                         // addr = dest_ptr + loop_counter * element_size + res_byte_offset
                         // Push addr for store
                         func.instruction(&Instruction::LocalGet(dest_local));

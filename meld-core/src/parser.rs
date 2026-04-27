@@ -1379,15 +1379,19 @@ impl ParsedComponent {
             },
             ComponentValType::String => 8,  // (ptr: i32, len: i32)
             ComponentValType::List(_) => 8, // (ptr: i32, len: i32)
-            ComponentValType::Record(fields) => {
-                fields.iter().map(|(_, ty)| self.flat_byte_size(ty)).sum()
-            }
-            ComponentValType::Tuple(elems) => elems.iter().map(|ty| self.flat_byte_size(ty)).sum(),
-            ComponentValType::Option(inner) => 4 + self.flat_byte_size(inner),
+            ComponentValType::Record(fields) => fields
+                .iter()
+                .map(|(_, ty)| self.flat_byte_size(ty))
+                .fold(0u32, u32::saturating_add),
+            ComponentValType::Tuple(elems) => elems
+                .iter()
+                .map(|ty| self.flat_byte_size(ty))
+                .fold(0u32, u32::saturating_add),
+            ComponentValType::Option(inner) => 4u32.saturating_add(self.flat_byte_size(inner)),
             ComponentValType::Result { ok, err } => {
                 let ok_size = ok.as_ref().map(|t| self.flat_byte_size(t)).unwrap_or(0);
                 let err_size = err.as_ref().map(|t| self.flat_byte_size(t)).unwrap_or(0);
-                4 + ok_size.max(err_size)
+                4u32.saturating_add(ok_size.max(err_size))
             }
             ComponentValType::Type(idx) => {
                 if let Some(ct) = self.get_type_definition(*idx) {
@@ -1407,9 +1411,11 @@ impl ParsedComponent {
                     .filter_map(|(_, ty)| ty.as_ref().map(|t| self.flat_byte_size(t)))
                     .max()
                     .unwrap_or(0);
-                4 + max_payload
+                4u32.saturating_add(max_payload)
             }
-            ComponentValType::FixedSizeList(elem, len) => self.flat_byte_size(elem) * len,
+            ComponentValType::FixedSizeList(elem, len) => {
+                self.flat_byte_size(elem).saturating_mul(*len)
+            }
             ComponentValType::Own(_) | ComponentValType::Borrow(_) => 4,
         }
     }
@@ -2488,15 +2494,19 @@ impl ParsedComponent {
         match ty {
             ComponentValType::Primitive(_) => 1, // always 1 core value (i32/i64/f32/f64)
             ComponentValType::String | ComponentValType::List(_) => 2, // (ptr, len)
-            ComponentValType::Record(fields) => {
-                fields.iter().map(|(_, t)| self.flat_count(t)).sum()
-            }
-            ComponentValType::Tuple(elems) => elems.iter().map(|t| self.flat_count(t)).sum(),
-            ComponentValType::Option(inner) => 1 + self.flat_count(inner),
+            ComponentValType::Record(fields) => fields
+                .iter()
+                .map(|(_, t)| self.flat_count(t))
+                .fold(0u32, u32::saturating_add),
+            ComponentValType::Tuple(elems) => elems
+                .iter()
+                .map(|t| self.flat_count(t))
+                .fold(0u32, u32::saturating_add),
+            ComponentValType::Option(inner) => 1u32.saturating_add(self.flat_count(inner)),
             ComponentValType::Result { ok, err } => {
                 let ok_c = ok.as_ref().map(|t| self.flat_count(t)).unwrap_or(0);
                 let err_c = err.as_ref().map(|t| self.flat_count(t)).unwrap_or(0);
-                1 + ok_c.max(err_c)
+                1u32.saturating_add(ok_c.max(err_c))
             }
             ComponentValType::Variant(cases) => {
                 let max_c = cases
@@ -2504,7 +2514,7 @@ impl ParsedComponent {
                     .filter_map(|(_, t)| t.as_ref().map(|t| self.flat_count(t)))
                     .max()
                     .unwrap_or(0);
-                1 + max_c
+                1u32.saturating_add(max_c)
             }
             ComponentValType::Type(idx) => {
                 if let Some(ct) = self.get_type_definition(*idx) {
@@ -2517,7 +2527,9 @@ impl ParsedComponent {
                     1
                 }
             }
-            ComponentValType::FixedSizeList(elem, len) => self.flat_count(elem) * len,
+            ComponentValType::FixedSizeList(elem, len) => {
+                self.flat_count(elem).saturating_mul(*len)
+            }
             ComponentValType::Own(_) | ComponentValType::Borrow(_) => 1,
         }
     }
@@ -2601,15 +2613,19 @@ impl ParsedComponent {
             },
             ComponentValType::String | ComponentValType::List(_) => 8, // (ptr: i32, len: i32)
             ComponentValType::FixedSizeList(elem, len) => {
-                // Inline: element_size (padded stride) * length
-                self.canonical_abi_element_size(elem) * len
+                // Inline: element_size (padded stride) * length.
+                // Saturating to u32::MAX prevents wrap-to-0 on adversarial
+                // nested fixed-length-list types whose product exceeds u32.
+                // Downstream allocation/copy with u32::MAX safely fails
+                // rather than under-allocating and writing OOB.
+                self.canonical_abi_element_size(elem).saturating_mul(*len)
             }
             ComponentValType::Record(fields) => {
                 let mut size = 0u32;
                 for (_, field_ty) in fields {
                     let align = self.canonical_abi_align(field_ty);
                     size = align_up(size, align);
-                    size += self.canonical_abi_size_unpadded(field_ty);
+                    size = size.saturating_add(self.canonical_abi_size_unpadded(field_ty));
                 }
                 size
             }
@@ -2618,7 +2634,7 @@ impl ParsedComponent {
                 for elem_ty in elems {
                     let align = self.canonical_abi_align(elem_ty);
                     size = align_up(size, align);
-                    size += self.canonical_abi_size_unpadded(elem_ty);
+                    size = size.saturating_add(self.canonical_abi_size_unpadded(elem_ty));
                 }
                 size
             }
@@ -2634,12 +2650,12 @@ impl ParsedComponent {
                     .filter_map(|(_, t)| t.as_ref().map(|t| self.canonical_abi_element_size(t)))
                     .max()
                     .unwrap_or(0);
-                align_up(ds, max_case_align) + max_payload
+                align_up(ds, max_case_align).saturating_add(max_payload)
             }
             ComponentValType::Option(inner) => {
                 let ds = disc_size(2);
                 let payload_align = self.canonical_abi_align(inner);
-                align_up(ds, payload_align) + self.canonical_abi_element_size(inner)
+                align_up(ds, payload_align).saturating_add(self.canonical_abi_element_size(inner))
             }
             ComponentValType::Result { ok, err } => {
                 let ds = disc_size(2);
@@ -2660,7 +2676,7 @@ impl ParsedComponent {
                     .as_ref()
                     .map(|t| self.canonical_abi_element_size(t))
                     .unwrap_or(0);
-                align_up(ds, max_case_align) + ok_s.max(err_s)
+                align_up(ds, max_case_align).saturating_add(ok_s.max(err_s))
             }
             ComponentValType::Type(idx) => {
                 if let Some(ct) = self.get_type_definition(*idx)
@@ -2770,14 +2786,29 @@ impl ParsedComponent {
 
     /// Find resource handles embedded within a composite type's memory layout.
     /// Returns `(byte_offset, resource_type_id, is_owned)` for each resource found.
-    fn element_inner_resources(&self, ty: &ComponentValType, base: u32) -> Vec<(u32, u32, bool)> {
+    fn element_inner_resources(
+        &self,
+        ty: &ComponentValType,
+        base: u32,
+    ) -> Vec<crate::resolver::InnerResource> {
+        use crate::resolver::InnerResource;
         let mut result = Vec::new();
         match ty {
             ComponentValType::Own(id) => {
-                result.push((base, *id, true));
+                result.push(InnerResource {
+                    byte_offset: base,
+                    resource_type_id: *id,
+                    is_owned: true,
+                    rep_import: None,
+                });
             }
             ComponentValType::Borrow(id) => {
-                result.push((base, *id, false));
+                result.push(InnerResource {
+                    byte_offset: base,
+                    resource_type_id: *id,
+                    is_owned: false,
+                    rep_import: None,
+                });
             }
             ComponentValType::Record(fields) => {
                 let mut offset = base;
@@ -2785,7 +2816,7 @@ impl ParsedComponent {
                     let align = self.canonical_abi_align(field_ty);
                     offset = align_up(offset, align);
                     result.extend(self.element_inner_resources(field_ty, offset));
-                    offset += self.canonical_abi_size_unpadded(field_ty);
+                    offset = offset.saturating_add(self.canonical_abi_size_unpadded(field_ty));
                 }
             }
             ComponentValType::Tuple(elems) => {
@@ -2794,7 +2825,7 @@ impl ParsedComponent {
                     let align = self.canonical_abi_align(elem_ty);
                     offset = align_up(offset, align);
                     result.extend(self.element_inner_resources(elem_ty, offset));
-                    offset += self.canonical_abi_size_unpadded(elem_ty);
+                    offset = offset.saturating_add(self.canonical_abi_size_unpadded(elem_ty));
                 }
             }
             ComponentValType::Type(idx) => {
@@ -2811,7 +2842,15 @@ impl ParsedComponent {
 }
 
 fn align_up(size: u32, align: u32) -> u32 {
-    (size + align - 1) & !(align - 1)
+    // Saturating to u32::MAX prevents overflow when `size` is already
+    // u32::MAX (e.g. from a saturated FixedSizeList multiplication) and
+    // `align >= 2`. Downstream sees "type too large" via a saturated max,
+    // not a panic.
+    if align <= 1 {
+        return size;
+    }
+    let mask = !(align - 1);
+    size.saturating_add(align - 1) & mask
 }
 
 /// Canonical ABI discriminant byte size for a variant-like type with `num_cases` cases.
@@ -4074,5 +4113,50 @@ mod tests {
         let display = format!("{err}");
         assert!(display.contains("P3 async"));
         let _ = fuser; // suppress unused warning
+    }
+
+    /// Mythos pre-release finding: nested `fixed-length-list` types whose
+    /// per-level lengths individually pass validation but whose product
+    /// exceeds u32::MAX would overflow `element_size * len` in
+    /// canonical_abi_size_unpadded — panic in debug, silent wrap to 0 in
+    /// release. The wrapped 0 propagates to adapter copy sizes, leading
+    /// to OOB writes on the receiver. After the saturating-arithmetic
+    /// fix, the product saturates to u32::MAX so downstream allocation
+    /// fails safely.
+    #[test]
+    fn test_canonical_abi_size_fixed_size_list_saturates_on_overflow() {
+        let pc = empty_parsed_component();
+        // 65536 * 65536 = 2^32 — exactly at u32 wrap boundary.
+        let inner = ComponentValType::FixedSizeList(
+            Box::new(ComponentValType::Primitive(PrimitiveValType::U8)),
+            65_536,
+        );
+        let outer = ComponentValType::FixedSizeList(Box::new(inner), 65_536);
+
+        // Must not panic.
+        let size = pc.canonical_abi_element_size(&outer);
+        let flat = pc.flat_count(&outer);
+        let flat_bytes = pc.flat_byte_size(&outer);
+
+        // Saturated to u32::MAX (or close), never wrap-to-zero.
+        assert_eq!(size, u32::MAX, "size must saturate, not wrap to 0");
+        assert_eq!(flat, u32::MAX, "flat_count must saturate");
+        assert_eq!(flat_bytes, u32::MAX, "flat_byte_size must saturate");
+    }
+
+    /// align_up must not panic when given a saturated u32::MAX size and
+    /// a non-trivial alignment — the previous `(size + align - 1)` form
+    /// would overflow.
+    #[test]
+    fn test_align_up_saturates_at_u32_max() {
+        // Sanity: small inputs unchanged.
+        assert_eq!(super::align_up(0, 4), 0);
+        assert_eq!(super::align_up(1, 4), 4);
+        assert_eq!(super::align_up(4, 4), 4);
+        assert_eq!(super::align_up(5, 8), 8);
+        // Boundary: would have panicked / overflowed before the fix.
+        // u32::MAX & !7 == !7 — the fix saturates the addition then masks.
+        assert_eq!(super::align_up(u32::MAX, 8), !7u32);
+        assert_eq!(super::align_up(u32::MAX - 3, 8), !7u32);
     }
 }
