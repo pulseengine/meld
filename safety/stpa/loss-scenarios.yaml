@@ -66,6 +66,51 @@ loss-scenarios:
       Parser believes the component is valid because the validator
       accepted it, but the validator was configured too permissively.
 
+  - id: LS-P-4
+    title: Canonical-ABI size arithmetic overflows for nested fixed-length-list
+    uca: UCA-P-3
+    hazards: [H-2, H-4, H-4.1]
+    type: inadequate-control-algorithm
+    scenario: >
+      A component declares nested `fixed-length-list` types whose
+      individual lengths each pass per-level wasmparser validation
+      (each ≤ MAX_WASM_FIXED_LIST_LENGTH = 65536) but whose product
+      exceeds u32::MAX. `canonical_abi_size_unpadded`,
+      `canonical_abi_element_size`, `flat_count`, and `flat_byte_size`
+      in meld-core/src/parser.rs computed `element_size * len` (and
+      record/tuple `+=` accumulators) on raw u32. With overflow-checks
+      = on (debug builds), `meld fuse` panics on adversarial input
+      (DoS [UCA-P-3]). With release defaults, the multiplication wraps
+      to a small value (often 0) — the wrapped tiny size is then
+      handed to the adapter generator, which emits realloc with a size
+      that under-allocates by ~4 GiB while the loop count is the true
+      (huge) flat count, producing an out-of-bounds write into the
+      receiving component's linear memory at downstream exec time
+      [H-4.1] and trampling caller-controlled offsets [H-2]. Detected
+      by Kani harness
+      meld-core::parser::tests::kani_fixed_size_list_size_no_overflow
+      and PoC unit test
+      meld-core::parser::tests::test_canonical_abi_size_fixed_size_list_saturates_on_overflow
+      which exercises 65536×65536 = 2^32 and asserts the size does not
+      wrap to 0. Fix lands in commit f0e981b: replace `*` with
+      `saturating_mul`, `+`/`+=`/`.sum()` with `saturating_add`/
+      `fold(0, saturating_add)`, and harden `align_up` against overflow
+      when given a saturated u32::MAX size with align ≥ 2. Saturated
+      u32::MAX makes downstream realloc/memory.copy fail safely instead
+      of under-allocating.
+    causal-factors:
+      - >-
+        Canonical-ABI size math used raw `u32 *` and `+=` with no
+        overflow check; debug panics, release wraps
+      - >-
+        `align_up` did `(size + align - 1) & !(align - 1)` and
+        overflowed when size was already saturated u32::MAX
+      - >-
+        No regression test for size saturation under nested
+        `fixed-length-list` adversarial inputs
+    status: approved
+    priority: high
+
   # ==========================================================================
   # Resolver scenarios
   # ==========================================================================
@@ -386,6 +431,48 @@ loss-scenarios:
     related-cve: CVE-2026-27572
     status: approved
     priority: critical
+
+  - id: LS-A-8
+    title: Inner-list rep_func selected by HashMap-iteration order
+    uca: UCA-A-7
+    hazards: [H-4, H-4.2]
+    type: inadequate-control-algorithm
+    scenario: >
+      For a `list<record { x: borrow<A>, y: borrow<B> }>` (or any list
+      whose element carries a `borrow<T>`), the params-area memcpy and
+      param_copy_layouts paths in meld-core/src/adapter/fact.rs at
+      `compute_adapter_options` (~line 960) and the
+      `generate_params_ptr_adapter` emission (~line 1971) walked the
+      inner_resources list and called `resource_rep_imports.values()
+      .next()` to pick a `[resource-rep]` import for each element. When
+      the callee imports more than one resource type, that pick is
+      arbitrary (HashMap iteration order is not defined and varies
+      across builds), so the adapter routinely emits the wrong rep_func
+      for the borrow handle: a memory-pointer of resource A is then
+      dereferenced inside the callee as if it were `_BRep<B>`. Result is
+      silent rep-vs-handle confusion across the cross-component handle
+      boundary [UCA-A-7] — the fused output is structurally valid wasm
+      but semantically wrong [H-4 / H-4.2], which the discover prompt
+      flags as the highest-amplification failure mode (downstream
+      runtimes consume the silently-broken module). Detected by
+      Kani harness
+      meld-core::adapter::fact::tests::kani_inner_resource_picks_correct_rep_func
+      and differential PoC fixture proving the wrong rep_func crashes a
+      multi-resource list-borrow chain. Fix lands in commit f0e981b:
+      `resolver::InnerResource` now carries a pre-resolved `rep_import`
+      filled at site-requirements time via the callee's
+      resource_type_to_import map; fact.rs looks up rep_func per type
+      rather than via `.values().next()`. When a type lacks an import
+      mapping the fixup is skipped with a warning rather than emitting
+      a wrong-rep_func instruction.
+    causal-factors:
+      - Inner-resource fixup discarded `resource_type_id` and used
+        `resource_rep_imports.values().next()` for every entry
+      - HashMap iteration order is non-deterministic, so the same
+        fixture could route correctly on one build and wrong on another
+      - No emitter-level test asserting per-type rep_func selection
+    status: approved
+    priority: high
 
   # ==========================================================================
   # Merger scenario (discovered during gap analysis)
