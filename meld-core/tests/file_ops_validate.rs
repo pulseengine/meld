@@ -205,6 +205,7 @@ fn file_ops_fuses_and_validates() {
     let config = FuserConfig {
         memory_strategy: MemoryStrategy::MultiMemory,
         output_format: OutputFormat::CoreModule,
+        opaque_resources: Vec::new(),
         ..Default::default()
     };
     let mut fuser = Fuser::new(config);

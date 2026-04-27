@@ -33,7 +33,7 @@
 //! 3. `canon lower` uses the fused module's real `cabi_realloc`.
 //! 4. A fixup module fills the indirect table with the lowered functions.
 
-use crate::merger::MergedModule;
+use crate::merger::{MergedModule, ht_export_suffix};
 use crate::parser::{self, ParsedComponent};
 use crate::resolver::DependencyGraph;
 use crate::{Error, MemoryStrategy, Result};
@@ -50,6 +50,7 @@ pub fn wrap_as_component(
     _graph: &DependencyGraph,
     merged: &MergedModule,
     memory_strategy: MemoryStrategy,
+    opaque_resources: &[(String, String)],
 ) -> Result<Vec<u8>> {
     // Pick the component with the most depth_0_sections (widest interface).
     // Prefer original (un-flattened) components since flattening may drop
@@ -106,6 +107,7 @@ pub fn wrap_as_component(
         merged,
         memory_strategy,
         components,
+        opaque_resources,
     )
 }
 
@@ -157,6 +159,14 @@ enum ImportResolution {
         /// Source component index (reserved for future handle table routing)
         #[allow(dead_code)]
         component_idx: Option<usize>,
+        /// `true` when the import came from an `[export]`-prefixed module —
+        /// meaning the importer is the DEFINER of the resource (its own
+        /// export). `false` when the importer is a CONSUMER of someone
+        /// else's resource (just calls into it). The two cases route
+        /// differently: definers must use canonical resource ops or their
+        /// own handle table; consumers may fall back to any re-exporter's
+        /// handle table for the same (interface, resource).
+        is_definer: bool,
     },
     /// Import resolves to a P3 task/async canonical built-in.
     ///
@@ -763,6 +773,10 @@ fn assemble_component(
     merged: &MergedModule,
     memory_strategy: MemoryStrategy,
     all_components: &[ParsedComponent],
+    // Currently consumed only by debug logging — the conditional behavior is
+    // not yet implemented. Threaded through the API so future work can use
+    // it without re-doing the plumbing.
+    _opaque_resources: &[(String, String)],
 ) -> Result<Vec<u8>> {
     use wasm_encoder::*;
 
@@ -844,6 +858,7 @@ fn assemble_component(
                 resource_name,
                 interface_name: inner_module.to_string(),
                 component_idx: comp_idx,
+                is_definer: true,
             });
             continue;
         }
@@ -892,6 +907,7 @@ fn assemble_component(
                 resource_name,
                 interface_name: module_name.clone(),
                 component_idx: comp_idx,
+                is_definer: false,
             });
             continue;
         }
@@ -1158,12 +1174,23 @@ fn assemble_component(
     // Shared between import resolution (P3 task-return types) and export lifting.
     let mut type_remap: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
 
-    // Cache: resource_name → component type index.
+    // Cache: (Option<component_idx>, resource_name) → component type index.
+    //
+    // STANDARD resources (Box-pattern wit-bindgen): keyed by `(None, name)`.
     // All components share one canonical resource type per resource name,
     // regardless of interface. Re-exporters import and export the same
     // resource under different interface names (imports, exports, test:…/test)
-    // but must share one wasmtime handle table.
-    let mut local_resource_types: std::collections::HashMap<String, u32> =
+    // but must share one wasmtime handle table so Box-pointer reps round-trip
+    // through the re-exporter chain.
+    //
+    // OPAQUE-REP resources (pulseengine/wit-bindgen feat/opaque-rep-attribute):
+    // keyed by `(Some(component_idx), name)`. Each component gets its OWN
+    // wasmtime resource type and table. The opaque-rep pattern relies on
+    // intermediate's small-integer rep being stored in its OWN table —
+    // sharing a table with leaf would mix value spaces (intermediate's rep=1
+    // would be retrieved by leaf as the rep for its own handle=1, then
+    // dereferenced as a Box pointer → trap).
+    let mut local_resource_types: std::collections::HashMap<(Option<usize>, String), u32> =
         std::collections::HashMap::new();
 
     // Pre-define component function types for async lift/lower imports.
@@ -1176,26 +1203,61 @@ fn assemble_component(
                 let field_name = &fused_info.func_imports[i].1;
 
                 if field_name.starts_with("[resource-drop]") {
-                    // Resource-drop from an external instance: alias the TYPE
-                    // from the instance, then canon resource.drop.
-                    let type_name = func_name
+                    // Resource-drop from an external instance.
+                    //
+                    // First check if a re-exporter handle table exists for
+                    // this resource (any iface, matching by name only). If
+                    // so, alias its ht_drop instead of emitting canonical
+                    // resource.drop — same alias-fallback as LocalResource.
+                    let resource_name = func_name
                         .strip_prefix("[resource-drop]")
                         .unwrap_or(func_name);
-                    let mut alias_section = ComponentAliasSection::new();
-                    alias_section.alias(Alias::InstanceExport {
-                        instance: *instance_idx,
-                        kind: ComponentExportKind::Type,
-                        name: type_name,
-                    });
-                    component.section(&alias_section);
+                    let stripped_rn = crate::merger::strip_dollar_suffix(resource_name);
+                    let alias_tail = format!("_{}", stripped_rn);
+                    let ht_drop_alias = fused_info
+                        .exports
+                        .iter()
+                        .find(|(n, k, _)| {
+                            *k == wasmparser::ExternalKind::Func
+                                && n.starts_with("$ht_drop_")
+                                && n.ends_with(&alias_tail)
+                        })
+                        .map(|(n, _, _)| n.clone());
+                    if let Some(ht_name) = ht_drop_alias {
+                        log::debug!(
+                            "Instance::ResourceDrop alias-fallback: import {} → {}",
+                            field_name,
+                            ht_name
+                        );
+                        let mut aliases = ComponentAliasSection::new();
+                        aliases.alias(Alias::CoreInstanceExport {
+                            instance: fused_instance,
+                            kind: ExportKind::Func,
+                            name: &ht_name,
+                        });
+                        component.section(&aliases);
+                        lowered_func_indices.push(core_func_idx);
+                        core_func_idx += 1;
+                    } else {
+                        let type_name = func_name
+                            .strip_prefix("[resource-drop]")
+                            .unwrap_or(func_name);
+                        let mut alias_section = ComponentAliasSection::new();
+                        alias_section.alias(Alias::InstanceExport {
+                            instance: *instance_idx,
+                            kind: ComponentExportKind::Type,
+                            name: type_name,
+                        });
+                        component.section(&alias_section);
 
-                    let mut canon = CanonicalFunctionSection::new();
-                    canon.resource_drop(component_type_idx);
-                    component.section(&canon);
+                        let mut canon = CanonicalFunctionSection::new();
+                        canon.resource_drop(component_type_idx);
+                        component.section(&canon);
 
-                    component_type_idx += 1;
-                    lowered_func_indices.push(core_func_idx);
-                    core_func_idx += 1;
+                        component_type_idx += 1;
+                        lowered_func_indices.push(core_func_idx);
+                        core_func_idx += 1;
+                    }
                 } else {
                     // Regular function: alias from instance, then canon lower
                     // with correct memory and realloc for the importing component.
@@ -1246,24 +1308,117 @@ fn assemble_component(
                 resource_name,
                 interface_name,
                 component_idx,
+                is_definer,
             } => {
-                // Check if this component has handle table exports
-                // ($ht_new_N, $ht_rep_N, $ht_drop_N) for re-exporter routing.
-                let ht_export = component_idx.and_then(|cidx| {
-                    let name = match operation {
-                        ResourceOp::New => format!("$ht_new_{}", cidx),
-                        ResourceOp::Rep => format!("$ht_rep_{}", cidx),
-                        ResourceOp::Drop => format!("$ht_drop_{}", cidx),
-                    };
-                    if fused_info
+                // Look up a handle table export for this (interface, resource).
+                //
+                // Definers (importer owns the resource — `[export]`-prefixed
+                // import) MUST use either their OWN component's handle table
+                // or canonical resource ops. Falling back to a re-exporter's
+                // ht_new would store the rep in the wrong table; the definer's
+                // own canonical [resource-rep] would later return whatever was
+                // there (a small handle integer, not the actual Box pointer)
+                // and the user code's deref would trap.
+                //
+                // Consumers (importer holds someone else's handle — no
+                // `[export]` prefix) MUST route to whoever allocated the
+                // handle. After fusion that's the re-exporter component, so
+                // fall back to ANY handle table matching (iface, rn).
+                let op_prefix = match operation {
+                    ResourceOp::New => "$ht_new_",
+                    ResourceOp::Rep => "$ht_rep_",
+                    ResourceOp::Drop => "$ht_drop_",
+                };
+                let direct = component_idx.and_then(|cidx| {
+                    let suffix = ht_export_suffix(cidx, interface_name, resource_name);
+                    let name = format!("{}{}", op_prefix, suffix);
+                    fused_info
                         .exports
                         .iter()
-                        .any(|(n, k, _)| *k == wasmparser::ExternalKind::Func && *n == name)
-                    {
-                        Some(name)
-                    } else {
-                        None
+                        .find(|(n, k, _)| *k == wasmparser::ExternalKind::Func && *n == name)
+                        .map(|_| name)
+                });
+                let ht_export: Option<String> = direct.or_else(|| {
+                    if *is_definer {
+                        // Definer with no own handle table: try the
+                        // resource-alias fallback first. When another
+                        // component re-exports THIS resource via `use`
+                        // (intermediate's `use test.{float}` re-exports
+                        // leaf's test.float as exports.float), wasmtime
+                        // unifies both into one canonical type but the
+                        // re-exporter's handle table is the only storage
+                        // that knows the memory-pointer handles. The
+                        // definer's [resource-rep]/[resource-new]/
+                        // [resource-drop] must route through that same
+                        // table or peer components hand it pointers it
+                        // cannot dereference. Match by resource_name only
+                        // since the iface differs across the alias.
+                        let alias_tail = format!("_{}", resource_name);
+                        return fused_info
+                            .exports
+                            .iter()
+                            .find(|(n, k, _)| {
+                                *k == wasmparser::ExternalKind::Func
+                                    && n.starts_with(op_prefix)
+                                    && n.ends_with(&alias_tail)
+                            })
+                            .map(|(n, _, _)| n.clone());
                     }
+                    // Consumer-side. If THIS component itself owns a handle
+                    // table for the same (iface, rn), this import is its
+                    // own inner-component view (e.g. a re-exporter that
+                    // also imports the resource from its leaf). Use
+                    // canonical resource ops, not the re-exporter's table.
+                    let safe_iface: String = interface_name
+                        .chars()
+                        .map(|c| match c {
+                            ':' | '/' | '@' | '.' | '-' => '_',
+                            other => other,
+                        })
+                        .collect();
+                    let tail = format!("_{}_{}", safe_iface, resource_name);
+                    let alias_tail = format!("_{}", resource_name);
+                    if let Some(cidx) = component_idx {
+                        // Self-owns check: this component owns a handle table
+                        // for the SPECIFIC (iface, resource) pair. Don't
+                        // borrow another component's ht for that exact pair.
+                        // We do NOT block when the iface differs but the
+                        // resource is the same — those are `use`-aliased
+                        // resources unified at canon-type level, and they
+                        // SHOULD route through the re-exporter's ht.
+                        let self_specific = format!(
+                            "$ht_new_{}",
+                            ht_export_suffix(*cidx, interface_name, resource_name)
+                        );
+                        let owns_specific = fused_info.exports.iter().any(|(n, k, _)| {
+                            *k == wasmparser::ExternalKind::Func && *n == self_specific
+                        });
+                        if owns_specific {
+                            return None;
+                        }
+                    }
+                    // Strict iface match first; alias-fallback by resource_name
+                    // only if strict misses (mirrors the definer-side fix).
+                    fused_info
+                        .exports
+                        .iter()
+                        .find(|(n, k, _)| {
+                            *k == wasmparser::ExternalKind::Func
+                                && n.starts_with(op_prefix)
+                                && n.ends_with(&tail)
+                        })
+                        .map(|(n, _, _)| n.clone())
+                        .or_else(|| {
+                            fused_info
+                                .exports
+                                .iter()
+                                .find(|(n, k, _)| {
+                                    *k == wasmparser::ExternalKind::Func
+                                        && n.starts_with(op_prefix)
+                                        && n.ends_with(&alias_tail)
+                                })
+                                .map(|(n, _, _)| n.clone())
+                        })
                 });
 
                 if let Some(ht_name) = ht_export {
@@ -1287,7 +1442,7 @@ fn assemble_component(
                     core_func_idx += 1;
                 } else {
                     // Standard path: canonical resource operations.
-                    let res_type_key = resource_name.clone();
+                    let res_type_key = (None, resource_name.clone());
                     let res_type_idx =
                         if let Some(&existing) = local_resource_types.get(&res_type_key) {
                             existing

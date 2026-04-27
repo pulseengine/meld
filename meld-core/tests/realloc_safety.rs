@@ -508,6 +508,7 @@ fn ls_a_7_every_realloc_call_has_null_guard() {
         preserve_names: false,
         custom_sections: meld_core::CustomSectionHandling::Drop,
         output_format: meld_core::OutputFormat::CoreModule,
+        opaque_resources: Vec::new(),
     };
 
     let mut fuser = Fuser::new(config);

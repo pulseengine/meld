@@ -130,8 +130,13 @@ pub struct MergedModule {
     /// Maps (component_idx, resource_name) → merged function index for [resource-new].
     pub resource_new_by_component: HashMap<(usize, String), u32>,
 
-    /// Per-component handle table info for re-exporters.
-    pub handle_tables: HashMap<usize, HandleTableInfo>,
+    /// Per-resource handle table info for re-exporters.
+    /// Key is (owning_component_idx, interface, resource_name) — a single
+    /// re-exporter component may have multiple entries when it re-exports
+    /// multiple resources, and routing must discriminate per-resource so the
+    /// re-exporter's own export resource gets a handle table while imports
+    /// it passes through do not.
+    pub handle_tables: HashMap<(usize, String, String), HandleTableInfo>,
 
     /// Task.return shim info: maps merged import index of [task-return]N
     /// to the global indices where the shim stores result values.
@@ -277,6 +282,37 @@ struct ImportDedupInfo {
 /// Strip `@major.minor.patch` version suffix from a WASI module name.
 ///
 /// `"wasi:io/error@0.2.0"` → `"wasi:io/error"`; `"env"` → `"env"`
+/// Build a unique export-name suffix for a per-resource handle table.
+///
+/// Combines component index, sanitised interface, and resource name into
+/// one identifier. The interface sanitisation replaces ':', '/', '@', '.'
+/// (illegal in WASM export names? all are legal but conventionally avoided)
+/// with '_'.
+/// Strip a trailing `$N` dedup suffix from a resource name. Meld appends
+/// these when multiple components import the same `[resource-*]X` helper —
+/// the canonical resource name (used for handle-table lookup and the
+/// canonical-ABI) doesn't include the suffix.
+pub(crate) fn strip_dollar_suffix(s: &str) -> &str {
+    if let Some(dollar_pos) = s.rfind('$') {
+        let suffix = &s[dollar_pos + 1..];
+        if !suffix.is_empty() && suffix.chars().all(|c| c.is_ascii_digit()) {
+            return &s[..dollar_pos];
+        }
+    }
+    s
+}
+
+pub(crate) fn ht_export_suffix(comp_idx: usize, interface: &str, resource_name: &str) -> String {
+    let safe_iface: String = interface
+        .chars()
+        .map(|c| match c {
+            ':' | '/' | '@' | '.' | '-' => '_',
+            other => other,
+        })
+        .collect();
+    format!("{}_{}_{}", comp_idx, safe_iface, resource_name)
+}
+
 fn normalize_wasi_module_name(name: &str) -> &str {
     match name.rfind('@') {
         Some(pos) if name[..pos].contains(':') => &name[..pos],
@@ -338,6 +374,10 @@ fn effective_module_name(unresolved: &crate::resolver::UnresolvedImport) -> &str
 pub struct Merger {
     memory_strategy: MemoryStrategy,
     address_rebasing: bool,
+    /// (interface, resource_name) tuples marked opaque-rep — skip handle
+    /// table allocation for these resources because their reps are already
+    /// valid integer handles (no Box dereferencing in user code).
+    opaque_resources: Vec<(String, String)>,
 }
 
 #[derive(Debug, Clone)]
@@ -353,7 +393,14 @@ impl Merger {
         Self {
             memory_strategy,
             address_rebasing,
+            opaque_resources: Vec::new(),
         }
+    }
+
+    /// Mark resources as opaque-rep so handle table allocation skips them.
+    pub fn with_opaque_resources(mut self, opaque: Vec<(String, String)>) -> Self {
+        self.opaque_resources = opaque;
+        self
     }
 
     fn compute_shared_memory_plan(
@@ -472,19 +519,45 @@ impl Merger {
     /// table at the start of the new page. Adds a mutable global for the
     /// next-allocation pointer and generates ht_new/ht_rep/ht_drop functions.
     #[allow(dead_code)]
-    fn allocate_handle_tables(graph: &DependencyGraph, merged: &mut MergedModule) -> Result<()> {
+    fn allocate_handle_tables(
+        graph: &DependencyGraph,
+        merged: &mut MergedModule,
+        opaque_resources: &[(String, String)],
+    ) -> Result<()> {
         // Handle table capacity: 256 entries = 1024 bytes (fits in 1 page)
         const HT_CAPACITY: u32 = 256;
         const ENTRY_SIZE: u32 = 4; // i32
 
-        for &comp_idx in &graph.reexporter_components {
+        for (comp_idx, iface, rn) in &graph.reexporter_resources {
+            let comp_idx = *comp_idx;
+            // Opaque-rep resources still get ht_* slots in handle_tables, but
+            // the function bodies are pure identity (no memory storage):
+            //   ht_new(rep)  → rep   (the rep IS the handle)
+            //   ht_rep(h)    → h     (the handle IS the rep)
+            //   ht_drop(h)   → ()    (no cleanup needed)
+            // Path B's redirect routes [resource-*] imports through these
+            // same ht_* functions whether opaque or not, so opaque imports
+            // bypass wasmtime's canonical resource layer entirely (which
+            // would otherwise reject cross-component handle passing for
+            // per-component-typed resources).
+            // Opaque-rep gets the same memory-backed ht_* as standard
+            // resources — the rep storage semantics are the same (ht_new
+            // allocates a fresh handle and stores the rep, ht_rep reads
+            // it back). The DIFFERENCE with --opaque-rep is in the wrapper:
+            // opaque resources use a separate-typed local_resource_types
+            // entry so wasmtime's canonical resource layer doesn't conflate
+            // them with standard Box-pattern reps.
+            let _is_opaque = opaque_resources.iter().any(|(i, r)| i == iface && r == rn);
+
             // Find merged memory index for this component's memory 0
             let memory_idx = match merged.memory_index_map.get(&(comp_idx, 0, 0)) {
                 Some(&idx) => idx,
                 None => continue, // No memory — skip (shouldn't happen for real components)
             };
 
-            // Determine table base: grow memory by 1 page, place table at start of new page
+            // Determine table base: grow memory by 1 page, place table at start
+            // of new page. Each (component, resource) gets its own page so the
+            // tables don't collide.
             let mem_slot = (memory_idx - merged.import_counts.memory) as usize;
             let current_pages = if mem_slot < merged.memories.len() {
                 merged.memories[mem_slot].minimum
@@ -563,14 +636,74 @@ impl Merger {
                 });
             }
 
-            // Generate ht_drop: mem[handle] = 0
+            // Find the resource's dtor function (if any) so ht_drop can
+            // invoke it before zeroing the slot. wit-bindgen-rust emits
+            // `<iface>#[dtor]<rn>` as a core export for each component that
+            // owns a Box-backed rep.
+            //
+            // Match by EXACT `<iface>#[dtor]<rn>` (with optional `$N` dedup
+            // suffix tolerance). A previous version used `name.contains(...)`
+            // which collided when one component defines the same resource
+            // name across multiple interfaces (e.g. `resource_floats` has
+            // dtors for `exports#[dtor]float`, `imports#[dtor]float`, and
+            // `test:resource-floats/test#[dtor]float` — the contains-match
+            // picked the first regardless of iface). Exact match plus the
+            // origin-comp filter selects the right dtor unambiguously.
+            let exact_dtor_export = format!("{}#[dtor]{}", iface, rn);
+            let exact_dtor_dollar = format!("{}#[dtor]{}$", iface, rn);
+            let dtor_func_idx: Option<u32> = merged
+                .exports
+                .iter()
+                .filter(|e| {
+                    matches!(e.kind, EncoderExportKind::Func)
+                        && (e.name == exact_dtor_export || e.name.starts_with(&exact_dtor_dollar))
+                })
+                .find_map(|e| {
+                    let import_count = merged.import_counts.func;
+                    if e.index < import_count {
+                        return None;
+                    }
+                    let local_idx = (e.index - import_count) as usize;
+                    let func = merged.functions.get(local_idx)?;
+                    if func.origin.0 == comp_idx {
+                        Some(e.index)
+                    } else {
+                        None
+                    }
+                });
+            if let Some(idx) = dtor_func_idx {
+                log::info!(
+                    "ht_drop for {}/{} in component {} will invoke dtor func {}",
+                    iface,
+                    rn,
+                    comp_idx,
+                    idx,
+                );
+            }
+
+            // Generate ht_drop: load rep, optionally call dtor(rep), zero slot.
+            // Skip the dtor invocation when ht_drop is called with handle=0
+            // (used as a sentinel by the canonical ABI). Using if-then to
+            // avoid double-free if the same handle is dropped twice.
             let drop_func_idx = merged.import_counts.func + merged.functions.len() as u32;
             {
                 let mut body = Function::new([]);
                 body.instruction(&Instruction::LocalGet(0)); // [handle]
+                body.instruction(&Instruction::I32Eqz); // [handle == 0]
+                body.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+                body.instruction(&Instruction::Else);
+                if let Some(dtor_idx) = dtor_func_idx {
+                    // Load the rep stored at this handle slot, then call dtor(rep).
+                    body.instruction(&Instruction::LocalGet(0));
+                    body.instruction(&Instruction::I32Load(mem_arg));
+                    body.instruction(&Instruction::Call(dtor_idx));
+                }
+                // Zero the slot regardless of whether a dtor was called.
+                body.instruction(&Instruction::LocalGet(0));
                 body.instruction(&Instruction::I32Const(0));
-                body.instruction(&Instruction::I32Store(mem_arg)); // mem[handle] = 0
-                body.instruction(&Instruction::End);
+                body.instruction(&Instruction::I32Store(mem_arg));
+                body.instruction(&Instruction::End); // end if
+                body.instruction(&Instruction::End); // end function
                 merged.functions.push(MergedFunction {
                     type_idx: type_i32_to_void,
                     body,
@@ -579,7 +712,7 @@ impl Merger {
             }
 
             merged.handle_tables.insert(
-                comp_idx,
+                (comp_idx, iface.clone(), rn.clone()),
                 HandleTableInfo {
                     memory_idx,
                     next_ptr_global,
@@ -592,25 +725,30 @@ impl Merger {
             );
 
             // Export handle table functions so the P2 wrapper can alias them.
+            // Naming: $ht_new_{comp}_{iface_safe}_{rn} so multiple resources
+            // per component don't collide.
+            let suffix = ht_export_suffix(comp_idx, iface, rn);
             merged.exports.push(MergedExport {
-                name: format!("$ht_new_{}", comp_idx),
+                name: format!("$ht_new_{}", suffix),
                 kind: EncoderExportKind::Func,
                 index: new_func_idx,
             });
             merged.exports.push(MergedExport {
-                name: format!("$ht_rep_{}", comp_idx),
+                name: format!("$ht_rep_{}", suffix),
                 kind: EncoderExportKind::Func,
                 index: rep_func_idx,
             });
             merged.exports.push(MergedExport {
-                name: format!("$ht_drop_{}", comp_idx),
+                name: format!("$ht_drop_{}", suffix),
                 kind: EncoderExportKind::Func,
                 index: drop_func_idx,
             });
 
             log::info!(
-                "handle table for component {}: memory={}, base=0x{:x}, global={}, funcs=({},{},{})",
+                "handle table for component {} resource {}/{}: memory={}, base=0x{:x}, global={}, funcs=({},{},{})",
                 comp_idx,
+                iface,
+                rn,
                 memory_idx,
                 table_base_addr,
                 next_ptr_global,
@@ -720,14 +858,30 @@ impl Merger {
         // These are needed for 3-component resource chains where the
         // re-exporter's wit-bindgen code expects 4-byte-aligned memory
         // pointers as handles, not sequential canonical ABI handles.
-        if !graph.reexporter_components.is_empty() {
-            Self::allocate_handle_tables(graph, &mut merged)?;
+        if !graph.reexporter_resources.is_empty() {
+            Self::allocate_handle_tables(graph, &mut merged, &self.opaque_resources)?;
 
-            // Remap re-exporter's resource.rep/new/drop imports to handle table
-            // functions, then re-rewrite affected function bodies so call
-            // instructions pick up the corrected indices.
+            // Remap [resource-*] imports to handle-table functions, with
+            // per-resource discrimination. For each component that owns a
+            // handle table, walk its core modules' imports and redirect only
+            // those imports whose (interface, resource_name) matches a
+            // registered handle table for this component as owner.
+            //
+            // The owner of `[export]<iface>.[resource-*]<rn>` is the
+            // importing component itself (it's the component's own export
+            // resource). The owner of `<iface>.[resource-*]<rn>` (no
+            // [export] prefix) is whatever component DEFINES the resource —
+            // that's resource_graph.resource_definer(iface, rn). Imports
+            // routed at the leaf-definer's helpers should NOT be rewritten
+            // through any other component's handle table; they must call
+            // the natural canonical-ABI handler in their owning component.
             let mut affected_modules: Vec<(usize, usize)> = Vec::new();
-            for (&comp_idx, ht) in &merged.handle_tables {
+            // Iterate ALL components, not just those with handle tables.
+            // A pure consumer (e.g. the runner in a 3-component chain) holds
+            // handles allocated by the re-exporter's ht_new and must drop
+            // them through the same handle table — its [resource-drop]
+            // imports also need redirection.
+            for (comp_idx, _component) in components.iter().enumerate() {
                 let component = &components[comp_idx];
                 for (mod_idx, module) in component.core_modules.iter().enumerate() {
                     let mut import_func_idx = 0u32;
@@ -736,20 +890,128 @@ impl Merger {
                         if !matches!(imp.kind, crate::parser::ImportKind::Function(_)) {
                             continue;
                         }
-                        if imp.name.starts_with("[resource-rep]") {
+                        // Parse: which (iface, resource_name) and which op?
+                        // Strip optional `$N` dedup suffix that meld appends
+                        // when multiple components import the same resource
+                        // helper — the canonical resource name is the same.
+                        let (op_kind, rn_raw) =
+                            if let Some(rn) = imp.name.strip_prefix("[resource-rep]") {
+                                (Some("rep"), rn)
+                            } else if let Some(rn) = imp.name.strip_prefix("[resource-new]") {
+                                (Some("new"), rn)
+                            } else if let Some(rn) = imp.name.strip_prefix("[resource-drop]") {
+                                (Some("drop"), rn)
+                            } else {
+                                (None, "")
+                            };
+                        if op_kind.is_none() {
+                            import_func_idx += 1;
+                            continue;
+                        }
+                        let rn = strip_dollar_suffix(rn_raw);
+                        // Strip [export] prefix from the import module name.
+                        // If present (importer's own export resource), the
+                        // owner is self. Otherwise the importer is consuming
+                        // a resource from elsewhere — find ANY component that
+                        // has a handle table for (iface, rn). That's the
+                        // re-exporter that allocated the handles being passed
+                        // around; consumers must route their [resource-*]
+                        // calls through that same table to stay consistent.
+                        let iface_with_prefix = imp.module.as_str();
+                        let iface = iface_with_prefix
+                            .strip_prefix("[export]")
+                            .unwrap_or(iface_with_prefix);
+                        let key_target = if iface_with_prefix.starts_with("[export]") {
+                            // Importer's own export — look up by self first.
+                            let key = (comp_idx, iface.to_string(), rn.to_string());
+                            merged.handle_tables.get(&key).or_else(|| {
+                                // Resource-alias fallback: when a different
+                                // component re-exports THIS resource via
+                                // `use` (e.g., intermediate has `use
+                                // test.{float}` re-exporting leaf's
+                                // test.float as exports.float), wasmtime
+                                // unifies them into one canonical type. The
+                                // re-exporter's handle table is the only
+                                // storage that knows the memory-pointer
+                                // handles minted by ht_new — definer-side
+                                // [resource-*] must route there too, or
+                                // peers will hand it pointers it can't
+                                // dereference. Match by resource_name only
+                                // since the iface differs across the alias.
+                                let found = merged
+                                    .handle_tables
+                                    .iter()
+                                    .find(|((_, _, r), _)| r == rn)
+                                    .map(|(_, ht)| ht);
+                                if found.is_some() {
+                                    log::info!(
+                                        "alias-fallback: comp {} mod {} import {}/{} → ht for resource '{}'",
+                                        comp_idx,
+                                        mod_idx,
+                                        iface,
+                                        imp.name,
+                                        rn,
+                                    );
+                                }
+                                found
+                            })
+                        } else {
+                            // Consumer-side import. If THIS component itself
+                            // re-exports (iface, rn) — has its own handle
+                            // table for the same resource — then this import
+                            // is the inner-component (definer) view, NOT the
+                            // re-exporter view. Use canonical resource ops
+                            // (don't redirect). Otherwise the importer is a
+                            // pure consumer and the handle was minted by the
+                            // re-exporter's ht_new — route through that table.
+                            //
+                            // Same alias-fallback as the definer branch: when
+                            // strict `(i, r)` matches no handle table, fall
+                            // back to matching by resource_name only. This
+                            // catches consumer imports of resources unified
+                            // via `use other-iface.{rn}` (e.g. runner's
+                            // `test:resource-floats/test [resource-drop]float`
+                            // when only `(3, "exports", "float")` ht exists).
+                            //
+                            // Self-owns check: this component owns a handle
+                            // table for the SPECIFIC (iface, rn) pair. We do
+                            // NOT block when the iface differs but the
+                            // resource name is the same — those are
+                            // `use`-aliased resources unified at canon-type
+                            // level, and they SHOULD route through the
+                            // re-exporter's ht.
+                            let self_owns_specific = merged.handle_tables.contains_key(&(
+                                comp_idx,
+                                iface.to_string(),
+                                rn.to_string(),
+                            ));
+                            if self_owns_specific {
+                                None
+                            } else {
+                                merged
+                                    .handle_tables
+                                    .iter()
+                                    .find(|((_, i, r), _)| i == iface && r == rn)
+                                    .map(|(_, ht)| ht)
+                                    .or_else(|| {
+                                        merged
+                                            .handle_tables
+                                            .iter()
+                                            .find(|((_, _, r), _)| r == rn)
+                                            .map(|(_, ht)| ht)
+                                    })
+                            }
+                        };
+                        if let Some(ht) = key_target {
+                            let target = match op_kind.unwrap() {
+                                "rep" => ht.rep_func,
+                                "new" => ht.new_func,
+                                "drop" => ht.drop_func,
+                                _ => unreachable!(),
+                            };
                             merged
                                 .function_index_map
-                                .insert((comp_idx, mod_idx, import_func_idx), ht.rep_func);
-                            changed = true;
-                        } else if imp.name.starts_with("[resource-new]") {
-                            merged
-                                .function_index_map
-                                .insert((comp_idx, mod_idx, import_func_idx), ht.new_func);
-                            changed = true;
-                        } else if imp.name.starts_with("[resource-drop]") {
-                            merged
-                                .function_index_map
-                                .insert((comp_idx, mod_idx, import_func_idx), ht.drop_func);
+                                .insert((comp_idx, mod_idx, import_func_idx), target);
                             changed = true;
                         }
                         import_func_idx += 1;
@@ -3257,6 +3519,7 @@ mod tests {
             module_resolutions: Vec::new(),
             resource_graph: None,
             reexporter_components: Vec::new(),
+            reexporter_resources: Vec::new(),
             unresolved_imports: vec![
                 UnresolvedImport {
                     component_idx: 0,
@@ -3378,6 +3641,7 @@ mod tests {
             module_resolutions: Vec::new(),
             resource_graph: None,
             reexporter_components: Vec::new(),
+            reexporter_resources: Vec::new(),
             unresolved_imports: vec![
                 UnresolvedImport {
                     component_idx: 0,
@@ -3429,6 +3693,7 @@ mod tests {
             module_resolutions: Vec::new(),
             resource_graph: None,
             reexporter_components: Vec::new(),
+            reexporter_resources: Vec::new(),
             unresolved_imports: vec![
                 UnresolvedImport {
                     component_idx: 0,
@@ -3488,6 +3753,7 @@ mod tests {
             module_resolutions: Vec::new(),
             resource_graph: None,
             reexporter_components: Vec::new(),
+            reexporter_resources: Vec::new(),
             unresolved_imports: vec![
                 UnresolvedImport {
                     component_idx: 0,
@@ -3538,6 +3804,7 @@ mod tests {
             module_resolutions: Vec::new(),
             resource_graph: None,
             reexporter_components: Vec::new(),
+            reexporter_resources: Vec::new(),
             unresolved_imports: vec![
                 UnresolvedImport {
                     component_idx: 0,
@@ -3592,6 +3859,7 @@ mod tests {
             module_resolutions: Vec::new(),
             resource_graph: None,
             reexporter_components: Vec::new(),
+            reexporter_resources: Vec::new(),
             unresolved_imports: vec![
                 UnresolvedImport {
                     component_idx: 0,
@@ -3723,6 +3991,7 @@ mod tests {
             module_resolutions: Vec::new(),
             resource_graph: None,
             reexporter_components: Vec::new(),
+            reexporter_resources: Vec::new(),
             unresolved_imports: vec![
                 UnresolvedImport {
                     component_idx: 0,
@@ -3880,6 +4149,7 @@ mod tests {
             module_resolutions: Vec::new(),
             resource_graph: None,
             reexporter_components: Vec::new(),
+            reexporter_resources: Vec::new(),
             unresolved_imports: vec![
                 UnresolvedImport {
                     component_idx: 0,
@@ -4030,6 +4300,7 @@ mod tests {
             module_resolutions: Vec::new(),
             resource_graph: None,
             reexporter_components: Vec::new(),
+            reexporter_resources: Vec::new(),
             unresolved_imports: vec![
                 UnresolvedImport {
                     component_idx: 0,

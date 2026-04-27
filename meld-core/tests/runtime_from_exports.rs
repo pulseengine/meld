@@ -132,6 +132,7 @@ fn test_from_exports_resolution_runtime() {
         preserve_names: false,
         custom_sections: meld_core::CustomSectionHandling::Drop,
         output_format: meld_core::OutputFormat::CoreModule,
+        opaque_resources: Vec::new(),
     };
 
     let mut fuser = Fuser::new(config);
@@ -181,6 +182,7 @@ fn test_from_exports_shared_memory_strategy() {
         preserve_names: false,
         custom_sections: meld_core::CustomSectionHandling::Drop,
         output_format: meld_core::OutputFormat::CoreModule,
+        opaque_resources: Vec::new(),
     };
 
     let mut fuser = Fuser::new(config);
@@ -230,6 +232,7 @@ fn test_from_exports_function_count() {
         preserve_names: false,
         custom_sections: meld_core::CustomSectionHandling::Drop,
         output_format: meld_core::OutputFormat::CoreModule,
+        opaque_resources: Vec::new(),
     };
 
     let mut fuser = Fuser::new(config);

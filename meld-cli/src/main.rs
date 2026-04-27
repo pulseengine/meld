@@ -81,6 +81,19 @@ enum Commands {
         /// Write a JSON import map to the given path (for synth/kiln integration)
         #[arg(long, value_name = "PATH")]
         emit_import_map: Option<String>,
+
+        /// Mark a resource as opaque-rep (for re-exporters whose representation
+        /// is treated as a `u32` rather than a boxed pointer). Repeatable.
+        ///
+        /// Format: `<interface>.<resource>` (qualified). Example:
+        /// `--opaque-rep test:resource-floats-opaque/chain.float`
+        ///
+        /// Opaque-rep resources skip meld's per-resource handle table layer
+        /// and get their own wasmtime resource type per component (rather
+        /// than the shared-by-name default). This matches the architecture
+        /// of pulseengine/wit-bindgen `feat/opaque-rep-attribute`.
+        #[arg(long, value_name = "IFACE.RESOURCE")]
+        opaque_rep: Vec<String>,
     },
 
     /// Inspect a WebAssembly component
@@ -124,6 +137,7 @@ fn main() -> Result<()> {
             validate,
             component,
             emit_import_map,
+            opaque_rep,
         }) => {
             fuse_command(
                 inputs,
@@ -136,6 +150,7 @@ fn main() -> Result<()> {
                 validate,
                 component,
                 emit_import_map,
+                opaque_rep,
             )?;
         }
 
@@ -190,6 +205,7 @@ fn fuse_command(
     validate: bool,
     component: bool,
     emit_import_map: Option<String>,
+    opaque_rep: Vec<String>,
 ) -> Result<()> {
     println!(
         "Meld v{} - Static Component Fusion",
@@ -221,12 +237,34 @@ fn fuse_command(
     } else {
         OutputFormat::CoreModule
     };
+    // Parse --opaque-rep <iface>.<resource> values into (iface, resource)
+    // tuples. Split on the LAST '.' so qualified interface names like
+    // `test:resource-floats-opaque/chain` (which contain no '.') are kept
+    // intact and only the trailing resource name is split off.
+    let opaque_resources: Vec<(String, String)> = opaque_rep
+        .iter()
+        .map(|s| match s.rsplit_once('.') {
+            Some((iface, rn)) => Ok((iface.to_string(), rn.to_string())),
+            None => Err(anyhow!(
+                "--opaque-rep value '{}' must be 'iface.resource' (e.g. 'test:foo/bar.baz')",
+                s
+            )),
+        })
+        .collect::<Result<_>>()?;
+    if !opaque_resources.is_empty() {
+        println!("Opaque-rep resources:");
+        for (iface, rn) in &opaque_resources {
+            println!("  {}.{}", iface, rn);
+        }
+    }
+
     let config = FuserConfig {
         memory_strategy,
         attestation: !no_attestation,
         address_rebasing: address_rebase,
         preserve_names,
         output_format,
+        opaque_resources,
         ..Default::default()
     };
 

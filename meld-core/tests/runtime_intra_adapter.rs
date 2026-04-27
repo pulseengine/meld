@@ -213,6 +213,7 @@ fn test_intra_component_three_module_fusion() {
         preserve_names: false,
         custom_sections: meld_core::CustomSectionHandling::Drop,
         output_format: meld_core::OutputFormat::CoreModule,
+        opaque_resources: Vec::new(),
     };
 
     let mut fuser = Fuser::new(config);
@@ -264,6 +265,7 @@ fn test_intra_component_memory_count() {
         preserve_names: false,
         custom_sections: meld_core::CustomSectionHandling::Drop,
         output_format: meld_core::OutputFormat::CoreModule,
+        opaque_resources: Vec::new(),
     };
 
     let mut fuser = Fuser::new(config);

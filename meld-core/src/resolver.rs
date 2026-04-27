@@ -35,6 +35,13 @@ pub struct DependencyGraph {
 
     /// Component indices that re-export resources (need per-component handle tables).
     pub reexporter_components: Vec<usize>,
+
+    /// Re-exporter (component, interface, resource_name) tuples that need their
+    /// own handle table. A single re-exporter component may appear multiple
+    /// times if it re-exports several distinct resources — one entry per
+    /// (component, resource) pair so handle table allocation and routing can
+    /// discriminate per-resource rather than per-component.
+    pub reexporter_resources: Vec<(usize, String, String)>,
 }
 
 /// An import that couldn't be resolved within the component set
@@ -1185,6 +1192,7 @@ impl Resolver {
             module_resolutions: Vec::new(),
             resource_graph: None,
             reexporter_components: Vec::new(),
+            reexporter_resources: Vec::new(),
         };
 
         // Build export index
@@ -1279,23 +1287,53 @@ impl Resolver {
             }
         }
 
-        // Identify re-exporter components: those targeted by adapter sites with
-        // callee_defines_resource=false (they re-export resources defined elsewhere).
+        // Identify re-exporter components and the specific resources each
+        // re-exports. A component is a re-exporter for resource R if it's
+        // targeted by an adapter site whose resource op for R has
+        // callee_defines_resource=false (i.e. the resource lives elsewhere
+        // and this component just re-exposes it).
+        //
+        // We track both the per-component set (used by older redirect logic
+        // and by tests) and the per-resource set (used by handle-table
+        // allocation and per-resource routing).
         {
             let mut reexporter_set: HashSet<usize> = HashSet::new();
+            let mut reexporter_resource_set: HashSet<(usize, String, String)> = HashSet::new();
+
+            let extract_iface_and_resource = |op: &ResolvedResourceOp| -> Option<(String, String)> {
+                let iface = op
+                    .import_module
+                    .strip_prefix("[export]")
+                    .unwrap_or(&op.import_module)
+                    .to_string();
+                let rn = op
+                    .import_field
+                    .strip_prefix("[resource-rep]")
+                    .or_else(|| op.import_field.strip_prefix("[resource-new]"))
+                    .or_else(|| op.import_field.strip_prefix("[resource-drop]"))?;
+                Some((iface, rn.to_string()))
+            };
+
             for site in &graph.adapter_sites {
                 for op in &site.requirements.resource_params {
                     if !op.callee_defines_resource {
                         reexporter_set.insert(site.to_component);
+                        if let Some((iface, rn)) = extract_iface_and_resource(op) {
+                            reexporter_resource_set.insert((site.to_component, iface, rn));
+                        }
                     }
                 }
                 for op in &site.requirements.resource_results {
                     if !op.callee_defines_resource {
                         reexporter_set.insert(site.to_component);
+                        if let Some((iface, rn)) = extract_iface_and_resource(op) {
+                            reexporter_resource_set.insert((site.to_component, iface, rn));
+                        }
                     }
                 }
             }
             graph.reexporter_components = reexporter_set.into_iter().collect();
+            graph.reexporter_resources = reexporter_resource_set.into_iter().collect();
         }
 
         // Note: the re-exporter caller_already_converted logic (from PR #81)
