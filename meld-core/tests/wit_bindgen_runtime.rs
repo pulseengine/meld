@@ -672,20 +672,20 @@ runtime_test!(
     test_runtime_wit_bindgen_resource_aggregates,
     "resource_aggregates"
 );
-fuse_only_test!(test_fuse_wit_bindgen_resource_floats, "resource_floats");
+runtime_test!(test_runtime_wit_bindgen_resource_floats, "resource_floats");
 runtime_test!(
     test_runtime_wit_bindgen_resource_borrow_in_record,
     "resource_borrow_in_record"
 );
-fuse_only_test!(
-    test_fuse_wit_bindgen_resource_with_lists,
+runtime_test!(
+    test_runtime_wit_bindgen_resource_with_lists,
     "resource_with_lists"
 );
 runtime_test!(test_runtime_wit_bindgen_ownership, "ownership");
 runtime_test!(test_runtime_wit_bindgen_xcrate, "xcrate");
 
-fuse_only_test!(
-    test_fuse_wit_bindgen_resource_import_and_export,
+runtime_test!(
+    test_runtime_wit_bindgen_resource_import_and_export,
     "resource-import-and-export"
 );
 

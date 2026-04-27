@@ -107,6 +107,25 @@ pub struct AdapterSite {
 /// For strings, `len` is the byte count. For lists, `len` is the element count
 /// and the actual byte size is `len * element_byte_size`. Elements may themselves
 /// contain pointers (e.g., `list<string>`), requiring recursive copy.
+/// One resource handle (own/borrow) embedded inside a list element type.
+///
+/// The adapter must convert each handle individually after a bulk copy.
+/// `rep_import` identifies which `[resource-rep]X` import to call so the
+/// right rep_func is emitted — distinct from the per-call-site `op` info
+/// since list elements may carry multiple resources of different types.
+#[derive(Debug, Clone)]
+pub struct InnerResource {
+    pub byte_offset: u32,
+    pub resource_type_id: u32,
+    pub is_owned: bool,
+    /// `(import_module, import_field)` of the `[resource-rep]<rn>` import
+    /// that matches `resource_type_id`, resolved via the callee's resource
+    /// type map. `None` when the type id couldn't be mapped (in that case
+    /// the fact.rs fallback is logged as a warning and the borrow conversion
+    /// is conservatively skipped).
+    pub rep_import: Option<(String, String)>,
+}
+
 #[derive(Debug, Clone)]
 pub enum CopyLayout {
     /// Bulk copy: `len * byte_multiplier` bytes, no inner pointers.
@@ -120,7 +139,7 @@ pub enum CopyLayout {
     Elements {
         element_size: u32,
         inner_pointers: Vec<(u32, CopyLayout)>,
-        inner_resources: Vec<(u32, u32, bool)>, // (byte_offset, resource_type_id, is_owned)
+        inner_resources: Vec<InnerResource>,
     },
 }
 
@@ -531,6 +550,51 @@ fn collect_result_copy_layouts(
         collect_type_copy_layouts(component, ty, &mut layouts);
     }
     layouts
+}
+
+/// Fill `rep_import` on every `InnerResource` inside `layouts` using the
+/// callee's resource-type-to-import map.
+///
+/// Build the map once (via `build_resource_type_to_import`), then walk every
+/// `CopyLayout::Elements` (recursively, to handle list-of-list-of-record)
+/// and resolve each `resource_type_id` to its `[resource-rep]X` import. Sites
+/// where the type id can't be mapped leave `rep_import = None`; downstream
+/// (fact.rs) logs a warning and skips the inner-borrow conversion rather than
+/// emitting a wrong-rep_func instruction.
+fn resolve_inner_resource_imports(
+    layouts: &mut [CopyLayout],
+    callee_resource_map: &std::collections::HashMap<(u32, &'static str), (String, String)>,
+) {
+    for layout in layouts {
+        resolve_one_layout(layout, callee_resource_map);
+    }
+}
+
+fn resolve_one_layout(
+    layout: &mut CopyLayout,
+    map: &std::collections::HashMap<(u32, &'static str), (String, String)>,
+) {
+    if let CopyLayout::Elements {
+        inner_pointers,
+        inner_resources,
+        ..
+    } = layout
+    {
+        for inner in inner_resources.iter_mut() {
+            // Look up the [resource-rep] import for this exact type id.
+            // If absent, also try the sentinel-0 fallback that
+            // `build_resource_type_to_import` registers for components
+            // that import resources but emit no canonical resource ops.
+            let entry = map
+                .get(&(inner.resource_type_id, "[resource-rep]"))
+                .or_else(|| map.get(&(0u32, "[resource-rep]")));
+            inner.rep_import = entry.cloned();
+        }
+        // Recurse into nested pointer-bearing sub-layouts.
+        for (_, sub) in inner_pointers.iter_mut() {
+            resolve_one_layout(sub, map);
+        }
+    }
 }
 
 /// Recursively collect copy layouts for pointer-bearing sub-types.
@@ -1332,8 +1396,35 @@ impl Resolver {
                     }
                 }
             }
-            graph.reexporter_components = reexporter_set.into_iter().collect();
-            graph.reexporter_resources = reexporter_resource_set.into_iter().collect();
+
+            // Option A — Phase 1: also allocate per-component handle tables
+            // for the resource's DEFINER component (not just re-exporters).
+            // Each definer needs its own ht so cross-component handle hand-offs
+            // through bridging trampolines (Phase 3 in fact.rs) can translate
+            // (caller_handle → caller_ht_rep → rep → callee_ht_new → callee_handle).
+            // Without per-definer tables, the un-translated handle from one
+            // component reaches another's user code with the wrong layout
+            // (Option::unwrap() on None — the resource_with_lists symptom).
+            if let Some(rg) = graph.resource_graph.as_ref() {
+                let initial: Vec<(usize, String, String)> =
+                    reexporter_resource_set.iter().cloned().collect();
+                for (_re_comp, iface, rn) in initial {
+                    if let Some(definer) = rg.resource_definer(&iface, &rn) {
+                        reexporter_resource_set.insert((definer, iface.clone(), rn.clone()));
+                    }
+                }
+            }
+
+            // Sort for determinism: HashSet iteration order is non-deterministic
+            // and downstream code (HT allocation, wrapper alias-fallback) makes
+            // first-match decisions that depend on this order.
+            let mut reexporter_components: Vec<usize> = reexporter_set.into_iter().collect();
+            reexporter_components.sort_unstable();
+            graph.reexporter_components = reexporter_components;
+            let mut reexporter_resources: Vec<(usize, String, String)> =
+                reexporter_resource_set.into_iter().collect();
+            reexporter_resources.sort_unstable();
+            graph.reexporter_resources = reexporter_resources;
         }
 
         // Note: the re-exporter caller_already_converted logic (from PR #81)
@@ -2386,8 +2477,16 @@ impl Resolver {
                                                     to_component,
                                                     comp_params,
                                                 );
+                                            resolve_inner_resource_imports(
+                                                &mut requirements.param_copy_layouts,
+                                                &callee_resource_map,
+                                            );
                                             requirements.result_copy_layouts =
                                                 collect_result_copy_layouts(to_component, results);
+                                            resolve_inner_resource_imports(
+                                                &mut requirements.result_copy_layouts,
+                                                &callee_resource_map,
+                                            );
                                             // Collect conditional pointer pairs (option/result/variant)
                                             requirements.conditional_pointer_pairs = to_component
                                                 .conditional_pointer_pair_positions(comp_params);
@@ -2421,6 +2520,10 @@ impl Resolver {
                                                         to_component,
                                                         comp_params,
                                                     );
+                                                resolve_inner_resource_imports(
+                                                    &mut requirements.params_area_copy_layouts,
+                                                    &callee_resource_map,
+                                                );
                                                 requirements.params_area_slots =
                                                     to_component.params_area_slots(comp_params);
                                                 requirements.params_area_resource_positions =
@@ -2675,6 +2778,22 @@ impl Resolver {
 
                                     let callee_resource_map =
                                         build_resource_type_to_import(to_component);
+                                    // Now that we have the type→import map, fill in
+                                    // rep_import on every InnerResource (list-element
+                                    // borrows) so fact.rs picks the correct
+                                    // [resource-rep] per type rather than .values().next().
+                                    resolve_inner_resource_imports(
+                                        &mut requirements.param_copy_layouts,
+                                        &callee_resource_map,
+                                    );
+                                    resolve_inner_resource_imports(
+                                        &mut requirements.result_copy_layouts,
+                                        &callee_resource_map,
+                                    );
+                                    resolve_inner_resource_imports(
+                                        &mut requirements.params_area_copy_layouts,
+                                        &callee_resource_map,
+                                    );
                                     let fb_callee_reexporter = graph
                                         .resolved_imports
                                         .contains_key(&(*to_comp, import_name.clone()));

@@ -483,7 +483,7 @@ impl FactStyleGenerator {
         let (type_idx, body) = if site.crosses_memory && options.needs_transcoding() {
             self.generate_transcoding_adapter(site, merged, &options)?
         } else if site.crosses_memory {
-            self.generate_memory_copy_adapter(site, merged, &options)?
+            self.generate_memory_copy_adapter(site, merged, &options, resource_rep_imports)?
         } else {
             self.generate_direct_adapter(site, merged, &options)?
         };
@@ -617,13 +617,78 @@ impl FactStyleGenerator {
                                 .get(&(op.import_module.clone(), op.import_field.clone()))
                                 .copied()
                         });
+                    // Option A Phase 3: when the callee ALSO has its own ht
+                    // for the same resource (post-Phase-1 per-component-ht),
+                    // bridge by also calling callee.ht_new(rep) so the
+                    // value lands in callee's namespace. Without this the
+                    // caller's memory-pointer handle would be deref'd by
+                    // callee in CALLEE's memory at that offset → garbage
+                    // (the resource_with_lists symptom). Match callee's ht
+                    // by resource_name only (caller iface may differ from
+                    // callee iface via `use` aliasing).
+                    // Only bridge when ALL of:
+                    //   - caller and callee are different components
+                    //   - caller has its OWN ht for the resource (the
+                    //     caller's rep_func came from the ht lookup, not
+                    //     the canonical [resource-rep] fallback)
+                    //   - callee has its own ht too
+                    // Without ALL three, the bridge double-translates or
+                    // converts canonical handles to memory pointers,
+                    // either of which corrupts the value.
+                    let caller_has_ht = rn_opt.as_deref().is_some_and(|rn| {
+                        merged
+                            .handle_tables
+                            .iter()
+                            .any(|((c, _, r), _)| *c == site.from_component && r == rn)
+                    });
+                    // For `[method]/[static]/[constructor]` exported by a
+                    // component that LOCALLY defines the resource, the
+                    // wit-bindgen cabi expects arg0 to be the REP (memory
+                    // pointer to `_ThingRep<T>`). Adding callee.new would
+                    // mint a fresh slot in callee's ht; the slot's address
+                    // gets passed as arg0; the deref reads 4 bytes at the
+                    // slot (the just-stored rep) but Option's discriminant
+                    // is the LOW BYTE of that rep — 0 for typical aligned
+                    // box pointers → Option::unwrap on None.
+                    //
+                    // For top-level functions or when the callee just uses
+                    // the resource (not locally defines it), the cabi
+                    // treats arg0 as a HANDLE — keep callee.new so the
+                    // value lands in callee's namespace.
+                    let is_method_like = site.import_name.starts_with("[method]")
+                        || site.import_name.starts_with("[static]")
+                        || site.import_name.starts_with("[constructor]");
+                    let callee_new_func = if site.from_component != site.to_component
+                        && caller_has_ht
+                        && !is_method_like
+                    {
+                        rn_opt.as_deref().and_then(|rn| {
+                            merged
+                                .handle_tables
+                                .iter()
+                                .find(|((c, _, r), _)| *c == site.to_component && r == rn)
+                                .map(|(_, ht)| ht.new_func)
+                        })
+                    } else {
+                        None
+                    };
                     if let Some(rep_func) = rep_func {
+                        if let Some(new_func) = callee_new_func {
+                            log::info!(
+                                "borrow bridge: rn={:?} from={} to={} caller_rep={} callee_new={}",
+                                rn_opt,
+                                site.from_component,
+                                site.to_component,
+                                rep_func,
+                                new_func,
+                            );
+                        }
                         options
                             .resource_rep_calls
                             .push(super::ResourceBorrowTransfer {
                                 param_idx: op.flat_idx,
                                 rep_func,
-                                new_func: None,
+                                new_func: callee_new_func,
                             });
                     }
                 }
@@ -689,13 +754,53 @@ impl FactStyleGenerator {
                             .copied()
                     });
 
+                // Distinguish two sub-cases of the 3-component branch:
+                //
+                // (a) Callee's exported function is a `[method]/[static]/
+                //     [constructor]` on a resource the callee LOCALLY
+                //     DEFINES via its own ht. wit-bindgen's `_export_*_cabi`
+                //     wraps the rep in `_ThingRep<T>` and the cabi expects
+                //     arg0 to be the REP (memory pointer). Emit
+                //     `caller.rep` ONLY — callee.new would mint a new
+                //     slot whose address gets passed as the rep, and the
+                //     deref reads adjacent fresh memory → Option=None.
+                //     This is the resource_with_lists `[method]thing.foo`
+                //     case where the re-exporter classification masks the
+                //     fact that the cabi still uses _ThingRep wrapping.
+                //
+                // (b) Top-level functions (no `[method]/[static]/
+                //     [constructor]` prefix) taking borrow<T> on a
+                //     `use`d resource. wit-bindgen's cabi calls
+                //     `Float::from_handle(arg0 as u32)` and treats arg0 as
+                //     a HANDLE. Emit `caller.rep + callee.new` so the
+                //     value lands in callee's namespace as a fresh slot
+                //     index the callee can pass back across downstream
+                //     adapters. This is the resource_floats `add` case.
+                //
+                // Discriminator: function name prefix. Methods/statics/
+                // constructors → case (a); top-level → case (b). Combined
+                // with a sanity check that the callee has SOME ht for the
+                // resource_name (so the rep-only path has somewhere
+                // sensible to derive the rep from).
+                let is_method_like = site.import_name.starts_with("[method]")
+                    || site.import_name.starts_with("[static]")
+                    || site.import_name.starts_with("[constructor]");
+                let callee_has_any_ht = merged
+                    .handle_tables
+                    .iter()
+                    .any(|((c, _, r), _)| *c == site.to_component && r == resource_name);
+                let new_func_for_emit = if is_method_like && callee_has_any_ht {
+                    None
+                } else {
+                    callee_new_func
+                };
                 if let Some(rep_func) = caller_rep_func {
                     options
                         .resource_rep_calls
                         .push(super::ResourceBorrowTransfer {
                             param_idx: op.flat_idx,
                             rep_func,
-                            new_func: callee_new_func,
+                            new_func: new_func_for_emit,
                         });
                 } else {
                     log::warn!(
@@ -710,10 +815,63 @@ impl FactStyleGenerator {
         }
 
         // Resolve own<T> results that need [resource-rep] + [resource-new].
-        // When callee_defines_resource is true, the P2 wrapper's canon lift/lower
-        // handles the conversion — the adapter passes the handle directly.
+        //
+        // Three cases:
+        // 1. callee_defines_resource=false (3-component): caller and callee
+        //    have separate tables, bridge via callee.rep + caller.new.
+        // 2. callee_defines_resource=true AND both caller+callee have their
+        //    own ht (post-Option-A-Phase-1): bridge via callee.ht_rep +
+        //    caller.ht_new so the handle ends up in caller's namespace
+        //    (memory-pointer in caller's memory). Without this bridge,
+        //    caller stores callee's memory-pointer handle but later passes
+        //    it back to callee for method calls — works for callee but
+        //    breaks for any caller-side _resource_rep call (cross-memory
+        //    deref of leaf-allocated rep in intermediate's memory →
+        //    Option::unwrap on garbage).
+        // 3. callee_defines_resource=true AND no caller ht: pass through
+        //    (the wrapper's canon lift handles conversion).
         for op in &site.requirements.resource_results {
-            if !op.is_owned || op.callee_defines_resource {
+            if !op.is_owned {
+                continue;
+            }
+            if op.callee_defines_resource {
+                // Case 2 vs 3: only emit a bridge when BOTH sides have ht
+                // for the same (iface, rn). Match by resource_name across
+                // both sides (caller's iface may differ from callee's via
+                // `use` aliasing).
+                let resource_name = op
+                    .import_field
+                    .strip_prefix("[resource-new]")
+                    .or_else(|| op.import_field.strip_prefix("[resource-rep]"))
+                    .unwrap_or(&op.import_field);
+                let callee_ht = merged
+                    .handle_tables
+                    .iter()
+                    .find(|((c, _, r), _)| *c == site.to_component && r == resource_name)
+                    .map(|(_, ht)| (ht.rep_func, ht.new_func));
+                let caller_ht = merged
+                    .handle_tables
+                    .iter()
+                    .find(|((c, _, r), _)| *c == site.from_component && r == resource_name)
+                    .map(|(_, ht)| (ht.rep_func, ht.new_func));
+                if let (Some((rep_func, _)), Some((_, new_func))) = (callee_ht, caller_ht) {
+                    log::info!(
+                        "own<T> bridge: resource '{}' from comp {} (callee) → comp {} (caller); rep={} new={}",
+                        resource_name,
+                        site.to_component,
+                        site.from_component,
+                        rep_func,
+                        new_func,
+                    );
+                    options
+                        .resource_new_calls
+                        .push(super::ResourceOwnResultTransfer {
+                            position: op.flat_idx,
+                            byte_offset: op.byte_offset,
+                            rep_func,
+                            new_func,
+                        });
+                }
                 continue;
             }
             let resource_name = op
@@ -790,21 +948,41 @@ impl FactStyleGenerator {
         // Resolve inner resource handles from param copy layouts.
         // When list elements contain borrow<T>, the adapter must convert
         // each handle after bulk-copying the list data to callee memory.
+        // Each inner resource carries its own pre-resolved (module, field)
+        // for the matching [resource-rep] import (filled in by the
+        // resolver via the callee's resource_type_to_import map). Using
+        // that lookup ensures the right rep_func per resource type even
+        // when the callee imports multiple resources — the previous
+        // `.values().next()` heuristic picked an arbitrary first match
+        // and silently routed handle A through resource B's rep_func.
         for layout in &site.requirements.param_copy_layouts {
             if let crate::resolver::CopyLayout::Elements {
                 inner_resources, ..
             } = layout
             {
-                for &(byte_offset, _resource_type_id, is_owned) in inner_resources {
-                    if is_owned {
+                for inner in inner_resources {
+                    if inner.is_owned {
                         continue; // own<T> in lists — callee handles internally
                     }
-                    // Find any [resource-rep] import for borrow handles.
-                    // For 2-component (callee defines), use callee's rep.
-                    // For 3-component, would need caller's rep + callee's new.
-                    // For now, find ANY matching [resource-rep] import.
-                    if let Some(&rep_func) = resource_rep_imports.values().next() {
-                        options.inner_resource_fixups.push((byte_offset, rep_func));
+                    let rep_func = inner
+                        .rep_import
+                        .as_ref()
+                        .and_then(|key| resource_rep_imports.get(key).copied());
+                    if let Some(rep_func) = rep_func {
+                        options
+                            .inner_resource_fixups
+                            .push((inner.byte_offset, rep_func));
+                    } else {
+                        log::warn!(
+                            "inner-list borrow at offset {} (resource_type_id={}): \
+                             no [resource-rep] import resolved — skipping fixup. \
+                             from={} to={} import_name={:?}",
+                            inner.byte_offset,
+                            inner.resource_type_id,
+                            site.from_component,
+                            site.to_component,
+                            site.import_name,
+                        );
                     }
                 }
             }
@@ -969,6 +1147,7 @@ impl FactStyleGenerator {
         site: &AdapterSite,
         merged: &MergedModule,
         options: &AdapterOptions,
+        resource_rep_imports: &std::collections::HashMap<(String, String), u32>,
     ) -> Result<(u32, Function)> {
         let target_func = self.resolve_target_function(site, merged)?;
 
@@ -1043,7 +1222,13 @@ impl FactStyleGenerator {
                     .filter(|p| !p.is_owned && p.callee_defines_resource)
                     .count(),
             );
-            return self.generate_params_ptr_adapter(site, options, target_func, caller_type_idx);
+            return self.generate_params_ptr_adapter(
+                site,
+                options,
+                target_func,
+                caller_type_idx,
+                resource_rep_imports,
+            );
         }
 
         // --- Non-retptr path: use callee's type so body is valid ---
@@ -1604,6 +1789,7 @@ impl FactStyleGenerator {
         options: &AdapterOptions,
         target_func: u32,
         caller_type_idx: u32,
+        resource_rep_imports: &std::collections::HashMap<(String, String), u32>,
     ) -> Result<(u32, Function)> {
         let params_area_size = site.requirements.params_area_byte_size.unwrap_or(0);
         let params_area_align = site.requirements.params_area_max_align.max(1);
@@ -1790,17 +1976,22 @@ impl FactStyleGenerator {
                 func.instruction(&Instruction::I32GeU);
                 func.instruction(&Instruction::BrIf(1)); // break to $exit
 
-                for &(res_byte_offset, _resource_type_id, is_owned) in inner_resources {
-                    if is_owned {
+                for inner in inner_resources {
+                    if inner.is_owned {
                         continue; // own<T>: callee handles internally
                     }
-                    // Find [resource-rep] for this resource
-                    if let Some(&rep_func) = options
-                        .params_area_borrow_fixups
-                        .first()
-                        .map(|f| &f.rep_func)
-                        .or_else(|| options.resource_rep_calls.first().map(|t| &t.rep_func))
-                    {
+                    // Use the per-element pre-resolved [resource-rep]
+                    // (filled at site-requirements time via the callee's
+                    // resource_type_to_import map). The previous code
+                    // picked an arbitrary first-fixup which silently
+                    // routed handle A through resource B's rep_func when
+                    // the callee imported >1 resource.
+                    let res_byte_offset = inner.byte_offset;
+                    let rep_func_opt = inner
+                        .rep_import
+                        .as_ref()
+                        .and_then(|key| resource_rep_imports.get(key).copied());
+                    if let Some(rep_func) = rep_func_opt {
                         // addr = dest_ptr + loop_counter * element_size + res_byte_offset
                         // Push addr for store
                         func.instruction(&Instruction::LocalGet(dest_local));
