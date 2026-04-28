@@ -2,6 +2,80 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.4.0] — Unreleased
+
+### Added
+
+- **Kani + proptest harnesses for parser/merger/resolver (#102 / #116).**
+  Three Kani harnesses (parser no-panic on bounded inputs, model topological
+  sort, model resolver loop) plus a proptest suite for fusion round-trips.
+  Kani is documented but not gated in CI yet; proptest runs as part of
+  `cargo test --release`.
+- **cargo-fuzz scaffolding (#104 / #114).** Four targets exercising the
+  parser, merger, resolver, and end-to-end fusion. Seed corpus committed
+  under `fuzz/corpus/`. CI smoke runs each target for 60 s on every PR
+  (informational; nightly Rust required). The first run already surfaced
+  a real parser panic — tracked as #118.
+
+### Fixed
+
+- **`compare_version` handles pre-release suffixes (#98 / #113).** The
+  previous `filter_map(parse::<u32>)` silently dropped non-numeric segments,
+  so `"0.2.99-rc1"` sorted *less* than `"0.2.0"`. Replaced with an inline
+  subset of semver 2.0.0 precedence rules. Build metadata is stripped per
+  spec. ~70 LOC, no new dependencies.
+- **Resource-import fallback keyed by name, sentinel eliminated (#99 /
+  #115).** `build_resource_type_to_import` previously collapsed all
+  `[resource-rep]` / `[resource-new]` imports onto a single `(0u32, prefix)`
+  sentinel slot when a component imported resources without canonical
+  entries. Replaced with `ResourceImportMap { by_type_id, by_name }` —
+  per-resource keying so multi-resource components don't silently overwrite
+  one another's imports.
+- **Mythos v0.4 follow-up — items 4, 5, 6 (#112 / #117).** Three confirmed
+  determinism / routing fixes:
+  - **Item 4 (LS-CP-3 / SR-19):** `graph.adapter_sites` is now sorted via
+    `sort_adapter_sites_for_determinism` after both cross- and
+    intra-component adapter passes. HashMap iteration was previously the
+    only order, propagating into adapter-offset → merged-function-index and
+    `merger.rs:1500` first-match.
+  - **Item 5 (LS-R-10 / UCA-R-3):** `identify_intra_component_adapter_sites`
+    now preserves `from_import_module` when promoting a `ModuleResolution`
+    to an `AdapterSite`; the previous code copied `import_name` and the
+    merger's disjunctive match accepted the wrong import for two same-name
+    functions from different modules.
+  - **Item 6 (LS-CP-3, second class):** three `caller_lower_map.iter().next()`
+    encoding fallbacks now use `iter().min_by_key(|(k, _)| **k)` so the
+    chosen `string_encoding` is stable across builds.
+  - Items 1–3 (HT_CAPACITY enforcement, u32 truncation, silent
+    `memory.maximum` raise) closed as still-uncertain — each requires
+    fixtures meld doesn't currently accept; tracked for future passes.
+
+### Safety / STPA
+
+- New approved loss scenarios documenting the v0.4 fixes:
+  - **LS-R-10** (UCA-R-3): intra-adapter-site promotion preserves
+    `from_import_module`.
+  - **LS-CP-3** (SR-19): adapter_sites sorting + caller-encoding fallback
+    determinism.
+
+### Internal
+
+- `meld-core/src/merger.rs` — semver-correct `compare_version` + new
+  `compare_prerelease` helper; 8 new unit tests.
+- `meld-core/src/resolver.rs` — `ResourceImportMap` struct;
+  `sort_adapter_sites_for_determinism`; `identify_intra_component_adapter_sites`
+  promotion fix; three `iter().next()` → `iter().min_by_key()` sites.
+- `meld-core/tests/kani_*.rs` and `meld-core/tests/proptest_fusion.rs` —
+  bounded V&V harnesses.
+- `fuzz/` — cargo-fuzz workspace with 4 targets and seed corpora.
+
+### Pre-release Mythos pass
+
+Tier-5 + tier-4 files changed since v0.3.0: `merger.rs`, `resolver.rs`.
+Both scanned per `scripts/mythos/discover.md`; **no confirmed findings**.
+The v0.4 fixes (LS-R-10, LS-CP-3) are themselves the result of the v0.3.0
+deferred follow-ups.
+
 ## [0.3.0] — Unreleased
 
 ### Added
