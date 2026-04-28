@@ -563,16 +563,18 @@ fn collect_result_copy_layouts(
 /// emitting a wrong-rep_func instruction.
 fn resolve_inner_resource_imports(
     layouts: &mut [CopyLayout],
-    callee_resource_map: &std::collections::HashMap<(u32, &'static str), (String, String)>,
+    callee_component: &ParsedComponent,
+    callee_resource_map: &ResourceImportMap,
 ) {
     for layout in layouts {
-        resolve_one_layout(layout, callee_resource_map);
+        resolve_one_layout(layout, callee_component, callee_resource_map);
     }
 }
 
 fn resolve_one_layout(
     layout: &mut CopyLayout,
-    map: &std::collections::HashMap<(u32, &'static str), (String, String)>,
+    component: &ParsedComponent,
+    map: &ResourceImportMap,
 ) {
     if let CopyLayout::Elements {
         inner_pointers,
@@ -581,18 +583,20 @@ fn resolve_one_layout(
     } = layout
     {
         for inner in inner_resources.iter_mut() {
-            // Look up the [resource-rep] import for this exact type id.
-            // If absent, also try the sentinel-0 fallback that
-            // `build_resource_type_to_import` registers for components
-            // that import resources but emit no canonical resource ops.
+            // Look up the [resource-rep] import for this exact type id; on
+            // miss, fall through to the name-keyed fallback that
+            // `build_resource_type_to_import` populates for components that
+            // import resources but emit no canonical resource ops. Per
+            // issue #99, the fallback is keyed per-resource by name rather
+            // than collapsing onto a single sentinel slot.
             let entry = map
-                .get(&(inner.resource_type_id, "[resource-rep]"))
-                .or_else(|| map.get(&(0u32, "[resource-rep]")));
-            inner.rep_import = entry.cloned();
+                .resolve(component, inner.resource_type_id, "[resource-rep]")
+                .map(|(e, _)| e.clone());
+            inner.rep_import = entry;
         }
         // Recurse into nested pointer-bearing sub-layouts.
         for (_, sub) in inner_pointers.iter_mut() {
-            resolve_one_layout(sub, map);
+            resolve_one_layout(sub, component, map);
         }
     }
 }
@@ -939,6 +943,101 @@ fn extract_wasi_resource_name(import_name: &str) -> &str {
     }
 }
 
+/// Per-component resource canonical-function import map.
+///
+/// Maps both component type IDs and resource short-names to the
+/// `(import_module, import_field)` of the corresponding `[resource-rep]` or
+/// `[resource-new]` core import.
+///
+/// Two indices are tracked because not every component has canonical
+/// function entries for the resources it imports. When canonical entries
+/// exist, `by_type_id` is populated authoritatively. When a component
+/// imports a resource without emitting a `canon resource.rep` /
+/// `canon resource.new` (the "import-only" case), only the core module
+/// imports `[resource-rep]<rn>` / `[resource-new]<rn>` are visible — and
+/// those carry the resource short-name `<rn>`, not a component type ID.
+/// Those are recorded in `by_name` instead.
+///
+/// Lookup at call sites should attempt `by_type_id` first; on miss, derive
+/// the resource short-name from the component-level type id (via
+/// `ParsedComponent::resolve_resource_type`) and consult `by_name`. See
+/// `resolve_resource_positions` for the canonical lookup helper.
+///
+/// Issue #99: this replaces an earlier sentinel-keyed fallback that put
+/// every import-only resource at key `(0u32, prefix)`, which silently
+/// collapsed components with multiple imported resources onto a single
+/// slot. Keying by name preserves per-resource discrimination.
+#[derive(Debug, Default, Clone)]
+pub(crate) struct ResourceImportMap {
+    /// Primary lookup: `(component_type_id, prefix)` →
+    /// `(import_module, import_field)`. Populated from canonical
+    /// `ResourceRep` / `ResourceNew` entries plus alias propagation.
+    pub by_type_id: HashMap<(u32, &'static str), (String, String)>,
+
+    /// Name-keyed fallback: `(resource_short_name, prefix)` →
+    /// `(import_module, import_field)`. Populated by scanning core module
+    /// imports (`[resource-rep]<rn>` / `[resource-new]<rn>`) for components
+    /// that lack canonical entries entirely, or where canonical entries
+    /// exist but produce no `(module, field)` pair.
+    pub by_name: HashMap<(String, &'static str), (String, String)>,
+}
+
+impl ResourceImportMap {
+    /// True when neither index has any entries.
+    #[allow(dead_code)]
+    pub fn is_empty(&self) -> bool {
+        self.by_type_id.is_empty() && self.by_name.is_empty()
+    }
+
+    /// Look up by component type id, with no name-based fallback.
+    pub fn get_by_type_id(&self, type_id: u32, prefix: &'static str) -> Option<&(String, String)> {
+        self.by_type_id.get(&(type_id, prefix))
+    }
+
+    /// Look up by resource short-name (e.g., `"x"` or `"frequency"`).
+    pub fn get_by_name(
+        &self,
+        resource_name: &str,
+        prefix: &'static str,
+    ) -> Option<&(String, String)> {
+        self.by_name.get(&(resource_name.to_string(), prefix))
+    }
+
+    /// Combined lookup: type-id first, then name fallback. The name fallback
+    /// uses the component to translate `type_id` into a resource short-name
+    /// via `ParsedComponent::resolve_resource_type`. Returns `(entry,
+    /// matched_via_name_fallback)`.
+    pub fn resolve(
+        &self,
+        component: &ParsedComponent,
+        type_id: u32,
+        prefix: &'static str,
+    ) -> Option<(&(String, String), bool)> {
+        if let Some(entry) = self.get_by_type_id(type_id, prefix) {
+            return Some((entry, false));
+        }
+        if let Some((_, rn)) = component.resolve_resource_type(type_id)
+            && let Some(entry) = self.get_by_name(&rn, prefix)
+        {
+            return Some((entry, true));
+        }
+        None
+    }
+}
+
+/// Strip a leading `[resource-rep]` or `[resource-new]` from a core import
+/// field name, returning the resource short-name. Returns `None` when the
+/// prefix is absent.
+fn strip_resource_prefix(field: &str) -> Option<(&'static str, &str)> {
+    if let Some(rest) = field.strip_prefix("[resource-rep]") {
+        Some(("[resource-rep]", rest))
+    } else {
+        field
+            .strip_prefix("[resource-new]")
+            .map(|rest| ("[resource-new]", rest))
+    }
+}
+
 /// Build a map from resource type ID → `(module, field)` for resource canonical
 /// functions (`[resource-rep]`, `[resource-new]`) in a component.
 ///
@@ -949,9 +1048,7 @@ fn extract_wasi_resource_name(import_name: &str) -> &str {
 ///    func index is exported as (e.g., `"[resource-new]x"`).
 /// 3. Scanning `Instantiate` core instances to find which module name each
 ///    `FromExports` instance provides (e.g., `"[export]exports"`).
-fn build_resource_type_to_import(
-    component: &ParsedComponent,
-) -> HashMap<(u32, &'static str), (String, String)> {
+fn build_resource_type_to_import(component: &ParsedComponent) -> ResourceImportMap {
     use crate::parser::{CanonicalEntry, CoreEntityDef, InstanceKind};
 
     // Step 1: Build resource_type → (core_func_idx, kind) from canonical functions
@@ -985,29 +1082,37 @@ fn build_resource_type_to_import(
         }
     }
 
-    if resource_core_funcs.is_empty() {
-        // Fallback: for components that IMPORT resources (no canonical entries),
-        // scan core module imports for [resource-rep]/[resource-new] patterns.
-        // Use resource_type_id = 0 as sentinel; the single-candidate fallback
-        // in resolve_resource_positions handles the type ID mismatch.
-        let mut map = HashMap::new();
+    // Helper: scan core module imports for `[resource-rep]<rn>` /
+    // `[resource-new]<rn>` and populate the name-keyed fallback. This is
+    // used both when no canonical entries exist at all (import-only
+    // components) and when canonical entries exist but Step 4 fails to
+    // resolve them to a `(module, field)` pair.
+    let scan_imports_by_name = |out: &mut HashMap<(String, &'static str), (String, String)>| {
         for module in &component.core_modules {
             for imp in &module.imports {
-                if matches!(&imp.kind, crate::parser::ImportKind::Function(_)) {
-                    if imp.name.starts_with("[resource-rep]") {
-                        map.entry((0u32, "[resource-rep]"))
-                            .or_insert((imp.module.clone(), imp.name.clone()));
-                    } else if imp.name.starts_with("[resource-new]") {
-                        map.entry((0u32, "[resource-new]"))
-                            .or_insert((imp.module.clone(), imp.name.clone()));
-                    }
+                if !matches!(&imp.kind, crate::parser::ImportKind::Function(_)) {
+                    continue;
+                }
+                if let Some((prefix, rn)) = strip_resource_prefix(&imp.name) {
+                    out.entry((rn.to_string(), prefix))
+                        .or_insert((imp.module.clone(), imp.name.clone()));
                 }
             }
         }
-        if !map.is_empty() {
-            return map;
-        }
-        return HashMap::new();
+    };
+
+    if resource_core_funcs.is_empty() {
+        // Fallback: for components that IMPORT resources (no canonical entries),
+        // scan core module imports for [resource-rep]/[resource-new] patterns.
+        // Per-resource keying by name preserves discrimination when a component
+        // imports two or more distinct resources (issue #99 — previously these
+        // collapsed onto a single sentinel slot keyed `(0u32, prefix)`).
+        let mut by_name = HashMap::new();
+        scan_imports_by_name(&mut by_name);
+        return ResourceImportMap {
+            by_type_id: HashMap::new(),
+            by_name,
+        };
     }
 
     // Step 2: Build core_func_idx → (instance_idx, field_name) from FromExports instances.
@@ -1037,12 +1142,12 @@ fn build_resource_type_to_import(
     }
 
     // Step 4: Combine: resource_type → (module_name, field_name)
-    let mut map = HashMap::new();
+    let mut by_type_id: HashMap<(u32, &'static str), (String, String)> = HashMap::new();
     for (resource_type, cf_idx, kind) in &resource_core_funcs {
         if let Some((from_exports_idx, field_name)) = core_func_to_field.get(cf_idx)
             && let Some(module_name) = instance_to_module.get(from_exports_idx)
         {
-            map.insert(
+            by_type_id.insert(
                 (*resource_type, *kind),
                 (module_name.clone(), field_name.clone()),
             );
@@ -1050,21 +1155,11 @@ fn build_resource_type_to_import(
     }
 
     // Step 4b: If Step 4 produced nothing but resource_core_funcs was non-empty,
-    // fall through to core module import scanning as a last resort.
-    if map.is_empty() && !resource_core_funcs.is_empty() {
-        for module in &component.core_modules {
-            for imp in &module.imports {
-                if matches!(&imp.kind, crate::parser::ImportKind::Function(_)) {
-                    if imp.name.starts_with("[resource-rep]") {
-                        map.entry((0u32, "[resource-rep]"))
-                            .or_insert((imp.module.clone(), imp.name.clone()));
-                    } else if imp.name.starts_with("[resource-new]") {
-                        map.entry((0u32, "[resource-new]"))
-                            .or_insert((imp.module.clone(), imp.name.clone()));
-                    }
-                }
-            }
-        }
+    // fall through to core module import scanning as a last resort. This
+    // populates the name-keyed fallback (per-resource keys, no sentinel).
+    let mut by_name: HashMap<(String, &'static str), (String, String)> = HashMap::new();
+    if by_type_id.is_empty() && !resource_core_funcs.is_empty() {
+        scan_imports_by_name(&mut by_name);
     }
 
     // Step 5: Infer missing operations from existing ones.
@@ -1074,25 +1169,25 @@ fn build_resource_type_to_import(
     // ResourceRep (or vice versa). If the adapter needs the missing one,
     // we can infer it: same module name, same resource name, different
     // prefix ("[resource-new]" vs "[resource-rep]").
-    let known_types: Vec<u32> = map.keys().map(|&(rt, _)| rt).collect();
+    let known_types: Vec<u32> = by_type_id.keys().map(|&(rt, _)| rt).collect();
     for rt in known_types {
-        let has_rep = map.contains_key(&(rt, "[resource-rep]"));
-        let has_new = map.contains_key(&(rt, "[resource-new]"));
+        let has_rep = by_type_id.contains_key(&(rt, "[resource-rep]"));
+        let has_new = by_type_id.contains_key(&(rt, "[resource-new]"));
 
         if has_new && !has_rep {
-            if let Some((module, field)) = map.get(&(rt, "[resource-new]")).cloned()
+            if let Some((module, field)) = by_type_id.get(&(rt, "[resource-new]")).cloned()
                 && let Some(name) = field.strip_prefix("[resource-new]")
             {
                 let rep_field = format!("[resource-rep]{}", name);
-                map.insert((rt, "[resource-rep]"), (module, rep_field));
+                by_type_id.insert((rt, "[resource-rep]"), (module, rep_field));
             }
         } else if has_rep
             && !has_new
-            && let Some((module, field)) = map.get(&(rt, "[resource-rep]")).cloned()
+            && let Some((module, field)) = by_type_id.get(&(rt, "[resource-rep]")).cloned()
             && let Some(name) = field.strip_prefix("[resource-rep]")
         {
             let new_field = format!("[resource-new]{}", name);
-            map.insert((rt, "[resource-new]"), (module, new_field));
+            by_type_id.insert((rt, "[resource-new]"), (module, new_field));
         }
     }
 
@@ -1103,7 +1198,7 @@ fn build_resource_type_to_import(
     // ResourceRep/ResourceNew entries use the target type (25). We need
     // the map to also contain the alias source so resolve_resource_positions
     // can find the import for either type ID.
-    let known_resource_types: Vec<u32> = map
+    let known_resource_types: Vec<u32> = by_type_id
         .keys()
         .map(|&(rt, _)| rt)
         .collect::<std::collections::HashSet<_>>()
@@ -1115,21 +1210,25 @@ fn build_resource_type_to_import(
             let target_id = *target;
             for kind in &["[resource-rep]", "[resource-new]"] {
                 if known_resource_types.contains(&target_id)
-                    && !map.contains_key(&(alias_id, kind))
-                    && let Some(entry) = map.get(&(target_id, kind)).cloned()
+                    && !by_type_id.contains_key(&(alias_id, kind))
+                    && let Some(entry) = by_type_id.get(&(target_id, kind)).cloned()
                 {
-                    map.insert((alias_id, kind), entry);
+                    by_type_id.insert((alias_id, kind), entry);
                 }
                 if known_resource_types.contains(&alias_id)
-                    && !map.contains_key(&(target_id, kind))
-                    && let Some(entry) = map.get(&(alias_id, kind)).cloned()
+                    && !by_type_id.contains_key(&(target_id, kind))
+                    && let Some(entry) = by_type_id.get(&(alias_id, kind)).cloned()
                 {
-                    map.insert((target_id, kind), entry);
+                    by_type_id.insert((target_id, kind), entry);
                 }
             }
         }
     }
-    map
+
+    ResourceImportMap {
+        by_type_id,
+        by_name,
+    }
 }
 
 /// Resolve resource positions to `(module, field)` import pairs.
@@ -1138,58 +1237,68 @@ fn build_resource_type_to_import(
 /// function signatures to their `[resource-rep]` or `[resource-new]` core
 /// import names. The `field_prefix` selects which canonical function kind
 /// to look up: `"[resource-rep]"` for params, `"[resource-new]"` for results.
+///
+/// Lookup falls back to the name-keyed fallback when type-id lookup misses
+/// (issue #99): the previous sentinel scheme keyed every import-only
+/// resource at `(0u32, prefix)`, which collapsed multi-resource components
+/// onto a single slot. With per-resource name keying, distinct imported
+/// resources stay distinct.
 fn resolve_resource_positions(
-    resource_map: &HashMap<(u32, &'static str), (String, String)>,
+    resource_map: &ResourceImportMap,
     positions: &[crate::parser::ResourcePosition],
     field_prefix: &'static str,
-    callee_type_defs: &[crate::parser::ComponentTypeDef],
+    component: &ParsedComponent,
     callee_is_reexporter: bool,
 ) -> Vec<ResolvedResourceOp> {
     let mut resolved = Vec::new();
     for pos in positions {
-        // Try exact match first
-        let entry = resource_map
-            .get(&(pos.resource_type_id, field_prefix))
+        // Lookup: type-id first, then name-keyed fallback. The boolean tracks
+        // whether the lookup escaped the type-id index — used below to mark
+        // import-only matches as "callee does not define the resource".
+        let lookup = resource_map
+            .resolve(component, pos.resource_type_id, field_prefix)
+            .map(|(entry, via_name)| (entry.clone(), via_name))
             .or_else(|| {
-                // Fallback: the resource type ID from the function signature may differ
-                // from the canonical entry's type ID (e.g., imported type 24 vs defined
-                // type 25). If there's exactly one resource with this prefix, use it.
-                // Use the first matching entry regardless of count — Step 6
-                // alias propagation may create multiple entries that all point
-                // to the same underlying import.
+                // Last-resort fallback: walk the type-id index for any entry
+                // with a matching prefix. The original code did this to
+                // bridge imported-vs-defined type id mismatches (e.g., 24 vs
+                // 25 after Step 6 alias propagation may not cover all
+                // cases). Step 6 normally covers this, but keep as a
+                // safety net for components whose ExportAlias chain isn't
+                // captured.
                 resource_map
+                    .by_type_id
                     .iter()
                     .find(|((_, k), _)| *k == field_prefix)
-                    .map(|(_, v)| v)
+                    .map(|(_, v)| (v.clone(), false))
             });
-        if let Some((module_name, field_name)) = entry {
+        if let Some(((module_name, field_name), via_name_fallback)) = lookup {
             // Check if the callee truly defines this resource (has ownership of the
             // underlying representation). A callee that re-exports a resource from
             // another component has a Defined type entry but doesn't own the rep.
-            // Use the sentinel check: if the map entry was resolved via sentinel type 0
-            // (Step 4b fallback), the callee doesn't define the resource.
+            // The name-fallback path means the resource was discovered via core
+            // module import scanning, so the callee imports rather than defines it.
             // If callee also imports the same interface, it re-exports → doesn't define.
             let callee_defines_resource = if callee_is_reexporter {
                 false
+            } else if via_name_fallback {
+                // Resolved via the name-keyed fallback: the callee imports this
+                // resource (no canonical entry definitively maps the type id),
+                // so it does not own the representation.
+                false
             } else {
-                // Sentinel check + type_defs check for non-reexporters
-                let used_sentinel = resource_map.contains_key(&(0u32, field_prefix))
-                    && !resource_map.contains_key(&(pos.resource_type_id, field_prefix));
-                if used_sentinel {
-                    false
-                } else {
-                    callee_type_defs
-                        .get(pos.resource_type_id as usize)
-                        .map(|def| !matches!(def, crate::parser::ComponentTypeDef::Import(_)))
-                        .unwrap_or(true)
-                }
+                component
+                    .component_type_defs
+                    .get(pos.resource_type_id as usize)
+                    .map(|def| !matches!(def, crate::parser::ComponentTypeDef::Import(_)))
+                    .unwrap_or(true)
             };
             resolved.push(ResolvedResourceOp {
                 flat_idx: pos.flat_idx,
                 byte_offset: pos.byte_offset,
                 is_owned: pos.is_owned,
-                import_module: module_name.clone(),
-                import_field: field_name.clone(),
+                import_module: module_name,
+                import_field: field_name,
                 callee_defines_resource,
                 caller_already_converted: false,
             });
@@ -2479,12 +2588,14 @@ impl Resolver {
                                                 );
                                             resolve_inner_resource_imports(
                                                 &mut requirements.param_copy_layouts,
+                                                to_component,
                                                 &callee_resource_map,
                                             );
                                             requirements.result_copy_layouts =
                                                 collect_result_copy_layouts(to_component, results);
                                             resolve_inner_resource_imports(
                                                 &mut requirements.result_copy_layouts,
+                                                to_component,
                                                 &callee_resource_map,
                                             );
                                             // Collect conditional pointer pairs (option/result/variant)
@@ -2522,6 +2633,7 @@ impl Resolver {
                                                     );
                                                 resolve_inner_resource_imports(
                                                     &mut requirements.params_area_copy_layouts,
+                                                    to_component,
                                                     &callee_resource_map,
                                                 );
                                                 requirements.params_area_slots =
@@ -2534,7 +2646,7 @@ impl Resolver {
                                                                 comp_params,
                                                             ),
                                                         "[resource-rep]",
-                                                        &to_component.component_type_defs,
+                                                        to_component,
                                                         callee_is_reexporter,
                                                     );
                                             }
@@ -2545,7 +2657,7 @@ impl Resolver {
                                                     &to_component
                                                         .resource_param_positions(comp_params),
                                                     "[resource-rep]",
-                                                    &to_component.component_type_defs,
+                                                    to_component,
                                                     callee_is_reexporter,
                                                 );
                                             requirements.resource_results =
@@ -2554,7 +2666,7 @@ impl Resolver {
                                                     &to_component
                                                         .resource_result_positions(results),
                                                     "[resource-new]",
-                                                    &to_component.component_type_defs,
+                                                    to_component,
                                                     callee_is_reexporter,
                                                 );
                                             // Caller-side resource params for 3-component chains
@@ -2564,7 +2676,7 @@ impl Resolver {
                                                     &to_component
                                                         .resource_param_positions(comp_params),
                                                     "[resource-rep]",
-                                                    &from_component.component_type_defs,
+                                                    from_component,
                                                     true, // caller never defines
                                                 );
 
@@ -2784,14 +2896,17 @@ impl Resolver {
                                     // [resource-rep] per type rather than .values().next().
                                     resolve_inner_resource_imports(
                                         &mut requirements.param_copy_layouts,
+                                        to_component,
                                         &callee_resource_map,
                                     );
                                     resolve_inner_resource_imports(
                                         &mut requirements.result_copy_layouts,
+                                        to_component,
                                         &callee_resource_map,
                                     );
                                     resolve_inner_resource_imports(
                                         &mut requirements.params_area_copy_layouts,
+                                        to_component,
                                         &callee_resource_map,
                                     );
                                     let fb_callee_reexporter = graph
@@ -2805,7 +2920,7 @@ impl Resolver {
                                                 &to_component
                                                     .resource_params_area_positions(comp_params),
                                                 "[resource-rep]",
-                                                &to_component.component_type_defs,
+                                                to_component,
                                                 fb_callee_reexporter,
                                             );
                                     }
@@ -2813,14 +2928,14 @@ impl Resolver {
                                         &callee_resource_map,
                                         &to_component.resource_param_positions(comp_params),
                                         "[resource-rep]",
-                                        &to_component.component_type_defs,
+                                        to_component,
                                         fb_callee_reexporter,
                                     );
                                     requirements.resource_results = resolve_resource_positions(
                                         &callee_resource_map,
                                         &to_component.resource_result_positions(results),
                                         "[resource-new]",
-                                        &to_component.component_type_defs,
+                                        to_component,
                                         fb_callee_reexporter,
                                     );
                                     // Caller-side resource params for 3-component chains
@@ -2831,7 +2946,7 @@ impl Resolver {
                                             &caller_resource_map,
                                             &to_component.resource_param_positions(comp_params),
                                             "[resource-rep]",
-                                            &from_component.component_type_defs,
+                                            from_component,
                                             true,
                                         );
 
@@ -4250,5 +4365,177 @@ mod tests {
         let resolver = Resolver::new();
         let result = resolver.resolve(&[comp]);
         assert!(result.is_ok(), "distinct modules should be accepted");
+    }
+
+    // ---------------------------------------------------------------
+    // Issue #99: per-resource keying for the import-only fallback
+    // ---------------------------------------------------------------
+    //
+    // The previous implementation collapsed every `[resource-rep]` /
+    // `[resource-new]` import onto a single sentinel slot keyed
+    // `(0u32, prefix)` whenever a component imported resources without
+    // emitting canonical entries. With two distinct resources that
+    // produced exactly one entry per prefix — silently overwriting one
+    // import. The tests below pin down the per-resource keying.
+
+    fn module_with_imports(imports: Vec<(&str, &str)>) -> crate::parser::CoreModule {
+        crate::parser::CoreModule {
+            index: 0,
+            bytes: Vec::new(),
+            types: Vec::new(),
+            imports: imports
+                .into_iter()
+                .map(|(module, name)| crate::parser::ModuleImport {
+                    module: module.to_string(),
+                    name: name.to_string(),
+                    kind: crate::parser::ImportKind::Function(0),
+                })
+                .collect(),
+            exports: Vec::new(),
+            functions: Vec::new(),
+            memories: Vec::new(),
+            tables: Vec::new(),
+            globals: Vec::new(),
+            start: None,
+            data_count: None,
+            element_count: 0,
+            custom_sections: Vec::new(),
+            code_section_range: None,
+            global_section_range: None,
+            element_section_range: None,
+            data_section_range: None,
+        }
+    }
+
+    /// LS-RH-2 / SR-35 (issue #99): A component that imports two distinct
+    /// resources without canonical `ResourceRep`/`ResourceNew` entries
+    /// should produce two distinct fallback entries — one per resource —
+    /// rather than collapsing onto a single sentinel slot.
+    #[test]
+    fn test_issue_99_multi_resource_import_only_no_collapse() {
+        let mut comp = empty_parsed_component();
+        comp.core_modules.push(module_with_imports(vec![
+            ("[export]exports", "[resource-rep]x"),
+            ("[export]exports", "[resource-rep]y"),
+            ("[export]exports", "[resource-new]x"),
+            ("[export]exports", "[resource-new]y"),
+        ]));
+
+        let map = build_resource_type_to_import(&comp);
+
+        // No canonical entries → no by-type-id entries.
+        assert!(
+            map.by_type_id.is_empty(),
+            "import-only fallback must not populate by_type_id"
+        );
+
+        // Per-resource keying: 4 distinct entries (2 resources × 2 prefixes),
+        // not 2 entries collapsed onto a sentinel.
+        assert_eq!(
+            map.by_name.len(),
+            4,
+            "expected 4 per-resource fallback entries, got {}: {:?}",
+            map.by_name.len(),
+            map.by_name
+        );
+
+        let rep_x = map
+            .get_by_name("x", "[resource-rep]")
+            .expect("x [resource-rep] entry");
+        assert_eq!(rep_x.0, "[export]exports");
+        assert_eq!(rep_x.1, "[resource-rep]x");
+
+        let rep_y = map
+            .get_by_name("y", "[resource-rep]")
+            .expect("y [resource-rep] entry");
+        assert_eq!(rep_y.0, "[export]exports");
+        assert_eq!(rep_y.1, "[resource-rep]y");
+
+        let new_x = map
+            .get_by_name("x", "[resource-new]")
+            .expect("x [resource-new] entry");
+        assert_eq!(new_x.1, "[resource-new]x");
+
+        let new_y = map
+            .get_by_name("y", "[resource-new]")
+            .expect("y [resource-new] entry");
+        assert_eq!(new_y.1, "[resource-new]y");
+
+        // x and y must point to different import fields (no collapse).
+        assert_ne!(rep_x.1, rep_y.1, "x and y [resource-rep] must differ");
+        assert_ne!(new_x.1, new_y.1, "x and y [resource-new] must differ");
+    }
+
+    /// Single-resource import-only case: keep keying by the actual
+    /// resource name. Previously this used `(0u32, prefix)` as a
+    /// sentinel; we now keep the same data per-resource so the lookup
+    /// path is uniform for every component.
+    #[test]
+    fn test_issue_99_single_resource_import_only_keyed_by_name() {
+        let mut comp = empty_parsed_component();
+        comp.core_modules.push(module_with_imports(vec![
+            ("[export]exports", "[resource-rep]frequency"),
+            ("[export]exports", "[resource-new]frequency"),
+        ]));
+
+        let map = build_resource_type_to_import(&comp);
+
+        assert!(map.by_type_id.is_empty());
+        assert_eq!(map.by_name.len(), 2);
+
+        // Sentinel slot must NOT exist anywhere.
+        assert!(
+            !map.by_name
+                .contains_key(&("".to_string(), "[resource-rep]")),
+            "no empty-string sentinel allowed"
+        );
+
+        let entry = map
+            .get_by_name("frequency", "[resource-rep]")
+            .expect("frequency [resource-rep] entry");
+        assert_eq!(entry.1, "[resource-rep]frequency");
+    }
+
+    /// Empty fallback case: a component with no resource imports at all
+    /// should produce an empty map (not a map with sentinel entries).
+    #[test]
+    fn test_issue_99_no_resources_produces_empty_map() {
+        let mut comp = empty_parsed_component();
+        comp.core_modules.push(module_with_imports(vec![
+            ("env", "regular_function"),
+            ("[export]exports", "_initialize"),
+        ]));
+
+        let map = build_resource_type_to_import(&comp);
+        assert!(map.by_type_id.is_empty());
+        assert!(map.by_name.is_empty());
+        assert!(map.is_empty());
+    }
+
+    /// Lookup behavior: with no canonical entries, the type-id lookup
+    /// always misses; the resolver must consult the name index using
+    /// the resource-name derived from the parsed component. Since we
+    /// don't have a full type-def chain in this fixture, exercise the
+    /// direct name lookup path.
+    #[test]
+    fn test_issue_99_get_by_name_disambiguates_resources() {
+        let mut comp = empty_parsed_component();
+        comp.core_modules.push(module_with_imports(vec![
+            ("[export]a", "[resource-rep]alpha"),
+            ("[export]b", "[resource-rep]beta"),
+        ]));
+
+        let map = build_resource_type_to_import(&comp);
+
+        // Different short-names → different module/field tuples.
+        let alpha = map.get_by_name("alpha", "[resource-rep]").unwrap();
+        let beta = map.get_by_name("beta", "[resource-rep]").unwrap();
+        assert_eq!(alpha.0, "[export]a");
+        assert_eq!(beta.0, "[export]b");
+        assert_ne!(alpha, beta);
+
+        // type-id lookup with arbitrary id always misses (no canonical entries).
+        assert!(map.get_by_type_id(0, "[resource-rep]").is_none());
+        assert!(map.get_by_type_id(7, "[resource-rep]").is_none());
     }
 }
