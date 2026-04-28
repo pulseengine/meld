@@ -322,13 +322,98 @@ fn normalize_wasi_module_name(name: &str) -> &str {
 
 /// Compare two semver-like version strings.
 ///
-/// `"0.2.6"` > `"0.2.0"`. Falls back to lexicographic comparison when
-/// versions don't parse as numeric triples.
+/// Implements a small subset of [semver 2.0.0] precedence rules sufficient
+/// for the WASI version strings meld encounters:
+///
+/// * Build metadata (`+...`) is ignored.
+/// * The main `MAJOR.MINOR.PATCH` triple is compared numerically; missing
+///   trailing segments default to `0` (so `"0.2"` == `"0.2.0"`).
+/// * A version *with* a pre-release suffix sorts BEFORE the same version
+///   without one (`0.2.0-rc1 < 0.2.0`).
+/// * Pre-release identifiers are compared dot-segment-wise: numeric
+///   identifiers numerically, alphanumeric identifiers lexically, and
+///   numeric identifiers always sort below alphanumeric ones.
+/// * Non-numeric main segments fall back to a lexical comparison of that
+///   segment (covers exotic inputs like `"0.2.x"`).
+///
+/// [semver 2.0.0]: https://semver.org/spec/v2.0.0.html
 fn compare_version(a: &str, b: &str) -> std::cmp::Ordering {
-    let parse = |s: &str| -> Vec<u32> { s.split('.').filter_map(|p| p.parse().ok()).collect() };
-    let va = parse(a);
-    let vb = parse(b);
-    va.cmp(&vb)
+    use std::cmp::Ordering;
+
+    // Strip build metadata: it does not affect precedence.
+    fn strip_build(s: &str) -> &str {
+        match s.find('+') {
+            Some(i) => &s[..i],
+            None => s,
+        }
+    }
+    // Split off pre-release suffix on the first '-'.
+    fn split_pre(s: &str) -> (&str, Option<&str>) {
+        match s.find('-') {
+            Some(i) => (&s[..i], Some(&s[i + 1..])),
+            None => (s, None),
+        }
+    }
+
+    let (main_a, pre_a) = split_pre(strip_build(a));
+    let (main_b, pre_b) = split_pre(strip_build(b));
+
+    // Compare the MAJOR.MINOR.PATCH... segments. Treat missing trailing
+    // segments as 0 so "0.2" == "0.2.0".
+    let segs_a: Vec<&str> = main_a.split('.').collect();
+    let segs_b: Vec<&str> = main_b.split('.').collect();
+    let max_len = segs_a.len().max(segs_b.len());
+    for i in 0..max_len {
+        let sa = segs_a.get(i).copied().unwrap_or("0");
+        let sb = segs_b.get(i).copied().unwrap_or("0");
+        let cmp = match (sa.parse::<u64>(), sb.parse::<u64>()) {
+            (Ok(na), Ok(nb)) => na.cmp(&nb),
+            // Fall back to lexical compare for non-numeric main segments.
+            _ => sa.cmp(sb),
+        };
+        if cmp != Ordering::Equal {
+            return cmp;
+        }
+    }
+
+    // Main triples are equal — compare pre-release suffixes per semver.
+    match (pre_a, pre_b) {
+        (None, None) => Ordering::Equal,
+        // No-prerelease > has-prerelease.
+        (None, Some(_)) => Ordering::Greater,
+        (Some(_), None) => Ordering::Less,
+        (Some(pa), Some(pb)) => compare_prerelease(pa, pb),
+    }
+}
+
+/// Compare two semver pre-release strings dot-segment-wise.
+///
+/// Numeric identifiers compare numerically and sort below alphanumeric
+/// identifiers; alphanumerics compare lexically; if all shared segments
+/// are equal, the longer suffix wins.
+fn compare_prerelease(a: &str, b: &str) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    let mut ia = a.split('.');
+    let mut ib = b.split('.');
+    loop {
+        match (ia.next(), ib.next()) {
+            (None, None) => return Ordering::Equal,
+            (None, Some(_)) => return Ordering::Less,
+            (Some(_), None) => return Ordering::Greater,
+            (Some(sa), Some(sb)) => {
+                let cmp = match (sa.parse::<u64>(), sb.parse::<u64>()) {
+                    (Ok(na), Ok(nb)) => na.cmp(&nb),
+                    // Numeric < alphanumeric per semver §11.4.3.
+                    (Ok(_), Err(_)) => Ordering::Less,
+                    (Err(_), Ok(_)) => Ordering::Greater,
+                    (Err(_), Err(_)) => sa.cmp(sb),
+                };
+                if cmp != Ordering::Equal {
+                    return cmp;
+                }
+            }
+        }
+    }
 }
 
 /// Extract the version suffix from a WASI module name, if any.
@@ -3628,11 +3713,103 @@ mod tests {
     #[test]
     fn test_compare_version() {
         use std::cmp::Ordering;
+        // Pure numeric triples (existing coverage).
         assert_eq!(compare_version("0.2.6", "0.2.0"), Ordering::Greater);
         assert_eq!(compare_version("0.2.0", "0.2.6"), Ordering::Less);
         assert_eq!(compare_version("0.2.6", "0.2.6"), Ordering::Equal);
         assert_eq!(compare_version("1.0.0", "0.9.9"), Ordering::Greater);
         assert_eq!(compare_version("0.3.0", "0.2.9"), Ordering::Greater);
+    }
+
+    #[test]
+    fn test_compare_version_prerelease_regression_issue_98() {
+        use std::cmp::Ordering;
+        // Issue #98: previously returned Less because filter_map(parse::<u32>)
+        // dropped the "99-rc1" segment, leaving [0, 2] vs [0, 2, 0]. After the
+        // fix the pre-release suffix is split off and 99 > 0 wins.
+        assert_eq!(compare_version("0.2.99-rc1", "0.2.0"), Ordering::Greater);
+    }
+
+    #[test]
+    fn test_compare_version_prerelease_below_release() {
+        use std::cmp::Ordering;
+        // Per semver §11: a pre-release version sorts BELOW the same version
+        // without a pre-release suffix.
+        assert_eq!(compare_version("0.2.0-rc1", "0.2.0"), Ordering::Less);
+        assert_eq!(compare_version("0.2.0", "0.2.0-rc1"), Ordering::Greater);
+        assert_eq!(compare_version("1.0.0-alpha", "1.0.0"), Ordering::Less);
+    }
+
+    #[test]
+    fn test_compare_version_prerelease_ordering() {
+        use std::cmp::Ordering;
+        // Both have pre-release: compare identifier-wise.
+        assert_eq!(compare_version("1.0.0-alpha", "1.0.0-beta"), Ordering::Less);
+        assert_eq!(compare_version("1.0.0-rc1", "1.0.0-rc2"), Ordering::Less);
+        // Numeric identifiers sort below alphanumeric ones (semver §11.4.3).
+        assert_eq!(compare_version("1.0.0-1", "1.0.0-alpha"), Ordering::Less);
+        // Longer pre-release wins when shared segments match.
+        assert_eq!(
+            compare_version("1.0.0-alpha", "1.0.0-alpha.1"),
+            Ordering::Less
+        );
+        assert_eq!(
+            compare_version("1.0.0-alpha.1", "1.0.0-alpha.1"),
+            Ordering::Equal
+        );
+    }
+
+    #[test]
+    fn test_compare_version_build_metadata_ignored() {
+        use std::cmp::Ordering;
+        // Build metadata (+...) does not affect precedence.
+        assert_eq!(
+            compare_version("1.0.0+meta", "1.0.0+other"),
+            Ordering::Equal
+        );
+        assert_eq!(compare_version("1.0.0+meta", "1.0.0"), Ordering::Equal);
+        assert_eq!(compare_version("0.2.6+sha.abc", "0.2.0"), Ordering::Greater);
+        // Build metadata after pre-release is also ignored.
+        assert_eq!(
+            compare_version("1.0.0-rc1+build.5", "1.0.0-rc1"),
+            Ordering::Equal
+        );
+    }
+
+    #[test]
+    fn test_compare_version_missing_segments() {
+        use std::cmp::Ordering;
+        // Missing trailing segments default to 0.
+        assert_eq!(compare_version("0.2", "0.2.0"), Ordering::Equal);
+        assert_eq!(compare_version("1", "1.0.0"), Ordering::Equal);
+        assert_eq!(compare_version("0.3", "0.2.99"), Ordering::Greater);
+        assert_eq!(compare_version("0.2", "0.2.1"), Ordering::Less);
+    }
+
+    #[test]
+    fn test_compare_version_mixed_alphanumeric() {
+        use std::cmp::Ordering;
+        // Non-numeric main segments fall back to lexical comparison of that
+        // segment so we never silently drop them like the old impl did.
+        assert_eq!(compare_version("0.2.x", "0.2.x"), Ordering::Equal);
+        // Different non-numeric segments compare lexically.
+        assert_ne!(compare_version("0.2.a", "0.2.b"), Ordering::Equal);
+        // A numeric segment vs a non-numeric one is decidable (not silently
+        // dropped) — exact ordering depends on lexical fallback, but it
+        // must not be Equal.
+        assert_ne!(compare_version("0.2.0", "0.2.x"), Ordering::Equal);
+    }
+
+    #[test]
+    fn test_compare_version_large_numbers() {
+        use std::cmp::Ordering;
+        // u64-range segments must compare numerically, not lexically.
+        // Lexical "10" < "9" but numeric 10 > 9.
+        assert_eq!(compare_version("0.0.10", "0.0.9"), Ordering::Greater);
+        assert_eq!(
+            compare_version("0.0.4294967296", "0.0.4294967295"),
+            Ordering::Greater
+        );
     }
 
     #[test]
