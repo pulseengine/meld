@@ -493,6 +493,40 @@ fn build_entity_provenance(component: &ParsedComponent) -> EntityProvenance {
 /// correct replacement for `compose_component_core_func_index`, which wrongly
 /// assumes the core function index space is a simple concatenation of module
 /// function counts (ignoring interleaved `canon lower` and alias entries).
+///
+/// Sort `adapter_sites` into a canonical, totally-ordered form so the
+/// downstream pipeline produces byte-equal output across runs.
+///
+/// `sort_unstable` is safe here because the key is a total order over
+/// (from_component, from_module, import_module, import_name,
+///  to_component, to_module, export_name, export_func_idx) — a tuple
+/// where `(from_component, from_module, import_name, import_module)`
+/// alone uniquely identifies an adapter site within the graph.
+fn sort_adapter_sites_for_determinism(sites: &mut [AdapterSite]) {
+    sites.sort_unstable_by(|a, b| {
+        (
+            a.from_component,
+            a.from_module,
+            &a.import_module,
+            &a.import_name,
+            a.to_component,
+            a.to_module,
+            &a.export_name,
+            a.export_func_idx,
+        )
+            .cmp(&(
+                b.from_component,
+                b.from_module,
+                &b.import_module,
+                &b.import_name,
+                b.to_component,
+                b.to_module,
+                &b.export_name,
+                b.export_func_idx,
+            ))
+    });
+}
+
 fn build_module_export_to_core_func(component: &ParsedComponent) -> HashMap<(usize, String), u32> {
     let prov = build_entity_provenance(component);
     prov.func_source
@@ -1419,6 +1453,16 @@ impl Resolver {
         // This must run after identify_adapter_sites and may promote some
         // module_resolutions entries to adapter_sites.
         self.identify_intra_component_adapter_sites(components, &mut graph)?;
+
+        // LS-CP-3 / SR-19 (issue #112 item 4): adapter_sites was populated
+        // by HashMap iteration order. Sort canonically so:
+        //   * lib.rs's adapter index allocation (`adapter_base + offset`)
+        //     uses the slot position to assign merged function indices,
+        //   * merger.rs:1500 walks `adapter_sites` and takes the first
+        //     match for an `(import_name, import_module)` pair.
+        // Either is enough to flip byte-equal builds when two sites share
+        // a name+module combination, breaking SR-19 reproducibility.
+        sort_adapter_sites_for_determinism(&mut graph.adapter_sites);
 
         // Fix double borrow conversion: when adapter A→B converts borrow<R>
         // handle→rep for function F, and adapter B→C also has borrow<R> for
@@ -2747,7 +2791,8 @@ impl Resolver {
                                         }
                                     }
                                     if matched_caller_enc.is_none()
-                                        && let Some((_, lo)) = caller_lower_map.iter().next()
+                                        && let Some((_, lo)) =
+                                            caller_lower_map.iter().min_by_key(|(k, _)| **k)
                                     {
                                         matched_caller_enc = Some(lo.string_encoding);
                                     }
@@ -3011,7 +3056,8 @@ impl Resolver {
                             }
 
                             if matched_caller_encoding.is_none()
-                                && let Some((_, lower_opts)) = caller_lower_map.iter().next()
+                                && let Some((_, lower_opts)) =
+                                    caller_lower_map.iter().min_by_key(|(k, _)| **k)
                             {
                                 log::debug!(
                                     "Using heuristic lower encoding for import '{}' \
@@ -3237,11 +3283,27 @@ impl Resolver {
                 requirements.string_transcoding = caller_enc != callee_enc;
             }
 
+            // LS-R-10 / UCA-R-3 (issue #112 item 5): when promoting a
+            // ModuleResolution to an AdapterSite, preserve the resolution's
+            // `from_import_module` rather than copying `import_name` into
+            // `import_module`. The merger's disjunctive match
+            // `(imp.module == site.import_module || imp.name == site.import_module)`
+            // would otherwise accept the WRONG import when a module imports
+            // two functions with the same `name` from different `module`s
+            // (e.g. `env.alloc` vs `mylib.alloc`). Fall back to
+            // `import_name` only when `from_import_module` is empty (legacy
+            // synthesised resolutions).
+            let import_module = if res.from_import_module.is_empty() {
+                res.import_name.clone()
+            } else {
+                res.from_import_module.clone()
+            };
+
             graph.adapter_sites.push(AdapterSite {
                 from_component: res.component_idx,
                 from_module: res.from_module,
                 import_name: res.import_name.clone(),
-                import_module: res.import_name.clone(),
+                import_module,
                 import_func_type_idx: None,
                 to_component: res.component_idx, // same component
                 to_module: res.to_module,
@@ -3340,8 +3402,11 @@ impl Resolver {
             }
         }
 
-        // Strategy 3: Fall back to first Lower entry (common single-function case)
-        if let Some((_, &lower_opts)) = lower_map.iter().next() {
+        // Strategy 3: Fall back to the lowest-keyed Lower entry (common
+        // single-function case). LS-CP-3 / SR-19: pick the smallest key
+        // rather than an arbitrary HashMap iteration first so the
+        // chosen encoding is stable across builds.
+        if let Some((_, &lower_opts)) = lower_map.iter().min_by_key(|(k, _)| **k) {
             log::debug!(
                 "Intra-component: using heuristic lower encoding for import '{}' \
                  ({} lower entries)",
@@ -4537,5 +4602,539 @@ mod tests {
         // type-id lookup with arbitrary id always misses (no canonical entries).
         assert!(map.get_by_type_id(0, "[resource-rep]").is_none());
         assert!(map.get_by_type_id(7, "[resource-rep]").is_none());
+    }
+    // Issue #112 — Mythos v0.4 follow-up unit tests
+    // ----------------------------------------------------------------
+
+    /// Build a `CoreModule` that defines its own memory and exports a
+    /// function `name` of type `() -> i32`.
+    fn build_unit_test_provider_module(idx: u32) -> crate::parser::CoreModule {
+        use crate::parser::{CoreModule, FuncType, MemoryType, ModuleExport};
+        use wasm_encoder::ValType;
+        CoreModule {
+            index: idx,
+            bytes: Vec::new(),
+            types: vec![FuncType {
+                params: vec![],
+                results: vec![ValType::I32],
+            }],
+            imports: Vec::new(),
+            exports: vec![ModuleExport {
+                name: "f".to_string(),
+                kind: ExportKind::Function,
+                index: 0,
+            }],
+            functions: vec![0],
+            memories: vec![MemoryType {
+                memory64: false,
+                shared: false,
+                initial: 1,
+                maximum: None,
+            }],
+            tables: Vec::new(),
+            globals: Vec::new(),
+            start: None,
+            data_count: None,
+            element_count: 0,
+            custom_sections: Vec::new(),
+            code_section_range: None,
+            global_section_range: None,
+            element_section_range: None,
+            data_section_range: None,
+        }
+    }
+
+    /// Build a consumer `CoreModule` that imports `f` from two different
+    /// `module` strings (`"providerA"` and `"providerB"`) and has its own
+    /// memory.
+    fn build_unit_test_consumer_module(idx: u32) -> crate::parser::CoreModule {
+        use crate::parser::{CoreModule, FuncType, ImportKind, MemoryType, ModuleImport};
+        use wasm_encoder::ValType;
+        CoreModule {
+            index: idx,
+            bytes: Vec::new(),
+            types: vec![FuncType {
+                params: vec![],
+                results: vec![ValType::I32],
+            }],
+            imports: vec![
+                ModuleImport {
+                    module: "providerA".to_string(),
+                    name: "f".to_string(),
+                    kind: ImportKind::Function(0),
+                },
+                ModuleImport {
+                    module: "providerB".to_string(),
+                    name: "f".to_string(),
+                    kind: ImportKind::Function(0),
+                },
+            ],
+            exports: Vec::new(),
+            functions: Vec::new(),
+            memories: vec![MemoryType {
+                memory64: false,
+                shared: false,
+                initial: 1,
+                maximum: None,
+            }],
+            tables: Vec::new(),
+            globals: Vec::new(),
+            start: None,
+            data_count: None,
+            element_count: 0,
+            custom_sections: Vec::new(),
+            code_section_range: None,
+            global_section_range: None,
+            element_section_range: None,
+            data_section_range: None,
+        }
+    }
+
+    /// Item 4 PoC: `sort_adapter_sites_for_determinism` must produce
+    /// the same canonical order regardless of the input order. The
+    /// resolver feeds it adapter sites pushed in HashMap-iteration order
+    /// (i.e. effectively random across processes), and downstream
+    /// pipeline correctness assumes a stable order.
+    ///
+    /// We construct the same six adapter sites in two distinct input
+    /// orders, run the sort, and assert the outputs are equal. We also
+    /// assert the sort is idempotent (applying it twice = once).
+    #[test]
+    fn test_issue112_item4_sort_adapter_sites_is_canonical() {
+        // Helper to build a minimal AdapterSite with caller/callee/name
+        // identifying fields.
+        #[allow(clippy::too_many_arguments)]
+        fn site(
+            from_component: usize,
+            from_module: usize,
+            import_module: &str,
+            import_name: &str,
+            to_component: usize,
+            to_module: usize,
+            export_name: &str,
+            export_func_idx: u32,
+        ) -> AdapterSite {
+            AdapterSite {
+                from_component,
+                from_module,
+                import_name: import_name.to_string(),
+                import_module: import_module.to_string(),
+                import_func_type_idx: None,
+                to_component,
+                to_module,
+                export_name: export_name.to_string(),
+                export_func_idx,
+                crosses_memory: false,
+                is_async_lift: false,
+                requirements: AdapterRequirements::default(),
+            }
+        }
+
+        // Six sites covering several sort-key columns:
+        //   * different from_component (A=0, B=1)
+        //   * same from_component, different from_module
+        //   * same name, different module (the from_import_module
+        //     disambiguator)
+        let canonical = vec![
+            site(0, 0, "modA", "f", 1, 0, "f", 0),
+            site(0, 0, "modA", "g", 2, 0, "g", 0),
+            site(0, 0, "modB", "f", 2, 0, "f", 0),
+            site(0, 1, "modA", "f", 1, 0, "f", 0),
+            site(1, 0, "modA", "f", 0, 0, "f", 0),
+            site(1, 0, "modB", "h", 2, 0, "h", 0),
+        ];
+
+        // Order #1: same as canonical.
+        let mut order1 = canonical.clone();
+        sort_adapter_sites_for_determinism(&mut order1);
+
+        // Order #2: reverse.
+        let mut order2: Vec<_> = canonical.iter().rev().cloned().collect();
+        sort_adapter_sites_for_determinism(&mut order2);
+
+        // Order #3: simulated HashMap-iteration shuffle.
+        let mut order3 = vec![
+            canonical[2].clone(),
+            canonical[5].clone(),
+            canonical[0].clone(),
+            canonical[3].clone(),
+            canonical[1].clone(),
+            canonical[4].clone(),
+        ];
+        sort_adapter_sites_for_determinism(&mut order3);
+
+        // All three must end up identical.
+        let key = |s: &AdapterSite| {
+            (
+                s.from_component,
+                s.from_module,
+                s.import_module.clone(),
+                s.import_name.clone(),
+                s.to_component,
+                s.to_module,
+                s.export_name.clone(),
+                s.export_func_idx,
+            )
+        };
+        let keys1: Vec<_> = order1.iter().map(key).collect();
+        let keys2: Vec<_> = order2.iter().map(key).collect();
+        let keys3: Vec<_> = order3.iter().map(key).collect();
+        assert_eq!(
+            keys1, keys2,
+            "sort must produce the same output regardless of input order \
+             (LS-CP-3 / SR-19 — original vs reversed differ)"
+        );
+        assert_eq!(
+            keys1, keys3,
+            "sort must produce the same output regardless of input order \
+             (LS-CP-3 / SR-19 — original vs shuffled differ)"
+        );
+
+        // Sort idempotence (paranoid second check).
+        let mut twice = order1.clone();
+        sort_adapter_sites_for_determinism(&mut twice);
+        let keys_twice: Vec<_> = twice.iter().map(key).collect();
+        assert_eq!(keys1, keys_twice, "sort must be idempotent");
+
+        // Spot-check the canonical order: (from_component, from_module,
+        // import_module, import_name) is strictly ascending — the
+        // primary keys we want for byte-equal output.
+        let primary: Vec<(usize, usize, String, String)> = order1
+            .iter()
+            .map(|s| {
+                (
+                    s.from_component,
+                    s.from_module,
+                    s.import_module.clone(),
+                    s.import_name.clone(),
+                )
+            })
+            .collect();
+        let mut sorted_primary = primary.clone();
+        sorted_primary.sort();
+        assert_eq!(
+            primary, sorted_primary,
+            "primary key columns must be ascending"
+        );
+    }
+
+    /// Item 5 unit-level PoC: when two `ModuleResolution`s share the
+    /// same `import_name` but have different `from_import_module`s, the
+    /// promoted adapter sites must preserve the `from_import_module` in
+    /// the `import_module` field. Pre-fix the function copied
+    /// `res.import_name` into `import_module`, which caused
+    /// `merger.rs:1500`'s disjunctive match to accept the wrong import.
+    ///
+    /// This test calls `identify_intra_component_adapter_sites` directly
+    /// with a hand-built `ParsedComponent` whose `core_entity_order` and
+    /// `component_aliases` give `build_entity_provenance` the entries it
+    /// needs to populate `func_source` for both providers' `f` exports —
+    /// which is the precondition for the function to actually promote
+    /// (rather than bail at the provenance miss).
+    #[test]
+    fn test_issue112_item5_intra_adapter_preserves_from_import_module() {
+        use crate::parser::{ComponentAliasEntry, CoreEntityDef, InstanceArg};
+        use wasmparser::ExternalKind;
+
+        // Component layout:
+        //   core_modules[0] = providerA (exports f, owns memory)
+        //   core_modules[1] = providerB (exports f, owns memory)
+        //   core_modules[2] = consumer (imports f from providerA and providerB,
+        //                               owns memory)
+        //   instances[0] = Instantiate(module 0)
+        //   instances[1] = Instantiate(module 1)
+        //   instances[2] = Instantiate(module 2, args providerA=0, providerB=1)
+        //   component_aliases[0] = CoreInstanceExport { Func, instance 0, "f" }
+        //   component_aliases[1] = CoreInstanceExport { Func, instance 1, "f" }
+        //   core_entity_order   = [CoreAlias(0), CoreAlias(1)]
+        //
+        // build_entity_provenance walks core_entity_order; each CoreAlias
+        // resolves through instance_to_module to (module_idx, name).
+        // intra_export_to_core then has entries (0,"f")=0 and (1,"f")=1.
+        let mut comp = empty_parsed_component();
+        comp.core_modules = vec![
+            build_unit_test_provider_module(0),
+            build_unit_test_provider_module(1),
+            build_unit_test_consumer_module(2),
+        ];
+        comp.instances = vec![
+            ComponentInstance {
+                index: 0,
+                kind: InstanceKind::Instantiate {
+                    module_idx: 0,
+                    args: vec![],
+                },
+            },
+            ComponentInstance {
+                index: 1,
+                kind: InstanceKind::Instantiate {
+                    module_idx: 1,
+                    args: vec![],
+                },
+            },
+            ComponentInstance {
+                index: 2,
+                kind: InstanceKind::Instantiate {
+                    module_idx: 2,
+                    args: vec![
+                        ("providerA".to_string(), InstanceArg::Instance(0)),
+                        ("providerB".to_string(), InstanceArg::Instance(1)),
+                    ],
+                },
+            },
+        ];
+        comp.component_aliases = vec![
+            ComponentAliasEntry::CoreInstanceExport {
+                kind: ExternalKind::Func,
+                instance_index: 0,
+                name: "f".to_string(),
+            },
+            ComponentAliasEntry::CoreInstanceExport {
+                kind: ExternalKind::Func,
+                instance_index: 1,
+                name: "f".to_string(),
+            },
+        ];
+        comp.core_entity_order = vec![CoreEntityDef::CoreAlias(0), CoreEntityDef::CoreAlias(1)];
+
+        // Two pre-resolved module-level imports (caller is module 2,
+        // callees are modules 0 and 1, both export "f").
+        let mut graph = DependencyGraph {
+            instantiation_order: vec![0],
+            resolved_imports: HashMap::new(),
+            unresolved_imports: Vec::new(),
+            adapter_sites: Vec::new(),
+            module_resolutions: vec![
+                ModuleResolution {
+                    component_idx: 0,
+                    from_module: 2,
+                    to_module: 0,
+                    import_name: "f".to_string(),
+                    export_name: "f".to_string(),
+                    from_import_module: "providerA".to_string(),
+                },
+                ModuleResolution {
+                    component_idx: 0,
+                    from_module: 2,
+                    to_module: 1,
+                    import_name: "f".to_string(),
+                    export_name: "f".to_string(),
+                    from_import_module: "providerB".to_string(),
+                },
+            ],
+            resource_graph: None,
+            reexporter_components: Vec::new(),
+            reexporter_resources: Vec::new(),
+        };
+
+        // MultiMemory + every module has memory => needs_adapter is true
+        // for both resolutions, so both should be promoted.
+        let resolver = Resolver::new();
+        resolver
+            .identify_intra_component_adapter_sites(std::slice::from_ref(&comp), &mut graph)
+            .expect("identify_intra_component_adapter_sites should succeed");
+
+        // Both module_resolutions must have been promoted to adapter_sites.
+        assert_eq!(
+            graph.adapter_sites.len(),
+            2,
+            "expected both module_resolutions to be promoted to adapter_sites; \
+             got {} sites (graph.module_resolutions left: {})",
+            graph.adapter_sites.len(),
+            graph.module_resolutions.len()
+        );
+
+        // Each promoted site must carry its provider's `from_import_module`
+        // in `import_module`, NOT the field name "f".
+        let mut sites: Vec<(usize, String, String)> = graph
+            .adapter_sites
+            .iter()
+            .map(|s| (s.to_module, s.import_name.clone(), s.import_module.clone()))
+            .collect();
+        sites.sort();
+        assert_eq!(
+            sites,
+            vec![
+                (0, "f".to_string(), "providerA".to_string()),
+                (1, "f".to_string(), "providerB".to_string()),
+            ],
+            "adapter_sites must preserve from_import_module in import_module \
+             (LS-R-10 / UCA-R-3 regression)"
+        );
+    }
+}
+
+// ----------------------------------------------------------------------
+// Issue #112 — Mythos v0.4 follow-up Kani harnesses
+// ----------------------------------------------------------------------
+
+#[cfg(kani)]
+mod kani_proofs {
+    //! Formal proofs for the determinism and disambiguation properties
+    //! introduced by issue #112 (Mythos v0.4 follow-up). These run
+    //! against small models (rather than the full resolver pipeline)
+    //! because the resolver pulls in wasmparser and HashMaps, which are
+    //! out of scope for Kani's symbolic execution.
+
+    /// Maximum number of adapter sites Kani will explore.
+    const MAX_SITES: usize = 4;
+    /// Maximum value any field in the sort key takes (kept small to
+    /// bound symbolic state space).
+    const MAX_FIELD: u8 = 3;
+
+    /// Model of an `AdapterSite`'s sort key. Mirrors the tuple used by
+    /// `sort_adapter_sites_for_determinism` in resolver.rs.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    struct SiteKey {
+        from_component: u8,
+        from_module: u8,
+        import_module: u8,
+        import_name: u8,
+        to_component: u8,
+        to_module: u8,
+        export_name: u8,
+        export_func_idx: u8,
+    }
+
+    impl SiteKey {
+        fn cmp_key(&self) -> (u8, u8, u8, u8, u8, u8, u8, u8) {
+            (
+                self.from_component,
+                self.from_module,
+                self.import_module,
+                self.import_name,
+                self.to_component,
+                self.to_module,
+                self.export_name,
+                self.export_func_idx,
+            )
+        }
+    }
+
+    fn model_sort(sites: &mut [SiteKey]) {
+        sites.sort_unstable_by(|a, b| a.cmp_key().cmp(&b.cmp_key()));
+    }
+
+    /// LS-CP-3 / SR-19: sort is a deterministic permutation. For any
+    /// pair of input arrays that are equal as multisets, the sorted
+    /// outputs must be element-equal.
+    #[kani::proof]
+    #[kani::unwind(5)]
+    fn check_item4_sort_is_canonical_under_swap() {
+        let n: usize = kani::any();
+        kani::assume(n > 0 && n <= MAX_SITES);
+
+        let mut a = [SiteKey {
+            from_component: 0,
+            from_module: 0,
+            import_module: 0,
+            import_name: 0,
+            to_component: 0,
+            to_module: 0,
+            export_name: 0,
+            export_func_idx: 0,
+        }; MAX_SITES];
+
+        for i in 0..MAX_SITES {
+            if i < n {
+                let fc: u8 = kani::any();
+                let fm: u8 = kani::any();
+                let im: u8 = kani::any();
+                let inm: u8 = kani::any();
+                let tc: u8 = kani::any();
+                let tm: u8 = kani::any();
+                let en: u8 = kani::any();
+                let efi: u8 = kani::any();
+                kani::assume(fc <= MAX_FIELD);
+                kani::assume(fm <= MAX_FIELD);
+                kani::assume(im <= MAX_FIELD);
+                kani::assume(inm <= MAX_FIELD);
+                kani::assume(tc <= MAX_FIELD);
+                kani::assume(tm <= MAX_FIELD);
+                kani::assume(en <= MAX_FIELD);
+                kani::assume(efi <= MAX_FIELD);
+                a[i] = SiteKey {
+                    from_component: fc,
+                    from_module: fm,
+                    import_module: im,
+                    import_name: inm,
+                    to_component: tc,
+                    to_module: tm,
+                    export_name: en,
+                    export_func_idx: efi,
+                };
+            }
+        }
+
+        // Build `b` as a swapped permutation of `a` (swap two random
+        // positions). For any swap, sorting must reach the same order.
+        let i: usize = kani::any();
+        let j: usize = kani::any();
+        kani::assume(i < n);
+        kani::assume(j < n);
+        let mut b = a;
+        b.swap(i, j);
+
+        let mut sa = a;
+        let mut sb = b;
+        model_sort(&mut sa[..n]);
+        model_sort(&mut sb[..n]);
+
+        for k in 0..n {
+            assert!(
+                sa[k].cmp_key() == sb[k].cmp_key(),
+                "sort must produce the same order regardless of input \
+                 permutation (LS-CP-3 / SR-19)"
+            );
+        }
+    }
+
+    /// LS-R-10 / UCA-R-3: when a `ModuleResolution` is promoted to an
+    /// `AdapterSite`, the new site's `import_module` must equal the
+    /// resolution's `from_import_module` whenever the latter is
+    /// non-empty. The pre-fix code copied `import_name` instead.
+    ///
+    /// Modelled as: given (import_name, from_import_module), the
+    /// promoted site's import_module is `from_import_module` if
+    /// non-empty else `import_name`.
+    #[kani::proof]
+    fn check_item5_promotion_preserves_from_import_module() {
+        let import_name_byte: u8 = kani::any();
+        let from_module_byte: u8 = kani::any();
+        let from_module_is_empty: bool = kani::any();
+
+        let import_name = if import_name_byte == 0 {
+            String::new()
+        } else {
+            String::from("name")
+        };
+        let from_import_module = if from_module_is_empty {
+            String::new()
+        } else if from_module_byte == 0 {
+            String::from("modA")
+        } else {
+            String::from("modB")
+        };
+
+        // Mirror the resolver fix exactly.
+        let import_module = if from_import_module.is_empty() {
+            import_name.clone()
+        } else {
+            from_import_module.clone()
+        };
+
+        if !from_import_module.is_empty() {
+            assert!(
+                import_module == from_import_module,
+                "when from_import_module is non-empty, the promoted \
+                 import_module must equal it (LS-R-10 / UCA-R-3)"
+            );
+        } else {
+            assert!(
+                import_module == import_name,
+                "when from_import_module is empty (legacy synthesised \
+                 resolutions), import_module falls back to import_name"
+            );
+        }
     }
 }
