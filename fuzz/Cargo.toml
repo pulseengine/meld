@@ -1,0 +1,53 @@
+[package]
+name = "meld-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+authors = ["PulseEngine <https://github.com/pulseengine>"]
+license = "Apache-2.0"
+description = "Fuzz targets for meld-core (parser, resolver, merger, full fusion roundtrip)"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+meld-core = { path = "../meld-core" }
+wasm-encoder = { version = "0.246", features = ["component-model"] }
+wasmparser = { version = "0.246", features = ["component-model"] }
+
+# Fuzz crate is a separate workspace by cargo-fuzz convention.
+# The root Cargo.toml lists "fuzz" in [workspace.exclude].
+[workspace]
+members = ["."]
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "fuzz_parse_component"
+path = "fuzz_targets/fuzz_parse_component.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_merger_idempotent"
+path = "fuzz_targets/fuzz_merger_idempotent.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_resolver_terminates"
+path = "fuzz_targets/fuzz_resolver_terminates.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_fusion_roundtrip"
+path = "fuzz_targets/fuzz_fusion_roundtrip.rs"
+test = false
+doc = false
+bench = false

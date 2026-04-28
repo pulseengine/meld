@@ -1,0 +1,73 @@
+name: Fuzz Smoke
+
+# 60-second-per-target smoke run. Catches regressions that crash a fuzz
+# target within the first minute. NOT a substitute for an overnight or
+# CI-fleet fuzz campaign — dedicated long-running infrastructure (e.g.
+# OSS-Fuzz, ClusterFuzzLite) is the right home for that.
+#
+# This job is currently informational (continue-on-error: true) because
+# cargo-fuzz requires nightly Rust and the project does not yet pin a
+# nightly version into its standard matrix. Once nightly is wired in,
+# flip continue-on-error to false to make the smoke gate enforcing.
+#
+# Security note: every `run:` step below uses values that come exclusively
+# from the workflow file itself (the matrix is hardcoded). No untrusted
+# event payloads (issue/PR titles, commit messages, branch refs from
+# forks, etc.) are interpolated into shell commands. If you add steps
+# that consume `github.event.*` data, route it through `env:` first.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  fuzz-smoke:
+    name: Fuzz smoke (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - fuzz_parse_component
+          - fuzz_resolver_terminates
+          - fuzz_merger_idempotent
+          - fuzz_fusion_roundtrip
+    env:
+      FUZZ_TARGET: ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install nightly Rust
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+
+      - name: Cache fuzz target build
+        uses: actions/cache@v4
+        with:
+          path: |
+            fuzz/target/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+          key: ${{ runner.os }}-fuzz-${{ matrix.target }}-${{ hashFiles('fuzz/Cargo.toml', 'meld-core/Cargo.toml') }}
+          restore-keys: ${{ runner.os }}-fuzz-${{ matrix.target }}-
+
+      - name: Run target for 60 s
+        run: cargo +nightly fuzz run --release "$FUZZ_TARGET" -- -max_total_time=60
+
+      - name: Upload crash artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts-${{ matrix.target }}
+          path: fuzz/artifacts/
+          if-no-files-found: ignore

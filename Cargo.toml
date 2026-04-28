@@ -6,6 +6,7 @@ members = [
 ]
 exclude = [
     "tools/spec-sync",
+    "fuzz",
 ]
 
 [workspace.package]
