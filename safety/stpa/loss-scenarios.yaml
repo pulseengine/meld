@@ -181,6 +181,54 @@ loss-scenarios:
       - Cycle detection skips self-edges in the dependency graph
       - No test for self-importing components
 
+  - id: LS-R-10
+    title: Intra-component adapter promotion drops from_import_module disambiguator
+    uca: UCA-R-3
+    hazards: [H-1, H-3.1]
+    type: inadequate-control-algorithm
+    scenario: >
+      `ModuleResolution` carries `from_import_module` (the wasm core
+      import's `module` string) precisely so the resolver and merger can
+      disambiguate when a single core module imports two functions with
+      the same `name` from different `module`s (e.g. `env.alloc` vs
+      `mylib.alloc`, or `wasi:clocks/wall-clock@0.2.0::now` vs
+      `wasi:clocks/monotonic-clock@0.2.0::now`). When intra-component
+      adapter promotion fired in
+      `meld-core/src/resolver.rs::identify_intra_component_adapter_sites`
+      (~line 3037 pre-fix), the new `AdapterSite.import_module` was set
+      to `res.import_name` (the field name) rather than
+      `res.from_import_module` (the module string). The downstream
+      first-match in `merger.rs:1500`
+      `(imp.module == site.import_module || imp.name == site.import_module)`
+      then accepted EITHER core import for EITHER promoted adapter site,
+      collapsing the two distinct calls onto whichever site sat first in
+      `adapter_sites`. The fused module called the wrong upstream export
+      [UCA-R-3], either trapping on a signature mismatch [H-1] or — when
+      signatures happened to align — silently producing wrong values
+      [H-3.1]. Detected by the unit test
+      meld-core::resolver::tests::test_issue112_item5_intra_adapter_preserves_from_import_module
+      (asserts the promoted site's `import_module` equals
+      `from_import_module`, not `import_name`) and Kani harness
+      `check_item5_promotion_preserves_from_import_module`. Fix lands in
+      commit on branch fix/issue-112-mythos-v04-followup: use
+      `res.from_import_module` when non-empty, fall back to
+      `res.import_name` only for legacy synthesised resolutions where
+      the field is empty.
+    causal-factors:
+      - >-
+        Intra-component adapter promotion path discarded the
+        `from_import_module` disambiguator already present on
+        `ModuleResolution`
+      - >-
+        `merger.rs:1500`'s disjunctive match accepts either field-name
+        OR module-name as the disambiguator, so the wrong value silently
+        succeeds rather than failing fast
+      - >-
+        No regression test asserted the `import_module` field for
+        promoted intra-component adapter sites
+    status: approved
+    priority: high
+
   # ==========================================================================
   # Merger scenarios
   # ==========================================================================
@@ -342,6 +390,81 @@ loss-scenarios:
       - Use of HashMap instead of BTreeMap or IndexMap for order-sensitive
         data
       - No byte-level reproducibility test
+
+  - id: LS-CP-3
+    title: HashMap iteration leaks into adapter_sites order and caller_encoding fallback
+    type: control-path
+    scenario: >
+      Two sites in `meld-core/src/resolver.rs` propagate HashMap
+      iteration order into observable fusion output:
+
+      (1) `identify_adapter_sites` iterates `graph.resolved_imports` (a
+      `HashMap<(usize, String), (usize, String)>`) and pushes each
+      cross-component call site into `graph.adapter_sites` in iteration
+      order. Rust's default hasher randomises per-process, so the same
+      input produces different `adapter_sites` orders across builds. The
+      order is observable downstream:
+        * `lib.rs:413-414` allocates merged function indices as
+          `adapter_base + adapter_offset`, so a different push order
+          yields different merged function indices for the same logical
+          adapters,
+        * `merger.rs:1500` walks `adapter_sites` and takes the first
+          match for an `(import_name, import_module)` pair, so when two
+          sites share that pair the merged module routes calls to
+          whichever was pushed first.
+
+      (2) Three encoding-fallback sites (`identify_adapter_sites` ~line
+      2638, the second resource path ~line 2965, and
+      `find_lower_for_intra_import` Strategy 3) used
+      `caller_lower_map.iter().next()` / `lower_map.iter().next()` to
+      pick a `string_encoding` when name-based matching missed. The
+      chosen encoding (UTF-8 vs UTF-16) and the `string_transcoding`
+      flag could flip across builds when a component had multiple
+      `canon lower` entries and the consumer's import name didn't match
+      any of them.
+
+      The 0.3.0 Mythos delta-pass fix sorted `reexporter_components` and
+      `reexporter_resources` (commit 8d7fb8f) but missed both classes
+      above. Result: byte-equal builds aren't guaranteed across
+      processes, breaking SR-19 reproducibility [H-7], and the routed
+      call (case 1) or chosen encoding (case 2) varies silently across
+      builds. Detected by unit tests
+      `meld-core::resolver::tests::test_issue112_item4_sort_adapter_sites_is_canonical`
+      and the integration test
+      `tests/issue_112_mythos_v04.rs::issue112_item4_adapter_sites_determinism`,
+      and Kani harness `check_item4_sort_is_canonical_under_swap`. Fix
+      lands in commit on branch fix/issue-112-mythos-v04-followup:
+      extract a free function `sort_adapter_sites_for_determinism` and
+      call it after both `identify_adapter_sites` and
+      `identify_intra_component_adapter_sites` complete; replace each
+      `iter().next()` encoding fallback with
+      `iter().min_by_key(|(k, _)| **k)`. The sort key is the totally-
+      ordered tuple (from_component, from_module, import_module,
+      import_name, to_component, to_module, export_name,
+      export_func_idx).
+    hazards: [H-7]
+    causal-factors:
+      - >-
+        `identify_adapter_sites` walks a `HashMap` and pushes results in
+        iteration order without normalising
+      - >-
+        Three `caller_lower_map.iter().next()` / `lower_map.iter().next()`
+        encoding fallbacks pick a non-deterministic entry from a
+        `HashMap<u32, _>`
+      - >-
+        Downstream consumers (lib.rs adapter index allocation,
+        merger.rs first-match) treat the `adapter_sites` slot order as
+        meaningful
+      - >-
+        `test_resolver_preserves_order_stability` covers
+        `instantiation_order` only, leaving `adapter_sites` and the
+        encoding fallback un-asserted
+      - >-
+        The 0.3.0 fix sorted `reexporter_components` and
+        `reexporter_resources` but did not sort `adapter_sites` itself
+        nor stabilise the encoding fallbacks
+    status: approved
+    priority: high
 
   # ==========================================================================
   # Additional adapter scenarios (discovered during gap analysis)
