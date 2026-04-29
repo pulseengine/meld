@@ -327,6 +327,15 @@ impl Fuser {
         stats.total_functions = merged.functions.len();
         stats.total_exports = merged.exports.len();
 
+        // Step 2.4: Lower P3 async canonical built-ins to `pulseengine:async`
+        // core-module imports. This adds one import per distinct intrinsic
+        // (stream.new, stream.read, …, future.drop-writable) and shifts
+        // every reference to defined functions up to make room. No-op when
+        // the components contain no P3 async data-plane constructs (the
+        // 73-test wit_bindgen_runtime suite). See `p3_async::lower_p3_async_intrinsics`
+        // and ADR-1 for the full design.
+        let _p3_lowering_plan = p3_async::lower_p3_async_intrinsics(&mut merged, &self.components)?;
+
         // Step 2.5: Generate task.return shims for internal fused async calls.
         //
         // For each [task-return]N import used by an internal async callee,
