@@ -46,6 +46,7 @@ pub mod attestation;
 pub mod component_wrap;
 mod error;
 pub mod merger;
+pub mod p3_async;
 pub mod parser;
 pub mod resolver;
 pub mod resource_graph;
@@ -235,6 +236,19 @@ impl Fuser {
     /// Get the number of components added
     pub fn component_count(&self) -> usize {
         self.components.len()
+    }
+
+    /// Inspect P3 async usage across all added components.
+    ///
+    /// Returns a per-component summary of stream/future types and async
+    /// canonical built-ins. Pure inspection — does not consume the fuser.
+    /// See [`crate::p3_async`] for the host-intrinsic ABI meld lowers
+    /// these constructs to.
+    pub fn p3_async_summary(&self) -> Vec<(Option<String>, p3_async::P3AsyncFeatures)> {
+        self.components
+            .iter()
+            .map(|c| (c.name.clone(), p3_async::detect_features(c)))
+            .collect()
     }
 
     /// Perform the fusion and return the fused module bytes
