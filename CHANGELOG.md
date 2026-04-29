@@ -2,6 +2,76 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.5.0] — Unreleased
+
+### Added
+
+- **P3 async lowering — foundation layer (#94 / #124, partial).** New
+  `meld-core::p3_async` module documents the `pulseengine:async`
+  host-intrinsic ABI (14 verbs covering `stream<T>` and `future<T>`), with
+  `HostIntrinsic` enum and per-canonical-built-in mapping. New
+  `Fuser::p3_async_summary()` exposes per-component P3 async usage. ADR-1
+  (`safety/adr/ADR-1-p3-async-lowering.md`) records the design and the
+  scope boundary. The actual rewrite pass remains deferred to follow-ups
+  #120 (lowering pass), #121 (error/backpressure), #122 (async-export
+  callback alignment); the v0.5.0 ABI is the stable contract those land
+  against.
+- **Criterion benchmarks for the fusion pipeline (#103 / #123).**
+  `meld-core/benches/fusion_benchmarks.rs` ships four groups (parser,
+  merger, resolver, end-to-end) running against the wit-bindgen test
+  fixtures. CI `Bench compile-only` job verifies they compile on every
+  PR. `safety/requirements/benchmarks.yaml` adds `TEST-BENCH-*` rivet
+  artifacts. README badge + run instructions included.
+
+### Fixed
+
+- **Parser slice OOB on truncated component-section input (#118 / #125).**
+  `meld-core/src/parser.rs` previously did
+  `&full_bytes[unchecked_range.start..unchecked_range.end]` on
+  `Payload::ModuleSection.unchecked_range` (and three sibling section
+  payloads) — a libFuzzer-discovered crash on truncated component-model
+  input. Fix: new `checked_section_slice` helper validates
+  `range.start <= range.end <= full.len()` and returns
+  `Error::ParseError("<section> range out of bounds (start=…, end=…,
+  input_len=…)")` on mismatch. Applied at all four sites. Regression test
+  + libFuzzer corpus seed shipped. cargo-fuzz `fuzz_parse_component`
+  smoke now passes.
+
+### Safety / STPA
+
+- New approved loss scenario:
+  - **LS-P-5** (UCA-P-3): truncated component-section input panic; fixed
+    via `checked_section_slice` (PR #125).
+
+### Internal
+
+- `meld-core/src/lib.rs` — added `Fuser::p3_async_summary()`,
+  `Fuser::components()`, and `Fuser::wiring_hints()` accessors (the
+  latter two for benchmark / external-tool drive-the-pipeline parity).
+- `meld-core/src/p3_async.rs` (new, ~470 LOC) — host-intrinsic ABI +
+  detection.
+- `meld-core/tests/p3_async_lowering.rs` (new) — 5 integration tests
+  including a hand-built `stream<u8>` component.
+- `meld-core/benches/fusion_benchmarks.rs` (new) — criterion harness.
+- `.github/workflows/bench.yml` — bench compile-only PR smoke.
+- `safety/adr/ADR-1-p3-async-lowering.md` — P3 async design ADR.
+- `safety/requirements/benchmarks.yaml` — TEST-BENCH-* artifacts.
+
+### Pre-release Mythos pass
+
+Tier-5 + tier-4 files changed since v0.4.0: `meld-core/src/parser.rs`
+only. Scanned per `scripts/mythos/discover.md`; **no confirmed findings**.
+The v0.5 LS-P-5 fix is itself the result of v0.4's cargo-fuzz finding,
+so additional discovery on that surface largely re-confirms the fix.
+
+One unverified hypothesis flagged for the v0.5.1 / v0.6 follow-up Mythos
+pass: there are three additional `reader.range()` / `range` storage
+sites in `parse_core_module` (`parser.rs:1268`, `:1272`, `:1276`) whose
+downstream consumers raw-index `&module.bytes[start..end]`. They share
+LS-P-5's bug class but the outer module slice is already bounds-checked
+at `parser.rs:820`, narrowing the surface. The 2026-05-20 verification
+routine includes a deeper Mythos sweep that will revisit this.
+
 ## [0.4.0] — Unreleased
 
 ### Added
