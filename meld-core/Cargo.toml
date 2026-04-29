@@ -44,8 +44,13 @@ wat = "1.219"
 wasmtime = "41.0.1"
 wasmtime-wasi = "41.0.4"
 bitflags.workspace = true  # Required for wit-bindgen component bindings
+criterion.workspace = true
 
 [features]
 default = []
 # Enable wsc-attestation integration for supply chain tracking
 attestation = ["wsc-attestation"]
+
+[[bench]]
+name = "fusion_benchmarks"
+harness = false

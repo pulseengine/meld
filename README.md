@@ -7,6 +7,7 @@
 &nbsp;
 
 [![CI](https://github.com/pulseengine/meld/actions/workflows/ci.yml/badge.svg)](https://github.com/pulseengine/meld/actions/workflows/ci.yml)
+[![Bench](https://github.com/pulseengine/meld/actions/workflows/bench.yml/badge.svg)](https://github.com/pulseengine/meld/actions/workflows/bench.yml)
 [![codecov](https://codecov.io/gh/pulseengine/meld/graph/badge.svg)](https://codecov.io/gh/pulseengine/meld)
 ![Rust](https://img.shields.io/badge/Rust-CE422B?style=flat-square&logo=rust&logoColor=white&labelColor=1a1b27)
 ![WebAssembly](https://img.shields.io/badge/WebAssembly-654FF0?style=flat-square&logo=webassembly&logoColor=white&labelColor=1a1b27)
@@ -151,6 +152,27 @@ cargo test                 # Test
 bazel build //...          # Bazel build
 RUST_LOG=debug cargo run -- fuse a.wasm b.wasm -o out.wasm
 ```
+
+### Benchmarks
+
+Criterion benchmarks for the fusion pipeline live in
+`meld-core/benches/fusion_benchmarks.rs` and exercise four groups:
+
+- `parser` — `ComponentParser::parse` throughput per input byte.
+- `merger` — `Merger::merge` throughput per component count.
+- `resolver` — `Resolver::resolve_with_hints` throughput per resolved-symbol count.
+- `end_to_end` — `Fuser::fuse_with_stats` over small / medium / large
+  graphs.
+
+```bash
+cargo bench -p meld-core                          # full run
+cargo bench -p meld-core --bench fusion_benchmarks -- parser   # one group
+cargo bench -p meld-core --no-run                 # compile-only sanity (CI smoke)
+```
+
+CI runs `cargo bench --no-run` on every PR (`.github/workflows/bench.yml`)
+to prevent the bench harness from rotting. Full benches are not run in CI
+to keep PRs fast and avoid noisy regressions on shared runners.
 
 ## License
 
