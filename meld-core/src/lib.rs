@@ -251,6 +251,23 @@ impl Fuser {
             .collect()
     }
 
+    /// Borrow the flattened parsed components.
+    ///
+    /// Useful for benchmarks and tools that want to drive `Resolver` /
+    /// `Merger` directly with the same flattened slice the fusion pipeline
+    /// uses internally, without having to re-implement
+    /// `flatten_nested_components`.
+    pub fn components(&self) -> &[ParsedComponent] {
+        &self.components
+    }
+
+    /// Borrow the wiring hints derived from composition graphs (component
+    /// instance / alias wiring). Pair with `components()` when calling
+    /// `Resolver::resolve_with_hints` for parity with the in-pipeline call.
+    pub fn wiring_hints(&self) -> &WiringHints {
+        &self.wiring_hints
+    }
+
     /// Perform the fusion and return the fused module bytes
     pub fn fuse(&self) -> Result<Vec<u8>> {
         let (bytes, _stats) = self.fuse_with_stats()?;
@@ -1615,7 +1632,7 @@ fn flatten_nested_components(
 /// propagated to whichever sub-component consumes them.
 /// Directed resolution hints from the composition graph.
 /// Maps (importer_flat_idx, interface_name) → exporter_flat_idx.
-type WiringHints = std::collections::HashMap<(usize, String), usize>;
+pub type WiringHints = std::collections::HashMap<(usize, String), usize>;
 
 #[allow(clippy::collapsible_if)]
 fn propagate_outer_wiring(

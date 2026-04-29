@@ -1,0 +1,53 @@
+name: Bench Smoke
+
+# Compile-only sanity check for the criterion fusion benches. Catches the
+# common regression where someone refactors a public API and the benches
+# silently rot. Does NOT run the actual benchmarks — running them on shared
+# CI runners produces noisy, untrustworthy numbers and slows PR feedback.
+#
+# Full benchmark runs are intended to live on a dedicated host (or be
+# reproduced locally with `cargo bench -p meld-core`).
+#
+# Security note: every `run:` step below uses values that come exclusively
+# from the workflow file itself. No untrusted event payloads (issue/PR
+# titles, commit messages, branch refs from forks, etc.) are interpolated
+# into shell commands. If you add steps that consume `github.event.*` data,
+# route it through `env:` first.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  bench-smoke:
+    name: Bench compile-only
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          override: true
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-bench-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-bench-
+
+      - name: Compile benches (no run)
+        run: cargo bench -p meld-core --no-run
