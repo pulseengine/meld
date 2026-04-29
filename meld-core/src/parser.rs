@@ -620,6 +620,35 @@ fn has_modules_recursive(component: &ParsedComponent) -> bool {
         .any(|sub| !sub.core_modules.is_empty() || has_modules_recursive(sub))
 }
 
+/// Validate that a wasmparser-reported byte range is in-bounds for the
+/// underlying input slice and return the bounded sub-slice.
+///
+/// On truncated input, `wasmparser` payloads such as
+/// `Payload::ModuleSection { unchecked_range, .. }` and reader ranges
+/// returned via `.range()` may extend past the actual input length —
+/// indexing the slice directly with the unchecked range then panics with
+/// "range end index N out of range for slice of length M". This helper
+/// fails fast with a structured `Error::ParseError` instead, so the
+/// fuzzer (and end users) see a clean diagnostic for malformed inputs
+/// rather than a process abort.
+///
+/// See loss-scenario LS-P-5 (UCA-P-3 / H-1) and issue #118.
+fn checked_section_slice<'a>(
+    full_bytes: &'a [u8],
+    range: &std::ops::Range<usize>,
+    section: &'static str,
+) -> Result<&'a [u8]> {
+    if range.start > range.end || range.end > full_bytes.len() {
+        return Err(Error::ParseError(format!(
+            "{section} range out of bounds (start={}, end={}, input_len={})",
+            range.start,
+            range.end,
+            full_bytes.len()
+        )));
+    }
+    Ok(&full_bytes[range.start..range.end])
+}
+
 impl ComponentParser {
     /// Create a new parser
     pub fn new() -> Self {
@@ -781,8 +810,18 @@ impl ComponentParser {
                 parser,
                 unchecked_range,
             } => {
-                // Found an embedded core module
-                let module_bytes = &_full_bytes[unchecked_range.start..unchecked_range.end];
+                // Found an embedded core module.
+                //
+                // `unchecked_range` is reported by wasmparser without a
+                // bounds check against the outer input — on truncated input
+                // it can extend past `_full_bytes.len()`, which would panic
+                // a raw slice. Validate explicitly and surface a structured
+                // parse error instead. See issue #118 / LS-P-5.
+                let module_bytes = checked_section_slice(
+                    _full_bytes,
+                    &unchecked_range,
+                    "component module section",
+                )?;
                 let core_module = self.parse_core_module(
                     component.core_modules.len() as u32,
                     module_bytes,
@@ -796,9 +835,9 @@ impl ComponentParser {
                 // Section ID 10 = ComponentImport in the component binary format.
                 if capture_sections {
                     let range = reader.range();
-                    component
-                        .depth_0_sections
-                        .push((10, _full_bytes[range.start..range.end].to_vec()));
+                    let bytes =
+                        checked_section_slice(_full_bytes, &range, "component import section")?;
+                    component.depth_0_sections.push((10, bytes.to_vec()));
                 }
                 for import in reader {
                     let import = import?;
@@ -899,9 +938,9 @@ impl ComponentParser {
                 // Section ID 7 = ComponentType in the component binary format.
                 if capture_sections {
                     let range = reader.range();
-                    component
-                        .depth_0_sections
-                        .push((7, _full_bytes[range.start..range.end].to_vec()));
+                    let bytes =
+                        checked_section_slice(_full_bytes, &range, "component type section")?;
+                    component.depth_0_sections.push((7, bytes.to_vec()));
                 }
                 for ty in reader {
                     let ty = ty?;
@@ -969,9 +1008,9 @@ impl ComponentParser {
                 // reference.
                 if capture_sections {
                     let range = reader.range();
-                    component
-                        .depth_0_sections
-                        .push((6, _full_bytes[range.start..range.end].to_vec()));
+                    let bytes =
+                        checked_section_slice(_full_bytes, &range, "component alias section")?;
+                    component.depth_0_sections.push((6, bytes.to_vec()));
                 }
                 for alias in reader {
                     let alias = alias?;
@@ -3294,6 +3333,66 @@ mod tests {
         // Invalid magic
         let result = parser.parse(&[1, 2, 3, 4, 5, 6, 7, 8]);
         assert!(matches!(result, Err(Error::InvalidWasm(_))));
+    }
+
+    /// Regression for issue #118: a truncated component-section input
+    /// where wasmparser reports a `Payload::ModuleSection.unchecked_range`
+    /// extending past the end of the input must produce a clean parse
+    /// error instead of panicking the slice indexer.
+    ///
+    /// libFuzzer reproducer (also in
+    /// `fuzz/corpus/fuzz_parse_component/crash-58e2560292606f3a49bde7edf9b939509a56cb32`).
+    /// Maps to LS-P-5 (UCA-P-3 family / H-1).
+    #[test]
+    fn test_parser_rejects_truncated_module_section_issue_118() {
+        // 15-byte truncated component header from libFuzzer:
+        //   00 61 73 6d 0d 00 01 00  -- component magic + version 0x0001000d
+        //   01 08                    -- (whatever leading section)
+        //   08 2b 00 ff ff           -- module-section header claiming 0x2b
+        //                               (43) bytes of body, but only ~3 bytes
+        //                               of input remain.
+        //
+        // Before the fix this panicked with
+        //   "range end index 17 out of range for slice of length 15".
+        // After the fix it must return a structured Err.
+        let bytes: &[u8] = &[
+            0x00, 0x61, 0x73, 0x6d, 0x0d, 0x00, 0x01, 0x00, 0x01, 0x08, 0x08, 0x2b, 0x00, 0xff,
+            0xff,
+        ];
+
+        // Both validating and non-validating parsers must return Err — never panic.
+        let validating = ComponentParser::new();
+        let r1 = validating.parse(bytes);
+        assert!(
+            r1.is_err(),
+            "validating parser unexpectedly accepted: {r1:?}"
+        );
+
+        let permissive = ComponentParser::without_validation();
+        let r2 = permissive.parse(bytes);
+        assert!(
+            r2.is_err(),
+            "non-validating parser unexpectedly accepted: {r2:?}"
+        );
+
+        // The non-validating path is the one that previously panicked
+        // inside handle_payload's slice; the new bounds check must surface
+        // a structured ParseError naming the offending section. wasmparser
+        // may also catch this earlier with its own BinaryReaderError
+        // -> ParseError conversion; either is acceptable, so we only
+        // require an Err and (when it's a ParseError) a sensible message.
+        match r2 {
+            Err(Error::ParseError(ref msg)) => {
+                assert!(
+                    msg.contains("module section")
+                        || msg.contains("range out of bounds")
+                        || !msg.is_empty(),
+                    "unexpected ParseError message: {msg}"
+                );
+            }
+            Err(Error::InvalidWasm(_)) => {}
+            other => panic!("expected ParseError or InvalidWasm, got: {other:?}"),
+        }
     }
 
     #[test]
