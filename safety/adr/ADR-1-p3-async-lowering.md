@@ -104,6 +104,11 @@ Out of scope (deferred to follow-up sub-issues under #94):
   (`stream_write` returns bytes accepted < requested = backpressure;
   negative = error) is fixed in rustdoc, but the runtime contract
   needs companion docs in kiln + a wasmtime reference impl.
+  *Update (issue #121):* the closed-enum convention is now formalised
+  in [`ADR-2`](ADR-2-p3-async-error-conventions.md) and pinned by
+  `meld-core/tests/p3_async_abi.rs`. Companion docs in kiln and the
+  wasmtime reference impl remain out of scope (separable tracking
+  issues).
 - **Static validation** — type-compat and circular-dependency checks
   for cross-component streams (issue #94 §4).
 
@@ -137,8 +142,12 @@ since they share only this contract.
 ## References
 
 * GitHub issue #94 — original proposal.
+* GitHub issue #121 — error/backpressure conventions follow-up
+  (resolved by ADR-2).
 * RFC #46 — meld toolchain architecture.
 * WASM Component Model P3 spec —
   https://github.com/WebAssembly/component-model
 * WASI 0.3 roadmap — https://wasi.dev/roadmap
 * `meld-core/src/p3_async.rs` — canonical ABI documentation.
+* [ADR-2](ADR-2-p3-async-error-conventions.md) — error/backpressure
+  conventions for the same `pulseengine:async` ABI.

@@ -67,6 +67,33 @@
 //!   (`component_wrap.rs::generate_callback_driving_adapter`). This module
 //!   only provides the *data-plane* (stream/future) intrinsics.
 //!
+//! ## Error and backpressure conventions (issue #121, ADR-2)
+//!
+//! Every `stream_*` / `future_*` intrinsic that returns `i32` follows the
+//! convention: **non-negative = success-with-payload, negative = error
+//! drawn from the closed enum [`AbiError`]**.
+//!
+//! * Stream EOF is `0` from `stream_read` and is **distinguishable** from
+//!   "no bytes available right now" — the latter returns
+//!   [`AbiError::Pending`]. EOF is sticky once observed.
+//! * `stream_write` exposes backpressure as a partial count
+//!   (`written < requested`). The **producer** is the retry authority;
+//!   the runtime does not queue the un-accepted tail. A write of `0`
+//!   bytes is still backpressure, NOT EOF.
+//! * `future_read` returns `1` (resolved), `0` (pending), or negative
+//!   (error). `0` is **not** EOF — `Closed` is.
+//! * Pending operations register the relevant handle in a waitable-set
+//!   and re-invoke the intrinsic after `[waitable-set-wait]` fires.
+//!   Byte counts / resolved flags are read from the *next intrinsic
+//!   call*, not from the waitable's payload.
+//!
+//! Helper decoders [`StreamWriteResult`], [`StreamReadResult`], and
+//! [`FutureReadResult`] turn raw `i32` returns into typed variants for
+//! use in tests and adapter glue.
+//!
+//! See [ADR-2](../../safety/adr/ADR-2-p3-async-error-conventions.md) for
+//! the formal rationale.
+//!
 //! ## Detection
 //!
 //! [`P3AsyncFeatures`] summarises what P3 async constructs a parsed component
@@ -126,21 +153,199 @@ pub mod future {
 
 /// A specific P3 async canonical built-in, mapped to the host intrinsic
 /// it lowers to.
+///
+/// # Return-value conventions
+///
+/// All `stream_*` / `future_*` intrinsics that return `i32` follow the
+/// **non-negative = success, negative = error** convention, where the error
+/// codes are drawn from the closed enum [`AbiError`]. Helper decoders
+/// [`StreamReadResult`], [`StreamWriteResult`], and [`FutureReadResult`]
+/// turn raw return values into these typed variants for testing and for
+/// generated adapter glue.
+///
+/// See the per-variant rustdoc below for partial-write semantics, EOF
+/// distinguishability, and how each intrinsic interacts with the
+/// `[waitable-set-wait]` built-in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HostIntrinsic {
+    /// `() -> i64` — allocate a new stream handle pair. Low 32 bits =
+    /// readable end, high 32 bits = writable end.
+    ///
+    /// Errors are reported by encoding [`AbiError::Oom`] (or other
+    /// negative codes) **in the low 32 bits** with the high 32 bits set to
+    /// zero. Callers MUST inspect the low 32 bits as `i32` before using
+    /// either half. (`i64::from_ne_bytes`-style decoding never produces a
+    /// negative low half from a valid handle pair, since handles are
+    /// non-negative.)
     StreamNew,
+    /// `(handle: i32, buf_ptr: i32, buf_len: i32, mem_idx: i32) -> i32`
+    /// — read up to `buf_len` bytes into `buf_ptr` of memory `mem_idx`.
+    ///
+    /// Return value (decode with [`StreamReadResult::decode`]):
+    ///
+    /// * `n > 0` — exactly `n` bytes were copied into `buf_ptr`. `n` may
+    ///   be less than `buf_len`; that simply means the runtime had fewer
+    ///   bytes available *right now*. The reader is free to retry — the
+    ///   stream is **not** at EOF.
+    /// * `n == 0` — **EOF, distinguishable from "0 bytes available"**:
+    ///   the writable end has been dropped AND no buffered bytes remain.
+    ///   The runtime MUST NOT return 0 to indicate "nothing available
+    ///   right now"; in that case the reader receives [`AbiError::Pending`]
+    ///   so the reader can register a waitable instead of busy-looping.
+    ///   Once a reader has observed `0`, every subsequent call on the
+    ///   same handle MUST also return `0` (EOF is sticky).
+    /// * `n < 0` — error from [`AbiError`]. Notable codes:
+    ///   * [`AbiError::Pending`] — no bytes available right now and the
+    ///     stream is still open. The reader SHOULD register the handle
+    ///     in a waitable-set (see *Interaction with `[waitable-set-wait]`*
+    ///     below) and re-invoke `stream_read` after the set fires.
+    ///   * [`AbiError::Closed`] — the writable end was dropped *before*
+    ///     the read started AND no buffered bytes were available. This
+    ///     is the same observable state as EOF; the runtime MAY return
+    ///     `0` instead and most do.
+    ///   * [`AbiError::InvalidHandle`] — `handle` is not a live readable
+    ///     end of a stream owned by this caller.
+    ///   * [`AbiError::Cancelled`] — the read was cancelled by a
+    ///     concurrent `stream_cancel_read`.
+    ///
+    /// ### Interaction with `[waitable-set-wait]`
+    ///
+    /// `stream_read` is a *non-blocking* primitive. When it returns
+    /// [`AbiError::Pending`], the caller registers the **readable handle**
+    /// in a waitable-set (created via `[waitable-set-new]`, populated via
+    /// `[waitable-join]`). The runtime fires the waitable when bytes
+    /// become available OR the writable end is dropped (whichever comes
+    /// first). The caller drains the readiness via `[waitable-set-wait]`
+    /// and re-invokes `stream_read` to retrieve the actual bytes (or `0`
+    /// for EOF). The waitable's payload identifies *which* handle is
+    /// ready; the byte count is **not** delivered through the waitable —
+    /// it is read out of the next `stream_read` call.
     StreamRead,
+    /// `(handle: i32, data_ptr: i32, data_len: i32, mem_idx: i32) -> i32`
+    /// — write `data_len` bytes from `data_ptr`.
+    ///
+    /// Return value (decode with [`StreamWriteResult::decode`]):
+    ///
+    /// * `n == data_len` — full success.
+    /// * `0 <= n < data_len` — **partial write / backpressure**: the
+    ///   reader is slow. The producer is the *retry authority*: meld and
+    ///   the runtime do **not** queue the un-accepted tail. The producer
+    ///   MUST resubmit the slice `[data_ptr + n .. data_ptr + data_len)`
+    ///   (typically after a `[waitable-set-wait]` round; see below). A
+    ///   compliant runtime may return `0` to mean "no progress right now";
+    ///   producers SHOULD treat `n == 0` identically to a positive
+    ///   partial write — backpressure, retry. Returning `0` is **not**
+    ///   EOF on the write side; readable EOF is signalled only on the
+    ///   read side.
+    /// * `n < 0` — error from [`AbiError`]:
+    ///   * [`AbiError::Closed`] — the readable end was dropped. The
+    ///     producer should drop the writable end; further writes will
+    ///     fail with the same code.
+    ///   * [`AbiError::InvalidHandle`] — `handle` is not a live writable
+    ///     end of a stream owned by this caller.
+    ///   * [`AbiError::Cancelled`] — the write was cancelled by a
+    ///     concurrent `stream_cancel_write`.
+    ///   * [`AbiError::Oom`] — the runtime could not allocate buffer
+    ///     space for any progress. Distinct from backpressure: producers
+    ///     SHOULD propagate this as a hard error rather than retry.
+    ///
+    /// ### Interaction with `[waitable-set-wait]`
+    ///
+    /// On a partial write or `AbiError::Pending` (some runtimes prefer
+    /// the latter when 0 bytes were accepted), the producer registers
+    /// the **writable handle** in a waitable-set. The runtime fires the
+    /// waitable when buffer space frees up OR the readable end is
+    /// dropped. The producer re-invokes `stream_write` with the
+    /// remaining slice; the actual byte count is read out of that call,
+    /// not the waitable payload.
     StreamWrite,
+    /// `(handle: i32) -> i32` — cancel a pending read on the given handle.
+    ///
+    /// Return value:
+    ///
+    /// * `1` — a pending read was cancelled. The cancelled `stream_read`
+    ///   call (on whichever task issued it) returns
+    ///   [`AbiError::Cancelled`].
+    /// * `0` — no read was pending; this is a no-op success.
+    /// * `n < 0` — error from [`AbiError`], typically
+    ///   [`AbiError::InvalidHandle`].
     StreamCancelRead,
+    /// `(handle: i32) -> i32` — cancel a pending write on the given
+    /// handle. Return convention matches [`HostIntrinsic::StreamCancelRead`].
     StreamCancelWrite,
+    /// `(handle: i32)` — drop the readable end. Closing both ends destroys
+    /// the stream and any buffered bytes. After dropping the readable end:
+    ///
+    /// * Pending writes complete with [`AbiError::Closed`] (if no bytes
+    ///   were already accepted) or with the partial count.
+    /// * Subsequent writes return [`AbiError::Closed`].
     StreamDropReadable,
+    /// `(handle: i32)` — drop the writable end. After dropping:
+    ///
+    /// * Pending reads drain any buffered bytes, then return `0` (EOF).
+    /// * Subsequent reads return `0` (EOF is sticky).
     StreamDropWritable,
+    /// `() -> i64` — allocate a new future handle pair. Low 32 bits =
+    /// read end, high 32 bits = write end. Error encoding matches
+    /// [`HostIntrinsic::StreamNew`].
     FutureNew,
+    /// `(handle: i32, buf_ptr: i32, mem_idx: i32) -> i32` — read the
+    /// resolved value into `buf_ptr` (size = canonical layout of `T`).
+    ///
+    /// Return value (decode with [`FutureReadResult::decode`]):
+    ///
+    /// * `1` — resolved; the canonical-ABI layout of `T` has been written
+    ///   to `buf_ptr`. Subsequent calls on the same handle MUST also
+    ///   return `1` (the resolved value is sticky until the read end is
+    ///   dropped); runtimes MAY instead return [`AbiError::Closed`] after
+    ///   the value has been consumed once.
+    /// * `0` — **not yet resolved AND the write end is still alive.**
+    ///   The reader registers the handle in a waitable-set (see
+    ///   `[waitable-set-wait]` interaction below) and retries on
+    ///   readiness.
+    /// * `n < 0` — error from [`AbiError`]:
+    ///   * [`AbiError::Closed`] — the write end was dropped without
+    ///     resolving. Distinguishable from "not yet resolved": EOF on a
+    ///     future means *no value will ever arrive*.
+    ///   * [`AbiError::InvalidHandle`], [`AbiError::Cancelled`].
+    ///
+    /// ### Interaction with `[waitable-set-wait]`
+    ///
+    /// Identical to `stream_read`: the reader joins the readable end
+    /// into a waitable-set, waits, then re-invokes `future_read` to
+    /// retrieve the resolved value (`1`) or observe drop (`Closed`).
     FutureRead,
+    /// `(handle: i32, data_ptr: i32, mem_idx: i32) -> i32` — resolve the
+    /// future by writing `T`'s canonical layout from `data_ptr`.
+    ///
+    /// Return value:
+    ///
+    /// * `1` — resolved successfully.
+    /// * `n < 0` — error from [`AbiError`]:
+    ///   * [`AbiError::Closed`] — the read end was dropped before
+    ///     resolution. The value is discarded.
+    ///   * [`AbiError::InvalidHandle`], [`AbiError::Cancelled`],
+    ///     [`AbiError::Oom`].
+    ///
+    /// Unlike `stream_write`, `future_write` is **all-or-nothing**:
+    /// there is no partial-write / backpressure case. Either the runtime
+    /// accepts the resolution or it errors.
     FutureWrite,
+    /// `(handle: i32) -> i32` — cancel a pending read on the given
+    /// future. Return convention matches
+    /// [`HostIntrinsic::StreamCancelRead`].
     FutureCancelRead,
+    /// `(handle: i32) -> i32` — cancel a pending write on the given
+    /// future. Return convention matches
+    /// [`HostIntrinsic::StreamCancelRead`].
     FutureCancelWrite,
+    /// `(handle: i32)` — drop the readable end. After dropping, a
+    /// pending or subsequent `future_write` returns [`AbiError::Closed`].
     FutureDropReadable,
+    /// `(handle: i32)` — drop the writable end without resolving.
+    /// Pending `future_read` calls return [`AbiError::Closed`] (no
+    /// value will arrive). Subsequent reads also return
+    /// [`AbiError::Closed`].
     FutureDropWritable,
 }
 
@@ -189,6 +394,214 @@ impl HostIntrinsic {
             CanonicalEntry::FutureDropReadable { .. } => Some(Self::FutureDropReadable),
             CanonicalEntry::FutureDropWritable { .. } => Some(Self::FutureDropWritable),
             _ => None,
+        }
+    }
+}
+
+/// Closed enum of error codes returned by `pulseengine:async` intrinsics.
+///
+/// This is the **canonical, stable** set of negative `i32` values that any
+/// `stream_*` or `future_*` intrinsic may return. Runtimes (kiln,
+/// wasmtime reference impl, …) MUST NOT invent additional negative codes
+/// outside this enum without a matching addition here and a version bump.
+///
+/// # Numeric stability
+///
+/// The discriminants are pinned by [`AbiError::as_i32`] / [`AbiError::from_i32`]
+/// and by the unit tests in `meld-core/tests/p3_async_abi.rs`. Changing
+/// these is a **breaking ABI change** — bump the meld minor version and
+/// document in the next ADR.
+///
+/// All codes are negative `i32` so that on the wire (`i32` return) the
+/// sign bit cleanly distinguishes error from success.
+///
+/// # Code rationale (mapping to WASI 0.3 stream semantics)
+///
+/// * [`AbiError::Closed`] — the *peer end* of the stream/future was
+///   dropped. Distinct from EOF on a stream-read (returned as `0`
+///   bytes), but the runtime MAY conflate the two on `stream_read` if
+///   no buffered bytes remain (see [`HostIntrinsic::StreamRead`] doc).
+/// * [`AbiError::InvalidHandle`] — the handle is not live, not owned by
+///   this caller, or is the wrong end (e.g., calling `stream_read` on a
+///   writable handle).
+/// * [`AbiError::Oom`] — the runtime could not allocate the buffer space
+///   needed to make any progress. NOT used for backpressure (which is
+///   signalled by partial-write / `Pending`).
+/// * [`AbiError::Cancelled`] — a concurrent `*_cancel_read` /
+///   `*_cancel_write` aborted this operation.
+/// * [`AbiError::Pending`] — operation would block. The caller is
+///   expected to register the handle in a waitable-set (see
+///   `[waitable-set-wait]` interaction in [`HostIntrinsic`] doc) and
+///   retry. Runtimes MAY instead return a positive partial count for
+///   `stream_write` / `stream_read`; producers and consumers must
+///   handle both forms.
+/// * [`AbiError::Runtime`] — catch-all for runtime-internal failures
+///   (e.g., trap during a multi-memory copy in the data-plane). Hosts
+///   SHOULD prefer a more specific code; this is a forward-compatible
+///   escape hatch so that runtimes can surface a non-fatal failure
+///   without trapping.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(i32)]
+pub enum AbiError {
+    /// The peer end of the stream/future has been dropped.
+    Closed = -1,
+    /// The provided handle is not live, not owned, or is the wrong end.
+    InvalidHandle = -2,
+    /// The runtime could not allocate buffer space to make any progress.
+    Oom = -3,
+    /// The operation was aborted by a concurrent `*_cancel_*` call.
+    Cancelled = -4,
+    /// The operation would block. Register the handle in a waitable-set
+    /// and retry once `[waitable-set-wait]` reports readiness.
+    Pending = -5,
+    /// Catch-all for runtime-internal failures. Forward-compatible
+    /// escape hatch; specific codes SHOULD be preferred.
+    Runtime = -6,
+}
+
+impl AbiError {
+    /// All defined error codes, in stable order. Useful for exhaustive
+    /// tests and for runtime implementers that want to assert coverage.
+    pub const ALL: [Self; 6] = [
+        Self::Closed,
+        Self::InvalidHandle,
+        Self::Oom,
+        Self::Cancelled,
+        Self::Pending,
+        Self::Runtime,
+    ];
+
+    /// The numeric `i32` value of this error code.
+    ///
+    /// Note: `repr(i32)` allows direct casting (`code as i32`); this
+    /// helper is provided for clarity at call sites.
+    pub const fn as_i32(self) -> i32 {
+        self as i32
+    }
+
+    /// Decode a raw `i32` return value into `Some(AbiError)` if it
+    /// matches a known code, or `None` otherwise.
+    ///
+    /// Non-negative values are always `None` (they are success codes,
+    /// not errors). Negative values that don't match a known
+    /// discriminant are also `None` — callers that receive such a value
+    /// SHOULD treat it as `AbiError::Runtime` per the forward-compat
+    /// rule, but this decoder does not synthesise that mapping.
+    pub const fn from_i32(v: i32) -> Option<Self> {
+        match v {
+            -1 => Some(Self::Closed),
+            -2 => Some(Self::InvalidHandle),
+            -3 => Some(Self::Oom),
+            -4 => Some(Self::Cancelled),
+            -5 => Some(Self::Pending),
+            -6 => Some(Self::Runtime),
+            _ => None,
+        }
+    }
+}
+
+/// Decoded return value of [`HostIntrinsic::StreamWrite`].
+///
+/// See the variant docs on [`HostIntrinsic::StreamWrite`] for the full
+/// partial-write / backpressure contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamWriteResult {
+    /// All `requested` bytes were accepted.
+    Complete { written: u32 },
+    /// `written < requested`. The producer is the retry authority; meld
+    /// and the runtime do NOT queue the un-accepted tail. `written` may
+    /// be `0`, which is still backpressure (not EOF, not error).
+    Partial { written: u32, requested: u32 },
+    /// The runtime returned an error code.
+    Error(AbiError),
+    /// The runtime returned an unrecognised negative code. Callers
+    /// SHOULD treat this as `AbiError::Runtime`. Surfacing the raw value
+    /// helps debugging and test assertions.
+    Unknown(i32),
+}
+
+impl StreamWriteResult {
+    /// Decode the raw `i32` return value of `stream_write` against the
+    /// `requested` byte count the producer passed in.
+    pub const fn decode(ret: i32, requested: u32) -> Self {
+        if ret < 0 {
+            match AbiError::from_i32(ret) {
+                Some(e) => Self::Error(e),
+                None => Self::Unknown(ret),
+            }
+        } else {
+            let written = ret as u32;
+            if written >= requested {
+                Self::Complete { written }
+            } else {
+                Self::Partial { written, requested }
+            }
+        }
+    }
+}
+
+/// Decoded return value of [`HostIntrinsic::StreamRead`].
+///
+/// See [`HostIntrinsic::StreamRead`] for the full EOF-vs-pending
+/// distinguishability contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamReadResult {
+    /// `n > 0` bytes were copied into the caller's buffer. `n` may be
+    /// less than the requested length; the stream is **not** at EOF.
+    Bytes { read: u32 },
+    /// `0` — EOF. The writable end has been dropped AND no buffered
+    /// bytes remain. EOF is sticky.
+    Eof,
+    /// The runtime returned a known error code (typically
+    /// [`AbiError::Pending`] for "no bytes available right now").
+    Error(AbiError),
+    /// The runtime returned an unrecognised negative code.
+    Unknown(i32),
+}
+
+impl StreamReadResult {
+    /// Decode the raw `i32` return value of `stream_read`.
+    pub const fn decode(ret: i32) -> Self {
+        if ret > 0 {
+            Self::Bytes { read: ret as u32 }
+        } else if ret == 0 {
+            Self::Eof
+        } else {
+            match AbiError::from_i32(ret) {
+                Some(e) => Self::Error(e),
+                None => Self::Unknown(ret),
+            }
+        }
+    }
+}
+
+/// Decoded return value of [`HostIntrinsic::FutureRead`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FutureReadResult {
+    /// `1` — the future is resolved; `T`'s canonical layout has been
+    /// written to the caller's buffer.
+    Resolved,
+    /// `0` — the future is not yet resolved AND the write end is still
+    /// alive. Register in a waitable-set and retry.
+    Pending,
+    /// The runtime returned a known error code.
+    Error(AbiError),
+    /// The runtime returned an unrecognised negative code.
+    Unknown(i32),
+}
+
+impl FutureReadResult {
+    /// Decode the raw `i32` return value of `future_read`.
+    pub const fn decode(ret: i32) -> Self {
+        match ret {
+            1 => Self::Resolved,
+            0 => Self::Pending,
+            n if n < 0 => match AbiError::from_i32(n) {
+                Some(e) => Self::Error(e),
+                None => Self::Unknown(n),
+            },
+            // Positive non-1 values are reserved; treat as Unknown.
+            n => Self::Unknown(n),
         }
     }
 }
