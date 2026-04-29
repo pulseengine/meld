@@ -111,6 +111,56 @@ loss-scenarios:
     status: approved
     priority: high
 
+  - id: LS-P-5
+    title: Truncated component-section input panics parser slice
+    uca: UCA-P-3
+    hazards: [H-1]
+    type: inadequate-control-algorithm
+    scenario: >
+      A truncated/adversarial component binary contains a
+      `Payload::ModuleSection` (or similarly a depth-0
+      Component{Import,Type,Alias}Section) whose declared section length
+      extends past the end of the input buffer. `wasmparser` reports the
+      `unchecked_range` (or `reader.range()`) verbatim — the name is
+      explicit that no bounds check has been performed. The parser in
+      `meld-core/src/parser.rs` then sliced
+      `_full_bytes[range.start..range.end]` directly, producing a Rust
+      slice-index panic such as "range end index 17 out of range for
+      slice of length 15" [UCA-P-3]. The whole `meld fuse` process
+      aborts on adversarial input, denying service and surfacing as a
+      hard panic rather than a clean diagnostic [H-1]. cargo-fuzz's
+      `fuzz_parse_component` smoke target found this within seconds of
+      its first 60-second run (PR #114). Fix for issue #118: a
+      `checked_section_slice(full, &range, "<section>")` helper
+      validates `range.start <= range.end <= full.len()` and returns
+      `Error::ParseError("<section> range out of bounds …")` otherwise,
+      applied at the four affected sites
+      (`Payload::ModuleSection.unchecked_range` plus the depth-0
+      capture sites for ComponentImport, ComponentType, and
+      ComponentAlias sections). Failing fast preserves the malformed-
+      input semantics without silently truncating a caller-controlled
+      length, which `min`-clamping would do. Regression test
+      `meld-core::parser::tests::test_parser_rejects_truncated_module_section_issue_118`
+      asserts both the validating and non-validating parsers return
+      `Err` rather than panic. The libFuzzer reproducer is committed at
+      `fuzz/corpus/fuzz_parse_component/crash-58e2560292606f3a49bde7edf9b939509a56cb32`.
+    causal-factors:
+      - >-
+        Direct slice indexing of a wasmparser-reported byte range
+        without first validating it against the input length
+      - >-
+        `unchecked_range` field name signals the contract but the
+        previous code did not honor it
+      - >-
+        No fuzz target for the parser entry point until PR #114; the
+        bug had been latent
+    process-model-flaw: >
+      Parser assumed wasmparser would only yield in-bounds ranges, but
+      `unchecked_range` is by spec post-bounds-check responsibility of
+      the caller.
+    status: approved
+    priority: high
+
   # ==========================================================================
   # Resolver scenarios
   # ==========================================================================
