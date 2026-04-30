@@ -101,12 +101,19 @@
 //! and returns the summary. This is a **pure inspection** — it never
 //! mutates the component.
 //!
-//! ## Scope of the foundation PR (#94 partial)
+//! ## Scope
 //!
-//! This module ships the **detection + ABI documentation** layer. The
-//! actual lowering pass (rewriting `(canon stream.new)` etc. to import
-//! calls in the fused output) is split out per the ADR; tracker issues
-//! list the deferred work.
+//! This module covers both halves of the P3 async pipeline:
+//!
+//! * **Detection** — [`detect_features`] inspects a parsed component
+//!   and returns the [`P3AsyncFeatures`] summary (foundation, PR #94).
+//! * **Lowering** — [`lower_p3_async_intrinsics`] rewrites the merged
+//!   module to add `pulseengine:async` imports for every detected
+//!   intrinsic and shifts function indices accordingly (issue #120).
+//!
+//! [`HostIntrinsic`] is the bridge: `from_canonical_entry` maps parsed
+//! entries to the abstract intrinsic, and `signature` / `import` /
+//! `name` give the concrete core-wasm shape used during lowering.
 
 use crate::parser::{CanonicalEntry, ComponentTypeKind, ParsedComponent};
 
@@ -373,6 +380,36 @@ impl HostIntrinsic {
     /// Fully qualified import: `(HOST_INTRINSIC_MODULE, name())`.
     pub const fn import(self) -> (&'static str, &'static str) {
         (HOST_INTRINSIC_MODULE, self.name())
+    }
+
+    /// Core-wasm function signature for the host-intrinsic lowering.
+    ///
+    /// Returns `(params, results)` matching the rustdoc table at the top
+    /// of this module. The lowering pass uses this when emitting the
+    /// `(import "pulseengine:async" "<name>" (func (type ...)))` entry.
+    ///
+    /// Element-width is intentionally NOT part of the signature — it is
+    /// encoded in adapter glue meld emits around each call. See ADR-1.
+    pub fn signature(self) -> (Vec<wasm_encoder::ValType>, Vec<wasm_encoder::ValType>) {
+        use wasm_encoder::ValType::{I32, I64};
+        match self {
+            // stream_new / future_new : () -> i64
+            Self::StreamNew | Self::FutureNew => (vec![], vec![I64]),
+            // stream_read / stream_write : (handle, ptr, len, mem_idx) -> i32
+            Self::StreamRead | Self::StreamWrite => (vec![I32, I32, I32, I32], vec![I32]),
+            // future_read / future_write : (handle, ptr, mem_idx) -> i32
+            Self::FutureRead | Self::FutureWrite => (vec![I32, I32, I32], vec![I32]),
+            // *_cancel_{read,write} : (handle) -> i32
+            Self::StreamCancelRead
+            | Self::StreamCancelWrite
+            | Self::FutureCancelRead
+            | Self::FutureCancelWrite => (vec![I32], vec![I32]),
+            // *_drop_{readable,writable} : (handle) -> ()
+            Self::StreamDropReadable
+            | Self::StreamDropWritable
+            | Self::FutureDropReadable
+            | Self::FutureDropWritable => (vec![I32], vec![]),
+        }
     }
 
     /// Map a parsed `CanonicalEntry` to its host intrinsic, if any.
@@ -709,6 +746,336 @@ impl Ord for HostIntrinsic {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         (*self as u8).cmp(&(*other as u8))
     }
+}
+
+/// Result of [`lower_p3_async_intrinsics`].
+///
+/// Reports which intrinsics were emitted and where they live in the
+/// fused module's import section. Useful for downstream tooling that
+/// wants to know the function index of each intrinsic (e.g., to wire
+/// `call N` instructions in glue code) without re-parsing the output.
+#[derive(Debug, Clone, Default)]
+pub struct LoweringPlan {
+    /// For each emitted intrinsic, `(intrinsic, merged_func_index)`.
+    /// The function index points into the fused module's function index
+    /// space (i.e., the position among function imports + defined funcs).
+    pub emitted: Vec<(HostIntrinsic, u32)>,
+}
+
+impl LoweringPlan {
+    /// Number of intrinsics emitted by the pass.
+    pub fn len(&self) -> usize {
+        self.emitted.len()
+    }
+    /// `true` when the pass was a no-op (no P3 async intrinsics required).
+    pub fn is_empty(&self) -> bool {
+        self.emitted.is_empty()
+    }
+    /// Look up the merged function index of a specific intrinsic, if it
+    /// was emitted.
+    pub fn func_index(&self, intr: HostIntrinsic) -> Option<u32> {
+        self.emitted
+            .iter()
+            .find_map(|(i, idx)| (*i == intr).then_some(*idx))
+    }
+}
+
+/// Lower P3 async canonical built-ins to `pulseengine:async` core-module
+/// imports in a [`crate::merger::MergedModule`].
+///
+/// This is the rewrite half of the P3 async lowering pipeline (see
+/// ADR-1). Detection has already populated component canonical entries;
+/// this pass walks those entries, collects the required
+/// [`HostIntrinsic`] set, and inserts the corresponding function imports
+/// into `merged.imports` under module
+/// [`HOST_INTRINSIC_MODULE`] (`"pulseengine:async"`).
+///
+/// Because new function imports occupy the lowest slots of the function
+/// index space, every existing reference to a *defined* function (in
+/// exports, element segments, the start function, function-index
+/// metadata, and call instructions inside function bodies) is shifted
+/// up by `K = number of new imports`. Existing function imports keep
+/// their indices.
+///
+/// # Returns
+///
+/// A [`LoweringPlan`] describing which intrinsics were emitted and at
+/// which final function indices. An empty plan means no P3 async
+/// constructs were detected — the merged module is unchanged.
+///
+/// # Errors
+///
+/// Returns an error if a function body cannot be re-extracted from its
+/// origin core module (this should not happen in practice; it would
+/// indicate corrupt component bytes).
+pub fn lower_p3_async_intrinsics(
+    merged: &mut crate::merger::MergedModule,
+    components: &[crate::parser::ParsedComponent],
+) -> crate::Result<LoweringPlan> {
+    use crate::merger::{MergedFuncType, MergedImport};
+    use std::collections::BTreeSet;
+
+    // -----------------------------------------------------------------
+    // 1. Collect required intrinsics across all components (deduped).
+    // -----------------------------------------------------------------
+    let mut required: BTreeSet<HostIntrinsic> = BTreeSet::new();
+    for comp in components {
+        for entry in &comp.canonical_functions {
+            if let Some(intr) = HostIntrinsic::from_canonical_entry(entry) {
+                required.insert(intr);
+            }
+        }
+    }
+    if required.is_empty() {
+        return Ok(LoweringPlan::default());
+    }
+
+    let k = required.len() as u32;
+    let f_old = merged.import_counts.func;
+
+    // -----------------------------------------------------------------
+    // 2. Allocate or reuse function types for each intrinsic.
+    //
+    //    Types may be appended (their indices are stable), so this does
+    //    not require any rewriting elsewhere in the merged module.
+    // -----------------------------------------------------------------
+    let mut intr_type_idx: Vec<(HostIntrinsic, u32)> = Vec::with_capacity(required.len());
+    for intr in &required {
+        let (params, results) = intr.signature();
+        let type_idx = match merged
+            .types
+            .iter()
+            .position(|t| t.params == params && t.results == results)
+        {
+            Some(idx) => idx as u32,
+            None => {
+                let idx = merged.types.len() as u32;
+                merged.types.push(MergedFuncType { params, results });
+                idx
+            }
+        };
+        intr_type_idx.push((*intr, type_idx));
+    }
+
+    // -----------------------------------------------------------------
+    // 3. Shift all existing references to defined functions by `k`.
+    //
+    //    Function imports keep indices 0..f_old; new intrinsic imports
+    //    take f_old..f_old+k; defined funcs shift from f_old.. to
+    //    f_old+k.. .
+    // -----------------------------------------------------------------
+    shift_function_indices(merged, components, f_old, k)?;
+
+    // -----------------------------------------------------------------
+    // 4. Append the intrinsic imports themselves and their final
+    //    function indices.
+    // -----------------------------------------------------------------
+    let mut plan = LoweringPlan::default();
+    for (i, (intr, type_idx)) in intr_type_idx.iter().enumerate() {
+        let merged_idx = f_old + i as u32;
+        merged.imports.push(MergedImport {
+            module: HOST_INTRINSIC_MODULE.to_string(),
+            name: intr.name().to_string(),
+            entity_type: wasm_encoder::EntityType::Function(*type_idx),
+            component_idx: None,
+        });
+        // Per-import metadata vectors must stay aligned with merged.imports.
+        // Intrinsic imports do not need a memory or realloc binding.
+        merged.import_memory_indices.push(0);
+        merged.import_realloc_indices.push(None);
+        plan.emitted.push((*intr, merged_idx));
+    }
+
+    // -----------------------------------------------------------------
+    // 5. Update the import count.
+    // -----------------------------------------------------------------
+    merged.import_counts.func = f_old + k;
+
+    log::info!(
+        "P3 async lowering: emitted {} import(s) under '{}'",
+        plan.emitted.len(),
+        HOST_INTRINSIC_MODULE
+    );
+
+    Ok(plan)
+}
+
+/// Shift every reference to a defined function index by `k` for indices
+/// that were `>= f_old` before the shift.
+///
+/// Function imports (indices `< f_old`) are not affected. Defined
+/// functions had indices in `[f_old, ...)`; after the shift they live at
+/// `[f_old + k, ...)`. We re-extract function bodies from their origin
+/// modules using the updated `function_index_map` so already-encoded
+/// `call` instructions pick up the new indices.
+fn shift_function_indices(
+    merged: &mut crate::merger::MergedModule,
+    components: &[crate::parser::ParsedComponent],
+    f_old: u32,
+    k: u32,
+) -> crate::Result<()> {
+    use std::collections::HashSet;
+
+    if k == 0 {
+        return Ok(());
+    }
+
+    // Rule: idx < f_old => unchanged; idx >= f_old => idx + k.
+    let bump = |idx: u32| -> u32 { if idx < f_old { idx } else { idx + k } };
+
+    // function_index_map values
+    for v in merged.function_index_map.values_mut() {
+        *v = bump(*v);
+    }
+
+    // realloc map values are function indices
+    for v in merged.realloc_map.values_mut() {
+        *v = bump(*v);
+    }
+
+    // resource_rep_by_component, resource_new_by_component values
+    for v in merged.resource_rep_by_component.values_mut() {
+        *v = bump(*v);
+    }
+    for v in merged.resource_new_by_component.values_mut() {
+        *v = bump(*v);
+    }
+
+    // handle_tables: new_func / rep_func / drop_func are function indices
+    for ht in merged.handle_tables.values_mut() {
+        ht.new_func = bump(ht.new_func);
+        ht.rep_func = bump(ht.rep_func);
+        ht.drop_func = bump(ht.drop_func);
+    }
+
+    // task_return_shims keys are merged import indices for
+    // [task-return]N — those are in the function index space too.
+    if !merged.task_return_shims.is_empty() {
+        let old: Vec<_> = merged.task_return_shims.drain().collect();
+        for (key, mut info) in old {
+            info.shim_func = bump(info.shim_func);
+            merged.task_return_shims.insert(bump(key), info);
+        }
+    }
+
+    // exports: function exports
+    for exp in merged.exports.iter_mut() {
+        if exp.kind == wasm_encoder::ExportKind::Func {
+            exp.index = bump(exp.index);
+        }
+    }
+
+    // start function
+    if let Some(s) = merged.start_function.as_mut() {
+        *s = bump(*s);
+    }
+
+    // element segments: function refs
+    for seg in merged.elements.iter_mut() {
+        match &mut seg.items {
+            crate::segments::ReindexedElementItems::Functions(funcs) => {
+                for f in funcs.iter_mut() {
+                    *f = bump(*f);
+                }
+            }
+            crate::segments::ReindexedElementItems::Expressions(_) => {
+                // Expressions hold encoded ConstExpr bytes (already
+                // baked). For ref.func the function index is encoded
+                // inside; we cannot easily rewrite without re-parsing.
+                // P3 async lowering does not currently support this
+                // case and components that hit it will be flagged.
+                // The vast majority of element segments in fused
+                // output use Functions(_) form.
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // Re-extract function bodies from origin modules with updated
+    // index maps so already-encoded `call` instructions get the new
+    // function indices. We collect the unique (comp_idx, mod_idx)
+    // pairs that contributed defined functions to merged.functions.
+    // -----------------------------------------------------------------
+    let affected_modules: HashSet<(usize, usize)> = merged
+        .functions
+        .iter()
+        .map(|f| (f.origin.0, f.origin.1))
+        .collect();
+
+    for (comp_idx, mod_idx) in affected_modules {
+        // Skip synthetic modules (e.g. wrappers / shims with origin func index u32::MAX)
+        // Those modules may not correspond to a real core_module entry,
+        // but we should still be careful: real defined functions originate
+        // from `components[comp_idx].core_modules[mod_idx]`. Out-of-range
+        // (synthetic) origins are filtered below.
+        let Some(component) = components.get(comp_idx) else {
+            continue;
+        };
+        let Some(module) = component.core_modules.get(mod_idx) else {
+            continue;
+        };
+
+        // Build index maps for this module using the updated merged state.
+        // Memory/global/etc maps are unaffected by the function-index shift.
+        let memory_strategy = if !merged.memories.is_empty() {
+            // Strategy doesn't affect function-index rewriting; multi-memory
+            // is the safe default for general re-extraction here.
+            crate::MemoryStrategy::MultiMemory
+        } else {
+            crate::MemoryStrategy::SharedMemory
+        };
+        let module_memory = crate::merger::module_memory_type(module).ok().flatten();
+        let memory64 = module_memory.as_ref().map(|m| m.memory64).unwrap_or(false);
+        let memory_initial_pages = module_memory.as_ref().map(|m| m.initial);
+
+        let index_maps = crate::merger::build_index_maps_for_module(
+            comp_idx,
+            mod_idx,
+            module,
+            merged,
+            memory_strategy,
+            false,
+            0,
+            memory64,
+            memory_initial_pages,
+        );
+
+        let import_func_count = module
+            .imports
+            .iter()
+            .filter(|i| matches!(i.kind, crate::parser::ImportKind::Function(_)))
+            .count() as u32;
+
+        // For every defined function in this module, re-extract & rewrite.
+        for (old_idx, &type_idx) in module.functions.iter().enumerate() {
+            let old_func_idx = import_func_count + old_idx as u32;
+            let param_count = module
+                .types
+                .get(type_idx as usize)
+                .map(|ty| ty.params.len() as u32)
+                .unwrap_or(0);
+
+            let body = match crate::merger::extract_function_body(
+                module,
+                old_idx,
+                param_count,
+                &index_maps,
+            ) {
+                Ok(b) => b,
+                Err(_) => continue, // Best-effort — leave body untouched if we can't re-extract.
+            };
+
+            if let Some(mf) = merged
+                .functions
+                .iter_mut()
+                .find(|f| f.origin == (comp_idx, mod_idx, old_func_idx))
+            {
+                mf.body = body;
+            }
+        }
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]

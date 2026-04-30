@@ -77,18 +77,41 @@ In scope:
      false positives on non-async components.
    * Existing 73-test `wit_bindgen_runtime` suite stays green.
 
+### Lowering pass — landed in issue #120
+
+The rewrite half of the pipeline is now implemented as
+`p3_async::lower_p3_async_intrinsics`. After `Merger::merge` produces a
+`MergedModule`, the pass:
+
+1. Walks `canonical_functions` across all components to collect the
+   `BTreeSet<HostIntrinsic>` of intrinsics actually used.
+2. Allocates (or reuses) one core function type per intrinsic per its
+   declared `signature()` (`stream_new: () -> i64`, `stream_read:
+   (i32,i32,i32,i32) -> i32`, …).
+3. Inserts one function import per intrinsic into `merged.imports`
+   under module `pulseengine:async`.
+4. Shifts every reference to a *defined* function (in
+   `function_index_map`, `realloc_map`, `resource_*_by_component`,
+   `handle_tables.{new,rep,drop}_func`, `task_return_shims`, function
+   exports, the start function, element-segment function refs) up by
+   `K = number of new imports`. Existing function imports keep their
+   indices.
+5. Re-extracts function bodies from their origin core modules with the
+   updated `function_index_map` so already-encoded `call N`
+   instructions pick up the new defined-function indices.
+6. Returns a `LoweringPlan` reporting `(intrinsic, merged_func_index)`
+   for each emitted import — useful for downstream tooling that wants
+   to wire `call N` instructions to specific intrinsics without
+   re-parsing the output.
+
+Coverage: `stream<T>` and `future<T>` symmetric (see
+`p3_async_lowering::stream_u8_lowering_emits_pulseengine_async_imports`
+and `…::future_s32_lowering_emits_pulseengine_async_imports`). The
+73-test `wit_bindgen_runtime` suite stays green because the pass is a
+no-op when `required_intrinsics` is empty.
+
 Out of scope (deferred to follow-up sub-issues under #94):
 
-- **Lowering pass (rewrite phase)** — actually rewriting
-  `(canon stream.new $T)` → `(import "pulseengine:async" "stream_new")`
-  in the fused core module. The detection layer this PR ships gives the
-  lowering pass everything it needs (entry → intrinsic mapping, import
-  module name) but the rewrite itself in `component_wrap.rs` /
-  `merger.rs` is a larger change and is split out.
-- **`future<T>` end-to-end** — the ABI is defined and the
-  `HostIntrinsic::Future*` enum variants exist, but no integration
-  fixture exercises them. The deferred lowering pass should land
-  `future<T>` and `stream<T>` together for symmetry.
 - **Async export callback variants** — async lift with `(callback ...)`
   is *detected* (`P3AsyncFeatures::uses_callback_lift`) but the
   callback-trampoline emission is partially implemented in
