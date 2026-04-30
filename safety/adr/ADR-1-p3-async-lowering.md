@@ -167,6 +167,8 @@ since they share only this contract.
 * GitHub issue #94 — original proposal.
 * GitHub issue #121 — error/backpressure conventions follow-up
   (resolved by ADR-2).
+* GitHub issue #122 — async-export callback trampoline alignment
+  (sub-issue of #94).
 * RFC #46 — meld toolchain architecture.
 * WASM Component Model P3 spec —
   https://github.com/WebAssembly/component-model
@@ -174,3 +176,63 @@ since they share only this contract.
 * `meld-core/src/p3_async.rs` — canonical ABI documentation.
 * [ADR-2](ADR-2-p3-async-error-conventions.md) — error/backpressure
   conventions for the same `pulseengine:async` ABI.
+
+---
+
+## Addendum (2026-04-26) — issue #122
+
+The "Out of scope" item *Async export callback variants* is partially
+addressed by this addendum: the **trampoline shape and event-code
+contract** are now pinned, even though the lowering pass that rewrites
+`(canon stream.*)` to `pulseengine:async/*` imports remains deferred.
+
+### What this addendum pins
+
+1. **Event-type codes** (`event::NONE`, `SUBTASK`, `STREAM_READ`,
+   `STREAM_WRITE`, `FUTURE_READ`, `FUTURE_WRITE`, `CANCELLED`) are
+   exposed as `pub const i32` in `meld_core::p3_async::event`. Numeric
+   values match the Component Model "Async Explainer" `EventCode` enum
+   and are now part of the cross-tool ABI: any runtime implementing
+   `pulseengine:async/stream_read` etc. **must** enqueue events with
+   these exact codes against the waitable set the trampoline polls.
+
+2. **Callback return codes** (`callback::EXIT`, `YIELD`, `WAIT`, `POLL`)
+   plus the unpack scheme (`CODE_MASK = 0xF`, `PAYLOAD_SHIFT = 4`) are
+   exposed in `meld_core::p3_async::callback`. The trampoline reads
+   these directly; the constants are referenced from
+   `adapter/fact.rs::generate_async_callback_adapter` in place of the
+   prior magic numbers.
+
+3. **Trampoline ↔ runtime interaction** (no host upcall) is documented
+   in `p3_async.rs` §"Trampoline ↔ `pulseengine:async/stream_read`
+   interaction": the runtime *enqueues* events; the trampoline *polls*
+   them via `[waitable-set-poll]`. This matches the Component Model's
+   no-host-reentrancy rule and is what lets meld emit a deterministic
+   core-wasm-only trampoline.
+
+4. **Single canonical trampoline shape**. The existing
+   `generate_async_callback_adapter` already emits one shape regardless
+   of which P3 built-ins the guest happens to use, because it speaks to
+   the callee through `[async-lift]` / `[callback]` and to the host
+   through `[waitable-set-poll]` only. This addendum adds tests
+   (`async_callback_trampoline_shape_canonical`,
+   `async_callback_event_codes_pinned`,
+   `async_callback_return_codes_pinned`) that pin the shape so a future
+   refactor can't accidentally diverge it.
+
+### What remains deferred
+
+* **Lowering pass for `stream<T>` / `future<T>`** (rewriting
+  `(canon stream.new $T)` → `(import "pulseengine:async" "stream_new")`)
+  — still tracked under #94. The trampoline is now wired against the
+  ABI; the data-plane rewrite is what's left to land for full e2e P3
+  async on a real runtime.
+* **Runtime stub for the e2e fixture**. Issue #122's acceptance allows
+  a fuse-only structural test (which this addendum ships); a kiln /
+  wasmtime stub for the `stream<u8>`-in / `stream<u8>`-out scenario is
+  cross-repo work and stays deferred.
+* **`POLL` (callback code 3) dispatch** is documented but currently
+  walks the same path as `WAIT` in the trampoline — non-blocking vs
+  blocking is the runtime's responsibility against `[waitable-set-poll]`
+  semantics. If the spec ever splits poll into a distinct host
+  intrinsic, the trampoline will need a third arm.
