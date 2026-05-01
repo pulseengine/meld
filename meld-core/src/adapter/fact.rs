@@ -4063,14 +4063,23 @@ impl FactStyleGenerator {
         body.instruction(&Instruction::I32Eqz);
         body.instruction(&Instruction::BrIf(1)); // break to $exit block
 
-        // if code == WAIT (2): call waitable-set-poll(payload, event_ptr)
+        // if code == WAIT (2) OR code == POLL (3): call
+        // waitable-set-poll(payload, event_ptr).
         // Use scratch space at address 0 in callee memory for the 3xi32 event tuple
         // (This is safe because the callee isn't running — we're driving it).
-        // Note: POLL (3) goes through the same path; the runtime treats
-        // poll as a non-blocking variant of wait against the same call.
+        // POLL is the non-blocking variant of WAIT against the same call;
+        // both must dispatch to the host. LS-A-9: a previous version
+        // matched only WAIT, silently treating POLL as YIELD which sent
+        // (EVENT_NONE, 0, 0) to [callback] and dropped the event the host
+        // had ready, producing semantic drift between fused and composed
+        // modules.
         body.instruction(&Instruction::LocalGet(l_code));
         body.instruction(&Instruction::I32Const(crate::p3_async::callback::WAIT));
         body.instruction(&Instruction::I32Eq);
+        body.instruction(&Instruction::LocalGet(l_code));
+        body.instruction(&Instruction::I32Const(crate::p3_async::callback::POLL));
+        body.instruction(&Instruction::I32Eq);
+        body.instruction(&Instruction::I32Or);
         body.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
         {
             // waitable-set-poll(set_handle, event_ptr) → i32

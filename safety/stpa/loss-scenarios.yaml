@@ -647,6 +647,43 @@ loss-scenarios:
     status: approved
     priority: high
 
+  - id: LS-A-9
+    title: Async callback POLL falls through to YIELD path
+    uca: UCA-F-3
+    hazards: [H-3]
+    type: inadequate-control-algorithm
+    scenario: >
+      `FactStyleGenerator::generate_async_callback_adapter` in
+      meld-core/src/adapter/fact.rs (~lines 4071-4119) dispatched
+      `[waitable-set-poll]` only when the guest's callback return code
+      equalled `callback::WAIT (2)`. The spec rustdoc on
+      `meld_core::p3_async::callback::POLL (3)` requires POLL to also
+      dispatch the host poll (POLL is the non-blocking variant of WAIT
+      against the same call). The pre-fix `if code == WAIT` branch
+      treated POLL as falling through to the else arm, which sent
+      `(EVENT_NONE, 0, 0)` to `[callback]` and dropped any event the
+      host had ready. Effect: a guest legitimately returning POLL never
+      sees the event it is polling for, even when the host has it
+      ready — the fused module diverges from the composed module on
+      P3 async export call paths [UCA-F-3]. Hazards: H-3
+      (semantic-preservation violation). Detected by Kani harness
+      `kani_trampoline_dispatches_poll_like_wait` and PoC
+      `async_callback_trampoline_dispatches_poll`. Fix: branch on
+      `code == WAIT || code == POLL` (an `I32Eq + I32Eq + I32Or` pair
+      replaces the single `I32Eq`). Existing
+      `async_callback_return_codes_pinned` /
+      `async_callback_trampoline_shape_canonical` tests pin the
+      *constants* / *bit layout* but not the *dispatch decision*, so
+      they did not catch this.
+    causal-factors:
+      - Single-arm `I32Eq` against `callback::WAIT` instead of
+        `WAIT || POLL`
+      - Comment at L4069-4070 claimed POLL goes through the same path,
+        but the code did not implement it
+      - Pin tests covered constants and bit layout, not dispatch
+    status: approved
+    priority: high
+
   # ==========================================================================
   # Merger scenario (discovered during gap analysis)
   # ==========================================================================
