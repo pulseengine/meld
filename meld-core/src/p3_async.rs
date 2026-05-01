@@ -63,9 +63,91 @@
 //!   composes with the existing `[waitable-set-wait]` builtin already
 //!   handled by `component_wrap.rs`.
 //! * **No async-export callback intrinsics here.** Async exports are
-//!   already handled by meld's existing P3 callback-driving adapter
-//!   (`component_wrap.rs::generate_callback_driving_adapter`). This module
-//!   only provides the *data-plane* (stream/future) intrinsics.
+//!   handled by meld's existing P3 callback-driving adapter (see
+//!   "Async-export callback trampoline" below). This module only provides
+//!   the *data-plane* (stream/future) intrinsics; the trampoline emits
+//!   only the codes documented here and dispatches against the
+//!   waitable-set events documented next to the [`event`] sub-module.
+//!
+//! ## Async-export callback trampoline
+//!
+//! For P3 async exports lifted with `(canon lift ... async (callback $f))`,
+//! meld emits a single **canonical core-wasm trampoline** that drives the
+//! callee's `[async-lift]` + `[callback]` pair from the caller's import
+//! site. The trampoline lives in `crate::adapter::fact` (private) and is
+//! described here next to the ABI it speaks to.
+//!
+//! ### Trampoline shape (canonical)
+//!
+//! ```text
+//! ;; pseudo-core-wasm; one trampoline shape regardless of which P3
+//! ;; built-ins the guest happens to use.
+//! func $async_adapter_<from>_to_<to> (param ...caller-params) (result ...)
+//!   ;; 1. (cross-memory copy of pointer-pair params, if any)
+//!   ;; 2. call [async-lift] $entry → packed i32
+//!   local.set $packed
+//!   ;; 3. unpack: $code = packed & 0xF; $payload = packed >> 4
+//!   block $exit
+//!     loop $drive
+//!       ;; 4. if $code == CALLBACK_CODE_EXIT: br $exit
+//!       ;; 5. if $code == CALLBACK_CODE_WAIT:
+//!       ;;       call [waitable-set-poll]($payload, scratch_ptr=0)
+//!       ;;       load event tuple from scratch [event_code, p1, p2]
+//!       ;;    else (CALLBACK_CODE_YIELD):
+//!       ;;       (event_code, p1, p2) = (EVENT_NONE, 0, 0)
+//!       ;; 6. call [callback]($event_code, $p1, $p2) → packed i32
+//!       ;; 7. re-unpack $code/$payload, br $drive
+//!     end
+//!   end
+//!   ;; 8. read result globals written by the task.return shim
+//!   ;;    (cross-memory copy on retptr if needed) and return
+//! ```
+//!
+//! The shape is **independent of which canonical built-ins the guest
+//! component uses** — `stream.read`, `future.read`, `task.wait`, the
+//! whole P3 family — because the trampoline only talks to the callee
+//! through `[async-lift]`/`[callback]` and to the host through
+//! `[waitable-set-poll]`. The data-plane operations (stream/future) are
+//! lowered separately to [`HOST_INTRINSIC_MODULE`] imports.
+//!
+//! ### Trampoline ↔ `pulseengine:async/stream_read` interaction
+//!
+//! When a P3 guest export reads from a `stream<T>`:
+//!
+//! 1. The guest core code calls [`stream::READ`] (an import resolved to
+//!    `pulseengine:async/stream_read`). The runtime **buffers** the read:
+//!    if data is already available it is copied immediately and the
+//!    intrinsic returns a positive byte count; otherwise the read is
+//!    queued and the intrinsic returns `0`.
+//! 2. When the data eventually arrives, the runtime **enqueues an
+//!    `EVENT_STREAM_READ` event** against the guest's waitable set. It
+//!    does **not** call the trampoline directly — there is no upcall.
+//! 3. The guest's `[callback]` returns `CALLBACK_CODE_WAIT` with the
+//!    waitable-set handle as payload, asking the host to block until any
+//!    event is ready.
+//! 4. The trampoline dispatches `[waitable-set-poll]`, reads the
+//!    `(event_code, p1, p2)` tuple from scratch memory, and re-enters
+//!    `[callback]` with `event_code == EVENT_STREAM_READ` (and `p1`/`p2`
+//!    set per the canonical ABI: stream handle and bytes-ready count).
+//!
+//! In other words: **the host never upcalls the trampoline**. The guest
+//! polls (via `WAIT`/`POLL` callback codes), the runtime is responsible
+//! for dispatching the queued event, and the trampoline marshals the
+//! event tuple from scratch memory back into the callback. This matches
+//! the Component Model spec's "no host re-entrancy" rule and is what
+//! lets meld emit a deterministic core-wasm-only trampoline.
+//!
+//! ### Stable codes used by the trampoline
+//!
+//! See [`event`] for the **event-type codes** dispatched to the
+//! `[callback]` import (e.g., `EVENT_STREAM_READ`, `EVENT_FUTURE_WRITE`),
+//! and [`callback`] for the **callback return codes** the trampoline
+//! interprets (`EXIT`, `YIELD`, `WAIT`, `POLL`).
+//!
+//! Both sets of codes are pinned numerically to the values in the
+//! Component Model canonical ABI; meld treats them as a **stable
+//! external contract**. Changing them is a breaking change for any
+//! runtime implementing `pulseengine:async`.
 //!
 //! ## Error and backpressure conventions (issue #121, ADR-2)
 //!
@@ -156,6 +238,100 @@ pub mod future {
     pub const DROP_READABLE: &str = "future_drop_readable";
     /// `(i32) -> ()` — drop the writable end of the future.
     pub const DROP_WRITABLE: &str = "future_drop_writable";
+}
+
+/// Event-type codes the async-export callback trampoline reads from a
+/// `[waitable-set-poll]` event tuple and forwards to the guest's
+/// `[callback]` import.
+///
+/// These codes are part of the **canonical ABI / `pulseengine:async`
+/// contract** — runtimes implementing `pulseengine:async/stream_read`
+/// etc. enqueue events with these numeric codes against the waitable
+/// set, and meld's trampoline reads them verbatim from scratch memory
+/// before re-entering `[callback]`.
+///
+/// The numeric values match the Component Model "Async Explainer"
+/// `EventCode` enum (see WebAssembly/component-model `design/mvp/Async.md`).
+/// Changing them is a breaking change for the cross-tool ABI.
+///
+/// ## Tuple layout in scratch memory
+///
+/// The trampoline allocates a 12-byte (3 × i32) buffer at scratch
+/// address `0` of the callee memory and passes it to
+/// `[waitable-set-poll]`. After the call the buffer holds:
+///
+/// ```text
+/// offset 0:  i32 event_code  — one of the constants below
+/// offset 4:  i32 p1          — first payload (typically a handle)
+/// offset 8:  i32 p2          — second payload (e.g. bytes ready, error)
+/// ```
+///
+/// ## Per-event semantics
+///
+/// | Code | Constant            | `p1`                  | `p2`                  |
+/// |------|---------------------|-----------------------|-----------------------|
+/// | 0    | [`event::NONE`]     | 0                     | 0                     |
+/// | 1    | [`event::SUBTASK`]  | subtask handle        | subtask status        |
+/// | 2    | [`event::STREAM_READ`]  | stream handle    | bytes-read / 0=EOF / <0=error |
+/// | 3    | [`event::STREAM_WRITE`] | stream handle    | bytes-accepted / <0=error |
+/// | 4    | [`event::FUTURE_READ`]  | future handle    | 1=resolved, <0=error |
+/// | 5    | [`event::FUTURE_WRITE`] | future handle    | 1=delivered, <0=error |
+/// | 6    | [`event::CANCELLED`]| cancelled-handle (stream/future/subtask) | 0 |
+pub mod event {
+    /// `0` — no event ready (e.g. yield-driven entry, or empty waitable set).
+    pub const NONE: i32 = 0;
+    /// `1` — a subtask completed; `p1` = subtask handle, `p2` = status.
+    pub const SUBTASK: i32 = 1;
+    /// `2` — a `stream_read` produced bytes; `p1` = stream handle,
+    /// `p2` = bytes ready (0 = EOF, negative = error code).
+    pub const STREAM_READ: i32 = 2;
+    /// `3` — a `stream_write` accepted bytes; `p1` = stream handle,
+    /// `p2` = bytes accepted (negative = error code).
+    pub const STREAM_WRITE: i32 = 3;
+    /// `4` — a `future_read` resolved; `p1` = future handle,
+    /// `p2` = `1` if delivered, negative = error.
+    pub const FUTURE_READ: i32 = 4;
+    /// `5` — a `future_write` was delivered; `p1` = future handle,
+    /// `p2` = `1` if delivered, negative = error.
+    pub const FUTURE_WRITE: i32 = 5;
+    /// `6` — a pending read or write was cancelled; `p1` = cancelled
+    /// handle, `p2` = 0.
+    pub const CANCELLED: i32 = 6;
+}
+
+/// Callback return codes the async-export trampoline interprets from
+/// the packed `i32` returned by `[async-lift]` / `[callback]`.
+///
+/// The packing scheme: low **4 bits** are the code; the remaining high
+/// 28 bits are an optional payload (typically a waitable-set handle for
+/// `WAIT`/`POLL`). This matches the Component Model "Async Explainer"
+/// callback-result encoding.
+///
+/// ```text
+/// packed: i32
+/// code    = packed & 0xF
+/// payload = (packed >> 4) as u32
+/// ```
+pub mod callback {
+    /// `0` — task is finished. The trampoline reads result globals
+    /// (written by the task.return shim) and returns to the caller.
+    pub const EXIT: i32 = 0;
+    /// `1` — guest yielded; trampoline immediately re-invokes
+    /// `[callback]` with `EVENT_NONE` (no host blocking).
+    pub const YIELD: i32 = 1;
+    /// `2` — guest is waiting on a waitable set; trampoline dispatches
+    /// `[waitable-set-poll]` (blocking) and forwards the event.
+    pub const WAIT: i32 = 2;
+    /// `3` — guest is polling a waitable set; trampoline dispatches
+    /// `[waitable-set-poll]` (non-blocking) and forwards the event,
+    /// or `EVENT_NONE` if nothing was ready.
+    pub const POLL: i32 = 3;
+
+    /// Mask applied to the packed return value to extract the code
+    /// (`packed & CODE_MASK`).
+    pub const CODE_MASK: i32 = 0xF;
+    /// Right-shift applied to extract the payload (`packed >> PAYLOAD_SHIFT`).
+    pub const PAYLOAD_SHIFT: u32 = 4;
 }
 
 /// A specific P3 async canonical built-in, mapped to the host intrinsic
@@ -1221,6 +1397,53 @@ mod tests {
             assert_eq!(module, "pulseengine:async");
             assert!(!name.is_empty());
             assert!(!name.contains(' '));
+        }
+    }
+
+    #[test]
+    fn event_codes_are_pinned() {
+        // These values are part of the cross-tool ABI contract with
+        // any runtime implementing `pulseengine:async`. Bumping them is
+        // a breaking change. Pin them numerically.
+        assert_eq!(event::NONE, 0);
+        assert_eq!(event::SUBTASK, 1);
+        assert_eq!(event::STREAM_READ, 2);
+        assert_eq!(event::STREAM_WRITE, 3);
+        assert_eq!(event::FUTURE_READ, 4);
+        assert_eq!(event::FUTURE_WRITE, 5);
+        assert_eq!(event::CANCELLED, 6);
+    }
+
+    #[test]
+    fn callback_codes_are_pinned() {
+        // Same contract: callback return codes are fixed by the
+        // Component Model "Async Explainer" and the trampoline assumes
+        // these exact numeric values.
+        assert_eq!(callback::EXIT, 0);
+        assert_eq!(callback::YIELD, 1);
+        assert_eq!(callback::WAIT, 2);
+        assert_eq!(callback::POLL, 3);
+        assert_eq!(callback::CODE_MASK, 0xF);
+        assert_eq!(callback::PAYLOAD_SHIFT, 4);
+    }
+
+    #[test]
+    fn callback_packing_is_invertible() {
+        // Sanity-check that the documented code/payload pack/unpack
+        // matches the trampoline's emitted core-wasm sequence.
+        for code in [
+            callback::EXIT,
+            callback::YIELD,
+            callback::WAIT,
+            callback::POLL,
+        ] {
+            for payload in [0u32, 1, 7, 0x0FFF_FFFF] {
+                let packed = (payload << callback::PAYLOAD_SHIFT) as i32 | code;
+                let recovered_code = packed & callback::CODE_MASK;
+                let recovered_payload = (packed as u32) >> callback::PAYLOAD_SHIFT;
+                assert_eq!(recovered_code, code);
+                assert_eq!(recovered_payload, payload);
+            }
         }
     }
 

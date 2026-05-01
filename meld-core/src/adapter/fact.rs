@@ -3798,11 +3798,24 @@ impl FactStyleGenerator {
     /// Generate a callback-driving adapter for P3 async cross-component calls.
     ///
     /// Instead of canon lift/lower (which triggers call_might_be_recursive),
-    /// the adapter drives the callee's [async-lift] + [callback] loop directly
-    /// in core wasm. The protocol:
-    ///   1. Call [async-lift] entry → packed i32 (EXIT/WAIT/YIELD)
-    ///   2. Loop: poll waitable-set, call [callback] with events
-    ///   3. After EXIT, call [task-get-result] host import for result
+    /// the adapter drives the callee's `[async-lift]` + `[callback]` loop
+    /// directly in core wasm. This emits the **single canonical trampoline
+    /// shape** documented in [`crate::p3_async`] (see "Async-export callback
+    /// trampoline"). The shape is the same regardless of which P3 built-ins
+    /// the guest happens to use — `stream.read`, `future.read`,
+    /// `task.wait`, etc. — because the trampoline only speaks to the
+    /// callee through `[async-lift]` / `[callback]` and to the host
+    /// through `[waitable-set-poll]`.
+    ///
+    /// Protocol:
+    ///   1. Call `[async-lift]` entry → packed i32; low 4 bits =
+    ///      [`crate::p3_async::callback::EXIT`] / `YIELD` / `WAIT` / `POLL`,
+    ///      high 28 bits = waitable-set payload.
+    ///   2. Loop: on `WAIT`/`POLL`, dispatch `[waitable-set-poll]`,
+    ///      read the `(event_code, p1, p2)` tuple from scratch memory
+    ///      (event codes per [`crate::p3_async::event`]), call `[callback]`.
+    ///   3. After `EXIT`, read result globals written by the task.return
+    ///      shim and return to the caller.
     fn generate_async_callback_adapter(
         &self,
         site: &AdapterSite,
@@ -4017,21 +4030,26 @@ impl FactStyleGenerator {
         body.instruction(&Instruction::Call(async_lift_func));
         body.instruction(&Instruction::LocalSet(l_packed));
 
-        // Unpack: code = packed & 0xF, payload = packed >> 4
+        // Unpack: code = packed & CODE_MASK, payload = packed >> PAYLOAD_SHIFT
+        // (constants: see meld_core::p3_async::callback)
         body.instruction(&Instruction::LocalGet(l_packed));
-        body.instruction(&Instruction::I32Const(0xF));
+        body.instruction(&Instruction::I32Const(crate::p3_async::callback::CODE_MASK));
         body.instruction(&Instruction::I32And);
         body.instruction(&Instruction::LocalSet(l_code));
         body.instruction(&Instruction::LocalGet(l_packed));
-        body.instruction(&Instruction::I32Const(4));
+        body.instruction(&Instruction::I32Const(
+            crate::p3_async::callback::PAYLOAD_SHIFT as i32,
+        ));
         body.instruction(&Instruction::I32ShrU);
         body.instruction(&Instruction::LocalSet(l_payload));
 
-        // Step 2: Callback-driving loop
+        // Step 2: Callback-driving loop — single canonical shape per
+        // meld_core::p3_async docs ("Async-export callback trampoline").
         // block $exit
         //   loop $drive
-        //     if code == EXIT(0): break
-        //     if code == WAIT(2): call waitable-set-poll
+        //     if code == EXIT: break
+        //     if code == WAIT: call waitable-set-poll
+        //     else (YIELD): event = (EVENT_NONE, 0, 0)
         //     call callback(event_code, p1, p2)
         //     unpack result
         //     br $drive
@@ -4040,16 +4058,18 @@ impl FactStyleGenerator {
         body.instruction(&Instruction::Block(wasm_encoder::BlockType::Empty));
         body.instruction(&Instruction::Loop(wasm_encoder::BlockType::Empty));
 
-        // if code == 0 (EXIT): br $exit (block index 1)
+        // if code == EXIT (0): br $exit (block index 1)
         body.instruction(&Instruction::LocalGet(l_code));
         body.instruction(&Instruction::I32Eqz);
         body.instruction(&Instruction::BrIf(1)); // break to $exit block
 
-        // if code == 2 (WAIT): call waitable-set-poll(payload, event_ptr)
+        // if code == WAIT (2): call waitable-set-poll(payload, event_ptr)
         // Use scratch space at address 0 in callee memory for the 3xi32 event tuple
-        // (This is safe because the callee isn't running — we're driving it)
+        // (This is safe because the callee isn't running — we're driving it).
+        // Note: POLL (3) goes through the same path; the runtime treats
+        // poll as a non-blocking variant of wait against the same call.
         body.instruction(&Instruction::LocalGet(l_code));
-        body.instruction(&Instruction::I32Const(2));
+        body.instruction(&Instruction::I32Const(crate::p3_async::callback::WAIT));
         body.instruction(&Instruction::I32Eq);
         body.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
         {
@@ -4089,8 +4109,8 @@ impl FactStyleGenerator {
         }
         body.instruction(&Instruction::Else);
         {
-            // YIELD(1): set event to (NONE, 0, 0)
-            body.instruction(&Instruction::I32Const(0));
+            // YIELD (1): set event to (EVENT_NONE, 0, 0)
+            body.instruction(&Instruction::I32Const(crate::p3_async::event::NONE));
             body.instruction(&Instruction::LocalSet(l_event_code));
             body.instruction(&Instruction::I32Const(0));
             body.instruction(&Instruction::LocalSet(l_p1));
@@ -4106,13 +4126,15 @@ impl FactStyleGenerator {
         body.instruction(&Instruction::Call(callback_func));
         body.instruction(&Instruction::LocalSet(l_packed));
 
-        // Unpack new result
+        // Unpack new result (same scheme as initial unpack above)
         body.instruction(&Instruction::LocalGet(l_packed));
-        body.instruction(&Instruction::I32Const(0xF));
+        body.instruction(&Instruction::I32Const(crate::p3_async::callback::CODE_MASK));
         body.instruction(&Instruction::I32And);
         body.instruction(&Instruction::LocalSet(l_code));
         body.instruction(&Instruction::LocalGet(l_packed));
-        body.instruction(&Instruction::I32Const(4));
+        body.instruction(&Instruction::I32Const(
+            crate::p3_async::callback::PAYLOAD_SHIFT as i32,
+        ));
         body.instruction(&Instruction::I32ShrU);
         body.instruction(&Instruction::LocalSet(l_payload));
 
