@@ -15,9 +15,7 @@
 //! deliberately scoped to the foundation layer so that lowering can be
 //! added incrementally without changing the ABI contract or detection API.
 
-use meld_core::p3_async::{
-    HOST_INTRINSIC_MODULE, HostIntrinsic, P3AsyncFeatures, callback, event,
-};
+use meld_core::p3_async::{HOST_INTRINSIC_MODULE, HostIntrinsic, P3AsyncFeatures, callback, event};
 use meld_core::{Fuser, FuserConfig};
 
 /// Helper: collect all imports under module `pulseengine:async` from a
