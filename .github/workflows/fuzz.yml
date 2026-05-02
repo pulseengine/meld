@@ -16,6 +16,10 @@ name: Fuzz Smoke
 # forks, etc.) are interpolated into shell commands. If you add steps
 # that consume `github.event.*` data, route it through `env:` first.
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 on:
   push:
     branches: [main]
