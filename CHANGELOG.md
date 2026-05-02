@@ -2,6 +2,83 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.6.0] — Unreleased
+
+### Added
+
+- **P3 async lowering pass — full data plane** (#120 / #129).
+  Canonical built-ins `(canon stream.{new,read,write,cancel-read,
+  cancel-write,drop-readable,drop-writable})` and the same seven verbs
+  for `future` are now rewritten into core-module imports against the
+  `pulseengine:async` ABI documented in `meld_core::p3_async`. The
+  rewrite reuses every existing function-index reference so already-
+  encoded `call N` instructions pick up the new defined-function
+  positions. End-to-end tests for `stream<u8>` and `future<i32>`
+  symmetric cases pass; the 73-test suite stays green when no P3
+  async features are present (the pass is a no-op).
+- **Closed `AbiError` enum + typed result decoders for `pulseengine:async`**
+  (#121 / #127). Stable numeric error codes (`Closed=-1`,
+  `InvalidHandle=-2`, `Oom=-3`, `Cancelled=-4`, `Pending=-5`,
+  `Runtime=-6`) plus `StreamWriteResult` / `StreamReadResult` /
+  `FutureReadResult` decoders. Per-variant rustdoc on every
+  `HostIntrinsic::Stream*` / `Future*` documents partial-write
+  semantics (producer is retry authority — runtime does NOT queue),
+  EOF vs Pending distinguishability, and the `[waitable-set-wait]`
+  interaction. ADR-2 documents the conventions.
+- **Async-export callback trampoline alignment** (#122 / #128). Stable
+  numeric event-type codes (`event::NONE`, `SUBTASK`, `STREAM_READ`,
+  `STREAM_WRITE`, `FUTURE_READ`, `FUTURE_WRITE`, `CANCELLED`) and
+  callback-return-code constants (`callback::EXIT`, `YIELD`, `WAIT`,
+  `POLL` + `CODE_MASK` / `PAYLOAD_SHIFT`) exposed in
+  `meld_core::p3_async`. ADR-1 addendum pins the canonical trampoline
+  shape (`generate_async_callback_adapter` emits one shape regardless
+  of which P3 built-ins the guest happens to use). Tests
+  `async_callback_trampoline_shape_canonical`,
+  `async_callback_event_codes_pinned`,
+  `async_callback_return_codes_pinned` pin the contract.
+
+### Fixed
+
+- **`callback::POLL` dispatched as YIELD (LS-A-9 / pre-release Mythos
+  finding).** The trampoline's
+  `if code == WAIT { dispatch [waitable-set-poll] } else { send EVENT_NONE }`
+  silently treated POLL (3) as YIELD (1), dropping any event the host
+  had ready. Discovered by the v0.6 pre-release Mythos pass on
+  `adapter/fact.rs`. Fix: branch on `code == WAIT || code == POLL`.
+  Approved as **LS-A-9**.
+
+### Safety / STPA
+
+- New approved loss scenario: **LS-A-9** (UCA-F-3): async callback
+  POLL fall-through; fixed in `adapter/fact.rs`.
+- New ADR: **ADR-2** (`safety/adr/ADR-2-p3-async-error-conventions.md`)
+  — `pulseengine:async` error / backpressure conventions.
+- Updated ADR-1 — P3 async lowering pass marked shipped; trampoline
+  addendum from #122 included; ADR-2 cross-reference added.
+
+### Internal
+
+- `meld-core/src/p3_async.rs` — +1019 LOC: lowering pass
+  (`lower_p3_async_intrinsics`, `LoweringPlan`), `AbiError` enum,
+  result decoders, event/callback constant tables, partial-write +
+  EOF + waitable-set-wait rustdoc.
+- `meld-core/src/adapter/fact.rs` — async-callback trampoline now
+  references named `event::*` / `callback::*` constants (no more
+  magic numbers); POLL dispatch fix.
+- `meld-core/tests/p3_async_lowering.rs` — +399 LOC: lowering
+  end-to-end tests for stream/future, callback shape pins.
+- `meld-core/tests/p3_async_abi.rs` (new) — 22 encoding-pin tests for
+  the `AbiError` numeric values and result decoders.
+- `safety/adr/ADR-2-p3-async-error-conventions.md` (new).
+
+### Pre-release Mythos pass
+
+Tier-5 + tier-4 files changed since v0.5.0: `adapter/fact.rs` only
+(+62 LOC, async-callback constant references). Scanned per
+`scripts/mythos/discover.md`; **1 confirmed finding** (LS-A-9 above).
+Fix shipped in this release; the discovery → fix → approved-LS pattern
+parallels v0.3.0 and v0.4.0's Mythos cycle.
+
 ## [0.5.0] — Unreleased
 
 ### Added
