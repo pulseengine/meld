@@ -1,5 +1,9 @@
 name: Update wit-bindgen Fixtures
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.run_id }}
+  cancel-in-progress: false
+
 on:
   workflow_dispatch:
   schedule:
