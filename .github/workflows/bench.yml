@@ -27,7 +27,7 @@ env:
 jobs:
   bench-smoke:
     name: Bench compile-only
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64, rust-cpu]
     steps:
       - uses: actions/checkout@v4
 

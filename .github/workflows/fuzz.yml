@@ -29,7 +29,7 @@ env:
 jobs:
   fuzz-smoke:
     name: Fuzz smoke (${{ matrix.target }})
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64, rust-cpu]
     continue-on-error: true
     strategy:
       fail-fast: false

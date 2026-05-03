@@ -15,14 +15,18 @@ jobs:
       matrix:
         include:
           - target: x86_64-unknown-linux-gnu
-            runner: ubuntu-latest
+            runner: [self-hosted, linux, x64, rust-cpu]
             use_cross: false
+          # Stays on ubuntu-latest: `cross` launches a Docker container;
+          # podman-docker compat shim on smithy is untested for cross images.
           - target: aarch64-unknown-linux-gnu
             runner: ubuntu-latest
             use_cross: true
+          # Stays on macos-14: smithy is Linux x86_64 only.
           - target: x86_64-apple-darwin
             runner: macos-14
             use_cross: false
+          # Stays on macos-14: smithy is Linux x86_64 only.
           - target: aarch64-apple-darwin
             runner: macos-14
             use_cross: false
@@ -58,7 +62,7 @@ jobs:
   release:
     name: Release
     needs: build
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64, light]
     permissions:
       contents: write
     steps:
