@@ -33,7 +33,7 @@ env:
 jobs:
   fuzz-smoke:
     name: Fuzz smoke (${{ matrix.target }})
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64, rust-cpu]
     continue-on-error: true
     strategy:
       fail-fast: false
@@ -50,6 +50,8 @@ jobs:
 
       - name: Install nightly Rust
         uses: dtolnay/rust-toolchain@nightly
+        with:
+          targets: x86_64-unknown-linux-musl
 
       - name: Install cargo-fuzz
         run: cargo install cargo-fuzz --locked
