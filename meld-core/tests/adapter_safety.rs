@@ -427,6 +427,7 @@ fn test_sr12_adapter_generation_for_string_param() {
         address_rebasing: false,
         preserve_names: false,
         custom_sections: meld_core::CustomSectionHandling::Drop,
+        dwarf_handling: meld_core::DwarfHandling::Strip,
         output_format: meld_core::OutputFormat::CoreModule,
         opaque_resources: Vec::new(),
     };
@@ -813,6 +814,7 @@ fn test_sr13_cabi_realloc_targets_correct_memory() {
         address_rebasing: false,
         preserve_names: false,
         custom_sections: meld_core::CustomSectionHandling::Drop,
+        dwarf_handling: meld_core::DwarfHandling::Strip,
         output_format: meld_core::OutputFormat::CoreModule,
         opaque_resources: Vec::new(),
     };
@@ -1227,6 +1229,7 @@ fn test_sr15_list_copy_length() {
         address_rebasing: false,
         preserve_names: false,
         custom_sections: meld_core::CustomSectionHandling::Drop,
+        dwarf_handling: meld_core::DwarfHandling::Strip,
         output_format: meld_core::OutputFormat::CoreModule,
         opaque_resources: Vec::new(),
     };
@@ -1721,6 +1724,7 @@ fn test_sr16_inner_pointer_fixup_list_string() {
         address_rebasing: false,
         preserve_names: false,
         custom_sections: meld_core::CustomSectionHandling::Drop,
+        dwarf_handling: meld_core::DwarfHandling::Strip,
         output_format: meld_core::OutputFormat::CoreModule,
         opaque_resources: Vec::new(),
     };
@@ -2008,6 +2012,7 @@ fn test_sr17_utf8_to_utf16_string_transcoding() {
         address_rebasing: false,
         preserve_names: false,
         custom_sections: meld_core::CustomSectionHandling::Drop,
+        dwarf_handling: meld_core::DwarfHandling::Strip,
         output_format: meld_core::OutputFormat::CoreModule,
         opaque_resources: Vec::new(),
     };

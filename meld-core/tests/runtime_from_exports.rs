@@ -131,6 +131,7 @@ fn test_from_exports_resolution_runtime() {
         address_rebasing: false,
         preserve_names: false,
         custom_sections: meld_core::CustomSectionHandling::Drop,
+        dwarf_handling: meld_core::DwarfHandling::Strip,
         output_format: meld_core::OutputFormat::CoreModule,
         opaque_resources: Vec::new(),
     };
@@ -181,6 +182,7 @@ fn test_from_exports_shared_memory_strategy() {
         address_rebasing: false,
         preserve_names: false,
         custom_sections: meld_core::CustomSectionHandling::Drop,
+        dwarf_handling: meld_core::DwarfHandling::Strip,
         output_format: meld_core::OutputFormat::CoreModule,
         opaque_resources: Vec::new(),
     };
@@ -231,6 +233,7 @@ fn test_from_exports_function_count() {
         address_rebasing: false,
         preserve_names: false,
         custom_sections: meld_core::CustomSectionHandling::Drop,
+        dwarf_handling: meld_core::DwarfHandling::Strip,
         output_format: meld_core::OutputFormat::CoreModule,
         opaque_resources: Vec::new(),
     };

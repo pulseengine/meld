@@ -516,6 +516,52 @@ loss-scenarios:
     status: approved
     priority: high
 
+  - id: LS-CP-4
+    title: DWARF passthrough emits address-incorrect debug info on fused output
+    type: control-path
+    scenario: >
+      Each input core module's `.debug_*` custom sections are pushed
+      verbatim into the fused module by `merger.rs` (around line 2010)
+      and emitted by `lib.rs::encode_output` whenever
+      `CustomSectionHandling != Drop`. Every DWARF address inside those
+      sections is a byte offset into the ORIGINAL per-input code section.
+      The fuser rewrites and renumbers function bodies into a single
+      merged code section, so every passed-through DWARF address
+      references the wrong instruction (or nothing). Downstream MC/DC
+      tooling (`pulseengine/witness`) trusts the `(code-offset -> file,
+      line)` map produced by `gimli` and therefore attributes branch
+      decisions to incorrect source lines [H-7]. Wrong attribution is
+      strictly worse than no attribution because witness has a
+      no-DWARF fallback that degrades gracefully — the lossy
+      passthrough silently subverts that fallback.
+
+      Phase 2 of issue #130 will add an address-remap pass over
+      `.debug_line` / `.debug_info` / `.debug_ranges`. Until then the
+      only non-corrupting policy is to drop `.debug_*` sections.
+
+      Phase 1.5 lands an explicit `DwarfHandling` enum
+      (`Strip` default, `PassThrough` opt-in) on `FuserConfig`,
+      filters `.debug_*` in `lib.rs::encode_output` when `Strip`, and
+      records the choice in attestation `tool_parameters` so consumers
+      can detect lossy emissions. Verified by
+      `meld-core/tests/dwarf_strip.rs`.
+    hazards: [H-7]
+    causal-factors:
+      - >-
+        `merger.rs` accumulates per-input `.debug_*` sections without
+        rewriting their internal addresses
+      - >-
+        `lib.rs::encode_output` had no `.debug_*`-aware policy; the
+        only knob was the generic `CustomSectionHandling` switch
+      - >-
+        Witness consumes the emitted DWARF and treats it as authoritative
+        for `(code-offset -> file, line)` mapping
+      - >-
+        Strip is correct-but-lossy; PassThrough is corrupting-but-loud;
+        Phase 2 (remap) is the eventual correct-and-lossless mode
+    status: approved
+    priority: high
+
   # ==========================================================================
   # Additional adapter scenarios (discovered during gap analysis)
   # ==========================================================================

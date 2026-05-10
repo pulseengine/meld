@@ -81,6 +81,20 @@ pub struct FuserConfig {
     /// Custom section handling
     pub custom_sections: CustomSectionHandling,
 
+    /// DWARF (`.debug_*`) section handling.
+    ///
+    /// Default `Strip` because meld currently does NOT remap DWARF
+    /// addresses across the merged code section (issue #130 Phase 2).
+    /// Passing the input DWARF through verbatim produces *wrong*
+    /// source-line attribution for every fused address — strictly
+    /// worse than emitting no DWARF, since downstream tooling
+    /// (`pulseengine/witness` MC/DC) trusts what it reads.
+    ///
+    /// Once Phase 2 ships an address-remapping pass, the default may
+    /// flip to a remap-based mode. Until then, `Strip` is the only
+    /// non-corrupting setting; `PassThrough` is opt-in and lossy.
+    pub dwarf_handling: DwarfHandling,
+
     /// Output format: core module (default) or P2 component
     pub output_format: OutputFormat,
 
@@ -108,6 +122,7 @@ impl Default for FuserConfig {
             address_rebasing: false,
             preserve_names: false,
             custom_sections: CustomSectionHandling::Merge,
+            dwarf_handling: DwarfHandling::Strip,
             output_format: OutputFormat::CoreModule,
             opaque_resources: Vec::new(),
         }
@@ -148,6 +163,30 @@ pub enum CustomSectionHandling {
     Prefix,
     /// Drop all custom sections
     Drop,
+}
+
+/// How to handle DWARF (`.debug_*`) custom sections during fusion.
+///
+/// Distinct from [`CustomSectionHandling`] because DWARF sections carry
+/// code-section byte offsets that meld does NOT yet remap (issue #130
+/// Phase 2). Passing them through unchanged is strictly worse than
+/// dropping them — downstream consumers like `pulseengine/witness`
+/// would silently produce wrong source-line attribution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DwarfHandling {
+    /// Drop all `.debug_*` sections (default).
+    ///
+    /// The fused module carries no DWARF; downstream MC/DC tooling
+    /// degrades to its no-DWARF fallback. Correct, lossy.
+    Strip,
+
+    /// Pass DWARF sections through verbatim from each input core
+    /// module.
+    ///
+    /// Addresses inside the sections refer to per-input code-section
+    /// offsets and will be wrong against the merged code section.
+    /// Use only if the consumer can tolerate or detect that.
+    PassThrough,
 }
 
 /// Statistics about the fusion process
@@ -1348,6 +1387,10 @@ impl Fuser {
                 if !self.config.preserve_names && name == "name" {
                     continue;
                 }
+                if self.config.dwarf_handling == DwarfHandling::Strip && name.starts_with(".debug_")
+                {
+                    continue;
+                }
                 module.section(&wasm_encoder::CustomSection {
                     name: std::borrow::Cow::Borrowed(name),
                     data: std::borrow::Cow::Borrowed(contents),
@@ -1470,6 +1513,10 @@ impl Fuser {
             serde_json::json!(self.custom_sections_label()),
         );
         tool_parameters.insert(
+            "dwarf_handling".to_string(),
+            serde_json::json!(self.dwarf_handling_label()),
+        );
+        tool_parameters.insert(
             "output_format".to_string(),
             serde_json::json!(self.output_format_label()),
         );
@@ -1549,6 +1596,14 @@ impl Fuser {
             CustomSectionHandling::Merge => "merge",
             CustomSectionHandling::Prefix => "prefix",
             CustomSectionHandling::Drop => "drop",
+        }
+    }
+
+    #[cfg(feature = "attestation")]
+    fn dwarf_handling_label(&self) -> &'static str {
+        match self.config.dwarf_handling {
+            DwarfHandling::Strip => "strip",
+            DwarfHandling::PassThrough => "passthrough",
         }
     }
 

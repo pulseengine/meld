@@ -75,6 +75,7 @@ fn bench_config() -> FuserConfig {
         address_rebasing: false,
         preserve_names: false,
         custom_sections: CustomSectionHandling::Drop,
+        dwarf_handling: meld_core::DwarfHandling::Strip,
         output_format: OutputFormat::CoreModule,
         opaque_resources: Vec::new(),
     }
