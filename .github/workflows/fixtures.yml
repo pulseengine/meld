@@ -17,7 +17,7 @@ env:
 jobs:
   update-fixtures:
     name: Generate wit-bindgen fixtures
-    runs-on: [self-hosted, linux, x64, rust-cpu]
+    runs-on: ubuntu-latest
     permissions:
       contents: write
       pull-requests: write

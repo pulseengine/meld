@@ -17,7 +17,7 @@ env:
 jobs:
   test:
     name: Test
-    runs-on: [self-hosted, linux, x64, rust-cpu]
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
@@ -47,7 +47,7 @@ jobs:
 
   coverage:
     name: Coverage
-    runs-on: [self-hosted, linux, x64, rust-cpu]
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
@@ -83,7 +83,7 @@ jobs:
 
   clippy:
     name: Clippy
-    runs-on: [self-hosted, linux, x64, rust-cpu]
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
@@ -99,7 +99,7 @@ jobs:
 
   fmt:
     name: Format
-    runs-on: [self-hosted, linux, x64, light]
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
