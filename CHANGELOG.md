@@ -2,7 +2,7 @@
 
 All notable changes to this project will be documented in this file.
 
-## [Unreleased]
+## [0.7.0] — 2026-05-11
 
 ### Added
 
@@ -16,12 +16,21 @@ All notable changes to this project will be documented in this file.
   `PassThrough` is opt-in for the rare case a caller wants the lossy
   prior behaviour. Recorded in attestation `tool_parameters` as
   `dwarf_handling = "strip" | "passthrough"`. Verified by
-  `meld-core/tests/dwarf_strip.rs`.
+  `meld-core/tests/dwarf_strip.rs`. Lands #135.
 
 ### Safety / STPA
 
 - New approved loss scenario: **LS-CP-4** (DWARF passthrough emits
   address-incorrect debug info on fused output, [H-7]).
+
+### Breaking
+
+- Default DWARF handling changed: `.debug_*` sections are now dropped
+  from fused output by default. Callers that previously relied on
+  passed-through DWARF must opt in with
+  `FuserConfig { dwarf_handling: DwarfHandling::PassThrough, .. }`,
+  understanding that the addresses inside those sections do not match
+  the merged code section.
 
 ## [0.6.0] — Unreleased
 
