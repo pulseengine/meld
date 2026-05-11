@@ -2,6 +2,27 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Added
+
+- **Explicit DWARF policy** (`DwarfHandling::{Strip, PassThrough}` on
+  `FuserConfig`, default `Strip`). Phase 1.5 of issue #130
+  (witness-mapping epic). Until Phase 2 ships an address-remap pass,
+  passing input `.debug_*` sections through verbatim produces source-
+  line attribution that points at wrong instructions in the merged code
+  section — strictly worse than no DWARF for downstream MC/DC tooling
+  (`pulseengine/witness`). The new default drops `.debug_*` sections;
+  `PassThrough` is opt-in for the rare case a caller wants the lossy
+  prior behaviour. Recorded in attestation `tool_parameters` as
+  `dwarf_handling = "strip" | "passthrough"`. Verified by
+  `meld-core/tests/dwarf_strip.rs`.
+
+### Safety / STPA
+
+- New approved loss scenario: **LS-CP-4** (DWARF passthrough emits
+  address-incorrect debug info on fused output, [H-7]).
+
 ## [0.6.0] — Unreleased
 
 ### Added

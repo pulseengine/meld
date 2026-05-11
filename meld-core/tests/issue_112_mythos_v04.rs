@@ -178,6 +178,7 @@ fn fuse_config() -> FuserConfig {
         address_rebasing: false,
         preserve_names: false,
         custom_sections: meld_core::CustomSectionHandling::Drop,
+        dwarf_handling: meld_core::DwarfHandling::Strip,
         opaque_resources: Vec::new(),
     }
 }

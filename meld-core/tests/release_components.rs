@@ -72,6 +72,7 @@ fn try_fuse(path: &str, name: &str) -> (bool, usize, String) {
         address_rebasing: false,
         preserve_names: false,
         custom_sections: meld_core::CustomSectionHandling::Drop,
+        dwarf_handling: meld_core::DwarfHandling::Strip,
         output_format: OutputFormat::CoreModule,
         opaque_resources: Vec::new(),
     };
@@ -230,6 +231,7 @@ fn test_fused_output_validates() {
             address_rebasing: false,
             preserve_names: false,
             custom_sections: meld_core::CustomSectionHandling::Drop,
+            dwarf_handling: meld_core::DwarfHandling::Strip,
             output_format: OutputFormat::CoreModule,
             opaque_resources: Vec::new(),
         };
@@ -322,6 +324,7 @@ fn test_p1_adapter_detection_with_instances() {
             address_rebasing: false,
             preserve_names: false,
             custom_sections: meld_core::CustomSectionHandling::Drop,
+            dwarf_handling: meld_core::DwarfHandling::Strip,
             output_format: OutputFormat::CoreModule,
             opaque_resources: Vec::new(),
         };
@@ -402,6 +405,7 @@ fn test_reasonable_memory_count() {
             address_rebasing: false,
             preserve_names: false,
             custom_sections: meld_core::CustomSectionHandling::Drop,
+            dwarf_handling: meld_core::DwarfHandling::Strip,
             output_format: OutputFormat::CoreModule,
             opaque_resources: Vec::new(),
         };
@@ -488,6 +492,7 @@ fn test_write_fused_output_for_runtime() {
             address_rebasing: false,
             preserve_names: true,
             custom_sections: meld_core::CustomSectionHandling::Drop,
+            dwarf_handling: meld_core::DwarfHandling::Strip,
             output_format: OutputFormat::CoreModule,
             opaque_resources: Vec::new(),
         };
@@ -553,6 +558,7 @@ fn test_no_duplicate_imports() {
             address_rebasing: false,
             preserve_names: false,
             custom_sections: meld_core::CustomSectionHandling::Drop,
+            dwarf_handling: meld_core::DwarfHandling::Strip,
             output_format: OutputFormat::CoreModule,
             opaque_resources: Vec::new(),
         };
@@ -637,6 +643,7 @@ fn test_adapter_generation_for_release_components() {
             address_rebasing: false,
             preserve_names: false,
             custom_sections: meld_core::CustomSectionHandling::Drop,
+            dwarf_handling: meld_core::DwarfHandling::Strip,
             output_format: OutputFormat::CoreModule,
             opaque_resources: Vec::new(),
         };
@@ -704,6 +711,7 @@ fn test_adapter_call_site_wiring() {
             address_rebasing: false,
             preserve_names: false,
             custom_sections: meld_core::CustomSectionHandling::Drop,
+            dwarf_handling: meld_core::DwarfHandling::Strip,
             output_format: OutputFormat::CoreModule,
             opaque_resources: Vec::new(),
         };
@@ -855,6 +863,7 @@ fn test_no_stale_resource_drop_versions() {
             address_rebasing: false,
             preserve_names: false,
             custom_sections: meld_core::CustomSectionHandling::Drop,
+            dwarf_handling: meld_core::DwarfHandling::Strip,
             output_format: OutputFormat::CoreModule,
             opaque_resources: Vec::new(),
         };
@@ -939,6 +948,7 @@ fn test_component_wrap_validates() {
             address_rebasing: false,
             preserve_names: false,
             custom_sections: meld_core::CustomSectionHandling::Drop,
+            dwarf_handling: meld_core::DwarfHandling::Strip,
             output_format: OutputFormat::Component,
             opaque_resources: Vec::new(),
         };

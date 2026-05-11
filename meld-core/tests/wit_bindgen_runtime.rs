@@ -61,6 +61,7 @@ fn fuse_fixture(name: &str, output_format: OutputFormat) -> anyhow::Result<Vec<u
         address_rebasing: false,
         preserve_names: false,
         custom_sections: CustomSectionHandling::Drop,
+        dwarf_handling: meld_core::DwarfHandling::Strip,
         output_format,
         opaque_resources: Vec::new(),
     };
