@@ -315,6 +315,44 @@ verification-status:
     status: not-verified
     note: "CRITICAL: No detection of multiply-instantiated modules. Silent corruption risk."
 
+  # Roadmap entries (SR-32..SR-36) — see docs/roadmap.md. status moves
+  # planned -> in-progress -> implemented as the milestone proceeds.
+
+  SR-32:
+    implementation-files: []
+    tests: []
+    proofs: []
+    status: planned
+    note: "v0.8.0 — Stackful P3 lifting mode (#140). Implementation lands in adapter/fact.rs."
+
+  SR-33:
+    implementation-files: []
+    tests: []
+    proofs: []
+    status: planned
+    note: "v0.9.0 — Cross-component stream<T> fusion (#141). adapter/fact.rs + resolver.rs."
+
+  SR-34:
+    implementation-files: []
+    tests: []
+    proofs: []
+    status: planned
+    note: "v0.9.0 — Static stream<T> validation (#142). Depends on SR-33."
+
+  SR-35:
+    implementation-files: []
+    tests: []
+    proofs: []
+    status: planned
+    note: "v0.10.0 — DWARF Phase 2 address remap (#143). New module meld-core/src/dwarf_remap.rs."
+
+  SR-36:
+    implementation-files: []
+    tests: []
+    proofs: []
+    status: planned
+    note: "v0.11.0 — DWARF Phase 3 adapter DIEs (#144). Depends on SR-35."
+
 # wit-bindgen fixture coverage (14 fixtures × 3 levels = 42 integration tests)
 wit-bindgen-fixtures:
   passing-all-3-levels:

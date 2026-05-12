@@ -663,3 +663,153 @@ artifacts:
       references:
         - "BA RFC #46 discussion: cfallin on multiply-instantiated modules"
         - "safety/stpa/rfc46-comparative-analysis.md section 4 Q1"
+
+  # ==========================================================================
+  # Roadmap requirements v0.8 → v0.11 (SR-32..SR-36)
+  #
+  # Each entry tracks a deliverable from docs/roadmap.md. `status` starts at
+  # `planned`, moves to `in-progress` when a PR opens, and to `implemented`
+  # when the release that contains it ships. Tagged `roadmap` so a future
+  # validation tool can cross-check open milestones against requirement
+  # status.
+  # ==========================================================================
+
+  - id: SR-32
+    type: requirement
+    title: Stackful P3 lifting mode emission
+    description: >
+      In addition to the callback trampoline (shipped #128), meld shall
+      emit a stackful lifting trampoline for components that suspend via
+      `task.wait` / `task.yield`. The trampoline imports
+      `pulseengine:async::thread_new`, `thread_switch_to`, `thread_yield`,
+      `thread_exit` host intrinsics and provides one stack per in-flight
+      async call. Documented in ADR-1 addendum.
+    status: planned
+    tags: [roadmap, p3-async, v0.8.0]
+    links:
+      - type: derives-from
+        target: "#94"
+      - type: tracked-by
+        target: "#140"
+    fields:
+      implementation: meld-core/src/adapter/fact.rs
+      verification-method: test
+      verification-description: >
+        Shape-pin test mirroring async_callback_trampoline_shape_canonical;
+        end-to-end stackful suspend/resume case.
+      milestone: v0.8.0
+
+  - id: SR-33
+    type: requirement
+    title: Cross-component `stream<T>` fusion at merge time
+    description: >
+      When two fused components share a `stream<T>` endpoint, meld shall
+      emit an in-module adapter that bridges the two sides without round-
+      tripping through the host. Two modes:
+      (a) same-memory (single-memory fusion): direct in-module ring buffer,
+      zero-copy.
+      (b) different-memory (multi-memory): `stream_read` → in-module copy
+      loop → `stream_write` chain, with `cabi_realloc` null-guard policy
+      per LS-A-7.
+    status: planned
+    tags: [roadmap, p3-async, v0.9.0]
+    links:
+      - type: derives-from
+        target: "#94"
+      - type: tracked-by
+        target: "#141"
+    fields:
+      implementation:
+        - meld-core/src/adapter/fact.rs
+        - meld-core/src/resolver.rs
+      verification-method: test
+      verification-description: >
+        Same-memory zero-copy fixture; different-memory chain fixture;
+        backpressure propagation; EOF passthrough.
+      milestone: v0.9.0
+
+  - id: SR-34
+    type: requirement
+    title: Static `stream<T>` validation
+    description: >
+      Build-time validation passes for cross-component streams:
+      (i) source `stream<A>` and sink `stream<B>` types must match;
+      (ii) bounded channels must declare capacity;
+      (iii) the stream-endpoint graph must be acyclic (no deadlock);
+      (iv) `own<T>` handles passed through a stream must outlive every
+      receiver. Each violation returns a typed `Error::ValidationError`
+      with the offending site.
+    status: planned
+    tags: [roadmap, p3-async, v0.9.0]
+    links:
+      - type: derives-from
+        target: "#94"
+      - type: tracked-by
+        target: "#142"
+      - type: depends-on
+        target: SR-33
+    fields:
+      implementation: meld-core/src/resolver.rs
+      verification-method: test+proof
+      verification-description: >
+        Regression test per check; Kani harness for cycle detection.
+        Approved LS-N per violation class.
+      milestone: v0.9.0
+
+  - id: SR-35
+    type: requirement
+    title: DWARF address remap into merged code section
+    description: >
+      A new `DwarfHandling::Remap` policy on `FuserConfig` shall rewrite
+      `.debug_line`, `.debug_info` (address-bearing DIEs), `.debug_ranges`
+      / `.debug_rnglists` so addresses inside those sections reference the
+      merged code section rather than per-input code sections.
+      `.debug_str` / `.debug_abbrev` pass through with string-pool dedup /
+      byte-equal merge. End-to-end verified by witness MC/DC integration:
+      ≥ X% of `br_if` byte offsets in fused output resolve to source.
+    status: planned
+    tags: [roadmap, dwarf, witness-mc-dc, v0.10.0]
+    links:
+      - type: derives-from
+        target: "#130"
+      - type: tracked-by
+        target: "#143"
+      - type: supersedes-default-of
+        target: LS-CP-4
+    fields:
+      implementation: meld-core/src/dwarf_remap.rs
+      verification-method: test+cross-repo
+      verification-description: >
+        Unit tests on `.debug_line` rewrite; cross-repo smoke against
+        `pulseengine/witness` confirming attribution coverage on a fused
+        wit-bindgen fixture.
+      milestone: v0.10.0
+
+  - id: SR-36
+    type: requirement
+    title: Synthesised DWARF DIEs for meld-generated adapter functions
+    description: >
+      For every adapter function meld emits (cross-component lift/lower,
+      `cabi_realloc` trampoline, `memory.copy` transcode loop), the
+      output module shall carry a synthesised DIE pointing at a
+      placeholder source file `<meld-adapter>` line N where N encodes
+      the adapter class. Witness then surfaces these as "adapter"
+      branches in its MC/DC line map rather than as un-attributed gaps.
+    status: planned
+    tags: [roadmap, dwarf, witness-mc-dc, v0.11.0]
+    links:
+      - type: derives-from
+        target: "#130"
+      - type: tracked-by
+        target: "#144"
+      - type: depends-on
+        target: SR-35
+    fields:
+      implementation:
+        - meld-core/src/dwarf_remap.rs
+        - meld-core/src/adapter/fact.rs
+      verification-method: test+cross-repo
+      verification-description: >
+        Witness confirms adapter ranges resolve to `<meld-adapter>:N`
+        rather than `unknown`; LS-N approved for MC/DC adapter accounting.
+      milestone: v0.11.0
