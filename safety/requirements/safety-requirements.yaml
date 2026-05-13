@@ -684,7 +684,7 @@ artifacts:
       `pulseengine:async::thread_new`, `thread_switch_to`, `thread_yield`,
       `thread_exit` host intrinsics and provides one stack per in-flight
       async call. Documented in ADR-1 addendum.
-    status: planned
+    status: in-progress
     tags: [roadmap, p3-async, v0.8.0]
     links:
       - type: derives-from
@@ -692,11 +692,15 @@ artifacts:
       - type: tracked-by
         target: "#140"
     fields:
-      implementation: meld-core/src/adapter/fact.rs
+      implementation:
+        - meld-core/src/p3_async.rs        # ABI foundation landed
+        - meld-core/src/adapter/fact.rs    # trampoline emitter — follow-up PR
       verification-method: test
       verification-description: >
-        Shape-pin test mirroring async_callback_trampoline_shape_canonical;
-        end-to-end stackful suspend/resume case.
+        Foundation: stackful_intrinsic_signatures_pinned +
+        stackful_lift_is_async_without_callback (this PR). Emitter:
+        shape-pin test mirroring async_callback_trampoline_shape_canonical;
+        end-to-end stackful suspend/resume case (follow-up PR).
       milestone: v0.8.0
 
   - id: SR-33

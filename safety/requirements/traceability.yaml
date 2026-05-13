@@ -319,11 +319,14 @@ verification-status:
   # planned -> in-progress -> implemented as the milestone proceeds.
 
   SR-32:
-    implementation-files: []
-    tests: []
+    implementation-files:
+      - meld-core/src/p3_async.rs
+    tests:
+      - p3_async::tests::stackful_intrinsic_signatures_pinned
+      - p3_async::tests::stackful_lift_is_async_without_callback
     proofs: []
-    status: planned
-    note: "v0.8.0 — Stackful P3 lifting mode (#140). Implementation lands in adapter/fact.rs."
+    status: in-progress
+    note: "v0.8.0 — Stackful P3 lifting mode (#140). ABI foundation landed (thread_* intrinsics + uses_stackful_lift detector). Trampoline emitter in adapter/fact.rs follow-up PR."
 
   SR-33:
     implementation-files: []
