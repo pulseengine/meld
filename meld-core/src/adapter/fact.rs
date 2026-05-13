@@ -4457,23 +4457,277 @@ impl FactStyleGenerator {
             .any(|e| e.kind == wasm_encoder::ExportKind::Func && e.name == callback_export_name)
     }
 
-    /// Stub emitter for stackful-mode async lifting (SR-32, #140 phase 2).
+    /// Emit the stackful-mode async-lift trampoline (SR-32, #140).
     ///
-    /// Until the trampoline body lands (commit 3 of phase 2), this returns a
-    /// clear error rather than letting the callback emitter fail silently on
-    /// the missing `[callback]` export. The error string is part of the
-    /// safety-requirement audit trail.
+    /// Stackful lifting per the Component Model spec: a canonical lift
+    /// with `(canon lift ... async ...)` but **no** `(callback ...)`
+    /// option. The runtime treats the lifted call as a fiber boundary —
+    /// the wasm code inside may call `task.wait`/`task.yield` to suspend,
+    /// and the runtime resumes the fiber transparently. From the
+    /// adapter's perspective, the call looks synchronous: invoke the
+    /// lift, await its return, read result globals.
+    ///
+    /// Generated wasm shape:
+    ///
+    /// ```wat
+    /// (func $async_stackful_adapter_<from>_to_<to>
+    ///   ;; step 0.5: cross-memory param copy (shared with callback path)
+    ///   ;; step 1:   call [async-lift]<export> — runtime-managed fiber
+    ///   ;; step 1.5: drop the lift's stackful return value (irrelevant —
+    ///   ;;           result has already been written via task.return)
+    ///   ;; step 3:   read result from async_result_globals and return
+    ///   ;;           to caller (push-on-stack OR write-to-retptr)
+    /// )
+    /// ```
+    ///
+    /// The Phase 1 `thread::*` host-intrinsic ABI (thread_new,
+    /// thread_switch_to, thread_yield, thread_exit) remains valid for
+    /// component-internal concurrency but is **not** consumed by this
+    /// trampoline; see ADR-1's 2026-05-13 addendum.
+    ///
+    /// Result readback covers:
+    /// - Push-results-onto-stack: caller expects direct results
+    /// - Retptr with non-pointer scalars: write globals at offset to
+    ///   caller's return buffer
+    ///
+    /// Returning lists / strings from stackful mode (cross-memory copy
+    /// of `(ptr, len)` results) is deferred to a follow-up; this emitter
+    /// errors clearly if asked to handle that case for now.
     fn generate_async_stackful_adapter(
         &self,
         site: &AdapterSite,
-        _merged: &MergedModule,
+        merged: &MergedModule,
     ) -> Result<AdapterFunction> {
-        Err(crate::error::Error::EncodingError(format!(
-            "stackful lifting requested by export {:?} but the trampoline \
-             emitter is not yet implemented (SR-32, #140 phase 2 in progress; \
-             see ADR-1)",
-            site.export_name,
-        )))
+        let name = format!(
+            "$async_stackful_adapter_{}_to_{}",
+            site.from_component, site.to_component
+        );
+
+        let async_lift_func = self.resolve_target_function(site, merged)?;
+
+        let caller_type_idx = site
+            .import_func_type_idx
+            .and_then(|local_ti| {
+                merged
+                    .type_index_map
+                    .get(&(site.from_component, site.from_module, local_ti))
+                    .copied()
+            })
+            .unwrap_or(0);
+
+        let caller_type = merged
+            .types
+            .get(caller_type_idx as usize)
+            .cloned()
+            .unwrap_or_else(|| crate::merger::MergedFuncType {
+                params: Vec::new(),
+                results: Vec::new(),
+            });
+        let caller_param_count = caller_type.params.len();
+
+        let caller_memory = crate::merger::component_memory_index(merged, site.from_component);
+
+        let callee_param_count = merged
+            .defined_func(async_lift_func)
+            .and_then(|f| merged.types.get(f.type_idx as usize))
+            .map(|t| t.params.len())
+            .unwrap_or(caller_param_count);
+
+        // Locals layout (simpler than callback mode — no packed/code/payload):
+        //   0..caller_param_count: params from caller
+        //   +0: $scratch (i32) — used by step 0.5 helper for new_ptr
+        let l_scratch = caller_param_count as u32;
+
+        // 1 scratch + room for nested-indirection patching (matches callback)
+        let mut body = Function::new([(8, wasm_encoder::ValType::I32)]);
+
+        // Step 0.5: cross-memory param copy (shared with callback path)
+        self.emit_param_copy_step(
+            &mut body,
+            site,
+            merged,
+            &caller_type,
+            caller_param_count,
+            callee_param_count,
+            l_scratch,
+        );
+
+        // Step 1: call [async-lift] entry. In stackful mode the runtime
+        // treats this call as a fiber boundary; control returns once the
+        // fiber has run to completion (including any task.wait suspensions
+        // the body issues internally).
+        for i in 0..callee_param_count {
+            body.instruction(&Instruction::LocalGet(i as u32));
+        }
+        body.instruction(&Instruction::Call(async_lift_func));
+
+        // Step 1.5: drop any return value the lift function produces. In
+        // stackful mode the real result has already been written to the
+        // task.return shim globals from inside the lift body; the wasm-
+        // level return value (if any) is a control word the runtime owns.
+        let lift_result_count = merged
+            .defined_func(async_lift_func)
+            .and_then(|f| merged.types.get(f.type_idx as usize))
+            .map(|t| t.results.len())
+            .unwrap_or(0);
+        for _ in 0..lift_result_count {
+            body.instruction(&Instruction::Drop);
+        }
+
+        // Step 3: read result values from task.return shim globals.
+        let adapter_func_name = site
+            .export_name
+            .rsplit_once('#')
+            .map(|(_, name)| name)
+            .unwrap_or(&site.export_name);
+
+        let result_globals_direct = merged
+            .async_result_globals
+            .get(&(site.to_component, adapter_func_name.to_string()));
+
+        let shim_info = if let Some(globals) = result_globals_direct {
+            let result_type = merged
+                .task_return_shims
+                .values()
+                .find(|info| {
+                    info.component_idx == site.to_component && info.result_globals == *globals
+                })
+                .and_then(|info| info.result_type.clone());
+            Some(crate::merger::TaskReturnShimInfo {
+                shim_func: 0,
+                result_globals: globals.clone(),
+                component_idx: site.to_component,
+                import_name: String::new(),
+                original_func_name: adapter_func_name.to_string(),
+                result_type,
+            })
+        } else {
+            merged
+                .task_return_shims
+                .values()
+                .find(|info| {
+                    info.component_idx == site.to_component
+                        && info.original_func_name == adapter_func_name
+                })
+                .cloned()
+        };
+
+        let uses_retptr = caller_type.results.is_empty() && caller_param_count > callee_param_count;
+
+        if let Some(info) = shim_info.as_ref() {
+            if uses_retptr {
+                // Detect cross-memory ptr-pair returns (string / list).
+                // Deferred to a follow-up — error clearly so the audit
+                // surface stays observable instead of silently producing
+                // wrong wasm.
+                let callee_memory =
+                    crate::merger::component_memory_index(merged, site.to_component);
+                let is_ptr_pair = info.result_globals.len() == 2
+                    && info
+                        .result_globals
+                        .iter()
+                        .all(|(_, t)| *t == wasm_encoder::ValType::I32)
+                    && callee_memory != caller_memory;
+                if is_ptr_pair {
+                    return Err(crate::error::Error::EncodingError(format!(
+                        "stackful async lift '{}' returns a cross-memory \
+                         (ptr, len) result; this path is deferred to a \
+                         follow-up after #140 (SR-32). Use callback-mode \
+                         lifting or fuse same-memory components for now.",
+                        site.export_name,
+                    )));
+                }
+
+                // Write each result global directly to the caller's
+                // retptr buffer at sequential offsets.
+                let retptr_local = callee_param_count as u32;
+                let mut offset = 0u32;
+                for (global_idx, val_ty) in &info.result_globals {
+                    body.instruction(&Instruction::LocalGet(retptr_local));
+                    body.instruction(&Instruction::GlobalGet(*global_idx));
+                    let mem_arg = wasm_encoder::MemArg {
+                        offset: offset as u64,
+                        align: match val_ty {
+                            wasm_encoder::ValType::I64 | wasm_encoder::ValType::F64 => 3,
+                            _ => 2,
+                        },
+                        memory_index: caller_memory,
+                    };
+                    match val_ty {
+                        wasm_encoder::ValType::I32 => {
+                            body.instruction(&Instruction::I32Store(mem_arg));
+                            offset += 4;
+                        }
+                        wasm_encoder::ValType::I64 => {
+                            body.instruction(&Instruction::I64Store(mem_arg));
+                            offset += 8;
+                        }
+                        wasm_encoder::ValType::F32 => {
+                            body.instruction(&Instruction::F32Store(mem_arg));
+                            offset += 4;
+                        }
+                        wasm_encoder::ValType::F64 => {
+                            body.instruction(&Instruction::F64Store(mem_arg));
+                            offset += 8;
+                        }
+                        _ => {
+                            body.instruction(&Instruction::I32Store(mem_arg));
+                            offset += 4;
+                        }
+                    }
+                }
+            } else {
+                // Push result values onto the stack for the caller.
+                for (global_idx, _) in &info.result_globals {
+                    body.instruction(&Instruction::GlobalGet(*global_idx));
+                }
+            }
+        } else {
+            // No matching task.return shim — emit default values per
+            // caller result types so the adapter is still a valid wasm
+            // function. The merger should always wire shims for
+            // async-lifted exports, so reaching here implies a parse-
+            // time invariant violation; logging keeps the path visible.
+            log::warn!(
+                "stackful adapter '{}': no task.return shim found; \
+                 emitting default results",
+                site.export_name,
+            );
+            for result_ty in &caller_type.results {
+                match result_ty {
+                    wasm_encoder::ValType::I32 => {
+                        body.instruction(&Instruction::I32Const(0));
+                    }
+                    wasm_encoder::ValType::I64 => {
+                        body.instruction(&Instruction::I64Const(0));
+                    }
+                    wasm_encoder::ValType::F32 => {
+                        body.instruction(&Instruction::F32Const(0.0_f32.into()));
+                    }
+                    wasm_encoder::ValType::F64 => {
+                        body.instruction(&Instruction::F64Const(0.0_f64.into()));
+                    }
+                    _ => {
+                        body.instruction(&Instruction::I32Const(0));
+                    }
+                }
+            }
+        }
+
+        body.instruction(&Instruction::End);
+
+        let target_func = self.resolve_target_function(site, merged)?;
+
+        Ok(AdapterFunction {
+            name,
+            type_idx: caller_type_idx,
+            body,
+            source_component: site.from_component,
+            source_module: site.from_module,
+            target_component: site.to_component,
+            target_module: site.to_module,
+            target_function: target_func,
+        })
     }
 }
 
@@ -4945,20 +5199,36 @@ mod tests {
     }
 
     #[test]
-    fn sr32_stackful_emitter_stub_errors_with_audit_string() {
+    fn sr32_stackful_emitter_handles_no_shim_with_default_results() {
+        // With no task.return shim in the empty merged module and an
+        // empty caller_type (no results), the emitter should still emit
+        // a valid adapter — body just ends. The path is the "no shim,
+        // no results" branch (warns via log) and validates that the
+        // overall emitter wiring compiles and produces an
+        // AdapterFunction without panicking.
         let gen_ = FactStyleGenerator::new(AdapterConfig::default());
         let site = async_lift_site("[async-lift]bar");
-        let merged = empty_merged();
+        let mut merged = empty_merged();
+        // Make resolve_target_function succeed by providing a defined
+        // function the site can point at; the emitter doesn't actually
+        // require the function to be well-typed for this minimal test.
+        merged.functions.push(crate::merger::MergedFunction {
+            type_idx: 0,
+            body: wasm_encoder::Function::new([]),
+            origin: (1, 0, 0),
+        });
+        merged.types.push(crate::merger::MergedFuncType {
+            params: Vec::new(),
+            results: Vec::new(),
+        });
+        merged.function_index_map.insert((1, 0, 0), 0);
 
-        let err = gen_
+        let adapter = gen_
             .generate_async_stackful_adapter(&site, &merged)
-            .expect_err("stackful stub must error until phase 2 commit 3");
-        let msg = format!("{err}");
-        assert!(msg.contains("SR-32"), "error must name SR-32: {msg}");
-        assert!(msg.contains("#140"), "error must name issue #140: {msg}");
-        assert!(
-            msg.contains("[async-lift]bar"),
-            "error must name the export: {msg}"
+            .expect("stackful emitter must succeed for trivial site");
+        assert_eq!(
+            adapter.name, "$async_stackful_adapter_0_to_1",
+            "adapter name must follow the stackful naming convention"
         );
     }
 }
