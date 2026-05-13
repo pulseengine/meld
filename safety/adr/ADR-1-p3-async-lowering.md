@@ -236,3 +236,67 @@ contract** are now pinned, even though the lowering pass that rewrites
   blocking is the runtime's responsibility against `[waitable-set-poll]`
   semantics. If the spec ever splits poll into a distinct host
   intrinsic, the trampoline will need a third arm.
+
+---
+
+## Addendum 2026-05-13 — Two-mode lifting policy (SR-32 / #140)
+
+P3 async exports come in two lifting modes per the Component Model:
+
+| Mode | Component opt-in | Trampoline cost | Use case |
+|---|---|---|---|
+| **Callback** (shipped) | `(canon lift ... async ... (callback $cb))` | One shared stack per component | Embedded / `cFS`-style "one message at a time" guests |
+| **Stackful** (foundation in this PR, emitter follow-up) | `(canon lift ... async ...)` with **no** `(callback ...)` | One stack per in-flight async call | Languages with native async/await (Rust, Go, Java) |
+
+**Detection.** `P3AsyncFeatures::uses_stackful_lift()` returns true iff
+the component has any `(canon lift ... async ...)` *without* a
+`(callback ...)` option. Mutually exclusive with the callback case on
+a per-lift basis; a single component may declare both kinds of lifts,
+in which case meld will emit both trampolines.
+
+**ABI surface.** Four new host-intrinsic imports under the existing
+`pulseengine:async` module:
+
+```wasm
+(import "pulseengine:async" "thread_new"        (func (param i32 i32) (result i32)))
+(import "pulseengine:async" "thread_switch_to"  (func (param i32)))
+(import "pulseengine:async" "thread_yield"      (func))
+(import "pulseengine:async" "thread_exit"       (func))
+```
+
+`thread_new(start_fn, arg) -> i32` returns a non-negative thread handle
+on success or a negative [`AbiError`] (typically [`AbiError::Oom`]) on
+failure. `thread_switch_to` traps if the target thread is exited or
+unknown. `thread_yield` lets the runtime scheduler pick another fiber.
+`thread_exit` permanently releases the current fiber.
+
+These names and signatures are pinned by
+`p3_async::tests::stackful_intrinsic_signatures_pinned`. Changing them
+is a breaking change to `pulseengine:async` and requires a version bump.
+
+**Emission policy.** Until the stackful trampoline emitter ships in a
+follow-up PR within the v0.8.0 milestone, meld surfaces a clear error
+for components that need stackful lifting rather than silently
+generating a callback trampoline (which would corrupt the suspended-
+stack semantics the guest expects).
+
+**Why not unify with `task.wait` / `task.yield` parsing.** Those
+component-model canon builtins are *what the guest emits inside its own
+body* to suspend; they go through the existing `P3BuiltinOp` lowering
+path in `component_wrap.rs`. The new `thread_*` intrinsics are *what
+meld synthesises* around the lifted function so the host can save and
+restore the wasm stack. The two are connected (the stackful trampoline
+turns `task.wait` body invocations into `thread_yield` / waitable
+registration sequences) but live at different abstraction layers.
+
+### What this addendum leaves deferred
+
+* **Stackful trampoline emitter** — separate follow-up PR under v0.8.0
+  / #140. The emitter generates: (a) a host-visible export function
+  that creates a fresh fiber on each async invocation, and (b)
+  in-body rewrites of `task.wait` to `thread_yield` + waitable
+  registration. ABI-level shape pins exist; structural test for the
+  generated trampoline will land with the emitter.
+* **Stackful + callback in the same component.** Permitted by the
+  Component Model. The emitter will produce both trampolines without
+  cross-talk; the test for that case ships with the emitter.

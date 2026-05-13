@@ -2,6 +2,24 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Added
+
+- **P3 stackful lifting — ABI foundation** (#140 / SR-32, sub-#94).
+  Adds four new host-intrinsic imports under `pulseengine:async` —
+  `thread_new`, `thread_switch_to`, `thread_yield`, `thread_exit` —
+  exposed as `HostIntrinsic::Thread*` variants with pinned signatures
+  and a new `thread` constants module. `P3AsyncFeatures::uses_stackful_lift()`
+  returns true when a component declares `(canon lift ... async ...)`
+  without a `(callback ...)` option. ADR-1 addendum (2026-05-13)
+  documents the two-mode lifting policy and emission contract. The
+  stackful trampoline emitter that consumes these intrinsics ships in
+  a follow-up PR within the v0.8.0 milestone; this PR is the ABI
+  foundation that downstream tooling (kiln runtime) can already
+  implement against. Verified by `stackful_intrinsic_signatures_pinned`
+  and `stackful_lift_is_async_without_callback`.
+
 ## [0.7.0] — 2026-05-11
 
 ### Added
