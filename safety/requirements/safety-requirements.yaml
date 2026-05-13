@@ -679,12 +679,18 @@ artifacts:
     title: Stackful P3 lifting mode emission
     description: >
       In addition to the callback trampoline (shipped #128), meld shall
-      emit a stackful lifting trampoline for components that suspend via
-      `task.wait` / `task.yield`. The trampoline imports
-      `pulseengine:async::thread_new`, `thread_switch_to`, `thread_yield`,
-      `thread_exit` host intrinsics and provides one stack per in-flight
-      async call. Documented in ADR-1 addendum.
-    status: in-progress
+      emit a stackful lifting trampoline for components that declare
+      `(canon lift ... async ...)` without a `(callback ...)` option.
+      The Phase 1 ABI surface (`pulseengine:async::thread_new`,
+      `thread_switch_to`, `thread_yield`, `thread_exit`) is reserved
+      for component-internal concurrency primitives. The shipped
+      trampoline calls the lift function directly and relies on the
+      runtime to treat the call as a fiber boundary (transparent
+      suspension on `task.wait`). Cross-memory `(ptr, len)` result
+      returns from stackful mode are deferred to a follow-up under
+      the same issue. Documented in ADR-1 addendums 2026-05-13 (a)
+      and 2026-05-13 (b).
+    status: implemented
     tags: [roadmap, p3-async, v0.8.0]
     links:
       - type: derives-from
@@ -693,14 +699,17 @@ artifacts:
         target: "#140"
     fields:
       implementation:
-        - meld-core/src/p3_async.rs        # ABI foundation landed
-        - meld-core/src/adapter/fact.rs    # trampoline emitter — follow-up PR
+        - meld-core/src/p3_async.rs        # ABI foundation (Phase 1)
+        - meld-core/src/adapter/fact.rs    # trampoline emitter (Phase 2)
       verification-method: test
       verification-description: >
         Foundation: stackful_intrinsic_signatures_pinned +
-        stackful_lift_is_async_without_callback (this PR). Emitter:
-        shape-pin test mirroring async_callback_trampoline_shape_canonical;
-        end-to-end stackful suspend/resume case (follow-up PR).
+        stackful_lift_is_async_without_callback. Emitter:
+        sr32_has_callback_export_detects_companion (detection),
+        sr32_stackful_emitter_handles_no_shim_with_default_results
+        (no-shim fallback), and
+        sr32_stackful_emitter_shape_pins_call_drop_globalget
+        (byte-scan structural pin on the emitted wasm trampoline).
       milestone: v0.8.0
 
   - id: SR-33

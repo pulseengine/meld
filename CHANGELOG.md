@@ -13,12 +13,33 @@ All notable changes to this project will be documented in this file.
   and a new `thread` constants module. `P3AsyncFeatures::uses_stackful_lift()`
   returns true when a component declares `(canon lift ... async ...)`
   without a `(callback ...)` option. ADR-1 addendum (2026-05-13)
-  documents the two-mode lifting policy and emission contract. The
-  stackful trampoline emitter that consumes these intrinsics ships in
-  a follow-up PR within the v0.8.0 milestone; this PR is the ABI
-  foundation that downstream tooling (kiln runtime) can already
-  implement against. Verified by `stackful_intrinsic_signatures_pinned`
-  and `stackful_lift_is_async_without_callback`.
+  documents the two-mode lifting policy and emission contract.
+  Verified by `stackful_intrinsic_signatures_pinned` and
+  `stackful_lift_is_async_without_callback`.
+
+- **P3 stackful lifting — trampoline emitter** (#140 / SR-32, sub-#94).
+  `FactStyleGenerator::generate_async_stackful_adapter` emits the
+  adapter trampoline for async-lift exports that declare no
+  `(callback ...)` option. The dispatcher routes async-lift sites
+  based on the presence of a `[callback]<export>` companion in the
+  merged module; absence routes to the stackful path. Shipped design
+  is a direct call to the lift function — the runtime treats the call
+  as a transparent fiber boundary, suspending on `task.wait` and
+  resuming on awaited events. The Phase 1 `thread_*` ABI surface
+  remains valid for component-internal concurrency but is not consumed
+  by this trampoline. ADR-1 addendum 2026-05-13 (b) records why this
+  design replaced the originally sketched `thread_new` + drive-loop
+  approach (avoids per-export wrapper functions and per-export
+  `$fiber_done` globals injected late in the adapter pass). Cross-
+  memory `(ptr, len)` result returns from stackful mode are deferred
+  to a follow-up under the same #140 and produce an explicit error
+  for now. The step 0.5 cross-memory param copy was extracted into
+  a shared `emit_param_copy_step` helper used by both callback and
+  stackful paths (SR-12 / SR-17 contract single source of truth).
+  Verified by `sr32_has_callback_export_detects_companion`,
+  `sr32_stackful_emitter_handles_no_shim_with_default_results`, and
+  `sr32_stackful_emitter_shape_pins_call_drop_globalget` (byte-scan
+  pin on the emitted wasm shape).
 
 ## [0.7.0] — 2026-05-11
 
