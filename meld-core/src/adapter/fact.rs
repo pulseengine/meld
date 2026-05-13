@@ -5231,4 +5231,99 @@ mod tests {
             "adapter name must follow the stackful naming convention"
         );
     }
+
+    #[test]
+    fn sr32_stackful_emitter_shape_pins_call_drop_globalget() {
+        // SR-32 acceptance: with a real shim wired into the merged
+        // module, the stackful emitter must produce a body that
+        // structurally matches the documented trampoline shape — call
+        // the lift function, drop its return, read the result global,
+        // end. Pin the wasm opcodes so future refactors that drift
+        // away from this shape break the test loudly.
+        //
+        // Opcodes:
+        //   local.get  = 0x20
+        //   call       = 0x10
+        //   drop       = 0x1A
+        //   global.get = 0x23
+        //   end        = 0x0B
+
+        let gen_ = FactStyleGenerator::new(AdapterConfig::default());
+        let mut merged = empty_merged();
+
+        // Type 0: () -> i32 — minimal lift signature returning one i32
+        // that the stackful trampoline will drop.
+        merged.types.push(crate::merger::MergedFuncType {
+            params: Vec::new(),
+            results: vec![wasm_encoder::ValType::I32],
+        });
+        // The lift function lives at merged index 0.
+        merged.functions.push(crate::merger::MergedFunction {
+            type_idx: 0,
+            body: wasm_encoder::Function::new([]),
+            origin: (1, 0, 0),
+        });
+        merged.function_index_map.insert((1, 0, 0), 0);
+
+        // A result global at index 7 — the stackful trampoline must
+        // emit `global.get 7` followed by the function epilogue.
+        // We register it both in async_result_globals (the primary
+        // lookup) and in task_return_shims (for the fallback path the
+        // emitter consults to recover the result type).
+        // The emitter looks up shims by `adapter_func_name`, derived
+        // from `export_name.rsplit_once('#')`. When the export has no
+        // '#', the lookup uses the full export name verbatim — match
+        // that here.
+        let lookup_name = "[async-lift]ping".to_string();
+        let globals = vec![(7u32, wasm_encoder::ValType::I32)];
+        merged
+            .async_result_globals
+            .insert((1, lookup_name.clone()), globals.clone());
+        merged.task_return_shims.insert(
+            0,
+            crate::merger::TaskReturnShimInfo {
+                shim_func: 0,
+                result_globals: globals.clone(),
+                component_idx: 1,
+                import_name: "[task-return]0".into(),
+                original_func_name: lookup_name.clone(),
+                result_type: None,
+            },
+        );
+
+        // Site: caller has the same result shape so we hit the
+        // push-results-on-stack branch (no retptr), which is the
+        // simplest readback the structural pin needs to cover.
+        let mut site = async_lift_site("[async-lift]ping");
+        site.import_func_type_idx = Some(0);
+        site.crosses_memory = false;
+
+        let adapter = gen_
+            .generate_async_stackful_adapter(&site, &merged)
+            .expect("stackful emitter must succeed");
+
+        let body = adapter.body.into_raw_body();
+
+        assert!(
+            body.contains(&0x10),
+            "stackful trampoline must emit `call` (0x10) to lift func; \
+             body={body:?}",
+        );
+        assert!(
+            body.contains(&0x1A),
+            "stackful trampoline must emit `drop` (0x1A) after the lift \
+             call (lift result is owned by runtime, not caller); body={body:?}",
+        );
+        assert!(
+            body.contains(&0x23),
+            "stackful trampoline must emit `global.get` (0x23) for \
+             result readback; body={body:?}",
+        );
+        assert_eq!(
+            body.last(),
+            Some(&0x0B),
+            "stackful trampoline body must end with `end` (0x0B); \
+             body={body:?}",
+        );
+    }
 }
