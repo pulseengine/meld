@@ -3913,114 +3913,18 @@ impl FactStyleGenerator {
         // + 6 for nested indirection patching (i, rec_dst, old_ptr, buf_len, new_ptr, rec_src)
         let mut body = Function::new([(16, wasm_encoder::ValType::I32)]);
 
-        // Step 0.5: Copy string/list params from caller to callee memory.
-        //
-        // The pointer_pair_positions from the resolver are in CALLEE component
-        // type order. But the adapter's locals are in CALLER order (from the
-        // caller's canon lower). These may differ if the component type
-        // reorders params.
-        //
-        // Instead of using the resolver's positions, compute positions from
-        // the caller's flat param types: find (i32, i32) pairs that could be
-        // (ptr, len) strings/lists.
-        let callee_realloc = crate::merger::component_realloc_index(merged, site.to_component);
-
-        // Detect pointer pairs in caller params: consecutive (i32, i32) pairs
-        // that aren't the last param (retptr). This is a heuristic — works for
-        // string and list params which are always (ptr: i32, len: i32).
-        let caller_ptr_positions: Vec<u32> = if site.crosses_memory && callee_realloc.is_some() {
-            let params = &caller_type.params;
-            let has_retptr =
-                caller_type.results.is_empty() && caller_param_count > callee_param_count;
-            let effective_len = if has_retptr {
-                params.len() - 1
-            } else {
-                params.len()
-            };
-            let mut positions = Vec::new();
-            let mut i = 0;
-            while i + 1 < effective_len {
-                if params[i] == wasm_encoder::ValType::I32
-                    && params[i + 1] == wasm_encoder::ValType::I32
-                {
-                    // Check if the resolver also thinks this is a pointer pair
-                    // (the resolver uses component type info to confirm)
-                    if site
-                        .requirements
-                        .pointer_pair_positions
-                        .iter()
-                        .any(|_| true)
-                    {
-                        positions.push(i as u32);
-                        i += 2; // skip the len
-                        continue;
-                    }
-                }
-                i += 1;
-            }
-            positions
-        } else {
-            Vec::new()
-        };
-
-        let has_param_copies = !caller_ptr_positions.is_empty();
-
-        if has_param_copies {
-            log::debug!(
-                "async adapter param copy: export={} caller_positions={:?} resolver_positions={:?}",
-                site.export_name,
-                caller_ptr_positions,
-                site.requirements.pointer_pair_positions,
-            );
-            let realloc = callee_realloc.unwrap();
-            // For each (ptr, len) pair in the caller's params, allocate in
-            // callee memory and copy the data from caller memory. Use the
-            // resolver's param_copy_layouts to get the per-element byte
-            // size so list<u32>/list<u64>/etc. copy the correct total size.
-            let param_layouts = &site.requirements.param_copy_layouts;
-            for (pair_idx, &ptr_pos) in caller_ptr_positions.iter().enumerate() {
-                let ptr_local = ptr_pos;
-                let len_local = ptr_local + 1;
-                let l_new_ptr = l_p2 + 4; // reuse scratch local
-
-                let byte_mult = param_layouts
-                    .get(pair_idx)
-                    .map(|cl| match cl {
-                        crate::resolver::CopyLayout::Bulk { byte_multiplier } => *byte_multiplier,
-                        crate::resolver::CopyLayout::Elements { element_size, .. } => *element_size,
-                    })
-                    .unwrap_or(1);
-
-                // Allocate: cabi_realloc(0, 0, 1, len * byte_mult)
-                emit_overflow_guard(&mut body, len_local, byte_mult);
-                body.instruction(&Instruction::I32Const(0));
-                body.instruction(&Instruction::I32Const(0));
-                body.instruction(&Instruction::I32Const(1));
-                body.instruction(&Instruction::LocalGet(len_local));
-                if byte_mult > 1 {
-                    body.instruction(&Instruction::I32Const(byte_mult as i32));
-                    body.instruction(&Instruction::I32Mul);
-                }
-                emit_checked_realloc(&mut body, realloc, l_new_ptr);
-
-                // Copy: memory.copy new_ptr <- old_ptr, len * byte_mult
-                body.instruction(&Instruction::LocalGet(l_new_ptr));
-                body.instruction(&Instruction::LocalGet(ptr_local));
-                body.instruction(&Instruction::LocalGet(len_local));
-                if byte_mult > 1 {
-                    body.instruction(&Instruction::I32Const(byte_mult as i32));
-                    body.instruction(&Instruction::I32Mul);
-                }
-                body.instruction(&Instruction::MemoryCopy {
-                    dst_mem: callee_memory,
-                    src_mem: caller_memory,
-                });
-
-                // Replace the ptr param with the new callee-memory ptr
-                body.instruction(&Instruction::LocalGet(l_new_ptr));
-                body.instruction(&Instruction::LocalSet(ptr_local));
-            }
-        }
+        // Step 0.5: copy string/list params from caller to callee memory.
+        // Shared with the stackful emitter (SR-32, #140); see
+        // `emit_param_copy_step` for the full contract.
+        self.emit_param_copy_step(
+            &mut body,
+            site,
+            merged,
+            &caller_type,
+            caller_param_count,
+            callee_param_count,
+            l_p2 + 4,
+        );
 
         // Step 1: Call [async-lift] entry with callee's params
         // (skip retptr if caller has more params than callee)
@@ -4414,6 +4318,129 @@ impl FactStyleGenerator {
             target_module: site.to_module,
             target_function: target_func,
         })
+    }
+
+    /// Step 0.5 of any async-lift adapter: copy `string` / `list<T>` params
+    /// from caller memory into callee memory, allocating callee buffers via
+    /// `cabi_realloc` and patching the caller's locals to point at the new
+    /// callee-side buffers. Shared between callback and stackful emitters so
+    /// the cross-memory contract has a single source of truth (SR-12,
+    /// SR-17).
+    ///
+    /// `scratch_local` is the local index the helper uses to hold the
+    /// realloc result. Callers must reserve at least one i32 local at that
+    /// index. Both emitters allocate their local layout so the scratch sits
+    /// just past the caller's params and per-emitter loop locals.
+    #[allow(clippy::too_many_arguments)]
+    fn emit_param_copy_step(
+        &self,
+        body: &mut Function,
+        site: &AdapterSite,
+        merged: &MergedModule,
+        caller_type: &crate::merger::MergedFuncType,
+        caller_param_count: usize,
+        callee_param_count: usize,
+        scratch_local: u32,
+    ) {
+        // The pointer_pair_positions from the resolver are in CALLEE
+        // component type order. But the adapter's locals are in CALLER
+        // order (from the caller's canon lower). These may differ if the
+        // component type reorders params.
+        //
+        // Instead of using the resolver's positions, compute positions from
+        // the caller's flat param types: find (i32, i32) pairs that could
+        // be (ptr, len) strings/lists.
+        let callee_realloc = crate::merger::component_realloc_index(merged, site.to_component);
+        let callee_memory = crate::merger::component_memory_index(merged, site.to_component);
+        let caller_memory = crate::merger::component_memory_index(merged, site.from_component);
+
+        let caller_ptr_positions: Vec<u32> = if site.crosses_memory && callee_realloc.is_some() {
+            let params = &caller_type.params;
+            let has_retptr =
+                caller_type.results.is_empty() && caller_param_count > callee_param_count;
+            let effective_len = if has_retptr {
+                params.len() - 1
+            } else {
+                params.len()
+            };
+            let mut positions = Vec::new();
+            let mut i = 0;
+            while i + 1 < effective_len {
+                // A (i32, i32) pair is a candidate pointer/length pair; the
+                // resolver confirms via component-type info.
+                if params[i] == wasm_encoder::ValType::I32
+                    && params[i + 1] == wasm_encoder::ValType::I32
+                    && site
+                        .requirements
+                        .pointer_pair_positions
+                        .iter()
+                        .any(|_| true)
+                {
+                    positions.push(i as u32);
+                    i += 2;
+                    continue;
+                }
+                i += 1;
+            }
+            positions
+        } else {
+            Vec::new()
+        };
+
+        if caller_ptr_positions.is_empty() {
+            return;
+        }
+
+        log::debug!(
+            "async adapter param copy: export={} caller_positions={:?} resolver_positions={:?}",
+            site.export_name,
+            caller_ptr_positions,
+            site.requirements.pointer_pair_positions,
+        );
+        let realloc = callee_realloc.unwrap();
+        let param_layouts = &site.requirements.param_copy_layouts;
+        for (pair_idx, &ptr_pos) in caller_ptr_positions.iter().enumerate() {
+            let ptr_local = ptr_pos;
+            let len_local = ptr_local + 1;
+            let l_new_ptr = scratch_local;
+
+            let byte_mult = param_layouts
+                .get(pair_idx)
+                .map(|cl| match cl {
+                    crate::resolver::CopyLayout::Bulk { byte_multiplier } => *byte_multiplier,
+                    crate::resolver::CopyLayout::Elements { element_size, .. } => *element_size,
+                })
+                .unwrap_or(1);
+
+            // Allocate: cabi_realloc(0, 0, 1, len * byte_mult)
+            emit_overflow_guard(body, len_local, byte_mult);
+            body.instruction(&Instruction::I32Const(0));
+            body.instruction(&Instruction::I32Const(0));
+            body.instruction(&Instruction::I32Const(1));
+            body.instruction(&Instruction::LocalGet(len_local));
+            if byte_mult > 1 {
+                body.instruction(&Instruction::I32Const(byte_mult as i32));
+                body.instruction(&Instruction::I32Mul);
+            }
+            emit_checked_realloc(body, realloc, l_new_ptr);
+
+            // Copy: memory.copy new_ptr <- old_ptr, len * byte_mult
+            body.instruction(&Instruction::LocalGet(l_new_ptr));
+            body.instruction(&Instruction::LocalGet(ptr_local));
+            body.instruction(&Instruction::LocalGet(len_local));
+            if byte_mult > 1 {
+                body.instruction(&Instruction::I32Const(byte_mult as i32));
+                body.instruction(&Instruction::I32Mul);
+            }
+            body.instruction(&Instruction::MemoryCopy {
+                dst_mem: callee_memory,
+                src_mem: caller_memory,
+            });
+
+            // Replace the ptr param with the new callee-memory ptr
+            body.instruction(&Instruction::LocalGet(l_new_ptr));
+            body.instruction(&Instruction::LocalSet(ptr_local));
+        }
     }
 
     /// Return true if a `[callback]<export>` companion export exists in the
