@@ -4415,6 +4415,39 @@ impl FactStyleGenerator {
             target_function: target_func,
         })
     }
+
+    /// Return true if a `[callback]<export>` companion export exists in the
+    /// merged module. The Component Model spec attaches `(callback ...)` to a
+    /// canonical lift to opt into callback-mode async; meld surfaces that
+    /// option as a sibling export so the adapter can find the callback by
+    /// name. Absence of the companion means the canonical used stackful
+    /// lifting (SR-32, #140).
+    fn has_callback_export(&self, site: &AdapterSite, merged: &MergedModule) -> bool {
+        let callback_export_name = format!("[callback]{}", site.export_name);
+        merged
+            .exports
+            .iter()
+            .any(|e| e.kind == wasm_encoder::ExportKind::Func && e.name == callback_export_name)
+    }
+
+    /// Stub emitter for stackful-mode async lifting (SR-32, #140 phase 2).
+    ///
+    /// Until the trampoline body lands (commit 3 of phase 2), this returns a
+    /// clear error rather than letting the callback emitter fail silently on
+    /// the missing `[callback]` export. The error string is part of the
+    /// safety-requirement audit trail.
+    fn generate_async_stackful_adapter(
+        &self,
+        site: &AdapterSite,
+        _merged: &MergedModule,
+    ) -> Result<AdapterFunction> {
+        Err(crate::error::Error::EncodingError(format!(
+            "stackful lifting requested by export {:?} but the trampoline \
+             emitter is not yet implemented (SR-32, #140 phase 2 in progress; \
+             see ADR-1)",
+            site.export_name,
+        )))
+    }
 }
 
 impl AdapterGenerator for FactStyleGenerator {
@@ -4428,7 +4461,11 @@ impl AdapterGenerator for FactStyleGenerator {
 
         for (idx, site) in graph.adapter_sites.iter().enumerate() {
             if site.is_async_lift {
-                let adapter = self.generate_async_callback_adapter(site, merged)?;
+                let adapter = if self.has_callback_export(site, merged) {
+                    self.generate_async_callback_adapter(site, merged)?
+                } else {
+                    self.generate_async_stackful_adapter(site, merged)?
+                };
                 adapters.push(adapter);
                 continue;
             }
@@ -4801,6 +4838,100 @@ mod tests {
         assert!(
             body_has_eqz_if_unreachable(&body),
             "LS-A-7: Latin-1→UTF-8 transcoder missing cabi_realloc null guard"
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // SR-32 / #140 phase 2 — stackful lifting routing
+    //
+    // The dispatcher must detect a stackful lift (an `[async-lift]`
+    // export with no `[callback]<export>` companion in the merged
+    // module) and route it to the stackful emitter rather than the
+    // callback emitter. Until commit 3 lands the trampoline body, the
+    // stackful emitter returns a clear error that names SR-32 / #140
+    // so audit and CI surface the path.
+
+    fn empty_merged() -> crate::merger::MergedModule {
+        use crate::merger::MergedModule;
+        MergedModule {
+            types: Vec::new(),
+            imports: Vec::new(),
+            functions: Vec::new(),
+            tables: Vec::new(),
+            memories: Vec::new(),
+            globals: Vec::new(),
+            exports: Vec::new(),
+            start_function: None,
+            elements: Vec::new(),
+            data_segments: Vec::new(),
+            custom_sections: Vec::new(),
+            function_index_map: std::collections::HashMap::new(),
+            memory_index_map: std::collections::HashMap::new(),
+            table_index_map: std::collections::HashMap::new(),
+            global_index_map: std::collections::HashMap::new(),
+            type_index_map: std::collections::HashMap::new(),
+            realloc_map: std::collections::HashMap::new(),
+            import_counts: Default::default(),
+            import_memory_indices: Vec::new(),
+            import_realloc_indices: Vec::new(),
+            resource_rep_by_component: std::collections::HashMap::new(),
+            resource_new_by_component: std::collections::HashMap::new(),
+            handle_tables: std::collections::HashMap::new(),
+            task_return_shims: std::collections::HashMap::new(),
+            async_result_globals: std::collections::HashMap::new(),
+        }
+    }
+
+    fn async_lift_site(export_name: &str) -> crate::resolver::AdapterSite {
+        use crate::resolver::AdapterSite;
+        AdapterSite {
+            from_component: 0,
+            from_module: 0,
+            import_name: "x".into(),
+            import_module: "m".into(),
+            import_func_type_idx: None,
+            to_component: 1,
+            to_module: 0,
+            export_name: export_name.into(),
+            export_func_idx: 0,
+            crosses_memory: false,
+            is_async_lift: true,
+            requirements: Default::default(),
+        }
+    }
+
+    #[test]
+    fn sr32_has_callback_export_detects_companion() {
+        let gen_ = FactStyleGenerator::new(AdapterConfig::default());
+        let site = async_lift_site("[async-lift]foo");
+
+        let mut with_cb = empty_merged();
+        with_cb.exports.push(crate::merger::MergedExport {
+            name: "[callback][async-lift]foo".into(),
+            kind: wasm_encoder::ExportKind::Func,
+            index: 0,
+        });
+        assert!(gen_.has_callback_export(&site, &with_cb));
+
+        let without_cb = empty_merged();
+        assert!(!gen_.has_callback_export(&site, &without_cb));
+    }
+
+    #[test]
+    fn sr32_stackful_emitter_stub_errors_with_audit_string() {
+        let gen_ = FactStyleGenerator::new(AdapterConfig::default());
+        let site = async_lift_site("[async-lift]bar");
+        let merged = empty_merged();
+
+        let err = gen_
+            .generate_async_stackful_adapter(&site, &merged)
+            .expect_err("stackful stub must error until phase 2 commit 3");
+        let msg = format!("{err}");
+        assert!(msg.contains("SR-32"), "error must name SR-32: {msg}");
+        assert!(msg.contains("#140"), "error must name issue #140: {msg}");
+        assert!(
+            msg.contains("[async-lift]bar"),
+            "error must name the export: {msg}"
         );
     }
 }
