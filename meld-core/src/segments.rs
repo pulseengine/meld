@@ -366,23 +366,130 @@ fn parse_const_expr(expr: &wasmparser::ConstExpr<'_>) -> Result<ParsedConstExpr>
     parse_const_expr_with_value(expr).map(|(expr, _)| expr)
 }
 
+/// Fold a wasm 2.0 extended-const i32 expression that has already had its
+/// first `i32.const <initial>` consumed by the caller. Continues reading
+/// operators from `ops` until `End`, applying `i32.add` / `i32.sub` /
+/// `i32.mul` / further `i32.const` to a small evaluation stack with
+/// wrapping semantics per the wasm execution model.
+///
+/// Returns the final stack value if exactly one value remains at `End`.
+/// Rejects unsupported operators (any non-extended-const op) with a
+/// clear error so audit and CI surface the path instead of silently
+/// dropping operators (LS-A-11).
+pub(crate) fn fold_extended_const_i32(
+    ops: &mut wasmparser::OperatorsReader<'_>,
+    initial: i32,
+) -> Result<i32> {
+    let mut stack: Vec<i32> = vec![initial];
+    loop {
+        let op = ops.read()?;
+        match op {
+            Operator::End => break,
+            Operator::I32Const { value } => stack.push(value),
+            Operator::I32Add => fold_i32_binop(&mut stack, i32::wrapping_add)?,
+            Operator::I32Sub => fold_i32_binop(&mut stack, i32::wrapping_sub)?,
+            Operator::I32Mul => fold_i32_binop(&mut stack, i32::wrapping_mul)?,
+            other => {
+                return Err(Error::UnsupportedFeature(format!(
+                    "unsupported i32 extended-const operator: {other:?}"
+                )));
+            }
+        }
+    }
+    if stack.len() != 1 {
+        return Err(Error::UnsupportedFeature(format!(
+            "extended-const i32 expression left {} values on the stack \
+             (expected 1)",
+            stack.len()
+        )));
+    }
+    Ok(stack[0])
+}
+
+fn fold_i32_binop(stack: &mut Vec<i32>, op: fn(i32, i32) -> i32) -> Result<()> {
+    let b = stack.pop().ok_or_else(|| {
+        Error::UnsupportedFeature("i32 extended-const binop with empty stack".to_string())
+    })?;
+    let a = stack.pop().ok_or_else(|| {
+        Error::UnsupportedFeature("i32 extended-const binop with single operand".to_string())
+    })?;
+    stack.push(op(a, b));
+    Ok(())
+}
+
+/// i64 counterpart to `fold_extended_const_i32`.
+pub(crate) fn fold_extended_const_i64(
+    ops: &mut wasmparser::OperatorsReader<'_>,
+    initial: i64,
+) -> Result<i64> {
+    let mut stack: Vec<i64> = vec![initial];
+    loop {
+        let op = ops.read()?;
+        match op {
+            Operator::End => break,
+            Operator::I64Const { value } => stack.push(value),
+            Operator::I64Add => fold_i64_binop(&mut stack, i64::wrapping_add)?,
+            Operator::I64Sub => fold_i64_binop(&mut stack, i64::wrapping_sub)?,
+            Operator::I64Mul => fold_i64_binop(&mut stack, i64::wrapping_mul)?,
+            other => {
+                return Err(Error::UnsupportedFeature(format!(
+                    "unsupported i64 extended-const operator: {other:?}"
+                )));
+            }
+        }
+    }
+    if stack.len() != 1 {
+        return Err(Error::UnsupportedFeature(format!(
+            "extended-const i64 expression left {} values on the stack \
+             (expected 1)",
+            stack.len()
+        )));
+    }
+    Ok(stack[0])
+}
+
+fn fold_i64_binop(stack: &mut Vec<i64>, op: fn(i64, i64) -> i64) -> Result<()> {
+    let b = stack.pop().ok_or_else(|| {
+        Error::UnsupportedFeature("i64 extended-const binop with empty stack".to_string())
+    })?;
+    let a = stack.pop().ok_or_else(|| {
+        Error::UnsupportedFeature("i64 extended-const binop with single operand".to_string())
+    })?;
+    stack.push(op(a, b));
+    Ok(())
+}
+
 fn parse_const_expr_with_value(
     expr: &wasmparser::ConstExpr<'_>,
 ) -> Result<(ParsedConstExpr, Option<ConstExprValue>)> {
     let mut ops = expr.get_operators_reader();
 
-    // Read the first (and usually only) operator
+    // Read the first operator. For an i32 / i64 const, the expression may
+    // continue with extended-const ops (i32.add / i32.sub / i32.mul and
+    // their i64 counterparts) per the WebAssembly 2.0 extended-const
+    // proposal. Fold those into a single value via `fold_extended_const_*`
+    // so downstream consumers see the semantically correct initializer.
+    //
+    // LS-A-11 — silent extended-const truncation: prior versions returned
+    // only the first const and dropped the remaining operators, producing
+    // a global / data / element offset that differed from the source.
     let op = ops.read()?;
 
     let (const_expr, value) = match op {
-        Operator::I32Const { value } => (
-            ParsedConstExpr::I32Const(value),
-            Some(ConstExprValue::I32(value)),
-        ),
-        Operator::I64Const { value } => (
-            ParsedConstExpr::I64Const(value),
-            Some(ConstExprValue::I64(value)),
-        ),
+        Operator::I32Const { value } => {
+            let folded = fold_extended_const_i32(&mut ops, value)?;
+            (
+                ParsedConstExpr::I32Const(folded),
+                Some(ConstExprValue::I32(folded)),
+            )
+        }
+        Operator::I64Const { value } => {
+            let folded = fold_extended_const_i64(&mut ops, value)?;
+            (
+                ParsedConstExpr::I64Const(folded),
+                Some(ConstExprValue::I64(folded)),
+            )
+        }
         Operator::F32Const { value } => (
             ParsedConstExpr::F32Const(f32::from_bits(value.bits())),
             None,
@@ -767,5 +874,89 @@ mod tests {
             actual, expected,
             "concrete type index should be remapped from 0 to 4"
         );
+    }
+
+    // ---------------------------------------------------------------
+    // LS-A-11 — extended-const truncation
+    //
+    // Prior to this fix, `parse_const_expr_with_value` read only the
+    // first operator and silently dropped the rest. Any wasm 2.0
+    // extended-const expression — e.g. `(i32.const 5)(i32.const 10)
+    // i32.add` — parsed as `i32.const 5` (value 5), producing data /
+    // element segment offsets at the wrong addresses.
+    // ---------------------------------------------------------------
+
+    /// Build a minimal active-data section with one segment whose offset
+    /// is an extended-const expression `(i32.const a)(i32.const b)(op)`,
+    /// then run parse_const_expr_with_value on it and return the
+    /// computed offset value.
+    fn parse_i32_extended_offset(a: i32, b: i32, opcode: u8) -> i32 {
+        let body: Vec<u8> = vec![
+            0x01, // segment count = 1
+            0x00, // flags = active mem 0
+            0x41, a as u8, // i32.const a
+            0x41, b as u8, // i32.const b
+            opcode,  // i32.add / sub / mul
+            0x0B,    // end
+            0x00,    // data count = 0
+        ];
+
+        let br = wasmparser::BinaryReader::new(&body, 0);
+        let reader = wasmparser::DataSectionReader::new(br).unwrap();
+        let mut value: Option<i32> = None;
+        for d in reader {
+            let d = d.unwrap();
+            if let wasmparser::DataKind::Active { offset_expr, .. } = d.kind {
+                let (_pce, v) = parse_const_expr_with_value(&offset_expr).unwrap();
+                if let Some(ConstExprValue::I32(n)) = v {
+                    value = Some(n);
+                }
+            }
+        }
+        value.expect("offset value present")
+    }
+
+    #[test]
+    fn ls_a_11_extended_const_i32_add_is_folded() {
+        // (i32.const 5)(i32.const 10) i32.add  →  15
+        assert_eq!(parse_i32_extended_offset(5, 10, 0x6A), 15);
+    }
+
+    #[test]
+    fn ls_a_11_extended_const_i32_sub_is_folded() {
+        // (i32.const 20)(i32.const 7) i32.sub  →  13
+        assert_eq!(parse_i32_extended_offset(20, 7, 0x6B), 13);
+    }
+
+    #[test]
+    fn ls_a_11_extended_const_i32_mul_is_folded() {
+        // (i32.const 6)(i32.const 7) i32.mul  →  42
+        assert_eq!(parse_i32_extended_offset(6, 7, 0x6C), 42);
+    }
+
+    #[test]
+    fn ls_a_11_single_const_still_works() {
+        // Plain `(i32.const 42) end` — no extended-const ops, must still
+        // round-trip as before. (42 fits in single-byte sleb128; 99 would
+        // need a 2-byte encoding due to sign-bit at position 6.)
+        let body: Vec<u8> = vec![
+            0x01, // segment count = 1
+            0x00, // flags = active mem 0
+            0x41, 42,   // i32.const 42
+            0x0B, // end
+            0x00, // data count = 0
+        ];
+        let br = wasmparser::BinaryReader::new(&body, 0);
+        let reader = wasmparser::DataSectionReader::new(br).unwrap();
+        for d in reader {
+            let d = d.unwrap();
+            if let wasmparser::DataKind::Active { offset_expr, .. } = d.kind {
+                let (_pce, v) = parse_const_expr_with_value(&offset_expr).unwrap();
+                assert!(
+                    matches!(v, Some(ConstExprValue::I32(42))),
+                    "expected Some(I32(42)), got {v:?}",
+                );
+            }
+        }
     }
 }
