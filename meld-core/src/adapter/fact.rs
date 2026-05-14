@@ -4239,41 +4239,13 @@ impl FactStyleGenerator {
                     body.instruction(&Instruction::I32Store(mem_arg_4));
                 } else {
                     // Non-pointer results: write globals directly to retptr
-                    let mut offset = 0u32;
-                    for (global_idx, val_ty) in &info.result_globals {
-                        body.instruction(&Instruction::LocalGet(retptr_local));
-                        body.instruction(&Instruction::GlobalGet(*global_idx));
-                        let mem_arg = wasm_encoder::MemArg {
-                            offset: offset as u64,
-                            align: match val_ty {
-                                wasm_encoder::ValType::I64 | wasm_encoder::ValType::F64 => 3,
-                                _ => 2,
-                            },
-                            memory_index: caller_memory,
-                        };
-                        match val_ty {
-                            wasm_encoder::ValType::I32 => {
-                                body.instruction(&Instruction::I32Store(mem_arg));
-                                offset += 4;
-                            }
-                            wasm_encoder::ValType::I64 => {
-                                body.instruction(&Instruction::I64Store(mem_arg));
-                                offset += 8;
-                            }
-                            wasm_encoder::ValType::F32 => {
-                                body.instruction(&Instruction::F32Store(mem_arg));
-                                offset += 4;
-                            }
-                            wasm_encoder::ValType::F64 => {
-                                body.instruction(&Instruction::F64Store(mem_arg));
-                                offset += 8;
-                            }
-                            _ => {
-                                body.instruction(&Instruction::I32Store(mem_arg));
-                                offset += 4;
-                            }
-                        }
-                    }
+                    // with canonical-ABI alignment padding between fields.
+                    self.emit_globals_to_retptr_cabi(
+                        &mut body,
+                        retptr_local,
+                        &info.result_globals,
+                        caller_memory,
+                    );
                 }
             } else {
                 // Push result values onto the stack
@@ -4455,6 +4427,79 @@ impl FactStyleGenerator {
             .exports
             .iter()
             .any(|e| e.kind == wasm_encoder::ExportKind::Func && e.name == callback_export_name)
+    }
+
+    /// Emit the canonical-ABI store sequence that writes each task.return
+    /// result global to the caller's retptr buffer at the spec-required
+    /// offset. Both the callback and stackful async-lift emitters use
+    /// this so the writeback contract has a single source of truth.
+    ///
+    /// Critical invariant — alignment padding between fields:
+    ///
+    /// The canonical ABI aligns every record/tuple field up to its
+    /// natural alignment before placing it. For example, a result whose
+    /// flat lowering contains `[I32, I64]` lays out as i32 at offset 0,
+    /// 4 bytes of padding, i64 at offset 8 (record size 16). A naïve
+    /// "advance offset by flat byte size" loop would write the i64 at
+    /// offset 4 — the caller's canon.lower then reads stale/zero bytes
+    /// at offset 8. Wasm engines treat `MemArg.align` as a hint and do
+    /// not trap on misalignment, so the bug is silent data corruption.
+    ///
+    /// Surfaced by the v0.8.0 pre-release Mythos delta-pass; pinned by
+    /// `cabi_alignment_stackful_retptr_writes_i64_at_offset_8`.
+    fn emit_globals_to_retptr_cabi(
+        &self,
+        body: &mut Function,
+        retptr_local: u32,
+        result_globals: &[(u32, wasm_encoder::ValType)],
+        caller_memory: u32,
+    ) {
+        fn align_up(n: u32, a: u32) -> u32 {
+            (n + a - 1) & !(a - 1)
+        }
+        fn natural(val_ty: &wasm_encoder::ValType) -> (u32, u32) {
+            // (size, alignment) per canonical-ABI flattening; align is
+            // identical to size for primitive numeric types.
+            match val_ty {
+                wasm_encoder::ValType::I64 | wasm_encoder::ValType::F64 => (8, 8),
+                wasm_encoder::ValType::I32 | wasm_encoder::ValType::F32 => (4, 4),
+                _ => (4, 4),
+            }
+        }
+
+        let mut offset = 0u32;
+        for (global_idx, val_ty) in result_globals {
+            let (size, align) = natural(val_ty);
+            offset = align_up(offset, align);
+            body.instruction(&Instruction::LocalGet(retptr_local));
+            body.instruction(&Instruction::GlobalGet(*global_idx));
+            let mem_arg = wasm_encoder::MemArg {
+                offset: offset as u64,
+                align: match val_ty {
+                    wasm_encoder::ValType::I64 | wasm_encoder::ValType::F64 => 3,
+                    _ => 2,
+                },
+                memory_index: caller_memory,
+            };
+            match val_ty {
+                wasm_encoder::ValType::I32 => {
+                    body.instruction(&Instruction::I32Store(mem_arg));
+                }
+                wasm_encoder::ValType::I64 => {
+                    body.instruction(&Instruction::I64Store(mem_arg));
+                }
+                wasm_encoder::ValType::F32 => {
+                    body.instruction(&Instruction::F32Store(mem_arg));
+                }
+                wasm_encoder::ValType::F64 => {
+                    body.instruction(&Instruction::F64Store(mem_arg));
+                }
+                _ => {
+                    body.instruction(&Instruction::I32Store(mem_arg));
+                }
+            }
+            offset += size;
+        }
     }
 
     /// Emit the stackful-mode async-lift trampoline (SR-32, #140).
@@ -4639,43 +4684,16 @@ impl FactStyleGenerator {
                 }
 
                 // Write each result global directly to the caller's
-                // retptr buffer at sequential offsets.
+                // retptr buffer with canonical-ABI alignment padding
+                // between fields (shared helper, see
+                // `emit_globals_to_retptr_cabi`).
                 let retptr_local = callee_param_count as u32;
-                let mut offset = 0u32;
-                for (global_idx, val_ty) in &info.result_globals {
-                    body.instruction(&Instruction::LocalGet(retptr_local));
-                    body.instruction(&Instruction::GlobalGet(*global_idx));
-                    let mem_arg = wasm_encoder::MemArg {
-                        offset: offset as u64,
-                        align: match val_ty {
-                            wasm_encoder::ValType::I64 | wasm_encoder::ValType::F64 => 3,
-                            _ => 2,
-                        },
-                        memory_index: caller_memory,
-                    };
-                    match val_ty {
-                        wasm_encoder::ValType::I32 => {
-                            body.instruction(&Instruction::I32Store(mem_arg));
-                            offset += 4;
-                        }
-                        wasm_encoder::ValType::I64 => {
-                            body.instruction(&Instruction::I64Store(mem_arg));
-                            offset += 8;
-                        }
-                        wasm_encoder::ValType::F32 => {
-                            body.instruction(&Instruction::F32Store(mem_arg));
-                            offset += 4;
-                        }
-                        wasm_encoder::ValType::F64 => {
-                            body.instruction(&Instruction::F64Store(mem_arg));
-                            offset += 8;
-                        }
-                        _ => {
-                            body.instruction(&Instruction::I32Store(mem_arg));
-                            offset += 4;
-                        }
-                    }
-                }
+                self.emit_globals_to_retptr_cabi(
+                    &mut body,
+                    retptr_local,
+                    &info.result_globals,
+                    caller_memory,
+                );
             } else {
                 // Push result values onto the stack for the caller.
                 for (global_idx, _) in &info.result_globals {
@@ -5324,6 +5342,116 @@ mod tests {
             Some(&0x0B),
             "stackful trampoline body must end with `end` (0x0B); \
              body={body:?}",
+        );
+    }
+
+    fn read_uleb(buf: &[u8]) -> (u64, usize) {
+        let mut result: u64 = 0;
+        let mut shift = 0;
+        let mut consumed = 0;
+        for b in buf {
+            consumed += 1;
+            result |= ((b & 0x7f) as u64) << shift;
+            if b & 0x80 == 0 {
+                break;
+            }
+            shift += 7;
+        }
+        (result, consumed)
+    }
+
+    /// Regression test for the alignment-padding bug surfaced by the
+    /// v0.8.0 pre-release Mythos delta-pass on adapter/fact.rs.
+    ///
+    /// The stackful and callback emitters both advance the retptr
+    /// write offset by only the flat size of each result global (4 or
+    /// 8 bytes) without aligning up to the next field's natural
+    /// alignment. For a result whose flat lowering contains
+    /// `[I32, I64]` (record `{u32, u64}`, tuple `(s32, s64)`,
+    /// `result<u64, u32>`, etc.), the canonical-ABI offset of the i64
+    /// is 8 (i32 at 0, 4 bytes padding, i64 at 8 — record size 16).
+    /// The emitter produced 4. Callers reading the retptr per CABI
+    /// see stale/zero bytes for the high-order field.
+    ///
+    /// Hazard: H-4 (canonical ABI lowering mismatch). Maps to UCA-A-13
+    /// generically — the stated context is "variants with i64/f64
+    /// payload" but any aggregate whose flat lowering interleaves
+    /// 4-byte and 8-byte fields realises the same defect.
+    ///
+    /// Engines treat MemArg `align` as a hint, so this is silent data
+    /// corruption with no trap.
+    #[test]
+    fn cabi_alignment_stackful_retptr_writes_i64_at_offset_8() {
+        let gen_ = FactStyleGenerator::new(AdapterConfig::default());
+        let mut merged = empty_merged();
+
+        // Caller type: (retptr: i32) -> ()
+        merged.types.push(crate::merger::MergedFuncType {
+            params: vec![wasm_encoder::ValType::I32],
+            results: vec![],
+        });
+        // Lift type: () -> ()
+        merged.types.push(crate::merger::MergedFuncType {
+            params: vec![],
+            results: vec![],
+        });
+        merged.functions.push(crate::merger::MergedFunction {
+            type_idx: 1,
+            body: wasm_encoder::Function::new([]),
+            origin: (1, 0, 0),
+        });
+        merged.function_index_map.insert((1, 0, 0), 0);
+
+        let lookup_name = "[async-lift]mixed".to_string();
+        let globals = vec![
+            (10u32, wasm_encoder::ValType::I32),
+            (11u32, wasm_encoder::ValType::I64),
+        ];
+        merged
+            .async_result_globals
+            .insert((1, lookup_name.clone()), globals.clone());
+        merged.task_return_shims.insert(
+            0,
+            crate::merger::TaskReturnShimInfo {
+                shim_func: 0,
+                result_globals: globals.clone(),
+                component_idx: 1,
+                import_name: "[task-return]0".into(),
+                original_func_name: lookup_name.clone(),
+                result_type: None,
+            },
+        );
+
+        let mut site = async_lift_site("[async-lift]mixed");
+        site.import_func_type_idx = Some(0);
+        site.crosses_memory = false;
+
+        let adapter = gen_
+            .generate_async_stackful_adapter(&site, &merged)
+            .expect("stackful emitter must succeed");
+
+        let raw = adapter.body.into_raw_body();
+
+        // i64.store opcode is 0x37 followed by LEB align then LEB offset.
+        let mut i = 0;
+        let mut found_offset: Option<u64> = None;
+        while i < raw.len() {
+            if raw[i] == 0x37 {
+                let (_align, n1) = read_uleb(&raw[i + 1..]);
+                let (offset, _n2) = read_uleb(&raw[i + 1 + n1..]);
+                found_offset = Some(offset);
+                break;
+            }
+            i += 1;
+        }
+
+        let offset = found_offset.expect("body must contain i64.store");
+        assert_eq!(
+            offset, 8,
+            "i64 result must store at CABI-aligned offset 8 for record \
+             {{i32, i64}} (i32 at 0, 4 bytes padding, i64 at 8); emitter \
+             produced offset {offset} — callers reading retptr per CABI \
+             would see stale bytes",
         );
     }
 }

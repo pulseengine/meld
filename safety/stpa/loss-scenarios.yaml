@@ -730,6 +730,50 @@ loss-scenarios:
     status: approved
     priority: high
 
+  - id: LS-A-10
+    title: Async-lift retptr writeback skips CABI alignment padding
+    uca: UCA-A-13
+    hazards: [H-4, H-4.5]
+    type: inadequate-control-algorithm
+    scenario: >
+      Both `FactStyleGenerator::generate_async_callback_adapter` and
+      `FactStyleGenerator::generate_async_stackful_adapter` in
+      meld-core/src/adapter/fact.rs (pre-fix lines ~4240-4277 and
+      ~4686-4723) wrote each task.return shim result global to the
+      caller's retptr buffer by advancing the byte offset by only the
+      flat size of the value (4 bytes for i32/f32, 8 bytes for i64/f64)
+      and never aligning up to the next field's natural alignment. For a
+      P3 async lift whose flat-lowered result globals contain `[I32,
+      I64]` — e.g. a record `{u32, u64}`, tuple `(s32, s64)`, or
+      `result<u64, u32>` — the canonical ABI requires the i64 at offset
+      8 (i32 at 0, 4 bytes padding, i64 at 8, record size 16). The
+      adapter wrote the i64 at offset 4. Wasm engines treat
+      `MemArg.align` as a hint and do not trap on misalignment, so the
+      bug is silent data corruption: the caller's canon.lower reads the
+      retptr per canonical ABI and sees stale/zero bytes at offset 8
+      [H-4, H-4.5]. Affects every downstream runtime consuming a meld-
+      fused module (kiln, wasmtime, browsers) because the misalignment
+      is baked into the emitted wasm. Surfaced by the v0.8.0 pre-release
+      Mythos delta-pass on `adapter/fact.rs`; PoC test
+      `cabi_alignment_stackful_retptr_writes_i64_at_offset_8`
+      reproduces with a concrete `[I32, I64]` result-global pair. Fix:
+      extracted shared helper `emit_globals_to_retptr_cabi` that calls
+      `align_up(offset, natural_align(val_ty))` before each store; both
+      emitters now route through this single CABI-correct writeback.
+    causal-factors:
+      - Offset advanced by flat size, never aligned up to the next
+        field's natural alignment
+      - Both emitters carried the same defect — the recent step 0.5
+        refactor for code reuse did not cover the retptr writeback, so
+        the bug remained duplicated across the two emitters
+      - Pin tests covered opcode shape (call/drop/global.get/end) and
+        the simple push-results-on-stack path, but no test exercised
+        the retptr writeback with mixed-size aggregate results
+      - Wasm `MemArg.align` is a hint; engines do not trap on
+        misalignment, so the bug is invisible at runtime
+    status: approved
+    priority: high
+
   # ==========================================================================
   # Merger scenario (discovered during gap analysis)
   # ==========================================================================
