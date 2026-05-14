@@ -66,6 +66,26 @@ All notable changes to this project will be documented in this file.
   pinned by `ls_a_20_flags_canonical_abi_matches_spec` (covers
   N=1/8/9/17/32/33) and `ls_a_20_flags_parser_produces_flags_variant`.
 
+- **P3 async detection: mixed-mode stackful, substring type classification,
+  stream-write over-count** (LS-A-12, LS-A-13, LS-A-14). Three independent
+  defects in `meld-core/src/p3_async.rs` surfaced by the post-v0.8.0 Mythos
+  delta-pass.
+  - `P3AsyncFeatures::uses_stackful_lift()` was derived as `uses_async_lift
+    && !uses_callback_lift`, mis-classifying mixed-mode components (one
+    callback-mode lift + one stackful-mode lift) as callback-only.
+    Now tracks the stackful presence via a new independent
+    `uses_stackful_lift_internal: bool` set per-lift in `detect_features`.
+  - `StreamWriteResult::decode(ret, requested)` folded any
+    `written >= requested` into `Complete { written }`, including the
+    out-of-contract `written > requested` case. A buggy / hostile runtime
+    returning `n > data_len` could drive callers to advance their cursor
+    past the source buffer. Now classifies as `Unknown(ret)` so callers
+    see a clear contract violation instead of silent corruption.
+  - `detect_features` classified P3Async types via `desc.contains("stream")`
+    / `desc.contains("future")`, so `future<stream<u8>>` matched "stream"
+    first and landed in `stream_types`. Now classifies on the **root
+    constructor** of the type description.
+
 ### Added
 
 - **Mythos delta-pass CI gate** (`.github/workflows/mythos-gate.yml`,
