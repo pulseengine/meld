@@ -4,6 +4,24 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- **CABI alignment padding in async-lift retptr writeback** (LS-A-10,
+  UCA-A-13, H-4 / H-4.5). Both `generate_async_callback_adapter` and
+  `generate_async_stackful_adapter` advanced the retptr byte offset by
+  only the flat size of each result global (4 or 8 bytes) and never
+  aligned up to the next field's natural alignment. For any P3 async
+  lift returning an aggregate whose flat lowering mixes 4- and 8-byte
+  values (record `{u32, u64}`, tuple `(s32, s64)`, `result<u64, u32>`,
+  etc.), the i64 / f64 field was stored at the wrong canonical-ABI
+  offset and the caller's canon.lower read stale/zero bytes. Silent
+  data corruption — wasm engines treat `MemArg.align` as a hint and
+  do not trap. Fix extracts the writeback into a shared
+  `emit_globals_to_retptr_cabi` helper that pads via `align_up` before
+  each store. Surfaced by the v0.8.0 pre-release Mythos delta-pass on
+  `adapter/fact.rs`; regression pinned by
+  `cabi_alignment_stackful_retptr_writes_i64_at_offset_8`.
+
 ### Added
 
 - **P3 stackful lifting — ABI foundation** (#140 / SR-32, sub-#94).
