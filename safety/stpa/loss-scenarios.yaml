@@ -822,6 +822,50 @@ loss-scenarios:
     status: approved
     priority: high
 
+  - id: LS-A-16
+    title: Wrapper drops source canonical options (lift type + string encoding)
+    uca: UCA-W-2
+    hazards: [H-1, H-4]
+    type: inadequate-control-algorithm
+    scenario: >
+      `meld-core/src/component_wrap.rs::find_lift_type_for_interface_func`
+      took `interface_name` and `func_name` parameters, built
+      `target_export_name = format!("{}#{}", interface_name, func_name)`,
+      then never compared the result against anything — `let _ =
+      target_export_name` at the bottom suppressed the unused warning.
+      Strategy 1 returned the **first** lift entry that had any matching
+      `ComponentFuncDef::Lift`; Strategy 2 returned the **first** lift
+      entry, period. For a component with N lifted exports, every
+      wrapper canon-lift section was emitted with the type and
+      canonical options of whichever lift the parser recorded first.
+      Mixed string-encoding components (e.g. one UTF-8 export and one
+      UTF-16 export, both via wit-bindgen) had every export silently
+      downgraded to whatever encoding the first lift carried. Wasm
+      validator accepts the wrapper output because the wrong-encoding
+      lift still type-checks against the wrapper interface; downstream
+      wasmtime transcodes against the wrong encoding, producing
+      mojibake / truncated strings with no trap. Same family as the
+      wasmtime 2026-04-09 CM-transcoding CVE wave. The bug also
+      hardcoded the lift's `string_encoding` to `UTF8` regardless of
+      the source component's declaration. Fix routes lift lookups via
+      the export-name match (matching the wit-bindgen `{iface}#{func}`
+      convention) and propagates the source `CanonStringEncoding`
+      through a new `source_string_encoding_option` helper. Lower-side
+      encoding propagation and lift-side `Memory(0)` hardcoding in
+      multi-memory mode remain deferred — they need additional
+      threading of source memory indices through the wrapper which is
+      tracked under the same UCA but lands in a follow-up.
+    causal-factors:
+      - Function took (iface, func) parameters but never used them;
+        explicit `let _ = target_export_name` suppressed the unused
+        warning, making the bug look intentional
+      - String-encoding was hardcoded UTF-8 in lift emission paths,
+        not derived from source canonical options
+      - No upstream test exercised a multi-lift / mixed-encoding
+        component
+    status: approved
+    priority: high
+
   # ==========================================================================
   # Merger scenario (discovered during gap analysis)
   # ==========================================================================
