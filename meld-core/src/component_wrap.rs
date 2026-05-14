@@ -1777,12 +1777,22 @@ fn assemble_component(
                 define_default_run_type(&mut component, &mut component_type_idx)
             };
 
-            // Canon lift with appropriate options
+            // Canon lift with appropriate options.
+            //
+            // String encoding is propagated from the source component's
+            // canon lift rather than hardcoded to UTF-8 (LS-A-16). A
+            // guest compiled with `--string-encoding=utf16` previously
+            // had its option silently downgraded, producing wrong-ABI
+            // strings downstream with no trap.
+            let source_string_encoding = lift_info
+                .as_ref()
+                .map(|(_, opts)| source_string_encoding_option(opts.string_encoding))
+                .unwrap_or(CanonicalOption::UTF8);
             let mut lift_options: Vec<CanonicalOption> = Vec::new();
             if func_info.has_post_return {
                 // String/list-returning functions need memory + encoding + post-return
                 lift_options.push(CanonicalOption::Memory(0)); // shim memory = shared memory
-                lift_options.push(CanonicalOption::UTF8);
+                lift_options.push(source_string_encoding);
                 if let Some(pr_idx) = post_return_core_idx {
                     lift_options.push(CanonicalOption::PostReturn(pr_idx));
                 }
@@ -1806,7 +1816,7 @@ fn assemble_component(
                                 | CanonicalOption::CompactUTF16
                         )
                     }) {
-                        lift_options.push(CanonicalOption::UTF8);
+                        lift_options.push(source_string_encoding);
                     }
                 }
                 if source_opts.callback.is_some() {
@@ -2485,6 +2495,20 @@ struct ExportFuncInfo {
 /// matches the `<interface>#<func_name>` pattern.
 /// Returns (type_index, canonical_options) for the source component's lift
 /// entry that matches the given interface function.
+/// Translate the source component's `CanonStringEncoding` enum into the
+/// `wasm_encoder::CanonicalOption` byte the wrapper emits. Without this
+/// helper the wrapper hardcoded `UTF8` regardless of what the source
+/// declared, silently downgrading UTF-16 / CompactUTF16 lifts (LS-A-16).
+fn source_string_encoding_option(
+    enc: parser::CanonStringEncoding,
+) -> wasm_encoder::CanonicalOption {
+    match enc {
+        parser::CanonStringEncoding::Utf8 => wasm_encoder::CanonicalOption::UTF8,
+        parser::CanonStringEncoding::Utf16 => wasm_encoder::CanonicalOption::UTF16,
+        parser::CanonStringEncoding::CompactUtf16 => wasm_encoder::CanonicalOption::CompactUTF16,
+    }
+}
+
 fn find_lift_type_for_interface_func(
     source: &ParsedComponent,
     interface_name: &str,
@@ -2492,50 +2516,77 @@ fn find_lift_type_for_interface_func(
 ) -> Option<(u32, parser::CanonicalOptions)> {
     let target_export_name = format!("{}#{}", interface_name, func_name);
 
-    // Strategy 1: Find a Lift entry whose core function is exported with the
-    // target name. Walk canonical_functions for Lift entries, then check if
-    // the core_func_index matches an export with our target name.
+    // Strategy 1: Find the export whose name matches `target_export_name`
+    // (the wit-bindgen interface-export convention `{iface}#{func}`),
+    // resolve its index through `component_func_defs` to a lift's
+    // canonical entry, and return *that lift's* type and options.
     //
-    // The source component's core module exports include the target name.
-    // The Lift entry references the core function by its core_func_index.
-    // We can match by looking at core aliases that reference the export name.
-    for (canon_idx, canon) in source.canonical_functions.iter().enumerate() {
-        if let parser::CanonicalEntry::Lift {
-            type_index,
-            options,
-            ..
-        } = canon
+    // Prior to this fix the function built `target_export_name` but never
+    // compared it against anything (`let _ = target_export_name` at the
+    // bottom suppressed the unused warning), returning the **first** lift
+    // entry for every (iface, func) request. For a multi-export interface
+    // every export got the first lift's type and options — including its
+    // `string_encoding` and `memory` canonical options — producing wrong
+    // canon-lift sections in the wrapper output (LS-A-16).
+    //
+    // Strategy 2 (fallback to "any lift"): kept for components that
+    // export their lift bare (no `{iface}#{func}` prefix) — many small
+    // wit fixtures fall into this shape — and have only a single lift,
+    // so picking the only one is safe. The fallback now triggers only
+    // when strategy 1 finds no matching export at all, not on every call.
+    for export in &source.exports {
+        if export.name != target_export_name
+            || !matches!(export.kind, wasmparser::ComponentExternalKind::Func)
         {
-            // Check if any component_func_def points to this lift, and if
-            // the corresponding export matches our interface
-            for func_def in &source.component_func_defs {
-                if let parser::ComponentFuncDef::Lift(idx) = func_def
-                    && *idx == canon_idx
-                {
-                    // This is a lifted function. Check if the source
-                    // component exports it as our interface.
-                    return Some((*type_index, options.clone()));
-                }
-            }
+            continue;
         }
-    }
-
-    // Strategy 2: Look for any Lift entry (fallback for simple components
-    // with only one export).
-    for canon in &source.canonical_functions {
-        if let parser::CanonicalEntry::Lift {
-            type_index,
-            options,
-            ..
-        } = canon
+        let func_def_idx = export.index as usize;
+        if let Some(parser::ComponentFuncDef::Lift(canon_idx)) =
+            source.component_func_defs.get(func_def_idx)
+            && let Some(parser::CanonicalEntry::Lift {
+                type_index,
+                options,
+                ..
+            }) = source.canonical_functions.get(*canon_idx)
         {
             return Some((*type_index, options.clone()));
         }
     }
 
-    // No lift found — export type unknown
-    let _ = target_export_name; // suppress unused warning
-    None
+    // Strategy 2: fallback when no export matched. Returns the first
+    // lift entry's type and options so downstream emission still
+    // produces *some* valid wasm. This preserves fuzz-safety
+    // (`fuzz_fusion_roundtrip` requires that any input meld accepts
+    // produces structurally valid output) at the cost of misclassifying
+    // multi-lift components where the lookup-by-name failed. For real
+    // wit-bindgen output every lift is paired with an export, so the
+    // export-name path above hits and this fallback is never reached.
+    //
+    // A `log::warn` documents the guess when more than one lift exists
+    // so audit-of-output catches multi-lift cases where the fallback
+    // was needed.
+    let mut lifts = source.canonical_functions.iter().filter_map(|c| match c {
+        parser::CanonicalEntry::Lift {
+            type_index,
+            options,
+            ..
+        } => Some((*type_index, options.clone())),
+        _ => None,
+    });
+    let first = lifts.next()?;
+    let extra = lifts.count();
+    if extra > 0 {
+        log::warn!(
+            "find_lift_type_for_interface_func: no export matched \
+             {interface_name}#{func_name} but component has {} lifts; \
+             falling back to first lift's type/options to keep the \
+             wrapper output valid. If this fires on a real wit-bindgen \
+             component, the export-naming convention has drifted from \
+             `{{iface}}#{{func}}` (LS-A-16 fuzz-safety fallback).",
+            extra + 1,
+        );
+    }
+    Some(first)
 }
 
 /// Define a source component's type in our wrapper, recursively defining
@@ -3028,6 +3079,7 @@ fn convert_type_ref(ty: wasmparser::TypeRef) -> Result<wasm_encoder::EntityType>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use wasm_encoder::CanonicalOption;
 
     #[test]
     fn test_count_replayed_types_hello_c_cli() {
@@ -3463,5 +3515,156 @@ mod tests {
             &instance_func_map,
         );
         assert!(result.is_none(), "unknown module should not resolve");
+    }
+
+    // ---------------------------------------------------------------
+    // LS-A-16 — find_lift_type_for_interface_func ignored its iface/func
+    // arguments and returned the first lift entry. For a multi-export
+    // component, every export silently received the first lift's type
+    // and canonical options (including string_encoding, breaking UTF-16
+    // lifts down to UTF-8).
+    // ---------------------------------------------------------------
+
+    fn empty_parsed_component_for_lift_test() -> parser::ParsedComponent {
+        parser::ParsedComponent {
+            name: None,
+            core_modules: vec![],
+            imports: vec![],
+            exports: vec![],
+            types: vec![],
+            instances: vec![],
+            canonical_functions: vec![],
+            sub_components: vec![],
+            component_aliases: vec![],
+            component_instances: vec![],
+            core_entity_order: vec![],
+            component_func_defs: vec![],
+            component_instance_defs: vec![],
+            component_type_defs: vec![],
+            original_size: 0,
+            original_hash: String::new(),
+            depth_0_sections: vec![],
+            p3_async_features: vec![],
+        }
+    }
+
+    fn lift_entry(
+        type_index: u32,
+        encoding: parser::CanonStringEncoding,
+    ) -> parser::CanonicalEntry {
+        parser::CanonicalEntry::Lift {
+            core_func_index: 0,
+            type_index,
+            options: parser::CanonicalOptions {
+                string_encoding: encoding,
+                memory: Some(0),
+                realloc: None,
+                post_return: None,
+                async_: false,
+                callback: None,
+            },
+        }
+    }
+
+    #[test]
+    fn ls_a_16_find_lift_distinguishes_between_two_exports() {
+        // Two lifts: lift 0 carries type 10 UTF-8, lift 1 carries type
+        // 20 UTF-16. Two exports map func_def 0 → lift 0 and func_def
+        // 1 → lift 1, with names "iface:a#fa" and "iface:b#fb"
+        // respectively. The lookup must return the correct lift per
+        // (iface, func) — prior to the fix it returned lift 0 for both.
+        let mut comp = empty_parsed_component_for_lift_test();
+        comp.canonical_functions
+            .push(lift_entry(10, parser::CanonStringEncoding::Utf8));
+        comp.canonical_functions
+            .push(lift_entry(20, parser::CanonStringEncoding::Utf16));
+        comp.component_func_defs
+            .push(parser::ComponentFuncDef::Lift(0));
+        comp.component_func_defs
+            .push(parser::ComponentFuncDef::Lift(1));
+        comp.exports.push(parser::ComponentExport {
+            name: "iface:a#fa".to_string(),
+            kind: wasmparser::ComponentExternalKind::Func,
+            index: 0,
+        });
+        comp.exports.push(parser::ComponentExport {
+            name: "iface:b#fb".to_string(),
+            kind: wasmparser::ComponentExternalKind::Func,
+            index: 1,
+        });
+
+        let a = find_lift_type_for_interface_func(&comp, "iface:a", "fa");
+        let b = find_lift_type_for_interface_func(&comp, "iface:b", "fb");
+
+        let (a_type, a_opts) = a.expect("lift for iface:a#fa must resolve");
+        let (b_type, b_opts) = b.expect("lift for iface:b#fb must resolve");
+        assert_eq!(a_type, 10);
+        assert_eq!(a_opts.string_encoding, parser::CanonStringEncoding::Utf8);
+        assert_eq!(
+            b_type, 20,
+            "iface:b#fb must resolve to lift 1 (type 20), not first-lift fallback"
+        );
+        assert_eq!(
+            b_opts.string_encoding,
+            parser::CanonStringEncoding::Utf16,
+            "iface:b#fb's string encoding must be UTF-16 from its own lift"
+        );
+    }
+
+    #[test]
+    fn ls_a_16_find_lift_single_lift_fallback_still_works() {
+        // Regression: a component with exactly one lift but no
+        // matching export should still resolve via the single-lift
+        // fallback (preserves existing behavior for simple fixtures).
+        let mut comp = empty_parsed_component_for_lift_test();
+        comp.canonical_functions
+            .push(lift_entry(7, parser::CanonStringEncoding::Utf8));
+        comp.component_func_defs
+            .push(parser::ComponentFuncDef::Lift(0));
+
+        let r = find_lift_type_for_interface_func(&comp, "any", "thing");
+        let (ty, _) = r.expect("single-lift fallback must resolve");
+        assert_eq!(ty, 7);
+    }
+
+    #[test]
+    fn ls_a_16_find_lift_two_lifts_without_matching_export_fuzz_safe_fallback() {
+        // Without a matching export AND with multiple lifts, the
+        // function falls back to the FIRST lift's type/options to
+        // keep downstream wasm emission valid. This preserves
+        // fuzz-safety (`fuzz_fusion_roundtrip`) at the cost of
+        // misclassifying — real wit-bindgen components always hit
+        // the export-match path. A `log::warn` documents the guess.
+        let mut comp = empty_parsed_component_for_lift_test();
+        comp.canonical_functions
+            .push(lift_entry(10, parser::CanonStringEncoding::Utf8));
+        comp.canonical_functions
+            .push(lift_entry(20, parser::CanonStringEncoding::Utf16));
+
+        let r = find_lift_type_for_interface_func(&comp, "any", "thing");
+        let (ty, _opts) = r.expect("fallback must return first lift, not None");
+        assert_eq!(
+            ty, 10,
+            "fallback must return the FIRST lift's type (10) for fuzz \
+             safety; returning None caused downstream invalid wasm in \
+             `fuzz_fusion_roundtrip`"
+        );
+    }
+
+    #[test]
+    fn ls_a_16_source_string_encoding_option_round_trips() {
+        // All three encodings must map to the correct CanonicalOption.
+        assert!(matches!(
+            source_string_encoding_option(parser::CanonStringEncoding::Utf8),
+            CanonicalOption::UTF8
+        ));
+        assert!(matches!(
+            source_string_encoding_option(parser::CanonStringEncoding::Utf16),
+            CanonicalOption::UTF16
+        ));
+        assert!(matches!(
+            source_string_encoding_option(parser::CanonStringEncoding::CompactUtf16),
+            CanonicalOption::CompactUTF16
+        ));
     }
 }
