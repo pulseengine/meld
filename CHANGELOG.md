@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.8.0] — 2026-05-14
+
 ### Fixed
 
 - **CABI alignment padding in async-lift retptr writeback** (LS-A-10,
