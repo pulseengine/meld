@@ -4145,98 +4145,17 @@ impl FactStyleGenerator {
                     && caller_realloc.is_some();
 
                 if is_ptr_len_pair {
-                    let realloc_func = caller_realloc.unwrap();
-                    let (ptr_global, _) = info.result_globals[0];
-                    let (len_global, _) = info.result_globals[1];
-
-                    // Determine the per-element byte size and alignment from
-                    // the WIT result type. For string the element is 1 byte;
-                    // for list<u32> it's 4; for list<record{...}> it's the
-                    // record's CABI size (with internal alignment padding).
-                    // Without a known type we fall back to 1 (string-like).
-                    let (elem_size, elem_align, list_elem_ty) = match &info.result_type {
-                        Some(crate::parser::ComponentValType::List(elem))
-                        | Some(crate::parser::ComponentValType::FixedSizeList(elem, _)) => {
-                            let (s, a) = cabi_size_align(elem);
-                            (s, a, Some(elem.as_ref().clone()))
-                        }
-                        Some(crate::parser::ComponentValType::String) => (1, 1, None),
-                        _ => (1, 1, None),
-                    };
-
-                    // locals
-                    let l_src_ptr = l_p2 + 1;
-                    let l_src_len = l_p2 + 2;
-                    let l_dst_ptr = l_p2 + 3;
-                    let l_byte_count = l_p2 + 4;
-
-                    // Read source ptr and len from shim globals
-                    body.instruction(&Instruction::GlobalGet(ptr_global));
-                    body.instruction(&Instruction::LocalSet(l_src_ptr));
-                    body.instruction(&Instruction::GlobalGet(len_global));
-                    body.instruction(&Instruction::LocalSet(l_src_len));
-
-                    // byte_count = len * elem_size
-                    emit_overflow_guard(&mut body, l_src_len, elem_size);
-                    body.instruction(&Instruction::LocalGet(l_src_len));
-                    if elem_size != 1 {
-                        body.instruction(&Instruction::I32Const(elem_size as i32));
-                        body.instruction(&Instruction::I32Mul);
-                    }
-                    body.instruction(&Instruction::LocalSet(l_byte_count));
-
-                    // Allocate in caller memory: cabi_realloc(0, 0, align, byte_count)
-                    body.instruction(&Instruction::I32Const(0)); // old_ptr
-                    body.instruction(&Instruction::I32Const(0)); // old_size
-                    body.instruction(&Instruction::I32Const(elem_align as i32));
-                    body.instruction(&Instruction::LocalGet(l_byte_count));
-                    emit_checked_realloc(&mut body, realloc_func, l_dst_ptr);
-
-                    // Copy from callee memory to caller memory
-                    body.instruction(&Instruction::LocalGet(l_dst_ptr));
-                    body.instruction(&Instruction::LocalGet(l_src_ptr));
-                    body.instruction(&Instruction::LocalGet(l_byte_count));
-                    body.instruction(&Instruction::MemoryCopy {
-                        dst_mem: caller_memory,
-                        src_mem: callee_memory,
-                    });
-
-                    // If the list element contains nested indirections
-                    // (string fields, nested lists), walk each element and
-                    // copy each indirect buffer into caller memory, then
-                    // patch the (ptr, len) pair stored in the copied record.
-                    if let Some(elem_ty) = &list_elem_ty {
-                        emit_patch_nested_indirections(
-                            &mut body,
-                            elem_ty,
-                            l_dst_ptr,
-                            l_src_ptr,
-                            l_src_len,
-                            elem_size,
-                            l_p2 + 5,
-                            realloc_func,
-                            caller_memory,
-                            callee_memory,
-                        );
-                    }
-
-                    // Write (new_ptr, len) to retptr
-                    let mem_arg_0 = wasm_encoder::MemArg {
-                        offset: 0,
-                        align: 2,
-                        memory_index: caller_memory,
-                    };
-                    let mem_arg_4 = wasm_encoder::MemArg {
-                        offset: 4,
-                        align: 2,
-                        memory_index: caller_memory,
-                    };
-                    body.instruction(&Instruction::LocalGet(retptr_local));
-                    body.instruction(&Instruction::LocalGet(l_dst_ptr));
-                    body.instruction(&Instruction::I32Store(mem_arg_0));
-                    body.instruction(&Instruction::LocalGet(retptr_local));
-                    body.instruction(&Instruction::LocalGet(l_src_len));
-                    body.instruction(&Instruction::I32Store(mem_arg_4));
+                    // Shared helper handles realloc + memory.copy +
+                    // nested-indirection walk + retptr writeback.
+                    self.emit_ptr_pair_result_writeback(
+                        &mut body,
+                        info,
+                        retptr_local,
+                        caller_realloc.unwrap(),
+                        caller_memory,
+                        callee_memory,
+                        l_p2 + 1,
+                    );
                 } else {
                     // Non-pointer results: write globals directly to retptr
                     // with canonical-ABI alignment padding between fields.
@@ -4429,6 +4348,121 @@ impl FactStyleGenerator {
             .any(|e| e.kind == wasm_encoder::ExportKind::Func && e.name == callback_export_name)
     }
 
+    /// Emit the cross-memory writeback for an async-lift result that is a
+    /// `(ptr, len)` pair (string / list<T>). Allocates a buffer in caller
+    /// memory via `cabi_realloc`, copies the source bytes from callee
+    /// memory, walks nested indirections if the list element type
+    /// contains them, and writes `(new_ptr, len)` to the caller's retptr.
+    ///
+    /// Shared between callback and stackful async-lift emitters so the
+    /// cross-memory contract has a single source of truth (SR-12 /
+    /// SR-17). The caller must reserve at least 4 consecutive scratch
+    /// i32 locals starting at `scratch_base`, plus the 6 locals
+    /// `emit_patch_nested_indirections` consumes starting at
+    /// `scratch_base + 4`.
+    #[allow(clippy::too_many_arguments)]
+    fn emit_ptr_pair_result_writeback(
+        &self,
+        body: &mut Function,
+        info: &crate::merger::TaskReturnShimInfo,
+        retptr_local: u32,
+        caller_realloc_func: u32,
+        caller_memory: u32,
+        callee_memory: u32,
+        scratch_base: u32,
+    ) {
+        let (ptr_global, _) = info.result_globals[0];
+        let (len_global, _) = info.result_globals[1];
+
+        // Determine the per-element byte size and alignment from the
+        // WIT result type. For string the element is 1 byte; for
+        // list<u32> it's 4; for list<record{...}> it's the record's
+        // CABI size. Without a known type we fall back to 1 (string-
+        // like).
+        let (elem_size, elem_align, list_elem_ty) = match &info.result_type {
+            Some(crate::parser::ComponentValType::List(elem))
+            | Some(crate::parser::ComponentValType::FixedSizeList(elem, _)) => {
+                let (s, a) = cabi_size_align(elem);
+                (s, a, Some(elem.as_ref().clone()))
+            }
+            Some(crate::parser::ComponentValType::String) => (1, 1, None),
+            _ => (1, 1, None),
+        };
+
+        let l_src_ptr = scratch_base;
+        let l_src_len = scratch_base + 1;
+        let l_dst_ptr = scratch_base + 2;
+        let l_byte_count = scratch_base + 3;
+
+        // Read source ptr and len from shim globals
+        body.instruction(&Instruction::GlobalGet(ptr_global));
+        body.instruction(&Instruction::LocalSet(l_src_ptr));
+        body.instruction(&Instruction::GlobalGet(len_global));
+        body.instruction(&Instruction::LocalSet(l_src_len));
+
+        // byte_count = len * elem_size, with LS-A-7 overflow guard
+        emit_overflow_guard(body, l_src_len, elem_size);
+        body.instruction(&Instruction::LocalGet(l_src_len));
+        if elem_size != 1 {
+            body.instruction(&Instruction::I32Const(elem_size as i32));
+            body.instruction(&Instruction::I32Mul);
+        }
+        body.instruction(&Instruction::LocalSet(l_byte_count));
+
+        // Allocate in caller memory: cabi_realloc(0, 0, align, byte_count)
+        body.instruction(&Instruction::I32Const(0)); // old_ptr
+        body.instruction(&Instruction::I32Const(0)); // old_size
+        body.instruction(&Instruction::I32Const(elem_align as i32));
+        body.instruction(&Instruction::LocalGet(l_byte_count));
+        emit_checked_realloc(body, caller_realloc_func, l_dst_ptr);
+
+        // Copy from callee memory to caller memory
+        body.instruction(&Instruction::LocalGet(l_dst_ptr));
+        body.instruction(&Instruction::LocalGet(l_src_ptr));
+        body.instruction(&Instruction::LocalGet(l_byte_count));
+        body.instruction(&Instruction::MemoryCopy {
+            dst_mem: caller_memory,
+            src_mem: callee_memory,
+        });
+
+        // Walk nested indirections (string fields, nested lists) if the
+        // list element type carries them.
+        if let Some(elem_ty) = &list_elem_ty {
+            emit_patch_nested_indirections(
+                body,
+                elem_ty,
+                l_dst_ptr,
+                l_src_ptr,
+                l_src_len,
+                elem_size,
+                scratch_base + 4,
+                caller_realloc_func,
+                caller_memory,
+                callee_memory,
+            );
+        }
+
+        // Write (new_ptr, len) to retptr at offsets 0 and 4 (both i32,
+        // align 2). The pair layout is fixed by the canonical ABI for
+        // string and list<T> returns, so no align_up needed here.
+        let mem_arg_0 = wasm_encoder::MemArg {
+            offset: 0,
+            align: 2,
+            memory_index: caller_memory,
+        };
+        let mem_arg_4 = wasm_encoder::MemArg {
+            offset: 4,
+            align: 2,
+            memory_index: caller_memory,
+        };
+        body.instruction(&Instruction::LocalGet(retptr_local));
+        body.instruction(&Instruction::LocalGet(l_dst_ptr));
+        body.instruction(&Instruction::I32Store(mem_arg_0));
+        body.instruction(&Instruction::LocalGet(retptr_local));
+        body.instruction(&Instruction::LocalGet(l_src_len));
+        body.instruction(&Instruction::I32Store(mem_arg_4));
+    }
+
     /// Emit the canonical-ABI store sequence that writes each task.return
     /// result global to the caller's retptr buffer at the spec-required
     /// offset. Both the callback and stackful async-lift emitters use
@@ -4580,11 +4614,16 @@ impl FactStyleGenerator {
 
         // Locals layout (simpler than callback mode — no packed/code/payload):
         //   0..caller_param_count: params from caller
-        //   +0: $scratch (i32) — used by step 0.5 helper for new_ptr
+        //   +0:        $scratch — used by step 0.5 helper for new_ptr
+        //   +1..+4:    ptr-pair result writeback scratch (src_ptr,
+        //              src_len, dst_ptr, byte_count)
+        //   +5..+10:   nested-indirection patching scratch (consumed by
+        //              `emit_patch_nested_indirections`)
         let l_scratch = caller_param_count as u32;
 
-        // 1 scratch + room for nested-indirection patching (matches callback)
-        let mut body = Function::new([(8, wasm_encoder::ValType::I32)]);
+        // 11 locals total: 1 for step 0.5 + 4 for ptr-pair writeback +
+        // 6 for nested-indirection patching. Plus 1 headroom = 12.
+        let mut body = Function::new([(12, wasm_encoder::ValType::I32)]);
 
         // Step 0.5: cross-memory param copy (shared with callback path)
         self.emit_param_copy_step(
@@ -4661,39 +4700,44 @@ impl FactStyleGenerator {
 
         if let Some(info) = shim_info.as_ref() {
             if uses_retptr {
-                // Detect cross-memory ptr-pair returns (string / list).
-                // Deferred to a follow-up — error clearly so the audit
-                // surface stays observable instead of silently producing
-                // wrong wasm.
+                let retptr_local = callee_param_count as u32;
                 let callee_memory =
                     crate::merger::component_memory_index(merged, site.to_component);
+                let caller_realloc =
+                    crate::merger::component_realloc_index(merged, site.from_component);
                 let is_ptr_pair = info.result_globals.len() == 2
                     && info
                         .result_globals
                         .iter()
                         .all(|(_, t)| *t == wasm_encoder::ValType::I32)
-                    && callee_memory != caller_memory;
-                if is_ptr_pair {
-                    return Err(crate::error::Error::EncodingError(format!(
-                        "stackful async lift '{}' returns a cross-memory \
-                         (ptr, len) result; this path is deferred to a \
-                         follow-up after #140 (SR-32). Use callback-mode \
-                         lifting or fuse same-memory components for now.",
-                        site.export_name,
-                    )));
-                }
+                    && callee_memory != caller_memory
+                    && caller_realloc.is_some();
 
-                // Write each result global directly to the caller's
-                // retptr buffer with canonical-ABI alignment padding
-                // between fields (shared helper, see
-                // `emit_globals_to_retptr_cabi`).
-                let retptr_local = callee_param_count as u32;
-                self.emit_globals_to_retptr_cabi(
-                    &mut body,
-                    retptr_local,
-                    &info.result_globals,
-                    caller_memory,
-                );
+                if is_ptr_pair {
+                    // Cross-memory (string / list<T>) return: realloc
+                    // in caller memory, copy, walk nested indirections,
+                    // write (new_ptr, len) to retptr. Shared with the
+                    // callback path; see `emit_ptr_pair_result_writeback`.
+                    self.emit_ptr_pair_result_writeback(
+                        &mut body,
+                        info,
+                        retptr_local,
+                        caller_realloc.unwrap(),
+                        caller_memory,
+                        callee_memory,
+                        l_scratch + 1,
+                    );
+                } else {
+                    // Non-pointer results: write globals directly to retptr
+                    // with canonical-ABI alignment padding between fields
+                    // (shared helper, see `emit_globals_to_retptr_cabi`).
+                    self.emit_globals_to_retptr_cabi(
+                        &mut body,
+                        retptr_local,
+                        &info.result_globals,
+                        caller_memory,
+                    );
+                }
             } else {
                 // Push result values onto the stack for the caller.
                 for (global_idx, _) in &info.result_globals {
@@ -5358,6 +5402,126 @@ mod tests {
             shift += 7;
         }
         (result, consumed)
+    }
+
+    /// Regression test for the cross-memory ptr-pair stackful return
+    /// path. Before v0.8.1 this returned an explicit "deferred to
+    /// follow-up" error rather than emit wasm. The fix routes through
+    /// `emit_ptr_pair_result_writeback` (shared with the callback
+    /// path) so the emitter produces the realloc + memory.copy +
+    /// retptr write sequence required by SR-12 / SR-17 for cross-
+    /// memory string / list<T> returns.
+    ///
+    /// The byte-scan asserts the body contains the marker opcodes:
+    ///   call             = 0x10  (cabi_realloc + lift call)
+    ///   memory.copy      = 0xFC 0x0A  (cross-memory copy of the buffer)
+    ///   i32.store        = 0x36  (writing new_ptr and len to retptr)
+    ///   end              = 0x0B
+    #[test]
+    fn stackful_ptr_pair_return_emits_realloc_memcopy_retptr_writes() {
+        let gen_ = FactStyleGenerator::new(AdapterConfig::default());
+        let mut merged = empty_merged();
+
+        // Caller type: (retptr: i32) -> ()
+        merged.types.push(crate::merger::MergedFuncType {
+            params: vec![wasm_encoder::ValType::I32],
+            results: vec![],
+        });
+        // Lift type: () -> ()
+        merged.types.push(crate::merger::MergedFuncType {
+            params: vec![],
+            results: vec![],
+        });
+
+        // Lift function lives in callee (component 1) at merged idx 0.
+        merged.functions.push(crate::merger::MergedFunction {
+            type_idx: 1,
+            body: wasm_encoder::Function::new([]),
+            origin: (1, 0, 0),
+        });
+        merged.function_index_map.insert((1, 0, 0), 0);
+
+        // Caller's cabi_realloc lives at merged idx 1 (defined function).
+        merged.functions.push(crate::merger::MergedFunction {
+            type_idx: 1,
+            body: wasm_encoder::Function::new([]),
+            origin: (0, 0, 0),
+        });
+        merged.realloc_map.insert((0, 0), 1);
+
+        // Two memories: caller at idx 0, callee at idx 1.
+        merged.memory_index_map.insert((0, 0, 0), 0);
+        merged.memory_index_map.insert((1, 0, 0), 1);
+
+        // Result globals: a (ptr, len) pair both i32, with a String
+        // result_type so elem_size = 1.
+        let lookup_name = "[async-lift]greet".to_string();
+        let globals = vec![
+            (20u32, wasm_encoder::ValType::I32),
+            (21u32, wasm_encoder::ValType::I32),
+        ];
+        merged
+            .async_result_globals
+            .insert((1, lookup_name.clone()), globals.clone());
+        merged.task_return_shims.insert(
+            0,
+            crate::merger::TaskReturnShimInfo {
+                shim_func: 0,
+                result_globals: globals.clone(),
+                component_idx: 1,
+                import_name: "[task-return]0".into(),
+                original_func_name: lookup_name.clone(),
+                result_type: Some(crate::parser::ComponentValType::String),
+            },
+        );
+
+        // Site: from=0 (caller), to=1 (callee), crosses_memory=true.
+        let mut site = async_lift_site("[async-lift]greet");
+        site.from_component = 0;
+        site.to_component = 1;
+        site.import_func_type_idx = Some(0);
+        site.crosses_memory = true;
+
+        let adapter = gen_
+            .generate_async_stackful_adapter(&site, &merged)
+            .expect("stackful emitter must succeed for ptr-pair return");
+
+        let body = adapter.body.into_raw_body();
+
+        // memory.copy is encoded as 0xFC 0x0A followed by dst-mem and
+        // src-mem indices. The 2-byte prefix is the deterministic marker.
+        let has_memcopy = body.windows(2).any(|w| w == [0xFC, 0x0A]);
+        assert!(
+            has_memcopy,
+            "stackful ptr-pair return must emit memory.copy (0xFC 0x0A) \
+             for cross-memory buffer copy; body={body:?}",
+        );
+
+        // i32.store is opcode 0x36 — must appear at least twice for
+        // the retptr (new_ptr at offset 0, len at offset 4).
+        let i32_store_count = body.iter().filter(|&&b| b == 0x36).count();
+        assert!(
+            i32_store_count >= 2,
+            "stackful ptr-pair return must emit >=2 i32.store (0x36) \
+             for retptr (new_ptr, len); found {i32_store_count} in body \
+             ={body:?}",
+        );
+
+        // The body must include a call (0x10) — at minimum the
+        // cabi_realloc call inside emit_checked_realloc plus the lift
+        // call. >=2 is the spec-required minimum.
+        let call_count = body.iter().filter(|&&b| b == 0x10).count();
+        assert!(
+            call_count >= 2,
+            "stackful ptr-pair return must emit >=2 call (0x10) — at \
+             least cabi_realloc + lift; found {call_count} in body={body:?}",
+        );
+
+        assert_eq!(
+            body.last(),
+            Some(&0x0B),
+            "body must end with `end` (0x0B); body={body:?}",
+        );
     }
 
     /// Regression test for the alignment-padding bug surfaced by the

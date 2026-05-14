@@ -4,6 +4,20 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **Stackful async-lift cross-memory `(ptr, len)` return** (SR-32 follow-up,
+  sub-#94). The stackful trampoline emitter now handles the case where a
+  stackful async lift returns a `string` or `list<T>` and the caller and
+  callee live in different linear memories. v0.8.0 errored out on this
+  path; v0.8.1 routes it through the same `emit_ptr_pair_result_writeback`
+  helper the callback emitter uses — `cabi_realloc` in caller memory,
+  cross-memory `memory.copy`, nested-indirection patch if the list
+  element carries indirections, then `(new_ptr, len)` written to retptr.
+  Both emitters now share the writeback contract single source of truth.
+  Regression pinned by
+  `stackful_ptr_pair_return_emits_realloc_memcopy_retptr_writes`.
+
 ## [0.8.0] — 2026-05-14
 
 ### Fixed
