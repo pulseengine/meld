@@ -3913,114 +3913,18 @@ impl FactStyleGenerator {
         // + 6 for nested indirection patching (i, rec_dst, old_ptr, buf_len, new_ptr, rec_src)
         let mut body = Function::new([(16, wasm_encoder::ValType::I32)]);
 
-        // Step 0.5: Copy string/list params from caller to callee memory.
-        //
-        // The pointer_pair_positions from the resolver are in CALLEE component
-        // type order. But the adapter's locals are in CALLER order (from the
-        // caller's canon lower). These may differ if the component type
-        // reorders params.
-        //
-        // Instead of using the resolver's positions, compute positions from
-        // the caller's flat param types: find (i32, i32) pairs that could be
-        // (ptr, len) strings/lists.
-        let callee_realloc = crate::merger::component_realloc_index(merged, site.to_component);
-
-        // Detect pointer pairs in caller params: consecutive (i32, i32) pairs
-        // that aren't the last param (retptr). This is a heuristic — works for
-        // string and list params which are always (ptr: i32, len: i32).
-        let caller_ptr_positions: Vec<u32> = if site.crosses_memory && callee_realloc.is_some() {
-            let params = &caller_type.params;
-            let has_retptr =
-                caller_type.results.is_empty() && caller_param_count > callee_param_count;
-            let effective_len = if has_retptr {
-                params.len() - 1
-            } else {
-                params.len()
-            };
-            let mut positions = Vec::new();
-            let mut i = 0;
-            while i + 1 < effective_len {
-                if params[i] == wasm_encoder::ValType::I32
-                    && params[i + 1] == wasm_encoder::ValType::I32
-                {
-                    // Check if the resolver also thinks this is a pointer pair
-                    // (the resolver uses component type info to confirm)
-                    if site
-                        .requirements
-                        .pointer_pair_positions
-                        .iter()
-                        .any(|_| true)
-                    {
-                        positions.push(i as u32);
-                        i += 2; // skip the len
-                        continue;
-                    }
-                }
-                i += 1;
-            }
-            positions
-        } else {
-            Vec::new()
-        };
-
-        let has_param_copies = !caller_ptr_positions.is_empty();
-
-        if has_param_copies {
-            log::debug!(
-                "async adapter param copy: export={} caller_positions={:?} resolver_positions={:?}",
-                site.export_name,
-                caller_ptr_positions,
-                site.requirements.pointer_pair_positions,
-            );
-            let realloc = callee_realloc.unwrap();
-            // For each (ptr, len) pair in the caller's params, allocate in
-            // callee memory and copy the data from caller memory. Use the
-            // resolver's param_copy_layouts to get the per-element byte
-            // size so list<u32>/list<u64>/etc. copy the correct total size.
-            let param_layouts = &site.requirements.param_copy_layouts;
-            for (pair_idx, &ptr_pos) in caller_ptr_positions.iter().enumerate() {
-                let ptr_local = ptr_pos;
-                let len_local = ptr_local + 1;
-                let l_new_ptr = l_p2 + 4; // reuse scratch local
-
-                let byte_mult = param_layouts
-                    .get(pair_idx)
-                    .map(|cl| match cl {
-                        crate::resolver::CopyLayout::Bulk { byte_multiplier } => *byte_multiplier,
-                        crate::resolver::CopyLayout::Elements { element_size, .. } => *element_size,
-                    })
-                    .unwrap_or(1);
-
-                // Allocate: cabi_realloc(0, 0, 1, len * byte_mult)
-                emit_overflow_guard(&mut body, len_local, byte_mult);
-                body.instruction(&Instruction::I32Const(0));
-                body.instruction(&Instruction::I32Const(0));
-                body.instruction(&Instruction::I32Const(1));
-                body.instruction(&Instruction::LocalGet(len_local));
-                if byte_mult > 1 {
-                    body.instruction(&Instruction::I32Const(byte_mult as i32));
-                    body.instruction(&Instruction::I32Mul);
-                }
-                emit_checked_realloc(&mut body, realloc, l_new_ptr);
-
-                // Copy: memory.copy new_ptr <- old_ptr, len * byte_mult
-                body.instruction(&Instruction::LocalGet(l_new_ptr));
-                body.instruction(&Instruction::LocalGet(ptr_local));
-                body.instruction(&Instruction::LocalGet(len_local));
-                if byte_mult > 1 {
-                    body.instruction(&Instruction::I32Const(byte_mult as i32));
-                    body.instruction(&Instruction::I32Mul);
-                }
-                body.instruction(&Instruction::MemoryCopy {
-                    dst_mem: callee_memory,
-                    src_mem: caller_memory,
-                });
-
-                // Replace the ptr param with the new callee-memory ptr
-                body.instruction(&Instruction::LocalGet(l_new_ptr));
-                body.instruction(&Instruction::LocalSet(ptr_local));
-            }
-        }
+        // Step 0.5: copy string/list params from caller to callee memory.
+        // Shared with the stackful emitter (SR-32, #140); see
+        // `emit_param_copy_step` for the full contract.
+        self.emit_param_copy_step(
+            &mut body,
+            site,
+            merged,
+            &caller_type,
+            caller_param_count,
+            callee_param_count,
+            l_p2 + 4,
+        );
 
         // Step 1: Call [async-lift] entry with callee's params
         // (skip retptr if caller has more params than callee)
@@ -4415,6 +4319,416 @@ impl FactStyleGenerator {
             target_function: target_func,
         })
     }
+
+    /// Step 0.5 of any async-lift adapter: copy `string` / `list<T>` params
+    /// from caller memory into callee memory, allocating callee buffers via
+    /// `cabi_realloc` and patching the caller's locals to point at the new
+    /// callee-side buffers. Shared between callback and stackful emitters so
+    /// the cross-memory contract has a single source of truth (SR-12,
+    /// SR-17).
+    ///
+    /// `scratch_local` is the local index the helper uses to hold the
+    /// realloc result. Callers must reserve at least one i32 local at that
+    /// index. Both emitters allocate their local layout so the scratch sits
+    /// just past the caller's params and per-emitter loop locals.
+    #[allow(clippy::too_many_arguments)]
+    fn emit_param_copy_step(
+        &self,
+        body: &mut Function,
+        site: &AdapterSite,
+        merged: &MergedModule,
+        caller_type: &crate::merger::MergedFuncType,
+        caller_param_count: usize,
+        callee_param_count: usize,
+        scratch_local: u32,
+    ) {
+        // The pointer_pair_positions from the resolver are in CALLEE
+        // component type order. But the adapter's locals are in CALLER
+        // order (from the caller's canon lower). These may differ if the
+        // component type reorders params.
+        //
+        // Instead of using the resolver's positions, compute positions from
+        // the caller's flat param types: find (i32, i32) pairs that could
+        // be (ptr, len) strings/lists.
+        let callee_realloc = crate::merger::component_realloc_index(merged, site.to_component);
+        let callee_memory = crate::merger::component_memory_index(merged, site.to_component);
+        let caller_memory = crate::merger::component_memory_index(merged, site.from_component);
+
+        let caller_ptr_positions: Vec<u32> = if site.crosses_memory && callee_realloc.is_some() {
+            let params = &caller_type.params;
+            let has_retptr =
+                caller_type.results.is_empty() && caller_param_count > callee_param_count;
+            let effective_len = if has_retptr {
+                params.len() - 1
+            } else {
+                params.len()
+            };
+            let mut positions = Vec::new();
+            let mut i = 0;
+            while i + 1 < effective_len {
+                // A (i32, i32) pair is a candidate pointer/length pair; the
+                // resolver confirms via component-type info.
+                if params[i] == wasm_encoder::ValType::I32
+                    && params[i + 1] == wasm_encoder::ValType::I32
+                    && site
+                        .requirements
+                        .pointer_pair_positions
+                        .iter()
+                        .any(|_| true)
+                {
+                    positions.push(i as u32);
+                    i += 2;
+                    continue;
+                }
+                i += 1;
+            }
+            positions
+        } else {
+            Vec::new()
+        };
+
+        if caller_ptr_positions.is_empty() {
+            return;
+        }
+
+        log::debug!(
+            "async adapter param copy: export={} caller_positions={:?} resolver_positions={:?}",
+            site.export_name,
+            caller_ptr_positions,
+            site.requirements.pointer_pair_positions,
+        );
+        let realloc = callee_realloc.unwrap();
+        let param_layouts = &site.requirements.param_copy_layouts;
+        for (pair_idx, &ptr_pos) in caller_ptr_positions.iter().enumerate() {
+            let ptr_local = ptr_pos;
+            let len_local = ptr_local + 1;
+            let l_new_ptr = scratch_local;
+
+            let byte_mult = param_layouts
+                .get(pair_idx)
+                .map(|cl| match cl {
+                    crate::resolver::CopyLayout::Bulk { byte_multiplier } => *byte_multiplier,
+                    crate::resolver::CopyLayout::Elements { element_size, .. } => *element_size,
+                })
+                .unwrap_or(1);
+
+            // Allocate: cabi_realloc(0, 0, 1, len * byte_mult)
+            emit_overflow_guard(body, len_local, byte_mult);
+            body.instruction(&Instruction::I32Const(0));
+            body.instruction(&Instruction::I32Const(0));
+            body.instruction(&Instruction::I32Const(1));
+            body.instruction(&Instruction::LocalGet(len_local));
+            if byte_mult > 1 {
+                body.instruction(&Instruction::I32Const(byte_mult as i32));
+                body.instruction(&Instruction::I32Mul);
+            }
+            emit_checked_realloc(body, realloc, l_new_ptr);
+
+            // Copy: memory.copy new_ptr <- old_ptr, len * byte_mult
+            body.instruction(&Instruction::LocalGet(l_new_ptr));
+            body.instruction(&Instruction::LocalGet(ptr_local));
+            body.instruction(&Instruction::LocalGet(len_local));
+            if byte_mult > 1 {
+                body.instruction(&Instruction::I32Const(byte_mult as i32));
+                body.instruction(&Instruction::I32Mul);
+            }
+            body.instruction(&Instruction::MemoryCopy {
+                dst_mem: callee_memory,
+                src_mem: caller_memory,
+            });
+
+            // Replace the ptr param with the new callee-memory ptr
+            body.instruction(&Instruction::LocalGet(l_new_ptr));
+            body.instruction(&Instruction::LocalSet(ptr_local));
+        }
+    }
+
+    /// Return true if a `[callback]<export>` companion export exists in the
+    /// merged module. The Component Model spec attaches `(callback ...)` to a
+    /// canonical lift to opt into callback-mode async; meld surfaces that
+    /// option as a sibling export so the adapter can find the callback by
+    /// name. Absence of the companion means the canonical used stackful
+    /// lifting (SR-32, #140).
+    fn has_callback_export(&self, site: &AdapterSite, merged: &MergedModule) -> bool {
+        let callback_export_name = format!("[callback]{}", site.export_name);
+        merged
+            .exports
+            .iter()
+            .any(|e| e.kind == wasm_encoder::ExportKind::Func && e.name == callback_export_name)
+    }
+
+    /// Emit the stackful-mode async-lift trampoline (SR-32, #140).
+    ///
+    /// Stackful lifting per the Component Model spec: a canonical lift
+    /// with `(canon lift ... async ...)` but **no** `(callback ...)`
+    /// option. The runtime treats the lifted call as a fiber boundary —
+    /// the wasm code inside may call `task.wait`/`task.yield` to suspend,
+    /// and the runtime resumes the fiber transparently. From the
+    /// adapter's perspective, the call looks synchronous: invoke the
+    /// lift, await its return, read result globals.
+    ///
+    /// Generated wasm shape:
+    ///
+    /// ```wat
+    /// (func $async_stackful_adapter_<from>_to_<to>
+    ///   ;; step 0.5: cross-memory param copy (shared with callback path)
+    ///   ;; step 1:   call [async-lift]<export> — runtime-managed fiber
+    ///   ;; step 1.5: drop the lift's stackful return value (irrelevant —
+    ///   ;;           result has already been written via task.return)
+    ///   ;; step 3:   read result from async_result_globals and return
+    ///   ;;           to caller (push-on-stack OR write-to-retptr)
+    /// )
+    /// ```
+    ///
+    /// The Phase 1 `thread::*` host-intrinsic ABI (thread_new,
+    /// thread_switch_to, thread_yield, thread_exit) remains valid for
+    /// component-internal concurrency but is **not** consumed by this
+    /// trampoline; see ADR-1's 2026-05-13 addendum.
+    ///
+    /// Result readback covers:
+    /// - Push-results-onto-stack: caller expects direct results
+    /// - Retptr with non-pointer scalars: write globals at offset to
+    ///   caller's return buffer
+    ///
+    /// Returning lists / strings from stackful mode (cross-memory copy
+    /// of `(ptr, len)` results) is deferred to a follow-up; this emitter
+    /// errors clearly if asked to handle that case for now.
+    fn generate_async_stackful_adapter(
+        &self,
+        site: &AdapterSite,
+        merged: &MergedModule,
+    ) -> Result<AdapterFunction> {
+        let name = format!(
+            "$async_stackful_adapter_{}_to_{}",
+            site.from_component, site.to_component
+        );
+
+        let async_lift_func = self.resolve_target_function(site, merged)?;
+
+        let caller_type_idx = site
+            .import_func_type_idx
+            .and_then(|local_ti| {
+                merged
+                    .type_index_map
+                    .get(&(site.from_component, site.from_module, local_ti))
+                    .copied()
+            })
+            .unwrap_or(0);
+
+        let caller_type = merged
+            .types
+            .get(caller_type_idx as usize)
+            .cloned()
+            .unwrap_or_else(|| crate::merger::MergedFuncType {
+                params: Vec::new(),
+                results: Vec::new(),
+            });
+        let caller_param_count = caller_type.params.len();
+
+        let caller_memory = crate::merger::component_memory_index(merged, site.from_component);
+
+        let callee_param_count = merged
+            .defined_func(async_lift_func)
+            .and_then(|f| merged.types.get(f.type_idx as usize))
+            .map(|t| t.params.len())
+            .unwrap_or(caller_param_count);
+
+        // Locals layout (simpler than callback mode — no packed/code/payload):
+        //   0..caller_param_count: params from caller
+        //   +0: $scratch (i32) — used by step 0.5 helper for new_ptr
+        let l_scratch = caller_param_count as u32;
+
+        // 1 scratch + room for nested-indirection patching (matches callback)
+        let mut body = Function::new([(8, wasm_encoder::ValType::I32)]);
+
+        // Step 0.5: cross-memory param copy (shared with callback path)
+        self.emit_param_copy_step(
+            &mut body,
+            site,
+            merged,
+            &caller_type,
+            caller_param_count,
+            callee_param_count,
+            l_scratch,
+        );
+
+        // Step 1: call [async-lift] entry. In stackful mode the runtime
+        // treats this call as a fiber boundary; control returns once the
+        // fiber has run to completion (including any task.wait suspensions
+        // the body issues internally).
+        for i in 0..callee_param_count {
+            body.instruction(&Instruction::LocalGet(i as u32));
+        }
+        body.instruction(&Instruction::Call(async_lift_func));
+
+        // Step 1.5: drop any return value the lift function produces. In
+        // stackful mode the real result has already been written to the
+        // task.return shim globals from inside the lift body; the wasm-
+        // level return value (if any) is a control word the runtime owns.
+        let lift_result_count = merged
+            .defined_func(async_lift_func)
+            .and_then(|f| merged.types.get(f.type_idx as usize))
+            .map(|t| t.results.len())
+            .unwrap_or(0);
+        for _ in 0..lift_result_count {
+            body.instruction(&Instruction::Drop);
+        }
+
+        // Step 3: read result values from task.return shim globals.
+        let adapter_func_name = site
+            .export_name
+            .rsplit_once('#')
+            .map(|(_, name)| name)
+            .unwrap_or(&site.export_name);
+
+        let result_globals_direct = merged
+            .async_result_globals
+            .get(&(site.to_component, adapter_func_name.to_string()));
+
+        let shim_info = if let Some(globals) = result_globals_direct {
+            let result_type = merged
+                .task_return_shims
+                .values()
+                .find(|info| {
+                    info.component_idx == site.to_component && info.result_globals == *globals
+                })
+                .and_then(|info| info.result_type.clone());
+            Some(crate::merger::TaskReturnShimInfo {
+                shim_func: 0,
+                result_globals: globals.clone(),
+                component_idx: site.to_component,
+                import_name: String::new(),
+                original_func_name: adapter_func_name.to_string(),
+                result_type,
+            })
+        } else {
+            merged
+                .task_return_shims
+                .values()
+                .find(|info| {
+                    info.component_idx == site.to_component
+                        && info.original_func_name == adapter_func_name
+                })
+                .cloned()
+        };
+
+        let uses_retptr = caller_type.results.is_empty() && caller_param_count > callee_param_count;
+
+        if let Some(info) = shim_info.as_ref() {
+            if uses_retptr {
+                // Detect cross-memory ptr-pair returns (string / list).
+                // Deferred to a follow-up — error clearly so the audit
+                // surface stays observable instead of silently producing
+                // wrong wasm.
+                let callee_memory =
+                    crate::merger::component_memory_index(merged, site.to_component);
+                let is_ptr_pair = info.result_globals.len() == 2
+                    && info
+                        .result_globals
+                        .iter()
+                        .all(|(_, t)| *t == wasm_encoder::ValType::I32)
+                    && callee_memory != caller_memory;
+                if is_ptr_pair {
+                    return Err(crate::error::Error::EncodingError(format!(
+                        "stackful async lift '{}' returns a cross-memory \
+                         (ptr, len) result; this path is deferred to a \
+                         follow-up after #140 (SR-32). Use callback-mode \
+                         lifting or fuse same-memory components for now.",
+                        site.export_name,
+                    )));
+                }
+
+                // Write each result global directly to the caller's
+                // retptr buffer at sequential offsets.
+                let retptr_local = callee_param_count as u32;
+                let mut offset = 0u32;
+                for (global_idx, val_ty) in &info.result_globals {
+                    body.instruction(&Instruction::LocalGet(retptr_local));
+                    body.instruction(&Instruction::GlobalGet(*global_idx));
+                    let mem_arg = wasm_encoder::MemArg {
+                        offset: offset as u64,
+                        align: match val_ty {
+                            wasm_encoder::ValType::I64 | wasm_encoder::ValType::F64 => 3,
+                            _ => 2,
+                        },
+                        memory_index: caller_memory,
+                    };
+                    match val_ty {
+                        wasm_encoder::ValType::I32 => {
+                            body.instruction(&Instruction::I32Store(mem_arg));
+                            offset += 4;
+                        }
+                        wasm_encoder::ValType::I64 => {
+                            body.instruction(&Instruction::I64Store(mem_arg));
+                            offset += 8;
+                        }
+                        wasm_encoder::ValType::F32 => {
+                            body.instruction(&Instruction::F32Store(mem_arg));
+                            offset += 4;
+                        }
+                        wasm_encoder::ValType::F64 => {
+                            body.instruction(&Instruction::F64Store(mem_arg));
+                            offset += 8;
+                        }
+                        _ => {
+                            body.instruction(&Instruction::I32Store(mem_arg));
+                            offset += 4;
+                        }
+                    }
+                }
+            } else {
+                // Push result values onto the stack for the caller.
+                for (global_idx, _) in &info.result_globals {
+                    body.instruction(&Instruction::GlobalGet(*global_idx));
+                }
+            }
+        } else {
+            // No matching task.return shim — emit default values per
+            // caller result types so the adapter is still a valid wasm
+            // function. The merger should always wire shims for
+            // async-lifted exports, so reaching here implies a parse-
+            // time invariant violation; logging keeps the path visible.
+            log::warn!(
+                "stackful adapter '{}': no task.return shim found; \
+                 emitting default results",
+                site.export_name,
+            );
+            for result_ty in &caller_type.results {
+                match result_ty {
+                    wasm_encoder::ValType::I32 => {
+                        body.instruction(&Instruction::I32Const(0));
+                    }
+                    wasm_encoder::ValType::I64 => {
+                        body.instruction(&Instruction::I64Const(0));
+                    }
+                    wasm_encoder::ValType::F32 => {
+                        body.instruction(&Instruction::F32Const(0.0_f32.into()));
+                    }
+                    wasm_encoder::ValType::F64 => {
+                        body.instruction(&Instruction::F64Const(0.0_f64.into()));
+                    }
+                    _ => {
+                        body.instruction(&Instruction::I32Const(0));
+                    }
+                }
+            }
+        }
+
+        body.instruction(&Instruction::End);
+
+        let target_func = self.resolve_target_function(site, merged)?;
+
+        Ok(AdapterFunction {
+            name,
+            type_idx: caller_type_idx,
+            body,
+            source_component: site.from_component,
+            source_module: site.from_module,
+            target_component: site.to_component,
+            target_module: site.to_module,
+            target_function: target_func,
+        })
+    }
 }
 
 impl AdapterGenerator for FactStyleGenerator {
@@ -4428,7 +4742,11 @@ impl AdapterGenerator for FactStyleGenerator {
 
         for (idx, site) in graph.adapter_sites.iter().enumerate() {
             if site.is_async_lift {
-                let adapter = self.generate_async_callback_adapter(site, merged)?;
+                let adapter = if self.has_callback_export(site, merged) {
+                    self.generate_async_callback_adapter(site, merged)?
+                } else {
+                    self.generate_async_stackful_adapter(site, merged)?
+                };
                 adapters.push(adapter);
                 continue;
             }
@@ -4801,6 +5119,211 @@ mod tests {
         assert!(
             body_has_eqz_if_unreachable(&body),
             "LS-A-7: Latin-1→UTF-8 transcoder missing cabi_realloc null guard"
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // SR-32 / #140 phase 2 — stackful lifting routing
+    //
+    // The dispatcher must detect a stackful lift (an `[async-lift]`
+    // export with no `[callback]<export>` companion in the merged
+    // module) and route it to the stackful emitter rather than the
+    // callback emitter. Until commit 3 lands the trampoline body, the
+    // stackful emitter returns a clear error that names SR-32 / #140
+    // so audit and CI surface the path.
+
+    fn empty_merged() -> crate::merger::MergedModule {
+        use crate::merger::MergedModule;
+        MergedModule {
+            types: Vec::new(),
+            imports: Vec::new(),
+            functions: Vec::new(),
+            tables: Vec::new(),
+            memories: Vec::new(),
+            globals: Vec::new(),
+            exports: Vec::new(),
+            start_function: None,
+            elements: Vec::new(),
+            data_segments: Vec::new(),
+            custom_sections: Vec::new(),
+            function_index_map: std::collections::HashMap::new(),
+            memory_index_map: std::collections::HashMap::new(),
+            table_index_map: std::collections::HashMap::new(),
+            global_index_map: std::collections::HashMap::new(),
+            type_index_map: std::collections::HashMap::new(),
+            realloc_map: std::collections::HashMap::new(),
+            import_counts: Default::default(),
+            import_memory_indices: Vec::new(),
+            import_realloc_indices: Vec::new(),
+            resource_rep_by_component: std::collections::HashMap::new(),
+            resource_new_by_component: std::collections::HashMap::new(),
+            handle_tables: std::collections::HashMap::new(),
+            task_return_shims: std::collections::HashMap::new(),
+            async_result_globals: std::collections::HashMap::new(),
+        }
+    }
+
+    fn async_lift_site(export_name: &str) -> crate::resolver::AdapterSite {
+        use crate::resolver::AdapterSite;
+        AdapterSite {
+            from_component: 0,
+            from_module: 0,
+            import_name: "x".into(),
+            import_module: "m".into(),
+            import_func_type_idx: None,
+            to_component: 1,
+            to_module: 0,
+            export_name: export_name.into(),
+            export_func_idx: 0,
+            crosses_memory: false,
+            is_async_lift: true,
+            requirements: Default::default(),
+        }
+    }
+
+    #[test]
+    fn sr32_has_callback_export_detects_companion() {
+        let gen_ = FactStyleGenerator::new(AdapterConfig::default());
+        let site = async_lift_site("[async-lift]foo");
+
+        let mut with_cb = empty_merged();
+        with_cb.exports.push(crate::merger::MergedExport {
+            name: "[callback][async-lift]foo".into(),
+            kind: wasm_encoder::ExportKind::Func,
+            index: 0,
+        });
+        assert!(gen_.has_callback_export(&site, &with_cb));
+
+        let without_cb = empty_merged();
+        assert!(!gen_.has_callback_export(&site, &without_cb));
+    }
+
+    #[test]
+    fn sr32_stackful_emitter_handles_no_shim_with_default_results() {
+        // With no task.return shim in the empty merged module and an
+        // empty caller_type (no results), the emitter should still emit
+        // a valid adapter — body just ends. The path is the "no shim,
+        // no results" branch (warns via log) and validates that the
+        // overall emitter wiring compiles and produces an
+        // AdapterFunction without panicking.
+        let gen_ = FactStyleGenerator::new(AdapterConfig::default());
+        let site = async_lift_site("[async-lift]bar");
+        let mut merged = empty_merged();
+        // Make resolve_target_function succeed by providing a defined
+        // function the site can point at; the emitter doesn't actually
+        // require the function to be well-typed for this minimal test.
+        merged.functions.push(crate::merger::MergedFunction {
+            type_idx: 0,
+            body: wasm_encoder::Function::new([]),
+            origin: (1, 0, 0),
+        });
+        merged.types.push(crate::merger::MergedFuncType {
+            params: Vec::new(),
+            results: Vec::new(),
+        });
+        merged.function_index_map.insert((1, 0, 0), 0);
+
+        let adapter = gen_
+            .generate_async_stackful_adapter(&site, &merged)
+            .expect("stackful emitter must succeed for trivial site");
+        assert_eq!(
+            adapter.name, "$async_stackful_adapter_0_to_1",
+            "adapter name must follow the stackful naming convention"
+        );
+    }
+
+    #[test]
+    fn sr32_stackful_emitter_shape_pins_call_drop_globalget() {
+        // SR-32 acceptance: with a real shim wired into the merged
+        // module, the stackful emitter must produce a body that
+        // structurally matches the documented trampoline shape — call
+        // the lift function, drop its return, read the result global,
+        // end. Pin the wasm opcodes so future refactors that drift
+        // away from this shape break the test loudly.
+        //
+        // Opcodes:
+        //   local.get  = 0x20
+        //   call       = 0x10
+        //   drop       = 0x1A
+        //   global.get = 0x23
+        //   end        = 0x0B
+
+        let gen_ = FactStyleGenerator::new(AdapterConfig::default());
+        let mut merged = empty_merged();
+
+        // Type 0: () -> i32 — minimal lift signature returning one i32
+        // that the stackful trampoline will drop.
+        merged.types.push(crate::merger::MergedFuncType {
+            params: Vec::new(),
+            results: vec![wasm_encoder::ValType::I32],
+        });
+        // The lift function lives at merged index 0.
+        merged.functions.push(crate::merger::MergedFunction {
+            type_idx: 0,
+            body: wasm_encoder::Function::new([]),
+            origin: (1, 0, 0),
+        });
+        merged.function_index_map.insert((1, 0, 0), 0);
+
+        // A result global at index 7 — the stackful trampoline must
+        // emit `global.get 7` followed by the function epilogue.
+        // We register it both in async_result_globals (the primary
+        // lookup) and in task_return_shims (for the fallback path the
+        // emitter consults to recover the result type).
+        // The emitter looks up shims by `adapter_func_name`, derived
+        // from `export_name.rsplit_once('#')`. When the export has no
+        // '#', the lookup uses the full export name verbatim — match
+        // that here.
+        let lookup_name = "[async-lift]ping".to_string();
+        let globals = vec![(7u32, wasm_encoder::ValType::I32)];
+        merged
+            .async_result_globals
+            .insert((1, lookup_name.clone()), globals.clone());
+        merged.task_return_shims.insert(
+            0,
+            crate::merger::TaskReturnShimInfo {
+                shim_func: 0,
+                result_globals: globals.clone(),
+                component_idx: 1,
+                import_name: "[task-return]0".into(),
+                original_func_name: lookup_name.clone(),
+                result_type: None,
+            },
+        );
+
+        // Site: caller has the same result shape so we hit the
+        // push-results-on-stack branch (no retptr), which is the
+        // simplest readback the structural pin needs to cover.
+        let mut site = async_lift_site("[async-lift]ping");
+        site.import_func_type_idx = Some(0);
+        site.crosses_memory = false;
+
+        let adapter = gen_
+            .generate_async_stackful_adapter(&site, &merged)
+            .expect("stackful emitter must succeed");
+
+        let body = adapter.body.into_raw_body();
+
+        assert!(
+            body.contains(&0x10),
+            "stackful trampoline must emit `call` (0x10) to lift func; \
+             body={body:?}",
+        );
+        assert!(
+            body.contains(&0x1A),
+            "stackful trampoline must emit `drop` (0x1A) after the lift \
+             call (lift result is owned by runtime, not caller); body={body:?}",
+        );
+        assert!(
+            body.contains(&0x23),
+            "stackful trampoline must emit `global.get` (0x23) for \
+             result readback; body={body:?}",
+        );
+        assert_eq!(
+            body.last(),
+            Some(&0x0B),
+            "stackful trampoline body must end with `end` (0x0B); \
+             body={body:?}",
         );
     }
 }

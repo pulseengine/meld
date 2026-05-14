@@ -321,12 +321,16 @@ verification-status:
   SR-32:
     implementation-files:
       - meld-core/src/p3_async.rs
+      - meld-core/src/adapter/fact.rs
     tests:
       - p3_async::tests::stackful_intrinsic_signatures_pinned
       - p3_async::tests::stackful_lift_is_async_without_callback
+      - adapter::fact::tests::sr32_has_callback_export_detects_companion
+      - adapter::fact::tests::sr32_stackful_emitter_handles_no_shim_with_default_results
+      - adapter::fact::tests::sr32_stackful_emitter_shape_pins_call_drop_globalget
     proofs: []
-    status: in-progress
-    note: "v0.8.0 — Stackful P3 lifting mode (#140). ABI foundation landed (thread_* intrinsics + uses_stackful_lift detector). Trampoline emitter in adapter/fact.rs follow-up PR."
+    status: implemented
+    note: "v0.8.0 — Stackful P3 lifting mode (#140). Phase 1 ABI foundation + Phase 2 trampoline emitter both shipped. Dispatcher routes async-lift sites without a [callback] companion to generate_async_stackful_adapter. Cross-memory (ptr,len) result returns deferred under same issue. See ADR-1 addendums 2026-05-13 (a) and (b)."
 
   SR-33:
     implementation-files: []

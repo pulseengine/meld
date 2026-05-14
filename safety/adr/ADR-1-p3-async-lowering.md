@@ -300,3 +300,77 @@ registration sequences) but live at different abstraction layers.
 * **Stackful + callback in the same component.** Permitted by the
   Component Model. The emitter will produce both trampolines without
   cross-talk; the test for that case ships with the emitter.
+
+---
+
+## Addendum 2026-05-13 (b) — Stackful trampoline emitter shipped (#140 phase 2)
+
+The emitter described as "deferred" above has shipped. This addendum
+records the implementation decision and the gap between the originally
+sketched approach (a) and what actually landed.
+
+**What shipped.** `FactStyleGenerator::generate_async_stackful_adapter`
+emits a trampoline of the form:
+
+```wat
+(func $async_stackful_adapter_<from>_to_<to>
+  ;; step 0.5 — cross-memory param copy (shared with callback path)
+  ;; step 1   — call [async-lift]<export> with caller's params
+  ;; step 1.5 — drop the lift's runtime-owned packed return
+  ;; step 3   — read task.return result globals (push-on-stack or
+  ;;            write-to-retptr) and return
+)
+```
+
+The dispatcher in `<impl AdapterGenerator>::generate` routes any
+`is_async_lift` site to this emitter when the merged module has no
+`[callback]<export>` companion.
+
+**What the originally sketched design got wrong, and why.** The
+original sketch above ("creates a fresh fiber on each async
+invocation") proposed an adapter-driven scheduling loop using
+`thread_new` + `thread_switch_to` + `thread_yield`. Implementing it
+literally requires:
+
+1. A per-export wrapper function whose `(i32 arg) -> ()` signature
+   matches `thread_new`, with the wrapper unpacking the canonical-
+   flattened params from scratch memory and invoking the lift.
+2. A per-export `$fiber_done` sentinel global, written by the wrapper
+   after the lift returns, read by the trampoline drive loop.
+3. Both (1) and (2) injected into the merged module's function and
+   global index spaces *from the adapter pass*, which runs after the
+   merger has finalised those spaces.
+
+That trio is implementable but adds roughly 350 lines of emitter code
+and a non-trivial late-stage modification of merged-module state. The
+shipped design replaces all of it with a direct call to the lift
+function: the wasm runtime sees `(canon lift ... async ...)` with no
+callback option and runs the call on a fresh fiber transparently,
+suspending on `task.wait` and resuming on the awaited event. From the
+adapter's perspective the call looks synchronous; the fiber lifecycle
+is the runtime's concern.
+
+**Status of the Phase 1 `thread::*` ABI.** Unchanged. The four
+host-intrinsic imports remain part of the `pulseengine:async` surface
+and are pinned by `p3_async::tests::stackful_intrinsic_signatures_pinned`.
+They are reserved for component-internal concurrency primitives (a
+guest spawning parallel tasks via `wasi:thread` or similar) but are
+**not consumed** by the stackful trampoline. A runtime that supports
+stackful lift need not yet implement them; a runtime that wants to
+expose userspace threading to guests must.
+
+**Part (b) — in-body `task.wait` rewrites.** Still deferred. The shipped
+trampoline relies on the runtime's transparent suspension contract,
+not on rewriting the lift body. If a future runtime requires explicit
+`task.wait` → `thread_yield` rewrites at the wasm level, those land
+as a separate follow-up; the stackful trampoline contract above does
+not change.
+
+**Deferred from this phase.** Stackful lifts that return a cross-
+memory `(ptr, len)` result (i.e., `string` or `list<T>` returns where
+caller and callee live in different linear memories) currently produce
+an explicit "deferred to follow-up" error rather than emit wrong wasm.
+Components hitting this can use callback-mode lifting or fuse same-
+memory components in the interim. Tracked under #140; structural test
+in `sr32_stackful_emitter_shape_pins_call_drop_globalget` excludes
+the cross-memory ptr-pair path by construction.
