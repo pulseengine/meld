@@ -1037,11 +1037,21 @@ impl Merger {
                                 // peers will hand it pointers it can't
                                 // dereference. Match by resource_name only
                                 // since the iface differs across the alias.
-                                let found = merged
+                                // Sort keys for deterministic tie-breaking
+                                // (LS-A-15).
+                                let mut keys: Vec<&(
+                                    usize,
+                                    String,
+                                    String,
+                                )> = merged
                                     .handle_tables
-                                    .iter()
-                                    .find(|((_, _, r), _)| r == rn)
-                                    .map(|(_, ht)| ht);
+                                    .keys()
+                                    .filter(|(_, _, r)| r == rn)
+                                    .collect();
+                                keys.sort();
+                                let found = keys
+                                    .first()
+                                    .and_then(|k| merged.handle_tables.get(*k));
                                 if found.is_some() {
                                     log::info!(
                                         "alias-fallback: comp {} mod {} import {}/{} → ht for resource '{}'",
@@ -1087,17 +1097,27 @@ impl Merger {
                             if self_owns_specific {
                                 None
                             } else {
-                                merged
+                                // Look up (any-owner, iface, rn) first, then
+                                // fall back to (any-owner, any-iface, rn).
+                                // Iterate in sorted-key order so ties are
+                                // broken deterministically (LS-A-15).
+                                let mut iface_keys: Vec<&(usize, String, String)> = merged
                                     .handle_tables
-                                    .iter()
-                                    .find(|((_, i, r), _)| i == iface && r == rn)
-                                    .map(|(_, ht)| ht)
+                                    .keys()
+                                    .filter(|(_, i, r)| i == iface && r == rn)
+                                    .collect();
+                                iface_keys.sort();
+                                iface_keys
+                                    .first()
+                                    .and_then(|k| merged.handle_tables.get(*k))
                                     .or_else(|| {
-                                        merged
+                                        let mut any_keys: Vec<&(usize, String, String)> = merged
                                             .handle_tables
-                                            .iter()
-                                            .find(|((_, _, r), _)| r == rn)
-                                            .map(|(_, ht)| ht)
+                                            .keys()
+                                            .filter(|(_, _, r)| r == rn)
+                                            .collect();
+                                        any_keys.sort();
+                                        any_keys.first().and_then(|k| merged.handle_tables.get(*k))
                                     })
                             }
                         };
@@ -2921,18 +2941,32 @@ pub(crate) fn component_memory_index(merged: &MergedModule, comp_idx: usize) -> 
 }
 
 /// Find the merged function index of a component's cabi_realloc.
+///
+/// Prefers module 0's realloc (the main module). If module 0 has no
+/// realloc, falls back to the realloc bound to the **lowest** module
+/// index for this component — chosen deterministically rather than via
+/// HashMap iteration order, which would let the hasher state pick a
+/// different module on every run and produce non-reproducible output
+/// (LS-A-15).
 pub(crate) fn component_realloc_index(merged: &MergedModule, comp_idx: usize) -> Option<u32> {
     // Prefer module 0's realloc (the main module)
     if let Some(&idx) = merged.realloc_map.get(&(comp_idx, 0)) {
         return Some(idx);
     }
-    // Fallback: any module's realloc for this component
-    for (&(ci, _mi), &merged_idx) in &merged.realloc_map {
-        if ci == comp_idx {
-            return Some(merged_idx);
-        }
-    }
-    None
+    // Fallback: pick the smallest module index belonging to this component,
+    // deterministically. HashMap.iter() returns entries in hash-seed
+    // order, which varies per process; collect-and-sort gives reproducible
+    // output and removes the multi-realloc race condition.
+    let mut module_idxs: Vec<usize> = merged
+        .realloc_map
+        .keys()
+        .filter(|(ci, _)| *ci == comp_idx)
+        .map(|(_, mi)| *mi)
+        .collect();
+    module_idxs.sort_unstable();
+    module_idxs
+        .first()
+        .and_then(|mi| merged.realloc_map.get(&(comp_idx, *mi)).copied())
 }
 
 ///
@@ -4641,15 +4675,12 @@ mod tests {
 
     // ---------------------------------------------------------------
     // LS-A-11 — extended-const truncation in global initializers
+    // LS-A-15 — HashMap iteration non-determinism
     //
-    // Prior to the fix, `convert_init_expr` read only the first
-    // operator of a global's init expression and emitted just that
-    // single const, silently dropping any subsequent extended-const
-    // ops. A global initialized with `(i32.const 100)(i32.const 23)
-    // i32.add` (intended value 123) was emitted as `(i32.const 100)`.
+    // Shared empty-merged fixture used by both regression suites.
     // ---------------------------------------------------------------
 
-    fn empty_merged_for_init_expr() -> MergedModule {
+    fn empty_merged_fixture() -> MergedModule {
         MergedModule {
             types: Vec::new(),
             imports: Vec::new(),
@@ -4679,13 +4710,15 @@ mod tests {
         }
     }
 
+    // LS-A-11: convert_init_expr must fold multi-op extended-const
+    // expressions (was previously truncating to the first operator).
     #[test]
     fn ls_a_11_convert_init_expr_folds_extended_const_i32_add() {
         // Init expr bytes WITHOUT trailing `end` (the function appends
         // it). Use small operands that fit in single-byte sleb (no sign
         // bit at position 6): i32.const 5, i32.const 10, i32.add → 15.
         let bytes: Vec<u8> = vec![0x41, 5, 0x41, 10, 0x6A];
-        let merged = empty_merged_for_init_expr();
+        let merged = empty_merged_fixture();
 
         let expr = convert_init_expr(&bytes, 0, 0, &merged, &ValType::I32);
 
@@ -4706,7 +4739,7 @@ mod tests {
         // Regression: the fold path must not change behavior for a
         // simple single-const initializer.
         let bytes: Vec<u8> = vec![0x41, 5];
-        let merged = empty_merged_for_init_expr();
+        let merged = empty_merged_fixture();
 
         let expr = convert_init_expr(&bytes, 0, 0, &merged, &ValType::I32);
         let mut encoded = Vec::new();
@@ -4714,6 +4747,52 @@ mod tests {
         let mut expected = Vec::new();
         wasm_encoder::Encode::encode(&ConstExpr::i32_const(5), &mut expected);
         assert_eq!(encoded, expected);
+    }
+
+    // LS-A-15: component_realloc_index fallback must be deterministic
+    // when multiple modules carry cabi_realloc (was hash-seed dependent).
+    #[test]
+    fn ls_a_15_component_realloc_index_picks_lowest_module_deterministically() {
+        // Component 0 has reallocs at modules 1 (idx 10), 2 (idx 11),
+        // and 3 (idx 12), but no module 0. The function must
+        // deterministically pick the realloc bound to the LOWEST module
+        // index (module 1 → idx 10), not whatever HashMap happens to
+        // iterate first.
+        //
+        // Rebuilding the HashMap from scratch each iteration gives
+        // each instance a fresh hash seed, so iteration order varies
+        // across iterations — if the impl picked an arbitrary entry,
+        // we'd see more than one observed value.
+        let mut observed = std::collections::HashSet::new();
+        for _ in 0..64 {
+            let mut merged = empty_merged_fixture();
+            merged.realloc_map.insert((0, 1), 10);
+            merged.realloc_map.insert((0, 2), 11);
+            merged.realloc_map.insert((0, 3), 12);
+            let got = component_realloc_index(&merged, 0).unwrap();
+            observed.insert(got);
+        }
+        assert_eq!(
+            observed.len(),
+            1,
+            "component_realloc_index must return a deterministic value \
+             across runs; saw {observed:?}",
+        );
+        assert!(
+            observed.contains(&10),
+            "lowest module index (1 → realloc 10) must be selected; \
+             observed {observed:?}",
+        );
+    }
+
+    #[test]
+    fn ls_a_15_component_realloc_index_prefers_module_0() {
+        // Regression: when module 0 has a realloc, the function must
+        // return it regardless of other modules in the map.
+        let mut merged = empty_merged_fixture();
+        merged.realloc_map.insert((0, 0), 100);
+        merged.realloc_map.insert((0, 1), 200);
+        assert_eq!(component_realloc_index(&merged, 0), Some(100));
     }
 }
 
