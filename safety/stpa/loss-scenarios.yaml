@@ -882,6 +882,125 @@ loss-scenarios:
     status: approved
     priority: high
 
+  - id: LS-A-17
+    title: Resource graph definer purge and terminal-exporter passes ignore (iface, rn)
+    uca: UCA-F-2
+    hazards: [H-3, H-1]
+    type: inadequate-control-algorithm
+    scenario: >
+      Two distinct passes in `meld-core/src/resource_graph.rs::ResourceGraph::build`
+      filtered the wrong dimension of the (component, interface,
+      resource_name) tuple, conflating distinct resources that shared
+      either a resource name or an interface family.
+
+      (a) The "definer purge" pass (lines 279-308) removed defines_cache
+      entries with `filter(|(idx, _iface, r)| *idx == from_comp && r == rn)`
+      — the interface was explicitly ignored. A component that imported
+      `[resource-rep]X` from interface `I_x` AND defined its own
+      `[resource-rep]X` in unrelated interface `I_y` lost the
+      (comp, I_y, X) definer entry. Same-resource-name across different
+      interfaces is permitted by the Component Model.
+
+      (b) The "terminal exporter" pass (lines 242-264) classified a
+      component as a re-exporter (not a definer) if any of its imports
+      carried any resource interface — even resources entirely
+      unrelated to the iface being attributed. A consumer that imported
+      `wasi:io/poll` alongside an app-defined resource interface
+      mis-classified the app's true definer as a re-exporter.
+
+      Both bugs led to wrong handle-table allocation downstream:
+      handle-table allocated for the wrong owning component, or no
+      handle table at all, with `resource_definer` returning None.
+      Subsequent `resource.rep` calls in the merger fell back to the
+      first matching HT (LS-A-15 family) and dereferenced foreign rep
+      data — cross-component handle confusion with no host trap.
+
+      Fix:
+      * Definer purge: restrict the filter to the specific
+        `(comp, iface, rn)` tuple captured in `matching_resource_ifaces`.
+      * Terminal exporter: scope `to_also_imports_resource` to the
+        specific iface being attributed (and its `[export]`-prefixed
+        variants), so unrelated resource imports no longer disqualify
+        the definer.
+    causal-factors:
+      - "Cleanup filter discarded the iface dimension of the (idx, iface, rn) tuple"
+      - "`to_also_imports_resource` checked `resource_nodes.keys().any(...)` against ANY iface rather than the iface under attribution"
+      - No upstream test exercised same-resource-name-across-different-interfaces or unrelated-resource-import cases
+    status: approved
+    priority: high
+
+  - id: LS-A-18
+    title: Resource graph silently drops [resource-drop] imports for non-pure-consumer components
+    uca: UCA-F-2
+    hazards: [H-3]
+    type: inadequate-control-algorithm
+    scenario: >
+      `ResourceGraph::build` had two passes that registered resource
+      nodes from core module imports. The first pass (`if has_rep ||
+      has_new`, ~lines 124-172) handled `[resource-rep]` and
+      `[resource-new]` prefixes but silently skipped
+      `[resource-drop]`. The second pass (lines 186-197) handled all
+      three prefixes — but only fired when `!has_any_canon` (the
+      component has no canonical ResourceRep/New of its own).
+
+      A re-exporter (has ResourceNew on some resource X) that ALSO
+      imports `[resource-drop]Y` for a foreign resource Y never
+      registered Y in the graph: the first pass didn't recognise drop
+      prefixes, and the second pass was skipped because the component
+      has canonical entries. Downstream, the merger's
+      `defines_resource`/`resource_definer` lookups for Y returned
+      empty, and the drop call was routed via the first matching
+      handle-table fallback (LS-A-15 family) — invoking a foreign
+      dtor on a foreign rep, which is UB inside the guest with no
+      host trap [H-3, H-7 inside-guest].
+
+      Fix: the first pass now also strips `[resource-drop]` and
+      registers an `ImportsFrom` edge for those, matching the second
+      pass's behaviour. A `ResourcePrefixKind` enum makes the match
+      arms explicit. The second pass is kept as a fallback for pure-
+      consumer components.
+    causal-factors:
+      - First pass only matched `[resource-rep]` and `[resource-new]`; the symmetric `[resource-drop]` arm was missing
+      - Second pass was gated on `!has_any_canon`, leaving a gap for components that participate in resource handling AND drop foreign resources
+      - No test exercised a re-exporter that drops a non-self-owned resource
+    status: approved
+    priority: high
+
+  - id: LS-A-19
+    title: Resource import dedup tracking uses ends_with() suffix match
+    uca: UCA-M-9
+    hazards: [H-1, H-10]
+    type: inadequate-control-algorithm
+    scenario: >
+      `meld-core/src/merger.rs::Merger::add_unresolved_imports` includes
+      a dedup-skip path (~lines 2127-2153) that, on a duplicate
+      `(module, field)` import, propagates the existing
+      `resource_rep_by_component` / `resource_new_by_component`
+      entry to the new component. The lookup uses
+      `imp.name.starts_with("[resource-rep]") && imp.name.ends_with(rn)`.
+
+      `ends_with(rn)` matches **any** import whose name ends with the
+      resource name. For two distinct resources whose names share a
+      suffix (`float` and `bigfloat`), the lookup matches both, and
+      `.find()` returns whichever the HashMap iterates first (also
+      LS-A-15 territory). The wrong import index is then stored in
+      `resource_rep_by_component`, and any subsequent
+      `[resource-rep]float` call on the second component routes to
+      the `bigfloat` import. Validator passes — both imports share
+      `(i32) -> i32` — but the runtime reads a `bigfloat` rep as a
+      `float`, producing type confusion with no trap [H-10].
+
+      Fix: replace the suffix match with an exact match against
+      `format!("[resource-{rep,new}]{rn}")`. The dedup-skip path now
+      tracks only the import that exactly matches the resource name
+      being deduped.
+    causal-factors:
+      - "`ends_with(rn)` matched suffix-overlap names without requiring exact equality"
+      - HashMap iteration tie-broken arbitrarily on a multi-match (compounded by LS-A-15)
+      - No test exercised resource names with shared suffix (`float` / `bigfloat`)
+    status: approved
+    priority: high
+
   # ==========================================================================
   # Merger scenario (discovered during gap analysis)
   # ==========================================================================
