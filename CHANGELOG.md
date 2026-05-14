@@ -6,6 +6,19 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **Mythos delta-pass CI gate** (`.github/workflows/mythos-gate.yml`,
+  `scripts/mythos/HOWTO-gate.md`). Blocks merge of PRs that modify
+  Tier-5 source files (parser, merger, resolver, rewriter,
+  component_wrap, p3_async, adapter/, resource_graph, segments) until
+  the author records a Mythos delta-pass on the touched files —
+  evidence as a PR comment plus the `mythos-pass-done` label.
+  Motivated by LS-A-10 (CABI alignment padding in async-lift retptr
+  writeback), which the v0.8.0 pre-release pass found but which had
+  silently lived in the callback emitter since #128. A PR-time gate
+  would have caught it at review time rather than at the release
+  boundary. The gate does not automate the LLM-driven pass itself;
+  that's tracked separately and requires API-key / cost design.
+
 - **Stackful async-lift cross-memory `(ptr, len)` return** (SR-32 follow-up,
   sub-#94). The stackful trampoline emitter now handles the case where a
   stackful async lift returns a `string` or `list<T>` and the caller and
