@@ -2342,7 +2342,9 @@ pub(crate) fn resolve_component_val_type(
                 })
                 .collect(),
         ),
-        CVT::Primitive(_) | CVT::String | CVT::Own(_) | CVT::Borrow(_) => ty.clone(),
+        CVT::Primitive(_) | CVT::String | CVT::Own(_) | CVT::Borrow(_) | CVT::Flags(_) => {
+            ty.clone()
+        }
     }
 }
 
@@ -2453,6 +2455,13 @@ fn flat_component_val_type_resolved(
         }],
         parser::ComponentValType::Own(_) | parser::ComponentValType::Borrow(_) => {
             vec![wasm_encoder::ValType::I32]
+        }
+        parser::ComponentValType::Flags(names) => {
+            // flags<N> flattens to ceil(N/32) i32 storage words per
+            // canonical ABI (LS-A-20).
+            let n = names.len() as u32;
+            let words = n.div_ceil(32);
+            vec![ValType::I32; words as usize]
         }
     }
 }
