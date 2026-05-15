@@ -6,22 +6,26 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
-- **Extended-const initializer / offset truncation** (LS-A-11, UCA-M-6,
-  H-1 / H-2 / H-3.3). Two const-expression parsers in meld-core read
-  only the first operator and discarded the rest, silently truncating
-  any wasm 2.0 `extended-const` expression. A data / element segment
-  with offset `(i32.const 5)(i32.const 10) i32.add` landed at offset 5
-  instead of 15; a global initialized to `(i32.const 100)(i32.const 23)
-  i32.add` (intended 123) was emitted as 100. Affected
-  `segments.rs::parse_const_expr_with_value` (data + element offsets)
-  and `merger.rs::convert_init_expr` (global initializers). Fix
-  introduces shared `fold_extended_const_i32` /
-  `fold_extended_const_i64` helpers that walk all operators with a
-  small stack-machine interpreter (i32/i64 add/sub/mul with wrapping
-  semantics) and return the folded scalar. Regression pinned by 6
-  tests covering all three arithmetic ops and the single-const
-  passthrough. Surfaced by the post-v0.8.0 Mythos delta-pass sweep on
-  the remaining 8 Tier-5 files (the protocol introduced in #151).
+- **HashMap iteration non-determinism in resource / realloc fallbacks**
+  (LS-A-15, UCA-M-10, H-7 / H-3 / H-4.3). Three sites resolved
+  cross-component routing via `HashMap::iter().find(...)`, which picks
+  an arbitrary entry per hash-seed-randomised iteration order. When
+  multiple entries matched, the chosen entry varied per run —
+  producing non-reproducible fused output bytes and, in some cases,
+  routing a call to the wrong target. Affected:
+  - `merger.rs::component_realloc_index` fallback when a component
+    has multiple modules each with `cabi_realloc` — could pick a
+    realloc bound to a different memory than the calling site.
+  - `merger.rs` handle-table fallbacks at two sites — ties between
+    candidate handle tables broken by iteration order.
+  - `resolver.rs::resolve_resource_positions` last-resort fallback
+    on `[resource-rep]` / `[resource-new]` prefix collisions.
+  Fix: collect candidate keys, sort, pick `.first()`. Deterministic
+  tie-breaking by lowest module index / smallest type-id /
+  lexicographic key. Picks may still be semantically wrong if
+  multiple distinct resources share a prefix (Step 6 alias propagation
+  is the right structural mitigation), but the output is now
+  reproducible across runs.
 
 ### Added
 

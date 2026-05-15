@@ -1300,11 +1300,25 @@ fn resolve_resource_positions(
                 // cases). Step 6 normally covers this, but keep as a
                 // safety net for components whose ExportAlias chain isn't
                 // captured.
-                resource_map
+                //
+                // Determinism: iterate in sorted type-id order rather than
+                // HashMap iteration order, so a tie between two resource
+                // imports with the same prefix is broken by the lowest
+                // type-id deterministically rather than by HashMap hasher
+                // state. Picks may still be wrong if two distinct resources
+                // share a prefix (Step 6 alias propagation is the right
+                // mitigation), but at least the output is now reproducible
+                // across runs (LS-A-15).
+                let mut keys: Vec<(u32, &str)> = resource_map
                     .by_type_id
-                    .iter()
-                    .find(|((_, k), _)| *k == field_prefix)
-                    .map(|(_, v)| (v.clone(), false))
+                    .keys()
+                    .filter(|(_, k)| *k == field_prefix)
+                    .map(|(ti, k)| (*ti, *k))
+                    .collect();
+                keys.sort_unstable_by_key(|(ti, _)| *ti);
+                keys.first()
+                    .and_then(|k| resource_map.by_type_id.get(k))
+                    .map(|v| (v.clone(), false))
             });
         if let Some(((module_name, field_name), via_name_fallback)) = lookup {
             // Check if the callee truly defines this resource (has ownership of the

@@ -822,6 +822,66 @@ loss-scenarios:
     status: approved
     priority: high
 
+  - id: LS-A-15
+    title: HashMap iteration non-determinism in resource / realloc lookups
+    uca: UCA-M-10
+    hazards: [H-7, H-3, H-4.3]
+    type: inadequate-control-algorithm
+    scenario: >
+      Three sites in `meld-core` resolved cross-component routing via
+      `HashMap::iter().find(...)` over keyed maps. HashMap iteration
+      order is hash-seed-randomised per process, so when more than one
+      entry matched the lookup predicate the chosen entry varied
+      across runs — producing **non-reproducible** fused output bytes
+      and, in some cases, routing a call to the wrong target on a
+      given run.
+
+      Affected sites:
+      * `merger.rs::component_realloc_index` (lines 2907-2919) — when
+        a component has multiple modules each carrying a
+        `cabi_realloc` and module 0 is not among them, the fallback
+        picked whichever module HashMap iteration visited first. The
+        chosen realloc may be bound to a different linear memory than
+        the calling site, producing cross-memory address corruption
+        [H-4.3].
+      * `merger.rs` handle-table fallbacks (~lines 1040 and 1090-1100)
+        — when looking up a handle table by `(any-owner, iface, rn)`
+        or `(any-owner, any-iface, rn)`, ties were broken by iteration
+        order.
+      * `resolver.rs::resolve_resource_positions` last-resort fallback
+        (lines 1295-1308) — `by_type_id.iter().find(|((_, k), _)| ...)`
+        on `[resource-rep]` / `[resource-new]` / `[resource-drop]`
+        prefix collisions returned an arbitrary import; cross-resource
+        confusion at the adapter call site [H-3].
+
+      Validator does not catch any of these because the structural
+      types match across candidates (all reallocs share
+      `(i32, i32, i32, i32) -> i32`; all resource-rep imports share
+      `(i32) -> i32`).
+
+      Fix: collect candidate keys, sort, then pick `.first()`.
+      `component_realloc_index` now deterministically chooses the
+      lowest module index. Resource fallback picks the lowest type-id
+      with the matching prefix. Handle-table fallbacks pick the
+      lexicographically smallest `(owner, iface, rn)` tuple. Picks may
+      still be wrong if multiple distinct resources share a prefix
+      (Step 6 alias propagation is the right structural mitigation),
+      but the output is now reproducible across runs.
+
+      Hazards: H-7 (non-deterministic output for identical inputs),
+      H-3 (cross-component reference integrity when the wrong target
+      is chosen), H-4.3 (canonical-ABI realloc bound to wrong memory).
+    causal-factors:
+      - "`HashMap::iter().find(predicate)` was used as a \"pick any matching\" idiom without recognising that the choice is hash-seed-randomised"
+      - No reproducibility test on the fuser's output bytes for
+        inputs with multi-module realloc or with prefix-collision
+        resource imports
+      - Three distinct sites carried the same bug pattern in
+        different files; a refactor pass would have surfaced them
+        together
+    status: approved
+    priority: high
+
   # ==========================================================================
   # Merger scenario (discovered during gap analysis)
   # ==========================================================================
