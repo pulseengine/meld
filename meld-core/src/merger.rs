@@ -2793,8 +2793,25 @@ fn convert_init_expr(
     };
 
     match op {
-        wasmparser::Operator::I32Const { value } => ConstExpr::i32_const(value),
-        wasmparser::Operator::I64Const { value } => ConstExpr::i64_const(value),
+        // For an i32 / i64 const, the wasm 2.0 extended-const proposal
+        // permits further `i32.add` / `i32.sub` / `i32.mul` (and i64
+        // counterparts) before `end`. Fold them into a single value via
+        // the shared helper so the merged global preserves the source's
+        // semantic initializer. Prior versions of this function read
+        // only the first op and silently dropped the rest, producing a
+        // wrong-valued global (LS-A-11).
+        wasmparser::Operator::I32Const { value } => {
+            match crate::segments::fold_extended_const_i32(&mut ops, value) {
+                Ok(folded) => ConstExpr::i32_const(folded),
+                Err(_) => ConstExpr::raw(bytes.iter().copied()),
+            }
+        }
+        wasmparser::Operator::I64Const { value } => {
+            match crate::segments::fold_extended_const_i64(&mut ops, value) {
+                Ok(folded) => ConstExpr::i64_const(folded),
+                Err(_) => ConstExpr::raw(bytes.iter().copied()),
+            }
+        }
         wasmparser::Operator::F32Const { value } => {
             ConstExpr::f32_const(f32::from_bits(value.bits()).into())
         }
@@ -4620,6 +4637,83 @@ mod tests {
         let comp = make_component_with_instances(vec![]);
         let result = Merger::check_no_duplicate_instantiations(&[comp]);
         assert!(result.is_ok());
+    }
+
+    // ---------------------------------------------------------------
+    // LS-A-11 — extended-const truncation in global initializers
+    //
+    // Prior to the fix, `convert_init_expr` read only the first
+    // operator of a global's init expression and emitted just that
+    // single const, silently dropping any subsequent extended-const
+    // ops. A global initialized with `(i32.const 100)(i32.const 23)
+    // i32.add` (intended value 123) was emitted as `(i32.const 100)`.
+    // ---------------------------------------------------------------
+
+    fn empty_merged_for_init_expr() -> MergedModule {
+        MergedModule {
+            types: Vec::new(),
+            imports: Vec::new(),
+            functions: Vec::new(),
+            tables: Vec::new(),
+            memories: Vec::new(),
+            globals: Vec::new(),
+            exports: Vec::new(),
+            start_function: None,
+            elements: Vec::new(),
+            data_segments: Vec::new(),
+            custom_sections: Vec::new(),
+            function_index_map: std::collections::HashMap::new(),
+            memory_index_map: std::collections::HashMap::new(),
+            table_index_map: std::collections::HashMap::new(),
+            global_index_map: std::collections::HashMap::new(),
+            type_index_map: std::collections::HashMap::new(),
+            realloc_map: std::collections::HashMap::new(),
+            import_counts: Default::default(),
+            import_memory_indices: Vec::new(),
+            import_realloc_indices: Vec::new(),
+            resource_rep_by_component: std::collections::HashMap::new(),
+            resource_new_by_component: std::collections::HashMap::new(),
+            handle_tables: std::collections::HashMap::new(),
+            task_return_shims: std::collections::HashMap::new(),
+            async_result_globals: std::collections::HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn ls_a_11_convert_init_expr_folds_extended_const_i32_add() {
+        // Init expr bytes WITHOUT trailing `end` (the function appends
+        // it). Use small operands that fit in single-byte sleb (no sign
+        // bit at position 6): i32.const 5, i32.const 10, i32.add → 15.
+        let bytes: Vec<u8> = vec![0x41, 5, 0x41, 10, 0x6A];
+        let merged = empty_merged_for_init_expr();
+
+        let expr = convert_init_expr(&bytes, 0, 0, &merged, &ValType::I32);
+
+        let mut encoded = Vec::new();
+        wasm_encoder::Encode::encode(&expr, &mut encoded);
+        let mut expected = Vec::new();
+        wasm_encoder::Encode::encode(&ConstExpr::i32_const(15), &mut expected);
+
+        assert_eq!(
+            encoded, expected,
+            "convert_init_expr must fold (i32.const 5)(i32.const 10) i32.add \
+             to i32.const 15; got bytes {encoded:?}",
+        );
+    }
+
+    #[test]
+    fn ls_a_11_convert_init_expr_preserves_single_const() {
+        // Regression: the fold path must not change behavior for a
+        // simple single-const initializer.
+        let bytes: Vec<u8> = vec![0x41, 5];
+        let merged = empty_merged_for_init_expr();
+
+        let expr = convert_init_expr(&bytes, 0, 0, &merged, &ValType::I32);
+        let mut encoded = Vec::new();
+        wasm_encoder::Encode::encode(&expr, &mut encoded);
+        let mut expected = Vec::new();
+        wasm_encoder::Encode::encode(&ConstExpr::i32_const(5), &mut expected);
+        assert_eq!(encoded, expected);
     }
 }
 

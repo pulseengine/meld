@@ -774,6 +774,54 @@ loss-scenarios:
     status: approved
     priority: high
 
+  - id: LS-A-11
+    title: Extended-const initializer / offset expression silently truncated
+    uca: UCA-M-6
+    hazards: [H-1, H-2, H-3.3]
+    type: inadequate-control-algorithm
+    scenario: >
+      Two const-expression parsers in meld-core read only the first
+      operator of an init expression and discarded the rest. Affected
+      sites: `meld-core/src/segments.rs::parse_const_expr_with_value`
+      (parses data / element segment offset expressions; pre-fix at
+      lines 369-425) and `meld-core/src/merger.rs::convert_init_expr`
+      (parses global initializer expressions; pre-fix at lines
+      2771-2844). Any input whose const expression uses the WebAssembly
+      2.0 `extended-const` proposal — `(i32.const A)(i32.const B)
+      i32.add` and friends — was silently truncated to its first
+      constant. Concrete impact: a data segment `(data (offset
+      (i32.const 5)(i32.const 10) i32.add) "...")` landed at offset 5
+      instead of 15; a global `(global i32 (i32.const 100)(i32.const 23)
+      i32.add)` was emitted with init value 100 instead of 123;
+      element-segment offsets and table fills land at wrong slots. Wasm
+      validator accepts both inputs because the truncated form is still
+      a well-typed single const. Affects every downstream runtime;
+      silent data corruption with no trap [H-1 semantic divergence,
+      H-2 wrong memory address, H-3.3 index/init-expr stopped too
+      soon]. Wasmparser 0.246 (meld's bundled version) enables
+      `WasmFeatures::extended_const` by default, so any input authored
+      after wit-bindgen / clang-wasi grew extended-const support can
+      trigger this. Surfaced by the v0.8.0 Mythos delta-pass on
+      segments.rs and merger.rs (#151 gate). Fix: shared helpers
+      `fold_extended_const_i32` / `fold_extended_const_i64` in
+      `segments.rs` walk all operators with a small stack-machine
+      interpreter, applying `i32.add` / `i32.sub` / `i32.mul` (and i64
+      counterparts) with wrapping semantics, and return the folded
+      scalar value. Both emitters route through these helpers. Regression
+      pinned by 6 tests (4 in segments, 2 in merger) including all three
+      arithmetic ops and the single-const passthrough case.
+    causal-factors:
+      - "`OperatorsReader::read` was called exactly once; subsequent operators were silently discarded"
+      - Extended-const proposal was enabled in wasmparser via default
+        features but no upstream test in meld exercised it
+      - Both parsers (segments.rs and merger.rs) had the same bug,
+        independently — a refactor would have surfaced it earlier
+      - No "shape" test pinned the full operator sequence — existing
+        tests checked the round-tripped value for single-const inputs
+        only
+    status: approved
+    priority: high
+
   # ==========================================================================
   # Merger scenario (discovered during gap analysis)
   # ==========================================================================
