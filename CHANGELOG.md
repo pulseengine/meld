@@ -4,7 +4,26 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.8.1] — 2026-05-16
+
 ### Fixed
+
+- **Extended-const initializer / offset truncation** (LS-A-11, UCA-M-6,
+  H-1 / H-2 / H-3.3). Two const-expression parsers in meld-core read
+  only the first operator and discarded the rest, silently truncating
+  any wasm 2.0 `extended-const` expression. A data / element segment
+  with offset `(i32.const 5)(i32.const 10) i32.add` landed at offset 5
+  instead of 15; a global initialized to `(i32.const 100)(i32.const 23)
+  i32.add` (intended 123) was emitted as 100. Affected
+  `segments.rs::parse_const_expr_with_value` (data + element offsets)
+  and `merger.rs::convert_init_expr` (global initializers). Fix
+  introduces shared `fold_extended_const_i32` /
+  `fold_extended_const_i64` helpers that walk all operators with a
+  small stack-machine interpreter (i32/i64 add/sub/mul with wrapping
+  semantics) and return the folded scalar. Regression pinned by 6
+  tests covering all three arithmetic ops and the single-const
+  passthrough. Surfaced by the post-v0.8.0 Mythos delta-pass sweep on
+  the remaining 8 Tier-5 files (the protocol introduced in #151).
 
 - **Resource graph + merger key-matching bugs** (LS-A-17, LS-A-18, LS-A-19;
   UCA-F-2 / UCA-M-9). Four sites in `meld-core` either dropped the
