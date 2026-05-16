@@ -4,6 +4,27 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **LS-N verification gate**
+  (`.github/workflows/verification-gate.yml`,
+  `tools/run_ls_verification.py`, `tools/post_verification_comment.py`).
+  PR-time gate that enforces the test-naming contract: each
+  `status: approved` entry in `safety/stpa/loss-scenarios.yaml` must
+  have at least one `#[test] fn ls_<letter>_<num>_*` in `meld-core`
+  (e.g. `LS-A-11` → `ls_a_11_*`). Runs the matching tests via cargo,
+  buckets results as passed / failed / missing, and upserts a single
+  sticky PR comment (marker `<!-- meld-ls-verification-gate -->`).
+  Failed tests hard-fail the gate; missing tests are advisory so the
+  10 older approved entries with ad-hoc test names (e.g. PR #114's
+  `test_canonical_abi_size_fixed_size_list_saturates_on_overflow`
+  for LS-P-4) can migrate incrementally rather than blocking every
+  PR. Adapted from spar's rivet-driven verification gate
+  (pulseengine/spar@ba329f3d); meld substitutes its STPA loss-
+  scenario artifacts for rivet's executable artifacts, resolving
+  test linkage via naming convention. The same script runs locally
+  via `python3 tools/run_ls_verification.py`.
+
 ## [0.8.1] — 2026-05-16
 
 ### Fixed
