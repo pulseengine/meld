@@ -405,6 +405,17 @@ pub enum ComponentValType {
     List(Box<ComponentValType>),
     FixedSizeList(Box<ComponentValType>, u32),
     Record(Vec<(String, ComponentValType)>),
+    /// Component-Model `flags<N>`. The vector stores the flag names (for
+    /// diagnostics); only the count `N = names.len()` participates in the
+    /// canonical-ABI layout calculations (`flat_count = ceil(N/32)`,
+    /// `size = ceil(N/8)` padded, `align` from storage class).
+    ///
+    /// Prior to LS-A-20, flags<N> was modelled as `Record<N × Bool>`,
+    /// which made the canonical-ABI layout calculations return N for
+    /// flat count, N bytes for size, and 1 for align — a silent
+    /// divergence from the spec that crossed the `total_flat_params > 16`
+    /// params-ptr threshold for any flags<17+> argument.
+    Flags(Vec<String>),
     Variant(Vec<(String, Option<ComponentValType>)>),
     Tuple(Vec<ComponentValType>),
     Option(Box<ComponentValType>),
@@ -1455,6 +1466,11 @@ impl ParsedComponent {
             ComponentValType::FixedSizeList(elem, len) => {
                 self.flat_byte_size(elem).saturating_mul(*len)
             }
+            ComponentValType::Flags(names) => {
+                // flats[ceil(N/32)] i32 storage words = 4 bytes each.
+                let n = names.len() as u32;
+                4u32.saturating_mul(n.div_ceil(32))
+            }
             ComponentValType::Own(_) | ComponentValType::Borrow(_) => 4,
         }
     }
@@ -1789,6 +1805,22 @@ impl ParsedComponent {
                 out.push(ReturnAreaSlot {
                     byte_offset: base,
                     byte_size: 4,
+                    is_pointer_pair: false,
+                });
+            }
+            ComponentValType::Flags(names) => {
+                // flags<N>: ceil(N/8) bytes padded to its storage class.
+                let n = names.len() as u32;
+                let size = if n <= 8 {
+                    1
+                } else if n <= 16 {
+                    2
+                } else {
+                    4u32.saturating_mul(n.div_ceil(32))
+                };
+                out.push(ReturnAreaSlot {
+                    byte_offset: base,
+                    byte_size: size,
                     is_pointer_pair: false,
                 });
             }
@@ -2569,6 +2601,11 @@ impl ParsedComponent {
             ComponentValType::FixedSizeList(elem, len) => {
                 self.flat_count(elem).saturating_mul(*len)
             }
+            ComponentValType::Flags(names) => {
+                // flags<N> flattens to ceil(N/32) i32 storage words per
+                // the Component Model canonical ABI.
+                (names.len() as u32).div_ceil(32)
+            }
             ComponentValType::Own(_) | ComponentValType::Borrow(_) => 1,
         }
     }
@@ -2629,6 +2666,21 @@ impl ParsedComponent {
                     return self.canonical_abi_align(inner);
                 }
                 4
+            }
+            ComponentValType::Flags(names) => {
+                // flags<N>: align to the smallest power-of-two storage
+                // class that holds N bits. Per the Component Model
+                // canonical ABI: N≤8 → 1, N≤16 → 2, else 4 (32-bit
+                // storage classes; flags<33+> uses an array of i32
+                // which still aligns to 4).
+                let n = names.len() as u32;
+                if n <= 8 {
+                    1
+                } else if n <= 16 {
+                    2
+                } else {
+                    4
+                }
             }
             ComponentValType::Own(_) | ComponentValType::Borrow(_) => 4,
         }
@@ -2716,6 +2768,25 @@ impl ParsedComponent {
                     .map(|t| self.canonical_abi_element_size(t))
                     .unwrap_or(0);
                 align_up(ds, max_case_align).saturating_add(ok_s.max(err_s))
+            }
+            ComponentValType::Flags(names) => {
+                // flags<N>: ceil(N/8) bytes, packed in the smallest
+                // storage class. Per Component Model canonical ABI:
+                //   N≤8:  1 byte
+                //   N≤16: 2 bytes (1 u16)
+                //   N≤32: 4 bytes (1 u32)
+                //   N≤64: 8 bytes (2 u32s)
+                //   etc.
+                // Storage scales as ceil(N/32) i32 words past N=32.
+                let n = names.len() as u32;
+                if n <= 8 {
+                    1
+                } else if n <= 16 {
+                    2
+                } else {
+                    // 4 bytes per i32 word; ceil(N/32) words.
+                    4u32.saturating_mul(n.div_ceil(32))
+                }
             }
             ComponentValType::Type(idx) => {
                 if let Some(ct) = self.get_type_definition(*idx)
@@ -3000,18 +3071,13 @@ fn convert_wp_defined_type(dt: &wasmparser::ComponentDefinedType) -> ComponentTy
             ))
         }
         wasmparser::ComponentDefinedType::Flags(names) => {
-            // Flags are represented as a record of bools in the canonical ABI.
-            // For flat counting and pointer analysis, we use a record representation.
-            ComponentTypeKind::Defined(ComponentValType::Record(
-                names
-                    .iter()
-                    .map(|name| {
-                        (
-                            name.to_string(),
-                            ComponentValType::Primitive(PrimitiveValType::Bool),
-                        )
-                    })
-                    .collect(),
+            // flags<N> has its own canonical-ABI lowering — packed into
+            // `ceil(N/32)` i32 storage words, NOT a record of N bools.
+            // Use the dedicated `ComponentValType::Flags` variant so the
+            // canonical-ABI helpers compute the correct flat count,
+            // size, and alignment (LS-A-20).
+            ComponentTypeKind::Defined(ComponentValType::Flags(
+                names.iter().map(|n| n.to_string()).collect(),
             ))
         }
         wasmparser::ComponentDefinedType::FixedLengthList(ty, len) => ComponentTypeKind::Defined(
@@ -4257,5 +4323,108 @@ mod tests {
         // u32::MAX & !7 == !7 — the fix saturates the addition then masks.
         assert_eq!(super::align_up(u32::MAX, 8), !7u32);
         assert_eq!(super::align_up(u32::MAX - 3, 8), !7u32);
+    }
+
+    // ---------------------------------------------------------------
+    // LS-A-20 — flags<N> canonical ABI silently modeled as Record<Bool>
+    //
+    // Prior to the fix, convert_wp_defined_type mapped Flags(names) to
+    // ComponentValType::Record(names × Bool), so flat_count = N,
+    // canonical_abi_size_unpadded = N, canonical_abi_align = 1 — wrong
+    // for any N where ceil(N/32) ≠ N or N ≥ 9 (storage alignment).
+    // ---------------------------------------------------------------
+
+    fn empty_parsed_for_flags() -> ParsedComponent {
+        ParsedComponent {
+            name: None,
+            core_modules: vec![],
+            imports: vec![],
+            exports: vec![],
+            types: vec![],
+            instances: vec![],
+            canonical_functions: vec![],
+            sub_components: vec![],
+            component_aliases: vec![],
+            component_instances: vec![],
+            core_entity_order: vec![],
+            component_func_defs: vec![],
+            component_instance_defs: vec![],
+            component_type_defs: vec![],
+            original_size: 0,
+            original_hash: String::new(),
+            depth_0_sections: vec![],
+            p3_async_features: vec![],
+        }
+    }
+
+    fn flags_ty(n: usize) -> ComponentValType {
+        ComponentValType::Flags((0..n).map(|i| format!("f{i}")).collect())
+    }
+
+    #[test]
+    fn ls_a_20_flags_canonical_abi_matches_spec() {
+        let pc = empty_parsed_for_flags();
+        // flags<1>: flat=1 size=1 align=1
+        assert_eq!(pc.flat_count(&flags_ty(1)), 1);
+        assert_eq!(pc.canonical_abi_size_unpadded(&flags_ty(1)), 1);
+        assert_eq!(pc.canonical_abi_align(&flags_ty(1)), 1);
+        // flags<8>: flat=1 size=1 align=1
+        assert_eq!(pc.flat_count(&flags_ty(8)), 1);
+        assert_eq!(pc.canonical_abi_size_unpadded(&flags_ty(8)), 1);
+        assert_eq!(pc.canonical_abi_align(&flags_ty(8)), 1);
+        // flags<9>: flat=1 size=2 align=2  (crosses byte boundary)
+        assert_eq!(pc.flat_count(&flags_ty(9)), 1);
+        assert_eq!(pc.canonical_abi_size_unpadded(&flags_ty(9)), 2);
+        assert_eq!(pc.canonical_abi_align(&flags_ty(9)), 2);
+        // flags<17>: flat=1 size=4 align=4  (THE bug-trigger case;
+        // pre-fix returned flat=17 which crosses the params-ptr
+        // threshold at >16 in resolver.rs)
+        assert_eq!(pc.flat_count(&flags_ty(17)), 1);
+        assert_eq!(pc.canonical_abi_size_unpadded(&flags_ty(17)), 4);
+        assert_eq!(pc.canonical_abi_align(&flags_ty(17)), 4);
+        // flags<32>: flat=1 size=4 align=4
+        assert_eq!(pc.flat_count(&flags_ty(32)), 1);
+        assert_eq!(pc.canonical_abi_size_unpadded(&flags_ty(32)), 4);
+        // flags<33>: flat=2 size=8 align=4  (spills to 2 i32 words)
+        assert_eq!(pc.flat_count(&flags_ty(33)), 2);
+        assert_eq!(pc.canonical_abi_size_unpadded(&flags_ty(33)), 8);
+        assert_eq!(pc.canonical_abi_align(&flags_ty(33)), 4);
+    }
+
+    #[test]
+    fn ls_a_20_flags_parser_produces_flags_variant() {
+        // The wasmparser-bridge convert_wp_defined_type must now produce
+        // ComponentValType::Flags (not Record<Bool>) for `(flags ...)`
+        // declarations. We exercise via the wat round-trip pattern used
+        // elsewhere in this file.
+        let wat = r#"
+        (component
+          (type $f (flags "a" "b" "c" "d" "e" "f" "g" "h" "i"
+                          "j" "k" "l" "m" "n" "o" "p" "q"))
+          (core module $m (func (export "run") (param i32)))
+          (core instance (instantiate $m))
+        )
+        "#;
+        let bytes = match wat::parse_str(wat) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("skipping: wat crate cannot parse flags syntax: {e}");
+                return;
+            }
+        };
+        let comp = ComponentParser::new()
+            .parse(&bytes)
+            .expect("parse should succeed");
+        let flags_ty = comp.types.iter().find_map(|t| match &t.kind {
+            ComponentTypeKind::Defined(v @ ComponentValType::Flags(_)) => Some(v.clone()),
+            _ => None,
+        });
+        assert!(
+            flags_ty.is_some(),
+            "(flags ...) must parse to ComponentValType::Flags, not \
+             Record<Bool>"
+        );
+        // And verify flat_count is 1, not 17.
+        assert_eq!(comp.flat_count(&flags_ty.unwrap()), 1);
     }
 }

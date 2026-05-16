@@ -1001,6 +1001,61 @@ loss-scenarios:
     status: approved
     priority: high
 
+  - id: LS-A-20
+    title: flags<N> canonical ABI silently modeled as Record<N × Bool>
+    uca: UCA-P-10
+    hazards: [H-4, H-4.1]
+    type: inadequate-control-algorithm
+    scenario: >
+      `meld-core/src/parser.rs::convert_wp_defined_type` (the
+      `Flags(names) =>` arm at lines 3002-3015) mapped a Component-
+      Model `flags<N>` to `ComponentValType::Record(N × Bool)`. The
+      downstream canonical-ABI helpers (`flat_count`,
+      `canonical_abi_size_unpadded`, `canonical_abi_align`,
+      `flat_byte_size`, `collect_return_area_type_slots`,
+      `cabi_size_align` in adapter/fact.rs, and the wrapper's
+      `flat_component_val_type_resolved`) then computed
+      record-of-bool layouts: flat=N, size=N bytes, align=1.
+
+      The Component-Model canonical ABI for `flags<N>` is
+      fundamentally different: `flat = ceil(N/32)` i32 storage words,
+      `size = ceil(N/8)` padded to its storage class (1/2/4/8/...
+      bytes), `align ∈ {1, 2, 4}` from the power-of-2 storage class.
+
+      Concrete impact: a function taking `flags<17>` as a parameter
+      has flat_count=1 (one i32) per spec, but meld computed 17
+      flat values. The resolver's "params-ptr threshold" check fires
+      at `total_flat_params > 16` — meld would flip into the
+      params-ptr calling convention for the same function the
+      producer kept on the flat path, mismatching call conventions
+      between fused and composed paths. Smaller N values (e.g.
+      flags<9>) produced wrong size (9 bytes vs spec's 2) and wrong
+      align (1 vs spec's 2), so adjacent fields in records
+      mis-aligned.
+
+      The bug existed since the Flags arm was added in commit
+      d7a5ddb (2026-03-09, ~2 months and multiple releases). Wasm
+      validator does not catch it because the truncated layout is
+      internally consistent within meld's own pipeline; the
+      divergence only surfaces when the fused output is called by a
+      caller that lowered against the spec.
+
+      Fix: add a `ComponentValType::Flags(Vec<String>)` variant
+      (preserving names for diagnostics), have the parser produce it
+      directly, and add explicit Flags arms to every canonical-ABI
+      function that walks ComponentValType. The arms compute the
+      spec-correct flat / size / align values directly from the
+      flag count.
+    causal-factors:
+      - "Flags was modelled as a Record of Bools as a simplification \
+        at parser bridge time, no helper recognised the special-case canonical-ABI layout"
+      - "No upstream test exercised flags<N> for any N that exposed the divergence"
+      - "Bug shape matches UCA-P-10 ('unrecognized types mapped to Other'): \
+        a structurally valid type misclassified at the parse boundary, propagating \
+        wrong layout decisions to downstream code generators"
+    status: approved
+    priority: high
+
   # ==========================================================================
   # Merger scenario (discovered during gap analysis)
   # ==========================================================================

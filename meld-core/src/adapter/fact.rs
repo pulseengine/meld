@@ -178,6 +178,18 @@ pub(crate) fn cabi_size_align(ty: &crate::parser::ComponentValType) -> (u32, u32
             let body = align_up(1, align) + max_size;
             (align_up(body, align), align)
         }
+        CVT::Flags(names) => {
+            // flags<N>: ceil(N/8) bytes padded to power-of-2 storage
+            // class; align ∈ {1, 2, 4} per LS-A-20.
+            let n = names.len() as u32;
+            if n <= 8 {
+                (1, 1)
+            } else if n <= 16 {
+                (2, 2)
+            } else {
+                (4u32.saturating_mul(n.div_ceil(32)), 4)
+            }
+        }
         CVT::Own(_) | CVT::Borrow(_) | CVT::Type(_) => (4, 4),
     }
 }

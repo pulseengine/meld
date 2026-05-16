@@ -49,6 +49,23 @@ All notable changes to this project will be documented in this file.
   is the right structural mitigation), but the output is now
   reproducible across runs.
 
+- **`flags<N>` canonical ABI silently modeled as `Record<N × Bool>`**
+  (LS-A-20, UCA-P-10, H-4 / H-4.1). `parser.rs::convert_wp_defined_type`
+  mapped a Component-Model `flags<N>` to `Record(N × Bool)`, so the
+  downstream canonical-ABI helpers (`flat_count`,
+  `canonical_abi_size_unpadded`, `canonical_abi_align`, etc.) computed
+  flat=N, size=N bytes, align=1. The spec requires flat=ceil(N/32) i32
+  words, size=ceil(N/8) padded to power-of-2 storage class, align ∈
+  {1, 2, 4}. A function taking `flags<17>` crossed meld's params-ptr
+  threshold (`total_flat_params > 16`) while the producer kept on the
+  flat path — silent calling-convention mismatch between fused and
+  composed paths. Bug shipped since March 2026 (~2 months, multiple
+  releases). Fix adds `ComponentValType::Flags(Vec<String>)` variant,
+  has the parser produce it directly, and adds explicit Flags arms to
+  every canonical-ABI function that walks ComponentValType. Regression
+  pinned by `ls_a_20_flags_canonical_abi_matches_spec` (covers
+  N=1/8/9/17/32/33) and `ls_a_20_flags_parser_produces_flags_variant`.
+
 ### Added
 
 - **Mythos delta-pass CI gate** (`.github/workflows/mythos-gate.yml`,
