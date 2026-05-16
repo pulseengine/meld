@@ -2144,13 +2144,22 @@ impl Merger {
                         // Still record per-component resource tracking: find the
                         // func index already assigned to this resource name.
                         let eff_field = &dedup_key.1;
+                        // Exact-match the full `[resource-{rep,new}]<name>`
+                        // import name. The prior `ends_with(rn)` matched any
+                        // resource whose name had `rn` as a suffix (e.g.
+                        // `rn = "float"` collided with both
+                        // `[resource-rep]float` and `[resource-rep]bigfloat`),
+                        // letting `resource_rep_by_component` track the
+                        // wrong import for the wrong-suffix collision — silent
+                        // cross-resource confusion (LS-A-19).
                         if let Some(rn) = eff_field.strip_prefix("[resource-rep]") {
+                            let expected = format!("[resource-rep]{rn}");
                             if let Some(&idx) =
                                 merged.resource_rep_by_component.values().find(|&&idx| {
-                                    merged.imports.get(idx as usize).is_some_and(|imp| {
-                                        imp.name.starts_with("[resource-rep]")
-                                            && imp.name.ends_with(rn)
-                                    })
+                                    merged
+                                        .imports
+                                        .get(idx as usize)
+                                        .is_some_and(|imp| imp.name == expected)
                                 })
                             {
                                 merged
@@ -2158,12 +2167,13 @@ impl Merger {
                                     .insert((unresolved.component_idx, rn.to_string()), idx);
                             }
                         } else if let Some(rn) = eff_field.strip_prefix("[resource-new]") {
+                            let expected = format!("[resource-new]{rn}");
                             if let Some(&idx) =
                                 merged.resource_new_by_component.values().find(|&&idx| {
-                                    merged.imports.get(idx as usize).is_some_and(|imp| {
-                                        imp.name.starts_with("[resource-new]")
-                                            && imp.name.ends_with(rn)
-                                    })
+                                    merged
+                                        .imports
+                                        .get(idx as usize)
+                                        .is_some_and(|imp| imp.name == expected)
                                 })
                             {
                                 merged

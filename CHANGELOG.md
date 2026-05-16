@@ -6,6 +6,28 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **Resource graph + merger key-matching bugs** (LS-A-17, LS-A-18, LS-A-19;
+  UCA-F-2 / UCA-M-9). Four sites in `meld-core` either dropped the
+  interface dimension of `(component, interface, resource_name)` tuples
+  or used substring/suffix matching where exact match was required:
+  - `resource_graph.rs` definer purge ignored the iface when removing
+    defines_cache entries, purging legitimate definers when an
+    unrelated component imported a resource sharing the name.
+  - `resource_graph.rs` terminal-exporter pass used over-broad
+    `to_also_imports_resource` check that classified a component as a
+    re-exporter if any of its imports carried any resource interface.
+  - `resource_graph.rs` only registered resource nodes for
+    `[resource-drop]X` imports on pure-consumer components; re-exporters
+    that dropped a foreign resource had their drop calls invisible to
+    the graph.
+  - `merger.rs::add_unresolved_imports` dedup-skip path matched
+    `imp.name.ends_with(rn)`, so two resources sharing a suffix (e.g.
+    `float` / `bigfloat`) collided into the same tracking entry.
+  All four led to silent cross-resource confusion or wrong-handle-table
+  routing with no host trap. Fixes scope each comparison to the full
+  `(comp, iface, rn)` tuple or use exact-match against the full
+  `[resource-{rep,new,drop}]<name>` import string.
+
 - **HashMap iteration non-determinism in resource / realloc fallbacks**
   (LS-A-15, UCA-M-10, H-7 / H-3 / H-4.3). Three sites resolved
   cross-component routing via `HashMap::iter().find(...)`, which picks
