@@ -2486,6 +2486,7 @@ struct ExportFuncInfo {
 /// matches the `<interface>#<func_name>` pattern.
 /// Returns (type_index, canonical_options) for the source component's lift
 /// entry that matches the given interface function.
+
 /// Translate the source component's `CanonStringEncoding` enum into the
 /// `wasm_encoder::CanonicalOption` byte the wrapper emits.
 ///
