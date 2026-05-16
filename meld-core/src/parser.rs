@@ -3461,6 +3461,13 @@ mod tests {
         }
     }
 
+    /// LS-N verification gate convention alias for the truncated-
+    /// module-section regression above. Same body, canonical name.
+    #[test]
+    fn ls_p_5_parser_rejects_truncated_module_section() {
+        test_parser_rejects_truncated_module_section_issue_118();
+    }
+
     #[test]
     fn test_convert_canonical_options_default() {
         // Empty options list should produce defaults
@@ -4307,6 +4314,16 @@ mod tests {
         assert_eq!(size, u32::MAX, "size must saturate, not wrap to 0");
         assert_eq!(flat, u32::MAX, "flat_count must saturate");
         assert_eq!(flat_bytes, u32::MAX, "flat_byte_size must saturate");
+    }
+
+    /// LS-N verification gate convention alias for the saturation
+    /// regression test above. Delegates to the original test body so
+    /// the canonical `ls_p_4_*` name is discoverable via
+    /// `tools/run_ls_verification.py` without renaming the historical
+    /// test that pins issue #112 / v0.4 follow-up coverage.
+    #[test]
+    fn ls_p_4_canonical_abi_size_saturates_on_overflow() {
+        test_canonical_abi_size_fixed_size_list_saturates_on_overflow();
     }
 
     /// align_up must not panic when given a saturated u32::MAX size and

@@ -4832,6 +4832,17 @@ mod tests {
         );
     }
 
+    /// LS-N verification gate convention alias for the
+    /// adapter-sites canonical-sort regression above. Pins the
+    /// LS-CP-3 (HashMap iteration leaks into adapter_sites order)
+    /// fix via the discoverable `ls_cp_3_*` name. The
+    /// `caller_encoding_fallback` half of LS-CP-3 still needs a
+    /// dedicated regression test — tracked as a follow-up.
+    #[test]
+    fn ls_cp_3_sort_adapter_sites_is_canonical() {
+        test_issue112_item4_sort_adapter_sites_is_canonical();
+    }
+
     /// Item 5 unit-level PoC: when two `ModuleResolution`s share the
     /// same `import_name` but have different `from_import_module`s, the
     /// promoted adapter sites must preserve the `from_import_module` in
@@ -4975,6 +4986,14 @@ mod tests {
             "adapter_sites must preserve from_import_module in import_module \
              (LS-R-10 / UCA-R-3 regression)"
         );
+    }
+
+    /// LS-N verification gate convention alias. Pins LS-R-10
+    /// (intra-component adapter promotion drops from_import_module
+    /// disambiguator) via the discoverable `ls_r_10_*` name.
+    #[test]
+    fn ls_r_10_intra_adapter_preserves_from_import_module() {
+        test_issue112_item5_intra_adapter_preserves_from_import_module();
     }
 }
 
