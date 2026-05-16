@@ -47,7 +47,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Install PyYAML
-        run: pip install --user pyyaml
+        # Self-hosted runners ship Debian/Ubuntu Python with PEP 668
+        # protection; `--break-system-packages` is the documented opt-out
+        # for CI environments where the runner's Python install is
+        # disposable per workflow run.
+        run: pip install --user --break-system-packages pyyaml
 
       - name: Run LS-N verification
         id: verify
