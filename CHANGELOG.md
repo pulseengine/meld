@@ -86,6 +86,23 @@ All notable changes to this project will be documented in this file.
     first and landed in `stream_types`. Now classifies on the **root
     constructor** of the type description.
 
+- **Wrapper drops source canonical options for lifts** (LS-A-16, UCA-W-2,
+  H-1 / H-4). `component_wrap.rs::find_lift_type_for_interface_func`
+  built a `{iface}#{func}` target export name but never compared it
+  against anything, returning the first lift entry for every (iface,
+  func) request. For multi-export components, every export silently
+  received the first lift's type and canonical options (including
+  `string_encoding`). A guest compiled with `--string-encoding=utf16`
+  had every export's encoding downgraded to whatever the first lift
+  declared. Same family as the wasmtime 2026-04-09 CM-transcoding CVE
+  wave; silent mojibake / truncated strings, no trap. Fix routes lift
+  lookup via export-name match (wit-bindgen `{iface}#{func}`
+  convention) and propagates the source `CanonStringEncoding` through
+  a new `source_string_encoding_option` helper. Lower-side encoding
+  propagation and lift-side `Memory(0)` hardcoding in multi-memory
+  mode remain deferred — they need additional source-memory-index
+  threading and land in a follow-up under the same UCA.
+
 ### Added
 
 - **Mythos delta-pass CI gate** (`.github/workflows/mythos-gate.yml`,
