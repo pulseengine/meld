@@ -810,6 +810,20 @@ pub enum StreamWriteResult {
 impl StreamWriteResult {
     /// Decode the raw `i32` return value of `stream_write` against the
     /// `requested` byte count the producer passed in.
+    ///
+    /// Per the ABI contract on [`HostIntrinsic::StreamWrite`]:
+    /// * `n == data_len` ⇒ [`Self::Complete`]
+    /// * `0 <= n < data_len` ⇒ [`Self::Partial`]
+    /// * `n < 0` ⇒ [`Self::Error`] (or [`Self::Unknown`] if the code is
+    ///   not a recognised [`AbiError`])
+    ///
+    /// `n > data_len` is **out-of-contract**. A previous version of this
+    /// decoder folded `n > requested` into `Complete { written: n }`,
+    /// which let a buggy / hostile runtime drive callers to advance
+    /// their producer cursor past the source buffer with no trap. The
+    /// current implementation classifies an over-count as [`Self::Unknown`]
+    /// so callers see a clear "contract violation, do not advance" rather
+    /// than silent corruption (LS-A-13).
     pub const fn decode(ret: i32, requested: u32) -> Self {
         if ret < 0 {
             match AbiError::from_i32(ret) {
@@ -818,10 +832,15 @@ impl StreamWriteResult {
             }
         } else {
             let written = ret as u32;
-            if written >= requested {
+            if written == requested {
                 Self::Complete { written }
-            } else {
+            } else if written < requested {
                 Self::Partial { written, requested }
+            } else {
+                // n > requested is out-of-contract. Surface it as
+                // Unknown(ret) rather than Complete, so callers never
+                // advance the producer cursor past the source buffer.
+                Self::Unknown(ret)
             }
         }
     }
@@ -911,6 +930,15 @@ pub struct P3AsyncFeatures {
     /// Whether any canonical lift carries a `(callback ...)` option (P3
     /// callback mode for async exports).
     pub uses_callback_lift: bool,
+    /// Whether any canonical lift is *stackful* — i.e. `async` without
+    /// a `(callback ...)` option. This is tracked **independently** of
+    /// [`uses_callback_lift`] because the Component Model permits a
+    /// single component to declare both kinds of lifts at once (one
+    /// callback-mode export and one stackful-mode export). A derived
+    /// predicate `uses_async_lift && !uses_callback_lift` would
+    /// misclassify mixed-mode components as callback-only — see
+    /// LS-A-12.
+    pub uses_stackful_lift_internal: bool,
     /// Whether any canonical lower uses `(canon lower ... async ...)`.
     pub uses_async_lower: bool,
 }
@@ -923,6 +951,7 @@ impl P3AsyncFeatures {
             && self.required_intrinsics.is_empty()
             && !self.uses_async_lift
             && !self.uses_callback_lift
+            && !self.uses_stackful_lift_internal
             && !self.uses_async_lower
     }
 
@@ -936,21 +965,27 @@ impl P3AsyncFeatures {
     /// `true` if the component uses any *control-plane* (async lift/lower /
     /// callback) construct.
     pub fn uses_control_plane(&self) -> bool {
-        self.uses_async_lift || self.uses_callback_lift || self.uses_async_lower
+        self.uses_async_lift
+            || self.uses_callback_lift
+            || self.uses_stackful_lift_internal
+            || self.uses_async_lower
     }
 
-    /// `true` if any async lift is **stackful** — i.e. uses `async`
-    /// without a `(callback ...)` option.
+    /// `true` if any async lift in the component is **stackful** — i.e.
+    /// uses `(canon lift ... async ...)` without a `(callback ...)` option.
     ///
     /// Stackful mode requires the trampoline shape declared in [`thread`]
     /// (`thread_new` / `thread_switch_to` / `thread_yield` / `thread_exit`).
-    /// The emitter for that trampoline ships in a follow-up PR within
-    /// the v0.8.0 milestone (SR-32, #140). Until then, callers SHOULD
-    /// surface a clear "stackful lifting not yet emitted by meld" error
-    /// rather than silently fall through to the callback path, which
-    /// would produce a wrong trampoline.
+    ///
+    /// The predicate is an **existential** over the component's lifts:
+    /// it returns `true` if *any* lift is stackful, regardless of whether
+    /// other lifts use callback mode. A component that declares both a
+    /// callback-mode lift and a stackful-mode lift correctly returns
+    /// `true` here so the dispatcher can route the stackful lift to the
+    /// stackful emitter and the callback lift to the callback emitter
+    /// (SR-32, LS-A-12).
     pub fn uses_stackful_lift(&self) -> bool {
-        self.uses_async_lift && !self.uses_callback_lift
+        self.uses_stackful_lift_internal
     }
 }
 
@@ -962,31 +997,41 @@ pub fn detect_features(comp: &ParsedComponent) -> P3AsyncFeatures {
     let mut required: std::collections::BTreeSet<HostIntrinsic> = std::collections::BTreeSet::new();
 
     // Walk component-level types looking for stream/future declarations.
+    // Classify on the **root constructor** of the type description
+    // (the prefix up to the first '<'), not on substring containment —
+    // `future<stream<u8>>` is a future type even though its description
+    // contains "stream" as a parameter (LS-A-14).
     for (idx, ty) in comp.types.iter().enumerate() {
         if let ComponentTypeKind::P3Async(desc) = &ty.kind {
-            if desc.contains("stream") {
-                feats.stream_types.push((idx as u32, desc.clone()));
-            } else if desc.contains("future") {
-                feats.future_types.push((idx as u32, desc.clone()));
+            let root = desc.split('<').next().unwrap_or(desc).trim();
+            match root {
+                "stream" => feats.stream_types.push((idx as u32, desc.clone())),
+                "future" => feats.future_types.push((idx as u32, desc.clone())),
+                _ => {
+                    // `map<K,V>` and any other P3Async kind not handled
+                    // by this ABI; tracked in comp.p3_async_features for
+                    // the warning path.
+                }
             }
-            // `map<K,V>` is also P3Async but not handled by this ABI;
-            // it's tracked in `comp.p3_async_features` for the warning path.
         }
     }
 
     // Walk canonicals to find any data-plane intrinsic the component
-    // already declares, and detect async lift/lower options.
+    // already declares, and detect async lift/lower options. The
+    // callback-vs-stackful classification is **per lift**: a single
+    // component may declare one callback-mode lift and one stackful-
+    // mode lift, so we set the two booleans independently (LS-A-12).
     for entry in &comp.canonical_functions {
         if let Some(intr) = HostIntrinsic::from_canonical_entry(entry) {
             required.insert(intr);
         }
         match entry {
-            CanonicalEntry::Lift { options, .. } => {
-                if options.async_ {
-                    feats.uses_async_lift = true;
-                }
+            CanonicalEntry::Lift { options, .. } if options.async_ => {
+                feats.uses_async_lift = true;
                 if options.callback.is_some() {
                     feats.uses_callback_lift = true;
+                } else {
+                    feats.uses_stackful_lift_internal = true;
                 }
             }
             CanonicalEntry::Lower { options, .. } if options.async_ => {
@@ -1611,27 +1656,174 @@ mod tests {
 
     /// SR-32 / #140 — `P3AsyncFeatures::uses_stackful_lift()` derived flag.
     ///
-    /// A component is in **stackful** mode iff it has an async lift
-    /// without a `(callback ...)` option. This pins the contract that
-    /// callers can use to decide whether to invoke the stackful emitter
-    /// (when it ships) or surface a "not yet emitted" error.
+    /// `uses_stackful_lift()` reports whether **any** lift in the
+    /// component is stackful — i.e. async without callback. It is
+    /// independent of `uses_callback_lift`: a component that declares
+    /// both a callback-mode lift and a stackful-mode lift returns true
+    /// here regardless. This pins the LS-A-12 fix.
     #[test]
-    fn stackful_lift_is_async_without_callback() {
+    fn stackful_lift_is_existential_over_lifts() {
         let mut feats = P3AsyncFeatures::default();
         assert!(!feats.uses_stackful_lift(), "empty: no stackful");
 
+        // Only a stackful lift exists.
         feats.uses_async_lift = true;
+        feats.uses_stackful_lift_internal = true;
         feats.uses_callback_lift = false;
-        assert!(feats.uses_stackful_lift(), "async + !callback => stackful");
-
-        feats.uses_callback_lift = true;
         assert!(
-            !feats.uses_stackful_lift(),
-            "async + callback => callback mode, NOT stackful"
+            feats.uses_stackful_lift(),
+            "async + stackful_internal => stackful"
         );
 
+        // Mixed: both a callback-mode and a stackful-mode lift.
+        feats.uses_callback_lift = true;
+        assert!(
+            feats.uses_stackful_lift(),
+            "mixed-mode component (LS-A-12): stackful_lift remains true \
+             when ANY lift is stackful, regardless of sibling callback lifts"
+        );
+
+        // Only callback lifts.
+        feats.uses_stackful_lift_internal = false;
+        assert!(
+            !feats.uses_stackful_lift(),
+            "callback-only component: not stackful"
+        );
+
+        // No async at all.
         feats.uses_async_lift = false;
         feats.uses_callback_lift = false;
+        feats.uses_stackful_lift_internal = false;
         assert!(!feats.uses_stackful_lift(), "no async => no stackful");
+    }
+
+    /// LS-A-12 regression: a component with both a callback-mode lift
+    /// and a stackful-mode lift must report `uses_stackful_lift() == true`.
+    /// Prior to the fix, `uses_stackful_lift` was derived as
+    /// `uses_async_lift && !uses_callback_lift`, which mis-classified
+    /// mixed-mode components as callback-only.
+    #[test]
+    fn ls_a_12_mixed_mode_component_reports_stackful() {
+        use crate::parser::{
+            CanonStringEncoding, CanonicalEntry, CanonicalOptions, ParsedComponent,
+        };
+
+        fn lift(callback: Option<u32>) -> CanonicalEntry {
+            CanonicalEntry::Lift {
+                core_func_index: 0,
+                type_index: 0,
+                options: CanonicalOptions {
+                    string_encoding: CanonStringEncoding::Utf8,
+                    memory: Some(0),
+                    realloc: None,
+                    post_return: None,
+                    async_: true,
+                    callback,
+                },
+            }
+        }
+
+        let mut comp = ParsedComponent {
+            name: None,
+            core_modules: vec![],
+            imports: vec![],
+            exports: vec![],
+            types: vec![],
+            instances: vec![],
+            canonical_functions: vec![lift(Some(7)), lift(None)],
+            sub_components: vec![],
+            component_aliases: vec![],
+            component_instances: vec![],
+            core_entity_order: vec![],
+            component_func_defs: vec![],
+            component_instance_defs: vec![],
+            component_type_defs: vec![],
+            original_size: 0,
+            original_hash: String::new(),
+            depth_0_sections: vec![],
+            p3_async_features: vec![],
+        };
+        // Suppress unused-let warning if the visibility test grows.
+        let _ = &mut comp;
+
+        let feats = detect_features(&comp);
+        assert!(feats.uses_async_lift);
+        assert!(feats.uses_callback_lift, "lift 1 has callback");
+        assert!(
+            feats.uses_stackful_lift(),
+            "mixed-mode: lift 2 is stackful (no callback), so the \
+             existential predicate must be true even though lift 1 is \
+             callback-mode"
+        );
+    }
+
+    /// LS-A-13 regression: `StreamWriteResult::decode` previously folded
+    /// any `written >= requested` into `Complete { written }`, including
+    /// the out-of-contract `written > requested` case. A buggy or hostile
+    /// runtime returning `n > data_len` would silently drive callers to
+    /// advance their producer cursor past the source buffer.
+    #[test]
+    fn ls_a_13_stream_write_over_count_is_unknown_not_complete() {
+        let r = StreamWriteResult::decode(100, 10);
+        assert!(
+            matches!(r, StreamWriteResult::Unknown(100)),
+            "decode(100, 10) must classify as Unknown(100) not Complete; \
+             got {r:?}"
+        );
+
+        // Exact-match still Complete.
+        assert!(matches!(
+            StreamWriteResult::decode(10, 10),
+            StreamWriteResult::Complete { written: 10 }
+        ));
+        // Partial unchanged.
+        assert!(matches!(
+            StreamWriteResult::decode(5, 10),
+            StreamWriteResult::Partial {
+                written: 5,
+                requested: 10
+            }
+        ));
+    }
+
+    /// LS-A-14 regression: `detect_features` classified types by
+    /// `desc.contains("stream")` / `desc.contains("future")`, so
+    /// `future<stream<u8>>` matched "stream" first and landed in
+    /// `stream_types` instead of `future_types`. Classify on the root
+    /// constructor.
+    #[test]
+    fn ls_a_14_future_of_stream_classifies_as_future() {
+        use crate::parser::{ComponentType, ComponentTypeKind, ParsedComponent};
+
+        let comp = ParsedComponent {
+            name: None,
+            core_modules: vec![],
+            imports: vec![],
+            exports: vec![],
+            types: vec![ComponentType {
+                kind: ComponentTypeKind::P3Async("future<stream<u8>>".to_string()),
+            }],
+            instances: vec![],
+            canonical_functions: vec![],
+            sub_components: vec![],
+            component_aliases: vec![],
+            component_instances: vec![],
+            core_entity_order: vec![],
+            component_func_defs: vec![],
+            component_instance_defs: vec![],
+            component_type_defs: vec![],
+            original_size: 0,
+            original_hash: String::new(),
+            depth_0_sections: vec![],
+            p3_async_features: vec![],
+        };
+        let feats = detect_features(&comp);
+        assert_eq!(
+            feats.future_types.len(),
+            1,
+            "`future<stream<u8>>` must classify as future (root \
+             constructor), not stream"
+        );
+        assert!(feats.stream_types.is_empty());
     }
 }

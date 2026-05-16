@@ -1056,6 +1056,103 @@ loss-scenarios:
     status: approved
     priority: high
 
+  - id: LS-A-12
+    title: uses_stackful_lift mis-classifies mixed-mode components
+    uca: UCA-A-3
+    hazards: [H-1, H-3]
+    type: inadequate-control-algorithm
+    scenario: >
+      `P3AsyncFeatures::uses_stackful_lift()` was derived as
+      `uses_async_lift && !uses_callback_lift` — a conjunction of two
+      component-wide existential flags. In a mixed-mode component that
+      declares one callback-mode async lift AND one stackful-mode async
+      lift, `uses_async_lift = true` and `uses_callback_lift = true`,
+      so the derived predicate returned `false` even though a stackful
+      lift was present. Downstream consumers following the rustdoc
+      contract ("dispatch the stackful emitter / surface the 'stackful
+      not yet emitted' error iff `uses_stackful_lift()`") would
+      silently classify the mixed-mode component as callback-only and
+      either skip a needed stackful adapter or skip the documented
+      reject. The bug was in code shipped in #146 / v0.8.0 (Phase 1
+      ABI foundation); the Phase 1 truth-table test only checked
+      single-lift cases. Fix tracks the stackful presence via a new
+      independent field `uses_stackful_lift_internal: bool` set per-
+      lift in `detect_features`. The two flags are now independent:
+      `uses_callback_lift` = "any lift has callback", and
+      `uses_stackful_lift_internal` = "any lift is stackful". A
+      component with both kinds correctly reports both as true.
+    causal-factors:
+      - Component-wide ANY-flags conjuncted into a derived predicate
+        that needs per-lift information
+      - Phase 1 truth-table test
+        (`stackful_lift_is_async_without_callback`) exercised only
+        single-lift cases, not mixed-mode
+      - The dispatcher in `adapter/fact.rs` already routes per-site
+        based on the merged module's `[callback]<export>` companion,
+        so the bug never reached the emitter — but external consumers
+        (kiln, downstream tooling) following the public API would
+        misroute
+    status: approved
+    priority: medium
+
+  - id: LS-A-13
+    title: StreamWriteResult::decode silently folds over-count into Complete
+    uca: UCA-A-5
+    hazards: [H-1, H-2]
+    type: inadequate-control-algorithm
+    scenario: >
+      `StreamWriteResult::decode(ret, requested)` previously classified
+      any non-negative `ret` with `written >= requested` as
+      `Complete { written }`, including the out-of-contract
+      `written > requested` case. The ABI contract on
+      [`HostIntrinsic::StreamWrite`] is `n == data_len` ⇒ Complete,
+      `0 <= n < data_len` ⇒ Partial, `n < 0` ⇒ Error/Unknown. A buggy
+      or hostile runtime returning `n > data_len` would silently drive
+      callers to advance their producer cursor past the source buffer
+      — silent off-by-many corruption with no trap. Fix splits the
+      check into three explicit arms: `==` ⇒ Complete, `<` ⇒ Partial,
+      `>` ⇒ Unknown(ret). The Unknown classification signals "contract
+      violation, do not advance" rather than treating it as success.
+    causal-factors:
+      - "`>=` comparison conflated the spec-correct exact-match case with the spec-violating over-count case"
+      - No upstream test in p3_async for the over-count scenario
+      - Decoder is the runtime→adapter contract enforcer; a
+        misclassifying decoder is functionally identical to an
+        unvalidated runtime
+    status: approved
+    priority: medium
+
+  - id: LS-A-14
+    title: detect_features substring matching misclassifies future<stream<...>>
+    uca: UCA-P-10
+    hazards: [H-3, H-4]
+    type: inadequate-control-algorithm
+    scenario: >
+      `detect_features` classified P3Async component-level types using
+      `desc.contains("stream")` / `desc.contains("future")` on the
+      human-readable type description. A nested type like
+      `future<stream<u8>>` matched the "stream" substring first (the
+      first `else if` branch never ran), so the type landed in
+      `stream_types` instead of `future_types`. The
+      `future_types`/`stream_types` sets are part of the public
+      `P3AsyncFeatures` surface (rustdoc presents them as the canonical
+      inventory for downstream consumers). A consumer iterating
+      `future_types` to wire `future_*` intrinsics, or to compute T's
+      canonical layout for `future_read`'s buffer-size argument, would
+      miss every nested-stream future and emit a wrong layout. Fix
+      classifies on the **root constructor** of the description (the
+      prefix up to the first `<`), not on substring containment.
+    causal-factors:
+      - Substring match used where a structural / root-constructor
+        match was required
+      - Public surface API (`future_types` / `stream_types` vectors)
+        carries ABI-relevant information through a free-form `String`
+        description — fragile by construction
+      - No test exercised nested-stream future types
+    status: approved
+    priority: medium
+
+
   # ==========================================================================
   # Merger scenario (discovered during gap analysis)
   # ==========================================================================
