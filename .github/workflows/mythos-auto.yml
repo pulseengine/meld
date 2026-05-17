@@ -1,0 +1,306 @@
+name: Mythos delta-pass (auto)
+
+# Runs the Mythos discover protocol automatically on every PR that
+# touches a Tier-5 file. Posts findings (or "NO FINDINGS") as a sticky
+# PR comment. Applies the `mythos-pass-done` label when all touched
+# files report NO FINDINGS, which clears the label-only gate in
+# `mythos-gate.yml`.
+#
+# Auth: uses Claude Code via CLAUDE_CODE_OAUTH_TOKEN (Max-plan OAuth
+# token, not a separate API key). Token usage draws from the
+# subscription's rate limits — see the budget knobs below.
+#
+# Authorization (defense-in-depth, "only avrabe can trigger this"):
+#
+#   1. Job-level `if:` checks both `github.actor == 'avrabe'` AND the
+#      immutable `github.actor_id == '10056645'`. Usernames can in
+#      principle be reassigned after account deletion; numeric IDs
+#      cannot. Both must match.
+#
+#   2. Trigger is `pull_request` (not `pull_request_target`). Per
+#      GitHub's default policy, secrets are not exposed to workflow
+#      runs from forked-repo PRs. Only same-repo branches see the
+#      OAuth token.
+#
+#   3. The Claude Code action is pinned by full commit SHA, not the
+#      `v1` tag. Even if `v1` is moved by an attacker who breaches the
+#      action repository, this workflow continues to run the
+#      SHA-pinned version.
+#
+#   4. Explicit minimal `permissions:` — only `pull-requests: write`
+#      (for the sticky comment + label) and `contents: read`. The
+#      OAuth token's powers are scoped by the user's Max plan, not by
+#      `GITHUB_TOKEN`.
+#
+#   5. `concurrency: cancel-in-progress` collapses sequential pushes
+#      to a single live run per PR head, preventing budget burn on
+#      rapid push cycles.
+#
+#   6. The detect step path-shape-validates every Tier-5 file before
+#      passing it into the matrix, so an attacker who manages to add
+#      a path with shell metacharacters cannot inject through the
+#      `matrix.file` interpolation downstream. In `run:` blocks we
+#      always read `matrix.file` via an `env:` variable rather than
+#      direct `${{ }}` substitution; see
+#      https://github.blog/security/vulnerability-research/how-to-catch-github-actions-workflow-injections-before-attackers-do/
+#
+# If you fork this repo and want to run the Mythos auto-gate yourself:
+# fork it, change the actor allow-list to your own user, set up your
+# own `CLAUDE_CODE_OAUTH_TOKEN`, and remove the avrabe ID. There is no
+# shared budget — every fork runs against its owner's token.
+
+on:
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: mythos-auto-${{ github.head_ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  detect:
+    name: Detect Tier-5 changes
+    # Single-actor lock: both username AND immutable user id must
+    # match. github.actor_id is a string in workflow context, so
+    # quote the numeric literal.
+    if: >-
+      github.actor == 'avrabe' &&
+      github.actor_id == '10056645'
+    runs-on: [self-hosted, linux, x64, light]
+    outputs:
+      files: ${{ steps.list.outputs.files }}
+      any: ${{ steps.list.outputs.any }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+      - name: List + path-shape-validate Tier-5 files
+        id: list
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          patterns=(
+            "meld-core/src/parser.rs"
+            "meld-core/src/merger.rs"
+            "meld-core/src/resolver.rs"
+            "meld-core/src/rewriter.rs"
+            "meld-core/src/component_wrap.rs"
+            "meld-core/src/p3_async.rs"
+            "meld-core/src/adapter/"
+            "meld-core/src/resource_graph.rs"
+            "meld-core/src/segments.rs"
+          )
+          changed=$(git diff --name-only "$BASE_SHA"..."$HEAD_SHA")
+          touched=()
+          while IFS= read -r f; do
+            [ -z "$f" ] && continue
+            for p in "${patterns[@]}"; do
+              case "$f" in
+                $p*)
+                  # Path-shape-validate: only alphanumerics, slash,
+                  # dot, underscore, dash. Anything else (quote,
+                  # backslash, semicolon, dollar, …) is rejected so
+                  # downstream `${{ matrix.file }}` interpolation
+                  # cannot inject shell or markdown.
+                  if [[ "$f" =~ ^[a-zA-Z0-9/_.-]+$ ]]; then
+                    touched+=("$f")
+                  else
+                    echo "::warning::Skipping Tier-5 path with non-portable shape: $f"
+                  fi
+                  break
+                  ;;
+              esac
+            done
+          done <<< "$changed"
+          if [ ${#touched[@]} -eq 0 ]; then
+            echo "any=false" >> "$GITHUB_OUTPUT"
+            echo "files=[]" >> "$GITHUB_OUTPUT"
+            echo "No Tier-5 files touched; nothing to scan."
+            exit 0
+          fi
+          # Emit a JSON array for matrix consumption.
+          printf -v joined '"%s",' "${touched[@]}"
+          echo "any=true" >> "$GITHUB_OUTPUT"
+          echo "files=[${joined%,}]" >> "$GITHUB_OUTPUT"
+          echo "Touched Tier-5 files:"
+          printf '  - %s\n' "${touched[@]}"
+
+  scan:
+    name: Mythos pass (${{ matrix.file }})
+    needs: detect
+    if: needs.detect.outputs.any == 'true'
+    runs-on: [self-hosted, linux, x64, rust-cpu]
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        file: ${{ fromJSON(needs.detect.outputs.files) }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Run Mythos discover.md on ${{ matrix.file }}
+        id: discover
+        # claude-code-action v1 pinned by commit SHA (not the `v1`
+        # tag) so a hijack of the tag doesn't change the action we
+        # run. Bump by SHA when intentionally upgrading; do not move
+        # to a floating tag.
+        #
+        # `matrix.file` is path-shape-validated by the detect job
+        # (alphanumerics + /._-) so direct interpolation into the
+        # prompt cannot inject markdown or shell.
+        uses: anthropics/claude-code-action@51ea8ea73a139f2a74ff649e3092c25a904aed7e # v1.0.123
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          prompt: |
+            Read scripts/mythos/discover.md and apply it to the file
+            ${{ matrix.file }}. The {{file}} placeholder in
+            discover.md resolves to ${{ matrix.file }}.
+
+            Do not relax the oracle requirement. If you cannot
+            produce both a Kani harness and a failing PoC test for a
+            finding, do not report that finding.
+
+            Emit your result strictly as JSON matching the schema in
+            --json-schema. The "verdict" field is the only signal
+            this workflow's gate logic consumes; everything else is
+            for the PR comment.
+          claude_args: |
+            --max-turns 30
+            --json-schema '{"type":"object","required":["verdict"],"properties":{"verdict":{"type":"string","enum":["NO_FINDINGS","FINDING"]},"file":{"type":"string"},"function":{"type":"string"},"hypothesis":{"type":"string"},"impact":{"type":"string"},"candidate_uca":{"type":"string"},"kani_harness":{"type":"string"},"poc_test":{"type":"string"}}}'
+
+      - name: Slugify file path for artifact name
+        id: slug
+        env:
+          F: ${{ matrix.file }}
+        run: |
+          # actions/upload-artifact rejects '/' in names.
+          slug=${F//\//__}
+          echo "slug=${slug}" >> "$GITHUB_OUTPUT"
+
+      - name: Save structured output as artifact
+        if: always()
+        env:
+          RESULT_JSON: ${{ steps.discover.outputs.structured_output }}
+          F: ${{ matrix.file }}
+        run: |
+          mkdir -p mythos-out
+          # If the action failed before emitting structured output,
+          # synthesize a FINDING-shaped placeholder so the aggregator
+          # treats this file as blocking rather than silently passing.
+          if [ -z "${RESULT_JSON:-}" ]; then
+            RESULT_JSON='{"verdict":"FINDING","file":"'"$F"'","hypothesis":"discover step failed before emitting structured output — see workflow logs"}'
+          fi
+          printf '%s' "$RESULT_JSON" > "mythos-out/${{ steps.slug.outputs.slug }}.json"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: mythos-result-${{ steps.slug.outputs.slug }}
+          path: mythos-out/${{ steps.slug.outputs.slug }}.json
+          if-no-files-found: error
+          retention-days: 14
+
+  aggregate:
+    name: Aggregate findings + label
+    needs: [detect, scan]
+    if: always() && needs.detect.outputs.any == 'true'
+    runs-on: [self-hosted, linux, x64, light]
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          path: mythos-out
+          pattern: mythos-result-*
+          merge-multiple: true
+
+      - name: Compose verdict + sticky comment
+        id: compose
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          # Aggregate every per-file JSON into a single verdict.
+          findings=0
+          no_findings=0
+          rows=""
+          for f in mythos-out/*.json; do
+            [ -e "$f" ] || continue
+            verdict=$(jq -r '.verdict' "$f")
+            file=$(jq -r '.file // ""' "$f")
+            hyp=$(jq -r '.hypothesis // ""' "$f")
+            if [ "$verdict" = "FINDING" ]; then
+              findings=$((findings + 1))
+              rows+="| \`$file\` | ❌ FINDING | ${hyp//|/\\|} |"$'\n'
+            else
+              no_findings=$((no_findings + 1))
+              rows+="| \`$file\` | ✅ NO FINDINGS | — |"$'\n'
+            fi
+          done
+
+          if [ "$findings" -gt 0 ]; then
+            status="❌ **${findings}** finding(s) across $((findings + no_findings)) Tier-5 file(s)"
+            verdict=FAIL
+          else
+            status="✅ **NO FINDINGS** across ${no_findings} Tier-5 file(s)"
+            verdict=PASS
+          fi
+
+          body=$(cat <<MARKER
+          <!-- mythos-auto-gate -->
+          ## Mythos delta-pass (auto)
+
+          ${status}
+
+          | File | Verdict | Hypothesis |
+          |---|---|---|
+          ${rows}
+
+          <sub>Auto-run via \`anthropics/claude-code-action@v1\`
+          (SHA-pinned) on the touched Tier-5 files, using the
+          maintainer's Max-plan OAuth token. See
+          \`.github/workflows/mythos-auto.yml\` and
+          \`scripts/mythos/discover.md\`.</sub>
+          MARKER
+          )
+
+          printf '%s' "$body" > /tmp/mythos-body.md
+          echo "verdict=$verdict" >> "$GITHUB_OUTPUT"
+
+          # Sticky-comment upsert: find by marker, PATCH if found
+          # else POST. Marker is the literal HTML comment string.
+          marker='<!-- mythos-auto-gate -->'
+          existing=$(gh api "repos/${REPO}/issues/${PR_NUMBER}/comments" \
+            --paginate --jq ".[] | select(.body | contains(\"${marker}\")) | .id" | head -n1)
+          if [ -n "$existing" ]; then
+            gh api -X PATCH "repos/${REPO}/issues/comments/${existing}" \
+              -f body="@/tmp/mythos-body.md" >/dev/null
+            echo "updated comment $existing"
+          else
+            gh api -X POST "repos/${REPO}/issues/${PR_NUMBER}/comments" \
+              -f body="@/tmp/mythos-body.md" >/dev/null
+            echo "posted new comment"
+          fi
+
+      - name: Apply mythos-pass-done label (PASS only)
+        if: steps.compose.outputs.verdict == 'PASS'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          gh pr edit "$PR_NUMBER" --add-label mythos-pass-done
+
+      - name: Fail job on FINDING verdict
+        if: steps.compose.outputs.verdict == 'FAIL'
+        run: |
+          echo "::error::Mythos discover reported at least one confirmed finding; see PR comment"
+          exit 1

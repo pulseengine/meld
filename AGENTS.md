@@ -703,6 +703,38 @@ Block the release if any `confirmed` finding lacks an `approved LS-N` in
 `safety/stpa/loss-scenarios.yaml` with a shipped fix or an explicit
 risk-acceptance note.
 
+#### Auto-runner (`.github/workflows/mythos-auto.yml`)
+
+The Mythos discover protocol is automated for the repository
+maintainer (`avrabe`, immutable user id `10056645`) via the
+`anthropics/claude-code-action` running against the maintainer's Max-
+plan OAuth token. On every PR that touches a Tier-5 file:
+
+1. The detect job lists touched Tier-5 paths (same path-list as
+   `mythos-gate.yml`) and **path-shape-validates** each one before
+   passing into the matrix.
+2. Per-file matrix runs the `claude-code-action`-pinned-by-SHA with
+   the discover.md prompt, asking for a structured JSON verdict
+   (`NO_FINDINGS` or `FINDING`).
+3. The aggregate job composes a sticky `<!-- mythos-auto-gate -->`
+   PR comment with the per-file table, and applies the
+   `mythos-pass-done` label when every file is `NO_FINDINGS`.
+4. If any file is `FINDING`, the job fails and the label is not
+   applied; the label-only `mythos-gate.yml` then keeps the PR
+   blocked until a human reviews the finding.
+
+**This auto-runner is single-actor scoped.** The job has a top-level
+`if: github.actor == 'avrabe' && github.actor_id == '10056645'`
+guard, and the `pull_request` trigger (not `pull_request_target`)
+means fork PRs don't get the OAuth token. Contributors should
+continue to expect the honor-system flow documented above (`Read
+scripts/mythos/discover.md ...`); the auto-runner is *one way* the
+label gets applied, not the only way.
+
+If you fork this repo and want to run the auto-runner under your own
+account: change the actor allow-list in `mythos-auto.yml`, set up
+your own `CLAUDE_CODE_OAUTH_TOKEN` secret, and remove `avrabe`'s id.
+
 ### LS-N verification gate
 
 CI workflow `.github/workflows/verification-gate.yml` enforces the
