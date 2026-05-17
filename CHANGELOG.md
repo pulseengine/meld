@@ -6,6 +6,27 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **Mythos delta-pass auto-runner** (`.github/workflows/mythos-auto.yml`).
+  Automates the human-driven discover protocol that
+  `mythos-gate.yml` enforces by label. On every PR that touches a
+  Tier-5 file, runs `anthropics/claude-code-action` (SHA-pinned)
+  against each touched file with `scripts/mythos/discover.md` as
+  the prompt, captures a structured `{verdict: NO_FINDINGS | FINDING}`
+  JSON via `--json-schema`, and posts a sticky `<!-- mythos-auto-gate -->`
+  PR comment with per-file results. Applies `mythos-pass-done` when
+  every file is `NO_FINDINGS`; fails the job (without applying the
+  label) when any file is `FINDING`. Single-actor scoped — runs only
+  when both `github.actor == 'avrabe'` and the immutable
+  `github.actor_id == '10056645'` match, and only on
+  `pull_request` (not `pull_request_target`) so fork PRs never see
+  the OAuth token. Auth flow uses `CLAUDE_CODE_OAUTH_TOKEN` from the
+  maintainer's Max-plan subscription (no separate API billing). The
+  detect job path-shape-validates every Tier-5 file
+  (`^[a-zA-Z0-9/_.-]+$`) before piping into the matrix so a hostile
+  path cannot inject through `${{ matrix.file }}` interpolation
+  downstream. The label-only `mythos-gate.yml` remains the source of
+  truth; the auto-runner is *one way* the label gets applied.
+
 - **LS-N verification gate**
   (`.github/workflows/verification-gate.yml`,
   `tools/run_ls_verification.py`, `tools/post_verification_comment.py`).
