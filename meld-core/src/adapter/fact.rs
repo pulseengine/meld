@@ -5630,4 +5630,14 @@ mod tests {
              would see stale bytes",
         );
     }
+
+    /// LS-N verification gate convention alias. Pins LS-A-10
+    /// (async-lift retptr writeback skips CABI alignment padding)
+    /// via the discoverable `ls_a_10_*` name. Same body as the
+    /// pre-existing `cabi_alignment_stackful_retptr_writes_i64_at_offset_8`
+    /// regression test.
+    #[test]
+    fn ls_a_10_cabi_align_retptr_writeback() {
+        cabi_alignment_stackful_retptr_writes_i64_at_offset_8();
+    }
 }

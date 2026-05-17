@@ -41,6 +41,9 @@ credentials.json
 # Test output
 test-output/
 
+# Local LS-N verification gate output
+verification-results.json
+
 # Claude local files
 .claude/
 
