@@ -145,6 +145,42 @@ jobs:
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
+      # Slugify before discover so the placeholder-write step below
+      # always has a non-empty `steps.slug.outputs.slug` to reference
+      # — even when the discover step fails and skips. (PR #163's
+      # first run skipped this step because it sat AFTER discover
+      # with no `if: always()`, leaving artifact paths as
+      # `mythos-out/.json`.)
+      - name: Slugify file path for artifact name
+        id: slug
+        env:
+          F: ${{ matrix.file }}
+        run: |
+          # actions/upload-artifact rejects '/' in names.
+          slug=${F//\//__}
+          echo "slug=${slug}" >> "$GITHUB_OUTPUT"
+
+      # The action's `oven-sh/setup-bun` step requires `unzip`, which
+      # is not installed by default on rust-cpu runners. Best-effort
+      # apt install; mirrors the action's own subprocess-isolation
+      # install pattern. Continues on failure so non-Debian runners
+      # don't break the workflow — if unzip is genuinely unavailable
+      # the next setup-bun step fails and the placeholder fallback
+      # fires correctly.
+      - name: Install unzip (required by setup-bun)
+        continue-on-error: true
+        run: |
+          if command -v unzip >/dev/null 2>&1; then
+            echo "unzip already present"
+            exit 0
+          fi
+          if command -v apt-get >/dev/null && command -v sudo >/dev/null; then
+            sudo apt-get update -qq
+            sudo apt-get install -y --no-install-recommends unzip
+          else
+            echo "::warning::no apt-get/sudo; setup-bun will likely fail"
+          fi
+
       - name: Run Mythos discover.md on ${{ matrix.file }}
         id: discover
         # claude-code-action v1 pinned by commit SHA (not the `v1`
@@ -175,32 +211,28 @@ jobs:
             --max-turns 30
             --json-schema '{"type":"object","required":["verdict"],"properties":{"verdict":{"type":"string","enum":["NO_FINDINGS","FINDING"]},"file":{"type":"string"},"function":{"type":"string"},"hypothesis":{"type":"string"},"impact":{"type":"string"},"candidate_uca":{"type":"string"},"kani_harness":{"type":"string"},"poc_test":{"type":"string"}}}'
 
-      - name: Slugify file path for artifact name
-        id: slug
-        env:
-          F: ${{ matrix.file }}
-        run: |
-          # actions/upload-artifact rejects '/' in names.
-          slug=${F//\//__}
-          echo "slug=${slug}" >> "$GITHUB_OUTPUT"
-
       - name: Save structured output as artifact
         if: always()
         env:
           RESULT_JSON: ${{ steps.discover.outputs.structured_output }}
+          SLUG: ${{ steps.slug.outputs.slug }}
           F: ${{ matrix.file }}
         run: |
           mkdir -p mythos-out
+          if [ -z "${SLUG:-}" ]; then
+            echo "::error::slug step output is empty — refusing to write to mythos-out/.json"
+            exit 1
+          fi
           # If the action failed before emitting structured output,
           # synthesize a FINDING-shaped placeholder so the aggregator
           # treats this file as blocking rather than silently passing.
           if [ -z "${RESULT_JSON:-}" ]; then
             RESULT_JSON='{"verdict":"FINDING","file":"'"$F"'","hypothesis":"discover step failed before emitting structured output — see workflow logs"}'
           fi
-          printf '%s' "$RESULT_JSON" > "mythos-out/${{ steps.slug.outputs.slug }}.json"
+          printf '%s' "$RESULT_JSON" > "mythos-out/${SLUG}.json"
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        if: always()
+        if: always() && steps.slug.outputs.slug != ''
         with:
           name: mythos-result-${{ steps.slug.outputs.slug }}
           path: mythos-out/${{ steps.slug.outputs.slug }}.json
