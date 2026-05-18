@@ -455,6 +455,26 @@ fn effective_module_name(unresolved: &crate::resolver::UnresolvedImport) -> &str
         .unwrap_or(&unresolved.module_name)
 }
 
+/// Resolve the imports-vector index whose name exactly matches
+/// `expected_name` by scanning the values of a per-component
+/// resource-tracking map. Exact match (not `ends_with`) — the prior
+/// `imp.name.ends_with(rn)` form silently conflated two resources
+/// whose names shared a suffix (e.g. `float` matched both
+/// `[resource-rep]float` and `[resource-rep]bigfloat`), letting the
+/// dedup-skip path register the wrong import for the wrong-suffix
+/// component. See LS-A-19 for the regression.
+fn find_exact_resource_import_idx(
+    tracking: &HashMap<(usize, String), u32>,
+    imports: &[MergedImport],
+    expected_name: &str,
+) -> Option<u32> {
+    tracking.values().copied().find(|&idx| {
+        imports
+            .get(idx as usize)
+            .is_some_and(|imp| imp.name == expected_name)
+    })
+}
+
 /// Module merger
 pub struct Merger {
     memory_strategy: MemoryStrategy,
@@ -2154,28 +2174,22 @@ impl Merger {
                         // cross-resource confusion (LS-A-19).
                         if let Some(rn) = eff_field.strip_prefix("[resource-rep]") {
                             let expected = format!("[resource-rep]{rn}");
-                            if let Some(&idx) =
-                                merged.resource_rep_by_component.values().find(|&&idx| {
-                                    merged
-                                        .imports
-                                        .get(idx as usize)
-                                        .is_some_and(|imp| imp.name == expected)
-                                })
-                            {
+                            if let Some(idx) = find_exact_resource_import_idx(
+                                &merged.resource_rep_by_component,
+                                &merged.imports,
+                                &expected,
+                            ) {
                                 merged
                                     .resource_rep_by_component
                                     .insert((unresolved.component_idx, rn.to_string()), idx);
                             }
                         } else if let Some(rn) = eff_field.strip_prefix("[resource-new]") {
                             let expected = format!("[resource-new]{rn}");
-                            if let Some(&idx) =
-                                merged.resource_new_by_component.values().find(|&&idx| {
-                                    merged
-                                        .imports
-                                        .get(idx as usize)
-                                        .is_some_and(|imp| imp.name == expected)
-                                })
-                            {
+                            if let Some(idx) = find_exact_resource_import_idx(
+                                &merged.resource_new_by_component,
+                                &merged.imports,
+                                &expected,
+                            ) {
                                 merged
                                     .resource_new_by_component
                                     .insert((unresolved.component_idx, rn.to_string()), idx);
@@ -4803,6 +4817,96 @@ mod tests {
         merged.realloc_map.insert((0, 0), 100);
         merged.realloc_map.insert((0, 1), 200);
         assert_eq!(component_realloc_index(&merged, 0), Some(100));
+    }
+
+    // LS-A-19: find_exact_resource_import_idx must match the full
+    // `[resource-{rep,new}]<name>` import string exactly. The prior
+    // `imp.name.ends_with(rn)` form let `float` match both
+    // `[resource-rep]float` and `[resource-rep]bigfloat`, so the
+    // dedup-skip path would register the wrong import for the
+    // wrong-suffix component (silent cross-resource confusion at
+    // runtime, no host trap).
+    fn merged_import(name: &str) -> MergedImport {
+        MergedImport {
+            module: "test".to_string(),
+            name: name.to_string(),
+            entity_type: EntityType::Function(0),
+            component_idx: None,
+        }
+    }
+
+    #[test]
+    fn ls_a_19_exact_match_picks_float_not_bigfloat() {
+        // imports[0] = [resource-rep]bigfloat
+        // imports[1] = [resource-rep]float
+        // Tracking has both indices. Asking for "[resource-rep]float"
+        // must return 1, not 0 — even though the buggy ends_with
+        // would have matched bigfloat first under some iteration
+        // orders.
+        let mut merged = empty_merged_fixture();
+        merged.imports.push(merged_import("[resource-rep]bigfloat"));
+        merged.imports.push(merged_import("[resource-rep]float"));
+        merged
+            .resource_rep_by_component
+            .insert((0, "bigfloat".to_string()), 0);
+        merged
+            .resource_rep_by_component
+            .insert((1, "float".to_string()), 1);
+
+        let idx = find_exact_resource_import_idx(
+            &merged.resource_rep_by_component,
+            &merged.imports,
+            "[resource-rep]float",
+        );
+        assert_eq!(
+            idx,
+            Some(1),
+            "exact match must pick float (idx 1), not bigfloat"
+        );
+    }
+
+    #[test]
+    fn ls_a_19_no_match_returns_none_even_with_suffix_collision() {
+        // Only bigfloat in tracking, but caller asks for plain float.
+        // The buggy ends_with("float") would have returned bigfloat's
+        // index. Exact match must return None.
+        let mut merged = empty_merged_fixture();
+        merged.imports.push(merged_import("[resource-rep]bigfloat"));
+        merged
+            .resource_rep_by_component
+            .insert((0, "bigfloat".to_string()), 0);
+
+        let idx = find_exact_resource_import_idx(
+            &merged.resource_rep_by_component,
+            &merged.imports,
+            "[resource-rep]float",
+        );
+        assert_eq!(
+            idx, None,
+            "no exact match for 'float' must return None even though \
+             'bigfloat' shares the suffix",
+        );
+    }
+
+    #[test]
+    fn ls_a_19_resource_new_lookup_is_also_exact() {
+        // Same suffix-collision case for [resource-new] table.
+        let mut merged = empty_merged_fixture();
+        merged.imports.push(merged_import("[resource-new]bigfloat"));
+        merged.imports.push(merged_import("[resource-new]float"));
+        merged
+            .resource_new_by_component
+            .insert((0, "bigfloat".to_string()), 0);
+        merged
+            .resource_new_by_component
+            .insert((1, "float".to_string()), 1);
+
+        let idx = find_exact_resource_import_idx(
+            &merged.resource_new_by_component,
+            &merged.imports,
+            "[resource-new]float",
+        );
+        assert_eq!(idx, Some(1));
     }
 }
 

@@ -4,6 +4,21 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- **LS-A-19 regression coverage** (`meld-core/src/merger.rs`). PR #156
+  fixed the `imp.name.ends_with(rn)` suffix-collision bug
+  (`float` / `bigfloat` cross-resource confusion) but landed without
+  a regression test. The LS-N verification gate (#161) surfaced this
+  gap as the "missing test" advisory bucket. Extracts the
+  exact-match lookup into a private helper
+  `find_exact_resource_import_idx` and adds three regression tests:
+  `ls_a_19_exact_match_picks_float_not_bigfloat`,
+  `ls_a_19_no_match_returns_none_even_with_suffix_collision`, and
+  `ls_a_19_resource_new_lookup_is_also_exact`. Gate result moves
+  from 15/19 verified to 16/19; remaining missing-bucket entries are
+  LS-CP-4 (likely subsumed by #130 Phase 2), LS-A-8, LS-A-9.
+
 ### Added
 
 - **Mythos delta-pass auto-runner** (`.github/workflows/mythos-auto.yml`).
