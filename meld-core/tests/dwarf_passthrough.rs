@@ -59,16 +59,22 @@
 //!
 //! # When to flip these assertions
 //!
-//! - **Phase 1.5 (deliberate passthrough policy)**: this test stays
-//!   green; we just gain a documented config knob.
-//! - **Phase 2 (DWARF remap)**: the duplicate-section assertion flips.
-//!   The fused module should contain a single, merged, address-correct
-//!   `.debug_info` / `.debug_line` pair. Update the test then.
-//! - **Phase 3 (adapter / inlined-code coverage)**: synthetic DIEs
-//!   covering adapter ranges land. Update the test to assert their
-//!   presence then.
+//! - **Phase 1.5 (deliberate passthrough policy)**: ✅ shipped in
+//!   v0.7 / PR #135. `FuserConfig::default().dwarf_handling` is now
+//!   `Strip`, and tests below explicitly opt into
+//!   `DwarfHandling::PassThrough` via `fuse_passthrough()` to pin
+//!   the broken-but-present behaviour for Phase 2 to flip.
+//! - **Phase 2 (DWARF remap, #143)**: the duplicate-section assertion
+//!   flips. The fused module should contain a single, merged,
+//!   address-correct `.debug_info` / `.debug_line` pair. Update the
+//!   test then.
+//! - **Phase 3 (adapter / inlined-code coverage, #144)**: synthetic
+//!   DIEs covering adapter ranges land. Update the test to assert
+//!   their presence then.
 
-use meld_core::{CustomSectionHandling, Fuser, FuserConfig, MemoryStrategy, OutputFormat};
+use meld_core::{
+    CustomSectionHandling, DwarfHandling, Fuser, FuserConfig, MemoryStrategy, OutputFormat,
+};
 
 /// One of the wit-bindgen integration fixtures known to embed core
 /// modules compiled with `debuginfo = 2`. Verified via `wasm-tools
@@ -149,18 +155,22 @@ fn count_dwarf_sections_recursive(bytes: &[u8]) -> std::collections::BTreeMap<St
     counts
 }
 
-fn fuse_default(input: &[u8]) -> Vec<u8> {
+/// Build a fuser that exercises the **PassThrough** DWARF policy, the
+/// path Phase 2 (#143) will flip from broken to correct. Phase 1.5
+/// (#135) made `DwarfHandling::Strip` the production default; this
+/// test fixture pins the explicit-opt-in path so the green-to-red
+/// signal for Phase 2 lives here rather than relying on a default
+/// that has already shifted once.
+fn fuse_passthrough(input: &[u8]) -> Vec<u8> {
     let mut fuser = Fuser::new(FuserConfig {
         memory_strategy: MemoryStrategy::MultiMemory,
         attestation: false,
         address_rebasing: false,
         preserve_names: false,
-        // Default in production is Merge, but we set it explicitly so
-        // the test reads as a self-contained spec of meld's current
-        // policy. See `current_default_is_merge_not_drop` below.
         custom_sections: CustomSectionHandling::Merge,
         output_format: OutputFormat::CoreModule,
         opaque_resources: Vec::new(),
+        dwarf_handling: DwarfHandling::PassThrough,
     });
     fuser
         .add_component_named(input, Some("dwarf-fixture"))
@@ -177,6 +187,7 @@ fn fuse_with_drop(input: &[u8]) -> Vec<u8> {
         custom_sections: CustomSectionHandling::Drop,
         output_format: OutputFormat::CoreModule,
         opaque_resources: Vec::new(),
+        dwarf_handling: DwarfHandling::Strip,
     });
     fuser
         .add_component_named(input, Some("dwarf-fixture"))
@@ -185,15 +196,27 @@ fn fuse_with_drop(input: &[u8]) -> Vec<u8> {
 }
 
 #[test]
-fn current_default_is_merge_not_drop() {
-    // Pin: any future change to the default must be a deliberate edit
-    // to this test, not a silent drift in `FuserConfig::default()`.
+fn current_default_is_strip_post_phase_1_5() {
+    // Pin: Phase 1.5 (#135, commit c7a2c0b) flipped the default DWARF
+    // handling from PassThrough (broken-but-present) to Strip
+    // (correct-but-lossy). The discovery oracle was originally
+    // authored against the pre-Phase-1.5 default and inverted in this
+    // commit to reflect shipped behaviour. Any future change to the
+    // default (e.g. Phase 2 making PassThrough correct + the new
+    // default) must be a deliberate edit to this test.
+    assert_eq!(
+        FuserConfig::default().dwarf_handling,
+        DwarfHandling::Strip,
+        "FuserConfig::default().dwarf_handling drifted from Strip. \
+         If this was intentional (Phase 2 making PassThrough address- \
+         correct etc.), update DWARF policy docs and the \
+         witness-integration discovery issue."
+    );
+    // The custom-sections default remains Merge — Phase 1.5 only
+    // changed DWARF policy, not the wider custom-section default.
     assert_eq!(
         FuserConfig::default().custom_sections,
         CustomSectionHandling::Merge,
-        "FuserConfig::default().custom_sections drifted from Merge. \
-         If this was intentional (Phase 1.5 etc.), update DWARF \
-         passthrough docs and the witness-integration discovery issue."
     );
 }
 
@@ -220,11 +243,13 @@ fn fixture_carries_dwarf_in_some_embedded_module() {
 
 #[test]
 fn fused_output_inherits_dwarf_byte_for_byte_today() {
-    // CURRENT BEHAVIOUR (Phase 1, broken):
+    // CURRENT BEHAVIOUR with `DwarfHandling::PassThrough` (Phase 1,
+    // broken; opt-in-only since Phase 1.5 / PR #135 made `Strip` the
+    // default):
     //
-    // - Default `CustomSectionHandling::Merge` causes meld to copy each
-    //   input core module's DWARF sections verbatim into the fused core
-    //   module's custom-section slot.
+    // - PassThrough + `CustomSectionHandling::Merge` causes meld to
+    //   copy each input core module's DWARF sections verbatim into
+    //   the fused core module's custom-section slot.
     // - DWARF addresses inside these sections are byte offsets into
     //   the ORIGINAL per-input code section. The fused module has a
     //   different code section (rewritten function bodies, different
@@ -233,13 +258,14 @@ fn fused_output_inherits_dwarf_byte_for_byte_today() {
     //   wrong source line, worst case it falls outside the new code
     //   section entirely.
     //
-    // This test asserts the lossy-but-present invariant. Flip it once
-    // Phase 2 (real DWARF remapping) lands.
+    // This test asserts the lossy-but-present invariant on the
+    // PassThrough code path. Flip it once Phase 2 (#143, real DWARF
+    // remapping) lands.
     if !fixture_available() {
         return;
     }
     let bytes = std::fs::read(DEBUG_INFO_FIXTURE).expect("read fixture");
-    let fused = fuse_default(&bytes);
+    let fused = fuse_passthrough(&bytes);
 
     let top_level_dwarf_in_fused = count_dwarf_sections_at_top_level(&fused);
     assert!(
@@ -269,8 +295,12 @@ fn drop_policy_strips_dwarf_completely() {
     // entire module reports as un-attributed), but at least the user
     // isn't told the WRONG source line.
     //
-    // Phase 1.5 will make this the recommended default until Phase 2
-    // ships real remapping.
+    // Note: Phase 1.5 (#135) shipped `DwarfHandling::Strip` as the
+    // default, so the `Drop` escape hatch is now mostly redundant for
+    // DWARF specifically — `Strip` removes only `.debug_*`, `Drop`
+    // removes all custom sections. This test still exercises the
+    // `Drop` path because the underlying invariant ("opting out
+    // produces no `.debug_*`") is what witness relies on.
     if !fixture_available() {
         return;
     }
@@ -306,7 +336,7 @@ fn dwarf_addresses_in_fused_output_are_known_to_be_wrong() {
         return;
     }
     let bytes = std::fs::read(DEBUG_INFO_FIXTURE).expect("read fixture");
-    let fused = fuse_default(&bytes);
+    let fused = fuse_passthrough(&bytes);
 
     let input_code_len = code_section_len_recursive(&bytes);
     let fused_code_len = code_section_len(&fused);
