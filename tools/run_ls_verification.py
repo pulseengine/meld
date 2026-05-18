@@ -76,25 +76,33 @@ _TEST_LINE = re.compile(r"^test result: (?P<verdict>ok|FAILED)\. "
 
 
 def run_prefix(package: str, prefix: str) -> tuple[int, int, int]:
-    """Return (matched, passed, failed) for `cargo test --lib <prefix>`.
+    """Return (matched, passed, failed) for `cargo test <prefix>`.
 
     `matched` = total selected tests (passed + failed + ignored). When
     cargo finds no matching tests, it reports `0 passed; 0 failed; 0
     ignored` and still exits 0; the caller treats matched=0 as missing.
+
+    Drops the `--lib` filter so integration tests under
+    `<package>/tests/` are also scanned. Several LS-N scenarios pin
+    their regression coverage in integration tests (e.g. LS-CP-4 in
+    `dwarf_strip.rs`); excluding them caused the gate to misreport
+    those entries as missing.
     """
     cmd = [
         "cargo",
         "test",
         "-p",
         package,
-        "--lib",
         "--no-fail-fast",
         "--",
-        "--exact" if False else "--test-threads=1",
+        "--test-threads=1",
         prefix,
     ]
     proc = subprocess.run(cmd, capture_output=True, text=True)
     passed = failed = ignored = 0
+    # cargo emits one `test result:` line per target (lib + each
+    # integration test binary), so we sum across all of them. A
+    # prefix that matches in *any* target counts as "matched".
     for line in proc.stdout.splitlines():
         m = _TEST_LINE.match(line)
         if m:
