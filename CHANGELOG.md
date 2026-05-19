@@ -6,6 +6,24 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **LS-A-8 regression coverage** (`meld-core/src/adapter/fact.rs`).
+  PR f0e981b fixed the `resource_rep_imports.values().next()`
+  HashMap-iteration-order bug in `analyze_call_site` (inner-list
+  borrow rep_func selection) by threading a pre-resolved
+  `rep_import: Option<(String, String)>` through `InnerResource` and
+  looking up per-type. The fix landed without a dedicated
+  regression test; the LS-N verification gate surfaced this as the
+  **last** missing-bucket entry. Adds two tests:
+  `ls_a_8_inner_list_rep_func_selected_by_type_not_iteration_order`
+  (adversarial 2-resource list, asserts per-byte-offset fixups map
+  to the correct rep_func — sampled 32× to make any residual
+  HashMap-order leak observable) and
+  `ls_a_8_no_rep_import_skips_fixup_rather_than_picking_arbitrary`
+  (pins the `rep_import=None` skip-with-warning path against the
+  pre-fix arbitrary-fallback regression). Gate verdict moves from
+  18/19 verified to **19/19 — full coverage**. The advisory
+  missing-bucket is now empty.
+
 - **LS-A-9 regression coverage** (`meld-core/src/adapter/fact.rs`).
   PR fixed the callback-mode `if code == WAIT` branch that silently
   treated `POLL (3)` as a YIELD fall-through (dropping host-ready
