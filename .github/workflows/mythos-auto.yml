@@ -60,6 +60,15 @@ concurrency:
 permissions:
   contents: read
   pull-requests: write
+  # `id-token: write` lets the action mint an OIDC token from the
+  # GitHub Actions OIDC issuer. claude-code-action calls
+  # `core.getIDToken()` (`@actions/core/lib/oidc-utils.js:71`) early in
+  # `setupGitHubToken`; without this permission the call throws
+  # "Unable to get ACTIONS_ID_TOKEN_REQUEST_URL env variable" and the
+  # action aborts before running its prompt. The token is workflow-
+  # scoped and signed by GitHub; it does not grant access to anything
+  # beyond what the workflow already has.
+  id-token: write
 
 jobs:
   detect:
