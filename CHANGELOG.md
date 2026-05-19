@@ -6,6 +6,22 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **LS-A-9 regression coverage** (`meld-core/src/adapter/fact.rs`).
+  PR fixed the callback-mode `if code == WAIT` branch that silently
+  treated `POLL (3)` as a YIELD fall-through (dropping host-ready
+  events on the callback handshake), but landed without a dedicated
+  test. The LS-N verification gate surfaced this gap. Adds
+  `ls_a_9_callback_adapter_dispatches_both_wait_and_poll`, which
+  drives `generate_async_callback_adapter` end-to-end against a
+  minimal merged-module fixture (lift func + `[callback]` companion
+  + `[waitable-set-poll]` import) and asserts the emitted body
+  contains the canonical `i32.const 2 / i32.eq / local.get … /
+  i32.const 3 / i32.eq / i32.or` byte sequence in order. Gate
+  verdict moves from 17/19 verified to **18/19** — only LS-A-8 left
+  in the missing bucket. **First PR to touch a Tier-5 file** since
+  `mythos-auto.yml`'s plumbing fixes (#164), so this also serves as
+  the auto-runner's first true end-to-end matrix-scan smoke test.
+
 - **LS-CP-4 regression coverage + LS-N gate integration-test scan**
   (`tools/run_ls_verification.py`,
   `meld-core/tests/dwarf_strip.rs`). The LS-N verification gate was
