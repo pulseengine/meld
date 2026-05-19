@@ -6,6 +6,24 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **LS-CP-4 regression coverage + LS-N gate integration-test scan**
+  (`tools/run_ls_verification.py`,
+  `meld-core/tests/dwarf_strip.rs`). The LS-N verification gate was
+  previously invoking `cargo test --lib`, which filtered out
+  integration tests under `<package>/tests/`. Three pre-existing
+  tests in `dwarf_strip.rs` (`default_strips_dwarf`,
+  `passthrough_preserves_dwarf`, `default_is_strip`) already pin
+  LS-CP-4 ("DWARF passthrough emits address-incorrect debug info on
+  fused output") via Phase 1.5's Strip-default policy, but the gate
+  reported the entry as missing because the test names didn't match
+  the `ls_cp_4_*` convention AND the integration-test binary
+  wasn't being scanned. Adds three convention aliases delegating to
+  the existing test bodies, and drops `--lib` from the gate runner
+  so both lib and integration tests participate. Gate verdict moves
+  from 16/19 verified to **17/19 verified**; remaining
+  missing-bucket entries are LS-A-8 and LS-A-9 (both need
+  net-new tests, not aliases).
+
 - **LS-A-19 regression coverage** (`meld-core/src/merger.rs`). PR #156
   fixed the `imp.name.ends_with(rn)` suffix-collision bug
   (`float` / `bigfloat` cross-resource confusion) but landed without

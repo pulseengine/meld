@@ -115,3 +115,30 @@ fn default_is_strip() {
     let cfg = FuserConfig::default();
     assert_eq!(cfg.dwarf_handling, DwarfHandling::Strip);
 }
+
+// LS-N verification gate convention aliases. These delegate to the
+// existing tests above; their purpose is the discoverable
+// `ls_cp_4_*` name that `tools/run_ls_verification.py` matches
+// against. The original tests stay in place as the canonical bodies
+// (preserves git blame + grep continuity).
+//
+// LS-CP-4 ("DWARF passthrough emits address-incorrect debug info on
+// fused output") is the loss scenario the Strip-default policy
+// directly mitigates — Phase 1.5 made Strip the default so the
+// broken passthrough is no longer the silent fallback. These tests
+// pin that policy.
+
+#[test]
+fn ls_cp_4_default_strips_dwarf() {
+    default_strips_dwarf();
+}
+
+#[test]
+fn ls_cp_4_passthrough_preserves_dwarf_explicitly() {
+    passthrough_preserves_dwarf();
+}
+
+#[test]
+fn ls_cp_4_default_is_strip() {
+    default_is_strip();
+}
