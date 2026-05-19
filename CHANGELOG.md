@@ -38,6 +38,18 @@ All notable changes to this project will be documented in this file.
   invalidate any contaminated snapshots. Root-cause analysis
   contributed by smithy team on the #168 thread.
 
+- **mythos-auto.yml missing `id-token: write` permission**
+  (`.github/workflows/mythos-auto.yml`). After the unzip block on
+  rust-cpu runners cleared (#167), the next mythos-auto run
+  surfaced a third plumbing issue: claude-code-action calls
+  `core.getIDToken()` early in `setupGitHubToken`, which requires
+  the OIDC token issuer URL. Without `id-token: write` in
+  `permissions:`, the action gets "Unable to get
+  ACTIONS_ID_TOKEN_REQUEST_URL env variable" and aborts before
+  running its prompt. Adds the permission with an inline comment
+  explaining the requirement. Discovered by PR #169's matrix scan
+  on the now-unzip-fixed runner image.
+
 - **LS-A-9 regression coverage** (`meld-core/src/adapter/fact.rs`).
   PR fixed the callback-mode `if code == WAIT` branch that silently
   treated `POLL (3)` as a YIELD fall-through (dropping host-ready
