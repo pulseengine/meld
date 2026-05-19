@@ -24,6 +24,20 @@ All notable changes to this project will be documented in this file.
   18/19 verified to **19/19 — full coverage**. The advisory
   missing-bucket is now empty.
 
+- **Fuzz smoke `sanitizer is incompatible with statically linked
+  libc` recurrence** (`.github/workflows/fuzz.yml`, #168). The
+  toolchain install was requesting `x86_64-unknown-linux-musl` as
+  an extra target. cargo-fuzz's `--release` reuse path can pick up
+  that musl target on cache restore, and musl statically links libc
+  which is incompatible with the AddressSanitizer cargo-fuzz
+  injects. The fuzz_parse_component / fuzz_resolver_terminates
+  failures attributed to runner config-drift (#139 §3) were
+  actually workflow-side: same failure on the "good" runner-7 once
+  the musl cache hit. Drops the `targets: x86_64-unknown-linux-musl`
+  line and version-bumps the `actions/cache` key to `v2-` to
+  invalidate any contaminated snapshots. Root-cause analysis
+  contributed by smithy team on the #168 thread.
+
 - **LS-A-9 regression coverage** (`meld-core/src/adapter/fact.rs`).
   PR fixed the callback-mode `if code == WAIT` branch that silently
   treated `POLL (3)` as a YIELD fall-through (dropping host-ready

@@ -48,10 +48,22 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Do NOT install the `x86_64-unknown-linux-musl` toolchain target.
+      # musl statically links libc, which is incompatible with the
+      # AddressSanitizer that `cargo-fuzz` injects via
+      # `-Z sanitizer=address`. The build then fails with
+      #   error: sanitizer is incompatible with statically linked libc,
+      #          disable it using `-C target-feature=-crt-static`
+      # cargo-fuzz's `--release` reuse path can pick up a musl target if
+      # a stale `fuzz/target/` is restored from cache. We default to the
+      # host gnu target (no `targets:` line, no `--target` flag on
+      # `cargo fuzz run`) so the sanitizer stays compatible.
+      # Inputs here are workflow-static (no untrusted event payloads):
+      # `matrix.target` is hardcoded in the strategy matrix and
+      # `runner.os` is GitHub-provided runner metadata.
+      # See pulseengine/meld#168 for the recurring failure pattern.
       - name: Install nightly Rust
         uses: dtolnay/rust-toolchain@nightly
-        with:
-          targets: x86_64-unknown-linux-musl
 
       - name: Install cargo-fuzz
         run: cargo install cargo-fuzz --locked
@@ -64,8 +76,12 @@ jobs:
             ~/.cargo/registry/index/
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
-          key: ${{ runner.os }}-fuzz-${{ matrix.target }}-${{ hashFiles('fuzz/Cargo.toml', 'meld-core/Cargo.toml') }}
-          restore-keys: ${{ runner.os }}-fuzz-${{ matrix.target }}-
+          # Cache key version-bumped to `v2-` once to bust any snapshots
+          # taken while the toolchain still had musl as an extra target
+          # (#168). Bump again if a future change should invalidate all
+          # existing caches in lock-step.
+          key: ${{ runner.os }}-fuzz-v2-${{ matrix.target }}-${{ hashFiles('fuzz/Cargo.toml', 'meld-core/Cargo.toml') }}
+          restore-keys: ${{ runner.os }}-fuzz-v2-${{ matrix.target }}-
 
       - name: Run target for 60 s
         run: cargo +nightly fuzz run --release "$FUZZ_TARGET" -- -max_total_time=60
