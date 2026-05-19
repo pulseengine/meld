@@ -5752,4 +5752,163 @@ mod tests {
              (locals interleave between them); poll_idx={poll_idx}"
         );
     }
+
+    /// LS-A-8: For a `list<record { x: borrow<A>, y: borrow<B> }>` (or
+    /// any list whose elements carry borrows to multiple distinct
+    /// resource types), `analyze_call_site` must select the **correct
+    /// per-type** `[resource-rep]` import for each inner-resource
+    /// slot. A previous version did `resource_rep_imports.values()
+    /// .next()` — HashMap iteration order, so the rep_func picked for
+    /// each slot was effectively random, routing borrow handles of
+    /// resource A through resource B's rep_func and vice versa
+    /// (silent rep-vs-handle confusion across the cross-component
+    /// handle boundary, H-4/H-4.2, UCA-A-7).
+    ///
+    /// The fix threads a pre-resolved `rep_import: Option<(String,
+    /// String)>` through `InnerResource`, populated at site-
+    /// requirements time; fact.rs looks the rep_func up per-type
+    /// rather than via `.values().next()`.
+    ///
+    /// This test pins the per-type lookup. It builds adversarial
+    /// inputs: two `InnerResource`s pointing at distinct rep_import
+    /// keys, a `resource_rep_imports` map binding each key to a
+    /// distinct func index, and asserts the resulting
+    /// `options.inner_resource_fixups` pair each byte_offset with
+    /// the **correct** func — never crossed.
+    #[test]
+    fn ls_a_8_inner_list_rep_func_selected_by_type_not_iteration_order() {
+        use crate::resolver::{AdapterRequirements, CopyLayout, InnerResource};
+
+        let gen_ = FactStyleGenerator::new(AdapterConfig::default());
+        let merged = empty_merged();
+
+        // Adversarial inner-resources: borrow<A> at offset 0 and
+        // borrow<B> at offset 4 (two i32 handles in the record).
+        let rep_a_key = ("$root".to_string(), "[resource-rep]res_a".to_string());
+        let rep_b_key = ("$root".to_string(), "[resource-rep]res_b".to_string());
+        let inner_a = InnerResource {
+            byte_offset: 0,
+            resource_type_id: 100,
+            is_owned: false,
+            rep_import: Some(rep_a_key.clone()),
+        };
+        let inner_b = InnerResource {
+            byte_offset: 4,
+            resource_type_id: 200,
+            is_owned: false,
+            rep_import: Some(rep_b_key.clone()),
+        };
+
+        // Build a single Elements layout carrying both inner-
+        // resources. The element_size + inner_pointers fields don't
+        // matter for this assertion — `analyze_call_site` only walks
+        // `inner_resources`.
+        let layout = CopyLayout::Elements {
+            element_size: 8,
+            inner_pointers: Vec::new(),
+            inner_resources: vec![inner_a, inner_b],
+        };
+
+        let requirements = AdapterRequirements {
+            param_copy_layouts: vec![layout],
+            ..Default::default()
+        };
+
+        let mut site = async_lift_site("[lift]list_of_borrows");
+        site.requirements = requirements;
+        site.is_async_lift = false;
+
+        // Two distinct rep_func indices, deliberately chosen so a
+        // HashMap-iteration `.values().next()` would pick wrongly
+        // for at least one of them.
+        let mut rep_imports = std::collections::HashMap::new();
+        rep_imports.insert(rep_a_key.clone(), 100u32);
+        rep_imports.insert(rep_b_key.clone(), 200u32);
+        let new_imports = std::collections::HashMap::new();
+
+        // Sample many times to make non-determinism observable. If the
+        // impl picked `.values().next()`, hash-seed-randomised
+        // iteration order would yield the wrong pairing under at
+        // least some seeds; with the type-pinned lookup the result is
+        // identical every run.
+        for _ in 0..32 {
+            let options = gen_.analyze_call_site(&site, &merged, &rep_imports, &new_imports);
+            assert_eq!(
+                options.inner_resource_fixups.len(),
+                2,
+                "both inner-resources must produce fixups; got {options:?}",
+            );
+            // Find the fixup tagged at offset 0 and 4 — they MUST map
+            // to rep_func 100 and 200 respectively (i.e., the
+            // resource type's own rep_func, not the other one).
+            let off_0 = options
+                .inner_resource_fixups
+                .iter()
+                .find(|(off, _)| *off == 0)
+                .expect("must have fixup at offset 0");
+            let off_4 = options
+                .inner_resource_fixups
+                .iter()
+                .find(|(off, _)| *off == 4)
+                .expect("must have fixup at offset 4");
+            assert_eq!(
+                off_0.1, 100,
+                "borrow<A> at offset 0 must select rep_a's func (100); got {off_0:?}",
+            );
+            assert_eq!(
+                off_4.1, 200,
+                "borrow<B> at offset 4 must select rep_b's func (200); got {off_4:?}",
+            );
+        }
+    }
+
+    /// LS-A-8 sibling case: when an `InnerResource` has no
+    /// `rep_import` (i.e., the resolver couldn't map the type id to
+    /// an import), the fixup must be **skipped** with a warning —
+    /// NOT fall back to an arbitrary HashMap entry, which was the
+    /// pre-fix behavior.
+    #[test]
+    fn ls_a_8_no_rep_import_skips_fixup_rather_than_picking_arbitrary() {
+        use crate::resolver::{AdapterRequirements, CopyLayout, InnerResource};
+
+        let gen_ = FactStyleGenerator::new(AdapterConfig::default());
+        let merged = empty_merged();
+
+        let inner = InnerResource {
+            byte_offset: 0,
+            resource_type_id: 999,
+            is_owned: false,
+            rep_import: None, // resolver failed to map; pre-fix would `.values().next()`
+        };
+
+        let requirements = AdapterRequirements {
+            param_copy_layouts: vec![CopyLayout::Elements {
+                element_size: 4,
+                inner_pointers: Vec::new(),
+                inner_resources: vec![inner],
+            }],
+            ..Default::default()
+        };
+
+        let mut site = async_lift_site("[lift]list_borrow_unmapped");
+        site.requirements = requirements;
+        site.is_async_lift = false;
+
+        // Even though imports are present, the lookup must skip when
+        // rep_import is None — not silently fall back.
+        let mut rep_imports = std::collections::HashMap::new();
+        rep_imports.insert(
+            ("$root".to_string(), "[resource-rep]res_other".to_string()),
+            777u32,
+        );
+        let new_imports = std::collections::HashMap::new();
+
+        let options = gen_.analyze_call_site(&site, &merged, &rep_imports, &new_imports);
+        assert!(
+            options.inner_resource_fixups.is_empty(),
+            "InnerResource with rep_import=None must NOT produce a \
+             fixup (pre-fix bug fell back to HashMap.values().next() \
+             yielding 777 arbitrarily); got {options:?}",
+        );
+    }
 }
