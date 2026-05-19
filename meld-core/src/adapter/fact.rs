@@ -5640,4 +5640,116 @@ mod tests {
     fn ls_a_10_cabi_align_retptr_writeback() {
         cabi_alignment_stackful_retptr_writes_i64_at_offset_8();
     }
+
+    /// LS-A-9: `generate_async_callback_adapter` must dispatch
+    /// `[waitable-set-poll]` on **both** `WAIT (2)` and `POLL (3)`.
+    /// The pre-fix `if code == WAIT` branch let POLL fall through to
+    /// the YIELD path, which sent `(EVENT_NONE, 0, 0)` to `[callback]`
+    /// and dropped any event the host had ready — silent semantic
+    /// drift between fused and composed modules with no host trap.
+    ///
+    /// Asserts the WAIT/POLL OR-pattern is present in the emitted
+    /// adapter body: the byte sequence
+    ///
+    ///     local.get l_code (0x20 <leb128>)
+    ///     i32.const WAIT=2 (0x41 0x02)
+    ///     i32.eq           (0x46)
+    ///     local.get l_code (0x20 <leb128>)
+    ///     i32.const POLL=3 (0x41 0x03)
+    ///     i32.eq           (0x46)
+    ///     i32.or           (0x72)
+    ///
+    /// Pin-by-substring is robust against unrelated body changes
+    /// (locals layout, surrounding control flow) — what we care about
+    /// is that `i32.const 2 / i32.eq / i32.const 3 / i32.eq / i32.or`
+    /// appears in that order somewhere in the loop body.
+    #[test]
+    fn ls_a_9_callback_adapter_dispatches_both_wait_and_poll() {
+        let gen_ = FactStyleGenerator::new(AdapterConfig::default());
+        let mut merged = empty_merged();
+
+        // Type 0: () -> i32 — minimal lift signature matching the
+        // callback-mode return convention (packed callback code i32).
+        merged.types.push(crate::merger::MergedFuncType {
+            params: Vec::new(),
+            results: vec![wasm_encoder::ValType::I32],
+        });
+
+        // The lift function lives at merged index 0.
+        merged.functions.push(crate::merger::MergedFunction {
+            type_idx: 0,
+            body: wasm_encoder::Function::new([]),
+            origin: (1, 0, 0),
+        });
+        merged.function_index_map.insert((1, 0, 0), 0);
+
+        // The [callback] companion export — the callback adapter
+        // resolves this by name (`[callback]<export_name>`).
+        let export_name = "[async-lift]async_export";
+        merged.exports.push(crate::merger::MergedExport {
+            name: format!("[callback]{export_name}"),
+            kind: wasm_encoder::ExportKind::Func,
+            index: 0,
+        });
+
+        // Required host import — the adapter looks up
+        // [waitable-set-poll] by name prefix.
+        merged.imports.push(crate::merger::MergedImport {
+            module: "$root".into(),
+            name: "[waitable-set-poll]".into(),
+            entity_type: wasm_encoder::EntityType::Function(0),
+            component_idx: None,
+        });
+
+        let mut site = async_lift_site(export_name);
+        site.import_func_type_idx = Some(0);
+        site.crosses_memory = false;
+
+        let adapter = gen_
+            .generate_async_callback_adapter(&site, &merged)
+            .expect("callback emitter must succeed with [callback] + [waitable-set-poll] wired");
+
+        let body = adapter.body.into_raw_body();
+
+        // The WAIT/POLL OR-pattern as raw bytes. WAIT=2 / POLL=3 both
+        // fit in single-byte sleb128. We omit the `local.get l_code`
+        // bytes from the pattern (their leb128 encoding depends on
+        // local index) and assert the constant+compare+or skeleton
+        // appears in order.
+        const WAIT_POLL_OR_TAIL: &[u8] = &[
+            0x41, 0x02, // i32.const WAIT (2)
+            0x46, // i32.eq
+            0x20, // local.get … (l_code; one-byte leb when index<128)
+        ];
+        const POLL_OR: &[u8] = &[
+            0x41, 0x03, // i32.const POLL (3)
+            0x46, // i32.eq
+            0x72, // i32.or
+        ];
+
+        let wait_idx = body
+            .windows(WAIT_POLL_OR_TAIL.len())
+            .position(|w| w == WAIT_POLL_OR_TAIL)
+            .unwrap_or_else(|| {
+                panic!(
+                    "callback adapter body must contain WAIT(2)/eq/local.get \
+                     prefix of the OR-pattern; body={body:?}"
+                )
+            });
+        let poll_idx = body[wait_idx..]
+            .windows(POLL_OR.len())
+            .position(|w| w == POLL_OR)
+            .unwrap_or_else(|| {
+                panic!(
+                    "callback adapter body must contain POLL(3)/eq/or \
+                     tail of the OR-pattern AFTER the WAIT match at \
+                     offset {wait_idx}; body={body:?}"
+                )
+            });
+        assert!(
+            poll_idx > 0,
+            "POLL_OR pattern must come after WAIT pattern in body \
+             (locals interleave between them); poll_idx={poll_idx}"
+        );
+    }
 }
