@@ -4,6 +4,20 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+
+- **CI workflows now skip on docs/safety-only changes**
+  (`.github/workflows/{bench,fuzz,ci}.yml`). Adds conservative
+  `paths-ignore` filters to bench, fuzz, and ci workflows: PRs that
+  only edit Markdown, `safety/`, `scripts/mythos/`, or
+  `tools/*.py` skip the rust-cpu-hungry jobs (~9 jobs saved per
+  docs-only PR). The LS-N gate, mythos-gate, and mythos-auto
+  workflows are untouched — they need to keep firing on those very
+  paths (`safety/stpa/loss-scenarios.yaml` is what the LS-N gate
+  reads). Substantive code PRs are unaffected. Pulls meld's
+  footprint on the shared smithy fleet down without losing
+  regression signal on real changes.
+
 ### Fixed
 
 - **LS-A-8 regression coverage** (`meld-core/src/adapter/fact.rs`).

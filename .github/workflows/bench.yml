@@ -21,8 +21,18 @@ concurrency:
 on:
   push:
     branches: [main]
+    paths-ignore:
+      - '**/*.md'
+      - 'safety/**'
+      - 'scripts/mythos/**'
+      - 'tools/*.py'
   pull_request:
     branches: [main]
+    paths-ignore:
+      - '**/*.md'
+      - 'safety/**'
+      - 'scripts/mythos/**'
+      - 'tools/*.py'
 
 env:
   CARGO_TERM_COLOR: always

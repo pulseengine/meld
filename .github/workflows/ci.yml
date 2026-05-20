@@ -7,8 +7,23 @@ concurrency:
 on:
   push:
     branches: [main]
+    # Skip CI on docs/safety-only changes — they don't affect code
+    # behavior. Reduces meld's draw on the shared smithy rust-cpu
+    # fleet. Conservative exclusion: anything that could affect
+    # cargo build/test/clippy/fmt outputs (.rs, Cargo.{toml,lock},
+    # workflows themselves) still triggers.
+    paths-ignore:
+      - '**/*.md'
+      - 'safety/**'
+      - 'scripts/mythos/**'
+      - 'tools/*.py'
   pull_request:
     branches: [main]
+    paths-ignore:
+      - '**/*.md'
+      - 'safety/**'
+      - 'scripts/mythos/**'
+      - 'tools/*.py'
 
 env:
   CARGO_TERM_COLOR: always
