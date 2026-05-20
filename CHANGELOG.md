@@ -4,6 +4,25 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- **mythos-auto aggregate job: `gh` → `curl`**
+  (`.github/workflows/mythos-auto.yml`). The `aggregate` job composed
+  the sticky PR comment and applied the `mythos-pass-done` label via
+  `gh api` / `gh pr edit`, but the GitHub CLI is not installed on the
+  `light` runner — the step exited 127 (`gh: command not found`),
+  blocking the label even when the Mythos scan returned NO_FINDINGS.
+  Rewrites both the comment upsert and the label apply with `curl`
+  against the REST API (`curl` + `jq` are universally present). The
+  markdown body is JSON-encoded with `jq -Rs '{body: .}'` so nothing
+  in the model-authored hypothesis text can break the request. Also
+  registers `meld-core/src/p3_stream.rs` in the Mythos Tier-5 path
+  lists (`mythos-gate.yml`, `mythos-auto.yml`) — deferred from #173,
+  which could not modify `mythos-auto.yml` and still be scanned by
+  it (claude-code-action self-validates the invoking workflow against
+  `main`). This PR touches only the workflow files, so its own
+  auto-runner detect job finds no Tier-5 source and skips the scan.
+
 ### Added
 
 - **Cross-component `stream<T>` pairing detection** (issue #141,
