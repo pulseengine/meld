@@ -4,6 +4,30 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **Cross-component `stream<T>` pairing detection** (issue #141,
+  ADR-3, `meld-core/src/p3_stream.rs`). Foundation for the in-module
+  stream adapter: when meld fuses two components that share a
+  `stream<T>` endpoint, today both sides still route every chunk
+  through host `pulseengine:async` imports. This PR adds the
+  detection half — a `StreamPairGraph` built at resolve time that
+  inventories which fused components form producer → consumer stream
+  pairings. The graph is attached to `DependencyGraph` next to the
+  resource graph. A `StreamPair` is a conservative *candidate*: it is
+  recorded only when two fusion-connected components have
+  complementary roles (one `StreamWrite`, one `StreamRead`) on a
+  stream of the **same element type** — pairing on matching element
+  type is the line between an honest candidate and a hallucinated
+  one. The ring-buffer (same-memory) and copy-chain (cross-memory)
+  adapter *emitter* is a runtime-verified follow-up (ADR-3 Path N);
+  cross-component stream codegen is only correct once executed on a
+  real runtime, so it is deliberately not in this PR. ADR-3 records
+  the design; SR-33's detection half is satisfied here, the codegen
+  half by the follow-up. `meld-core/src/p3_stream.rs` added to the
+  Mythos Tier-5 path lists. 9 unit tests including the 4 ADR-3
+  gating fixtures.
+
 ### Changed
 
 - **CI workflows now skip on docs/safety-only changes**

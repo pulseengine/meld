@@ -30,6 +30,13 @@ pub struct DependencyGraph {
     /// which resource and how handles should be routed.
     pub resource_graph: Option<crate::resource_graph::ResourceGraph>,
 
+    /// Cross-component `stream<T>` pairings detected at merge time
+    /// (ADR-3, issue #141). The detection foundation populates this; the
+    /// in-module stream adapter emitter (ADR-3 follow-up) and issue
+    /// #142's static stream validation consume it. `None` until the
+    /// resolver runs stream-pair detection.
+    pub stream_pair_graph: Option<crate::p3_stream::StreamPairGraph>,
+
     /// Module-level resolution within components
     pub module_resolutions: Vec<ModuleResolution>,
 
@@ -1412,6 +1419,7 @@ impl Resolver {
             adapter_sites: Vec::new(),
             module_resolutions: Vec::new(),
             resource_graph: None,
+            stream_pair_graph: None,
             reexporter_components: Vec::new(),
             reexporter_resources: Vec::new(),
         };
@@ -1457,6 +1465,19 @@ impl Resolver {
         graph.resource_graph = Some(crate::resource_graph::ResourceGraph::build(
             &graph.resolved_imports,
             components,
+        ));
+
+        // Build the cross-component stream-pair graph (ADR-3, #141).
+        // Detection foundation only — the in-module stream adapter
+        // emitter that consumes this is a runtime-verified follow-up.
+        let stream_mode = match self.memory_strategy {
+            MemoryStrategy::SharedMemory => crate::p3_stream::StreamMemoryMode::SameMemory,
+            MemoryStrategy::MultiMemory => crate::p3_stream::StreamMemoryMode::CrossMemory,
+        };
+        graph.stream_pair_graph = Some(crate::p3_stream::build_stream_pair_graph(
+            components,
+            &graph.resolved_imports,
+            stream_mode,
         ));
 
         // Identify adapter sites (cross-component)
@@ -4948,6 +4969,7 @@ mod tests {
                 },
             ],
             resource_graph: None,
+            stream_pair_graph: None,
             reexporter_components: Vec::new(),
             reexporter_resources: Vec::new(),
         };
