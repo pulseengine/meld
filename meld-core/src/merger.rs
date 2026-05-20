@@ -3692,6 +3692,7 @@ mod tests {
             adapter_sites: Vec::new(),
             module_resolutions: Vec::new(),
             resource_graph: None,
+            stream_pair_graph: None,
             reexporter_components: Vec::new(),
             reexporter_resources: Vec::new(),
             unresolved_imports: vec![
@@ -3906,6 +3907,7 @@ mod tests {
             adapter_sites: Vec::new(),
             module_resolutions: Vec::new(),
             resource_graph: None,
+            stream_pair_graph: None,
             reexporter_components: Vec::new(),
             reexporter_resources: Vec::new(),
             unresolved_imports: vec![
@@ -3958,6 +3960,7 @@ mod tests {
             adapter_sites: Vec::new(),
             module_resolutions: Vec::new(),
             resource_graph: None,
+            stream_pair_graph: None,
             reexporter_components: Vec::new(),
             reexporter_resources: Vec::new(),
             unresolved_imports: vec![
@@ -4018,6 +4021,7 @@ mod tests {
             adapter_sites: Vec::new(),
             module_resolutions: Vec::new(),
             resource_graph: None,
+            stream_pair_graph: None,
             reexporter_components: Vec::new(),
             reexporter_resources: Vec::new(),
             unresolved_imports: vec![
@@ -4069,6 +4073,7 @@ mod tests {
             adapter_sites: Vec::new(),
             module_resolutions: Vec::new(),
             resource_graph: None,
+            stream_pair_graph: None,
             reexporter_components: Vec::new(),
             reexporter_resources: Vec::new(),
             unresolved_imports: vec![
@@ -4124,6 +4129,7 @@ mod tests {
             adapter_sites: Vec::new(),
             module_resolutions: Vec::new(),
             resource_graph: None,
+            stream_pair_graph: None,
             reexporter_components: Vec::new(),
             reexporter_resources: Vec::new(),
             unresolved_imports: vec![
@@ -4256,6 +4262,7 @@ mod tests {
             adapter_sites: Vec::new(),
             module_resolutions: Vec::new(),
             resource_graph: None,
+            stream_pair_graph: None,
             reexporter_components: Vec::new(),
             reexporter_resources: Vec::new(),
             unresolved_imports: vec![
@@ -4414,6 +4421,7 @@ mod tests {
             adapter_sites: Vec::new(),
             module_resolutions: Vec::new(),
             resource_graph: None,
+            stream_pair_graph: None,
             reexporter_components: Vec::new(),
             reexporter_resources: Vec::new(),
             unresolved_imports: vec![
@@ -4565,6 +4573,7 @@ mod tests {
             adapter_sites: Vec::new(),
             module_resolutions: Vec::new(),
             resource_graph: None,
+            stream_pair_graph: None,
             reexporter_components: Vec::new(),
             reexporter_resources: Vec::new(),
             unresolved_imports: vec![

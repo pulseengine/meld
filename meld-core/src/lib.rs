@@ -47,6 +47,7 @@ pub mod component_wrap;
 mod error;
 pub mod merger;
 pub mod p3_async;
+pub mod p3_stream;
 pub mod parser;
 pub mod resolver;
 pub mod resource_graph;
