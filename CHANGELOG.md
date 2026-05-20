@@ -24,9 +24,11 @@ All notable changes to this project will be documented in this file.
   cross-component stream codegen is only correct once executed on a
   real runtime, so it is deliberately not in this PR. ADR-3 records
   the design; SR-33's detection half is satisfied here, the codegen
-  half by the follow-up. `meld-core/src/p3_stream.rs` added to the
-  Mythos Tier-5 path lists. 9 unit tests including the 4 ADR-3
-  gating fixtures.
+  half by the follow-up. 9 unit tests including the 4 ADR-3 gating
+  fixtures. Registering `p3_stream.rs` in the Mythos Tier-5 path
+  lists is a separate follow-up — claude-code-action self-validates
+  that the invoking workflow matches `main`, so a PR cannot both
+  modify `mythos-auto.yml` and be scanned by it.
 
 ### Changed
 
