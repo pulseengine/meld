@@ -101,6 +101,7 @@ jobs:
             "meld-core/src/rewriter.rs"
             "meld-core/src/component_wrap.rs"
             "meld-core/src/p3_async.rs"
+            "meld-core/src/p3_stream.rs"
             "meld-core/src/adapter/"
             "meld-core/src/resource_graph.rs"
             "meld-core/src/segments.rs"
@@ -317,18 +318,35 @@ jobs:
           printf '%s' "$body" > /tmp/mythos-body.md
           echo "verdict=$verdict" >> "$GITHUB_OUTPUT"
 
-          # Sticky-comment upsert: find by marker, PATCH if found
-          # else POST. Marker is the literal HTML comment string.
+          # Sticky-comment upsert via the GitHub REST API with `curl`.
+          # `gh` (GitHub CLI) is NOT installed on the `light` runner —
+          # the prior `gh api` form exited 127. `curl` and `jq` are
+          # universally present. Marker is the literal HTML comment.
+          #
+          # `jq -Rs '{body: .}'` reads the whole markdown file as one
+          # raw string and JSON-encodes it — newlines, quotes, emoji,
+          # backticks are all escaped, so nothing in the model-authored
+          # hypothesis text can break out of the JSON request body.
           marker='<!-- mythos-auto-gate -->'
-          existing=$(gh api "repos/${REPO}/issues/${PR_NUMBER}/comments" \
-            --paginate --jq ".[] | select(.body | contains(\"${marker}\")) | .id" | head -n1)
+          api="https://api.github.com"
+          auth="Authorization: Bearer ${GH_TOKEN}"
+          accept="Accept: application/vnd.github+json"
+          jq -Rs '{body: .}' < /tmp/mythos-body.md > /tmp/mythos-body.json
+
+          existing=$(curl -fsS -H "$auth" -H "$accept" \
+            "${api}/repos/${REPO}/issues/${PR_NUMBER}/comments?per_page=100" \
+            | jq -r --arg m "$marker" \
+                'map(select(.body | contains($m))) | .[0].id // empty')
+
           if [ -n "$existing" ]; then
-            gh api -X PATCH "repos/${REPO}/issues/comments/${existing}" \
-              -f body="@/tmp/mythos-body.md" >/dev/null
+            curl -fsS -X PATCH -H "$auth" -H "$accept" \
+              "${api}/repos/${REPO}/issues/comments/${existing}" \
+              -d @/tmp/mythos-body.json >/dev/null
             echo "updated comment $existing"
           else
-            gh api -X POST "repos/${REPO}/issues/${PR_NUMBER}/comments" \
-              -f body="@/tmp/mythos-body.md" >/dev/null
+            curl -fsS -X POST -H "$auth" -H "$accept" \
+              "${api}/repos/${REPO}/issues/${PR_NUMBER}/comments" \
+              -d @/tmp/mythos-body.json >/dev/null
             echo "posted new comment"
           fi
 
@@ -337,8 +355,16 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
         run: |
-          gh pr edit "$PR_NUMBER" --add-label mythos-pass-done
+          # `curl` rather than `gh pr edit` — `gh` is absent on the
+          # light runner. The labels endpoint adds without clobbering
+          # existing labels.
+          curl -fsS -X POST \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${REPO}/issues/${PR_NUMBER}/labels" \
+            -d '{"labels":["mythos-pass-done"]}' >/dev/null
 
       - name: Fail job on FINDING verdict
         if: steps.compose.outputs.verdict == 'FAIL'
