@@ -3388,6 +3388,90 @@ mod tests {
         assert!(matches!(result, Err(Error::NotAComponent)));
     }
 
+    /// #174 Step 5 — Mythos delta-pass regression guard (LS-P-5
+    /// sibling hypothesis: **NO FINDINGS**).
+    ///
+    /// `parse_core_module` stores `reader.range()` for the element and
+    /// data sections into `element_section_range` / `data_section_range`
+    /// (parser.rs:1279 / :1287). `parse_element_segments` /
+    /// `parse_data_segments` (segments.rs:198 / :258) then slice
+    /// `module.bytes[start..end]` with no explicit bounds check. The
+    /// #174 post-ship sweep asked whether those are LS-P-5 siblings —
+    /// i.e. whether `wasmparser`'s `parse_all` could yield a core-module
+    /// `ElementSection`/`DataSection` whose `range().end` exceeds the
+    /// buffer, the way `ModuleSection::unchecked_range` could in LS-P-5.
+    ///
+    /// It cannot. Unlike `ModuleSection` (yielded eagerly with an
+    /// explicitly *unchecked* range before the nested module is
+    /// parsed), a core-module element/data section is only framed once
+    /// `parse_all` has its declared bytes. A truncated section — size
+    /// LEB claiming more bytes than remain — makes `parse_all` yield an
+    /// `Err`, which `parse_core_module`'s `payload?` propagates; the
+    /// `*_section_range` field is never set. The downstream slice is
+    /// therefore defended by construction: the only ranges that reach
+    /// it come from sections wasmparser successfully framed, and a
+    /// successfully framed section has an in-bounds range.
+    ///
+    /// This test pins that wasmparser framing guarantee. If a future
+    /// `wasmparser` bump changes it — yielding a section reader with an
+    /// out-of-bounds range — this test fails and 1279/1287 become
+    /// confirmed LS-P-5 siblings needing a `checked_section_slice`-style
+    /// guard before the segments.rs slice.
+    #[test]
+    fn truncated_core_section_errors_rather_than_yielding_oob_range() {
+        // magic + version 1 + element section (id 0x09) declaring 16
+        // content bytes but providing only 2.
+        let elem_truncated: &[u8] = &[
+            0x00, 0x61, 0x73, 0x6d, // \0asm
+            0x01, 0x00, 0x00, 0x00, // version 1
+            0x09, // element section id
+            0x10, // section size LEB128 = 16
+            0x00, 0x00, // 2 of the claimed 16 content bytes
+        ];
+        // Same shape for the data section (id 0x0b).
+        let data_truncated: &[u8] = &[
+            0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, //
+            0x0b, // data section id
+            0x10, // size LEB = 16
+            0x00, 0x00,
+        ];
+
+        for bytes in [elem_truncated, data_truncated] {
+            let mut saw_err = false;
+            for payload in wasmparser::Parser::new(0).parse_all(bytes) {
+                let payload = match payload {
+                    Ok(p) => p,
+                    Err(_) => {
+                        // The safe outcome — `parse_core_module`'s
+                        // `payload?` propagates this; no range stored.
+                        saw_err = true;
+                        break;
+                    }
+                };
+                let range = match payload {
+                    Payload::ElementSection(r) => r.range(),
+                    Payload::DataSection(r) => r.range(),
+                    _ => continue,
+                };
+                assert!(
+                    range.start <= range.end && range.end <= bytes.len(),
+                    "wasmparser yielded a section with out-of-bounds \
+                     range {:?} for a {}-byte buffer — parse_core_module \
+                     would store this and the segments.rs slice would \
+                     panic (LS-P-5 sibling, issue #174)",
+                    range,
+                    bytes.len(),
+                );
+            }
+            assert!(
+                saw_err,
+                "expected wasmparser to reject the truncated section \
+                 with an Err — if it stopped silently the probe never \
+                 exercised the truncation",
+            );
+        }
+    }
+
     #[test]
     fn test_parser_rejects_invalid_wasm() {
         let parser = ComponentParser::new();
