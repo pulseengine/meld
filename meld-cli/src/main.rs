@@ -50,7 +50,12 @@ enum Commands {
         #[arg(short, long, default_value = "fused.wasm")]
         output: String,
 
-        /// Memory strategy: "multi" (default) or "shared"
+        /// Memory strategy. "multi" (default) keeps one linear memory
+        /// per input component — the fused module then needs
+        /// `wasm-opt --enable-multimemory` and has no single-address-
+        /// space (MCU) lowering. "shared" merges into one memory; pair
+        /// it with --address-rebase for a module the wasm-opt → synth
+        /// chain accepts directly. See issue #172.
         #[arg(long, default_value = "multi")]
         memory: String,
 
@@ -214,7 +219,21 @@ fn fuse_command(
 
     // Parse memory strategy
     let memory_strategy = match memory.as_str() {
-        "multi" => MemoryStrategy::MultiMemory,
+        "multi" => {
+            // #172: the `multi` default produces a multi-memory module
+            // that wasm-opt rejects without --enable-multimemory and
+            // that has no MCU (single-address-space) lowering. Warn so
+            // a user on the happy path is not surprised at the next
+            // tool in the chain.
+            eprintln!(
+                "warning: --memory multi produced a multi-memory module. \
+                 wasm-opt needs --enable-multimemory to consume it, and \
+                 it has no single-address-space (MCU) lowering. For a \
+                 fused module the wasm-opt → synth chain accepts \
+                 directly, re-run with `--memory shared --address-rebase`."
+            );
+            MemoryStrategy::MultiMemory
+        }
         "shared" => {
             println!("Using shared memory (legacy mode)");
             MemoryStrategy::SharedMemory
@@ -598,6 +617,31 @@ mod tests {
             assert_eq!(emit_import_map, Some("/tmp/imports.json".to_string()));
         } else {
             panic!("Expected Fuse command");
+        }
+    }
+
+    #[test]
+    fn test_cli_memory_default_is_multi() {
+        // #172: the `--memory` default is `multi`. Pin it so a future
+        // change to the default is a deliberate edit to this test
+        // (flipping it is a high-blast-radius decision — see #172).
+        let cli = Cli::try_parse_from(["meld", "fuse", "a.wasm", "-o", "out.wasm"])
+            .expect("fuse args parse");
+        match cli.command {
+            Some(Commands::Fuse { memory, .. }) => assert_eq!(memory, "multi"),
+            _ => panic!("Expected Fuse command"),
+        }
+    }
+
+    #[test]
+    fn test_cli_memory_shared_parses() {
+        let cli = Cli::try_parse_from([
+            "meld", "fuse", "a.wasm", "-o", "out.wasm", "--memory", "shared",
+        ])
+        .expect("fuse args parse");
+        match cli.command {
+            Some(Commands::Fuse { memory, .. }) => assert_eq!(memory, "shared"),
+            _ => panic!("Expected Fuse command"),
         }
     }
 

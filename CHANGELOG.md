@@ -4,6 +4,23 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+
+- **`meld fuse` warns when the `multi` memory default is used**
+  (issue #172, `meld-cli`). The default `--memory multi` produces a
+  multi-memory core module that `wasm-opt` rejects without
+  `--enable-multimemory` and that has no single-address-space (MCU)
+  lowering for `synth`. A user on the happy path
+  (`meld fuse a b -o fused.wasm`) previously hit that wall silently
+  at the next tool. `meld fuse` now prints a warning naming the
+  downstream implication and pointing at
+  `--memory shared --address-rebase`, and the `--memory` help text
+  documents it. The *default itself* is intentionally left at
+  `multi` — flipping it is a high-blast-radius change, and `shared`
+  carries its own caveat (broken under `memory.grow`, currently
+  labelled "legacy mode"), so the default flip is deferred as a
+  separate decision (#172 option 1) rather than made here.
+
 ## [0.9.0] — 2026-05-20
 
 ### Fixed
