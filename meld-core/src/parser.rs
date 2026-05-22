@@ -1581,7 +1581,13 @@ impl ParsedComponent {
         for (_, ty) in results {
             let align = self.canonical_abi_align(ty);
             size = align_up(size, align);
-            size += self.canonical_abi_size_unpadded(ty);
+            // saturating_add, not `+=`: canonical_abi_size_unpadded
+            // saturates to u32::MAX for a pathological fixed-length-list
+            // (LS-P-4); a bare `+=` on a saturated accumulator then
+            // overflows — debug panic, release wrap-to-small. The
+            // wrapped value would size a too-small cabi_realloc buffer
+            // and the adapter would write OOB (LS-P-6).
+            size = size.saturating_add(self.canonical_abi_size_unpadded(ty));
         }
         // Align final size to the max alignment of the tuple
         let max_align = results
@@ -1610,7 +1616,11 @@ impl ParsedComponent {
         for (_, ty) in params {
             let align = self.canonical_abi_align(ty);
             size = align_up(size, align);
-            size += self.canonical_abi_size_unpadded(ty);
+            // saturating_add, not `+=` — see return_area_byte_size
+            // above and LS-P-6: a bare `+=` on a u32::MAX accumulator
+            // overflows, wrapping the params buffer size down to a
+            // small value that under-allocates the cabi_realloc buffer.
+            size = size.saturating_add(self.canonical_abi_size_unpadded(ty));
         }
         // Align final size to the max alignment of the tuple
         let max_align = params
@@ -4573,6 +4583,62 @@ mod tests {
         ]);
         assert_eq!(pc.flat_byte_size(&record), 12, "record: [i32]+[i32,i32]=12");
         assert_eq!(pc.flat_byte_size(&u64_t), 8, "u64: [i64]=8");
+    }
+
+    /// LS-P-6 — `params_area_byte_size` / `return_area_byte_size` must
+    /// **saturate** their cross-field accumulator, not plain `+=`.
+    ///
+    /// `canonical_abi_size_unpadded` saturates to `u32::MAX` for a
+    /// pathologically large `fixed-length-list` (LS-P-4). But the two
+    /// area-size loops accumulated each field with a bare
+    /// `size += canonical_abi_size_unpadded(ty)`: once a first field
+    /// saturates `size` to `u32::MAX`, the next field's `+=` overflows
+    /// — debug builds panic, release builds wrap `u32::MAX` down to a
+    /// small value. The resolver stores that wrapped value as
+    /// `params_area_byte_size`, the adapter passes it to
+    /// `cabi_realloc`, and a multi-field params buffer is allocated
+    /// far too small → OOB write in callee memory. (The sibling
+    /// accumulators inside `canonical_abi_size_unpadded` itself already
+    /// use `saturating_add`; these two were missed.) Surfaced by the
+    /// mythos-auto delta-pass on PR #179.
+    #[test]
+    fn ls_p_6_area_byte_size_saturates_across_fields() {
+        let pc = empty_parsed_component();
+        // FixedSizeList(f64, 2^29): element size 8, 8 * 2^29 = 2^32 —
+        // canonical_abi_size_unpadded saturates this to u32::MAX.
+        let huge = ComponentValType::FixedSizeList(
+            Box::new(ComponentValType::Primitive(PrimitiveValType::F64)),
+            1 << 29,
+        );
+        let u32_t = ComponentValType::Primitive(PrimitiveValType::U32);
+
+        // params_area_byte_size: huge field then a second field. The
+        // accumulator is u32::MAX after field 1; field 2's add must
+        // saturate, not wrap (and must not panic in a debug build).
+        // The contract: the result stays an un-allocatable size near
+        // u32::MAX (the final `align_up` may round the saturated value
+        // down by < max_align), so a downstream `cabi_realloc` fails
+        // safely. The pre-fix bug wrapped it to ~3 — catastrophic
+        // under-allocation. Anything above 2 GiB proves no wrap.
+        let params = vec![
+            ("a".to_string(), huge.clone()),
+            ("b".to_string(), u32_t.clone()),
+        ];
+        let psize = pc.params_area_byte_size(&params);
+        assert!(
+            psize > (1u32 << 31),
+            "params_area_byte_size must saturate across fields, not \
+             wrap; got {psize}",
+        );
+
+        // return_area_byte_size: same accumulator, same hazard.
+        let results = vec![(None, huge), (Some("r".to_string()), u32_t)];
+        let rsize = pc.return_area_byte_size(&results);
+        assert!(
+            rsize > (1u32 << 31),
+            "return_area_byte_size must saturate across fields, not \
+             wrap; got {rsize}",
+        );
     }
 
     /// align_up must not panic when given a saturated u32::MAX size and

@@ -161,6 +161,67 @@ loss-scenarios:
     status: approved
     priority: high
 
+  - id: LS-P-6
+    title: Area-size accumulators wrap, undoing canonical_abi_size_unpadded saturation
+    uca: UCA-P-3
+    hazards: [H-2, H-4, H-4.1]
+    type: inadequate-control-algorithm
+    scenario: >
+      `meld-core/src/parser.rs::params_area_byte_size` and
+      `return_area_byte_size` compute the canonical-ABI memory size of a
+      component function's params / results by accumulating each field:
+      `size = align_up(size, align); size += canonical_abi_size_unpadded(ty)`.
+      The `+=` is a bare wrapping add. `canonical_abi_size_unpadded`
+      itself **saturates** to `u32::MAX` for a pathologically large
+      `fixed-length-list` (the LS-P-4 fix, which also hardened
+      `align_up` against a saturated input). But the LS-P-4 fix did not
+      reach these two cross-field accumulators: once a first field
+      saturates `size` to `u32::MAX`, the next field's `size +=
+      canonical_abi_size_unpadded(ty)` overflows — a debug build panics
+      ("attempt to add with overflow"), a release build wraps `u32::MAX`
+      down to a small value. A function with params
+      `(fixed-length-list<f64, 2^29>, u32)` makes `params_area_byte_size`
+      wrap from `u32::MAX` to ~3. The resolver stores that wrapped value
+      as `AdapterRequirements::params_area_byte_size`; the FACT adapter
+      generator passes it to `cabi_realloc`, allocating a params buffer
+      a few bytes long and then copying every parameter into it —
+      an out-of-bounds write into the callee's linear memory
+      [UCA-P-3 / H-2 caller-controlled offsets / H-4.1 OOB write].
+      The wasm validator does not catch it; the under-sized realloc and
+      the copy both type-check. The sibling accumulators inside
+      `canonical_abi_size_unpadded` (its Record and Tuple arms) already
+      use `saturating_add` — these two area-size loops were simply
+      missed by LS-P-4. Fix replaces both `+=` sites with
+      `size = size.saturating_add(...)`, so a saturated field keeps the
+      whole area size at a near-`u32::MAX` (un-allocatable) value and
+      the downstream `cabi_realloc` fails safely instead of
+      under-allocating. Surfaced by the mythos-auto delta-pass on
+      PR #179. Confirmed by PoC
+      `meld-core::parser::tests::ls_p_6_area_byte_size_saturates_across_fields`,
+      which panics today on the bare `+=` and asserts a saturated
+      result after the fix; the nearest primitive-layer proof is
+      LS-P-4's `kani_fixed_size_list_size_no_overflow` Kani harness
+      (the symbolic surface here is a `&[(String, ComponentValType)]`
+      slice, which CBMC cannot enumerate directly).
+    causal-factors:
+      - >-
+        `canonical_abi_size_unpadded` was hardened to saturate (LS-P-4)
+        but its two callers' cross-field `+=` accumulators were not,
+        re-introducing the wrap at the next layer up
+      - >-
+        Bare `+=` used where the sibling Record/Tuple accumulators
+        inside the same module already use `saturating_add` —
+        an inconsistency that hid the gap
+      - >-
+        No regression test exercised a multi-field params/results area
+        whose first field saturates the size accumulator
+    process-model-flaw: >
+      The LS-P-4 fix's model was "the size primitives saturate", but the
+      saturation guarantee is only end-to-end if every accumulator that
+      consumes a saturated value also saturates.
+    status: approved
+    priority: high
+
   # ==========================================================================
   # Resolver scenarios
   # ==========================================================================

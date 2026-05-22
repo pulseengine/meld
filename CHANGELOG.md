@@ -6,6 +6,27 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **Area-size accumulators wrapped, undoing `canonical_abi_size_unpadded`
+  saturation** (LS-P-6, UCA-P-3, H-2 / H-4 / H-4.1,
+  `meld-core/src/parser.rs`). `params_area_byte_size` and
+  `return_area_byte_size` accumulated each field with a bare
+  `size += canonical_abi_size_unpadded(ty)`. `canonical_abi_size_unpadded`
+  saturates to `u32::MAX` for a pathological `fixed-length-list`
+  (LS-P-4), but the LS-P-4 fix did not reach these two cross-field
+  accumulators: once a first field saturated `size`, the next field's
+  `+=` overflowed — a debug build panics, a release build wraps
+  `u32::MAX` down to a small value. The resolver stores that wrapped
+  value as `params_area_byte_size`; the FACT adapter passes it to
+  `cabi_realloc`, under-allocating the params buffer and then writing
+  every parameter into it — an OOB write into callee memory. The
+  sibling Record/Tuple accumulators inside `canonical_abi_size_unpadded`
+  already used `saturating_add`; these two were missed. Both `+=`
+  sites are now `size.saturating_add(...)`. **A confirmed Mythos
+  finding** — surfaced by the mythos-auto delta-pass on PR #179,
+  validated with a panicking PoC, promoted to approved loss scenario
+  **LS-P-6**; regression pinned by
+  `ls_p_6_area_byte_size_saturates_across_fields`.
+
 - **`flat_byte_size` underestimated `result`/`variant` flat width**
   (`meld-core/src/parser.rs`). Surfaced by the mythos-auto delta-pass
   on PR #178: `flat_byte_size` computed the payload of `result<T,E>`
