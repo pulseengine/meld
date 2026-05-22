@@ -4,6 +4,24 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **Regression guard for the `parse_core_module` section-range
+  invariant** (issue #174 Step 5, `meld-core/src/parser.rs`). The
+  v0.5 post-ship Mythos sweep flagged an unverified LS-P-5-sibling
+  hypothesis: `parse_core_module` stores `reader.range()` for the
+  element/data sections and `parse_element_segments` /
+  `parse_data_segments` slice `module.bytes[start..end]` from it
+  without an explicit bounds check. Mythos delta-pass verdict:
+  **NO FINDINGS**. Unlike `ModuleSection::unchecked_range` (the
+  LS-P-5 site), a core-module element/data section is only framed
+  once `wasmparser` has its declared bytes — a truncated section
+  makes `parse_all` yield an `Err`, propagated by
+  `parse_core_module`'s `payload?`, so no out-of-bounds range is
+  ever stored. Adds `truncated_core_section_errors_rather_than_yielding_oob_range`
+  to pin that `wasmparser` framing guarantee: if a future bump
+  changes it, the test fails and the hypothesis reopens.
+
 ### Changed
 
 - **`meld fuse` warns when the `multi` memory default is used**
