@@ -4,6 +4,28 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- **`flat_byte_size` underestimated `result`/`variant` flat width**
+  (`meld-core/src/parser.rs`). Surfaced by the mythos-auto delta-pass
+  on PR #178: `flat_byte_size` computed the payload of `result<T,E>`
+  and `variant` as `max(flat_byte_size(arm))` rather than the
+  Component Model's element-wise `flatten_variant` JOIN. When two
+  arms flatten to a different *number* of core values, `max` of byte
+  totals underestimates — `result<u64, string>` returned 12 where
+  the joined sequence `[i32, i64, i32]` is 16. Rewrites
+  `flat_byte_size` over a new `flat_width_list` helper that
+  materialises each type's flat core-value width list and JOINs
+  variant arms element-wise; non-variant types are unchanged. The
+  helper caps its list length (`FLAT_WIDTH_CAP`) so a pathological
+  nested `fixed-length-list` still saturates to `u32::MAX` rather
+  than allocating an unbounded `Vec` (preserves the LS-P-4
+  saturation contract). This is correctness hygiene on a `pub fn`:
+  the mythos-auto finding's claimed OOB-write impact was rejected on
+  validation — `flat_byte_size` has no in-tree consumers, so there
+  is no reachable hazard and no LS-N entry; a future consumer would
+  nonetheless have inherited the wrong value.
+
 ### Added
 
 - **Regression guard for the `parse_core_module` section-range

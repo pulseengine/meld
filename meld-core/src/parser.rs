@@ -1421,58 +1421,155 @@ impl ParsedComponent {
     /// In the canonical ABI, complex types are "flattened" to sequences of core wasm values.
     /// This returns the total byte size of that flat representation, used for sizing
     /// return area buffers in the retptr calling convention.
+    /// Total byte size of a type's flat (core wasm) representation —
+    /// the sum of the byte widths of each core value in its
+    /// canonical-ABI flattening.
+    ///
+    /// For `result<T,E>` and `variant`, the payload is the **element-
+    /// wise JOIN** of the arms' flat width lists, not `max` of their
+    /// byte totals. When two arms flatten to a different *number* of
+    /// core values, `max` of totals underestimates: for
+    /// `result<u64, string>` the `ok` arm `u64` flattens to `[i64]`
+    /// (8 B) and the `err` arm `string` to `[i32, i32]` (8 B), so
+    /// `max` gives `4 + 8 = 12` — but the joined payload is
+    /// `[i64, i32]` (12 B) and the true flat size is `4 + 12 = 16`.
+    ///
+    /// Returns `u32::MAX` for pathologically large types (e.g. nested
+    /// `fixed-length-list` whose flattening exceeds `FLAT_WIDTH_CAP`).
+    /// Such a type is never flat-passed — the canonical ABI memory-
+    /// passes anything over `MAX_FLAT_PARAMS = 16` — so its flat byte
+    /// size is not a meaningful quantity; a saturated value fails
+    /// downstream allocation safely rather than wrapping (cf. LS-P-4).
     pub fn flat_byte_size(&self, ty: &ComponentValType) -> u32 {
-        match ty {
+        match self.flat_width_list(ty) {
+            Some(widths) => widths.iter().copied().fold(0u32, u32::saturating_add),
+            None => u32::MAX,
+        }
+    }
+
+    /// The flat (core wasm) value-width list of a type — one entry per
+    /// core value, each 4 or 8 bytes. `None` if the list would exceed
+    /// `FLAT_WIDTH_CAP`, which only happens for a pathologically large
+    /// type that the canonical ABI never flat-passes anyway.
+    ///
+    /// `variant` / `result` payloads are the element-wise JOIN of their
+    /// arms: the joined list has the longest arm's length, and each
+    /// position takes the wider of the arms' widths (a position present
+    /// in only one arm takes that arm's width).
+    fn flat_width_list(&self, ty: &ComponentValType) -> Option<Vec<u32>> {
+        // Far beyond the canonical-ABI flat limit (MAX_FLAT_PARAMS = 16).
+        // A flat list longer than this belongs to a memory-passed type
+        // whose flat byte size is not a meaningful quantity; bailing
+        // here also bounds the Vec against nested `fixed-length-list`
+        // blow-up (the LS-P-4 OOM class).
+        const FLAT_WIDTH_CAP: usize = 256;
+
+        // Element-wise JOIN of two flat width lists. The joined list is
+        // as long as the longer input; a position only one list reaches
+        // takes that list's width (`max` with the absent side's 0).
+        fn join(a: &[u32], b: &[u32]) -> Vec<u32> {
+            let n = a.len().max(b.len());
+            (0..n)
+                .map(|i| {
+                    a.get(i)
+                        .copied()
+                        .unwrap_or(0)
+                        .max(b.get(i).copied().unwrap_or(0))
+                })
+                .collect()
+        }
+
+        let widths: Vec<u32> = match ty {
             ComponentValType::Primitive(p) => match p {
-                PrimitiveValType::S64 | PrimitiveValType::U64 | PrimitiveValType::F64 => 8,
-                _ => 4,
+                PrimitiveValType::S64 | PrimitiveValType::U64 | PrimitiveValType::F64 => vec![8],
+                _ => vec![4],
             },
-            ComponentValType::String => 8,  // (ptr: i32, len: i32)
-            ComponentValType::List(_) => 8, // (ptr: i32, len: i32)
-            ComponentValType::Record(fields) => fields
-                .iter()
-                .map(|(_, ty)| self.flat_byte_size(ty))
-                .fold(0u32, u32::saturating_add),
-            ComponentValType::Tuple(elems) => elems
-                .iter()
-                .map(|ty| self.flat_byte_size(ty))
-                .fold(0u32, u32::saturating_add),
-            ComponentValType::Option(inner) => 4u32.saturating_add(self.flat_byte_size(inner)),
+            // (ptr: i32, len: i32)
+            ComponentValType::String | ComponentValType::List(_) => vec![4, 4],
+            ComponentValType::Record(fields) => {
+                let mut w = Vec::new();
+                for (_, t) in fields {
+                    w.extend(self.flat_width_list(t)?);
+                    if w.len() > FLAT_WIDTH_CAP {
+                        return None;
+                    }
+                }
+                w
+            }
+            ComponentValType::Tuple(elems) => {
+                let mut w = Vec::new();
+                for t in elems {
+                    w.extend(self.flat_width_list(t)?);
+                    if w.len() > FLAT_WIDTH_CAP {
+                        return None;
+                    }
+                }
+                w
+            }
+            ComponentValType::Option(inner) => {
+                // option = variant { none, some(inner) }; the none arm
+                // is empty, so the joined payload is just `inner`'s.
+                let mut w = vec![4];
+                w.extend(self.flat_width_list(inner)?);
+                w
+            }
             ComponentValType::Result { ok, err } => {
-                let ok_size = ok.as_ref().map(|t| self.flat_byte_size(t)).unwrap_or(0);
-                let err_size = err.as_ref().map(|t| self.flat_byte_size(t)).unwrap_or(0);
-                4u32.saturating_add(ok_size.max(err_size))
+                let okw = match ok {
+                    Some(t) => self.flat_width_list(t)?,
+                    None => Vec::new(),
+                };
+                let errw = match err {
+                    Some(t) => self.flat_width_list(t)?,
+                    None => Vec::new(),
+                };
+                let mut w = vec![4];
+                w.extend(join(&okw, &errw));
+                w
+            }
+            ComponentValType::Variant(cases) => {
+                let mut payload: Vec<u32> = Vec::new();
+                for (_, t) in cases {
+                    if let Some(t) = t {
+                        payload = join(&payload, &self.flat_width_list(t)?);
+                    }
+                }
+                let mut w = vec![4];
+                w.extend(payload);
+                w
             }
             ComponentValType::Type(idx) => {
                 if let Some(ct) = self.get_type_definition(*idx) {
                     if let ComponentTypeKind::Defined(inner) = &ct.kind {
-                        self.flat_byte_size(inner)
+                        self.flat_width_list(inner)?
                     } else {
-                        4
+                        vec![4]
                     }
                 } else {
-                    4
+                    vec![4]
                 }
             }
-            ComponentValType::Variant(cases) => {
-                // discriminant + max case payload
-                let max_payload = cases
-                    .iter()
-                    .filter_map(|(_, ty)| ty.as_ref().map(|t| self.flat_byte_size(t)))
-                    .max()
-                    .unwrap_or(0);
-                4u32.saturating_add(max_payload)
-            }
             ComponentValType::FixedSizeList(elem, len) => {
-                self.flat_byte_size(elem).saturating_mul(*len)
+                let ew = self.flat_width_list(elem)?;
+                let total = ew.len().checked_mul(*len as usize)?;
+                if total > FLAT_WIDTH_CAP {
+                    return None;
+                }
+                ew.repeat(*len as usize)
             }
             ComponentValType::Flags(names) => {
-                // flats[ceil(N/32)] i32 storage words = 4 bytes each.
-                let n = names.len() as u32;
-                4u32.saturating_mul(n.div_ceil(32))
+                // ceil(N/32) i32 storage words, 4 bytes each.
+                let words = (names.len() as u32).div_ceil(32) as usize;
+                if words > FLAT_WIDTH_CAP {
+                    return None;
+                }
+                vec![4; words]
             }
-            ComponentValType::Own(_) | ComponentValType::Borrow(_) => 4,
+            ComponentValType::Own(_) | ComponentValType::Borrow(_) => vec![4],
+        };
+        if widths.len() > FLAT_WIDTH_CAP {
+            return None;
         }
+        Some(widths)
     }
 
     /// Compute the byte size of the return area for a component function's results.
@@ -4408,6 +4505,74 @@ mod tests {
     #[test]
     fn ls_p_4_canonical_abi_size_saturates_on_overflow() {
         test_canonical_abi_size_fixed_size_list_saturates_on_overflow();
+    }
+
+    /// `flat_byte_size` for `result<T,E>` / `variant` must use the
+    /// canonical-ABI element-wise JOIN of the arms' flat width lists,
+    /// not `max` of their byte totals.
+    ///
+    /// Surfaced by the mythos-auto delta-pass on PR #178: for
+    /// `result<u64, string>` the old `4 + max(flat_byte_size(u64),
+    /// flat_byte_size(string))` gave `4 + max(8, 8) = 12`, but the
+    /// joined flat sequence is `[i32 disc, i64, i32]` = 16 bytes. The
+    /// `max` form underestimates whenever the arms flatten to a
+    /// different *number* of core values.
+    #[test]
+    fn flat_byte_size_result_uses_element_wise_join_not_max() {
+        let pc = empty_parsed_component();
+        let u64_t = ComponentValType::Primitive(PrimitiveValType::U64);
+
+        // result<u64, string>: ok arm u64 -> [i64] (8 B), err arm
+        // string -> [i32,i32] (8 B). Joined payload [i64,i32] = 12 B,
+        // + 4 B discriminant = 16. The pre-fix `max` form gave 12.
+        let result_u64_string = ComponentValType::Result {
+            ok: Some(Box::new(u64_t.clone())),
+            err: Some(Box::new(ComponentValType::String)),
+        };
+        assert_eq!(
+            pc.flat_byte_size(&result_u64_string),
+            16,
+            "result<u64,string> flat byte size must be the element-wise \
+             join 4+[i64,i32]=16, not 4+max(8,8)=12",
+        );
+
+        // variant with unequal-arity arms: { a(u64), b(tuple<u32,u32>) }
+        // -> a [i64] (8 B), b [i32,i32] (8 B). Joined [i64,i32] = 12,
+        // + 4 disc = 16.
+        let variant = ComponentValType::Variant(vec![
+            ("a".into(), Some(u64_t.clone())),
+            (
+                "b".into(),
+                Some(ComponentValType::Tuple(vec![
+                    ComponentValType::Primitive(PrimitiveValType::U32),
+                    ComponentValType::Primitive(PrimitiveValType::U32),
+                ])),
+            ),
+        ]);
+        assert_eq!(
+            pc.flat_byte_size(&variant),
+            16,
+            "variant with unequal-arity arms must join element-wise",
+        );
+
+        // Equal-shape arms: result<u32,u32> -> both [i32]; join [i32]
+        // = 4, + 4 disc = 8. (max and join agree when arms are equal.)
+        let result_u32_u32 = ComponentValType::Result {
+            ok: Some(Box::new(ComponentValType::Primitive(PrimitiveValType::U32))),
+            err: Some(Box::new(ComponentValType::Primitive(PrimitiveValType::U32))),
+        };
+        assert_eq!(pc.flat_byte_size(&result_u32_u32), 8);
+
+        // Non-variant types are unchanged by the rewrite.
+        let record = ComponentValType::Record(vec![
+            (
+                "x".into(),
+                ComponentValType::Primitive(PrimitiveValType::U8),
+            ),
+            ("y".into(), ComponentValType::String),
+        ]);
+        assert_eq!(pc.flat_byte_size(&record), 12, "record: [i32]+[i32,i32]=12");
+        assert_eq!(pc.flat_byte_size(&u64_t), 8, "u64: [i64]=8");
     }
 
     /// align_up must not panic when given a saturated u32::MAX size and
