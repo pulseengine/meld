@@ -2273,6 +2273,55 @@ impl ParsedComponent {
         }
     }
 
+    /// Like [`Self::collect_pointer_positions`], but also records the
+    /// [`CopyLayout`](crate::resolver::CopyLayout) for the String/List leaf at
+    /// each flat position. The layout describes that specific leaf — not the
+    /// enclosing composite — so a `list<u32>` field inside a record yields
+    /// `Bulk { byte_multiplier: 4 }` rather than the `_ => Bulk { 1 }` fallback
+    /// `copy_layout` returns when handed a whole record/tuple/fixed-list.
+    fn collect_pointer_positions_with_layout(
+        &self,
+        ty: &ComponentValType,
+        base: u32,
+        out: &mut Vec<(u32, crate::resolver::CopyLayout)>,
+    ) {
+        match ty {
+            ComponentValType::String | ComponentValType::List(_) => {
+                out.push((base, self.copy_layout(ty)));
+            }
+            ComponentValType::FixedSizeList(elem, len) => {
+                let elem_flat = self.flat_count(elem);
+                let mut offset = base;
+                for _ in 0..*len {
+                    self.collect_pointer_positions_with_layout(elem, offset, out);
+                    offset += elem_flat;
+                }
+            }
+            ComponentValType::Record(fields) => {
+                let mut offset = base;
+                for (_, field_ty) in fields {
+                    self.collect_pointer_positions_with_layout(field_ty, offset, out);
+                    offset += self.flat_count(field_ty);
+                }
+            }
+            ComponentValType::Tuple(elems) => {
+                let mut offset = base;
+                for elem_ty in elems {
+                    self.collect_pointer_positions_with_layout(elem_ty, offset, out);
+                    offset += self.flat_count(elem_ty);
+                }
+            }
+            ComponentValType::Type(idx) => {
+                if let Some(ct) = self.get_type_definition(*idx)
+                    && let ComponentTypeKind::Defined(inner) = &ct.kind
+                {
+                    self.collect_pointer_positions_with_layout(inner, base, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
     /// Collect byte offsets in the return area where pointer pairs start.
     /// Uses canonical ABI memory layout offsets (with alignment).
     fn collect_pointer_byte_offsets(&self, ty: &ComponentValType, base: u32, out: &mut Vec<u32>) {
@@ -2312,6 +2361,56 @@ impl ParsedComponent {
                     && let ComponentTypeKind::Defined(inner) = &ct.kind
                 {
                     self.collect_pointer_byte_offsets(inner, base, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Like [`Self::collect_pointer_byte_offsets`], but also records the
+    /// [`CopyLayout`](crate::resolver::CopyLayout) for the String/List leaf at
+    /// each byte offset — the layout of that leaf, not the enclosing composite.
+    fn collect_pointer_byte_offsets_with_layout(
+        &self,
+        ty: &ComponentValType,
+        base: u32,
+        out: &mut Vec<(u32, crate::resolver::CopyLayout)>,
+    ) {
+        match ty {
+            ComponentValType::String | ComponentValType::List(_) => {
+                out.push((base, self.copy_layout(ty)));
+            }
+            ComponentValType::FixedSizeList(elem, len) => {
+                let elem_size = self.canonical_abi_element_size(elem);
+                let mut offset = base;
+                for _ in 0..*len {
+                    self.collect_pointer_byte_offsets_with_layout(elem, offset, out);
+                    offset += elem_size;
+                }
+            }
+            ComponentValType::Record(fields) => {
+                let mut offset = base;
+                for (_, field_ty) in fields {
+                    let align = self.canonical_abi_align(field_ty);
+                    offset = align_up(offset, align);
+                    self.collect_pointer_byte_offsets_with_layout(field_ty, offset, out);
+                    offset += self.canonical_abi_size_unpadded(field_ty);
+                }
+            }
+            ComponentValType::Tuple(elems) => {
+                let mut offset = base;
+                for elem_ty in elems {
+                    let align = self.canonical_abi_align(elem_ty);
+                    offset = align_up(offset, align);
+                    self.collect_pointer_byte_offsets_with_layout(elem_ty, offset, out);
+                    offset += self.canonical_abi_size_unpadded(elem_ty);
+                }
+            }
+            ComponentValType::Type(idx) => {
+                if let Some(ct) = self.get_type_definition(*idx)
+                    && let ComponentTypeKind::Defined(inner) = &ct.kind
+                {
+                    self.collect_pointer_byte_offsets_with_layout(inner, base, out);
                 }
             }
             _ => {}
@@ -2379,9 +2478,12 @@ impl ParsedComponent {
                 // In flat representation, discriminant is always i32 (4 bytes)
                 let payload_base = base + 1;
                 let mut inner_positions = Vec::new();
-                self.collect_pointer_positions(inner, payload_base, &mut inner_positions);
-                for ptr_pos in inner_positions {
-                    let layout = self.copy_layout_for_string_or_list_at(inner);
+                self.collect_pointer_positions_with_layout(
+                    inner,
+                    payload_base,
+                    &mut inner_positions,
+                );
+                for (ptr_pos, layout) in inner_positions {
                     out.push(crate::resolver::ConditionalPointerPair {
                         discriminant_position: base,
                         discriminant_value: 1,
@@ -2400,9 +2502,12 @@ impl ParsedComponent {
                     && self.type_contains_pointers(ok_ty)
                 {
                     let mut inner_positions = Vec::new();
-                    self.collect_pointer_positions(ok_ty, payload_base, &mut inner_positions);
-                    for ptr_pos in inner_positions {
-                        let layout = self.copy_layout_for_string_or_list_at(ok_ty);
+                    self.collect_pointer_positions_with_layout(
+                        ok_ty,
+                        payload_base,
+                        &mut inner_positions,
+                    );
+                    for (ptr_pos, layout) in inner_positions {
                         out.push(crate::resolver::ConditionalPointerPair {
                             discriminant_position: base,
                             discriminant_value: 0,
@@ -2417,9 +2522,12 @@ impl ParsedComponent {
                     && self.type_contains_pointers(err_ty)
                 {
                     let mut inner_positions = Vec::new();
-                    self.collect_pointer_positions(err_ty, payload_base, &mut inner_positions);
-                    for ptr_pos in inner_positions {
-                        let layout = self.copy_layout_for_string_or_list_at(err_ty);
+                    self.collect_pointer_positions_with_layout(
+                        err_ty,
+                        payload_base,
+                        &mut inner_positions,
+                    );
+                    for (ptr_pos, layout) in inner_positions {
                         out.push(crate::resolver::ConditionalPointerPair {
                             discriminant_position: base,
                             discriminant_value: 1,
@@ -2439,9 +2547,12 @@ impl ParsedComponent {
                         && self.type_contains_pointers(ty)
                     {
                         let mut inner_positions = Vec::new();
-                        self.collect_pointer_positions(ty, payload_base, &mut inner_positions);
-                        for ptr_pos in inner_positions {
-                            let layout = self.copy_layout_for_string_or_list_at(ty);
+                        self.collect_pointer_positions_with_layout(
+                            ty,
+                            payload_base,
+                            &mut inner_positions,
+                        );
+                        for (ptr_pos, layout) in inner_positions {
                             out.push(crate::resolver::ConditionalPointerPair {
                                 discriminant_position: base,
                                 discriminant_value: case_idx as u32,
@@ -2502,9 +2613,12 @@ impl ParsedComponent {
                 let payload_align = self.canonical_abi_align(inner);
                 let payload_offset = base + align_up(ds, payload_align);
                 let mut inner_offsets = Vec::new();
-                self.collect_pointer_byte_offsets(inner, payload_offset, &mut inner_offsets);
-                for ptr_off in inner_offsets {
-                    let layout = self.copy_layout_for_string_or_list_at(inner);
+                self.collect_pointer_byte_offsets_with_layout(
+                    inner,
+                    payload_offset,
+                    &mut inner_offsets,
+                );
+                for (ptr_off, layout) in inner_offsets {
                     out.push(crate::resolver::ConditionalPointerPair {
                         discriminant_position: disc_offset,
                         discriminant_value: 1,
@@ -2532,9 +2646,12 @@ impl ParsedComponent {
                     && self.type_contains_pointers(ok_ty)
                 {
                     let mut inner_offsets = Vec::new();
-                    self.collect_pointer_byte_offsets(ok_ty, payload_offset, &mut inner_offsets);
-                    for ptr_off in inner_offsets {
-                        let layout = self.copy_layout_for_string_or_list_at(ok_ty);
+                    self.collect_pointer_byte_offsets_with_layout(
+                        ok_ty,
+                        payload_offset,
+                        &mut inner_offsets,
+                    );
+                    for (ptr_off, layout) in inner_offsets {
                         out.push(crate::resolver::ConditionalPointerPair {
                             discriminant_position: disc_offset,
                             discriminant_value: 0,
@@ -2549,9 +2666,12 @@ impl ParsedComponent {
                     && self.type_contains_pointers(err_ty)
                 {
                     let mut inner_offsets = Vec::new();
-                    self.collect_pointer_byte_offsets(err_ty, payload_offset, &mut inner_offsets);
-                    for ptr_off in inner_offsets {
-                        let layout = self.copy_layout_for_string_or_list_at(err_ty);
+                    self.collect_pointer_byte_offsets_with_layout(
+                        err_ty,
+                        payload_offset,
+                        &mut inner_offsets,
+                    );
+                    for (ptr_off, layout) in inner_offsets {
                         out.push(crate::resolver::ConditionalPointerPair {
                             discriminant_position: disc_offset,
                             discriminant_value: 1,
@@ -2577,9 +2697,12 @@ impl ParsedComponent {
                         && self.type_contains_pointers(ty)
                     {
                         let mut inner_offsets = Vec::new();
-                        self.collect_pointer_byte_offsets(ty, payload_offset, &mut inner_offsets);
-                        for ptr_off in inner_offsets {
-                            let layout = self.copy_layout_for_string_or_list_at(ty);
+                        self.collect_pointer_byte_offsets_with_layout(
+                            ty,
+                            payload_offset,
+                            &mut inner_offsets,
+                        );
+                        for (ptr_off, layout) in inner_offsets {
                             out.push(crate::resolver::ConditionalPointerPair {
                                 discriminant_position: disc_offset,
                                 discriminant_value: case_idx as u32,
@@ -2657,14 +2780,6 @@ impl ParsedComponent {
             }
             _ => false,
         }
-    }
-
-    /// Get the copy layout for a type that is either a string or a list.
-    fn copy_layout_for_string_or_list_at(
-        &self,
-        ty: &ComponentValType,
-    ) -> crate::resolver::CopyLayout {
-        self.copy_layout(ty)
     }
 
     /// Count the number of flat core wasm values a component type flattens to.
@@ -4639,6 +4754,69 @@ mod tests {
             "return_area_byte_size must saturate across fields, not \
              wrap; got {rsize}",
         );
+    }
+
+    /// LS-P-7 — `collect_conditional_pointers` and
+    /// `collect_conditional_result_pointers` must compute the `CopyLayout` for
+    /// each *pointer leaf* inside an option/result/variant payload, not for the
+    /// whole composite payload.
+    ///
+    /// Before the fix both functions called
+    /// `copy_layout_for_string_or_list_at(<whole payload type>)`. `copy_layout`
+    /// only special-cases a bare `String`/`List`; a `record`/`tuple`/
+    /// `fixed-list` payload fell to the `_ => Bulk { byte_multiplier: 1 }` arm.
+    /// Every inner pointer position then inherited a 1× multiplier, so a
+    /// `list<u64>` field inside the payload was copied as `len * 1` bytes
+    /// instead of `len * 8` — a 7/8 under-copy / silent truncation [H-4.1] —
+    /// and a pointer-containing `Elements` leaf collapsed to `Bulk`, dropping
+    /// the recursive inner-pointer fixup [H-4.2]. Surfaced by the mythos-auto
+    /// delta-pass on PR #179.
+    #[test]
+    fn ls_p_7_conditional_pointer_layout_is_per_leaf_not_per_composite() {
+        use crate::resolver::CopyLayout;
+        let pc = empty_parsed_component();
+
+        // canonical element size of u64 is align_up(8, 8) = 8.
+        let expect_mult = 8u32;
+        let list_u64 =
+            || ComponentValType::List(Box::new(ComponentValType::Primitive(PrimitiveValType::U64)));
+
+        // Flat-param path: option<tuple<u32, list<u64>>>. The list<u64> is a
+        // pointer leaf inside a tuple; its CopyLayout must be Bulk{8}, not the
+        // Bulk{1} the tuple-level fallback produced before the fix.
+        let opt_param = ComponentValType::Option(Box::new(ComponentValType::Tuple(vec![
+            ComponentValType::Primitive(PrimitiveValType::U32),
+            list_u64(),
+        ])));
+        let flat_pairs = pc.conditional_pointer_pair_positions(&[("p".to_string(), opt_param)]);
+        assert_eq!(flat_pairs.len(), 1, "expected one conditional pointer pair");
+        match &flat_pairs[0].copy_layout {
+            CopyLayout::Bulk { byte_multiplier } => assert_eq!(
+                *byte_multiplier, expect_mult,
+                "list<u64> leaf inside a tuple payload must keep its 8x \
+                 multiplier, not inherit the composite's Bulk{{1}} fallback",
+            ),
+            CopyLayout::Elements { .. } => panic!("list<u64> should be Bulk"),
+        }
+
+        // Retptr/byte-offset path: result<record{ items: list<u64> }, _>.
+        let res_ty = ComponentValType::Result {
+            ok: Some(Box::new(ComponentValType::Record(vec![(
+                "items".to_string(),
+                list_u64(),
+            )]))),
+            err: None,
+        };
+        let byte_pairs = pc.conditional_pointer_pair_result_positions(&[(None, res_ty)]);
+        assert_eq!(byte_pairs.len(), 1, "expected one conditional pointer pair");
+        match &byte_pairs[0].copy_layout {
+            CopyLayout::Bulk { byte_multiplier } => assert_eq!(
+                *byte_multiplier, expect_mult,
+                "list<u64> leaf inside a record payload must keep its 8x \
+                 multiplier in the retptr path too",
+            ),
+            CopyLayout::Elements { .. } => panic!("list<u64> should be Bulk"),
+        }
     }
 
     /// align_up must not panic when given a saturated u32::MAX size and

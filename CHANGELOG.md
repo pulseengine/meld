@@ -6,6 +6,34 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **Conditional-pointer `CopyLayout` computed for the composite payload,
+  not the pointer leaf** (LS-P-7, UCA-P-3, H-4 / H-4.1 / H-4.2,
+  `meld-core/src/parser.rs`). `collect_conditional_pointers` (flat-param
+  path) and `collect_conditional_result_pointers` (retptr byte-offset
+  path) emit one `ConditionalPointerPair` per pointer leaf inside an
+  `option` / `result` / `variant` payload. They enumerated each leaf's
+  position correctly but computed the `CopyLayout` once by calling
+  `copy_layout` on the *whole payload type* and reusing it for every
+  position. `copy_layout` only special-cases a bare `string` / `list`;
+  any composite payload (`record`, `tuple`, `fixed-length-list`) fell
+  to its `_ => Bulk { byte_multiplier: 1 }` fallback. So a `list<u64>`
+  leaf inside `option<tuple<u32, list<u64>>>` or
+  `result<record { items: list<u64> }, E>` was tagged `Bulk { 1 }`
+  instead of `Bulk { 8 }` — the adapter copies `len * 1` bytes, a 7/8
+  silent under-copy — and a pointer-containing `list<string>` leaf,
+  whose correct layout is `Elements` with recursive inner-pointer
+  fixup, collapsed to flat `Bulk`, dropping the fixup so the callee
+  dereferences pointers still addressing the source memory (the LS-R-2
+  misclassification class, on the conditional path). New
+  `collect_pointer_positions_with_layout` /
+  `collect_pointer_byte_offsets_with_layout` helpers carry each
+  String/List leaf's own `CopyLayout` alongside its position; the now
+  dead `copy_layout_for_string_or_list_at` shim is removed. **A
+  confirmed Mythos finding** — surfaced by the mythos-auto delta-pass
+  on PR #179, promoted to approved loss scenario **LS-P-7**; regression
+  pinned by
+  `ls_p_7_conditional_pointer_layout_is_per_leaf_not_per_composite`.
+
 - **Area-size accumulators wrapped, undoing `canonical_abi_size_unpadded`
   saturation** (LS-P-6, UCA-P-3, H-2 / H-4 / H-4.1,
   `meld-core/src/parser.rs`). `params_area_byte_size` and

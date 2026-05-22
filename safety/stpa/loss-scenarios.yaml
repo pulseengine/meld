@@ -222,6 +222,73 @@ loss-scenarios:
     status: approved
     priority: high
 
+  - id: LS-P-7
+    title: Conditional-pointer CopyLayout computed for composite, not the leaf
+    uca: UCA-P-3
+    hazards: [H-4, H-4.1, H-4.2]
+    type: inadequate-process-model
+    scenario: >
+      `meld-core/src/parser.rs::collect_conditional_pointers` (flat-param
+      path) and `collect_conditional_result_pointers` (retptr byte-offset
+      path) emit one `ConditionalPointerPair` per pointer leaf inside an
+      `option<T>` / `result<T,E>` / `variant` payload. They correctly
+      enumerated each leaf's *position* by recursing through the payload
+      with `collect_pointer_positions` / `collect_pointer_byte_offsets`,
+      but then computed the `CopyLayout` exactly once by calling
+      `copy_layout_for_string_or_list_at(<whole payload type>)` and
+      assigning that single layout to every position. `copy_layout` only
+      special-cases a bare `string` / `list`; any composite payload
+      (`record`, `tuple`, `fixed-length-list`) falls to the
+      `_ => CopyLayout::Bulk { byte_multiplier: 1 }` fallback. So for a
+      param `option<tuple<u32, list<u64>>>` or a result
+      `result<record { items: list<u64> }, E>`, the `list<u64>` leaf —
+      whose correct layout is `Bulk { byte_multiplier: 8 }` — was tagged
+      `Bulk { byte_multiplier: 1 }` [UCA-P-3]. The FACT adapter then
+      copies `len * 1` bytes for that conditional list instead of
+      `len * 8`: a 7/8 silent under-copy / truncation of caller data
+      [H-4 / H-4.1]. Worse, when the leaf is a pointer-containing list
+      (e.g. `list<string>`) whose correct layout is `CopyLayout::Elements`
+      with recursive inner-pointer fixup, the composite fallback collapses
+      it to flat `Bulk`, so the adapter performs a raw byte copy and omits
+      the inner pointer fixup entirely — the callee then dereferences
+      string/list pointers that still address the *source* memory
+      [H-4.2], the same misclassification class as LS-R-2 but on the
+      conditional (option/result/variant) payload path rather than the
+      list-element path. The wasm validator does not catch it; the
+      under-sized copy type-checks. Fix adds
+      `collect_pointer_positions_with_layout` /
+      `collect_pointer_byte_offsets_with_layout`, which carry the
+      `CopyLayout` of each String/List leaf alongside its position, so
+      every `ConditionalPointerPair` gets the layout of *its own* leaf
+      rather than the enclosing composite's `Bulk{1}` fallback; the now
+      dead `copy_layout_for_string_or_list_at` shim is removed. Surfaced
+      by the mythos-auto delta-pass on PR #179. Confirmed by PoC
+      `meld-core::parser::tests::ls_p_7_conditional_pointer_layout_is_per_leaf_not_per_composite`,
+      which exercises both the flat-param and retptr paths and asserts the
+      `list<u64>` leaf keeps an 8× multiplier; the layout primitive it
+      defends, `copy_layout`, is already covered by the SR-6 / LS-R-2
+      `copy_layout` unit tests in `resolver.rs` (the symbolic surface here
+      is a nested `ComponentValType` tree, which CBMC cannot enumerate
+      directly).
+    causal-factors:
+      - >-
+        `copy_layout` was called once on the whole payload type instead
+        of once per pointer leaf, so its `_ => Bulk{1}` fallback masked
+        every composite payload
+      - >-
+        `collect_pointer_positions` returned bare positions, discarding
+        the leaf type needed to compute the correct per-leaf layout
+      - >-
+        No regression test exercised a conditional payload whose pointer
+        leaf was nested inside a record / tuple / fixed-length-list
+    process-model-flaw: >
+      The code's model was "a conditional payload is one pointer object",
+      but a composite payload holds several independent pointer leaves,
+      each needing its own CopyLayout — the same level-of-detail mistake
+      as LS-R-2, here on the option/result/variant path.
+    status: approved
+    priority: high
+
   # ==========================================================================
   # Resolver scenarios
   # ==========================================================================
