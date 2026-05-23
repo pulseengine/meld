@@ -369,6 +369,71 @@ loss-scenarios:
     status: approved
     priority: high
 
+  - id: LS-P-9
+    title: total_flat_params uses non-saturating Iterator::sum across params
+    uca: UCA-P-3
+    hazards: [H-2, H-4]
+    type: inadequate-control-algorithm
+    scenario: >
+      `meld-core/src/parser.rs::total_flat_params` returns the total
+      number of flat (core wasm) values a component function's params
+      flatten to. The Component Model canonical ABI uses this count to
+      pick the calling convention: `<= MAX_FLAT_PARAMS` (16) means the
+      flat convention (each param a core value); `>` means the
+      params-ptr convention (a single i32 pointer to a params buffer in
+      linear memory). The function summed per-param `flat_count` values
+      with `Iterator::sum::<u32>()`. `flat_count` for a `FixedSizeList`
+      is `flat_count(elem).saturating_mul(len)` (LS-P-4 saturation
+      contract), so a nested `FixedSizeList` can produce a per-param
+      `flat_count` of `u32::MAX`. A bare `sum()` over u32 then panics
+      in debug builds on `u32::MAX + 1`; a release build wraps the
+      total to a small value. The wrapped total then compares
+      `<= MAX_FLAT_PARAMS` and the adapter selects the **flat** calling
+      convention for a function that genuinely needs **params-ptr**.
+      The fused output then passes the param as a sequence of flat core
+      values that the wasm engine cannot represent (a multi-billion-arg
+      function call), or — worse, when the wrapped count happens to fit
+      a valid flat signature — silently emits the *wrong* calling
+      convention, so the callee reads its parameters from the wrong
+      ABI slot [UCA-P-3]; the adapter's matching `params_area_*` and
+      `pointer_pair_params_*` paths use the params-ptr layout while the
+      function signature uses flat, so call-site lowering and
+      callee-side lifting disagree [H-2 caller-controlled offsets /
+      H-4 wrong adapter]. The sibling area-size accumulators inside
+      `params_area_byte_size` / `return_area_byte_size` already use
+      `saturating_add` (LS-P-6) — this calling-convention picker was
+      simply missed. Fix replaces `.sum()` with
+      `.fold(0u32, u32::saturating_add)`. Surfaced by the mythos-auto
+      delta-pass on PR #179. Confirmed by PoC
+      `meld-core::parser::tests::ls_p_9_total_flat_params_saturates_across_params`,
+      which builds a nested FixedSizeList param whose `flat_count`
+      saturates to `u32::MAX` plus a second param of `flat_count >= 1`
+      and asserts the total stays near `u32::MAX` rather than wrapping.
+      The nearest primitive-layer proof is LS-P-4's
+      `kani_fixed_size_list_size_no_overflow` Kani harness; the
+      symbolic surface here is a `&[(String, ComponentValType)]` slice
+      which CBMC cannot enumerate directly.
+    causal-factors:
+      - >-
+        `Iterator::sum::<u32>()` panics on overflow in debug and wraps
+        in release — neither matches the LS-P-4 saturating contract of
+        the values it sums
+      - >-
+        The calling-convention picker was hardened against per-type
+        saturation (LS-P-4) but not against cross-param accumulation —
+        the same gap LS-P-6 fixed for the area-size accumulators
+      - >-
+        No regression test exercised a params list whose first param's
+        `flat_count` already saturated to `u32::MAX`
+    process-model-flaw: >
+      LS-P-4's model was "the size/count primitives saturate", but the
+      saturation guarantee is only end-to-end if every accumulator that
+      consumes a saturated value also saturates — the same model-flaw
+      class as LS-P-6, here on the flat-param-count side rather than
+      the area-byte-size side.
+    status: approved
+    priority: high
+
   # ==========================================================================
   # Resolver scenarios
   # ==========================================================================

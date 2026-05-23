@@ -1603,7 +1603,17 @@ impl ParsedComponent {
     /// If this exceeds MAX_FLAT_PARAMS (16), the canonical ABI uses the params-ptr
     /// calling convention: a single i32 pointer to a buffer in linear memory.
     pub fn total_flat_params(&self, params: &[(String, ComponentValType)]) -> u32 {
-        params.iter().map(|(_, ty)| self.flat_count(ty)).sum()
+        // saturating_add fold, not `sum()`: flat_count is saturating
+        // (FixedSizeList multiplies element_flat by len, saturating to
+        // u32::MAX). A bare `sum()` then panics in debug / wraps in
+        // release on `u32::MAX + 1`; a wrapped small value compares
+        // `<= MAX_FLAT_PARAMS` and selects the flat calling convention
+        // for a function that genuinely needs params-ptr — semantic
+        // divergence in the fused output (LS-P-9).
+        params
+            .iter()
+            .map(|(_, ty)| self.flat_count(ty))
+            .fold(0u32, u32::saturating_add)
     }
 
     /// Compute the byte size of the params area for a component function's params.
@@ -4905,6 +4915,48 @@ mod tests {
             vec![8],
             "list<u32> following record{{u32,u8}} must sit at offset 8 \
              (spec size of the preceding record), not at the unpadded 5",
+        );
+    }
+
+    /// LS-P-9 — `total_flat_params` must saturate-fold per-param `flat_count`
+    /// values, not use `Iterator::sum::<u32>()`.
+    ///
+    /// `flat_count(FixedSizeList(elem, len))` is
+    /// `flat_count(elem).saturating_mul(len)` (LS-P-4 saturation contract),
+    /// so a pathological nested `FixedSizeList` can produce a per-param
+    /// `flat_count` of `u32::MAX`. A bare `.sum::<u32>()` then panics in
+    /// debug builds and wraps `u32::MAX + 1` to a small value in release.
+    /// The wrapped sum then compares `<= MAX_FLAT_PARAMS` (16) and the
+    /// adapter selects the flat calling convention for a function that
+    /// genuinely needs params-ptr — semantic divergence in the fused
+    /// output. Surfaced by the mythos-auto delta-pass on PR #179.
+    #[test]
+    fn ls_p_9_total_flat_params_saturates_across_params() {
+        let pc = empty_parsed_component();
+        // Nested FixedSizeList: inner flat_count = 1 * 2^17 = 131072,
+        // outer multiplies by 2^16 = 65536 → 2^33, saturates to u32::MAX.
+        let huge = ComponentValType::FixedSizeList(
+            Box::new(ComponentValType::FixedSizeList(
+                Box::new(ComponentValType::Primitive(PrimitiveValType::U32)),
+                1 << 17,
+            )),
+            1 << 16,
+        );
+        let params = vec![
+            ("p".to_string(), huge),
+            (
+                "q".to_string(),
+                ComponentValType::Primitive(PrimitiveValType::U32),
+            ),
+        ];
+        // Pre-fix: panics in debug, wraps to 0 in release (≤ 16 → flat
+        // convention). Post-fix: saturates near u32::MAX → params-ptr,
+        // which is the spec-correct lowering for the function.
+        let total = pc.total_flat_params(&params);
+        assert!(
+            total > (1u32 << 31),
+            "total_flat_params must saturate across params, not wrap; \
+             got {total}",
         );
     }
 

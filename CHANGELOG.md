@@ -6,6 +6,27 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **`total_flat_params` used `Iterator::sum::<u32>()` instead of a
+  saturating fold** (LS-P-9, UCA-P-3, H-2 / H-4,
+  `meld-core/src/parser.rs`). The Component Model canonical ABI picks
+  the calling convention from `total_flat_params`: `<=
+  MAX_FLAT_PARAMS` (16) → flat; `>` → params-ptr. `flat_count` for a
+  `FixedSizeList` is `flat_count(elem).saturating_mul(len)`
+  (LS-P-4), so a nested `FixedSizeList` can produce a per-param
+  `flat_count` of `u32::MAX`. A bare `.sum()` over `u32` then panics
+  in debug on `u32::MAX + 1` and **wraps to a small value** in
+  release; the wrapped total compares `<= 16` and the adapter selects
+  the flat convention for a function that genuinely needs params-ptr
+  — call-site lowering and callee-side lifting disagree on the ABI
+  slot. The sibling area-size accumulators inside
+  `params_area_byte_size` / `return_area_byte_size` already use
+  `saturating_add` (LS-P-6); this calling-convention picker was
+  missed. Replaces `.sum()` with `.fold(0u32, u32::saturating_add)`.
+  **A confirmed Mythos finding** — surfaced by the mythos-auto
+  delta-pass on PR #179, promoted to approved loss scenario
+  **LS-P-9**; regression pinned by
+  `ls_p_9_total_flat_params_saturates_across_params`.
+
 - **Record/tuple field-walk added the unpadded child size, undercounting
   every offset and size built on it** (LS-P-8, UCA-P-3,
   H-4 / H-4.1 / H-4.2, `meld-core/src/parser.rs`). The Component Model
