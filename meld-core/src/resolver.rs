@@ -2000,9 +2000,26 @@ impl Resolver {
         // Build export index for this component's modules
         let mut module_exports: HashMap<(&str, &str), (usize, &ModuleExport)> = HashMap::new();
 
+        // Use entry().or_insert() + explicit collision check so a duplicate
+        // flat-name export between two core modules in this component fails
+        // loudly rather than silently routing every importer to the last
+        // module (LS-P-11). The instance-graph resolver below uses the
+        // explicit instance edges and is immune to this; the flat-name path
+        // is reached only for components without an `InstanceSection`.
         for (mod_idx, module) in component.core_modules.iter().enumerate() {
             for export in &module.exports {
                 let key = ("", export.name.as_str());
+                if let Some((prev_idx, _)) = module_exports.get(&key) {
+                    let prev_idx = *prev_idx;
+                    if prev_idx != mod_idx {
+                        return Err(Error::DuplicateModuleExport {
+                            component_idx: comp_idx,
+                            export_name: export.name.clone(),
+                            first_module_idx: prev_idx,
+                            second_module_idx: mod_idx,
+                        });
+                    }
+                }
                 module_exports.insert(key, (mod_idx, export));
             }
         }
@@ -4504,6 +4521,77 @@ mod tests {
     // emitting canonical entries. With two distinct resources that
     // produced exactly one entry per prefix — silently overwriting one
     // import. The tests below pin down the per-resource keying.
+
+    fn module_with_exports(idx: u32, exports: Vec<&str>) -> crate::parser::CoreModule {
+        crate::parser::CoreModule {
+            index: idx,
+            bytes: Vec::new(),
+            types: Vec::new(),
+            imports: Vec::new(),
+            exports: exports
+                .into_iter()
+                .map(|name| crate::parser::ModuleExport {
+                    name: name.to_string(),
+                    kind: crate::parser::ExportKind::Function,
+                    index: 0,
+                })
+                .collect(),
+            functions: Vec::new(),
+            memories: Vec::new(),
+            tables: Vec::new(),
+            globals: Vec::new(),
+            start: None,
+            data_count: None,
+            element_count: 0,
+            custom_sections: Vec::new(),
+            code_section_range: None,
+            global_section_range: None,
+            element_section_range: None,
+            data_section_range: None,
+        }
+    }
+
+    /// LS-P-11 — `resolve_via_flat_names` populates its export index with
+    /// blind `HashMap::insert`. When two core modules within one component
+    /// export the same flat name, the second silently overwrites the first
+    /// (last-writer wins), routing any importer to the wrong module — a
+    /// semantic-preservation violation with no error or warning.
+    ///
+    /// The instance-graph resolver is immune (keys lookups through the
+    /// explicit instance edges), so the bug is unreachable for any
+    /// well-formed multi-module component produced by `wit-component` /
+    /// `wasm-tools` (those always emit an `InstanceSection`). It IS
+    /// reachable for components without instances — synthetic test
+    /// fixtures and a few legacy shapes. Per Mythos process this is a
+    /// hardening fix, not a security emergency. Surfaced by the
+    /// mythos-auto delta-pass on PR #179 and clean-room verified.
+    #[test]
+    fn ls_p_11_duplicate_flat_name_export_is_rejected() {
+        let mut comp = empty_parsed_component();
+        // Two core modules in one component, both exporting `foo`. No
+        // InstanceSection — dispatcher routes to resolve_via_flat_names.
+        comp.core_modules.push(module_with_exports(0, vec!["foo"]));
+        comp.core_modules.push(module_with_exports(1, vec!["foo"]));
+
+        let result = Resolver::new().resolve(&[comp]);
+        match result {
+            Err(Error::DuplicateModuleExport {
+                component_idx,
+                export_name,
+                first_module_idx,
+                second_module_idx,
+            }) => {
+                assert_eq!(component_idx, 0);
+                assert_eq!(export_name, "foo");
+                assert_eq!(first_module_idx, 0);
+                assert_eq!(second_module_idx, 1);
+            }
+            other => panic!(
+                "expected DuplicateModuleExport for two modules exporting \
+                 the same flat name; got {other:?}",
+            ),
+        }
+    }
 
     fn module_with_imports(imports: Vec<(&str, &str)>) -> crate::parser::CoreModule {
         crate::parser::CoreModule {

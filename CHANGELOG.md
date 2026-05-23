@@ -6,6 +6,27 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **Flat-name resolver silently overwrote duplicate module exports**
+  (LS-P-11, UCA-R-3, H-5 / H-1, `meld-core/src/resolver.rs`,
+  `meld-core/src/error.rs`). `resolve_via_flat_names` built its export
+  index with a blind `HashMap::insert(key, …)` where `key` is the flat
+  export name. When two core modules within one component both
+  exported the same name, the second silently overwrote the first
+  (last-writer wins), routing any importer of that name to the wrong
+  module with no error or warning. The instance-graph resolver
+  (taken whenever the component has an `InstanceSection`, which
+  `wit-component` / `wasm-tools` always emit for multi-module
+  components) is immune; the vulnerable path is practically
+  unreachable for production components, **defensive hardening** for
+  the synthetic-fixture and legacy single-module fallback shapes.
+  Replaces the blind insert with an explicit collision check that
+  returns a new `Error::DuplicateModuleExport { component_idx,
+  export_name, first_module_idx, second_module_idx }`, mirroring the
+  existing `DuplicateModuleInstantiation` pattern. **A confirmed
+  Mythos finding** — clean-room verified, promoted to approved loss
+  scenario **LS-P-11** (priority `low`); regression pinned by
+  `ls_p_11_duplicate_flat_name_export_is_rejected`.
+
 - **Nested conditional pointer pair omitted outer-discriminant guard —
   arbitrary cross-component read with attacker-controlled `(ptr, len)`**
   (LS-P-10, UCA-P-3, H-2 / H-4 / H-4.2, `meld-core/src/parser.rs`,

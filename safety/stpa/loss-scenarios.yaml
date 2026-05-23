@@ -523,6 +523,70 @@ loss-scenarios:
     status: approved
     priority: high
 
+  - id: LS-P-11
+    title: Flat-name resolver overwrites duplicate module exports silently
+    uca: UCA-R-3
+    hazards: [H-5, H-1]
+    type: inadequate-process-model
+    scenario: >
+      `meld-core/src/resolver.rs::resolve_via_flat_names` (called from
+      `resolve_module_imports` when `component.instances.is_empty()`)
+      builds an export index `HashMap<(&str, &str), (usize, &ModuleExport)>`
+      keyed by the flat export name. The population loop iterates
+      `component.core_modules` and calls `module_exports.insert(key, …)`
+      with no entry check, no warning, no error. When two core modules
+      within the same component both export the same flat name, the
+      second module silently overwrites the first (last-writer wins);
+      any subsequent import of that name resolves to the wrong module
+      [UCA-R-3 misrouted import], the fused module is wired wrong but
+      validates clean [H-5 dependency resolution produces wrong order /
+      H-1 fused module traps at the wrong call site]. The wasm
+      component validator does not catch it; the import/export shape
+      type-checks. The instance-graph resolver
+      (`resolve_via_instances`, taken whenever an `InstanceSection`
+      exists) keys lookups through explicit instance edges and is
+      immune. `wit-component` / `wasm-tools` always emit an
+      `InstanceSection` for multi-module components, so this bug is
+      latent and **practically unreachable** for well-formed
+      production components — it is reachable for synthetic test
+      fixtures and the legacy single-module fallback shape where the
+      flat-name path is taken. Fix replaces the blind insert with an
+      explicit collision check that returns a new
+      `Error::DuplicateModuleExport { component_idx, export_name,
+      first_module_idx, second_module_idx }` (mirroring the
+      `DuplicateModuleInstantiation` pattern at `resolver.rs:2115`),
+      converting silent misrouting into a loud error. Surfaced by the
+      mythos-auto delta-pass on PR #179 and clean-room verified;
+      promoted to approved loss scenario as defensive hardening rather
+      than an emergency. Confirmed by PoC
+      `meld-core::resolver::tests::ls_p_11_duplicate_flat_name_export_is_rejected`,
+      which constructs two `CoreModule` entries both exporting `foo`
+      and no `InstanceSection`, then asserts the resolver returns
+      `Err(DuplicateModuleExport { .. })`.
+    causal-factors:
+      - >-
+        `HashMap::insert` was used where the spec-correct semantics is
+        "reject duplicate name within one component" — the duplicate
+        check was simply missing on this code path
+      - >-
+        The sibling `DuplicateModuleInstantiation` error
+        (`resolver.rs:2115`) already established the precedent for
+        rejecting same-component duplicates, but the pattern was not
+        replicated for export names
+      - >-
+        No regression test exercised the flat-name path with two
+        modules emitting the same export — the path is rarely
+        exercised because production multi-module components have an
+        `InstanceSection`
+    process-model-flaw: >
+      The code's model was "module-export index is whatever the last
+      module wrote", but the correct invariant is "within one component
+      a flat export name resolves to at most one module" — same model
+      as `DuplicateModuleInstantiation`, applied to exports rather than
+      instantiations.
+    status: approved
+    priority: low
+
   # ==========================================================================
   # Resolver scenarios
   # ==========================================================================
