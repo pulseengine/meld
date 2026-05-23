@@ -101,6 +101,113 @@ pub(crate) fn emit_overflow_guard(body: &mut Function, len_local: u32, k: u32) {
     body.instruction(&Instruction::End);
 }
 
+/// Emit a chain of `(disc == value)` checks for a [`ConditionalPointerPair`]'s
+/// guards on the **flat-local** path — every guard in `cond.outer_guards`
+/// followed by the pair's innermost discriminant. All checks are ANDed; the
+/// resulting i32 (0/1) is left on the wasm stack so the caller can immediately
+/// emit `If`. `flat_base` is added to every guard's `position` (use 0 for
+/// param paths, `result_save_base` for the flat-result path).
+///
+/// Without this AND-chain, a `ConditionalPointerPair` inside a nested
+/// option/result/variant payload would fire whenever the *inner* discriminant
+/// slot happens to read as the inner value — *even in arms where the payload
+/// type is something else entirely* — yielding an arbitrary cross-memory copy
+/// with attacker-controlled `(ptr, len)` (LS-P-10).
+pub(crate) fn emit_conditional_guard_chain_flat(
+    body: &mut Function,
+    cond: &crate::resolver::ConditionalPointerPair,
+    flat_base: u32,
+) {
+    let mut emitted_any = false;
+    for guard in &cond.outer_guards {
+        body.instruction(&Instruction::LocalGet(flat_base + guard.position));
+        body.instruction(&Instruction::I32Const(guard.value as i32));
+        body.instruction(&Instruction::I32Eq);
+        if emitted_any {
+            body.instruction(&Instruction::I32And);
+        }
+        emitted_any = true;
+    }
+    // Innermost (current-level) guard.
+    body.instruction(&Instruction::LocalGet(
+        flat_base + cond.discriminant_position,
+    ));
+    body.instruction(&Instruction::I32Const(cond.discriminant_value as i32));
+    body.instruction(&Instruction::I32Eq);
+    if emitted_any {
+        body.instruction(&Instruction::I32And);
+    }
+}
+
+/// Emit a chain of `(disc == value)` checks for a [`ConditionalPointerPair`]'s
+/// guards on the **byte-offset** path — every guard in `cond.outer_guards`
+/// followed by the innermost discriminant, all ANDed. `base_ptr_local` holds
+/// the pointer to the buffer (callee result area, etc.); each guard's
+/// `byte_size` selects the load width (`I32Load8U` / `I32Load16U` /
+/// `I32Load`). See [`emit_conditional_guard_chain_flat`] for the LS-P-10
+/// rationale.
+pub(crate) fn emit_conditional_guard_chain_byte(
+    body: &mut Function,
+    cond: &crate::resolver::ConditionalPointerPair,
+    base_ptr_local: u32,
+    memory_index: u32,
+) {
+    fn emit_disc_load(
+        body: &mut Function,
+        base_ptr_local: u32,
+        byte_size: u32,
+        offset: u32,
+        memory_index: u32,
+    ) {
+        body.instruction(&Instruction::LocalGet(base_ptr_local));
+        match byte_size {
+            1 => body.instruction(&Instruction::I32Load8U(wasm_encoder::MemArg {
+                offset: offset as u64,
+                align: 0,
+                memory_index,
+            })),
+            2 => body.instruction(&Instruction::I32Load16U(wasm_encoder::MemArg {
+                offset: offset as u64,
+                align: 1,
+                memory_index,
+            })),
+            _ => body.instruction(&Instruction::I32Load(wasm_encoder::MemArg {
+                offset: offset as u64,
+                align: 2,
+                memory_index,
+            })),
+        };
+    }
+    let mut emitted_any = false;
+    for guard in &cond.outer_guards {
+        emit_disc_load(
+            body,
+            base_ptr_local,
+            guard.byte_size,
+            guard.position,
+            memory_index,
+        );
+        body.instruction(&Instruction::I32Const(guard.value as i32));
+        body.instruction(&Instruction::I32Eq);
+        if emitted_any {
+            body.instruction(&Instruction::I32And);
+        }
+        emitted_any = true;
+    }
+    emit_disc_load(
+        body,
+        base_ptr_local,
+        cond.discriminant_byte_size,
+        cond.discriminant_position,
+        memory_index,
+    );
+    body.instruction(&Instruction::I32Const(cond.discriminant_value as i32));
+    body.instruction(&Instruction::I32Eq);
+    if emitted_any {
+        body.instruction(&Instruction::I32And);
+    }
+}
+
 /// Compute Canonical ABI (size, alignment) in bytes for a component value type.
 ///
 /// Per Component Model Canonical ABI spec, every type has a fixed lowered
@@ -1571,7 +1678,6 @@ impl FactStyleGenerator {
             // NOTE: We handle this by modifying the params in-place using
             // local.set on the original param slots.
             for cond in &site.requirements.conditional_pointer_pairs {
-                let disc_local = cond.discriminant_position;
                 let ptr_local = cond.ptr_position;
                 let len_local = cond.ptr_position + 1;
                 let byte_mult = match &cond.copy_layout {
@@ -1579,10 +1685,11 @@ impl FactStyleGenerator {
                     crate::resolver::CopyLayout::Elements { element_size, .. } => *element_size,
                 };
 
-                // if (disc == expected_value) { copy and replace ptr }
-                func.instruction(&Instruction::LocalGet(disc_local));
-                func.instruction(&Instruction::I32Const(cond.discriminant_value as i32));
-                func.instruction(&Instruction::I32Eq);
+                // if (all guards in chain hold) { copy and replace ptr }
+                // — outer-guard ANDing matters for nested option/result/variant
+                // payloads where reading only the inner disc byte could be
+                // sampling unrelated payload bytes in another arm (LS-P-10).
+                emit_conditional_guard_chain_flat(&mut func, cond, 0);
                 func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
 
                 // Allocate: new_ptr = cabi_realloc(0, 0, 1, len * byte_mult)
@@ -1722,7 +1829,6 @@ impl FactStyleGenerator {
             if needs_conditional_result_copy && result_count > 0 {
                 let caller_realloc = options.caller_realloc.unwrap();
                 for cond in &site.requirements.conditional_result_flat_pairs {
-                    let disc_local = result_save_base + cond.discriminant_position;
                     let ptr_local = result_save_base + cond.ptr_position;
                     let len_local = result_save_base + cond.ptr_position + 1;
                     let byte_mult = match &cond.copy_layout {
@@ -1730,10 +1836,9 @@ impl FactStyleGenerator {
                         crate::resolver::CopyLayout::Elements { element_size, .. } => *element_size,
                     };
 
-                    // if (disc == expected_value) { allocate in caller, copy, replace ptr }
-                    func.instruction(&Instruction::LocalGet(disc_local));
-                    func.instruction(&Instruction::I32Const(cond.discriminant_value as i32));
-                    func.instruction(&Instruction::I32Eq);
+                    // if (all guards in chain hold) { allocate in caller,
+                    // copy, replace ptr } — outer-guard ANDing per LS-P-10.
+                    emit_conditional_guard_chain_flat(&mut func, cond, result_save_base);
                     func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
 
                     // Allocate in caller memory
@@ -2288,7 +2393,6 @@ impl FactStyleGenerator {
         // --- Phase 1b: Conditional param copy (option/result/variant params) ---
         if let Some(callee_realloc) = options.callee_realloc.filter(|_| has_cond_param_pairs) {
             for cond in &site.requirements.conditional_pointer_pairs {
-                let disc_local = cond.discriminant_position;
                 let ptr_local = cond.ptr_position;
                 let len_local = cond.ptr_position + 1;
                 let byte_mult = match &cond.copy_layout {
@@ -2296,9 +2400,8 @@ impl FactStyleGenerator {
                     crate::resolver::CopyLayout::Elements { element_size, .. } => *element_size,
                 };
 
-                func.instruction(&Instruction::LocalGet(disc_local));
-                func.instruction(&Instruction::I32Const(cond.discriminant_value as i32));
-                func.instruction(&Instruction::I32Eq);
+                // Outer-guard AND-chain (LS-P-10) before firing the copy.
+                emit_conditional_guard_chain_flat(&mut func, cond, 0);
                 func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
 
                 // Allocate in callee memory
@@ -2539,7 +2642,6 @@ impl FactStyleGenerator {
         // --- Phase 5b: Conditional result copy (option/result/variant in return area) ---
         if let Some(caller_realloc) = options.caller_realloc.filter(|_| has_cond_result_pairs) {
             for cond in &site.requirements.conditional_result_pointer_pairs {
-                let disc_offset = cond.discriminant_position;
                 let ptr_offset = cond.ptr_position;
                 let len_offset = cond.ptr_position + 4;
                 let byte_mult = match &cond.copy_layout {
@@ -2547,27 +2649,15 @@ impl FactStyleGenerator {
                     crate::resolver::CopyLayout::Elements { element_size, .. } => *element_size,
                 };
 
-                // Load discriminant from callee's return area using correct byte width
-                func.instruction(&Instruction::LocalGet(result_ptr_local));
-                match cond.discriminant_byte_size {
-                    1 => func.instruction(&Instruction::I32Load8U(wasm_encoder::MemArg {
-                        offset: disc_offset as u64,
-                        align: 0,
-                        memory_index: options.callee_memory,
-                    })),
-                    2 => func.instruction(&Instruction::I32Load16U(wasm_encoder::MemArg {
-                        offset: disc_offset as u64,
-                        align: 1,
-                        memory_index: options.callee_memory,
-                    })),
-                    _ => func.instruction(&Instruction::I32Load(wasm_encoder::MemArg {
-                        offset: disc_offset as u64,
-                        align: 2,
-                        memory_index: options.callee_memory,
-                    })),
-                };
-                func.instruction(&Instruction::I32Const(cond.discriminant_value as i32));
-                func.instruction(&Instruction::I32Eq);
+                // Outer-guard AND-chain (LS-P-10) before firing the copy.
+                // Each guard's discriminant is loaded from the callee's
+                // return area at its byte offset using the matching width.
+                emit_conditional_guard_chain_byte(
+                    &mut func,
+                    cond,
+                    result_ptr_local,
+                    options.callee_memory,
+                );
                 func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
 
                 // Load ptr and len from callee's return area

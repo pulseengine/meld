@@ -434,6 +434,95 @@ loss-scenarios:
     status: approved
     priority: high
 
+  - id: LS-P-10
+    title: Nested conditional pointer pair omits outer-discriminant guard
+    uca: UCA-P-3
+    hazards: [H-2, H-4, H-4.2]
+    type: inadequate-process-model
+    scenario: >
+      For a pointer-containing type nested inside an option/result/variant
+      arm — for instance `result<option<string>, u32>` —
+      `meld-core/src/parser.rs::collect_conditional_pointers` (flat-param
+      path) and `collect_conditional_result_pointers` (retptr byte-offset
+      path) emitted a `ConditionalPointerPair` guarded only on the
+      *innermost* discriminant. For the example, the string's pair carried
+      `discriminant_position = base+1, discriminant_value = 1` (the
+      option's Some byte), but no guard on the outer Result discriminant
+      at `base`. The FACT adapter (`meld-core/src/adapter/fact.rs`, four
+      consumer loops covering flat-param, flat-result, retptr-param, and
+      retptr-result paths) loaded that single discriminant and fired
+      `cabi_realloc` + `memory.copy` whenever it equalled the expected
+      value. When the runtime value was `Err(v: u32)`, the byte at
+      `base+1` did not hold an option discriminant — it held the `u32`
+      payload. If those bytes happened to read as `1`, the adapter
+      sampled adjacent slots (the next `(ptr, len)` pair worth of bytes
+      from the caller's stack / params buffer / return area) as a
+      string pointer pair and copied `len * 1` bytes from
+      caller-controlled `ptr` into a freshly allocated callee buffer,
+      then handed the forged pointer to the callee. That is an
+      **arbitrary cross-component memory read** with attacker-controlled
+      length and source address [UCA-P-3 / H-2 caller-controlled offsets /
+      H-4 wrong adapter / H-4.2 missing pointer fixup gate]. The same
+      defect applied symmetrically to every nesting where an outer
+      option/result/variant payload contains a pointer-bearing
+      option/result/variant (e.g. `option<option<string>>`,
+      `variant { a(option<string>), b(u32) }`). Surfaced by the
+      mythos-auto delta-pass on PR #179; independent clean-room
+      verification (validator traced the four `fact.rs` consumer loops
+      and confirmed each treats every `ConditionalPointerPair`'s guard
+      independently — no implicit AND with any enclosing conditional)
+      promoted it to approved loss scenario. Fix introduces
+      `DiscriminantGuard` and adds an `outer_guards: Vec<DiscriminantGuard>`
+      field to `ConditionalPointerPair`; both
+      `collect_conditional_pointers` and
+      `collect_conditional_result_pointers` accept an `outer_guards`
+      parameter that is the chain of enclosing-arm discriminants, append
+      their own discriminant onto the chain when recursing into a payload,
+      and stamp each emitted pair with the prefix chain; the four FACT
+      adapter loops call two new helpers
+      (`emit_conditional_guard_chain_flat` /
+      `emit_conditional_guard_chain_byte` in `meld-core/src/adapter/fact.rs`)
+      that emit each guard's `(load disc, I32Const value, I32Eq)` and
+      `I32And` them all together before the existing `If` block fires the
+      copy. The innermost guard remains in the existing
+      `discriminant_*` fields for backward compatibility — `outer_guards`
+      is empty for single-level conditionals so unchanged callers behave
+      identically. Confirmed by PoC
+      `meld-core::parser::tests::ls_p_10_nested_conditional_pointer_carries_outer_guard_chain`,
+      which builds `result<option<string>, u32>` and asserts that on both
+      the flat-param and retptr paths the pair guarding the string leaf
+      carries the outer Result-Ok guard alongside the inner Option-Some
+      guard.
+    causal-factors:
+      - >-
+        `ConditionalPointerPair` carried a single (position, value, size)
+        triple rather than a guard chain, so the parser had nowhere to
+        encode "this copy is conditional on more than one discriminant"
+      - >-
+        Both `collect_conditional_pointers` and
+        `collect_conditional_result_pointers` recursed into the payload
+        of an outer option/result/variant by calling themselves with the
+        payload's base, but did not thread the outer arm's discriminant
+        into the recursion — so inner-emitted pairs guarded only on the
+        inner arm
+      - >-
+        The four FACT adapter consumer loops processed each pair
+        independently with a single `(load + I32Eq + If)` block; there
+        was no separate mechanism that re-gated a nested pair on its
+        enclosing conditional
+      - >-
+        No regression test exercised a nested-conditional pointer shape
+        — every existing test had at most one level of option/result/
+        variant
+    process-model-flaw: >
+      The code's model was "a `ConditionalPointerPair` is guarded by its
+      one discriminant", but pointer-bearing nested conditionals demand a
+      *conjunction* of discriminants: every enclosing arm must also hold,
+      because reading the inner discriminant slot in a sibling outer arm
+      reads unrelated payload bytes that the attacker controls.
+    status: approved
+    priority: high
+
   # ==========================================================================
   # Resolver scenarios
   # ==========================================================================

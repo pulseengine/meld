@@ -2436,7 +2436,7 @@ impl ParsedComponent {
         let mut out = Vec::new();
         let mut flat_idx = 0u32;
         for (_, ty) in params {
-            self.collect_conditional_pointers(ty, flat_idx, &mut out);
+            self.collect_conditional_pointers(ty, flat_idx, &[], &mut out);
             flat_idx += self.flat_count(ty);
         }
         out
@@ -2450,7 +2450,7 @@ impl ParsedComponent {
         let mut out = Vec::new();
         let mut flat_idx = 0u32;
         for (_, ty) in results {
-            self.collect_conditional_pointers(ty, flat_idx, &mut out);
+            self.collect_conditional_pointers(ty, flat_idx, &[], &mut out);
             flat_idx += self.flat_count(ty);
         }
         out
@@ -2467,7 +2467,7 @@ impl ParsedComponent {
         for (_, ty) in results {
             let align = self.canonical_abi_align(ty);
             byte_offset = align_up(byte_offset, align);
-            self.collect_conditional_result_pointers(ty, byte_offset, &mut out);
+            self.collect_conditional_result_pointers(ty, byte_offset, &[], &mut out);
             byte_offset += self.canonical_abi_element_size(ty);
         }
         out
@@ -2475,10 +2475,19 @@ impl ParsedComponent {
 
     /// Collect conditional pointer pairs for flat params.
     /// For option<T> where T contains pointers: disc at base, payload at base+1.
+    ///
+    /// `outer_guards` is the chain of enclosing option/result/variant
+    /// discriminants that must also hold for any pair emitted here to be
+    /// active — empty at the top level; one entry per nesting level deeper.
+    /// Without this chain, a `result<option<string>, u32>` would emit only
+    /// the inner option-Some guard, and the adapter would copy memory
+    /// whenever the bytes that happen to occupy the option's discriminant
+    /// slot (in the Err arm: the u32 payload) read as `1` (LS-P-10).
     fn collect_conditional_pointers(
         &self,
         ty: &ComponentValType,
         base: u32,
+        outer_guards: &[crate::resolver::DiscriminantGuard],
         out: &mut Vec<crate::resolver::ConditionalPointerPair>,
     ) {
         match ty {
@@ -2487,6 +2496,11 @@ impl ParsedComponent {
                 // disc=1 means Some, payload starts at base+1
                 // In flat representation, discriminant is always i32 (4 bytes)
                 let payload_base = base + 1;
+                let my_guard = crate::resolver::DiscriminantGuard {
+                    position: base,
+                    value: 1,
+                    byte_size: 4,
+                };
                 let mut inner_positions = Vec::new();
                 self.collect_pointer_positions_with_layout(
                     inner,
@@ -2495,14 +2509,17 @@ impl ParsedComponent {
                 );
                 for (ptr_pos, layout) in inner_positions {
                     out.push(crate::resolver::ConditionalPointerPair {
-                        discriminant_position: base,
-                        discriminant_value: 1,
+                        discriminant_position: my_guard.position,
+                        discriminant_value: my_guard.value,
                         ptr_position: ptr_pos,
                         copy_layout: layout,
-                        discriminant_byte_size: 4,
+                        discriminant_byte_size: my_guard.byte_size,
+                        outer_guards: outer_guards.to_vec(),
                     });
                 }
-                self.collect_conditional_pointers(inner, payload_base, out);
+                let mut nested = outer_guards.to_vec();
+                nested.push(my_guard);
+                self.collect_conditional_pointers(inner, payload_base, &nested, out);
             }
             ComponentValType::Result { ok, err } => {
                 // result<T,E> flattens to [disc, ...max(T_flat, E_flat)]
@@ -2511,6 +2528,11 @@ impl ParsedComponent {
                 if let Some(ok_ty) = ok
                     && self.type_contains_pointers(ok_ty)
                 {
+                    let ok_guard = crate::resolver::DiscriminantGuard {
+                        position: base,
+                        value: 0,
+                        byte_size: 4,
+                    };
                     let mut inner_positions = Vec::new();
                     self.collect_pointer_positions_with_layout(
                         ok_ty,
@@ -2519,18 +2541,26 @@ impl ParsedComponent {
                     );
                     for (ptr_pos, layout) in inner_positions {
                         out.push(crate::resolver::ConditionalPointerPair {
-                            discriminant_position: base,
-                            discriminant_value: 0,
+                            discriminant_position: ok_guard.position,
+                            discriminant_value: ok_guard.value,
                             ptr_position: ptr_pos,
                             copy_layout: layout,
-                            discriminant_byte_size: 4,
+                            discriminant_byte_size: ok_guard.byte_size,
+                            outer_guards: outer_guards.to_vec(),
                         });
                     }
-                    self.collect_conditional_pointers(ok_ty, payload_base, out);
+                    let mut nested = outer_guards.to_vec();
+                    nested.push(ok_guard);
+                    self.collect_conditional_pointers(ok_ty, payload_base, &nested, out);
                 }
                 if let Some(err_ty) = err
                     && self.type_contains_pointers(err_ty)
                 {
+                    let err_guard = crate::resolver::DiscriminantGuard {
+                        position: base,
+                        value: 1,
+                        byte_size: 4,
+                    };
                     let mut inner_positions = Vec::new();
                     self.collect_pointer_positions_with_layout(
                         err_ty,
@@ -2539,14 +2569,17 @@ impl ParsedComponent {
                     );
                     for (ptr_pos, layout) in inner_positions {
                         out.push(crate::resolver::ConditionalPointerPair {
-                            discriminant_position: base,
-                            discriminant_value: 1,
+                            discriminant_position: err_guard.position,
+                            discriminant_value: err_guard.value,
                             ptr_position: ptr_pos,
                             copy_layout: layout,
-                            discriminant_byte_size: 4,
+                            discriminant_byte_size: err_guard.byte_size,
+                            outer_guards: outer_guards.to_vec(),
                         });
                     }
-                    self.collect_conditional_pointers(err_ty, payload_base, out);
+                    let mut nested = outer_guards.to_vec();
+                    nested.push(err_guard);
+                    self.collect_conditional_pointers(err_ty, payload_base, &nested, out);
                 }
             }
             ComponentValType::Variant(cases) => {
@@ -2556,6 +2589,11 @@ impl ParsedComponent {
                     if let Some(ty) = case_ty
                         && self.type_contains_pointers(ty)
                     {
+                        let case_guard = crate::resolver::DiscriminantGuard {
+                            position: base,
+                            value: case_idx as u32,
+                            byte_size: 4,
+                        };
                         let mut inner_positions = Vec::new();
                         self.collect_pointer_positions_with_layout(
                             ty,
@@ -2564,14 +2602,17 @@ impl ParsedComponent {
                         );
                         for (ptr_pos, layout) in inner_positions {
                             out.push(crate::resolver::ConditionalPointerPair {
-                                discriminant_position: base,
-                                discriminant_value: case_idx as u32,
+                                discriminant_position: case_guard.position,
+                                discriminant_value: case_guard.value,
                                 ptr_position: ptr_pos,
                                 copy_layout: layout,
-                                discriminant_byte_size: 4,
+                                discriminant_byte_size: case_guard.byte_size,
+                                outer_guards: outer_guards.to_vec(),
                             });
                         }
-                        self.collect_conditional_pointers(ty, payload_base, out);
+                        let mut nested = outer_guards.to_vec();
+                        nested.push(case_guard);
+                        self.collect_conditional_pointers(ty, payload_base, &nested, out);
                     }
                 }
             }
@@ -2579,21 +2620,21 @@ impl ParsedComponent {
                 let elem_flat = self.flat_count(elem);
                 let mut offset = base;
                 for _ in 0..*len {
-                    self.collect_conditional_pointers(elem, offset, out);
+                    self.collect_conditional_pointers(elem, offset, outer_guards, out);
                     offset += elem_flat;
                 }
             }
             ComponentValType::Record(fields) => {
                 let mut offset = base;
                 for (_, field_ty) in fields {
-                    self.collect_conditional_pointers(field_ty, offset, out);
+                    self.collect_conditional_pointers(field_ty, offset, outer_guards, out);
                     offset += self.flat_count(field_ty);
                 }
             }
             ComponentValType::Tuple(elems) => {
                 let mut offset = base;
                 for elem_ty in elems {
-                    self.collect_conditional_pointers(elem_ty, offset, out);
+                    self.collect_conditional_pointers(elem_ty, offset, outer_guards, out);
                     offset += self.flat_count(elem_ty);
                 }
             }
@@ -2601,7 +2642,7 @@ impl ParsedComponent {
                 if let Some(ct) = self.get_type_definition(*idx)
                     && let ComponentTypeKind::Defined(inner) = &ct.kind
                 {
-                    self.collect_conditional_pointers(inner, base, out);
+                    self.collect_conditional_pointers(inner, base, outer_guards, out);
                 }
             }
             _ => {}
@@ -2609,10 +2650,16 @@ impl ParsedComponent {
     }
 
     /// Collect conditional pointer pairs for result byte offsets.
+    ///
+    /// `outer_guards` is the chain of enclosing option/result/variant
+    /// discriminants — see `collect_conditional_pointers` for the LS-P-10
+    /// rationale; identical semantics, byte-offset addressing instead of
+    /// flat-local addressing.
     fn collect_conditional_result_pointers(
         &self,
         ty: &ComponentValType,
         base: u32,
+        outer_guards: &[crate::resolver::DiscriminantGuard],
         out: &mut Vec<crate::resolver::ConditionalPointerPair>,
     ) {
         match ty {
@@ -2622,6 +2669,11 @@ impl ParsedComponent {
                 let ds = disc_size(2);
                 let payload_align = self.canonical_abi_align(inner);
                 let payload_offset = base + align_up(ds, payload_align);
+                let my_guard = crate::resolver::DiscriminantGuard {
+                    position: disc_offset,
+                    value: 1,
+                    byte_size: ds,
+                };
                 let mut inner_offsets = Vec::new();
                 self.collect_pointer_byte_offsets_with_layout(
                     inner,
@@ -2630,14 +2682,17 @@ impl ParsedComponent {
                 );
                 for (ptr_off, layout) in inner_offsets {
                     out.push(crate::resolver::ConditionalPointerPair {
-                        discriminant_position: disc_offset,
-                        discriminant_value: 1,
+                        discriminant_position: my_guard.position,
+                        discriminant_value: my_guard.value,
                         ptr_position: ptr_off,
                         copy_layout: layout,
-                        discriminant_byte_size: ds,
+                        discriminant_byte_size: my_guard.byte_size,
+                        outer_guards: outer_guards.to_vec(),
                     });
                 }
-                self.collect_conditional_result_pointers(inner, payload_offset, out);
+                let mut nested = outer_guards.to_vec();
+                nested.push(my_guard);
+                self.collect_conditional_result_pointers(inner, payload_offset, &nested, out);
             }
             ComponentValType::Result { ok, err } => {
                 let disc_offset = base;
@@ -2655,6 +2710,11 @@ impl ParsedComponent {
                 if let Some(ok_ty) = ok
                     && self.type_contains_pointers(ok_ty)
                 {
+                    let ok_guard = crate::resolver::DiscriminantGuard {
+                        position: disc_offset,
+                        value: 0,
+                        byte_size: ds,
+                    };
                     let mut inner_offsets = Vec::new();
                     self.collect_pointer_byte_offsets_with_layout(
                         ok_ty,
@@ -2663,18 +2723,26 @@ impl ParsedComponent {
                     );
                     for (ptr_off, layout) in inner_offsets {
                         out.push(crate::resolver::ConditionalPointerPair {
-                            discriminant_position: disc_offset,
-                            discriminant_value: 0,
+                            discriminant_position: ok_guard.position,
+                            discriminant_value: ok_guard.value,
                             ptr_position: ptr_off,
                             copy_layout: layout,
-                            discriminant_byte_size: ds,
+                            discriminant_byte_size: ok_guard.byte_size,
+                            outer_guards: outer_guards.to_vec(),
                         });
                     }
-                    self.collect_conditional_result_pointers(ok_ty, payload_offset, out);
+                    let mut nested = outer_guards.to_vec();
+                    nested.push(ok_guard);
+                    self.collect_conditional_result_pointers(ok_ty, payload_offset, &nested, out);
                 }
                 if let Some(err_ty) = err
                     && self.type_contains_pointers(err_ty)
                 {
+                    let err_guard = crate::resolver::DiscriminantGuard {
+                        position: disc_offset,
+                        value: 1,
+                        byte_size: ds,
+                    };
                     let mut inner_offsets = Vec::new();
                     self.collect_pointer_byte_offsets_with_layout(
                         err_ty,
@@ -2683,14 +2751,17 @@ impl ParsedComponent {
                     );
                     for (ptr_off, layout) in inner_offsets {
                         out.push(crate::resolver::ConditionalPointerPair {
-                            discriminant_position: disc_offset,
-                            discriminant_value: 1,
+                            discriminant_position: err_guard.position,
+                            discriminant_value: err_guard.value,
                             ptr_position: ptr_off,
                             copy_layout: layout,
-                            discriminant_byte_size: ds,
+                            discriminant_byte_size: err_guard.byte_size,
+                            outer_guards: outer_guards.to_vec(),
                         });
                     }
-                    self.collect_conditional_result_pointers(err_ty, payload_offset, out);
+                    let mut nested = outer_guards.to_vec();
+                    nested.push(err_guard);
+                    self.collect_conditional_result_pointers(err_ty, payload_offset, &nested, out);
                 }
             }
             ComponentValType::Variant(cases) => {
@@ -2706,6 +2777,11 @@ impl ParsedComponent {
                     if let Some(ty) = case_ty
                         && self.type_contains_pointers(ty)
                     {
+                        let case_guard = crate::resolver::DiscriminantGuard {
+                            position: disc_offset,
+                            value: case_idx as u32,
+                            byte_size: ds,
+                        };
                         let mut inner_offsets = Vec::new();
                         self.collect_pointer_byte_offsets_with_layout(
                             ty,
@@ -2714,14 +2790,17 @@ impl ParsedComponent {
                         );
                         for (ptr_off, layout) in inner_offsets {
                             out.push(crate::resolver::ConditionalPointerPair {
-                                discriminant_position: disc_offset,
-                                discriminant_value: case_idx as u32,
+                                discriminant_position: case_guard.position,
+                                discriminant_value: case_guard.value,
                                 ptr_position: ptr_off,
                                 copy_layout: layout,
-                                discriminant_byte_size: ds,
+                                discriminant_byte_size: case_guard.byte_size,
+                                outer_guards: outer_guards.to_vec(),
                             });
                         }
-                        self.collect_conditional_result_pointers(ty, payload_offset, out);
+                        let mut nested = outer_guards.to_vec();
+                        nested.push(case_guard);
+                        self.collect_conditional_result_pointers(ty, payload_offset, &nested, out);
                     }
                 }
             }
@@ -2729,7 +2808,7 @@ impl ParsedComponent {
                 let elem_size = self.canonical_abi_element_size(elem);
                 let mut offset = base;
                 for _ in 0..*len {
-                    self.collect_conditional_result_pointers(elem, offset, out);
+                    self.collect_conditional_result_pointers(elem, offset, outer_guards, out);
                     offset += elem_size;
                 }
             }
@@ -2738,7 +2817,7 @@ impl ParsedComponent {
                 for (_, field_ty) in fields {
                     let align = self.canonical_abi_align(field_ty);
                     offset = align_up(offset, align);
-                    self.collect_conditional_result_pointers(field_ty, offset, out);
+                    self.collect_conditional_result_pointers(field_ty, offset, outer_guards, out);
                     offset += self.canonical_abi_element_size(field_ty);
                 }
             }
@@ -2747,7 +2826,7 @@ impl ParsedComponent {
                 for elem_ty in elems {
                     let align = self.canonical_abi_align(elem_ty);
                     offset = align_up(offset, align);
-                    self.collect_conditional_result_pointers(elem_ty, offset, out);
+                    self.collect_conditional_result_pointers(elem_ty, offset, outer_guards, out);
                     offset += self.canonical_abi_element_size(elem_ty);
                 }
             }
@@ -2755,7 +2834,7 @@ impl ParsedComponent {
                 if let Some(ct) = self.get_type_definition(*idx)
                     && let ComponentTypeKind::Defined(inner) = &ct.kind
                 {
-                    self.collect_conditional_result_pointers(inner, base, out);
+                    self.collect_conditional_result_pointers(inner, base, outer_guards, out);
                 }
             }
             _ => {}
@@ -4915,6 +4994,87 @@ mod tests {
             vec![8],
             "list<u32> following record{{u32,u8}} must sit at offset 8 \
              (spec size of the preceding record), not at the unpadded 5",
+        );
+    }
+
+    /// LS-P-10 — a `ConditionalPointerPair` whose pointer lives inside a
+    /// nested option/result/variant payload must carry the full chain of
+    /// enclosing discriminants in `outer_guards`, so the adapter only fires
+    /// the cross-memory copy when *every* enclosing arm holds.
+    ///
+    /// Before the fix, `collect_conditional_pointers` / `_result_pointers`
+    /// emitted a `ConditionalPointerPair` for the leaf pointer guarded only
+    /// on the *innermost* discriminant (e.g. the option's Some byte for the
+    /// string inside `result<option<string>, u32>`). The outer Result-Ok
+    /// guard was missing, so when the runtime value was `Err(some_u32)`,
+    /// the adapter inspected the bytes that happened to occupy the option's
+    /// discriminant slot — i.e. the `u32` payload — and if those bytes
+    /// read as `1`, fired a `memory.copy` with the adjacent slots'
+    /// contents as `(ptr, len)`: a cross-component arbitrary read with
+    /// attacker-controlled length and source address [H-2 / H-4 / H-4.2].
+    /// Surfaced and clean-room-verified on PR #179. The fix threads
+    /// `outer_guards: &[DiscriminantGuard]` through both collectors and
+    /// extends `ConditionalPointerPair` with an `outer_guards` field; the
+    /// fact-adapter helpers (`emit_conditional_guard_chain_flat` /
+    /// `_byte`) emit the AND of every guard before the existing copy.
+    #[test]
+    fn ls_p_10_nested_conditional_pointer_carries_outer_guard_chain() {
+        use crate::resolver::DiscriminantGuard;
+        let pc = empty_parsed_component();
+
+        // result<option<string>, u32>. Flat layout:
+        //   [result_disc @ 0, option_disc @ 1, string_ptr @ 2, string_len @ 3]
+        // The string at flat slot 2 should fire ONLY when
+        //   result_disc == 0 (Ok) AND option_disc == 1 (Some).
+        let ty = ComponentValType::Result {
+            ok: Some(Box::new(ComponentValType::Option(Box::new(
+                ComponentValType::String,
+            )))),
+            err: Some(Box::new(ComponentValType::Primitive(PrimitiveValType::U32))),
+        };
+        let pairs = pc.conditional_pointer_pair_positions(&[("p".to_string(), ty.clone())]);
+
+        // Find the pair guarding the string leaf (innermost = option-Some
+        // at slot 1). Before the fix this was the only pair; after the fix
+        // it must also carry the outer Result-Ok guard.
+        let string_pair = pairs
+            .iter()
+            .find(|p| p.discriminant_position == 1 && p.discriminant_value == 1)
+            .expect("expected a pair for the string under option-Some");
+        assert_eq!(string_pair.ptr_position, 2);
+        assert_eq!(
+            string_pair.outer_guards,
+            vec![DiscriminantGuard {
+                position: 0,
+                value: 0,
+                byte_size: 4,
+            }],
+            "string pair inside result<option<string>, _> must AND the \
+             outer Result-Ok guard at slot 0; without it, an Err arm \
+             whose u32 byte at slot 1 reads as 1 (Some) would trigger a \
+             spurious cross-memory copy",
+        );
+
+        // Retptr / byte-offset path: the same nested type as a result with
+        // disc_size(2) = 1 byte. payload_offset = align_up(1, 4) = 4.
+        // Inner option: disc at byte 4, disc_size=1, payload at
+        // align_up(4+1, 4) = 8. String (ptr, len) at offsets 8 and 12.
+        let byte_pairs = pc.conditional_pointer_pair_result_positions(&[(None, ty)]);
+        let string_byte_pair = byte_pairs
+            .iter()
+            .find(|p| p.discriminant_position == 4 && p.discriminant_value == 1)
+            .expect("expected a byte-offset pair for the string under option-Some");
+        assert_eq!(string_byte_pair.ptr_position, 8);
+        assert_eq!(string_byte_pair.discriminant_byte_size, 1);
+        assert_eq!(
+            string_byte_pair.outer_guards,
+            vec![DiscriminantGuard {
+                position: 0,
+                value: 0,
+                byte_size: 1,
+            }],
+            "retptr-path string pair must AND the outer Result-Ok guard \
+             at byte 0; same LS-P-10 hazard, byte-offset variant",
         );
     }
 

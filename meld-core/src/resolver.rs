@@ -168,6 +168,21 @@ pub struct ReturnAreaSlot {
     pub is_pointer_pair: bool,
 }
 
+/// A single discriminant check: "the discriminant at `position` must equal
+/// `value`" (with the correct byte width for the byte-offset path).
+///
+/// The adapter loads the discriminant slot (`LocalGet` for the flat path,
+/// `I32Load{8U,16U,_}` for the byte-offset path picked by `byte_size`) and
+/// compares it to `value`. A [`ConditionalPointerPair`] copy fires only when
+/// *every* guard — its inner one plus every entry in `outer_guards` —
+/// holds simultaneously (LS-P-10).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiscriminantGuard {
+    pub position: u32,
+    pub value: u32,
+    pub byte_size: u32,
+}
+
 /// A pointer pair that is conditional on a discriminant value.
 /// Used for option<string>, result<string, E>, variant types where
 /// the pointer data only exists when the discriminant matches.
@@ -186,6 +201,18 @@ pub struct ConditionalPointerPair {
     /// (I32Load8U, I32Load16U, I32Load) for byte-offset-based paths.
     /// For flat (stack) paths, this is always 4 (i32).
     pub discriminant_byte_size: u32,
+    /// Discriminants of *enclosing* option/result/variant levels that must
+    /// also hold for the copy to fire. Empty for a single-level conditional
+    /// (e.g. `option<string>`); non-empty when the pointer lives inside a
+    /// nested conditional payload (e.g. the string inside
+    /// `result<option<string>, u32>` needs the outer Result-Ok guard at
+    /// `base` AND the inner Option-Some guard at `base+1`). Without this
+    /// chain, the adapter would inspect the *inner* discriminant byte even
+    /// in arms where the payload type is something else entirely, copying
+    /// memory based on unrelated bytes that happen to read as the inner
+    /// discriminant value — an arbitrary cross-component read with
+    /// attacker-controlled `(ptr, len)` (LS-P-10).
+    pub outer_guards: Vec<DiscriminantGuard>,
 }
 
 /// A resolved resource operation for adapter generation.

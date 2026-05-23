@@ -6,6 +6,41 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **Nested conditional pointer pair omitted outer-discriminant guard —
+  arbitrary cross-component read with attacker-controlled `(ptr, len)`**
+  (LS-P-10, UCA-P-3, H-2 / H-4 / H-4.2, `meld-core/src/parser.rs`,
+  `meld-core/src/resolver.rs`, `meld-core/src/adapter/fact.rs`). For a
+  pointer-containing type nested inside an option/result/variant arm
+  — `result<option<string>, u32>`,
+  `variant { a(option<string>), b(u32) }`, `option<option<string>>`,
+  etc. — `collect_conditional_pointers` /
+  `collect_conditional_result_pointers` emitted a
+  `ConditionalPointerPair` guarded **only** on the innermost
+  discriminant. The four FACT adapter consumer loops processed each
+  pair independently: load disc → compare to value → fire copy. When
+  the runtime value was `Err(v: u32)` (or any sibling arm whose payload
+  type is something else), the byte at the option's discriminant slot
+  was actually the `u32` payload; if those bytes happened to read as
+  `1`, the adapter sampled the adjacent slots as a `(ptr, len)` string
+  pair and ran `cabi_realloc` + `memory.copy` with attacker-controlled
+  source pointer and length — **an arbitrary cross-component memory
+  read** that also hands the callee a forged string pointer pointing
+  into the freshly allocated buffer. New `DiscriminantGuard` struct +
+  `outer_guards: Vec<DiscriminantGuard>` field on
+  `ConditionalPointerPair`; both collectors thread the enclosing
+  discriminant chain through their recursion and stamp it onto each
+  emitted pair. Two new fact-adapter helpers
+  (`emit_conditional_guard_chain_flat` /
+  `emit_conditional_guard_chain_byte`) emit each guard's `(load disc,
+  I32Const value, I32Eq)` and `I32And` them before the existing `If` /
+  copy block. The innermost guard stays in the existing
+  `discriminant_*` fields, so single-level conditionals (empty
+  `outer_guards`) behave identically. **A confirmed Mythos finding** —
+  surfaced by the mythos-auto delta-pass on PR #179, independently
+  clean-room-verified as a real memory-safety hazard, promoted to
+  approved loss scenario **LS-P-10**; regression pinned by
+  `ls_p_10_nested_conditional_pointer_carries_outer_guard_chain`.
+
 - **`total_flat_params` used `Iterator::sum::<u32>()` instead of a
   saturating fold** (LS-P-9, UCA-P-3, H-2 / H-4,
   `meld-core/src/parser.rs`). The Component Model canonical ABI picks
