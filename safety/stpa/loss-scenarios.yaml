@@ -672,6 +672,88 @@ loss-scenarios:
     status: approved
     priority: high
 
+  - id: LS-P-13
+    title: Async adapter param-copy treats every (i32, i32) pair as a pointer pair
+    uca: UCA-P-3
+    hazards: [H-2, H-4, H-4.1]
+    type: inadequate-control-algorithm
+    scenario: >
+      `meld-core/src/adapter/fact.rs::emit_param_copy_step` (called from
+      `generate_async_callback_adapter` and `generate_async_stackful_adapter`
+      — the P3-async lift paths) determines which of the caller's flat
+      param slots are `(ptr, len)` pointer pairs that need a
+      cross-memory `cabi_realloc` + `memory.copy` fixup. Instead of
+      using the resolver's `site.requirements.pointer_pair_positions`
+      slice directly (which is already the list of *flat* indices,
+      computed by `parser.rs::pointer_pair_param_positions` walking the
+      function's params with `flat_count`), the code walked
+      `caller_type.params` looking for consecutive `(i32, i32)` slots
+      and gated each match on
+      `pointer_pair_positions.iter().any(|_| true)` — semantically
+      `!is_empty()`. Every adjacent integer-pair argument was therefore
+      treated as a pointer pair whenever the function had **any**
+      string/list param. For a signature like
+      `fn f(a: i32, s: string, b: i32, c: i32)` lowered to flat params
+      `[I32, I32, I32, I32, I32]` with the resolver's positions
+      `[1]`, the buggy code emitted `positions = [0, 2]`: it then ran
+      `cabi_realloc(0, 0, 1, ptr_s_value)` (treating the string's
+      *pointer* as a length, attacker-influenced byte count), copied
+      from caller-memory address `a` (treating the integer arg as a
+      source pointer), and replaced `a` with the freshly allocated
+      buffer — corrupting plain integer args and reading from
+      attacker-controlled caller-memory addresses [UCA-P-3 / H-2
+      caller-controlled offsets / H-4.1 wrong byte length]. The real
+      string at flat index 1 was never copied. Reachable for any
+      mixed-signature async-lift fusion that crosses memories. Pure
+      single-string signatures like `fn f(s: string)` flattened to
+      `[I32, I32]` happen to behave correctly by accident — the only
+      pair the code considers is `(0, 1)`, which is the string. Same
+      shape with extra args is corrupting. Surfaced by the mythos-auto
+      delta-pass on PR #179 and clean-room verified. Fix replaces the
+      heuristic walk + emptiness check with
+      `site.requirements.pointer_pair_positions.clone()`: the resolver
+      already produces the correct flat indices and canonical lowering
+      preserves param order between caller and callee component types,
+      so the comment block claiming the positions are "in callee
+      component type order" while locals are "in caller order" was
+      misleading — flat indices computed from canonical lowering apply
+      equally to both sides. Confirmed by PoC
+      `meld-core::parser::tests::ls_p_13_pointer_pair_param_positions_is_flat_indices_not_just_nonempty`,
+      which pins the resolver contract on `(a: u32, s: string, b: u32,
+      c: u32)` returning `[1]` and on `(a, s1, b, s2, c)` returning
+      `[1, 4]` — the invariants the async adapter now consumes
+      directly.
+    causal-factors:
+      - >-
+        `.any(|_| true)` was a stand-in placeholder pattern that should
+        have been `.any(|&pos| pos == i as u32)` (and that, in turn,
+        should have been the cleaner direct use of the resolver's
+        positions); the placeholder was never replaced and the
+        predicate name made it look intentional
+      - >-
+        The comment block at the top of `emit_param_copy_step`
+        claimed the resolver's positions were "in callee component
+        type order" — implying a caller/callee mismatch the function
+        needed to work around — but
+        `pointer_pair_param_positions` returns *flat* indices
+        computed from the canonical-lowered param list, which
+        canonical lowering preserves identically between caller and
+        callee component-type matched signatures
+      - >-
+        No regression test exercised `emit_param_copy_step` with a
+        mixed-signature async export crossing memories; the
+        `tests/p3_async_lowering.rs` coverage focuses on trampoline
+        shape and event codes, not parameter copy correctness
+    process-model-flaw: >
+      The mental model was "verify there's *something* to copy before
+      walking the flat params," which collapsed the per-position
+      identity check into an emptiness check. The right invariant
+      ("this specific flat slot is a pointer pair") was encoded in
+      the resolver's positions all along — the adapter just discarded
+      them.
+    status: approved
+    priority: high
+
   # ==========================================================================
   # Resolver scenarios
   # ==========================================================================

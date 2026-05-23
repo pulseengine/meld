@@ -4335,47 +4335,27 @@ impl FactStyleGenerator {
         callee_param_count: usize,
         scratch_local: u32,
     ) {
-        // The pointer_pair_positions from the resolver are in CALLEE
-        // component type order. But the adapter's locals are in CALLER
-        // order (from the caller's canon lower). These may differ if the
-        // component type reorders params.
-        //
-        // Instead of using the resolver's positions, compute positions from
-        // the caller's flat param types: find (i32, i32) pairs that could
-        // be (ptr, len) strings/lists.
+        // `pointer_pair_positions` from the resolver are flat indices into
+        // the component-type param list, computed by
+        // `pointer_pair_param_positions` walking the function's params with
+        // `flat_count`. Canonical lowering preserves param order, so those
+        // flat indices apply equally to the caller's lowered param locals
+        // (the retptr the adapter inserts for results is appended after the
+        // component-type params, so it never collides with a position from
+        // this slice). LS-P-13: the previous code walked `caller_type.params`
+        // looking for consecutive `(i32, i32)` slots and joined each with
+        // `pointer_pair_positions.iter().any(|_| true)` — semantically
+        // `!is_empty()`. Every adjacent integer-pair argument was then
+        // treated as a (ptr, len) string/list and rewritten via
+        // `cabi_realloc` + `memory.copy`, corrupting plain integer args at
+        // the callee. Replaces that with the resolver's positions directly.
+        let _ = (caller_type, caller_param_count, callee_param_count);
         let callee_realloc = crate::merger::component_realloc_index(merged, site.to_component);
         let callee_memory = crate::merger::component_memory_index(merged, site.to_component);
         let caller_memory = crate::merger::component_memory_index(merged, site.from_component);
 
         let caller_ptr_positions: Vec<u32> = if site.crosses_memory && callee_realloc.is_some() {
-            let params = &caller_type.params;
-            let has_retptr =
-                caller_type.results.is_empty() && caller_param_count > callee_param_count;
-            let effective_len = if has_retptr {
-                params.len() - 1
-            } else {
-                params.len()
-            };
-            let mut positions = Vec::new();
-            let mut i = 0;
-            while i + 1 < effective_len {
-                // A (i32, i32) pair is a candidate pointer/length pair; the
-                // resolver confirms via component-type info.
-                if params[i] == wasm_encoder::ValType::I32
-                    && params[i + 1] == wasm_encoder::ValType::I32
-                    && site
-                        .requirements
-                        .pointer_pair_positions
-                        .iter()
-                        .any(|_| true)
-                {
-                    positions.push(i as u32);
-                    i += 2;
-                    continue;
-                }
-                i += 1;
-            }
-            positions
+            site.requirements.pointer_pair_positions.clone()
         } else {
             Vec::new()
         };

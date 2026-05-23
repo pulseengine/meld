@@ -5094,6 +5094,83 @@ mod tests {
         }
     }
 
+    /// LS-P-13 — `pointer_pair_param_positions` returns *flat* indices into
+    /// the function's lowered param list, and the async FACT adapter's
+    /// param-copy step must use those positions directly.
+    ///
+    /// Before the fix, the async adapter
+    /// (`fact.rs::emit_param_copy_step`) ignored the resolver's positions
+    /// and walked `caller_type.params` looking for consecutive `(i32, i32)`
+    /// slots, gating each match on
+    /// `pointer_pair_positions.iter().any(|_| true)` — semantically
+    /// `!is_empty()`. Every adjacent `(i32, i32)` argument was then
+    /// treated as a `(ptr, len)` string/list and rewritten via
+    /// `cabi_realloc` + `memory.copy`, corrupting plain integer args
+    /// (and reading from attacker-controlled addresses when those
+    /// integers came from a caller). For a signature like
+    /// `(a: u32, s: string, b: u32, c: u32)` the buggy code produced
+    /// `positions = [0, 2]` instead of the correct `[1]`. This test
+    /// pins the resolver contract the fix relies on: positions ARE
+    /// flat indices into the canonical-lowered param list, and
+    /// adjacent flat indices in the result correspond to the actual
+    /// pointer pairs (not every (i32, i32) shape).
+    #[test]
+    fn ls_p_13_pointer_pair_param_positions_is_flat_indices_not_just_nonempty() {
+        let pc = empty_parsed_component();
+        // (a: u32, s: string, b: u32, c: u32) → flat layout
+        //   [a@0, ptr_s@1, len_s@2, b@3, c@4]
+        // The only pointer pair is the string at flat index 1.
+        let params = vec![
+            (
+                "a".to_string(),
+                ComponentValType::Primitive(PrimitiveValType::U32),
+            ),
+            ("s".to_string(), ComponentValType::String),
+            (
+                "b".to_string(),
+                ComponentValType::Primitive(PrimitiveValType::U32),
+            ),
+            (
+                "c".to_string(),
+                ComponentValType::Primitive(PrimitiveValType::U32),
+            ),
+        ];
+        assert_eq!(
+            pc.pointer_pair_param_positions(&params),
+            vec![1],
+            "the string is the only pointer pair; pre-LS-P-13 the async \
+             adapter would have copied `(a, ptr_s)` and `(len_s, b)` as if \
+             both were string ptr-pairs, corrupting plain integer args",
+        );
+
+        // Two strings interleaved with integers:
+        // (a, s1, b, s2, c) → flat [a@0, ptr1@1, len1@2, b@3, ptr2@4, len2@5, c@6]
+        // Pointer pairs at flat indices [1, 4].
+        let mixed = vec![
+            (
+                "a".to_string(),
+                ComponentValType::Primitive(PrimitiveValType::U32),
+            ),
+            ("s1".to_string(), ComponentValType::String),
+            (
+                "b".to_string(),
+                ComponentValType::Primitive(PrimitiveValType::U32),
+            ),
+            ("s2".to_string(), ComponentValType::String),
+            (
+                "c".to_string(),
+                ComponentValType::Primitive(PrimitiveValType::U32),
+            ),
+        ];
+        assert_eq!(
+            pc.pointer_pair_param_positions(&mixed),
+            vec![1, 4],
+            "pointer_pair_param_positions must return flat indices for \
+             EVERY pointer pair, in order — the async adapter clones this \
+             Vec directly to drive its per-pair cabi_realloc + memory.copy",
+        );
+    }
+
     /// LS-P-10 — a `ConditionalPointerPair` whose pointer lives inside a
     /// nested option/result/variant payload must carry the full chain of
     /// enclosing discriminants in `outer_guards`, so the adapter only fires

@@ -6,6 +6,35 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **Async adapter param-copy treated every consecutive `(i32, i32)`
+  pair as a pointer pair, corrupting plain integer args** (LS-P-13,
+  UCA-P-3, H-2 / H-4 / H-4.1,
+  `meld-core/src/adapter/fact.rs`). The P3-async lift adapter
+  (`emit_param_copy_step`, called from
+  `generate_async_callback_adapter` /
+  `generate_async_stackful_adapter`) walked `caller_type.params`
+  looking for adjacent `(i32, i32)` slots and gated each match on
+  `pointer_pair_positions.iter().any(|_| true)` — semantically
+  `!is_empty()`. Every adjacent integer-pair argument was rewritten
+  via `cabi_realloc` + cross-memory `memory.copy` as if it were a
+  `(ptr, len)` string/list, using one integer as the source pointer
+  and the other as the byte count. For `fn f(a, s: string, b, c)`
+  the buggy code copied `(a, ptr_s)` and `(len_s, b)` as
+  pointer-pair slots and missed the real string at flat index 1 —
+  callee saw corrupted integer args, the real string was never
+  copied, and `memory.copy` read from caller-memory addresses
+  influenced by the caller. The resolver's
+  `pointer_pair_param_positions` already returns the correct *flat*
+  indices (computed via `flat_count`), and canonical lowering
+  preserves param order between caller and callee component types —
+  the heuristic walk's claim of a caller/callee mismatch was
+  misleading. Replaces the whole walk with
+  `site.requirements.pointer_pair_positions.clone()`. **A confirmed
+  Mythos finding** — surfaced by the mythos-auto delta-pass on PR
+  #179, clean-room verified. Promoted to approved loss scenario
+  **LS-P-13** (priority high); regression pinned by
+  `ls_p_13_pointer_pair_param_positions_is_flat_indices_not_just_nonempty`.
+
 - **`list<option<string>>` / `list<result<string, _>>` / `list<variant
   with string payload>` silently produced stale cross-memory pointers
   in callee elements — defensive refusal (partial mitigation)** (LS-P-12,
