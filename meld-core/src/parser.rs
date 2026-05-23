@@ -3130,6 +3130,31 @@ impl ParsedComponent {
                 let inner_ptrs = self.element_inner_pointers(inner, 0);
                 let inner_res = self.element_inner_resources(inner, 0);
                 if inner_ptrs.is_empty() && inner_res.is_empty() {
+                    // LS-P-12 safety check: if the element type contains
+                    // pointers that `element_inner_pointers` didn't find
+                    // (currently happens for option/result/variant element
+                    // payloads — those arms aren't yet implemented), returning
+                    // `Bulk { element_size }` would copy the raw bytes
+                    // including stale `(ptr, len)` pairs that still reference
+                    // the source component's memory. Refuse to generate the
+                    // adapter rather than silently corrupting list elements;
+                    // the full structural fix (per-element conditional inner
+                    // pointer fixup) is tracked as the LS-P-12 follow-up.
+                    if self.type_contains_pointers(inner) {
+                        panic!(
+                            "LS-P-12: list element type contains a pointer-\
+                             bearing option/result/variant payload that is \
+                             not yet supported by the per-element fixup loop \
+                             (element_inner_pointers does not recurse into \
+                             these arms). Generating an adapter would silently \
+                             copy raw bytes including stale string/list \
+                             pointers into the callee's memory — refusing \
+                             rather than corrupting. Workaround: avoid \
+                             list<option<…>> / list<result<…>> / list<variant>\
+                             {{ …(string/list)… }} until LS-P-12 lands. \
+                             Inner type: {inner:?}",
+                        );
+                    }
                     CopyLayout::Bulk {
                         byte_multiplier: element_size,
                     }
@@ -4995,6 +5020,78 @@ mod tests {
             "list<u32> following record{{u32,u8}} must sit at offset 8 \
              (spec size of the preceding record), not at the unpadded 5",
         );
+    }
+
+    /// LS-P-12 — `copy_layout(List(inner))` must refuse rather than silently
+    /// emit `Bulk` for a list element type that contains a pointer-bearing
+    /// option/result/variant payload.
+    ///
+    /// `element_inner_pointers` currently has no arms for `Option` / `Result`
+    /// / `Variant` (its match falls through to `_ => {}`) — so for
+    /// `list<option<string>>` it returns the empty Vec, and the existing
+    /// `copy_layout` would happily produce `CopyLayout::Bulk { byte_multiplier:
+    /// element_size }`. The FACT adapter's Bulk path is a flat
+    /// `memory.copy(dst, src, len * element_size)` with NO per-element walk:
+    /// every option's `(ptr, len)` is copied byte-for-byte into the callee,
+    /// where `ptr` still references the *source* component's memory. The
+    /// callee then dereferences a wild pointer for each `Some(...)` element —
+    /// a cross-memory dangling-reference / arbitrary read on each list use.
+    /// Surfaced by the mythos-auto delta-pass on PR #179 and clean-room
+    /// verified as reachable for `list<option<string>>`,
+    /// `list<result<string, _>>`, and `list<variant { …(string)… }>`. The
+    /// per-element conditional fixup the full fix requires (Option/Result/
+    /// Variant arms on `element_inner_pointers` + per-element discriminant
+    /// guards threaded through the inner-pointer descriptor and the adapter's
+    /// fixup loop) is structural follow-up work; this commit's mitigation is
+    /// to *refuse to generate the adapter* for these types, converting silent
+    /// corruption into a loud `panic!` at adapter-generation time.
+    #[test]
+    #[should_panic(expected = "LS-P-12")]
+    fn ls_p_12_list_of_option_string_refuses_rather_than_silently_corrupts() {
+        let pc = empty_parsed_component();
+        let list_opt_string = ComponentValType::List(Box::new(ComponentValType::Option(Box::new(
+            ComponentValType::String,
+        ))));
+        // Pre-fix: returns Bulk { byte_multiplier: 12 } and the adapter
+        // silently produces stale string pointers in callee elements.
+        // Post-fix: panics with an LS-P-12 message — full per-element
+        // conditional fixup tracked as structural follow-up.
+        let _ = pc.copy_layout(&list_opt_string);
+    }
+
+    /// LS-P-12 also covers `list<result<string, _>>`: the result's payload
+    /// holds a string in the Ok arm; `element_inner_pointers` doesn't
+    /// recurse into Result, so the same silent-corruption hazard applies.
+    #[test]
+    #[should_panic(expected = "LS-P-12")]
+    fn ls_p_12_list_of_result_string_refuses() {
+        let pc = empty_parsed_component();
+        let list_result_string = ComponentValType::List(Box::new(ComponentValType::Result {
+            ok: Some(Box::new(ComponentValType::String)),
+            err: Some(Box::new(ComponentValType::Primitive(PrimitiveValType::U32))),
+        }));
+        let _ = pc.copy_layout(&list_result_string);
+    }
+
+    /// Sanity: a list whose element contains NO pointers must still produce
+    /// `Bulk` (no panic). This pins down that LS-P-12's check is gated on
+    /// `type_contains_pointers(inner)` — pure-scalar option/result payloads
+    /// are unaffected by the conservative refusal.
+    #[test]
+    fn ls_p_12_pure_scalar_option_list_is_still_bulk() {
+        use crate::resolver::CopyLayout;
+        let pc = empty_parsed_component();
+        // option<u32> contains no pointer; copy_layout(list<option<u32>>)
+        // must still classify as Bulk and not panic.
+        let list_opt_u32 = ComponentValType::List(Box::new(ComponentValType::Option(Box::new(
+            ComponentValType::Primitive(PrimitiveValType::U32),
+        ))));
+        match pc.copy_layout(&list_opt_u32) {
+            CopyLayout::Bulk { .. } => {}
+            CopyLayout::Elements { .. } => {
+                panic!("list<option<u32>> must still be Bulk (no inner pointers)")
+            }
+        }
     }
 
     /// LS-P-10 — a `ConditionalPointerPair` whose pointer lives inside a

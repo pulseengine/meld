@@ -6,6 +6,39 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **`list<option<string>>` / `list<result<string, _>>` / `list<variant
+  with string payload>` silently produced stale cross-memory pointers
+  in callee elements — defensive refusal (partial mitigation)** (LS-P-12,
+  UCA-P-3, H-4 / H-4.2, `meld-core/src/parser.rs`).
+  `element_inner_pointers` (the helper that builds the per-element
+  inner-pointer descriptor consumed by `CopyLayout::Elements`) has no
+  arms for `Option` / `Result` / `Variant` — its match falls through
+  to `_ => {}`. So `copy_layout(list<option<string>>)` (and the
+  Result/Variant analogues) classified as `CopyLayout::Bulk {
+  byte_multiplier }` with no per-element pointer walk — even though
+  `type_contains_pointers(option<string>) == true`. The FACT adapter's
+  Bulk path is a flat `memory.copy(dst, src, len * byte_mult)` with
+  no per-element fixup, so every option's `(ptr, len)` pair was copied
+  verbatim into the callee — `ptr` still referencing the *source*
+  component's memory. The callee then dereferenced a wild pointer for
+  each `Some(...)` element. **Mitigation only**: `copy_layout` now
+  detects the smoking gun (`element_inner_pointers` empty AND
+  `type_contains_pointers(inner)`) and panics with a clearly-labelled
+  `LS-P-12: …` message at adapter-generation time, converting silent
+  cross-memory dangling-reference into a loud refusal. The full
+  structural fix — Option/Result/Variant arms on `element_inner_pointers`,
+  per-element `DiscriminantGuard` chains on the inner-pointer
+  descriptor, and adapter-side per-element guard evaluation
+  (structurally analogous to LS-P-10 on the list-element axis) — is
+  tracked as follow-up. **A confirmed Mythos finding** — surfaced by
+  the mythos-auto delta-pass on PR #179, clean-room verified.
+  Promoted to approved loss scenario **LS-P-12** (priority high).
+  Regression pinned by
+  `ls_p_12_list_of_option_string_refuses_rather_than_silently_corrupts`,
+  `ls_p_12_list_of_result_string_refuses`, and a positive sanity test
+  `ls_p_12_pure_scalar_option_list_is_still_bulk` that pins the check
+  is gated on `type_contains_pointers(inner)`.
+
 - **Flat-name resolver silently overwrote duplicate module exports**
   (LS-P-11, UCA-R-3, H-5 / H-1, `meld-core/src/resolver.rs`,
   `meld-core/src/error.rs`). `resolve_via_flat_names` built its export

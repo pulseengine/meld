@@ -587,6 +587,91 @@ loss-scenarios:
     status: approved
     priority: low
 
+  - id: LS-P-12
+    title: List of pointer-bearing option/result/variant — silent stale pointer corruption
+    uca: UCA-P-3
+    hazards: [H-4, H-4.2]
+    type: inadequate-process-model
+    scenario: >
+      `meld-core/src/parser.rs::element_inner_pointers` walks the byte
+      layout of a list-element type and returns each inner `(byte_offset,
+      copy_layout)` pointer pair so the FACT adapter can do per-element
+      fixup (allocate in callee memory, copy the pointed-to bytes, replace
+      the source ptr with the callee's). The function handles `String`,
+      `List`, `FixedSizeList`, `Record`, `Tuple`, and `Type`-aliased
+      versions of those, plus a `_ => {}` catch-all (line 3203) that
+      silently drops `Option`, `Result`, `Variant`, `Flags`, and `Enum`.
+      As a consequence, `copy_layout(list<option<string>>)`,
+      `copy_layout(list<result<string, _>>)`, and
+      `copy_layout(list<variant { …(string)… }>)` all classified as
+      `CopyLayout::Bulk { byte_multiplier: element_size }` — because
+      `element_inner_pointers(option<string>, 0)` returns the empty
+      vector even though `type_contains_pointers(option<string>)` is
+      true. The FACT adapter's Bulk path (`adapter/fact.rs:1564-1575` /
+      `2317-2331` / `2534-2549`) is a flat `memory.copy(dst, src,
+      len * byte_multiplier)` with **no per-element walk** — so every
+      copied option's `(ptr, len)` pair is written byte-for-byte into
+      the callee's memory, with `ptr` still referencing the *source*
+      component's linear memory. The callee then dereferences a wild
+      pointer for each `Some(...)` element — a cross-memory
+      dangling-reference / arbitrary read on every list use
+      [UCA-P-3 / H-4 wrong adapter / H-4.2 missing pointer fixup].
+      `ConditionalPointerPair` (LS-P-7, LS-P-10) does not rescue this:
+      `collect_conditional_pointers` drops `List(_)` at its own
+      `_ => {}` arm, and `collect_pointer_positions_with_layout` stops
+      at `List(_)` and emits the pair with the (here Bulk) layout from
+      `copy_layout`. Reachable for any non-empty `list<option<string>>`
+      passed across a component boundary. Surfaced by the mythos-auto
+      delta-pass on PR #179 and clean-room verified.
+      **This commit is the conservative mitigation**, not the full fix.
+      The proper fix needs (a) `Option`/`Result`/`Variant` arms on
+      `element_inner_pointers` that recurse into the payload at the
+      payload byte offset, AND (b) extending the
+      `inner_pointers` descriptor on `CopyLayout::Elements` (currently
+      `Vec<(u32, CopyLayout)>`) with per-element `DiscriminantGuard`
+      chains, AND (c) updating the FACT per-element fixup loop in
+      `fact.rs` to evaluate those guards before each inner copy. That
+      is structurally analogous to LS-P-10 but on the list-element axis
+      rather than the top-level conditional axis — material follow-up
+      work tracked separately. Until then, `copy_layout` panics with a
+      clearly-labelled `LS-P-12: …` message when it would otherwise
+      have produced the corrupting `Bulk` classification, and the
+      panic includes the offending element type in the diagnostic so
+      WIT authors and tool integrators see why the adapter can't be
+      generated. Confirmed by PoC
+      `meld-core::parser::tests::ls_p_12_list_of_option_string_refuses_rather_than_silently_corrupts`
+      (plus the `list<result<string, _>>` variant); a positive sanity
+      test (`ls_p_12_pure_scalar_option_list_is_still_bulk`) pins the
+      check is gated on `type_contains_pointers(inner)` so pure-scalar
+      `list<option<u32>>` etc. remain `Bulk` as before.
+    causal-factors:
+      - >-
+        `element_inner_pointers` was written when only Record/Tuple
+        pointer-bearing list elements were considered; the
+        Option/Result/Variant arms were never added and the
+        `_ => {}` catch-all silently dropped them
+      - >-
+        `copy_layout(List(inner))` accepted the empty inner-pointer
+        list from a pointer-bearing inner type and produced `Bulk`,
+        the corrupting classification, with no consistency check
+      - >-
+        The adapter's per-element fixup machinery does not yet
+        support per-element discriminant guards — required for
+        conditional inner pointer fixup
+      - >-
+        No regression test exercised `list<option<string>>` or any
+        nested-conditional list element
+    process-model-flaw: >
+      The shared model between `element_inner_pointers` and
+      `copy_layout` was "if the inner-pointer set is empty, the element
+      has no pointers and a flat byte copy is correct" — but emptiness
+      came from the missing arms, not from absence-of-pointers. The
+      `type_contains_pointers(inner)` predicate already encoded the
+      right invariant; it just wasn't checked alongside the emptiness
+      decision.
+    status: approved
+    priority: high
+
   # ==========================================================================
   # Resolver scenarios
   # ==========================================================================
