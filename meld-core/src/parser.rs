@@ -1587,7 +1587,7 @@ impl ParsedComponent {
             // overflows — debug panic, release wrap-to-small. The
             // wrapped value would size a too-small cabi_realloc buffer
             // and the adapter would write OOB (LS-P-6).
-            size = size.saturating_add(self.canonical_abi_size_unpadded(ty));
+            size = size.saturating_add(self.canonical_abi_element_size(ty));
         }
         // Align final size to the max alignment of the tuple
         let max_align = results
@@ -1620,7 +1620,7 @@ impl ParsedComponent {
             // above and LS-P-6: a bare `+=` on a u32::MAX accumulator
             // overflows, wrapping the params buffer size down to a
             // small value that under-allocates the cabi_realloc buffer.
-            size = size.saturating_add(self.canonical_abi_size_unpadded(ty));
+            size = size.saturating_add(self.canonical_abi_element_size(ty));
         }
         // Align final size to the max alignment of the tuple
         let max_align = params
@@ -1655,7 +1655,7 @@ impl ParsedComponent {
             let align = self.canonical_abi_align(ty);
             byte_offset = align_up(byte_offset, align);
             self.collect_pointer_byte_offsets(ty, byte_offset, &mut offsets);
-            byte_offset += self.canonical_abi_size_unpadded(ty);
+            byte_offset += self.canonical_abi_element_size(ty);
         }
         offsets
     }
@@ -1675,7 +1675,7 @@ impl ParsedComponent {
             let align = self.canonical_abi_align(ty);
             byte_offset = align_up(byte_offset, align);
             self.collect_return_area_type_slots(ty, byte_offset, &mut slots);
-            byte_offset += self.canonical_abi_size_unpadded(ty);
+            byte_offset += self.canonical_abi_element_size(ty);
         }
         slots
     }
@@ -1696,7 +1696,7 @@ impl ParsedComponent {
             let align = self.canonical_abi_align(ty);
             byte_offset = align_up(byte_offset, align);
             self.collect_return_area_type_slots(ty, byte_offset, &mut slots);
-            byte_offset += self.canonical_abi_size_unpadded(ty);
+            byte_offset += self.canonical_abi_element_size(ty);
         }
         slots
     }
@@ -1740,7 +1740,7 @@ impl ParsedComponent {
                     let align = self.canonical_abi_align(field_ty);
                     offset = align_up(offset, align);
                     self.collect_return_area_type_slots(field_ty, offset, out);
-                    offset += self.canonical_abi_size_unpadded(field_ty);
+                    offset += self.canonical_abi_element_size(field_ty);
                 }
             }
             ComponentValType::Tuple(elems) => {
@@ -1749,7 +1749,7 @@ impl ParsedComponent {
                     let align = self.canonical_abi_align(elem_ty);
                     offset = align_up(offset, align);
                     self.collect_return_area_type_slots(elem_ty, offset, out);
-                    offset += self.canonical_abi_size_unpadded(elem_ty);
+                    offset += self.canonical_abi_element_size(elem_ty);
                 }
             }
             ComponentValType::Variant(cases) => {
@@ -2003,7 +2003,7 @@ impl ParsedComponent {
             let align = self.canonical_abi_align(ty);
             byte_offset = align_up(byte_offset, align);
             self.collect_resource_byte_positions(ty, byte_offset, &mut positions);
-            byte_offset += self.canonical_abi_size_unpadded(ty);
+            byte_offset += self.canonical_abi_element_size(ty);
         }
         positions
     }
@@ -2039,7 +2039,7 @@ impl ParsedComponent {
                     let align = self.canonical_abi_align(field_ty);
                     offset = align_up(offset, align);
                     self.collect_resource_byte_positions(field_ty, offset, out);
-                    offset += self.canonical_abi_size_unpadded(field_ty);
+                    offset += self.canonical_abi_element_size(field_ty);
                 }
             }
             ComponentValType::Tuple(elems) => {
@@ -2048,7 +2048,7 @@ impl ParsedComponent {
                     let align = self.canonical_abi_align(elem_ty);
                     offset = align_up(offset, align);
                     self.collect_resource_byte_positions(elem_ty, offset, out);
-                    offset += self.canonical_abi_size_unpadded(elem_ty);
+                    offset += self.canonical_abi_element_size(elem_ty);
                 }
             }
             ComponentValType::Option(inner) => {
@@ -2140,7 +2140,7 @@ impl ParsedComponent {
                 });
             }
             flat_idx += self.flat_count(ty);
-            byte_offset += self.canonical_abi_size_unpadded(ty);
+            byte_offset += self.canonical_abi_element_size(ty);
         }
         positions
     }
@@ -2227,7 +2227,7 @@ impl ParsedComponent {
             let align = self.canonical_abi_align(ty);
             byte_offset = align_up(byte_offset, align);
             self.collect_pointer_byte_offsets(ty, byte_offset, &mut offsets);
-            byte_offset += self.canonical_abi_size_unpadded(ty);
+            byte_offset += self.canonical_abi_element_size(ty);
         }
         offsets
     }
@@ -2344,7 +2344,7 @@ impl ParsedComponent {
                     let align = self.canonical_abi_align(field_ty);
                     offset = align_up(offset, align);
                     self.collect_pointer_byte_offsets(field_ty, offset, out);
-                    offset += self.canonical_abi_size_unpadded(field_ty);
+                    offset += self.canonical_abi_element_size(field_ty);
                 }
             }
             ComponentValType::Tuple(elems) => {
@@ -2353,7 +2353,7 @@ impl ParsedComponent {
                     let align = self.canonical_abi_align(elem_ty);
                     offset = align_up(offset, align);
                     self.collect_pointer_byte_offsets(elem_ty, offset, out);
-                    offset += self.canonical_abi_size_unpadded(elem_ty);
+                    offset += self.canonical_abi_element_size(elem_ty);
                 }
             }
             ComponentValType::Type(idx) => {
@@ -2394,7 +2394,7 @@ impl ParsedComponent {
                     let align = self.canonical_abi_align(field_ty);
                     offset = align_up(offset, align);
                     self.collect_pointer_byte_offsets_with_layout(field_ty, offset, out);
-                    offset += self.canonical_abi_size_unpadded(field_ty);
+                    offset += self.canonical_abi_element_size(field_ty);
                 }
             }
             ComponentValType::Tuple(elems) => {
@@ -2403,7 +2403,7 @@ impl ParsedComponent {
                     let align = self.canonical_abi_align(elem_ty);
                     offset = align_up(offset, align);
                     self.collect_pointer_byte_offsets_with_layout(elem_ty, offset, out);
-                    offset += self.canonical_abi_size_unpadded(elem_ty);
+                    offset += self.canonical_abi_element_size(elem_ty);
                 }
             }
             ComponentValType::Type(idx) => {
@@ -2458,7 +2458,7 @@ impl ParsedComponent {
             let align = self.canonical_abi_align(ty);
             byte_offset = align_up(byte_offset, align);
             self.collect_conditional_result_pointers(ty, byte_offset, &mut out);
-            byte_offset += self.canonical_abi_size_unpadded(ty);
+            byte_offset += self.canonical_abi_element_size(ty);
         }
         out
     }
@@ -2729,7 +2729,7 @@ impl ParsedComponent {
                     let align = self.canonical_abi_align(field_ty);
                     offset = align_up(offset, align);
                     self.collect_conditional_result_pointers(field_ty, offset, out);
-                    offset += self.canonical_abi_size_unpadded(field_ty);
+                    offset += self.canonical_abi_element_size(field_ty);
                 }
             }
             ComponentValType::Tuple(elems) => {
@@ -2738,7 +2738,7 @@ impl ParsedComponent {
                     let align = self.canonical_abi_align(elem_ty);
                     offset = align_up(offset, align);
                     self.collect_conditional_result_pointers(elem_ty, offset, out);
-                    offset += self.canonical_abi_size_unpadded(elem_ty);
+                    offset += self.canonical_abi_element_size(elem_ty);
                 }
             }
             ComponentValType::Type(idx) => {
@@ -2938,7 +2938,7 @@ impl ParsedComponent {
                 for (_, field_ty) in fields {
                     let align = self.canonical_abi_align(field_ty);
                     size = align_up(size, align);
-                    size = size.saturating_add(self.canonical_abi_size_unpadded(field_ty));
+                    size = size.saturating_add(self.canonical_abi_element_size(field_ty));
                 }
                 size
             }
@@ -2947,7 +2947,7 @@ impl ParsedComponent {
                 for elem_ty in elems {
                     let align = self.canonical_abi_align(elem_ty);
                     size = align_up(size, align);
-                    size = size.saturating_add(self.canonical_abi_size_unpadded(elem_ty));
+                    size = size.saturating_add(self.canonical_abi_element_size(elem_ty));
                 }
                 size
             }
@@ -3092,7 +3092,7 @@ impl ParsedComponent {
                     let align = self.canonical_abi_align(field_ty);
                     offset = align_up(offset, align);
                     result.extend(self.element_inner_pointers(field_ty, offset));
-                    offset += self.canonical_abi_size_unpadded(field_ty);
+                    offset += self.canonical_abi_element_size(field_ty);
                 }
             }
             ComponentValType::Tuple(elems) => {
@@ -3101,7 +3101,7 @@ impl ParsedComponent {
                     let align = self.canonical_abi_align(elem_ty);
                     offset = align_up(offset, align);
                     result.extend(self.element_inner_pointers(elem_ty, offset));
-                    offset += self.canonical_abi_size_unpadded(elem_ty);
+                    offset += self.canonical_abi_element_size(elem_ty);
                 }
             }
             ComponentValType::Type(idx) => {
@@ -3148,7 +3148,7 @@ impl ParsedComponent {
                     let align = self.canonical_abi_align(field_ty);
                     offset = align_up(offset, align);
                     result.extend(self.element_inner_resources(field_ty, offset));
-                    offset = offset.saturating_add(self.canonical_abi_size_unpadded(field_ty));
+                    offset = offset.saturating_add(self.canonical_abi_element_size(field_ty));
                 }
             }
             ComponentValType::Tuple(elems) => {
@@ -3157,7 +3157,7 @@ impl ParsedComponent {
                     let align = self.canonical_abi_align(elem_ty);
                     offset = align_up(offset, align);
                     result.extend(self.element_inner_resources(elem_ty, offset));
-                    offset = offset.saturating_add(self.canonical_abi_size_unpadded(elem_ty));
+                    offset = offset.saturating_add(self.canonical_abi_element_size(elem_ty));
                 }
             }
             ComponentValType::Type(idx) => {
@@ -4817,6 +4817,95 @@ mod tests {
             ),
             CopyLayout::Elements { .. } => panic!("list<u64> should be Bulk"),
         }
+    }
+
+    /// LS-P-8 — record/tuple field-walk accumulation must add each field's
+    /// *padded* canonical-ABI footprint (`canonical_abi_element_size`), not the
+    /// `_unpadded` value.
+    ///
+    /// Before the fix, ~25 field-walk sites (the `Record` / `Tuple` arms of
+    /// `canonical_abi_size_unpadded`, `collect_pointer_byte_offsets`,
+    /// `collect_pointer_byte_offsets_with_layout`,
+    /// `collect_conditional_result_pointers`, `collect_return_area_type_slots`,
+    /// `collect_resource_byte_positions`, `element_inner_pointers`,
+    /// `element_inner_resources`, plus the top-level params/results walks in
+    /// `params_area_byte_size`, `return_area_byte_size`,
+    /// `pointer_pair_params_byte_offsets`, `pointer_pair_result_offsets`,
+    /// `params_area_slots`, `return_area_slots`, `resource_params_area_positions`,
+    /// `resource_result_positions`, and
+    /// `conditional_pointer_pair_result_positions`) advanced the running offset
+    /// by `canonical_abi_size_unpadded(field)`. The Component Model spec says
+    /// `s += size(field)` where `size(field)` for an aggregate field is the
+    /// field's full padded size (= this codebase's `canonical_abi_element_size`).
+    /// The per-field `align_up(offset, next_field_align)` does NOT re-absorb a
+    /// preceding field's trailing pad when the next field has *smaller*
+    /// alignment — so a record/tuple containing a padded aggregate followed by
+    /// a lower-aligned field came out smaller than the spec, and a list-copy
+    /// adapter built from those offsets used wrong byte offsets / multipliers.
+    /// Surfaced by the mythos-auto delta-pass on PR #179 (the auto-runner
+    /// mis-located the bug as the option/variant/result payload contribution;
+    /// independent clean-room verification corrected it to the Record/Tuple
+    /// field accumulation).
+    #[test]
+    fn ls_p_8_record_tuple_field_accumulation_uses_padded_field_size() {
+        let pc = empty_parsed_component();
+
+        // Inner record { a: u32, b: u8 } — align 4, spec size 8, unpadded 5.
+        let r_in = ComponentValType::Record(vec![
+            (
+                "a".to_string(),
+                ComponentValType::Primitive(PrimitiveValType::U32),
+            ),
+            (
+                "b".to_string(),
+                ComponentValType::Primitive(PrimitiveValType::U8),
+            ),
+        ]);
+
+        // Outer tuple<R_in, u8> — the canonical bug shape: padded aggregate
+        // followed by a lower-aligned trailing field. Pre-fix:
+        // unpadded(R_in)=5 → b at offset 5, total 6, element_size 8.
+        // Post-fix per spec: element_size(R_in)=8 → b at offset 8, total 9,
+        // element_size 12.
+        let t = ComponentValType::Tuple(vec![
+            r_in.clone(),
+            ComponentValType::Primitive(PrimitiveValType::U8),
+        ]);
+
+        // element_size must equal spec size(T) = 12.
+        assert_eq!(
+            pc.canonical_abi_element_size(&t),
+            12,
+            "element_size(tuple<record{{u32,u8}}, u8>) must match spec size = 12",
+        );
+
+        // params_area_byte_size: top-level params walk follows the same spec
+        // record_size rule, then aligns to max-align. params [R_in, u8]:
+        // align_up(0,4)=0, +8=8; align_up(8,1)=8, +1=9; final align_up(9,4)=12.
+        let params = vec![("p".to_string(), r_in.clone()), ("q".to_string(), t)];
+        assert_eq!(
+            pc.params_area_byte_size(&params),
+            // p (R_in): 0, +8 = 8.  q (T = element_size 12, align 4):
+            // align_up(8,4)=8, +12=20. final align_up(20, max_align=4)=20.
+            20,
+            "params_area_byte_size must add each top-level param's padded \
+             element_size, not its unpadded size",
+        );
+
+        // pointer_pair_result_offsets: with `tuple<R_in, list<u32>>` the
+        // list<u32> must be located at offset 8 (after R_in's full padded
+        // footprint), not at the pre-fix offset 5.
+        let t_with_list = ComponentValType::Tuple(vec![
+            r_in,
+            ComponentValType::List(Box::new(ComponentValType::Primitive(PrimitiveValType::U32))),
+        ]);
+        let offsets = pc.pointer_pair_result_offsets(&[(None, t_with_list)]);
+        assert_eq!(
+            offsets,
+            vec![8],
+            "list<u32> following record{{u32,u8}} must sit at offset 8 \
+             (spec size of the preceding record), not at the unpadded 5",
+        );
     }
 
     /// align_up must not panic when given a saturated u32::MAX size and

@@ -289,6 +289,86 @@ loss-scenarios:
     status: approved
     priority: high
 
+  - id: LS-P-8
+    title: Record/tuple field-walk adds unpadded child size, undercounting layout
+    uca: UCA-P-3
+    hazards: [H-4, H-4.1, H-4.2]
+    type: inadequate-control-algorithm
+    scenario: >
+      The Component Model canonical ABI specifies record/tuple layout as
+      `s = 0; for each field f: s = align_to(s, alignment(f)); s += size(f);
+      return align_to(s, alignment(record))`, where `size(f)` for an
+      aggregate field is the field's *full padded* canonical size
+      (`align_to(unpadded_inner, alignment(f))`). In `meld-core/src/parser.rs`
+      that full padded size is `canonical_abi_element_size`;
+      `canonical_abi_size_unpadded` is the outer size *without* the
+      type's own trailing align-up. Roughly 25 field-walk sites — the
+      `Record` and `Tuple` match arms of `canonical_abi_size_unpadded`,
+      `collect_pointer_byte_offsets`,
+      `collect_pointer_byte_offsets_with_layout` (added by LS-P-7),
+      `collect_conditional_result_pointers`,
+      `collect_return_area_type_slots`, `collect_resource_byte_positions`,
+      `element_inner_pointers`, `element_inner_resources`, plus the
+      top-level params/results walks in `params_area_byte_size`,
+      `return_area_byte_size`, `pointer_pair_params_byte_offsets`,
+      `pointer_pair_result_offsets`, `params_area_slots`,
+      `return_area_slots`, `resource_params_area_positions`,
+      `resource_result_positions`, and
+      `conditional_pointer_pair_result_positions` — advanced the running
+      offset by `canonical_abi_size_unpadded(field)` instead of
+      `canonical_abi_element_size(field)`. The per-field
+      `align_up(offset, next_field_align)` does NOT re-absorb the
+      preceding field's omitted trailing pad whenever the next field has
+      *smaller* alignment than the preceding aggregate. So a
+      `tuple<record { a: u32, b: u8 }, u8>` came out with running
+      `_unpadded` = 6 and `element_size` = 8 instead of the spec's
+      9 / 12; a `list<u32>` following `record { u32, u8 }` was located
+      at offset 5 instead of the spec's 8. Wrong field offsets propagate
+      into `pointer_pair_*` and the FACT adapter's list-copy / inner
+      pointer-fixup emission, so the adapter reads pointer pairs from
+      misaligned offsets and copies bytes using stale offsets [UCA-P-3 /
+      H-4 / H-4.1 wrong byte length, H-4.2 fixup walks wrong fields].
+      `params_area_byte_size` / `return_area_byte_size` under-size the
+      adapter buffer for the same reason: a `cabi_realloc` sized for the
+      under-counted total then receives every parameter, and the trailing
+      bytes spill past the buffer (the LS-P-6 hazard class, but reached
+      via the wrong field-size primitive rather than the cross-field
+      accumulator wrap). Fix replaces `canonical_abi_size_unpadded(field)`
+      with `canonical_abi_element_size(field)` at the 25 record/tuple
+      field-walk sites; `canonical_abi_size_unpadded` itself still
+      returns the outer type minus its own trailing pad (that contract is
+      unchanged — `canonical_abi_element_size` re-adds the pad). Surfaced
+      by the mythos-auto delta-pass on PR #179; the discover step
+      mis-located the bug as the `Option` / `Variant` / `Result` payload
+      contribution (which is actually spec-correct — those arms already
+      use `canonical_abi_element_size` for payloads). The actual location
+      was corrected by independent clean-room verification. Confirmed by
+      PoC `meld-core::parser::tests::ls_p_8_record_tuple_field_accumulation_uses_padded_field_size`,
+      which asserts `canonical_abi_element_size(tuple<record{u32,u8},u8>)`
+      = 12, `params_area_byte_size` for the same shape = 20, and a
+      `list<u32>` field after `record{u32,u8}` sitting at byte offset 8.
+    causal-factors:
+      - >-
+        `canonical_abi_size_unpadded` and `canonical_abi_element_size`
+        are two adjacent primitives differing only by the type's own
+        trailing align-up; the wrong one was called at the per-field
+        accumulation step and the function name made it look correct
+      - >-
+        25 independent field-walks rather than a single shared helper
+        replicated the same wrong call across the file
+      - >-
+        No regression test exercised a record/tuple containing a padded
+        aggregate followed by a lower-aligned trailing field — the only
+        type shape that surfaces the bug
+    process-model-flaw: >
+      The code's model was "advance by the inner type's `_unpadded` size
+      because we'll align the next field anyway", but the next field's
+      `align_up` only re-absorbs the trailing pad when the next field's
+      alignment is at least as large as the preceding aggregate's own
+      alignment.
+    status: approved
+    priority: high
+
   # ==========================================================================
   # Resolver scenarios
   # ==========================================================================

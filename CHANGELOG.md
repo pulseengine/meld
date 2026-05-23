@@ -6,6 +6,49 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **Record/tuple field-walk added the unpadded child size, undercounting
+  every offset and size built on it** (LS-P-8, UCA-P-3,
+  H-4 / H-4.1 / H-4.2, `meld-core/src/parser.rs`). The Component Model
+  canonical ABI lays out a record/tuple as `s = 0; for each field f:
+  s = align_to(s, alignment(f)); s += size(f)`, where `size(f)` for an
+  aggregate field is its *full padded* size. In this codebase the full
+  padded size is `canonical_abi_element_size`; `canonical_abi_size_unpadded`
+  is the outer type *without* its own trailing align-up. Roughly 25
+  field-walk sites — the `Record` / `Tuple` arms of
+  `canonical_abi_size_unpadded`, `collect_pointer_byte_offsets`,
+  `collect_pointer_byte_offsets_with_layout` (the LS-P-7 helper),
+  `collect_conditional_result_pointers`, `collect_return_area_type_slots`,
+  `collect_resource_byte_positions`, `element_inner_pointers`,
+  `element_inner_resources`, plus the top-level params/results walks in
+  `params_area_byte_size`, `return_area_byte_size`,
+  `pointer_pair_params_byte_offsets`, `pointer_pair_result_offsets`,
+  `params_area_slots`, `return_area_slots`,
+  `resource_params_area_positions`, `resource_result_positions`, and
+  `conditional_pointer_pair_result_positions` — advanced the running
+  offset by `canonical_abi_size_unpadded(field)` instead of
+  `canonical_abi_element_size(field)`. The per-field `align_up` on the
+  next field does NOT re-absorb the preceding field's omitted trailing
+  pad when the next field has *smaller* alignment, so a
+  `tuple<record { u32, u8 }, u8>` came out with `_unpadded` 6 and
+  `element_size` 8 instead of the spec's 9 / 12, and a `list<u32>`
+  following `record { u32, u8 }` was located at offset 5 instead of 8.
+  Wrong field offsets flow into the FACT adapter's pointer-pair load,
+  list-copy byte length, and inner pointer-fixup walk; the area-size
+  callers under-size the `cabi_realloc` buffer (LS-P-6 hazard class
+  reached via the per-field primitive rather than the cross-field `+=`).
+  Fix replaces `canonical_abi_size_unpadded(field)` with
+  `canonical_abi_element_size(field)` at the 25 field-walk sites;
+  `canonical_abi_size_unpadded` itself still returns the outer size
+  minus its own trailing pad (its contract is unchanged —
+  `canonical_abi_element_size` recovers the pad). **A confirmed Mythos
+  finding** — surfaced by the mythos-auto delta-pass on PR #179, with
+  the auto-runner mis-locating the bug as the option/variant/result
+  payload contribution (which is actually spec-correct); independent
+  clean-room verification corrected the location to the Record/Tuple
+  field accumulation. Promoted to approved loss scenario **LS-P-8**;
+  regression pinned by
+  `ls_p_8_record_tuple_field_accumulation_uses_padded_field_size`.
+
 - **Conditional-pointer `CopyLayout` computed for the composite payload,
   not the pointer leaf** (LS-P-7, UCA-P-3, H-4 / H-4.1 / H-4.2,
   `meld-core/src/parser.rs`). `collect_conditional_pointers` (flat-param
