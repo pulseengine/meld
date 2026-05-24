@@ -3170,41 +3170,55 @@ impl FactStyleGenerator {
             func.instruction(&Instruction::I32LtU);
             func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
             {
-                // LS-P-19: trap when the 2-byte sequence's continuation byte
-                // would be read past the end of the input — without this
-                // guard a truncated 2-byte lead at the buffer tail reads
-                // 1 byte of attacker-adjacent caller memory and folds it
-                // into the encoded code point.
+                // LS-P-19: emit U+FFFD when the 2-byte sequence's
+                // continuation byte would be read past the end of input
+                // (truncated multi-byte lead). Pre-v0.11 trapped via
+                // `unreachable`; the Canonical-ABI-correct behaviour is
+                // lossy replacement with U+FFFD (a single UTF-16 code
+                // unit), consuming only the lead byte. The continuations
+                // would have started a valid sequence in another world;
+                // by not consuming bytes past the lead we leave that
+                // possibility open for the next iteration.
                 func.instruction(&Instruction::LocalGet(src_idx_local));
                 func.instruction(&Instruction::I32Const(1));
                 func.instruction(&Instruction::I32Add);
                 func.instruction(&Instruction::LocalGet(1));
                 func.instruction(&Instruction::I32GeU);
                 func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
-                func.instruction(&Instruction::Unreachable);
-                func.instruction(&Instruction::End);
-
-                // cp = (byte & 0x1F) << 6 | (b1 & 0x3F)
-                func.instruction(&Instruction::LocalGet(byte_local));
-                func.instruction(&Instruction::I32Const(0x1F));
-                func.instruction(&Instruction::I32And);
-                func.instruction(&Instruction::I32Const(6));
-                func.instruction(&Instruction::I32Shl);
-                func.instruction(&Instruction::LocalGet(0));
-                func.instruction(&Instruction::LocalGet(src_idx_local));
-                func.instruction(&Instruction::I32Add);
-                func.instruction(&Instruction::I32Const(1));
-                func.instruction(&Instruction::I32Add);
-                func.instruction(&Instruction::I32Load8U(src_mem8));
-                func.instruction(&Instruction::I32Const(0x3F));
-                func.instruction(&Instruction::I32And);
-                func.instruction(&Instruction::I32Or);
-                func.instruction(&Instruction::LocalSet(cp_local));
-                // src_idx += 2
-                func.instruction(&Instruction::LocalGet(src_idx_local));
-                func.instruction(&Instruction::I32Const(2));
-                func.instruction(&Instruction::I32Add);
-                func.instruction(&Instruction::LocalSet(src_idx_local));
+                {
+                    // Truncated 2-byte lead → U+FFFD.
+                    func.instruction(&Instruction::I32Const(0xFFFD));
+                    func.instruction(&Instruction::LocalSet(cp_local));
+                    func.instruction(&Instruction::LocalGet(src_idx_local));
+                    func.instruction(&Instruction::I32Const(1));
+                    func.instruction(&Instruction::I32Add);
+                    func.instruction(&Instruction::LocalSet(src_idx_local));
+                }
+                func.instruction(&Instruction::Else);
+                {
+                    // cp = (byte & 0x1F) << 6 | (b1 & 0x3F)
+                    func.instruction(&Instruction::LocalGet(byte_local));
+                    func.instruction(&Instruction::I32Const(0x1F));
+                    func.instruction(&Instruction::I32And);
+                    func.instruction(&Instruction::I32Const(6));
+                    func.instruction(&Instruction::I32Shl);
+                    func.instruction(&Instruction::LocalGet(0));
+                    func.instruction(&Instruction::LocalGet(src_idx_local));
+                    func.instruction(&Instruction::I32Add);
+                    func.instruction(&Instruction::I32Const(1));
+                    func.instruction(&Instruction::I32Add);
+                    func.instruction(&Instruction::I32Load8U(src_mem8));
+                    func.instruction(&Instruction::I32Const(0x3F));
+                    func.instruction(&Instruction::I32And);
+                    func.instruction(&Instruction::I32Or);
+                    func.instruction(&Instruction::LocalSet(cp_local));
+                    // src_idx += 2
+                    func.instruction(&Instruction::LocalGet(src_idx_local));
+                    func.instruction(&Instruction::I32Const(2));
+                    func.instruction(&Instruction::I32Add);
+                    func.instruction(&Instruction::LocalSet(src_idx_local));
+                }
+                func.instruction(&Instruction::End); // end LS-P-19 (2-byte) check
             }
             func.instruction(&Instruction::Else);
             {
@@ -3214,54 +3228,64 @@ impl FactStyleGenerator {
                 func.instruction(&Instruction::I32LtU);
                 func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
                 {
-                    // LS-P-19: trap when the 3-byte sequence's continuation
-                    // bytes would extend past the end of the input — a
-                    // truncated 3-byte lead at the buffer tail would
-                    // otherwise read up to 2 bytes of caller memory past
-                    // the buffer and incorporate them into the code point.
+                    // LS-P-19: emit U+FFFD when the 3-byte sequence's
+                    // continuation bytes would extend past the end of
+                    // input. Pre-v0.11 trapped; now substitutes the
+                    // truncated lead with U+FFFD and consumes only the
+                    // lead byte.
                     func.instruction(&Instruction::LocalGet(src_idx_local));
                     func.instruction(&Instruction::I32Const(2));
                     func.instruction(&Instruction::I32Add);
                     func.instruction(&Instruction::LocalGet(1));
                     func.instruction(&Instruction::I32GeU);
                     func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
-                    func.instruction(&Instruction::Unreachable);
-                    func.instruction(&Instruction::End);
-
-                    // cp = (byte & 0x0F) << 12 | (b1 & 0x3F) << 6 | (b2 & 0x3F)
-                    func.instruction(&Instruction::LocalGet(byte_local));
-                    func.instruction(&Instruction::I32Const(0x0F));
-                    func.instruction(&Instruction::I32And);
-                    func.instruction(&Instruction::I32Const(12));
-                    func.instruction(&Instruction::I32Shl);
-                    // b1
-                    func.instruction(&Instruction::LocalGet(0));
-                    func.instruction(&Instruction::LocalGet(src_idx_local));
-                    func.instruction(&Instruction::I32Add);
-                    func.instruction(&Instruction::I32Const(1));
-                    func.instruction(&Instruction::I32Add);
-                    func.instruction(&Instruction::I32Load8U(src_mem8));
-                    func.instruction(&Instruction::I32Const(0x3F));
-                    func.instruction(&Instruction::I32And);
-                    func.instruction(&Instruction::I32Const(6));
-                    func.instruction(&Instruction::I32Shl);
-                    func.instruction(&Instruction::I32Or);
-                    // b2
-                    func.instruction(&Instruction::LocalGet(0));
-                    func.instruction(&Instruction::LocalGet(src_idx_local));
-                    func.instruction(&Instruction::I32Add);
-                    func.instruction(&Instruction::I32Const(2));
-                    func.instruction(&Instruction::I32Add);
-                    func.instruction(&Instruction::I32Load8U(src_mem8));
-                    func.instruction(&Instruction::I32Const(0x3F));
-                    func.instruction(&Instruction::I32And);
-                    func.instruction(&Instruction::I32Or);
-                    func.instruction(&Instruction::LocalSet(cp_local));
-                    // src_idx += 3
-                    func.instruction(&Instruction::LocalGet(src_idx_local));
-                    func.instruction(&Instruction::I32Const(3));
-                    func.instruction(&Instruction::I32Add);
-                    func.instruction(&Instruction::LocalSet(src_idx_local));
+                    {
+                        // Truncated 3-byte lead → U+FFFD.
+                        func.instruction(&Instruction::I32Const(0xFFFD));
+                        func.instruction(&Instruction::LocalSet(cp_local));
+                        func.instruction(&Instruction::LocalGet(src_idx_local));
+                        func.instruction(&Instruction::I32Const(1));
+                        func.instruction(&Instruction::I32Add);
+                        func.instruction(&Instruction::LocalSet(src_idx_local));
+                    }
+                    func.instruction(&Instruction::Else);
+                    {
+                        // cp = (byte & 0x0F) << 12 | (b1 & 0x3F) << 6 | (b2 & 0x3F)
+                        func.instruction(&Instruction::LocalGet(byte_local));
+                        func.instruction(&Instruction::I32Const(0x0F));
+                        func.instruction(&Instruction::I32And);
+                        func.instruction(&Instruction::I32Const(12));
+                        func.instruction(&Instruction::I32Shl);
+                        // b1
+                        func.instruction(&Instruction::LocalGet(0));
+                        func.instruction(&Instruction::LocalGet(src_idx_local));
+                        func.instruction(&Instruction::I32Add);
+                        func.instruction(&Instruction::I32Const(1));
+                        func.instruction(&Instruction::I32Add);
+                        func.instruction(&Instruction::I32Load8U(src_mem8));
+                        func.instruction(&Instruction::I32Const(0x3F));
+                        func.instruction(&Instruction::I32And);
+                        func.instruction(&Instruction::I32Const(6));
+                        func.instruction(&Instruction::I32Shl);
+                        func.instruction(&Instruction::I32Or);
+                        // b2
+                        func.instruction(&Instruction::LocalGet(0));
+                        func.instruction(&Instruction::LocalGet(src_idx_local));
+                        func.instruction(&Instruction::I32Add);
+                        func.instruction(&Instruction::I32Const(2));
+                        func.instruction(&Instruction::I32Add);
+                        func.instruction(&Instruction::I32Load8U(src_mem8));
+                        func.instruction(&Instruction::I32Const(0x3F));
+                        func.instruction(&Instruction::I32And);
+                        func.instruction(&Instruction::I32Or);
+                        func.instruction(&Instruction::LocalSet(cp_local));
+                        // src_idx += 3
+                        func.instruction(&Instruction::LocalGet(src_idx_local));
+                        func.instruction(&Instruction::I32Const(3));
+                        func.instruction(&Instruction::I32Add);
+                        func.instruction(&Instruction::LocalSet(src_idx_local));
+                    }
+                    func.instruction(&Instruction::End); // end LS-P-19 (3-byte) check
                 }
                 func.instruction(&Instruction::Else);
                 {
@@ -3271,61 +3295,76 @@ impl FactStyleGenerator {
                     // this guard a truncated 4-byte lead at the buffer tail
                     // reads up to 3 bytes of attacker-adjacent caller memory
                     // and folds them into the encoded code point.
+                    // LS-P-19: emit U+FFFD when the 4-byte sequence's
+                    // continuation bytes would extend past the end of
+                    // input. Pre-v0.11 trapped; now substitutes the
+                    // truncated lead with U+FFFD and consumes only the
+                    // lead byte.
                     func.instruction(&Instruction::LocalGet(src_idx_local));
                     func.instruction(&Instruction::I32Const(3));
                     func.instruction(&Instruction::I32Add);
                     func.instruction(&Instruction::LocalGet(1));
                     func.instruction(&Instruction::I32GeU);
                     func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
-                    func.instruction(&Instruction::Unreachable);
-                    func.instruction(&Instruction::End);
-
-                    // cp = (byte & 0x07) << 18 | (b1 & 0x3F) << 12 | (b2 & 0x3F) << 6 | (b3 & 0x3F)
-                    func.instruction(&Instruction::LocalGet(byte_local));
-                    func.instruction(&Instruction::I32Const(0x07));
-                    func.instruction(&Instruction::I32And);
-                    func.instruction(&Instruction::I32Const(18));
-                    func.instruction(&Instruction::I32Shl);
-                    // b1
-                    func.instruction(&Instruction::LocalGet(0));
-                    func.instruction(&Instruction::LocalGet(src_idx_local));
-                    func.instruction(&Instruction::I32Add);
-                    func.instruction(&Instruction::I32Const(1));
-                    func.instruction(&Instruction::I32Add);
-                    func.instruction(&Instruction::I32Load8U(src_mem8));
-                    func.instruction(&Instruction::I32Const(0x3F));
-                    func.instruction(&Instruction::I32And);
-                    func.instruction(&Instruction::I32Const(12));
-                    func.instruction(&Instruction::I32Shl);
-                    func.instruction(&Instruction::I32Or);
-                    // b2
-                    func.instruction(&Instruction::LocalGet(0));
-                    func.instruction(&Instruction::LocalGet(src_idx_local));
-                    func.instruction(&Instruction::I32Add);
-                    func.instruction(&Instruction::I32Const(2));
-                    func.instruction(&Instruction::I32Add);
-                    func.instruction(&Instruction::I32Load8U(src_mem8));
-                    func.instruction(&Instruction::I32Const(0x3F));
-                    func.instruction(&Instruction::I32And);
-                    func.instruction(&Instruction::I32Const(6));
-                    func.instruction(&Instruction::I32Shl);
-                    func.instruction(&Instruction::I32Or);
-                    // b3
-                    func.instruction(&Instruction::LocalGet(0));
-                    func.instruction(&Instruction::LocalGet(src_idx_local));
-                    func.instruction(&Instruction::I32Add);
-                    func.instruction(&Instruction::I32Const(3));
-                    func.instruction(&Instruction::I32Add);
-                    func.instruction(&Instruction::I32Load8U(src_mem8));
-                    func.instruction(&Instruction::I32Const(0x3F));
-                    func.instruction(&Instruction::I32And);
-                    func.instruction(&Instruction::I32Or);
-                    func.instruction(&Instruction::LocalSet(cp_local));
-                    // src_idx += 4
-                    func.instruction(&Instruction::LocalGet(src_idx_local));
-                    func.instruction(&Instruction::I32Const(4));
-                    func.instruction(&Instruction::I32Add);
-                    func.instruction(&Instruction::LocalSet(src_idx_local));
+                    {
+                        // Truncated 4-byte lead → U+FFFD.
+                        func.instruction(&Instruction::I32Const(0xFFFD));
+                        func.instruction(&Instruction::LocalSet(cp_local));
+                        func.instruction(&Instruction::LocalGet(src_idx_local));
+                        func.instruction(&Instruction::I32Const(1));
+                        func.instruction(&Instruction::I32Add);
+                        func.instruction(&Instruction::LocalSet(src_idx_local));
+                    }
+                    func.instruction(&Instruction::Else);
+                    {
+                        // cp = (byte & 0x07) << 18 | (b1 & 0x3F) << 12 | (b2 & 0x3F) << 6 | (b3 & 0x3F)
+                        func.instruction(&Instruction::LocalGet(byte_local));
+                        func.instruction(&Instruction::I32Const(0x07));
+                        func.instruction(&Instruction::I32And);
+                        func.instruction(&Instruction::I32Const(18));
+                        func.instruction(&Instruction::I32Shl);
+                        // b1
+                        func.instruction(&Instruction::LocalGet(0));
+                        func.instruction(&Instruction::LocalGet(src_idx_local));
+                        func.instruction(&Instruction::I32Add);
+                        func.instruction(&Instruction::I32Const(1));
+                        func.instruction(&Instruction::I32Add);
+                        func.instruction(&Instruction::I32Load8U(src_mem8));
+                        func.instruction(&Instruction::I32Const(0x3F));
+                        func.instruction(&Instruction::I32And);
+                        func.instruction(&Instruction::I32Const(12));
+                        func.instruction(&Instruction::I32Shl);
+                        func.instruction(&Instruction::I32Or);
+                        // b2
+                        func.instruction(&Instruction::LocalGet(0));
+                        func.instruction(&Instruction::LocalGet(src_idx_local));
+                        func.instruction(&Instruction::I32Add);
+                        func.instruction(&Instruction::I32Const(2));
+                        func.instruction(&Instruction::I32Add);
+                        func.instruction(&Instruction::I32Load8U(src_mem8));
+                        func.instruction(&Instruction::I32Const(0x3F));
+                        func.instruction(&Instruction::I32And);
+                        func.instruction(&Instruction::I32Const(6));
+                        func.instruction(&Instruction::I32Shl);
+                        func.instruction(&Instruction::I32Or);
+                        // b3
+                        func.instruction(&Instruction::LocalGet(0));
+                        func.instruction(&Instruction::LocalGet(src_idx_local));
+                        func.instruction(&Instruction::I32Add);
+                        func.instruction(&Instruction::I32Const(3));
+                        func.instruction(&Instruction::I32Add);
+                        func.instruction(&Instruction::I32Load8U(src_mem8));
+                        func.instruction(&Instruction::I32Const(0x3F));
+                        func.instruction(&Instruction::I32And);
+                        func.instruction(&Instruction::I32Or);
+                        func.instruction(&Instruction::LocalSet(cp_local));
+                        // src_idx += 4
+                        func.instruction(&Instruction::LocalGet(src_idx_local));
+                        func.instruction(&Instruction::I32Const(4));
+                        func.instruction(&Instruction::I32Add);
+                        func.instruction(&Instruction::LocalSet(src_idx_local));
+                    }
+                    func.instruction(&Instruction::End); // end LS-P-19 (4-byte) check
                 }
                 func.instruction(&Instruction::End); // end 3-byte vs 4-byte
             }
@@ -3524,54 +3563,67 @@ impl FactStyleGenerator {
         func.instruction(&Instruction::I32And);
         func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
         {
-            // LS-P-16: trap when a lone high surrogate sits at the last code
-            // unit of the input — without this guard the `I32Load16U` below
-            // reads `mem16[ptr + (src_idx + 1) * 2]`, i.e. 2 bytes past the
-            // caller-supplied UTF-16 buffer. Those bytes (adjacent caller
-            // linear memory) then get treated as the "low surrogate" and
-            // encoded into a 4-byte UTF-8 sequence in the callee output —
-            // a silent leak of attacker-adjacent caller memory across the
-            // component boundary. Trap is the conservative mitigation; the
-            // Canonical-ABI-correct behaviour is to replace the lone
-            // surrogate with U+FFFD (3-byte UTF-8 EF BF BD), which is a
-            // structural follow-up to this guard.
+            // LS-P-16: emit U+FFFD replacement when a lone high surrogate
+            // sits at the last code unit of the input. Pre-v0.11, this site
+            // trapped via `unreachable` (the conservative mitigation that
+            // closed a 2-byte OOB read into adjacent caller linear memory).
+            // The Canonical ABI's correct behaviour for malformed UTF-16 is
+            // **lossy replacement**, not abort — so we now substitute the
+            // lone high surrogate with the Unicode replacement character
+            // U+FFFD (3-byte UTF-8 `EF BF BD`) and continue. The existing
+            // 3-byte UTF-8 encoder below handles `cp = 0xFFFD` directly
+            // (it lives in the BMP), so the only restructure here is to
+            // turn the trap into an `If/Else`: when `src_idx + 1 >=
+            // input_len`, take the replacement path; otherwise read the
+            // low surrogate and compute the full code point.
             func.instruction(&Instruction::LocalGet(src_idx_local));
             func.instruction(&Instruction::I32Const(1));
             func.instruction(&Instruction::I32Add);
             func.instruction(&Instruction::LocalGet(1));
             func.instruction(&Instruction::I32GeU);
             func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
-            func.instruction(&Instruction::Unreachable);
-            func.instruction(&Instruction::End);
-
-            // Surrogate pair: read low surrogate
-            // cu2 = mem16[ptr + (src_idx + 1) * 2]
-            // code_point = 0x10000 + ((cu - 0xD800) << 10) + (cu2 - 0xDC00)
-            func.instruction(&Instruction::I32Const(0x10000));
-            func.instruction(&Instruction::LocalGet(cu_local));
-            func.instruction(&Instruction::I32Const(0xD800_u32 as i32));
-            func.instruction(&Instruction::I32Sub);
-            func.instruction(&Instruction::I32Const(10));
-            func.instruction(&Instruction::I32Shl);
-            func.instruction(&Instruction::I32Add);
-            // Load low surrogate
-            func.instruction(&Instruction::LocalGet(0));
-            func.instruction(&Instruction::LocalGet(src_idx_local));
-            func.instruction(&Instruction::I32Const(1));
-            func.instruction(&Instruction::I32Add);
-            func.instruction(&Instruction::I32Const(1));
-            func.instruction(&Instruction::I32Shl);
-            func.instruction(&Instruction::I32Add);
-            func.instruction(&Instruction::I32Load16U(src_mem16));
-            func.instruction(&Instruction::I32Const(0xDC00_u32 as i32));
-            func.instruction(&Instruction::I32Sub);
-            func.instruction(&Instruction::I32Add);
-            func.instruction(&Instruction::LocalSet(cp_local));
-            // src_idx += 2
-            func.instruction(&Instruction::LocalGet(src_idx_local));
-            func.instruction(&Instruction::I32Const(2));
-            func.instruction(&Instruction::I32Add);
-            func.instruction(&Instruction::LocalSet(src_idx_local));
+            {
+                // Lone high surrogate at end of input → U+FFFD replacement.
+                func.instruction(&Instruction::I32Const(0xFFFD));
+                func.instruction(&Instruction::LocalSet(cp_local));
+                // Consume only the lone high surrogate.
+                func.instruction(&Instruction::LocalGet(src_idx_local));
+                func.instruction(&Instruction::I32Const(1));
+                func.instruction(&Instruction::I32Add);
+                func.instruction(&Instruction::LocalSet(src_idx_local));
+            }
+            func.instruction(&Instruction::Else);
+            {
+                // Surrogate pair: read low surrogate
+                // cu2 = mem16[ptr + (src_idx + 1) * 2]
+                // code_point = 0x10000 + ((cu - 0xD800) << 10) + (cu2 - 0xDC00)
+                func.instruction(&Instruction::I32Const(0x10000));
+                func.instruction(&Instruction::LocalGet(cu_local));
+                func.instruction(&Instruction::I32Const(0xD800_u32 as i32));
+                func.instruction(&Instruction::I32Sub);
+                func.instruction(&Instruction::I32Const(10));
+                func.instruction(&Instruction::I32Shl);
+                func.instruction(&Instruction::I32Add);
+                // Load low surrogate
+                func.instruction(&Instruction::LocalGet(0));
+                func.instruction(&Instruction::LocalGet(src_idx_local));
+                func.instruction(&Instruction::I32Const(1));
+                func.instruction(&Instruction::I32Add);
+                func.instruction(&Instruction::I32Const(1));
+                func.instruction(&Instruction::I32Shl);
+                func.instruction(&Instruction::I32Add);
+                func.instruction(&Instruction::I32Load16U(src_mem16));
+                func.instruction(&Instruction::I32Const(0xDC00_u32 as i32));
+                func.instruction(&Instruction::I32Sub);
+                func.instruction(&Instruction::I32Add);
+                func.instruction(&Instruction::LocalSet(cp_local));
+                // src_idx += 2
+                func.instruction(&Instruction::LocalGet(src_idx_local));
+                func.instruction(&Instruction::I32Const(2));
+                func.instruction(&Instruction::I32Add);
+                func.instruction(&Instruction::LocalSet(src_idx_local));
+            }
+            func.instruction(&Instruction::End); // end LS-P-16 lone-surrogate check
         }
         func.instruction(&Instruction::Else);
         {
@@ -5006,108 +5058,94 @@ mod tests {
         assert!(!options.needs_transcoding());
     }
 
-    /// LS-P-19 — `emit_utf8_to_utf16_transcode` must guard against reading
-    /// continuation bytes past the end of the input buffer for truncated
-    /// multi-byte UTF-8 sequences.
+    /// LS-P-19 — `emit_utf8_to_utf16_transcode` must replace truncated
+    /// multi-byte UTF-8 sequences with U+FFFD instead of reading past the
+    /// end of the input buffer.
     ///
-    /// The mirror of LS-P-16 on the UTF-8→UTF-16 direction. Before the fix,
-    /// each multi-byte branch (2-byte, 3-byte, 4-byte) unconditionally read
-    /// the continuation bytes at `src_idx + 1`, `+2`, `+3` via `I32Load8U`
-    /// without checking against `input_len`. A UTF-8 string ending on a
-    /// truncated multi-byte lead byte (e.g. `0xE2` with no following bytes)
-    /// caused the adapter to load 1–3 bytes of attacker-adjacent caller
-    /// memory, incorporate them into a code point, and emit the result
-    /// as UTF-16 in the callee — silent cross-memory leak per
-    /// transcoded string. The composed (non-fused) execution traps on
-    /// invalid UTF-8; the fused execution silently corrupted, producing
-    /// semantic drift.
-    ///
-    /// Conservative mitigation: prepend a `src_idx + N >= input_len` trap
-    /// to each multi-byte branch (N = 1/2/3 for the 2/3/4-byte case). The
-    /// Canonical-ABI-correct upgrade replaces truncated sequences with
-    /// U+FFFD, tracked alongside LS-P-16's upgrade.
+    /// The mirror of LS-P-16 on the UTF-8→UTF-16 direction. Before the
+    /// v0.10 mitigation, each multi-byte branch (2-byte, 3-byte, 4-byte)
+    /// unconditionally read continuation bytes at `src_idx + 1`, `+2`,
+    /// `+3` via `I32Load8U` without checking against `input_len` — a
+    /// UTF-8 string ending on a truncated multi-byte lead byte caused
+    /// the adapter to load 1–3 bytes of attacker-adjacent caller memory,
+    /// incorporate them into a synthesized code point, and emit the
+    /// result as UTF-16 in the callee. v0.10 trapped via `unreachable`
+    /// (conservative). **v0.11.0 substitutes U+FFFD per the Canonical
+    /// ABI's lossy-replacement rule**: when the continuation bytes are
+    /// out of range, set `cp = 0xFFFD` and consume only the lead byte;
+    /// the loop continues with the next byte as a potential new lead.
     ///
     /// Pinned structurally: the LS-P-19 marker must appear at all three
-    /// branches and Unreachable + I32GeU opcodes must precede each
-    /// `I32Load8U` continuation-byte read.
+    /// branches AND the U+FFFD code point must be emitted at each.
     #[test]
-    fn ls_p_19_utf8_to_utf16_continuation_byte_oob_guard_emitted() {
+    fn ls_p_19_utf8_to_utf16_continuation_byte_emits_replacement() {
         const SRC: &str = include_str!("fact.rs");
-        let marker = "LS-P-19: trap when the";
+        let marker = "LS-P-19: emit U+FFFD when the";
         let marker_count = SRC.matches(marker).count();
         assert!(
             marker_count >= 3,
-            "fact.rs must retain LS-P-19 markers for all three multi-byte \
-             branches (2-byte, 3-byte, 4-byte) in \
+            "fact.rs must retain LS-P-19 U+FFFD markers for all three \
+             multi-byte branches (2-byte, 3-byte, 4-byte) in \
              emit_utf8_to_utf16_transcode; found {marker_count}",
         );
-        // Cross-cutting: at least 3 Unreachable + 3 I32GeU pairs from
-        // LS-P-19's branch guards, plus the original LS-P-16 pair from
-        // emit_utf16_to_utf8_transcode = at least 4 instances of each.
-        let unreachable_count = SRC.matches("Instruction::Unreachable").count();
+        // The Canonical ABI's replacement character is U+FFFD (decimal
+        // 65533). The emitter sets `cp_local = 0xFFFD` at each of the
+        // three multi-byte truncation paths, plus once at the LS-P-16
+        // lone-high-surrogate path in emit_utf16_to_utf8_transcode →
+        // at least 4 occurrences of `I32Const(0xFFFD)` in fact.rs.
+        let fffd_count = SRC.matches("I32Const(0xFFFD)").count();
         assert!(
-            unreachable_count >= 4,
-            "expected at least 4 Instruction::Unreachable in fact.rs \
-             (LS-P-16 + LS-P-19 branch guards); found {unreachable_count}",
+            fffd_count >= 4,
+            "expected at least 4 I32Const(0xFFFD) emissions in fact.rs \
+             (LS-P-16 + LS-P-19 replacement paths); found {fffd_count}",
         );
     }
 
-    /// LS-P-16 — `emit_utf16_to_utf8_transcode` must guard against reading the
-    /// low-surrogate code unit out-of-bounds when the input ends on a lone
-    /// high surrogate.
+    /// LS-P-16 — `emit_utf16_to_utf8_transcode` must replace a lone high
+    /// surrogate at end-of-input with U+FFFD rather than reading past the
+    /// buffer.
     ///
-    /// Before the fix the surrogate-pair `If` arm unconditionally emitted a
-    /// second `I32Load16U` at `mem16[ptr + (src_idx + 1) * 2]`. For an
-    /// input whose last code unit is a high surrogate, that load is 2 bytes
-    /// past the caller-supplied buffer end. The 2 bytes (attacker-adjacent
-    /// caller linear memory) are then treated as the "low surrogate" and
-    /// encoded into a 4-byte UTF-8 sequence in the callee — silent cross-
-    /// memory leak per UTF-16→UTF-8 transcoded string. Surfaced by the
-    /// mythos-auto delta-pass on PR #179. Conservative mitigation traps
-    /// (`unreachable`) when `src_idx + 1 >= input_len`. The full
-    /// Canonical-ABI-correct behaviour replaces the lone surrogate with
-    /// U+FFFD (3-byte UTF-8 `EF BF BD`) — that upgrade is structural
-    /// follow-up; this commit's guard converts silent leak into loud trap.
+    /// Before the v0.10 mitigation, the surrogate-pair `If` arm
+    /// unconditionally emitted a second `I32Load16U` at `mem16[ptr +
+    /// (src_idx + 1) * 2]` — for an input whose last code unit is a high
+    /// surrogate, that read 2 bytes past the buffer. v0.10 added a
+    /// `src_idx + 1 >= input_len` trap (conservative mitigation).
+    /// **v0.11.0 substitutes U+FFFD** (3-byte UTF-8 `EF BF BD`) per the
+    /// Canonical ABI's lossy-replacement rule, consuming only the lone
+    /// high surrogate and continuing the loop. The existing 3-byte UTF-8
+    /// encoder handles `cp = 0xFFFD` directly (it lives in the BMP).
     ///
-    /// This test pins the structural invariant: the LS-P-16 marker comment
-    /// must remain in the source AND the surrogate-pair `If` arm must emit
-    /// an `Unreachable` instruction *before* the second `I32Load16U`. A
-    /// refactor that removes the comment OR drops the `Unreachable` is
-    /// caught here.
+    /// Pinned structurally: the LS-P-16 U+FFFD marker must remain in the
+    /// source AND `cp_local` must be set to `0xFFFD` in the bounds-
+    /// failure path. A refactor that drops the marker or the replacement
+    /// code point is caught here.
     #[test]
-    fn ls_p_16_utf16_lone_high_surrogate_oob_guard_emitted() {
+    fn ls_p_16_utf16_lone_high_surrogate_emits_replacement() {
         const SRC: &str = include_str!("fact.rs");
-        let marker = "LS-P-16: trap when a lone high surrogate";
+        let marker = "LS-P-16: emit U+FFFD replacement";
         let pos = SRC.find(marker).unwrap_or_else(|| {
             panic!(
-                "fact.rs must retain the LS-P-16 marker `{marker}`; \
-                 without the guard the surrogate-pair If arm reads 2 \
-                 bytes past the UTF-16 input buffer",
+                "fact.rs must retain the LS-P-16 U+FFFD marker `{marker}`; \
+                 without the replacement, the surrogate-pair If arm reads \
+                 2 bytes past the UTF-16 input buffer when input ends on a \
+                 lone high surrogate",
             )
         });
-        // Look only within the guard block + the immediate next ~2000 bytes
-        // (the surrogate-pair body that ends with the next "Surrogate pair:
-        // read low surrogate" comment marker).
+        // The replacement-code-point emission lives within ~2000 bytes of
+        // the marker; assert U+FFFD is set there.
         let after = &SRC[pos..];
-        let end = after
-            .find("Surrogate pair: read low surrogate")
-            .unwrap_or(after.len())
-            .min(3000);
-        let block = &after[..end];
+        let block = &after[..after.len().min(3000)];
         assert!(
-            block.contains("Unreachable"),
-            "LS-P-16 guard must emit Instruction::Unreachable inside the \
-             surrogate-pair If arm before the second I32Load16U; the \
-             segment between the LS-P-16 marker and the second-load \
-             comment is missing the Unreachable opcode",
+            block.contains("I32Const(0xFFFD)"),
+            "LS-P-16 replacement path must set cp_local = 0xFFFD via \
+             I32Const(0xFFFD); the segment after the LS-P-16 marker is \
+             missing the replacement code point",
         );
-        // Also require the bounds check shape: src_idx + 1 >= input_len.
-        // The exact wasm-encoder pattern is LocalGet(src_idx_local),
-        // I32Const(1), I32Add, LocalGet(1), I32GeU. Match on the textual
-        // representation.
+        // Bounds-check still has to be there — the replacement path is
+        // gated on `src_idx + 1 >= input_len`.
         assert!(
             block.contains("I32GeU"),
-            "LS-P-16 guard must include an I32GeU comparison against \
+            "LS-P-16 path must still gate on an I32GeU comparison against \
              input_len",
         );
     }

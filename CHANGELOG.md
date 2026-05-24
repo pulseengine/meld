@@ -4,6 +4,24 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+
+- **UTF transcoders now emit U+FFFD instead of trapping on truncated input**
+  (LS-P-16 + LS-P-19 upgrade, `meld-core/src/adapter/fact.rs`). v0.10
+  closed two cross-memory leaks by trapping (`unreachable`) when
+  `emit_utf16_to_utf8_transcode` encountered a lone high surrogate at
+  end-of-input (LS-P-16) and when `emit_utf8_to_utf16_transcode`
+  encountered a truncated multi-byte lead (LS-P-19, three sites for
+  the 2/3/4-byte branches). The Canonical ABI's correct behaviour for
+  malformed UTF input is **lossy replacement**, not abort. Both
+  emitters now set `cp_local = 0xFFFD` and consume only the lead /
+  lone code unit; the existing UTF-8 / UTF-16 encoders handle
+  `0xFFFD` directly (3-byte UTF-8 `EF BF BD` / single UTF-16 BMP
+  code unit). Fused adapters are now spec-compliant on malformed
+  input rather than refusing to run. LS-P-16 and LS-P-19 regression
+  tests updated to pin the new `I32Const(0xFFFD)` emission at all
+  four sites.
+
 ## [0.10.0] - 2026-05-24
 
 ### Fixed
