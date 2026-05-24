@@ -6,6 +6,33 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
+- **`list<option-with-pointer>` / `list<result<…,…>>` /
+  `list<variant{…(string)…}>` now generate correct cross-component
+  adapters** (LS-P-12 + LS-P-18 structural upgrade,
+  `meld-core/src/resolver.rs`, `meld-core/src/parser.rs`,
+  `meld-core/src/adapter/fact.rs`). v0.10 mitigated by panicking at
+  adapter generation when these shapes appeared; v0.11 ships the
+  proper per-element conditional pointer fixup. New `InnerPointer`
+  descriptor on `CopyLayout::Elements.inner_pointers` (replaces the
+  bare `(u32, CopyLayout)` tuple) carries a `Vec<DiscriminantGuard>`
+  chain per inner pointer; `element_inner_pointers` in the parser
+  now has `Option` / `Result` / `Variant` arms that recurse into the
+  payload at the post-disc/aligned offset and append the enclosing
+  discriminant to the chain; the FACT adapter's
+  `emit_inner_pointer_fixup` per-element loop loads each guard's
+  discriminant byte at element-relative offset, AND-evaluates the
+  chain, and wraps the existing realloc + memory.copy + ptr-rewrite
+  in an `If` so the fixup only fires when every enclosing arm
+  holds. The LS-P-12 panic and the `has_pointer_bearing_conditional`
+  helper are removed; the LS-P-12 / LS-P-18 regression tests are
+  upgraded from `#[should_panic]` to structural assertions that pin
+  the guarded `InnerPointer` shape. Mixed records (LS-P-18:
+  `record { items: list<u8>, maybe: option<string> }`) now emit
+  TWO inner pointers — one unconditional (the bare list field) and
+  one guarded (the option payload). Fused adapters can now safely
+  cross-memory-copy these common WIT types instead of refusing to
+  generate.
+
 - **UTF transcoders now emit U+FFFD instead of trapping on truncated input**
   (LS-P-16 + LS-P-19 upgrade, `meld-core/src/adapter/fact.rs`). v0.10
   closed two cross-memory leaks by trapping (`unreachable`) when
