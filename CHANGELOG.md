@@ -6,6 +6,37 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **UTF-16→UTF-8 transcoding read 2 bytes past the input buffer on a
+  lone high surrogate at the end of a UTF-16 string — silent
+  cross-memory leak of adjacent caller bytes into the callee's UTF-8
+  output** (LS-P-16, UCA-P-3, H-2 / H-4 / H-4.4,
+  `meld-core/src/adapter/fact.rs`).
+  `emit_utf16_to_utf8_transcode`'s only bounds check was
+  `src_idx >= input_len` against the *first* code unit per iteration.
+  When that code unit was a high surrogate (`[0xD800, 0xDC00)`), the
+  surrogate-pair `If` arm unconditionally emitted a second
+  `I32Load16U` at `mem16[ptr + (src_idx + 1) * 2]`. For input whose
+  last code unit was a lone high surrogate, that load read 2 bytes
+  past the caller-supplied UTF-16 buffer; those 2 attacker-adjacent
+  bytes were treated as the "low surrogate" without validating
+  `0xDC00 <= cu2 < 0xE000` and packed into a 4-byte UTF-8 sequence
+  written to callee memory — silent cross-memory leak per
+  transcoded string. `src_idx += 2` advanced past `input_len`, so
+  the outer break check cleanly terminated the loop, no trap,
+  silent corruption. **Conservative mitigation only**: inject an
+  inline `src_idx + 1 >= input_len` check inside the surrogate-pair
+  `If` arm and `unreachable`-trap on failure. The Canonical-ABI-
+  correct behaviour replaces the lone surrogate with U+FFFD
+  (3-byte UTF-8 `EF BF BD`) and continues; that upgrade is tracked
+  as a separate structural follow-up. **A confirmed Mythos
+  finding** — surfaced by the mythos-auto delta-pass on PR #179,
+  independently clean-room verified. Promoted to approved loss
+  scenario **LS-P-16** (priority high). Regression pinned by
+  `ls_p_16_utf16_lone_high_surrogate_oob_guard_emitted`, a
+  structural test that requires the LS-P-16 marker AND an
+  `Unreachable` + `I32GeU` opcode pair to live inside the
+  surrogate-pair `If` arm before the second `I32Load16U`.
+
 - **Out-of-bounds `resource_type_id` silently misclassified as
   callee-defined — `[resource-rep]` / `[resource-new]` swap on the
   fused adapter** (LS-P-15, UCA-R-3, H-5 / H-1,

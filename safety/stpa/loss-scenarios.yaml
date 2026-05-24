@@ -892,6 +892,80 @@ loss-scenarios:
     status: approved
     priority: low
 
+  - id: LS-P-16
+    title: UTF-16→UTF-8 transcoding reads OOB on lone high surrogate at end of input
+    uca: UCA-P-3
+    hazards: [H-2, H-4, H-4.4]
+    type: inadequate-control-algorithm
+    scenario: >
+      `meld-core/src/adapter/fact.rs::emit_utf16_to_utf8_transcode`
+      emits the per-code-unit transcoding loop the FACT adapter uses
+      when the caller component declares `string-encoding=utf16` and
+      the callee declares `utf8` (the `(caller=Utf16, callee=Utf8)`
+      case dispatched at fact.rs:2999–3001, gated on
+      `crosses_memory && needs_transcoding`). The loop's only bounds
+      check is `src_idx >= input_len` (lines 3460–3463) against the
+      *first* code unit of each iteration. When that code unit is in
+      `[0xD800, 0xDC00)` (high surrogate), the surrogate-pair `If`
+      arm unconditionally emits a second `I32Load16U` at
+      `mem16[ptr + (src_idx + 1) * 2]`. For an input whose **last**
+      code unit is a lone high surrogate, that load reads 2 bytes
+      past the end of the caller-supplied UTF-16 buffer — into
+      attacker-adjacent caller linear memory. The two bytes are
+      treated as the "low surrogate" without validating
+      `0xDC00 <= cu2 < 0xE000`, producing a `cp = 0x10000 +
+      ((cu - 0xD800) << 10) + (cu2_oob - 0xDC00)` whose value is
+      typically in the 4-byte UTF-8 range. The 4-byte encoder
+      then writes 4 bytes derived from the OOB read into callee
+      linear memory — silent cross-memory leak of attacker-adjacent
+      caller bytes into the callee's UTF-8 output [UCA-P-3 /
+      H-2 caller-controlled offsets / H-4.4 incorrect string
+      transcoding]. `src_idx += 2` then advances past `input_len`,
+      so the outer `src_idx >= input_len` check breaks the loop
+      cleanly the next iteration — no trap, silent corruption.
+      Reachable for any cross-memory UTF-16→UTF-8 string transfer
+      whose last UTF-16 code unit is a lone high surrogate.
+      Surfaced by the mythos-auto delta-pass on PR #179 and
+      clean-room verified. This commit is the conservative
+      mitigation: inject a `src_idx + 1 >= input_len` check inside
+      the surrogate-pair `If` arm and `unreachable`-trap on failure.
+      The Canonical-ABI-correct behaviour is to replace the lone
+      surrogate with U+FFFD (3-byte UTF-8 `EF BF BD`) and continue
+      — that upgrade is tracked as a separate structural follow-up.
+      Trap converts silent cross-memory leak into a loud
+      adapter-runtime trap. Confirmed by PoC
+      `meld-core::adapter::fact::tests::ls_p_16_utf16_lone_high_surrogate_oob_guard_emitted`,
+      a structural regression that pins the LS-P-16 marker comment
+      AND requires an `Unreachable` + `I32GeU` opcode pair to live
+      inside the surrogate-pair `If` arm before the second
+      `I32Load16U`.
+    causal-factors:
+      - >-
+        `emit_utf16_to_utf8_transcode`'s only bounds check guarded
+        the first code unit per iteration; the surrogate-pair arm
+        unconditionally followed up with a second load
+      - >-
+        No bounds check between the high-surrogate detection and the
+        low-surrogate load, despite UTF-16 trivially admitting a
+        lone high surrogate at the end of a string
+      - >-
+        No validation that the second code unit is actually a low
+        surrogate (`0xDC00 <= cu2 < 0xE000`) — without it, an OOB
+        read whose value happens to fall outside the low-surrogate
+        range still proceeds into the 4-byte encoder
+      - >-
+        No regression test for UTF-16 inputs ending on a high
+        surrogate; the test module's TODO list (line 5067) had this
+        explicitly listed as not-yet-covered
+    process-model-flaw: >
+      The model was "high-surrogate detection implies a valid
+      surrogate pair," but UTF-16 strings legitimately end on a lone
+      high surrogate (e.g., malformed input from JS, broken
+      truncation). The Canonical ABI mandates lossy replacement, not
+      OOB read.
+    status: approved
+    priority: high
+
   # ==========================================================================
   # Resolver scenarios
   # ==========================================================================

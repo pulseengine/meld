@@ -3482,6 +3482,26 @@ impl FactStyleGenerator {
         func.instruction(&Instruction::I32And);
         func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
         {
+            // LS-P-16: trap when a lone high surrogate sits at the last code
+            // unit of the input — without this guard the `I32Load16U` below
+            // reads `mem16[ptr + (src_idx + 1) * 2]`, i.e. 2 bytes past the
+            // caller-supplied UTF-16 buffer. Those bytes (adjacent caller
+            // linear memory) then get treated as the "low surrogate" and
+            // encoded into a 4-byte UTF-8 sequence in the callee output —
+            // a silent leak of attacker-adjacent caller memory across the
+            // component boundary. Trap is the conservative mitigation; the
+            // Canonical-ABI-correct behaviour is to replace the lone
+            // surrogate with U+FFFD (3-byte UTF-8 EF BF BD), which is a
+            // structural follow-up to this guard.
+            func.instruction(&Instruction::LocalGet(src_idx_local));
+            func.instruction(&Instruction::I32Const(1));
+            func.instruction(&Instruction::I32Add);
+            func.instruction(&Instruction::LocalGet(1));
+            func.instruction(&Instruction::I32GeU);
+            func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+            func.instruction(&Instruction::Unreachable);
+            func.instruction(&Instruction::End);
+
             // Surrogate pair: read low surrogate
             // cu2 = mem16[ptr + (src_idx + 1) * 2]
             // code_point = 0x10000 + ((cu - 0xD800) << 10) + (cu2 - 0xDC00)
@@ -4942,6 +4962,66 @@ mod tests {
         assert_eq!(options.caller_string_encoding, StringEncoding::Utf8);
         assert_eq!(options.callee_string_encoding, StringEncoding::Utf8);
         assert!(!options.needs_transcoding());
+    }
+
+    /// LS-P-16 — `emit_utf16_to_utf8_transcode` must guard against reading the
+    /// low-surrogate code unit out-of-bounds when the input ends on a lone
+    /// high surrogate.
+    ///
+    /// Before the fix the surrogate-pair `If` arm unconditionally emitted a
+    /// second `I32Load16U` at `mem16[ptr + (src_idx + 1) * 2]`. For an
+    /// input whose last code unit is a high surrogate, that load is 2 bytes
+    /// past the caller-supplied buffer end. The 2 bytes (attacker-adjacent
+    /// caller linear memory) are then treated as the "low surrogate" and
+    /// encoded into a 4-byte UTF-8 sequence in the callee — silent cross-
+    /// memory leak per UTF-16→UTF-8 transcoded string. Surfaced by the
+    /// mythos-auto delta-pass on PR #179. Conservative mitigation traps
+    /// (`unreachable`) when `src_idx + 1 >= input_len`. The full
+    /// Canonical-ABI-correct behaviour replaces the lone surrogate with
+    /// U+FFFD (3-byte UTF-8 `EF BF BD`) — that upgrade is structural
+    /// follow-up; this commit's guard converts silent leak into loud trap.
+    ///
+    /// This test pins the structural invariant: the LS-P-16 marker comment
+    /// must remain in the source AND the surrogate-pair `If` arm must emit
+    /// an `Unreachable` instruction *before* the second `I32Load16U`. A
+    /// refactor that removes the comment OR drops the `Unreachable` is
+    /// caught here.
+    #[test]
+    fn ls_p_16_utf16_lone_high_surrogate_oob_guard_emitted() {
+        const SRC: &str = include_str!("fact.rs");
+        let marker = "LS-P-16: trap when a lone high surrogate";
+        let pos = SRC.find(marker).unwrap_or_else(|| {
+            panic!(
+                "fact.rs must retain the LS-P-16 marker `{marker}`; \
+                 without the guard the surrogate-pair If arm reads 2 \
+                 bytes past the UTF-16 input buffer",
+            )
+        });
+        // Look only within the guard block + the immediate next ~2000 bytes
+        // (the surrogate-pair body that ends with the next "Surrogate pair:
+        // read low surrogate" comment marker).
+        let after = &SRC[pos..];
+        let end = after
+            .find("Surrogate pair: read low surrogate")
+            .unwrap_or(after.len())
+            .min(3000);
+        let block = &after[..end];
+        assert!(
+            block.contains("Unreachable"),
+            "LS-P-16 guard must emit Instruction::Unreachable inside the \
+             surrogate-pair If arm before the second I32Load16U; the \
+             segment between the LS-P-16 marker and the second-load \
+             comment is missing the Unreachable opcode",
+        );
+        // Also require the bounds check shape: src_idx + 1 >= input_len.
+        // The exact wasm-encoder pattern is LocalGet(src_idx_local),
+        // I32Const(1), I32Add, LocalGet(1), I32GeU. Match on the textual
+        // representation.
+        assert!(
+            block.contains("I32GeU"),
+            "LS-P-16 guard must include an I32GeU comparison against \
+             input_len",
+        );
     }
 
     /// LS-P-14 — the nested-list inner copy in `emit_patch_nested_indirections`
