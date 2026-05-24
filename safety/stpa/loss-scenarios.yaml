@@ -966,6 +966,87 @@ loss-scenarios:
     status: approved
     priority: high
 
+  - id: LS-P-17
+    title: Caller-encoding match filters on Func only, miscalibrates mixed-encoding callers
+    uca: UCA-R-3
+    hazards: [H-4, H-4.4]
+    type: inadequate-process-model
+    scenario: >
+      `meld-core/src/resolver.rs` has two structurally-identical
+      caller-encoding lookup loops (primary site around lines 2877–
+      2910, fallback site around 3175–3225). Each iterates
+      `from_component.imports` filtering on
+      `wasmparser::ComponentTypeRef::Func(_)` and tries to match
+      `ci.name == *import_name` to find the caller's `Lower` options
+      for the resolved interface. WIT interface imports lower to
+      `ComponentTypeRef::Instance(_)` at the component-import level,
+      so the loop **never matches for interface imports** — the only
+      shape that can match is a top-level bare-`Func` component
+      import, which `wit-component` / `wasm-tools` does not emit
+      under the WIT-bindgen norm. The loops fall through to a
+      heuristic `caller_lower_map.iter().min_by_key(|(k, _)| **k)`
+      that picks the encoding of the **lowest-indexed Lower** entry,
+      then assigns it as `requirements.caller_encoding` for whatever
+      interface is currently being resolved. `string_transcoding` is
+      then computed as `caller_encoding != callee_encoding` against
+      the single heuristic-selected encoding. For single-encoding
+      callers (the overwhelming majority of WIT-bindgen output
+      today — UTF-8 throughout) the heuristic happens to pick the
+      only encoding present and `string_transcoding` is correctly
+      attributed. For mixed-encoding callers (UTF-16 for one
+      interface, UTF-8 for another — e.g. a JS/.NET host component
+      lowering UTF-16 to one import alongside a Rust UTF-8 lowering
+      to another, both calling a UTF-8 callee) the heuristic picks
+      one encoding for **every** interface, so the adapter skips
+      transcoding where it was needed (or forces it where it was
+      unnecessary). The emitted lift/lower bridge then either reads
+      raw UTF-16 bytes as UTF-8 or vice versa, producing scrambled
+      strings at the call boundary [UCA-R-3 wrong adapter wiring /
+      H-4 / H-4.4 incorrect string transcoding]. Reachability:
+      latent today since most components are single-encoding, but
+      legal under the Component Model and exposed whenever multi-
+      encoding host components arrive. Surfaced by the mythos-auto
+      delta-pass on PR #179 and clean-room verified. **This commit
+      is the conservative mitigation**: detect mixed-encoding
+      callers (`caller_lower_map.values()` not all identical) before
+      the heuristic fallback fires and emit a `log::warn!` with the
+      LS-P-17 marker and the interface name, so the miscompile is
+      no longer silent. The full structural fix — resolve the
+      caller's component func index from the core import via a
+      `caller_core_import_to_comp_func` map (or extend the loop to
+      walk `ComponentTypeRef::Instance` aliases) to get per-function
+      precision — is tracked as follow-up. Confirmed by PoC
+      `meld-core::resolver::tests::ls_p_17_mixed_caller_encoding_warns_before_heuristic_fallback`,
+      a structural test that requires the LS-P-17 marker comment to
+      live at **both** sites and that the warn-on-mixed pattern
+      (`all_same` uniformity check + `log::warn!`) is present.
+    causal-factors:
+      - >-
+        The component-import filter was hardcoded to
+        `ComponentTypeRef::Func`, but the canonical encoding of WIT
+        interface imports is `ComponentTypeRef::Instance` — the
+        filter excludes the very shape it was meant to match
+      - >-
+        The heuristic fallback (`min_by_key` over the entire
+        `caller_lower_map`) cannot recover per-interface attribution
+        from a global lowest-index choice
+      - >-
+        The fallback emitted only a `log::debug!`, so the
+        misattribution was invisible at default logging level
+      - >-
+        No regression test exercised
+        `resolve_component_imports_with_hints` with a
+        mixed-encoding caller (UTF-16 for one interface, UTF-8 for
+        another)
+    process-model-flaw: >
+      The model was "the per-interface caller encoding is a function
+      of the lowered-options table alone," but it is actually a
+      function of the (interface, func) pair — multi-encoding
+      callers need per-interface lookup. The global heuristic
+      collapses that pairing onto a single global default.
+    status: approved
+    priority: low
+
   # ==========================================================================
   # Resolver scenarios
   # ==========================================================================

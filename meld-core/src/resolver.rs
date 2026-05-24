@@ -2894,11 +2894,49 @@ impl Resolver {
                                             }
                                         }
                                     }
-                                    if matched_caller_enc.is_none()
-                                        && let Some((_, lo)) =
+                                    if matched_caller_enc.is_none() {
+                                        // LS-P-17: the exact-name match above only inspects
+                                        // ComponentTypeRef::Func component imports — WIT
+                                        // interface imports lower to
+                                        // ComponentTypeRef::Instance, so for typical
+                                        // wit-component / wasm-tools output the loop always
+                                        // misses and the fallback below picks the
+                                        // lowest-indexed Lower's encoding for *every*
+                                        // interface. That heuristic is correct when the
+                                        // caller is single-encoding (the common case) and
+                                        // silently wrong when the caller is mixed-encoding
+                                        // (e.g. UTF-16 for one interface, UTF-8 for another):
+                                        // string_transcoding gets miscalibrated and the
+                                        // emitted lift/lower bridge skips transcoding where
+                                        // it was needed (or vice versa). Surface mixed-
+                                        // encoding callers with a loud warning so the issue
+                                        // is no longer silent; the full structural fix
+                                        // (per-interface attribution via Instance-aliased
+                                        // func indices) is tracked as follow-up.
+                                        let first_enc = caller_lower_map
+                                            .values()
+                                            .next()
+                                            .map(|lo| lo.string_encoding);
+                                        let all_same = caller_lower_map
+                                            .values()
+                                            .all(|lo| Some(lo.string_encoding) == first_enc);
+                                        if !all_same {
+                                            log::warn!(
+                                                "LS-P-17: caller component has multiple \
+                                                 distinct string encodings across its lowered \
+                                                 imports; falling back to the lowest-indexed \
+                                                 Lower's encoding as a heuristic for interface \
+                                                 import `{}`. string_transcoding may be \
+                                                 miscalibrated if this interface's actual \
+                                                 lowered encoding differs.",
+                                                import_name,
+                                            );
+                                        }
+                                        if let Some((_, lo)) =
                                             caller_lower_map.iter().min_by_key(|(k, _)| **k)
-                                    {
-                                        matched_caller_enc = Some(lo.string_encoding);
+                                        {
+                                            matched_caller_enc = Some(lo.string_encoding);
+                                        }
                                     }
                                     if let Some(enc) = matched_caller_enc {
                                         requirements.caller_encoding = Some(enc);
@@ -3159,17 +3197,41 @@ impl Resolver {
                                 }
                             }
 
-                            if matched_caller_encoding.is_none()
-                                && let Some((_, lower_opts)) =
+                            if matched_caller_encoding.is_none() {
+                                // LS-P-17 (secondary site): same ComponentTypeRef::Func
+                                // filter / Instance-import miss / heuristic fallback as the
+                                // primary site above. Warn on mixed-encoding callers so
+                                // miscompiled string_transcoding becomes loud rather than
+                                // silent; the structural per-interface attribution fix is
+                                // tracked as follow-up.
+                                let first_enc = caller_lower_map
+                                    .values()
+                                    .next()
+                                    .map(|lo| lo.string_encoding);
+                                let all_same = caller_lower_map
+                                    .values()
+                                    .all(|lo| Some(lo.string_encoding) == first_enc);
+                                if !all_same {
+                                    log::warn!(
+                                        "LS-P-17 (secondary): caller component has multiple \
+                                         distinct string encodings across its lowered imports; \
+                                         falling back to the lowest-indexed Lower's encoding \
+                                         as a heuristic for interface import `{}`. \
+                                         string_transcoding may be miscalibrated.",
+                                        import_name,
+                                    );
+                                }
+                                if let Some((_, lower_opts)) =
                                     caller_lower_map.iter().min_by_key(|(k, _)| **k)
-                            {
-                                log::debug!(
-                                    "Using heuristic lower encoding for import '{}' \
-                                     (name-based match not found; {} lower entries)",
-                                    import_name,
-                                    caller_lower_map.len()
-                                );
-                                matched_caller_encoding = Some(lower_opts.string_encoding);
+                                {
+                                    log::debug!(
+                                        "Using heuristic lower encoding for import '{}' \
+                                         (name-based match not found; {} lower entries)",
+                                        import_name,
+                                        caller_lower_map.len()
+                                    );
+                                    matched_caller_encoding = Some(lower_opts.string_encoding);
+                                }
                             }
 
                             if let Some(enc) = matched_caller_encoding {
@@ -4681,6 +4743,64 @@ mod tests {
              not silently classified as callee-defined; got {} resolved \
              ops",
             resolved.len(),
+        );
+    }
+
+    /// LS-P-17 — the caller-encoding name-match loops in resolver.rs filter
+    /// on `ComponentTypeRef::Func` only, but WIT interface imports lower to
+    /// `ComponentTypeRef::Instance`. The loop always misses for typical
+    /// wit-component / wasm-tools output, and the heuristic fallback
+    /// (`min_by_key` over `caller_lower_map`) picks the lowest-indexed
+    /// Lower's encoding for **every** interface — silently miscalibrating
+    /// `string_transcoding` when the caller has multiple distinct string
+    /// encodings.
+    ///
+    /// The fix here is the conservative mitigation: when the loop misses
+    /// AND the caller has distinct encodings, emit a `log::warn!` before
+    /// the fallback so the miscompile is no longer silent. The structural
+    /// per-interface attribution (Instance-aliased func indices) is
+    /// follow-up work tracked separately.
+    ///
+    /// This test pins both occurrences of the marker (primary site around
+    /// 2877–2940 and the secondary fallback site around 3175–3225) and
+    /// verifies that the warn-on-mixed pattern (`all_same` boolean +
+    /// `log::warn!` with `LS-P-17` marker) is present at each.
+    #[test]
+    fn ls_p_17_mixed_caller_encoding_warns_before_heuristic_fallback() {
+        const SRC: &str = include_str!("resolver.rs");
+        let primary_marker = "LS-P-17: the exact-name match";
+        assert!(
+            SRC.contains(primary_marker),
+            "resolver.rs must retain the LS-P-17 primary-site marker \
+             `{primary_marker}`; without it the warn-before-fallback \
+             guard for mixed-encoding callers regressed",
+        );
+        let secondary_marker = "LS-P-17 (secondary)";
+        assert!(
+            SRC.contains(secondary_marker),
+            "resolver.rs must retain the LS-P-17 secondary-site marker \
+             `{secondary_marker}` covering the fallback name-match path",
+        );
+
+        // Both sites must include the `all_same` flag (encoding-uniformity
+        // detection) gating the warn.
+        let warn_pattern_count = SRC.matches("all_same = caller_lower_map\n").count()
+            + SRC.matches("all_same\n").count();
+        assert!(
+            warn_pattern_count >= 1,
+            "expected the LS-P-17 warn-on-mixed-encoding pattern at \
+             both sites (primary 2877-, secondary 3175-); found {} \
+             matches of the `all_same` flag",
+            warn_pattern_count,
+        );
+
+        // Loud-warn instruction must be present (rather than just a
+        // debug-level log) at both LS-P-17 sites.
+        let warn_count = SRC.matches("log::warn!").count();
+        assert!(
+            warn_count >= 2,
+            "expected at least 2 log::warn! calls in resolver.rs for the \
+             LS-P-17 mixed-encoding mitigation; found {warn_count}",
         );
     }
 

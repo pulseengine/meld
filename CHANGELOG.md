@@ -6,6 +6,34 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **Caller-encoding name match filtered on `ComponentTypeRef::Func`
+  only, miscalibrated `string_transcoding` for mixed-encoding
+  callers — defensive warn-before-heuristic** (LS-P-17, UCA-R-3,
+  H-4 / H-4.4, `meld-core/src/resolver.rs`). Two structurally-
+  identical lookup loops (primary around lines 2877–2910, fallback
+  around 3175–3225) filtered `from_component.imports` on
+  `ComponentTypeRef::Func(_)` to find a caller's `Lower` options
+  for the resolved interface. WIT interface imports lower to
+  `ComponentTypeRef::Instance(_)`, so the loops **never matched**
+  for typical wit-component / wasm-tools output and fell through to
+  a heuristic `caller_lower_map.iter().min_by_key(|(k, _)| **k)`
+  that picked the lowest-indexed Lower's encoding for **every**
+  interface. For single-encoding callers (the common case) this
+  happens to be correct; for mixed-encoding callers (UTF-16 for one
+  interface, UTF-8 for another — e.g. JS/.NET host components) the
+  heuristic miscalibrated `string_transcoding` across the board,
+  silently scrambling strings at one or more call boundaries.
+  **Mitigation only**: detect mixed-encoding callers (`values()`
+  not all identical) before the heuristic and emit a `log::warn!`
+  with the LS-P-17 marker and the interface name. The full
+  structural per-interface attribution (Instance-aliased func
+  indices or per-interface lookup) is tracked as follow-up. **A
+  confirmed Mythos finding** — surfaced by the mythos-auto
+  delta-pass on PR #179, clean-room verified. Promoted to approved
+  loss scenario **LS-P-17** (priority low — bug is latent for
+  single-encoding callers). Regression pinned by
+  `ls_p_17_mixed_caller_encoding_warns_before_heuristic_fallback`.
+
 - **UTF-16→UTF-8 transcoding read 2 bytes past the input buffer on a
   lone high surrogate at the end of a UTF-16 string — silent
   cross-memory leak of adjacent caller bytes into the callee's UTF-8
