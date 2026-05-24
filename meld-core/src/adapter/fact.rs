@@ -2751,7 +2751,7 @@ impl FactStyleGenerator {
                     } else {
                         1 + inner_pointers
                             .iter()
-                            .map(|(_, cl)| depth(cl))
+                            .map(|ip| depth(&ip.copy_layout))
                             .max()
                             .unwrap_or(0)
                     }
@@ -2778,7 +2778,7 @@ impl FactStyleGenerator {
     #[allow(clippy::too_many_arguments)]
     fn emit_inner_pointer_fixup(
         func: &mut Function,
-        inner_pointers: &[(u32, crate::resolver::CopyLayout)],
+        inner_pointers: &[crate::resolver::InnerPointer],
         element_size: u32,
         _src_base_local: u32, // local holding source array base pointer (reserved for future deep copy)
         dst_base_local: u32,  // local holding destination array base pointer
@@ -2810,12 +2810,58 @@ impl FactStyleGenerator {
         func.instruction(&Instruction::I32GeU);
         func.instruction(&Instruction::BrIf(1)); // break to $exit
 
-        // For each inner pointer pair in the element:
-        for (inner_offset, inner_layout) in inner_pointers {
+        // For each inner pointer descriptor:
+        for ip in inner_pointers {
+            let inner_offset = ip.byte_offset;
+            let inner_layout = &ip.copy_layout;
             let byte_mult = match inner_layout {
                 crate::resolver::CopyLayout::Bulk { byte_multiplier } => *byte_multiplier,
                 crate::resolver::CopyLayout::Elements { element_size, .. } => *element_size,
             };
+
+            // LS-P-12: AND-evaluate this descriptor's per-element discriminant
+            // guards. Empty guards → unconditional fixup (the historic
+            // Record/Tuple/List path). Non-empty → load each guard's
+            // discriminant byte from the per-element base
+            // (`dst_base + loop_idx * element_size + guard.position`) at the
+            // right width (`I32Load{8U,16U,_}` per `guard.byte_size`),
+            // compare with `guard.value`, AND-chain the results, and wrap
+            // the entire fixup body in an `If` so it only fires when every
+            // enclosing option/result/variant arm holds.
+            let guarded = !ip.guards.is_empty();
+            if guarded {
+                let mut emitted_any = false;
+                for guard in &ip.guards {
+                    func.instruction(&Instruction::LocalGet(dst_base_local));
+                    func.instruction(&Instruction::LocalGet(loop_idx));
+                    func.instruction(&Instruction::I32Const(element_size as i32));
+                    func.instruction(&Instruction::I32Mul);
+                    func.instruction(&Instruction::I32Add);
+                    let mem_arg = wasm_encoder::MemArg {
+                        offset: guard.position as u64,
+                        align: 0,
+                        memory_index: dst_mem,
+                    };
+                    match guard.byte_size {
+                        1 => func.instruction(&Instruction::I32Load8U(mem_arg)),
+                        2 => func.instruction(&Instruction::I32Load16U(wasm_encoder::MemArg {
+                            align: 1,
+                            ..mem_arg
+                        })),
+                        _ => func.instruction(&Instruction::I32Load(wasm_encoder::MemArg {
+                            align: 2,
+                            ..mem_arg
+                        })),
+                    };
+                    func.instruction(&Instruction::I32Const(guard.value as i32));
+                    func.instruction(&Instruction::I32Eq);
+                    if emitted_any {
+                        func.instruction(&Instruction::I32And);
+                    }
+                    emitted_any = true;
+                }
+                func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+            }
 
             // elem_offset = loop_idx * element_size + inner_offset
             // Read inner_ptr from dst_base[elem_offset]
@@ -2824,7 +2870,7 @@ impl FactStyleGenerator {
             func.instruction(&Instruction::I32Const(element_size as i32));
             func.instruction(&Instruction::I32Mul);
             func.instruction(&Instruction::I32Add);
-            func.instruction(&Instruction::I32Const(*inner_offset as i32));
+            func.instruction(&Instruction::I32Const(inner_offset as i32));
             func.instruction(&Instruction::I32Add);
             // Now stack has: dst_base + loop_idx * element_size + inner_offset
             // But we need to load from the SOURCE memory (the pointer values
@@ -2842,7 +2888,7 @@ impl FactStyleGenerator {
             func.instruction(&Instruction::I32Const(element_size as i32));
             func.instruction(&Instruction::I32Mul);
             func.instruction(&Instruction::I32Add);
-            func.instruction(&Instruction::I32Const(*inner_offset as i32 + 4));
+            func.instruction(&Instruction::I32Const(inner_offset as i32 + 4));
             func.instruction(&Instruction::I32Add);
             func.instruction(&Instruction::I32Load(wasm_encoder::MemArg {
                 offset: 0,
@@ -2904,7 +2950,7 @@ impl FactStyleGenerator {
             func.instruction(&Instruction::I32Const(element_size as i32));
             func.instruction(&Instruction::I32Mul);
             func.instruction(&Instruction::I32Add);
-            func.instruction(&Instruction::I32Const(*inner_offset as i32));
+            func.instruction(&Instruction::I32Const(inner_offset as i32));
             func.instruction(&Instruction::I32Add);
             func.instruction(&Instruction::LocalGet(new_ptr));
             func.instruction(&Instruction::I32Store(wasm_encoder::MemArg {
@@ -2913,6 +2959,10 @@ impl FactStyleGenerator {
                 memory_index: dst_mem,
             }));
             // len stays the same — no need to update it
+
+            if guarded {
+                func.instruction(&Instruction::End); // end LS-P-12 per-element guard If
+            }
         }
 
         // Increment loop counter

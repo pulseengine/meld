@@ -139,15 +139,45 @@ pub enum CopyLayout {
     /// Used for strings (multiplier=1) and lists of scalars.
     Bulk { byte_multiplier: u32 },
     /// Element-wise copy: `len` elements of `element_size` bytes each.
-    /// `inner_pointers` lists byte offsets within each element where (ptr, len)
-    /// pairs exist, along with their own recursive copy layout.
-    /// `inner_resources` lists byte offsets of resource handles that need
-    /// conversion after bulk copy.
+    /// `inner_pointers` lists the per-element pointer-pair fixup
+    /// descriptors (offset + sub-layout + optional discriminant guards
+    /// for pointer-bearing option/result/variant payloads, LS-P-12).
+    /// `inner_resources` lists byte offsets of resource handles that
+    /// need conversion after bulk copy.
     Elements {
         element_size: u32,
-        inner_pointers: Vec<(u32, CopyLayout)>,
+        inner_pointers: Vec<InnerPointer>,
         inner_resources: Vec<InnerResource>,
     },
+}
+
+/// Per-element inner pointer descriptor for `CopyLayout::Elements`.
+///
+/// `byte_offset` and `copy_layout` describe an inner (ptr, len) pair at a
+/// fixed offset within each element of the outer list. `guards` is a chain
+/// of discriminant checks that must ALL hold (AND-evaluated by the
+/// adapter) before the per-element fixup fires — non-empty when the
+/// pointer lives inside an option/result/variant payload (LS-P-12 /
+/// LS-P-18 structural fix). All discriminant byte offsets in `guards`
+/// are RELATIVE to each element's base, not absolute.
+#[derive(Debug, Clone)]
+pub struct InnerPointer {
+    pub byte_offset: u32,
+    pub copy_layout: CopyLayout,
+    pub guards: Vec<DiscriminantGuard>,
+}
+
+impl InnerPointer {
+    /// Convenience: construct an unconditional inner pointer (empty guard
+    /// chain — fires for every element). Used by the historic Record /
+    /// Tuple / FixedSizeList paths in `element_inner_pointers`.
+    pub fn unconditional(byte_offset: u32, copy_layout: CopyLayout) -> Self {
+        Self {
+            byte_offset,
+            copy_layout,
+            guards: Vec::new(),
+        }
+    }
 }
 
 /// Describes a single scalar slot in the return area's canonical ABI layout.
@@ -663,8 +693,8 @@ fn resolve_one_layout(
             inner.rep_import = entry;
         }
         // Recurse into nested pointer-bearing sub-layouts.
-        for (_, sub) in inner_pointers.iter_mut() {
-            resolve_one_layout(sub, component, map);
+        for ip in inner_pointers.iter_mut() {
+            resolve_one_layout(&mut ip.copy_layout, component, map);
         }
     }
 }
@@ -4109,7 +4139,8 @@ mod tests {
                     1,
                     "one pointer pair per string element"
                 );
-                let (offset, ref inner_layout) = inner_pointers[0];
+                let offset = inner_pointers[0].byte_offset;
+                let inner_layout = &inner_pointers[0].copy_layout;
                 assert_eq!(offset, 0, "string pointer pair starts at byte offset 0");
                 // Inner layout for a string is Bulk { byte_multiplier: 1 }
                 match inner_layout {
@@ -4160,7 +4191,8 @@ mod tests {
                     1,
                     "one pointer pair from the string field"
                 );
-                let (offset, ref inner_layout) = inner_pointers[0];
+                let offset = inner_pointers[0].byte_offset;
+                let inner_layout = &inner_pointers[0].copy_layout;
                 assert_eq!(
                     offset, 0,
                     "string field starts at byte offset 0 in the record"
@@ -4205,7 +4237,8 @@ mod tests {
                     1,
                     "one pointer pair per inner list element"
                 );
-                let (offset, ref inner_layout) = inner_pointers[0];
+                let offset = inner_pointers[0].byte_offset;
+                let inner_layout = &inner_pointers[0].copy_layout;
                 assert_eq!(offset, 0, "inner list pointer pair starts at byte offset 0");
                 // Inner layout for list<u8> is Bulk { byte_multiplier: 1 }
                 match inner_layout {
