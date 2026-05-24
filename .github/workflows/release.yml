@@ -1,5 +1,21 @@
 name: Release
 
+# Release variant: serialize per-tag, never cancel. A cancelled release
+# mid-publish leaves the GitHub Release page, build attestations, and
+# per-target binary archives in an inconsistent state — better to queue
+# any follow-up runs than to interrupt one that may have already signed
+# or attested some assets. Adopts the pulseengine/synth reference flow
+# for artifact verification: archive → CycloneDX SBOM → SHA256SUMS →
+# SLSA build provenance → cosign keyless signing → build-env capture →
+# GH Release upload. No per-file `.sha256` sidecars — the single signed
+# `SHA256SUMS.txt` plus its cosign bundle covers everything.
+#
+# Untrusted-input safety: every shell-interpolated value from the
+# workflow context (`matrix.target`, `inputs.tag`, etc.) flows through
+# an `env:` mapping and is dereferenced as `$VAR` inside `run:` blocks
+# so the GitHub Actions workflow injection guidance is satisfied
+# (https://github.blog/security/vulnerability-research/how-to-catch-github-actions-workflow-injections-before-attackers-do/).
+
 concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: false
@@ -7,12 +23,18 @@ concurrency:
 on:
   push:
     tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to release (e.g. v0.11.0)'
+        required: true
+        type: string
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  build:
+  build-binaries:
     name: Build ${{ matrix.target }}
     runs-on: ${{ matrix.runner }}
     strategy:
@@ -30,12 +52,13 @@ jobs:
           - target: x86_64-apple-darwin
             runner: macos-14
             use_cross: false
-          # Stays on macos-14: smithy is Linux x86_64 only.
           - target: aarch64-apple-darwin
             runner: macos-14
             use_cross: false
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -46,37 +69,198 @@ jobs:
         if: matrix.use_cross
         run: cargo install cross --git https://github.com/cross-rs/cross
 
-      - name: Build
+      - name: Build meld
+        env:
+          TARGET: ${{ matrix.target }}
+          USE_CROSS: ${{ matrix.use_cross }}
         run: |
-          if [ "${{ matrix.use_cross }}" = "true" ]; then
-            cross build --release --target ${{ matrix.target }}
+          set -euo pipefail
+          if [ "$USE_CROSS" = "true" ]; then
+            cross build --release --target "$TARGET"
           else
-            cargo build --release --target ${{ matrix.target }}
+            cargo build --release --target "$TARGET"
           fi
 
-      - name: Rename binary
-        run: mv target/${{ matrix.target }}/release/meld meld-${{ matrix.target }}
+      - name: Strip binary (release builds)
+        if: runner.os != 'Windows'
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          BIN="target/${TARGET}/release/meld"
+          if command -v strip >/dev/null 2>&1; then
+            strip "$BIN" || true
+          fi
 
-      - name: Upload artifact
+      - name: Package archive
+        id: package
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          VERSION="${INPUT_TAG:-${GITHUB_REF#refs/tags/}}"
+          NAME="meld-${VERSION}-${TARGET}"
+          mkdir -p "dist/${NAME}"
+          cp "target/${TARGET}/release/meld" "dist/${NAME}/meld"
+          # README/LICENSE/CHANGELOG are best-effort: ship them when present.
+          cp LICENSE "dist/${NAME}/" 2>/dev/null || true
+          cp README.md "dist/${NAME}/" 2>/dev/null || true
+          cp CHANGELOG.md "dist/${NAME}/" 2>/dev/null || true
+          ( cd dist && tar -czf "${NAME}.tar.gz" "${NAME}" )
+          echo "archive=dist/${NAME}.tar.gz" >> "$GITHUB_OUTPUT"
+          ls -la dist/
+
+      - name: Upload archive artifact
         uses: actions/upload-artifact@v4
         with:
           name: meld-${{ matrix.target }}
-          path: meld-${{ matrix.target }}
+          path: ${{ steps.package.outputs.archive }}
+          if-no-files-found: error
 
-  release:
-    name: Release
-    needs: build
-    runs-on: [self-hosted, linux, x64, light]
+  # ── Create the GitHub Release: SBOM, checksums, provenance, signing ────
+  create-release:
+    name: Create GitHub Release
+    needs: [build-binaries]
+    runs-on: ubuntu-latest
     permissions:
+      # Keyless signing + provenance need an OIDC token; release-asset
+      # upload needs contents: write; build provenance attestation
+      # needs attestations: write. Mirrors the pulseengine/synth
+      # release-workflow permissions set.
       contents: write
+      id-token: write
+      attestations: write
     steps:
-      - name: Download artifacts
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: Download all build artifacts
         uses: actions/download-artifact@v4
         with:
-          merge-multiple: true
+          path: artifacts
 
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+      - name: Flatten release assets
+        run: |
+          set -euo pipefail
+          mkdir -p release-assets
+          find artifacts -type f -name "*.tar.gz" -exec cp {} release-assets/ \;
+          ls -la release-assets/
+
+      # Phase 6: CycloneDX SBOM for the meld toolchain itself. The SBOM
+      # is generated *before* SHA256SUMS so its digest is captured in the
+      # checksum manifest; the cosign signature over SHA256SUMS.txt
+      # transitively covers the SBOM. Adapts the synth reference manifest
+      # path: meld's main crate is `meld-cli` (binary name `meld`).
+      - name: Install Rust (for cargo-cyclonedx)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-cyclonedx
+        run: cargo install --locked cargo-cyclonedx
+
+      - name: Generate toolchain SBOM (CycloneDX)
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          VERSION="${INPUT_TAG:-${GITHUB_REF#refs/tags/}}"
+          BARE="${VERSION#v}"
+          # cargo-cyclonedx doesn't proxy cargo's `-p` package-selection
+          # flag (synth caught this on its first v0.6.0 release attempt).
+          # Use `--manifest-path` to target meld-cli's Cargo.toml directly;
+          # the generated SBOM lands next to that Cargo.toml.
+          cargo cyclonedx \
+            --manifest-path meld-cli/Cargo.toml \
+            --format json \
+            --spec-version 1.5
+          SBOM_SRC="meld-cli/meld-cli.cdx.json"
+          if [ ! -f "$SBOM_SRC" ]; then
+            SBOM_SRC=$(find meld-cli -maxdepth 2 -name '*.cdx.json' | head -1)
+          fi
+          test -n "$SBOM_SRC" && test -f "$SBOM_SRC"
+          cp "$SBOM_SRC" "release-assets/meld-${BARE}.cdx.json"
+          echo "::notice::Toolchain SBOM written to release-assets/meld-${BARE}.cdx.json"
+          ls -la release-assets/
+
+      - name: Generate SHA256 checksums
+        run: |
+          set -euo pipefail
+          cd release-assets
+          sha256sum ./* > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      # ── SLSA build provenance (GitHub-native) ──────────────────────────
+      # actions/attest-build-provenance generates an in-toto SLSA v1
+      # provenance statement for every binary archive, signs it keyless
+      # via Sigstore (Fulcio cert bound to this workflow's OIDC identity),
+      # and records it in the Rekor transparency log. Consumers verify
+      # with `gh attestation verify <file> --repo pulseengine/meld`.
+      - name: Generate SLSA build provenance
+        uses: actions/attest-build-provenance@v2
         with:
-          generate_release_notes: true
-          files: meld-*
+          subject-path: "release-assets/*.tar.gz"
+
+      # ── Sigstore keyless signing (cosign) ──────────────────────────────
+      # Signs SHA256SUMS.txt so a consumer can verify the checksum file
+      # itself was produced by this workflow. The .cosign.bundle is the
+      # verifier-friendly artifact; .sig + .pem are the detached
+      # signature and Fulcio certificate. Verify with:
+      #   cosign verify-blob \
+      #     --certificate-identity-regexp \
+      #       'https://github.com/pulseengine/meld/.github/workflows/release.yml@.*' \
+      #     --certificate-oidc-issuer \
+      #       'https://token.actions.githubusercontent.com' \
+      #     --bundle SHA256SUMS.txt.cosign.bundle \
+      #     SHA256SUMS.txt
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+        with:
+          cosign-release: 'v2.4.1'
+
+      - name: Sign SHA256SUMS with cosign (keyless OIDC)
+        run: |
+          set -euo pipefail
+          cd release-assets
+          cosign sign-blob \
+            --yes \
+            --bundle SHA256SUMS.txt.cosign.bundle \
+            --output-signature SHA256SUMS.txt.sig \
+            --output-certificate SHA256SUMS.txt.pem \
+            SHA256SUMS.txt
+          echo "::notice::SHA256SUMS signed via Sigstore keyless flow."
+          ls -la ./*
+
+      - name: Capture build environment
+        run: |
+          set -euo pipefail
+          {
+            echo "rustc: $(rustc --version)"
+            echo "cargo: $(cargo --version)"
+            echo "cosign: $(cosign version 2>&1 | head -1)"
+            echo "runner: $(uname -srm)"
+          } > release-assets/build-env.txt
+          cat release-assets/build-env.txt
+
+      - name: Create or update GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Untrusted-input safety: the tag name flows in via env: and is
+          # dereferenced through $VERSION, never expanded into the shell.
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          VERSION="${INPUT_TAG:-${GITHUB_REF#refs/tags/}}"
+          # Idempotent: re-running the workflow for an existing release
+          # uploads/overwrites assets rather than failing. --clobber lets
+          # a re-run replace assets a previous partial run left behind.
+          if gh release view "$VERSION" >/dev/null 2>&1; then
+            echo "::notice::Release $VERSION exists; uploading assets"
+            gh release upload "$VERSION" --clobber release-assets/*
+          else
+            echo "::notice::Creating Release $VERSION with assets"
+            gh release create "$VERSION" \
+              --title "meld $VERSION" \
+              --generate-notes \
+              release-assets/*
+          fi
