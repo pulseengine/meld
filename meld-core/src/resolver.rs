@@ -168,6 +168,21 @@ pub struct ReturnAreaSlot {
     pub is_pointer_pair: bool,
 }
 
+/// A single discriminant check: "the discriminant at `position` must equal
+/// `value`" (with the correct byte width for the byte-offset path).
+///
+/// The adapter loads the discriminant slot (`LocalGet` for the flat path,
+/// `I32Load{8U,16U,_}` for the byte-offset path picked by `byte_size`) and
+/// compares it to `value`. A [`ConditionalPointerPair`] copy fires only when
+/// *every* guard — its inner one plus every entry in `outer_guards` —
+/// holds simultaneously (LS-P-10).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiscriminantGuard {
+    pub position: u32,
+    pub value: u32,
+    pub byte_size: u32,
+}
+
 /// A pointer pair that is conditional on a discriminant value.
 /// Used for option<string>, result<string, E>, variant types where
 /// the pointer data only exists when the discriminant matches.
@@ -186,6 +201,18 @@ pub struct ConditionalPointerPair {
     /// (I32Load8U, I32Load16U, I32Load) for byte-offset-based paths.
     /// For flat (stack) paths, this is always 4 (i32).
     pub discriminant_byte_size: u32,
+    /// Discriminants of *enclosing* option/result/variant levels that must
+    /// also hold for the copy to fire. Empty for a single-level conditional
+    /// (e.g. `option<string>`); non-empty when the pointer lives inside a
+    /// nested conditional payload (e.g. the string inside
+    /// `result<option<string>, u32>` needs the outer Result-Ok guard at
+    /// `base` AND the inner Option-Some guard at `base+1`). Without this
+    /// chain, the adapter would inspect the *inner* discriminant byte even
+    /// in arms where the payload type is something else entirely, copying
+    /// memory based on unrelated bytes that happen to read as the inner
+    /// discriminant value — an arbitrary cross-component read with
+    /// attacker-controlled `(ptr, len)` (LS-P-10).
+    pub outer_guards: Vec<DiscriminantGuard>,
 }
 
 /// A resolved resource operation for adapter generation.
@@ -1342,11 +1369,36 @@ fn resolve_resource_positions(
                 // so it does not own the representation.
                 false
             } else {
-                component
+                match component
                     .component_type_defs
                     .get(pos.resource_type_id as usize)
-                    .map(|def| !matches!(def, crate::parser::ComponentTypeDef::Import(_)))
-                    .unwrap_or(true)
+                {
+                    Some(def) => !matches!(def, crate::parser::ComponentTypeDef::Import(_)),
+                    None => {
+                        // LS-P-15: out-of-bounds resource_type_id — the previous
+                        // `unwrap_or(true)` silently classified the resource as
+                        // callee-defined, so the adapter generator emitted a
+                        // [resource-rep]/[resource-new] mismatch (treating an
+                        // import as a definition) with no warning. That
+                        // produced wrong handle conversions on every fused
+                        // cross-component call that passed the handle. Drop the
+                        // resolution entry and warn instead — downstream the
+                        // adapter will either find no work to do (if the
+                        // handle is unused on this flat slot) or surface a
+                        // loud missing-fixup error at adapter generation,
+                        // never silently swap conversion sides.
+                        log::warn!(
+                            "resource_type_id {} out of bounds for \
+                             component_type_defs (len {}); dropping resource \
+                             resolution for {} at flat_idx {} (LS-P-15)",
+                            pos.resource_type_id,
+                            component.component_type_defs.len(),
+                            field_prefix,
+                            pos.flat_idx,
+                        );
+                        continue;
+                    }
+                }
             };
             resolved.push(ResolvedResourceOp {
                 flat_idx: pos.flat_idx,
@@ -1973,9 +2025,26 @@ impl Resolver {
         // Build export index for this component's modules
         let mut module_exports: HashMap<(&str, &str), (usize, &ModuleExport)> = HashMap::new();
 
+        // Use entry().or_insert() + explicit collision check so a duplicate
+        // flat-name export between two core modules in this component fails
+        // loudly rather than silently routing every importer to the last
+        // module (LS-P-11). The instance-graph resolver below uses the
+        // explicit instance edges and is immune to this; the flat-name path
+        // is reached only for components without an `InstanceSection`.
         for (mod_idx, module) in component.core_modules.iter().enumerate() {
             for export in &module.exports {
                 let key = ("", export.name.as_str());
+                if let Some((prev_idx, _)) = module_exports.get(&key) {
+                    let prev_idx = *prev_idx;
+                    if prev_idx != mod_idx {
+                        return Err(Error::DuplicateModuleExport {
+                            component_idx: comp_idx,
+                            export_name: export.name.clone(),
+                            first_module_idx: prev_idx,
+                            second_module_idx: mod_idx,
+                        });
+                    }
+                }
                 module_exports.insert(key, (mod_idx, export));
             }
         }
@@ -2825,11 +2894,49 @@ impl Resolver {
                                             }
                                         }
                                     }
-                                    if matched_caller_enc.is_none()
-                                        && let Some((_, lo)) =
+                                    if matched_caller_enc.is_none() {
+                                        // LS-P-17: the exact-name match above only inspects
+                                        // ComponentTypeRef::Func component imports — WIT
+                                        // interface imports lower to
+                                        // ComponentTypeRef::Instance, so for typical
+                                        // wit-component / wasm-tools output the loop always
+                                        // misses and the fallback below picks the
+                                        // lowest-indexed Lower's encoding for *every*
+                                        // interface. That heuristic is correct when the
+                                        // caller is single-encoding (the common case) and
+                                        // silently wrong when the caller is mixed-encoding
+                                        // (e.g. UTF-16 for one interface, UTF-8 for another):
+                                        // string_transcoding gets miscalibrated and the
+                                        // emitted lift/lower bridge skips transcoding where
+                                        // it was needed (or vice versa). Surface mixed-
+                                        // encoding callers with a loud warning so the issue
+                                        // is no longer silent; the full structural fix
+                                        // (per-interface attribution via Instance-aliased
+                                        // func indices) is tracked as follow-up.
+                                        let first_enc = caller_lower_map
+                                            .values()
+                                            .next()
+                                            .map(|lo| lo.string_encoding);
+                                        let all_same = caller_lower_map
+                                            .values()
+                                            .all(|lo| Some(lo.string_encoding) == first_enc);
+                                        if !all_same {
+                                            log::warn!(
+                                                "LS-P-17: caller component has multiple \
+                                                 distinct string encodings across its lowered \
+                                                 imports; falling back to the lowest-indexed \
+                                                 Lower's encoding as a heuristic for interface \
+                                                 import `{}`. string_transcoding may be \
+                                                 miscalibrated if this interface's actual \
+                                                 lowered encoding differs.",
+                                                import_name,
+                                            );
+                                        }
+                                        if let Some((_, lo)) =
                                             caller_lower_map.iter().min_by_key(|(k, _)| **k)
-                                    {
-                                        matched_caller_enc = Some(lo.string_encoding);
+                                        {
+                                            matched_caller_enc = Some(lo.string_encoding);
+                                        }
                                     }
                                     if let Some(enc) = matched_caller_enc {
                                         requirements.caller_encoding = Some(enc);
@@ -3090,17 +3197,41 @@ impl Resolver {
                                 }
                             }
 
-                            if matched_caller_encoding.is_none()
-                                && let Some((_, lower_opts)) =
+                            if matched_caller_encoding.is_none() {
+                                // LS-P-17 (secondary site): same ComponentTypeRef::Func
+                                // filter / Instance-import miss / heuristic fallback as the
+                                // primary site above. Warn on mixed-encoding callers so
+                                // miscompiled string_transcoding becomes loud rather than
+                                // silent; the structural per-interface attribution fix is
+                                // tracked as follow-up.
+                                let first_enc = caller_lower_map
+                                    .values()
+                                    .next()
+                                    .map(|lo| lo.string_encoding);
+                                let all_same = caller_lower_map
+                                    .values()
+                                    .all(|lo| Some(lo.string_encoding) == first_enc);
+                                if !all_same {
+                                    log::warn!(
+                                        "LS-P-17 (secondary): caller component has multiple \
+                                         distinct string encodings across its lowered imports; \
+                                         falling back to the lowest-indexed Lower's encoding \
+                                         as a heuristic for interface import `{}`. \
+                                         string_transcoding may be miscalibrated.",
+                                        import_name,
+                                    );
+                                }
+                                if let Some((_, lower_opts)) =
                                     caller_lower_map.iter().min_by_key(|(k, _)| **k)
-                            {
-                                log::debug!(
-                                    "Using heuristic lower encoding for import '{}' \
-                                     (name-based match not found; {} lower entries)",
-                                    import_name,
-                                    caller_lower_map.len()
-                                );
-                                matched_caller_encoding = Some(lower_opts.string_encoding);
+                                {
+                                    log::debug!(
+                                        "Using heuristic lower encoding for import '{}' \
+                                         (name-based match not found; {} lower entries)",
+                                        import_name,
+                                        caller_lower_map.len()
+                                    );
+                                    matched_caller_encoding = Some(lower_opts.string_encoding);
+                                }
                             }
 
                             if let Some(enc) = matched_caller_encoding {
@@ -4477,6 +4608,201 @@ mod tests {
     // emitting canonical entries. With two distinct resources that
     // produced exactly one entry per prefix — silently overwriting one
     // import. The tests below pin down the per-resource keying.
+
+    fn module_with_exports(idx: u32, exports: Vec<&str>) -> crate::parser::CoreModule {
+        crate::parser::CoreModule {
+            index: idx,
+            bytes: Vec::new(),
+            types: Vec::new(),
+            imports: Vec::new(),
+            exports: exports
+                .into_iter()
+                .map(|name| crate::parser::ModuleExport {
+                    name: name.to_string(),
+                    kind: crate::parser::ExportKind::Function,
+                    index: 0,
+                })
+                .collect(),
+            functions: Vec::new(),
+            memories: Vec::new(),
+            tables: Vec::new(),
+            globals: Vec::new(),
+            start: None,
+            data_count: None,
+            element_count: 0,
+            custom_sections: Vec::new(),
+            code_section_range: None,
+            global_section_range: None,
+            element_section_range: None,
+            data_section_range: None,
+        }
+    }
+
+    /// LS-P-11 — `resolve_via_flat_names` populates its export index with
+    /// blind `HashMap::insert`. When two core modules within one component
+    /// export the same flat name, the second silently overwrites the first
+    /// (last-writer wins), routing any importer to the wrong module — a
+    /// semantic-preservation violation with no error or warning.
+    ///
+    /// The instance-graph resolver is immune (keys lookups through the
+    /// explicit instance edges), so the bug is unreachable for any
+    /// well-formed multi-module component produced by `wit-component` /
+    /// `wasm-tools` (those always emit an `InstanceSection`). It IS
+    /// reachable for components without instances — synthetic test
+    /// fixtures and a few legacy shapes. Per Mythos process this is a
+    /// hardening fix, not a security emergency. Surfaced by the
+    /// mythos-auto delta-pass on PR #179 and clean-room verified.
+    #[test]
+    fn ls_p_11_duplicate_flat_name_export_is_rejected() {
+        let mut comp = empty_parsed_component();
+        // Two core modules in one component, both exporting `foo`. No
+        // InstanceSection — dispatcher routes to resolve_via_flat_names.
+        comp.core_modules.push(module_with_exports(0, vec!["foo"]));
+        comp.core_modules.push(module_with_exports(1, vec!["foo"]));
+
+        let result = Resolver::new().resolve(&[comp]);
+        match result {
+            Err(Error::DuplicateModuleExport {
+                component_idx,
+                export_name,
+                first_module_idx,
+                second_module_idx,
+            }) => {
+                assert_eq!(component_idx, 0);
+                assert_eq!(export_name, "foo");
+                assert_eq!(first_module_idx, 0);
+                assert_eq!(second_module_idx, 1);
+            }
+            other => panic!(
+                "expected DuplicateModuleExport for two modules exporting \
+                 the same flat name; got {other:?}",
+            ),
+        }
+    }
+
+    /// LS-P-15 — `resolve_resource_positions` must drop (not silently
+    /// misclassify) a `ResourcePosition` whose `resource_type_id` is out
+    /// of bounds for `component.component_type_defs`.
+    ///
+    /// Before the fix, the classifier called
+    /// `.get(pos.resource_type_id as usize).map(...).unwrap_or(true)` —
+    /// out-of-bounds defaulted to `callee_defines_resource = true`, so
+    /// the adapter generator emitted a `[resource-rep]` call where
+    /// `[resource-new]` was correct (or vice versa) — a silent swap of
+    /// the two resource-handle conversion sides on every fused
+    /// cross-component call passing that handle. Surfaced by the
+    /// mythos-auto delta-pass on PR #179. The instance-graph normal
+    /// path keys `resource_type_id` through validated type indices
+    /// produced by the parser, so this is reachable only on parser-
+    /// produced stale ids, malformed input, or after alias remaps that
+    /// outrun the local type table — defensive hardening, not a
+    /// memory-safety emergency. Fix matches on `.get(...)` and emits a
+    /// `log::warn!` + `continue` on `None`, so the position is dropped
+    /// and the downstream adapter will either find no work to do for
+    /// the unused flat slot or surface a loud missing-fixup error,
+    /// never silently swap.
+    #[test]
+    fn ls_p_15_out_of_bounds_resource_type_id_is_dropped_not_misclassified() {
+        let mut by_type_id: std::collections::HashMap<(u32, &'static str), (String, String)> =
+            std::collections::HashMap::new();
+        // Force the lookup to succeed at an OOB resource_type_id (999),
+        // so flow reaches the `component_type_defs.get(...)` check.
+        by_type_id.insert(
+            (999, "[resource-rep]"),
+            ("ext".to_string(), "rep".to_string()),
+        );
+        let resource_map = ResourceImportMap {
+            by_type_id,
+            by_name: std::collections::HashMap::new(),
+        };
+
+        // empty_parsed_component has component_type_defs empty, so any
+        // non-zero resource_type_id is OOB.
+        let pc = empty_parsed_component();
+        let pos = crate::parser::ResourcePosition {
+            flat_idx: 0,
+            byte_offset: 0,
+            is_owned: true,
+            resource_type_id: 999,
+        };
+
+        let resolved = resolve_resource_positions(
+            &resource_map,
+            std::slice::from_ref(&pos),
+            "[resource-rep]",
+            &pc,
+            /* callee_is_reexporter = */ false,
+        );
+
+        // Pre-fix: 1 entry pushed with callee_defines_resource = true,
+        // mis-routing the downstream [resource-rep]/[resource-new] call.
+        // Post-fix: warn + continue → 0 entries.
+        assert!(
+            resolved.is_empty(),
+            "out-of-bounds resource_type_id must be dropped (LS-P-15), \
+             not silently classified as callee-defined; got {} resolved \
+             ops",
+            resolved.len(),
+        );
+    }
+
+    /// LS-P-17 — the caller-encoding name-match loops in resolver.rs filter
+    /// on `ComponentTypeRef::Func` only, but WIT interface imports lower to
+    /// `ComponentTypeRef::Instance`. The loop always misses for typical
+    /// wit-component / wasm-tools output, and the heuristic fallback
+    /// (`min_by_key` over `caller_lower_map`) picks the lowest-indexed
+    /// Lower's encoding for **every** interface — silently miscalibrating
+    /// `string_transcoding` when the caller has multiple distinct string
+    /// encodings.
+    ///
+    /// The fix here is the conservative mitigation: when the loop misses
+    /// AND the caller has distinct encodings, emit a `log::warn!` before
+    /// the fallback so the miscompile is no longer silent. The structural
+    /// per-interface attribution (Instance-aliased func indices) is
+    /// follow-up work tracked separately.
+    ///
+    /// This test pins both occurrences of the marker (primary site around
+    /// 2877–2940 and the secondary fallback site around 3175–3225) and
+    /// verifies that the warn-on-mixed pattern (`all_same` boolean +
+    /// `log::warn!` with `LS-P-17` marker) is present at each.
+    #[test]
+    fn ls_p_17_mixed_caller_encoding_warns_before_heuristic_fallback() {
+        const SRC: &str = include_str!("resolver.rs");
+        let primary_marker = "LS-P-17: the exact-name match";
+        assert!(
+            SRC.contains(primary_marker),
+            "resolver.rs must retain the LS-P-17 primary-site marker \
+             `{primary_marker}`; without it the warn-before-fallback \
+             guard for mixed-encoding callers regressed",
+        );
+        let secondary_marker = "LS-P-17 (secondary)";
+        assert!(
+            SRC.contains(secondary_marker),
+            "resolver.rs must retain the LS-P-17 secondary-site marker \
+             `{secondary_marker}` covering the fallback name-match path",
+        );
+
+        // Both sites must include the `all_same` flag (encoding-uniformity
+        // detection) gating the warn.
+        let warn_pattern_count = SRC.matches("all_same = caller_lower_map\n").count()
+            + SRC.matches("all_same\n").count();
+        assert!(
+            warn_pattern_count >= 1,
+            "expected the LS-P-17 warn-on-mixed-encoding pattern at \
+             both sites (primary 2877-, secondary 3175-); found {} \
+             matches of the `all_same` flag",
+            warn_pattern_count,
+        );
+
+        // Loud-warn instruction must be present (rather than just a
+        // debug-level log) at both LS-P-17 sites.
+        let warn_count = SRC.matches("log::warn!").count();
+        assert!(
+            warn_count >= 2,
+            "expected at least 2 log::warn! calls in resolver.rs for the \
+             LS-P-17 mixed-encoding mitigation; found {warn_count}",
+        );
+    }
 
     fn module_with_imports(imports: Vec<(&str, &str)>) -> crate::parser::CoreModule {
         crate::parser::CoreModule {

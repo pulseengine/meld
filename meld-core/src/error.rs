@@ -85,6 +85,24 @@ pub enum Error {
         module_idx: u32,
     },
 
+    /// Two core modules within one component export the same flat name.
+    /// In the flat-name resolution path the previous code silently
+    /// overwrote the first module's entry with the second (last-writer
+    /// wins), routing any import of that name to the wrong module and
+    /// violating the semantic-preservation invariant. The instance-graph
+    /// path is not vulnerable, so this error is only reachable for
+    /// components without an `InstanceSection`; rejecting the collision
+    /// makes the violation loud instead of silent (LS-P-11).
+    #[error(
+        "component {component_idx}: core modules {first_module_idx} and {second_module_idx} both export `{export_name}` in the flat-name resolver path; ambiguous, and the previous behavior silently picked the latter"
+    )]
+    DuplicateModuleExport {
+        component_idx: usize,
+        export_name: String,
+        first_module_idx: usize,
+        second_module_idx: usize,
+    },
+
     /// P3 async component model features are not yet supported
     #[error("P3 async component features not supported: {0}")]
     P3AsyncNotSupported(String),

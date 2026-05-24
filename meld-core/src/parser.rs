@@ -1421,58 +1421,155 @@ impl ParsedComponent {
     /// In the canonical ABI, complex types are "flattened" to sequences of core wasm values.
     /// This returns the total byte size of that flat representation, used for sizing
     /// return area buffers in the retptr calling convention.
+    /// Total byte size of a type's flat (core wasm) representation —
+    /// the sum of the byte widths of each core value in its
+    /// canonical-ABI flattening.
+    ///
+    /// For `result<T,E>` and `variant`, the payload is the **element-
+    /// wise JOIN** of the arms' flat width lists, not `max` of their
+    /// byte totals. When two arms flatten to a different *number* of
+    /// core values, `max` of totals underestimates: for
+    /// `result<u64, string>` the `ok` arm `u64` flattens to `[i64]`
+    /// (8 B) and the `err` arm `string` to `[i32, i32]` (8 B), so
+    /// `max` gives `4 + 8 = 12` — but the joined payload is
+    /// `[i64, i32]` (12 B) and the true flat size is `4 + 12 = 16`.
+    ///
+    /// Returns `u32::MAX` for pathologically large types (e.g. nested
+    /// `fixed-length-list` whose flattening exceeds `FLAT_WIDTH_CAP`).
+    /// Such a type is never flat-passed — the canonical ABI memory-
+    /// passes anything over `MAX_FLAT_PARAMS = 16` — so its flat byte
+    /// size is not a meaningful quantity; a saturated value fails
+    /// downstream allocation safely rather than wrapping (cf. LS-P-4).
     pub fn flat_byte_size(&self, ty: &ComponentValType) -> u32 {
-        match ty {
+        match self.flat_width_list(ty) {
+            Some(widths) => widths.iter().copied().fold(0u32, u32::saturating_add),
+            None => u32::MAX,
+        }
+    }
+
+    /// The flat (core wasm) value-width list of a type — one entry per
+    /// core value, each 4 or 8 bytes. `None` if the list would exceed
+    /// `FLAT_WIDTH_CAP`, which only happens for a pathologically large
+    /// type that the canonical ABI never flat-passes anyway.
+    ///
+    /// `variant` / `result` payloads are the element-wise JOIN of their
+    /// arms: the joined list has the longest arm's length, and each
+    /// position takes the wider of the arms' widths (a position present
+    /// in only one arm takes that arm's width).
+    fn flat_width_list(&self, ty: &ComponentValType) -> Option<Vec<u32>> {
+        // Far beyond the canonical-ABI flat limit (MAX_FLAT_PARAMS = 16).
+        // A flat list longer than this belongs to a memory-passed type
+        // whose flat byte size is not a meaningful quantity; bailing
+        // here also bounds the Vec against nested `fixed-length-list`
+        // blow-up (the LS-P-4 OOM class).
+        const FLAT_WIDTH_CAP: usize = 256;
+
+        // Element-wise JOIN of two flat width lists. The joined list is
+        // as long as the longer input; a position only one list reaches
+        // takes that list's width (`max` with the absent side's 0).
+        fn join(a: &[u32], b: &[u32]) -> Vec<u32> {
+            let n = a.len().max(b.len());
+            (0..n)
+                .map(|i| {
+                    a.get(i)
+                        .copied()
+                        .unwrap_or(0)
+                        .max(b.get(i).copied().unwrap_or(0))
+                })
+                .collect()
+        }
+
+        let widths: Vec<u32> = match ty {
             ComponentValType::Primitive(p) => match p {
-                PrimitiveValType::S64 | PrimitiveValType::U64 | PrimitiveValType::F64 => 8,
-                _ => 4,
+                PrimitiveValType::S64 | PrimitiveValType::U64 | PrimitiveValType::F64 => vec![8],
+                _ => vec![4],
             },
-            ComponentValType::String => 8,  // (ptr: i32, len: i32)
-            ComponentValType::List(_) => 8, // (ptr: i32, len: i32)
-            ComponentValType::Record(fields) => fields
-                .iter()
-                .map(|(_, ty)| self.flat_byte_size(ty))
-                .fold(0u32, u32::saturating_add),
-            ComponentValType::Tuple(elems) => elems
-                .iter()
-                .map(|ty| self.flat_byte_size(ty))
-                .fold(0u32, u32::saturating_add),
-            ComponentValType::Option(inner) => 4u32.saturating_add(self.flat_byte_size(inner)),
+            // (ptr: i32, len: i32)
+            ComponentValType::String | ComponentValType::List(_) => vec![4, 4],
+            ComponentValType::Record(fields) => {
+                let mut w = Vec::new();
+                for (_, t) in fields {
+                    w.extend(self.flat_width_list(t)?);
+                    if w.len() > FLAT_WIDTH_CAP {
+                        return None;
+                    }
+                }
+                w
+            }
+            ComponentValType::Tuple(elems) => {
+                let mut w = Vec::new();
+                for t in elems {
+                    w.extend(self.flat_width_list(t)?);
+                    if w.len() > FLAT_WIDTH_CAP {
+                        return None;
+                    }
+                }
+                w
+            }
+            ComponentValType::Option(inner) => {
+                // option = variant { none, some(inner) }; the none arm
+                // is empty, so the joined payload is just `inner`'s.
+                let mut w = vec![4];
+                w.extend(self.flat_width_list(inner)?);
+                w
+            }
             ComponentValType::Result { ok, err } => {
-                let ok_size = ok.as_ref().map(|t| self.flat_byte_size(t)).unwrap_or(0);
-                let err_size = err.as_ref().map(|t| self.flat_byte_size(t)).unwrap_or(0);
-                4u32.saturating_add(ok_size.max(err_size))
+                let okw = match ok {
+                    Some(t) => self.flat_width_list(t)?,
+                    None => Vec::new(),
+                };
+                let errw = match err {
+                    Some(t) => self.flat_width_list(t)?,
+                    None => Vec::new(),
+                };
+                let mut w = vec![4];
+                w.extend(join(&okw, &errw));
+                w
+            }
+            ComponentValType::Variant(cases) => {
+                let mut payload: Vec<u32> = Vec::new();
+                for (_, t) in cases {
+                    if let Some(t) = t {
+                        payload = join(&payload, &self.flat_width_list(t)?);
+                    }
+                }
+                let mut w = vec![4];
+                w.extend(payload);
+                w
             }
             ComponentValType::Type(idx) => {
                 if let Some(ct) = self.get_type_definition(*idx) {
                     if let ComponentTypeKind::Defined(inner) = &ct.kind {
-                        self.flat_byte_size(inner)
+                        self.flat_width_list(inner)?
                     } else {
-                        4
+                        vec![4]
                     }
                 } else {
-                    4
+                    vec![4]
                 }
             }
-            ComponentValType::Variant(cases) => {
-                // discriminant + max case payload
-                let max_payload = cases
-                    .iter()
-                    .filter_map(|(_, ty)| ty.as_ref().map(|t| self.flat_byte_size(t)))
-                    .max()
-                    .unwrap_or(0);
-                4u32.saturating_add(max_payload)
-            }
             ComponentValType::FixedSizeList(elem, len) => {
-                self.flat_byte_size(elem).saturating_mul(*len)
+                let ew = self.flat_width_list(elem)?;
+                let total = ew.len().checked_mul(*len as usize)?;
+                if total > FLAT_WIDTH_CAP {
+                    return None;
+                }
+                ew.repeat(*len as usize)
             }
             ComponentValType::Flags(names) => {
-                // flats[ceil(N/32)] i32 storage words = 4 bytes each.
-                let n = names.len() as u32;
-                4u32.saturating_mul(n.div_ceil(32))
+                // ceil(N/32) i32 storage words, 4 bytes each.
+                let words = (names.len() as u32).div_ceil(32) as usize;
+                if words > FLAT_WIDTH_CAP {
+                    return None;
+                }
+                vec![4; words]
             }
-            ComponentValType::Own(_) | ComponentValType::Borrow(_) => 4,
+            ComponentValType::Own(_) | ComponentValType::Borrow(_) => vec![4],
+        };
+        if widths.len() > FLAT_WIDTH_CAP {
+            return None;
         }
+        Some(widths)
     }
 
     /// Compute the byte size of the return area for a component function's results.
@@ -1484,7 +1581,13 @@ impl ParsedComponent {
         for (_, ty) in results {
             let align = self.canonical_abi_align(ty);
             size = align_up(size, align);
-            size += self.canonical_abi_size_unpadded(ty);
+            // saturating_add, not `+=`: canonical_abi_size_unpadded
+            // saturates to u32::MAX for a pathological fixed-length-list
+            // (LS-P-4); a bare `+=` on a saturated accumulator then
+            // overflows — debug panic, release wrap-to-small. The
+            // wrapped value would size a too-small cabi_realloc buffer
+            // and the adapter would write OOB (LS-P-6).
+            size = size.saturating_add(self.canonical_abi_element_size(ty));
         }
         // Align final size to the max alignment of the tuple
         let max_align = results
@@ -1500,7 +1603,17 @@ impl ParsedComponent {
     /// If this exceeds MAX_FLAT_PARAMS (16), the canonical ABI uses the params-ptr
     /// calling convention: a single i32 pointer to a buffer in linear memory.
     pub fn total_flat_params(&self, params: &[(String, ComponentValType)]) -> u32 {
-        params.iter().map(|(_, ty)| self.flat_count(ty)).sum()
+        // saturating_add fold, not `sum()`: flat_count is saturating
+        // (FixedSizeList multiplies element_flat by len, saturating to
+        // u32::MAX). A bare `sum()` then panics in debug / wraps in
+        // release on `u32::MAX + 1`; a wrapped small value compares
+        // `<= MAX_FLAT_PARAMS` and selects the flat calling convention
+        // for a function that genuinely needs params-ptr — semantic
+        // divergence in the fused output (LS-P-9).
+        params
+            .iter()
+            .map(|(_, ty)| self.flat_count(ty))
+            .fold(0u32, u32::saturating_add)
     }
 
     /// Compute the byte size of the params area for a component function's params.
@@ -1513,7 +1626,11 @@ impl ParsedComponent {
         for (_, ty) in params {
             let align = self.canonical_abi_align(ty);
             size = align_up(size, align);
-            size += self.canonical_abi_size_unpadded(ty);
+            // saturating_add, not `+=` — see return_area_byte_size
+            // above and LS-P-6: a bare `+=` on a u32::MAX accumulator
+            // overflows, wrapping the params buffer size down to a
+            // small value that under-allocates the cabi_realloc buffer.
+            size = size.saturating_add(self.canonical_abi_element_size(ty));
         }
         // Align final size to the max alignment of the tuple
         let max_align = params
@@ -1548,7 +1665,7 @@ impl ParsedComponent {
             let align = self.canonical_abi_align(ty);
             byte_offset = align_up(byte_offset, align);
             self.collect_pointer_byte_offsets(ty, byte_offset, &mut offsets);
-            byte_offset += self.canonical_abi_size_unpadded(ty);
+            byte_offset += self.canonical_abi_element_size(ty);
         }
         offsets
     }
@@ -1568,7 +1685,7 @@ impl ParsedComponent {
             let align = self.canonical_abi_align(ty);
             byte_offset = align_up(byte_offset, align);
             self.collect_return_area_type_slots(ty, byte_offset, &mut slots);
-            byte_offset += self.canonical_abi_size_unpadded(ty);
+            byte_offset += self.canonical_abi_element_size(ty);
         }
         slots
     }
@@ -1589,7 +1706,7 @@ impl ParsedComponent {
             let align = self.canonical_abi_align(ty);
             byte_offset = align_up(byte_offset, align);
             self.collect_return_area_type_slots(ty, byte_offset, &mut slots);
-            byte_offset += self.canonical_abi_size_unpadded(ty);
+            byte_offset += self.canonical_abi_element_size(ty);
         }
         slots
     }
@@ -1633,7 +1750,7 @@ impl ParsedComponent {
                     let align = self.canonical_abi_align(field_ty);
                     offset = align_up(offset, align);
                     self.collect_return_area_type_slots(field_ty, offset, out);
-                    offset += self.canonical_abi_size_unpadded(field_ty);
+                    offset += self.canonical_abi_element_size(field_ty);
                 }
             }
             ComponentValType::Tuple(elems) => {
@@ -1642,7 +1759,7 @@ impl ParsedComponent {
                     let align = self.canonical_abi_align(elem_ty);
                     offset = align_up(offset, align);
                     self.collect_return_area_type_slots(elem_ty, offset, out);
-                    offset += self.canonical_abi_size_unpadded(elem_ty);
+                    offset += self.canonical_abi_element_size(elem_ty);
                 }
             }
             ComponentValType::Variant(cases) => {
@@ -1896,7 +2013,7 @@ impl ParsedComponent {
             let align = self.canonical_abi_align(ty);
             byte_offset = align_up(byte_offset, align);
             self.collect_resource_byte_positions(ty, byte_offset, &mut positions);
-            byte_offset += self.canonical_abi_size_unpadded(ty);
+            byte_offset += self.canonical_abi_element_size(ty);
         }
         positions
     }
@@ -1932,7 +2049,7 @@ impl ParsedComponent {
                     let align = self.canonical_abi_align(field_ty);
                     offset = align_up(offset, align);
                     self.collect_resource_byte_positions(field_ty, offset, out);
-                    offset += self.canonical_abi_size_unpadded(field_ty);
+                    offset += self.canonical_abi_element_size(field_ty);
                 }
             }
             ComponentValType::Tuple(elems) => {
@@ -1941,7 +2058,7 @@ impl ParsedComponent {
                     let align = self.canonical_abi_align(elem_ty);
                     offset = align_up(offset, align);
                     self.collect_resource_byte_positions(elem_ty, offset, out);
-                    offset += self.canonical_abi_size_unpadded(elem_ty);
+                    offset += self.canonical_abi_element_size(elem_ty);
                 }
             }
             ComponentValType::Option(inner) => {
@@ -2033,7 +2150,7 @@ impl ParsedComponent {
                 });
             }
             flat_idx += self.flat_count(ty);
-            byte_offset += self.canonical_abi_size_unpadded(ty);
+            byte_offset += self.canonical_abi_element_size(ty);
         }
         positions
     }
@@ -2120,7 +2237,7 @@ impl ParsedComponent {
             let align = self.canonical_abi_align(ty);
             byte_offset = align_up(byte_offset, align);
             self.collect_pointer_byte_offsets(ty, byte_offset, &mut offsets);
-            byte_offset += self.canonical_abi_size_unpadded(ty);
+            byte_offset += self.canonical_abi_element_size(ty);
         }
         offsets
     }
@@ -2166,6 +2283,55 @@ impl ParsedComponent {
         }
     }
 
+    /// Like [`Self::collect_pointer_positions`], but also records the
+    /// [`CopyLayout`](crate::resolver::CopyLayout) for the String/List leaf at
+    /// each flat position. The layout describes that specific leaf — not the
+    /// enclosing composite — so a `list<u32>` field inside a record yields
+    /// `Bulk { byte_multiplier: 4 }` rather than the `_ => Bulk { 1 }` fallback
+    /// `copy_layout` returns when handed a whole record/tuple/fixed-list.
+    fn collect_pointer_positions_with_layout(
+        &self,
+        ty: &ComponentValType,
+        base: u32,
+        out: &mut Vec<(u32, crate::resolver::CopyLayout)>,
+    ) {
+        match ty {
+            ComponentValType::String | ComponentValType::List(_) => {
+                out.push((base, self.copy_layout(ty)));
+            }
+            ComponentValType::FixedSizeList(elem, len) => {
+                let elem_flat = self.flat_count(elem);
+                let mut offset = base;
+                for _ in 0..*len {
+                    self.collect_pointer_positions_with_layout(elem, offset, out);
+                    offset += elem_flat;
+                }
+            }
+            ComponentValType::Record(fields) => {
+                let mut offset = base;
+                for (_, field_ty) in fields {
+                    self.collect_pointer_positions_with_layout(field_ty, offset, out);
+                    offset += self.flat_count(field_ty);
+                }
+            }
+            ComponentValType::Tuple(elems) => {
+                let mut offset = base;
+                for elem_ty in elems {
+                    self.collect_pointer_positions_with_layout(elem_ty, offset, out);
+                    offset += self.flat_count(elem_ty);
+                }
+            }
+            ComponentValType::Type(idx) => {
+                if let Some(ct) = self.get_type_definition(*idx)
+                    && let ComponentTypeKind::Defined(inner) = &ct.kind
+                {
+                    self.collect_pointer_positions_with_layout(inner, base, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
     /// Collect byte offsets in the return area where pointer pairs start.
     /// Uses canonical ABI memory layout offsets (with alignment).
     fn collect_pointer_byte_offsets(&self, ty: &ComponentValType, base: u32, out: &mut Vec<u32>) {
@@ -2188,7 +2354,7 @@ impl ParsedComponent {
                     let align = self.canonical_abi_align(field_ty);
                     offset = align_up(offset, align);
                     self.collect_pointer_byte_offsets(field_ty, offset, out);
-                    offset += self.canonical_abi_size_unpadded(field_ty);
+                    offset += self.canonical_abi_element_size(field_ty);
                 }
             }
             ComponentValType::Tuple(elems) => {
@@ -2197,7 +2363,7 @@ impl ParsedComponent {
                     let align = self.canonical_abi_align(elem_ty);
                     offset = align_up(offset, align);
                     self.collect_pointer_byte_offsets(elem_ty, offset, out);
-                    offset += self.canonical_abi_size_unpadded(elem_ty);
+                    offset += self.canonical_abi_element_size(elem_ty);
                 }
             }
             ComponentValType::Type(idx) => {
@@ -2205,6 +2371,56 @@ impl ParsedComponent {
                     && let ComponentTypeKind::Defined(inner) = &ct.kind
                 {
                     self.collect_pointer_byte_offsets(inner, base, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Like [`Self::collect_pointer_byte_offsets`], but also records the
+    /// [`CopyLayout`](crate::resolver::CopyLayout) for the String/List leaf at
+    /// each byte offset — the layout of that leaf, not the enclosing composite.
+    fn collect_pointer_byte_offsets_with_layout(
+        &self,
+        ty: &ComponentValType,
+        base: u32,
+        out: &mut Vec<(u32, crate::resolver::CopyLayout)>,
+    ) {
+        match ty {
+            ComponentValType::String | ComponentValType::List(_) => {
+                out.push((base, self.copy_layout(ty)));
+            }
+            ComponentValType::FixedSizeList(elem, len) => {
+                let elem_size = self.canonical_abi_element_size(elem);
+                let mut offset = base;
+                for _ in 0..*len {
+                    self.collect_pointer_byte_offsets_with_layout(elem, offset, out);
+                    offset += elem_size;
+                }
+            }
+            ComponentValType::Record(fields) => {
+                let mut offset = base;
+                for (_, field_ty) in fields {
+                    let align = self.canonical_abi_align(field_ty);
+                    offset = align_up(offset, align);
+                    self.collect_pointer_byte_offsets_with_layout(field_ty, offset, out);
+                    offset += self.canonical_abi_element_size(field_ty);
+                }
+            }
+            ComponentValType::Tuple(elems) => {
+                let mut offset = base;
+                for elem_ty in elems {
+                    let align = self.canonical_abi_align(elem_ty);
+                    offset = align_up(offset, align);
+                    self.collect_pointer_byte_offsets_with_layout(elem_ty, offset, out);
+                    offset += self.canonical_abi_element_size(elem_ty);
+                }
+            }
+            ComponentValType::Type(idx) => {
+                if let Some(ct) = self.get_type_definition(*idx)
+                    && let ComponentTypeKind::Defined(inner) = &ct.kind
+                {
+                    self.collect_pointer_byte_offsets_with_layout(inner, base, out);
                 }
             }
             _ => {}
@@ -2220,7 +2436,7 @@ impl ParsedComponent {
         let mut out = Vec::new();
         let mut flat_idx = 0u32;
         for (_, ty) in params {
-            self.collect_conditional_pointers(ty, flat_idx, &mut out);
+            self.collect_conditional_pointers(ty, flat_idx, &[], &mut out);
             flat_idx += self.flat_count(ty);
         }
         out
@@ -2234,7 +2450,7 @@ impl ParsedComponent {
         let mut out = Vec::new();
         let mut flat_idx = 0u32;
         for (_, ty) in results {
-            self.collect_conditional_pointers(ty, flat_idx, &mut out);
+            self.collect_conditional_pointers(ty, flat_idx, &[], &mut out);
             flat_idx += self.flat_count(ty);
         }
         out
@@ -2251,18 +2467,27 @@ impl ParsedComponent {
         for (_, ty) in results {
             let align = self.canonical_abi_align(ty);
             byte_offset = align_up(byte_offset, align);
-            self.collect_conditional_result_pointers(ty, byte_offset, &mut out);
-            byte_offset += self.canonical_abi_size_unpadded(ty);
+            self.collect_conditional_result_pointers(ty, byte_offset, &[], &mut out);
+            byte_offset += self.canonical_abi_element_size(ty);
         }
         out
     }
 
     /// Collect conditional pointer pairs for flat params.
     /// For option<T> where T contains pointers: disc at base, payload at base+1.
+    ///
+    /// `outer_guards` is the chain of enclosing option/result/variant
+    /// discriminants that must also hold for any pair emitted here to be
+    /// active — empty at the top level; one entry per nesting level deeper.
+    /// Without this chain, a `result<option<string>, u32>` would emit only
+    /// the inner option-Some guard, and the adapter would copy memory
+    /// whenever the bytes that happen to occupy the option's discriminant
+    /// slot (in the Err arm: the u32 payload) read as `1` (LS-P-10).
     fn collect_conditional_pointers(
         &self,
         ty: &ComponentValType,
         base: u32,
+        outer_guards: &[crate::resolver::DiscriminantGuard],
         out: &mut Vec<crate::resolver::ConditionalPointerPair>,
     ) {
         match ty {
@@ -2271,19 +2496,30 @@ impl ParsedComponent {
                 // disc=1 means Some, payload starts at base+1
                 // In flat representation, discriminant is always i32 (4 bytes)
                 let payload_base = base + 1;
+                let my_guard = crate::resolver::DiscriminantGuard {
+                    position: base,
+                    value: 1,
+                    byte_size: 4,
+                };
                 let mut inner_positions = Vec::new();
-                self.collect_pointer_positions(inner, payload_base, &mut inner_positions);
-                for ptr_pos in inner_positions {
-                    let layout = self.copy_layout_for_string_or_list_at(inner);
+                self.collect_pointer_positions_with_layout(
+                    inner,
+                    payload_base,
+                    &mut inner_positions,
+                );
+                for (ptr_pos, layout) in inner_positions {
                     out.push(crate::resolver::ConditionalPointerPair {
-                        discriminant_position: base,
-                        discriminant_value: 1,
+                        discriminant_position: my_guard.position,
+                        discriminant_value: my_guard.value,
                         ptr_position: ptr_pos,
                         copy_layout: layout,
-                        discriminant_byte_size: 4,
+                        discriminant_byte_size: my_guard.byte_size,
+                        outer_guards: outer_guards.to_vec(),
                     });
                 }
-                self.collect_conditional_pointers(inner, payload_base, out);
+                let mut nested = outer_guards.to_vec();
+                nested.push(my_guard);
+                self.collect_conditional_pointers(inner, payload_base, &nested, out);
             }
             ComponentValType::Result { ok, err } => {
                 // result<T,E> flattens to [disc, ...max(T_flat, E_flat)]
@@ -2292,36 +2528,58 @@ impl ParsedComponent {
                 if let Some(ok_ty) = ok
                     && self.type_contains_pointers(ok_ty)
                 {
+                    let ok_guard = crate::resolver::DiscriminantGuard {
+                        position: base,
+                        value: 0,
+                        byte_size: 4,
+                    };
                     let mut inner_positions = Vec::new();
-                    self.collect_pointer_positions(ok_ty, payload_base, &mut inner_positions);
-                    for ptr_pos in inner_positions {
-                        let layout = self.copy_layout_for_string_or_list_at(ok_ty);
+                    self.collect_pointer_positions_with_layout(
+                        ok_ty,
+                        payload_base,
+                        &mut inner_positions,
+                    );
+                    for (ptr_pos, layout) in inner_positions {
                         out.push(crate::resolver::ConditionalPointerPair {
-                            discriminant_position: base,
-                            discriminant_value: 0,
+                            discriminant_position: ok_guard.position,
+                            discriminant_value: ok_guard.value,
                             ptr_position: ptr_pos,
                             copy_layout: layout,
-                            discriminant_byte_size: 4,
+                            discriminant_byte_size: ok_guard.byte_size,
+                            outer_guards: outer_guards.to_vec(),
                         });
                     }
-                    self.collect_conditional_pointers(ok_ty, payload_base, out);
+                    let mut nested = outer_guards.to_vec();
+                    nested.push(ok_guard);
+                    self.collect_conditional_pointers(ok_ty, payload_base, &nested, out);
                 }
                 if let Some(err_ty) = err
                     && self.type_contains_pointers(err_ty)
                 {
+                    let err_guard = crate::resolver::DiscriminantGuard {
+                        position: base,
+                        value: 1,
+                        byte_size: 4,
+                    };
                     let mut inner_positions = Vec::new();
-                    self.collect_pointer_positions(err_ty, payload_base, &mut inner_positions);
-                    for ptr_pos in inner_positions {
-                        let layout = self.copy_layout_for_string_or_list_at(err_ty);
+                    self.collect_pointer_positions_with_layout(
+                        err_ty,
+                        payload_base,
+                        &mut inner_positions,
+                    );
+                    for (ptr_pos, layout) in inner_positions {
                         out.push(crate::resolver::ConditionalPointerPair {
-                            discriminant_position: base,
-                            discriminant_value: 1,
+                            discriminant_position: err_guard.position,
+                            discriminant_value: err_guard.value,
                             ptr_position: ptr_pos,
                             copy_layout: layout,
-                            discriminant_byte_size: 4,
+                            discriminant_byte_size: err_guard.byte_size,
+                            outer_guards: outer_guards.to_vec(),
                         });
                     }
-                    self.collect_conditional_pointers(err_ty, payload_base, out);
+                    let mut nested = outer_guards.to_vec();
+                    nested.push(err_guard);
+                    self.collect_conditional_pointers(err_ty, payload_base, &nested, out);
                 }
             }
             ComponentValType::Variant(cases) => {
@@ -2331,19 +2589,30 @@ impl ParsedComponent {
                     if let Some(ty) = case_ty
                         && self.type_contains_pointers(ty)
                     {
+                        let case_guard = crate::resolver::DiscriminantGuard {
+                            position: base,
+                            value: case_idx as u32,
+                            byte_size: 4,
+                        };
                         let mut inner_positions = Vec::new();
-                        self.collect_pointer_positions(ty, payload_base, &mut inner_positions);
-                        for ptr_pos in inner_positions {
-                            let layout = self.copy_layout_for_string_or_list_at(ty);
+                        self.collect_pointer_positions_with_layout(
+                            ty,
+                            payload_base,
+                            &mut inner_positions,
+                        );
+                        for (ptr_pos, layout) in inner_positions {
                             out.push(crate::resolver::ConditionalPointerPair {
-                                discriminant_position: base,
-                                discriminant_value: case_idx as u32,
+                                discriminant_position: case_guard.position,
+                                discriminant_value: case_guard.value,
                                 ptr_position: ptr_pos,
                                 copy_layout: layout,
-                                discriminant_byte_size: 4,
+                                discriminant_byte_size: case_guard.byte_size,
+                                outer_guards: outer_guards.to_vec(),
                             });
                         }
-                        self.collect_conditional_pointers(ty, payload_base, out);
+                        let mut nested = outer_guards.to_vec();
+                        nested.push(case_guard);
+                        self.collect_conditional_pointers(ty, payload_base, &nested, out);
                     }
                 }
             }
@@ -2351,21 +2620,21 @@ impl ParsedComponent {
                 let elem_flat = self.flat_count(elem);
                 let mut offset = base;
                 for _ in 0..*len {
-                    self.collect_conditional_pointers(elem, offset, out);
+                    self.collect_conditional_pointers(elem, offset, outer_guards, out);
                     offset += elem_flat;
                 }
             }
             ComponentValType::Record(fields) => {
                 let mut offset = base;
                 for (_, field_ty) in fields {
-                    self.collect_conditional_pointers(field_ty, offset, out);
+                    self.collect_conditional_pointers(field_ty, offset, outer_guards, out);
                     offset += self.flat_count(field_ty);
                 }
             }
             ComponentValType::Tuple(elems) => {
                 let mut offset = base;
                 for elem_ty in elems {
-                    self.collect_conditional_pointers(elem_ty, offset, out);
+                    self.collect_conditional_pointers(elem_ty, offset, outer_guards, out);
                     offset += self.flat_count(elem_ty);
                 }
             }
@@ -2373,7 +2642,7 @@ impl ParsedComponent {
                 if let Some(ct) = self.get_type_definition(*idx)
                     && let ComponentTypeKind::Defined(inner) = &ct.kind
                 {
-                    self.collect_conditional_pointers(inner, base, out);
+                    self.collect_conditional_pointers(inner, base, outer_guards, out);
                 }
             }
             _ => {}
@@ -2381,10 +2650,16 @@ impl ParsedComponent {
     }
 
     /// Collect conditional pointer pairs for result byte offsets.
+    ///
+    /// `outer_guards` is the chain of enclosing option/result/variant
+    /// discriminants — see `collect_conditional_pointers` for the LS-P-10
+    /// rationale; identical semantics, byte-offset addressing instead of
+    /// flat-local addressing.
     fn collect_conditional_result_pointers(
         &self,
         ty: &ComponentValType,
         base: u32,
+        outer_guards: &[crate::resolver::DiscriminantGuard],
         out: &mut Vec<crate::resolver::ConditionalPointerPair>,
     ) {
         match ty {
@@ -2394,19 +2669,30 @@ impl ParsedComponent {
                 let ds = disc_size(2);
                 let payload_align = self.canonical_abi_align(inner);
                 let payload_offset = base + align_up(ds, payload_align);
+                let my_guard = crate::resolver::DiscriminantGuard {
+                    position: disc_offset,
+                    value: 1,
+                    byte_size: ds,
+                };
                 let mut inner_offsets = Vec::new();
-                self.collect_pointer_byte_offsets(inner, payload_offset, &mut inner_offsets);
-                for ptr_off in inner_offsets {
-                    let layout = self.copy_layout_for_string_or_list_at(inner);
+                self.collect_pointer_byte_offsets_with_layout(
+                    inner,
+                    payload_offset,
+                    &mut inner_offsets,
+                );
+                for (ptr_off, layout) in inner_offsets {
                     out.push(crate::resolver::ConditionalPointerPair {
-                        discriminant_position: disc_offset,
-                        discriminant_value: 1,
+                        discriminant_position: my_guard.position,
+                        discriminant_value: my_guard.value,
                         ptr_position: ptr_off,
                         copy_layout: layout,
-                        discriminant_byte_size: ds,
+                        discriminant_byte_size: my_guard.byte_size,
+                        outer_guards: outer_guards.to_vec(),
                     });
                 }
-                self.collect_conditional_result_pointers(inner, payload_offset, out);
+                let mut nested = outer_guards.to_vec();
+                nested.push(my_guard);
+                self.collect_conditional_result_pointers(inner, payload_offset, &nested, out);
             }
             ComponentValType::Result { ok, err } => {
                 let disc_offset = base;
@@ -2424,36 +2710,58 @@ impl ParsedComponent {
                 if let Some(ok_ty) = ok
                     && self.type_contains_pointers(ok_ty)
                 {
+                    let ok_guard = crate::resolver::DiscriminantGuard {
+                        position: disc_offset,
+                        value: 0,
+                        byte_size: ds,
+                    };
                     let mut inner_offsets = Vec::new();
-                    self.collect_pointer_byte_offsets(ok_ty, payload_offset, &mut inner_offsets);
-                    for ptr_off in inner_offsets {
-                        let layout = self.copy_layout_for_string_or_list_at(ok_ty);
+                    self.collect_pointer_byte_offsets_with_layout(
+                        ok_ty,
+                        payload_offset,
+                        &mut inner_offsets,
+                    );
+                    for (ptr_off, layout) in inner_offsets {
                         out.push(crate::resolver::ConditionalPointerPair {
-                            discriminant_position: disc_offset,
-                            discriminant_value: 0,
+                            discriminant_position: ok_guard.position,
+                            discriminant_value: ok_guard.value,
                             ptr_position: ptr_off,
                             copy_layout: layout,
-                            discriminant_byte_size: ds,
+                            discriminant_byte_size: ok_guard.byte_size,
+                            outer_guards: outer_guards.to_vec(),
                         });
                     }
-                    self.collect_conditional_result_pointers(ok_ty, payload_offset, out);
+                    let mut nested = outer_guards.to_vec();
+                    nested.push(ok_guard);
+                    self.collect_conditional_result_pointers(ok_ty, payload_offset, &nested, out);
                 }
                 if let Some(err_ty) = err
                     && self.type_contains_pointers(err_ty)
                 {
+                    let err_guard = crate::resolver::DiscriminantGuard {
+                        position: disc_offset,
+                        value: 1,
+                        byte_size: ds,
+                    };
                     let mut inner_offsets = Vec::new();
-                    self.collect_pointer_byte_offsets(err_ty, payload_offset, &mut inner_offsets);
-                    for ptr_off in inner_offsets {
-                        let layout = self.copy_layout_for_string_or_list_at(err_ty);
+                    self.collect_pointer_byte_offsets_with_layout(
+                        err_ty,
+                        payload_offset,
+                        &mut inner_offsets,
+                    );
+                    for (ptr_off, layout) in inner_offsets {
                         out.push(crate::resolver::ConditionalPointerPair {
-                            discriminant_position: disc_offset,
-                            discriminant_value: 1,
+                            discriminant_position: err_guard.position,
+                            discriminant_value: err_guard.value,
                             ptr_position: ptr_off,
                             copy_layout: layout,
-                            discriminant_byte_size: ds,
+                            discriminant_byte_size: err_guard.byte_size,
+                            outer_guards: outer_guards.to_vec(),
                         });
                     }
-                    self.collect_conditional_result_pointers(err_ty, payload_offset, out);
+                    let mut nested = outer_guards.to_vec();
+                    nested.push(err_guard);
+                    self.collect_conditional_result_pointers(err_ty, payload_offset, &nested, out);
                 }
             }
             ComponentValType::Variant(cases) => {
@@ -2469,19 +2777,30 @@ impl ParsedComponent {
                     if let Some(ty) = case_ty
                         && self.type_contains_pointers(ty)
                     {
+                        let case_guard = crate::resolver::DiscriminantGuard {
+                            position: disc_offset,
+                            value: case_idx as u32,
+                            byte_size: ds,
+                        };
                         let mut inner_offsets = Vec::new();
-                        self.collect_pointer_byte_offsets(ty, payload_offset, &mut inner_offsets);
-                        for ptr_off in inner_offsets {
-                            let layout = self.copy_layout_for_string_or_list_at(ty);
+                        self.collect_pointer_byte_offsets_with_layout(
+                            ty,
+                            payload_offset,
+                            &mut inner_offsets,
+                        );
+                        for (ptr_off, layout) in inner_offsets {
                             out.push(crate::resolver::ConditionalPointerPair {
-                                discriminant_position: disc_offset,
-                                discriminant_value: case_idx as u32,
+                                discriminant_position: case_guard.position,
+                                discriminant_value: case_guard.value,
                                 ptr_position: ptr_off,
                                 copy_layout: layout,
-                                discriminant_byte_size: ds,
+                                discriminant_byte_size: case_guard.byte_size,
+                                outer_guards: outer_guards.to_vec(),
                             });
                         }
-                        self.collect_conditional_result_pointers(ty, payload_offset, out);
+                        let mut nested = outer_guards.to_vec();
+                        nested.push(case_guard);
+                        self.collect_conditional_result_pointers(ty, payload_offset, &nested, out);
                     }
                 }
             }
@@ -2489,7 +2808,7 @@ impl ParsedComponent {
                 let elem_size = self.canonical_abi_element_size(elem);
                 let mut offset = base;
                 for _ in 0..*len {
-                    self.collect_conditional_result_pointers(elem, offset, out);
+                    self.collect_conditional_result_pointers(elem, offset, outer_guards, out);
                     offset += elem_size;
                 }
             }
@@ -2498,8 +2817,8 @@ impl ParsedComponent {
                 for (_, field_ty) in fields {
                     let align = self.canonical_abi_align(field_ty);
                     offset = align_up(offset, align);
-                    self.collect_conditional_result_pointers(field_ty, offset, out);
-                    offset += self.canonical_abi_size_unpadded(field_ty);
+                    self.collect_conditional_result_pointers(field_ty, offset, outer_guards, out);
+                    offset += self.canonical_abi_element_size(field_ty);
                 }
             }
             ComponentValType::Tuple(elems) => {
@@ -2507,15 +2826,15 @@ impl ParsedComponent {
                 for elem_ty in elems {
                     let align = self.canonical_abi_align(elem_ty);
                     offset = align_up(offset, align);
-                    self.collect_conditional_result_pointers(elem_ty, offset, out);
-                    offset += self.canonical_abi_size_unpadded(elem_ty);
+                    self.collect_conditional_result_pointers(elem_ty, offset, outer_guards, out);
+                    offset += self.canonical_abi_element_size(elem_ty);
                 }
             }
             ComponentValType::Type(idx) => {
                 if let Some(ct) = self.get_type_definition(*idx)
                     && let ComponentTypeKind::Defined(inner) = &ct.kind
                 {
-                    self.collect_conditional_result_pointers(inner, base, out);
+                    self.collect_conditional_result_pointers(inner, base, outer_guards, out);
                 }
             }
             _ => {}
@@ -2550,14 +2869,6 @@ impl ParsedComponent {
             }
             _ => false,
         }
-    }
-
-    /// Get the copy layout for a type that is either a string or a list.
-    fn copy_layout_for_string_or_list_at(
-        &self,
-        ty: &ComponentValType,
-    ) -> crate::resolver::CopyLayout {
-        self.copy_layout(ty)
     }
 
     /// Count the number of flat core wasm values a component type flattens to.
@@ -2716,7 +3027,7 @@ impl ParsedComponent {
                 for (_, field_ty) in fields {
                     let align = self.canonical_abi_align(field_ty);
                     size = align_up(size, align);
-                    size = size.saturating_add(self.canonical_abi_size_unpadded(field_ty));
+                    size = size.saturating_add(self.canonical_abi_element_size(field_ty));
                 }
                 size
             }
@@ -2725,7 +3036,7 @@ impl ParsedComponent {
                 for elem_ty in elems {
                     let align = self.canonical_abi_align(elem_ty);
                     size = align_up(size, align);
-                    size = size.saturating_add(self.canonical_abi_size_unpadded(elem_ty));
+                    size = size.saturating_add(self.canonical_abi_element_size(elem_ty));
                 }
                 size
             }
@@ -2815,6 +3126,38 @@ impl ParsedComponent {
         match ty {
             ComponentValType::String => CopyLayout::Bulk { byte_multiplier: 1 },
             ComponentValType::List(inner) => {
+                // LS-P-12 / LS-P-18 safety check: refuse adapter generation
+                // when the inner type contains any pointer-bearing
+                // option/result/variant arm anywhere reachable.
+                // `element_inner_pointers` does not recurse into Option /
+                // Result / Variant payloads (its `_ => {}` catch-all silently
+                // drops them), so the returned `CopyLayout::Elements`
+                // descriptor would omit fixup for the conditional payload's
+                // pointer. The original LS-P-12 mitigation only fired when
+                // `inner_ptrs.is_empty()` — a record/tuple mixing a covered
+                // pointer (bare `string`/`list`) with a hidden conditional
+                // pointer (e.g. `record { items: list<u8>, maybe:
+                // option<string> }`) made `inner_ptrs` non-empty via the
+                // covered field, bypassing the guard and silently dropping
+                // the conditional fixup (LS-P-18). The deep recursive check
+                // closes that bypass.
+                if self.has_pointer_bearing_conditional(inner) {
+                    panic!(
+                        "LS-P-18: list element type contains a pointer-\
+                         bearing option/result/variant payload reachable \
+                         anywhere within the element layout — \
+                         `element_inner_pointers` does not yet emit the \
+                         per-element conditional fixup these payloads need, \
+                         so generating an adapter would silently leave \
+                         stale string/list pointers in the callee's \
+                         memory. Refusing rather than corrupting. The full \
+                         structural fix (per-element `DiscriminantGuard` \
+                         on `CopyLayout::Elements.inner_pointers` plus the \
+                         adapter-side per-element guard evaluation) is \
+                         tracked as follow-up to LS-P-12. Inner type: \
+                         {inner:?}",
+                    );
+                }
                 let element_size = self.canonical_abi_element_size(inner);
                 let inner_ptrs = self.element_inner_pointers(inner, 0);
                 let inner_res = self.element_inner_resources(inner, 0);
@@ -2832,6 +3175,53 @@ impl ParsedComponent {
             }
             // For non-list/string types, treat as bulk with 1x multiplier
             _ => CopyLayout::Bulk { byte_multiplier: 1 },
+        }
+    }
+
+    /// LS-P-18 helper: does the type contain a pointer-bearing
+    /// option/result/variant payload anywhere reachable (recursing through
+    /// records, tuples, fixed-size lists, and type aliases)?
+    ///
+    /// Used by `copy_layout(List(inner))` to refuse adapter generation
+    /// rather than emit a `CopyLayout::Elements` whose `inner_pointers`
+    /// silently omits the per-element conditional fixup
+    /// `element_inner_pointers` cannot yet emit for option/result/variant
+    /// payloads. Returning `true` means the adapter would silently leave
+    /// stale string/list pointers in callee memory if we proceeded.
+    fn has_pointer_bearing_conditional(&self, ty: &ComponentValType) -> bool {
+        match ty {
+            ComponentValType::Option(inner) => {
+                self.type_contains_pointers(inner) || self.has_pointer_bearing_conditional(inner)
+            }
+            ComponentValType::Result { ok, err } => {
+                ok.as_ref().is_some_and(|t| {
+                    self.type_contains_pointers(t) || self.has_pointer_bearing_conditional(t)
+                }) || err.as_ref().is_some_and(|t| {
+                    self.type_contains_pointers(t) || self.has_pointer_bearing_conditional(t)
+                })
+            }
+            ComponentValType::Variant(cases) => cases.iter().any(|(_, t)| {
+                t.as_ref().is_some_and(|t| {
+                    self.type_contains_pointers(t) || self.has_pointer_bearing_conditional(t)
+                })
+            }),
+            ComponentValType::Record(fields) => fields
+                .iter()
+                .any(|(_, t)| self.has_pointer_bearing_conditional(t)),
+            ComponentValType::Tuple(elems) => elems
+                .iter()
+                .any(|t| self.has_pointer_bearing_conditional(t)),
+            ComponentValType::FixedSizeList(elem, _) => self.has_pointer_bearing_conditional(elem),
+            ComponentValType::Type(idx) => {
+                if let Some(ct) = self.get_type_definition(*idx)
+                    && let ComponentTypeKind::Defined(inner) = &ct.kind
+                {
+                    self.has_pointer_bearing_conditional(inner)
+                } else {
+                    false
+                }
+            }
+            _ => false,
         }
     }
 
@@ -2870,7 +3260,7 @@ impl ParsedComponent {
                     let align = self.canonical_abi_align(field_ty);
                     offset = align_up(offset, align);
                     result.extend(self.element_inner_pointers(field_ty, offset));
-                    offset += self.canonical_abi_size_unpadded(field_ty);
+                    offset += self.canonical_abi_element_size(field_ty);
                 }
             }
             ComponentValType::Tuple(elems) => {
@@ -2879,7 +3269,7 @@ impl ParsedComponent {
                     let align = self.canonical_abi_align(elem_ty);
                     offset = align_up(offset, align);
                     result.extend(self.element_inner_pointers(elem_ty, offset));
-                    offset += self.canonical_abi_size_unpadded(elem_ty);
+                    offset += self.canonical_abi_element_size(elem_ty);
                 }
             }
             ComponentValType::Type(idx) => {
@@ -2926,7 +3316,7 @@ impl ParsedComponent {
                     let align = self.canonical_abi_align(field_ty);
                     offset = align_up(offset, align);
                     result.extend(self.element_inner_resources(field_ty, offset));
-                    offset = offset.saturating_add(self.canonical_abi_size_unpadded(field_ty));
+                    offset = offset.saturating_add(self.canonical_abi_element_size(field_ty));
                 }
             }
             ComponentValType::Tuple(elems) => {
@@ -2935,7 +3325,7 @@ impl ParsedComponent {
                     let align = self.canonical_abi_align(elem_ty);
                     offset = align_up(offset, align);
                     result.extend(self.element_inner_resources(elem_ty, offset));
-                    offset = offset.saturating_add(self.canonical_abi_size_unpadded(elem_ty));
+                    offset = offset.saturating_add(self.canonical_abi_element_size(elem_ty));
                 }
             }
             ComponentValType::Type(idx) => {
@@ -4408,6 +4798,625 @@ mod tests {
     #[test]
     fn ls_p_4_canonical_abi_size_saturates_on_overflow() {
         test_canonical_abi_size_fixed_size_list_saturates_on_overflow();
+    }
+
+    /// `flat_byte_size` for `result<T,E>` / `variant` must use the
+    /// canonical-ABI element-wise JOIN of the arms' flat width lists,
+    /// not `max` of their byte totals.
+    ///
+    /// Surfaced by the mythos-auto delta-pass on PR #178: for
+    /// `result<u64, string>` the old `4 + max(flat_byte_size(u64),
+    /// flat_byte_size(string))` gave `4 + max(8, 8) = 12`, but the
+    /// joined flat sequence is `[i32 disc, i64, i32]` = 16 bytes. The
+    /// `max` form underestimates whenever the arms flatten to a
+    /// different *number* of core values.
+    #[test]
+    fn flat_byte_size_result_uses_element_wise_join_not_max() {
+        let pc = empty_parsed_component();
+        let u64_t = ComponentValType::Primitive(PrimitiveValType::U64);
+
+        // result<u64, string>: ok arm u64 -> [i64] (8 B), err arm
+        // string -> [i32,i32] (8 B). Joined payload [i64,i32] = 12 B,
+        // + 4 B discriminant = 16. The pre-fix `max` form gave 12.
+        let result_u64_string = ComponentValType::Result {
+            ok: Some(Box::new(u64_t.clone())),
+            err: Some(Box::new(ComponentValType::String)),
+        };
+        assert_eq!(
+            pc.flat_byte_size(&result_u64_string),
+            16,
+            "result<u64,string> flat byte size must be the element-wise \
+             join 4+[i64,i32]=16, not 4+max(8,8)=12",
+        );
+
+        // variant with unequal-arity arms: { a(u64), b(tuple<u32,u32>) }
+        // -> a [i64] (8 B), b [i32,i32] (8 B). Joined [i64,i32] = 12,
+        // + 4 disc = 16.
+        let variant = ComponentValType::Variant(vec![
+            ("a".into(), Some(u64_t.clone())),
+            (
+                "b".into(),
+                Some(ComponentValType::Tuple(vec![
+                    ComponentValType::Primitive(PrimitiveValType::U32),
+                    ComponentValType::Primitive(PrimitiveValType::U32),
+                ])),
+            ),
+        ]);
+        assert_eq!(
+            pc.flat_byte_size(&variant),
+            16,
+            "variant with unequal-arity arms must join element-wise",
+        );
+
+        // Equal-shape arms: result<u32,u32> -> both [i32]; join [i32]
+        // = 4, + 4 disc = 8. (max and join agree when arms are equal.)
+        let result_u32_u32 = ComponentValType::Result {
+            ok: Some(Box::new(ComponentValType::Primitive(PrimitiveValType::U32))),
+            err: Some(Box::new(ComponentValType::Primitive(PrimitiveValType::U32))),
+        };
+        assert_eq!(pc.flat_byte_size(&result_u32_u32), 8);
+
+        // Non-variant types are unchanged by the rewrite.
+        let record = ComponentValType::Record(vec![
+            (
+                "x".into(),
+                ComponentValType::Primitive(PrimitiveValType::U8),
+            ),
+            ("y".into(), ComponentValType::String),
+        ]);
+        assert_eq!(pc.flat_byte_size(&record), 12, "record: [i32]+[i32,i32]=12");
+        assert_eq!(pc.flat_byte_size(&u64_t), 8, "u64: [i64]=8");
+    }
+
+    /// LS-P-6 — `params_area_byte_size` / `return_area_byte_size` must
+    /// **saturate** their cross-field accumulator, not plain `+=`.
+    ///
+    /// `canonical_abi_size_unpadded` saturates to `u32::MAX` for a
+    /// pathologically large `fixed-length-list` (LS-P-4). But the two
+    /// area-size loops accumulated each field with a bare
+    /// `size += canonical_abi_size_unpadded(ty)`: once a first field
+    /// saturates `size` to `u32::MAX`, the next field's `+=` overflows
+    /// — debug builds panic, release builds wrap `u32::MAX` down to a
+    /// small value. The resolver stores that wrapped value as
+    /// `params_area_byte_size`, the adapter passes it to
+    /// `cabi_realloc`, and a multi-field params buffer is allocated
+    /// far too small → OOB write in callee memory. (The sibling
+    /// accumulators inside `canonical_abi_size_unpadded` itself already
+    /// use `saturating_add`; these two were missed.) Surfaced by the
+    /// mythos-auto delta-pass on PR #179.
+    #[test]
+    fn ls_p_6_area_byte_size_saturates_across_fields() {
+        let pc = empty_parsed_component();
+        // FixedSizeList(f64, 2^29): element size 8, 8 * 2^29 = 2^32 —
+        // canonical_abi_size_unpadded saturates this to u32::MAX.
+        let huge = ComponentValType::FixedSizeList(
+            Box::new(ComponentValType::Primitive(PrimitiveValType::F64)),
+            1 << 29,
+        );
+        let u32_t = ComponentValType::Primitive(PrimitiveValType::U32);
+
+        // params_area_byte_size: huge field then a second field. The
+        // accumulator is u32::MAX after field 1; field 2's add must
+        // saturate, not wrap (and must not panic in a debug build).
+        // The contract: the result stays an un-allocatable size near
+        // u32::MAX (the final `align_up` may round the saturated value
+        // down by < max_align), so a downstream `cabi_realloc` fails
+        // safely. The pre-fix bug wrapped it to ~3 — catastrophic
+        // under-allocation. Anything above 2 GiB proves no wrap.
+        let params = vec![
+            ("a".to_string(), huge.clone()),
+            ("b".to_string(), u32_t.clone()),
+        ];
+        let psize = pc.params_area_byte_size(&params);
+        assert!(
+            psize > (1u32 << 31),
+            "params_area_byte_size must saturate across fields, not \
+             wrap; got {psize}",
+        );
+
+        // return_area_byte_size: same accumulator, same hazard.
+        let results = vec![(None, huge), (Some("r".to_string()), u32_t)];
+        let rsize = pc.return_area_byte_size(&results);
+        assert!(
+            rsize > (1u32 << 31),
+            "return_area_byte_size must saturate across fields, not \
+             wrap; got {rsize}",
+        );
+    }
+
+    /// LS-P-7 — `collect_conditional_pointers` and
+    /// `collect_conditional_result_pointers` must compute the `CopyLayout` for
+    /// each *pointer leaf* inside an option/result/variant payload, not for the
+    /// whole composite payload.
+    ///
+    /// Before the fix both functions called
+    /// `copy_layout_for_string_or_list_at(<whole payload type>)`. `copy_layout`
+    /// only special-cases a bare `String`/`List`; a `record`/`tuple`/
+    /// `fixed-list` payload fell to the `_ => Bulk { byte_multiplier: 1 }` arm.
+    /// Every inner pointer position then inherited a 1× multiplier, so a
+    /// `list<u64>` field inside the payload was copied as `len * 1` bytes
+    /// instead of `len * 8` — a 7/8 under-copy / silent truncation [H-4.1] —
+    /// and a pointer-containing `Elements` leaf collapsed to `Bulk`, dropping
+    /// the recursive inner-pointer fixup [H-4.2]. Surfaced by the mythos-auto
+    /// delta-pass on PR #179.
+    #[test]
+    fn ls_p_7_conditional_pointer_layout_is_per_leaf_not_per_composite() {
+        use crate::resolver::CopyLayout;
+        let pc = empty_parsed_component();
+
+        // canonical element size of u64 is align_up(8, 8) = 8.
+        let expect_mult = 8u32;
+        let list_u64 =
+            || ComponentValType::List(Box::new(ComponentValType::Primitive(PrimitiveValType::U64)));
+
+        // Flat-param path: option<tuple<u32, list<u64>>>. The list<u64> is a
+        // pointer leaf inside a tuple; its CopyLayout must be Bulk{8}, not the
+        // Bulk{1} the tuple-level fallback produced before the fix.
+        let opt_param = ComponentValType::Option(Box::new(ComponentValType::Tuple(vec![
+            ComponentValType::Primitive(PrimitiveValType::U32),
+            list_u64(),
+        ])));
+        let flat_pairs = pc.conditional_pointer_pair_positions(&[("p".to_string(), opt_param)]);
+        assert_eq!(flat_pairs.len(), 1, "expected one conditional pointer pair");
+        match &flat_pairs[0].copy_layout {
+            CopyLayout::Bulk { byte_multiplier } => assert_eq!(
+                *byte_multiplier, expect_mult,
+                "list<u64> leaf inside a tuple payload must keep its 8x \
+                 multiplier, not inherit the composite's Bulk{{1}} fallback",
+            ),
+            CopyLayout::Elements { .. } => panic!("list<u64> should be Bulk"),
+        }
+
+        // Retptr/byte-offset path: result<record{ items: list<u64> }, _>.
+        let res_ty = ComponentValType::Result {
+            ok: Some(Box::new(ComponentValType::Record(vec![(
+                "items".to_string(),
+                list_u64(),
+            )]))),
+            err: None,
+        };
+        let byte_pairs = pc.conditional_pointer_pair_result_positions(&[(None, res_ty)]);
+        assert_eq!(byte_pairs.len(), 1, "expected one conditional pointer pair");
+        match &byte_pairs[0].copy_layout {
+            CopyLayout::Bulk { byte_multiplier } => assert_eq!(
+                *byte_multiplier, expect_mult,
+                "list<u64> leaf inside a record payload must keep its 8x \
+                 multiplier in the retptr path too",
+            ),
+            CopyLayout::Elements { .. } => panic!("list<u64> should be Bulk"),
+        }
+    }
+
+    /// LS-P-8 — record/tuple field-walk accumulation must add each field's
+    /// *padded* canonical-ABI footprint (`canonical_abi_element_size`), not the
+    /// `_unpadded` value.
+    ///
+    /// Before the fix, ~25 field-walk sites (the `Record` / `Tuple` arms of
+    /// `canonical_abi_size_unpadded`, `collect_pointer_byte_offsets`,
+    /// `collect_pointer_byte_offsets_with_layout`,
+    /// `collect_conditional_result_pointers`, `collect_return_area_type_slots`,
+    /// `collect_resource_byte_positions`, `element_inner_pointers`,
+    /// `element_inner_resources`, plus the top-level params/results walks in
+    /// `params_area_byte_size`, `return_area_byte_size`,
+    /// `pointer_pair_params_byte_offsets`, `pointer_pair_result_offsets`,
+    /// `params_area_slots`, `return_area_slots`, `resource_params_area_positions`,
+    /// `resource_result_positions`, and
+    /// `conditional_pointer_pair_result_positions`) advanced the running offset
+    /// by `canonical_abi_size_unpadded(field)`. The Component Model spec says
+    /// `s += size(field)` where `size(field)` for an aggregate field is the
+    /// field's full padded size (= this codebase's `canonical_abi_element_size`).
+    /// The per-field `align_up(offset, next_field_align)` does NOT re-absorb a
+    /// preceding field's trailing pad when the next field has *smaller*
+    /// alignment — so a record/tuple containing a padded aggregate followed by
+    /// a lower-aligned field came out smaller than the spec, and a list-copy
+    /// adapter built from those offsets used wrong byte offsets / multipliers.
+    /// Surfaced by the mythos-auto delta-pass on PR #179 (the auto-runner
+    /// mis-located the bug as the option/variant/result payload contribution;
+    /// independent clean-room verification corrected it to the Record/Tuple
+    /// field accumulation).
+    #[test]
+    fn ls_p_8_record_tuple_field_accumulation_uses_padded_field_size() {
+        let pc = empty_parsed_component();
+
+        // Inner record { a: u32, b: u8 } — align 4, spec size 8, unpadded 5.
+        let r_in = ComponentValType::Record(vec![
+            (
+                "a".to_string(),
+                ComponentValType::Primitive(PrimitiveValType::U32),
+            ),
+            (
+                "b".to_string(),
+                ComponentValType::Primitive(PrimitiveValType::U8),
+            ),
+        ]);
+
+        // Outer tuple<R_in, u8> — the canonical bug shape: padded aggregate
+        // followed by a lower-aligned trailing field. Pre-fix:
+        // unpadded(R_in)=5 → b at offset 5, total 6, element_size 8.
+        // Post-fix per spec: element_size(R_in)=8 → b at offset 8, total 9,
+        // element_size 12.
+        let t = ComponentValType::Tuple(vec![
+            r_in.clone(),
+            ComponentValType::Primitive(PrimitiveValType::U8),
+        ]);
+
+        // element_size must equal spec size(T) = 12.
+        assert_eq!(
+            pc.canonical_abi_element_size(&t),
+            12,
+            "element_size(tuple<record{{u32,u8}}, u8>) must match spec size = 12",
+        );
+
+        // params_area_byte_size: top-level params walk follows the same spec
+        // record_size rule, then aligns to max-align. params [R_in, u8]:
+        // align_up(0,4)=0, +8=8; align_up(8,1)=8, +1=9; final align_up(9,4)=12.
+        let params = vec![("p".to_string(), r_in.clone()), ("q".to_string(), t)];
+        assert_eq!(
+            pc.params_area_byte_size(&params),
+            // p (R_in): 0, +8 = 8.  q (T = element_size 12, align 4):
+            // align_up(8,4)=8, +12=20. final align_up(20, max_align=4)=20.
+            20,
+            "params_area_byte_size must add each top-level param's padded \
+             element_size, not its unpadded size",
+        );
+
+        // pointer_pair_result_offsets: with `tuple<R_in, list<u32>>` the
+        // list<u32> must be located at offset 8 (after R_in's full padded
+        // footprint), not at the pre-fix offset 5.
+        let t_with_list = ComponentValType::Tuple(vec![
+            r_in,
+            ComponentValType::List(Box::new(ComponentValType::Primitive(PrimitiveValType::U32))),
+        ]);
+        let offsets = pc.pointer_pair_result_offsets(&[(None, t_with_list)]);
+        assert_eq!(
+            offsets,
+            vec![8],
+            "list<u32> following record{{u32,u8}} must sit at offset 8 \
+             (spec size of the preceding record), not at the unpadded 5",
+        );
+    }
+
+    /// LS-P-18 — strengthens the LS-P-12 mitigation against a mixed-fields
+    /// bypass.
+    ///
+    /// The original LS-P-12 guard fired when `element_inner_pointers(inner, 0)`
+    /// was empty AND `type_contains_pointers(inner)` was true. For a record
+    /// that mixed a covered pointer (bare `string` or `list`) with a hidden
+    /// conditional pointer (`option<string>`), `element_inner_pointers`
+    /// returned a non-empty Vec from the covered field — the guard didn't
+    /// fire, `copy_layout` produced `CopyLayout::Elements` whose
+    /// `inner_pointers` omitted the conditional payload's pointer, and the
+    /// adapter never fixed it up across memories. LS-P-18 replaces the
+    /// emptiness-based guard with a recursive
+    /// `has_pointer_bearing_conditional(inner)` check that detects any
+    /// pointer-bearing option/result/variant *anywhere* in the inner
+    /// element layout. Surfaced by the mythos-auto delta-pass on PR #179.
+    #[test]
+    #[should_panic(expected = "LS-P-18")]
+    fn ls_p_18_mixed_record_with_option_string_bypasses_p12_then_refuses() {
+        let pc = empty_parsed_component();
+        // record { items: list<u8>, maybe: option<string> }
+        // Pre-LS-P-18:
+        //   element_inner_pointers(record) finds the `items` list — non-empty.
+        //   `inner_ptrs.is_empty() && type_contains_pointers(inner)` is FALSE
+        //     (since inner_ptrs is non-empty), so the LS-P-12 panic doesn't
+        //     fire.
+        //   `copy_layout(list<record>)` returns Elements with inner_pointers
+        //     covering only the bare `items` list — the option<string>'s
+        //     payload pointer is silently omitted.
+        // Post-LS-P-18:
+        //   has_pointer_bearing_conditional(record) recurses into fields,
+        //   hits the option<string>, returns true → panic.
+        let mixed = ComponentValType::Record(vec![
+            (
+                "items".to_string(),
+                ComponentValType::List(Box::new(ComponentValType::Primitive(PrimitiveValType::U8))),
+            ),
+            (
+                "maybe".to_string(),
+                ComponentValType::Option(Box::new(ComponentValType::String)),
+            ),
+        ]);
+        let list_of_mixed = ComponentValType::List(Box::new(mixed));
+        let _ = pc.copy_layout(&list_of_mixed);
+    }
+
+    /// LS-P-18 — pure-bare-pointer records (no nested conditional) must still
+    /// flow through `CopyLayout::Elements` without panicking. Pins the
+    /// guard's specificity.
+    #[test]
+    fn ls_p_18_pure_bare_pointer_record_still_works() {
+        use crate::resolver::CopyLayout;
+        let pc = empty_parsed_component();
+        // record { name: string, value: u32 } — both fields covered by
+        // element_inner_pointers; no conditional payload pointer.
+        let rec = ComponentValType::Record(vec![
+            ("name".to_string(), ComponentValType::String),
+            (
+                "value".to_string(),
+                ComponentValType::Primitive(PrimitiveValType::U32),
+            ),
+        ]);
+        let list_of_rec = ComponentValType::List(Box::new(rec));
+        match pc.copy_layout(&list_of_rec) {
+            CopyLayout::Elements { .. } => {}
+            CopyLayout::Bulk { .. } => panic!(
+                "list<record{{name: string, value: u32}}> must be \
+                 Elements (LS-R-2), not Bulk; LS-P-18 must not over-refuse",
+            ),
+        }
+    }
+
+    /// LS-P-12 — `copy_layout(List(inner))` must refuse rather than silently
+    /// emit `Bulk` for a list element type that contains a pointer-bearing
+    /// option/result/variant payload.
+    ///
+    /// `element_inner_pointers` currently has no arms for `Option` / `Result`
+    /// / `Variant` (its match falls through to `_ => {}`) — so for
+    /// `list<option<string>>` it returns the empty Vec, and the existing
+    /// `copy_layout` would happily produce `CopyLayout::Bulk { byte_multiplier:
+    /// element_size }`. The FACT adapter's Bulk path is a flat
+    /// `memory.copy(dst, src, len * element_size)` with NO per-element walk:
+    /// every option's `(ptr, len)` is copied byte-for-byte into the callee,
+    /// where `ptr` still references the *source* component's memory. The
+    /// callee then dereferences a wild pointer for each `Some(...)` element —
+    /// a cross-memory dangling-reference / arbitrary read on each list use.
+    /// Surfaced by the mythos-auto delta-pass on PR #179 and clean-room
+    /// verified as reachable for `list<option<string>>`,
+    /// `list<result<string, _>>`, and `list<variant { …(string)… }>`. The
+    /// per-element conditional fixup the full fix requires (Option/Result/
+    /// Variant arms on `element_inner_pointers` + per-element discriminant
+    /// guards threaded through the inner-pointer descriptor and the adapter's
+    /// fixup loop) is structural follow-up work; this commit's mitigation is
+    /// to *refuse to generate the adapter* for these types, converting silent
+    /// corruption into a loud `panic!` at adapter-generation time.
+    #[test]
+    #[should_panic(expected = "LS-P-12")]
+    fn ls_p_12_list_of_option_string_refuses_rather_than_silently_corrupts() {
+        let pc = empty_parsed_component();
+        let list_opt_string = ComponentValType::List(Box::new(ComponentValType::Option(Box::new(
+            ComponentValType::String,
+        ))));
+        // Pre-fix: returns Bulk { byte_multiplier: 12 } and the adapter
+        // silently produces stale string pointers in callee elements.
+        // Post-fix: panics with an LS-P-12 message — full per-element
+        // conditional fixup tracked as structural follow-up.
+        let _ = pc.copy_layout(&list_opt_string);
+    }
+
+    /// LS-P-12 also covers `list<result<string, _>>`: the result's payload
+    /// holds a string in the Ok arm; `element_inner_pointers` doesn't
+    /// recurse into Result, so the same silent-corruption hazard applies.
+    #[test]
+    #[should_panic(expected = "LS-P-12")]
+    fn ls_p_12_list_of_result_string_refuses() {
+        let pc = empty_parsed_component();
+        let list_result_string = ComponentValType::List(Box::new(ComponentValType::Result {
+            ok: Some(Box::new(ComponentValType::String)),
+            err: Some(Box::new(ComponentValType::Primitive(PrimitiveValType::U32))),
+        }));
+        let _ = pc.copy_layout(&list_result_string);
+    }
+
+    /// Sanity: a list whose element contains NO pointers must still produce
+    /// `Bulk` (no panic). This pins down that LS-P-12's check is gated on
+    /// `type_contains_pointers(inner)` — pure-scalar option/result payloads
+    /// are unaffected by the conservative refusal.
+    #[test]
+    fn ls_p_12_pure_scalar_option_list_is_still_bulk() {
+        use crate::resolver::CopyLayout;
+        let pc = empty_parsed_component();
+        // option<u32> contains no pointer; copy_layout(list<option<u32>>)
+        // must still classify as Bulk and not panic.
+        let list_opt_u32 = ComponentValType::List(Box::new(ComponentValType::Option(Box::new(
+            ComponentValType::Primitive(PrimitiveValType::U32),
+        ))));
+        match pc.copy_layout(&list_opt_u32) {
+            CopyLayout::Bulk { .. } => {}
+            CopyLayout::Elements { .. } => {
+                panic!("list<option<u32>> must still be Bulk (no inner pointers)")
+            }
+        }
+    }
+
+    /// LS-P-13 — `pointer_pair_param_positions` returns *flat* indices into
+    /// the function's lowered param list, and the async FACT adapter's
+    /// param-copy step must use those positions directly.
+    ///
+    /// Before the fix, the async adapter
+    /// (`fact.rs::emit_param_copy_step`) ignored the resolver's positions
+    /// and walked `caller_type.params` looking for consecutive `(i32, i32)`
+    /// slots, gating each match on
+    /// `pointer_pair_positions.iter().any(|_| true)` — semantically
+    /// `!is_empty()`. Every adjacent `(i32, i32)` argument was then
+    /// treated as a `(ptr, len)` string/list and rewritten via
+    /// `cabi_realloc` + `memory.copy`, corrupting plain integer args
+    /// (and reading from attacker-controlled addresses when those
+    /// integers came from a caller). For a signature like
+    /// `(a: u32, s: string, b: u32, c: u32)` the buggy code produced
+    /// `positions = [0, 2]` instead of the correct `[1]`. This test
+    /// pins the resolver contract the fix relies on: positions ARE
+    /// flat indices into the canonical-lowered param list, and
+    /// adjacent flat indices in the result correspond to the actual
+    /// pointer pairs (not every (i32, i32) shape).
+    #[test]
+    fn ls_p_13_pointer_pair_param_positions_is_flat_indices_not_just_nonempty() {
+        let pc = empty_parsed_component();
+        // (a: u32, s: string, b: u32, c: u32) → flat layout
+        //   [a@0, ptr_s@1, len_s@2, b@3, c@4]
+        // The only pointer pair is the string at flat index 1.
+        let params = vec![
+            (
+                "a".to_string(),
+                ComponentValType::Primitive(PrimitiveValType::U32),
+            ),
+            ("s".to_string(), ComponentValType::String),
+            (
+                "b".to_string(),
+                ComponentValType::Primitive(PrimitiveValType::U32),
+            ),
+            (
+                "c".to_string(),
+                ComponentValType::Primitive(PrimitiveValType::U32),
+            ),
+        ];
+        assert_eq!(
+            pc.pointer_pair_param_positions(&params),
+            vec![1],
+            "the string is the only pointer pair; pre-LS-P-13 the async \
+             adapter would have copied `(a, ptr_s)` and `(len_s, b)` as if \
+             both were string ptr-pairs, corrupting plain integer args",
+        );
+
+        // Two strings interleaved with integers:
+        // (a, s1, b, s2, c) → flat [a@0, ptr1@1, len1@2, b@3, ptr2@4, len2@5, c@6]
+        // Pointer pairs at flat indices [1, 4].
+        let mixed = vec![
+            (
+                "a".to_string(),
+                ComponentValType::Primitive(PrimitiveValType::U32),
+            ),
+            ("s1".to_string(), ComponentValType::String),
+            (
+                "b".to_string(),
+                ComponentValType::Primitive(PrimitiveValType::U32),
+            ),
+            ("s2".to_string(), ComponentValType::String),
+            (
+                "c".to_string(),
+                ComponentValType::Primitive(PrimitiveValType::U32),
+            ),
+        ];
+        assert_eq!(
+            pc.pointer_pair_param_positions(&mixed),
+            vec![1, 4],
+            "pointer_pair_param_positions must return flat indices for \
+             EVERY pointer pair, in order — the async adapter clones this \
+             Vec directly to drive its per-pair cabi_realloc + memory.copy",
+        );
+    }
+
+    /// LS-P-10 — a `ConditionalPointerPair` whose pointer lives inside a
+    /// nested option/result/variant payload must carry the full chain of
+    /// enclosing discriminants in `outer_guards`, so the adapter only fires
+    /// the cross-memory copy when *every* enclosing arm holds.
+    ///
+    /// Before the fix, `collect_conditional_pointers` / `_result_pointers`
+    /// emitted a `ConditionalPointerPair` for the leaf pointer guarded only
+    /// on the *innermost* discriminant (e.g. the option's Some byte for the
+    /// string inside `result<option<string>, u32>`). The outer Result-Ok
+    /// guard was missing, so when the runtime value was `Err(some_u32)`,
+    /// the adapter inspected the bytes that happened to occupy the option's
+    /// discriminant slot — i.e. the `u32` payload — and if those bytes
+    /// read as `1`, fired a `memory.copy` with the adjacent slots'
+    /// contents as `(ptr, len)`: a cross-component arbitrary read with
+    /// attacker-controlled length and source address [H-2 / H-4 / H-4.2].
+    /// Surfaced and clean-room-verified on PR #179. The fix threads
+    /// `outer_guards: &[DiscriminantGuard]` through both collectors and
+    /// extends `ConditionalPointerPair` with an `outer_guards` field; the
+    /// fact-adapter helpers (`emit_conditional_guard_chain_flat` /
+    /// `_byte`) emit the AND of every guard before the existing copy.
+    #[test]
+    fn ls_p_10_nested_conditional_pointer_carries_outer_guard_chain() {
+        use crate::resolver::DiscriminantGuard;
+        let pc = empty_parsed_component();
+
+        // result<option<string>, u32>. Flat layout:
+        //   [result_disc @ 0, option_disc @ 1, string_ptr @ 2, string_len @ 3]
+        // The string at flat slot 2 should fire ONLY when
+        //   result_disc == 0 (Ok) AND option_disc == 1 (Some).
+        let ty = ComponentValType::Result {
+            ok: Some(Box::new(ComponentValType::Option(Box::new(
+                ComponentValType::String,
+            )))),
+            err: Some(Box::new(ComponentValType::Primitive(PrimitiveValType::U32))),
+        };
+        let pairs = pc.conditional_pointer_pair_positions(&[("p".to_string(), ty.clone())]);
+
+        // Find the pair guarding the string leaf (innermost = option-Some
+        // at slot 1). Before the fix this was the only pair; after the fix
+        // it must also carry the outer Result-Ok guard.
+        let string_pair = pairs
+            .iter()
+            .find(|p| p.discriminant_position == 1 && p.discriminant_value == 1)
+            .expect("expected a pair for the string under option-Some");
+        assert_eq!(string_pair.ptr_position, 2);
+        assert_eq!(
+            string_pair.outer_guards,
+            vec![DiscriminantGuard {
+                position: 0,
+                value: 0,
+                byte_size: 4,
+            }],
+            "string pair inside result<option<string>, _> must AND the \
+             outer Result-Ok guard at slot 0; without it, an Err arm \
+             whose u32 byte at slot 1 reads as 1 (Some) would trigger a \
+             spurious cross-memory copy",
+        );
+
+        // Retptr / byte-offset path: the same nested type as a result with
+        // disc_size(2) = 1 byte. payload_offset = align_up(1, 4) = 4.
+        // Inner option: disc at byte 4, disc_size=1, payload at
+        // align_up(4+1, 4) = 8. String (ptr, len) at offsets 8 and 12.
+        let byte_pairs = pc.conditional_pointer_pair_result_positions(&[(None, ty)]);
+        let string_byte_pair = byte_pairs
+            .iter()
+            .find(|p| p.discriminant_position == 4 && p.discriminant_value == 1)
+            .expect("expected a byte-offset pair for the string under option-Some");
+        assert_eq!(string_byte_pair.ptr_position, 8);
+        assert_eq!(string_byte_pair.discriminant_byte_size, 1);
+        assert_eq!(
+            string_byte_pair.outer_guards,
+            vec![DiscriminantGuard {
+                position: 0,
+                value: 0,
+                byte_size: 1,
+            }],
+            "retptr-path string pair must AND the outer Result-Ok guard \
+             at byte 0; same LS-P-10 hazard, byte-offset variant",
+        );
+    }
+
+    /// LS-P-9 — `total_flat_params` must saturate-fold per-param `flat_count`
+    /// values, not use `Iterator::sum::<u32>()`.
+    ///
+    /// `flat_count(FixedSizeList(elem, len))` is
+    /// `flat_count(elem).saturating_mul(len)` (LS-P-4 saturation contract),
+    /// so a pathological nested `FixedSizeList` can produce a per-param
+    /// `flat_count` of `u32::MAX`. A bare `.sum::<u32>()` then panics in
+    /// debug builds and wraps `u32::MAX + 1` to a small value in release.
+    /// The wrapped sum then compares `<= MAX_FLAT_PARAMS` (16) and the
+    /// adapter selects the flat calling convention for a function that
+    /// genuinely needs params-ptr — semantic divergence in the fused
+    /// output. Surfaced by the mythos-auto delta-pass on PR #179.
+    #[test]
+    fn ls_p_9_total_flat_params_saturates_across_params() {
+        let pc = empty_parsed_component();
+        // Nested FixedSizeList: inner flat_count = 1 * 2^17 = 131072,
+        // outer multiplies by 2^16 = 65536 → 2^33, saturates to u32::MAX.
+        let huge = ComponentValType::FixedSizeList(
+            Box::new(ComponentValType::FixedSizeList(
+                Box::new(ComponentValType::Primitive(PrimitiveValType::U32)),
+                1 << 17,
+            )),
+            1 << 16,
+        );
+        let params = vec![
+            ("p".to_string(), huge),
+            (
+                "q".to_string(),
+                ComponentValType::Primitive(PrimitiveValType::U32),
+            ),
+        ];
+        // Pre-fix: panics in debug, wraps to 0 in release (≤ 16 → flat
+        // convention). Post-fix: saturates near u32::MAX → params-ptr,
+        // which is the spec-correct lowering for the function.
+        let total = pc.total_flat_params(&params);
+        assert!(
+            total > (1u32 << 31),
+            "total_flat_params must saturate across params, not wrap; \
+             got {total}",
+        );
     }
 
     /// align_up must not panic when given a saturated u32::MAX size and

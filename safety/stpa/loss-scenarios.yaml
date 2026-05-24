@@ -161,6 +161,1010 @@ loss-scenarios:
     status: approved
     priority: high
 
+  - id: LS-P-6
+    title: Area-size accumulators wrap, undoing canonical_abi_size_unpadded saturation
+    uca: UCA-P-3
+    hazards: [H-2, H-4, H-4.1]
+    type: inadequate-control-algorithm
+    scenario: >
+      `meld-core/src/parser.rs::params_area_byte_size` and
+      `return_area_byte_size` compute the canonical-ABI memory size of a
+      component function's params / results by accumulating each field:
+      `size = align_up(size, align); size += canonical_abi_size_unpadded(ty)`.
+      The `+=` is a bare wrapping add. `canonical_abi_size_unpadded`
+      itself **saturates** to `u32::MAX` for a pathologically large
+      `fixed-length-list` (the LS-P-4 fix, which also hardened
+      `align_up` against a saturated input). But the LS-P-4 fix did not
+      reach these two cross-field accumulators: once a first field
+      saturates `size` to `u32::MAX`, the next field's `size +=
+      canonical_abi_size_unpadded(ty)` overflows — a debug build panics
+      ("attempt to add with overflow"), a release build wraps `u32::MAX`
+      down to a small value. A function with params
+      `(fixed-length-list<f64, 2^29>, u32)` makes `params_area_byte_size`
+      wrap from `u32::MAX` to ~3. The resolver stores that wrapped value
+      as `AdapterRequirements::params_area_byte_size`; the FACT adapter
+      generator passes it to `cabi_realloc`, allocating a params buffer
+      a few bytes long and then copying every parameter into it —
+      an out-of-bounds write into the callee's linear memory
+      [UCA-P-3 / H-2 caller-controlled offsets / H-4.1 OOB write].
+      The wasm validator does not catch it; the under-sized realloc and
+      the copy both type-check. The sibling accumulators inside
+      `canonical_abi_size_unpadded` (its Record and Tuple arms) already
+      use `saturating_add` — these two area-size loops were simply
+      missed by LS-P-4. Fix replaces both `+=` sites with
+      `size = size.saturating_add(...)`, so a saturated field keeps the
+      whole area size at a near-`u32::MAX` (un-allocatable) value and
+      the downstream `cabi_realloc` fails safely instead of
+      under-allocating. Surfaced by the mythos-auto delta-pass on
+      PR #179. Confirmed by PoC
+      `meld-core::parser::tests::ls_p_6_area_byte_size_saturates_across_fields`,
+      which panics today on the bare `+=` and asserts a saturated
+      result after the fix; the nearest primitive-layer proof is
+      LS-P-4's `kani_fixed_size_list_size_no_overflow` Kani harness
+      (the symbolic surface here is a `&[(String, ComponentValType)]`
+      slice, which CBMC cannot enumerate directly).
+    causal-factors:
+      - >-
+        `canonical_abi_size_unpadded` was hardened to saturate (LS-P-4)
+        but its two callers' cross-field `+=` accumulators were not,
+        re-introducing the wrap at the next layer up
+      - >-
+        Bare `+=` used where the sibling Record/Tuple accumulators
+        inside the same module already use `saturating_add` —
+        an inconsistency that hid the gap
+      - >-
+        No regression test exercised a multi-field params/results area
+        whose first field saturates the size accumulator
+    process-model-flaw: >
+      The LS-P-4 fix's model was "the size primitives saturate", but the
+      saturation guarantee is only end-to-end if every accumulator that
+      consumes a saturated value also saturates.
+    status: approved
+    priority: high
+
+  - id: LS-P-7
+    title: Conditional-pointer CopyLayout computed for composite, not the leaf
+    uca: UCA-P-3
+    hazards: [H-4, H-4.1, H-4.2]
+    type: inadequate-process-model
+    scenario: >
+      `meld-core/src/parser.rs::collect_conditional_pointers` (flat-param
+      path) and `collect_conditional_result_pointers` (retptr byte-offset
+      path) emit one `ConditionalPointerPair` per pointer leaf inside an
+      `option<T>` / `result<T,E>` / `variant` payload. They correctly
+      enumerated each leaf's *position* by recursing through the payload
+      with `collect_pointer_positions` / `collect_pointer_byte_offsets`,
+      but then computed the `CopyLayout` exactly once by calling
+      `copy_layout_for_string_or_list_at(<whole payload type>)` and
+      assigning that single layout to every position. `copy_layout` only
+      special-cases a bare `string` / `list`; any composite payload
+      (`record`, `tuple`, `fixed-length-list`) falls to the
+      `_ => CopyLayout::Bulk { byte_multiplier: 1 }` fallback. So for a
+      param `option<tuple<u32, list<u64>>>` or a result
+      `result<record { items: list<u64> }, E>`, the `list<u64>` leaf —
+      whose correct layout is `Bulk { byte_multiplier: 8 }` — was tagged
+      `Bulk { byte_multiplier: 1 }` [UCA-P-3]. The FACT adapter then
+      copies `len * 1` bytes for that conditional list instead of
+      `len * 8`: a 7/8 silent under-copy / truncation of caller data
+      [H-4 / H-4.1]. Worse, when the leaf is a pointer-containing list
+      (e.g. `list<string>`) whose correct layout is `CopyLayout::Elements`
+      with recursive inner-pointer fixup, the composite fallback collapses
+      it to flat `Bulk`, so the adapter performs a raw byte copy and omits
+      the inner pointer fixup entirely — the callee then dereferences
+      string/list pointers that still address the *source* memory
+      [H-4.2], the same misclassification class as LS-R-2 but on the
+      conditional (option/result/variant) payload path rather than the
+      list-element path. The wasm validator does not catch it; the
+      under-sized copy type-checks. Fix adds
+      `collect_pointer_positions_with_layout` /
+      `collect_pointer_byte_offsets_with_layout`, which carry the
+      `CopyLayout` of each String/List leaf alongside its position, so
+      every `ConditionalPointerPair` gets the layout of *its own* leaf
+      rather than the enclosing composite's `Bulk{1}` fallback; the now
+      dead `copy_layout_for_string_or_list_at` shim is removed. Surfaced
+      by the mythos-auto delta-pass on PR #179. Confirmed by PoC
+      `meld-core::parser::tests::ls_p_7_conditional_pointer_layout_is_per_leaf_not_per_composite`,
+      which exercises both the flat-param and retptr paths and asserts the
+      `list<u64>` leaf keeps an 8× multiplier; the layout primitive it
+      defends, `copy_layout`, is already covered by the SR-6 / LS-R-2
+      `copy_layout` unit tests in `resolver.rs` (the symbolic surface here
+      is a nested `ComponentValType` tree, which CBMC cannot enumerate
+      directly).
+    causal-factors:
+      - >-
+        `copy_layout` was called once on the whole payload type instead
+        of once per pointer leaf, so its `_ => Bulk{1}` fallback masked
+        every composite payload
+      - >-
+        `collect_pointer_positions` returned bare positions, discarding
+        the leaf type needed to compute the correct per-leaf layout
+      - >-
+        No regression test exercised a conditional payload whose pointer
+        leaf was nested inside a record / tuple / fixed-length-list
+    process-model-flaw: >
+      The code's model was "a conditional payload is one pointer object",
+      but a composite payload holds several independent pointer leaves,
+      each needing its own CopyLayout — the same level-of-detail mistake
+      as LS-R-2, here on the option/result/variant path.
+    status: approved
+    priority: high
+
+  - id: LS-P-8
+    title: Record/tuple field-walk adds unpadded child size, undercounting layout
+    uca: UCA-P-3
+    hazards: [H-4, H-4.1, H-4.2]
+    type: inadequate-control-algorithm
+    scenario: >
+      The Component Model canonical ABI specifies record/tuple layout as
+      `s = 0; for each field f: s = align_to(s, alignment(f)); s += size(f);
+      return align_to(s, alignment(record))`, where `size(f)` for an
+      aggregate field is the field's *full padded* canonical size
+      (`align_to(unpadded_inner, alignment(f))`). In `meld-core/src/parser.rs`
+      that full padded size is `canonical_abi_element_size`;
+      `canonical_abi_size_unpadded` is the outer size *without* the
+      type's own trailing align-up. Roughly 25 field-walk sites — the
+      `Record` and `Tuple` match arms of `canonical_abi_size_unpadded`,
+      `collect_pointer_byte_offsets`,
+      `collect_pointer_byte_offsets_with_layout` (added by LS-P-7),
+      `collect_conditional_result_pointers`,
+      `collect_return_area_type_slots`, `collect_resource_byte_positions`,
+      `element_inner_pointers`, `element_inner_resources`, plus the
+      top-level params/results walks in `params_area_byte_size`,
+      `return_area_byte_size`, `pointer_pair_params_byte_offsets`,
+      `pointer_pair_result_offsets`, `params_area_slots`,
+      `return_area_slots`, `resource_params_area_positions`,
+      `resource_result_positions`, and
+      `conditional_pointer_pair_result_positions` — advanced the running
+      offset by `canonical_abi_size_unpadded(field)` instead of
+      `canonical_abi_element_size(field)`. The per-field
+      `align_up(offset, next_field_align)` does NOT re-absorb the
+      preceding field's omitted trailing pad whenever the next field has
+      *smaller* alignment than the preceding aggregate. So a
+      `tuple<record { a: u32, b: u8 }, u8>` came out with running
+      `_unpadded` = 6 and `element_size` = 8 instead of the spec's
+      9 / 12; a `list<u32>` following `record { u32, u8 }` was located
+      at offset 5 instead of the spec's 8. Wrong field offsets propagate
+      into `pointer_pair_*` and the FACT adapter's list-copy / inner
+      pointer-fixup emission, so the adapter reads pointer pairs from
+      misaligned offsets and copies bytes using stale offsets [UCA-P-3 /
+      H-4 / H-4.1 wrong byte length, H-4.2 fixup walks wrong fields].
+      `params_area_byte_size` / `return_area_byte_size` under-size the
+      adapter buffer for the same reason: a `cabi_realloc` sized for the
+      under-counted total then receives every parameter, and the trailing
+      bytes spill past the buffer (the LS-P-6 hazard class, but reached
+      via the wrong field-size primitive rather than the cross-field
+      accumulator wrap). Fix replaces `canonical_abi_size_unpadded(field)`
+      with `canonical_abi_element_size(field)` at the 25 record/tuple
+      field-walk sites; `canonical_abi_size_unpadded` itself still
+      returns the outer type minus its own trailing pad (that contract is
+      unchanged — `canonical_abi_element_size` re-adds the pad). Surfaced
+      by the mythos-auto delta-pass on PR #179; the discover step
+      mis-located the bug as the `Option` / `Variant` / `Result` payload
+      contribution (which is actually spec-correct — those arms already
+      use `canonical_abi_element_size` for payloads). The actual location
+      was corrected by independent clean-room verification. Confirmed by
+      PoC `meld-core::parser::tests::ls_p_8_record_tuple_field_accumulation_uses_padded_field_size`,
+      which asserts `canonical_abi_element_size(tuple<record{u32,u8},u8>)`
+      = 12, `params_area_byte_size` for the same shape = 20, and a
+      `list<u32>` field after `record{u32,u8}` sitting at byte offset 8.
+    causal-factors:
+      - >-
+        `canonical_abi_size_unpadded` and `canonical_abi_element_size`
+        are two adjacent primitives differing only by the type's own
+        trailing align-up; the wrong one was called at the per-field
+        accumulation step and the function name made it look correct
+      - >-
+        25 independent field-walks rather than a single shared helper
+        replicated the same wrong call across the file
+      - >-
+        No regression test exercised a record/tuple containing a padded
+        aggregate followed by a lower-aligned trailing field — the only
+        type shape that surfaces the bug
+    process-model-flaw: >
+      The code's model was "advance by the inner type's `_unpadded` size
+      because we'll align the next field anyway", but the next field's
+      `align_up` only re-absorbs the trailing pad when the next field's
+      alignment is at least as large as the preceding aggregate's own
+      alignment.
+    status: approved
+    priority: high
+
+  - id: LS-P-9
+    title: total_flat_params uses non-saturating Iterator::sum across params
+    uca: UCA-P-3
+    hazards: [H-2, H-4]
+    type: inadequate-control-algorithm
+    scenario: >
+      `meld-core/src/parser.rs::total_flat_params` returns the total
+      number of flat (core wasm) values a component function's params
+      flatten to. The Component Model canonical ABI uses this count to
+      pick the calling convention: `<= MAX_FLAT_PARAMS` (16) means the
+      flat convention (each param a core value); `>` means the
+      params-ptr convention (a single i32 pointer to a params buffer in
+      linear memory). The function summed per-param `flat_count` values
+      with `Iterator::sum::<u32>()`. `flat_count` for a `FixedSizeList`
+      is `flat_count(elem).saturating_mul(len)` (LS-P-4 saturation
+      contract), so a nested `FixedSizeList` can produce a per-param
+      `flat_count` of `u32::MAX`. A bare `sum()` over u32 then panics
+      in debug builds on `u32::MAX + 1`; a release build wraps the
+      total to a small value. The wrapped total then compares
+      `<= MAX_FLAT_PARAMS` and the adapter selects the **flat** calling
+      convention for a function that genuinely needs **params-ptr**.
+      The fused output then passes the param as a sequence of flat core
+      values that the wasm engine cannot represent (a multi-billion-arg
+      function call), or — worse, when the wrapped count happens to fit
+      a valid flat signature — silently emits the *wrong* calling
+      convention, so the callee reads its parameters from the wrong
+      ABI slot [UCA-P-3]; the adapter's matching `params_area_*` and
+      `pointer_pair_params_*` paths use the params-ptr layout while the
+      function signature uses flat, so call-site lowering and
+      callee-side lifting disagree [H-2 caller-controlled offsets /
+      H-4 wrong adapter]. The sibling area-size accumulators inside
+      `params_area_byte_size` / `return_area_byte_size` already use
+      `saturating_add` (LS-P-6) — this calling-convention picker was
+      simply missed. Fix replaces `.sum()` with
+      `.fold(0u32, u32::saturating_add)`. Surfaced by the mythos-auto
+      delta-pass on PR #179. Confirmed by PoC
+      `meld-core::parser::tests::ls_p_9_total_flat_params_saturates_across_params`,
+      which builds a nested FixedSizeList param whose `flat_count`
+      saturates to `u32::MAX` plus a second param of `flat_count >= 1`
+      and asserts the total stays near `u32::MAX` rather than wrapping.
+      The nearest primitive-layer proof is LS-P-4's
+      `kani_fixed_size_list_size_no_overflow` Kani harness; the
+      symbolic surface here is a `&[(String, ComponentValType)]` slice
+      which CBMC cannot enumerate directly.
+    causal-factors:
+      - >-
+        `Iterator::sum::<u32>()` panics on overflow in debug and wraps
+        in release — neither matches the LS-P-4 saturating contract of
+        the values it sums
+      - >-
+        The calling-convention picker was hardened against per-type
+        saturation (LS-P-4) but not against cross-param accumulation —
+        the same gap LS-P-6 fixed for the area-size accumulators
+      - >-
+        No regression test exercised a params list whose first param's
+        `flat_count` already saturated to `u32::MAX`
+    process-model-flaw: >
+      LS-P-4's model was "the size/count primitives saturate", but the
+      saturation guarantee is only end-to-end if every accumulator that
+      consumes a saturated value also saturates — the same model-flaw
+      class as LS-P-6, here on the flat-param-count side rather than
+      the area-byte-size side.
+    status: approved
+    priority: high
+
+  - id: LS-P-10
+    title: Nested conditional pointer pair omits outer-discriminant guard
+    uca: UCA-P-3
+    hazards: [H-2, H-4, H-4.2]
+    type: inadequate-process-model
+    scenario: >
+      For a pointer-containing type nested inside an option/result/variant
+      arm — for instance `result<option<string>, u32>` —
+      `meld-core/src/parser.rs::collect_conditional_pointers` (flat-param
+      path) and `collect_conditional_result_pointers` (retptr byte-offset
+      path) emitted a `ConditionalPointerPair` guarded only on the
+      *innermost* discriminant. For the example, the string's pair carried
+      `discriminant_position = base+1, discriminant_value = 1` (the
+      option's Some byte), but no guard on the outer Result discriminant
+      at `base`. The FACT adapter (`meld-core/src/adapter/fact.rs`, four
+      consumer loops covering flat-param, flat-result, retptr-param, and
+      retptr-result paths) loaded that single discriminant and fired
+      `cabi_realloc` + `memory.copy` whenever it equalled the expected
+      value. When the runtime value was `Err(v: u32)`, the byte at
+      `base+1` did not hold an option discriminant — it held the `u32`
+      payload. If those bytes happened to read as `1`, the adapter
+      sampled adjacent slots (the next `(ptr, len)` pair worth of bytes
+      from the caller's stack / params buffer / return area) as a
+      string pointer pair and copied `len * 1` bytes from
+      caller-controlled `ptr` into a freshly allocated callee buffer,
+      then handed the forged pointer to the callee. That is an
+      **arbitrary cross-component memory read** with attacker-controlled
+      length and source address [UCA-P-3 / H-2 caller-controlled offsets /
+      H-4 wrong adapter / H-4.2 missing pointer fixup gate]. The same
+      defect applied symmetrically to every nesting where an outer
+      option/result/variant payload contains a pointer-bearing
+      option/result/variant (e.g. `option<option<string>>`,
+      `variant { a(option<string>), b(u32) }`). Surfaced by the
+      mythos-auto delta-pass on PR #179; independent clean-room
+      verification (validator traced the four `fact.rs` consumer loops
+      and confirmed each treats every `ConditionalPointerPair`'s guard
+      independently — no implicit AND with any enclosing conditional)
+      promoted it to approved loss scenario. Fix introduces
+      `DiscriminantGuard` and adds an `outer_guards: Vec<DiscriminantGuard>`
+      field to `ConditionalPointerPair`; both
+      `collect_conditional_pointers` and
+      `collect_conditional_result_pointers` accept an `outer_guards`
+      parameter that is the chain of enclosing-arm discriminants, append
+      their own discriminant onto the chain when recursing into a payload,
+      and stamp each emitted pair with the prefix chain; the four FACT
+      adapter loops call two new helpers
+      (`emit_conditional_guard_chain_flat` /
+      `emit_conditional_guard_chain_byte` in `meld-core/src/adapter/fact.rs`)
+      that emit each guard's `(load disc, I32Const value, I32Eq)` and
+      `I32And` them all together before the existing `If` block fires the
+      copy. The innermost guard remains in the existing
+      `discriminant_*` fields for backward compatibility — `outer_guards`
+      is empty for single-level conditionals so unchanged callers behave
+      identically. Confirmed by PoC
+      `meld-core::parser::tests::ls_p_10_nested_conditional_pointer_carries_outer_guard_chain`,
+      which builds `result<option<string>, u32>` and asserts that on both
+      the flat-param and retptr paths the pair guarding the string leaf
+      carries the outer Result-Ok guard alongside the inner Option-Some
+      guard.
+    causal-factors:
+      - >-
+        `ConditionalPointerPair` carried a single (position, value, size)
+        triple rather than a guard chain, so the parser had nowhere to
+        encode "this copy is conditional on more than one discriminant"
+      - >-
+        Both `collect_conditional_pointers` and
+        `collect_conditional_result_pointers` recursed into the payload
+        of an outer option/result/variant by calling themselves with the
+        payload's base, but did not thread the outer arm's discriminant
+        into the recursion — so inner-emitted pairs guarded only on the
+        inner arm
+      - >-
+        The four FACT adapter consumer loops processed each pair
+        independently with a single `(load + I32Eq + If)` block; there
+        was no separate mechanism that re-gated a nested pair on its
+        enclosing conditional
+      - >-
+        No regression test exercised a nested-conditional pointer shape
+        — every existing test had at most one level of option/result/
+        variant
+    process-model-flaw: >
+      The code's model was "a `ConditionalPointerPair` is guarded by its
+      one discriminant", but pointer-bearing nested conditionals demand a
+      *conjunction* of discriminants: every enclosing arm must also hold,
+      because reading the inner discriminant slot in a sibling outer arm
+      reads unrelated payload bytes that the attacker controls.
+    status: approved
+    priority: high
+
+  - id: LS-P-11
+    title: Flat-name resolver overwrites duplicate module exports silently
+    uca: UCA-R-3
+    hazards: [H-5, H-1]
+    type: inadequate-process-model
+    scenario: >
+      `meld-core/src/resolver.rs::resolve_via_flat_names` (called from
+      `resolve_module_imports` when `component.instances.is_empty()`)
+      builds an export index `HashMap<(&str, &str), (usize, &ModuleExport)>`
+      keyed by the flat export name. The population loop iterates
+      `component.core_modules` and calls `module_exports.insert(key, …)`
+      with no entry check, no warning, no error. When two core modules
+      within the same component both export the same flat name, the
+      second module silently overwrites the first (last-writer wins);
+      any subsequent import of that name resolves to the wrong module
+      [UCA-R-3 misrouted import], the fused module is wired wrong but
+      validates clean [H-5 dependency resolution produces wrong order /
+      H-1 fused module traps at the wrong call site]. The wasm
+      component validator does not catch it; the import/export shape
+      type-checks. The instance-graph resolver
+      (`resolve_via_instances`, taken whenever an `InstanceSection`
+      exists) keys lookups through explicit instance edges and is
+      immune. `wit-component` / `wasm-tools` always emit an
+      `InstanceSection` for multi-module components, so this bug is
+      latent and **practically unreachable** for well-formed
+      production components — it is reachable for synthetic test
+      fixtures and the legacy single-module fallback shape where the
+      flat-name path is taken. Fix replaces the blind insert with an
+      explicit collision check that returns a new
+      `Error::DuplicateModuleExport { component_idx, export_name,
+      first_module_idx, second_module_idx }` (mirroring the
+      `DuplicateModuleInstantiation` pattern at `resolver.rs:2115`),
+      converting silent misrouting into a loud error. Surfaced by the
+      mythos-auto delta-pass on PR #179 and clean-room verified;
+      promoted to approved loss scenario as defensive hardening rather
+      than an emergency. Confirmed by PoC
+      `meld-core::resolver::tests::ls_p_11_duplicate_flat_name_export_is_rejected`,
+      which constructs two `CoreModule` entries both exporting `foo`
+      and no `InstanceSection`, then asserts the resolver returns
+      `Err(DuplicateModuleExport { .. })`.
+    causal-factors:
+      - >-
+        `HashMap::insert` was used where the spec-correct semantics is
+        "reject duplicate name within one component" — the duplicate
+        check was simply missing on this code path
+      - >-
+        The sibling `DuplicateModuleInstantiation` error
+        (`resolver.rs:2115`) already established the precedent for
+        rejecting same-component duplicates, but the pattern was not
+        replicated for export names
+      - >-
+        No regression test exercised the flat-name path with two
+        modules emitting the same export — the path is rarely
+        exercised because production multi-module components have an
+        `InstanceSection`
+    process-model-flaw: >
+      The code's model was "module-export index is whatever the last
+      module wrote", but the correct invariant is "within one component
+      a flat export name resolves to at most one module" — same model
+      as `DuplicateModuleInstantiation`, applied to exports rather than
+      instantiations.
+    status: approved
+    priority: low
+
+  - id: LS-P-12
+    title: List of pointer-bearing option/result/variant — silent stale pointer corruption
+    uca: UCA-P-3
+    hazards: [H-4, H-4.2]
+    type: inadequate-process-model
+    scenario: >
+      `meld-core/src/parser.rs::element_inner_pointers` walks the byte
+      layout of a list-element type and returns each inner `(byte_offset,
+      copy_layout)` pointer pair so the FACT adapter can do per-element
+      fixup (allocate in callee memory, copy the pointed-to bytes, replace
+      the source ptr with the callee's). The function handles `String`,
+      `List`, `FixedSizeList`, `Record`, `Tuple`, and `Type`-aliased
+      versions of those, plus a `_ => {}` catch-all (line 3203) that
+      silently drops `Option`, `Result`, `Variant`, `Flags`, and `Enum`.
+      As a consequence, `copy_layout(list<option<string>>)`,
+      `copy_layout(list<result<string, _>>)`, and
+      `copy_layout(list<variant { …(string)… }>)` all classified as
+      `CopyLayout::Bulk { byte_multiplier: element_size }` — because
+      `element_inner_pointers(option<string>, 0)` returns the empty
+      vector even though `type_contains_pointers(option<string>)` is
+      true. The FACT adapter's Bulk path (`adapter/fact.rs:1564-1575` /
+      `2317-2331` / `2534-2549`) is a flat `memory.copy(dst, src,
+      len * byte_multiplier)` with **no per-element walk** — so every
+      copied option's `(ptr, len)` pair is written byte-for-byte into
+      the callee's memory, with `ptr` still referencing the *source*
+      component's linear memory. The callee then dereferences a wild
+      pointer for each `Some(...)` element — a cross-memory
+      dangling-reference / arbitrary read on every list use
+      [UCA-P-3 / H-4 wrong adapter / H-4.2 missing pointer fixup].
+      `ConditionalPointerPair` (LS-P-7, LS-P-10) does not rescue this:
+      `collect_conditional_pointers` drops `List(_)` at its own
+      `_ => {}` arm, and `collect_pointer_positions_with_layout` stops
+      at `List(_)` and emits the pair with the (here Bulk) layout from
+      `copy_layout`. Reachable for any non-empty `list<option<string>>`
+      passed across a component boundary. Surfaced by the mythos-auto
+      delta-pass on PR #179 and clean-room verified.
+      **This commit is the conservative mitigation**, not the full fix.
+      The proper fix needs (a) `Option`/`Result`/`Variant` arms on
+      `element_inner_pointers` that recurse into the payload at the
+      payload byte offset, AND (b) extending the
+      `inner_pointers` descriptor on `CopyLayout::Elements` (currently
+      `Vec<(u32, CopyLayout)>`) with per-element `DiscriminantGuard`
+      chains, AND (c) updating the FACT per-element fixup loop in
+      `fact.rs` to evaluate those guards before each inner copy. That
+      is structurally analogous to LS-P-10 but on the list-element axis
+      rather than the top-level conditional axis — material follow-up
+      work tracked separately. Until then, `copy_layout` panics with a
+      clearly-labelled `LS-P-12: …` message when it would otherwise
+      have produced the corrupting `Bulk` classification, and the
+      panic includes the offending element type in the diagnostic so
+      WIT authors and tool integrators see why the adapter can't be
+      generated. Confirmed by PoC
+      `meld-core::parser::tests::ls_p_12_list_of_option_string_refuses_rather_than_silently_corrupts`
+      (plus the `list<result<string, _>>` variant); a positive sanity
+      test (`ls_p_12_pure_scalar_option_list_is_still_bulk`) pins the
+      check is gated on `type_contains_pointers(inner)` so pure-scalar
+      `list<option<u32>>` etc. remain `Bulk` as before.
+    causal-factors:
+      - >-
+        `element_inner_pointers` was written when only Record/Tuple
+        pointer-bearing list elements were considered; the
+        Option/Result/Variant arms were never added and the
+        `_ => {}` catch-all silently dropped them
+      - >-
+        `copy_layout(List(inner))` accepted the empty inner-pointer
+        list from a pointer-bearing inner type and produced `Bulk`,
+        the corrupting classification, with no consistency check
+      - >-
+        The adapter's per-element fixup machinery does not yet
+        support per-element discriminant guards — required for
+        conditional inner pointer fixup
+      - >-
+        No regression test exercised `list<option<string>>` or any
+        nested-conditional list element
+    process-model-flaw: >
+      The shared model between `element_inner_pointers` and
+      `copy_layout` was "if the inner-pointer set is empty, the element
+      has no pointers and a flat byte copy is correct" — but emptiness
+      came from the missing arms, not from absence-of-pointers. The
+      `type_contains_pointers(inner)` predicate already encoded the
+      right invariant; it just wasn't checked alongside the emptiness
+      decision.
+    status: approved
+    priority: high
+
+  - id: LS-P-13
+    title: Async adapter param-copy treats every (i32, i32) pair as a pointer pair
+    uca: UCA-P-3
+    hazards: [H-2, H-4, H-4.1]
+    type: inadequate-control-algorithm
+    scenario: >
+      `meld-core/src/adapter/fact.rs::emit_param_copy_step` (called from
+      `generate_async_callback_adapter` and `generate_async_stackful_adapter`
+      — the P3-async lift paths) determines which of the caller's flat
+      param slots are `(ptr, len)` pointer pairs that need a
+      cross-memory `cabi_realloc` + `memory.copy` fixup. Instead of
+      using the resolver's `site.requirements.pointer_pair_positions`
+      slice directly (which is already the list of *flat* indices,
+      computed by `parser.rs::pointer_pair_param_positions` walking the
+      function's params with `flat_count`), the code walked
+      `caller_type.params` looking for consecutive `(i32, i32)` slots
+      and gated each match on
+      `pointer_pair_positions.iter().any(|_| true)` — semantically
+      `!is_empty()`. Every adjacent integer-pair argument was therefore
+      treated as a pointer pair whenever the function had **any**
+      string/list param. For a signature like
+      `fn f(a: i32, s: string, b: i32, c: i32)` lowered to flat params
+      `[I32, I32, I32, I32, I32]` with the resolver's positions
+      `[1]`, the buggy code emitted `positions = [0, 2]`: it then ran
+      `cabi_realloc(0, 0, 1, ptr_s_value)` (treating the string's
+      *pointer* as a length, attacker-influenced byte count), copied
+      from caller-memory address `a` (treating the integer arg as a
+      source pointer), and replaced `a` with the freshly allocated
+      buffer — corrupting plain integer args and reading from
+      attacker-controlled caller-memory addresses [UCA-P-3 / H-2
+      caller-controlled offsets / H-4.1 wrong byte length]. The real
+      string at flat index 1 was never copied. Reachable for any
+      mixed-signature async-lift fusion that crosses memories. Pure
+      single-string signatures like `fn f(s: string)` flattened to
+      `[I32, I32]` happen to behave correctly by accident — the only
+      pair the code considers is `(0, 1)`, which is the string. Same
+      shape with extra args is corrupting. Surfaced by the mythos-auto
+      delta-pass on PR #179 and clean-room verified. Fix replaces the
+      heuristic walk + emptiness check with
+      `site.requirements.pointer_pair_positions.clone()`: the resolver
+      already produces the correct flat indices and canonical lowering
+      preserves param order between caller and callee component types,
+      so the comment block claiming the positions are "in callee
+      component type order" while locals are "in caller order" was
+      misleading — flat indices computed from canonical lowering apply
+      equally to both sides. Confirmed by PoC
+      `meld-core::parser::tests::ls_p_13_pointer_pair_param_positions_is_flat_indices_not_just_nonempty`,
+      which pins the resolver contract on `(a: u32, s: string, b: u32,
+      c: u32)` returning `[1]` and on `(a, s1, b, s2, c)` returning
+      `[1, 4]` — the invariants the async adapter now consumes
+      directly.
+    causal-factors:
+      - >-
+        `.any(|_| true)` was a stand-in placeholder pattern that should
+        have been `.any(|&pos| pos == i as u32)` (and that, in turn,
+        should have been the cleaner direct use of the resolver's
+        positions); the placeholder was never replaced and the
+        predicate name made it look intentional
+      - >-
+        The comment block at the top of `emit_param_copy_step`
+        claimed the resolver's positions were "in callee component
+        type order" — implying a caller/callee mismatch the function
+        needed to work around — but
+        `pointer_pair_param_positions` returns *flat* indices
+        computed from the canonical-lowered param list, which
+        canonical lowering preserves identically between caller and
+        callee component-type matched signatures
+      - >-
+        No regression test exercised `emit_param_copy_step` with a
+        mixed-signature async export crossing memories; the
+        `tests/p3_async_lowering.rs` coverage focuses on trampoline
+        shape and event codes, not parameter copy correctness
+    process-model-flaw: >
+      The mental model was "verify there's *something* to copy before
+      walking the flat params," which collapsed the per-position
+      identity check into an emptiness check. The right invariant
+      ("this specific flat slot is a pointer pair") was encoded in
+      the resolver's positions all along — the adapter just discarded
+      them.
+    status: approved
+    priority: high
+
+  - id: LS-P-14
+    title: Nested-list inner copy `buf_len = len * sub_elem_size` lacks overflow guard
+    uca: UCA-P-3
+    hazards: [H-2, H-4, H-4.1]
+    type: inadequate-control-algorithm
+    scenario: >
+      `meld-core/src/adapter/fact.rs::emit_patch_nested_indirections`
+      walks each element of a list-of-records (or list-of-tuples) at
+      adapter-generation time and emits, for each inner pointer
+      indirection inside the element, a `cabi_realloc` + `memory.copy`
+      sequence that copies the inner list/string from callee memory into
+      the caller's. The byte count for that copy is computed at runtime:
+      load `len` from the callee's memory at byte offset `+4` from the
+      element record, then multiply by `sub_elem_size` (the inner list's
+      element stride) via a bare `i32.mul`. `i32.mul` is modulo 2³², so
+      a callee-supplied `len` near `u32::MAX / sub_elem_size` wraps the
+      product to a small value. The subsequent bounds check
+      (`old_ptr + buf_len > mem_bytes`) uses `i32.add`, which **also**
+      wraps and is bypassed. The adapter then allocates and copies only
+      the wrapped byte count, while the caller-side bulk copy of the
+      outer element bytes keeps the original large `len` field — so the
+      callee receives a `(new_ptr, full_len)` pair whose buffer is far
+      smaller than `full_len` bytes [UCA-P-3 / H-2 caller-controlled
+      offsets / H-4 / H-4.1 wrong byte length]. Reads/writes into the
+      buffer past `wrapped_buf_len` walk into adjacent caller-allocated
+      memory — silent truncation in the inner list contents and OOB
+      access on every dereference past the truncated edge. Reachable for
+      any cross-memory fusion of a function whose param/result contains
+      a `list<record { …; inner: list<T> }>` (or tuple analogue) where
+      the callee can produce a length within one `sub_elem_size` of
+      `u32::MAX / sub_elem_size`. Surfaced by the mythos-auto delta-pass
+      on PR #179. Fix: stash the loaded `len` into the existing
+      `l_buf_len` scratch local, call
+      `emit_overflow_guard(body, l_buf_len, sub_elem_size as u32)`
+      (which traps via `unreachable` when the multiplication would wrap),
+      then re-fetch the local for the multiplication. `emit_overflow_guard`
+      with `k == 1` is a no-op so the guard is harmless when
+      `sub_elem_size == 1`. Confirmed by PoC
+      `meld-core::adapter::fact::tests::ls_p_14_nested_list_inner_copy_emits_overflow_guard`,
+      which emits a synthetic patch-loop for `record { items: list<u32> }`
+      (`sub_elem_size = 4`) and asserts the encoded function body
+      contains an `Unreachable` opcode — the only place that opcode
+      appears along this path is inside `emit_overflow_guard`.
+    causal-factors:
+      - >-
+        `emit_patch_nested_indirections` was written before the
+        `emit_overflow_guard` helper landed (the helper was added as
+        the LS-A-7 leg (a) fix for the outer-list copy paths), and the
+        retrofit never reached the inner copy
+      - >-
+        The bounds check below the multiplication uses the same
+        wrapping `i32.add` arithmetic, so the comment "skip patch if
+        (old_ptr, buf_len) doesn't fit in callee mem" overstated the
+        protection — a wrapped `buf_len` slips the check
+      - >-
+        No regression test exercised
+        `emit_patch_nested_indirections` for an element type with
+        non-trivial `sub_elem_size`
+    process-model-flaw: >
+      The model was "the outer copy paths guard against overflow; the
+      inner per-element copies do not need to," but the inner copies
+      consume callee-controlled `len` values just like the outer ones —
+      the trust boundary is the same.
+    status: approved
+    priority: high
+
+  - id: LS-P-15
+    title: Out-of-bounds resource_type_id silently misclassified as callee-defined
+    uca: UCA-R-3
+    hazards: [H-5, H-1]
+    type: inadequate-process-model
+    scenario: >
+      `meld-core/src/resolver.rs::resolve_resource_positions` decides
+      whether the callee component owns a resource's representation
+      (and therefore the adapter must emit `[resource-rep]`) or merely
+      imports it (`[resource-new]`). The decision routes through a
+      lookup into `component.component_type_defs` keyed by
+      `pos.resource_type_id as usize`:
+      `.get(...).map(|def| !matches!(def, ComponentTypeDef::Import(_))).unwrap_or(true)`.
+      When `resource_type_id` exceeds `component_type_defs.len()` — a
+      stale id surviving alias propagation, a parser-produced id past
+      the local table, a malformed input — `.get(...)` returns `None`
+      and `unwrap_or(true)` silently classifies the resource as
+      *callee-defined* with no warning. The adapter then emits a
+      `[resource-rep]` call where `[resource-new]` was correct (or
+      vice versa) — a silent swap of the two resource-handle
+      conversion sides on every fused cross-component call passing that
+      handle [UCA-R-3 import wired to wrong source / H-5 dependency
+      resolution produces wrong order / H-1 fused module traps at the
+      wrong call site when the handle is dereferenced]. The handle
+      type-checks on both sides (both are i32-shaped) so the validator
+      does not catch it. Reachability is bounded: the normal
+      instance-graph path keys `resource_type_id` through validated
+      type indices that the parser produced from canonical entries, so
+      this is reachable mainly on stale ids, malformed input, or after
+      alias remaps that outrun the local type table — defensive
+      hardening rather than a memory-safety emergency. Surfaced by the
+      mythos-auto delta-pass on PR #179. Fix replaces the
+      `.unwrap_or(true)` with an explicit `match`: on `Some(def)`,
+      classify by type; on `None`, emit a `log::warn!` and `continue`,
+      so the position is *dropped* rather than silently misclassified.
+      The downstream adapter will either find no work to do for the
+      unused flat slot, or surface a loud missing-fixup error at
+      adapter generation — never silently swap conversion sides.
+      Confirmed by PoC
+      `meld-core::resolver::tests::ls_p_15_out_of_bounds_resource_type_id_is_dropped_not_misclassified`,
+      which builds a synthetic `ResourceImportMap` whose lookup
+      succeeds at `resource_type_id = 999`, then calls
+      `resolve_resource_positions` against an `empty_parsed_component`
+      (zero entries in `component_type_defs`) and asserts the returned
+      `Vec<ResolvedResourceOp>` is empty (pre-fix: one mis-classified
+      entry; post-fix: dropped with a warn log).
+    causal-factors:
+      - >-
+        `unwrap_or(true)` was a stand-in defensive default that should
+        have been "fall through to the import path" or "fail loud" —
+        `true` is the more dangerous default because it triggers the
+        adapter to emit a `[resource-rep]` call against a resource
+        whose representation the callee does not own
+      - >-
+        The lookup miss had no warning channel, so a stale/malformed
+        `resource_type_id` produced an adapter with quietly wrong
+        resource-handle conversions and no diagnostic for the
+        toolchain to surface
+      - >-
+        No regression test exercised `resolve_resource_positions` with
+        a `resource_type_id` outside the local `component_type_defs`
+        range
+    process-model-flaw: >
+      The model was "any failure to classify is benign," but the
+      adapter's `[resource-rep]` vs `[resource-new]` choice is
+      asymmetric — emitting the wrong call produces a handle whose
+      conversion side mismatches the callee's expectation, an error
+      that compiles cleanly and only surfaces when the handle is
+      dereferenced at runtime.
+    status: approved
+    priority: low
+
+  - id: LS-P-16
+    title: UTF-16→UTF-8 transcoding reads OOB on lone high surrogate at end of input
+    uca: UCA-P-3
+    hazards: [H-2, H-4, H-4.4]
+    type: inadequate-control-algorithm
+    scenario: >
+      `meld-core/src/adapter/fact.rs::emit_utf16_to_utf8_transcode`
+      emits the per-code-unit transcoding loop the FACT adapter uses
+      when the caller component declares `string-encoding=utf16` and
+      the callee declares `utf8` (the `(caller=Utf16, callee=Utf8)`
+      case dispatched at fact.rs:2999–3001, gated on
+      `crosses_memory && needs_transcoding`). The loop's only bounds
+      check is `src_idx >= input_len` (lines 3460–3463) against the
+      *first* code unit of each iteration. When that code unit is in
+      `[0xD800, 0xDC00)` (high surrogate), the surrogate-pair `If`
+      arm unconditionally emits a second `I32Load16U` at
+      `mem16[ptr + (src_idx + 1) * 2]`. For an input whose **last**
+      code unit is a lone high surrogate, that load reads 2 bytes
+      past the end of the caller-supplied UTF-16 buffer — into
+      attacker-adjacent caller linear memory. The two bytes are
+      treated as the "low surrogate" without validating
+      `0xDC00 <= cu2 < 0xE000`, producing a `cp = 0x10000 +
+      ((cu - 0xD800) << 10) + (cu2_oob - 0xDC00)` whose value is
+      typically in the 4-byte UTF-8 range. The 4-byte encoder
+      then writes 4 bytes derived from the OOB read into callee
+      linear memory — silent cross-memory leak of attacker-adjacent
+      caller bytes into the callee's UTF-8 output [UCA-P-3 /
+      H-2 caller-controlled offsets / H-4.4 incorrect string
+      transcoding]. `src_idx += 2` then advances past `input_len`,
+      so the outer `src_idx >= input_len` check breaks the loop
+      cleanly the next iteration — no trap, silent corruption.
+      Reachable for any cross-memory UTF-16→UTF-8 string transfer
+      whose last UTF-16 code unit is a lone high surrogate.
+      Surfaced by the mythos-auto delta-pass on PR #179 and
+      clean-room verified. This commit is the conservative
+      mitigation: inject a `src_idx + 1 >= input_len` check inside
+      the surrogate-pair `If` arm and `unreachable`-trap on failure.
+      The Canonical-ABI-correct behaviour is to replace the lone
+      surrogate with U+FFFD (3-byte UTF-8 `EF BF BD`) and continue
+      — that upgrade is tracked as a separate structural follow-up.
+      Trap converts silent cross-memory leak into a loud
+      adapter-runtime trap. Confirmed by PoC
+      `meld-core::adapter::fact::tests::ls_p_16_utf16_lone_high_surrogate_oob_guard_emitted`,
+      a structural regression that pins the LS-P-16 marker comment
+      AND requires an `Unreachable` + `I32GeU` opcode pair to live
+      inside the surrogate-pair `If` arm before the second
+      `I32Load16U`.
+    causal-factors:
+      - >-
+        `emit_utf16_to_utf8_transcode`'s only bounds check guarded
+        the first code unit per iteration; the surrogate-pair arm
+        unconditionally followed up with a second load
+      - >-
+        No bounds check between the high-surrogate detection and the
+        low-surrogate load, despite UTF-16 trivially admitting a
+        lone high surrogate at the end of a string
+      - >-
+        No validation that the second code unit is actually a low
+        surrogate (`0xDC00 <= cu2 < 0xE000`) — without it, an OOB
+        read whose value happens to fall outside the low-surrogate
+        range still proceeds into the 4-byte encoder
+      - >-
+        No regression test for UTF-16 inputs ending on a high
+        surrogate; the test module's TODO list (line 5067) had this
+        explicitly listed as not-yet-covered
+    process-model-flaw: >
+      The model was "high-surrogate detection implies a valid
+      surrogate pair," but UTF-16 strings legitimately end on a lone
+      high surrogate (e.g., malformed input from JS, broken
+      truncation). The Canonical ABI mandates lossy replacement, not
+      OOB read.
+    status: approved
+    priority: high
+
+  - id: LS-P-18
+    title: LS-P-12 bypassed when a record mixes a covered pointer with a hidden conditional one
+    uca: UCA-P-3
+    hazards: [H-4, H-4.2]
+    type: inadequate-process-model
+    scenario: >
+      The LS-P-12 mitigation in `copy_layout(List(inner))` fires only when
+      `element_inner_pointers(inner, 0)` is empty AND
+      `type_contains_pointers(inner)` is true. For a record/tuple that
+      mixes a *covered* pointer field (bare `string` or `list`) with a
+      *hidden* conditional pointer field (an `option/result/variant` whose
+      payload contains a pointer), `element_inner_pointers` returns a
+      non-empty Vec from the covered field — the LS-P-12 panic does not
+      fire and `copy_layout` returns
+      `CopyLayout::Elements { inner_pointers: [<covered field only>] }`.
+      The FACT adapter walks `inner_pointers`, fixes up the covered field,
+      and never touches the option-payload pointer. After the cross-memory
+      copy the callee receives an element whose option payload still
+      contains a string `(ptr, len)` pair referencing the *source*
+      component's memory — silent cross-memory dangling reference per
+      `Some(_)` element on every fused list copy [UCA-P-3 / H-4 / H-4.2].
+      Reachable for any `list<record { …; option<string> }>` (and the
+      tuple / nested / type-aliased analogues). Surfaced by the
+      mythos-auto delta-pass on PR #179 as a refinement attack on
+      LS-P-12; clean-room verified by tracing the `inner_ptrs` /
+      `inner_res` non-emptiness short-circuit. Fix replaces the
+      emptiness-based guard with a deep recursive
+      `has_pointer_bearing_conditional(inner)` check (new helper) that
+      visits Option / Result / Variant arms reachable through Records,
+      Tuples, FixedSizeLists, and `Type` aliases. If any pointer-bearing
+      conditional exists anywhere within the element layout,
+      `copy_layout(List(inner))` panics with the LS-P-18 marker — the
+      adapter refuses to generate rather than emit a `CopyLayout::Elements`
+      whose `inner_pointers` would omit a per-element conditional
+      fixup. Confirmed by PoC
+      `meld-core::parser::tests::ls_p_18_mixed_record_with_option_string_bypasses_p12_then_refuses`
+      which builds `list<record { items: list<u8>, maybe: option<string> }>`
+      and asserts the panic. A positive sanity test,
+      `ls_p_18_pure_bare_pointer_record_still_works`, pins that the
+      strengthened guard does not over-refuse pure-bare-pointer records
+      (e.g. `record { name: string, value: u32 }`).
+    causal-factors:
+      - >-
+        The original LS-P-12 guard's emptiness criterion was a proxy for
+        "no pointers covered yet" — a positive presence of any covered
+        pointer (bare `string`/`list`) short-circuited the proxy even
+        when other pointer positions were silently missing
+      - >-
+        No regression test exercised a record that mixed a covered
+        pointer field with a hidden conditional pointer field — the
+        bypass had no fixture
+    process-model-flaw: >
+      The shared model was "empty `inner_pointers` is the only failure
+      mode," but the missing-arms behaviour of `element_inner_pointers`
+      produces a partial output (some pointer positions, missing
+      others) that the emptiness check accepts as complete.
+    status: approved
+    priority: high
+
+  - id: LS-P-19
+    title: UTF-8→UTF-16 transcoder reads OOB for truncated multi-byte UTF-8
+    uca: UCA-P-3
+    hazards: [H-2, H-4, H-4.4]
+    type: inadequate-control-algorithm
+    scenario: >
+      `meld-core/src/adapter/fact.rs::emit_utf8_to_utf16_transcode` emits
+      the per-byte UTF-8→UTF-16 transcoding loop the FACT adapter uses
+      when the caller declares `string-encoding=utf8` and the callee
+      declares `utf16` (the canonical mirror of LS-P-16). The outer
+      loop guards the lead byte with `src_idx >= input_len`. Each
+      multi-byte branch (2-byte: `byte < 0xE0`; 3-byte: `byte < 0xF0`;
+      4-byte: `byte >= 0xF0`) then unconditionally reads its
+      continuation bytes via `I32Load8U` at offsets `src_idx + 1`,
+      `+2`, `+3`. A UTF-8 string ending on a truncated multi-byte lead
+      byte (e.g. `0xE2` with no following bytes; `0xF0` with only one
+      following byte; etc.) causes the adapter to read 1–3 bytes of
+      attacker-adjacent caller linear memory past the buffer end,
+      incorporate them into a synthesized code point via the canonical
+      shift/mask formula, and emit the resulting code point as UTF-16
+      into the callee output — silent cross-memory leak of caller
+      bytes per transcoded string [UCA-P-3 / H-2 caller-controlled
+      offsets / H-4.4 incorrect string transcoding]. The composed
+      (non-fused) execution traps on invalid UTF-8 with a `len`/byte
+      mismatch; the fused execution silently corrupted, producing
+      semantic drift. Reachable for any cross-memory
+      UTF-8-caller/UTF-16-callee fusion whose UTF-8 string ends on a
+      truncated multi-byte lead. Surfaced by the mythos-auto
+      delta-pass on PR #179. Conservative mitigation prepends a
+      `src_idx + N >= input_len` `unreachable` trap to each multi-byte
+      branch (N = 1 for the 2-byte case, 2 for 3-byte, 3 for 4-byte).
+      The Canonical-ABI-correct upgrade replaces truncated sequences
+      with the U+FFFD replacement character (tracked alongside the
+      LS-P-16 upgrade). Trap converts silent leak into loud
+      adapter-runtime trap. Confirmed by PoC
+      `meld-core::adapter::fact::tests::ls_p_19_utf8_to_utf16_continuation_byte_oob_guard_emitted`,
+      a structural test pinning the LS-P-19 marker at all three
+      multi-byte branches and the cumulative Unreachable + I32GeU
+      opcode count across LS-P-16 and LS-P-19.
+    causal-factors:
+      - >-
+        The outer-loop bounds check guarded only the lead byte; the
+        continuation-byte reads inside each multi-byte branch had no
+        independent guard
+      - >-
+        The canonical UTF-8 decoder pattern assumes valid UTF-8 input
+        (continuation bytes always present); fused adapters consume
+        untrusted caller buffers where truncation is reachable
+      - >-
+        No regression test covered the truncated-lead-byte edge case
+        for any of the three multi-byte branches
+    process-model-flaw: >
+      The model was "if the lead byte is in-range, the implied
+      continuation bytes must also be in-range," but the lead byte's
+      classification does not constrain the buffer end — a truncated
+      multi-byte sequence is the obvious counterexample.
+    status: approved
+    priority: high
+
+  - id: LS-P-17
+    title: Caller-encoding match filters on Func only, miscalibrates mixed-encoding callers
+    uca: UCA-R-3
+    hazards: [H-4, H-4.4]
+    type: inadequate-process-model
+    scenario: >
+      `meld-core/src/resolver.rs` has two structurally-identical
+      caller-encoding lookup loops (primary site around lines 2877–
+      2910, fallback site around 3175–3225). Each iterates
+      `from_component.imports` filtering on
+      `wasmparser::ComponentTypeRef::Func(_)` and tries to match
+      `ci.name == *import_name` to find the caller's `Lower` options
+      for the resolved interface. WIT interface imports lower to
+      `ComponentTypeRef::Instance(_)` at the component-import level,
+      so the loop **never matches for interface imports** — the only
+      shape that can match is a top-level bare-`Func` component
+      import, which `wit-component` / `wasm-tools` does not emit
+      under the WIT-bindgen norm. The loops fall through to a
+      heuristic `caller_lower_map.iter().min_by_key(|(k, _)| **k)`
+      that picks the encoding of the **lowest-indexed Lower** entry,
+      then assigns it as `requirements.caller_encoding` for whatever
+      interface is currently being resolved. `string_transcoding` is
+      then computed as `caller_encoding != callee_encoding` against
+      the single heuristic-selected encoding. For single-encoding
+      callers (the overwhelming majority of WIT-bindgen output
+      today — UTF-8 throughout) the heuristic happens to pick the
+      only encoding present and `string_transcoding` is correctly
+      attributed. For mixed-encoding callers (UTF-16 for one
+      interface, UTF-8 for another — e.g. a JS/.NET host component
+      lowering UTF-16 to one import alongside a Rust UTF-8 lowering
+      to another, both calling a UTF-8 callee) the heuristic picks
+      one encoding for **every** interface, so the adapter skips
+      transcoding where it was needed (or forces it where it was
+      unnecessary). The emitted lift/lower bridge then either reads
+      raw UTF-16 bytes as UTF-8 or vice versa, producing scrambled
+      strings at the call boundary [UCA-R-3 wrong adapter wiring /
+      H-4 / H-4.4 incorrect string transcoding]. Reachability:
+      latent today since most components are single-encoding, but
+      legal under the Component Model and exposed whenever multi-
+      encoding host components arrive. Surfaced by the mythos-auto
+      delta-pass on PR #179 and clean-room verified. **This commit
+      is the conservative mitigation**: detect mixed-encoding
+      callers (`caller_lower_map.values()` not all identical) before
+      the heuristic fallback fires and emit a `log::warn!` with the
+      LS-P-17 marker and the interface name, so the miscompile is
+      no longer silent. The full structural fix — resolve the
+      caller's component func index from the core import via a
+      `caller_core_import_to_comp_func` map (or extend the loop to
+      walk `ComponentTypeRef::Instance` aliases) to get per-function
+      precision — is tracked as follow-up. Confirmed by PoC
+      `meld-core::resolver::tests::ls_p_17_mixed_caller_encoding_warns_before_heuristic_fallback`,
+      a structural test that requires the LS-P-17 marker comment to
+      live at **both** sites and that the warn-on-mixed pattern
+      (`all_same` uniformity check + `log::warn!`) is present.
+    causal-factors:
+      - >-
+        The component-import filter was hardcoded to
+        `ComponentTypeRef::Func`, but the canonical encoding of WIT
+        interface imports is `ComponentTypeRef::Instance` — the
+        filter excludes the very shape it was meant to match
+      - >-
+        The heuristic fallback (`min_by_key` over the entire
+        `caller_lower_map`) cannot recover per-interface attribution
+        from a global lowest-index choice
+      - >-
+        The fallback emitted only a `log::debug!`, so the
+        misattribution was invisible at default logging level
+      - >-
+        No regression test exercised
+        `resolve_component_imports_with_hints` with a
+        mixed-encoding caller (UTF-16 for one interface, UTF-8 for
+        another)
+    process-model-flaw: >
+      The model was "the per-interface caller encoding is a function
+      of the lowered-options table alone," but it is actually a
+      function of the (interface, func) pair — multi-encoding
+      callers need per-interface lookup. The global heuristic
+      collapses that pairing onto a single global default.
+    status: approved
+    priority: low
+
   # ==========================================================================
   # Resolver scenarios
   # ==========================================================================

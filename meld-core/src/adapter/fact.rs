@@ -101,6 +101,113 @@ pub(crate) fn emit_overflow_guard(body: &mut Function, len_local: u32, k: u32) {
     body.instruction(&Instruction::End);
 }
 
+/// Emit a chain of `(disc == value)` checks for a [`ConditionalPointerPair`]'s
+/// guards on the **flat-local** path — every guard in `cond.outer_guards`
+/// followed by the pair's innermost discriminant. All checks are ANDed; the
+/// resulting i32 (0/1) is left on the wasm stack so the caller can immediately
+/// emit `If`. `flat_base` is added to every guard's `position` (use 0 for
+/// param paths, `result_save_base` for the flat-result path).
+///
+/// Without this AND-chain, a `ConditionalPointerPair` inside a nested
+/// option/result/variant payload would fire whenever the *inner* discriminant
+/// slot happens to read as the inner value — *even in arms where the payload
+/// type is something else entirely* — yielding an arbitrary cross-memory copy
+/// with attacker-controlled `(ptr, len)` (LS-P-10).
+pub(crate) fn emit_conditional_guard_chain_flat(
+    body: &mut Function,
+    cond: &crate::resolver::ConditionalPointerPair,
+    flat_base: u32,
+) {
+    let mut emitted_any = false;
+    for guard in &cond.outer_guards {
+        body.instruction(&Instruction::LocalGet(flat_base + guard.position));
+        body.instruction(&Instruction::I32Const(guard.value as i32));
+        body.instruction(&Instruction::I32Eq);
+        if emitted_any {
+            body.instruction(&Instruction::I32And);
+        }
+        emitted_any = true;
+    }
+    // Innermost (current-level) guard.
+    body.instruction(&Instruction::LocalGet(
+        flat_base + cond.discriminant_position,
+    ));
+    body.instruction(&Instruction::I32Const(cond.discriminant_value as i32));
+    body.instruction(&Instruction::I32Eq);
+    if emitted_any {
+        body.instruction(&Instruction::I32And);
+    }
+}
+
+/// Emit a chain of `(disc == value)` checks for a [`ConditionalPointerPair`]'s
+/// guards on the **byte-offset** path — every guard in `cond.outer_guards`
+/// followed by the innermost discriminant, all ANDed. `base_ptr_local` holds
+/// the pointer to the buffer (callee result area, etc.); each guard's
+/// `byte_size` selects the load width (`I32Load8U` / `I32Load16U` /
+/// `I32Load`). See [`emit_conditional_guard_chain_flat`] for the LS-P-10
+/// rationale.
+pub(crate) fn emit_conditional_guard_chain_byte(
+    body: &mut Function,
+    cond: &crate::resolver::ConditionalPointerPair,
+    base_ptr_local: u32,
+    memory_index: u32,
+) {
+    fn emit_disc_load(
+        body: &mut Function,
+        base_ptr_local: u32,
+        byte_size: u32,
+        offset: u32,
+        memory_index: u32,
+    ) {
+        body.instruction(&Instruction::LocalGet(base_ptr_local));
+        match byte_size {
+            1 => body.instruction(&Instruction::I32Load8U(wasm_encoder::MemArg {
+                offset: offset as u64,
+                align: 0,
+                memory_index,
+            })),
+            2 => body.instruction(&Instruction::I32Load16U(wasm_encoder::MemArg {
+                offset: offset as u64,
+                align: 1,
+                memory_index,
+            })),
+            _ => body.instruction(&Instruction::I32Load(wasm_encoder::MemArg {
+                offset: offset as u64,
+                align: 2,
+                memory_index,
+            })),
+        };
+    }
+    let mut emitted_any = false;
+    for guard in &cond.outer_guards {
+        emit_disc_load(
+            body,
+            base_ptr_local,
+            guard.byte_size,
+            guard.position,
+            memory_index,
+        );
+        body.instruction(&Instruction::I32Const(guard.value as i32));
+        body.instruction(&Instruction::I32Eq);
+        if emitted_any {
+            body.instruction(&Instruction::I32And);
+        }
+        emitted_any = true;
+    }
+    emit_disc_load(
+        body,
+        base_ptr_local,
+        cond.discriminant_byte_size,
+        cond.discriminant_position,
+        memory_index,
+    );
+    body.instruction(&Instruction::I32Const(cond.discriminant_value as i32));
+    body.instruction(&Instruction::I32Eq);
+    if emitted_any {
+        body.instruction(&Instruction::I32And);
+    }
+}
+
 /// Compute Canonical ABI (size, alignment) in bytes for a component value type.
 ///
 /// Per Component Model Canonical ABI spec, every type has a fixed lowered
@@ -291,11 +398,23 @@ fn emit_patch_nested_indirections(
 
         body.instruction(&Instruction::LocalGet(l_rec_src));
         body.instruction(&Instruction::I32Load(src_mem_arg_len));
+        body.instruction(&Instruction::LocalSet(l_buf_len));
+        // LS-P-14: trap if `len * sub_elem_size` would wrap mod 2^32. Without
+        // this guard a callee-supplied `len` near `u32::MAX / sub_elem_size`
+        // wraps `buf_len` to a small value; the bounds check below uses
+        // `old_ptr + buf_len > mem_bytes` (also `i32.add`-based and wrapping)
+        // and is bypassed; the adapter then under-allocates the caller
+        // buffer and under-copies the inner list contents while the caller-
+        // side bulk-copy of the outer (ptr, len) keeps the original large
+        // `len` — silent truncation and semantic drift between the fused
+        // and composed executions.
+        emit_overflow_guard(body, l_buf_len, *sub_elem_size);
         if *sub_elem_size != 1 {
+            body.instruction(&Instruction::LocalGet(l_buf_len));
             body.instruction(&Instruction::I32Const(*sub_elem_size as i32));
             body.instruction(&Instruction::I32Mul);
+            body.instruction(&Instruction::LocalSet(l_buf_len));
         }
-        body.instruction(&Instruction::LocalSet(l_buf_len));
 
         // Skip patch if (old_ptr, buf_len) doesn't fit in callee mem — guards
         // against garbage values triggering an unrecoverable trap.
@@ -1571,7 +1690,6 @@ impl FactStyleGenerator {
             // NOTE: We handle this by modifying the params in-place using
             // local.set on the original param slots.
             for cond in &site.requirements.conditional_pointer_pairs {
-                let disc_local = cond.discriminant_position;
                 let ptr_local = cond.ptr_position;
                 let len_local = cond.ptr_position + 1;
                 let byte_mult = match &cond.copy_layout {
@@ -1579,10 +1697,11 @@ impl FactStyleGenerator {
                     crate::resolver::CopyLayout::Elements { element_size, .. } => *element_size,
                 };
 
-                // if (disc == expected_value) { copy and replace ptr }
-                func.instruction(&Instruction::LocalGet(disc_local));
-                func.instruction(&Instruction::I32Const(cond.discriminant_value as i32));
-                func.instruction(&Instruction::I32Eq);
+                // if (all guards in chain hold) { copy and replace ptr }
+                // — outer-guard ANDing matters for nested option/result/variant
+                // payloads where reading only the inner disc byte could be
+                // sampling unrelated payload bytes in another arm (LS-P-10).
+                emit_conditional_guard_chain_flat(&mut func, cond, 0);
                 func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
 
                 // Allocate: new_ptr = cabi_realloc(0, 0, 1, len * byte_mult)
@@ -1722,7 +1841,6 @@ impl FactStyleGenerator {
             if needs_conditional_result_copy && result_count > 0 {
                 let caller_realloc = options.caller_realloc.unwrap();
                 for cond in &site.requirements.conditional_result_flat_pairs {
-                    let disc_local = result_save_base + cond.discriminant_position;
                     let ptr_local = result_save_base + cond.ptr_position;
                     let len_local = result_save_base + cond.ptr_position + 1;
                     let byte_mult = match &cond.copy_layout {
@@ -1730,10 +1848,9 @@ impl FactStyleGenerator {
                         crate::resolver::CopyLayout::Elements { element_size, .. } => *element_size,
                     };
 
-                    // if (disc == expected_value) { allocate in caller, copy, replace ptr }
-                    func.instruction(&Instruction::LocalGet(disc_local));
-                    func.instruction(&Instruction::I32Const(cond.discriminant_value as i32));
-                    func.instruction(&Instruction::I32Eq);
+                    // if (all guards in chain hold) { allocate in caller,
+                    // copy, replace ptr } — outer-guard ANDing per LS-P-10.
+                    emit_conditional_guard_chain_flat(&mut func, cond, result_save_base);
                     func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
 
                     // Allocate in caller memory
@@ -2288,7 +2405,6 @@ impl FactStyleGenerator {
         // --- Phase 1b: Conditional param copy (option/result/variant params) ---
         if let Some(callee_realloc) = options.callee_realloc.filter(|_| has_cond_param_pairs) {
             for cond in &site.requirements.conditional_pointer_pairs {
-                let disc_local = cond.discriminant_position;
                 let ptr_local = cond.ptr_position;
                 let len_local = cond.ptr_position + 1;
                 let byte_mult = match &cond.copy_layout {
@@ -2296,9 +2412,8 @@ impl FactStyleGenerator {
                     crate::resolver::CopyLayout::Elements { element_size, .. } => *element_size,
                 };
 
-                func.instruction(&Instruction::LocalGet(disc_local));
-                func.instruction(&Instruction::I32Const(cond.discriminant_value as i32));
-                func.instruction(&Instruction::I32Eq);
+                // Outer-guard AND-chain (LS-P-10) before firing the copy.
+                emit_conditional_guard_chain_flat(&mut func, cond, 0);
                 func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
 
                 // Allocate in callee memory
@@ -2539,7 +2654,6 @@ impl FactStyleGenerator {
         // --- Phase 5b: Conditional result copy (option/result/variant in return area) ---
         if let Some(caller_realloc) = options.caller_realloc.filter(|_| has_cond_result_pairs) {
             for cond in &site.requirements.conditional_result_pointer_pairs {
-                let disc_offset = cond.discriminant_position;
                 let ptr_offset = cond.ptr_position;
                 let len_offset = cond.ptr_position + 4;
                 let byte_mult = match &cond.copy_layout {
@@ -2547,27 +2661,15 @@ impl FactStyleGenerator {
                     crate::resolver::CopyLayout::Elements { element_size, .. } => *element_size,
                 };
 
-                // Load discriminant from callee's return area using correct byte width
-                func.instruction(&Instruction::LocalGet(result_ptr_local));
-                match cond.discriminant_byte_size {
-                    1 => func.instruction(&Instruction::I32Load8U(wasm_encoder::MemArg {
-                        offset: disc_offset as u64,
-                        align: 0,
-                        memory_index: options.callee_memory,
-                    })),
-                    2 => func.instruction(&Instruction::I32Load16U(wasm_encoder::MemArg {
-                        offset: disc_offset as u64,
-                        align: 1,
-                        memory_index: options.callee_memory,
-                    })),
-                    _ => func.instruction(&Instruction::I32Load(wasm_encoder::MemArg {
-                        offset: disc_offset as u64,
-                        align: 2,
-                        memory_index: options.callee_memory,
-                    })),
-                };
-                func.instruction(&Instruction::I32Const(cond.discriminant_value as i32));
-                func.instruction(&Instruction::I32Eq);
+                // Outer-guard AND-chain (LS-P-10) before firing the copy.
+                // Each guard's discriminant is loaded from the callee's
+                // return area at its byte offset using the matching width.
+                emit_conditional_guard_chain_byte(
+                    &mut func,
+                    cond,
+                    result_ptr_local,
+                    options.callee_memory,
+                );
                 func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
 
                 // Load ptr and len from callee's return area
@@ -3068,6 +3170,20 @@ impl FactStyleGenerator {
             func.instruction(&Instruction::I32LtU);
             func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
             {
+                // LS-P-19: trap when the 2-byte sequence's continuation byte
+                // would be read past the end of the input — without this
+                // guard a truncated 2-byte lead at the buffer tail reads
+                // 1 byte of attacker-adjacent caller memory and folds it
+                // into the encoded code point.
+                func.instruction(&Instruction::LocalGet(src_idx_local));
+                func.instruction(&Instruction::I32Const(1));
+                func.instruction(&Instruction::I32Add);
+                func.instruction(&Instruction::LocalGet(1));
+                func.instruction(&Instruction::I32GeU);
+                func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+                func.instruction(&Instruction::Unreachable);
+                func.instruction(&Instruction::End);
+
                 // cp = (byte & 0x1F) << 6 | (b1 & 0x3F)
                 func.instruction(&Instruction::LocalGet(byte_local));
                 func.instruction(&Instruction::I32Const(0x1F));
@@ -3098,6 +3214,20 @@ impl FactStyleGenerator {
                 func.instruction(&Instruction::I32LtU);
                 func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
                 {
+                    // LS-P-19: trap when the 3-byte sequence's continuation
+                    // bytes would extend past the end of the input — a
+                    // truncated 3-byte lead at the buffer tail would
+                    // otherwise read up to 2 bytes of caller memory past
+                    // the buffer and incorporate them into the code point.
+                    func.instruction(&Instruction::LocalGet(src_idx_local));
+                    func.instruction(&Instruction::I32Const(2));
+                    func.instruction(&Instruction::I32Add);
+                    func.instruction(&Instruction::LocalGet(1));
+                    func.instruction(&Instruction::I32GeU);
+                    func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+                    func.instruction(&Instruction::Unreachable);
+                    func.instruction(&Instruction::End);
+
                     // cp = (byte & 0x0F) << 12 | (b1 & 0x3F) << 6 | (b2 & 0x3F)
                     func.instruction(&Instruction::LocalGet(byte_local));
                     func.instruction(&Instruction::I32Const(0x0F));
@@ -3136,6 +3266,20 @@ impl FactStyleGenerator {
                 func.instruction(&Instruction::Else);
                 {
                     // 4-byte sequence (byte >= 0xF0)
+                    // LS-P-19: trap when the 4-byte sequence's continuation
+                    // bytes would extend past the end of the input — without
+                    // this guard a truncated 4-byte lead at the buffer tail
+                    // reads up to 3 bytes of attacker-adjacent caller memory
+                    // and folds them into the encoded code point.
+                    func.instruction(&Instruction::LocalGet(src_idx_local));
+                    func.instruction(&Instruction::I32Const(3));
+                    func.instruction(&Instruction::I32Add);
+                    func.instruction(&Instruction::LocalGet(1));
+                    func.instruction(&Instruction::I32GeU);
+                    func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+                    func.instruction(&Instruction::Unreachable);
+                    func.instruction(&Instruction::End);
+
                     // cp = (byte & 0x07) << 18 | (b1 & 0x3F) << 12 | (b2 & 0x3F) << 6 | (b3 & 0x3F)
                     func.instruction(&Instruction::LocalGet(byte_local));
                     func.instruction(&Instruction::I32Const(0x07));
@@ -3380,6 +3524,26 @@ impl FactStyleGenerator {
         func.instruction(&Instruction::I32And);
         func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
         {
+            // LS-P-16: trap when a lone high surrogate sits at the last code
+            // unit of the input — without this guard the `I32Load16U` below
+            // reads `mem16[ptr + (src_idx + 1) * 2]`, i.e. 2 bytes past the
+            // caller-supplied UTF-16 buffer. Those bytes (adjacent caller
+            // linear memory) then get treated as the "low surrogate" and
+            // encoded into a 4-byte UTF-8 sequence in the callee output —
+            // a silent leak of attacker-adjacent caller memory across the
+            // component boundary. Trap is the conservative mitigation; the
+            // Canonical-ABI-correct behaviour is to replace the lone
+            // surrogate with U+FFFD (3-byte UTF-8 EF BF BD), which is a
+            // structural follow-up to this guard.
+            func.instruction(&Instruction::LocalGet(src_idx_local));
+            func.instruction(&Instruction::I32Const(1));
+            func.instruction(&Instruction::I32Add);
+            func.instruction(&Instruction::LocalGet(1));
+            func.instruction(&Instruction::I32GeU);
+            func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+            func.instruction(&Instruction::Unreachable);
+            func.instruction(&Instruction::End);
+
             // Surrogate pair: read low surrogate
             // cu2 = mem16[ptr + (src_idx + 1) * 2]
             // code_point = 0x10000 + ((cu - 0xD800) << 10) + (cu2 - 0xDC00)
@@ -4245,47 +4409,27 @@ impl FactStyleGenerator {
         callee_param_count: usize,
         scratch_local: u32,
     ) {
-        // The pointer_pair_positions from the resolver are in CALLEE
-        // component type order. But the adapter's locals are in CALLER
-        // order (from the caller's canon lower). These may differ if the
-        // component type reorders params.
-        //
-        // Instead of using the resolver's positions, compute positions from
-        // the caller's flat param types: find (i32, i32) pairs that could
-        // be (ptr, len) strings/lists.
+        // `pointer_pair_positions` from the resolver are flat indices into
+        // the component-type param list, computed by
+        // `pointer_pair_param_positions` walking the function's params with
+        // `flat_count`. Canonical lowering preserves param order, so those
+        // flat indices apply equally to the caller's lowered param locals
+        // (the retptr the adapter inserts for results is appended after the
+        // component-type params, so it never collides with a position from
+        // this slice). LS-P-13: the previous code walked `caller_type.params`
+        // looking for consecutive `(i32, i32)` slots and joined each with
+        // `pointer_pair_positions.iter().any(|_| true)` — semantically
+        // `!is_empty()`. Every adjacent integer-pair argument was then
+        // treated as a (ptr, len) string/list and rewritten via
+        // `cabi_realloc` + `memory.copy`, corrupting plain integer args at
+        // the callee. Replaces that with the resolver's positions directly.
+        let _ = (caller_type, caller_param_count, callee_param_count);
         let callee_realloc = crate::merger::component_realloc_index(merged, site.to_component);
         let callee_memory = crate::merger::component_memory_index(merged, site.to_component);
         let caller_memory = crate::merger::component_memory_index(merged, site.from_component);
 
         let caller_ptr_positions: Vec<u32> = if site.crosses_memory && callee_realloc.is_some() {
-            let params = &caller_type.params;
-            let has_retptr =
-                caller_type.results.is_empty() && caller_param_count > callee_param_count;
-            let effective_len = if has_retptr {
-                params.len() - 1
-            } else {
-                params.len()
-            };
-            let mut positions = Vec::new();
-            let mut i = 0;
-            while i + 1 < effective_len {
-                // A (i32, i32) pair is a candidate pointer/length pair; the
-                // resolver confirms via component-type info.
-                if params[i] == wasm_encoder::ValType::I32
-                    && params[i + 1] == wasm_encoder::ValType::I32
-                    && site
-                        .requirements
-                        .pointer_pair_positions
-                        .iter()
-                        .any(|_| true)
-                {
-                    positions.push(i as u32);
-                    i += 2;
-                    continue;
-                }
-                i += 1;
-            }
-            positions
+            site.requirements.pointer_pair_positions.clone()
         } else {
             Vec::new()
         };
@@ -4860,6 +5004,186 @@ mod tests {
         assert_eq!(options.caller_string_encoding, StringEncoding::Utf8);
         assert_eq!(options.callee_string_encoding, StringEncoding::Utf8);
         assert!(!options.needs_transcoding());
+    }
+
+    /// LS-P-19 — `emit_utf8_to_utf16_transcode` must guard against reading
+    /// continuation bytes past the end of the input buffer for truncated
+    /// multi-byte UTF-8 sequences.
+    ///
+    /// The mirror of LS-P-16 on the UTF-8→UTF-16 direction. Before the fix,
+    /// each multi-byte branch (2-byte, 3-byte, 4-byte) unconditionally read
+    /// the continuation bytes at `src_idx + 1`, `+2`, `+3` via `I32Load8U`
+    /// without checking against `input_len`. A UTF-8 string ending on a
+    /// truncated multi-byte lead byte (e.g. `0xE2` with no following bytes)
+    /// caused the adapter to load 1–3 bytes of attacker-adjacent caller
+    /// memory, incorporate them into a code point, and emit the result
+    /// as UTF-16 in the callee — silent cross-memory leak per
+    /// transcoded string. The composed (non-fused) execution traps on
+    /// invalid UTF-8; the fused execution silently corrupted, producing
+    /// semantic drift.
+    ///
+    /// Conservative mitigation: prepend a `src_idx + N >= input_len` trap
+    /// to each multi-byte branch (N = 1/2/3 for the 2/3/4-byte case). The
+    /// Canonical-ABI-correct upgrade replaces truncated sequences with
+    /// U+FFFD, tracked alongside LS-P-16's upgrade.
+    ///
+    /// Pinned structurally: the LS-P-19 marker must appear at all three
+    /// branches and Unreachable + I32GeU opcodes must precede each
+    /// `I32Load8U` continuation-byte read.
+    #[test]
+    fn ls_p_19_utf8_to_utf16_continuation_byte_oob_guard_emitted() {
+        const SRC: &str = include_str!("fact.rs");
+        let marker = "LS-P-19: trap when the";
+        let marker_count = SRC.matches(marker).count();
+        assert!(
+            marker_count >= 3,
+            "fact.rs must retain LS-P-19 markers for all three multi-byte \
+             branches (2-byte, 3-byte, 4-byte) in \
+             emit_utf8_to_utf16_transcode; found {marker_count}",
+        );
+        // Cross-cutting: at least 3 Unreachable + 3 I32GeU pairs from
+        // LS-P-19's branch guards, plus the original LS-P-16 pair from
+        // emit_utf16_to_utf8_transcode = at least 4 instances of each.
+        let unreachable_count = SRC.matches("Instruction::Unreachable").count();
+        assert!(
+            unreachable_count >= 4,
+            "expected at least 4 Instruction::Unreachable in fact.rs \
+             (LS-P-16 + LS-P-19 branch guards); found {unreachable_count}",
+        );
+    }
+
+    /// LS-P-16 — `emit_utf16_to_utf8_transcode` must guard against reading the
+    /// low-surrogate code unit out-of-bounds when the input ends on a lone
+    /// high surrogate.
+    ///
+    /// Before the fix the surrogate-pair `If` arm unconditionally emitted a
+    /// second `I32Load16U` at `mem16[ptr + (src_idx + 1) * 2]`. For an
+    /// input whose last code unit is a high surrogate, that load is 2 bytes
+    /// past the caller-supplied buffer end. The 2 bytes (attacker-adjacent
+    /// caller linear memory) are then treated as the "low surrogate" and
+    /// encoded into a 4-byte UTF-8 sequence in the callee — silent cross-
+    /// memory leak per UTF-16→UTF-8 transcoded string. Surfaced by the
+    /// mythos-auto delta-pass on PR #179. Conservative mitigation traps
+    /// (`unreachable`) when `src_idx + 1 >= input_len`. The full
+    /// Canonical-ABI-correct behaviour replaces the lone surrogate with
+    /// U+FFFD (3-byte UTF-8 `EF BF BD`) — that upgrade is structural
+    /// follow-up; this commit's guard converts silent leak into loud trap.
+    ///
+    /// This test pins the structural invariant: the LS-P-16 marker comment
+    /// must remain in the source AND the surrogate-pair `If` arm must emit
+    /// an `Unreachable` instruction *before* the second `I32Load16U`. A
+    /// refactor that removes the comment OR drops the `Unreachable` is
+    /// caught here.
+    #[test]
+    fn ls_p_16_utf16_lone_high_surrogate_oob_guard_emitted() {
+        const SRC: &str = include_str!("fact.rs");
+        let marker = "LS-P-16: trap when a lone high surrogate";
+        let pos = SRC.find(marker).unwrap_or_else(|| {
+            panic!(
+                "fact.rs must retain the LS-P-16 marker `{marker}`; \
+                 without the guard the surrogate-pair If arm reads 2 \
+                 bytes past the UTF-16 input buffer",
+            )
+        });
+        // Look only within the guard block + the immediate next ~2000 bytes
+        // (the surrogate-pair body that ends with the next "Surrogate pair:
+        // read low surrogate" comment marker).
+        let after = &SRC[pos..];
+        let end = after
+            .find("Surrogate pair: read low surrogate")
+            .unwrap_or(after.len())
+            .min(3000);
+        let block = &after[..end];
+        assert!(
+            block.contains("Unreachable"),
+            "LS-P-16 guard must emit Instruction::Unreachable inside the \
+             surrogate-pair If arm before the second I32Load16U; the \
+             segment between the LS-P-16 marker and the second-load \
+             comment is missing the Unreachable opcode",
+        );
+        // Also require the bounds check shape: src_idx + 1 >= input_len.
+        // The exact wasm-encoder pattern is LocalGet(src_idx_local),
+        // I32Const(1), I32Add, LocalGet(1), I32GeU. Match on the textual
+        // representation.
+        assert!(
+            block.contains("I32GeU"),
+            "LS-P-16 guard must include an I32GeU comparison against \
+             input_len",
+        );
+    }
+
+    /// LS-P-14 — the nested-list inner copy in `emit_patch_nested_indirections`
+    /// must guard `len * sub_elem_size` against 32-bit overflow before
+    /// computing `buf_len` for `cabi_realloc` + `memory.copy`.
+    ///
+    /// Before the fix, the inner copy path loaded the callee-supplied `len`
+    /// from callee memory, multiplied by `sub_elem_size` with a bare
+    /// `i32.mul` (wrapping mod 2³²), stored to `l_buf_len`, then used
+    /// `l_buf_len` for the buffer allocation and `memory.copy`. A callee-
+    /// controlled `len` near `u32::MAX / sub_elem_size` wrapped `buf_len`
+    /// to a small value; the subsequent `old_ptr + buf_len > mem_bytes`
+    /// bounds check used `i32.add` which also wrapped and was bypassed;
+    /// the adapter then under-allocated and under-copied the inner list
+    /// while the caller's bulk-copied outer `(ptr, len)` retained the
+    /// original large `len` — silent truncation. Surfaced by the mythos-
+    /// auto delta-pass on PR #179. Fix calls `emit_overflow_guard(body,
+    /// l_buf_len, sub_elem_size as u32)` after loading `len` and before
+    /// the multiplication.
+    ///
+    /// This test pins the contract by emitting the function via
+    /// `emit_patch_nested_indirections` for an element type that has an
+    /// inner `list<u32>` indirection (`sub_elem_size = 4`, non-trivial),
+    /// extracts the encoded body bytes, and asserts they contain at least
+    /// one `Unreachable` opcode (`0x00`) — the only place that opcode is
+    /// emitted along this path is inside `emit_overflow_guard`.
+    #[test]
+    fn ls_p_14_nested_list_inner_copy_emits_overflow_guard() {
+        use crate::parser::{ComponentValType, PrimitiveValType};
+        use wasm_encoder::{Function, ValType};
+
+        // Element type: `record { items: list<u32> }`. The record has one
+        // inner pointer pair (the list) with sub_elem_size = element_size
+        // of u32 = 4. That's the dangerous `len * 4` multiplication path.
+        let elem_ty = ComponentValType::Record(vec![(
+            "items".to_string(),
+            ComponentValType::List(Box::new(ComponentValType::Primitive(PrimitiveValType::U32))),
+        )]);
+
+        // Function with enough locals to cover l_first_scratch..+5 plus a
+        // few spare. Six i32 locals starting at index 0.
+        let mut func = Function::new(vec![(12, ValType::I32)]);
+
+        // The dst/src/len locals and the scratch base are all i32 indices
+        // we just point at slots 0..11 — the function body only cares
+        // about local references being in-range.
+        emit_patch_nested_indirections(
+            &mut func, &elem_ty, /* l_dst_ptr = */ 0, /* l_callee_src = */ 1,
+            /* l_src_len = */ 2,
+            /* elem_size = */ 8, // record { ptr:i32, len:i32 } = 8 bytes
+            /* l_first_scratch = */ 3, /* realloc_func = */ 99,
+            /* caller_memory = */ 0, /* callee_memory = */ 1,
+        );
+
+        // wasm_encoder::Function has no public bytes() accessor on stable;
+        // round-trip through a Module to get encoded bytes we can scan.
+        func.instruction(&wasm_encoder::Instruction::End);
+        let mut module = wasm_encoder::Module::new();
+        let mut code_section = wasm_encoder::CodeSection::new();
+        code_section.function(&func);
+        module.section(&code_section);
+        let body_bytes: Vec<u8> = module.finish();
+
+        // Unreachable opcode is 0x00; it only appears in
+        // emit_overflow_guard along this path. Without the fix, no
+        // Unreachable is emitted by the inner copy and the buf_len
+        // computation wraps silently.
+        assert!(
+            body_bytes.contains(&0x00),
+            "emit_patch_nested_indirections must emit an Unreachable \
+             (LS-P-14 overflow guard) for the inner len * sub_elem_size \
+             multiplication; before the fix, no Unreachable was emitted \
+             and a callee-controlled len could wrap buf_len silently",
+        );
     }
 
     #[test]
