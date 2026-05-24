@@ -3170,6 +3170,20 @@ impl FactStyleGenerator {
             func.instruction(&Instruction::I32LtU);
             func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
             {
+                // LS-P-19: trap when the 2-byte sequence's continuation byte
+                // would be read past the end of the input — without this
+                // guard a truncated 2-byte lead at the buffer tail reads
+                // 1 byte of attacker-adjacent caller memory and folds it
+                // into the encoded code point.
+                func.instruction(&Instruction::LocalGet(src_idx_local));
+                func.instruction(&Instruction::I32Const(1));
+                func.instruction(&Instruction::I32Add);
+                func.instruction(&Instruction::LocalGet(1));
+                func.instruction(&Instruction::I32GeU);
+                func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+                func.instruction(&Instruction::Unreachable);
+                func.instruction(&Instruction::End);
+
                 // cp = (byte & 0x1F) << 6 | (b1 & 0x3F)
                 func.instruction(&Instruction::LocalGet(byte_local));
                 func.instruction(&Instruction::I32Const(0x1F));
@@ -3200,6 +3214,20 @@ impl FactStyleGenerator {
                 func.instruction(&Instruction::I32LtU);
                 func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
                 {
+                    // LS-P-19: trap when the 3-byte sequence's continuation
+                    // bytes would extend past the end of the input — a
+                    // truncated 3-byte lead at the buffer tail would
+                    // otherwise read up to 2 bytes of caller memory past
+                    // the buffer and incorporate them into the code point.
+                    func.instruction(&Instruction::LocalGet(src_idx_local));
+                    func.instruction(&Instruction::I32Const(2));
+                    func.instruction(&Instruction::I32Add);
+                    func.instruction(&Instruction::LocalGet(1));
+                    func.instruction(&Instruction::I32GeU);
+                    func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+                    func.instruction(&Instruction::Unreachable);
+                    func.instruction(&Instruction::End);
+
                     // cp = (byte & 0x0F) << 12 | (b1 & 0x3F) << 6 | (b2 & 0x3F)
                     func.instruction(&Instruction::LocalGet(byte_local));
                     func.instruction(&Instruction::I32Const(0x0F));
@@ -3238,6 +3266,20 @@ impl FactStyleGenerator {
                 func.instruction(&Instruction::Else);
                 {
                     // 4-byte sequence (byte >= 0xF0)
+                    // LS-P-19: trap when the 4-byte sequence's continuation
+                    // bytes would extend past the end of the input — without
+                    // this guard a truncated 4-byte lead at the buffer tail
+                    // reads up to 3 bytes of attacker-adjacent caller memory
+                    // and folds them into the encoded code point.
+                    func.instruction(&Instruction::LocalGet(src_idx_local));
+                    func.instruction(&Instruction::I32Const(3));
+                    func.instruction(&Instruction::I32Add);
+                    func.instruction(&Instruction::LocalGet(1));
+                    func.instruction(&Instruction::I32GeU);
+                    func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+                    func.instruction(&Instruction::Unreachable);
+                    func.instruction(&Instruction::End);
+
                     // cp = (byte & 0x07) << 18 | (b1 & 0x3F) << 12 | (b2 & 0x3F) << 6 | (b3 & 0x3F)
                     func.instruction(&Instruction::LocalGet(byte_local));
                     func.instruction(&Instruction::I32Const(0x07));
@@ -4962,6 +5004,52 @@ mod tests {
         assert_eq!(options.caller_string_encoding, StringEncoding::Utf8);
         assert_eq!(options.callee_string_encoding, StringEncoding::Utf8);
         assert!(!options.needs_transcoding());
+    }
+
+    /// LS-P-19 — `emit_utf8_to_utf16_transcode` must guard against reading
+    /// continuation bytes past the end of the input buffer for truncated
+    /// multi-byte UTF-8 sequences.
+    ///
+    /// The mirror of LS-P-16 on the UTF-8→UTF-16 direction. Before the fix,
+    /// each multi-byte branch (2-byte, 3-byte, 4-byte) unconditionally read
+    /// the continuation bytes at `src_idx + 1`, `+2`, `+3` via `I32Load8U`
+    /// without checking against `input_len`. A UTF-8 string ending on a
+    /// truncated multi-byte lead byte (e.g. `0xE2` with no following bytes)
+    /// caused the adapter to load 1–3 bytes of attacker-adjacent caller
+    /// memory, incorporate them into a code point, and emit the result
+    /// as UTF-16 in the callee — silent cross-memory leak per
+    /// transcoded string. The composed (non-fused) execution traps on
+    /// invalid UTF-8; the fused execution silently corrupted, producing
+    /// semantic drift.
+    ///
+    /// Conservative mitigation: prepend a `src_idx + N >= input_len` trap
+    /// to each multi-byte branch (N = 1/2/3 for the 2/3/4-byte case). The
+    /// Canonical-ABI-correct upgrade replaces truncated sequences with
+    /// U+FFFD, tracked alongside LS-P-16's upgrade.
+    ///
+    /// Pinned structurally: the LS-P-19 marker must appear at all three
+    /// branches and Unreachable + I32GeU opcodes must precede each
+    /// `I32Load8U` continuation-byte read.
+    #[test]
+    fn ls_p_19_utf8_to_utf16_continuation_byte_oob_guard_emitted() {
+        const SRC: &str = include_str!("fact.rs");
+        let marker = "LS-P-19: trap when the";
+        let marker_count = SRC.matches(marker).count();
+        assert!(
+            marker_count >= 3,
+            "fact.rs must retain LS-P-19 markers for all three multi-byte \
+             branches (2-byte, 3-byte, 4-byte) in \
+             emit_utf8_to_utf16_transcode; found {marker_count}",
+        );
+        // Cross-cutting: at least 3 Unreachable + 3 I32GeU pairs from
+        // LS-P-19's branch guards, plus the original LS-P-16 pair from
+        // emit_utf16_to_utf8_transcode = at least 4 instances of each.
+        let unreachable_count = SRC.matches("Instruction::Unreachable").count();
+        assert!(
+            unreachable_count >= 4,
+            "expected at least 4 Instruction::Unreachable in fact.rs \
+             (LS-P-16 + LS-P-19 branch guards); found {unreachable_count}",
+        );
     }
 
     /// LS-P-16 — `emit_utf16_to_utf8_transcode` must guard against reading the

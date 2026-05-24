@@ -3126,35 +3126,42 @@ impl ParsedComponent {
         match ty {
             ComponentValType::String => CopyLayout::Bulk { byte_multiplier: 1 },
             ComponentValType::List(inner) => {
+                // LS-P-12 / LS-P-18 safety check: refuse adapter generation
+                // when the inner type contains any pointer-bearing
+                // option/result/variant arm anywhere reachable.
+                // `element_inner_pointers` does not recurse into Option /
+                // Result / Variant payloads (its `_ => {}` catch-all silently
+                // drops them), so the returned `CopyLayout::Elements`
+                // descriptor would omit fixup for the conditional payload's
+                // pointer. The original LS-P-12 mitigation only fired when
+                // `inner_ptrs.is_empty()` — a record/tuple mixing a covered
+                // pointer (bare `string`/`list`) with a hidden conditional
+                // pointer (e.g. `record { items: list<u8>, maybe:
+                // option<string> }`) made `inner_ptrs` non-empty via the
+                // covered field, bypassing the guard and silently dropping
+                // the conditional fixup (LS-P-18). The deep recursive check
+                // closes that bypass.
+                if self.has_pointer_bearing_conditional(inner) {
+                    panic!(
+                        "LS-P-18: list element type contains a pointer-\
+                         bearing option/result/variant payload reachable \
+                         anywhere within the element layout — \
+                         `element_inner_pointers` does not yet emit the \
+                         per-element conditional fixup these payloads need, \
+                         so generating an adapter would silently leave \
+                         stale string/list pointers in the callee's \
+                         memory. Refusing rather than corrupting. The full \
+                         structural fix (per-element `DiscriminantGuard` \
+                         on `CopyLayout::Elements.inner_pointers` plus the \
+                         adapter-side per-element guard evaluation) is \
+                         tracked as follow-up to LS-P-12. Inner type: \
+                         {inner:?}",
+                    );
+                }
                 let element_size = self.canonical_abi_element_size(inner);
                 let inner_ptrs = self.element_inner_pointers(inner, 0);
                 let inner_res = self.element_inner_resources(inner, 0);
                 if inner_ptrs.is_empty() && inner_res.is_empty() {
-                    // LS-P-12 safety check: if the element type contains
-                    // pointers that `element_inner_pointers` didn't find
-                    // (currently happens for option/result/variant element
-                    // payloads — those arms aren't yet implemented), returning
-                    // `Bulk { element_size }` would copy the raw bytes
-                    // including stale `(ptr, len)` pairs that still reference
-                    // the source component's memory. Refuse to generate the
-                    // adapter rather than silently corrupting list elements;
-                    // the full structural fix (per-element conditional inner
-                    // pointer fixup) is tracked as the LS-P-12 follow-up.
-                    if self.type_contains_pointers(inner) {
-                        panic!(
-                            "LS-P-12: list element type contains a pointer-\
-                             bearing option/result/variant payload that is \
-                             not yet supported by the per-element fixup loop \
-                             (element_inner_pointers does not recurse into \
-                             these arms). Generating an adapter would silently \
-                             copy raw bytes including stale string/list \
-                             pointers into the callee's memory — refusing \
-                             rather than corrupting. Workaround: avoid \
-                             list<option<…>> / list<result<…>> / list<variant>\
-                             {{ …(string/list)… }} until LS-P-12 lands. \
-                             Inner type: {inner:?}",
-                        );
-                    }
                     CopyLayout::Bulk {
                         byte_multiplier: element_size,
                     }
@@ -3168,6 +3175,53 @@ impl ParsedComponent {
             }
             // For non-list/string types, treat as bulk with 1x multiplier
             _ => CopyLayout::Bulk { byte_multiplier: 1 },
+        }
+    }
+
+    /// LS-P-18 helper: does the type contain a pointer-bearing
+    /// option/result/variant payload anywhere reachable (recursing through
+    /// records, tuples, fixed-size lists, and type aliases)?
+    ///
+    /// Used by `copy_layout(List(inner))` to refuse adapter generation
+    /// rather than emit a `CopyLayout::Elements` whose `inner_pointers`
+    /// silently omits the per-element conditional fixup
+    /// `element_inner_pointers` cannot yet emit for option/result/variant
+    /// payloads. Returning `true` means the adapter would silently leave
+    /// stale string/list pointers in callee memory if we proceeded.
+    fn has_pointer_bearing_conditional(&self, ty: &ComponentValType) -> bool {
+        match ty {
+            ComponentValType::Option(inner) => {
+                self.type_contains_pointers(inner) || self.has_pointer_bearing_conditional(inner)
+            }
+            ComponentValType::Result { ok, err } => {
+                ok.as_ref().is_some_and(|t| {
+                    self.type_contains_pointers(t) || self.has_pointer_bearing_conditional(t)
+                }) || err.as_ref().is_some_and(|t| {
+                    self.type_contains_pointers(t) || self.has_pointer_bearing_conditional(t)
+                })
+            }
+            ComponentValType::Variant(cases) => cases.iter().any(|(_, t)| {
+                t.as_ref().is_some_and(|t| {
+                    self.type_contains_pointers(t) || self.has_pointer_bearing_conditional(t)
+                })
+            }),
+            ComponentValType::Record(fields) => fields
+                .iter()
+                .any(|(_, t)| self.has_pointer_bearing_conditional(t)),
+            ComponentValType::Tuple(elems) => elems
+                .iter()
+                .any(|t| self.has_pointer_bearing_conditional(t)),
+            ComponentValType::FixedSizeList(elem, _) => self.has_pointer_bearing_conditional(elem),
+            ComponentValType::Type(idx) => {
+                if let Some(ct) = self.get_type_definition(*idx)
+                    && let ComponentTypeKind::Defined(inner) = &ct.kind
+                {
+                    self.has_pointer_bearing_conditional(inner)
+                } else {
+                    false
+                }
+            }
+            _ => false,
         }
     }
 
@@ -5020,6 +5074,77 @@ mod tests {
             "list<u32> following record{{u32,u8}} must sit at offset 8 \
              (spec size of the preceding record), not at the unpadded 5",
         );
+    }
+
+    /// LS-P-18 — strengthens the LS-P-12 mitigation against a mixed-fields
+    /// bypass.
+    ///
+    /// The original LS-P-12 guard fired when `element_inner_pointers(inner, 0)`
+    /// was empty AND `type_contains_pointers(inner)` was true. For a record
+    /// that mixed a covered pointer (bare `string` or `list`) with a hidden
+    /// conditional pointer (`option<string>`), `element_inner_pointers`
+    /// returned a non-empty Vec from the covered field — the guard didn't
+    /// fire, `copy_layout` produced `CopyLayout::Elements` whose
+    /// `inner_pointers` omitted the conditional payload's pointer, and the
+    /// adapter never fixed it up across memories. LS-P-18 replaces the
+    /// emptiness-based guard with a recursive
+    /// `has_pointer_bearing_conditional(inner)` check that detects any
+    /// pointer-bearing option/result/variant *anywhere* in the inner
+    /// element layout. Surfaced by the mythos-auto delta-pass on PR #179.
+    #[test]
+    #[should_panic(expected = "LS-P-18")]
+    fn ls_p_18_mixed_record_with_option_string_bypasses_p12_then_refuses() {
+        let pc = empty_parsed_component();
+        // record { items: list<u8>, maybe: option<string> }
+        // Pre-LS-P-18:
+        //   element_inner_pointers(record) finds the `items` list — non-empty.
+        //   `inner_ptrs.is_empty() && type_contains_pointers(inner)` is FALSE
+        //     (since inner_ptrs is non-empty), so the LS-P-12 panic doesn't
+        //     fire.
+        //   `copy_layout(list<record>)` returns Elements with inner_pointers
+        //     covering only the bare `items` list — the option<string>'s
+        //     payload pointer is silently omitted.
+        // Post-LS-P-18:
+        //   has_pointer_bearing_conditional(record) recurses into fields,
+        //   hits the option<string>, returns true → panic.
+        let mixed = ComponentValType::Record(vec![
+            (
+                "items".to_string(),
+                ComponentValType::List(Box::new(ComponentValType::Primitive(PrimitiveValType::U8))),
+            ),
+            (
+                "maybe".to_string(),
+                ComponentValType::Option(Box::new(ComponentValType::String)),
+            ),
+        ]);
+        let list_of_mixed = ComponentValType::List(Box::new(mixed));
+        let _ = pc.copy_layout(&list_of_mixed);
+    }
+
+    /// LS-P-18 — pure-bare-pointer records (no nested conditional) must still
+    /// flow through `CopyLayout::Elements` without panicking. Pins the
+    /// guard's specificity.
+    #[test]
+    fn ls_p_18_pure_bare_pointer_record_still_works() {
+        use crate::resolver::CopyLayout;
+        let pc = empty_parsed_component();
+        // record { name: string, value: u32 } — both fields covered by
+        // element_inner_pointers; no conditional payload pointer.
+        let rec = ComponentValType::Record(vec![
+            ("name".to_string(), ComponentValType::String),
+            (
+                "value".to_string(),
+                ComponentValType::Primitive(PrimitiveValType::U32),
+            ),
+        ]);
+        let list_of_rec = ComponentValType::List(Box::new(rec));
+        match pc.copy_layout(&list_of_rec) {
+            CopyLayout::Elements { .. } => {}
+            CopyLayout::Bulk { .. } => panic!(
+                "list<record{{name: string, value: u32}}> must be \
+                 Elements (LS-R-2), not Bulk; LS-P-18 must not over-refuse",
+            ),
+        }
     }
 
     /// LS-P-12 — `copy_layout(List(inner))` must refuse rather than silently

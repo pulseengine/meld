@@ -966,6 +966,124 @@ loss-scenarios:
     status: approved
     priority: high
 
+  - id: LS-P-18
+    title: LS-P-12 bypassed when a record mixes a covered pointer with a hidden conditional one
+    uca: UCA-P-3
+    hazards: [H-4, H-4.2]
+    type: inadequate-process-model
+    scenario: >
+      The LS-P-12 mitigation in `copy_layout(List(inner))` fires only when
+      `element_inner_pointers(inner, 0)` is empty AND
+      `type_contains_pointers(inner)` is true. For a record/tuple that
+      mixes a *covered* pointer field (bare `string` or `list`) with a
+      *hidden* conditional pointer field (an `option/result/variant` whose
+      payload contains a pointer), `element_inner_pointers` returns a
+      non-empty Vec from the covered field — the LS-P-12 panic does not
+      fire and `copy_layout` returns
+      `CopyLayout::Elements { inner_pointers: [<covered field only>] }`.
+      The FACT adapter walks `inner_pointers`, fixes up the covered field,
+      and never touches the option-payload pointer. After the cross-memory
+      copy the callee receives an element whose option payload still
+      contains a string `(ptr, len)` pair referencing the *source*
+      component's memory — silent cross-memory dangling reference per
+      `Some(_)` element on every fused list copy [UCA-P-3 / H-4 / H-4.2].
+      Reachable for any `list<record { …; option<string> }>` (and the
+      tuple / nested / type-aliased analogues). Surfaced by the
+      mythos-auto delta-pass on PR #179 as a refinement attack on
+      LS-P-12; clean-room verified by tracing the `inner_ptrs` /
+      `inner_res` non-emptiness short-circuit. Fix replaces the
+      emptiness-based guard with a deep recursive
+      `has_pointer_bearing_conditional(inner)` check (new helper) that
+      visits Option / Result / Variant arms reachable through Records,
+      Tuples, FixedSizeLists, and `Type` aliases. If any pointer-bearing
+      conditional exists anywhere within the element layout,
+      `copy_layout(List(inner))` panics with the LS-P-18 marker — the
+      adapter refuses to generate rather than emit a `CopyLayout::Elements`
+      whose `inner_pointers` would omit a per-element conditional
+      fixup. Confirmed by PoC
+      `meld-core::parser::tests::ls_p_18_mixed_record_with_option_string_bypasses_p12_then_refuses`
+      which builds `list<record { items: list<u8>, maybe: option<string> }>`
+      and asserts the panic. A positive sanity test,
+      `ls_p_18_pure_bare_pointer_record_still_works`, pins that the
+      strengthened guard does not over-refuse pure-bare-pointer records
+      (e.g. `record { name: string, value: u32 }`).
+    causal-factors:
+      - >-
+        The original LS-P-12 guard's emptiness criterion was a proxy for
+        "no pointers covered yet" — a positive presence of any covered
+        pointer (bare `string`/`list`) short-circuited the proxy even
+        when other pointer positions were silently missing
+      - >-
+        No regression test exercised a record that mixed a covered
+        pointer field with a hidden conditional pointer field — the
+        bypass had no fixture
+    process-model-flaw: >
+      The shared model was "empty `inner_pointers` is the only failure
+      mode," but the missing-arms behaviour of `element_inner_pointers`
+      produces a partial output (some pointer positions, missing
+      others) that the emptiness check accepts as complete.
+    status: approved
+    priority: high
+
+  - id: LS-P-19
+    title: UTF-8→UTF-16 transcoder reads OOB for truncated multi-byte UTF-8
+    uca: UCA-P-3
+    hazards: [H-2, H-4, H-4.4]
+    type: inadequate-control-algorithm
+    scenario: >
+      `meld-core/src/adapter/fact.rs::emit_utf8_to_utf16_transcode` emits
+      the per-byte UTF-8→UTF-16 transcoding loop the FACT adapter uses
+      when the caller declares `string-encoding=utf8` and the callee
+      declares `utf16` (the canonical mirror of LS-P-16). The outer
+      loop guards the lead byte with `src_idx >= input_len`. Each
+      multi-byte branch (2-byte: `byte < 0xE0`; 3-byte: `byte < 0xF0`;
+      4-byte: `byte >= 0xF0`) then unconditionally reads its
+      continuation bytes via `I32Load8U` at offsets `src_idx + 1`,
+      `+2`, `+3`. A UTF-8 string ending on a truncated multi-byte lead
+      byte (e.g. `0xE2` with no following bytes; `0xF0` with only one
+      following byte; etc.) causes the adapter to read 1–3 bytes of
+      attacker-adjacent caller linear memory past the buffer end,
+      incorporate them into a synthesized code point via the canonical
+      shift/mask formula, and emit the resulting code point as UTF-16
+      into the callee output — silent cross-memory leak of caller
+      bytes per transcoded string [UCA-P-3 / H-2 caller-controlled
+      offsets / H-4.4 incorrect string transcoding]. The composed
+      (non-fused) execution traps on invalid UTF-8 with a `len`/byte
+      mismatch; the fused execution silently corrupted, producing
+      semantic drift. Reachable for any cross-memory
+      UTF-8-caller/UTF-16-callee fusion whose UTF-8 string ends on a
+      truncated multi-byte lead. Surfaced by the mythos-auto
+      delta-pass on PR #179. Conservative mitigation prepends a
+      `src_idx + N >= input_len` `unreachable` trap to each multi-byte
+      branch (N = 1 for the 2-byte case, 2 for 3-byte, 3 for 4-byte).
+      The Canonical-ABI-correct upgrade replaces truncated sequences
+      with the U+FFFD replacement character (tracked alongside the
+      LS-P-16 upgrade). Trap converts silent leak into loud
+      adapter-runtime trap. Confirmed by PoC
+      `meld-core::adapter::fact::tests::ls_p_19_utf8_to_utf16_continuation_byte_oob_guard_emitted`,
+      a structural test pinning the LS-P-19 marker at all three
+      multi-byte branches and the cumulative Unreachable + I32GeU
+      opcode count across LS-P-16 and LS-P-19.
+    causal-factors:
+      - >-
+        The outer-loop bounds check guarded only the lead byte; the
+        continuation-byte reads inside each multi-byte branch had no
+        independent guard
+      - >-
+        The canonical UTF-8 decoder pattern assumes valid UTF-8 input
+        (continuation bytes always present); fused adapters consume
+        untrusted caller buffers where truncation is reachable
+      - >-
+        No regression test covered the truncated-lead-byte edge case
+        for any of the three multi-byte branches
+    process-model-flaw: >
+      The model was "if the lead byte is in-range, the implied
+      continuation bytes must also be in-range," but the lead byte's
+      classification does not constrain the buffer end — a truncated
+      multi-byte sequence is the obvious counterexample.
+    status: approved
+    priority: high
+
   - id: LS-P-17
     title: Caller-encoding match filters on Func only, miscalibrates mixed-encoding callers
     uca: UCA-R-3

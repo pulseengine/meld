@@ -6,6 +6,47 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **UTF-8→UTF-16 transcoding read 1–3 bytes past the input buffer for
+  truncated multi-byte UTF-8 sequences — silent cross-memory leak,
+  mirror of LS-P-16** (LS-P-19, UCA-P-3, H-2 / H-4 / H-4.4,
+  `meld-core/src/adapter/fact.rs`). `emit_utf8_to_utf16_transcode`'s
+  outer loop bounds-checked only the lead byte; each multi-byte
+  branch then unconditionally read its continuation bytes at
+  `src_idx + 1`/`+2`/`+3`. A UTF-8 string ending on a truncated
+  multi-byte lead (e.g. a bare `0xE2` at the buffer tail) caused the
+  adapter to load up to 3 bytes of attacker-adjacent caller memory,
+  fold them into a synthesized code point, and emit the result as
+  UTF-16 into the callee output. Conservative mitigation prepends a
+  `src_idx + N >= input_len` `unreachable` trap to each multi-byte
+  branch (N = 1/2/3). Promoted to approved loss scenario
+  **LS-P-19** (priority high). Regression pinned by
+  `ls_p_19_utf8_to_utf16_continuation_byte_oob_guard_emitted`.
+
+- **LS-P-12 bypassed when a record mixed a covered pointer with a
+  hidden conditional one — silent cross-memory dangling pointers in
+  callee elements** (LS-P-18, UCA-P-3, H-4 / H-4.2,
+  `meld-core/src/parser.rs`). The original LS-P-12 guard in
+  `copy_layout(List(inner))` fired only when
+  `element_inner_pointers(inner, 0)` was empty AND `inner` contained
+  pointers. A record/tuple that mixed a covered field (bare
+  `string`/`list`) with a hidden conditional pointer field (e.g.
+  `option<string>`) made `element_inner_pointers` return a non-empty
+  Vec from the covered field — the LS-P-12 panic didn't fire, and
+  `copy_layout` produced `CopyLayout::Elements` whose
+  `inner_pointers` omitted the option-payload pointer. The FACT
+  adapter then never fixed up the conditional payload across
+  memories, leaving callee elements with stale string pointers per
+  `Some(_)`. Fix replaces the emptiness-based guard with a deep
+  recursive `has_pointer_bearing_conditional(inner)` check (new
+  helper) that walks Option / Result / Variant arms reachable
+  through Records, Tuples, FixedSizeLists, and `Type` aliases. If
+  any pointer-bearing conditional exists, `copy_layout(List(inner))`
+  panics with the LS-P-18 marker. Promoted to approved loss scenario
+  **LS-P-18** (priority high). Regression pinned by
+  `ls_p_18_mixed_record_with_option_string_bypasses_p12_then_refuses`
+  + positive sanity test
+  `ls_p_18_pure_bare_pointer_record_still_works`.
+
 - **Caller-encoding name match filtered on `ComponentTypeRef::Func`
   only, miscalibrated `string_transcoding` for mixed-encoding
   callers — defensive warn-before-heuristic** (LS-P-17, UCA-R-3,
