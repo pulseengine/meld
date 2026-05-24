@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-05-24
+
 ### Fixed
 
 - **UTF-8→UTF-16 transcoding read 1–3 bytes past the input buffer for
