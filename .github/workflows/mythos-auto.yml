@@ -6,6 +6,16 @@ name: Mythos delta-pass (auto)
 # files report NO FINDINGS, which clears the label-only gate in
 # `mythos-gate.yml`.
 #
+# Diff-scoped scanning (since v0.11.0): for each touched Tier-5 file the
+# scan step extracts the PR's diff for that file (merge-base...head) and
+# the prompt instructs the AI to report only findings INTRODUCED by the
+# diff. Pre-existing latent bugs in unchanged regions are out of scope
+# for the run; the AI may read the full file for context (caller/callee
+# relationships) but must not surface findings unrelated to the diff.
+# This avoids the v0.9-v0.10 "whole-file scan treadmill" where every
+# parser.rs PR was blocked until every latent bug in the file was
+# fixed — Tier-5 PRs are now judged on their own changes.
+#
 # Auth: uses Claude Code via CLAUDE_CODE_OAUTH_TOKEN (Max-plan OAuth
 # token, not a separate API key). Token usage draws from the
 # subscription's rate limits — see the budget knobs below.
@@ -154,6 +164,12 @@ jobs:
         file: ${{ fromJSON(needs.detect.outputs.files) }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          # Diff-scoped scanning (LS-P-* treadmill fix, v0.11.0): we need
+          # both `base.sha` and `head.sha` reachable to compute the
+          # per-file diff. fetch-depth=0 pulls full history; the base
+          # SHA is otherwise not in the shallow clone.
+          fetch-depth: 0
 
       # Slugify before discover so the placeholder-write step below
       # always has a non-empty `steps.slug.outputs.slug` to reference
@@ -169,6 +185,36 @@ jobs:
           # actions/upload-artifact rejects '/' in names.
           slug=${F//\//__}
           echo "slug=${slug}" >> "$GITHUB_OUTPUT"
+
+      # Diff-scoped scanning: extract just the PR's diff for this
+      # Tier-5 file. The discover prompt below references this path and
+      # tells the AI to scope its analysis to lines the diff adds or
+      # modifies — pre-existing bugs in unchanged regions of the file
+      # are out of scope. Triple-dot `BASE...HEAD` uses the merge-base
+      # so commits the base branch advanced past after PR open do not
+      # show up in the diff. An empty diff (rename / mode-only / pure
+      # delete) is allowed — the AI sees no introduced changes and
+      # reports NO_FINDINGS by construction.
+      - name: Extract PR diff for ${{ matrix.file }}
+        id: diff
+        env:
+          F: ${{ matrix.file }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          SLUG: ${{ steps.slug.outputs.slug }}
+        run: |
+          set -euo pipefail
+          mkdir -p mythos-diffs
+          out="mythos-diffs/${SLUG}.diff"
+          git diff --no-color "$BASE_SHA"..."$HEAD_SHA" -- "$F" > "$out"
+          size=$(wc -c < "$out")
+          echo "diff_path=$out" >> "$GITHUB_OUTPUT"
+          echo "diff_size=$size" >> "$GITHUB_OUTPUT"
+          if [ "$size" -eq 0 ]; then
+            echo "Empty diff for $F (rename / mode / delete only); AI will report NO_FINDINGS."
+          else
+            echo "Diff for $F: $size bytes."
+          fi
 
       # The action's `oven-sh/setup-bun` step requires `unzip`, which
       # is not installed by default on rust-cpu runners. Best-effort
@@ -208,6 +254,19 @@ jobs:
             Read scripts/mythos/discover.md and apply it to the file
             ${{ matrix.file }}. The {{file}} placeholder in
             discover.md resolves to ${{ matrix.file }}.
+
+            **Diff-scoped scope (LS-P-treadmill fix).** This run
+            considers only bugs *introduced* by the changes in this
+            pull request. The unified diff for this file is at
+            `${{ steps.diff.outputs.diff_path }}` (${{ steps.diff.outputs.diff_size }}
+            bytes). Read that diff first; analyse only the lines it
+            adds or modifies. Pre-existing bugs in unchanged regions
+            of ${{ matrix.file }} are explicitly OUT OF SCOPE for this
+            run, even if discover.md's heuristics would otherwise
+            flag them. You may read the full file for context
+            (caller/callee relationships, type definitions) but
+            report a FINDING only when the offending code is in the
+            diff. An empty diff means NO_FINDINGS by construction.
 
             Do not relax the oracle requirement. If you cannot
             produce both a Kani harness and a failing PoC test for a
