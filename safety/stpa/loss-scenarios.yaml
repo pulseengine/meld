@@ -754,6 +754,72 @@ loss-scenarios:
     status: approved
     priority: high
 
+  - id: LS-P-14
+    title: Nested-list inner copy `buf_len = len * sub_elem_size` lacks overflow guard
+    uca: UCA-P-3
+    hazards: [H-2, H-4, H-4.1]
+    type: inadequate-control-algorithm
+    scenario: >
+      `meld-core/src/adapter/fact.rs::emit_patch_nested_indirections`
+      walks each element of a list-of-records (or list-of-tuples) at
+      adapter-generation time and emits, for each inner pointer
+      indirection inside the element, a `cabi_realloc` + `memory.copy`
+      sequence that copies the inner list/string from callee memory into
+      the caller's. The byte count for that copy is computed at runtime:
+      load `len` from the callee's memory at byte offset `+4` from the
+      element record, then multiply by `sub_elem_size` (the inner list's
+      element stride) via a bare `i32.mul`. `i32.mul` is modulo 2³², so
+      a callee-supplied `len` near `u32::MAX / sub_elem_size` wraps the
+      product to a small value. The subsequent bounds check
+      (`old_ptr + buf_len > mem_bytes`) uses `i32.add`, which **also**
+      wraps and is bypassed. The adapter then allocates and copies only
+      the wrapped byte count, while the caller-side bulk copy of the
+      outer element bytes keeps the original large `len` field — so the
+      callee receives a `(new_ptr, full_len)` pair whose buffer is far
+      smaller than `full_len` bytes [UCA-P-3 / H-2 caller-controlled
+      offsets / H-4 / H-4.1 wrong byte length]. Reads/writes into the
+      buffer past `wrapped_buf_len` walk into adjacent caller-allocated
+      memory — silent truncation in the inner list contents and OOB
+      access on every dereference past the truncated edge. Reachable for
+      any cross-memory fusion of a function whose param/result contains
+      a `list<record { …; inner: list<T> }>` (or tuple analogue) where
+      the callee can produce a length within one `sub_elem_size` of
+      `u32::MAX / sub_elem_size`. Surfaced by the mythos-auto delta-pass
+      on PR #179. Fix: stash the loaded `len` into the existing
+      `l_buf_len` scratch local, call
+      `emit_overflow_guard(body, l_buf_len, sub_elem_size as u32)`
+      (which traps via `unreachable` when the multiplication would wrap),
+      then re-fetch the local for the multiplication. `emit_overflow_guard`
+      with `k == 1` is a no-op so the guard is harmless when
+      `sub_elem_size == 1`. Confirmed by PoC
+      `meld-core::adapter::fact::tests::ls_p_14_nested_list_inner_copy_emits_overflow_guard`,
+      which emits a synthetic patch-loop for `record { items: list<u32> }`
+      (`sub_elem_size = 4`) and asserts the encoded function body
+      contains an `Unreachable` opcode — the only place that opcode
+      appears along this path is inside `emit_overflow_guard`.
+    causal-factors:
+      - >-
+        `emit_patch_nested_indirections` was written before the
+        `emit_overflow_guard` helper landed (the helper was added as
+        the LS-A-7 leg (a) fix for the outer-list copy paths), and the
+        retrofit never reached the inner copy
+      - >-
+        The bounds check below the multiplication uses the same
+        wrapping `i32.add` arithmetic, so the comment "skip patch if
+        (old_ptr, buf_len) doesn't fit in callee mem" overstated the
+        protection — a wrapped `buf_len` slips the check
+      - >-
+        No regression test exercised
+        `emit_patch_nested_indirections` for an element type with
+        non-trivial `sub_elem_size`
+    process-model-flaw: >
+      The model was "the outer copy paths guard against overflow; the
+      inner per-element copies do not need to," but the inner copies
+      consume callee-controlled `len` values just like the outer ones —
+      the trust boundary is the same.
+    status: approved
+    priority: high
+
   # ==========================================================================
   # Resolver scenarios
   # ==========================================================================

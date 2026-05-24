@@ -6,6 +6,36 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **Nested-list inner copy `buf_len = len * sub_elem_size` missed the
+  overflow guard** (LS-P-14, UCA-P-3, H-2 / H-4 / H-4.1,
+  `meld-core/src/adapter/fact.rs`).
+  `emit_patch_nested_indirections` — the per-element fixup loop for a
+  list-of-records (or tuples) — computed the byte count for each inner
+  list's `cabi_realloc` + `memory.copy` by loading the callee's
+  `len` field and multiplying by `sub_elem_size` with a bare
+  `i32.mul`. `i32.mul` is modulo 2³², so a callee-supplied `len` near
+  `u32::MAX / sub_elem_size` wrapped `buf_len` to a small value;
+  the subsequent `old_ptr + buf_len > mem_bytes` bounds check used
+  `i32.add` (also wrapping) and was bypassed. The adapter then
+  allocated/copied only the wrapped byte count while the caller-side
+  bulk copy of the outer element kept the original large `len` —
+  silent inner-list truncation, plus OOB read/write into adjacent
+  caller-allocated memory on every dereference past the truncated
+  edge. The `emit_overflow_guard` helper (added as the LS-A-7 leg
+  (a) fix for the outer copy paths) was never retrofitted to the
+  inner copy. Fix stashes the loaded `len` into the existing
+  `l_buf_len` scratch local, calls `emit_overflow_guard(body,
+  l_buf_len, sub_elem_size as u32)` to trap via `unreachable` on
+  wrapping, then re-fetches the local for the multiplication.
+  **A confirmed Mythos finding** — surfaced by the mythos-auto
+  delta-pass on PR #179. Promoted to approved loss scenario
+  **LS-P-14** (priority high). Regression pinned by
+  `ls_p_14_nested_list_inner_copy_emits_overflow_guard`, which
+  emits a synthetic patch loop for `record { items: list<u32> }`
+  (`sub_elem_size = 4`) and asserts the encoded function body
+  contains an `Unreachable` opcode (the only place that opcode
+  appears along this path is inside `emit_overflow_guard`).
+
 - **Async adapter param-copy treated every consecutive `(i32, i32)`
   pair as a pointer pair, corrupting plain integer args** (LS-P-13,
   UCA-P-3, H-2 / H-4 / H-4.1,

@@ -398,11 +398,23 @@ fn emit_patch_nested_indirections(
 
         body.instruction(&Instruction::LocalGet(l_rec_src));
         body.instruction(&Instruction::I32Load(src_mem_arg_len));
+        body.instruction(&Instruction::LocalSet(l_buf_len));
+        // LS-P-14: trap if `len * sub_elem_size` would wrap mod 2^32. Without
+        // this guard a callee-supplied `len` near `u32::MAX / sub_elem_size`
+        // wraps `buf_len` to a small value; the bounds check below uses
+        // `old_ptr + buf_len > mem_bytes` (also `i32.add`-based and wrapping)
+        // and is bypassed; the adapter then under-allocates the caller
+        // buffer and under-copies the inner list contents while the caller-
+        // side bulk-copy of the outer (ptr, len) keeps the original large
+        // `len` — silent truncation and semantic drift between the fused
+        // and composed executions.
+        emit_overflow_guard(body, l_buf_len, *sub_elem_size);
         if *sub_elem_size != 1 {
+            body.instruction(&Instruction::LocalGet(l_buf_len));
             body.instruction(&Instruction::I32Const(*sub_elem_size as i32));
             body.instruction(&Instruction::I32Mul);
+            body.instruction(&Instruction::LocalSet(l_buf_len));
         }
-        body.instruction(&Instruction::LocalSet(l_buf_len));
 
         // Skip patch if (old_ptr, buf_len) doesn't fit in callee mem — guards
         // against garbage values triggering an unrecoverable trap.
@@ -4930,6 +4942,80 @@ mod tests {
         assert_eq!(options.caller_string_encoding, StringEncoding::Utf8);
         assert_eq!(options.callee_string_encoding, StringEncoding::Utf8);
         assert!(!options.needs_transcoding());
+    }
+
+    /// LS-P-14 — the nested-list inner copy in `emit_patch_nested_indirections`
+    /// must guard `len * sub_elem_size` against 32-bit overflow before
+    /// computing `buf_len` for `cabi_realloc` + `memory.copy`.
+    ///
+    /// Before the fix, the inner copy path loaded the callee-supplied `len`
+    /// from callee memory, multiplied by `sub_elem_size` with a bare
+    /// `i32.mul` (wrapping mod 2³²), stored to `l_buf_len`, then used
+    /// `l_buf_len` for the buffer allocation and `memory.copy`. A callee-
+    /// controlled `len` near `u32::MAX / sub_elem_size` wrapped `buf_len`
+    /// to a small value; the subsequent `old_ptr + buf_len > mem_bytes`
+    /// bounds check used `i32.add` which also wrapped and was bypassed;
+    /// the adapter then under-allocated and under-copied the inner list
+    /// while the caller's bulk-copied outer `(ptr, len)` retained the
+    /// original large `len` — silent truncation. Surfaced by the mythos-
+    /// auto delta-pass on PR #179. Fix calls `emit_overflow_guard(body,
+    /// l_buf_len, sub_elem_size as u32)` after loading `len` and before
+    /// the multiplication.
+    ///
+    /// This test pins the contract by emitting the function via
+    /// `emit_patch_nested_indirections` for an element type that has an
+    /// inner `list<u32>` indirection (`sub_elem_size = 4`, non-trivial),
+    /// extracts the encoded body bytes, and asserts they contain at least
+    /// one `Unreachable` opcode (`0x00`) — the only place that opcode is
+    /// emitted along this path is inside `emit_overflow_guard`.
+    #[test]
+    fn ls_p_14_nested_list_inner_copy_emits_overflow_guard() {
+        use crate::parser::{ComponentValType, PrimitiveValType};
+        use wasm_encoder::{Function, ValType};
+
+        // Element type: `record { items: list<u32> }`. The record has one
+        // inner pointer pair (the list) with sub_elem_size = element_size
+        // of u32 = 4. That's the dangerous `len * 4` multiplication path.
+        let elem_ty = ComponentValType::Record(vec![(
+            "items".to_string(),
+            ComponentValType::List(Box::new(ComponentValType::Primitive(PrimitiveValType::U32))),
+        )]);
+
+        // Function with enough locals to cover l_first_scratch..+5 plus a
+        // few spare. Six i32 locals starting at index 0.
+        let mut func = Function::new(vec![(12, ValType::I32)]);
+
+        // The dst/src/len locals and the scratch base are all i32 indices
+        // we just point at slots 0..11 — the function body only cares
+        // about local references being in-range.
+        emit_patch_nested_indirections(
+            &mut func, &elem_ty, /* l_dst_ptr = */ 0, /* l_callee_src = */ 1,
+            /* l_src_len = */ 2,
+            /* elem_size = */ 8, // record { ptr:i32, len:i32 } = 8 bytes
+            /* l_first_scratch = */ 3, /* realloc_func = */ 99,
+            /* caller_memory = */ 0, /* callee_memory = */ 1,
+        );
+
+        // wasm_encoder::Function has no public bytes() accessor on stable;
+        // round-trip through a Module to get encoded bytes we can scan.
+        func.instruction(&wasm_encoder::Instruction::End);
+        let mut module = wasm_encoder::Module::new();
+        let mut code_section = wasm_encoder::CodeSection::new();
+        code_section.function(&func);
+        module.section(&code_section);
+        let body_bytes: Vec<u8> = module.finish();
+
+        // Unreachable opcode is 0x00; it only appears in
+        // emit_overflow_guard along this path. Without the fix, no
+        // Unreachable is emitted by the inner copy and the buf_len
+        // computation wraps silently.
+        assert!(
+            body_bytes.contains(&0x00),
+            "emit_patch_nested_indirections must emit an Unreachable \
+             (LS-P-14 overflow guard) for the inner len * sub_elem_size \
+             multiplication; before the fix, no Unreachable was emitted \
+             and a callee-controlled len could wrap buf_len silently",
+        );
     }
 
     #[test]
