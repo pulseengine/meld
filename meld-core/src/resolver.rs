@@ -1369,11 +1369,36 @@ fn resolve_resource_positions(
                 // so it does not own the representation.
                 false
             } else {
-                component
+                match component
                     .component_type_defs
                     .get(pos.resource_type_id as usize)
-                    .map(|def| !matches!(def, crate::parser::ComponentTypeDef::Import(_)))
-                    .unwrap_or(true)
+                {
+                    Some(def) => !matches!(def, crate::parser::ComponentTypeDef::Import(_)),
+                    None => {
+                        // LS-P-15: out-of-bounds resource_type_id — the previous
+                        // `unwrap_or(true)` silently classified the resource as
+                        // callee-defined, so the adapter generator emitted a
+                        // [resource-rep]/[resource-new] mismatch (treating an
+                        // import as a definition) with no warning. That
+                        // produced wrong handle conversions on every fused
+                        // cross-component call that passed the handle. Drop the
+                        // resolution entry and warn instead — downstream the
+                        // adapter will either find no work to do (if the
+                        // handle is unused on this flat slot) or surface a
+                        // loud missing-fixup error at adapter generation,
+                        // never silently swap conversion sides.
+                        log::warn!(
+                            "resource_type_id {} out of bounds for \
+                             component_type_defs (len {}); dropping resource \
+                             resolution for {} at flat_idx {} (LS-P-15)",
+                            pos.resource_type_id,
+                            component.component_type_defs.len(),
+                            field_prefix,
+                            pos.flat_idx,
+                        );
+                        continue;
+                    }
+                }
             };
             resolved.push(ResolvedResourceOp {
                 flat_idx: pos.flat_idx,
@@ -4591,6 +4616,72 @@ mod tests {
                  the same flat name; got {other:?}",
             ),
         }
+    }
+
+    /// LS-P-15 — `resolve_resource_positions` must drop (not silently
+    /// misclassify) a `ResourcePosition` whose `resource_type_id` is out
+    /// of bounds for `component.component_type_defs`.
+    ///
+    /// Before the fix, the classifier called
+    /// `.get(pos.resource_type_id as usize).map(...).unwrap_or(true)` —
+    /// out-of-bounds defaulted to `callee_defines_resource = true`, so
+    /// the adapter generator emitted a `[resource-rep]` call where
+    /// `[resource-new]` was correct (or vice versa) — a silent swap of
+    /// the two resource-handle conversion sides on every fused
+    /// cross-component call passing that handle. Surfaced by the
+    /// mythos-auto delta-pass on PR #179. The instance-graph normal
+    /// path keys `resource_type_id` through validated type indices
+    /// produced by the parser, so this is reachable only on parser-
+    /// produced stale ids, malformed input, or after alias remaps that
+    /// outrun the local type table — defensive hardening, not a
+    /// memory-safety emergency. Fix matches on `.get(...)` and emits a
+    /// `log::warn!` + `continue` on `None`, so the position is dropped
+    /// and the downstream adapter will either find no work to do for
+    /// the unused flat slot or surface a loud missing-fixup error,
+    /// never silently swap.
+    #[test]
+    fn ls_p_15_out_of_bounds_resource_type_id_is_dropped_not_misclassified() {
+        let mut by_type_id: std::collections::HashMap<(u32, &'static str), (String, String)> =
+            std::collections::HashMap::new();
+        // Force the lookup to succeed at an OOB resource_type_id (999),
+        // so flow reaches the `component_type_defs.get(...)` check.
+        by_type_id.insert(
+            (999, "[resource-rep]"),
+            ("ext".to_string(), "rep".to_string()),
+        );
+        let resource_map = ResourceImportMap {
+            by_type_id,
+            by_name: std::collections::HashMap::new(),
+        };
+
+        // empty_parsed_component has component_type_defs empty, so any
+        // non-zero resource_type_id is OOB.
+        let pc = empty_parsed_component();
+        let pos = crate::parser::ResourcePosition {
+            flat_idx: 0,
+            byte_offset: 0,
+            is_owned: true,
+            resource_type_id: 999,
+        };
+
+        let resolved = resolve_resource_positions(
+            &resource_map,
+            std::slice::from_ref(&pos),
+            "[resource-rep]",
+            &pc,
+            /* callee_is_reexporter = */ false,
+        );
+
+        // Pre-fix: 1 entry pushed with callee_defines_resource = true,
+        // mis-routing the downstream [resource-rep]/[resource-new] call.
+        // Post-fix: warn + continue → 0 entries.
+        assert!(
+            resolved.is_empty(),
+            "out-of-bounds resource_type_id must be dropped (LS-P-15), \
+             not silently classified as callee-defined; got {} resolved \
+             ops",
+            resolved.len(),
+        );
     }
 
     fn module_with_imports(imports: Vec<(&str, &str)>) -> crate::parser::CoreModule {

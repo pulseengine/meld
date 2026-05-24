@@ -6,6 +6,34 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **Out-of-bounds `resource_type_id` silently misclassified as
+  callee-defined — `[resource-rep]` / `[resource-new]` swap on the
+  fused adapter** (LS-P-15, UCA-R-3, H-5 / H-1,
+  `meld-core/src/resolver.rs`). `resolve_resource_positions` decided
+  callee-vs-caller resource ownership via
+  `.get(pos.resource_type_id as usize).map(|def| !matches!(def,
+  ComponentTypeDef::Import(_))).unwrap_or(true)`. When the id
+  exceeded `component_type_defs.len()` (stale id, alias remap past
+  the local table, malformed input), `.get(...) → None` and
+  `.unwrap_or(true)` silently classified the resource as
+  *callee-defined* with no warning — the adapter emitted a
+  `[resource-rep]` call where `[resource-new]` was correct (or vice
+  versa), swapping the two resource-handle conversion sides on every
+  fused cross-component call passing that handle. The handle
+  type-checks on both sides, so the validator doesn't catch it.
+  Reachability is bounded — the instance-graph path keys
+  `resource_type_id` through validated parser-produced indices —
+  making this **defensive hardening**, not a memory-safety
+  emergency. Replaces the `unwrap_or(true)` with an explicit `match`:
+  on `None`, emit `log::warn!` and `continue` so the position is
+  dropped instead of silently misclassified; the downstream adapter
+  will surface a loud missing-fixup error at adapter generation
+  rather than silently swap. **A confirmed Mythos finding** —
+  surfaced by the mythos-auto delta-pass on PR #179. Promoted to
+  approved loss scenario **LS-P-15** (priority low). Regression
+  pinned by
+  `ls_p_15_out_of_bounds_resource_type_id_is_dropped_not_misclassified`.
+
 - **Nested-list inner copy `buf_len = len * sub_elem_size` missed the
   overflow guard** (LS-P-14, UCA-P-3, H-2 / H-4 / H-4.1,
   `meld-core/src/adapter/fact.rs`).

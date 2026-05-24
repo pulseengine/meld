@@ -820,6 +820,78 @@ loss-scenarios:
     status: approved
     priority: high
 
+  - id: LS-P-15
+    title: Out-of-bounds resource_type_id silently misclassified as callee-defined
+    uca: UCA-R-3
+    hazards: [H-5, H-1]
+    type: inadequate-process-model
+    scenario: >
+      `meld-core/src/resolver.rs::resolve_resource_positions` decides
+      whether the callee component owns a resource's representation
+      (and therefore the adapter must emit `[resource-rep]`) or merely
+      imports it (`[resource-new]`). The decision routes through a
+      lookup into `component.component_type_defs` keyed by
+      `pos.resource_type_id as usize`:
+      `.get(...).map(|def| !matches!(def, ComponentTypeDef::Import(_))).unwrap_or(true)`.
+      When `resource_type_id` exceeds `component_type_defs.len()` — a
+      stale id surviving alias propagation, a parser-produced id past
+      the local table, a malformed input — `.get(...)` returns `None`
+      and `unwrap_or(true)` silently classifies the resource as
+      *callee-defined* with no warning. The adapter then emits a
+      `[resource-rep]` call where `[resource-new]` was correct (or
+      vice versa) — a silent swap of the two resource-handle
+      conversion sides on every fused cross-component call passing that
+      handle [UCA-R-3 import wired to wrong source / H-5 dependency
+      resolution produces wrong order / H-1 fused module traps at the
+      wrong call site when the handle is dereferenced]. The handle
+      type-checks on both sides (both are i32-shaped) so the validator
+      does not catch it. Reachability is bounded: the normal
+      instance-graph path keys `resource_type_id` through validated
+      type indices that the parser produced from canonical entries, so
+      this is reachable mainly on stale ids, malformed input, or after
+      alias remaps that outrun the local type table — defensive
+      hardening rather than a memory-safety emergency. Surfaced by the
+      mythos-auto delta-pass on PR #179. Fix replaces the
+      `.unwrap_or(true)` with an explicit `match`: on `Some(def)`,
+      classify by type; on `None`, emit a `log::warn!` and `continue`,
+      so the position is *dropped* rather than silently misclassified.
+      The downstream adapter will either find no work to do for the
+      unused flat slot, or surface a loud missing-fixup error at
+      adapter generation — never silently swap conversion sides.
+      Confirmed by PoC
+      `meld-core::resolver::tests::ls_p_15_out_of_bounds_resource_type_id_is_dropped_not_misclassified`,
+      which builds a synthetic `ResourceImportMap` whose lookup
+      succeeds at `resource_type_id = 999`, then calls
+      `resolve_resource_positions` against an `empty_parsed_component`
+      (zero entries in `component_type_defs`) and asserts the returned
+      `Vec<ResolvedResourceOp>` is empty (pre-fix: one mis-classified
+      entry; post-fix: dropped with a warn log).
+    causal-factors:
+      - >-
+        `unwrap_or(true)` was a stand-in defensive default that should
+        have been "fall through to the import path" or "fail loud" —
+        `true` is the more dangerous default because it triggers the
+        adapter to emit a `[resource-rep]` call against a resource
+        whose representation the callee does not own
+      - >-
+        The lookup miss had no warning channel, so a stale/malformed
+        `resource_type_id` produced an adapter with quietly wrong
+        resource-handle conversions and no diagnostic for the
+        toolchain to surface
+      - >-
+        No regression test exercised `resolve_resource_positions` with
+        a `resource_type_id` outside the local `component_type_defs`
+        range
+    process-model-flaw: >
+      The model was "any failure to classify is benign," but the
+      adapter's `[resource-rep]` vs `[resource-new]` choice is
+      asymmetric — emitting the wrong call produces a handle whose
+      conversion side mismatches the callee's expectation, an error
+      that compiles cleanly and only surfaces when the handle is
+      dereferenced at runtime.
+    status: approved
+    priority: low
+
   # ==========================================================================
   # Resolver scenarios
   # ==========================================================================
