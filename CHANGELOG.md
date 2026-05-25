@@ -4,32 +4,68 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-05-25
+
 ### Added
 
-- **Static stream cycle detection at fusion time** (#142 (iii),
-  LS-R-12, `meld-core/src/p3_stream.rs`, `meld-core/src/resolver.rs`,
-  `meld-core/src/error.rs`). Tarjan-style strongly-connected-component
-  detection on the directed `producer → consumer` graph induced by
-  detected `StreamPair`s; strongly-connected components of size ≥ 3
-  are reported as deadlock candidates at fusion time. The legal
-  bidirectional-pipe pattern (size-2 SCCs from two independent streams
-  in opposite directions) is explicitly excluded. New
-  `Error::StreamValidation(String)` variant reports all issues from a
-  single fusion attempt at once so users can act on the whole punch
-  list. Validation logic factored into pure `validate_from_pairs` so
-  the four new regression tests
-  (`ls_r_12_stream_three_component_cycle_flagged`,
-  `bidirectional_pipe_is_not_flagged_as_cycle`,
-  `four_component_cycle_flagged`, `linear_pipeline_is_not_flagged`)
-  pin behavior without needing `ParsedComponent` fixtures.
-  Checks (i) "stream element-type compatibility", (ii) "bounded-channel
-  capacity", and (iv) "resource lifetime across async boundaries"
-  remain open. (i) needs per-import-edge type lookups — the role-list
-  heuristic that landed in an earlier draft of this PR raised a
-  false-positive on sync-connected components with unrelated streams,
-  as the Mythos delta-pass auto-scan caught; LS-R-11 stays open
-  tracking that follow-up. (ii) and (iv) need information beyond
-  `CanonicalEntry` / `ParsedComponent`.
+- **Static stream cycle detection at fusion time** (#142 (iii) / #188,
+  LS-R-12, LS-R-13, `meld-core/src/p3_stream.rs`,
+  `meld-core/src/resolver.rs`, `meld-core/src/error.rs`).
+  Strongly-connected-component detection on the directed
+  `producer → consumer` graph induced by detected `StreamPair`s;
+  multi-component SCCs of size ≥ 3 are reported as deadlock candidates
+  at fusion time. The legal bidirectional-pipe pattern (size-2 SCCs
+  from two independent streams in opposite directions) is explicitly
+  excluded. New `Error::StreamValidation(String)` variant batches every
+  issue from a single fusion attempt so users can act on the whole
+  punch list at once. Backed by an **iterative Tarjan implementation**
+  (LS-R-13) so deep linear chains can't overflow the call stack — the
+  Mythos delta-pass auto-scan on the PR identified that the original
+  recursive draft (and `petgraph 0.8`'s own `tarjan_scc`) overflows the
+  default 8 MB Rust thread stack at ~40 000 nodes. Pinned by a
+  50 000-node deep-chain regression test
+  (`deep_linear_chain_does_not_overflow_stack`). Checks (i) "stream
+  element-type compatibility", (ii) "bounded-channel capacity", and
+  (iv) "resource lifetime across async boundaries" from #142 remain
+  open. (i) needs per-import-edge type lookups — a role-list heuristic
+  attempted in an earlier draft of #188 produced false-positives on
+  sync-connected components with unrelated streams, as Mythos caught;
+  LS-R-11 stays open tracking that follow-up.
+
+- **Consumer verification recipe for signed releases** (#187, README).
+  Four-step `cosign verify-blob` + `gh attestation verify` recipe in
+  the Supply Chain Security section so consumers can independently
+  confirm a downloaded archive was produced by this repo's release
+  workflow. Closes the documentation gap from #186.
+
+### Changed
+
+- **Release pipeline shipped** (#186, `.github/workflows/release.yml`).
+  Re-implemented around the synth reference flow: per-target
+  `meld-${VERSION}-${TARGET}.tar.gz` archives, CycloneDX SBOM
+  (`meld-<bare>.cdx.json` via cargo-cyclonedx), Sigstore-keyless-signed
+  `SHA256SUMS.txt` (cosign v2.4.1; signature, certificate, and
+  Sigstore bundle alongside), SLSA v1 build-provenance attestation per
+  archive via `actions/attest-build-provenance@v2`, and a captured
+  `build-env.txt`. Per-file `.sha256` sidecars dropped. Workflow
+  permissions: `contents: write`, `id-token: write`,
+  `attestations: write`. Untrusted-input safety: all workflow-context
+  values (`matrix.target`, `inputs.tag`, etc.) flow through `env:`
+  bindings and dereference as `$VAR`. This is the first v0.12 release
+  to publish with the new format; v0.11.0's binaries were the last
+  built under the bare-asset flow.
+
+### Fixed
+
+- **Fuzz smoke job no longer collapses on drifted runner config**
+  (#168 / #189, `.github/workflows/fuzz.yml`). Set
+  `RUSTFLAGS: "-C target-feature=-crt-static"` at the workflow `env:`
+  level so cargo's env-RUSTFLAGS strict precedence overrides any
+  `+crt-static` setting cached in a drifted self-hosted runner's
+  `/etc/cargo/config.toml`. Defends against the recurring
+  "sanitizer is incompatible with statically linked libc" failure
+  pattern; harmless no-op on clean runners. Upstream re-imaging of
+  the rust-cpu runner pool remains the durable fix tracked in #168.
 
 ## [0.11.0] - 2026-05-24
 
