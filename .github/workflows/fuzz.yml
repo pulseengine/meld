@@ -39,6 +39,20 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  # Defensive belt: cargo-fuzz injects `-Z sanitizer=address` which is
+  # incompatible with statically-linked libc. Even though we never opt
+  # into musl as a build target (see the explanation on the `Install
+  # nightly Rust` step), a drifted smithy runner may still have
+  # `target-feature=+crt-static` configured via /etc/cargo/config.toml
+  # or an inherited environment variable. Setting RUSTFLAGS at the
+  # workflow level completely overrides any cargo-config rustflags
+  # (cargo gives env-RUSTFLAGS strict precedence), so we force-disable
+  # static-crt up-front. Defends against the recurring #168 pattern
+  # ("sanitizer is incompatible with statically linked libc, disable
+  # it using -C target-feature=-crt-static") landing on `-5`/`-6`-type
+  # drifted runners. Harmless no-op on clean runners (target feature
+  # was already off).
+  RUSTFLAGS: "-C target-feature=-crt-static"
 
 jobs:
   fuzz-smoke:
