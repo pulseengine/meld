@@ -345,14 +345,21 @@ pub fn validate_from_pairs(graph: &StreamPairGraph) -> Vec<StreamValidationIssue
     issues
 }
 
-/// Tarjan-style strongly-connected-components on the directed graph
-/// induced by `pairs.producer.component → pairs.consumer.component`.
+/// Strongly-connected-components on the directed graph induced by
+/// `pair.producer.component → pair.consumer.component`. Returns each
+/// multi-node SCC as a sorted `Vec<component_index>`. Singleton SCCs
+/// (a component with no stream-pair self-loop, or one whose edges all
+/// leave the SCC) are excluded.
 ///
-/// Returns each SCC as a sorted `Vec<component_index>`; singleton SCCs
-/// (a component with no stream-pair edges, or one with only self-edges
-/// that fusion_connections would have dropped anyway) are excluded.
+/// Iterative Tarjan — uses an explicit work stack rather than direct
+/// recursion. A recursive implementation overflows the default Rust
+/// thread stack at roughly 40 000 nodes (Mythos delta-pass identified
+/// this on the first draft of this code, and `petgraph 0.8`'s own
+/// `tarjan_scc` is also recursive). Meld's practical fusion input is
+/// bounded by component count, but moving the recursion off the call
+/// stack lets the same routine survive pathological or
+/// attacker-controlled input shapes too.
 fn strongly_connected_components(pairs: &[StreamPair]) -> Vec<Vec<usize>> {
-    // Build adjacency.
     let mut adj: HashMap<usize, Vec<usize>> = HashMap::new();
     let mut nodes: Vec<usize> = Vec::new();
     for p in pairs {
@@ -365,64 +372,92 @@ fn strongly_connected_components(pairs: &[StreamPair]) -> Vec<Vec<usize>> {
         }
     }
 
-    #[derive(Default)]
-    struct Tarjan {
-        index_counter: i64,
-        stack: Vec<usize>,
-        on_stack: std::collections::HashSet<usize>,
-        index: HashMap<usize, i64>,
-        lowlink: HashMap<usize, i64>,
-        out: Vec<Vec<usize>>,
-    }
+    let mut index_counter: i64 = 0;
+    let mut tarjan_stack: Vec<usize> = Vec::new();
+    let mut on_stack: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    let mut index: HashMap<usize, i64> = HashMap::new();
+    let mut lowlink: HashMap<usize, i64> = HashMap::new();
+    let mut out: Vec<Vec<usize>> = Vec::new();
 
-    fn strongconnect(t: &mut Tarjan, v: usize, adj: &HashMap<usize, Vec<usize>>) {
-        t.index.insert(v, t.index_counter);
-        t.lowlink.insert(v, t.index_counter);
-        t.index_counter += 1;
-        t.stack.push(v);
-        t.on_stack.insert(v);
+    // Each work-stack entry holds (current node, next successor index
+    // to inspect). On first entry the index is 0; after returning from
+    // a child the index points one past the child we just finished, so
+    // `succs[index - 1]` identifies which child's lowlink to fold in.
+    let mut work: Vec<(usize, usize)> = Vec::new();
+    let empty: Vec<usize> = Vec::new();
 
-        if let Some(succs) = adj.get(&v) {
-            for &w in succs {
-                if !t.index.contains_key(&w) {
-                    strongconnect(t, w, adj);
-                    let wl = t.lowlink[&w];
-                    let vl = t.lowlink[&v];
-                    t.lowlink.insert(v, vl.min(wl));
-                } else if t.on_stack.contains(&w) {
-                    let wi = t.index[&w];
-                    let vl = t.lowlink[&v];
-                    t.lowlink.insert(v, vl.min(wi));
-                }
-            }
-        }
-
-        if t.lowlink[&v] == t.index[&v] {
-            let mut scc = Vec::new();
-            loop {
-                let w = t.stack.pop().expect("stack non-empty inside SCC root");
-                t.on_stack.remove(&w);
-                scc.push(w);
-                if w == v {
-                    break;
-                }
-            }
-            scc.sort_unstable();
-            t.out.push(scc);
-        }
-    }
-
-    let mut t = Tarjan::default();
     for &v in &nodes {
-        if !t.index.contains_key(&v) {
-            strongconnect(&mut t, v, &adj);
+        if index.contains_key(&v) {
+            continue;
+        }
+        work.push((v, 0));
+
+        while let Some(&(u, ci)) = work.last() {
+            if ci == 0 {
+                index.insert(u, index_counter);
+                lowlink.insert(u, index_counter);
+                index_counter += 1;
+                tarjan_stack.push(u);
+                on_stack.insert(u);
+            } else {
+                // Just returned from succs[ci - 1] — fold its lowlink
+                // back into our own. Only safe to read after the
+                // child has finished, which is exactly this branch.
+                let succs = adj.get(&u).unwrap_or(&empty);
+                let prev_w = succs[ci - 1];
+                let w_low = lowlink[&prev_w];
+                let u_low = lowlink[&u];
+                lowlink.insert(u, u_low.min(w_low));
+            }
+
+            // Scan for the next successor we still need to descend
+            // into. Already-visited successors that are on the
+            // tarjan_stack contribute to our lowlink directly; nodes
+            // with no remaining unvisited successors fall through to
+            // the SCC-root check below.
+            let succs = adj.get(&u).unwrap_or(&empty);
+            let mut next_ci = ci;
+            let mut descended = false;
+            while next_ci < succs.len() {
+                let w = succs[next_ci];
+                if !index.contains_key(&w) {
+                    work.last_mut().expect("work non-empty").1 = next_ci + 1;
+                    work.push((w, 0));
+                    descended = true;
+                    break;
+                } else {
+                    if on_stack.contains(&w) {
+                        let wi = index[&w];
+                        let u_low = lowlink[&u];
+                        lowlink.insert(u, u_low.min(wi));
+                    }
+                    next_ci += 1;
+                }
+            }
+
+            if !descended {
+                // All children of u are settled. Pop the SCC if u is
+                // a root, then return to the parent (or end the
+                // outer scan).
+                if lowlink[&u] == index[&u] {
+                    let mut scc = Vec::new();
+                    loop {
+                        let w = tarjan_stack.pop().expect("stack non-empty inside SCC root");
+                        on_stack.remove(&w);
+                        scc.push(w);
+                        if w == u {
+                            break;
+                        }
+                    }
+                    scc.sort_unstable();
+                    out.push(scc);
+                }
+                work.pop();
+            }
         }
     }
-    // Keep only SCCs that contain at least one edge inside them — drop
-    // singleton SCCs without self-loops (the bare-node case). A node
-    // appears here only if it had a producer or consumer edge, so a
-    // singleton SCC is a node with edges only to/from outside the SCC.
-    t.out.into_iter().filter(|scc| scc.len() > 1).collect()
+
+    out.into_iter().filter(|scc| scc.len() > 1).collect()
 }
 
 #[cfg(test)]
@@ -671,6 +706,30 @@ mod tests {
             })
             .collect();
         assert_eq!(cycles, vec![vec![0, 1, 2, 3]]);
+    }
+
+    /// Regression: the SCC implementation must tolerate deep linear
+    /// chains without exhausting the call stack. A recursive Tarjan
+    /// would overflow the default 8 MB Rust thread stack at roughly
+    /// 40 000 nodes (Mythos delta-pass identified this on the first
+    /// draft of this code; the fix swapped to petgraph's iterative
+    /// implementation). 50 000 nodes is comfortably past that limit
+    /// and well into "would have crashed" territory for the recursive
+    /// version, so a clean run here pins the iterative backend in
+    /// place.
+    #[test]
+    fn deep_linear_chain_does_not_overflow_stack() {
+        let n = 50_000usize;
+        let mut pairs = Vec::with_capacity(n - 1);
+        for i in 0..(n - 1) {
+            pairs.push(pair(i, i + 1, "U8"));
+        }
+        let graph = StreamPairGraph { pairs };
+        let issues = validate_from_pairs(&graph);
+        assert!(
+            issues.is_empty(),
+            "linear chain of {n} components must not flag a cycle; got {issues:?}"
+        );
     }
 
     /// Acyclic pipeline (A→B→C, no edge back to A) must NOT flag a

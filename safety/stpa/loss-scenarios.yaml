@@ -1342,6 +1342,59 @@ loss-scenarios:
       from #188 leave a place for the new variant to plug in without
       a public-signature break.
 
+  - id: LS-R-13
+    title: Recursive Tarjan in stream-cycle detector exhausts call stack
+    uca: UCA-R-5
+    hazards: [H-9]
+    type: inadequate-process-model
+    scenario: >
+      `strongly_connected_components` in `meld-core/src/p3_stream.rs`
+      walks the directed producer→consumer graph using a Tarjan SCC
+      implementation. The first draft of this code recursed once per
+      node via an inner `strongconnect` function; a linear chain of N
+      stream-coupled components (the common pipeline dataflow) becomes
+      a depth-N call sequence. At roughly N ≈ 40 000 — a function of
+      the ~200-byte stack-frame size against the default 8 MB Rust
+      thread stack — the recursion overflows and the meld process
+      aborts (`fatal runtime error: stack overflow`) before validation
+      completes [H-9]. Switching the backing implementation to
+      `petgraph::algo::tarjan_scc` did NOT fix this — petgraph 0.8's
+      tarjan_scc is also recursive (confirmed by a 50 000-node
+      regression test still overflowing). Meld's practical fusion
+      input is bounded by component count and the hazard is not
+      reachable from normal WIT compositions, but a maliciously
+      crafted component graph (or a future scaled-up use case) could
+      hit it.
+    causal-factors:
+      - >-
+        The first draft of `strongconnect` was a straight transliteration
+        of the canonical recursive Tarjan from the algorithm paper,
+        without consideration of the Rust thread-stack bound
+      - >-
+        Assuming a library implementation (e.g. `petgraph::algo::tarjan_scc`)
+        is automatically iterative because it's "library code" — both
+        common SCC libraries in the Rust ecosystem ship recursive
+        implementations at the time of writing
+      - >-
+        No regression test exercised a graph deep enough to hit the
+        recursion depth limit
+    process-model-flaw: >
+      The detection model implicitly assumed practical inputs sit
+      well below the stack-depth bound. That holds for meld's actual
+      WIT component counts but isn't a property of the validator
+      itself — any code accepting an unbounded graph from external
+      input is responsible for not blowing the stack on it.
+    status: approved
+    priority: medium
+    fix: >
+      Replaced the recursive `strongconnect` with an iterative Tarjan
+      that holds (node, next-successor-index) frames on an explicit
+      work-stack. Identified by the Mythos delta-pass auto-scan on
+      PR #188, confirmed by
+      `meld-core::p3_stream::tests::deep_linear_chain_does_not_overflow_stack`
+      (50 000-node linear chain — comfortably past the recursive
+      threshold).
+
   - id: LS-R-12
     title: Multi-component stream cycle deadlocks at runtime
     uca: UCA-R-5
