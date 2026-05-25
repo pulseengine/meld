@@ -271,39 +271,37 @@ pub fn build_stream_pair_graph(
 
 // ─── #142: static stream validation at build time ─────────────────────
 //
-// Two of the four checks from #142's scope table are tractable from the
-// information meld already has at fusion time:
+// Of the four checks in #142's scope table, this module ships **(iii)
+// circular stream dependencies**: SCC of size ≥ 3 in the directed
+// `producer → consumer` graph built from detected [`StreamPair`]s.
+// Size-2 SCCs are excluded — that's the legal bidirectional-pipe
+// pattern (two independent streams in opposite directions, each
+// individually acyclic).
 //
-//   (i)   Stream element-type compatibility — fusion-connected components
-//         where one side has producers and the other consumers, but no
-//         producer/consumer element-type pair matches. Today
-//         `pair_streams` silently drops these; the validator surfaces
-//         them as an error so users learn their wiring isn't paired.
-//   (iii) Circular stream dependencies — strongly-connected components
-//         of size ≥ 3 in the directed `producer → consumer` graph built
-//         from the detected pairs. Size-2 SCCs are excluded: a 2-cycle
-//         is the legal bidirectional-pipe pattern (two independent
-//         streams in opposite directions).
+// Check **(i) type-compatibility** is deliberately NOT shipped here.
+// An earlier draft of this PR used a role-list heuristic (connected
+// components where one side has producers, the other has consumers,
+// but no element types match → flag as mismatch). The Mythos
+// delta-pass auto-scan running on the PR correctly identified that
+// this raises a false positive whenever two components are sync-
+// connected and each happens to have unrelated stream operations:
+// e.g. A produces stream<u8> for some third component, B consumes
+// stream<s32> from some fourth component, and A↔B share a sync call.
+// The role-list pass cannot tell that A's and B's streams are
+// independent. A precise check needs per-import-edge type lookups
+// (walk `resolved_imports`, find which imports are `stream<T>`-typed,
+// compare to the matched export's element type) — a different shape
+// of code than the role-list pass. LS-R-11 stays open and tracks
+// that follow-up.
 //
-// Checks (ii) "bounded-channel capacity" and (iv) "resource lifetime
-// across async boundaries" remain TODO — they need information beyond
-// `CanonicalEntry` / `ParsedComponent` (capacity flags + per-handle
-// lifetime tracking).
+// Checks **(ii) bounded-channel capacity** and **(iv) resource
+// lifetime across async boundaries** remain TODO — they need
+// information beyond `CanonicalEntry` / `ParsedComponent` (capacity
+// flags + per-handle lifetime tracking).
 
 /// A validation issue raised by [`validate_stream_pair_graph`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StreamValidationIssue {
-    /// Two fusion-connected components have producer / consumer roles
-    /// that should pair, but no element-type combination matches. The
-    /// adapter emitter cannot build an optimized in-module path, and the
-    /// runtime falls back to host-routed lowering with the original
-    /// (mis-matched) types — usually a wiring bug.
-    TypeMismatch {
-        producer_component: usize,
-        consumer_component: usize,
-        producer_types: Vec<StreamElement>,
-        consumer_types: Vec<StreamElement>,
-    },
     /// The directed `producer → consumer` graph of detected
     /// [`StreamPair`]s contains a strongly-connected component of size
     /// ≥ 3. Could deadlock at runtime if every component is waiting on
@@ -313,68 +311,27 @@ pub enum StreamValidationIssue {
 
 /// Run #142's static validation passes over a built [`StreamPairGraph`].
 ///
-/// Returns an empty vec when no issues were found. Caller decides whether
-/// to surface as warnings or hard errors (the resolver hoists each issue
-/// into [`crate::error::Error::StreamValidation`]).
+/// Returns an empty vec when no issues were found. Caller decides
+/// whether to surface as warnings or hard errors (the resolver hoists
+/// each issue into [`crate::error::Error::StreamValidation`]).
+///
+/// The `components` and `resolved_imports` parameters are unused today
+/// — check (iii) reads only the pair graph — but stay on the signature
+/// so that the precise per-edge implementation of check (i) (see the
+/// module comment) can plug in without a public signature break.
 pub fn validate_stream_pair_graph(
     components: &[ParsedComponent],
     resolved_imports: &HashMap<(usize, String), (usize, String)>,
     graph: &StreamPairGraph,
 ) -> Vec<StreamValidationIssue> {
-    let roles: Vec<Vec<(StreamElement, StreamRole)>> =
-        components.iter().map(component_stream_roles).collect();
-    let connections = fusion_connections(resolved_imports);
-    validate_from_roles(&roles, &connections, graph)
+    let _ = components;
+    let _ = resolved_imports;
+    validate_from_pairs(graph)
 }
 
-/// Pure validation core — the unit unit-tests pin. Same checks as
-/// [`validate_stream_pair_graph`] but takes already-derived role and
-/// connection slices so tests don't have to construct full
-/// [`ParsedComponent`] fixtures.
-pub fn validate_from_roles(
-    roles: &[Vec<(StreamElement, StreamRole)>],
-    connections: &[(usize, usize)],
-    graph: &StreamPairGraph,
-) -> Vec<StreamValidationIssue> {
+/// Pure validation core — the unit unit-tests pin.
+pub fn validate_from_pairs(graph: &StreamPairGraph) -> Vec<StreamValidationIssue> {
     let mut issues = Vec::new();
-
-    // Check (i): type-compatibility near-miss detection.
-    for &(a, b) in connections {
-        for &(producer_c, consumer_c) in &[(a, b), (b, a)] {
-            let (Some(producer_roles), Some(consumer_roles)) =
-                (roles.get(producer_c), roles.get(consumer_c))
-            else {
-                continue;
-            };
-            let producer_types: Vec<StreamElement> = producer_roles
-                .iter()
-                .filter(|(_, r)| *r == StreamRole::Producer)
-                .map(|(e, _)| e.clone())
-                .collect();
-            let consumer_types: Vec<StreamElement> = consumer_roles
-                .iter()
-                .filter(|(_, r)| *r == StreamRole::Consumer)
-                .map(|(e, _)| e.clone())
-                .collect();
-            if producer_types.is_empty() || consumer_types.is_empty() {
-                continue;
-            }
-            let any_matched = producer_types
-                .iter()
-                .any(|p| consumer_types.iter().any(|c| p == c));
-            if !any_matched {
-                let issue = StreamValidationIssue::TypeMismatch {
-                    producer_component: producer_c,
-                    consumer_component: consumer_c,
-                    producer_types: producer_types.clone(),
-                    consumer_types: consumer_types.clone(),
-                };
-                if !issues.contains(&issue) {
-                    issues.push(issue);
-                }
-            }
-        }
-    }
 
     // Check (iii): SCC ≥ 3 in the directed producer → consumer graph.
     for scc in strongly_connected_components(&graph.pairs) {
@@ -644,88 +601,6 @@ mod tests {
         }
     }
 
-    /// LS-R-11 regression: connected components where one has only
-    /// `stream<u8>` producers and the other only `stream<s32>` consumers
-    /// must surface a TypeMismatch issue. Today `pair_streams` silently
-    /// drops them.
-    #[test]
-    fn ls_r_11_stream_type_mismatch_detected() {
-        let roles = vec![
-            vec![(typed("U8"), StreamRole::Producer)],
-            vec![(typed("S32"), StreamRole::Consumer)],
-        ];
-        let graph = StreamPairGraph {
-            pairs: pair_streams(&roles, &[(0, 1)], StreamMemoryMode::CrossMemory),
-        };
-        assert!(
-            graph.pairs.is_empty(),
-            "precondition: pair_streams drops the mismatch silently"
-        );
-
-        let issues = validate_from_roles(&roles, &[(0, 1)], &graph);
-        assert_eq!(
-            issues.len(),
-            1,
-            "expected exactly one type-mismatch issue, got {issues:?}"
-        );
-        match &issues[0] {
-            StreamValidationIssue::TypeMismatch {
-                producer_component,
-                consumer_component,
-                producer_types,
-                consumer_types,
-            } => {
-                assert_eq!(*producer_component, 0);
-                assert_eq!(*consumer_component, 1);
-                assert_eq!(producer_types, &vec![typed("U8")]);
-                assert_eq!(consumer_types, &vec![typed("S32")]);
-            }
-            other => panic!("expected TypeMismatch, got {other:?}"),
-        }
-    }
-
-    /// Negative: when at least one element type matches across the
-    /// connection, no TypeMismatch is reported — even if other roles
-    /// on the same component pair don't pair up.
-    #[test]
-    fn type_mismatch_not_reported_when_any_pair_matches() {
-        let roles = vec![
-            vec![
-                (typed("U8"), StreamRole::Producer),
-                (typed("U32"), StreamRole::Producer),
-            ],
-            vec![(typed("U8"), StreamRole::Consumer)],
-        ];
-        let graph = StreamPairGraph {
-            pairs: pair_streams(&roles, &[(0, 1)], StreamMemoryMode::CrossMemory),
-        };
-        assert_eq!(graph.pairs.len(), 1, "U8 producers/consumers should pair");
-
-        let issues = validate_from_roles(&roles, &[(0, 1)], &graph);
-        let mismatches = issues
-            .iter()
-            .filter(|i| matches!(i, StreamValidationIssue::TypeMismatch { .. }))
-            .count();
-        assert_eq!(
-            mismatches, 0,
-            "U8 pair exists, U32 producer is unconsumed — not a near-miss"
-        );
-    }
-
-    /// Negative: a connection where only one side has stream roles
-    /// (e.g., fused via sync calls; one component never touches
-    /// streams) does NOT trigger a TypeMismatch.
-    #[test]
-    fn type_mismatch_not_reported_when_one_side_has_no_streams() {
-        let roles = vec![
-            vec![(typed("U8"), StreamRole::Producer)],
-            vec![], // No stream operations at all.
-        ];
-        let graph = StreamPairGraph::default();
-        let issues = validate_from_roles(&roles, &[(0, 1)], &graph);
-        assert!(issues.is_empty(), "expected no issues, got {issues:?}");
-    }
-
     /// Bidirectional pipe (2-cycle) is the canonical legal pattern: two
     /// independent streams in opposite directions. The cycle detector
     /// must NOT flag this.
@@ -746,7 +621,7 @@ mod tests {
         };
         assert_eq!(graph.pairs.len(), 2, "precondition: pipe pairs both ways");
 
-        let issues = validate_from_roles(&roles, &[(0, 1)], &graph);
+        let issues = validate_from_pairs(&graph);
         let cycles = issues
             .iter()
             .filter(|i| matches!(i, StreamValidationIssue::Cycle { .. }))
@@ -761,30 +636,12 @@ mod tests {
         let graph = StreamPairGraph {
             pairs: vec![pair(0, 1, "U8"), pair(1, 2, "U8"), pair(2, 0, "U8")],
         };
-        // Roles + connections are not load-bearing for cycle detection,
-        // but pass plausible values so the type-mismatch pass is silent.
-        let roles = vec![
-            vec![
-                (typed("U8"), StreamRole::Producer),
-                (typed("U8"), StreamRole::Consumer),
-            ],
-            vec![
-                (typed("U8"), StreamRole::Producer),
-                (typed("U8"), StreamRole::Consumer),
-            ],
-            vec![
-                (typed("U8"), StreamRole::Producer),
-                (typed("U8"), StreamRole::Consumer),
-            ],
-        ];
-        let connections = vec![(0, 1), (1, 2), (0, 2)];
 
-        let issues = validate_from_roles(&roles, &connections, &graph);
+        let issues = validate_from_pairs(&graph);
         let cycle_components: Vec<Vec<usize>> = issues
             .iter()
-            .filter_map(|i| match i {
-                StreamValidationIssue::Cycle { component_cycle } => Some(component_cycle.clone()),
-                _ => None,
+            .map(|i| match i {
+                StreamValidationIssue::Cycle { component_cycle } => component_cycle.clone(),
             })
             .collect();
         assert_eq!(
@@ -806,19 +663,11 @@ mod tests {
                 pair(3, 0, "U8"),
             ],
         };
-        let roles = vec![
-            vec![
-                (typed("U8"), StreamRole::Producer),
-                (typed("U8"), StreamRole::Consumer)
-            ];
-            4
-        ];
-        let issues = validate_from_roles(&roles, &[], &graph);
+        let issues = validate_from_pairs(&graph);
         let cycles: Vec<_> = issues
             .iter()
-            .filter_map(|i| match i {
-                StreamValidationIssue::Cycle { component_cycle } => Some(component_cycle.clone()),
-                _ => None,
+            .map(|i| match i {
+                StreamValidationIssue::Cycle { component_cycle } => component_cycle.clone(),
             })
             .collect();
         assert_eq!(cycles, vec![vec![0, 1, 2, 3]]);
@@ -831,8 +680,7 @@ mod tests {
         let graph = StreamPairGraph {
             pairs: vec![pair(0, 1, "U8"), pair(1, 2, "U8")],
         };
-        let roles = vec![vec![(typed("U8"), StreamRole::Producer)]; 3];
-        let issues = validate_from_roles(&roles, &[], &graph);
+        let issues = validate_from_pairs(&graph);
         assert!(
             issues.is_empty(),
             "linear pipeline must not flag; got {issues:?}"
