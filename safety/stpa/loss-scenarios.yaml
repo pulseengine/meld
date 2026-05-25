@@ -1334,7 +1334,7 @@ loss-scenarios:
       `StreamValidationIssue::TypeMismatch`; the resolver hoists each
       issue into `Error::StreamValidation` so fusion fails loudly
       instead of producing a misconfigured module. Confirmed by
-      `meld-core::p3_stream::tests::ls_stream_1_type_mismatch_detected`.
+      `meld-core::p3_stream::tests::ls_r_11_stream_type_mismatch_detected`.
 
   - id: LS-R-12
     title: Multi-component stream cycle deadlocks at runtime
@@ -1383,7 +1383,7 @@ loss-scenarios:
       `StreamPair`s; SCCs of size ≥ 3 emit
       `StreamValidationIssue::Cycle`. Size-2 SCCs are excluded as the
       canonical bidirectional-pipe pattern. Confirmed by
-      `meld-core::p3_stream::tests::ls_stream_2_three_component_cycle_flagged`
+      `meld-core::p3_stream::tests::ls_r_12_stream_three_component_cycle_flagged`
       plus negative test
       `bidirectional_pipe_is_not_flagged_as_cycle`.
 

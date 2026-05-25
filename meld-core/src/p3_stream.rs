@@ -644,12 +644,12 @@ mod tests {
         }
     }
 
-    /// LS-stream-1 regression: connected components where one has only
+    /// LS-R-11 regression: connected components where one has only
     /// `stream<u8>` producers and the other only `stream<s32>` consumers
     /// must surface a TypeMismatch issue. Today `pair_streams` silently
     /// drops them.
     #[test]
-    fn ls_stream_1_type_mismatch_detected() {
+    fn ls_r_11_stream_type_mismatch_detected() {
         let roles = vec![
             vec![(typed("U8"), StreamRole::Producer)],
             vec![(typed("S32"), StreamRole::Consumer)],
@@ -754,10 +754,10 @@ mod tests {
         assert_eq!(cycles, 0, "2-cycle is the legal pipe — must not flag");
     }
 
-    /// LS-stream-2 regression: a 3-component stream loop (A→B, B→C,
+    /// LS-R-12 regression: a 3-component stream loop (A→B, B→C,
     /// C→A) is the smallest non-trivial cycle. Must be flagged.
     #[test]
-    fn ls_stream_2_three_component_cycle_flagged() {
+    fn ls_r_12_stream_three_component_cycle_flagged() {
         let graph = StreamPairGraph {
             pairs: vec![pair(0, 1, "U8"), pair(1, 2, "U8"), pair(2, 0, "U8")],
         };
