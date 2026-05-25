@@ -116,6 +116,37 @@ meld fuse --memory shared a.wasm b.wasm -o fused.wasm
 
 Meld integrates with [Sigil](https://github.com/pulseengine/sigil) for supply chain attestation. Each fusion operation records input component hashes, tool version and configuration, and transformation metadata. The attestation is embedded in the output module's custom section.
 
+### Verifying a Release
+
+Every tagged release ships with a CycloneDX SBOM, a cosign-signed `SHA256SUMS.txt`, and a SLSA v1 build-provenance attestation. To verify an installed binary against what GitHub Actions actually built:
+
+```bash
+# 1. Download an archive plus the signed checksum manifest from the release page.
+TAG=v0.11.0
+TARGET=x86_64-unknown-linux-gnu
+gh release download "$TAG" --repo pulseengine/meld \
+  --pattern "meld-${TAG}-${TARGET}.tar.gz" \
+  --pattern 'SHA256SUMS.txt' \
+  --pattern 'SHA256SUMS.txt.cosign.bundle'
+
+# 2. Verify SHA256SUMS.txt was signed by meld's release workflow (Sigstore keyless).
+cosign verify-blob \
+  --certificate-identity-regexp \
+    'https://github.com/pulseengine/meld/.github/workflows/release.yml@.*' \
+  --certificate-oidc-issuer \
+    'https://token.actions.githubusercontent.com' \
+  --bundle SHA256SUMS.txt.cosign.bundle \
+  SHA256SUMS.txt
+
+# 3. Verify the archive's digest is in the signed manifest.
+sha256sum --ignore-missing -c SHA256SUMS.txt
+
+# 4. (Optional) Verify the SLSA v1 build provenance attestation.
+gh attestation verify "meld-${TAG}-${TARGET}.tar.gz" --repo pulseengine/meld
+```
+
+Step 2 proves the checksum file came from this repo's `release.yml`; step 3 ties the archive on disk to that signed manifest; step 4 independently confirms the archive was built by the same workflow run via GitHub's attestation API. Each release also includes a `meld-<version>.cdx.json` (CycloneDX SBOM, transitively covered by the signature on `SHA256SUMS.txt`) and `build-env.txt` capturing the runner toolchain versions.
+
 ## Formal Verification
 
 Meld's core transformations are formally verified using Rocq. The proofs establish that fusion preserves program semantics — the fused module behaves identically to the original composed components.
