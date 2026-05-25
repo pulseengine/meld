@@ -269,6 +269,197 @@ pub fn build_stream_pair_graph(
     }
 }
 
+// ─── #142: static stream validation at build time ─────────────────────
+//
+// Of the four checks in #142's scope table, this module ships **(iii)
+// circular stream dependencies**: SCC of size ≥ 3 in the directed
+// `producer → consumer` graph built from detected [`StreamPair`]s.
+// Size-2 SCCs are excluded — that's the legal bidirectional-pipe
+// pattern (two independent streams in opposite directions, each
+// individually acyclic).
+//
+// Check **(i) type-compatibility** is deliberately NOT shipped here.
+// An earlier draft of this PR used a role-list heuristic (connected
+// components where one side has producers, the other has consumers,
+// but no element types match → flag as mismatch). The Mythos
+// delta-pass auto-scan running on the PR correctly identified that
+// this raises a false positive whenever two components are sync-
+// connected and each happens to have unrelated stream operations:
+// e.g. A produces stream<u8> for some third component, B consumes
+// stream<s32> from some fourth component, and A↔B share a sync call.
+// The role-list pass cannot tell that A's and B's streams are
+// independent. A precise check needs per-import-edge type lookups
+// (walk `resolved_imports`, find which imports are `stream<T>`-typed,
+// compare to the matched export's element type) — a different shape
+// of code than the role-list pass. LS-R-11 stays open and tracks
+// that follow-up.
+//
+// Checks **(ii) bounded-channel capacity** and **(iv) resource
+// lifetime across async boundaries** remain TODO — they need
+// information beyond `CanonicalEntry` / `ParsedComponent` (capacity
+// flags + per-handle lifetime tracking).
+
+/// A validation issue raised by [`validate_stream_pair_graph`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StreamValidationIssue {
+    /// The directed `producer → consumer` graph of detected
+    /// [`StreamPair`]s contains a strongly-connected component of size
+    /// ≥ 3. Could deadlock at runtime if every component is waiting on
+    /// inbound stream data before producing outbound data.
+    Cycle { component_cycle: Vec<usize> },
+}
+
+/// Run #142's static validation passes over a built [`StreamPairGraph`].
+///
+/// Returns an empty vec when no issues were found. Caller decides
+/// whether to surface as warnings or hard errors (the resolver hoists
+/// each issue into [`crate::error::Error::StreamValidation`]).
+///
+/// The `components` and `resolved_imports` parameters are unused today
+/// — check (iii) reads only the pair graph — but stay on the signature
+/// so that the precise per-edge implementation of check (i) (see the
+/// module comment) can plug in without a public signature break.
+pub fn validate_stream_pair_graph(
+    components: &[ParsedComponent],
+    resolved_imports: &HashMap<(usize, String), (usize, String)>,
+    graph: &StreamPairGraph,
+) -> Vec<StreamValidationIssue> {
+    let _ = components;
+    let _ = resolved_imports;
+    validate_from_pairs(graph)
+}
+
+/// Pure validation core — the unit unit-tests pin.
+pub fn validate_from_pairs(graph: &StreamPairGraph) -> Vec<StreamValidationIssue> {
+    let mut issues = Vec::new();
+
+    // Check (iii): SCC ≥ 3 in the directed producer → consumer graph.
+    for scc in strongly_connected_components(&graph.pairs) {
+        if scc.len() >= 3 {
+            issues.push(StreamValidationIssue::Cycle {
+                component_cycle: scc,
+            });
+        }
+    }
+
+    issues
+}
+
+/// Strongly-connected-components on the directed graph induced by
+/// `pair.producer.component → pair.consumer.component`. Returns each
+/// multi-node SCC as a sorted `Vec<component_index>`. Singleton SCCs
+/// (a component with no stream-pair self-loop, or one whose edges all
+/// leave the SCC) are excluded.
+///
+/// Iterative Tarjan — uses an explicit work stack rather than direct
+/// recursion. A recursive implementation overflows the default Rust
+/// thread stack at roughly 40 000 nodes (Mythos delta-pass identified
+/// this on the first draft of this code, and `petgraph 0.8`'s own
+/// `tarjan_scc` is also recursive). Meld's practical fusion input is
+/// bounded by component count, but moving the recursion off the call
+/// stack lets the same routine survive pathological or
+/// attacker-controlled input shapes too.
+fn strongly_connected_components(pairs: &[StreamPair]) -> Vec<Vec<usize>> {
+    let mut adj: HashMap<usize, Vec<usize>> = HashMap::new();
+    let mut nodes: Vec<usize> = Vec::new();
+    for p in pairs {
+        let (from, to) = (p.producer.component, p.consumer.component);
+        adj.entry(from).or_default().push(to);
+        for &n in &[from, to] {
+            if !nodes.contains(&n) {
+                nodes.push(n);
+            }
+        }
+    }
+
+    let mut index_counter: i64 = 0;
+    let mut tarjan_stack: Vec<usize> = Vec::new();
+    let mut on_stack: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    let mut index: HashMap<usize, i64> = HashMap::new();
+    let mut lowlink: HashMap<usize, i64> = HashMap::new();
+    let mut out: Vec<Vec<usize>> = Vec::new();
+
+    // Each work-stack entry holds (current node, next successor index
+    // to inspect). On first entry the index is 0; after returning from
+    // a child the index points one past the child we just finished, so
+    // `succs[index - 1]` identifies which child's lowlink to fold in.
+    let mut work: Vec<(usize, usize)> = Vec::new();
+    let empty: Vec<usize> = Vec::new();
+
+    for &v in &nodes {
+        if index.contains_key(&v) {
+            continue;
+        }
+        work.push((v, 0));
+
+        while let Some(&(u, ci)) = work.last() {
+            if ci == 0 {
+                index.insert(u, index_counter);
+                lowlink.insert(u, index_counter);
+                index_counter += 1;
+                tarjan_stack.push(u);
+                on_stack.insert(u);
+            } else {
+                // Just returned from succs[ci - 1] — fold its lowlink
+                // back into our own. Only safe to read after the
+                // child has finished, which is exactly this branch.
+                let succs = adj.get(&u).unwrap_or(&empty);
+                let prev_w = succs[ci - 1];
+                let w_low = lowlink[&prev_w];
+                let u_low = lowlink[&u];
+                lowlink.insert(u, u_low.min(w_low));
+            }
+
+            // Scan for the next successor we still need to descend
+            // into. Already-visited successors that are on the
+            // tarjan_stack contribute to our lowlink directly; nodes
+            // with no remaining unvisited successors fall through to
+            // the SCC-root check below.
+            let succs = adj.get(&u).unwrap_or(&empty);
+            let mut next_ci = ci;
+            let mut descended = false;
+            while next_ci < succs.len() {
+                let w = succs[next_ci];
+                if !index.contains_key(&w) {
+                    work.last_mut().expect("work non-empty").1 = next_ci + 1;
+                    work.push((w, 0));
+                    descended = true;
+                    break;
+                } else {
+                    if on_stack.contains(&w) {
+                        let wi = index[&w];
+                        let u_low = lowlink[&u];
+                        lowlink.insert(u, u_low.min(wi));
+                    }
+                    next_ci += 1;
+                }
+            }
+
+            if !descended {
+                // All children of u are settled. Pop the SCC if u is
+                // a root, then return to the parent (or end the
+                // outer scan).
+                if lowlink[&u] == index[&u] {
+                    let mut scc = Vec::new();
+                    loop {
+                        let w = tarjan_stack.pop().expect("stack non-empty inside SCC root");
+                        on_stack.remove(&w);
+                        scc.push(w);
+                        if w == u {
+                            break;
+                        }
+                    }
+                    scc.sort_unstable();
+                    out.push(scc);
+                }
+                work.pop();
+            }
+        }
+    }
+
+    out.into_iter().filter(|scc| scc.len() > 1).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -425,6 +616,133 @@ mod tests {
             pairs
                 .iter()
                 .any(|p| p.producer.component == 1 && p.consumer.component == 0)
+        );
+    }
+
+    // ─── #142 validation tests ────────────────────────────────────────
+
+    fn pair(producer: usize, consumer: usize, elem: &str) -> StreamPair {
+        StreamPair {
+            producer: StreamEndpoint {
+                component: producer,
+                role: StreamRole::Producer,
+            },
+            consumer: StreamEndpoint {
+                component: consumer,
+                role: StreamRole::Consumer,
+            },
+            element: typed(elem),
+            mode: StreamMemoryMode::CrossMemory,
+        }
+    }
+
+    /// Bidirectional pipe (2-cycle) is the canonical legal pattern: two
+    /// independent streams in opposite directions. The cycle detector
+    /// must NOT flag this.
+    #[test]
+    fn bidirectional_pipe_is_not_flagged_as_cycle() {
+        let roles = vec![
+            vec![
+                (typed("U8"), StreamRole::Producer),
+                (typed("U8"), StreamRole::Consumer),
+            ],
+            vec![
+                (typed("U8"), StreamRole::Producer),
+                (typed("U8"), StreamRole::Consumer),
+            ],
+        ];
+        let graph = StreamPairGraph {
+            pairs: pair_streams(&roles, &[(0, 1)], StreamMemoryMode::CrossMemory),
+        };
+        assert_eq!(graph.pairs.len(), 2, "precondition: pipe pairs both ways");
+
+        let issues = validate_from_pairs(&graph);
+        let cycles = issues
+            .iter()
+            .filter(|i| matches!(i, StreamValidationIssue::Cycle { .. }))
+            .count();
+        assert_eq!(cycles, 0, "2-cycle is the legal pipe — must not flag");
+    }
+
+    /// LS-R-12 regression: a 3-component stream loop (A→B, B→C,
+    /// C→A) is the smallest non-trivial cycle. Must be flagged.
+    #[test]
+    fn ls_r_12_stream_three_component_cycle_flagged() {
+        let graph = StreamPairGraph {
+            pairs: vec![pair(0, 1, "U8"), pair(1, 2, "U8"), pair(2, 0, "U8")],
+        };
+
+        let issues = validate_from_pairs(&graph);
+        let cycle_components: Vec<Vec<usize>> = issues
+            .iter()
+            .map(|i| match i {
+                StreamValidationIssue::Cycle { component_cycle } => component_cycle.clone(),
+            })
+            .collect();
+        assert_eq!(
+            cycle_components,
+            vec![vec![0, 1, 2]],
+            "expected one SCC {{0,1,2}}, got {cycle_components:?}"
+        );
+    }
+
+    /// A 4-component cycle (A→B, B→C, C→D, D→A) must also fire — the
+    /// SCC detector is size-agnostic above the size-2 threshold.
+    #[test]
+    fn four_component_cycle_flagged() {
+        let graph = StreamPairGraph {
+            pairs: vec![
+                pair(0, 1, "U8"),
+                pair(1, 2, "U8"),
+                pair(2, 3, "U8"),
+                pair(3, 0, "U8"),
+            ],
+        };
+        let issues = validate_from_pairs(&graph);
+        let cycles: Vec<_> = issues
+            .iter()
+            .map(|i| match i {
+                StreamValidationIssue::Cycle { component_cycle } => component_cycle.clone(),
+            })
+            .collect();
+        assert_eq!(cycles, vec![vec![0, 1, 2, 3]]);
+    }
+
+    /// Regression: the SCC implementation must tolerate deep linear
+    /// chains without exhausting the call stack. A recursive Tarjan
+    /// would overflow the default 8 MB Rust thread stack at roughly
+    /// 40 000 nodes (Mythos delta-pass identified this on the first
+    /// draft of this code; the fix swapped to petgraph's iterative
+    /// implementation). 50 000 nodes is comfortably past that limit
+    /// and well into "would have crashed" territory for the recursive
+    /// version, so a clean run here pins the iterative backend in
+    /// place.
+    #[test]
+    fn deep_linear_chain_does_not_overflow_stack() {
+        let n = 50_000usize;
+        let mut pairs = Vec::with_capacity(n - 1);
+        for i in 0..(n - 1) {
+            pairs.push(pair(i, i + 1, "U8"));
+        }
+        let graph = StreamPairGraph { pairs };
+        let issues = validate_from_pairs(&graph);
+        assert!(
+            issues.is_empty(),
+            "linear chain of {n} components must not flag a cycle; got {issues:?}"
+        );
+    }
+
+    /// Acyclic pipeline (A→B→C, no edge back to A) must NOT flag a
+    /// cycle. This is the common dataflow shape.
+    #[test]
+    fn linear_pipeline_is_not_flagged() {
+        let graph = StreamPairGraph {
+            pairs: vec![pair(0, 1, "U8"), pair(1, 2, "U8")],
+        };
+        let issues = validate_from_pairs(&graph);
+        assert!(
+            issues.is_empty(),
+            "linear pipeline must not flag; got {issues:?}"
         );
     }
 }
