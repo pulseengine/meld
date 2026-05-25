@@ -4,6 +4,37 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **Static stream validation at fusion time** (#142, LS-R-11 + LS-R-12,
+  `meld-core/src/p3_stream.rs`, `meld-core/src/resolver.rs`,
+  `meld-core/src/error.rs`). Two of the four #142 checks now run as a
+  build-time pass after the `StreamPairGraph` is built:
+  (i) **Type-compatibility near-miss detection** — fusion-connected
+  components where one side has stream producers and the other has
+  consumers, but no element-type combination matches. The pure-pairing
+  pass previously dropped these silently; the validator now hoists
+  each into `Error::StreamValidation`, so a `stream<u8>` producer wired
+  to a `stream<s32>` consumer is rejected at fusion time instead of
+  silently mis-typing at runtime. (iii) **Multi-component stream
+  cycles** — Tarjan-style strongly-connected-component detection on the
+  directed `producer → consumer` graph induced by `StreamPair`s.
+  Strongly-connected components of size ≥ 3 are reported as deadlock
+  candidates; the legal bidirectional-pipe pattern (size-2 SCCs from
+  two independent streams in opposite directions) is explicitly
+  excluded. New `Error::StreamValidation(String)` variant reports all
+  issues from a single fusion attempt at once so users can act on the
+  whole punch list. Validation logic factored into pure
+  `validate_from_roles` so the seven new regression tests
+  (`ls_stream_1_type_mismatch_detected`,
+  `ls_stream_2_three_component_cycle_flagged`,
+  `bidirectional_pipe_is_not_flagged_as_cycle`, three negative-control
+  tests, and a 4-component cycle case) pin behavior without needing
+  full `ParsedComponent` fixtures. Checks (ii) "bounded-channel
+  capacity" and (iv) "resource lifetime across async boundaries"
+  remain open — they need information beyond `CanonicalEntry` /
+  `ParsedComponent`.
+
 ## [0.11.0] - 2026-05-24
 
 ### Changed

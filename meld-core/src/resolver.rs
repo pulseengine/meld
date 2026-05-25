@@ -1562,6 +1562,41 @@ impl Resolver {
             stream_mode,
         ));
 
+        // Issue #142: static stream validation. Catches wiring bugs the
+        // pure-pairing pass above silently drops (mismatched element
+        // types) and dataflow cycles that would deadlock at runtime
+        // (SCC size ≥ 3 in the producer → consumer graph).
+        if let Some(spg) = graph.stream_pair_graph.as_ref() {
+            let issues = crate::p3_stream::validate_stream_pair_graph(
+                components,
+                &graph.resolved_imports,
+                spg,
+            );
+            if !issues.is_empty() {
+                let mut lines = Vec::with_capacity(issues.len());
+                for issue in &issues {
+                    match issue {
+                        crate::p3_stream::StreamValidationIssue::TypeMismatch {
+                            producer_component,
+                            consumer_component,
+                            producer_types,
+                            consumer_types,
+                        } => {
+                            lines.push(format!(
+                                "  · type mismatch: component {producer_component} produces {producer_types:?} but connected component {consumer_component} consumes {consumer_types:?} — no element type pairs"
+                            ));
+                        }
+                        crate::p3_stream::StreamValidationIssue::Cycle { component_cycle } => {
+                            lines.push(format!(
+                                "  · cycle: components {component_cycle:?} form a closed stream-pair loop (SCC size ≥ 3)"
+                            ));
+                        }
+                    }
+                }
+                return Err(crate::error::Error::StreamValidation(lines.join("\n")));
+            }
+        }
+
         // Identify adapter sites (cross-component)
         self.identify_adapter_sites(components, &mut graph)?;
 

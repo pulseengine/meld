@@ -1283,6 +1283,110 @@ loss-scenarios:
     status: approved
     priority: high
 
+  - id: LS-R-11
+    title: Cross-component stream pair wired with mismatched element types
+    uca: UCA-R-5
+    hazards: [H-1, H-3.1]
+    type: inadequate-process-model
+    scenario: >
+      Component A's export declares `stream<u8>` and component B's import
+      declares `stream<s32>`. The component-model linker accepts the name
+      match (resolved import edge exists), but
+      `meld-core/src/p3_stream.rs::pair_streams` silently drops the
+      candidate at line 229 (`if p_elem != c_elem { continue; }`) because
+      the honest-candidate rule rejects mismatched element types. The
+      cross-component adapter that would otherwise short-circuit the
+      stream chain is never emitted, and the fused module falls back to
+      the host-routed lowering with each side reinterpreting the wire
+      bytes as its own element type. Numeric values are truncated /
+      sign-extended at the wrong width [H-3.1]; for variable-width
+      element types this can produce out-of-bounds reads on the consumer
+      side [H-1]. The hazard surfaces only at runtime when the stream is
+      first written, and on test fixtures small enough to "happen to
+      look right" can stay latent indefinitely.
+    causal-factors:
+      - >-
+        `pair_streams` is a pure-candidate-emission function; rejection
+        and reporting are different concerns, so the silent drop has no
+        diagnostic path back to the user
+      - >-
+        Component-model name-match resolution accepts the wiring at
+        link time because stream element types are encoded as
+        `ComponentTypeKind::P3Async(desc)` strings, and the resolver
+        does not yet compare descriptor equality
+      - >-
+        No build-time validation pass ever asked "is every connected
+        component pair with complementary stream roles actually paired
+        by the candidate emitter?"
+    process-model-flaw: >
+      The detection model was "if we don't generate a pair, the program
+      stays in the existing host-routed code path and runs correctly."
+      That model breaks when the host-routed path itself is built from
+      type-erased import names: the same byte stream reaches the
+      consumer with a different on-wire interpretation than the
+      producer intended.
+    status: approved
+    priority: high
+    fix: >
+      `validate_stream_pair_graph` (#142 (i)). For every fusion
+      connection where one side has stream producers and the other has
+      stream consumers but no element-type combination matches, emit
+      `StreamValidationIssue::TypeMismatch`; the resolver hoists each
+      issue into `Error::StreamValidation` so fusion fails loudly
+      instead of producing a misconfigured module. Confirmed by
+      `meld-core::p3_stream::tests::ls_stream_1_type_mismatch_detected`.
+
+  - id: LS-R-12
+    title: Multi-component stream cycle deadlocks at runtime
+    uca: UCA-R-5
+    hazards: [H-9, H-1]
+    type: inadequate-process-model
+    scenario: >
+      Three or more components wire `stream<T>` endpoints in a closed
+      cycle: A → B → C → A (each component is both producer for the
+      next and consumer for the previous). The fused module instantiates
+      all three streams, but every component blocks waiting on inbound
+      data before producing outbound — and the only path to inbound
+      data is through the cycle. No component ever progresses [H-9];
+      depending on runtime, this manifests as a hang, a fairness
+      deadlock, or eventually a watchdog trap [H-1]. The 2-component
+      "bidirectional pipe" pattern (A↔B with two independent streams)
+      is the legal version of this shape: each stream individually has
+      one producer and one consumer, and at least one side can
+      progress independently. The hazard only appears at SCC size ≥ 3,
+      where every component is mutually dependent.
+    causal-factors:
+      - >-
+        `StreamPairGraph` stored only the set of detected pairs with
+        no traversal of the induced directed component graph, so cycle
+        detection on streams was never run (the resolver's
+        module-level `detect_module_cycles` operates on a different
+        graph and does not see stream edges)
+      - >-
+        The bidirectional pipe pattern is a 2-cycle on the same
+        component graph, so a naive "any cycle is bad" detector would
+        false-positive on the canonical pipe shape and force the
+        detector to be either over-tight (rejects legal pipes) or
+        absent
+      - >-
+        Stream deadlocks surface only when actual data flows, which
+        may be hours or days into a long-running fused module
+    process-model-flaw: >
+      The model assumed cross-component stream pairs were independent
+      edges in a bag; in reality they induce a directed graph whose
+      strongly-connected structure determines runtime liveness.
+    status: approved
+    priority: medium
+    fix: >
+      `validate_stream_pair_graph` (#142 (iii)). Tarjan-style SCC over
+      the directed `producer → consumer` graph built from
+      `StreamPair`s; SCCs of size ≥ 3 emit
+      `StreamValidationIssue::Cycle`. Size-2 SCCs are excluded as the
+      canonical bidirectional-pipe pattern. Confirmed by
+      `meld-core::p3_stream::tests::ls_stream_2_three_component_cycle_flagged`
+      plus negative test
+      `bidirectional_pipe_is_not_flagged_as_cycle`.
+
   # ==========================================================================
   # Merger scenarios
   # ==========================================================================

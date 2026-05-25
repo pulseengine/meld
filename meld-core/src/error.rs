@@ -107,6 +107,14 @@ pub enum Error {
     #[error("P3 async component features not supported: {0}")]
     P3AsyncNotSupported(String),
 
+    /// Static stream validation (issue #142) found at least one wiring
+    /// problem in the fused component graph. The message lists each
+    /// detected issue (type-mismatch near-misses, multi-component
+    /// cycles) so the user can act on all of them at once instead of
+    /// having to re-run after each fix.
+    #[error("stream validation failed:\n{0}")]
+    StreamValidation(String),
+
     /// I/O error
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
