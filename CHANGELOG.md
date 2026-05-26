@@ -4,6 +4,49 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **Stream type-mismatch detection on stream-carrying import edges**
+  (#142 (i) / LS-R-11, `meld-core/src/p3_stream.rs`,
+  `meld-core/src/resolver.rs`). Restores check (i) from #142 after the
+  role-list heuristic was withdrawn from #188 (Mythos delta-pass
+  finding). The new validator walks each fusion connection's
+  `resolved_imports`; if at least one edge carries a `stream<T>`
+  reference in its component-level `ComponentTypeRef` signature
+  (Func params/results, Type aliases, or Instance exports — recursing
+  through `ComponentValType::List`, `Option`, `Result`, `Record`,
+  `Variant`, `Tuple`, `FixedSizeList`), the role-list pair check is
+  applied; sync-only connections with unrelated streams on each side
+  are now correctly skipped. New `StreamValidationIssue::TypeMismatch`
+  enum variant routed into the same `Error::StreamValidation` batched
+  reporting added in v0.12.0. Five new regression tests pin behavior:
+  the true positive (stream-typed function import resolved to an
+  export with a mismatched element type), the Mythos finding's
+  former false positive (sync-only connection + unrelated streams =
+  no raise), the matching-types case, and two direct unit tests of
+  the type walker. **Precision boundary** documented in the module
+  comment: the filter knows a connection carries SOME stream but
+  still uses the role-list multiset for the mismatch decision — a
+  fully precise per-edge implementation needs export-side type-graph
+  walking via `component_func_defs`, kept on the backlog.
+
+### Fixed
+
+- **Fuzz workflow layer-2 defense against #168 build-target drift**
+  (`.github/workflows/fuzz.yml`). Set
+  `CARGO_BUILD_TARGET: x86_64-unknown-linux-gnu` at the workflow `env`
+  level. v0.12.0's RUSTFLAGS fix (#189) closed the
+  sanitizer-vs-crt-static path, but follow-up CI on PR #188 surfaced
+  a second drift mode: drifted runners have
+  `[build] target = "x86_64-unknown-linux-musl"` in
+  `/etc/cargo/config.toml`, so once RUSTFLAGS got past rustc,
+  libfuzzer-sys's build.rs tried to invoke `x86_64-linux-musl-g++`
+  (not on the runner's PATH) and the build failed with
+  `ToolNotFound`. CARGO_BUILD_TARGET set at the workflow env level
+  overrides the config-derived default; cargo-fuzz inherits it,
+  builds for gnu, and uses the host `g++`. Harmless no-op on clean
+  runners (host triple matches).
+
 ## [0.12.0] - 2026-05-25
 
 ### Added

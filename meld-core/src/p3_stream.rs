@@ -31,7 +31,7 @@
 //! `stream<u8>` and a `stream<s32>` between the same two components are
 //! two different streams. See ADR-3.
 
-use crate::parser::{CanonicalEntry, ComponentTypeKind, ParsedComponent};
+use crate::parser::{CanonicalEntry, ComponentTypeKind, ComponentValType, ParsedComponent};
 use std::collections::HashMap;
 
 /// The element type carried by a `stream<T>`, parsed from the
@@ -271,28 +271,34 @@ pub fn build_stream_pair_graph(
 
 // ─── #142: static stream validation at build time ─────────────────────
 //
-// Of the four checks in #142's scope table, this module ships **(iii)
-// circular stream dependencies**: SCC of size ≥ 3 in the directed
-// `producer → consumer` graph built from detected [`StreamPair`]s.
-// Size-2 SCCs are excluded — that's the legal bidirectional-pipe
-// pattern (two independent streams in opposite directions, each
-// individually acyclic).
+// Of the four checks in #142's scope table, this module ships:
 //
-// Check **(i) type-compatibility** is deliberately NOT shipped here.
-// An earlier draft of this PR used a role-list heuristic (connected
-// components where one side has producers, the other has consumers,
-// but no element types match → flag as mismatch). The Mythos
-// delta-pass auto-scan running on the PR correctly identified that
-// this raises a false positive whenever two components are sync-
-// connected and each happens to have unrelated stream operations:
-// e.g. A produces stream<u8> for some third component, B consumes
-// stream<s32> from some fourth component, and A↔B share a sync call.
-// The role-list pass cannot tell that A's and B's streams are
-// independent. A precise check needs per-import-edge type lookups
-// (walk `resolved_imports`, find which imports are `stream<T>`-typed,
-// compare to the matched export's element type) — a different shape
-// of code than the role-list pass. LS-R-11 stays open and tracks
-// that follow-up.
+//   (i)   Stream type-mismatch on stream-carrying import edges.
+//         For each fusion connection (a, b), if at least one resolved
+//         import between them carries a `stream<T>` reference in its
+//         type signature, apply the role-list pair check. Components
+//         that share only sync calls (no stream-typed imports) are
+//         skipped — that's the false-positive case LS-R-11's first
+//         draft tripped over, which the Mythos delta-pass auto-scan
+//         caught.
+//
+//         The check is filtered, not fully type-precise: we know that
+//         (a, b) carry streams, but not which import binds to which
+//         stream-handle pair. So the type-mismatch decision still
+//         falls back to "do any of A's producer element types pair
+//         with any of B's consumer element types?", same as the
+//         original role-list test. Filtering eliminates the false
+//         positive without requiring full export-side type-graph
+//         walks (those need traversal of `component_func_defs` and
+//         the component's func index space). Documented in LS-R-11
+//         as the layer-1 fix; a fully precise per-edge check stays
+//         on the LS-R-11 backlog for a future PR.
+//
+//   (iii) Circular stream dependencies — SCC of size ≥ 3 in the
+//         directed `producer → consumer` graph built from detected
+//         [`StreamPair`]s. Size-2 SCCs are excluded — that's the
+//         legal bidirectional-pipe pattern (two independent streams
+//         in opposite directions, each individually acyclic).
 //
 // Checks **(ii) bounded-channel capacity** and **(iv) resource
 // lifetime across async boundaries** remain TODO — they need
@@ -302,6 +308,19 @@ pub fn build_stream_pair_graph(
 /// A validation issue raised by [`validate_stream_pair_graph`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StreamValidationIssue {
+    /// Two fusion-connected components have at least one resolved
+    /// import edge carrying a `stream<T>` reference, but their
+    /// producer/consumer role lists share no element type — so the
+    /// optimized in-module adapter cannot be emitted and the
+    /// host-routed path will mis-type the wire bytes at runtime.
+    /// The element-type Vecs preserve the local lists so the error
+    /// message names what the user wired up.
+    TypeMismatch {
+        producer_component: usize,
+        consumer_component: usize,
+        producer_types: Vec<StreamElement>,
+        consumer_types: Vec<StreamElement>,
+    },
     /// The directed `producer → consumer` graph of detected
     /// [`StreamPair`]s contains a strongly-connected component of size
     /// ≥ 3. Could deadlock at runtime if every component is waiting on
@@ -309,31 +328,236 @@ pub enum StreamValidationIssue {
     Cycle { component_cycle: Vec<usize> },
 }
 
+/// Return every `stream<T>` element type reachable from the given
+/// component-level type reference.
+///
+/// Walks `ComponentTypeRef::Type(Eq idx)` directly resolving to a
+/// stream type, `Func(idx)` recursing through every param/result,
+/// and `Instance(idx)` recursing through every export. Returns an
+/// empty Vec when no streams are present, which is the signal for
+/// "this import edge carries no streams" used by check (i).
+pub fn stream_elements_in_typeref(
+    comp: &ParsedComponent,
+    ty_ref: &wasmparser::ComponentTypeRef,
+) -> Vec<StreamElement> {
+    use wasmparser::ComponentTypeRef as Ref;
+    use wasmparser::TypeBounds;
+    let mut out = Vec::new();
+    match ty_ref {
+        Ref::Type(TypeBounds::Eq(idx)) => {
+            if let Some(ty) = comp.types.get(*idx as usize) {
+                match &ty.kind {
+                    ComponentTypeKind::P3Async(desc) => {
+                        if let Some(elem) = StreamElement::from_descriptor(desc) {
+                            out.push(elem);
+                        }
+                    }
+                    ComponentTypeKind::Function { params, results } => {
+                        for (_, vt) in params {
+                            out.extend(stream_elements_in_valtype(comp, vt));
+                        }
+                        for (_, vt) in results {
+                            out.extend(stream_elements_in_valtype(comp, vt));
+                        }
+                    }
+                    ComponentTypeKind::Instance { exports } => {
+                        for (_, inner_ref) in exports {
+                            out.extend(stream_elements_in_typeref(comp, inner_ref));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Ref::Func(idx) => {
+            if let Some(ty) = comp.types.get(*idx as usize)
+                && let ComponentTypeKind::Function { params, results } = &ty.kind
+            {
+                for (_, vt) in params {
+                    out.extend(stream_elements_in_valtype(comp, vt));
+                }
+                for (_, vt) in results {
+                    out.extend(stream_elements_in_valtype(comp, vt));
+                }
+            }
+        }
+        Ref::Instance(idx) => {
+            if let Some(ty) = comp.types.get(*idx as usize)
+                && let ComponentTypeKind::Instance { exports } = &ty.kind
+            {
+                for (_, inner_ref) in exports {
+                    out.extend(stream_elements_in_typeref(comp, inner_ref));
+                }
+            }
+        }
+        _ => {}
+    }
+    out
+}
+
+/// Recurse through a `ComponentValType`, collecting every reachable
+/// `stream<T>` element type. Handles composite types (list / option /
+/// result / record / variant / tuple / fixed-size list) by
+/// descending into their payload value types; halts at primitives,
+/// strings, flags, and resource handles.
+///
+/// Streams appear in the AST only via `Type(idx)` references to a
+/// `ComponentTypeKind::P3Async("stream<...>")` entry; the walker does
+/// not chase further through `Type(idx)` referring to non-stream
+/// composite types, so a `stream<T>` hidden inside an aliased record
+/// won't surface here. That's an acknowledged limit, not a target.
+pub fn stream_elements_in_valtype(
+    comp: &ParsedComponent,
+    val_ty: &ComponentValType,
+) -> Vec<StreamElement> {
+    let mut out = Vec::new();
+    match val_ty {
+        ComponentValType::Type(idx) => {
+            if let Some(ty) = comp.types.get(*idx as usize)
+                && let ComponentTypeKind::P3Async(desc) = &ty.kind
+                && let Some(elem) = StreamElement::from_descriptor(desc)
+            {
+                out.push(elem);
+            }
+        }
+        ComponentValType::List(inner)
+        | ComponentValType::Option(inner)
+        | ComponentValType::FixedSizeList(inner, _) => {
+            out.extend(stream_elements_in_valtype(comp, inner));
+        }
+        ComponentValType::Record(fields) => {
+            for (_, vt) in fields {
+                out.extend(stream_elements_in_valtype(comp, vt));
+            }
+        }
+        ComponentValType::Variant(arms) => {
+            for (_, opt) in arms {
+                if let Some(vt) = opt {
+                    out.extend(stream_elements_in_valtype(comp, vt));
+                }
+            }
+        }
+        ComponentValType::Tuple(items) => {
+            for vt in items {
+                out.extend(stream_elements_in_valtype(comp, vt));
+            }
+        }
+        ComponentValType::Result { ok, err } => {
+            if let Some(vt) = ok {
+                out.extend(stream_elements_in_valtype(comp, vt));
+            }
+            if let Some(vt) = err {
+                out.extend(stream_elements_in_valtype(comp, vt));
+            }
+        }
+        _ => {}
+    }
+    out
+}
+
+/// `true` if any resolved import edge between components `a` and `b`
+/// (in either direction) carries a `stream<T>` reference somewhere in
+/// its component-level import type signature.
+///
+/// Used by the type-mismatch validator (LS-R-11) to filter out pairs
+/// that are merely sync-connected — those can have unrelated stream
+/// roles on each side without that being a wiring bug. Returns
+/// `false` if neither side imports any stream from the other.
+pub fn pair_has_stream_typed_import(
+    components: &[ParsedComponent],
+    resolved_imports: &HashMap<(usize, String), (usize, String)>,
+    a: usize,
+    b: usize,
+) -> bool {
+    for ((importer, import_name), (exporter, _)) in resolved_imports {
+        let on_pair = (*importer == a && *exporter == b) || (*importer == b && *exporter == a);
+        if !on_pair {
+            continue;
+        }
+        let Some(importer_comp) = components.get(*importer) else {
+            continue;
+        };
+        let Some(import) = importer_comp
+            .imports
+            .iter()
+            .find(|i| &i.name == import_name)
+        else {
+            continue;
+        };
+        if !stream_elements_in_typeref(importer_comp, &import.ty).is_empty() {
+            return true;
+        }
+    }
+    false
+}
+
 /// Run #142's static validation passes over a built [`StreamPairGraph`].
 ///
 /// Returns an empty vec when no issues were found. Caller decides
 /// whether to surface as warnings or hard errors (the resolver hoists
 /// each issue into [`crate::error::Error::StreamValidation`]).
-///
-/// The `components` and `resolved_imports` parameters are unused today
-/// — check (iii) reads only the pair graph — but stay on the signature
-/// so that the precise per-edge implementation of check (i) (see the
-/// module comment) can plug in without a public signature break.
 pub fn validate_stream_pair_graph(
     components: &[ParsedComponent],
     resolved_imports: &HashMap<(usize, String), (usize, String)>,
     graph: &StreamPairGraph,
 ) -> Vec<StreamValidationIssue> {
-    let _ = components;
-    let _ = resolved_imports;
-    validate_from_pairs(graph)
-}
+    let roles: Vec<Vec<(StreamElement, StreamRole)>> =
+        components.iter().map(component_stream_roles).collect();
+    let connections = fusion_connections(resolved_imports);
 
-/// Pure validation core — the unit unit-tests pin.
-pub fn validate_from_pairs(graph: &StreamPairGraph) -> Vec<StreamValidationIssue> {
     let mut issues = Vec::new();
 
+    // Check (i): type-mismatch, filtered by stream-typed-import presence.
+    for &(a, b) in &connections {
+        if !pair_has_stream_typed_import(components, resolved_imports, a, b) {
+            continue;
+        }
+        for &(producer_c, consumer_c) in &[(a, b), (b, a)] {
+            let (Some(producer_roles), Some(consumer_roles)) =
+                (roles.get(producer_c), roles.get(consumer_c))
+            else {
+                continue;
+            };
+            let producer_types: Vec<StreamElement> = producer_roles
+                .iter()
+                .filter(|(_, r)| *r == StreamRole::Producer)
+                .map(|(e, _)| e.clone())
+                .collect();
+            let consumer_types: Vec<StreamElement> = consumer_roles
+                .iter()
+                .filter(|(_, r)| *r == StreamRole::Consumer)
+                .map(|(e, _)| e.clone())
+                .collect();
+            if producer_types.is_empty() || consumer_types.is_empty() {
+                continue;
+            }
+            let any_matched = producer_types
+                .iter()
+                .any(|p| consumer_types.iter().any(|c| p == c));
+            if !any_matched {
+                let issue = StreamValidationIssue::TypeMismatch {
+                    producer_component: producer_c,
+                    consumer_component: consumer_c,
+                    producer_types: producer_types.clone(),
+                    consumer_types: consumer_types.clone(),
+                };
+                if !issues.contains(&issue) {
+                    issues.push(issue);
+                }
+            }
+        }
+    }
+
     // Check (iii): SCC ≥ 3 in the directed producer → consumer graph.
+    issues.extend(cycle_issues_from_pairs(graph));
+
+    issues
+}
+
+/// Cycle-only sub-pass — exposed so tests that only care about (iii)
+/// don't have to construct `ParsedComponent` fixtures.
+pub fn cycle_issues_from_pairs(graph: &StreamPairGraph) -> Vec<StreamValidationIssue> {
+    let mut issues = Vec::new();
     for scc in strongly_connected_components(&graph.pairs) {
         if scc.len() >= 3 {
             issues.push(StreamValidationIssue::Cycle {
@@ -341,7 +565,6 @@ pub fn validate_from_pairs(graph: &StreamPairGraph) -> Vec<StreamValidationIssue
             });
         }
     }
-
     issues
 }
 
@@ -656,7 +879,7 @@ mod tests {
         };
         assert_eq!(graph.pairs.len(), 2, "precondition: pipe pairs both ways");
 
-        let issues = validate_from_pairs(&graph);
+        let issues = cycle_issues_from_pairs(&graph);
         let cycles = issues
             .iter()
             .filter(|i| matches!(i, StreamValidationIssue::Cycle { .. }))
@@ -672,11 +895,12 @@ mod tests {
             pairs: vec![pair(0, 1, "U8"), pair(1, 2, "U8"), pair(2, 0, "U8")],
         };
 
-        let issues = validate_from_pairs(&graph);
+        let issues = cycle_issues_from_pairs(&graph);
         let cycle_components: Vec<Vec<usize>> = issues
             .iter()
-            .map(|i| match i {
-                StreamValidationIssue::Cycle { component_cycle } => component_cycle.clone(),
+            .filter_map(|i| match i {
+                StreamValidationIssue::Cycle { component_cycle } => Some(component_cycle.clone()),
+                _ => None,
             })
             .collect();
         assert_eq!(
@@ -698,11 +922,12 @@ mod tests {
                 pair(3, 0, "U8"),
             ],
         };
-        let issues = validate_from_pairs(&graph);
+        let issues = cycle_issues_from_pairs(&graph);
         let cycles: Vec<_> = issues
             .iter()
-            .map(|i| match i {
-                StreamValidationIssue::Cycle { component_cycle } => component_cycle.clone(),
+            .filter_map(|i| match i {
+                StreamValidationIssue::Cycle { component_cycle } => Some(component_cycle.clone()),
+                _ => None,
             })
             .collect();
         assert_eq!(cycles, vec![vec![0, 1, 2, 3]]);
@@ -725,7 +950,7 @@ mod tests {
             pairs.push(pair(i, i + 1, "U8"));
         }
         let graph = StreamPairGraph { pairs };
-        let issues = validate_from_pairs(&graph);
+        let issues = cycle_issues_from_pairs(&graph);
         assert!(
             issues.is_empty(),
             "linear chain of {n} components must not flag a cycle; got {issues:?}"
@@ -739,10 +964,275 @@ mod tests {
         let graph = StreamPairGraph {
             pairs: vec![pair(0, 1, "U8"), pair(1, 2, "U8")],
         };
-        let issues = validate_from_pairs(&graph);
+        let issues = cycle_issues_from_pairs(&graph);
         assert!(
             issues.is_empty(),
             "linear pipeline must not flag; got {issues:?}"
+        );
+    }
+
+    // ─── LS-R-11 (precise stream type-mismatch) tests ─────────────────
+
+    use crate::parser::{
+        CanonicalOptions, ComponentExport, ComponentImport, ComponentType, ComponentTypeKind,
+        ComponentValType, PrimitiveValType,
+    };
+    use wasmparser::ComponentExternalKind;
+
+    /// Build a minimal `ParsedComponent` with the given imports, types,
+    /// and stream-role-bearing canonical functions. Most fields are
+    /// left empty — the validator only reads `imports`, `types`, and
+    /// `canonical_functions` for these checks.
+    fn make_component(
+        imports: Vec<ComponentImport>,
+        exports: Vec<ComponentExport>,
+        types: Vec<ComponentType>,
+        canonical_functions: Vec<CanonicalEntry>,
+    ) -> ParsedComponent {
+        ParsedComponent {
+            name: None,
+            core_modules: vec![],
+            imports,
+            exports,
+            types,
+            instances: vec![],
+            canonical_functions,
+            sub_components: vec![],
+            component_aliases: vec![],
+            component_instances: vec![],
+            core_entity_order: vec![],
+            component_func_defs: vec![],
+            component_instance_defs: vec![],
+            component_type_defs: vec![],
+            original_size: 0,
+            original_hash: String::new(),
+            depth_0_sections: vec![],
+            p3_async_features: vec![],
+        }
+    }
+
+    fn stream_type(elem: &str) -> ComponentType {
+        ComponentType {
+            kind: ComponentTypeKind::P3Async(format!("stream<{elem}>")),
+        }
+    }
+
+    fn func_type_taking_stream(stream_ty_idx: u32) -> ComponentType {
+        ComponentType {
+            kind: ComponentTypeKind::Function {
+                params: vec![("s".to_string(), ComponentValType::Type(stream_ty_idx))],
+                results: vec![],
+            },
+        }
+    }
+
+    fn options() -> CanonicalOptions {
+        CanonicalOptions::default()
+    }
+
+    /// LS-R-11 layer-1 regression: when component A imports a function
+    /// whose signature takes `stream<u8>` and that import resolves to
+    /// component B's export, but A and B's role lists declare
+    /// incompatible element types (u8 vs s32), the validator MUST
+    /// raise a TypeMismatch. This is the case that motivated #142 (i).
+    #[test]
+    fn ls_r_11_stream_typed_import_with_mismatched_roles_raises() {
+        // Component 0: imports a function taking stream<U8>; has a
+        // producer role on stream<U8>.
+        let comp_a = make_component(
+            vec![ComponentImport {
+                name: "consume".into(),
+                ty: wasmparser::ComponentTypeRef::Func(1),
+            }],
+            vec![],
+            vec![
+                stream_type("U8"),          // types[0]
+                func_type_taking_stream(0), // types[1]
+            ],
+            vec![CanonicalEntry::StreamWrite {
+                ty: 0,
+                options: options(),
+            }],
+        );
+        // Component 1: exports the matching function name; declares
+        // a consumer role on stream<S32> (the mismatch).
+        let comp_b = make_component(
+            vec![],
+            vec![ComponentExport {
+                name: "consume".into(),
+                kind: ComponentExternalKind::Func,
+                index: 0,
+            }],
+            vec![stream_type("S32")], // types[0]
+            vec![CanonicalEntry::StreamRead {
+                ty: 0,
+                options: options(),
+            }],
+        );
+        let components = vec![comp_a, comp_b];
+        let mut resolved: HashMap<(usize, String), (usize, String)> = HashMap::new();
+        resolved.insert((0, "consume".into()), (1, "consume".into()));
+
+        // pair_streams drops the mismatch silently, so the pair graph
+        // is empty — but the validator still picks up the issue via
+        // the resolved-import walk.
+        let graph = StreamPairGraph::default();
+
+        let issues = validate_stream_pair_graph(&components, &resolved, &graph);
+        let mismatches: Vec<_> = issues
+            .iter()
+            .filter(|i| matches!(i, StreamValidationIssue::TypeMismatch { .. }))
+            .collect();
+        assert_eq!(
+            mismatches.len(),
+            1,
+            "expected exactly one TypeMismatch, got issues {issues:?}"
+        );
+    }
+
+    /// LS-R-11 Mythos-finding regression: components A and B are
+    /// sync-connected via a non-stream function, and each independently
+    /// has unrelated stream operations on incompatible element types.
+    /// The validator MUST NOT raise a TypeMismatch — the streams belong
+    /// to other connections, not A↔B. This is the false positive the
+    /// Mythos delta-pass auto-scan caught in PR #188.
+    #[test]
+    fn ls_r_11_sync_only_connection_with_unrelated_streams_does_not_raise() {
+        // types[0] = u32 primitive (used as the sync import's param);
+        // ComponentTypeRef::Type referring to it does NOT carry a stream.
+        let u32_func_type = ComponentType {
+            kind: ComponentTypeKind::Function {
+                params: vec![(
+                    "x".into(),
+                    ComponentValType::Primitive(PrimitiveValType::U32),
+                )],
+                results: vec![],
+            },
+        };
+
+        // Component 0: imports a sync function (no stream); has a
+        // stream<U8> producer for an unrelated wiring.
+        let comp_a = make_component(
+            vec![ComponentImport {
+                name: "sync_call".into(),
+                ty: wasmparser::ComponentTypeRef::Func(1),
+            }],
+            vec![],
+            vec![
+                stream_type("U8"), // types[0]: unrelated stream
+                u32_func_type,     // types[1]: the sync import's type
+            ],
+            vec![CanonicalEntry::StreamWrite {
+                ty: 0,
+                options: options(),
+            }],
+        );
+        // Component 1: exports the matching sync function; has a
+        // stream<S32> consumer for an unrelated wiring.
+        let comp_b = make_component(
+            vec![],
+            vec![ComponentExport {
+                name: "sync_call".into(),
+                kind: ComponentExternalKind::Func,
+                index: 0,
+            }],
+            vec![stream_type("S32")],
+            vec![CanonicalEntry::StreamRead {
+                ty: 0,
+                options: options(),
+            }],
+        );
+        let components = vec![comp_a, comp_b];
+        let mut resolved: HashMap<(usize, String), (usize, String)> = HashMap::new();
+        resolved.insert((0, "sync_call".into()), (1, "sync_call".into()));
+        let graph = StreamPairGraph::default();
+
+        let issues = validate_stream_pair_graph(&components, &resolved, &graph);
+        let mismatches: Vec<_> = issues
+            .iter()
+            .filter(|i| matches!(i, StreamValidationIssue::TypeMismatch { .. }))
+            .collect();
+        assert!(
+            mismatches.is_empty(),
+            "Mythos finding regression: sync-only connection with unrelated streams must not raise; got {issues:?}"
+        );
+    }
+
+    /// Negative: when the stream types DO match across the
+    /// stream-typed import edge, no mismatch is raised.
+    #[test]
+    fn stream_typed_import_with_matching_types_does_not_raise() {
+        let comp_a = make_component(
+            vec![ComponentImport {
+                name: "consume".into(),
+                ty: wasmparser::ComponentTypeRef::Func(1),
+            }],
+            vec![],
+            vec![stream_type("U8"), func_type_taking_stream(0)],
+            vec![CanonicalEntry::StreamWrite {
+                ty: 0,
+                options: options(),
+            }],
+        );
+        let comp_b = make_component(
+            vec![],
+            vec![ComponentExport {
+                name: "consume".into(),
+                kind: ComponentExternalKind::Func,
+                index: 0,
+            }],
+            vec![stream_type("U8")],
+            vec![CanonicalEntry::StreamRead {
+                ty: 0,
+                options: options(),
+            }],
+        );
+        let components = vec![comp_a, comp_b];
+        let mut resolved: HashMap<(usize, String), (usize, String)> = HashMap::new();
+        resolved.insert((0, "consume".into()), (1, "consume".into()));
+        let graph = StreamPairGraph::default();
+
+        let issues = validate_stream_pair_graph(&components, &resolved, &graph);
+        assert!(
+            issues.is_empty(),
+            "matching stream types must not raise; got {issues:?}"
+        );
+    }
+
+    /// Direct unit test of the type walker: a `Func` typeref whose
+    /// param is a `Type(idx)` resolving to a `P3Async("stream<U8>")`
+    /// must surface as a single `Typed("U8")` element.
+    #[test]
+    fn stream_elements_in_typeref_walks_func_param() {
+        let comp = make_component(
+            vec![],
+            vec![],
+            vec![stream_type("U8"), func_type_taking_stream(0)],
+            vec![],
+        );
+        let elems = stream_elements_in_typeref(&comp, &wasmparser::ComponentTypeRef::Func(1));
+        assert_eq!(elems, vec![typed("U8")]);
+    }
+
+    /// Direct unit test: a `Func` typeref with no streams returns an
+    /// empty Vec — that's the "this edge carries no streams" signal
+    /// the filter relies on.
+    #[test]
+    fn stream_elements_in_typeref_returns_empty_for_sync_func() {
+        let sync_func = ComponentType {
+            kind: ComponentTypeKind::Function {
+                params: vec![(
+                    "x".into(),
+                    ComponentValType::Primitive(PrimitiveValType::U32),
+                )],
+                results: vec![],
+            },
+        };
+        let comp = make_component(vec![], vec![], vec![sync_func], vec![]);
+        let elems = stream_elements_in_typeref(&comp, &wasmparser::ComponentTypeRef::Func(0));
+        assert!(
+            elems.is_empty(),
+            "sync function must not surface stream elements; got {elems:?}"
         );
     }
 }
