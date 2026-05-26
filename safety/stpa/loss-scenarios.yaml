@@ -1325,22 +1325,37 @@ loss-scenarios:
       type-erased import names: the same byte stream reaches the
       consumer with a different on-wire interpretation than the
       producer intended.
-    status: open
+    status: approved
     priority: high
-    notes: >
-      A first attempt (PR #188) used a role-list heuristic — flag any
-      fusion connection where one side has producers, the other has
-      consumers, and no element type pairs. The Mythos delta-pass
-      auto-scan correctly identified that this is a near-miss check,
-      not a precise one: two components sync-connected with unrelated
-      stream operations on each side raise a false positive. Heuristic
-      was dropped from #188; the cycle check (LS-R-12) shipped alone.
-      The precise check needs per-import-edge type lookups (walk
-      `resolved_imports`, find which imports are `stream<T>`-typed,
-      compare to the matched export's element type). Tracked for a
-      follow-up PR; the `StreamValidationIssue` enum + resolver wiring
-      from #188 leave a place for the new variant to plug in without
-      a public-signature break.
+    fix: >
+      Two-stage fix across PR #188 and a follow-up PR. PR #188 first
+      shipped a role-list heuristic, which the Mythos delta-pass
+      auto-scan correctly identified as having a false-positive path
+      (sync-only connection + unrelated streams). The heuristic was
+      withdrawn from #188; the follow-up PR replaced it with a
+      stream-typed-import filter: for each fusion connection, walk
+      `resolved_imports` and check whether any edge's importer
+      declares a `stream<T>` somewhere in its `ComponentTypeRef`
+      signature (Func params/results, Type aliases, Instance exports
+      — recursing through `ComponentValType::List`, `Option`,
+      `Result`, `Record`, `Variant`, `Tuple`, `FixedSizeList`). The
+      role-list pair check now fires only on filtered connections.
+      Confirmed by `meld-core::p3_stream::tests::ls_r_11_stream_typed_import_with_mismatched_roles_raises`
+      (true positive) and `ls_r_11_sync_only_connection_with_unrelated_streams_does_not_raise`
+      (Mythos-finding regression — the exact false positive the
+      original heuristic produced). Two type-walker unit tests
+      (`stream_elements_in_typeref_walks_func_param`,
+      `stream_elements_in_typeref_returns_empty_for_sync_func`) pin
+      the walker independently. **Precision boundary**: the filter
+      knows a connection carries SOME stream, but the mismatch
+      decision still uses the role-list multiset — it cannot tie a
+      specific import to a specific stream-handle pair without full
+      export-side type-graph walks via `component_func_defs`. A
+      `stream<T>` hidden inside an aliased composite type accessed
+      via `ComponentValType::Type(idx)` is also not chased. Both
+      boundaries are documented in `p3_stream.rs`'s module comment;
+      future refinements remain backlogged but are not required to
+      close this entry.
 
   - id: LS-R-13
     title: Recursive Tarjan in stream-cycle detector exhausts call stack
