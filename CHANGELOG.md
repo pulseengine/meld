@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-05-26
+
 ### Added
 
 - **Stream type-mismatch detection on stream-carrying import edges**
