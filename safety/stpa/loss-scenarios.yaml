@@ -1356,6 +1356,31 @@ loss-scenarios:
       boundaries are documented in `p3_stream.rs`'s module comment;
       future refinements remain backlogged but are not required to
       close this entry.
+      ###
+      ### v0.15.0 follow-up: layer-2 per-edge precision
+      ###
+      v0.15.0 promotes the check from heuristic to per-edge precise
+      for the common path. New `export_stream_elements` walks
+      `comp.component_func_defs[export.index]` to resolve a `Func`
+      export to its underlying type. Handles `Import` (re-export
+      forwarding) and `Lift` (canon-lifted exports — the common
+      case for stream-bearing component-defined functions);
+      `InstanceExportAlias` (deferred — would need to chase alias
+      chains through nested instance types) falls back to the
+      layer-1 role-list heuristic. For each resolved import edge,
+      if BOTH the importer side and the exporter side resolve to
+      non-empty stream-element lists, the multisets are compared
+      directly; mismatches emit a `TypeMismatch` keyed to the
+      exact `(producer_component=exporter, consumer_component=importer)`
+      pair with the real element types from each side's signature
+      (not role-list multisets). Layer-1 only fires for connections
+      not already precisely checked. New regression tests:
+      `export_stream_elements_walks_lift_function_signature`,
+      `export_stream_elements_returns_empty_for_alias_export`,
+      `ls_r_11_per_edge_lift_export_mismatch_raises`,
+      `per_edge_matching_lift_export_does_not_raise`. Remaining
+      backlog: alias-chain resolution + `stream<T>` hidden inside
+      aliased composite types.
 
   - id: LS-R-13
     title: Recursive Tarjan in stream-cycle detector exhausts call stack
