@@ -4,6 +4,35 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **`component-provenance` custom section** (#192, LS-M-6,
+  `meld-core/src/provenance.rs`, `meld-core/src/lib.rs`,
+  `meld-cli/src/main.rs`). Cross-repo dependency from
+  `pulseengine/scry`'s DD-002: every defined function in the fused
+  module now gets a JSON-encoded back-pointer entry
+  `{ fused_func_idx, component_id, originating_func_idx }` under a
+  Wasm custom section named `component-provenance`. The data has
+  been in-memory all along — `MergedFunction.origin` is a
+  `(component_idx, module_idx, function_idx)` triple built by the
+  merger and previously dropped at emit time; this preserves it for
+  consumers (scry's sound abstract interpreter) to project
+  Component-Model invariants onto fused-module locations.
+  `component_id` is the user-supplied name from
+  `add_component_named` if set, otherwise the positional fallback
+  `component-<idx>`. The section's `fused_module_sha256` field
+  binds it to the fused module's bytes-without-the-two-meld-
+  authored-sections — same self-referential-hash pattern the
+  attestation section already uses; consumers strip both sections
+  before verifying. New `--no-component-provenance` CLI flag for
+  opt-out (default on). 6 new integration tests pin the contract
+  end-to-end including the consumer verification recipe; 5 unit
+  tests pin JSON round-trip, version-field stability, and the
+  SHA-256 hex helper's canonical "hello world" value. Section
+  format documented in `meld-core/src/provenance.rs`'s module
+  doc-block (the boundary between meld's Core-Wasm-fusion
+  correctness and scry's Component-Model semantics).
+
 ## [0.13.0] - 2026-05-26
 
 ### Added

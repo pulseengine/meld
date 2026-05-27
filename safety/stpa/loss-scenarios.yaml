@@ -2455,3 +2455,65 @@ loss-scenarios:
       but the merger's index-space merging model does not account for this.
     status: open
     priority: critical
+
+  - id: LS-M-6
+    title: component-provenance section mis-attributes fused functions
+    uca: UCA-M-9
+    hazards: [H-1]
+    type: inadequate-control-algorithm
+    scenario: >
+      The `component-provenance` custom section (#192) maps each
+      defined function in the fused module to a back-pointer
+      `{ component_id, originating_func_idx }`. If the emitter
+      builds those entries from the wrong source — using a stale
+      `MergedFunction.origin`, the wrong import-count offset for the
+      `fused_func_idx` calculation, or a `component_id` lookup that
+      picks the wrong slot in `self.components` — the
+      cross-repo consumer (`pulseengine/scry`'s sound abstract
+      interpreter, DD-002) projects its Component-Model invariants
+      onto the wrong fused-module location. Scry then reports
+      "function F is safe" about the wrong F, and any downstream
+      witness MC/DC or sigil-attested decision relying on that
+      claim is silently de-grounded [H-1]. The hazard is invisible
+      because the fused module still runs correctly — only the
+      paper-trail of invariants is wrong.
+    causal-factors:
+      - >-
+        `fused_func_idx` is computed as
+        `import_counts.func + defined_idx`; an off-by-one against
+        the import-count would shift every entry by one
+      - >-
+        `MergedFunction.origin` is set by merger.rs and never
+        mutated, but adapter trampolines inserted by
+        `wire_adapter_indices` could in principle change function
+        slots if the wiring step ever stopped preserving origin
+        tuples
+      - >-
+        `component_id` falls back to `component-<idx>` for
+        flattened sub-components without a name from
+        `add_component_named`; if `flatten_nested_components`
+        reorders the slice without updating origins, the fallback
+        names would silently rotate
+    process-model-flaw: >
+      The model assumes "the data is already there, just preserve
+      it" — which is true for the *origin* tuples, but the
+      `fused_func_idx` and `component_id` fields are *derived* at
+      emit time from the merged module's import-count and the
+      caller's component slice. A future refactor that changes the
+      import-count semantics or the flattening order without
+      updating the emitter would silently mis-attribute.
+    status: approved
+    priority: high
+    fix: >
+      Integration test
+      `meld-core::tests::component_provenance::*` (6 cases) pins
+      the contract end-to-end: section is present by default,
+      decodes via standard wasmparser, every entry's
+      `fused_func_idx` is distinct, every `component_id` is
+      non-empty and matches either the user-supplied name or the
+      `component-<idx>` positional fallback, and the
+      `fused_module_sha256` claim verifies against the
+      bytes-without-the-two-meld-authored-sections (consumer
+      verification recipe). Plus 5 unit tests pin the JSON
+      round-trip, version-field stability, and SHA-256 helper
+      canonical value.

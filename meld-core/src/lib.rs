@@ -49,6 +49,7 @@ pub mod merger;
 pub mod p3_async;
 pub mod p3_stream;
 pub mod parser;
+pub mod provenance;
 pub mod resolver;
 pub mod resource_graph;
 pub mod rewriter;
@@ -72,6 +73,18 @@ pub struct FuserConfig {
 
     /// Whether to generate attestation data
     pub attestation: bool,
+
+    /// Whether to emit the `component-provenance` custom section
+    /// (issue #192). When enabled (the default), every defined
+    /// function in the fused module gets a back-pointer entry
+    /// `{ component_id, originating_func_idx }` in a JSON payload
+    /// under the section name `component-provenance`. Consumers
+    /// (notably `pulseengine/scry`'s sound abstract interpreter)
+    /// use this to project Component-Model invariants onto fused-
+    /// module locations. Section overhead is ~120 bytes per fused
+    /// function; opting out via `--no-component-provenance` is
+    /// supported for size-sensitive builds.
+    pub component_provenance: bool,
 
     /// Whether to rebase per-module memory addresses into a shared memory
     pub address_rebasing: bool,
@@ -120,6 +133,7 @@ impl Default for FuserConfig {
         Self {
             memory_strategy: MemoryStrategy::MultiMemory,
             attestation: true,
+            component_provenance: true,
             address_rebasing: false,
             preserve_names: false,
             custom_sections: CustomSectionHandling::Merge,
@@ -407,20 +421,39 @@ impl Fuser {
             self.wire_adapter_indices(&mut merged, &adapters, &graph)?;
         }
 
-        // Step 4: Encode output module
+        // Step 4: Encode output module.
+        //
+        // Two-pass dance: first encode without any self-referential
+        // custom sections, then build attestation (#wsc) and
+        // provenance (#192) over THAT byte sequence and re-encode
+        // with both as extras. Both sections' SHA-256 hashes refer
+        // to the bytes-without-extras, so consumers strip both
+        // sections before verifying.
         log::info!("Encoding fused module");
-        let output_without_attestation = self.encode_output(&merged, &adapters, &[])?;
-        let output = if self.config.attestation {
-            // Build attestation from the output without the attestation section to avoid
-            // self-referential hashing.
+        let output_without_extras = self.encode_output(&merged, &adapters, &[])?;
+
+        let mut extra_sections: Vec<(&str, Vec<u8>)> = Vec::new();
+
+        if self.config.attestation {
             let mut attestation_stats = stats.clone();
-            attestation_stats.output_size = output_without_attestation.len();
+            attestation_stats.output_size = output_without_extras.len();
             let (section_name, payload) =
-                self.build_attestation_payload(&output_without_attestation, &attestation_stats)?;
-            let extra_sections = vec![(section_name, payload)];
-            self.encode_output(&merged, &adapters, &extra_sections)?
+                self.build_attestation_payload(&output_without_extras, &attestation_stats)?;
+            extra_sections.push((section_name, payload));
+        }
+
+        if self.config.component_provenance {
+            let provenance = provenance::build(&merged, &self.components, &output_without_extras);
+            let payload = provenance.to_bytes().map_err(|e| {
+                Error::EncodingError(format!("component-provenance serialization failed: {e}"))
+            })?;
+            extra_sections.push((provenance::SECTION_NAME, payload));
+        }
+
+        let output = if extra_sections.is_empty() {
+            output_without_extras
         } else {
-            output_without_attestation
+            self.encode_output(&merged, &adapters, &extra_sections)?
         };
 
         // Optionally wrap the fused core module as a P2 component

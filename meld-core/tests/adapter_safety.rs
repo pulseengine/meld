@@ -424,6 +424,7 @@ fn test_sr12_adapter_generation_for_string_param() {
     let config = FuserConfig {
         memory_strategy: MemoryStrategy::MultiMemory,
         attestation: false,
+        component_provenance: false,
         address_rebasing: false,
         preserve_names: false,
         custom_sections: meld_core::CustomSectionHandling::Drop,
@@ -811,6 +812,7 @@ fn test_sr13_cabi_realloc_targets_correct_memory() {
     let config = FuserConfig {
         memory_strategy: MemoryStrategy::MultiMemory,
         attestation: false,
+        component_provenance: false,
         address_rebasing: false,
         preserve_names: false,
         custom_sections: meld_core::CustomSectionHandling::Drop,
@@ -1226,6 +1228,7 @@ fn test_sr15_list_copy_length() {
     let config = FuserConfig {
         memory_strategy: MemoryStrategy::MultiMemory,
         attestation: false,
+        component_provenance: false,
         address_rebasing: false,
         preserve_names: false,
         custom_sections: meld_core::CustomSectionHandling::Drop,
@@ -1721,6 +1724,7 @@ fn test_sr16_inner_pointer_fixup_list_string() {
     let config = FuserConfig {
         memory_strategy: MemoryStrategy::MultiMemory,
         attestation: false,
+        component_provenance: false,
         address_rebasing: false,
         preserve_names: false,
         custom_sections: meld_core::CustomSectionHandling::Drop,
@@ -2009,6 +2013,7 @@ fn test_sr17_utf8_to_utf16_string_transcoding() {
     let config = FuserConfig {
         memory_strategy: MemoryStrategy::MultiMemory,
         attestation: false,
+        component_provenance: false,
         address_rebasing: false,
         preserve_names: false,
         custom_sections: meld_core::CustomSectionHandling::Drop,

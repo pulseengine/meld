@@ -58,6 +58,7 @@ fn fuse_fixture(name: &str, output_format: OutputFormat) -> anyhow::Result<Vec<u
     let config = FuserConfig {
         memory_strategy: MemoryStrategy::MultiMemory,
         attestation: false,
+        component_provenance: false,
         address_rebasing: false,
         preserve_names: false,
         custom_sections: CustomSectionHandling::Drop,
