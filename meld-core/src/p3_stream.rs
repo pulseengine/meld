@@ -31,8 +31,11 @@
 //! `stream<u8>` and a `stream<s32>` between the same two components are
 //! two different streams. See ADR-3.
 
-use crate::parser::{CanonicalEntry, ComponentTypeKind, ComponentValType, ParsedComponent};
+use crate::parser::{
+    CanonicalEntry, ComponentFuncDef, ComponentTypeKind, ComponentValType, ParsedComponent,
+};
 use std::collections::HashMap;
+use wasmparser::ComponentExternalKind;
 
 /// The element type carried by a `stream<T>`, parsed from the
 /// component-type descriptor the parser records.
@@ -491,11 +494,75 @@ pub fn pair_has_stream_typed_import(
     false
 }
 
+/// Resolve a component-level `Func` export by name to the stream
+/// element types its signature carries.
+///
+/// Walks `comp.component_func_defs[export.index]` to find the source
+/// of the exported function:
+///
+/// - [`ComponentFuncDef::Import`] → look up `comp.imports[idx].ty`
+///   and reuse [`stream_elements_in_typeref`].
+/// - [`ComponentFuncDef::Lift`] → look up the `CanonicalEntry::Lift`
+///   entry, extract its `type_index`, and walk it as
+///   `ComponentTypeRef::Func(type_index)`.
+/// - [`ComponentFuncDef::InstanceExportAlias`] → returns empty for
+///   now; alias chains require chasing through nested instance
+///   types and are deferred. The common-case stream-bearing exports
+///   are Lift entries (component-defined functions) or Import
+///   re-exports (forwarding pattern), both covered above.
+///
+/// Returns an empty Vec for non-Func exports, unresolved indices,
+/// or alias-export chains — same "this edge carries no streams"
+/// signal as the importer-side walker.
+pub fn export_stream_elements(comp: &ParsedComponent, export_name: &str) -> Vec<StreamElement> {
+    let Some(export) = comp.exports.iter().find(|e| e.name == export_name) else {
+        return Vec::new();
+    };
+    if !matches!(export.kind, ComponentExternalKind::Func) {
+        return Vec::new();
+    }
+    let Some(def) = comp.component_func_defs.get(export.index as usize) else {
+        return Vec::new();
+    };
+    match def {
+        ComponentFuncDef::Import(import_idx) => comp
+            .imports
+            .get(*import_idx)
+            .map(|imp| stream_elements_in_typeref(comp, &imp.ty))
+            .unwrap_or_default(),
+        ComponentFuncDef::Lift(canon_idx) => {
+            let Some(entry) = comp.canonical_functions.get(*canon_idx) else {
+                return Vec::new();
+            };
+            let CanonicalEntry::Lift { type_index, .. } = entry else {
+                return Vec::new();
+            };
+            stream_elements_in_typeref(comp, &wasmparser::ComponentTypeRef::Func(*type_index))
+        }
+        ComponentFuncDef::InstanceExportAlias(_) => {
+            // Deferred — would require following the alias chain
+            // through `comp.component_aliases[idx]` and then
+            // resolving the alias's target instance type. Tracked
+            // in LS-R-11's "limits" block.
+            Vec::new()
+        }
+    }
+}
+
 /// Run #142's static validation passes over a built [`StreamPairGraph`].
 ///
 /// Returns an empty vec when no issues were found. Caller decides
 /// whether to surface as warnings or hard errors (the resolver hoists
 /// each issue into [`crate::error::Error::StreamValidation`]).
+///
+/// **Check (i) precision**: per-edge type comparison. For each
+/// resolved import where both sides carry stream<T> references,
+/// the importer-side and exporter-side element types are compared
+/// directly. Falls back to the role-list heuristic only when the
+/// exporter side is unresolvable (alias-chain exports, which
+/// haven't been threaded through `component_func_defs` walking
+/// yet). The previous v0.13.0 release shipped only the heuristic;
+/// v0.15.0 promotes most fusion connections to the precise check.
 pub fn validate_stream_pair_graph(
     components: &[ParsedComponent],
     resolved_imports: &HashMap<(usize, String), (usize, String)>,
@@ -503,12 +570,76 @@ pub fn validate_stream_pair_graph(
 ) -> Vec<StreamValidationIssue> {
     let roles: Vec<Vec<(StreamElement, StreamRole)>> =
         components.iter().map(component_stream_roles).collect();
-    let connections = fusion_connections(resolved_imports);
 
     let mut issues = Vec::new();
+    let mut precise_pairs: std::collections::HashSet<(usize, usize)> =
+        std::collections::HashSet::new();
 
-    // Check (i): type-mismatch, filtered by stream-typed-import presence.
+    // Check (i), layer 2 (per-edge precise): walk every resolved
+    // import. If the importer's import is stream-typed AND the
+    // exporter's matching export is stream-typed AND the element-
+    // type multisets differ, emit a TypeMismatch keyed to the
+    // exact (importer, exporter) component pair. Once a pair has
+    // been precisely checked (whether or not it raised), suppress
+    // the layer-1 heuristic for that pair to avoid double-counting.
+    for ((importer, import_name), (exporter, export_name)) in resolved_imports {
+        if importer == exporter {
+            continue;
+        }
+        let Some(importer_comp) = components.get(*importer) else {
+            continue;
+        };
+        let Some(import) = importer_comp
+            .imports
+            .iter()
+            .find(|i| &i.name == import_name)
+        else {
+            continue;
+        };
+        let imp_elems = stream_elements_in_typeref(importer_comp, &import.ty);
+        if imp_elems.is_empty() {
+            continue;
+        }
+        let Some(exporter_comp) = components.get(*exporter) else {
+            continue;
+        };
+        let exp_elems = export_stream_elements(exporter_comp, export_name);
+        if exp_elems.is_empty() {
+            // Exporter side unresolved (alias chain, missing
+            // export, etc.). Leave to the layer-1 heuristic.
+            continue;
+        }
+        precise_pairs.insert((*importer, *exporter));
+
+        // Compare as multisets. Sort + equality is fine for the
+        // small list sizes typical of stream-bearing function
+        // signatures (usually 1 stream per signature).
+        let mut imp_sorted: Vec<_> = imp_elems.iter().collect();
+        let mut exp_sorted: Vec<_> = exp_elems.iter().collect();
+        imp_sorted.sort_by_key(|e| format!("{e:?}"));
+        exp_sorted.sort_by_key(|e| format!("{e:?}"));
+        if imp_sorted != exp_sorted {
+            let issue = StreamValidationIssue::TypeMismatch {
+                producer_component: *exporter,
+                consumer_component: *importer,
+                producer_types: exp_elems.clone(),
+                consumer_types: imp_elems.clone(),
+            };
+            if !issues.contains(&issue) {
+                issues.push(issue);
+            }
+        }
+    }
+
+    // Check (i), layer 1 (role-list heuristic, filtered): only fire
+    // on fusion connections that DID NOT get a precise check above.
+    // The filter still gates by stream-typed-import presence so
+    // sync-only connections with unrelated streams stay silent.
+    let connections = fusion_connections(resolved_imports);
     for &(a, b) in &connections {
+        if precise_pairs.contains(&(a, b)) || precise_pairs.contains(&(b, a)) {
+            continue;
+        }
         if !pair_has_stream_typed_import(components, resolved_imports, a, b) {
             continue;
         }
@@ -989,6 +1120,16 @@ mod tests {
         types: Vec<ComponentType>,
         canonical_functions: Vec<CanonicalEntry>,
     ) -> ParsedComponent {
+        make_component_with_func_defs(imports, exports, types, canonical_functions, vec![])
+    }
+
+    fn make_component_with_func_defs(
+        imports: Vec<ComponentImport>,
+        exports: Vec<ComponentExport>,
+        types: Vec<ComponentType>,
+        canonical_functions: Vec<CanonicalEntry>,
+        component_func_defs: Vec<ComponentFuncDef>,
+    ) -> ParsedComponent {
         ParsedComponent {
             name: None,
             core_modules: vec![],
@@ -1001,7 +1142,7 @@ mod tests {
             component_aliases: vec![],
             component_instances: vec![],
             core_entity_order: vec![],
-            component_func_defs: vec![],
+            component_func_defs,
             component_instance_defs: vec![],
             component_type_defs: vec![],
             original_size: 0,
@@ -1233,6 +1374,174 @@ mod tests {
         assert!(
             elems.is_empty(),
             "sync function must not surface stream elements; got {elems:?}"
+        );
+    }
+
+    // ─── LS-R-11 layer-2 (precise per-edge) tests ─────────────────────
+
+    /// Direct unit test of [`export_stream_elements`] for the
+    /// `ComponentFuncDef::Lift` resolution path. A component that
+    /// exports a `canon lift` of a function taking `stream<U8>` must
+    /// surface that stream element type via the export-side walker —
+    /// this is the path the layer-2 precise check relies on.
+    #[test]
+    fn export_stream_elements_walks_lift_function_signature() {
+        let comp = make_component_with_func_defs(
+            vec![],
+            vec![ComponentExport {
+                name: "produce".into(),
+                kind: ComponentExternalKind::Func,
+                index: 0,
+            }],
+            vec![
+                stream_type("U8"),          // types[0]: stream<U8>
+                func_type_taking_stream(0), // types[1]: fn(stream<U8>)
+            ],
+            vec![CanonicalEntry::Lift {
+                core_func_index: 0,
+                type_index: 1,
+                options: options(),
+            }],
+            // component_func_defs[0] = Lift(0) — the exported function
+            // came from canonical_functions[0].
+            vec![ComponentFuncDef::Lift(0)],
+        );
+        let elems = export_stream_elements(&comp, "produce");
+        assert_eq!(elems, vec![typed("U8")]);
+    }
+
+    /// `export_stream_elements` must return empty for an export
+    /// resolved through an alias chain (`InstanceExportAlias`) —
+    /// that path is deferred per the LS-R-11 limits documentation,
+    /// and the precise check falls back to the layer-1 heuristic
+    /// for those edges.
+    #[test]
+    fn export_stream_elements_returns_empty_for_alias_export() {
+        let comp = make_component_with_func_defs(
+            vec![],
+            vec![ComponentExport {
+                name: "aliased".into(),
+                kind: ComponentExternalKind::Func,
+                index: 0,
+            }],
+            vec![],
+            vec![],
+            // component_func_defs[0] = InstanceExportAlias(0). The
+            // alias index doesn't matter for this test — the walker
+            // returns empty without inspecting it.
+            vec![ComponentFuncDef::InstanceExportAlias(0)],
+        );
+        let elems = export_stream_elements(&comp, "aliased");
+        assert!(
+            elems.is_empty(),
+            "alias-export path should return empty until alias chains are walked; got {elems:?}"
+        );
+    }
+
+    /// LS-R-11 layer-2 regression: when the importer's
+    /// `stream<u8>` import is resolved to an exporter's Lift-defined
+    /// `stream<s32>` export, the per-edge precise check MUST raise
+    /// a TypeMismatch with the actual element types — not just
+    /// "no element type pairs".
+    #[test]
+    fn ls_r_11_per_edge_lift_export_mismatch_raises() {
+        let comp_a = make_component_with_func_defs(
+            vec![ComponentImport {
+                name: "data".into(),
+                ty: wasmparser::ComponentTypeRef::Func(1),
+            }],
+            vec![],
+            vec![stream_type("U8"), func_type_taking_stream(0)],
+            vec![],
+            vec![ComponentFuncDef::Import(0)],
+        );
+        let comp_b = make_component_with_func_defs(
+            vec![],
+            vec![ComponentExport {
+                name: "data".into(),
+                kind: ComponentExternalKind::Func,
+                index: 0,
+            }],
+            vec![
+                stream_type("S32"),         // types[0]: stream<S32> ≠ A's stream<U8>
+                func_type_taking_stream(0), // types[1]: fn(stream<S32>)
+            ],
+            vec![CanonicalEntry::Lift {
+                core_func_index: 0,
+                type_index: 1,
+                options: options(),
+            }],
+            vec![ComponentFuncDef::Lift(0)],
+        );
+        let components = vec![comp_a, comp_b];
+        let mut resolved: HashMap<(usize, String), (usize, String)> = HashMap::new();
+        resolved.insert((0, "data".into()), (1, "data".into()));
+        let graph = StreamPairGraph::default();
+
+        let issues = validate_stream_pair_graph(&components, &resolved, &graph);
+        let mismatch = issues.iter().find_map(|i| match i {
+            StreamValidationIssue::TypeMismatch {
+                producer_component,
+                consumer_component,
+                producer_types,
+                consumer_types,
+            } => Some((
+                *producer_component,
+                *consumer_component,
+                producer_types.clone(),
+                consumer_types.clone(),
+            )),
+            _ => None,
+        });
+        let mismatch = mismatch.expect("expected exactly one TypeMismatch");
+        // Per-edge: producer is the exporter (comp 1), consumer is
+        // the importer (comp 0). Types are the precise element types
+        // from each side's signature, not role-list multisets.
+        assert_eq!(mismatch.0, 1, "producer_component should be the exporter");
+        assert_eq!(mismatch.1, 0, "consumer_component should be the importer");
+        assert_eq!(mismatch.2, vec![typed("S32")]);
+        assert_eq!(mismatch.3, vec![typed("U8")]);
+    }
+
+    /// LS-R-11 layer-2: matching stream types on a resolved edge
+    /// must NOT raise (precise check path, not the heuristic). Pins
+    /// the no-false-positive property of the precise check.
+    #[test]
+    fn per_edge_matching_lift_export_does_not_raise() {
+        let comp_a = make_component_with_func_defs(
+            vec![ComponentImport {
+                name: "data".into(),
+                ty: wasmparser::ComponentTypeRef::Func(1),
+            }],
+            vec![],
+            vec![stream_type("U8"), func_type_taking_stream(0)],
+            vec![],
+            vec![ComponentFuncDef::Import(0)],
+        );
+        let comp_b = make_component_with_func_defs(
+            vec![],
+            vec![ComponentExport {
+                name: "data".into(),
+                kind: ComponentExternalKind::Func,
+                index: 0,
+            }],
+            vec![stream_type("U8"), func_type_taking_stream(0)],
+            vec![CanonicalEntry::Lift {
+                core_func_index: 0,
+                type_index: 1,
+                options: options(),
+            }],
+            vec![ComponentFuncDef::Lift(0)],
+        );
+        let components = vec![comp_a, comp_b];
+        let mut resolved: HashMap<(usize, String), (usize, String)> = HashMap::new();
+        resolved.insert((0, "data".into()), (1, "data".into()));
+        let graph = StreamPairGraph::default();
+
+        let issues = validate_stream_pair_graph(&components, &resolved, &graph);
+        assert!(
+            issues.is_empty(),
+            "matching stream types on resolved edge must not raise; got {issues:?}"
         );
     }
 }

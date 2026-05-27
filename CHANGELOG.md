@@ -4,6 +4,28 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **LS-R-11 layer-2 per-edge precise stream type-mismatch**
+  (`meld-core/src/p3_stream.rs`). Promotes the v0.13.0 heuristic
+  to a per-edge precise check for the common path. New
+  `export_stream_elements` walks `comp.component_func_defs[export.index]`
+  to resolve a `Func` export to its underlying type:
+  `ComponentFuncDef::Import` reuses the importer-side typeref
+  walker; `ComponentFuncDef::Lift` looks up the `CanonicalEntry::Lift`'s
+  `type_index` and walks the function signature directly.
+  `ComponentFuncDef::InstanceExportAlias` is deferred (would
+  require chasing alias chains through nested instance types) and
+  falls back to the layer-1 role-list heuristic. For each resolved
+  import edge where both endpoints resolve to non-empty stream-
+  element lists, the multisets are compared directly; mismatches
+  emit `TypeMismatch` keyed to the exact
+  `(producer_component=exporter, consumer_component=importer)`
+  pair with the real element types from each side's signature.
+  4 new regression tests pin the new behavior. Layer-1 only fires
+  for connections not precisely checked, so the v0.13.0 heuristic
+  stays in place as a safety net.
+
 ## [0.14.0] - 2026-05-27
 
 ### Added
