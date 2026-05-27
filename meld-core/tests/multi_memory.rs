@@ -206,6 +206,7 @@ fn test_multi_memory_separate_memories() {
     let config = FuserConfig {
         memory_strategy: MemoryStrategy::MultiMemory,
         attestation: false,
+        component_provenance: false,
         address_rebasing: false,
         preserve_names: false,
         custom_sections: meld_core::CustomSectionHandling::Merge,
@@ -258,6 +259,7 @@ fn test_multi_memory_preserves_isolation() {
     let config = FuserConfig {
         memory_strategy: MemoryStrategy::MultiMemory,
         attestation: false,
+        component_provenance: false,
         address_rebasing: false,
         preserve_names: false,
         custom_sections: meld_core::CustomSectionHandling::Merge,

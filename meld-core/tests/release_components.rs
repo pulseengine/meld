@@ -69,6 +69,7 @@ fn try_fuse(path: &str, name: &str) -> (bool, usize, String) {
     let config = FuserConfig {
         memory_strategy: MemoryStrategy::MultiMemory,
         attestation: false,
+        component_provenance: false,
         address_rebasing: false,
         preserve_names: false,
         custom_sections: meld_core::CustomSectionHandling::Drop,
@@ -228,6 +229,7 @@ fn test_fused_output_validates() {
         let config = FuserConfig {
             memory_strategy: MemoryStrategy::MultiMemory,
             attestation: false,
+            component_provenance: false,
             address_rebasing: false,
             preserve_names: false,
             custom_sections: meld_core::CustomSectionHandling::Drop,
@@ -321,6 +323,7 @@ fn test_p1_adapter_detection_with_instances() {
         let config = FuserConfig {
             memory_strategy: MemoryStrategy::MultiMemory,
             attestation: false,
+            component_provenance: false,
             address_rebasing: false,
             preserve_names: false,
             custom_sections: meld_core::CustomSectionHandling::Drop,
@@ -402,6 +405,7 @@ fn test_reasonable_memory_count() {
         let config = FuserConfig {
             memory_strategy: MemoryStrategy::MultiMemory,
             attestation: false,
+            component_provenance: false,
             address_rebasing: false,
             preserve_names: false,
             custom_sections: meld_core::CustomSectionHandling::Drop,
@@ -489,6 +493,7 @@ fn test_write_fused_output_for_runtime() {
         let config = FuserConfig {
             memory_strategy: MemoryStrategy::MultiMemory,
             attestation: false,
+            component_provenance: false,
             address_rebasing: false,
             preserve_names: true,
             custom_sections: meld_core::CustomSectionHandling::Drop,
@@ -555,6 +560,7 @@ fn test_no_duplicate_imports() {
         let config = FuserConfig {
             memory_strategy: MemoryStrategy::MultiMemory,
             attestation: false,
+            component_provenance: false,
             address_rebasing: false,
             preserve_names: false,
             custom_sections: meld_core::CustomSectionHandling::Drop,
@@ -640,6 +646,7 @@ fn test_adapter_generation_for_release_components() {
         let config = FuserConfig {
             memory_strategy: MemoryStrategy::MultiMemory,
             attestation: false,
+            component_provenance: false,
             address_rebasing: false,
             preserve_names: false,
             custom_sections: meld_core::CustomSectionHandling::Drop,
@@ -708,6 +715,7 @@ fn test_adapter_call_site_wiring() {
         let config = FuserConfig {
             memory_strategy: MemoryStrategy::MultiMemory,
             attestation: false,
+            component_provenance: false,
             address_rebasing: false,
             preserve_names: false,
             custom_sections: meld_core::CustomSectionHandling::Drop,
@@ -860,6 +868,7 @@ fn test_no_stale_resource_drop_versions() {
         let config = FuserConfig {
             memory_strategy: MemoryStrategy::MultiMemory,
             attestation: false,
+            component_provenance: false,
             address_rebasing: false,
             preserve_names: false,
             custom_sections: meld_core::CustomSectionHandling::Drop,
@@ -945,6 +954,7 @@ fn test_component_wrap_validates() {
         let config = FuserConfig {
             memory_strategy: MemoryStrategy::MultiMemory,
             attestation: false,
+            component_provenance: false,
             address_rebasing: false,
             preserve_names: false,
             custom_sections: meld_core::CustomSectionHandling::Drop,

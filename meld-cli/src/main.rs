@@ -71,6 +71,15 @@ enum Commands {
         #[arg(long)]
         no_attestation: bool,
 
+        /// Disable the `component-provenance` custom section (#192).
+        /// The section maps each fused-module function index back to
+        /// its originating component + function index; downstream
+        /// consumers (pulseengine/scry) use it to project
+        /// Component-Model invariants onto fused-module locations.
+        /// Section overhead is ~120 bytes per fused function.
+        #[arg(long)]
+        no_component_provenance: bool,
+
         /// Preserve debug names in output
         #[arg(long)]
         preserve_names: bool,
@@ -138,6 +147,7 @@ fn main() -> Result<()> {
             address_rebase,
             stats,
             no_attestation,
+            no_component_provenance,
             preserve_names,
             validate,
             component,
@@ -151,6 +161,7 @@ fn main() -> Result<()> {
                 address_rebase,
                 stats,
                 no_attestation,
+                no_component_provenance,
                 preserve_names,
                 validate,
                 component,
@@ -206,6 +217,7 @@ fn fuse_command(
     address_rebase: bool,
     show_stats: bool,
     no_attestation: bool,
+    no_component_provenance: bool,
     preserve_names: bool,
     validate: bool,
     component: bool,
@@ -280,6 +292,7 @@ fn fuse_command(
     let config = FuserConfig {
         memory_strategy,
         attestation: !no_attestation,
+        component_provenance: !no_component_provenance,
         address_rebasing: address_rebase,
         preserve_names,
         output_format,
