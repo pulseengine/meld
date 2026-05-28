@@ -2478,8 +2478,33 @@ loss-scenarios:
       instantiation order. The component model spec allows multiple
       instantiations of the same module (with different import wiring),
       but the merger's index-space merging model does not account for this.
-    status: open
+    status: fixed
     priority: critical
+    fix: >
+      Mitigated by detection-and-reject, the same pattern used for
+      LS-P-11 (DuplicateModuleExport). `Merger::check_no_duplicate_instantiations`
+      (`meld-core/src/merger.rs`) walks every component's instances
+      and returns `Error::DuplicateModuleInstantiation { component_idx,
+      module_idx }` the moment a `module_idx` reappears in the
+      instantiate set; it is invoked unconditionally at the top of the
+      merge pipeline (merger.rs ~909) before any index-space merging
+      runs, so the corrupt-output path is unreachable. The resolver
+      has an independent guard at resolver.rs ~2222 for the
+      instance-graph path. The silent-corruption hazard [H-1, H-2, H-3]
+      is therefore eliminated: a multiply-instantiated module produces
+      a loud build-time error, never a mis-merged module. Confirmed by
+      `meld-core::merger::tests::ls_m_5_multiply_instantiated_module_rejected`
+      (gate-convention regression test), plus the pre-existing
+      `test_duplicate_module_instantiation_rejected`,
+      `test_single_instantiation_accepted`, `test_no_instances_accepted`
+      (merger) and `test_multiply_instantiated_module_rejected`
+      (resolver). NOTE: this *rejects* multiply-instantiated modules
+      rather than *supporting* them. Full per-instance index-space
+      support (so a shared utility module instantiated twice fuses
+      correctly with two independent function/memory/table spaces)
+      remains a forward feature on the backlog — it is a large merger
+      refactor and is NOT required to close this safety hazard, since
+      rejection already prevents the unsafe output.
 
   - id: LS-M-6
     title: component-provenance section mis-attributes fused functions

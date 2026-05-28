@@ -4,6 +4,23 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+
+- **LS-M-5 status corrected to `fixed`** (`safety/stpa/loss-scenarios.yaml`,
+  `meld-core/src/merger.rs`). The multiply-instantiated-module
+  silent-corruption hazard was already mitigated by detection-and-
+  reject (`Merger::check_no_duplicate_instantiations`, invoked
+  unconditionally at the top of the merge pipeline, plus an
+  independent resolver-side guard), but the loss-scenario entry
+  still read `status: open`. Clean-room verification confirmed the
+  corrupt-output path is unreachable. Added the gate-convention
+  regression test `ls_m_5_multiply_instantiated_module_rejected`
+  and flipped the entry to `fixed` with a `fix:` block. NOTE: this
+  documents the *rejection* mitigation; full per-instance index-
+  space *support* (fusing a module instantiated twice into two
+  independent function/memory/table spaces) remains a backlog
+  forward feature and is not required to close the hazard.
+
 ## [0.15.0] - 2026-05-28
 
 ### Added
