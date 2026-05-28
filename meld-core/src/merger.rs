@@ -4649,6 +4649,46 @@ mod tests {
         }
     }
 
+    /// LS-M-5 gate-convention regression: a component that
+    /// instantiates the same core module twice must be rejected at
+    /// merge time with `DuplicateModuleInstantiation`, never silently
+    /// mis-merged. This pins the detection-and-reject mitigation that
+    /// closes the LS-M-5 silent-corruption hazard. (Named to satisfy
+    /// the LS-N verification gate's `ls_<letter>_<num>_*` convention;
+    /// `test_duplicate_module_instantiation_rejected` below predates
+    /// the convention and is kept as-is.)
+    #[test]
+    fn ls_m_5_multiply_instantiated_module_rejected() {
+        let comp = make_component_with_instances(vec![
+            crate::parser::ComponentInstance {
+                index: 0,
+                kind: crate::parser::InstanceKind::Instantiate {
+                    module_idx: 2,
+                    args: vec![],
+                },
+            },
+            crate::parser::ComponentInstance {
+                index: 1,
+                kind: crate::parser::InstanceKind::Instantiate {
+                    module_idx: 2, // same module instantiated again
+                    args: vec![],
+                },
+            },
+        ]);
+        let err = Merger::check_no_duplicate_instantiations(&[comp])
+            .expect_err("multiply-instantiated module must be rejected");
+        match err {
+            Error::DuplicateModuleInstantiation {
+                component_idx,
+                module_idx,
+            } => {
+                assert_eq!(component_idx, 0);
+                assert_eq!(module_idx, 2);
+            }
+            other => panic!("expected DuplicateModuleInstantiation, got {other:?}"),
+        }
+    }
+
     #[test]
     fn test_duplicate_module_instantiation_rejected() {
         let comp = make_component_with_instances(vec![
