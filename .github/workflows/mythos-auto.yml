@@ -112,6 +112,7 @@ jobs:
             "meld-core/src/component_wrap.rs"
             "meld-core/src/p3_async.rs"
             "meld-core/src/p3_stream.rs"
+            "meld-core/src/provenance.rs"
             "meld-core/src/adapter/"
             "meld-core/src/resource_graph.rs"
             "meld-core/src/segments.rs"
