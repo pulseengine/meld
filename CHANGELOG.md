@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.15.0] - 2026-05-28
+
 ### Added
 
 - **LS-R-11 layer-2 per-edge precise stream type-mismatch**
@@ -25,6 +27,17 @@ All notable changes to this project will be documented in this file.
   4 new regression tests pin the new behavior. Layer-1 only fires
   for connections not precisely checked, so the v0.13.0 heuristic
   stays in place as a safety net.
+
+### Changed
+
+- **`provenance.rs` registered as Tier-5** in
+  `.github/workflows/mythos-auto.yml` (#197). Future changes to the
+  component-provenance section emitter now get the AI-driven Mythos
+  delta-pass scan on PR. Shipped as a standalone PR because the
+  `anthropics/claude-code-action` requires the workflow file to be
+  byte-identical to main for PR runs — bundling the registry edit
+  with a Tier-5 source change would break the action's auth flow on
+  that PR.
 
 ## [0.14.0] - 2026-05-27
 
