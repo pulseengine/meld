@@ -4,6 +4,28 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **`component-provenance` section v2: per-function code-byte ranges**
+  (#143 DWARF Phase 2 increment 1, LS-M-6, `meld-core/src/provenance.rs`).
+  Each entry gains an optional `code_range { start, end }` giving the
+  function body's byte span in the fused code section, rebased to the
+  code-section content start (the WebAssembly-DWARF address
+  convention). This is the anchor for DWARF address remapping. New
+  `provenance::code_section_function_ranges` re-parses the output code
+  section and index-aligns bodies with `merged.functions`. The bump
+  to `VERSION = 2` is **additive**: `code_range` is
+  `#[serde(default, skip_serializing_if = "Option::is_none")]`, so v1
+  consumers that check `version` first still parse the entries and v1-
+  shaped payloads (no `code_range` key) round-trip unchanged. 5 new
+  unit tests + 1 integration test pin range ordering, non-overlap,
+  the no-code-section path, the rebasing cross-check, and v1/v2
+  backward-compat. **Scope**: this delivers accurate *current* byte
+  spans; DWARF `.debug_line` remapping inside rewritten functions
+  (meld's rewriter shifts intra-function offsets via LEB128 operand-
+  length changes) is deferred to #143 increment 2 (rewriter
+  instruction-offset map) + increment 3 (gimli DWARF rewrite).
+
 ### Changed
 
 - **LS-M-5 status corrected to `fixed`** (`safety/stpa/loss-scenarios.yaml`,
