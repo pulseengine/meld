@@ -4,6 +4,31 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **Rewriter instruction-level offset map** (#143 DWARF Phase 2
+  increment 2, `meld-core/src/rewriter.rs`). New
+  `rewrite_function_body_with_offsets` returns, alongside the
+  rewritten `Function`, an `InstrOffsetMap` recording each input
+  operator's `(old, new)` byte offset at instruction boundaries
+  (relative to the function body's instruction stream). This is the
+  second anchor DWARF address remapping needs: meld's rewriter
+  changes operand values (function/global/etc. indices) whose LEB128
+  encodings shift length, so intra-function byte offsets drift —
+  `.debug_line` programs can't be remapped by function-base relocation
+  alone. The map is collected by measuring each emitted instruction's
+  encoded length (identical to what `Function::instruction` appends,
+  via `wasm_encoder::Encode`); it is **opt-in** — the plain
+  `rewrite_function_body` path pays zero cost and emits byte-identical
+  code (pinned by `with_offsets_emits_identical_function_bytes`).
+  `InstrOffsetMap::translate` resolves an old instruction-stream
+  offset to its new offset. 4 new tests pin LEB-growth accumulation
+  (`call 0`→`call 200` diverges +1 per call), the identity case (no
+  LEB change ⇒ `new == old`), translate hit/miss, and output-byte
+  equivalence. Increment 3 (gimli `.debug_line`/`.debug_info` rewrite)
+  composes this intra-function map with the per-function base from the
+  v0.16.0 component-provenance v2 `code_range`.
+
 ## [0.16.0] - 2026-05-28
 
 ### Added
