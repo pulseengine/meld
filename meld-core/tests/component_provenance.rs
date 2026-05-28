@@ -153,6 +153,46 @@ fn component_provenance_round_trips() {
 }
 
 #[test]
+fn v2_code_ranges_are_populated_ordered_and_nonoverlapping() {
+    // DWARF Phase 2 increment 1: every entry should carry a
+    // `code_range`, the spans should be ordered by fused_func_idx and
+    // non-overlapping (function bodies are laid out sequentially in
+    // the code section). This is the anchor downstream DWARF
+    // remapping (increment 3) builds on, so the contract is pinned
+    // end-to-end against a real fused module.
+    if !fixture_available() {
+        return;
+    }
+    let bytes = std::fs::read(FIXTURE).expect("read fixture");
+    let fused = fuse_default(&bytes, "auth");
+
+    let payloads = read_custom_sections(&fused, SECTION_NAME);
+    let payload = payloads.first().expect("section present");
+    let prov = ComponentProvenance::from_bytes(payload).expect("decode JSON");
+
+    // Entries are emitted in defined-function order; sort by
+    // fused_func_idx to be robust, then check each range is valid and
+    // the sequence is non-overlapping.
+    let mut entries = prov.entries.clone();
+    entries.sort_by_key(|e| e.fused_func_idx);
+
+    let mut prev_end: Option<u32> = None;
+    for e in &entries {
+        let r = e
+            .code_range
+            .unwrap_or_else(|| panic!("v2 entry missing code_range: {e:?}"));
+        assert!(r.start < r.end, "empty/inverted code_range: {e:?}");
+        if let Some(pe) = prev_end {
+            assert!(
+                pe <= r.start,
+                "code ranges overlap or go backwards: prev_end={pe}, entry={e:?}"
+            );
+        }
+        prev_end = Some(r.end);
+    }
+}
+
+#[test]
 fn every_entry_has_a_valid_back_pointer() {
     if !fixture_available() {
         return;

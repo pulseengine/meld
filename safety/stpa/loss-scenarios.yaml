@@ -2567,3 +2567,31 @@ loss-scenarios:
       verification recipe). Plus 5 unit tests pin the JSON
       round-trip, version-field stability, and SHA-256 helper
       canonical value.
+      ###
+      ### v2 (DWARF Phase 2 increment 1, #143)
+      ###
+      The section gained an optional `code_range { start, end }` per
+      entry — the function body's byte span in the fused code
+      section (code-section-relative, the WebAssembly-DWARF address
+      convention). This is a new mis-attribution surface: a wrong
+      `code_range` would point DWARF address remapping (and any scry
+      invariant keyed to it) at the wrong bytes. The range is derived
+      by `provenance::code_section_function_ranges` re-parsing the
+      output code section and index-aligning bodies with
+      `merged.functions` (meld emits merged functions before adapter
+      trampolines, so position `i` maps to `merged.functions[i]`).
+      Pinned by `provenance::tests::code_section_ranges_*` (ordering,
+      non-overlap, empty-when-no-code-section, and an independent
+      rebasing cross-check) plus the integration test
+      `component_provenance::v2_code_ranges_are_populated_ordered_and_nonoverlapping`
+      against a real fused fixture. v1→v2 is additive: `code_range`
+      is `#[serde(default, skip_serializing_if)]` so v1-shaped
+      entries round-trip unchanged
+      (`v1_shaped_entry_deserializes_with_none_code_range`,
+      `code_range_omitted_from_json_when_none`). Residual: the byte
+      ranges are accurate for the *current* fused output, but DWARF
+      line-table remapping inside rewritten function bodies (where
+      meld's rewriter shifts intra-function offsets via LEB128
+      operand-length changes) is NOT yet handled — that needs the
+      rewriter instruction-offset map (#143 increment 2) and the
+      gimli DWARF rewrite (increment 3).
