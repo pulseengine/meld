@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.17.0] - 2026-05-28
+
 ### Added
 
 - **Rewriter instruction-level offset map** (#143 DWARF Phase 2
