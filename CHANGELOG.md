@@ -4,6 +4,46 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.19.0] - 2026-05-29
+
+### Added
+
+- **`DwarfHandling::Remap` — end-to-end DWARF address remapping**
+  (#143 DWARF Phase 2 increment 3b, `meld-core/src/dwarf.rs`). The
+  final piece of DWARF Phase 2: reads an input core module's `.debug_*`
+  sections, translates every code address to the fused code section via
+  the `AddressRemap` engine (v0.18.0), and re-serializes a single
+  remapped DWARF set with `gimli::write::Dwarf::from`. New `gimli`
+  dependency. Exposed via `meld fuse --dwarf remap` (modes: `strip`
+  (default), `passthrough`, `remap`).
+  - The per-function instruction offset map is recovered **post-hoc**
+    by walking the input and final-output operator streams in lockstep
+    — no state threaded through the merge hot path, and it reflects
+    whatever rewriting actually happened (including the adapter-wiring
+    re-rewrite). A per-function operator-count or locals-prefix mismatch
+    aborts the remap (correct-or-strip).
+  - **Correct-or-strip throughout.** `gimli::write::Dwarf::from` is
+    all-or-nothing on addresses, which is used as the safety gate: only
+    the structurally-invariant code-section base (address 0) is
+    special-cased; any other unmapped address fails the conversion and
+    falls back to stripping rather than emitting a wrong address.
+  - **Single DWARF source** is supported in this increment. Inputs
+    where more than one core module carries DWARF fall back to `strip`
+    with a warning (merging independent DWARF unit sets is deferred);
+    zero DWARF sources is a no-op.
+  - Encoding uses a three-pass dance so the remapped `.debug_*` land in
+    the attestation/provenance-hashed bytes (trailing custom sections
+    don't shift code offsets, so the remap built from pass A is valid
+    for the final output).
+  - New loss scenario **LS-D-1** (wrong remapped DWARF address →
+    de-grounded downstream coverage/breakpoints) is `approved`, gated by
+    `dwarf::tests::ls_d_1_remap_translates_low_pc` (full gimli
+    read→convert→write→read oracle). **Residual:** `DW_AT_high_pc`
+    encoded as a *length* is copied verbatim, so a function's reported
+    byte length may be off by intra-function LEB drift; `low_pc` and the
+    line-number program (what debuggers and `pulseengine/witness` use)
+    are correct.
+
 ## [0.18.0] - 2026-05-29
 
 ### Added

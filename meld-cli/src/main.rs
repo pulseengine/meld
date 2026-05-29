@@ -18,7 +18,7 @@
 
 use anyhow::{Context, Result, anyhow};
 use clap::{Parser, Subcommand};
-use meld_core::{Fuser, FuserConfig, FusionStats, MemoryStrategy, OutputFormat};
+use meld_core::{DwarfHandling, Fuser, FuserConfig, FusionStats, MemoryStrategy, OutputFormat};
 use std::fs;
 use std::path::Path;
 use std::time::Instant;
@@ -79,6 +79,15 @@ enum Commands {
         /// Section overhead is ~120 bytes per fused function.
         #[arg(long)]
         no_component_provenance: bool,
+
+        /// DWARF debug-info handling: `strip` (default — drop all
+        /// `.debug_*`), `passthrough` (copy verbatim; addresses are
+        /// wrong against the fused code section), or `remap` (#143 —
+        /// translate code addresses to the fused code section). `remap`
+        /// currently supports a single DWARF-bearing input module and
+        /// falls back to `strip` for multi-source inputs.
+        #[arg(long, value_name = "MODE", default_value = "strip")]
+        dwarf: String,
 
         /// Preserve debug names in output
         #[arg(long)]
@@ -148,6 +157,7 @@ fn main() -> Result<()> {
             stats,
             no_attestation,
             no_component_provenance,
+            dwarf,
             preserve_names,
             validate,
             component,
@@ -162,6 +172,7 @@ fn main() -> Result<()> {
                 stats,
                 no_attestation,
                 no_component_provenance,
+                dwarf,
                 preserve_names,
                 validate,
                 component,
@@ -218,6 +229,7 @@ fn fuse_command(
     show_stats: bool,
     no_attestation: bool,
     no_component_provenance: bool,
+    dwarf: String,
     preserve_names: bool,
     validate: bool,
     component: bool,
@@ -289,6 +301,18 @@ fn fuse_command(
         }
     }
 
+    let dwarf_handling = match dwarf.as_str() {
+        "strip" => DwarfHandling::Strip,
+        "passthrough" => DwarfHandling::PassThrough,
+        "remap" => DwarfHandling::Remap,
+        other => {
+            return Err(anyhow!(
+                "Invalid --dwarf mode: {}. Use 'strip', 'passthrough', or 'remap'",
+                other
+            ));
+        }
+    };
+
     let config = FuserConfig {
         memory_strategy,
         attestation: !no_attestation,
@@ -297,6 +321,7 @@ fn fuse_command(
         preserve_names,
         output_format,
         opaque_resources,
+        dwarf_handling,
         ..Default::default()
     };
 

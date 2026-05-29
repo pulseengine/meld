@@ -2595,3 +2595,83 @@ loss-scenarios:
       operand-length changes) is NOT yet handled — that needs the
       rewriter instruction-offset map (#143 increment 2) and the
       gimli DWARF rewrite (increment 3).
+
+  - id: LS-D-1
+    title: remapped DWARF emits a wrong code address for a fused function
+    uca: UCA-M-9
+    hazards: [H-1]
+    type: inadequate-control-algorithm
+    scenario: >
+      `DwarfHandling::Remap` (#143 Phase 2 increment 3b) reads an input
+      core module's `.debug_*` sections and rewrites every code address
+      to the fused code section via `dwarf::AddressRemap`, then emits a
+      single remapped DWARF set with `gimli::write::Dwarf::from`. If the
+      remap returns a *wrong* output address for any
+      `DW_AT_low_pc`/line-program/range address — rather than failing —
+      the fused module ships DWARF that resolves an instruction to the
+      wrong source line. A downstream consumer (`pulseengine/witness`
+      MC/DC mapping, or a debugger) then attributes coverage/breakpoints
+      to the wrong source location, silently de-grounding any
+      witness/sigil-attested decision keyed to that line [H-1]. As with
+      LS-M-6 the hazard is invisible at runtime: the fused module still
+      executes correctly; only the debug paper-trail lies.
+    causal-factors:
+      - >-
+        The remap reconciles three offset spaces (input code-section
+        address, instruction-stream offset, output code-section
+        address). A base-alignment error — e.g. forgetting that the
+        locals prefix cancels, or mis-deriving a function's input span
+        — would shift every translated address within that function.
+      - >-
+        The instruction offset map is recovered by walking the input
+        and final-output operator streams in lockstep, assuming a 1:1
+        operator correspondence. If the rewriter ever *inserts*
+        instructions (memory address-rebasing scratch ops) the streams
+        desynchronise and a naive zip would pair the wrong operators.
+      - >-
+        `gimli::write::Dwarf::from` is all-or-nothing: a `convert_address`
+        that returns a plausible-but-wrong `Some(addr)` for an unmapped
+        address (instead of `None`) would bake a wrong address into the
+        output rather than aborting.
+    process-model-flaw: >
+      The tempting model is "translate what you can, drop the rest."
+      But gimli cannot drop a single address — any unmapped address
+      fails the whole conversion. The safe model is therefore
+      correct-or-strip: every real instruction address must map
+      exactly, the only special-cased address is the code-section base
+      0 (structurally invariant), and any other miss aborts the
+      conversion so the caller strips DWARF rather than emit a wrong
+      address.
+    status: approved
+    priority: high
+    fix: >
+      Defense-in-depth, correct-or-strip:
+      (1) The operator-stream walk aborts the remap (returns `None` →
+      caller strips) on any per-function operator-count or
+      locals-prefix mismatch, so an inserted-instruction rewrite can
+      never produce a misaligned map
+      (`dwarf::tests::build_remap_from_parts_aborts_on_operator_count_mismatch`).
+      (2) `convert_address` maps only address 0 (code-section base) to
+      itself and routes everything else through the instruction-accurate
+      remap; an unmapped real address returns `None`, which fails
+      `gimli::write::Dwarf::from` and triggers the strip fallback —
+      never a wrong address.
+      (3) Multi-DWARF-source inputs (where merging independent unit sets
+      is not yet supported) fall back to strip with a warning rather
+      than emitting one source's addresses against the merged code
+      section
+      (`tests::dwarf_passthrough::remap_policy_falls_back_to_strip_on_multi_dwarf_source`).
+      The address-translation correctness oracle is
+      `meld-core::dwarf::tests::ls_d_1_remap_translates_low_pc`: it
+      builds real input DWARF with gimli, remaps a subprogram's
+      `low_pc`, then re-parses the *output* DWARF and asserts the
+      address was actually translated (full read→convert→write→read
+      round-trip). The remap math itself is pinned by the six
+      `dwarf::tests::translate_*` unit tests (increment 3a).
+      Residual: `DW_AT_high_pc` encoded as a *length* (`DW_FORM_data*`,
+      the common Rust/LLVM encoding) is copied verbatim — gimli treats
+      it as a constant, not an address — so the function's reported
+      byte *length* may be off by the intra-function LEB drift. The
+      start address (`low_pc`) and line-number program — what debuggers
+      and witness actually use — are correct. Eliminating the high_pc
+      length drift is deferred to a later increment.
