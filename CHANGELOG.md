@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.18.0] - 2026-05-29
+
 ### Added
 
 - **DWARF `AddressRemap` engine** (#143 DWARF Phase 2 increment 3a,
