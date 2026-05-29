@@ -4,6 +4,28 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **DWARF `AddressRemap` engine** (#143 DWARF Phase 2 increment 3a,
+  `meld-core/src/dwarf.rs`). Composes the two anchors released in
+  v0.16.0 (per-function base via component-provenance v2 `code_range`)
+  and v0.17.0 (intra-function `InstrOffsetMap`) into a single
+  input→output code-address translation: `AddressRemap::translate`
+  takes an input code-section-relative DWARF address and returns the
+  fused-output address, or `None` when the address is outside any
+  function or off an instruction boundary (the signal for the gimli
+  converter to drop it rather than emit a wrong address). The module
+  carefully reconciles the three byte-offset spaces — input DWARF
+  address, instruction-stream offset, output DWARF address —
+  accounting for the shared locals-prefix length that cancels between
+  input and output. 6 unit tests pin identity mapping, instruction-
+  offset shift (LEB growth), locals-prefix handling, multi-function
+  selection, and the miss cases (outside functions, mid-instruction,
+  inside-locals-prefix underflow). This is the mathematical core of
+  DWARF Phase 2; increment 3b wires it into a `gimli`-driven
+  `write::Dwarf::from(convert_address)` rewrite of the `.debug_*`
+  sections behind a new `DwarfHandling::Remap` mode.
+
 ## [0.17.0] - 2026-05-28
 
 ### Added

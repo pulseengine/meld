@@ -44,6 +44,7 @@
 pub mod adapter;
 pub mod attestation;
 pub mod component_wrap;
+pub mod dwarf;
 mod error;
 pub mod merger;
 pub mod p3_async;
