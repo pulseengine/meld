@@ -2675,3 +2675,39 @@ loss-scenarios:
       start address (`low_pc`) and line-number program — what debuggers
       and witness actually use — are correct. Eliminating the high_pc
       length drift is deferred to a later increment.
+      ###
+      ### v0.20.0 — real-DWARF hardening + per-address tombstoning (#130)
+      ###
+      Falsifying the inc-3b remap against a real Rust fixture
+      (`tests/dwarf_remap_witness.rs`) surfaced four address classes the
+      synthetic oracle missed, each now handled in
+      `AddressRemap::translate` / the `convert_address` closure:
+      (1) WebAssembly DWARF `low_pc` is the function **body start** (the
+      locals-declaration byte), not the first instruction — the
+      locals/prefix region now maps linearly (locals are preserved
+      verbatim); (2) exclusive-end addresses (`high_pc`-as-address, range
+      end, line `end_sequence`) map to the output body end; (3) LLVM
+      emits fixed-width **zero-padded LEBs** for relocatable indices, so
+      DWARF rows can land *inside* an operator's operand bytes — these
+      resolve to the **containing** operator (exact on boundaries),
+      attributing the address to the right instruction; (4) linear-memory
+      / data addresses (`DW_OP_addr`) at or beyond the code extent pass
+      through unchanged (correct under multi-memory fusion).
+      Crucially, `gimli::write::Dwarf::from` is **all-or-nothing**: one
+      unmappable address aborts the whole conversion. On real modules
+      (hundreds of functions, dead-code gaps) that made the strict
+      correct-or-strip gate strip *everything*. The gate is now
+      **per-address**: `convert_address` is total — it returns the
+      correct fused offset where mappable, an identity for data/existing
+      tombstones, and the DWARF tombstone `0xFFFF_FFFF` for unmappable
+      code addresses (functions meld dropped). Consumers already ignore
+      `0xFFFF_FFFF`, so the guarantee strengthens from "all-or-nothing"
+      to *"every emitted address is correct or an ignored tombstone —
+      never a plausible-but-wrong address."* Validated end-to-end by
+      `dwarf_remap_witness::remapped_subprogram_low_pcs_match_fused_body_starts`:
+      it fuses a real Rust component with `--dwarf remap`, then asserts
+      every non-tombstone `DW_TAG_subprogram` `low_pc` in the output
+      DWARF equals some fused function's component-provenance
+      `code_range.start` (the cross-repo `pulseengine/witness` contract,
+      checked in-tree). On the fixture, all but 9 of 225 functions map
+      exactly; the 9 are dead code, tombstoned.
