@@ -203,6 +203,17 @@ pub enum DwarfHandling {
     /// offsets and will be wrong against the merged code section.
     /// Use only if the consumer can tolerate or detect that.
     PassThrough,
+
+    /// Remap DWARF code addresses to the fused code section (#143).
+    ///
+    /// Reads the input `.debug_*` sections, translates every code
+    /// address through an [`crate::dwarf::AddressRemap`] built from the
+    /// actual input→output instruction layout, and emits a single
+    /// rewritten DWARF set. Currently supports the case where exactly
+    /// one input core module carries DWARF; with zero or more than one
+    /// DWARF source — or if any address fails to map — it falls back to
+    /// [`DwarfHandling::Strip`] (never emitting a wrong address).
+    Remap,
 }
 
 /// Statistics about the fusion process
@@ -431,7 +442,33 @@ impl Fuser {
         // to the bytes-without-extras, so consumers strip both
         // sections before verifying.
         log::info!("Encoding fused module");
-        let output_without_extras = self.encode_output(&merged, &adapters, &[])?;
+        // Pass A: encode without DWARF and without meld-extras. Its
+        // code-section offsets are what the DWARF remap targets (trailing
+        // custom sections do not shift code offsets, so the same offsets
+        // hold in passes B and C).
+        let bytes_for_remap = self.encode_output(&merged, &adapters, &[], &[])?;
+
+        // Build the remapped `.debug_*` sections (only under Remap; a
+        // miss or unsupported shape returns no sections → DWARF stripped).
+        let dwarf_sections: Vec<(String, Vec<u8>)> = if self.config.dwarf_handling
+            == DwarfHandling::Remap
+        {
+            dwarf::remap_for_output(&self.components, &merged, &bytes_for_remap).unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+
+        // Pass B: re-encode with the remapped DWARF embedded. These are
+        // the bytes the attestation/provenance hashes cover.
+        let output_without_extras = if dwarf_sections.is_empty() {
+            bytes_for_remap
+        } else {
+            log::info!(
+                "Embedding {} remapped DWARF section(s)",
+                dwarf_sections.len()
+            );
+            self.encode_output(&merged, &adapters, &[], &dwarf_sections)?
+        };
 
         let mut extra_sections: Vec<(&str, Vec<u8>)> = Vec::new();
 
@@ -454,7 +491,7 @@ impl Fuser {
         let output = if extra_sections.is_empty() {
             output_without_extras
         } else {
-            self.encode_output(&merged, &adapters, &extra_sections)?
+            self.encode_output(&merged, &adapters, &extra_sections, &dwarf_sections)?
         };
 
         // Optionally wrap the fused core module as a P2 component
@@ -1295,6 +1332,7 @@ impl Fuser {
         merged: &MergedModule,
         adapters: &[adapter::AdapterFunction],
         extra_custom_sections: &[(&str, Vec<u8>)],
+        dwarf_sections: &[(String, Vec<u8>)],
     ) -> Result<Vec<u8>> {
         let mut module = EncodedModule::new();
 
@@ -1422,7 +1460,11 @@ impl Fuser {
                 if !self.config.preserve_names && name == "name" {
                     continue;
                 }
-                if self.config.dwarf_handling == DwarfHandling::Strip && name.starts_with(".debug_")
+                // Only PassThrough emits raw per-input `.debug_*`
+                // sections. Strip drops them; Remap drops them here and
+                // emits a single remapped set below.
+                if self.config.dwarf_handling != DwarfHandling::PassThrough
+                    && name.starts_with(".debug_")
                 {
                     continue;
                 }
@@ -1431,6 +1473,19 @@ impl Fuser {
                     data: std::borrow::Cow::Borrowed(contents),
                 });
             }
+        }
+
+        // Remapped DWARF (DwarfHandling::Remap): a single `.debug_*` set
+        // whose code addresses target the fused code section, replacing
+        // the per-input sections skipped above. Emitted before the
+        // meld-metadata extras so they sit at a stable byte offset
+        // across the encode passes (the attestation/provenance hash
+        // covers these bytes; the extras are stripped before verifying).
+        for (name, contents) in dwarf_sections {
+            module.section(&wasm_encoder::CustomSection {
+                name: std::borrow::Cow::Borrowed(name),
+                data: std::borrow::Cow::Borrowed(contents),
+            });
         }
 
         for (name, contents) in extra_custom_sections {
@@ -1639,6 +1694,7 @@ impl Fuser {
         match self.config.dwarf_handling {
             DwarfHandling::Strip => "strip",
             DwarfHandling::PassThrough => "passthrough",
+            DwarfHandling::Remap => "remap",
         }
     }
 

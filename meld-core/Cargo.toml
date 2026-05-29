@@ -18,6 +18,9 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }
 wasmparser.workspace = true
 wasm-encoder.workspace = true
 
+# DWARF read/write for address remapping (#143 Phase 2 — DwarfHandling::Remap)
+gimli.workspace = true
+
 # Error handling
 anyhow.workspace = true
 thiserror.workspace = true

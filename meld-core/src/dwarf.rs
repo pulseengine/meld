@@ -50,7 +50,7 @@
 //! and output. So the prefix cancels when both are equal, and the
 //! [`FunctionSpan`] records it once as `locals_prefix_len`.
 
-use crate::rewriter::InstrOffsetMap;
+use crate::rewriter::{InstrOffset, InstrOffsetMap};
 use std::collections::BTreeMap;
 
 /// One fused function's mapping data: where it was in the input code
@@ -146,6 +146,296 @@ impl AddressRemap {
 
     pub fn is_empty(&self) -> bool {
         self.by_input_start.is_empty()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Increment 3b: build the remap from a real fusion and rewrite `.debug_*`.
+// ---------------------------------------------------------------------------
+
+/// Per-defined-function byte layout of one core module's code section,
+/// recovered by parsing. Used on both the input and the fused output so
+/// the two can be walked in lockstep to recover the instruction offset
+/// map without threading state through the merge hot path.
+struct FnLayout {
+    /// Function body start, code-section-relative (points at the
+    /// locals-count LEB — the same convention as
+    /// [`crate::provenance::CodeRange`]).
+    body_start: u32,
+    /// Function body end, code-section-relative (exclusive).
+    body_end: u32,
+    /// Bytes from `body_start` to the first operator (locals vector).
+    locals_prefix_len: u32,
+    /// Instruction-stream offset (0 at the first operator) of every
+    /// operator, in code order.
+    op_offsets: Vec<u32>,
+}
+
+/// Parse `module_bytes` and return the [`FnLayout`] of every *defined*
+/// function, in code-section order. Returns `None` on any parse error
+/// or if there is no code section — the caller then falls back to
+/// stripping DWARF rather than emitting a guessed address.
+fn module_function_layouts(module_bytes: &[u8]) -> Option<Vec<FnLayout>> {
+    use wasmparser::{Parser, Payload};
+    let mut content_start: Option<usize> = None;
+    let mut layouts = Vec::new();
+    for payload in Parser::new(0).parse_all(module_bytes) {
+        match payload.ok()? {
+            Payload::CodeSectionStart { range, .. } => content_start = Some(range.start),
+            Payload::CodeSectionEntry(body) => {
+                let base = content_start?;
+                let r = body.range();
+                let ops_reader = body.get_operators_reader().ok()?;
+                let first_op_pos = ops_reader.original_position();
+                let locals_prefix_len = (first_op_pos - r.start) as u32;
+                let mut op_offsets = Vec::new();
+                for item in ops_reader.into_iter_with_offsets() {
+                    let (_op, pos) = item.ok()?;
+                    op_offsets.push((pos - first_op_pos) as u32);
+                }
+                layouts.push(FnLayout {
+                    body_start: (r.start - base) as u32,
+                    body_end: (r.end - base) as u32,
+                    locals_prefix_len,
+                    op_offsets,
+                });
+            }
+            _ => {}
+        }
+    }
+    // No code section → cannot remap; signal the caller to strip.
+    content_start?;
+    Some(layouts)
+}
+
+/// Number of imported functions in a core module — the offset between a
+/// module-level function index and its defined-function index.
+fn import_func_count(module: &crate::parser::CoreModule) -> u32 {
+    module
+        .imports
+        .iter()
+        .filter(|i| matches!(i.kind, crate::parser::ImportKind::Function(_)))
+        .count() as u32
+}
+
+/// Build an [`AddressRemap`] for the single source core module
+/// `(comp_idx, mod_idx)`, pairing each of its defined functions with
+/// the corresponding fused-output function and zipping their
+/// instruction streams.
+///
+/// Returns `None` if any function's input/output layouts are
+/// inconsistent (different operator count or locals prefix — which
+/// happens when the rewriter inserted instructions, e.g. memory
+/// address-rebasing) or if parsing fails. A `None` is a hard "do not
+/// remap" signal: better to strip DWARF than emit a wrong address.
+fn build_remap_for_module(
+    module: &crate::parser::CoreModule,
+    merged: &crate::merger::MergedModule,
+    comp_idx: usize,
+    mod_idx: usize,
+    output_bytes: &[u8],
+) -> Option<AddressRemap> {
+    let imports = import_func_count(module);
+    // (output defined-function index, input module-level function index)
+    // for every fused function originating from this source module.
+    let pairs: Vec<(usize, u32)> = merged
+        .functions
+        .iter()
+        .enumerate()
+        .filter(|(_, mf)| mf.origin.0 == comp_idx && mf.origin.1 == mod_idx)
+        .map(|(out_idx, mf)| (out_idx, mf.origin.2))
+        .collect();
+    build_remap_from_parts(&module.bytes, imports, output_bytes, &pairs)
+}
+
+/// Testable core of [`build_remap_for_module`]: pair input and output
+/// function layouts and assemble the [`AddressRemap`]. `pairs` lists
+/// `(output_defined_idx, input_module_level_func_idx)` for the source
+/// module. Returns `None` on any layout inconsistency (operator-count
+/// or locals-prefix mismatch — meaning the rewriter inserted
+/// instructions, so addresses cannot be mapped 1:1) or if no function
+/// mapped.
+fn build_remap_from_parts(
+    input_bytes: &[u8],
+    imports: u32,
+    output_bytes: &[u8],
+    pairs: &[(usize, u32)],
+) -> Option<AddressRemap> {
+    let input_layouts = module_function_layouts(input_bytes)?;
+    let output_layouts = module_function_layouts(output_bytes)?;
+
+    let mut remap = AddressRemap::new();
+    for &(defined_out_idx, old_func_idx) in pairs {
+        // Module-level function index → input defined-function index.
+        let in_idx = old_func_idx.checked_sub(imports)? as usize;
+        let input = input_layouts.get(in_idx)?;
+        let output = output_layouts.get(defined_out_idx)?;
+
+        // Locals are preserved verbatim in the DWARF-remap path, so the
+        // prefix must be identical; an operator was inserted otherwise.
+        if input.locals_prefix_len != output.locals_prefix_len {
+            return None;
+        }
+        if input.op_offsets.len() != output.op_offsets.len() {
+            return None;
+        }
+
+        let entries = input
+            .op_offsets
+            .iter()
+            .zip(output.op_offsets.iter())
+            .map(|(&old, &new)| InstrOffset { old, new })
+            .collect();
+
+        remap.insert(FunctionSpan {
+            input_start: input.body_start,
+            input_end: input.body_end,
+            output_body_start: output.body_start,
+            locals_prefix_len: input.locals_prefix_len,
+            instr_offsets: InstrOffsetMap { entries },
+        });
+    }
+
+    if remap.is_empty() {
+        return None;
+    }
+    Some(remap)
+}
+
+/// Read the `.debug_*` sections in `debug` (a single source module's
+/// DWARF), remap every code address through `remap`, and re-serialize.
+/// Returns the rewritten `(section_name, bytes)` pairs, or `None` if
+/// gimli could not round-trip the DWARF (caller falls back to strip).
+///
+/// Wasm DWARF is little-endian and uses code-section-relative
+/// addresses, which is exactly what [`AddressRemap::translate`]
+/// consumes and produces.
+///
+/// **Fidelity note:** `DW_AT_high_pc` encoded as a *length*
+/// (`DW_FORM_data*`, the common Rust/LLVM encoding) is copied verbatim
+/// — gimli treats it as a constant, not an address, so it is not routed
+/// through `convert_address`. The function's start address (`low_pc`)
+/// and the line-number program — what debuggers use for breakpoints and
+/// backtraces — are remapped correctly; the high_pc *length* may be off
+/// by the intra-function LEB drift. This is tracked as LS-D-1.
+fn rewrite_debug_sections(
+    debug: &[(String, Vec<u8>)],
+    remap: &AddressRemap,
+) -> Option<Vec<(String, Vec<u8>)>> {
+    use gimli::write::{Address, Dwarf as WriteDwarf, EndianVec, Sections};
+    use gimli::{EndianSlice, LittleEndian, SectionId};
+
+    let endian = LittleEndian;
+    let section_data = |name: &str| -> &[u8] {
+        debug
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, d)| d.as_slice())
+            .unwrap_or(&[])
+    };
+
+    let load = |id: SectionId| -> Result<EndianSlice<'_, LittleEndian>, gimli::Error> {
+        Ok(EndianSlice::new(section_data(id.name()), endian))
+    };
+    let read_dwarf = gimli::Dwarf::load(load).ok()?;
+
+    // gimli's `Dwarf::from` is all-or-nothing: if `convert_address`
+    // returns `None` for *any* address it queries, the whole conversion
+    // fails. We exploit that as a correct-or-strip gate — a real
+    // instruction address that we cannot map aborts the conversion and
+    // the caller strips the DWARF rather than emit a wrong address.
+    //
+    // The one address that is *structurally invariant* and not a mapped
+    // instruction is `0`: wasm DWARF code addresses are relative to the
+    // start of the code-section contents, and the compilation unit's
+    // base (`DW_AT_low_pc` = 0) denotes that start, which is offset 0 in
+    // both the input and the fused output. Map it to itself; everything
+    // else must go through the instruction-accurate remap.
+    let convert_address = |addr: u64| -> Option<Address> {
+        if addr == 0 {
+            return Some(Address::Constant(0));
+        }
+        remap
+            .translate(addr as u32)
+            .map(|new| Address::Constant(new as u64))
+    };
+
+    let mut write_dwarf = WriteDwarf::from(&read_dwarf, &convert_address).ok()?;
+    let mut sections = Sections::new(EndianVec::new(endian));
+    write_dwarf.write(&mut sections).ok()?;
+
+    let mut out = Vec::new();
+    sections
+        .for_each(|id, data| {
+            let bytes = data.slice();
+            if !bytes.is_empty() {
+                out.push((id.name().to_string(), bytes.to_vec()));
+            }
+            Ok::<(), gimli::Error>(())
+        })
+        .ok()?;
+    Some(out)
+}
+
+/// Top-level entry point for [`crate::DwarfHandling::Remap`].
+///
+/// Inspects the input components for `.debug_*` sections and, when
+/// exactly one source core module carries DWARF, builds its
+/// [`AddressRemap`] and returns the rewritten debug sections to embed in
+/// the fused output. Returns `None` (caller strips DWARF) when:
+///
+/// - no input module carries DWARF, or
+/// - **more than one** module carries DWARF (merging independent DWARF
+///   unit sets into one consistent `.debug_info` is a separate problem,
+///   deferred to a later increment — emitting either source's addresses
+///   against the merged code section would be wrong for the other), or
+/// - the remap or gimli round-trip fails any consistency check.
+///
+/// `output_bytes` must be the fused module encoded *without* the
+/// remapped DWARF (its code-section offsets are what the remap targets;
+/// trailing custom sections do not shift code offsets, so the same
+/// offsets hold in the final output).
+pub fn remap_for_output(
+    components: &[crate::parser::ParsedComponent],
+    merged: &crate::merger::MergedModule,
+    output_bytes: &[u8],
+) -> Option<Vec<(String, Vec<u8>)>> {
+    // Find every (comp_idx, mod_idx) whose module carries DWARF.
+    let mut dwarf_sources: Vec<(usize, usize)> = Vec::new();
+    for (ci, comp) in components.iter().enumerate() {
+        for (mi, module) in comp.core_modules.iter().enumerate() {
+            if module
+                .custom_sections
+                .iter()
+                .any(|(name, _)| name.starts_with(".debug_"))
+            {
+                dwarf_sources.push((ci, mi));
+            }
+        }
+    }
+
+    match dwarf_sources.as_slice() {
+        [] => None,
+        [(ci, mi)] => {
+            let module = &components[*ci].core_modules[*mi];
+            let remap = build_remap_for_module(module, merged, *ci, *mi, output_bytes)?;
+            let debug: Vec<(String, Vec<u8>)> = module
+                .custom_sections
+                .iter()
+                .filter(|(name, _)| name.starts_with(".debug_"))
+                .cloned()
+                .collect();
+            rewrite_debug_sections(&debug, &remap)
+        }
+        many => {
+            log::warn!(
+                "DwarfHandling::Remap: {} source modules carry DWARF; merging \
+                 independent DWARF unit sets is not yet supported — stripping \
+                 debug info instead of emitting wrong addresses (#143)",
+                many.len()
+            );
+            None
+        }
     }
 }
 
@@ -262,5 +552,140 @@ mod tests {
         remap.insert(span(10, 30, 50, 5, &[(0, 0)]));
         // Input addr 12 = body_rel 2 < locals_prefix_len 5 → None.
         assert_eq!(remap.translate(12), None);
+    }
+
+    /// Oracle for inc 3b: build real input DWARF with gimli, remap a
+    /// subprogram's `low_pc` from 0x10 → 0x200 through
+    /// [`rewrite_debug_sections`], then re-parse the *output* DWARF and
+    /// assert the address was actually translated. This exercises the
+    /// full gimli read → `convert_address` → write → read round-trip —
+    /// the genuinely new, fidelity-risky code path.
+    #[test]
+    fn ls_d_1_remap_translates_low_pc() {
+        use gimli::write::{
+            Address, AttributeValue, Dwarf, EndianVec, LineProgram, Sections, Unit,
+        };
+        use gimli::{Encoding, Format, LittleEndian, constants};
+
+        // --- Build input DWARF: one unit, one subprogram @ low_pc 0x10.
+        let encoding = Encoding {
+            format: Format::Dwarf32,
+            version: 4,
+            address_size: 4,
+        };
+        let mut in_dwarf = Dwarf::new();
+        let unit_id = in_dwarf.units.add(Unit::new(encoding, LineProgram::none()));
+        let unit = in_dwarf.units.get_mut(unit_id);
+        let root = unit.root();
+        let sp = unit.add(root, constants::DW_TAG_subprogram);
+        unit.get_mut(sp).set(
+            constants::DW_AT_low_pc,
+            AttributeValue::Address(Address::Constant(0x10)),
+        );
+        unit.get_mut(sp)
+            .set(constants::DW_AT_high_pc, AttributeValue::Udata(0x20));
+
+        let mut sections = Sections::new(EndianVec::new(LittleEndian));
+        in_dwarf.write(&mut sections).expect("write input dwarf");
+        let mut input: Vec<(String, Vec<u8>)> = Vec::new();
+        sections
+            .for_each(|id, data| {
+                input.push((id.name().to_string(), data.slice().to_vec()));
+                Ok::<(), gimli::Error>(())
+            })
+            .expect("collect input sections");
+
+        // --- Remap input 0x10 → output 0x200 (single instruction).
+        let mut remap = AddressRemap::new();
+        remap.insert(FunctionSpan {
+            input_start: 0x10,
+            input_end: 0x40,
+            output_body_start: 0x200,
+            locals_prefix_len: 0,
+            instr_offsets: InstrOffsetMap {
+                entries: vec![InstrOffset { old: 0, new: 0 }],
+            },
+        });
+
+        let out = rewrite_debug_sections(&input, &remap).expect("rewrite debug sections");
+
+        // --- Re-parse output DWARF and read the subprogram's low_pc.
+        let section_data = |name: &str| -> &[u8] {
+            out.iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, d)| d.as_slice())
+                .unwrap_or(&[])
+        };
+        let load =
+            |id: gimli::SectionId| -> Result<gimli::EndianSlice<'_, LittleEndian>, gimli::Error> {
+                Ok(gimli::EndianSlice::new(
+                    section_data(id.name()),
+                    LittleEndian,
+                ))
+            };
+        let dwarf = gimli::Dwarf::load(load).expect("load output dwarf");
+        let mut units = dwarf.units();
+        let header = units.next().expect("units iter").expect("exactly one unit");
+        let unit = dwarf.unit(header).expect("parse unit");
+        let mut entries = unit.entries();
+        let mut low_pc = None;
+        while let Some((_, entry)) = entries.next_dfs().expect("dfs walk") {
+            if entry.tag() == constants::DW_TAG_subprogram
+                && let Some(gimli::AttributeValue::Addr(a)) = entry
+                    .attr_value(constants::DW_AT_low_pc)
+                    .expect("read low_pc attr")
+            {
+                low_pc = Some(a);
+            }
+        }
+        assert_eq!(
+            low_pc,
+            Some(0x200),
+            "low_pc must be remapped from input 0x10 to output 0x200"
+        );
+    }
+
+    /// The parallel-walk core: with an identity rewrite (output bytes ==
+    /// input bytes) the recovered remap must be an identity on the first
+    /// instruction of every function — proving the layout parsing and
+    /// instruction-stream zipping line up.
+    #[test]
+    fn build_remap_from_parts_identity_walk() {
+        let wat = r#"(module
+            (func (param i32) (result i32) local.get 0 i32.const 1 i32.add)
+            (func (result i32) i32.const 42))"#;
+        let bytes = wat::parse_str(wat).expect("assemble wat");
+
+        // No imports; merged order matches input defined order.
+        let pairs = [(0usize, 0u32), (1usize, 1u32)];
+        let remap =
+            build_remap_from_parts(&bytes, 0, &bytes, &pairs).expect("build identity remap");
+        assert_eq!(remap.len(), 2);
+
+        let layouts = module_function_layouts(&bytes).expect("layouts");
+        assert_eq!(layouts.len(), 2);
+        for l in &layouts {
+            let first_instr = l.body_start + l.locals_prefix_len;
+            assert_eq!(
+                remap.translate(first_instr),
+                Some(first_instr),
+                "identity rewrite must map an address to itself"
+            );
+        }
+    }
+
+    /// A layout mismatch (output has more operators than input — what a
+    /// rewriter that inserted instructions would produce) must abort the
+    /// remap rather than emit a misaligned address.
+    #[test]
+    fn build_remap_from_parts_aborts_on_operator_count_mismatch() {
+        let input = wat::parse_str("(module (func (result i32) i32.const 1))").expect("input");
+        let output = wat::parse_str("(module (func (result i32) i32.const 1 drop i32.const 2))")
+            .expect("output");
+        let pairs = [(0usize, 0u32)];
+        assert!(
+            build_remap_from_parts(&input, 0, &output, &pairs).is_none(),
+            "operator-count mismatch must yield None (fall back to strip)"
+        );
     }
 }

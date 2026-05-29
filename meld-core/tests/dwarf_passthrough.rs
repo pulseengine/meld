@@ -179,6 +179,29 @@ fn fuse_passthrough(input: &[u8]) -> Vec<u8> {
     fuser.fuse().expect("fuse")
 }
 
+/// Build a fuser exercising the **Remap** DWARF policy (#143 Phase 2
+/// inc 3b). When exactly one source core module carries DWARF its
+/// addresses are remapped to the fused code section; with more than one
+/// DWARF source (the `lists.wasm` fixture case) merging independent
+/// unit sets is not yet supported, so it falls back to stripping.
+fn fuse_remap(input: &[u8]) -> Vec<u8> {
+    let mut fuser = Fuser::new(FuserConfig {
+        memory_strategy: MemoryStrategy::MultiMemory,
+        attestation: false,
+        component_provenance: false,
+        address_rebasing: false,
+        preserve_names: false,
+        custom_sections: CustomSectionHandling::Merge,
+        output_format: OutputFormat::CoreModule,
+        opaque_resources: Vec::new(),
+        dwarf_handling: DwarfHandling::Remap,
+    });
+    fuser
+        .add_component_named(input, Some("dwarf-fixture"))
+        .expect("add_component");
+    fuser.fuse().expect("fuse")
+}
+
 fn fuse_with_drop(input: &[u8]) -> Vec<u8> {
     let mut fuser = Fuser::new(FuserConfig {
         memory_strategy: MemoryStrategy::MultiMemory,
@@ -369,6 +392,45 @@ fn dwarf_addresses_in_fused_output_are_known_to_be_wrong() {
         "code-section length unchanged across fusion — DWARF \
          addresses might be coincidentally valid, but more likely \
          the merger is no longer doing what this test thinks it is"
+    );
+}
+
+#[test]
+fn remap_policy_falls_back_to_strip_on_multi_dwarf_source() {
+    // `lists.wasm` embeds more than one core module carrying DWARF (two
+    // `.debug_info` sections — verified at fixture-selection time).
+    // Merging independent DWARF unit sets into one consistent
+    // `.debug_info` against the fused code section is deferred to a
+    // later increment; the honest behaviour is to strip rather than
+    // emit one source's addresses (wrong for the other). This pins that
+    // fallback: Remap on a multi-source fixture yields NO `.debug_*`.
+    //
+    // The single-source happy path (addresses actually remapped) is
+    // covered mechanically by the `dwarf` module unit tests:
+    // `rewrite_debug_sections_translates_low_pc` (full gimli
+    // read→convert→write→read round-trip) and
+    // `build_remap_from_parts_identity_walk` (remap built from real
+    // wasm bytes).
+    if !fixture_available() {
+        return;
+    }
+    let bytes = std::fs::read(DEBUG_INFO_FIXTURE).expect("read fixture");
+
+    // Precondition: the fixture really is multi-DWARF-source.
+    let input_dwarf = count_dwarf_sections_recursive(&bytes);
+    assert!(
+        input_dwarf.get(".debug_info").copied().unwrap_or(0) > 1,
+        "this test assumes a multi-DWARF-source fixture; saw {input_dwarf:?}. \
+         If the fixture became single-source, it should now exercise the \
+         remap happy path — assert remapped `.debug_*` are present instead."
+    );
+
+    let fused = fuse_remap(&bytes);
+    let counts = count_dwarf_sections_at_top_level(&fused);
+    assert!(
+        counts.is_empty(),
+        "Remap must fall back to stripping when >1 source module carries \
+         DWARF (never emit wrong addresses). Saw: {counts:?}"
     );
 }
 
