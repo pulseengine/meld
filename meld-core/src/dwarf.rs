@@ -66,6 +66,12 @@ pub struct FunctionSpan {
     /// section (code-section-relative), including the locals prefix.
     /// This is the v2 provenance `code_range.start`.
     pub output_body_start: u32,
+    /// Exclusive end of this function body in the **output** code
+    /// section. Used to map an exclusive-end DWARF address
+    /// (`DW_AT_high_pc` as address, range-list end, line-program
+    /// `end_sequence`) — which points one byte past the last
+    /// instruction — to the corresponding output end.
+    pub output_body_end: u32,
     /// Byte length of the locals-declaration vector at the head of the
     /// body — identical on input and output (locals are preserved).
     /// The instruction stream begins `locals_prefix_len` bytes past
@@ -98,6 +104,15 @@ pub struct AddressRemap {
     /// lookup. Spans are non-overlapping (function bodies are laid
     /// out sequentially), so the greatest key ≤ addr is the candidate.
     by_input_start: BTreeMap<u32, FunctionSpan>,
+    /// Exclusive end of the **input** module's code section (the size of
+    /// its code-section contents), covering *every* input function —
+    /// including ones meld dropped that have no registered span. This is
+    /// the code/data boundary: an address below it is a code offset
+    /// (mapped or tombstoned), at/above it is a linear-memory address.
+    /// Distinct from the registered spans' max `input_end`, which would
+    /// wrongly classify a dropped *trailing* function's code address as
+    /// data (Mythos #209).
+    input_code_extent: u32,
 }
 
 impl AddressRemap {
@@ -120,23 +135,75 @@ impl AddressRemap {
     /// Translate an input code-section-relative address to the fused
     /// output code-section-relative address.
     ///
+    /// WebAssembly DWARF measures code addresses from the **function
+    /// body start** (the locals-declaration byte), so three regions of
+    /// a body must be handled:
+    ///
+    /// 1. **Locals/prefix** `[input_start, input_start+locals_prefix)`
+    ///    — includes `DW_AT_low_pc`, which points at the body start.
+    ///    Locals are preserved verbatim during fusion, so this maps
+    ///    linearly: `output_body_start + body_rel`.
+    /// 2. **Instruction stream** — mapped through the rewriter's
+    ///    [`InstrOffsetMap`] (operand LEB widths shift offsets).
+    /// 3. **Exclusive end** `addr == input_end` — an end address
+    ///    (`high_pc`, range end, line `end_sequence`) one byte past the
+    ///    last instruction; maps to `output_body_end`.
+    ///
     /// Returns `None` if `addr` is not inside any registered function
     /// or does not land on a recorded instruction boundary.
     pub fn translate(&self, addr: u32) -> Option<u32> {
         // Greatest span whose input_start ≤ addr.
         let (_, span) = self.by_input_start.range(..=addr).next_back()?;
+
+        // Aliased boundary: input function bodies are contiguous, so
+        // `addr` can be BOTH the previous function A's exclusive end
+        // (A.input_end) and this span B's start (B.input_start). The
+        // range lookup picks B, but a `high_pc`/range-end/`end_sequence`
+        // query means A's end while a `low_pc`/first-instruction query
+        // means B's start — and `convert_address` cannot tell them
+        // apart. The two output offsets coincide ONLY when A and B stay
+        // adjacent in the fused output (input order preserved — the
+        // single-source case). If they diverge (functions interleaved
+        // or reordered), the address is genuinely ambiguous: return None
+        // so the caller tombstones it rather than emit a plausible but
+        // wrong offset for one of the two meanings (Mythos #209).
+        if addr == span.input_start
+            && let Some((_, prev)) = self.by_input_start.range(..addr).next_back()
+            && prev.input_end == addr
+            && prev.output_body_end != span.output_body_start
+        {
+            return None;
+        }
+
+        // Exclusive-end address: maps to the output body end. Reached
+        // for the span whose input_end equals addr (the last body, or a
+        // boundary where the next body's start was not selected above).
+        if addr == span.input_end {
+            return Some(span.output_body_end);
+        }
         if !span.contains_input(addr) {
             return None;
         }
-        // Convert the input address to an instruction-stream offset:
-        // subtract the body start and the locals prefix.
         let body_rel = addr - span.input_start;
-        let instr_stream_old = body_rel.checked_sub(span.locals_prefix_len)?;
-        // Map through the rewriter's instruction offset map.
-        let instr_stream_new = span.instr_offsets.translate(instr_stream_old)?;
-        // Reassemble the output address: merged body start + locals
-        // prefix (unchanged) + new instruction-stream offset.
-        Some(span.output_body_start + span.locals_prefix_len + instr_stream_new)
+        // Region 1: locals/prefix — preserved verbatim, maps linearly.
+        if body_rel < span.locals_prefix_len {
+            return Some(span.output_body_start + body_rel);
+        }
+        // Region 2: instruction stream. Map to the *containing*
+        // operator's new offset. Exact on instruction boundaries; for
+        // an address inside an operator's operand bytes — which happens
+        // because LLVM emits fixed-width (zero-padded) LEBs for
+        // relocatable indices while meld re-encodes them canonically —
+        // it resolves to that operator's start, attributing the address
+        // to the instruction it is actually inside (correct source-line
+        // attribution for debuggers / witness).
+        let instr_stream_old = body_rel - span.locals_prefix_len;
+        let entries = &span.instr_offsets.entries;
+        // Greatest entry whose `old` <= instr_stream_old (entries are in
+        // ascending operator order).
+        let idx = entries.partition_point(|e| e.old <= instr_stream_old);
+        let entry = entries.get(idx.checked_sub(1)?)?;
+        Some(span.output_body_start + span.locals_prefix_len + entry.new)
     }
 
     /// Number of registered function spans.
@@ -146,6 +213,28 @@ impl AddressRemap {
 
     pub fn is_empty(&self) -> bool {
         self.by_input_start.is_empty()
+    }
+
+    /// Record the input module's full code-section extent (covering all
+    /// input functions, including dropped ones). Set once at build time.
+    pub fn set_input_code_extent(&mut self, extent: u32) {
+        self.input_code_extent = extent;
+    }
+
+    /// Exclusive upper bound of the input code section — the code/data
+    /// classification boundary. Prefers the explicitly-recorded full
+    /// input extent ([`Self::set_input_code_extent`]); falls back to the
+    /// greatest registered span end when unset (synthetic test remaps).
+    /// Addresses `< code_extent` are code offsets (mapped or tombstoned);
+    /// `>= code_extent` are linear-memory data addresses.
+    pub fn code_extent(&self) -> u32 {
+        let registered_max = self
+            .by_input_start
+            .values()
+            .map(|s| s.input_end)
+            .max()
+            .unwrap_or(0);
+        self.input_code_extent.max(registered_max)
     }
 }
 
@@ -265,6 +354,12 @@ fn build_remap_from_parts(
     let output_layouts = module_function_layouts(output_bytes)?;
 
     let mut remap = AddressRemap::new();
+    // Code/data boundary = the full input code-section extent (every
+    // input function, including any meld dropped), so a dropped
+    // function's code address is tombstoned rather than mistaken for a
+    // linear-memory data address (Mythos #209).
+    let input_code_extent = input_layouts.iter().map(|l| l.body_end).max().unwrap_or(0);
+    remap.set_input_code_extent(input_code_extent);
     for &(defined_out_idx, old_func_idx) in pairs {
         // Module-level function index → input defined-function index.
         let in_idx = old_func_idx.checked_sub(imports)? as usize;
@@ -274,9 +369,21 @@ fn build_remap_from_parts(
         // Locals are preserved verbatim in the DWARF-remap path, so the
         // prefix must be identical; an operator was inserted otherwise.
         if input.locals_prefix_len != output.locals_prefix_len {
+            log::debug!(
+                "dwarf remap abort: func in_idx={in_idx} locals_prefix mismatch \
+                 (in={} out={})",
+                input.locals_prefix_len,
+                output.locals_prefix_len
+            );
             return None;
         }
         if input.op_offsets.len() != output.op_offsets.len() {
+            log::debug!(
+                "dwarf remap abort: func in_idx={in_idx} out_idx={defined_out_idx} \
+                 operator-count mismatch (in={} out={})",
+                input.op_offsets.len(),
+                output.op_offsets.len()
+            );
             return None;
         }
 
@@ -291,6 +398,7 @@ fn build_remap_from_parts(
             input_start: input.body_start,
             input_end: input.body_end,
             output_body_start: output.body_start,
+            output_body_end: output.body_end,
             locals_prefix_len: input.locals_prefix_len,
             instr_offsets: InstrOffsetMap { entries },
         });
@@ -351,16 +459,49 @@ fn rewrite_debug_sections(
     // base (`DW_AT_low_pc` = 0) denotes that start, which is offset 0 in
     // both the input and the fused output. Map it to itself; everything
     // else must go through the instruction-accurate remap.
+    // DWARF tombstone: the conventional "this address is invalid / dead
+    // code" marker (max address). Consumers (debuggers, gimli, witness)
+    // skip DIEs and line rows whose address is the tombstone. wasm-ld
+    // itself tombstones discarded code this way.
+    const TOMBSTONE: u64 = 0xFFFF_FFFF;
+
+    let code_extent = remap.code_extent() as u64;
+    // `convert_address` is **total** — it never returns `None`, because
+    // `gimli::write::Dwarf::from` aborts the *entire* conversion on a
+    // single `None`. On real compiler output (hundreds of functions,
+    // dead-code gaps, padded LEBs, data addresses) some address always
+    // fails to map; all-or-nothing would then strip every byte of
+    // DWARF. Instead each address is independently resolved to either
+    // its correct fused offset or a tombstone — never a plausible but
+    // wrong address. This keeps the LS-D-1 guarantee per-address while
+    // emitting correct debug info for everything that does map.
     let convert_address = |addr: u64| -> Option<Address> {
         if addr == 0 {
             return Some(Address::Constant(0));
         }
-        remap
-            .translate(addr as u32)
-            .map(|new| Address::Constant(new as u64))
+        if let Some(new) = remap.translate(addr as u32) {
+            return Some(Address::Constant(new as u64));
+        }
+        // Not a mapped code offset. At/beyond the code extent it is a
+        // linear-memory / data address (e.g. `DW_OP_addr` in a variable
+        // location) or an existing wasm-ld tombstone — unchanged under
+        // multi-memory fusion, pass through. Within the code section it
+        // is a genuine code miss (a function meld dropped, a dead-code
+        // range): tombstone it rather than emit a stale offset.
+        if addr >= code_extent {
+            return Some(Address::Constant(addr));
+        }
+        log::debug!("dwarf remap: tombstoning unmapped code address {addr:#x}");
+        Some(Address::Constant(TOMBSTONE))
     };
 
-    let mut write_dwarf = WriteDwarf::from(&read_dwarf, &convert_address).ok()?;
+    let mut write_dwarf = match WriteDwarf::from(&read_dwarf, &convert_address) {
+        Ok(d) => d,
+        Err(e) => {
+            log::debug!("dwarf remap abort: gimli convert failed: {e:?}");
+            return None;
+        }
+    };
     let mut sections = Sections::new(EndianVec::new(endian));
     write_dwarf.write(&mut sections).ok()?;
 
@@ -418,7 +559,12 @@ pub fn remap_for_output(
         [] => None,
         [(ci, mi)] => {
             let module = &components[*ci].core_modules[*mi];
+            log::debug!("dwarf remap: single DWARF source at component {ci} module {mi}");
             let remap = build_remap_for_module(module, merged, *ci, *mi, output_bytes)?;
+            log::debug!(
+                "dwarf remap: built remap with {} function spans",
+                remap.len()
+            );
             let debug: Vec<(String, Vec<u8>)> = module
                 .custom_sections
                 .iter()
@@ -455,6 +601,9 @@ mod tests {
             input_start,
             input_end,
             output_body_start,
+            // Tests that don't exercise the end-address path set a
+            // plausible end; the dedicated end-address test overrides it.
+            output_body_end: output_body_start + (input_end - input_start),
             locals_prefix_len,
             instr_offsets: InstrOffsetMap {
                 entries: offsets
@@ -527,31 +676,80 @@ mod tests {
         assert_eq!(remap.translate(28), Some(3003)); // func 2
     }
 
-    /// Addresses outside any function, or not on an instruction
-    /// boundary, return None — gimli will then drop them rather than
-    /// emit a wrong address.
+    /// Addresses outside any registered function return None — the
+    /// caller then tombstones or passes them through.
     #[test]
-    fn translate_misses_return_none() {
+    fn translate_outside_functions_return_none() {
         let mut remap = AddressRemap::new();
+        // span(10,20,...) → output_body_end = 100 + (20-10) = 110.
         remap.insert(span(10, 20, 100, 0, &[(0, 0), (2, 2)]));
 
         assert_eq!(remap.translate(5), None, "before any function");
-        assert_eq!(remap.translate(20), None, "at end (exclusive)");
         assert_eq!(remap.translate(50), None, "past all functions");
         assert_eq!(remap.translate(1), None, "below first function");
-        // Inside the function but not on a recorded instruction start.
-        assert_eq!(remap.translate(11), None, "mid-instruction offset");
     }
 
-    /// An address whose body-relative offset is *less than* the locals
-    /// prefix (i.e. pointing into the locals declarations, not the
-    /// instruction stream) returns None rather than underflowing.
+    /// An exclusive-end address (`high_pc` as address, range end, line
+    /// `end_sequence`) maps to the output body end, not the next
+    /// function's start.
     #[test]
-    fn translate_address_inside_locals_prefix_is_none() {
+    fn translate_exclusive_end_maps_to_output_body_end() {
+        let mut remap = AddressRemap::new();
+        remap.insert(span(10, 20, 100, 0, &[(0, 0), (2, 2)]));
+        // addr == input_end (20) → output_body_end (110).
+        assert_eq!(remap.translate(20), Some(110));
+    }
+
+    /// An address inside an operator's operand bytes (not on a recorded
+    /// boundary — e.g. inside a padded LEB) resolves to the *containing*
+    /// operator's new offset, attributing it to the right instruction.
+    #[test]
+    fn translate_mid_operator_maps_to_containing_operator() {
+        let mut remap = AddressRemap::new();
+        // Operators at stream offsets 0 and 2; output shifts 2→3.
+        remap.insert(span(10, 20, 100, 0, &[(0, 0), (2, 3)]));
+        // Input 11 = stream 1, inside the first operator → maps to op 0.
+        assert_eq!(remap.translate(11), Some(100));
+        // Input 13 = stream 3, inside the second operator → maps to op@2.
+        assert_eq!(remap.translate(13), Some(103));
+    }
+
+    /// Mythos #209: when two adjacent input functions (A.input_end ==
+    /// B.input_start) are NOT adjacent in the fused output, the shared
+    /// boundary address is ambiguous (A's exclusive end vs B's start)
+    /// and must tombstone (None) rather than emit B's start as A's end.
+    /// When they ARE adjacent in the output (input order preserved), the
+    /// two interpretations coincide and the address resolves cleanly.
+    #[test]
+    fn translate_ambiguous_boundary_tombstones_when_reordered() {
+        // A = [10,20) → output [200,210); B = [20,30) → output [500,510).
+        // A and B are contiguous in input but far apart in output.
+        let mut remap = AddressRemap::new();
+        remap.insert(span(10, 20, 200, 0, &[(0, 0)]));
+        remap.insert(span(20, 30, 500, 0, &[(0, 0)]));
+        // addr 20 is A.input_end AND B.input_start; outputs diverge
+        // (A end = 210, B start = 500) → ambiguous → None.
+        assert_eq!(remap.translate(20), None);
+
+        // Order-preserved layout: A end (210) == B start (210) → the
+        // boundary is unambiguous and resolves.
+        let mut ordered = AddressRemap::new();
+        ordered.insert(span(10, 20, 200, 0, &[(0, 0)]));
+        ordered.insert(span(20, 30, 210, 0, &[(0, 0)]));
+        assert_eq!(ordered.translate(20), Some(210));
+    }
+
+    /// An address in the locals/prefix region (`DW_AT_low_pc` points at
+    /// the body start) maps linearly — the locals are preserved verbatim
+    /// during fusion.
+    #[test]
+    fn translate_locals_prefix_maps_linearly() {
         let mut remap = AddressRemap::new();
         remap.insert(span(10, 30, 50, 5, &[(0, 0)]));
-        // Input addr 12 = body_rel 2 < locals_prefix_len 5 → None.
-        assert_eq!(remap.translate(12), None);
+        // low_pc at body start (body_rel 0) → output_body_start.
+        assert_eq!(remap.translate(10), Some(50));
+        // body_rel 2 (still in the 5-byte locals prefix) → 50 + 2.
+        assert_eq!(remap.translate(12), Some(52));
     }
 
     /// Oracle for inc 3b: build real input DWARF with gimli, remap a
@@ -601,6 +799,7 @@ mod tests {
             input_start: 0x10,
             input_end: 0x40,
             output_body_start: 0x200,
+            output_body_end: 0x230,
             locals_prefix_len: 0,
             instr_offsets: InstrOffsetMap {
                 entries: vec![InstrOffset { old: 0, new: 0 }],
@@ -672,6 +871,37 @@ mod tests {
                 "identity rewrite must map an address to itself"
             );
         }
+    }
+
+    /// Mythos #209 (2nd finding): `code_extent` must cover the input
+    /// module's *full* code section — including functions meld dropped —
+    /// so a dropped function's code address is classified as code
+    /// (tombstoned) rather than as a linear-memory data address (passed
+    /// through stale). Using only the surviving spans' max end would
+    /// misclassify a dropped trailing function.
+    #[test]
+    fn code_extent_covers_dropped_trailing_function() {
+        let wat = r#"(module
+            (func (result i32) i32.const 1)
+            (func (result i32) i32.const 2)
+            (func (result i32) i32.const 3))"#;
+        let bytes = wat::parse_str(wat).expect("assemble wat");
+        let layouts = module_function_layouts(&bytes).expect("layouts");
+        let full_extent = layouts.iter().map(|l| l.body_end).max().unwrap();
+        let surviving_max = layouts[1].body_end;
+        assert!(
+            full_extent > surviving_max,
+            "the dropped trailing function must extend past the survivors"
+        );
+
+        // meld keeps func 0 and func 1; func 2 is dropped (no pair).
+        let pairs = [(0usize, 0u32), (1usize, 1u32)];
+        let remap = build_remap_from_parts(&bytes, 0, &bytes, &pairs).expect("build remap");
+
+        // The code/data boundary is the full input extent, so func 2's
+        // address range stays classified as code (→ tombstone in
+        // convert_address), not data (→ stale pass-through).
+        assert_eq!(remap.code_extent(), full_extent);
     }
 
     /// A layout mismatch (output has more operators than input — what a

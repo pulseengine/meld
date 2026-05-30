@@ -43,6 +43,9 @@ petgraph = "0.8.3"
 [dev-dependencies]
 proptest.workspace = true
 wasmprinter.workspace = true
+# Re-declared for integration tests (tests/dwarf_remap_witness.rs) to
+# parse and validate the remapped DWARF in the fused output.
+gimli.workspace = true
 wat = "1.219"
 wasmtime = "41.0.1"
 wasmtime-wasi = "41.0.4"

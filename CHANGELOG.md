@@ -4,6 +4,58 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.20.0] - 2026-05-29
+
+### Changed
+
+- **`DwarfHandling::Remap` now works on real compiler-emitted DWARF**
+  (#143 / #130, witness integration). Falsifying the v0.19.0 remap
+  against a real Rust component (`hello_rust.wasm`) surfaced four
+  address classes the synthetic oracle missed; all are now handled, and
+  the all-or-nothing gimli failure mode is replaced with per-address
+  tombstoning.
+  - **`low_pc` is the function body start.** WebAssembly DWARF measures
+    `DW_AT_low_pc` from the locals-declaration byte, not the first
+    instruction. The locals/prefix region now maps linearly (locals are
+    preserved verbatim during fusion). Previously every function's
+    `low_pc` underflowed to a miss.
+  - **Exclusive-end addresses** (`high_pc`-as-address, range-list ends,
+    line-program `end_sequence`) map to the output body end.
+  - **Padded LEBs.** LLVM emits fixed-width zero-padded LEBs for
+    relocatable indices, so DWARF rows can land inside an operator's
+    operand bytes; these now resolve to the **containing** operator
+    (exact on instruction boundaries), giving correct source-line
+    attribution.
+  - **Data addresses** (`DW_OP_addr` linear-memory locations) at or
+    beyond the code extent pass through unchanged (correct under
+    multi-memory fusion).
+  - **Per-address tombstoning replaces all-or-nothing strip.**
+    `gimli::write::Dwarf::from` aborts the entire conversion on a single
+    unmappable address, so on real modules (hundreds of functions,
+    dead-code gaps) the strict gate stripped *all* DWARF. The
+    `convert_address` closure is now total: correct fused offset where
+    mappable, identity for data/existing tombstones, and the DWARF
+    tombstone `0xFFFF_FFFF` for unmappable code (functions meld dropped).
+    The LS-D-1 guarantee strengthens to *"every emitted address is
+    correct or an ignored tombstone — never a plausible-but-wrong
+    address."*
+
+### Added
+
+- **DWARF remap falsification oracle** (`tests/dwarf_remap_witness.rs`,
+  #130). Fuses a real Rust component with `--dwarf remap` and asserts
+  every non-tombstone `DW_TAG_subprogram` `low_pc` in the *output* DWARF
+  equals some fused function's component-provenance `code_range.start` —
+  the `pulseengine/witness` code-offset → source-line contract, checked
+  in-tree with `gimli`. On the fixture all but 9 of 225 functions map
+  exactly (the 9 are dead code, tombstoned). Updates LS-D-1.
+
+### Notes
+
+- Multi-DWARF-source fusion still falls back to `strip` (merging
+  independent DWARF unit sets is blocked by gimli's writer API — see
+  issue #208 for the analysis and the relocator design).
+
 ## [0.19.0] - 2026-05-29
 
 ### Added
