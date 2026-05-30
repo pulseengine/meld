@@ -1563,15 +1563,26 @@ impl Resolver {
         ));
 
         // Issue #142: static stream validation. Catches dataflow cycles
-        // (SCC ≥ 3 in the producer→consumer graph) and type-mismatches
-        // on stream-typed import edges. See the module comment in
-        // p3_stream.rs for the precision boundary on (i).
-        if let Some(spg) = graph.stream_pair_graph.as_ref() {
-            let issues = crate::p3_stream::validate_stream_pair_graph(
-                components,
-                &graph.resolved_imports,
-                spg,
-            );
+        // (SCC ≥ 3 in the producer→consumer graph), type-mismatches on
+        // stream-typed import edges (i/iii), and resource handles
+        // carried as stream/future element types (iv). See the module
+        // comment in p3_stream.rs for the precision boundary on (i) and
+        // why (ii) bounded-channel capacity is not applicable.
+        {
+            let mut issues = graph
+                .stream_pair_graph
+                .as_ref()
+                .map(|spg| {
+                    crate::p3_stream::validate_stream_pair_graph(
+                        components,
+                        &graph.resolved_imports,
+                        spg,
+                    )
+                })
+                .unwrap_or_default();
+            // (iv) resource lifetime — scans component types directly, so
+            // it runs even when no cross-component stream pairs were found.
+            issues.extend(crate::p3_stream::resource_lifetime_issues(components));
             if !issues.is_empty() {
                 let mut lines = Vec::with_capacity(issues.len());
                 for issue in &issues {
@@ -1589,6 +1600,17 @@ impl Resolver {
                         crate::p3_stream::StreamValidationIssue::Cycle { component_cycle } => {
                             lines.push(format!(
                                 "  · cycle: components {component_cycle:?} form a closed stream-pair loop (SCC size ≥ 3)"
+                            ));
+                        }
+                        crate::p3_stream::StreamValidationIssue::ResourceLifetime {
+                            component,
+                            descriptor,
+                            resource_type_id,
+                            owned,
+                        } => {
+                            let kind = if *owned { "own" } else { "borrow" };
+                            lines.push(format!(
+                                "  · resource lifetime: component {component} carries a {kind}<resource {resource_type_id}> handle as a `{descriptor}` element — a handle's lifetime cannot be guaranteed across the async stream/future boundary (#142 iv)"
                             ));
                         }
                     }

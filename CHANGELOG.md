@@ -4,6 +4,35 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.21.0] - 2026-05-30
+
+### Added
+
+- **Static resource-lifetime validation for async streams** (#142 (iv),
+  SR-34). `meld fuse` now rejects a fusion where a component declares a
+  `stream<T>` / `future<T>` whose element type is a resource handle.
+  `borrow<R>` is a definite violation — the borrow cannot outlive its
+  lending call across the async boundary (use-after-scope); `own<R>` is
+  flagged as the drop-while-referenced hazard #142 names. Surfaced as
+  `StreamValidationIssue::ResourceLifetime` →
+  `Error::StreamValidation`. Detection reuses
+  `ParsedComponent::resolve_to_resource` (the same `Type(idx)` → handle
+  resolution meld applies to function params), with the wasmparser
+  `ComponentValType::Type(N)` descriptor form pinned by a regression
+  test. New loss scenario **LS-R-14** (approved). Limitation: a handle
+  nested inside a composite element (`stream<list<own<R>>>`) is not
+  flagged — the same boundary as `stream_elements_in_valtype`.
+
+### Notes
+
+- **#142 (ii) bounded-channel capacity is not applicable.** The
+  Component-Model canonical ABI has no bounded-channel / capacity
+  concept — `stream.new` takes no capacity and streams are unbounded by
+  construction — so there is nothing in the component binary to
+  validate. Documented in `p3_stream.rs` and LS-R-14; this closes the
+  #142 (i)–(iv) checklist (i/iii shipped in v0.13.0/v0.15.0, iv here,
+  ii not-applicable).
+
 ## [0.20.0] - 2026-05-29
 
 ### Changed

@@ -303,10 +303,22 @@ pub fn build_stream_pair_graph(
 //         legal bidirectional-pipe pattern (two independent streams
 //         in opposite directions, each individually acyclic).
 //
-// Checks **(ii) bounded-channel capacity** and **(iv) resource
-// lifetime across async boundaries** remain TODO — they need
-// information beyond `CanonicalEntry` / `ParsedComponent` (capacity
-// flags + per-handle lifetime tracking).
+//   (iv) Resource lifetime across async boundaries — a resource
+//        handle (`own<R>` / `borrow<R>`) carried as a `stream<T>` /
+//        `future<T>` element type. A `borrow<R>` is only valid within
+//        its lending call, but a stream/future is read *after* that
+//        call returns across the async boundary → use-after-scope; an
+//        `own<R>` transferred into a stream and then dropped by the
+//        producer while the consumer still holds it is the
+//        drop-while-referenced hazard #142 names. See
+//        [`resource_lifetime_issues`].
+//
+// Check **(ii) bounded-channel capacity** is **not applicable**: the
+// Component-Model canonical ABI has no bounded-channel / capacity
+// concept — `stream.new` (`CanonicalEntry::StreamNew { ty }`) takes no
+// capacity, and streams are unbounded by construction. There is nothing
+// in the component binary to validate; "declare a capacity" presupposes
+// an annotation mechanism the ABI does not provide (#142).
 
 /// A validation issue raised by [`validate_stream_pair_graph`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -329,6 +341,20 @@ pub enum StreamValidationIssue {
     /// ≥ 3. Could deadlock at runtime if every component is waiting on
     /// inbound stream data before producing outbound data.
     Cycle { component_cycle: Vec<usize> },
+    /// Check (iv): a `stream<T>` / `future<T>` carries a resource handle
+    /// as its element type. `owned == false` is a `borrow<R>` —
+    /// definitely invalid, the borrow cannot outlive its lending call
+    /// across the async boundary. `owned == true` is an `own<R>` —
+    /// permitted only if the producer never drops the handle while the
+    /// consumer still references it (the drop-while-referenced hazard
+    /// meld cannot rule out statically). `descriptor` is the offending
+    /// `stream<…>` / `future<…>` type descriptor.
+    ResourceLifetime {
+        component: usize,
+        descriptor: String,
+        resource_type_id: u32,
+        owned: bool,
+    },
 }
 
 /// Return every `stream<T>` element type reachable from the given
@@ -683,6 +709,64 @@ pub fn validate_stream_pair_graph(
     issues.extend(cycle_issues_from_pairs(graph));
 
     issues
+}
+
+/// Check (iv): flag any `stream<T>` / `future<T>` whose element type is
+/// a resource handle (`own<R>` / `borrow<R>`).
+///
+/// The P3Async descriptor records the element type as the Debug form of
+/// the wasmparser `ComponentValType`, so a handle element appears as
+/// `stream<Type(N)>` where component type index `N` resolves to a
+/// `Defined(Own(R))` / `Defined(Borrow(R))`. We parse the `Type(N)`
+/// index out and reuse [`ParsedComponent::resolve_to_resource`] — the
+/// same `Type(idx)` → handle chase meld already applies to function
+/// params — rather than trusting the Debug text for the handle kind.
+///
+/// Limitations (acknowledged, not targets): only a *direct* handle
+/// element is detected. A handle nested inside a composite element
+/// (`stream<list<own<R>>>` → `stream<List(..)>`) is not flagged, the
+/// same boundary as [`stream_elements_in_valtype`].
+pub fn resource_lifetime_issues(components: &[ParsedComponent]) -> Vec<StreamValidationIssue> {
+    let mut issues = Vec::new();
+    for (ci, comp) in components.iter().enumerate() {
+        for ty in &comp.types {
+            let ComponentTypeKind::P3Async(desc) = &ty.kind else {
+                continue;
+            };
+            let Some(inner) = desc
+                .strip_prefix("stream<")
+                .or_else(|| desc.strip_prefix("future<"))
+                .and_then(|s| s.strip_suffix('>'))
+            else {
+                continue;
+            };
+            let Some(idx) = parse_type_index(inner.trim()) else {
+                continue;
+            };
+            if let Some((resource_type_id, owned)) =
+                comp.resolve_to_resource(&ComponentValType::Type(idx))
+            {
+                issues.push(StreamValidationIssue::ResourceLifetime {
+                    component: ci,
+                    descriptor: desc.clone(),
+                    resource_type_id,
+                    owned,
+                });
+            }
+        }
+    }
+    issues
+}
+
+/// Parse the wasmparser `ComponentValType::Type(N)` Debug form
+/// (`"Type(N)"`) back to its index. Returns `None` for any other shape
+/// (e.g. `"Primitive(U8)"`, `"List(..)"`).
+fn parse_type_index(s: &str) -> Option<u32> {
+    s.strip_prefix("Type(")?
+        .strip_suffix(')')?
+        .trim()
+        .parse()
+        .ok()
 }
 
 /// Cycle-only sub-pass — exposed so tests that only care about (iii)
@@ -1542,6 +1626,100 @@ mod tests {
         assert!(
             issues.is_empty(),
             "matching stream types on resolved edge must not raise; got {issues:?}"
+        );
+    }
+
+    // ─── (iv) resource lifetime across async boundaries ──────────────
+
+    /// Pin the wasmparser `ComponentValType::Type(N)` Debug form that
+    /// `parse_type_index` depends on. If a wasmparser upgrade changes
+    /// this, the resource-lifetime check would silently stop detecting
+    /// handle elements — this test fails first.
+    #[test]
+    fn wasmparser_type_debug_form_is_stable() {
+        assert_eq!(
+            format!("{:?}", wasmparser::ComponentValType::Type(7)),
+            "Type(7)"
+        );
+        assert_eq!(parse_type_index("Type(7)"), Some(7));
+        assert_eq!(parse_type_index("Primitive(U8)"), None);
+        assert_eq!(parse_type_index("List(..)"), None);
+    }
+
+    /// Build a component whose type table is all defined types, with a
+    /// matching all-`Defined` `component_type_defs` so
+    /// `get_type_definition(idx)` (and thus `resolve_to_resource`)
+    /// resolves `Type(idx)` to `types[idx]`.
+    fn comp_with_defined_types(types: Vec<ComponentType>) -> ParsedComponent {
+        let defs = vec![crate::parser::ComponentTypeDef::Defined; types.len()];
+        let mut c = make_component(vec![], vec![], types, vec![]);
+        c.component_type_defs = defs;
+        c
+    }
+
+    fn defined(vt: ComponentValType) -> ComponentType {
+        ComponentType {
+            kind: ComponentTypeKind::Defined(vt),
+        }
+    }
+
+    #[test]
+    fn ls_r_14_borrow_handle_in_stream_flagged() {
+        // types[0] = stream<Type(1)>; types[1] = borrow<resource 42>.
+        let comp = comp_with_defined_types(vec![
+            stream_type("Type(1)"),
+            defined(ComponentValType::Borrow(42)),
+        ]);
+        let issues = resource_lifetime_issues(&[comp]);
+        assert_eq!(issues.len(), 1, "borrow-in-stream must flag: {issues:?}");
+        match &issues[0] {
+            StreamValidationIssue::ResourceLifetime {
+                component,
+                resource_type_id,
+                owned,
+                ..
+            } => {
+                assert_eq!(*component, 0);
+                assert_eq!(*resource_type_id, 42);
+                assert!(!owned, "borrow ⇒ owned = false");
+            }
+            other => panic!("expected ResourceLifetime, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ls_r_14_own_handle_in_future_flagged_as_owned() {
+        // types[0] = future<Type(1)>; types[1] = own<resource 5>.
+        let future_ty = ComponentType {
+            kind: ComponentTypeKind::P3Async("future<Type(1)>".to_string()),
+        };
+        let comp = comp_with_defined_types(vec![future_ty, defined(ComponentValType::Own(5))]);
+        let issues = resource_lifetime_issues(&[comp]);
+        assert_eq!(issues.len(), 1, "own-in-future must flag: {issues:?}");
+        assert!(
+            matches!(
+                &issues[0],
+                StreamValidationIssue::ResourceLifetime {
+                    owned: true,
+                    resource_type_id: 5,
+                    ..
+                }
+            ),
+            "own ⇒ owned = true; got {:?}",
+            issues[0]
+        );
+    }
+
+    #[test]
+    fn ls_r_14_primitive_element_stream_not_flagged() {
+        // A plain data stream carries no handle — must not flag.
+        let comp = comp_with_defined_types(vec![
+            stream_type("Primitive(U8)"),
+            defined(ComponentValType::Primitive(PrimitiveValType::U8)),
+        ]);
+        assert!(
+            resource_lifetime_issues(&[comp]).is_empty(),
+            "primitive-element stream must not flag (iv)"
         );
     }
 }
