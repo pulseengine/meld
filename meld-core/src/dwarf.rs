@@ -104,6 +104,15 @@ pub struct AddressRemap {
     /// lookup. Spans are non-overlapping (function bodies are laid
     /// out sequentially), so the greatest key ≤ addr is the candidate.
     by_input_start: BTreeMap<u32, FunctionSpan>,
+    /// Exclusive end of the **input** module's code section (the size of
+    /// its code-section contents), covering *every* input function —
+    /// including ones meld dropped that have no registered span. This is
+    /// the code/data boundary: an address below it is a code offset
+    /// (mapped or tombstoned), at/above it is a linear-memory address.
+    /// Distinct from the registered spans' max `input_end`, which would
+    /// wrongly classify a dropped *trailing* function's code address as
+    /// data (Mythos #209).
+    input_code_extent: u32,
 }
 
 impl AddressRemap {
@@ -206,16 +215,26 @@ impl AddressRemap {
         self.by_input_start.is_empty()
     }
 
-    /// Exclusive upper bound of the input code section covered by the
-    /// registered spans (the greatest `input_end`). Used to tell code
-    /// addresses (`< code_extent`, must map exactly) from linear-memory
-    /// data addresses (`>= code_extent`, passed through unchanged).
+    /// Record the input module's full code-section extent (covering all
+    /// input functions, including dropped ones). Set once at build time.
+    pub fn set_input_code_extent(&mut self, extent: u32) {
+        self.input_code_extent = extent;
+    }
+
+    /// Exclusive upper bound of the input code section — the code/data
+    /// classification boundary. Prefers the explicitly-recorded full
+    /// input extent ([`Self::set_input_code_extent`]); falls back to the
+    /// greatest registered span end when unset (synthetic test remaps).
+    /// Addresses `< code_extent` are code offsets (mapped or tombstoned);
+    /// `>= code_extent` are linear-memory data addresses.
     pub fn code_extent(&self) -> u32 {
-        self.by_input_start
+        let registered_max = self
+            .by_input_start
             .values()
             .map(|s| s.input_end)
             .max()
-            .unwrap_or(0)
+            .unwrap_or(0);
+        self.input_code_extent.max(registered_max)
     }
 }
 
@@ -335,6 +354,12 @@ fn build_remap_from_parts(
     let output_layouts = module_function_layouts(output_bytes)?;
 
     let mut remap = AddressRemap::new();
+    // Code/data boundary = the full input code-section extent (every
+    // input function, including any meld dropped), so a dropped
+    // function's code address is tombstoned rather than mistaken for a
+    // linear-memory data address (Mythos #209).
+    let input_code_extent = input_layouts.iter().map(|l| l.body_end).max().unwrap_or(0);
+    remap.set_input_code_extent(input_code_extent);
     for &(defined_out_idx, old_func_idx) in pairs {
         // Module-level function index → input defined-function index.
         let in_idx = old_func_idx.checked_sub(imports)? as usize;
@@ -846,6 +871,37 @@ mod tests {
                 "identity rewrite must map an address to itself"
             );
         }
+    }
+
+    /// Mythos #209 (2nd finding): `code_extent` must cover the input
+    /// module's *full* code section — including functions meld dropped —
+    /// so a dropped function's code address is classified as code
+    /// (tombstoned) rather than as a linear-memory data address (passed
+    /// through stale). Using only the surviving spans' max end would
+    /// misclassify a dropped trailing function.
+    #[test]
+    fn code_extent_covers_dropped_trailing_function() {
+        let wat = r#"(module
+            (func (result i32) i32.const 1)
+            (func (result i32) i32.const 2)
+            (func (result i32) i32.const 3))"#;
+        let bytes = wat::parse_str(wat).expect("assemble wat");
+        let layouts = module_function_layouts(&bytes).expect("layouts");
+        let full_extent = layouts.iter().map(|l| l.body_end).max().unwrap();
+        let surviving_max = layouts[1].body_end;
+        assert!(
+            full_extent > surviving_max,
+            "the dropped trailing function must extend past the survivors"
+        );
+
+        // meld keeps func 0 and func 1; func 2 is dropped (no pair).
+        let pairs = [(0usize, 0u32), (1usize, 1u32)];
+        let remap = build_remap_from_parts(&bytes, 0, &bytes, &pairs).expect("build remap");
+
+        // The code/data boundary is the full input extent, so func 2's
+        // address range stays classified as code (→ tombstone in
+        // convert_address), not data (→ stale pass-through).
+        assert_eq!(remap.code_extent(), full_extent);
     }
 
     /// A layout mismatch (output has more operators than input — what a

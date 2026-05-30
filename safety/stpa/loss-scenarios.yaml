@@ -2725,3 +2725,12 @@ loss-scenarios:
       the boundary so the caller tombstones it, rather than emit B's
       output start as A's end — a plausible but wrong offset. Pinned by
       `dwarf::tests::translate_ambiguous_boundary_tombstones_when_reordered`.
+      A second auto-scan finding (same PR) noted that the code/data
+      classification boundary (`AddressRemap::code_extent`) was the max
+      *registered* span end, so a dropped *trailing* function's code
+      address (which exceeds the surviving extent) was classified as a
+      linear-memory data address and passed through stale instead of
+      tombstoned. `code_extent` is now the input module's *full*
+      code-section extent (every input function, dropped or not), so a
+      dropped function's address stays in the code range and tombstones.
+      Pinned by `dwarf::tests::code_extent_covers_dropped_trailing_function`.
