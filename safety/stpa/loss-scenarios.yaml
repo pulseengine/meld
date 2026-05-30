@@ -2711,3 +2711,17 @@ loss-scenarios:
       `code_range.start` (the cross-repo `pulseengine/witness` contract,
       checked in-tree). On the fixture, all but 9 of 225 functions map
       exactly; the 9 are dead code, tombstoned.
+      ###
+      ### Boundary-aliasing hazard (Mythos auto-scan finding, PR #209)
+      ###
+      Input function bodies are contiguous, so a single address is BOTH
+      function A's exclusive end (`A.input_end`) and the next function
+      B's start (`B.input_start`). `convert_address` gets no DWARF
+      context to tell an A-`high_pc`/`end_sequence` query from a
+      B-`low_pc` query. The two output offsets coincide only when A and B
+      stay adjacent in the fused output (input order preserved — the
+      single-source case meld currently emits). If they diverge
+      (functions interleaved/reordered), `translate` now returns None for
+      the boundary so the caller tombstones it, rather than emit B's
+      output start as A's end — a plausible but wrong offset. Pinned by
+      `dwarf::tests::translate_ambiguous_boundary_tombstones_when_reordered`.

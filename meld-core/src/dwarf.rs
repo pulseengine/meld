@@ -145,12 +145,30 @@ impl AddressRemap {
     pub fn translate(&self, addr: u32) -> Option<u32> {
         // Greatest span whose input_start ≤ addr.
         let (_, span) = self.by_input_start.range(..=addr).next_back()?;
-        // Exclusive-end address: maps to the output body end. Checked
-        // before `contains_input` because a function's end equals the
-        // next function's start in the contiguous input code section;
-        // for the body this `addr == input_end` case only triggers for
-        // the span whose input_end it is (the last body, or via the
-        // boundary alias resolved to the next body's start below).
+
+        // Aliased boundary: input function bodies are contiguous, so
+        // `addr` can be BOTH the previous function A's exclusive end
+        // (A.input_end) and this span B's start (B.input_start). The
+        // range lookup picks B, but a `high_pc`/range-end/`end_sequence`
+        // query means A's end while a `low_pc`/first-instruction query
+        // means B's start — and `convert_address` cannot tell them
+        // apart. The two output offsets coincide ONLY when A and B stay
+        // adjacent in the fused output (input order preserved — the
+        // single-source case). If they diverge (functions interleaved
+        // or reordered), the address is genuinely ambiguous: return None
+        // so the caller tombstones it rather than emit a plausible but
+        // wrong offset for one of the two meanings (Mythos #209).
+        if addr == span.input_start
+            && let Some((_, prev)) = self.by_input_start.range(..addr).next_back()
+            && prev.input_end == addr
+            && prev.output_body_end != span.output_body_start
+        {
+            return None;
+        }
+
+        // Exclusive-end address: maps to the output body end. Reached
+        // for the span whose input_end equals addr (the last body, or a
+        // boundary where the next body's start was not selected above).
         if addr == span.input_end {
             return Some(span.output_body_end);
         }
@@ -669,6 +687,31 @@ mod tests {
         assert_eq!(remap.translate(11), Some(100));
         // Input 13 = stream 3, inside the second operator → maps to op@2.
         assert_eq!(remap.translate(13), Some(103));
+    }
+
+    /// Mythos #209: when two adjacent input functions (A.input_end ==
+    /// B.input_start) are NOT adjacent in the fused output, the shared
+    /// boundary address is ambiguous (A's exclusive end vs B's start)
+    /// and must tombstone (None) rather than emit B's start as A's end.
+    /// When they ARE adjacent in the output (input order preserved), the
+    /// two interpretations coincide and the address resolves cleanly.
+    #[test]
+    fn translate_ambiguous_boundary_tombstones_when_reordered() {
+        // A = [10,20) → output [200,210); B = [20,30) → output [500,510).
+        // A and B are contiguous in input but far apart in output.
+        let mut remap = AddressRemap::new();
+        remap.insert(span(10, 20, 200, 0, &[(0, 0)]));
+        remap.insert(span(20, 30, 500, 0, &[(0, 0)]));
+        // addr 20 is A.input_end AND B.input_start; outputs diverge
+        // (A end = 210, B start = 500) → ambiguous → None.
+        assert_eq!(remap.translate(20), None);
+
+        // Order-preserved layout: A end (210) == B start (210) → the
+        // boundary is unambiguous and resolves.
+        let mut ordered = AddressRemap::new();
+        ordered.insert(span(10, 20, 200, 0, &[(0, 0)]));
+        ordered.insert(span(20, 30, 210, 0, &[(0, 0)]));
+        assert_eq!(ordered.translate(20), Some(210));
     }
 
     /// An address in the locals/prefix region (`DW_AT_low_pc` points at
