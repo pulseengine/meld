@@ -1486,6 +1486,78 @@ loss-scenarios:
       plus negative test
       `bidirectional_pipe_is_not_flagged_as_cycle`.
 
+  - id: LS-R-14
+    title: Resource handle carried across an async stream/future boundary
+    uca: UCA-R-5
+    hazards: [H-1, H-3]
+    type: inadequate-control-algorithm
+    scenario: >
+      A component declares a `stream<T>` or `future<T>` whose element
+      type `T` is a resource handle — `borrow<R>` or `own<R>`. A
+      `borrow<R>` handle is valid only for the duration of the call that
+      received it, but a stream/future is read by the consumer *after*
+      the producing call has returned, across the async boundary: the
+      borrow is dereferenced after its lending scope ended — a
+      use-after-scope on the resource's representation [H-3], and any
+      witness/sigil claim about that handle's validity is de-grounded
+      [H-1]. An `own<R>` transferred into a stream is the
+      drop-while-referenced hazard #142 (iv) names: if the producer
+      drops the handle while the consumer still holds it via the stream,
+      the representation is freed under the consumer. Meld cannot rule
+      out the drop discipline statically, so it surfaces the structural
+      precondition (a handle as a stream/future element) and flags
+      `borrow` as a definite violation, `own` as one to verify.
+    causal-factors:
+      - >-
+        The component-model type system permits a `stream<T>` /
+        `future<T>` element to be any value type, including a resource
+        handle, with no validator rejecting borrow-in-stream
+      - >-
+        Resource handles surface in the parsed stream descriptor only
+        indirectly, as `stream<Type(N)>` where component type index N
+        resolves to a `Defined(Own/Borrow)` — so a naive descriptor
+        scan that looks only for primitive element names misses them
+      - >-
+        The hazard is invisible at fusion time and at producer runtime;
+        it manifests only when the consumer dereferences the handle
+        after the producer's scope/ownership ended
+    process-model-flaw: >
+      The model treated a stream's element type as plain data that is
+      copied through the ring buffer. Resource handles are not plain
+      data — they are scoped (`borrow`) or singly-owned (`own`)
+      capabilities whose validity is tied to a call or an ownership
+      chain that the async stream boundary breaks.
+    status: approved
+    priority: medium
+    fix: >
+      `p3_stream::resource_lifetime_issues` (#142 (iv)). Scans every
+      component's `stream<T>` / `future<T>` type, parses the
+      `Type(N)` element index out of the descriptor (the wasmparser
+      `ComponentValType::Type(N)` Debug form, pinned by
+      `wasmparser_type_debug_form_is_stable`), and reuses
+      `ParsedComponent::resolve_to_resource` — the same `Type(idx)` →
+      handle chase meld applies to function params — to classify the
+      element as `borrow` or `own`. Emits
+      `StreamValidationIssue::ResourceLifetime`, surfaced as an
+      `Error::StreamValidation`. Confirmed by
+      `ls_r_14_borrow_handle_in_stream_flagged`,
+      `ls_r_14_own_handle_in_future_flagged_as_owned`, and negative
+      test `ls_r_14_primitive_element_stream_not_flagged`. Limitation
+      (acknowledged): a handle nested inside a composite element
+      (`stream<list<own<R>>>`) is not flagged — same boundary as
+      `stream_elements_in_valtype`.
+      ###
+      ### #142 (ii) bounded-channel capacity — NOT APPLICABLE
+      ###
+      The Component-Model canonical ABI has no bounded-channel /
+      capacity concept: `stream.new` (`CanonicalEntry::StreamNew { ty }`)
+      takes no capacity argument and streams are unbounded by
+      construction. There is nothing in the component binary to
+      validate — "components that opt into bounded channels but don't
+      declare capacity" presupposes a capacity-annotation mechanism the
+      ABI does not provide. (ii) is therefore closed as not-applicable
+      rather than implemented; documented in `p3_stream.rs`.
+
   # ==========================================================================
   # Merger scenarios
   # ==========================================================================
