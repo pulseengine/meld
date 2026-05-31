@@ -25,7 +25,7 @@ artifacts:
     description: >
       The parser shall extract all core modules from a component,
       including those nested within component instances at any depth.
-    status: draft
+    status: implemented
     tags: [stpa-derived]
     links:
       - type: derives-from
@@ -46,7 +46,7 @@ artifacts:
     description: >
       The parser shall extract every import and export entry declared
       by a component, preserving names, types, and kind.
-    status: draft
+    status: implemented
     tags: [stpa-derived]
     links:
       - type: derives-from
@@ -65,7 +65,7 @@ artifacts:
       canonical_abi_element_size shall return the correctly aligned
       element size for all Canonical ABI types, including records with
       heterogeneous field alignments.
-    status: draft
+    status: implemented
     tags: [stpa-derived]
     links:
       - type: derives-from
@@ -91,7 +91,7 @@ artifacts:
       The parser shall reject components that do not pass wasmparser
       validation with feature flags locked to the Component Model
       baseline spec.
-    status: draft
+    status: implemented
     tags: [stpa-derived]
     links:
       - type: derives-from
@@ -116,7 +116,7 @@ artifacts:
       The resolver shall match every import to exactly one export with
       a matching interface name and compatible type. Ambiguous matches
       (multiple exports with the same name) shall produce an error.
-    status: draft
+    status: implemented
     tags: [stpa-derived]
     links:
       - type: derives-from
@@ -141,7 +141,7 @@ artifacts:
       type into the correct CopyLayout. Types with inner pointer fields
       (strings, lists, records containing pointers) shall be classified
       as Elements with inner_pointers, not as Bulk.
-    status: draft
+    status: implemented
     tags: [stpa-derived]
     links:
       - type: derives-from
@@ -168,7 +168,7 @@ artifacts:
       component appears after all components it imports from. Dependency
       cycles shall be detected and reported as an error (or handled by
       cycle-tolerant sort with documented semantics).
-    status: draft
+    status: implemented
     tags: [stpa-derived]
     links:
       - type: derives-from
@@ -198,7 +198,7 @@ artifacts:
       The merger shall compute each component's function base offset
       as the cumulative sum of all preceding components' total function
       counts (imports + defined functions).
-    status: draft
+    status: implemented
     tags: [stpa-derived]
     links:
       - type: derives-from
@@ -220,7 +220,7 @@ artifacts:
       The rewriter shall remap indices in all instruction types that
       reference functions, memories, tables, globals, or types. This
       includes multi-index instructions (memory.copy, memory.init).
-    status: draft
+    status: implemented
     tags: [stpa-derived]
     links:
       - type: derives-from
@@ -248,7 +248,7 @@ artifacts:
       The merger shall reindex data segment memory indices, element
       segment table indices, and global indices in init expressions
       using the correct per-kind base offset.
-    status: draft
+    status: implemented
     tags: [stpa-derived]
     links:
       - type: derives-from
@@ -269,7 +269,7 @@ artifacts:
     description: >
       The merger shall process components in the same order as the
       resolver's topological sort output.
-    status: draft
+    status: implemented
     tags: [stpa-derived]
     links:
       - type: derives-from
@@ -292,7 +292,7 @@ artifacts:
       resolved cross-component call whose signature includes pointer
       types (string, list, record with pointer fields) in multi-memory
       mode.
-    status: draft
+    status: implemented
     tags: [stpa-derived]
     links:
       - type: derives-from
@@ -310,7 +310,7 @@ artifacts:
     description: >
       The adapter shall call cabi_realloc using the post-merge function
       index of the destination component's allocator.
-    status: draft
+    status: implemented
     tags: [stpa-derived]
     links:
       - type: derives-from
@@ -334,7 +334,7 @@ artifacts:
       indices for all memory.copy, i32.load, and i32.store instructions.
       Source = caller's memory, destination = callee's memory for
       arguments; reversed for return values.
-    status: draft
+    status: implemented
     tags: [stpa-derived]
     links:
       - type: derives-from
@@ -359,7 +359,7 @@ artifacts:
     description: >
       The adapter shall compute list copy byte length as element_count
       multiplied by canonical_abi_element_size of the element type.
-    status: draft
+    status: implemented
     tags: [stpa-derived]
     links:
       - type: derives-from
@@ -381,7 +381,7 @@ artifacts:
       each inner pointer to reference the destination memory. The loop
       stride shall equal canonical_abi_element_size. The loop shall
       process exactly element_count iterations.
-    status: draft
+    status: implemented
     tags: [stpa-derived]
     links:
       - type: derives-from
@@ -407,7 +407,7 @@ artifacts:
       String transcoding adapters shall produce valid output encoding
       for all valid input, including characters outside the BMP
       (surrogate pair handling for UTF-16).
-    status: draft
+    status: implemented
     tags: [stpa-derived]
     links:
       - type: derives-from
@@ -426,7 +426,7 @@ artifacts:
       The adapter shall emit instructions in the correct order:
       cabi_realloc before memory.copy, memory.copy before callee
       function call.
-    status: draft
+    status: implemented
     tags: [stpa-derived]
     links:
       - type: derives-from
@@ -448,7 +448,7 @@ artifacts:
     description: >
       Given identical input component bytes and identical FuserConfig,
       meld shall produce byte-identical output across invocations.
-    status: draft
+    status: implemented
     tags: [stpa-derived]
     links:
       - type: derives-from
@@ -469,7 +469,7 @@ artifacts:
       out-of-bounds index, malformed input), meld shall abort with a
       diagnostic error. Partial or best-effort output shall not be
       produced.
-    status: draft
+    status: implemented
     tags: [stpa-derived]
     links:
       - type: derives-from
@@ -496,7 +496,7 @@ artifacts:
       each canon lower shall reference the correct memory index and
       cabi_realloc for the importing component. The stubs module shall
       define all memories needed by the fused module.
-    status: draft
+    status: implemented
     tags: [stpa-derived]
     links:
       - type: derives-from
@@ -545,7 +545,7 @@ artifacts:
       module:field name but different type signatures. In multi-memory mode,
       imports from different components shall be kept separate even if they
       share the same name, to allow per-component canon lower configuration.
-    status: draft
+    status: implemented
     tags: [stpa-derived]
     links:
       - type: derives-from
@@ -596,7 +596,7 @@ artifacts:
       The adapter shall pass resource handles through cross-component calls
       without modification (no pointer copy or fixup). Resource drop
       functions shall be forwarded directly.
-    status: draft
+    status: implemented
     tags: [stpa-derived]
     links:
       - type: derives-from
@@ -645,7 +645,7 @@ artifacts:
       may support multi-module component output (per cfallin's "simple
       component" proposal), but until then, fail-fast rejection is
       required.
-    status: draft
+    status: implemented
     tags: [stpa-derived]
     links:
       - type: derives-from
@@ -724,7 +724,7 @@ artifacts:
       (b) different-memory (multi-memory): `stream_read` → in-module copy
       loop → `stream_write` chain, with `cabi_realloc` null-guard policy
       per LS-A-7.
-    status: planned
+    status: implemented
     tags: [roadmap, p3-async, v0.9.0]
     links:
       - type: derives-from
@@ -780,7 +780,7 @@ artifacts:
       `.debug_str` / `.debug_abbrev` pass through with string-pool dedup /
       byte-equal merge. End-to-end verified by witness MC/DC integration:
       ≥ X% of `br_if` byte offsets in fused output resolve to source.
-    status: planned
+    status: implemented
     tags: [roadmap, dwarf, witness-mc-dc, v0.10.0]
     links:
       - type: derives-from
