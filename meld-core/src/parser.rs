@@ -1948,7 +1948,7 @@ impl ParsedComponent {
     ///
     /// Returns `Some((resource_type_id, is_owned))` for `Own(T)`, `Borrow(T)`,
     /// and `Type(idx)` that resolves to a `Defined(Own(T))` or `Defined(Borrow(T))`.
-    fn resolve_to_resource(&self, ty: &ComponentValType) -> Option<(u32, bool)> {
+    pub(crate) fn resolve_to_resource(&self, ty: &ComponentValType) -> Option<(u32, bool)> {
         match ty {
             ComponentValType::Own(id) => Some((*id, true)),
             ComponentValType::Borrow(id) => Some((*id, false)),
