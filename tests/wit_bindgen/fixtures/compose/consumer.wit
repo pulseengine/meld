@@ -1,0 +1,5 @@
+package golden:app@0.1.0;
+world consumer {
+  import golden:math/lib@0.1.0;
+  export compute: func() -> u32;
+}

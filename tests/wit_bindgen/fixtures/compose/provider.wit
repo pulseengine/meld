@@ -1,0 +1,7 @@
+package golden:math@0.1.0;
+interface lib {
+  add: func(a: u32, b: u32) -> u32;
+}
+world provider {
+  export lib;
+}
