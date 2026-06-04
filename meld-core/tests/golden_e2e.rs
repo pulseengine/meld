@@ -310,65 +310,81 @@ fn call_compute(wasm: &[u8]) -> anyhow::Result<u32> {
     Ok(r)
 }
 
-/// Tier B: fusing a real multi-component composition must preserve the
-/// cross-component call result. The host-linked (`wac`-composed)
-/// component computes `add(20, 22) = 42`; the meld-fused module must
-/// compute the same — proving fusion correctly internalises the
-/// consumer→provider call instead of breaking it.
-///
-/// **Discovery oracle, currently `#[ignore]`d on meld#212.** This
-/// harness surfaced that meld does not yet internalise a cross-component
-/// interface link across separate inputs (the fused output still imports
-/// `golden:math/lib`), so `compute()` can't run standalone. The body
-/// below is the fix's acceptance test — remove `#[ignore]` once meld#212
-/// lands. (Tier A — real wit-bindgen compositions — passes unignored.)
-#[test]
-#[ignore = "meld#212: cross-component interface link not internalised across separate inputs"]
-fn tier_b_fused_multicomponent_matches_host_linked() {
-    let (Ok(composed), Ok(consumer), Ok(provider)) = (
-        std::fs::read(format!("{COMPOSE_DIR}/composed.wasm")),
-        std::fs::read(format!("{COMPOSE_DIR}/consumer.wasm")),
-        std::fs::read(format!("{COMPOSE_DIR}/provider.wasm")),
-    ) else {
-        eprintln!("skipping: compose fixtures not found in {COMPOSE_DIR} (run build.sh)");
-        return;
-    };
-
-    // Golden: the host-linked (wac-composed) composition runs compute()
-    // = add(20, 22) = 42.
+/// Read the host-linked composed fixture and its `compute()` golden value
+/// (`add(20, 22) = 42`), or `None` to skip when fixtures are absent.
+fn composed_golden() -> Option<(Vec<u8>, u32)> {
+    let composed = std::fs::read(format!("{COMPOSE_DIR}/composed.wasm")).ok()?;
     let golden = call_compute(&composed).expect("host-linked composed compute() should run");
     assert_eq!(
         golden, 42,
         "sanity: wac-composed compute() must be add(20,22)=42"
     );
+    Some((composed, golden))
+}
 
-    // meld-native path: hand meld the two components separately; it must
-    // resolve consumer's `golden:math/lib` import against provider's
-    // export, internalise the call, and emit a self-contained component
-    // whose compute() still returns 42 with NO host providing `add`.
+/// Tier B (#212.2): fusing a real `wac`-composed multi-component must
+/// preserve the cross-component call result. The host-linked composition
+/// computes `add(20, 22) = 42`; meld fusing that composition must emit a
+/// self-contained component whose `compute()` still returns 42 — proving
+/// the wrap keeps the top-level export *and* its correct signature through
+/// fusion (the empty-world / wrong-type regression this harness surfaced).
+#[test]
+fn tier_b_fused_composed_matches_host_linked() {
+    let Some((composed, golden)) = composed_golden() else {
+        eprintln!("skipping: compose fixtures not found in {COMPOSE_DIR} (run build.sh)");
+        return;
+    };
+
+    let mut ran = 0usize;
     for memory in [MemoryStrategy::MultiMemory, MemoryStrategy::SharedMemory] {
-        let fused = match fuse_many(
-            &[("consumer", &consumer), ("provider", &provider)],
-            OutputFormat::Component,
-            memory,
-        ) {
+        let fused = match fuse(&composed, "composed", OutputFormat::Component, memory) {
             Ok(f) => f,
             Err(e) => {
-                eprintln!("[2-input/{memory:?}] fuse declined ({e}); skipping");
+                eprintln!("[composed/{memory:?}] fuse declined ({e}); skipping");
                 continue;
             }
         };
         let got = call_compute(&fused).unwrap_or_else(|e| {
             panic!(
-                "[2-input/{memory:?}] fused compute() failed: {e} — meld did not produce a \
-                 self-contained component that runs the internalised cross-component call"
+                "[composed/{memory:?}] fused compute() failed: {e} — meld dropped or \
+                 mis-typed the composition's top-level export (#212.2)"
             )
         });
         assert_eq!(
             got, golden,
-            "[2-input/{memory:?}] meld-fused composition diverged from host-linked \
-             (cross-component add() call not internalised correctly): got {got}, want {golden}"
+            "[composed/{memory:?}] meld-fused composition diverged from host-linked: \
+             got {got}, want {golden}"
         );
-        eprintln!("Tier B [{memory:?}]: fused 2-component compute() = {got} ✓");
+        eprintln!("Tier B [{memory:?}]: fused composed compute() = {got} ✓");
+        ran += 1;
     }
+    assert!(ran > 0, "no memory strategy produced a fusable composition");
+}
+
+/// Tier B (#212.1, still open): meld's *native* path — hand it the two
+/// components separately and have it link consumer→provider, internalise
+/// the call, and emit a self-contained component. Currently `#[ignore]`d:
+/// meld does not yet resolve a cross-component *interface* import/export
+/// across separate inputs (the fused output still imports
+/// `golden:math/lib`). Un-ignore when #212.1 lands.
+#[test]
+#[ignore = "meld#212.1: cross-component interface link not internalised across separate inputs"]
+fn tier_b_separate_inputs_internalise_link() {
+    let (Ok(consumer), Ok(provider), Some((_, golden))) = (
+        std::fs::read(format!("{COMPOSE_DIR}/consumer.wasm")),
+        std::fs::read(format!("{COMPOSE_DIR}/provider.wasm")),
+        composed_golden(),
+    ) else {
+        eprintln!("skipping: compose fixtures not found in {COMPOSE_DIR}");
+        return;
+    };
+    let fused = fuse_many(
+        &[("consumer", &consumer), ("provider", &provider)],
+        OutputFormat::Component,
+        MemoryStrategy::MultiMemory,
+    )
+    .expect("fuse two inputs");
+    let got = call_compute(&fused)
+        .expect("fused separate-input composition should run compute() standalone");
+    assert_eq!(got, golden, "separate-input fusion must match host-linked");
 }
