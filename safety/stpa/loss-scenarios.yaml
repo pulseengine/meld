@@ -1841,6 +1841,82 @@ loss-scenarios:
     status: approved
     priority: high
 
+  - id: LS-CP-5
+    title: Multi-component fusion drops or mis-types the composition's export
+    uca: UCA-CP-1
+    hazards: [H-1, H-3]
+    type: inadequate-control-algorithm
+    scenario: >
+      When meld fuses a `wac`-composed multi-component (its documented
+      input — several sub-components linked into one), `wrap_as_component`
+      reconstructs the output component's exports by re-lifting each
+      top-level export. For such a composition the pieces are spread
+      across *different* parsed components: the top-level instance export
+      lives in the outer shell, while the canon-lift carrying the
+      function's real WIT type lives in a flattened inner component and is
+      reached only through an interface-*instance* export. Two failures
+      followed [H-1/H-3]: (1) source-component selection ranked candidates
+      by `depth_0_sections` count, which ties at 0 for these inputs, so
+      `max_by_key` picked the *last* candidate — a bare-func sub-component
+      — and the real top-level export was dropped, yielding an empty
+      `world root {}` (a validating but functionless component); (2) once
+      the export was surfaced, the lift type was looked up only on that
+      (wrong) component, missing the real lift, so the export came out as
+      `func() -> result` instead of its true signature — a silent ABI
+      mismatch a consumer would mis-decode. Found by the golden-e2e
+      (`tests/golden_e2e.rs`), which fused a real consumer→provider
+      composition and found `compute()` neither present nor correctly
+      typed in the fused output.
+    causal-factors:
+      - >-
+        `wrap_as_component` source selection used only `depth_0_sections`
+        length, ambiguous when every candidate is 0 (flattened
+        sub-components carry no captured depth-0 sections)
+      - >-
+        `find_lift_type_for_interface_func` searched only the single
+        `source` component and only flat `{iface}#{func}` Func exports,
+        so a lift reached via an interface-instance export in a different
+        component was invisible — it fell back to a default `() -> result`
+      - >-
+        meld's wrap implicitly assumed one component holds both the
+        top-level export and the lift — true for single wit-bindgen
+        fixtures, false for a `wac`-composed multi-component
+    process-model-flaw: >
+      The model treated "the source component" as a single object owning
+      both the composition's exports and every export function's lift. In
+      a real composition those are spread across the outer shell, an
+      interface-instance export, and a flattened inner component.
+    status: approved
+    priority: high
+    fix: >
+      Two-part fix in `component_wrap.rs`. (1) Source selection now ranks
+      by `(depth_0_sections, top-level instance-export count,
+      prefer-original)`, so the component holding the composition's real
+      top-level exports wins even when depth-0 counts tie. (2)
+      `find_lift_type_for_interface_func` searches all input components
+      (source first) and, beyond the flat `{iface}#{func}` Func-export
+      path, resolves a lift via the owning component's CORE export name →
+      `core_func_index` → matching `CanonicalEntry::Lift` — the
+      interface-instance export shape — returning the *owning* component
+      so its (component-relative) type index resolves correctly. Unit
+      test
+      `component_wrap::tests::ls_cp_5_lift_resolved_cross_component_via_core_export`
+      pins the cross-component resolution; the end-to-end acceptance test
+      `tests::golden_e2e::tier_b_fused_composed_matches_host_linked` fuses
+      a real `wac`-composed component and asserts the fused interface
+      returns the host-linked `compute()=add(20,22)=42` AND `greet()=7`
+      under both memory strategies. The fixture is deliberately
+      adversarial: the inner core module *imports* `add`, so the module-
+      local func index space diverges from the component-level core-func
+      index space, and the two exports carry *different* WIT types
+      (`u32` vs `u8`) checked by typed wasmtime calls — a fix that matched
+      by index rather than by name (the fragile path a Mythos clean-room
+      scan flagged on the earlier attempt) swaps or mis-types them and
+      fails here. Tier A (single-component wit-bindgen fixtures) is
+      unchanged — no regression. NB the
+      *separate*-input linking case remains open as #212.1; the supported
+      workflow is `wac compose` then `meld fuse`.
+
   # ==========================================================================
   # Additional adapter scenarios (discovered during gap analysis)
   # ==========================================================================
