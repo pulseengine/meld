@@ -808,6 +808,16 @@ artifacts:
       placeholder source file `<meld-adapter>` line N where N encodes
       the adapter class. Witness then surfaces these as "adapter"
       branches in its MC/DC line map rather than as un-attributed gaps.
+
+      Delivered incrementally. Increment 1 (`dwarf::adapter_spans`):
+      the enumeration seam — reports which fused-output code ranges are
+      meld-generated (identified via the merger's synthetic-origin
+      sentinels), the data witness consumes to classify adapter branches
+      and the input the DIE emitter iterates. Increment 2 (pending):
+      emit the synthetic DWARF DIEs via gimli and assign per-class
+      `<meld-adapter>` line numbers (requires the merger to tag each
+      synthetic function's adapter class at generation time). Status
+      remains `planned` until the DIEs are actually emitted.
     status: planned
     tags: [roadmap, dwarf, witness-mc-dc, v0.11.0]
     links:
@@ -819,10 +829,13 @@ artifacts:
         target: SR-35
     fields:
       implementation:
-        - meld-core/src/dwarf_remap.rs
+        - meld-core/src/dwarf.rs
         - meld-core/src/adapter/fact.rs
       verification-method: test+cross-repo
       verification-description: >
-        Witness confirms adapter ranges resolve to `<meld-adapter>:N`
+        Increment 1: `dwarf::tests::adapter_spans_*` pin that
+        meld-generated functions are enumerated at their correct output
+        ranges and are disjoint from source-function ranges. Increment 2:
+        witness confirms adapter ranges resolve to `<meld-adapter>:N`
         rather than `unknown`; LS-N approved for MC/DC adapter accounting.
       milestone: v0.11.0

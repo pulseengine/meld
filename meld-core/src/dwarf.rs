@@ -585,6 +585,126 @@ pub fn remap_for_output(
     }
 }
 
+// ====================================================================
+// Phase 3 (#144): synthetic source attribution for meld-generated code
+// ====================================================================
+//
+// The fused output contains functions meld emits *itself* — cross-
+// component adapters, canonical-ABI lift/lower glue, `cabi_realloc`
+// trampolines — that have no original source and so no input DWARF.
+// Phase 2 (above) remaps the DWARF of *original* code; Phase 3 attributes
+// the *generated* code to a placeholder `<meld-adapter>` source so
+// witness's MC/DC truth-table view surfaces these as **adapter branches**
+// rather than unattributed `unknown` gaps (see #130 §"Phase 3").
+//
+// Increment 1 (this code): the enumeration seam. [`adapter_spans`] reports
+// which fused-output code ranges are meld-generated, the data witness
+// consumes to classify adapter branches and the input the synthetic-DIE
+// emitter will iterate. Embedding synthetic DWARF DIEs for stock debuggers,
+// and per-class [`AdapterRole`] line numbers, land in a follow-up increment.
+
+/// Role of a meld-generated function, for synthetic source attribution.
+///
+/// Per #130 §"Phase 3 — adapters and inlined code", each role maps to a
+/// line in the placeholder `<meld-adapter>` file. Increment 1 records only
+/// [`AdapterRole::Generated`] (line 0): it answers "which ranges are
+/// meld-generated" completely. Per-class lines (1 = canonical-ABI
+/// transcode loop, 2 = `cabi_realloc` trampoline, 3 = lift, 4 = lower)
+/// require the merger to tag each synthetic function's class at generation
+/// time and land in a follow-up increment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdapterRole {
+    /// meld-generated, role not yet classified (placeholder line 0).
+    Generated,
+}
+
+impl AdapterRole {
+    /// Line number in the synthetic `<meld-adapter>` file encoding this
+    /// role, per #130 §"Phase 3".
+    pub fn adapter_line(self) -> u32 {
+        match self {
+            AdapterRole::Generated => 0,
+        }
+    }
+}
+
+/// The synthetic placeholder "source file" name meld-generated functions
+/// are attributed to. witness recognises this sentinel and treats lines in
+/// it as adapter branches exempt from source-level MC/DC.
+pub const ADAPTER_SOURCE_NAME: &str = "<meld-adapter>";
+
+/// One meld-generated function's location in the fused output code
+/// section — the unit of Phase 3 synthetic attribution (#144).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdapterSpan {
+    /// Defined-function index in the fused output (0-based among defined
+    /// functions, i.e. excluding imports). Equals the function's position
+    /// in [`crate::merger::MergedModule::functions`].
+    pub output_defined_idx: usize,
+    /// `[start, end)` of the function body in the fused output code
+    /// section (code-section-relative), including the locals prefix —
+    /// the same convention as [`FunctionSpan::output_body_start`] and
+    /// [`crate::provenance::CodeRange`].
+    pub output_body_start: u32,
+    pub output_body_end: u32,
+    /// Best-effort adapter role (see [`AdapterRole`]).
+    pub role: AdapterRole,
+}
+
+/// `true` if `origin` is one of the merger's synthetic-function sentinels
+/// — a function meld generated rather than carried over from an input
+/// module. The merger marks these as `(comp_idx, 0, u32::MAX)`
+/// (component-attributed synthetics: resource destructors, callback /
+/// stream adapters) or `(usize::MAX, usize::MAX, 0)` (fully synthetic). A
+/// real defined-function index is never `u32::MAX` and a real component
+/// index is never `usize::MAX`, so either sentinel is unambiguous.
+fn is_generated_origin(origin: (usize, usize, u32)) -> bool {
+    origin.0 == usize::MAX || origin.2 == u32::MAX
+}
+
+/// Enumerate the meld-generated (adapter / synthetic) functions in the
+/// fused output, with their output code-section ranges — the foundation
+/// for Phase 3 synthetic attribution (#144).
+///
+/// `output_bytes` is the fused core module; its defined-function layout
+/// aligns index-for-index with [`crate::merger::MergedModule::functions`]
+/// (both exclude imports, same order), exactly as
+/// [`build_remap_for_module`] relies on. Returns an empty vector if the
+/// output code section can't be parsed or there are no generated
+/// functions.
+pub fn adapter_spans(
+    merged: &crate::merger::MergedModule,
+    output_bytes: &[u8],
+) -> Vec<AdapterSpan> {
+    let origins: Vec<(usize, usize, u32)> = merged.functions.iter().map(|f| f.origin).collect();
+    adapter_spans_from_parts(&origins, output_bytes)
+}
+
+/// Testable core of [`adapter_spans`]: `origins[i]` is the origin tuple of
+/// fused-output defined-function `i`.
+fn adapter_spans_from_parts(
+    origins: &[(usize, usize, u32)],
+    output_bytes: &[u8],
+) -> Vec<AdapterSpan> {
+    let Some(layouts) = module_function_layouts(output_bytes) else {
+        return Vec::new();
+    };
+    origins
+        .iter()
+        .enumerate()
+        .filter(|(_, origin)| is_generated_origin(**origin))
+        .filter_map(|(out_idx, _)| {
+            let l = layouts.get(out_idx)?;
+            Some(AdapterSpan {
+                output_defined_idx: out_idx,
+                output_body_start: l.body_start,
+                output_body_end: l.body_end,
+                role: AdapterRole::Generated,
+            })
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -917,5 +1037,94 @@ mod tests {
             build_remap_from_parts(&input, 0, &output, &pairs).is_none(),
             "operator-count mismatch must yield None (fall back to strip)"
         );
+    }
+
+    // ---- Phase 3 (#144): adapter-span enumeration ----
+
+    /// A component-attributed synthetic (`origin.2 == u32::MAX`) is
+    /// reported as an adapter span at its real output body range; source
+    /// functions are not.
+    #[test]
+    fn adapter_spans_identifies_component_synthetic() {
+        let wat = r#"(module
+            (func (result i32) i32.const 1)
+            (func (result i32) i32.const 2)
+            (func (result i32) i32.const 3))"#;
+        let bytes = wat::parse_str(wat).expect("assemble wat");
+        // func 1 is meld-generated; 0 and 2 are original source.
+        let origins = [
+            (0usize, 0usize, 0u32),
+            (0usize, 0usize, u32::MAX),
+            (0usize, 0usize, 2u32),
+        ];
+
+        let spans = adapter_spans_from_parts(&origins, &bytes);
+        assert_eq!(spans.len(), 1, "exactly one generated function");
+        assert_eq!(spans[0].output_defined_idx, 1);
+        assert_eq!(spans[0].role, AdapterRole::Generated);
+        assert_eq!(spans[0].role.adapter_line(), 0);
+
+        // The span must match func 1's real layout in the output.
+        let layouts = module_function_layouts(&bytes).expect("layouts");
+        assert_eq!(spans[0].output_body_start, layouts[1].body_start);
+        assert_eq!(spans[0].output_body_end, layouts[1].body_end);
+        assert!(
+            spans[0].output_body_end > spans[0].output_body_start,
+            "body range must be non-empty"
+        );
+    }
+
+    /// The fully-synthetic sentinel `(usize::MAX, usize::MAX, 0)` is also
+    /// recognised even though `origin.2` is a plausible real index (0).
+    #[test]
+    fn adapter_spans_recognises_fully_synthetic_sentinel() {
+        let wat = r#"(module (func (result i32) i32.const 7))"#;
+        let bytes = wat::parse_str(wat).expect("assemble wat");
+        let origins = [(usize::MAX, usize::MAX, 0u32)];
+
+        let spans = adapter_spans_from_parts(&origins, &bytes);
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].output_defined_idx, 0);
+    }
+
+    /// An all-original module produces no adapter spans.
+    #[test]
+    fn adapter_spans_empty_when_all_source() {
+        let wat = r#"(module
+            (func (result i32) i32.const 1)
+            (func (result i32) i32.const 2))"#;
+        let bytes = wat::parse_str(wat).expect("assemble wat");
+        let origins = [(0usize, 0usize, 0u32), (0usize, 1usize, 1u32)];
+        assert!(adapter_spans_from_parts(&origins, &bytes).is_empty());
+    }
+
+    /// Adapter ranges must be disjoint from every source-function range —
+    /// otherwise a synthetic DIE would double-attribute a code byte that a
+    /// remapped original DIE already covers.
+    #[test]
+    fn adapter_spans_disjoint_from_source_ranges() {
+        let wat = r#"(module
+            (func (result i32) i32.const 1)
+            (func (result i32) i32.const 2)
+            (func (result i32) i32.const 3))"#;
+        let bytes = wat::parse_str(wat).expect("assemble wat");
+        let origins = [
+            (0usize, 0usize, 0u32),
+            (0usize, 0usize, u32::MAX), // generated
+            (0usize, 0usize, 2u32),
+        ];
+
+        let adapters = adapter_spans_from_parts(&origins, &bytes);
+        let layouts = module_function_layouts(&bytes).expect("layouts");
+        for a in &adapters {
+            for (i, l) in layouts.iter().enumerate() {
+                if is_generated_origin(origins[i]) {
+                    continue;
+                }
+                let disjoint =
+                    a.output_body_end <= l.body_start || a.output_body_start >= l.body_end;
+                assert!(disjoint, "adapter span overlaps source function {i}");
+            }
+        }
     }
 }
