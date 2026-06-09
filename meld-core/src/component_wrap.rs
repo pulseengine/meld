@@ -52,6 +52,14 @@ pub fn wrap_as_component(
     memory_strategy: MemoryStrategy,
     opaque_resources: &[(String, String)],
 ) -> Result<Vec<u8>> {
+    // Unresolved `MemoryStrategy::Auto` (direct API use only — the Fuser
+    // resolves it before calling here) behaves as `MultiMemory`, matching
+    // the same normalization in `Merger::new` and `Resolver::with_strategy`
+    // so the `== MultiMemory` comparisons below stay coherent (PR #220).
+    let memory_strategy = match memory_strategy {
+        MemoryStrategy::Auto => MemoryStrategy::MultiMemory,
+        concrete => concrete,
+    };
     // Pick the component with the most depth_0_sections (widest interface).
     // Prefer original (un-flattened) components since flattening may drop
     // the outer shell that carries the depth_0_sections.

@@ -2700,9 +2700,15 @@ loss-scenarios:
         `CoreModule.bytes` actually merged into the output
       - >-
         the auto-resolution running before all components are added, or
-        a later `add_component` not re-triggering resolution (mitigated:
-        resolution happens inside `fuse_with_stats`, after the
-        component set is final)
+        a later `add_component` not re-triggering resolution. NOT
+        hypothetical: the PR's own clean-room pass proved it (Mythos
+        finding A) — the first implementation resolved Auto in place,
+        so fuse → add_component → fuse reused the stale "shared"
+        resolution and errored on the newly-added growing input.
+        Mitigated by capturing the requested strategy in
+        `Fuser::requested_memory` and re-deriving the resolution from
+        the current component set on every fuse; pinned by
+        `ls_m_7_auto_reprobes_after_add_component`
     process-model-flaw: >
       The resolver's model is "absence of memory.grow in the code
       section ⇒ memory size is static". That implication is sound for

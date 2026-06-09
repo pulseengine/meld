@@ -495,6 +495,19 @@ struct SharedMemoryPlan {
 impl Merger {
     /// Create a new merger with the specified memory strategy
     pub fn new(memory_strategy: MemoryStrategy, address_rebasing: bool) -> Self {
+        // `Auto` is resolved to a concrete strategy by
+        // `Fuser::fuse_with_stats` before the merger is constructed. If an
+        // unresolved `Auto` arrives via direct API use, normalize it to
+        // `MultiMemory` (the always-sound strategy) HERE — the strategy
+        // comparisons throughout this file are a mix of `== SharedMemory`
+        // and `== MultiMemory`, and an un-normalized third variant would
+        // satisfy neither consistently (Mythos finding B, PR #220: multi
+        // memory layout with shared-style export dedup silently drops the
+        // second component's memory export).
+        let memory_strategy = match memory_strategy {
+            MemoryStrategy::Auto => MemoryStrategy::MultiMemory,
+            concrete => concrete,
+        };
         Self {
             memory_strategy,
             address_rebasing,
@@ -3407,6 +3420,21 @@ mod tests {
             None,
         );
         assert_eq!(maps_b.remap_memory(0), 1);
+    }
+
+    /// Mythos finding B (PR #220): an unresolved `MemoryStrategy::Auto`
+    /// reaching `Merger::new` directly must normalize to MultiMemory.
+    /// Without normalization the merger is split-brained — `== SharedMemory`
+    /// sites treat Auto as multi while `== MultiMemory` sites treat it as
+    /// shared, silently dropping the second component's memory export.
+    #[test]
+    fn test_merger_new_normalizes_auto_to_multi_memory() {
+        let merger = Merger::new(MemoryStrategy::Auto, false);
+        assert_eq!(
+            merger.memory_strategy,
+            MemoryStrategy::MultiMemory,
+            "Merger::new(Auto, _) must normalize to MultiMemory"
+        );
     }
 
     /// Regression test for Bug #7: Merger::default() must use MultiMemory strategy.

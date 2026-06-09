@@ -264,6 +264,39 @@ fn auto_keeps_multi_for_single_memory_input() {
     assert!(validates_without_multimemory(&fused));
 }
 
+/// Mythos finding A (PR #220): Auto resolution must be re-derived from the
+/// CURRENT component set on every fuse. A fuse → `add_component` → fuse
+/// sequence must not reuse the first fuse's stale "shared" resolution when
+/// the newly added component grows memory — the second fuse must succeed
+/// and resolve to multi. (`ls_m_7_` prefix: LS-M-7 / UCA-M-11 regression,
+/// run by the LS-N verification gate.)
+#[test]
+fn ls_m_7_auto_reprobes_after_add_component() {
+    let component_a = build_component(build_module_a());
+    let component_b = build_component(build_module_b(false));
+    let component_grow = build_component(build_module_b(true));
+
+    let mut fuser = Fuser::new(FuserConfig::default());
+    fuser.add_component_named(&component_a, Some("a")).unwrap();
+    fuser.add_component_named(&component_b, Some("b")).unwrap();
+
+    let (_, stats) = fuser.fuse_with_stats().unwrap();
+    assert_eq!(stats.memory_strategy, "shared", "grow-free pair → shared");
+
+    fuser
+        .add_component_named(&component_grow, Some("grower"))
+        .unwrap();
+    let (fused, stats) = fuser
+        .fuse_with_stats()
+        .expect("second fuse must re-resolve, not reuse the stale shared plan");
+    assert_eq!(
+        stats.memory_strategy, "multi",
+        "a growing component added after a previous fuse must flip the \
+         resolution back to multi"
+    );
+    assert_eq!(output_memory_count(&fused), 3);
+}
+
 /// Explicit strategies are untouched by Auto: `MultiMemory` still produces
 /// the multi-memory form even for grow-free inputs.
 #[test]

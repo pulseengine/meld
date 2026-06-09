@@ -284,6 +284,13 @@ pub struct Fuser {
     original_components: Vec<ParsedComponent>,
     /// Directed wiring hints from composition graph.
     wiring_hints: WiringHints,
+    /// The memory strategy/rebasing pair as originally requested, captured
+    /// before `MemoryStrategy::Auto` resolution mutates `config`. Restored
+    /// at the start of every fuse so resolution is re-derived from the
+    /// CURRENT component set — without this, a fuse → `add_component` →
+    /// fuse sequence would reuse a stale resolution (Mythos finding A,
+    /// PR #220 / UCA-M-11).
+    requested_memory: Option<(MemoryStrategy, bool)>,
 }
 
 impl Fuser {
@@ -294,6 +301,7 @@ impl Fuser {
             components: Vec::new(),
             original_components: Vec::new(),
             wiring_hints: std::collections::HashMap::new(),
+            requested_memory: None,
         }
     }
 
@@ -380,6 +388,15 @@ impl Fuser {
         if self.components.is_empty() {
             return Err(Error::NoComponents);
         }
+        // Restore the originally-requested strategy before resolving, so a
+        // repeated fuse (e.g. after another `add_component`) re-derives the
+        // resolution from the CURRENT component set instead of reusing a
+        // stale one (Mythos finding A, PR #220).
+        let (requested_strategy, requested_rebasing) = *self
+            .requested_memory
+            .get_or_insert((self.config.memory_strategy, self.config.address_rebasing));
+        self.config.memory_strategy = requested_strategy;
+        self.config.address_rebasing = requested_rebasing;
         if self.config.memory_strategy == MemoryStrategy::Auto {
             self.resolve_auto_memory_strategy();
             if self.config.memory_strategy == MemoryStrategy::SharedMemory {

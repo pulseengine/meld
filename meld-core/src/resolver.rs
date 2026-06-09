@@ -1472,11 +1472,18 @@ impl Resolver {
     ///
     /// `MemoryStrategy::Auto` is resolved to a concrete strategy by
     /// `Fuser::fuse_with_stats` before the resolver is constructed. If an
-    /// unresolved `Auto` reaches the resolver anyway (direct API use), it
-    /// behaves as `MultiMemory` — the always-sound strategy — in every
-    /// strategy decision below, matching the merger's `== SharedMemory`
-    /// comparisons which treat `Auto` the same way.
+    /// unresolved `Auto` reaches this constructor anyway (direct API use),
+    /// it is normalized to `MultiMemory` — the always-sound strategy —
+    /// here, mirroring the identical normalization in `Merger::new` and
+    /// `component_wrap::wrap_as_component` so the three consumers can
+    /// never disagree about what `Auto` means. The strategy matches below
+    /// also carry `MultiMemory | Auto` arms as a compiler-enforced
+    /// backstop should a future code path bypass this constructor.
     pub fn with_strategy(memory_strategy: MemoryStrategy) -> Self {
+        let memory_strategy = match memory_strategy {
+            MemoryStrategy::Auto => MemoryStrategy::MultiMemory,
+            concrete => concrete,
+        };
         Self {
             allow_unresolved: true,
             memory_strategy,
@@ -3691,6 +3698,15 @@ impl Default for Resolver {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Mythos finding B (PR #220): an unresolved `MemoryStrategy::Auto`
+    /// reaching `Resolver::with_strategy` directly must normalize to
+    /// MultiMemory, mirroring `Merger::new` so the two can never disagree.
+    #[test]
+    fn test_with_strategy_normalizes_auto_to_multi_memory() {
+        let resolver = Resolver::with_strategy(MemoryStrategy::Auto);
+        assert_eq!(resolver.memory_strategy, MemoryStrategy::MultiMemory);
+    }
 
     #[test]
     fn test_topological_sort_no_deps() {
