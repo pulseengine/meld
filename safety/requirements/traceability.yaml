@@ -340,18 +340,43 @@ verification-status:
     note: "v0.9.0 — Cross-component stream<T> fusion (#141). adapter/fact.rs + resolver.rs."
 
   SR-34:
-    implementation-files: []
-    tests: []
+    implementation-files:
+      - meld-core/src/p3_stream.rs
+      - meld-core/src/resolver.rs
+    tests:
+      - meld-core/src/p3_stream.rs::tests::ls_r_11_stream_typed_import_with_mismatched_roles_raises
+      - meld-core/src/p3_stream.rs::tests::ls_r_11_per_edge_lift_export_mismatch_raises
+      - meld-core/src/p3_stream.rs::tests::ls_r_11_sync_only_connection_with_unrelated_streams_does_not_raise
     proofs: []
-    status: planned
-    note: "v0.9.0 — Static stream<T> validation (#142). Depends on SR-33."
+    status: implemented
+    note: >-
+      Shipped incrementally, not in v0.9.0 as planned: (i) type-match +
+      (iii) cycle detection (iterative SCC) in v0.12.0; LS-R-11 per-edge
+      precision v0.13.0/v0.15.0; (ii) bounded-channel + (iv) resource
+      lifetime v0.21.0 (#142, PR #210). Cycle-detection Kani harness from
+      the original plan was NOT produced — the iterative SCC is pinned by
+      tests only; carried as a proof gap to the v0.31.0 traceability
+      audit (docs/roadmap.md).
 
   SR-35:
-    implementation-files: []
-    tests: []
+    implementation-files:
+      - meld-core/src/dwarf.rs
+      - meld-core/src/rewriter.rs
+    tests:
+      - meld-core/src/dwarf.rs::tests::ls_d_1_remap_translates_low_pc
+      - meld-core/tests/dwarf_remap_witness.rs
+      - meld-core/tests/dwarf_strip.rs
+      - meld-core/tests/dwarf_passthrough.rs
     proofs: []
-    status: planned
-    note: "v0.10.0 — DWARF Phase 2 address remap (#143). New module meld-core/src/dwarf_remap.rs."
+    status: implemented
+    note: >-
+      v0.16.0–v0.18.0 (#143 inc 1–3b): provenance v2 code ranges,
+      rewriter instruction-offset map, AddressRemap engine, gimli
+      section rewrite behind DwarfHandling::Remap (landed in
+      meld-core/src/dwarf.rs, not the originally-planned dwarf_remap.rs).
+      `verified` is gated on the cross-repo witness MC/DC attribution
+      run scheduled for v0.25.0 (docs/roadmap.md) — the Strip→Remap
+      default flip rides the same gate.
 
   SR-36:
     implementation-files: []

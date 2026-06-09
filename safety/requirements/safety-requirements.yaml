@@ -752,8 +752,8 @@ artifacts:
       (iv) `own<T>` handles passed through a stream must outlive every
       receiver. Each violation returns a typed `Error::ValidationError`
       with the offending site.
-    status: planned
-    tags: [roadmap, p3-async, v0.9.0]
+    status: implemented
+    tags: [roadmap, p3-async, v0.12.0, v0.21.0]
     links:
       - type: derives-from
         target: "#94"
@@ -762,12 +762,19 @@ artifacts:
       - type: depends-on
         target: SR-33
     fields:
-      implementation: meld-core/src/resolver.rs
-      verification-method: test+proof
+      implementation:
+        - meld-core/src/p3_stream.rs
+        - meld-core/src/resolver.rs
+      verification-method: test
       verification-description: >
-        Regression test per check; Kani harness for cycle detection.
-        Approved LS-N per violation class.
-      milestone: v0.9.0
+        Shipped incrementally: (i)+(iii) v0.12.0, LS-R-11 per-edge
+        precision v0.13.0/v0.15.0, (ii)+(iv) v0.21.0 (#142, PR #210).
+        Pinned by `ls_r_11_*` tests in p3_stream.rs plus the per-check
+        regression suites. The originally-planned Kani harness for
+        cycle detection was NOT produced (iterative SCC is test-pinned
+        only) — carried as a proof gap to the v0.31.0 traceability
+        audit (docs/roadmap.md).
+      milestone: v0.21.0
 
   - id: SR-35
     type: requirement
