@@ -1469,6 +1469,13 @@ impl Resolver {
     }
 
     /// Create a resolver with a specific memory strategy
+    ///
+    /// `MemoryStrategy::Auto` is resolved to a concrete strategy by
+    /// `Fuser::fuse_with_stats` before the resolver is constructed. If an
+    /// unresolved `Auto` reaches the resolver anyway (direct API use), it
+    /// behaves as `MultiMemory` — the always-sound strategy — in every
+    /// strategy decision below, matching the merger's `== SharedMemory`
+    /// comparisons which treat `Auto` the same way.
     pub fn with_strategy(memory_strategy: MemoryStrategy) -> Self {
         Self {
             allow_unresolved: true,
@@ -1554,7 +1561,9 @@ impl Resolver {
         // emitter that consumes this is a runtime-verified follow-up.
         let stream_mode = match self.memory_strategy {
             MemoryStrategy::SharedMemory => crate::p3_stream::StreamMemoryMode::SameMemory,
-            MemoryStrategy::MultiMemory => crate::p3_stream::StreamMemoryMode::CrossMemory,
+            MemoryStrategy::MultiMemory | MemoryStrategy::Auto => {
+                crate::p3_stream::StreamMemoryMode::CrossMemory
+            }
         };
         graph.stream_pair_graph = Some(crate::p3_stream::build_stream_pair_graph(
             components,
@@ -2677,7 +2686,7 @@ impl Resolver {
                     // across all functions in the interface).
                     let crosses_memory = match self.memory_strategy {
                         MemoryStrategy::SharedMemory => false,
-                        MemoryStrategy::MultiMemory => {
+                        MemoryStrategy::MultiMemory | MemoryStrategy::Auto => {
                             let has_memory = |c: &ParsedComponent| {
                                 c.core_modules.iter().any(|m| {
                                     !m.memories.is_empty()
@@ -3454,7 +3463,7 @@ impl Resolver {
                 // memories (multi-memory mode).
                 let module_memory_differs = match self.memory_strategy {
                     MemoryStrategy::SharedMemory => false,
-                    MemoryStrategy::MultiMemory => {
+                    MemoryStrategy::MultiMemory | MemoryStrategy::Auto => {
                         let from_has_memory = {
                             let m = &component.core_modules[res.from_module];
                             !m.memories.is_empty()
@@ -3495,7 +3504,7 @@ impl Resolver {
             // Determine crosses_memory for the adapter site
             let crosses_memory = match self.memory_strategy {
                 MemoryStrategy::SharedMemory => false,
-                MemoryStrategy::MultiMemory => {
+                MemoryStrategy::MultiMemory | MemoryStrategy::Auto => {
                     let from_has_memory = {
                         let m = &component.core_modules[res.from_module];
                         !m.memories.is_empty()

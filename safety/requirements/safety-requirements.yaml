@@ -826,3 +826,48 @@ artifacts:
         Witness confirms adapter ranges resolve to `<meld-adapter>:N`
         rather than `unknown`; LS-N approved for MC/DC adapter accounting.
       milestone: v0.11.0
+
+  - id: SR-37
+    type: requirement
+    title: Automatic memory-strategy resolution (sound-by-construction default)
+    description: >
+      `MemoryStrategy::Auto` — the default for both `FuserConfig` and the
+      `meld fuse` CLI — shall resolve to shared memory + address rebasing
+      if and only if (a) no input core module contains a `memory.grow`
+      instruction (static probe, conservative on parse failure) and
+      (b) the inputs carry at least two linear memories. Otherwise it
+      shall resolve to multi-memory. If the shared-memory plan refuses
+      the input, fusion shall retry with multi-memory, so Auto accepts
+      every input multi-memory accepts. The resolved strategy shall be
+      reported in `FusionStats` and recorded in the attestation /
+      provenance metadata as the concrete strategy, never as "auto".
+      Rationale: out-of-the-box `meld fuse` output must flow through the
+      `wasm-opt → synth` chain with no extra flags (#172) without ever
+      selecting the shared form where `memory.grow` makes it unsound
+      (merger Bug #7, LS-M-7).
+    status: implemented
+    tags: [usability, memory-strategy, v0.22.0]
+    links:
+      - type: tracked-by
+        target: "#172"
+      - type: mitigates
+        target: LS-M-7
+    fields:
+      implementation:
+        - meld-core/src/memory_probe.rs
+        - meld-core/src/lib.rs
+      verification-method: test
+      verification-description: >
+        Unit tests on the probe (grow detected anywhere in any body;
+        memory.size not a false positive; malformed input counts as
+        growing — `ls_m_7_malformed_input_counts_as_grow`). Integration
+        oracle in tests/auto_memory.rs: grow-free inputs fuse to a
+        single-memory output that validates with multi-memory disabled
+        (the `wasm-opt -Os` feature set) and behaves correctly at
+        runtime; a growing input resolves to multi with both memories
+        preserved (`ls_m_7_auto_keeps_multi_when_input_grows`);
+        explicit strategies are never overridden. Manual evidence on
+        the issue repro: `meld fuse a b -o fused.wasm` then
+        `wasm-opt -Os fused.wasm` succeeds with no flags; the explicit
+        `--memory multi` control still reproduces the rejection.
+      milestone: v0.22.0

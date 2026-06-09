@@ -2668,6 +2668,67 @@ loss-scenarios:
       rewriter instruction-offset map (#143 increment 2) and the
       gimli DWARF rewrite (increment 3).
 
+  - id: LS-M-7
+    title: auto memory-strategy resolution selects unsound shared memory
+    uca: UCA-M-11
+    hazards: [H-2, H-3.2]
+    type: inadequate-control-algorithm
+    scenario: >
+      `MemoryStrategy::Auto` (the default since #172) resolves to
+      shared memory + address rebasing from a static probe: it scans
+      every input core module's code section and selects shared only
+      when no `memory.grow` instruction exists and at least two
+      memories would otherwise be merged. If the probe under-reports —
+      a parse error treated as "no growth", a future Wasm proposal
+      adding a second growth opcode the probe does not know, or a
+      refactor that probes the wrong byte slice (e.g. component bytes
+      instead of core-module bytes, where the code section never
+      parses) — fusion freezes every module's layout into one memory
+      while a module can still grow it at runtime. The first
+      `memory.grow` then returns pages whose ownership no other
+      module's allocator knows about; writes land in a neighbour's
+      address space and data corrupts silently [H-2, H-3.2]. The
+      output validates and runs — corruption only manifests when the
+      growth path executes, which typical smoke tests never trigger.
+    causal-factors:
+      - >-
+        `memory_probe::module_uses_memory_grow` returning false on
+        unparseable input (the sound direction is: parse failure ⇒
+        assume growth ⇒ multi-memory)
+      - >-
+        probing `ParsedComponent` bytes or a stale copy instead of each
+        `CoreModule.bytes` actually merged into the output
+      - >-
+        the auto-resolution running before all components are added, or
+        a later `add_component` not re-triggering resolution (mitigated:
+        resolution happens inside `fuse_with_stats`, after the
+        component set is final)
+    process-model-flaw: >
+      The resolver's model is "absence of memory.grow in the code
+      section ⇒ memory size is static". That implication is sound for
+      current core WebAssembly, but the model silently breaks if
+      growth can be induced any other way (new opcodes, host-side
+      growth of an exported memory). The probe must stay conservative:
+      anything it cannot prove growth-free is treated as growing.
+    status: approved
+    priority: high
+    fix: >
+      `Fuser::resolve_auto_memory_strategy` only selects shared when
+      `memory_probe::module_uses_memory_grow` is false for every core
+      module of every component; the probe returns true on any parse
+      failure (conservative direction). A shared-plan refusal
+      downgrades to multi-memory rather than failing, so the sound
+      strategy is also the fallback. Pinned by
+      `ls_m_7_auto_keeps_multi_when_input_grows` (integration,
+      tests/auto_memory.rs: a growing input must resolve to "multi"
+      with both memories preserved) and
+      `ls_m_7_malformed_input_counts_as_grow` (unit,
+      memory_probe::tests: unparseable bytes must probe as growing).
+      `auto_selects_shared_for_growfree_inputs` covers the other
+      direction end-to-end: grow-free inputs produce a single-memory
+      output that validates without multi-memory and behaves
+      correctly at runtime (B's data at its rebased base).
+
   - id: LS-D-1
     title: remapped DWARF emits a wrong code address for a fused function
     uca: UCA-M-9
