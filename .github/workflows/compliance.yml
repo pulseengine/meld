@@ -1,0 +1,66 @@
+name: Compliance report
+
+# Publishes meld-vX.Y.Z-compliance-report.tar.gz to each GitHub Release so
+# pulseengine.eu's fetch-reports surfaces it on the Reports page. Decoupled
+# from release.yml on purpose: triggers on release publish, is additive, and
+# cannot affect the existing release flow if it fails.
+#
+# NOTE: rivet-version pins the rivet binary used to validate/export meld's
+# artifacts. Bump it if a future schema needs a newer rivet.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing release tag to (re)generate the report for (e.g. v1.2.3)'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  compliance:
+    name: Generate compliance report
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve tag
+        id: tag
+        env:
+          REL_TAG: ${{ github.event.release.tag_name }}
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          TAG="${INPUT_TAG:-$REL_TAG}"
+          case "$TAG" in v*) ;; *) echo "::error::tag '$TAG' must start with v"; exit 1 ;; esac
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.tag.outputs.tag }}
+
+      - name: Generate compliance report
+        id: report
+        uses: pulseengine/rivet/.github/actions/compliance@v0.6.0
+        with:
+          theme: dark
+          rivet-version: v0.15.0
+          include-data-formats: true
+          report-label: ${{ steps.tag.outputs.tag }}
+          archive: 'true'
+          archive-name: meld-${{ steps.tag.outputs.tag }}-compliance-report
+
+      - name: Upload report to release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ARCHIVE_PATH: ${{ steps.report.outputs.archive-path }}
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if [ -z "${ARCHIVE_PATH:-}" ] || [ ! -f "$ARCHIVE_PATH" ]; then
+            echo "::error::compliance action produced no archive-path"; exit 1
+          fi
+          gh release upload "$TAG" "$ARCHIVE_PATH" --clobber
+          echo "::notice title=Compliance report::uploaded $(basename "$ARCHIVE_PATH")"
