@@ -4,6 +4,76 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.22.0] - 2026-06-11
+
+### Added
+
+- **`--memory auto` is the new default** for `meld fuse` and
+  `FuserConfig` (#172, SR-37, PR #220). Resolves to shared memory +
+  address rebasing **iff** no input core module contains `memory.grow`
+  (static probe, conservative on parse failure) and at least two
+  memories would be merged; multi-memory otherwise; a shared-plan
+  refusal retries as multi, so auto accepts every input multi accepts.
+  Out-of-the-box fused output now flows through `wasm-opt → synth`
+  with no extra flags whenever soundness permits (measured: the #172
+  repro passes `wasm-opt -Os` with no flags; explicit `--memory multi`
+  still reproduces the rejection). The PR's Mythos clean-room pass
+  found and fixed two real findings pre-merge: stale Auto resolution
+  on `Fuser` reuse (re-derived per fuse via `requested_memory`), and
+  a Merger split-brain on unresolved `Auto` (normalized at all three
+  public entry points). New UCA-M-11 + approved LS-M-7 with
+  gate-runnable `ls_m_7_*` regression tests.
+
+### Fixed
+
+- **Composed multi-component exports survive wrapping** (#212 items
+  2+3, LS-CP-5, PR #216). `wac`-composed inputs no longer come out as
+  an empty `world root {}`: canonical lifts are resolved by core-export
+  NAME (immune to the module-local vs component-level index-space
+  divergence that core imports cause), and the wrap source is ranked by
+  (depth-0 sections, instance-export count, prefer-original). Pinned by
+  an adversarial divergent-type two-export fixture and golden-e2e
+  Tier B (`fused composed runner == host-linked (42, 7)`).
+- **`CustomSectionHandling::Merge` actually merges** (#222, PR #223).
+  `producers` sections are merged field-wise per tool-conventions
+  (value names unique within a field — first-seen version wins);
+  `target_features` set-unioned; both emitted last in the canonical
+  order LLVM's wasm reader enforces. `llvm-dwarfdump` now reads the
+  fused `.debug_line` untouched (previously: hard `out of order
+  section type: 0` error on every fused module with duplicated
+  `producers`).
+
+### Infrastructure
+
+- **The merge gate is now real**: `main` requires `Test`, `Clippy`,
+  `Format`, `LS-N verification gate`, and `Mythos delta-pass gate`
+  (`strict` up-to-date, admins bound). The campaign-invariants audit
+  found `required_status_checks` had been EMPTY — every prior "CI-gated"
+  merge was gated by convention only. A companion docs-only stub
+  workflow (PR #224) reports the three code contexts instantly for
+  `paths-ignore`d changes so docs/safety PRs stay mergeable.
+- Roadmap v0.22.0 → v0.31.0 in `docs/roadmap.md` (PR #221), mirrored
+  to GitHub milestones; SR-33 honesty correction (detection shipped,
+  emitter did NOT — reverted to `planned`, rebuilt as v0.29.0 scope)
+  and SR-34/SR-35 traceability sync.
+
+### Pre-release Mythos note
+
+Tier-5 files changed since v0.21.0: `component_wrap.rs` (#216),
+`resolver.rs` + `merger.rs` (#220). Both PRs carried clean-room
+delta passes with findings comments and the `mythos-pass-done` label;
+#220's pass produced two provable findings, both fixed and
+regression-pinned in the same PR.
+
+### Falsification statement
+
+Claim: default `meld fuse a.component.wasm b.component.wasm -o fused.wasm`
+on grow-free inputs produces a single-memory module accepted by
+`wasm-opt -Os` with no feature flags. Refute by producing grow-free
+inputs (≥2 memories) whose default fusion emits >1 memory or is
+rejected by a standards-default validator — `tests/auto_memory.rs`
+encodes the oracle.
+
 ## [0.21.0] - 2026-05-30
 
 ### Added
