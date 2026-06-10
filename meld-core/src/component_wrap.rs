@@ -60,13 +60,35 @@ pub fn wrap_as_component(
         MemoryStrategy::Auto => MemoryStrategy::MultiMemory,
         concrete => concrete,
     };
-    // Pick the component with the most depth_0_sections (widest interface).
-    // Prefer original (un-flattened) components since flattening may drop
-    // the outer shell that carries the depth_0_sections.
+    // Pick the source component that carries the widest *top-level*
+    // interface. Ranking by `depth_0_sections` alone is ambiguous when
+    // every candidate ties at 0 — e.g. a `wac`-composed input whose
+    // flattened sub-components have no captured depth-0 sections. There
+    // `max_by_key` returns the *last* candidate, often a flattened
+    // sub-component exporting a single bare func, so the real top-level
+    // instance export is lost and the wrapped component comes out with an
+    // empty world (#212). Rank by (depth-0 sections, top-level
+    // instance-export count, prefer-original): instance-export count
+    // surfaces the component holding the composition's real exports, and
+    // preferring the un-flattened `original` on ties keeps the outer shell.
+    let instance_export_count = |c: &ParsedComponent| {
+        c.exports
+            .iter()
+            .filter(|e| e.kind == wasmparser::ComponentExternalKind::Instance)
+            .count()
+    };
     let source = original_components
         .iter()
-        .chain(components.iter())
-        .max_by_key(|c| c.depth_0_sections.len())
+        .map(|c| (2u8, c))
+        .chain(components.iter().map(|c| (1u8, c)))
+        .max_by_key(|(origin_rank, c)| {
+            (
+                c.depth_0_sections.len(),
+                instance_export_count(c),
+                *origin_rank,
+            )
+        })
+        .map(|(_, c)| c)
         .ok_or(Error::NoComponents)?;
 
     // Parse the fused module to extract its imports, exports, and memory info
@@ -1766,16 +1788,22 @@ fn assemble_component(
                 None
             };
 
-            // Find the source component's lift type and canonical options for
-            // this export function.
-            let lift_info =
-                find_lift_type_for_interface_func(source, interface_name, &func_info.func_name);
+            // Find the lift type + options for this export and the
+            // component that owns the lift — which, for a multi-component
+            // composition, may differ from `source`; the type index is
+            // then resolved against that owning component (#212).
+            let lift_info = find_lift_type_for_interface_func(
+                source,
+                all_components,
+                interface_name,
+                &func_info.func_name,
+            );
 
             // Define the component function type in our wrapper
-            let wrapper_func_type = if let Some((source_type_idx, _)) = &lift_info {
+            let wrapper_func_type = if let Some((lift_comp, source_type_idx, _)) = &lift_info {
                 define_source_type_in_wrapper(
                     &mut component,
-                    source,
+                    lift_comp,
                     *source_type_idx,
                     &mut component_type_idx,
                     &mut type_remap,
@@ -1794,7 +1822,7 @@ fn assemble_component(
             // strings downstream with no trap.
             let source_string_encoding = lift_info
                 .as_ref()
-                .map(|(_, opts)| source_string_encoding_option(opts.string_encoding))
+                .map(|(_, _, opts)| source_string_encoding_option(opts.string_encoding))
                 .unwrap_or(CanonicalOption::UTF8);
             let mut lift_options: Vec<CanonicalOption> = Vec::new();
             if func_info.has_post_return {
@@ -1806,7 +1834,7 @@ fn assemble_component(
                 }
             }
             // Propagate P3 async/callback from source component's canon lift
-            if let Some((_, ref source_opts)) = lift_info {
+            if let Some((_, _, ref source_opts)) = lift_info {
                 if source_opts.async_ {
                     lift_options.push(CanonicalOption::Async);
                     // async requires memory
@@ -2517,62 +2545,72 @@ fn source_string_encoding_option(
     }
 }
 
-fn find_lift_type_for_interface_func(
-    source: &ParsedComponent,
+/// Resolve the canon-lift type index + options for an exported function,
+/// returning the **owning component** (the type index is component-relative
+/// and must be resolved against the component that holds the lift).
+///
+/// A `wac`-composed multi-component spreads the top-level export, the
+/// interface-instance export, and the canon-lift across *different* parsed
+/// components, so the lift can live in a component other than the export
+/// shell (#212). Per component (source first, then the rest):
+///
+///  - **(A)** A component-level `{iface}#{func}` Func export → its lift.
+///    The wit-bindgen single-component convention (preserves LS-A-16's
+///    per-export type/option fidelity).
+///  - **(B, #212)** No flat Func export, but a canon-lift's
+///    `core_func_index` resolves (through the component's `core_entity_order`
+///    core-function space) to a core export named `{iface}#{func}`. This is
+///    the interface-*instance* export shape `wac` produces. Matching by the
+///    resolved **name** — not by raw index — is essential: `core_func_index`
+///    is a *component-level* index in the flattened alias space, which does
+///    NOT equal the lifted function's module-local export index whenever the
+///    core module has imported funcs or earlier aliases (Mythos finding on
+///    the first #212.2 attempt).
+///
+/// Fuzz-safety fallback (`fuzz_fusion_roundtrip`): the first lift of
+/// `source`, so emission stays structurally valid when nothing matched.
+fn find_lift_type_for_interface_func<'a>(
+    source: &'a ParsedComponent,
+    others: &'a [ParsedComponent],
     interface_name: &str,
     func_name: &str,
-) -> Option<(u32, parser::CanonicalOptions)> {
-    let target_export_name = format!("{}#{}", interface_name, func_name);
+) -> Option<(&'a ParsedComponent, u32, parser::CanonicalOptions)> {
+    let qualified = format!("{}#{}", interface_name, func_name);
 
-    // Strategy 1: Find the export whose name matches `target_export_name`
-    // (the wit-bindgen interface-export convention `{iface}#{func}`),
-    // resolve its index through `component_func_defs` to a lift's
-    // canonical entry, and return *that lift's* type and options.
-    //
-    // Prior to this fix the function built `target_export_name` but never
-    // compared it against anything (`let _ = target_export_name` at the
-    // bottom suppressed the unused warning), returning the **first** lift
-    // entry for every (iface, func) request. For a multi-export interface
-    // every export got the first lift's type and options — including its
-    // `string_encoding` and `memory` canonical options — producing wrong
-    // canon-lift sections in the wrapper output (LS-A-16).
-    //
-    // Strategy 2 (fallback to "any lift"): kept for components that
-    // export their lift bare (no `{iface}#{func}` prefix) — many small
-    // wit fixtures fall into this shape — and have only a single lift,
-    // so picking the only one is safe. The fallback now triggers only
-    // when strategy 1 finds no matching export at all, not on every call.
-    for export in &source.exports {
-        if export.name != target_export_name
-            || !matches!(export.kind, wasmparser::ComponentExternalKind::Func)
-        {
-            continue;
+    for c in std::iter::once(source).chain(others.iter()) {
+        // (A) component-level `{iface}#{func}` Func export → its lift.
+        for export in &c.exports {
+            if export.name == qualified
+                && matches!(export.kind, wasmparser::ComponentExternalKind::Func)
+                && let Some(parser::ComponentFuncDef::Lift(canon_idx)) =
+                    c.component_func_defs.get(export.index as usize)
+                && let Some(parser::CanonicalEntry::Lift {
+                    type_index,
+                    options,
+                    ..
+                }) = c.canonical_functions.get(*canon_idx)
+            {
+                return Some((c, *type_index, options.clone()));
+            }
         }
-        let func_def_idx = export.index as usize;
-        if let Some(parser::ComponentFuncDef::Lift(canon_idx)) =
-            source.component_func_defs.get(func_def_idx)
-            && let Some(parser::CanonicalEntry::Lift {
+        // (B, #212) a canon-lift whose core_func_index resolves (via the
+        // component-level core-function space) to a core export named
+        // `{iface}#{func}`. Matched by NAME, not raw index.
+        if let Some(found) = c.canonical_functions.iter().find_map(|ce| match ce {
+            parser::CanonicalEntry::Lift {
+                core_func_index,
                 type_index,
                 options,
-                ..
-            }) = source.canonical_functions.get(*canon_idx)
-        {
-            return Some((*type_index, options.clone()));
+            } if core_func_name(c, *core_func_index) == Some(qualified.as_str()) => {
+                Some((*type_index, options.clone()))
+            }
+            _ => None,
+        }) {
+            return Some((c, found.0, found.1));
         }
     }
 
-    // Strategy 2: fallback when no export matched. Returns the first
-    // lift entry's type and options so downstream emission still
-    // produces *some* valid wasm. This preserves fuzz-safety
-    // (`fuzz_fusion_roundtrip` requires that any input meld accepts
-    // produces structurally valid output) at the cost of misclassifying
-    // multi-lift components where the lookup-by-name failed. For real
-    // wit-bindgen output every lift is paired with an export, so the
-    // export-name path above hits and this fallback is never reached.
-    //
-    // A `log::warn` documents the guess when more than one lift exists
-    // so audit-of-output catches multi-lift cases where the fallback
-    // was needed.
+    // Fuzz-safety fallback: the first lift of `source`.
     let mut lifts = source.canonical_functions.iter().filter_map(|c| match c {
         parser::CanonicalEntry::Lift {
             type_index,
@@ -2586,15 +2624,54 @@ fn find_lift_type_for_interface_func(
     if extra > 0 {
         log::warn!(
             "find_lift_type_for_interface_func: no export matched \
-             {interface_name}#{func_name} but component has {} lifts; \
-             falling back to first lift's type/options to keep the \
-             wrapper output valid. If this fires on a real wit-bindgen \
-             component, the export-naming convention has drifted from \
-             `{{iface}}#{{func}}` (LS-A-16 fuzz-safety fallback).",
+             {interface_name}#{func_name} across components but source has {} \
+             lifts; falling back to first lift's type/options to keep the \
+             wrapper output valid (LS-A-16 fuzz-safety fallback).",
             extra + 1,
         );
     }
-    Some(first)
+    Some((source, first.0, first.1))
+}
+
+/// Resolve a component-level core-function index to the name it was aliased
+/// under, or `None` for an unnamed (canonical-builtin) core function.
+///
+/// The component's core-function index space is the subsequence of
+/// `core_entity_order` that produces core *functions*, in order:
+///  - `CoreEntityDef::CanonicalFunction(_)` — always a core func (the
+///    parser only records non-`Lift` canon entries here, all of which
+///    lower to a core function).
+///  - `CoreEntityDef::CoreAlias(_)` — a core func *only* when the aliased
+///    core-instance export is a `Func` (Table/Memory/Global aliases live in
+///    other index spaces and must not be counted).
+///
+/// This is the index space `CanonicalEntry::Lift::core_func_index` and
+/// `canon lift` reference — distinct from any core module's module-local
+/// function indices.
+fn core_func_name(c: &ParsedComponent, core_func_index: u32) -> Option<&str> {
+    let mut func_i = 0u32;
+    for def in &c.core_entity_order {
+        let (is_func, name) = match def {
+            parser::CoreEntityDef::CanonicalFunction(_) => (true, None),
+            parser::CoreEntityDef::CoreAlias(alias_idx) => {
+                match c.component_aliases.get(*alias_idx) {
+                    Some(parser::ComponentAliasEntry::CoreInstanceExport {
+                        kind: wasmparser::ExternalKind::Func,
+                        name,
+                        ..
+                    }) => (true, Some(name.as_str())),
+                    _ => (false, None),
+                }
+            }
+        };
+        if is_func {
+            if func_i == core_func_index {
+                return name;
+            }
+            func_i += 1;
+        }
+    }
+    None
 }
 
 /// Define a source component's type in our wrapper, recursively defining
@@ -3601,11 +3678,11 @@ mod tests {
             index: 1,
         });
 
-        let a = find_lift_type_for_interface_func(&comp, "iface:a", "fa");
-        let b = find_lift_type_for_interface_func(&comp, "iface:b", "fb");
+        let a = find_lift_type_for_interface_func(&comp, &[], "iface:a", "fa");
+        let b = find_lift_type_for_interface_func(&comp, &[], "iface:b", "fb");
 
-        let (a_type, a_opts) = a.expect("lift for iface:a#fa must resolve");
-        let (b_type, b_opts) = b.expect("lift for iface:b#fb must resolve");
+        let (_, a_type, a_opts) = a.expect("lift for iface:a#fa must resolve");
+        let (_, b_type, b_opts) = b.expect("lift for iface:b#fb must resolve");
         assert_eq!(a_type, 10);
         assert_eq!(a_opts.string_encoding, parser::CanonStringEncoding::Utf8);
         assert_eq!(
@@ -3630,8 +3707,8 @@ mod tests {
         comp.component_func_defs
             .push(parser::ComponentFuncDef::Lift(0));
 
-        let r = find_lift_type_for_interface_func(&comp, "any", "thing");
-        let (ty, _) = r.expect("single-lift fallback must resolve");
+        let r = find_lift_type_for_interface_func(&comp, &[], "any", "thing");
+        let (_, ty, _) = r.expect("single-lift fallback must resolve");
         assert_eq!(ty, 7);
     }
 
@@ -3649,13 +3726,99 @@ mod tests {
         comp.canonical_functions
             .push(lift_entry(20, parser::CanonStringEncoding::Utf16));
 
-        let r = find_lift_type_for_interface_func(&comp, "any", "thing");
-        let (ty, _opts) = r.expect("fallback must return first lift, not None");
+        let r = find_lift_type_for_interface_func(&comp, &[], "any", "thing");
+        let (_, ty, _opts) = r.expect("fallback must return first lift, not None");
         assert_eq!(
             ty, 10,
             "fallback must return the FIRST lift's type (10) for fuzz \
              safety; returning None caused downstream invalid wasm in \
              `fuzz_fusion_roundtrip`"
+        );
+    }
+
+    fn opts_utf8() -> parser::CanonicalOptions {
+        parser::CanonicalOptions {
+            string_encoding: parser::CanonStringEncoding::Utf8,
+            memory: Some(0),
+            realloc: None,
+            post_return: None,
+            async_: false,
+            callback: None,
+        }
+    }
+
+    /// LS-CP-5 (#212.2): when a `wac`-composed multi-component's lift lives
+    /// in a *different* parsed component than the export shell — exported
+    /// as an interface *instance*, not a flat `{iface}#{func}` Func — the
+    /// resolver must find the correct lift via name resolution through the
+    /// owning component's `core_entity_order` core-function space.
+    ///
+    /// **Adversarial:** the compute lift's `core_func_index` is **1**, not
+    /// 0 — an unnamed canonical core func (a lowered import) precedes it in
+    /// the component core-func space. The first #212.2 attempt matched the
+    /// raw index against a module-local export index and was caught by the
+    /// Mythos scan; this fixture makes those spaces diverge, so only the
+    /// name-resolution path (`core_func_name`) gets it right.
+    #[test]
+    fn ls_cp_5_lift_resolved_cross_component_via_core_export() {
+        // `source` is the bare export shell: interface-instance export only,
+        // no lift, no flat Func export.
+        let source = empty_parsed_component_for_lift_test();
+
+        let mut owner = empty_parsed_component_for_lift_test();
+        // canon 0 — a lowered import: an *unnamed* core func at core-func
+        // index 0, shifting the lift's core_func_index off 0.
+        owner
+            .canonical_functions
+            .push(parser::CanonicalEntry::Lower {
+                func_index: 0,
+                options: opts_utf8(),
+            });
+        // canon 1 — the compute lift, referencing core func index 1.
+        owner
+            .canonical_functions
+            .push(parser::CanonicalEntry::Lift {
+                core_func_index: 1,
+                type_index: 77,
+                options: opts_utf8(),
+            });
+        // alias 0 — the named core export `…#compute` (core func index 1).
+        owner
+            .component_aliases
+            .push(parser::ComponentAliasEntry::CoreInstanceExport {
+                kind: wasmparser::ExternalKind::Func,
+                instance_index: 0,
+                name: "golden:app/runner@0.1.0#compute".to_string(),
+            });
+        // core-func space order: [Lower (idx 0), CoreAlias compute (idx 1)].
+        owner
+            .core_entity_order
+            .push(parser::CoreEntityDef::CanonicalFunction(0));
+        owner
+            .core_entity_order
+            .push(parser::CoreEntityDef::CoreAlias(0));
+
+        // Sanity: name resolution maps core-func index 1 → compute, 0 → none.
+        assert_eq!(
+            core_func_name(&owner, 1),
+            Some("golden:app/runner@0.1.0#compute")
+        );
+        assert_eq!(core_func_name(&owner, 0), None);
+
+        let (comp, ty, _opts) = find_lift_type_for_interface_func(
+            &source,
+            std::slice::from_ref(&owner),
+            "golden:app/runner@0.1.0",
+            "compute",
+        )
+        .expect("cross-component lift must resolve via core_entity_order name");
+        assert_eq!(
+            ty, 77,
+            "must resolve compute's lift by NAME (core_func_index=1), not a naive index match"
+        );
+        assert!(
+            std::ptr::eq(comp, &owner),
+            "must return the OWNING component so its type index resolves correctly"
         );
     }
 

@@ -49,6 +49,7 @@
 pub mod adapter;
 pub mod attestation;
 pub mod component_wrap;
+pub mod custom_merge;
 pub mod dwarf;
 mod error;
 pub mod memory_probe;
@@ -1584,18 +1585,36 @@ impl Fuser {
 
         // Handle custom sections based on config
         if self.config.custom_sections != CustomSectionHandling::Drop {
-            for (name, contents) in &merged.custom_sections {
-                if !self.config.preserve_names && name == "name" {
-                    continue;
-                }
-                // Only PassThrough emits raw per-input `.debug_*`
-                // sections. Strip drops them; Remap drops them here and
-                // emits a single remapped set below.
-                if self.config.dwarf_handling != DwarfHandling::PassThrough
-                    && name.starts_with(".debug_")
-                {
-                    continue;
-                }
+            let kept: Vec<(String, Vec<u8>)> = merged
+                .custom_sections
+                .iter()
+                .filter(|(name, _)| {
+                    if !self.config.preserve_names && name == "name" {
+                        return false;
+                    }
+                    // Only PassThrough emits raw per-input `.debug_*`
+                    // sections. Strip drops them; Remap drops them here and
+                    // emits a single remapped set below.
+                    if self.config.dwarf_handling != DwarfHandling::PassThrough
+                        && name.starts_with(".debug_")
+                    {
+                        return false;
+                    }
+                    true
+                })
+                .cloned()
+                .collect();
+            // Under Merge, coalesce same-name tool-metadata sections
+            // (`producers`, `target_features`) into one section each, in
+            // the canonical order LLVM's wasm reader enforces (#222) —
+            // duplicate `producers` sections make llvm-dwarfdump reject
+            // the whole module.
+            let kept = if self.config.custom_sections == CustomSectionHandling::Merge {
+                custom_merge::coalesce(&kept)
+            } else {
+                kept
+            };
+            for (name, contents) in &kept {
                 module.section(&wasm_encoder::CustomSection {
                     name: std::borrow::Cow::Borrowed(name),
                     data: std::borrow::Cow::Borrowed(contents),
