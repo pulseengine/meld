@@ -274,7 +274,13 @@ const COMPOSE_DIR: &str = "../tests/wit_bindgen/fixtures/compose";
 
 /// Instantiate a component exporting `compute: func() -> u32` and call it.
 /// The composed/fused fixture has no imports, so a bare linker suffices.
-fn call_compute(wasm: &[u8]) -> anyhow::Result<u32> {
+/// Call both `golden:app/runner` exports with their **distinct** typed
+/// signatures: `compute() -> u32` (= add(20,22) = 42) and
+/// `greet() -> u8` (= 7). The typed lookups validate the WIT type, so a
+/// mis-resolved lift that swapped or wrong-typed an export (the #212.2
+/// failure class) makes the typed call fail — not silently return a
+/// plausible number.
+fn call_runner(wasm: &[u8]) -> anyhow::Result<(u32, u8)> {
     let mut cfg = Config::new();
     cfg.wasm_component_model(true);
     cfg.wasm_multi_memory(true);
@@ -289,86 +295,113 @@ fn call_compute(wasm: &[u8]) -> anyhow::Result<u32> {
         },
     );
     let instance = linker.instantiate(&mut store, &component)?;
-    // `compute` is exported via the `golden:app/runner` interface; fall
-    // back to a bare top-level export if present.
-    let func = if let Some(f) = instance.get_func(&mut store, "compute") {
-        f
-    } else {
-        let (_, iface) = instance
-            .get_export(&mut store, None, "golden:app/runner@0.1.0")
-            .ok_or_else(|| anyhow::anyhow!("no golden:app/runner interface export"))?;
-        let (_, cidx) = instance
-            .get_export(&mut store, Some(&iface), "compute")
-            .ok_or_else(|| anyhow::anyhow!("no compute in runner interface"))?;
-        instance
-            .get_func(&mut store, cidx)
-            .ok_or_else(|| anyhow::anyhow!("compute export is not a function"))?
-    };
-    let typed = func.typed::<(), (u32,)>(&store)?;
-    let (r,) = typed.call(&mut store, ())?;
-    typed.post_return(&mut store)?;
-    Ok(r)
+    let (_, iface) = instance
+        .get_export(&mut store, None, "golden:app/runner@0.1.0")
+        .ok_or_else(|| anyhow::anyhow!("no golden:app/runner interface export"))?;
+
+    let (_, cidx) = instance
+        .get_export(&mut store, Some(&iface), "compute")
+        .ok_or_else(|| anyhow::anyhow!("no compute in runner interface"))?;
+    let compute = instance
+        .get_func(&mut store, cidx)
+        .ok_or_else(|| anyhow::anyhow!("compute is not a function"))?
+        .typed::<(), (u32,)>(&store)?; // fails if compute isn't typed u32
+    let (c,) = compute.call(&mut store, ())?;
+    compute.post_return(&mut store)?;
+
+    let (_, gidx) = instance
+        .get_export(&mut store, Some(&iface), "greet")
+        .ok_or_else(|| anyhow::anyhow!("no greet in runner interface"))?;
+    let greet = instance
+        .get_func(&mut store, gidx)
+        .ok_or_else(|| anyhow::anyhow!("greet is not a function"))?
+        .typed::<(), (u8,)>(&store)?; // fails if greet isn't typed u8
+    let (g,) = greet.call(&mut store, ())?;
+    greet.post_return(&mut store)?;
+
+    Ok((c, g))
 }
 
-/// Tier B: fusing a real multi-component composition must preserve the
-/// cross-component call result. The host-linked (`wac`-composed)
-/// component computes `add(20, 22) = 42`; the meld-fused module must
-/// compute the same — proving fusion correctly internalises the
-/// consumer→provider call instead of breaking it.
-///
-/// **Discovery oracle, currently `#[ignore]`d on meld#212.** This
-/// harness surfaced that meld does not yet internalise a cross-component
-/// interface link across separate inputs (the fused output still imports
-/// `golden:math/lib`), so `compute()` can't run standalone. The body
-/// below is the fix's acceptance test — remove `#[ignore]` once meld#212
-/// lands. (Tier A — real wit-bindgen compositions — passes unignored.)
+/// Read the host-linked composed fixture and its runner golden values —
+/// `compute() = add(20,22) = 42` (u32) and `greet() = 7` (u8) — or `None`
+/// to skip when fixtures are absent.
+fn composed_golden() -> Option<(Vec<u8>, (u32, u8))> {
+    let composed = std::fs::read(format!("{COMPOSE_DIR}/composed.wasm")).ok()?;
+    let golden = call_runner(&composed).expect("host-linked composed runner should run");
+    assert_eq!(
+        golden,
+        (42, 7),
+        "sanity: wac-composed runner = (compute 42, greet 7)"
+    );
+    Some((composed, golden))
+}
+
+/// Tier B (#212.2): fusing a real `wac`-composed multi-component must
+/// preserve **both** exports and their **distinct** types. The host-linked
+/// composition yields `compute()=42` (u32) and `greet()=7` (u8); meld
+/// fusing it must emit a self-contained component that yields the same.
+/// The two-export-with-different-types fixture is adversarial: the lift's
+/// `core_func_index` diverges from any module-local index (the core module
+/// imports `add`), so a mis-resolved lift would swap/wrong-type the
+/// exports and the typed `call_runner` lookup would fail — the exact
+/// #212.2 failure class the first attempt regressed on.
 #[test]
-#[ignore = "meld#212: cross-component interface link not internalised across separate inputs"]
-fn tier_b_fused_multicomponent_matches_host_linked() {
-    let (Ok(composed), Ok(consumer), Ok(provider)) = (
-        std::fs::read(format!("{COMPOSE_DIR}/composed.wasm")),
-        std::fs::read(format!("{COMPOSE_DIR}/consumer.wasm")),
-        std::fs::read(format!("{COMPOSE_DIR}/provider.wasm")),
-    ) else {
+fn tier_b_fused_composed_matches_host_linked() {
+    let Some((composed, golden)) = composed_golden() else {
         eprintln!("skipping: compose fixtures not found in {COMPOSE_DIR} (run build.sh)");
         return;
     };
 
-    // Golden: the host-linked (wac-composed) composition runs compute()
-    // = add(20, 22) = 42.
-    let golden = call_compute(&composed).expect("host-linked composed compute() should run");
-    assert_eq!(
-        golden, 42,
-        "sanity: wac-composed compute() must be add(20,22)=42"
-    );
-
-    // meld-native path: hand meld the two components separately; it must
-    // resolve consumer's `golden:math/lib` import against provider's
-    // export, internalise the call, and emit a self-contained component
-    // whose compute() still returns 42 with NO host providing `add`.
+    let mut ran = 0usize;
     for memory in [MemoryStrategy::MultiMemory, MemoryStrategy::SharedMemory] {
-        let fused = match fuse_many(
-            &[("consumer", &consumer), ("provider", &provider)],
-            OutputFormat::Component,
-            memory,
-        ) {
+        let fused = match fuse(&composed, "composed", OutputFormat::Component, memory) {
             Ok(f) => f,
             Err(e) => {
-                eprintln!("[2-input/{memory:?}] fuse declined ({e}); skipping");
+                eprintln!("[composed/{memory:?}] fuse declined ({e}); skipping");
                 continue;
             }
         };
-        let got = call_compute(&fused).unwrap_or_else(|e| {
+        let got = call_runner(&fused).unwrap_or_else(|e| {
             panic!(
-                "[2-input/{memory:?}] fused compute() failed: {e} — meld did not produce a \
-                 self-contained component that runs the internalised cross-component call"
+                "[composed/{memory:?}] fused runner failed: {e} — meld dropped or \
+                 mis-typed the composition's exports (#212.2)"
             )
         });
         assert_eq!(
             got, golden,
-            "[2-input/{memory:?}] meld-fused composition diverged from host-linked \
-             (cross-component add() call not internalised correctly): got {got}, want {golden}"
+            "[composed/{memory:?}] meld-fused composition diverged from host-linked: \
+             got {got:?}, want {golden:?}"
         );
-        eprintln!("Tier B [{memory:?}]: fused 2-component compute() = {got} ✓");
+        eprintln!("Tier B [{memory:?}]: fused composed runner = {got:?} ✓");
+        ran += 1;
     }
+    assert!(ran > 0, "no memory strategy produced a fusable composition");
+}
+
+/// Tier B (#212.1, still open): meld's *native* path — hand it the two
+/// components separately and have it link consumer→provider, internalise
+/// the call, and emit a self-contained component. Currently `#[ignore]`d:
+/// meld does not yet resolve a cross-component *interface* import/export
+/// across separate inputs (the fused output still imports
+/// `golden:math/lib`). Un-ignore when #212.1 lands.
+#[test]
+#[ignore = "meld#212.1: cross-component interface link not internalised across separate inputs"]
+fn tier_b_separate_inputs_internalise_link() {
+    let (Ok(consumer), Ok(provider), Some((_, golden))) = (
+        std::fs::read(format!("{COMPOSE_DIR}/consumer.wasm")),
+        std::fs::read(format!("{COMPOSE_DIR}/provider.wasm")),
+        composed_golden(),
+    ) else {
+        eprintln!("skipping: compose fixtures not found in {COMPOSE_DIR}");
+        return;
+    };
+    let fused = fuse_many(
+        &[("consumer", &consumer), ("provider", &provider)],
+        OutputFormat::Component,
+        MemoryStrategy::MultiMemory,
+    )
+    .expect("fuse two inputs");
+    let got =
+        call_runner(&fused).expect("fused separate-input composition should run runner standalone");
+    assert_eq!(got, golden, "separate-input fusion must match host-linked");
 }
