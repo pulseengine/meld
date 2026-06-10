@@ -398,6 +398,25 @@ verification-status:
     status: planned
     note: "v0.11.0 — DWARF Phase 3 adapter DIEs (#144). Depends on SR-35."
 
+  SR-37:
+    implementation-files:
+      - meld-core/src/memory_probe.rs
+      - meld-core/src/lib.rs
+    tests:
+      - meld-core/tests/auto_memory.rs::auto_selects_shared_for_growfree_inputs
+      - meld-core/tests/auto_memory.rs::ls_m_7_auto_keeps_multi_when_input_grows
+      - meld-core/tests/auto_memory.rs::ls_m_7_auto_reprobes_after_add_component
+      - meld-core/tests/auto_memory.rs::auto_keeps_multi_for_single_memory_input
+      - meld-core/tests/auto_memory.rs::explicit_multi_is_not_overridden
+      - meld-core/src/memory_probe.rs::tests::ls_m_7_malformed_input_counts_as_grow
+    proofs: []
+    status: verified
+    note: >-
+      v0.22.0 (#172, PR #220). Verified: full oracle suite green on the
+      merged main commit through the required-checks gate (Test, Clippy,
+      LS-N gate incl. ls_m_7_*, Mythos delta-pass); manual wasm-opt 116
+      evidence on the issue repro recorded on #172 and in the PR body.
+
 # wit-bindgen fixture coverage (14 fixtures × 3 levels = 42 integration tests)
 wit-bindgen-fixtures:
   passing-all-3-levels:

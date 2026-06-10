@@ -862,7 +862,7 @@ artifacts:
       `wasm-opt → synth` chain with no extra flags (#172) without ever
       selecting the shared form where `memory.grow` makes it unsound
       (merger Bug #7, LS-M-7).
-    status: implemented
+    status: verified
     tags: [usability, memory-strategy, v0.22.0]
     links:
       - type: tracked-by
