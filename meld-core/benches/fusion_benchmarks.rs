@@ -248,7 +248,7 @@ fn bench_end_to_end(c: &mut Criterion) {
             |b, fixtures| {
                 b.iter_batched(
                     || build_fuser(fixtures).expect("fixtures present"),
-                    |fuser| {
+                    |mut fuser| {
                         let (bytes, stats) = fuser.fuse_with_stats().unwrap();
                         black_box((bytes, stats));
                     },
