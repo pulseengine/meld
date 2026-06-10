@@ -2806,3 +2806,63 @@ loss-scenarios:
       code-section extent (every input function, dropped or not), so a
       dropped function's address stays in the code range and tombstones.
       Pinned by `dwarf::tests::code_extent_covers_dropped_trailing_function`.
+
+  - id: LS-D-2
+    title: synthetic adapter DWARF corrupts or mis-attributes the fused line table
+    uca: UCA-M-9
+    hazards: [H-1]
+    type: inadequate-control-algorithm
+    scenario: >
+      `DwarfHandling::Remap` (#144 Phase 3 increment 3) adds a synthetic
+      `<meld-adapter>` compilation unit attributing meld-GENERATED code
+      ranges (adapter trampolines, handle-table helpers, the multi-start
+      wrapper) alongside the remapped original units. Two ways this can
+      de-ground the witness MC/DC line map [H-1]: (a) the synthetic unit
+      is serialised in a SEPARATE `gimli::write::Dwarf` and its
+      `.debug_*` bytes concatenated onto the remapped set — the two unit
+      sets then carry colliding abbrev/str/line cross-section offsets and
+      consumers either fail to parse or read garbage rows; (b) the
+      adapter spans are wrong (stale output bytes, wrong origin
+      sentinels) and the synthetic rows attribute ORIGINAL source code to
+      `<meld-adapter>`, silently re-labelling real branches as adapter
+      glue in the MC/DC view. Both are invisible at runtime — the fused
+      module executes identically; only the evidence chain is wrong.
+    causal-factors:
+      - >-
+        emitting the synthetic unit through a second `dwarf.write()` and
+        appending section bytes (offset spaces collide; the failure shows
+        up only when a consumer walks BOTH unit sets)
+      - >-
+        computing adapter spans against module bytes that are not the
+        final fused encoding (function layouts shift; rows land inside
+        neighbouring source functions)
+      - >-
+        a future merger change emitting real-source functions with
+        sentinel origins (every such function silently becomes "adapter"
+        in the line map)
+    process-model-flaw: >
+      The model "synthetic DWARF is independent of source DWARF" holds
+      for the unit GRAPH but not for the SERIALISATION: gimli computes
+      cross-section offsets per write, so independence ends the moment
+      bytes are emitted. The integration must thread the synthetic unit
+      into the same write — which is invisible in any single-unit test
+      and only falsifiable by walking a combined output.
+    status: approved
+    priority: high
+    fix: >
+      `dwarf::append_adapter_unit` adds the synthetic unit into the SAME
+      `gimli::write::Dwarf` that `rewrite_debug_sections` builds from the
+      remapped source units — one `dwarf.write()`, one offset space; the
+      no-source-DWARF and multi-source cases emit the synthetic unit via
+      a fresh single write (`build_adapter_dwarf`). Pinned by
+      `ls_d_2_rewrite_emits_source_and_adapter_units_in_one_write`
+      (combined write: re-parsed output resolves the REMAPPED original
+      address to its real source AND the adapter range to
+      `<meld-adapter>:1` in one .debug_line; a byte-concat
+      implementation fails the re-parse) and
+      `ls_d_2_generated_start_wrapper_is_attributed_to_meld_adapter`
+      (tests/adapter_dwarf_e2e.rs: full-pipeline fusion of dwarf-less
+      inputs generating a start wrapper — adapter rows land at
+      independently-derived real body addresses, line 1, and nothing
+      else is attributed; plus a runtime guard that emission does not
+      perturb behaviour).

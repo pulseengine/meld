@@ -429,6 +429,7 @@ fn build_remap_from_parts(
 fn rewrite_debug_sections(
     debug: &[(String, Vec<u8>)],
     remap: &AddressRemap,
+    adapter_spans: &[AdapterSpan],
 ) -> Option<Vec<(String, Vec<u8>)>> {
     use gimli::write::{Address, Dwarf as WriteDwarf, EndianVec, Sections};
     use gimli::{EndianSlice, LittleEndian, SectionId};
@@ -502,6 +503,11 @@ fn rewrite_debug_sections(
             return None;
         }
     };
+    // #144 inc 3: the synthetic `<meld-adapter>` unit rides the SAME
+    // write as the remapped original units, so every cross-section
+    // offset is computed in one shared offset space (appending
+    // independently-serialised `.debug_*` bytes would collide).
+    append_adapter_unit(&mut write_dwarf, adapter_spans);
     let mut sections = Sections::new(EndianVec::new(endian));
     write_dwarf.write(&mut sections).ok()?;
 
@@ -523,13 +529,20 @@ fn rewrite_debug_sections(
 /// Inspects the input components for `.debug_*` sections and, when
 /// exactly one source core module carries DWARF, builds its
 /// [`AddressRemap`] and returns the rewritten debug sections to embed in
-/// the fused output. Returns `None` (caller strips DWARF) when:
+/// the fused output. meld-GENERATED code ranges additionally get a
+/// synthetic `<meld-adapter>` unit in the same write (#144 inc 3) —
+/// including when NO source DWARF exists at all, so adapter attribution
+/// never depends on the inputs being built with debug info. Returns
+/// `None` (caller strips/omits DWARF) when:
 ///
-/// - no input module carries DWARF, or
+/// - no input module carries DWARF AND the fusion generated no adapter
+///   code, or
 /// - **more than one** module carries DWARF (merging independent DWARF
 ///   unit sets into one consistent `.debug_info` is a separate problem,
-///   deferred to a later increment — emitting either source's addresses
-///   against the merged code section would be wrong for the other), or
+///   #208 — emitting either source's addresses against the merged code
+///   section would be wrong for the other). The synthetic adapter unit
+///   IS still emitted in this case: it references only meld-generated
+///   ranges, so no wrong source addresses are involved, or
 /// - the remap or gimli round-trip fails any consistency check.
 ///
 /// `output_bytes` must be the fused module encoded *without* the
@@ -555,8 +568,22 @@ pub fn remap_for_output(
         }
     }
 
+    // #144: which fused-output ranges are meld-generated. Computed once;
+    // attributed to `<meld-adapter>` in every branch below.
+    let spans = adapter_spans(merged, output_bytes);
+
     match dwarf_sources.as_slice() {
-        [] => None,
+        [] => {
+            if spans.is_empty() {
+                return None;
+            }
+            log::debug!(
+                "dwarf remap: no source DWARF; emitting synthetic \
+                 <meld-adapter> unit for {} generated ranges (#144)",
+                spans.len()
+            );
+            build_adapter_dwarf(&spans)
+        }
         [(ci, mi)] => {
             let module = &components[*ci].core_modules[*mi];
             log::debug!("dwarf remap: single DWARF source at component {ci} module {mi}");
@@ -571,16 +598,24 @@ pub fn remap_for_output(
                 .filter(|(name, _)| name.starts_with(".debug_"))
                 .cloned()
                 .collect();
-            rewrite_debug_sections(&debug, &remap)
+            rewrite_debug_sections(&debug, &remap, &spans)
         }
         many => {
             log::warn!(
                 "DwarfHandling::Remap: {} source modules carry DWARF; merging \
                  independent DWARF unit sets is not yet supported — stripping \
-                 debug info instead of emitting wrong addresses (#143)",
+                 source debug info instead of emitting wrong addresses (#143/#208)",
                 many.len()
             );
-            None
+            if spans.is_empty() {
+                return None;
+            }
+            log::debug!(
+                "dwarf remap: emitting synthetic <meld-adapter> unit only \
+                 ({} generated ranges) — references no source addresses",
+                spans.len()
+            );
+            build_adapter_dwarf(&spans)
         }
     }
 }
@@ -740,13 +775,49 @@ fn emitted_adapter_line(role: AdapterRole) -> u64 {
 /// ([`emitted_adapter_line`]), closed by `end_sequence` at the exclusive
 /// body end.
 pub fn build_adapter_dwarf(spans: &[AdapterSpan]) -> Option<Vec<(String, Vec<u8>)>> {
-    use gimli::write::{
-        Address, AttributeValue, Dwarf, EndianVec, LineProgram, LineString, Sections, Unit,
-    };
-    use gimli::{Encoding, Format, LineEncoding, LittleEndian, constants};
+    use gimli::LittleEndian;
+    use gimli::write::{Dwarf, EndianVec, Sections};
 
-    if spans.is_empty() {
+    let mut dwarf = Dwarf::new();
+    if !append_adapter_unit(&mut dwarf, spans) {
         return None;
+    }
+
+    let mut sections = Sections::new(EndianVec::new(LittleEndian));
+    dwarf.write(&mut sections).ok()?;
+
+    let mut out = Vec::new();
+    sections
+        .for_each(|id, data| {
+            let bytes = data.slice();
+            if !bytes.is_empty() {
+                out.push((id.name().to_string(), bytes.to_vec()));
+            }
+            Ok::<(), gimli::Error>(())
+        })
+        .ok()?;
+    Some(out)
+}
+
+/// Add the synthetic `<meld-adapter>` compilation unit into an existing
+/// `gimli::write::Dwarf` (#144 increment 3).
+///
+/// This is the single-write integration point: the remapped original
+/// units (Phase 2) and the synthetic unit must go through ONE
+/// `dwarf.write()` so all `.debug_*` cross-section offsets are computed
+/// in one shared offset space. Serialising the synthetic unit separately
+/// and concatenating section bytes would produce two unit sets whose
+/// abbrev/str/line offsets collide. Returns `false` (Dwarf untouched)
+/// when there are no non-empty spans.
+fn append_adapter_unit(dwarf: &mut gimli::write::Dwarf, spans: &[AdapterSpan]) -> bool {
+    use gimli::write::{Address, AttributeValue, LineProgram, LineString, Unit};
+    use gimli::{Encoding, Format, LineEncoding, constants};
+
+    if spans
+        .iter()
+        .all(|s| s.output_body_end <= s.output_body_start)
+    {
+        return false;
     }
 
     let encoding = Encoding {
@@ -788,7 +859,6 @@ pub fn build_adapter_dwarf(spans: &[AdapterSpan]) -> Option<Vec<(String, Vec<u8>
         line_program.end_sequence(body_len);
     }
 
-    let mut dwarf = Dwarf::new();
     let unit_id = dwarf.units.add(Unit::new(encoding, line_program));
     let unit = dwarf.units.get_mut(unit_id);
     let root = unit.root();
@@ -798,21 +868,7 @@ pub fn build_adapter_dwarf(spans: &[AdapterSpan]) -> Option<Vec<(String, Vec<u8>
     );
     unit.get_mut(root)
         .set(constants::DW_AT_comp_dir, AttributeValue::String(comp_dir));
-
-    let mut sections = Sections::new(EndianVec::new(LittleEndian));
-    dwarf.write(&mut sections).ok()?;
-
-    let mut out = Vec::new();
-    sections
-        .for_each(|id, data| {
-            let bytes = data.slice();
-            if !bytes.is_empty() {
-                out.push((id.name().to_string(), bytes.to_vec()));
-            }
-            Ok::<(), gimli::Error>(())
-        })
-        .ok()?;
-    Some(out)
+    true
 }
 
 #[cfg(test)]
@@ -1036,7 +1092,7 @@ mod tests {
             },
         });
 
-        let out = rewrite_debug_sections(&input, &remap).expect("rewrite debug sections");
+        let out = rewrite_debug_sections(&input, &remap, &[]).expect("rewrite debug sections");
 
         // --- Re-parse output DWARF and read the subprogram's low_pc.
         let section_data = |name: &str| -> &[u8] {
@@ -1321,5 +1377,148 @@ mod tests {
     #[test]
     fn build_adapter_dwarf_none_when_no_spans() {
         assert!(build_adapter_dwarf(&[]).is_none());
+    }
+
+    /// Inc 3 oracle: source DWARF and the synthetic `<meld-adapter>` unit
+    /// go through ONE `dwarf.write()` and must coexist in the output.
+    /// Build real input DWARF (one unit, line program attributing
+    /// [0x10,0x40) to `orig.rs:7`), remap 0x10 → 0x200 through
+    /// [`rewrite_debug_sections`] WITH an adapter span at [0x300,0x320),
+    /// then re-parse the single output `.debug_line` and assert BOTH:
+    /// the original row landed at its remapped address still pointing at
+    /// `orig.rs:7`, and the adapter row points at `<meld-adapter>:1`.
+    /// This falsifies the naive concat approach — two independently
+    /// written unit sets would collide on cross-section offsets and fail
+    /// the re-parse. (`ls_d_2_` prefix: LS-D-2 regression, run by the
+    /// LS-N verification gate.)
+    #[test]
+    fn ls_d_2_rewrite_emits_source_and_adapter_units_in_one_write() {
+        use gimli::write::{
+            Address, AttributeValue, Dwarf, EndianVec, LineProgram, LineString, Sections, Unit,
+        };
+        use gimli::{Encoding, EndianSlice, Format, LineEncoding, LittleEndian, constants};
+
+        // --- Input DWARF: one unit whose line program maps 0x10 → orig.rs:7.
+        let encoding = Encoding {
+            format: Format::Dwarf32,
+            version: 4,
+            address_size: 4,
+        };
+        let mut line_program = LineProgram::new(
+            encoding,
+            LineEncoding::default(),
+            LineString::String(b"/src".to_vec()),
+            LineString::String(b"orig.rs".to_vec()),
+            None,
+        );
+        let dir = line_program.default_directory();
+        let file = line_program.add_file(LineString::String(b"orig.rs".to_vec()), dir, None);
+        line_program.begin_sequence(Some(Address::Constant(0x10)));
+        {
+            let row = line_program.row();
+            row.address_offset = 0;
+            row.file = file;
+            row.line = 7;
+            row.is_statement = true;
+        }
+        line_program.generate_row();
+        line_program.end_sequence(0x30);
+
+        let mut in_dwarf = Dwarf::new();
+        let unit_id = in_dwarf.units.add(Unit::new(encoding, line_program));
+        let unit = in_dwarf.units.get_mut(unit_id);
+        let root = unit.root();
+        unit.get_mut(root).set(
+            constants::DW_AT_name,
+            AttributeValue::String(b"orig.rs".to_vec()),
+        );
+
+        let mut sections = Sections::new(EndianVec::new(LittleEndian));
+        in_dwarf.write(&mut sections).expect("write input dwarf");
+        let mut input: Vec<(String, Vec<u8>)> = Vec::new();
+        sections
+            .for_each(|id, data| {
+                input.push((id.name().to_string(), data.slice().to_vec()));
+                Ok::<(), gimli::Error>(())
+            })
+            .expect("collect input sections");
+
+        // --- Remap input 0x10 → output 0x200; adapter span at [0x300,0x320).
+        let mut remap = AddressRemap::new();
+        remap.insert(FunctionSpan {
+            input_start: 0x10,
+            input_end: 0x40,
+            output_body_start: 0x200,
+            output_body_end: 0x230,
+            locals_prefix_len: 0,
+            instr_offsets: InstrOffsetMap {
+                entries: vec![InstrOffset { old: 0, new: 0 }],
+            },
+        });
+        let spans = vec![AdapterSpan {
+            output_defined_idx: 9,
+            output_body_start: 0x300,
+            output_body_end: 0x320,
+            role: AdapterRole::Generated,
+        }];
+
+        let out = rewrite_debug_sections(&input, &remap, &spans)
+            .expect("combined rewrite must serialise");
+
+        // --- Re-parse the OUTPUT and walk every unit's line program.
+        let section_data = |name: &str| -> &[u8] {
+            out.iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, d)| d.as_slice())
+                .unwrap_or(&[])
+        };
+        let load = |id: gimli::SectionId| -> Result<EndianSlice<'_, LittleEndian>, gimli::Error> {
+            Ok(EndianSlice::new(section_data(id.name()), LittleEndian))
+        };
+        let dwarf = gimli::Dwarf::load(load).expect("load combined dwarf");
+
+        // (address, file, line) rows across all units.
+        let mut attributed: Vec<(u64, String, u64)> = Vec::new();
+        let mut unit_count = 0usize;
+        let mut units = dwarf.units();
+        while let Some(header) = units.next().expect("units iter") {
+            unit_count += 1;
+            let unit = dwarf.unit(header).expect("parse unit");
+            let Some(program) = unit.line_program.clone() else {
+                continue;
+            };
+            let mut rows = program.rows();
+            while let Some((hdr, row)) = rows.next_row().expect("read row") {
+                if row.end_sequence() {
+                    continue;
+                }
+                let fname = row
+                    .file(hdr)
+                    .map(|f| match f.path_name() {
+                        gimli::AttributeValue::String(s) => {
+                            String::from_utf8_lossy(s.slice()).into_owned()
+                        }
+                        _ => String::new(),
+                    })
+                    .unwrap_or_default();
+                attributed.push((row.address(), fname, row.line().map_or(0, |l| l.get())));
+            }
+        }
+
+        assert_eq!(unit_count, 2, "remapped original unit + synthetic unit");
+        assert!(
+            attributed
+                .iter()
+                .any(|(a, f, l)| *a == 0x200 && f == "orig.rs" && *l == 7),
+            "original code must resolve at its REMAPPED address to its real \
+             source; rows = {attributed:?}"
+        );
+        assert!(
+            attributed
+                .iter()
+                .any(|(a, f, l)| *a == 0x300 && f == ADAPTER_SOURCE_NAME && *l == 1),
+            "adapter range must resolve to <meld-adapter>:1 in the same \
+             .debug_line; rows = {attributed:?}"
+        );
     }
 }
