@@ -128,10 +128,16 @@ fixtures for type mismatch and partial matches.
 | Audit #141 deliverables vs shipped (same-memory ring-buffer path, backpressure propagation tests, EOF passthrough) and close the gaps | #141 | SR-33 → verified |
 | #94 umbrella disposition: enumerate sub-items, close or re-scope what remains | #94 | — |
 
-**Honesty note.** SR-33 is `implemented`, but resolver carries a
-"detection foundation only" comment — the audit decides whether the
-in-module emitter chain is actually complete before anything is called
-verified.
+**Honesty note — audited 2026-06-10, emitter MISSING.** SR-33's brief
+`implemented` status (bulk sync, PR #211) was reverted to `planned`:
+only the detection half (`StreamPairGraph`) shipped in v0.9.0; fused
+stream traffic still round-trips through `pulseengine:async` host
+imports, `fact.rs` contains no stream bridging code, and the four named
+runtime fixtures exist only as ABI-enum unit tests. ADR-3 (still open)
+records the deferral as the chosen path. So v0.29.0 is a BUILD release,
+not an audit: ring-buffer + copy-chain emitter consuming the pair
+graph, four runtime fixtures executing fused wasm, Tier-5 registration
++ Mythos pass on the new emitter. Full evidence on #141.
 
 ### v0.30.0 — Formal soundness, increment 1 (#218)
 

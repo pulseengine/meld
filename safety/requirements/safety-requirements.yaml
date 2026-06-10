@@ -724,8 +724,8 @@ artifacts:
       (b) different-memory (multi-memory): `stream_read` → in-module copy
       loop → `stream_write` chain, with `cabi_realloc` null-guard policy
       per LS-A-7.
-    status: implemented
-    tags: [roadmap, p3-async, v0.9.0]
+    status: planned
+    tags: [roadmap, p3-async, v0.29.0]
     links:
       - type: derives-from
         target: "#94"
@@ -733,13 +733,23 @@ artifacts:
         target: "#141"
     fields:
       implementation:
-        - meld-core/src/adapter/fact.rs
+        - meld-core/src/p3_stream.rs
         - meld-core/src/resolver.rs
       verification-method: test
       verification-description: >
-        Same-memory zero-copy fixture; different-memory chain fixture;
-        backpressure propagation; EOF passthrough.
-      milestone: v0.9.0
+        Status correction (audit 2026-06-10, reverting the bulk flip in
+        PR #211): only the DETECTION half shipped in v0.9.0 (#173) —
+        `StreamPairGraph` built at resolve time (resolver.rs /
+        p3_stream.rs), gated by the four ADR-3 detection fixtures. The
+        emitter this requirement actually demands (same-memory ring
+        buffer; cross-memory read→copy→write chain) is NOT implemented:
+        fused stream traffic still round-trips through `pulseengine:async`
+        host imports, fact.rs contains no stream bridging code, and the
+        named runtime fixtures (zero-copy, chain, backpressure, EOF) exist
+        only as ABI-enum unit tests. ADR-3 (status open) records the
+        deferral as the chosen path. Emitter + runtime fixtures + Mythos
+        pass are the v0.29.0 scope (docs/roadmap.md).
+      milestone: v0.29.0
 
   - id: SR-34
     type: requirement

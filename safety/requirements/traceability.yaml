@@ -333,10 +333,23 @@ verification-status:
     note: "v0.8.0 — Stackful P3 lifting mode (#140). Phase 1 ABI foundation + Phase 2 trampoline emitter both shipped. Dispatcher routes async-lift sites without a [callback] companion to generate_async_stackful_adapter. Cross-memory (ptr,len) result returns deferred under same issue. See ADR-1 addendums 2026-05-13 (a) and (b)."
 
   SR-33:
-    implementation-files: []
-    tests: []
+    implementation-files:
+      - meld-core/src/p3_stream.rs   # detection half ONLY (StreamPairGraph)
+      - meld-core/src/resolver.rs    # graph built at resolve time
+    tests:
+      - meld-core/src/p3_stream.rs::tests::stream_pair_detected_for_connected_producer_consumer
+      - meld-core/src/p3_stream.rs::tests::no_pair_when_components_not_fusion_connected
+      - meld-core/src/p3_stream.rs::tests::no_pair_without_producer_consumer_complementarity
+      - meld-core/src/p3_stream.rs::tests::memory_mode_follows_strategy
     proofs: []
     status: planned
+    note: >-
+      Audited 2026-06-10: detection foundation shipped v0.9.0 (#173,
+      ADR-3 path "detection now, emitter follow-up"); the in-module
+      emitter the requirement demands is not implemented — stream
+      traffic still round-trips through pulseengine:async host imports.
+      safety-requirements.yaml briefly carried status implemented from
+      a bulk sync (PR #211); reverted. Emitter is v0.29.0 scope.
     note: "v0.9.0 — Cross-component stream<T> fusion (#141). adapter/fact.rs + resolver.rs."
 
   SR-34:
