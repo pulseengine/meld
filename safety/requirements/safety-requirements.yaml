@@ -899,7 +899,7 @@ artifacts:
       abort the merge and fall back to synthetic-only emission —
       never a guessed offset. A source whose remap fails is dropped
       individually; the others proceed.
-    status: implemented
+    status: verified
     tags: [roadmap, dwarf, witness-mc-dc, v0.26.0]
     links:
       - type: derives-from

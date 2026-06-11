@@ -4,6 +4,28 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.27.0] - 2026-06-11
+
+### Added
+
+- **Multi-source DWARF merge: string-pool dedup + abbrev reuse**
+  (#208 inc 2, closes #208; SR-38 → verified; PR #234). The merged
+  `.debug_str` is a deduped content-addressed pool (per-string `strp`
+  relocation map), and byte-identical `.debug_abbrev` tables are
+  reused rather than appended. `.debug_ranges`/`.debug_loc` need no
+  dedup (address-pair contents, already converted per source).
+
+### Pre-release Mythos note
+
+No Tier-5 files changed since v0.26.0 (dwarf.rs only).
+
+### Falsification statement
+
+Claim: the deduped merge preserves the full unit/file/line/strp
+round-trip while making merged abbrev strictly smaller than naive
+concatenation and pooling shared strings. Refute via the extended
+`ls_d_3_multi_source_merge_round_trips_both_units`.
+
 ## [0.26.0] - 2026-06-11
 
 ### Added
