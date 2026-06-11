@@ -218,6 +218,25 @@ pub struct MergedFunction {
     pub body: Function,
     /// Original location (component_idx, module_idx, function_idx)
     pub origin: (usize, usize, u32),
+    /// What kind of meld-generated helper this is, when the function is
+    /// synthetic (`origin` carries a sentinel). `None` for functions
+    /// copied from input modules. Consumed by `dwarf::adapter_spans`
+    /// for per-class `<meld-adapter>` attribution (#144 inc 4).
+    pub synthetic_kind: Option<SyntheticKind>,
+}
+
+/// Kind of merger-emitted synthetic function (#144 inc 4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SyntheticKind {
+    /// Per-resource handle-table helper (`ht_new` / `ht_rep` / `ht_drop`).
+    HandleTable,
+    /// Wrapper calling every input module's `start` function in order.
+    StartWrapper,
+    /// Type-coercion shim wrapping a call to a FACT adapter (i32/i64
+    /// widening glue between the caller's import type and the adapter).
+    AdapterShim,
+    /// P3 async `task.return` shim storing results into result globals.
+    TaskReturnShim,
 }
 
 /// Global in merged module
@@ -737,6 +756,7 @@ impl Merger {
                     type_idx: type_i32_to_i32,
                     body,
                     origin: (comp_idx, 0, u32::MAX), // synthetic
+                    synthetic_kind: Some(SyntheticKind::HandleTable),
                 });
             }
 
@@ -751,6 +771,7 @@ impl Merger {
                     type_idx: type_i32_to_i32,
                     body,
                     origin: (comp_idx, 0, u32::MAX),
+                    synthetic_kind: Some(SyntheticKind::HandleTable),
                 });
             }
 
@@ -840,6 +861,7 @@ impl Merger {
                     type_idx: type_i32_to_void,
                     body,
                     origin: (comp_idx, 0, u32::MAX),
+                    synthetic_kind: Some(SyntheticKind::HandleTable),
                 });
             }
 
@@ -1843,6 +1865,7 @@ impl Merger {
                 type_idx: new_type_idx,
                 body,
                 origin: (comp_idx, mod_idx, old_func_idx),
+                synthetic_kind: None,
             });
         }
 
@@ -2474,6 +2497,7 @@ impl Merger {
                 type_idx: empty_type_idx,
                 body: wrapper,
                 origin: (usize::MAX, usize::MAX, 0), // synthetic function
+                synthetic_kind: Some(SyntheticKind::StartWrapper),
             });
 
             log::info!(

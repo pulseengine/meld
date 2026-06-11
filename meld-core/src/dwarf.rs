@@ -552,6 +552,7 @@ fn rewrite_debug_sections(
 pub fn remap_for_output(
     components: &[crate::parser::ParsedComponent],
     merged: &crate::merger::MergedModule,
+    adapter_classes: &[crate::adapter::AdapterClass],
     output_bytes: &[u8],
 ) -> Option<Vec<(String, Vec<u8>)>> {
     // Find every (comp_idx, mod_idx) whose module carries DWARF.
@@ -570,7 +571,7 @@ pub fn remap_for_output(
 
     // #144: which fused-output ranges are meld-generated. Computed once;
     // attributed to `<meld-adapter>` in every branch below.
-    let spans = adapter_spans(merged, output_bytes);
+    let spans = adapter_spans(merged, adapter_classes, output_bytes);
 
     match dwarf_sources.as_slice() {
         [] => {
@@ -649,16 +650,71 @@ pub fn remap_for_output(
 /// time and land in a follow-up increment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AdapterRole {
-    /// meld-generated, role not yet classified (placeholder line 0).
+    /// meld-generated, class not determinable (fallback).
     Generated,
+    /// FACT direct call shim — same memory, no transcoding.
+    Direct,
+    /// FACT cross-memory `(ptr, len)` copy chain (lower → callee
+    /// `cabi_realloc` → `memory.copy` → lift, fused in one body).
+    MemoryCopy,
+    /// FACT cross-memory + string-encoding transcode loop.
+    Transcode,
+    /// P3 async adapter (callback-driving or stackful trampoline).
+    Async,
+    /// Merger handle-table helper (`ht_new` / `ht_rep` / `ht_drop`).
+    HandleTable,
+    /// Merger multi-`start` wrapper.
+    StartWrapper,
+    /// Type-coercion shim wrapping a FACT adapter call (i32/i64 glue).
+    AdapterShim,
+    /// P3 async `task.return` result-global shim.
+    TaskReturnShim,
 }
 
 impl AdapterRole {
     /// Line number in the synthetic `<meld-adapter>` file encoding this
-    /// role, per #130 §"Phase 3".
+    /// role (#144 inc 4). Line 0 means "no source line" in DWARF, so the
+    /// mapping starts at 1; the assignment is a stable contract consumed
+    /// by witness's adapter-branch classification.
+    ///
+    /// Note on granularity vs #130's sketch ("transcode / cabi_realloc /
+    /// lift / lower"): meld emits ONE fused trampoline per call site —
+    /// lowering, allocation (a call to the callee's own `cabi_realloc`),
+    /// copying and lifting live inline in a single body — so the honest
+    /// class unit is the trampoline kind, not sub-function stages.
     pub fn adapter_line(self) -> u32 {
         match self {
-            AdapterRole::Generated => 0,
+            AdapterRole::Generated => 1,
+            AdapterRole::Direct => 2,
+            AdapterRole::MemoryCopy => 3,
+            AdapterRole::Transcode => 4,
+            AdapterRole::Async => 5,
+            AdapterRole::HandleTable => 6,
+            AdapterRole::StartWrapper => 7,
+            AdapterRole::AdapterShim => 8,
+            AdapterRole::TaskReturnShim => 9,
+        }
+    }
+}
+
+impl From<crate::adapter::AdapterClass> for AdapterRole {
+    fn from(class: crate::adapter::AdapterClass) -> Self {
+        match class {
+            crate::adapter::AdapterClass::Direct => AdapterRole::Direct,
+            crate::adapter::AdapterClass::MemoryCopy => AdapterRole::MemoryCopy,
+            crate::adapter::AdapterClass::Transcode => AdapterRole::Transcode,
+            crate::adapter::AdapterClass::Async => AdapterRole::Async,
+        }
+    }
+}
+
+impl From<crate::merger::SyntheticKind> for AdapterRole {
+    fn from(kind: crate::merger::SyntheticKind) -> Self {
+        match kind {
+            crate::merger::SyntheticKind::HandleTable => AdapterRole::HandleTable,
+            crate::merger::SyntheticKind::StartWrapper => AdapterRole::StartWrapper,
+            crate::merger::SyntheticKind::AdapterShim => AdapterRole::AdapterShim,
+            crate::merger::SyntheticKind::TaskReturnShim => AdapterRole::TaskReturnShim,
         }
     }
 }
@@ -709,32 +765,48 @@ fn is_generated_origin(origin: (usize, usize, u32)) -> bool {
 /// functions.
 pub fn adapter_spans(
     merged: &crate::merger::MergedModule,
+    adapter_classes: &[crate::adapter::AdapterClass],
     output_bytes: &[u8],
 ) -> Vec<AdapterSpan> {
-    let origins: Vec<(usize, usize, u32)> = merged.functions.iter().map(|f| f.origin).collect();
-    adapter_spans_from_parts(&origins, output_bytes)
+    // Roles for merged.functions (None = real source function), followed
+    // by the FACT adapters the encoder appends AFTER merged.functions in
+    // the output code section — previously un-enumerated (#144 inc 4),
+    // which left every FACT trampoline unattributed.
+    let mut roles: Vec<Option<AdapterRole>> = merged
+        .functions
+        .iter()
+        .map(|f| {
+            f.synthetic_kind.map(AdapterRole::from).or_else(|| {
+                // Sentinel origin without a kind tag (future generator
+                // paths): still attribute, as the unclassified fallback.
+                is_generated_origin(f.origin).then_some(AdapterRole::Generated)
+            })
+        })
+        .collect();
+    roles.extend(adapter_classes.iter().map(|c| Some(AdapterRole::from(*c))));
+    adapter_spans_from_parts(&roles, output_bytes)
 }
 
-/// Testable core of [`adapter_spans`]: `origins[i]` is the origin tuple of
-/// fused-output defined-function `i`.
+/// Testable core of [`adapter_spans`]: `roles[i]` is `Some(role)` when
+/// fused-output defined-function `i` is meld-generated.
 fn adapter_spans_from_parts(
-    origins: &[(usize, usize, u32)],
+    roles: &[Option<AdapterRole>],
     output_bytes: &[u8],
 ) -> Vec<AdapterSpan> {
     let Some(layouts) = module_function_layouts(output_bytes) else {
         return Vec::new();
     };
-    origins
+    roles
         .iter()
         .enumerate()
-        .filter(|(_, origin)| is_generated_origin(**origin))
-        .filter_map(|(out_idx, _)| {
+        .filter_map(|(out_idx, role)| {
+            let role = (*role)?;
             let l = layouts.get(out_idx)?;
             Some(AdapterSpan {
                 output_defined_idx: out_idx,
                 output_body_start: l.body_start,
                 output_body_end: l.body_end,
-                role: AdapterRole::Generated,
+                role,
             })
         })
         .collect()
@@ -752,9 +824,7 @@ fn adapter_spans_from_parts(
 /// enum and [`AdapterRole::adapter_line`] are the seam that refinement
 /// will populate.
 fn emitted_adapter_line(role: AdapterRole) -> u64 {
-    match role {
-        AdapterRole::Generated => 1,
-    }
+    u64::from(role.adapter_line())
 }
 
 /// Build a fresh, synthetic DWARF unit attributing each adapter span's
@@ -1218,17 +1288,13 @@ mod tests {
             (func (result i32) i32.const 3))"#;
         let bytes = wat::parse_str(wat).expect("assemble wat");
         // func 1 is meld-generated; 0 and 2 are original source.
-        let origins = [
-            (0usize, 0usize, 0u32),
-            (0usize, 0usize, u32::MAX),
-            (0usize, 0usize, 2u32),
-        ];
+        let roles = [None, Some(AdapterRole::Generated), None];
 
-        let spans = adapter_spans_from_parts(&origins, &bytes);
+        let spans = adapter_spans_from_parts(&roles, &bytes);
         assert_eq!(spans.len(), 1, "exactly one generated function");
         assert_eq!(spans[0].output_defined_idx, 1);
         assert_eq!(spans[0].role, AdapterRole::Generated);
-        assert_eq!(spans[0].role.adapter_line(), 0);
+        assert_eq!(spans[0].role.adapter_line(), 1);
 
         // The span must match func 1's real layout in the output.
         let layouts = module_function_layouts(&bytes).expect("layouts");
@@ -1246,11 +1312,12 @@ mod tests {
     fn adapter_spans_recognises_fully_synthetic_sentinel() {
         let wat = r#"(module (func (result i32) i32.const 7))"#;
         let bytes = wat::parse_str(wat).expect("assemble wat");
-        let origins = [(usize::MAX, usize::MAX, 0u32)];
+        let roles = [Some(AdapterRole::StartWrapper)];
 
-        let spans = adapter_spans_from_parts(&origins, &bytes);
+        let spans = adapter_spans_from_parts(&roles, &bytes);
         assert_eq!(spans.len(), 1);
         assert_eq!(spans[0].output_defined_idx, 0);
+        assert_eq!(spans[0].role.adapter_line(), 7);
     }
 
     /// An all-original module produces no adapter spans.
@@ -1260,8 +1327,8 @@ mod tests {
             (func (result i32) i32.const 1)
             (func (result i32) i32.const 2))"#;
         let bytes = wat::parse_str(wat).expect("assemble wat");
-        let origins = [(0usize, 0usize, 0u32), (0usize, 1usize, 1u32)];
-        assert!(adapter_spans_from_parts(&origins, &bytes).is_empty());
+        let roles = [None, None];
+        assert!(adapter_spans_from_parts(&roles, &bytes).is_empty());
     }
 
     /// Adapter ranges must be disjoint from every source-function range —
@@ -1274,17 +1341,13 @@ mod tests {
             (func (result i32) i32.const 2)
             (func (result i32) i32.const 3))"#;
         let bytes = wat::parse_str(wat).expect("assemble wat");
-        let origins = [
-            (0usize, 0usize, 0u32),
-            (0usize, 0usize, u32::MAX), // generated
-            (0usize, 0usize, 2u32),
-        ];
+        let roles = [None, Some(AdapterRole::MemoryCopy), None];
 
-        let adapters = adapter_spans_from_parts(&origins, &bytes);
+        let adapters = adapter_spans_from_parts(&roles, &bytes);
         let layouts = module_function_layouts(&bytes).expect("layouts");
         for a in &adapters {
             for (i, l) in layouts.iter().enumerate() {
-                if is_generated_origin(origins[i]) {
+                if roles[i].is_some() {
                     continue;
                 }
                 let disjoint =
@@ -1377,6 +1440,94 @@ mod tests {
     #[test]
     fn build_adapter_dwarf_none_when_no_spans() {
         assert!(build_adapter_dwarf(&[]).is_none());
+    }
+
+    /// #144 inc 4: every adapter class maps to a distinct, non-zero
+    /// `<meld-adapter>` line — the stable contract witness consumes.
+    /// Line 0 means "no source line" in DWARF and would read back as
+    /// `unknown`; two classes sharing a line would be indistinguishable.
+    #[test]
+    fn adapter_lines_are_distinct_and_nonzero() {
+        let all = [
+            AdapterRole::Generated,
+            AdapterRole::Direct,
+            AdapterRole::MemoryCopy,
+            AdapterRole::Transcode,
+            AdapterRole::Async,
+            AdapterRole::HandleTable,
+            AdapterRole::StartWrapper,
+            AdapterRole::AdapterShim,
+            AdapterRole::TaskReturnShim,
+        ];
+        let mut seen = std::collections::BTreeSet::new();
+        for role in all {
+            let line = role.adapter_line();
+            assert!(line > 0, "{role:?} must not use DWARF line 0");
+            assert!(seen.insert(line), "{role:?} reuses line {line}");
+        }
+    }
+
+    /// #144 inc 4: spans carry per-class roles and the indices stay
+    /// aligned with output layout — including entries appended AFTER the
+    /// merged functions (the FACT-adapter positions that were previously
+    /// un-enumerated). Round-trip through `build_adapter_dwarf` and
+    /// assert each address resolves to its class's line.
+    #[test]
+    fn per_class_spans_round_trip_to_distinct_lines() {
+        use gimli::{EndianSlice, LittleEndian};
+
+        let wat = r#"(module
+            (func (result i32) i32.const 1)
+            (func (result i32) i32.const 2)
+            (func (result i32) i32.const 3))"#;
+        let bytes = wat::parse_str(wat).expect("assemble wat");
+        // func 0 = real source; func 1 = merger handle-table helper;
+        // func 2 = appended FACT transcode adapter.
+        let roles = [
+            None,
+            Some(AdapterRole::HandleTable),
+            Some(AdapterRole::Transcode),
+        ];
+        let spans = adapter_spans_from_parts(&roles, &bytes);
+        assert_eq!(spans.len(), 2);
+
+        let sections = build_adapter_dwarf(&spans).expect("build");
+        let section_data = |name: &str| -> &[u8] {
+            sections
+                .iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, d)| d.as_slice())
+                .unwrap_or(&[])
+        };
+        let load = |id: gimli::SectionId| -> Result<EndianSlice<'_, LittleEndian>, gimli::Error> {
+            Ok(EndianSlice::new(section_data(id.name()), LittleEndian))
+        };
+        let dwarf = gimli::Dwarf::load(load).expect("load");
+        let mut by_addr = std::collections::BTreeMap::new();
+        let mut units = dwarf.units();
+        while let Some(header) = units.next().expect("units") {
+            let unit = dwarf.unit(header).expect("unit");
+            let Some(program) = unit.line_program.clone() else {
+                continue;
+            };
+            let mut rows = program.rows();
+            while let Some((_, row)) = rows.next_row().expect("row") {
+                if !row.end_sequence() {
+                    by_addr.insert(row.address(), row.line().map_or(0, |l| l.get()));
+                }
+            }
+        }
+        for span in &spans {
+            assert_eq!(
+                by_addr.get(&u64::from(span.output_body_start)).copied(),
+                Some(u64::from(span.role.adapter_line())),
+                "span at {:#x} must resolve to its class line",
+                span.output_body_start
+            );
+        }
+        // And the two classes resolved to DIFFERENT lines.
+        let lines: std::collections::BTreeSet<u64> = by_addr.values().copied().collect();
+        assert_eq!(lines.len(), 2, "two classes, two distinct lines");
     }
 
     /// Inc 3 oracle: source DWARF and the synthetic `<meld-adapter>` unit
