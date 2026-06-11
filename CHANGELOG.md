@@ -4,6 +4,39 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.25.0] - 2026-06-11
+
+### Changed
+
+- **`DwarfHandling::Remap` is the default** (#143 closeout, SR-35 →
+  verified; PR #230). `meld fuse` output now carries remapped DWARF by
+  default: single-source addresses translated to the fused code
+  section (correct-or-tombstone per address, LS-D-1), meld-generated
+  code attributed to per-class `<meld-adapter>` lines (LS-D-2), and
+  multi-source inputs drop source DWARF rather than emit wrong
+  addresses (#208 lifts that). Witness-measured gate evidence:
+  line tables survive remap byte-identically (2011/2011 rows);
+  75.9% of fused branch offsets resolve to source vs 83.0% unfused —
+  the unfused gap is debug-info-less libc, the fusion delta is
+  tombstoned/dropped ranges (tracked under #208). The invariant
+  carried through every default flip: the default NEVER emits
+  address-wrong DWARF; `PassThrough` stays a deliberate opt-in
+  (pinned by `default_is_remap_never_passthrough`).
+  CLI: `--dwarf` default `strip` → `remap`.
+
+### Pre-release Mythos note
+
+No Tier-5 files changed since v0.24.0 (lib.rs/CLI/tests/YAML only).
+
+### Falsification statement
+
+Claim: the default fuse of a single-DWARF-source component yields
+output whose `.debug_line` resolves remapped addresses to their
+original sources, and never attributes any address to a wrong source
+file (tombstone or correct only). Refute via
+`dwarf_remap_witness.rs`'s low_pc/code-range cross-check or the
+`dwarf_passthrough.rs` policy suite.
+
 ## [0.24.0] - 2026-06-11
 
 ### Added
