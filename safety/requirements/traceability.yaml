@@ -13,7 +13,7 @@
 #   6. Every requirement has at least one verification method
 #   7. No dangling references (all IDs resolve)
 #
-# Last updated: 2026-03-14
+# Last updated: 2026-06-11
 
 # Reverse traceability: which requirements address each loss
 loss-coverage:
@@ -187,10 +187,18 @@ verification-status:
 
   SR-17:
     implementation-files: [meld-core/src/adapter/fact.rs]
-    tests: []
+    tests:
+      - adapter_safety::test_sr17_utf8_to_utf16_string_transcoding
+      - resolver::tests::test_sr17_all_encoding_pairs_transcoding_matrix
     proofs: []
-    status: not-verified
-    note: "CRITICAL GAP: No UTF-16, CompactUTF16, or surrogate pair tests"
+    status: partial
+    note: >-
+      Refreshed 2026-06-11: UTF-16 ASCII transcoding is now tested
+      (test_sr17_utf8_to_utf16_string_transcoding) and the resolver's
+      transcoding-requirement matrix is pinned (test_sr17_* in
+      resolver.rs). Remaining open gap — the one left for SR-17: the
+      non-BMP / surrogate-pair clause of the requirement is still
+      untested (no non-BMP UTF-16 or CompactUTF16 round-trip test).
 
   SR-18:
     implementation-files: [meld-core/src/adapter/fact.rs]
@@ -268,9 +276,16 @@ verification-status:
     implementation-files: [meld-core/src/adapter/fact.rs, meld-core/src/component_wrap.rs]
     tests:
       - wit_bindgen_runtime::test_fuse_wit_bindgen_resources
+      - wit_bindgen_runtime::test_fuse_component_wit_bindgen_resources
+      - wit_bindgen_runtime::test_runtime_wit_bindgen_resources
     proofs: []
-    status: partial
-    note: "Core module fusion works. P2 wrapping blocked on [resource-new]/[resource-rep]/[export] support."
+    status: verified
+    note: >-
+      Refreshed 2026-06-11: the resources fixture now passes all three
+      levels including runtime (test_runtime_wit_bindgen_resources) —
+      the former "P2 wrapping blocked on
+      [resource-new]/[resource-rep]/[export] support" blocker is gone
+      and GAP-5 is resolved.
 
   SR-26:
     implementation-files: [meld-core/src/parser.rs]
@@ -310,10 +325,15 @@ verification-status:
 
   SR-31:
     implementation-files: [meld-core/src/merger.rs]
-    tests: []
+    tests:
+      - merger::tests::ls_m_5_multiply_instantiated_module_rejected
     proofs: []
-    status: not-verified
-    note: "CRITICAL: No detection of multiply-instantiated modules. Silent corruption risk."
+    status: verified
+    note: >-
+      Refreshed 2026-06-11: fail-fast detection is implemented and
+      pinned by ls_m_5_multiply_instantiated_module_rejected
+      (merger.rs:4719), discovered and passing through the LS
+      verification gate.
 
   # Roadmap entries (SR-32..SR-36) — see docs/roadmap.md. status moves
   # planned -> in-progress -> implemented as the milestone proceeds.
@@ -334,23 +354,25 @@ verification-status:
 
   SR-33:
     implementation-files:
-      - meld-core/src/p3_stream.rs   # detection half ONLY (StreamPairGraph)
-      - meld-core/src/resolver.rs    # graph built at resolve time
+      - meld-core/src/p3_bridge.rs
     tests:
-      - meld-core/src/p3_stream.rs::tests::stream_pair_detected_for_connected_producer_consumer
-      - meld-core/src/p3_stream.rs::tests::no_pair_when_components_not_fusion_connected
-      - meld-core/src/p3_stream.rs::tests::no_pair_without_producer_consumer_complementarity
-      - meld-core/src/p3_stream.rs::tests::memory_mode_follows_strategy
+      - p3_bridge_runtime::ls_st_1_round_trip_local_stream_never_crosses_host
+      - p3_bridge_runtime::cross_memory_chain_preserves_data_across_distinct_memories
+      - p3_bridge_runtime::backpressure_partial_write_then_drain_then_resume
+      - p3_bridge_runtime::ls_st_1_eof_only_after_writer_drop_and_drain
+      - p3_bridge_runtime::slot_exhaustion_falls_back_to_host_stream
     proofs: []
-    status: planned
+    status: verified
     note: >-
-      Audited 2026-06-10: detection foundation shipped v0.9.0 (#173,
-      ADR-3 path "detection now, emitter follow-up"); the in-module
-      emitter the requirement demands is not implemented — stream
-      traffic still round-trips through pulseengine:async host imports.
-      safety-requirements.yaml briefly carried status implemented from
-      a bulk sync (PR #211); reverted. Emitter is v0.29.0 scope.
-    note: "v0.9.0 — Cross-component stream<T> fusion (#141). adapter/fact.rs + resolver.rs."
+      Audited 2026-06-11: the v0.29.0 in-module bridge emitter
+      (p3_bridge.rs, consuming the resolve-time StreamPairGraph) is
+      verified by the five runtime oracles in
+      tests/p3_bridge_runtime.rs, which fuse two hand-built components
+      through the real pipeline and execute under wasmtime with host
+      stubs that trap on any bridge-local (bit-31-tagged) handle.
+      History: only the detection half shipped in v0.9.0 (#173); the
+      v0.9.0-era implemented status was a bulk-sync error reverted in
+      PR #221 after the 2026-06-10 audit.
 
   SR-34:
     implementation-files:
@@ -396,11 +418,26 @@ verification-status:
       same evidence; evidence trail on #143.
 
   SR-36:
-    implementation-files: []
-    tests: []
+    implementation-files:
+      - meld-core/src/dwarf.rs
+    tests:
+      - dwarf::tests::adapter_spans_identifies_component_synthetic
+      - dwarf::tests::adapter_spans_recognises_fully_synthetic_sentinel
+      - dwarf::tests::adapter_spans_empty_when_all_source
+      - dwarf::tests::adapter_spans_disjoint_from_source_ranges
+      - dwarf::tests::build_adapter_dwarf_attributes_ranges_to_meld_adapter
+      - dwarf::tests::ls_d_2_rewrite_emits_source_and_adapter_units_in_one_write
+      - adapter_dwarf_e2e::ls_d_2_generated_start_wrapper_is_attributed_to_meld_adapter
     proofs: []
-    status: planned
-    note: "v0.11.0 — DWARF Phase 3 adapter DIEs (#144). Depends on SR-35."
+    status: implemented
+    note: >-
+      Audited 2026-06-11: increments 1-4 shipped (#144, v0.23.0/v0.24.0)
+      — adapter-span enumeration, synthetic-unit builder with
+      write→read round-trip oracle, single-write pipeline emission, and
+      per-class <meld-adapter> lines. Upgrade to verified is gated on
+      the cross-repo witness MC/DC re-run confirming adapter ranges
+      resolve to <meld-adapter> (not "unknown") on a real fused
+      fixture; that re-run has not happened yet.
 
   SR-37:
     implementation-files:
@@ -421,6 +458,58 @@ verification-status:
       LS-N gate incl. ls_m_7_*, Mythos delta-pass); manual wasm-opt 116
       evidence on the issue repro recorded on #172 and in the PR body.
 
+  SR-38:
+    implementation-files:
+      - meld-core/src/dwarf.rs
+    tests:
+      - dwarf::tests::ls_d_3_multi_source_merge_round_trips_both_units
+      - dwarf_passthrough (multi-source policy test on lists.wasm)
+    proofs: []
+    status: verified
+    note: >-
+      v0.26.0 (#208). Multi-source DWARF merge via bounded relocation;
+      out-of-repertoire inputs abort to synthetic-only emission, never
+      a guessed offset. Verified by the gimli-built two-source
+      round-trip (units, files, lines, strp strings survive relocation)
+      plus the real-fixture policy test (287 units merge; 23k line rows
+      parse via llvm-dwarfdump locally). Known limitation carried on
+      #208: DW_AT_location convert-path verifier warnings (variable
+      locations, out of #130 scope).
+
+  SR-39:
+    implementation-files:
+      - meld-core/src/component_wrap.rs
+    tests:
+      - golden_e2e::ls_cp_6_separate_inputs_internalise_link
+      - wit_bindgen_runtime (full suite guards WASI imports staying declared)
+    proofs: []
+    status: verified
+    note: >-
+      v0.28.0 (#212). Separate-input cross-component linking (import
+      internalisation). Verified by the golden-e2e acceptance: fuse
+      consumer.wasm + provider.wasm --component, instantiate standalone
+      in wasmtime with no linker definitions, assert compute()==42 and
+      greet()==7 against the host-linked golden run.
+
+  SR-40:
+    implementation-files:
+      - meld-core/src/abi_proofs.rs
+    tests: []
+    proofs:
+      - abi_proofs::flags_layout_matches_spec (Kani)
+      - abi_proofs::total_flat_params_saturating_monotone (Kani)
+      - abi_proofs::ring_cursor_invariant_inductive (Kani)
+    status: verified
+    note: >-
+      v0.30.0 (#218 inc 1). Three Kani harnesses, each VERIFICATION
+      SUCCESSFUL locally on 2026-06-11 via `cargo kani --harness
+      <name>`. Caveat: local-Kani evidence only — smithy CI runners do
+      not ship the Kani toolchain, so the proofs are not re-checked in
+      CI (wiring is follow-up under #218). Honest scope cuts recorded
+      in-module: nondet leaf/container and aggregate-padding harnesses
+      do not converge in CBMC against the current ParsedComponent
+      shape; that contract stays pinned by the exhaustive unit tests.
+
 # wit-bindgen fixture coverage (14 fixtures × 3 levels = 42 integration tests)
 wit-bindgen-fixtures:
   passing-all-3-levels:
@@ -436,8 +525,7 @@ wit-bindgen-fixtures:
     - lists-alias
     - strings-alias
     - strings-simple
-  core-module-only:
-    - resources  # P2 wrapping blocked on resource handles (SR-25)
+    - resources  # since resource P2-wrapping support landed (SR-25, GAP-5)
   graceful-degradation:
     - fixed-length-lists  # Parser doesn't support 0x67 encoding
 
@@ -482,13 +570,12 @@ gaps:
 
   - id: GAP-5
     description: >
-      SR-25 (resource handles) has partial support — core module fusion
-      works but P2 wrapping fails. Resources fixture exists but only
-      passes core module validation level. Wrapper needs [resource-new],
-      [resource-rep], [export]-prefixed module support.
-    priority: high
-    action: >
-      Implement resource support in component_wrap.rs.
+      SR-25 (resource handles): resource support landed in
+      component_wrap.rs — the resources fixture now passes all three
+      levels including runtime (test_runtime_wit_bindgen_resources).
+      Resolved in the v0.31.0 traceability audit.
+    priority: closed
+    status: resolved
 
   - id: GAP-6
     description: >
@@ -505,10 +592,13 @@ gaps:
       is instantiated more than once. BA RFC #46 discussion (cfallin)
       identifies this as a fundamental component model capability that
       must be handled correctly, not just rejected.
-    priority: critical
-    action: >
-      Immediate: fail-fast rejection in merger. Strategic: multi-module
-      component output per cfallin's "simple component" proposal.
+      Resolved in the v0.31.0 traceability audit: fail-fast rejection
+      is implemented and pinned by
+      ls_m_5_multiply_instantiated_module_rejected (SR-31 verified).
+      The strategic multi-module component output (cfallin's "simple
+      component" proposal) remains future work, not a safety gap.
+    priority: closed
+    status: resolved
     references:
       - "BA RFC #46 discussion, cfallin 2026-03-10"
       - "safety/stpa/weighted-gap-analysis.md GAP-P2-1"
