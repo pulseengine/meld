@@ -4,6 +4,37 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.26.0] - 2026-06-11
+
+### Added
+
+- **Multi-source DWARF merge** (#208 inc 1, SR-38, LS-D-3; PR #232).
+  `DwarfHandling::Remap` no longer drops source DWARF when more than
+  one input module carries it: each source is converted and
+  address-remapped independently, and the written section sets are
+  merged by a bounded relocator patching the closed cross-section
+  reference list (CU abbrev offset, `strp`, `stmt_list`/`ranges`/
+  location `sec_offset`s, `ref_addr`) on every set after the first.
+  Abort-don't-guess: inputs outside the DWARF32-v4 repertoire fall
+  back to synthetic-only emission; a source whose remap fails is
+  dropped individually. Real-fixture evidence: lists.wasm merges 287
+  compile units with >23k parseable line rows. Known carried
+  limitation (SR-38): pre-existing convert-path `DW_AT_location`
+  verifier warnings (variable-location data, out of #130 scope).
+
+### Pre-release Mythos note
+
+No Tier-5 files changed since v0.25.0 (dwarf.rs + tests + YAML only).
+
+### Falsification statement
+
+Claim: merging two independently remapped DWARF sources preserves
+every unit, file, line, and strp-referenced string at the correct
+relocated offsets. Refute via
+`ls_d_3_multi_source_merge_round_trips_both_units` or the
+dwarf_passthrough multi-source policy test — a single missed
+relocation fails the re-parse or resolves foreign data.
+
 ## [0.25.0] - 2026-06-11
 
 ### Changed
