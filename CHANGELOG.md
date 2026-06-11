@@ -4,6 +4,35 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.30.0] - 2026-06-11
+
+### Added
+
+- **Machine-checked Canonical-ABI invariants** (#218 inc 1, SR-40;
+  PR #241). Three Kani harnesses, each VERIFICATION SUCCESSFUL:
+  flags<N> storage classes at every class boundary (LS-A-20),
+  total_flat_params saturating monotonicity (LS-P-9), and the #141
+  stream-bridge ring-cursor invariant under u32 wraparound (model
+  compile-tied to the emitter's constants). Honest scope cuts
+  recorded in-module and in SR-40: nondet leaf/container and
+  aggregate-padding harnesses do not converge in CBMC against the
+  current ParsedComponent heap shape — those contracts remain pinned
+  by the exhaustive unit tests; tractable post allocation-free
+  layout-core refactor. Kani CI wiring is follow-up (runners lack the
+  toolchain); the local invocation is pinned in abi_proofs.rs.
+
+### Pre-release Mythos note
+
+No Tier-5 files changed since v0.29.0 (abi_proofs.rs is
+cfg(kani)-gated; one module-registration line in lib.rs).
+
+### Falsification statement
+
+Claim: the three stated invariants hold for all inputs within the
+harness bounds. Refute by `cargo kani --harness <name>` returning
+FAILED on any of ring_cursor_invariant_inductive,
+total_flat_params_saturating_monotone, flags_layout_matches_spec.
+
 ## [0.29.0] - 2026-06-11
 
 ### Added
