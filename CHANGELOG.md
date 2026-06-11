@@ -4,6 +4,42 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.23.0] - 2026-06-11
+
+### Added
+
+- **Synthetic `<meld-adapter>` source attribution for meld-generated
+  code** (#144 Phase 3 increments 1–3, SR-36, PRs #217/#219/#226).
+  Under `DwarfHandling::Remap` the fused output now carries a synthetic
+  DWARF compilation unit attributing every meld-GENERATED code range
+  (adapter trampolines, handle-table helpers, the multi-start wrapper)
+  to the placeholder source `<meld-adapter>:1` — witness's MC/DC view
+  surfaces these as adapter branches instead of un-attributed `unknown`
+  gaps. The synthetic unit rides the SAME `gimli::write::Dwarf` write
+  as the remapped original units (one shared cross-section offset
+  space; the byte-concat alternative provably fails re-parse — pinned
+  as LS-D-2). Emitted even when no input carries DWARF, so adapter
+  attribution never depends on debug-built inputs. Public seam:
+  `dwarf::adapter_spans` (enumeration), `dwarf::build_adapter_dwarf`
+  (standalone build), both consumed by the pipeline integration.
+  Per-class line numbers (transcode / cabi_realloc / lift / lower)
+  are v0.24.0 scope (inc 4, merger-side class tagging).
+
+### Pre-release Mythos note
+
+No Tier-5 files changed since v0.22.0 (`dwarf.rs` is not Tier-5;
+gate-verified by the `Detect Tier-5 changes` check on each PR).
+New approved loss scenario LS-D-2 with gate-runnable `ls_d_2_*`
+regression tests.
+
+### Falsification statement
+
+Claim: fusing two DWARF-less components whose `start` functions force
+a synthetic start wrapper, under `--dwarf remap`, yields output whose
+`.debug_line` resolves the wrapper's body to `<meld-adapter>:1` at a
+real function-body address, without perturbing behaviour. Refute via
+`tests/adapter_dwarf_e2e.rs` — both oracles encode it.
+
 ## [0.22.0] - 2026-06-11
 
 ### Added
