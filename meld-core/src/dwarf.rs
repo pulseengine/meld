@@ -865,7 +865,7 @@ fn concat_dwarf_section_sets(sets: &[Vec<(String, Vec<u8>)>]) -> Option<Vec<(Str
 
         // Byte-equal abbrev reuse.
         let abbrev = section_of(set, ".debug_abbrev");
-        let abbrev_base = match abbrev_seen.iter().find(|(_, b)| b == &abbrev) {
+        let abbrev_base = match abbrev_seen.iter().find(|(_, b)| *b == abbrev) {
             Some((at, _)) => *at,
             None => {
                 let at = u32::try_from(abbrev_out.len()).ok()?;
