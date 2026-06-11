@@ -237,6 +237,12 @@ pub enum SyntheticKind {
     AdapterShim,
     /// P3 async `task.return` shim storing results into result globals.
     TaskReturnShim,
+    /// Cross-component stream-bridge shim (#141): per-component
+    /// `stream_*` dispatch function emitted by `crate::p3_bridge` that
+    /// routes locally-minted (bit-31-tagged) handles to the in-module
+    /// bridge ring memory and forwards host handles to the retained
+    /// `pulseengine:async` imports.
+    StreamBridge,
 }
 
 /// Global in merged module

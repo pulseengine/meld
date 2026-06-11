@@ -718,13 +718,18 @@ artifacts:
     description: >
       When two fused components share a `stream<T>` endpoint, meld shall
       emit an in-module adapter that bridges the two sides without round-
-      tripping through the host. Two modes:
-      (a) same-memory (single-memory fusion): direct in-module ring buffer,
-      zero-copy.
-      (b) different-memory (multi-memory): `stream_read` → in-module copy
-      loop → `stream_write` chain, with `cabi_realloc` null-guard policy
-      per LS-A-7.
-    status: planned
+      tripping through the host. Shipped shape (shim-dispatch bridge,
+      #141 design comment + ADR-3 amendment): one bridge ring memory +
+      per-component dispatch shims with hardwired memory immediates;
+      handles minted in-module carry bit 31 (LOCAL_TAG) and route to the
+      ring, host handles keep routing to the retained pulseengine:async
+      imports. Same-memory fusion is the identical codegen with caller-
+      memory immediates 0 — the original "zero-copy same-memory ring"
+      claim is amended to "no host crossing, single copy", because the
+      ABI's caller-buffer contract (stream_read(handle, buf_ptr, …))
+      requires a copy into the caller's buffer regardless; fusion removes
+      the double host round-trip per chunk.
+    status: implemented
     tags: [roadmap, p3-async, v0.29.0]
     links:
       - type: derives-from
@@ -733,22 +738,37 @@ artifacts:
         target: "#141"
     fields:
       implementation:
+        - meld-core/src/p3_bridge.rs
         - meld-core/src/p3_stream.rs
         - meld-core/src/resolver.rs
       verification-method: test
       verification-description: >
-        Status correction (audit 2026-06-10, reverting the bulk flip in
-        PR #211): only the DETECTION half shipped in v0.9.0 (#173) —
-        `StreamPairGraph` built at resolve time (resolver.rs /
-        p3_stream.rs), gated by the four ADR-3 detection fixtures. The
-        emitter this requirement actually demands (same-memory ring
-        buffer; cross-memory read→copy→write chain) is NOT implemented:
-        fused stream traffic still round-trips through `pulseengine:async`
-        host imports, fact.rs contains no stream bridging code, and the
-        named runtime fixtures (zero-copy, chain, backpressure, EOF) exist
-        only as ABI-enum unit tests. ADR-3 (status open) records the
-        deferral as the chosen path. Emitter + runtime fixtures + Mythos
-        pass are the v0.29.0 scope (docs/roadmap.md).
+        Honest history: only the DETECTION half shipped in v0.9.0 (#173)
+        — `StreamPairGraph` built at resolve time, gated by the four
+        ADR-3 detection fixtures — and the emitter was MISSING until
+        v0.29.0 (the v0.9.0-era `implemented` status was a bulk-sync
+        error, reverted in PR #221 after the 2026-06-10 audit). The
+        v0.29.0 emitter (p3_bridge.rs, consuming the StreamPairGraph) is
+        verified by four RUNTIME oracles in tests/p3_bridge_runtime.rs
+        that fuse two hand-built components through the real pipeline
+        and execute the fused module under wasmtime with host stubs that
+        trap on any bridge-local (bit-31-tagged) handle:
+        (1) ls_st_1_round_trip_local_stream_never_crosses_host — bytes
+        [1,2,3,4] producer→consumer through a local stream, zero host
+        intrinsic calls; (2)
+        cross_memory_chain_preserves_data_across_distinct_memories —
+        multi-memory fusion (producer mem ≠ consumer mem ≠ bridge mem),
+        300-byte pattern intact across both memory.copy hops; (3)
+        backpressure_partial_write_then_drain_then_resume — write >
+        RING_CAP returns the accepted count (ADR-2 Partial), 0 on a full
+        ring, remainder accepted after drain, two-part ring-wrap copy
+        exercised on write and read; (4)
+        ls_st_1_eof_only_after_writer_drop_and_drain — read is -5
+        (Pending) while open+empty, drains buffered bytes after
+        drop_writable, returns 0 (EOF, sticky) only once drained.
+        slot_exhaustion_falls_back_to_host_stream additionally pins the
+        graceful host fallback (9th stream is host-minted and its ops
+        reach the host imports). LS-ST-1 records the hazard analysis.
       milestone: v0.29.0
 
   - id: SR-34

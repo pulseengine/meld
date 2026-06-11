@@ -952,6 +952,8 @@ pub enum AdapterRole {
     AdapterShim,
     /// P3 async `task.return` result-global shim.
     TaskReturnShim,
+    /// Cross-component stream-bridge dispatch shim (#141, `p3_bridge`).
+    StreamBridge,
 }
 
 impl AdapterRole {
@@ -976,6 +978,7 @@ impl AdapterRole {
             AdapterRole::StartWrapper => 7,
             AdapterRole::AdapterShim => 8,
             AdapterRole::TaskReturnShim => 9,
+            AdapterRole::StreamBridge => 10,
         }
     }
 }
@@ -998,6 +1001,7 @@ impl From<crate::merger::SyntheticKind> for AdapterRole {
             crate::merger::SyntheticKind::StartWrapper => AdapterRole::StartWrapper,
             crate::merger::SyntheticKind::AdapterShim => AdapterRole::AdapterShim,
             crate::merger::SyntheticKind::TaskReturnShim => AdapterRole::TaskReturnShim,
+            crate::merger::SyntheticKind::StreamBridge => AdapterRole::StreamBridge,
         }
     }
 }
@@ -1741,6 +1745,7 @@ mod tests {
             AdapterRole::StartWrapper,
             AdapterRole::AdapterShim,
             AdapterRole::TaskReturnShim,
+            AdapterRole::StreamBridge,
         ];
         let mut seen = std::collections::BTreeSet::new();
         for role in all {

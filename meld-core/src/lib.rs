@@ -55,6 +55,7 @@ mod error;
 pub mod memory_probe;
 pub mod merger;
 pub mod p3_async;
+pub mod p3_bridge;
 pub mod p3_stream;
 pub mod parser;
 pub mod provenance;
@@ -540,6 +541,30 @@ impl Fuser {
         // after EXIT. Must run BEFORE adapter generation so shim info
         // is available to the async adapter.
         self.generate_task_return_shims(&mut merged, &graph)?;
+
+        // Step 2.6: Cross-component stream-bridge emitter (#141, SR-33).
+        //
+        // When the resolver detected cross-component stream pairs
+        // (graph.stream_pair_graph, ADR-3 detection foundation), emit the
+        // bridge memory + per-component dispatch shims and rewire every
+        // stream-intrinsic call site to its component's shim. This MUST
+        // run before adapter generation/wiring: adapters are encoded
+        // after merged.functions, so wire_adapter_indices bakes adapter
+        // indices derived from functions.len() into call sites —
+        // appending shim functions any later would shift those indices
+        // off-target. Running here, the shims are plain merged functions
+        // that every later index computation already accounts for.
+        if let Some(stream_pairs) = graph.stream_pair_graph.as_ref()
+            && !stream_pairs.is_empty()
+        {
+            p3_bridge::emit_stream_bridge(
+                &mut merged,
+                &self.components,
+                stream_pairs,
+                self.config.memory_strategy,
+                self.config.address_rebasing,
+            )?;
+        }
 
         // Step 3: Generate adapters
         log::info!("Generating adapters");
