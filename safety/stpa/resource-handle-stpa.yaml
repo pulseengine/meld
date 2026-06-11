@@ -679,10 +679,18 @@ gap-analysis:
 
 # =============================================================================
 # Recommended New/Updated Safety Requirements
+#
+# Namespace note (v0.31.0 traceability audit): these are DRAFT proposals
+# local to this analysis, renumbered SR-RH-1..SR-RH-8 (from their original
+# draft ids SR-25, SR-32..SR-38) to stop colliding with the unrelated
+# requirements that now occupy SR-32..SR-38 in
+# safety/requirements/safety-requirements.yaml. SR-RH-1 proposes a rewrite
+# of the existing SR-25; the gap-analysis section above intentionally
+# still references SR-25 because it discusses that existing requirement.
 # =============================================================================
 
 requirements:
-  - id: SR-25
+  - id: SR-RH-1
     type: requirement
     title: Correct borrow<T> handle conversion in adapters
     description: >
@@ -715,7 +723,7 @@ requirements:
         Runtime test with 2-component borrow<T> call (callee defines T) and
         3-component borrow<T> chain; verify correct rep/handle conversion.
 
-  - id: SR-32
+  - id: SR-RH-2
     type: requirement
     title: Recursive resource detection in aggregate types
     description: >
@@ -746,7 +754,7 @@ requirements:
         option<own<T>>, and list<own<T>>. Verify all inner handles are
         correctly converted across component boundaries.
 
-  - id: SR-33
+  - id: SR-RH-3
     type: requirement
     title: Own<T> result conversion via resource.new
     description: >
@@ -772,7 +780,7 @@ requirements:
         Verify caller receives a valid handle (not raw rep) and can use it
         in subsequent calls.
 
-  - id: SR-34
+  - id: SR-RH-4
     type: requirement
     title: Own<T> parameter ownership transfer semantics
     description: >
@@ -800,7 +808,7 @@ requirements:
         is freed and destination can use the resource. Verify no double-free
         on subsequent drop.
 
-  - id: SR-35
+  - id: SR-RH-5
     type: requirement
     title: Deterministic resource.rep import disambiguation
     description: >
@@ -824,7 +832,7 @@ requirements:
         [resource-rep] imports for the same resource name. Verify the
         adapter selects the caller's import, not an arbitrary one.
 
-  - id: SR-36
+  - id: SR-RH-6
     type: requirement
     title: Transitive resource type alias resolution
     description: >
@@ -849,7 +857,7 @@ requirements:
         Test with component having 3-level alias chain for resource type.
         Verify resolve_resource_positions returns correct import pair.
 
-  - id: SR-37
+  - id: SR-RH-7
     type: requirement
     title: Toplevel resource import resolution in P2 wrapper
     description: >
@@ -874,7 +882,7 @@ requirements:
         Test with resource-import-and-export fixture. Verify P2 wrapping
         succeeds and the component passes wasm-tools validate.
 
-  - id: SR-38
+  - id: SR-RH-8
     type: requirement
     title: Correct destructor binding for locally-defined resources
     description: >
@@ -1039,7 +1047,7 @@ fixture-failure-mapping:
     root-cause: >
       First-match strategy in analyze_call_site selects wrong [resource-rep]
       import when multiple candidates exist from different components.
-    recommended-sr: SR-35
+    recommended-sr: SR-RH-5
 
   - fixture: resource_aggregates
     failure-mode: "own<T> handle assertion failure — rep misinterpreted as handle"
@@ -1049,7 +1057,7 @@ fixture-failure-mapping:
     root-cause: >
       Adapter does not call [resource-new] on own<T> return values. Callee
       returns rep, caller interprets it as handle index.
-    recommended-sr: SR-33
+    recommended-sr: SR-RH-3
 
   - fixture: ownership
     failure-mode: "Resource ownership transfer trap"
@@ -1060,7 +1068,7 @@ fixture-failure-mapping:
       Adapter does not clean up source-side handle table entry when own<T>
       ownership transfers. Handle leaks lead to double-free or stale handle
       access.
-    recommended-sr: SR-34
+    recommended-sr: SR-RH-4
 
   - fixture: resource_borrow_in_record
     failure-mode: "borrow<T> inside record not converted"
@@ -1070,7 +1078,7 @@ fixture-failure-mapping:
     root-cause: >
       resource_param_positions does not recurse into record fields to detect
       borrow<T>. Handle passes through without conversion.
-    recommended-sr: SR-32
+    recommended-sr: SR-RH-2
 
   - fixture: resource_with_lists
     failure-mode: "Data corruption in resource+list combination"
@@ -1081,7 +1089,7 @@ fixture-failure-mapping:
       CopyLayout and resource detection are independent subsystems. Neither
       handles the intersection: resource handles inside list elements or
       alongside list pointer pairs in return areas.
-    recommended-sr: SR-32
+    recommended-sr: SR-RH-2
 
   - fixture: resource-import-and-export
     failure-mode: "P2 wrapper cannot resolve toplevel resource import"
@@ -1092,4 +1100,4 @@ fixture-failure-mapping:
       resolve_import_to_instance does not handle resource imports at the
       component level (outside of named interface instances). Fallback
       Category C only covers [resource-drop], not [resource-rep]/[resource-new].
-    recommended-sr: SR-37
+    recommended-sr: SR-RH-7
