@@ -835,6 +835,18 @@ fn assemble_component(
         .flat_map(|m| m.imports.iter())
         .map(|imp| imp.module.as_str())
         .collect();
+    // INVARIANT (Mythos pass, PR #236): `instance_renum` keys are import
+    // ordinals but are consumed with component-instance indices from
+    // `component_instance_defs` — these coincide only while import
+    // instances occupy the contiguous LEADING slots of the component
+    // instance space, which every real producer (wit-component, wac,
+    // wit-bindgen) satisfies. Likewise the depth-0 replay only filters
+    // the Import section; a depth-0 Alias/Type section referencing an
+    // import instance by index would dangle after a drop — unreachable
+    // from real producers (their instance-referencing aliases come after
+    // the first core module and are not captured as depth-0). If either
+    // assumption breaks, the loud dropped-instance error below fires
+    // rather than emitting a wrong index.
     let mut dropped_import_names: std::collections::BTreeSet<String> = Default::default();
     let mut instance_renum: std::collections::HashMap<u32, u32> = Default::default();
     {
