@@ -105,16 +105,17 @@ pub struct FuserConfig {
 
     /// DWARF (`.debug_*`) section handling.
     ///
-    /// Default `Strip` because meld currently does NOT remap DWARF
-    /// addresses across the merged code section (issue #130 Phase 2).
-    /// Passing the input DWARF through verbatim produces *wrong*
-    /// source-line attribution for every fused address — strictly
-    /// worse than emitting no DWARF, since downstream tooling
-    /// (`pulseengine/witness` MC/DC) trusts what it reads.
-    ///
-    /// Once Phase 2 ships an address-remapping pass, the default may
-    /// flip to a remap-based mode. Until then, `Strip` is the only
-    /// non-corrupting setting; `PassThrough` is opt-in and lossy.
+    /// Default `Remap` since v0.25.0 (#143/#144 complete): single-source
+    /// input DWARF is address-remapped against the fused code section
+    /// (correct-or-tombstone per address, LS-D-1), meld-generated code
+    /// gets the synthetic `<meld-adapter>` per-class unit (LS-D-2), and
+    /// the multi-source case drops source DWARF rather than emit wrong
+    /// addresses (#208 lifts that). Witness-measured on hello_rust:
+    /// 75.9% of fused branch offsets resolve to source (83.0% unfused;
+    /// the unfused 17% is debug-info-less libc, the fusion delta is
+    /// tombstoned/dropped ranges — tracked under #208). `Strip` remains
+    /// available; `PassThrough` is opt-in and lossy (its addresses are
+    /// wrong against the fused code section).
     pub dwarf_handling: DwarfHandling,
 
     /// Output format: core module (default) or P2 component
@@ -145,7 +146,7 @@ impl Default for FuserConfig {
             address_rebasing: false,
             preserve_names: false,
             custom_sections: CustomSectionHandling::Merge,
-            dwarf_handling: DwarfHandling::Strip,
+            dwarf_handling: DwarfHandling::Remap,
             output_format: OutputFormat::CoreModule,
             opaque_resources: Vec::new(),
         }

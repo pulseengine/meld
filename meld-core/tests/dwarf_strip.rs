@@ -8,14 +8,17 @@
 //! fused output points at the wrong instruction. Phase 1.5 makes the
 //! policy explicit:
 //!
-//! - `DwarfHandling::Strip` (default) drops every `.debug_*` section so
+//! - `DwarfHandling::Strip` drops every `.debug_*` section so
 //!   downstream consumers (e.g. `pulseengine/witness` MC/DC) see no
 //!   DWARF rather than corrupted DWARF.
 //! - `DwarfHandling::PassThrough` is opt-in for the rare case a caller
 //!   wants the lossy old behaviour for diagnostics.
-//!
-//! Phase 2 will add an actual address-remap pass; until then, "no
-//! DWARF" is strictly safer than "wrong DWARF".
+//! - `DwarfHandling::Remap` (default since v0.25.0, #143/#144 complete)
+//!   address-remaps single-source DWARF and attributes meld-generated
+//!   code to per-class `<meld-adapter>` lines; with multiple DWARF
+//!   sources it drops the source DWARF (#208) but keeps the synthetic
+//!   unit. The LS-CP-4 invariant is unchanged: the DEFAULT never emits
+//!   address-wrong DWARF — `PassThrough` stays a deliberate opt-in.
 
 use meld_core::{DwarfHandling, Fuser, FuserConfig};
 
@@ -78,15 +81,15 @@ fn fuse_with(handling: DwarfHandling) -> Vec<u8> {
 /// Default `FuserConfig` strips DWARF — the fused module carries zero
 /// `.debug_*` sections at the top level.
 #[test]
-fn default_strips_dwarf() {
+fn strip_strips_dwarf() {
     if !fixture_available() {
         return;
     }
-    let fused = fuse_with(FuserConfig::default().dwarf_handling);
+    let fused = fuse_with(DwarfHandling::Strip);
     assert_eq!(
         count_dwarf_sections(&fused),
         0,
-        "default DwarfHandling::Strip must produce zero DWARF sections"
+        "DwarfHandling::Strip must produce zero DWARF sections"
     );
 }
 
@@ -107,13 +110,14 @@ fn passthrough_preserves_dwarf() {
     );
 }
 
-/// Smoke check: `Default::default()` resolves to `DwarfHandling::Strip`,
-/// not `PassThrough`. If the default ever flips, this test must be
-/// updated together with the LS-CP-N entry.
+/// `Default::default()` resolves to `DwarfHandling::Remap` (v0.25.0),
+/// and — the actual LS-CP-4 invariant — NEVER to `PassThrough`, whose
+/// addresses are wrong against the fused code section.
 #[test]
-fn default_is_strip() {
+fn default_is_remap_never_passthrough() {
     let cfg = FuserConfig::default();
-    assert_eq!(cfg.dwarf_handling, DwarfHandling::Strip);
+    assert_eq!(cfg.dwarf_handling, DwarfHandling::Remap);
+    assert_ne!(cfg.dwarf_handling, DwarfHandling::PassThrough);
 }
 
 // LS-N verification gate convention aliases. These delegate to the
@@ -129,8 +133,8 @@ fn default_is_strip() {
 // pin that policy.
 
 #[test]
-fn ls_cp_4_default_strips_dwarf() {
-    default_strips_dwarf();
+fn ls_cp_4_strip_strips_dwarf() {
+    strip_strips_dwarf();
 }
 
 #[test]
@@ -139,6 +143,6 @@ fn ls_cp_4_passthrough_preserves_dwarf_explicitly() {
 }
 
 #[test]
-fn ls_cp_4_default_is_strip() {
-    default_is_strip();
+fn ls_cp_4_default_is_never_passthrough() {
+    default_is_remap_never_passthrough();
 }

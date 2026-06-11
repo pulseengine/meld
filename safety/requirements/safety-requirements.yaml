@@ -797,7 +797,7 @@ artifacts:
       `.debug_str` / `.debug_abbrev` pass through with string-pool dedup /
       byte-equal merge. End-to-end verified by witness MC/DC integration:
       ≥ X% of `br_if` byte offsets in fused output resolve to source.
-    status: implemented
+    status: verified
     tags: [roadmap, dwarf, witness-mc-dc, v0.10.0]
     links:
       - type: derives-from
