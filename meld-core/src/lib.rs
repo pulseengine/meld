@@ -23,7 +23,7 @@
 //! use meld_core::{Fuser, FuserConfig};
 //!
 //! let config = FuserConfig::default();
-//! let fuser = Fuser::new(config);
+//! let mut fuser = Fuser::new(config);
 //!
 //! // Add components to fuse
 //! fuser.add_component(&component_a_bytes)?;
@@ -35,17 +35,24 @@
 //!
 //! ## Memory Strategy
 //!
-//! - **Multi-memory** (default): Each component keeps its own linear memory.
+//! - **Auto** (default): Resolves to shared memory + address rebasing when
+//!   no input module contains `memory.grow` and the inputs carry two or
+//!   more memories; multi-memory otherwise. See [`MemoryStrategy::Auto`]
+//!   and issue #172.
+//! - **Multi-memory**: Each component keeps its own linear memory.
 //!   Cross-component pointer-passing calls use adapters with `cabi_realloc`
-//!   and `memory.copy`.
-//! - **Shared memory** (legacy): All components share one memory. Broken when
+//!   and `memory.copy`. Downstream tools need multi-memory support
+//!   (`wasm-opt --enable-multimemory`); no single-address-space lowering.
+//! - **Shared memory**: All components share one memory. Broken when
 //!   any component uses `memory.grow`.
 
 pub mod adapter;
 pub mod attestation;
 pub mod component_wrap;
+pub mod custom_merge;
 pub mod dwarf;
 mod error;
+pub mod memory_probe;
 pub mod merger;
 pub mod p3_async;
 pub mod p3_stream;
@@ -132,7 +139,7 @@ pub struct FuserConfig {
 impl Default for FuserConfig {
     fn default() -> Self {
         Self {
-            memory_strategy: MemoryStrategy::MultiMemory,
+            memory_strategy: MemoryStrategy::Auto,
             attestation: true,
             component_provenance: true,
             address_rebasing: false,
@@ -153,11 +160,31 @@ pub enum MemoryStrategy {
     /// growth corrupts every other component's address space.
     SharedMemory,
 
-    /// Each component keeps its own memory (default).
+    /// Each component keeps its own memory.
     /// Cross-component pointer-passing calls use adapters with
     /// `cabi_realloc` and `memory.copy`. Requires WebAssembly
-    /// multi-memory (Core Spec 3.0).
+    /// multi-memory (Core Spec 3.0) — downstream tools such as
+    /// `wasm-opt` need `--enable-multimemory`, and single-address-
+    /// space (MCU) targets have no lowering for it (issue #172).
     MultiMemory,
+
+    /// Resolve to `SharedMemory` + address rebasing when that is
+    /// provably sound, `MultiMemory` otherwise (default; issue #172).
+    ///
+    /// Resolution happens once, at the start of fusion, from two
+    /// static facts about the inputs:
+    /// 1. No input module contains a `memory.grow` instruction
+    ///    (`memory_probe`) — growth is what breaks shared memory.
+    /// 2. The inputs carry two or more linear memories — with at most
+    ///    one, multi-memory output is already single-memory, so the
+    ///    rebasing path adds risk without benefit.
+    ///
+    /// Both hold → `SharedMemory` with address rebasing. Otherwise →
+    /// `MultiMemory`. If the shared-memory plan itself refuses the
+    /// input (`Error::MemoryStrategyUnsupported`), fusion retries as
+    /// `MultiMemory`, so `Auto` never fails on input that the
+    /// multi-memory strategy accepts.
+    Auto,
 }
 
 /// Output format for the fused binary
@@ -242,6 +269,11 @@ pub struct FusionStats {
 
     /// Size of fused output (bytes)
     pub output_size: usize,
+
+    /// The memory strategy the output was actually built with ("shared" or
+    /// "multi"). With `MemoryStrategy::Auto` this reports the resolution
+    /// outcome (#172), so callers can tell the user what was selected.
+    pub memory_strategy: String,
 }
 
 /// Main fuser interface for static component fusion
@@ -253,6 +285,13 @@ pub struct Fuser {
     original_components: Vec<ParsedComponent>,
     /// Directed wiring hints from composition graph.
     wiring_hints: WiringHints,
+    /// The memory strategy/rebasing pair as originally requested, captured
+    /// before `MemoryStrategy::Auto` resolution mutates `config`. Restored
+    /// at the start of every fuse so resolution is re-derived from the
+    /// CURRENT component set — without this, a fuse → `add_component` →
+    /// fuse sequence would reuse a stale resolution (Mythos finding A,
+    /// PR #220 / UCA-M-11).
+    requested_memory: Option<(MemoryStrategy, bool)>,
 }
 
 impl Fuser {
@@ -263,6 +302,7 @@ impl Fuser {
             components: Vec::new(),
             original_components: Vec::new(),
             wiring_hints: std::collections::HashMap::new(),
+            requested_memory: None,
         }
     }
 
@@ -335,16 +375,104 @@ impl Fuser {
     }
 
     /// Perform the fusion and return the fused module bytes
-    pub fn fuse(&self) -> Result<Vec<u8>> {
+    pub fn fuse(&mut self) -> Result<Vec<u8>> {
         let (bytes, _stats) = self.fuse_with_stats()?;
         Ok(bytes)
     }
 
     /// Perform fusion and return both the bytes and statistics
-    pub fn fuse_with_stats(&self) -> Result<(Vec<u8>, FusionStats)> {
+    ///
+    /// Takes `&mut self` because `MemoryStrategy::Auto` is resolved here,
+    /// in place, to a concrete strategy before the pipeline runs (#172) —
+    /// every later read of `self.config` then sees the resolved values.
+    pub fn fuse_with_stats(&mut self) -> Result<(Vec<u8>, FusionStats)> {
         if self.components.is_empty() {
             return Err(Error::NoComponents);
         }
+        // Restore the originally-requested strategy before resolving, so a
+        // repeated fuse (e.g. after another `add_component`) re-derives the
+        // resolution from the CURRENT component set instead of reusing a
+        // stale one (Mythos finding A, PR #220).
+        let (requested_strategy, requested_rebasing) = *self
+            .requested_memory
+            .get_or_insert((self.config.memory_strategy, self.config.address_rebasing));
+        self.config.memory_strategy = requested_strategy;
+        self.config.address_rebasing = requested_rebasing;
+        if self.config.memory_strategy == MemoryStrategy::Auto {
+            self.resolve_auto_memory_strategy();
+            if self.config.memory_strategy == MemoryStrategy::SharedMemory {
+                return match self.fuse_with_stats_resolved() {
+                    Err(Error::MemoryStrategyUnsupported(msg)) => {
+                        // Auto must never fail on input multi-memory accepts:
+                        // a shared-plan refusal downgrades to multi-memory
+                        // instead of surfacing as an error.
+                        log::warn!(
+                            "memory strategy auto: shared-memory fusion refused \
+                             ({msg}); retrying with multi-memory"
+                        );
+                        self.config.memory_strategy = MemoryStrategy::MultiMemory;
+                        self.config.address_rebasing = false;
+                        self.fuse_with_stats_resolved()
+                    }
+                    other => other,
+                };
+            }
+        }
+        self.fuse_with_stats_resolved()
+    }
+
+    /// Resolve `MemoryStrategy::Auto` against the added components.
+    ///
+    /// Shared memory + address rebasing is selected only when it is
+    /// statically sound AND buys anything: no input module can grow its
+    /// memory (`memory_probe`, merger Bug #7) and the inputs carry at
+    /// least two memories (with fewer, multi-memory output is already
+    /// single-memory). Any user-supplied `address_rebasing` value is
+    /// overridden — Auto owns both knobs.
+    fn resolve_auto_memory_strategy(&mut self) {
+        let mut memory_count = 0usize;
+        let mut grows = false;
+        for component in &self.components {
+            for module in &component.core_modules {
+                memory_count += module.memories.len();
+                memory_count += module
+                    .imports
+                    .iter()
+                    .filter(|imp| matches!(imp.kind, parser::ImportKind::Memory(_)))
+                    .count();
+                if !grows && memory_probe::module_uses_memory_grow(&module.bytes) {
+                    grows = true;
+                }
+            }
+        }
+
+        if grows {
+            log::info!(
+                "memory strategy auto: input uses memory.grow; selecting multi-memory \
+                 (shared memory is unsound under growth)"
+            );
+            self.config.memory_strategy = MemoryStrategy::MultiMemory;
+            self.config.address_rebasing = false;
+        } else if memory_count < 2 {
+            log::info!(
+                "memory strategy auto: {memory_count} input memory(ies); selecting \
+                 multi-memory (output is already single-memory)"
+            );
+            self.config.memory_strategy = MemoryStrategy::MultiMemory;
+            self.config.address_rebasing = false;
+        } else {
+            log::info!(
+                "memory strategy auto: {memory_count} memories, no memory.grow; \
+                 selecting shared memory with address rebasing"
+            );
+            self.config.memory_strategy = MemoryStrategy::SharedMemory;
+            self.config.address_rebasing = true;
+        }
+    }
+
+    /// The fusion pipeline proper. `self.config.memory_strategy` is a
+    /// concrete strategy here — `Auto` has been resolved by the caller.
+    fn fuse_with_stats_resolved(&self) -> Result<(Vec<u8>, FusionStats)> {
         if self.config.address_rebasing
             && self.config.memory_strategy != MemoryStrategy::SharedMemory
         {
@@ -367,6 +495,7 @@ impl Fuser {
 
         let mut stats = FusionStats {
             components_fused: self.components.len(),
+            memory_strategy: self.memory_strategy_label().to_string(),
             ..Default::default()
         };
 
@@ -1456,18 +1585,36 @@ impl Fuser {
 
         // Handle custom sections based on config
         if self.config.custom_sections != CustomSectionHandling::Drop {
-            for (name, contents) in &merged.custom_sections {
-                if !self.config.preserve_names && name == "name" {
-                    continue;
-                }
-                // Only PassThrough emits raw per-input `.debug_*`
-                // sections. Strip drops them; Remap drops them here and
-                // emits a single remapped set below.
-                if self.config.dwarf_handling != DwarfHandling::PassThrough
-                    && name.starts_with(".debug_")
-                {
-                    continue;
-                }
+            let kept: Vec<(String, Vec<u8>)> = merged
+                .custom_sections
+                .iter()
+                .filter(|(name, _)| {
+                    if !self.config.preserve_names && name == "name" {
+                        return false;
+                    }
+                    // Only PassThrough emits raw per-input `.debug_*`
+                    // sections. Strip drops them; Remap drops them here and
+                    // emits a single remapped set below.
+                    if self.config.dwarf_handling != DwarfHandling::PassThrough
+                        && name.starts_with(".debug_")
+                    {
+                        return false;
+                    }
+                    true
+                })
+                .cloned()
+                .collect();
+            // Under Merge, coalesce same-name tool-metadata sections
+            // (`producers`, `target_features`) into one section each, in
+            // the canonical order LLVM's wasm reader enforces (#222) —
+            // duplicate `producers` sections make llvm-dwarfdump reject
+            // the whole module.
+            let kept = if self.config.custom_sections == CustomSectionHandling::Merge {
+                custom_merge::coalesce(&kept)
+            } else {
+                kept
+            };
+            for (name, contents) in &kept {
                 module.section(&wasm_encoder::CustomSection {
                     name: std::borrow::Cow::Borrowed(name),
                     data: std::borrow::Cow::Borrowed(contents),
@@ -1677,6 +1824,9 @@ impl Fuser {
         match self.config.memory_strategy {
             MemoryStrategy::SharedMemory => "shared",
             MemoryStrategy::MultiMemory => "multi",
+            // Unreachable after `resolve_auto_memory_strategy`; kept as an
+            // honest label in case attestation is ever built pre-resolution.
+            MemoryStrategy::Auto => "auto",
         }
     }
 
@@ -2274,10 +2424,12 @@ fn generate_stabilizing_shim(
 mod tests {
     use super::*;
 
+    /// #172: the library default is `Auto` — shared+rebase when provably
+    /// safe, multi-memory otherwise. Pin it so a change is deliberate.
     #[test]
     fn test_fuser_config_default() {
         let config = FuserConfig::default();
-        assert_eq!(config.memory_strategy, MemoryStrategy::MultiMemory);
+        assert_eq!(config.memory_strategy, MemoryStrategy::Auto);
         assert!(config.attestation);
         assert!(!config.address_rebasing);
         assert!(!config.preserve_names);
@@ -2285,7 +2437,7 @@ mod tests {
 
     #[test]
     fn test_fuser_empty_components_error() {
-        let fuser = Fuser::with_defaults();
+        let mut fuser = Fuser::with_defaults();
         let result = fuser.fuse();
         assert!(matches!(result, Err(Error::NoComponents)));
     }

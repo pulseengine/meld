@@ -50,16 +50,21 @@ enum Commands {
         #[arg(short, long, default_value = "fused.wasm")]
         output: String,
 
-        /// Memory strategy. "multi" (default) keeps one linear memory
-        /// per input component — the fused module then needs
-        /// `wasm-opt --enable-multimemory` and has no single-address-
-        /// space (MCU) lowering. "shared" merges into one memory; pair
-        /// it with --address-rebase for a module the wasm-opt → synth
-        /// chain accepts directly. See issue #172.
-        #[arg(long, default_value = "multi")]
+        /// Memory strategy. "auto" (default) picks shared memory with
+        /// address rebasing when no input module contains `memory.grow`
+        /// and there are two or more memories to merge — the resulting
+        /// single-memory module flows through wasm-opt → synth with no
+        /// extra flags — and multi-memory otherwise. "multi" keeps one
+        /// linear memory per input component; the fused module then
+        /// needs `wasm-opt --enable-multimemory` and has no single-
+        /// address-space (MCU) lowering. "shared" forces one merged
+        /// memory; pair it with --address-rebase. Unsound if any input
+        /// grows memory. See issue #172.
+        #[arg(long, default_value = "auto")]
         memory: String,
 
-        /// Rebase memory addresses for shared memory (experimental)
+        /// Rebase memory addresses for shared memory (experimental).
+        /// Only valid with --memory shared; "auto" decides it itself.
         #[arg(long)]
         address_rebase: bool,
 
@@ -243,28 +248,38 @@ fn fuse_command(
 
     // Parse memory strategy
     let memory_strategy = match memory.as_str() {
+        "auto" => {
+            // #172: resolved during fusion — shared+rebase when no input
+            // can grow memory and ≥2 memories exist, multi otherwise.
+            if address_rebase {
+                return Err(anyhow!(
+                    "--address-rebase requires --memory shared; \
+                     'auto' decides address rebasing itself"
+                ));
+            }
+            MemoryStrategy::Auto
+        }
         "multi" => {
-            // #172: the `multi` default produces a multi-memory module
-            // that wasm-opt rejects without --enable-multimemory and
-            // that has no MCU (single-address-space) lowering. Warn so
-            // a user on the happy path is not surprised at the next
-            // tool in the chain.
+            // #172: multi-memory output needs --enable-multimemory in
+            // wasm-opt and has no MCU (single-address-space) lowering.
+            // Warn so a user who picked it deliberately still knows what
+            // the next tool in the chain will require.
             eprintln!(
-                "warning: --memory multi produced a multi-memory module. \
-                 wasm-opt needs --enable-multimemory to consume it, and \
-                 it has no single-address-space (MCU) lowering. For a \
-                 fused module the wasm-opt → synth chain accepts \
-                 directly, re-run with `--memory shared --address-rebase`."
+                "warning: --memory multi produces a multi-memory module \
+                 when inputs carry more than one memory. wasm-opt needs \
+                 --enable-multimemory to consume it, and it has no \
+                 single-address-space (MCU) lowering. `--memory auto` \
+                 (the default) picks a single-memory form when sound."
             );
             MemoryStrategy::MultiMemory
         }
         "shared" => {
-            println!("Using shared memory (legacy mode)");
+            println!("Using shared memory");
             MemoryStrategy::SharedMemory
         }
         _ => {
             return Err(anyhow!(
-                "Invalid memory strategy: {}. Use 'multi' or 'shared'",
+                "Invalid memory strategy: {}. Use 'auto', 'multi', or 'shared'",
                 memory
             ));
         }
@@ -358,6 +373,25 @@ fn fuse_command(
     // Perform fusion
     let (fused_bytes, stats) = fuser.fuse_with_stats().context("Fusion failed")?;
 
+    if memory_strategy == MemoryStrategy::Auto {
+        match stats.memory_strategy.as_str() {
+            "shared" => println!(
+                "Memory strategy: shared + address rebasing (auto: no \
+                 memory.grow in inputs) — single-memory output"
+            ),
+            resolved => {
+                println!("Memory strategy: {resolved} (auto)");
+                if resolved == "multi" {
+                    eprintln!(
+                        "note: multi-memory output needs `wasm-opt \
+                         --enable-multimemory` and has no single-address-\
+                         space (MCU) lowering. See issue #172."
+                    );
+                }
+            }
+        }
+    }
+
     let elapsed = start.elapsed();
 
     // Validate if requested
@@ -386,12 +420,18 @@ fn fuse_command(
     if show_stats {
         print_stats(&stats, total_input_size, elapsed);
     } else {
-        let reduction = if total_input_size > 0 {
-            ((total_input_size - fused_bytes.len()) as f64 / total_input_size as f64) * 100.0
+        // Fused output can be larger than tiny inputs (adapters, wrapper
+        // sections), so this is a signed delta, not an unsigned reduction.
+        let delta = if total_input_size > 0 {
+            (total_input_size as f64 - fused_bytes.len() as f64) / total_input_size as f64 * 100.0
         } else {
             0.0
         };
-        println!("  Size reduction: {:.1}%", reduction);
+        if delta >= 0.0 {
+            println!("  Size reduction: {:.1}%", delta);
+        } else {
+            println!("  Size increase: {:.1}%", -delta);
+        }
         println!("  Time: {:?}", elapsed);
     }
 
@@ -659,14 +699,15 @@ mod tests {
     }
 
     #[test]
-    fn test_cli_memory_default_is_multi() {
-        // #172: the `--memory` default is `multi`. Pin it so a future
+    fn test_cli_memory_default_is_auto() {
+        // #172: the `--memory` default is `auto` — shared+rebase when no
+        // input can grow memory, multi otherwise. Pin it so a future
         // change to the default is a deliberate edit to this test
         // (flipping it is a high-blast-radius decision — see #172).
         let cli = Cli::try_parse_from(["meld", "fuse", "a.wasm", "-o", "out.wasm"])
             .expect("fuse args parse");
         match cli.command {
-            Some(Commands::Fuse { memory, .. }) => assert_eq!(memory, "multi"),
+            Some(Commands::Fuse { memory, .. }) => assert_eq!(memory, "auto"),
             _ => panic!("Expected Fuse command"),
         }
     }
@@ -679,6 +720,18 @@ mod tests {
         .expect("fuse args parse");
         match cli.command {
             Some(Commands::Fuse { memory, .. }) => assert_eq!(memory, "shared"),
+            _ => panic!("Expected Fuse command"),
+        }
+    }
+
+    #[test]
+    fn test_cli_memory_multi_parses() {
+        let cli = Cli::try_parse_from([
+            "meld", "fuse", "a.wasm", "-o", "out.wasm", "--memory", "multi",
+        ])
+        .expect("fuse args parse");
+        match cli.command {
+            Some(Commands::Fuse { memory, .. }) => assert_eq!(memory, "multi"),
             _ => panic!("Expected Fuse command"),
         }
     }

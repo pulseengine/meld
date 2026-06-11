@@ -1,5 +1,9 @@
 package golden:app@0.1.0;
+interface runner {
+  compute: func() -> u32;
+  greet: func() -> u8;
+}
 world consumer {
   import golden:math/lib@0.1.0;
-  export compute: func() -> u32;
+  export runner;
 }

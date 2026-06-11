@@ -370,6 +370,23 @@ merger-ucas:
         Unrewritten memory arguments cause bulk operations to read/write
         the wrong memory.
 
+    - id: UCA-M-11
+      description: >
+        Merger is configured with the shared-memory strategy for inputs
+        that can grow their linear memory at runtime (automatic
+        memory-strategy resolution selects an unsound strategy, #172)
+      context: >
+        `MemoryStrategy::Auto` (the default since #172) resolves to
+        shared memory + address rebasing based on a static probe of the
+        input modules; any input containing `memory.grow` makes the
+        shared layout unsound (merger Bug #7)
+      hazards: [H-2, H-3.2]
+      rationale: >
+        Under shared memory every module's static layout is frozen at
+        fuse time; a `memory.grow` executed by one module hands it pages
+        the other modules' allocators know nothing about, so address
+        spaces silently collide and cross-component data corrupts.
+
 # ============================================================================
 # Adapter Generator UCAs
 # ============================================================================
