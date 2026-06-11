@@ -1841,6 +1841,82 @@ loss-scenarios:
     status: approved
     priority: high
 
+  - id: LS-CP-5
+    title: Multi-component fusion drops or mis-types the composition's export
+    uca: UCA-CP-1
+    hazards: [H-1, H-3]
+    type: inadequate-control-algorithm
+    scenario: >
+      When meld fuses a `wac`-composed multi-component (its documented
+      input — several sub-components linked into one), `wrap_as_component`
+      reconstructs the output component's exports by re-lifting each
+      top-level export. For such a composition the pieces are spread
+      across *different* parsed components: the top-level instance export
+      lives in the outer shell, while the canon-lift carrying the
+      function's real WIT type lives in a flattened inner component and is
+      reached only through an interface-*instance* export. Two failures
+      followed [H-1/H-3]: (1) source-component selection ranked candidates
+      by `depth_0_sections` count, which ties at 0 for these inputs, so
+      `max_by_key` picked the *last* candidate — a bare-func sub-component
+      — and the real top-level export was dropped, yielding an empty
+      `world root {}` (a validating but functionless component); (2) once
+      the export was surfaced, the lift type was looked up only on that
+      (wrong) component, missing the real lift, so the export came out as
+      `func() -> result` instead of its true signature — a silent ABI
+      mismatch a consumer would mis-decode. Found by the golden-e2e
+      (`tests/golden_e2e.rs`), which fused a real consumer→provider
+      composition and found `compute()` neither present nor correctly
+      typed in the fused output.
+    causal-factors:
+      - >-
+        `wrap_as_component` source selection used only `depth_0_sections`
+        length, ambiguous when every candidate is 0 (flattened
+        sub-components carry no captured depth-0 sections)
+      - >-
+        `find_lift_type_for_interface_func` searched only the single
+        `source` component and only flat `{iface}#{func}` Func exports,
+        so a lift reached via an interface-instance export in a different
+        component was invisible — it fell back to a default `() -> result`
+      - >-
+        meld's wrap implicitly assumed one component holds both the
+        top-level export and the lift — true for single wit-bindgen
+        fixtures, false for a `wac`-composed multi-component
+    process-model-flaw: >
+      The model treated "the source component" as a single object owning
+      both the composition's exports and every export function's lift. In
+      a real composition those are spread across the outer shell, an
+      interface-instance export, and a flattened inner component.
+    status: approved
+    priority: high
+    fix: >
+      Two-part fix in `component_wrap.rs`. (1) Source selection now ranks
+      by `(depth_0_sections, top-level instance-export count,
+      prefer-original)`, so the component holding the composition's real
+      top-level exports wins even when depth-0 counts tie. (2)
+      `find_lift_type_for_interface_func` searches all input components
+      (source first) and, beyond the flat `{iface}#{func}` Func-export
+      path, resolves a lift via the owning component's CORE export name →
+      `core_func_index` → matching `CanonicalEntry::Lift` — the
+      interface-instance export shape — returning the *owning* component
+      so its (component-relative) type index resolves correctly. Unit
+      test
+      `component_wrap::tests::ls_cp_5_lift_resolved_cross_component_via_core_export`
+      pins the cross-component resolution; the end-to-end acceptance test
+      `tests::golden_e2e::tier_b_fused_composed_matches_host_linked` fuses
+      a real `wac`-composed component and asserts the fused interface
+      returns the host-linked `compute()=add(20,22)=42` AND `greet()=7`
+      under both memory strategies. The fixture is deliberately
+      adversarial: the inner core module *imports* `add`, so the module-
+      local func index space diverges from the component-level core-func
+      index space, and the two exports carry *different* WIT types
+      (`u32` vs `u8`) checked by typed wasmtime calls — a fix that matched
+      by index rather than by name (the fragile path a Mythos clean-room
+      scan flagged on the earlier attempt) swaps or mis-types them and
+      fails here. Tier A (single-component wit-bindgen fixtures) is
+      unchanged — no regression. NB the
+      *separate*-input linking case remains open as #212.1; the supported
+      workflow is `wac compose` then `meld fuse`.
+
   # ==========================================================================
   # Additional adapter scenarios (discovered during gap analysis)
   # ==========================================================================
@@ -2667,6 +2743,73 @@ loss-scenarios:
       operand-length changes) is NOT yet handled — that needs the
       rewriter instruction-offset map (#143 increment 2) and the
       gimli DWARF rewrite (increment 3).
+
+  - id: LS-M-7
+    title: auto memory-strategy resolution selects unsound shared memory
+    uca: UCA-M-11
+    hazards: [H-2, H-3.2]
+    type: inadequate-control-algorithm
+    scenario: >
+      `MemoryStrategy::Auto` (the default since #172) resolves to
+      shared memory + address rebasing from a static probe: it scans
+      every input core module's code section and selects shared only
+      when no `memory.grow` instruction exists and at least two
+      memories would otherwise be merged. If the probe under-reports —
+      a parse error treated as "no growth", a future Wasm proposal
+      adding a second growth opcode the probe does not know, or a
+      refactor that probes the wrong byte slice (e.g. component bytes
+      instead of core-module bytes, where the code section never
+      parses) — fusion freezes every module's layout into one memory
+      while a module can still grow it at runtime. The first
+      `memory.grow` then returns pages whose ownership no other
+      module's allocator knows about; writes land in a neighbour's
+      address space and data corrupts silently [H-2, H-3.2]. The
+      output validates and runs — corruption only manifests when the
+      growth path executes, which typical smoke tests never trigger.
+    causal-factors:
+      - >-
+        `memory_probe::module_uses_memory_grow` returning false on
+        unparseable input (the sound direction is: parse failure ⇒
+        assume growth ⇒ multi-memory)
+      - >-
+        probing `ParsedComponent` bytes or a stale copy instead of each
+        `CoreModule.bytes` actually merged into the output
+      - >-
+        the auto-resolution running before all components are added, or
+        a later `add_component` not re-triggering resolution. NOT
+        hypothetical: the PR's own clean-room pass proved it (Mythos
+        finding A) — the first implementation resolved Auto in place,
+        so fuse → add_component → fuse reused the stale "shared"
+        resolution and errored on the newly-added growing input.
+        Mitigated by capturing the requested strategy in
+        `Fuser::requested_memory` and re-deriving the resolution from
+        the current component set on every fuse; pinned by
+        `ls_m_7_auto_reprobes_after_add_component`
+    process-model-flaw: >
+      The resolver's model is "absence of memory.grow in the code
+      section ⇒ memory size is static". That implication is sound for
+      current core WebAssembly, but the model silently breaks if
+      growth can be induced any other way (new opcodes, host-side
+      growth of an exported memory). The probe must stay conservative:
+      anything it cannot prove growth-free is treated as growing.
+    status: approved
+    priority: high
+    fix: >
+      `Fuser::resolve_auto_memory_strategy` only selects shared when
+      `memory_probe::module_uses_memory_grow` is false for every core
+      module of every component; the probe returns true on any parse
+      failure (conservative direction). A shared-plan refusal
+      downgrades to multi-memory rather than failing, so the sound
+      strategy is also the fallback. Pinned by
+      `ls_m_7_auto_keeps_multi_when_input_grows` (integration,
+      tests/auto_memory.rs: a growing input must resolve to "multi"
+      with both memories preserved) and
+      `ls_m_7_malformed_input_counts_as_grow` (unit,
+      memory_probe::tests: unparseable bytes must probe as growing).
+      `auto_selects_shared_for_growfree_inputs` covers the other
+      direction end-to-end: grow-free inputs produce a single-memory
+      output that validates without multi-memory and behaves
+      correctly at runtime (B's data at its rebased base).
 
   - id: LS-D-1
     title: remapped DWARF emits a wrong code address for a fused function

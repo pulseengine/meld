@@ -96,20 +96,29 @@ Cross-component calls may require adapters that handle string transcoding (UTF-8
 
 ## Memory Strategies
 
-### Multi-Memory (Default)
+### Auto (Default)
 
-Each component retains its own linear memory. Cross-component calls use adapters that allocate in the callee's memory via `cabi_realloc` and copy data with `memory.copy`. Requires multi-memory support (WebAssembly Core Spec 3.0).
+Resolves to shared memory + address rebasing when that is provably sound — no input module contains `memory.grow` and there are at least two memories to merge — and to multi-memory otherwise. The point: out-of-the-box output flows through `wasm-opt → synth` with no extra flags whenever soundness permits a single-memory form (issue #172).
 
 ```bash
 meld fuse a.wasm b.wasm -o fused.wasm
+wasm-opt -Os fused.wasm -o fused.opt.wasm   # no --enable-multimemory needed
 ```
 
-### Shared Memory (Legacy)
+### Multi-Memory
 
-All components share a single linear memory. Simpler but one component's `memory.grow` corrupts every other component's address space.
+Each component retains its own linear memory. Cross-component calls use adapters that allocate in the callee's memory via `cabi_realloc` and copy data with `memory.copy`. Requires multi-memory support (WebAssembly Core Spec 3.0) — downstream tools need `wasm-opt --enable-multimemory`, and single-address-space (MCU) targets have no lowering for it.
 
 ```bash
-meld fuse --memory shared a.wasm b.wasm -o fused.wasm
+meld fuse --memory multi a.wasm b.wasm -o fused.wasm
+```
+
+### Shared Memory
+
+All components share a single linear memory; pair with `--address-rebase`. Unsound if any component uses `memory.grow` — one component's growth corrupts every other component's address space, which is why `auto` only selects this form when no input can grow.
+
+```bash
+meld fuse --memory shared --address-rebase a.wasm b.wasm -o fused.wasm
 ```
 
 ## Supply Chain Security
