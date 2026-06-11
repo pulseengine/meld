@@ -85,13 +85,15 @@ enum Commands {
         #[arg(long)]
         no_component_provenance: bool,
 
-        /// DWARF debug-info handling: `strip` (default — drop all
-        /// `.debug_*`), `passthrough` (copy verbatim; addresses are
-        /// wrong against the fused code section), or `remap` (#143 —
-        /// translate code addresses to the fused code section). `remap`
-        /// currently supports a single DWARF-bearing input module and
-        /// falls back to `strip` for multi-source inputs.
-        #[arg(long, value_name = "MODE", default_value = "strip")]
+        /// DWARF debug-info handling: `remap` (default since v0.25.0 —
+        /// translate code addresses to the fused code section; meld-
+        /// generated code is attributed to per-class `<meld-adapter>`
+        /// lines), `strip` (drop all `.debug_*`), or `passthrough`
+        /// (copy verbatim; addresses are wrong against the fused code
+        /// section). With multiple DWARF-bearing input modules, `remap`
+        /// drops the source DWARF (never wrong addresses, #208) but
+        /// still emits the synthetic adapter unit.
+        #[arg(long, value_name = "MODE", default_value = "remap")]
         dwarf: String,
 
         /// Preserve debug names in output

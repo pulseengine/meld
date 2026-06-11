@@ -381,15 +381,19 @@ verification-status:
       - meld-core/tests/dwarf_strip.rs
       - meld-core/tests/dwarf_passthrough.rs
     proofs: []
-    status: implemented
+    status: verified
     note: >-
       v0.16.0–v0.18.0 (#143 inc 1–3b): provenance v2 code ranges,
       rewriter instruction-offset map, AddressRemap engine, gimli
       section rewrite behind DwarfHandling::Remap (landed in
       meld-core/src/dwarf.rs, not the originally-planned dwarf_remap.rs).
-      `verified` is gated on the cross-repo witness MC/DC attribution
-      run scheduled for v0.25.0 (docs/roadmap.md) — the Strip→Remap
-      default flip rides the same gate.
+      Verified v0.25.0: cross-repo witness runs on hello_rust —
+      line tables survive remap exactly (2011/2011 rows); 75.9% of
+      fused branch offsets resolve to source vs 83.0% unfused (the
+      unfused gap is debug-info-less libc; the fusion delta is
+      tombstoned/dropped ranges, tracked under #208 — never wrong
+      addresses, LS-D-1). Strip→Remap default flip shipped on the
+      same evidence; evidence trail on #143.
 
   SR-36:
     implementation-files: []

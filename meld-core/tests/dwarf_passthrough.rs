@@ -222,20 +222,26 @@ fn fuse_with_drop(input: &[u8]) -> Vec<u8> {
 
 #[test]
 fn current_default_is_strip_post_phase_1_5() {
-    // Pin: Phase 1.5 (#135, commit c7a2c0b) flipped the default DWARF
-    // handling from PassThrough (broken-but-present) to Strip
-    // (correct-but-lossy). The discovery oracle was originally
-    // authored against the pre-Phase-1.5 default and inverted in this
-    // commit to reflect shipped behaviour. Any future change to the
-    // default (e.g. Phase 2 making PassThrough correct + the new
-    // default) must be a deliberate edit to this test.
+    // Pin history: Phase 1.5 (#135) flipped PassThrough → Strip
+    // (correct-but-lossy). v0.25.0 (#143/#144 complete) flipped
+    // Strip → Remap (correct AND attributing: single-source addresses
+    // remapped, generated code on per-class `<meld-adapter>` lines,
+    // multi-source drops source DWARF rather than emit wrong
+    // addresses). The invariant carried through both flips: the
+    // default NEVER emits address-wrong DWARF — PassThrough stays a
+    // deliberate opt-in. Any future change to the default must be a
+    // deliberate edit to this test.
     assert_eq!(
         FuserConfig::default().dwarf_handling,
-        DwarfHandling::Strip,
-        "FuserConfig::default().dwarf_handling drifted from Strip. \
-         If this was intentional (Phase 2 making PassThrough address- \
-         correct etc.), update DWARF policy docs and the \
-         witness-integration discovery issue."
+        DwarfHandling::Remap,
+        "FuserConfig::default().dwarf_handling drifted from Remap. \
+         If intentional, update DWARF policy docs, dwarf_strip.rs \
+         pins, and the witness-integration discovery issue."
+    );
+    assert_ne!(
+        FuserConfig::default().dwarf_handling,
+        DwarfHandling::PassThrough,
+        "the default must never be the address-wrong PassThrough"
     );
     // The custom-sections default remains Merge — Phase 1.5 only
     // changed DWARF policy, not the wider custom-section default.
