@@ -15,7 +15,9 @@
 //! For static fusion, we generate similar adapters but inline them directly
 //! into the fused module rather than keeping them as separate adapter modules.
 
-use super::{AdapterConfig, AdapterFunction, AdapterGenerator, AdapterOptions, StringEncoding};
+use super::{
+    AdapterClass, AdapterConfig, AdapterFunction, AdapterGenerator, AdapterOptions, StringEncoding,
+};
 use crate::Result;
 use crate::merger::MergedModule;
 use crate::parser::CanonStringEncoding;
@@ -611,12 +613,16 @@ impl FactStyleGenerator {
             self.analyze_call_site(site, merged, resource_rep_imports, resource_new_imports);
 
         // Generate the adapter function body
-        let (type_idx, body) = if site.crosses_memory && options.needs_transcoding() {
-            self.generate_transcoding_adapter(site, merged, &options)?
+        let (type_idx, body, class) = if site.crosses_memory && options.needs_transcoding() {
+            let (t, b) = self.generate_transcoding_adapter(site, merged, &options)?;
+            (t, b, AdapterClass::Transcode)
         } else if site.crosses_memory {
-            self.generate_memory_copy_adapter(site, merged, &options, resource_rep_imports)?
+            let (t, b) =
+                self.generate_memory_copy_adapter(site, merged, &options, resource_rep_imports)?;
+            (t, b, AdapterClass::MemoryCopy)
         } else {
-            self.generate_direct_adapter(site, merged, &options)?
+            let (t, b) = self.generate_direct_adapter(site, merged, &options)?;
+            (t, b, AdapterClass::Direct)
         };
 
         Ok(AdapterFunction {
@@ -628,6 +634,7 @@ impl FactStyleGenerator {
             target_component: site.to_component,
             target_module: site.to_module,
             target_function: self.resolve_target_function(site, merged)?,
+            class,
         })
     }
 
@@ -4486,6 +4493,7 @@ impl FactStyleGenerator {
             target_component: site.to_component,
             target_module: site.to_module,
             target_function: target_func,
+            class: AdapterClass::Async,
         })
     }
 
@@ -5047,6 +5055,7 @@ impl FactStyleGenerator {
             target_component: site.to_component,
             target_module: site.to_module,
             target_function: target_func,
+            class: AdapterClass::Async,
         })
     }
 }
@@ -5702,6 +5711,7 @@ mod tests {
             type_idx: 0,
             body: wasm_encoder::Function::new([]),
             origin: (1, 0, 0),
+            synthetic_kind: None,
         });
         merged.types.push(crate::merger::MergedFuncType {
             params: Vec::new(),
@@ -5748,6 +5758,7 @@ mod tests {
             type_idx: 0,
             body: wasm_encoder::Function::new([]),
             origin: (1, 0, 0),
+            synthetic_kind: None,
         });
         merged.function_index_map.insert((1, 0, 0), 0);
 
@@ -5862,6 +5873,7 @@ mod tests {
             type_idx: 1,
             body: wasm_encoder::Function::new([]),
             origin: (1, 0, 0),
+            synthetic_kind: None,
         });
         merged.function_index_map.insert((1, 0, 0), 0);
 
@@ -5870,6 +5882,7 @@ mod tests {
             type_idx: 1,
             body: wasm_encoder::Function::new([]),
             origin: (0, 0, 0),
+            synthetic_kind: None,
         });
         merged.realloc_map.insert((0, 0), 1);
 
@@ -5987,6 +6000,7 @@ mod tests {
             type_idx: 1,
             body: wasm_encoder::Function::new([]),
             origin: (1, 0, 0),
+            synthetic_kind: None,
         });
         merged.function_index_map.insert((1, 0, 0), 0);
 
@@ -6092,6 +6106,7 @@ mod tests {
             type_idx: 0,
             body: wasm_encoder::Function::new([]),
             origin: (1, 0, 0),
+            synthetic_kind: None,
         });
         merged.function_index_map.insert((1, 0, 0), 0);
 

@@ -579,13 +579,22 @@ impl Fuser {
 
         // Build the remapped `.debug_*` sections (only under Remap; a
         // miss or unsupported shape returns no sections → DWARF stripped).
-        let dwarf_sections: Vec<(String, Vec<u8>)> = if self.config.dwarf_handling
-            == DwarfHandling::Remap
-        {
-            dwarf::remap_for_output(&self.components, &merged, &bytes_for_remap).unwrap_or_default()
-        } else {
-            Vec::new()
-        };
+        let dwarf_sections: Vec<(String, Vec<u8>)> =
+            if self.config.dwarf_handling == DwarfHandling::Remap {
+                {
+                    let adapter_classes: Vec<adapter::AdapterClass> =
+                        adapters.iter().map(|a| a.class).collect();
+                    dwarf::remap_for_output(
+                        &self.components,
+                        &merged,
+                        &adapter_classes,
+                        &bytes_for_remap,
+                    )
+                    .unwrap_or_default()
+                }
+            } else {
+                Vec::new()
+            };
 
         // Pass B: re-encode with the remapped DWARF embedded. These are
         // the bytes the attestation/provenance hashes cover.
@@ -806,6 +815,7 @@ impl Fuser {
                 type_idx: info.caller_type_idx,
                 body,
                 origin: (info.comp_idx, info.mod_idx, u32::MAX),
+                synthetic_kind: Some(merger::SyntheticKind::AdapterShim),
             });
             affected_modules.insert((info.comp_idx, info.mod_idx));
         }
@@ -1224,6 +1234,7 @@ impl Fuser {
                 type_idx: shim_type,
                 body,
                 origin: (comp_idx, 0, u32::MAX),
+                synthetic_kind: Some(merger::SyntheticKind::TaskReturnShim),
             });
 
             // Export the shim so the component wrapper can alias it

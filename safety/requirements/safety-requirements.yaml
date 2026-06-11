@@ -837,12 +837,23 @@ artifacts:
       source units (one shared offset space; concatenating separately
       serialised `.debug_*` bytes would collide), and is emitted even
       when no input carries DWARF, so adapter attribution never depends
-      on debug-built inputs. Increment 4 (pending, v0.24.0): per-class
-      `<meld-adapter>` line numbers (requires the merger to tag each
-      synthetic function's adapter class at generation time). All
-      generated code currently attributes to line 1.
+      on debug-built inputs. Increment 4 (v0.24.0): per-class
+      `<meld-adapter>` lines. The merger tags synthetic functions
+      (`MergedFunction::synthetic_kind`: handle-table, start wrapper,
+      adapter shim, task-return shim) and the FACT generator tags each
+      `AdapterFunction` (`AdapterClass`: direct, memory-copy, transcode,
+      async); `dwarf::adapter_spans` additionally enumerates the FACT
+      trampolines appended after the merged functions — previously a
+      coverage gap leaving every FACT adapter unattributed. Stable line
+      contract (`AdapterRole::adapter_line`): 1 unclassified, 2 direct,
+      3 memory-copy, 4 transcode, 5 async, 6 handle-table, 7 start
+      wrapper, 8 adapter shim, 9 task-return shim. Granularity
+      correction vs #130's sketch ("transcode/cabi_realloc/lift/lower"):
+      meld emits ONE fused trampoline per call site with lowering,
+      allocation (a call to the callee's own cabi_realloc) and lifting
+      inline, so the honest class unit is the trampoline kind.
     status: implemented
-    tags: [roadmap, dwarf, witness-mc-dc, v0.23.0]
+    tags: [roadmap, dwarf, witness-mc-dc, v0.23.0, v0.24.0]
     links:
       - type: derives-from
         target: "#130"

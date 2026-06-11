@@ -157,9 +157,12 @@ fn debug_line_rows(wasm: &[u8]) -> Vec<(u64, String, u64)> {
 
 /// The pipeline contract: dwarf-less inputs whose fusion generates code
 /// produce a fused output whose `.debug_line` attributes the generated
-/// range to `<meld-adapter>:1`, at an address that is a real function
-/// body start (independently derived). (`ls_d_2_` prefix: LS-D-2
-/// regression, run by the LS-N verification gate.)
+/// range to `<meld-adapter>:<class-line>`, at an address that is a real
+/// function body start (independently derived). Since #144 inc 4 the
+/// line encodes the adapter CLASS — the only generated function in this
+/// fixture is the merger's multi-`start` wrapper, so every adapter row
+/// must carry [`AdapterRole::StartWrapper`]'s line. (`ls_d_2_` prefix:
+/// LS-D-2 regression, run by the LS-N verification gate.)
 #[test]
 fn ls_d_2_generated_start_wrapper_is_attributed_to_meld_adapter() {
     let fused = fuse_remap();
@@ -174,8 +177,13 @@ fn ls_d_2_generated_start_wrapper_is_attributed_to_meld_adapter() {
         "fusion generated a start wrapper; output .debug_line must carry \
          <meld-adapter> attribution (rows: {rows:?})"
     );
+    let start_wrapper_line = u64::from(meld_core::dwarf::AdapterRole::StartWrapper.adapter_line());
+    assert!(start_wrapper_line > 0, "line 0 means 'no line' in DWARF");
     for (_, _, line) in &adapter_rows {
-        assert_eq!(*line, 1, "adapter line must be 1 (0 means 'no line')");
+        assert_eq!(
+            *line, start_wrapper_line,
+            "the start wrapper must attribute to its CLASS line (#144 inc 4)"
+        );
     }
 
     let ranges = function_body_ranges(&fused);
