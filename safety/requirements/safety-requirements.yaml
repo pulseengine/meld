@@ -925,3 +925,36 @@ artifacts:
         (4 on single-source, 11 on multi) — variable-location data,
         explicitly out of #130 scope.
       milestone: v0.26.0
+
+  - id: SR-39
+    type: requirement
+    title: Separate-input cross-component linking (import internalisation)
+    description: >
+      `meld fuse a.wasm b.wasm --component` shall resolve one input's
+      instance imports against another input's matching exports and
+      internalise the calls, producing a self-contained component: the
+      wrapped output declares an instance import IFF the fused core
+      module still references it. Satisfied imports are dropped from
+      the component's import surface with the surviving instance
+      indices renumbered consistently at every consumer.
+    status: implemented
+    tags: [roadmap, composition, v0.28.0]
+    links:
+      - type: derives-from
+        target: "#94"
+      - type: tracked-by
+        target: "#212"
+      - type: mitigates
+        target: LS-CP-6
+    fields:
+      implementation:
+        - meld-core/src/component_wrap.rs
+      verification-method: test
+      verification-description: >
+        ls_cp_6_separate_inputs_internalise_link — the golden-e2e
+        acceptance authored with #212: fuse consumer.wasm+provider.wasm
+        --component, instantiate standalone in wasmtime with no linker
+        definitions, assert compute()==42 and greet()==7 (host-linked
+        golden equivalence). The full wit-bindgen runtime suite guards
+        the dual failure (WASI imports must remain declared).
+      milestone: v0.28.0

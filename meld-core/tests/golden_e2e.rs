@@ -383,9 +383,11 @@ fn tier_b_fused_composed_matches_host_linked() {
 /// the call, and emit a self-contained component. Currently `#[ignore]`d:
 /// meld does not yet resolve a cross-component *interface* import/export
 /// across separate inputs (the fused output still imports
-/// `golden:math/lib`). Un-ignore when #212.1 lands.
+/// `golden:math/lib`). Un-ignored since #212.1 landed (v0.28.0):
+/// component_wrap drops internalised instance imports and renumbers
+/// the survivors, so the fused component is self-contained.
+/// (`ls_cp_6_` alias below: LS-CP-6 regression, run by the LS-N gate.)
 #[test]
-#[ignore = "meld#212.1: cross-component interface link not internalised across separate inputs"]
 fn tier_b_separate_inputs_internalise_link() {
     let (Ok(consumer), Ok(provider), Some((_, golden))) = (
         std::fs::read(format!("{COMPOSE_DIR}/consumer.wasm")),
@@ -404,4 +406,9 @@ fn tier_b_separate_inputs_internalise_link() {
     let got =
         call_runner(&fused).expect("fused separate-input composition should run runner standalone");
     assert_eq!(got, golden, "separate-input fusion must match host-linked");
+}
+
+#[test]
+fn ls_cp_6_separate_inputs_internalise_link() {
+    tier_b_separate_inputs_internalise_link();
 }

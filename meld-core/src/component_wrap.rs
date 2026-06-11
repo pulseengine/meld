@@ -814,15 +814,103 @@ fn assemble_component(
     let n = fused_info.func_imports.len();
 
     // -----------------------------------------------------------------------
+    // 0. Internalised-import elimination (#212.1). An instance import in
+    //    the wrapped component is needed IFF some import remaining in the
+    //    FUSED core module references it (module name == instance name).
+    //    An interface that an input module imported but the fused module
+    //    no longer does was satisfied internally by the resolver — its
+    //    component-level import declaration must be dropped, or the
+    //    wrapped component demands an implementation the linker cannot
+    //    have. Dropping shifts later instance indices, so a renumber map
+    //    is threaded to every consumer below.
+    // -----------------------------------------------------------------------
+    let remaining_modules: std::collections::BTreeSet<&str> = fused_info
+        .func_imports
+        .iter()
+        .map(|(m, _, _)| m.as_str())
+        .collect();
+    let original_modules: std::collections::BTreeSet<&str> = all_components
+        .iter()
+        .flat_map(|c| c.core_modules.iter())
+        .flat_map(|m| m.imports.iter())
+        .map(|imp| imp.module.as_str())
+        .collect();
+    let mut dropped_import_names: std::collections::BTreeSet<String> = Default::default();
+    let mut instance_renum: std::collections::HashMap<u32, u32> = Default::default();
+    {
+        let mut old_idx = 0u32;
+        let mut new_idx = 0u32;
+        for imp in &source.imports {
+            if !matches!(imp.ty, wasmparser::ComponentTypeRef::Instance(_)) {
+                continue;
+            }
+            let internalised = original_modules.contains(imp.name.as_str())
+                && !remaining_modules.contains(imp.name.as_str());
+            if internalised {
+                log::debug!(
+                    "component wrap: dropping internalised import `{}` (#212.1)",
+                    imp.name
+                );
+                dropped_import_names.insert(imp.name.clone());
+            } else {
+                instance_renum.insert(old_idx, new_idx);
+                new_idx += 1;
+            }
+            old_idx += 1;
+        }
+    }
+
+    // -----------------------------------------------------------------------
     // 1. Replay depth-0 Type and Import sections from the original component.
     //    These define the component-level instance types and import declarations
-    //    that the runtime validates against.
+    //    that the runtime validates against. Import sections are filtered
+    //    through the internalised-import drop set (#212.1).
     // -----------------------------------------------------------------------
     for (section_id, data) in &source.depth_0_sections {
-        component.section(&RawSection {
-            id: *section_id,
-            data,
-        });
+        if *section_id == ComponentSectionId::Import as u8 && !dropped_import_names.is_empty() {
+            let reader = wasmparser::ComponentImportSectionReader::new(
+                wasmparser::BinaryReader::new(data, 0),
+            )
+            .map_err(|e| Error::EncodingError(format!("replay import section: {e}")))?;
+            let mut imports = ComponentImportSection::new();
+            for entry in reader {
+                let entry =
+                    entry.map_err(|e| Error::EncodingError(format!("import entry: {e}")))?;
+                if dropped_import_names.contains(entry.name.0) {
+                    continue;
+                }
+                let ty = match entry.ty {
+                    wasmparser::ComponentTypeRef::Module(i) => ComponentTypeRef::Module(i),
+                    wasmparser::ComponentTypeRef::Func(i) => ComponentTypeRef::Func(i),
+                    wasmparser::ComponentTypeRef::Value(_) => {
+                        return Err(Error::EncodingError(
+                            "value imports are not supported in wrap replay".into(),
+                        ));
+                    }
+                    wasmparser::ComponentTypeRef::Type(_) => {
+                        ComponentTypeRef::Type(TypeBounds::Eq(0))
+                    }
+                    wasmparser::ComponentTypeRef::Instance(i) => ComponentTypeRef::Instance(i),
+                    wasmparser::ComponentTypeRef::Component(i) => ComponentTypeRef::Component(i),
+                };
+                // Type imports carry bounds we must preserve precisely.
+                let ty = if let wasmparser::ComponentTypeRef::Type(bounds) = entry.ty {
+                    ComponentTypeRef::Type(match bounds {
+                        wasmparser::TypeBounds::Eq(i) => TypeBounds::Eq(i),
+                        wasmparser::TypeBounds::SubResource => TypeBounds::SubResource,
+                    })
+                } else {
+                    ty
+                };
+                imports.import(entry.name.0, ty);
+            }
+            component.section(&imports);
+        } else {
+            component.section(&RawSection {
+                id: *section_id,
+                data,
+            });
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -921,8 +1009,20 @@ fn assemble_component(
         if let Some((inst_idx, func_name)) =
             resolve_import_to_instance(source, module_name, field_name, &instance_map)
         {
+            // Source-numbered instance index → output numbering after the
+            // internalised-import drops (#212.1). A miss here would mean a
+            // resolution references a DROPPED instance — impossible by
+            // construction (drops require the module absent from the fused
+            // imports, and resolutions exist only for present ones), so
+            // surface it loudly rather than emit a wrong index.
+            let renumbered = *instance_renum.get(&inst_idx).ok_or_else(|| {
+                Error::EncodingError(format!(
+                    "import resolution references dropped instance {inst_idx} \
+                     ({module_name}::{field_name})"
+                ))
+            })?;
             import_resolutions.push(ImportResolution::Instance {
-                instance_idx: inst_idx,
+                instance_idx: renumbered,
                 func_name,
             });
             continue;
@@ -1739,12 +1839,9 @@ fn assemble_component(
         }
     }
 
-    // Track component instance index (starts after import instances)
-    let mut component_instance_idx = source
-        .imports
-        .iter()
-        .filter(|imp| matches!(imp.ty, wasmparser::ComponentTypeRef::Instance(_)))
-        .count() as u32;
+    // Track component instance index (starts after the KEPT import
+    // instances — internalised imports were dropped above, #212.1).
+    let mut component_instance_idx = instance_renum.len() as u32;
 
     for comp_export in &source.exports {
         if comp_export.kind != wasmparser::ComponentExternalKind::Instance {
