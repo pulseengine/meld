@@ -883,3 +883,45 @@ artifacts:
         resolve to `<meld-adapter>` rather than `unknown` on a real
         fixture.
       milestone: v0.23.0
+
+  - id: SR-38
+    type: requirement
+    title: Multi-source DWARF merge (bounded relocator)
+    description: >
+      When more than one input core module carries `.debug_*` sections,
+      `DwarfHandling::Remap` shall convert and address-remap EACH
+      source independently (per-module `AddressRemap`) and merge the
+      resulting section sets into one coherent set via concatenation
+      plus bounded relocation of the known cross-section references
+      (CU abbrev offset, `strp`, `stmt_list`/`ranges`/location
+      sec_offsets, `ref_addr`). Inputs outside the bounded repertoire
+      (DWARF64, version != 4, unexpected sections or forms) shall
+      abort the merge and fall back to synthetic-only emission —
+      never a guessed offset. A source whose remap fails is dropped
+      individually; the others proceed.
+    status: implemented
+    tags: [roadmap, dwarf, witness-mc-dc, v0.26.0]
+    links:
+      - type: derives-from
+        target: "#130"
+      - type: tracked-by
+        target: "#208"
+      - type: depends-on
+        target: SR-35
+      - type: mitigates
+        target: LS-D-3
+    fields:
+      implementation:
+        - meld-core/src/dwarf.rs
+      verification-method: test
+      verification-description: >
+        ls_d_3_multi_source_merge_round_trips_both_units (gimli-built
+        two-source round-trip: units, files, lines, strp strings all
+        survive relocation) plus the dwarf_passthrough multi-source
+        policy test on the real lists.wasm fixture (287 units merge,
+        23k line rows parse via llvm-dwarfdump locally). Known
+        limitation carried to #208 follow-up: DW_AT_location
+        expressions show pre-existing convert-path verifier warnings
+        (4 on single-source, 11 on multi) — variable-location data,
+        explicitly out of #130 scope.
+      milestone: v0.26.0

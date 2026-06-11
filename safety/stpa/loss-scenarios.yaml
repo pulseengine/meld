@@ -3009,3 +3009,55 @@ loss-scenarios:
       independently-derived real body addresses, line 1, and nothing
       else is attributed; plus a runtime guard that emission does not
       perturb behaviour).
+
+  - id: LS-D-3
+    title: multi-source DWARF merge mis-relocates a cross-section offset
+    uca: UCA-M-9
+    hazards: [H-1]
+    type: inadequate-control-algorithm
+    scenario: >
+      #208 inc 1 merges independently gimli-written DWARF section sets
+      by concatenation plus a bounded relocator that patches the known
+      cross-section references of sets after the first (CU header
+      abbrev offset; DW_FORM_strp; DW_AT_stmt_list/ranges/location
+      sec_offsets; DW_FORM_ref_addr). A missed patch site, a wrong
+      base, or an input outside the assumed repertoire (DWARF64,
+      version != 4, a new form emitted by a future gimli) makes the
+      second source's offsets point into the FIRST source's data —
+      consumers then read the wrong abbreviations, strings, or line
+      programs and the witness MC/DC line map silently de-grounds
+      [H-1]. The failure is invisible at runtime; only the evidence
+      chain is wrong.
+    causal-factors:
+      - >-
+        a relocation site outside the bounded list (mitigated: any
+        unexpected section name or sec_offset attribute ABORTS the
+        merge and falls back to synthetic-only — never guess)
+      - >-
+        a false DWARF64/version guard (occurred during development:
+        testing only the first BYTE of the initial length flagged any
+        unit whose length ended in 0xff; fixed to header.format())
+      - >-
+        base accounting drift between the patcher and the
+        concatenation order
+    process-model-flaw: >
+      The relocator's model is "we produced these sections, so the
+      form repertoire is closed". That holds only while the producer
+      (gimli write at the pinned version, DWARF32 v4) is unchanged —
+      so the merge must abort on anything outside the repertoire
+      rather than extrapolate.
+    status: approved
+    priority: high
+    fix: >
+      `dwarf::concat_dwarf_section_sets` + `relocate_debug_info`
+      implement the bounded relocator with abort-don't-guess on any
+      out-of-repertoire input. Pinned by
+      `ls_d_3_multi_source_merge_round_trips_both_units` (two gimli-
+      built sources with distinct files/lines and strp-referenced
+      producer strings, remapped to disjoint fused ranges, merged,
+      re-parsed: both units survive, each address resolves to ITS
+      file:line, both strp strings intact — any missed relocation
+      fails the re-parse or resolves foreign data) and the
+      dwarf_passthrough multi-source policy test (real lists.wasm
+      fixture: merged output parses coherently, >1 unit, file names
+      from the input union only).
