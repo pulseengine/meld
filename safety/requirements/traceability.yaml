@@ -333,25 +333,63 @@ verification-status:
     note: "v0.8.0 — Stackful P3 lifting mode (#140). Phase 1 ABI foundation + Phase 2 trampoline emitter both shipped. Dispatcher routes async-lift sites without a [callback] companion to generate_async_stackful_adapter. Cross-memory (ptr,len) result returns deferred under same issue. See ADR-1 addendums 2026-05-13 (a) and (b)."
 
   SR-33:
-    implementation-files: []
-    tests: []
+    implementation-files:
+      - meld-core/src/p3_stream.rs   # detection half ONLY (StreamPairGraph)
+      - meld-core/src/resolver.rs    # graph built at resolve time
+    tests:
+      - meld-core/src/p3_stream.rs::tests::stream_pair_detected_for_connected_producer_consumer
+      - meld-core/src/p3_stream.rs::tests::no_pair_when_components_not_fusion_connected
+      - meld-core/src/p3_stream.rs::tests::no_pair_without_producer_consumer_complementarity
+      - meld-core/src/p3_stream.rs::tests::memory_mode_follows_strategy
     proofs: []
     status: planned
+    note: >-
+      Audited 2026-06-10: detection foundation shipped v0.9.0 (#173,
+      ADR-3 path "detection now, emitter follow-up"); the in-module
+      emitter the requirement demands is not implemented — stream
+      traffic still round-trips through pulseengine:async host imports.
+      safety-requirements.yaml briefly carried status implemented from
+      a bulk sync (PR #211); reverted. Emitter is v0.29.0 scope.
     note: "v0.9.0 — Cross-component stream<T> fusion (#141). adapter/fact.rs + resolver.rs."
 
   SR-34:
-    implementation-files: []
-    tests: []
+    implementation-files:
+      - meld-core/src/p3_stream.rs
+      - meld-core/src/resolver.rs
+    tests:
+      - meld-core/src/p3_stream.rs::tests::ls_r_11_stream_typed_import_with_mismatched_roles_raises
+      - meld-core/src/p3_stream.rs::tests::ls_r_11_per_edge_lift_export_mismatch_raises
+      - meld-core/src/p3_stream.rs::tests::ls_r_11_sync_only_connection_with_unrelated_streams_does_not_raise
     proofs: []
-    status: planned
-    note: "v0.9.0 — Static stream<T> validation (#142). Depends on SR-33."
+    status: implemented
+    note: >-
+      Shipped incrementally, not in v0.9.0 as planned: (i) type-match +
+      (iii) cycle detection (iterative SCC) in v0.12.0; LS-R-11 per-edge
+      precision v0.13.0/v0.15.0; (ii) bounded-channel + (iv) resource
+      lifetime v0.21.0 (#142, PR #210). Cycle-detection Kani harness from
+      the original plan was NOT produced — the iterative SCC is pinned by
+      tests only; carried as a proof gap to the v0.31.0 traceability
+      audit (docs/roadmap.md).
 
   SR-35:
-    implementation-files: []
-    tests: []
+    implementation-files:
+      - meld-core/src/dwarf.rs
+      - meld-core/src/rewriter.rs
+    tests:
+      - meld-core/src/dwarf.rs::tests::ls_d_1_remap_translates_low_pc
+      - meld-core/tests/dwarf_remap_witness.rs
+      - meld-core/tests/dwarf_strip.rs
+      - meld-core/tests/dwarf_passthrough.rs
     proofs: []
-    status: planned
-    note: "v0.10.0 — DWARF Phase 2 address remap (#143). New module meld-core/src/dwarf_remap.rs."
+    status: implemented
+    note: >-
+      v0.16.0–v0.18.0 (#143 inc 1–3b): provenance v2 code ranges,
+      rewriter instruction-offset map, AddressRemap engine, gimli
+      section rewrite behind DwarfHandling::Remap (landed in
+      meld-core/src/dwarf.rs, not the originally-planned dwarf_remap.rs).
+      `verified` is gated on the cross-repo witness MC/DC attribution
+      run scheduled for v0.25.0 (docs/roadmap.md) — the Strip→Remap
+      default flip rides the same gate.
 
   SR-36:
     implementation-files: []
@@ -359,6 +397,25 @@ verification-status:
     proofs: []
     status: planned
     note: "v0.11.0 — DWARF Phase 3 adapter DIEs (#144). Depends on SR-35."
+
+  SR-37:
+    implementation-files:
+      - meld-core/src/memory_probe.rs
+      - meld-core/src/lib.rs
+    tests:
+      - meld-core/tests/auto_memory.rs::auto_selects_shared_for_growfree_inputs
+      - meld-core/tests/auto_memory.rs::ls_m_7_auto_keeps_multi_when_input_grows
+      - meld-core/tests/auto_memory.rs::ls_m_7_auto_reprobes_after_add_component
+      - meld-core/tests/auto_memory.rs::auto_keeps_multi_for_single_memory_input
+      - meld-core/tests/auto_memory.rs::explicit_multi_is_not_overridden
+      - meld-core/src/memory_probe.rs::tests::ls_m_7_malformed_input_counts_as_grow
+    proofs: []
+    status: verified
+    note: >-
+      v0.22.0 (#172, PR #220). Verified: full oracle suite green on the
+      merged main commit through the required-checks gate (Test, Clippy,
+      LS-N gate incl. ls_m_7_*, Mythos delta-pass); manual wasm-opt 116
+      evidence on the issue repro recorded on #172 and in the PR body.
 
 # wit-bindgen fixture coverage (14 fixtures × 3 levels = 42 integration tests)
 wit-bindgen-fixtures:

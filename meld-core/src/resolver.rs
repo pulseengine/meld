@@ -1469,7 +1469,21 @@ impl Resolver {
     }
 
     /// Create a resolver with a specific memory strategy
+    ///
+    /// `MemoryStrategy::Auto` is resolved to a concrete strategy by
+    /// `Fuser::fuse_with_stats` before the resolver is constructed. If an
+    /// unresolved `Auto` reaches this constructor anyway (direct API use),
+    /// it is normalized to `MultiMemory` — the always-sound strategy —
+    /// here, mirroring the identical normalization in `Merger::new` and
+    /// `component_wrap::wrap_as_component` so the three consumers can
+    /// never disagree about what `Auto` means. The strategy matches below
+    /// also carry `MultiMemory | Auto` arms as a compiler-enforced
+    /// backstop should a future code path bypass this constructor.
     pub fn with_strategy(memory_strategy: MemoryStrategy) -> Self {
+        let memory_strategy = match memory_strategy {
+            MemoryStrategy::Auto => MemoryStrategy::MultiMemory,
+            concrete => concrete,
+        };
         Self {
             allow_unresolved: true,
             memory_strategy,
@@ -1554,7 +1568,9 @@ impl Resolver {
         // emitter that consumes this is a runtime-verified follow-up.
         let stream_mode = match self.memory_strategy {
             MemoryStrategy::SharedMemory => crate::p3_stream::StreamMemoryMode::SameMemory,
-            MemoryStrategy::MultiMemory => crate::p3_stream::StreamMemoryMode::CrossMemory,
+            MemoryStrategy::MultiMemory | MemoryStrategy::Auto => {
+                crate::p3_stream::StreamMemoryMode::CrossMemory
+            }
         };
         graph.stream_pair_graph = Some(crate::p3_stream::build_stream_pair_graph(
             components,
@@ -2677,7 +2693,7 @@ impl Resolver {
                     // across all functions in the interface).
                     let crosses_memory = match self.memory_strategy {
                         MemoryStrategy::SharedMemory => false,
-                        MemoryStrategy::MultiMemory => {
+                        MemoryStrategy::MultiMemory | MemoryStrategy::Auto => {
                             let has_memory = |c: &ParsedComponent| {
                                 c.core_modules.iter().any(|m| {
                                     !m.memories.is_empty()
@@ -3454,7 +3470,7 @@ impl Resolver {
                 // memories (multi-memory mode).
                 let module_memory_differs = match self.memory_strategy {
                     MemoryStrategy::SharedMemory => false,
-                    MemoryStrategy::MultiMemory => {
+                    MemoryStrategy::MultiMemory | MemoryStrategy::Auto => {
                         let from_has_memory = {
                             let m = &component.core_modules[res.from_module];
                             !m.memories.is_empty()
@@ -3495,7 +3511,7 @@ impl Resolver {
             // Determine crosses_memory for the adapter site
             let crosses_memory = match self.memory_strategy {
                 MemoryStrategy::SharedMemory => false,
-                MemoryStrategy::MultiMemory => {
+                MemoryStrategy::MultiMemory | MemoryStrategy::Auto => {
                     let from_has_memory = {
                         let m = &component.core_modules[res.from_module];
                         !m.memories.is_empty()
@@ -3682,6 +3698,15 @@ impl Default for Resolver {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Mythos finding B (PR #220): an unresolved `MemoryStrategy::Auto`
+    /// reaching `Resolver::with_strategy` directly must normalize to
+    /// MultiMemory, mirroring `Merger::new` so the two can never disagree.
+    #[test]
+    fn test_with_strategy_normalizes_auto_to_multi_memory() {
+        let resolver = Resolver::with_strategy(MemoryStrategy::Auto);
+        assert_eq!(resolver.memory_strategy, MemoryStrategy::MultiMemory);
+    }
 
     #[test]
     fn test_topological_sort_no_deps() {
