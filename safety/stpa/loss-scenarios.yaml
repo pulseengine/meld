@@ -3111,3 +3111,77 @@ loss-scenarios:
       standalone, compute()==42 ∧ greet()==7) and the full wit-bindgen
       runtime suite (WASI imports stay declared — wrong-drop
       regression).
+
+  - id: LS-ST-1
+    title: stream bridge mis-routes an op or corrupts ring cursors
+    uca: UCA-A-4
+    hazards: [H-1, H-3, H-4]
+    type: inadequate-control-algorithm
+    scenario: >
+      The #141 stream-bridge emitter dispatches every stream op on
+      handle bit 31 (LOCAL_TAG): tagged → in-module ring ops against the
+      bridge memory; untagged → the retained pulseengine:async host
+      import. A wrong dispatch in either direction is silent data-plane
+      corruption: a LOCAL handle forwarded to the host targets a stream
+      the runtime never minted (data vanishes or the runtime corrupts an
+      unrelated handle's state [H-3]); a FOREIGN handle routed to the
+      ring reads/writes a bridge slot whose header was never claimed
+      [H-1]. Independently, the ring protocol itself can be emitted
+      wrong: swapped memory.copy src/dst immediates (the UCA-A-4
+      pattern, now with a third memory in play), a fill-level computed
+      with saturating instead of wrapping u32 arithmetic, a missed
+      second copy part at the ring wrap boundary, or rd/wr cursor
+      updates landing at the wrong header offset — each corrupts bytes
+      or cursor state while every call still returns a plausible count
+      [H-4]. The ADR-2 contract is also routable wrong-by-construction:
+      returning 0 from an open-and-empty read turns Pending into a
+      false EOF; returning Pending after the writer dropped wedges the
+      consumer forever.
+    causal-factors:
+      - >-
+        the bridge must reimplement the host runtime's stream
+        semantics in raw core-wasm codegen — there is no shared
+        implementation to diverge-check against, only the ADR-2
+        contract
+      - >-
+        memory immediates are hardwired per component (the ABI's
+        dynamic mem_idx cannot be honoured in-module), so a per-
+        component shim wired with another component's memory index
+        compiles and validates but copies through the wrong memory
+      - >-
+        cursor arithmetic correctness depends on RING_CAP being a
+        power of two and on u32 wrap-around being intentional; a
+        future "cleanup" to checked arithmetic would break the
+        full-vs-empty distinction
+      - >-
+        the host-handle invariant (host handles < 2^31, ADR-2
+        small-int convention) is owned by the runtime, not meld; a
+        runtime minting large handles would alias the tag
+    process-model-flaw: >
+      The emitter's model is "handle provenance is decidable from bit
+      31 alone". That holds only while in-module minting is the sole
+      source of tagged handles and the runtime honours the small-int
+      convention — so the dispatch and the ring protocol must be pinned
+      by runtime fixtures whose host stubs trap on any tagged handle,
+      making a mis-route loud instead of silent.
+    status: approved
+    priority: high
+    fix: >
+      p3_bridge.rs emits the dispatch prologue from a single shared
+      helper (emit_host_fallback) and the ring ops with bridge/caller
+      memory immediates taken from the merged memory_index_map. Pinned
+      by the four runtime oracles in tests/p3_bridge_runtime.rs, which
+      fuse two hand-built components through the real pipeline and
+      execute the fused module under wasmtime with host stubs that TRAP
+      on any bit-31-tagged handle:
+      ls_st_1_round_trip_local_stream_never_crosses_host (local
+      round-trip, zero host calls),
+      cross_memory_chain_preserves_data_across_distinct_memories
+      (3-memory integrity incl. byte-pattern check),
+      backpressure_partial_write_then_drain_then_resume (Partial at
+      RING_CAP, 0-accepted on full ring, resume after drain, two-part
+      wrap copy on both sides), and
+      ls_st_1_eof_only_after_writer_drop_and_drain (Pending -5 while
+      open+empty; EOF 0 only after drop_writable AND drain; sticky).
+      slot_exhaustion_falls_back_to_host_stream pins the untagged
+      fallback direction (host ops are reached exactly once each).
