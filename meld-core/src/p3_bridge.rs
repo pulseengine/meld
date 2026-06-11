@@ -575,6 +575,18 @@ fn emit_write_shim(bridge_mem: u32, caller_mem: u32, host_write: u32) -> Functio
     emit_host_fallback(&mut f, host_write, 4);
     emit_slot_decode(&mut f);
 
+    // Mythos S2 hardening: a write to a slot whose reader (or writer)
+    // end was dropped must signal Closed, not silently fill the ring
+    // (ADR-2: "subsequent writes return Closed").
+    f.instruction(&Instruction::LocalGet(4));
+    f.instruction(&Instruction::I32Load(bridge_arg(0, bridge_mem)));
+    f.instruction(&Instruction::I32Const(STATE_WRITER_DROPPED));
+    f.instruction(&Instruction::I32GeU);
+    f.instruction(&Instruction::If(BlockType::Empty));
+    f.instruction(&Instruction::I32Const(p3_async::AbiError::Closed.as_i32()));
+    f.instruction(&Instruction::Return);
+    f.instruction(&Instruction::End);
+
     // l6 = rd, l7 = wr
     f.instruction(&Instruction::LocalGet(4));
     f.instruction(&Instruction::I32Load(bridge_arg(4, bridge_mem)));
@@ -692,6 +704,16 @@ fn emit_read_shim(bridge_mem: u32, caller_mem: u32, host_read: u32) -> Function 
     f.instruction(&Instruction::LocalSet(8));
     emit_min_u(&mut f, 2, 8);
     f.instruction(&Instruction::LocalSet(8));
+
+    // Mythos S1 hardening: n==0 here means len==0 while data exists
+    // (the empty case returned above). 0 is the EOF sentinel — a
+    // zero-length probe must report Pending, never EOF.
+    f.instruction(&Instruction::LocalGet(8));
+    f.instruction(&Instruction::I32Eqz);
+    f.instruction(&Instruction::If(BlockType::Empty));
+    f.instruction(&Instruction::I32Const(p3_async::AbiError::Pending.as_i32()));
+    f.instruction(&Instruction::Return);
+    f.instruction(&Instruction::End);
 
     // l9 = off = rd & (RING_CAP - 1)
     f.instruction(&Instruction::LocalGet(6));
