@@ -4,14 +4,25 @@ Implementation vs formal verification coverage for the Meld fusion pipeline.
 
 ## Numbers at a Glance
 
+Counts refreshed 2026-06-11 (v0.31.0 traceability audit).
+
 | Metric | Count |
 |--------|-------|
-| Rocq `.v` files | 23 |
-| Rocq lines (total) | 13,330 |
-| Closed proofs (Qed) | 286 |
+| Rocq `.v` files | 28 |
+| Rocq lines (total) | 14,487 |
+| Closed proofs (Qed) | 350 |
 | Admitted proofs | 0 |
-| Rust lines (`meld-core/src`) | 8,218 |
-| Proof-to-code ratio | 1.62x |
+| Rust lines (`meld-core/src`, recursive, incl. inline tests) | 41,378 |
+| Proof-to-code ratio | 0.35x |
+
+Measurement method: Rocq counts via `find proofs -name "*.v"` (file
+count, total `wc -l`, `grep -c "Qed."` summed). Rust lines via
+`find meld-core/src -name "*.rs" | xargs wc -l` — this counts ALL
+sources under `meld-core/src` including `adapter/` and the inline
+`#[cfg(test)]` test modules (a large share of the total), so the
+proof-to-code ratio is conservative and not comparable to the earlier
+8,218 figure, which counted only top-level production files of a much
+smaller codebase.
 
 ## Pipeline Coverage Matrix
 
@@ -28,6 +39,27 @@ Implementation vs formal verification coverage for the Meld fusion pipeline.
 | **Spec layer** | — | — | `spec/*.v` (6 files) | 4,392 | Covered | Wasm core types, component model, fusion types, instruction semantics, forward simulation (fully proved), trap simulation (forward direction) |
 
 Proof file paths are relative to `proofs/` (e.g. `merge/*.v` means `proofs/transformations/merge/*.v`).
+
+## Kani Layer (bounded model checking)
+
+Alongside the Rocq proofs, `meld-core/src/abi_proofs.rs` carries Kani
+harnesses for Canonical-ABI invariants (#218 inc 1, SR-40, v0.30.0):
+
+| Harness | Invariant | Status |
+|---------|-----------|--------|
+| `flags_layout_matches_spec` | `flags<N>` follows the spec storage classes at every boundary N in {1, 8, 9, 16, 17, 32, 33, 64} | VERIFICATION SUCCESSFUL (local, 2026-06-11) |
+| `total_flat_params_saturating_monotone` | `total_flat_params` is panic-free and monotone (LS-P-9) | VERIFICATION SUCCESSFUL (local, 2026-06-11) |
+| `ring_cursor_invariant_inductive` | #141 stream-bridge ring-cursor model preserves `fill <= CAP` inductively under u32 wraparound, both wrapping-copy segments in-bounds (parameters compile-tied to the emitter's constants) | VERIFICATION SUCCESSFUL (local, 2026-06-11) |
+
+Run via `cargo kani --harness <name>`; local evidence only — smithy CI
+runners do not ship the Kani toolchain (CI wiring is follow-up under
+#218). Honest CBMC scope cuts, recorded in-module: nondet
+leaf/container and aggregate-padding harnesses for the
+size-multiple-of-align contract do not converge against the current
+`ParsedComponent` shape (heap-state explosion); that contract stays
+pinned by the exhaustive unit tests
+(`test_canonical_abi_element_size_*`, `test_sr17_alignment_*`) until
+the layout core is factored allocation-free.
 
 ## What the Proofs Establish
 
