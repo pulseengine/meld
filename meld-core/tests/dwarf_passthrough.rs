@@ -400,17 +400,17 @@ fn remap_policy_falls_back_to_strip_on_multi_dwarf_source() {
     // `lists.wasm` embeds more than one core module carrying DWARF (two
     // `.debug_info` sections — verified at fixture-selection time).
     // Merging independent DWARF unit sets into one consistent
-    // `.debug_info` against the fused code section is deferred to a
-    // later increment; the honest behaviour is to strip rather than
-    // emit one source's addresses (wrong for the other). This pins that
-    // fallback: Remap on a multi-source fixture yields NO `.debug_*`.
+    // `.debug_info` against the fused code section is deferred (#208);
+    // the honest behaviour is to drop the SOURCE DWARF rather than emit
+    // one source's addresses (wrong for the other).
     //
-    // The single-source happy path (addresses actually remapped) is
-    // covered mechanically by the `dwarf` module unit tests:
-    // `rewrite_debug_sections_translates_low_pc` (full gimli
-    // read→convert→write→read round-trip) and
-    // `build_remap_from_parts_identity_walk` (remap built from real
-    // wasm bytes).
+    // Since #144 inc 3/4 the multi-source case still emits the
+    // synthetic `<meld-adapter>` unit when the fusion generated code —
+    // it references only meld-generated ranges, so no wrong source
+    // addresses are involved. The invariant this test pins is therefore
+    // "no SOURCE DWARF leaks": any emitted `.debug_*` must form exactly
+    // one compilation unit whose every line row attributes to
+    // `<meld-adapter>` — never to a real source file.
     if !fixture_available() {
         return;
     }
@@ -426,11 +426,68 @@ fn remap_policy_falls_back_to_strip_on_multi_dwarf_source() {
     );
 
     let fused = fuse_remap(&bytes);
-    let counts = count_dwarf_sections_at_top_level(&fused);
-    assert!(
-        counts.is_empty(),
-        "Remap must fall back to stripping when >1 source module carries \
-         DWARF (never emit wrong addresses). Saw: {counts:?}"
+
+    // Collect emitted .debug_* and parse them with gimli.
+    let mut sections: Vec<(String, Vec<u8>)> = Vec::new();
+    for payload in wasmparser::Parser::new(0).parse_all(&fused) {
+        if let Ok(wasmparser::Payload::CustomSection(r)) = payload
+            && r.name().starts_with(".debug_")
+        {
+            sections.push((r.name().to_string(), r.data().to_vec()));
+        }
+    }
+    if sections.is_empty() {
+        // Also a valid outcome: the fusion generated no code to
+        // attribute, so nothing is emitted at all.
+        return;
+    }
+
+    use gimli::{EndianSlice, LittleEndian};
+    let section_data = |name: &str| -> &[u8] {
+        sections
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, d)| d.as_slice())
+            .unwrap_or(&[])
+    };
+    let load = |id: gimli::SectionId| -> Result<EndianSlice<'_, LittleEndian>, gimli::Error> {
+        Ok(EndianSlice::new(section_data(id.name()), LittleEndian))
+    };
+    let dwarf = gimli::Dwarf::load(load).expect("emitted DWARF must parse");
+
+    let mut unit_count = 0usize;
+    let mut units = dwarf.units();
+    while let Some(header) = units.next().expect("units") {
+        unit_count += 1;
+        let unit = dwarf.unit(header).expect("unit");
+        let Some(program) = unit.line_program.clone() else {
+            continue;
+        };
+        let mut rows = program.rows();
+        while let Some((hdr, row)) = rows.next_row().expect("row") {
+            if row.end_sequence() {
+                continue;
+            }
+            let fname = row
+                .file(hdr)
+                .map(|f| match f.path_name() {
+                    gimli::AttributeValue::String(s) => {
+                        String::from_utf8_lossy(s.slice()).into_owned()
+                    }
+                    _ => String::new(),
+                })
+                .unwrap_or_default();
+            assert_eq!(
+                fname, "<meld-adapter>",
+                "multi-DWARF-source fusion must never leak SOURCE \
+                 attribution (wrong addresses for at least one source); \
+                 only the synthetic adapter unit is allowed"
+            );
+        }
+    }
+    assert_eq!(
+        unit_count, 1,
+        "multi-source fusion may emit exactly the one synthetic unit"
     );
 }
 
