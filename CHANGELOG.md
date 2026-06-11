@@ -4,6 +4,38 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.28.0] - 2026-06-11
+
+### Added
+
+- **Separate-input cross-component linking** (#212.1, closes #212;
+  SR-39, LS-CP-6; PR #236). `meld fuse consumer.wasm provider.wasm
+  --component` now produces a SELF-CONTAINED component: the wrapped
+  output's import surface is derived from the fused core module's
+  REMAINING imports, so interfaces the resolver satisfied internally
+  are dropped from the component-level declarations (with surviving
+  instance indices renumbered consistently); WASI and other external
+  imports remain by construction. The formerly `#[ignore]`d golden-e2e
+  acceptance (`tier_b_separate_inputs_internalise_link`) is un-ignored
+  and passing: the fused composition instantiates standalone with zero
+  linker definitions, `compute()==42 ∧ greet()==7` equal to the
+  host-linked golden.
+
+### Pre-release Mythos note
+
+Tier-5 file changed since v0.27.0: `component_wrap.rs` (PR #236).
+Clean-room pass: NO PROVABLE FINDING; the pass additionally verified
+the drop-one-keep-one renumber path with its own 2-import fixture, and
+its two latent-fragility observations are pinned as an INVARIANT
+comment in code. `mythos-pass-done` applied.
+
+### Falsification statement
+
+Claim: fusing two separate components where one's instance import
+matches the other's export yields a component that instantiates with
+NO linker definitions and behaves identically to the host-linked
+composition. Refute via `ls_cp_6_separate_inputs_internalise_link`.
+
 ## [0.27.0] - 2026-06-11
 
 ### Added
