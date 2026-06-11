@@ -701,7 +701,6 @@ pub fn remap_for_output(
 struct SectionBases {
     info: u32,
     abbrev: u32,
-    str_: u32,
     line: u32,
     ranges: u32,
     loc: u32,
@@ -716,7 +715,15 @@ fn section_of<'a>(set: &'a [(String, Vec<u8>)], name: &str) -> &'a [u8] {
 
 /// Apply the bounded relocations to one section set's `.debug_info`,
 /// returning the patched bytes. `None` aborts the whole merge.
-fn relocate_debug_info(set: &[(String, Vec<u8>)], bases: SectionBases) -> Option<Vec<u8>> {
+///
+/// `strp_map` maps this set's `.debug_str` offsets to offsets in the
+/// DEDUPED merged string pool (#208 inc 2) — identity for set 0, a real
+/// remapping for later sets whose strings collapsed into earlier ones.
+fn relocate_debug_info(
+    set: &[(String, Vec<u8>)],
+    bases: SectionBases,
+    strp_map: &std::collections::HashMap<u32, u32>,
+) -> Option<Vec<u8>> {
     use gimli::{EndianSlice, LittleEndian, constants};
 
     let mut info = section_of(set, ".debug_info").to_vec();
@@ -765,7 +772,11 @@ fn relocate_debug_info(set: &[(String, Vec<u8>)], bases: SectionBases) -> Option
                 let attr = entries.read_attribute(*spec).ok()?;
                 match spec.form() {
                     constants::DW_FORM_strp => {
-                        patch(&mut info, value_pos, bases.str_)?;
+                        let bytes: &[u8] = info.get(value_pos..value_pos + 4)?;
+                        let old_off = u32::from_le_bytes(bytes.try_into().ok()?);
+                        let new_off = *strp_map.get(&old_off)?;
+                        info.get_mut(value_pos..value_pos + 4)?
+                            .copy_from_slice(&new_off.to_le_bytes());
                     }
                     constants::DW_FORM_ref_addr => {
                         patch(&mut info, value_pos, bases.info)?;
@@ -825,26 +836,69 @@ fn concat_dwarf_section_sets(sets: &[Vec<(String, Vec<u8>)>]) -> Option<Vec<(Str
     let mut out: Vec<(String, Vec<u8>)> =
         NAMES.iter().map(|n| (n.to_string(), Vec::new())).collect();
     let mut bases = SectionBases::default();
+    // #208 inc 2: dedup state. The merged string pool maps string
+    // CONTENT to its pool offset; identical `.debug_abbrev` tables
+    // (gimli emits byte-identical tables for same-shaped sources) are
+    // reused instead of appended.
+    let mut string_pool: Vec<u8> = Vec::new();
+    let mut pool_index: std::collections::HashMap<Vec<u8>, u32> = Default::default();
+    let mut abbrev_seen: Vec<(u32, Vec<u8>)> = Vec::new();
+    let mut abbrev_out: Vec<u8> = Vec::new();
+
     for set in sets {
-        let info = relocate_debug_info(set, bases)?;
+        // Intern this set's strings into the pool, recording the
+        // old-offset → pool-offset map for the strp relocation.
+        let mut strp_map: std::collections::HashMap<u32, u32> = Default::default();
+        let strs = section_of(set, ".debug_str");
+        let mut off = 0usize;
+        while off < strs.len() {
+            let end = off + strs[off..].iter().position(|b| *b == 0)?;
+            let content = strs[off..=end].to_vec(); // include NUL
+            let pool_off = *pool_index.entry(content.clone()).or_insert_with(|| {
+                let at = string_pool.len() as u32;
+                string_pool.extend_from_slice(&content);
+                at
+            });
+            strp_map.insert(u32::try_from(off).ok()?, pool_off);
+            off = end + 1;
+        }
+
+        // Byte-equal abbrev reuse.
+        let abbrev = section_of(set, ".debug_abbrev");
+        let abbrev_base = match abbrev_seen.iter().find(|(_, b)| b == &abbrev) {
+            Some((at, _)) => *at,
+            None => {
+                let at = u32::try_from(abbrev_out.len()).ok()?;
+                abbrev_out.extend_from_slice(abbrev);
+                abbrev_seen.push((at, abbrev.to_vec()));
+                at
+            }
+        };
+        bases.abbrev = abbrev_base;
+
+        let info = relocate_debug_info(set, bases, &strp_map)?;
         for (name, acc) in out.iter_mut() {
-            let data: &[u8] = if name == ".debug_info" {
-                &info
-            } else {
-                section_of(set, name)
-            };
-            acc.extend_from_slice(data);
+            match name.as_str() {
+                ".debug_info" => acc.extend_from_slice(&info),
+                ".debug_str" | ".debug_abbrev" => {} // pooled below
+                other => acc.extend_from_slice(section_of(set, other)),
+            }
         }
         bases.info = bases.info.checked_add(u32::try_from(info.len()).ok()?)?;
         let grow = |base: &mut u32, name: &str| -> Option<()> {
             *base = base.checked_add(u32::try_from(section_of(set, name).len()).ok()?)?;
             Some(())
         };
-        grow(&mut bases.abbrev, ".debug_abbrev")?;
-        grow(&mut bases.str_, ".debug_str")?;
         grow(&mut bases.line, ".debug_line")?;
         grow(&mut bases.ranges, ".debug_ranges")?;
         grow(&mut bases.loc, ".debug_loc")?;
+    }
+    for (name, acc) in out.iter_mut() {
+        match name.as_str() {
+            ".debug_str" => *acc = string_pool.clone(),
+            ".debug_abbrev" => *acc = abbrev_out.clone(),
+            _ => {}
+        }
     }
     out.retain(|(_, d)| !d.is_empty());
     Some(out)
@@ -1749,11 +1803,18 @@ mod tests {
             // Use a StringRef so the source actually exercises
             // DW_FORM_strp relocation (inline strings would not).
             let producer = dwarf.strings.add(format!("producer-of-{file}"));
+            // A string SHARED by both sources, so the merge has real
+            // overlap to pool (#208 inc 2).
+            let comp_dir = dwarf.strings.add("shared-comp-dir");
             let unit = dwarf.units.get_mut(unit_id);
             let root = unit.root();
             unit.get_mut(root).set(
                 constants::DW_AT_producer,
                 AttributeValue::StringRef(producer),
+            );
+            unit.get_mut(root).set(
+                constants::DW_AT_comp_dir,
+                AttributeValue::StringRef(comp_dir),
             );
             let sp = unit.add(root, constants::DW_TAG_subprogram);
             unit.get_mut(sp).set(
@@ -1799,8 +1860,28 @@ mod tests {
         let set_b =
             rewrite_debug_sections(&src_b, &remap_for(0x40, 0x200), &[]).expect("convert source b");
 
+        let sum_str: usize = [&set_a, &set_b]
+            .iter()
+            .map(|s| section_of(s, ".debug_str").len())
+            .sum();
+        let sum_abbrev: usize = [&set_a, &set_b]
+            .iter()
+            .map(|s| section_of(s, ".debug_abbrev").len())
+            .sum();
         let merged =
             concat_dwarf_section_sets(&[set_a, set_b]).expect("bounded merge must succeed");
+        // #208 inc 2: identical abbrev tables are reused and overlapping
+        // strings pooled — the merged sections must be smaller than the
+        // naive concatenation (the two sources share gimli's emitted
+        // comp-dir/name strings and identical abbrev shapes).
+        assert!(
+            section_of(&merged, ".debug_abbrev").len() < sum_abbrev,
+            "byte-identical abbrev tables must be reused"
+        );
+        assert!(
+            section_of(&merged, ".debug_str").len() < sum_str,
+            "overlapping strings must be pooled"
+        );
 
         // Re-parse the merged set.
         let section_data = |name: &str| -> &[u8] { section_of(&merged, name) };
