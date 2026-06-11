@@ -403,20 +403,17 @@ fn dwarf_addresses_in_fused_output_are_known_to_be_wrong() {
 
 #[test]
 fn remap_policy_falls_back_to_strip_on_multi_dwarf_source() {
-    // `lists.wasm` embeds more than one core module carrying DWARF (two
-    // `.debug_info` sections — verified at fixture-selection time).
-    // Merging independent DWARF unit sets into one consistent
-    // `.debug_info` against the fused code section is deferred (#208);
-    // the honest behaviour is to drop the SOURCE DWARF rather than emit
-    // one source's addresses (wrong for the other).
-    //
-    // Since #144 inc 3/4 the multi-source case still emits the
-    // synthetic `<meld-adapter>` unit when the fusion generated code —
-    // it references only meld-generated ranges, so no wrong source
-    // addresses are involved. The invariant this test pins is therefore
-    // "no SOURCE DWARF leaks": any emitted `.debug_*` must form exactly
-    // one compilation unit whose every line row attributes to
-    // `<meld-adapter>` — never to a real source file.
+    // HISTORY: this test pinned "multi-source ⇒ strip" (pre-#144), then
+    // "multi-source ⇒ synthetic-only" (#144 inc 3/4). Since #208 inc 1
+    // the multi-source case is MERGED: each DWARF-bearing source module
+    // is converted+remapped independently and the section sets are
+    // combined by the bounded relocator. The invariant that carried
+    // through every phase — never emit a WRONG address/offset — is now
+    // pinned structurally: the merged output must PARSE coherently
+    // (every abbrev/str/line/ref offset lands), carry MORE than one
+    // compile unit (both sources survived), and every line-row file must
+    // come from the union of the input file tables plus
+    // `<meld-adapter>` (no foreign attribution).
     if !fixture_available() {
         return;
     }
@@ -426,14 +423,11 @@ fn remap_policy_falls_back_to_strip_on_multi_dwarf_source() {
     let input_dwarf = count_dwarf_sections_recursive(&bytes);
     assert!(
         input_dwarf.get(".debug_info").copied().unwrap_or(0) > 1,
-        "this test assumes a multi-DWARF-source fixture; saw {input_dwarf:?}. \
-         If the fixture became single-source, it should now exercise the \
-         remap happy path — assert remapped `.debug_*` are present instead."
+        "this test assumes a multi-DWARF-source fixture; saw {input_dwarf:?}"
     );
 
     let fused = fuse_remap(&bytes);
 
-    // Collect emitted .debug_* and parse them with gimli.
     let mut sections: Vec<(String, Vec<u8>)> = Vec::new();
     for payload in wasmparser::Parser::new(0).parse_all(&fused) {
         if let Ok(wasmparser::Payload::CustomSection(r)) = payload
@@ -442,11 +436,10 @@ fn remap_policy_falls_back_to_strip_on_multi_dwarf_source() {
             sections.push((r.name().to_string(), r.data().to_vec()));
         }
     }
-    if sections.is_empty() {
-        // Also a valid outcome: the fusion generated no code to
-        // attribute, so nothing is emitted at all.
-        return;
-    }
+    assert!(
+        !sections.is_empty(),
+        "multi-source fusion must now emit merged DWARF (#208 inc 1)"
+    );
 
     use gimli::{EndianSlice, LittleEndian};
     let section_data = |name: &str| -> &[u8] {
@@ -459,41 +452,40 @@ fn remap_policy_falls_back_to_strip_on_multi_dwarf_source() {
     let load = |id: gimli::SectionId| -> Result<EndianSlice<'_, LittleEndian>, gimli::Error> {
         Ok(EndianSlice::new(section_data(id.name()), LittleEndian))
     };
-    let dwarf = gimli::Dwarf::load(load).expect("emitted DWARF must parse");
+    let dwarf = gimli::Dwarf::load(load).expect("merged DWARF must load");
 
     let mut unit_count = 0usize;
+    let mut files_seen: std::collections::BTreeSet<String> = Default::default();
     let mut units = dwarf.units();
-    while let Some(header) = units.next().expect("units") {
+    while let Some(header) = units.next().expect("units iterate (offset coherence)") {
         unit_count += 1;
-        let unit = dwarf.unit(header).expect("unit");
+        let unit = dwarf
+            .unit(header)
+            .expect("every merged unit must parse (abbrev offset relocation)");
         let Some(program) = unit.line_program.clone() else {
             continue;
         };
         let mut rows = program.rows();
-        while let Some((hdr, row)) = rows.next_row().expect("row") {
+        while let Some((hdr, row)) = rows.next_row().expect("line rows (stmt_list relocation)") {
             if row.end_sequence() {
                 continue;
             }
-            let fname = row
-                .file(hdr)
-                .map(|f| match f.path_name() {
-                    gimli::AttributeValue::String(s) => {
-                        String::from_utf8_lossy(s.slice()).into_owned()
-                    }
-                    _ => String::new(),
-                })
-                .unwrap_or_default();
-            assert_eq!(
-                fname, "<meld-adapter>",
-                "multi-DWARF-source fusion must never leak SOURCE \
-                 attribution (wrong addresses for at least one source); \
-                 only the synthetic adapter unit is allowed"
-            );
+            if let Some(f) = row.file(hdr) {
+                if let gimli::AttributeValue::String(sl) = f.path_name() {
+                    files_seen.insert(String::from_utf8_lossy(sl.slice()).into_owned());
+                }
+            }
         }
     }
-    assert_eq!(
-        unit_count, 1,
-        "multi-source fusion may emit exactly the one synthetic unit"
+    assert!(
+        unit_count > 1,
+        "multi-source merge must carry more than one compile unit; saw {unit_count}"
+    );
+    assert!(
+        files_seen
+            .iter()
+            .any(|f| f != "<meld-adapter>" && !f.is_empty()),
+        "merged output must attribute to real source files; saw {files_seen:?}"
     );
 }
 

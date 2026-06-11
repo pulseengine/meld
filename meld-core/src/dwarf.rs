@@ -602,23 +602,252 @@ pub fn remap_for_output(
             rewrite_debug_sections(&debug, &remap, &spans)
         }
         many => {
-            log::warn!(
-                "DwarfHandling::Remap: {} source modules carry DWARF; merging \
-                 independent DWARF unit sets is not yet supported — stripping \
-                 source debug info instead of emitting wrong addresses (#143/#208)",
+            // #208 inc 1: per-source convert+remap into independent
+            // section sets, then merge via the bounded relocator. The
+            // synthetic adapter unit rides the FIRST successful set's
+            // write (single shared offset space within that set); the
+            // relocator then makes the sets coexist.
+            log::debug!(
+                "dwarf remap: {} source modules carry DWARF; merging (#208)",
                 many.len()
             );
-            if spans.is_empty() {
-                return None;
+            let mut sets: Vec<Vec<(String, Vec<u8>)>> = Vec::new();
+            let mut spans_pending = spans.as_slice();
+            for (ci, mi) in many {
+                let module = &components[*ci].core_modules[*mi];
+                let Some(remap) = build_remap_for_module(module, merged, *ci, *mi, output_bytes)
+                else {
+                    log::warn!(
+                        "dwarf remap: source ({ci},{mi}) failed remap; dropping \
+                         its DWARF (others proceed)"
+                    );
+                    continue;
+                };
+                let debug: Vec<(String, Vec<u8>)> = module
+                    .custom_sections
+                    .iter()
+                    .filter(|(name, _)| name.starts_with(".debug_"))
+                    .cloned()
+                    .collect();
+                let Some(set) = rewrite_debug_sections(&debug, &remap, spans_pending) else {
+                    log::warn!(
+                        "dwarf remap: source ({ci},{mi}) failed conversion; \
+                         dropping its DWARF (others proceed)"
+                    );
+                    continue;
+                };
+                spans_pending = &[]; // adapter unit emitted exactly once
+                sets.push(set);
             }
-            log::debug!(
-                "dwarf remap: emitting synthetic <meld-adapter> unit only \
-                 ({} generated ranges) — references no source addresses",
-                spans.len()
-            );
-            build_adapter_dwarf(&spans)
+            if sets.is_empty() {
+                // Every source failed — fall back to synthetic-only,
+                // exactly the pre-#208 behaviour.
+                if spans.is_empty() {
+                    return None;
+                }
+                return build_adapter_dwarf(&spans);
+            }
+            match concat_dwarf_section_sets(&sets) {
+                Some(merged_sections) => Some(merged_sections),
+                None => {
+                    // Outside the bounded repertoire: never guess.
+                    log::warn!(
+                        "dwarf remap: multi-source merge outside the bounded \
+                         relocation repertoire; falling back to synthetic-only"
+                    );
+                    if spans.is_empty() {
+                        None
+                    } else {
+                        build_adapter_dwarf(&spans)
+                    }
+                }
+            }
         }
     }
+}
+
+// ====================================================================
+// #208 increment 1: multi-source DWARF merge (bounded relocator)
+// ====================================================================
+//
+// gimli's `write::UnitTable`s cannot be merged (private fields, per-table
+// `BaseId`s), so multi-source merge works at the SECTION level: each
+// DWARF-bearing source module is converted+remapped into its own
+// independently written section set (the proven single-source path), and
+// the sets are then concatenated with raw offset fixups applied to every
+// set after the first. This is sound ONLY because we control the
+// producer: the sets are gimli-written DWARF32 v4 with gimli's fixed
+// form repertoire, so the complete list of cross-section references is
+// known and bounded:
+//
+//   1. CU header `debug_abbrev_offset` (fixed position: unit offset + 6)
+//   2. `DW_FORM_strp`        → `.debug_str`    (+ str prefix len)
+//   3. `DW_FORM_sec_offset`  → by attribute:
+//        `DW_AT_stmt_list`   → `.debug_line`   (+ line prefix len)
+//        `DW_AT_ranges`      → `.debug_ranges` (+ ranges prefix len)
+//        `DW_AT_location` &c → `.debug_loc`    (+ loc prefix len)
+//   4. `DW_FORM_ref_addr`    → `.debug_info`   (+ info prefix len)
+//
+// `.debug_abbrev` / `.debug_str` / `.debug_line` / `.debug_ranges` /
+// `.debug_loc` contents are offset-free internally (addresses, not
+// section offsets), so they concatenate verbatim. Anything outside this
+// repertoire (DWARF64, version ≠ 4, an unexpected `sec_offset`
+// attribute) aborts the merge — the caller falls back to synthetic-only
+// emission rather than risk a wrong offset.
+
+/// Cumulative lengths of already-merged sections, used as relocation
+/// bases for the next set.
+#[derive(Debug, Default, Clone, Copy)]
+struct SectionBases {
+    info: u32,
+    abbrev: u32,
+    str_: u32,
+    line: u32,
+    ranges: u32,
+    loc: u32,
+}
+
+fn section_of<'a>(set: &'a [(String, Vec<u8>)], name: &str) -> &'a [u8] {
+    set.iter()
+        .find(|(n, _)| n == name)
+        .map(|(_, d)| d.as_slice())
+        .unwrap_or(&[])
+}
+
+/// Apply the bounded relocations to one section set's `.debug_info`,
+/// returning the patched bytes. `None` aborts the whole merge.
+fn relocate_debug_info(set: &[(String, Vec<u8>)], bases: SectionBases) -> Option<Vec<u8>> {
+    use gimli::{EndianSlice, LittleEndian, constants};
+
+    let mut info = section_of(set, ".debug_info").to_vec();
+    if info.is_empty() {
+        return Some(info);
+    }
+
+    let load = |id: gimli::SectionId| -> Result<EndianSlice<'_, LittleEndian>, gimli::Error> {
+        Ok(EndianSlice::new(section_of(set, id.name()), LittleEndian))
+    };
+    let dwarf = gimli::Dwarf::load(load).ok()?;
+
+    let patch = |info: &mut [u8], pos: usize, delta: u32| -> Option<()> {
+        let bytes: &mut [u8] = info.get_mut(pos..pos + 4)?;
+        let old = u32::from_le_bytes(bytes.try_into().ok()?);
+        bytes.copy_from_slice(&old.checked_add(delta)?.to_le_bytes());
+        Some(())
+    };
+
+    let mut units = dwarf.units();
+    while let Some(header) = units.next().ok()? {
+        // DWARF32 v4 only: initial length must not be the DWARF64
+        // escape, version must be 4. (We produced these sections, so
+        // anything else means the producer changed — abort, never
+        // guess.)
+        if header.version() != 4 || header.format() != gimli::Format::Dwarf32 {
+            log::warn!(
+                "multi-DWARF merge: unit not DWARF32 v4 (version {}, {:?}); aborting merge",
+                header.version(),
+                header.format()
+            );
+            return None;
+        }
+        let unit_base = header.offset().as_debug_info_offset()?.0;
+        // CU header: length(4) version(2) abbrev_offset(4) addr_size(1)
+        patch(&mut info, unit_base + 6, bases.abbrev)?;
+
+        let unit = dwarf.unit(header).ok()?;
+        let mut entries = unit.entries_raw(None).ok()?;
+        while !entries.is_empty() {
+            let Some(abbrev) = entries.read_abbreviation().ok()? else {
+                continue; // null entry
+            };
+            for spec in abbrev.attributes() {
+                let value_pos = unit_base + entries.next_offset().0;
+                let attr = entries.read_attribute(*spec).ok()?;
+                match spec.form() {
+                    constants::DW_FORM_strp => {
+                        patch(&mut info, value_pos, bases.str_)?;
+                    }
+                    constants::DW_FORM_ref_addr => {
+                        patch(&mut info, value_pos, bases.info)?;
+                    }
+                    constants::DW_FORM_sec_offset => {
+                        let delta = match attr.name() {
+                            constants::DW_AT_stmt_list => bases.line,
+                            constants::DW_AT_ranges => bases.ranges,
+                            constants::DW_AT_location
+                            | constants::DW_AT_data_member_location
+                            | constants::DW_AT_frame_base
+                            | constants::DW_AT_vtable_elem_location
+                            | constants::DW_AT_use_location => bases.loc,
+                            other => {
+                                log::warn!(
+                                    "multi-DWARF merge: unexpected sec_offset \
+                                     attribute {other}; aborting merge"
+                                );
+                                return None;
+                            }
+                        };
+                        patch(&mut info, value_pos, delta)?;
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    Some(info)
+}
+
+/// Merge independently written DWARF section sets into one coherent set
+/// (#208 inc 1). Set 0 is taken verbatim; each later set's `.debug_info`
+/// is relocated against the cumulative bases, then all sections are
+/// concatenated. Returns `None` (caller falls back) if any set is
+/// outside the bounded repertoire.
+fn concat_dwarf_section_sets(sets: &[Vec<(String, Vec<u8>)>]) -> Option<Vec<(String, Vec<u8>)>> {
+    const NAMES: &[&str] = &[
+        ".debug_info",
+        ".debug_abbrev",
+        ".debug_str",
+        ".debug_line",
+        ".debug_ranges",
+        ".debug_loc",
+    ];
+    // Any section outside the known list means a producer change —
+    // abort rather than silently drop it.
+    for set in sets {
+        for (name, _) in set {
+            if !NAMES.contains(&name.as_str()) {
+                log::warn!("multi-DWARF merge: unexpected section {name}; aborting merge");
+                return None;
+            }
+        }
+    }
+
+    let mut out: Vec<(String, Vec<u8>)> =
+        NAMES.iter().map(|n| (n.to_string(), Vec::new())).collect();
+    let mut bases = SectionBases::default();
+    for set in sets {
+        let info = relocate_debug_info(set, bases)?;
+        for (name, acc) in out.iter_mut() {
+            let data: &[u8] = if name == ".debug_info" {
+                &info
+            } else {
+                section_of(set, name)
+            };
+            acc.extend_from_slice(data);
+        }
+        bases.info = bases.info.checked_add(u32::try_from(info.len()).ok()?)?;
+        let grow = |base: &mut u32, name: &str| -> Option<()> {
+            *base = base.checked_add(u32::try_from(section_of(set, name).len()).ok()?)?;
+            Some(())
+        };
+        grow(&mut bases.abbrev, ".debug_abbrev")?;
+        grow(&mut bases.str_, ".debug_str")?;
+        grow(&mut bases.line, ".debug_line")?;
+        grow(&mut bases.ranges, ".debug_ranges")?;
+        grow(&mut bases.loc, ".debug_loc")?;
+    }
+    out.retain(|(_, d)| !d.is_empty());
+    Some(out)
 }
 
 // ====================================================================
@@ -1465,6 +1694,175 @@ mod tests {
             assert!(line > 0, "{role:?} must not use DWARF line 0");
             assert!(seen.insert(line), "{role:?} reuses line {line}");
         }
+    }
+
+    /// #208 inc 1 oracle: two independently converted+remapped source
+    /// DWARFs merge into ONE coherent section set. Build two sources
+    /// with gimli (a.rs:5 covering [0x10,0x30); b.rs:9 covering
+    /// [0x40,0x60)), remap them to disjoint fused ranges, merge via the
+    /// bounded relocator, re-parse the MERGED set and assert each
+    /// remapped address resolves to ITS OWN file:line — proving the
+    /// abbrev/str/line offset relocations all landed (any miss makes
+    /// gimli fail the parse or resolve the wrong file).
+    #[test]
+    fn ls_d_3_multi_source_merge_round_trips_both_units() {
+        use gimli::write::{
+            Address, AttributeValue, Dwarf, EndianVec, LineProgram, LineString, Sections, Unit,
+        };
+        use gimli::{Encoding, EndianSlice, Format, LineEncoding, LittleEndian, constants};
+
+        let encoding = Encoding {
+            format: Format::Dwarf32,
+            version: 4,
+            address_size: 4,
+        };
+
+        let build_source = |file: &str, line: u64, addr: u64, len: u64| -> Vec<(String, Vec<u8>)> {
+            let mut lp = LineProgram::new(
+                encoding,
+                LineEncoding::default(),
+                LineString::String(b"/src".to_vec()),
+                LineString::String(file.as_bytes().to_vec()),
+                None,
+            );
+            let dir = lp.default_directory();
+            let fid = lp.add_file(LineString::String(file.as_bytes().to_vec()), dir, None);
+            lp.begin_sequence(Some(Address::Constant(addr)));
+            {
+                let row = lp.row();
+                row.address_offset = 0;
+                row.file = fid;
+                row.line = line;
+                row.is_statement = true;
+            }
+            lp.generate_row();
+            lp.end_sequence(len);
+
+            let mut dwarf = Dwarf::new();
+            let unit_id = dwarf.units.add(Unit::new(encoding, lp));
+            let unit = dwarf.units.get_mut(unit_id);
+            let root = unit.root();
+            unit.get_mut(root).set(
+                constants::DW_AT_name,
+                AttributeValue::String(file.as_bytes().to_vec()),
+            );
+            // Use a StringRef so the source actually exercises
+            // DW_FORM_strp relocation (inline strings would not).
+            let producer = dwarf.strings.add(format!("producer-of-{file}"));
+            let unit = dwarf.units.get_mut(unit_id);
+            let root = unit.root();
+            unit.get_mut(root).set(
+                constants::DW_AT_producer,
+                AttributeValue::StringRef(producer),
+            );
+            let sp = unit.add(root, constants::DW_TAG_subprogram);
+            unit.get_mut(sp).set(
+                constants::DW_AT_low_pc,
+                AttributeValue::Address(Address::Constant(addr)),
+            );
+            unit.get_mut(sp)
+                .set(constants::DW_AT_high_pc, AttributeValue::Udata(len));
+
+            let mut sections = Sections::new(EndianVec::new(LittleEndian));
+            dwarf.write(&mut sections).expect("write source dwarf");
+            let mut out = Vec::new();
+            sections
+                .for_each(|id, data| {
+                    if !data.slice().is_empty() {
+                        out.push((id.name().to_string(), data.slice().to_vec()));
+                    }
+                    Ok::<(), gimli::Error>(())
+                })
+                .expect("collect");
+            out
+        };
+
+        let src_a = build_source("a.rs", 5, 0x10, 0x20);
+        let src_b = build_source("b.rs", 9, 0x40, 0x20);
+
+        let remap_for = |in_start: u32, out_start: u32| {
+            let mut remap = AddressRemap::new();
+            remap.insert(FunctionSpan {
+                input_start: in_start,
+                input_end: in_start + 0x20,
+                output_body_start: out_start,
+                output_body_end: out_start + 0x20,
+                locals_prefix_len: 0,
+                instr_offsets: InstrOffsetMap {
+                    entries: vec![InstrOffset { old: 0, new: 0 }],
+                },
+            });
+            remap
+        };
+        let set_a =
+            rewrite_debug_sections(&src_a, &remap_for(0x10, 0x100), &[]).expect("convert source a");
+        let set_b =
+            rewrite_debug_sections(&src_b, &remap_for(0x40, 0x200), &[]).expect("convert source b");
+
+        let merged =
+            concat_dwarf_section_sets(&[set_a, set_b]).expect("bounded merge must succeed");
+
+        // Re-parse the merged set.
+        let section_data = |name: &str| -> &[u8] { section_of(&merged, name) };
+        let load = |id: gimli::SectionId| -> Result<EndianSlice<'_, LittleEndian>, gimli::Error> {
+            Ok(EndianSlice::new(section_data(id.name()), LittleEndian))
+        };
+        let dwarf = gimli::Dwarf::load(load).expect("merged dwarf must load");
+
+        let mut rows_seen: Vec<(u64, String, u64)> = Vec::new();
+        let mut producers: Vec<String> = Vec::new();
+        let mut unit_count = 0;
+        let mut units = dwarf.units();
+        while let Some(header) = units.next().expect("units") {
+            unit_count += 1;
+            let unit = dwarf.unit(header).expect("merged unit must parse");
+            // DW_AT_producer goes through .debug_str — proves strp
+            // relocation for the second unit.
+            {
+                let mut entries = unit.entries();
+                if let Some((_, root)) = entries.next_dfs().expect("root") {
+                    if let Some(attr) = root.attr(constants::DW_AT_producer).expect("attr read") {
+                        if let Ok(sref) = dwarf.attr_string(&unit, attr.value()) {
+                            producers.push(String::from_utf8_lossy(sref.slice()).into_owned());
+                        }
+                    }
+                }
+            }
+            let Some(program) = unit.line_program.clone() else {
+                continue;
+            };
+            let mut rows = program.rows();
+            while let Some((hdr, row)) = rows.next_row().expect("row") {
+                if row.end_sequence() {
+                    continue;
+                }
+                let fname = row
+                    .file(hdr)
+                    .map(|f| match f.path_name() {
+                        gimli::AttributeValue::String(sl) => {
+                            String::from_utf8_lossy(sl.slice()).into_owned()
+                        }
+                        _ => String::new(),
+                    })
+                    .unwrap_or_default();
+                rows_seen.push((row.address(), fname, row.line().map_or(0, |l| l.get())));
+            }
+        }
+
+        assert_eq!(unit_count, 2, "both units survive the merge");
+        assert!(
+            rows_seen.contains(&(0x100, "a.rs".to_string(), 5)),
+            "source A resolves at its remapped address; rows: {rows_seen:?}"
+        );
+        assert!(
+            rows_seen.contains(&(0x200, "b.rs".to_string(), 9)),
+            "source B resolves at its remapped address; rows: {rows_seen:?}"
+        );
+        assert!(
+            producers.contains(&"producer-of-a.rs".to_string())
+                && producers.contains(&"producer-of-b.rs".to_string()),
+            "strp-referenced strings must survive relocation; got {producers:?}"
+        );
     }
 
     /// #144 inc 4: spans carry per-class roles and the indices stay
