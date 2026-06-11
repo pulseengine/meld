@@ -705,6 +705,116 @@ fn adapter_spans_from_parts(
         .collect()
 }
 
+/// The `<meld-adapter>` line attributed to a span, as actually emitted in
+/// the synthetic line-number program.
+///
+/// DWARF line `0` conventionally means "no source line", so it would read
+/// back as `unknown` — defeating the attribution. Increment 2 therefore
+/// emits every meld-generated range at line **1** ("meld-generated,
+/// class unspecified"). Increment 3 assigns distinct per-class lines
+/// (transcode / `cabi_realloc` / lift / lower) once the merger tags each
+/// synthetic function's class at generation time; the [`AdapterRole`]
+/// enum and [`AdapterRole::adapter_line`] are the seam that refinement
+/// will populate.
+fn emitted_adapter_line(role: AdapterRole) -> u64 {
+    match role {
+        AdapterRole::Generated => 1,
+    }
+}
+
+/// Build a fresh, synthetic DWARF unit attributing each adapter span's
+/// fused-output code range to the placeholder `<meld-adapter>` source via
+/// a line-number program, so a DWARF consumer (witness's MC/DC view,
+/// debuggers) resolves those addresses to `<meld-adapter>:N` instead of
+/// `unknown` (#144 / #130 §Phase 3). Returns the `.debug_*`
+/// `(section_name, bytes)` pairs, or `None` when there are no spans or
+/// gimli fails to serialise.
+///
+/// Addresses are output code-section-relative `Address::Constant`, the
+/// same convention [`rewrite_debug_sections`] emits for remapped original
+/// DWARF, so the synthetic unit and any remapped original units share one
+/// address space and can coexist in the fused module's `.debug_*`.
+///
+/// Each span becomes a one-row line-table sequence: a row at the body
+/// start attributing the whole body to `<meld-adapter>:1`
+/// ([`emitted_adapter_line`]), closed by `end_sequence` at the exclusive
+/// body end.
+pub fn build_adapter_dwarf(spans: &[AdapterSpan]) -> Option<Vec<(String, Vec<u8>)>> {
+    use gimli::write::{
+        Address, AttributeValue, Dwarf, EndianVec, LineProgram, LineString, Sections, Unit,
+    };
+    use gimli::{Encoding, Format, LineEncoding, LittleEndian, constants};
+
+    if spans.is_empty() {
+        return None;
+    }
+
+    let encoding = Encoding {
+        format: Format::Dwarf32,
+        version: 4,
+        address_size: 4,
+    };
+    let line_encoding = LineEncoding::default();
+
+    let comp_dir = b"<meld>".to_vec();
+    let mut line_program = LineProgram::new(
+        encoding,
+        line_encoding,
+        LineString::String(comp_dir.clone()),
+        LineString::String(ADAPTER_SOURCE_NAME.as_bytes().to_vec()),
+        None,
+    );
+    let dir_id = line_program.default_directory();
+    let file_id = line_program.add_file(
+        LineString::String(ADAPTER_SOURCE_NAME.as_bytes().to_vec()),
+        dir_id,
+        None,
+    );
+
+    for span in spans {
+        if span.output_body_end <= span.output_body_start {
+            continue;
+        }
+        line_program.begin_sequence(Some(Address::Constant(span.output_body_start as u64)));
+        {
+            let row = line_program.row();
+            row.address_offset = 0;
+            row.file = file_id;
+            row.line = emitted_adapter_line(span.role);
+            row.is_statement = true;
+        }
+        line_program.generate_row();
+        let body_len = (span.output_body_end - span.output_body_start) as u64;
+        line_program.end_sequence(body_len);
+    }
+
+    let mut dwarf = Dwarf::new();
+    let unit_id = dwarf.units.add(Unit::new(encoding, line_program));
+    let unit = dwarf.units.get_mut(unit_id);
+    let root = unit.root();
+    unit.get_mut(root).set(
+        constants::DW_AT_name,
+        AttributeValue::String(ADAPTER_SOURCE_NAME.as_bytes().to_vec()),
+    );
+    unit.get_mut(root)
+        .set(constants::DW_AT_comp_dir, AttributeValue::String(comp_dir));
+
+    let mut sections = Sections::new(EndianVec::new(LittleEndian));
+    dwarf.write(&mut sections).ok()?;
+
+    let mut out = Vec::new();
+    sections
+        .for_each(|id, data| {
+            let bytes = data.slice();
+            if !bytes.is_empty() {
+                out.push((id.name().to_string(), bytes.to_vec()));
+            }
+            Ok::<(), gimli::Error>(())
+        })
+        .ok()?;
+    Some(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1126,5 +1236,90 @@ mod tests {
                 assert!(disjoint, "adapter span overlaps source function {i}");
             }
         }
+    }
+
+    // ---- Phase 3 (#144) inc 2: synthetic DWARF emission ----
+
+    /// Oracle for inc 2: build a synthetic `<meld-adapter>` DWARF unit from
+    /// adapter spans, then re-parse it and run the line-number program —
+    /// every adapter body-start address must resolve to file
+    /// `<meld-adapter>` line 1 (non-zero, so it is not a DWARF "no line").
+    /// This exercises the full hand-built line-program write → gimli-read
+    /// round-trip, the genuinely new and fidelity-risky code path.
+    #[test]
+    fn build_adapter_dwarf_attributes_ranges_to_meld_adapter() {
+        use gimli::{EndianSlice, LittleEndian};
+
+        let spans = vec![
+            AdapterSpan {
+                output_defined_idx: 3,
+                output_body_start: 0x100,
+                output_body_end: 0x140,
+                role: AdapterRole::Generated,
+            },
+            AdapterSpan {
+                output_defined_idx: 5,
+                output_body_start: 0x200,
+                output_body_end: 0x230,
+                role: AdapterRole::Generated,
+            },
+        ];
+        let sections = build_adapter_dwarf(&spans).expect("build synthetic dwarf");
+        assert!(
+            sections.iter().any(|(n, _)| n == ".debug_line"),
+            "must emit a .debug_line section"
+        );
+
+        let section_data = |name: &str| -> &[u8] {
+            sections
+                .iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, d)| d.as_slice())
+                .unwrap_or(&[])
+        };
+        let load = |id: gimli::SectionId| -> Result<EndianSlice<'_, LittleEndian>, gimli::Error> {
+            Ok(EndianSlice::new(section_data(id.name()), LittleEndian))
+        };
+        let dwarf = gimli::Dwarf::load(load).expect("load synthetic dwarf");
+        let mut units = dwarf.units();
+        let header = units.next().expect("units iter").expect("exactly one unit");
+        let unit = dwarf.unit(header).expect("parse unit");
+        let program = unit
+            .line_program
+            .clone()
+            .expect("synthetic unit carries a line program");
+
+        let mut rows = program.rows();
+        let mut found_starts = std::collections::BTreeSet::new();
+        while let Some((hdr, row)) = rows.next_row().expect("read row") {
+            if row.end_sequence() {
+                continue;
+            }
+            let file = row.file(hdr).expect("row has a file entry");
+            let fname = match file.path_name() {
+                gimli::AttributeValue::String(s) => String::from_utf8_lossy(s.slice()).into_owned(),
+                _ => String::new(),
+            };
+            assert_eq!(
+                fname, ADAPTER_SOURCE_NAME,
+                "every adapter row must point at <meld-adapter>"
+            );
+            assert_eq!(
+                row.line().map(|l| l.get()),
+                Some(1),
+                "adapter line must be 1 (non-zero — DWARF line 0 means 'no line')"
+            );
+            found_starts.insert(row.address());
+        }
+        assert!(
+            found_starts.contains(&0x100) && found_starts.contains(&0x200),
+            "both adapter span starts must produce line rows; got {found_starts:?}"
+        );
+    }
+
+    /// No spans → no synthetic DWARF (nothing to attribute).
+    #[test]
+    fn build_adapter_dwarf_none_when_no_spans() {
+        assert!(build_adapter_dwarf(&[]).is_none());
     }
 }
