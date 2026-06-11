@@ -3061,3 +3061,53 @@ loss-scenarios:
       dwarf_passthrough multi-source policy test (real lists.wasm
       fixture: merged output parses coherently, >1 unit, file names
       from the input union only).
+
+  - id: LS-CP-6
+    title: wrapped component retains (or wrongly drops) instance imports after internalisation
+    uca: UCA-M-9
+    hazards: [H-1, H-5]
+    type: inadequate-control-algorithm
+    scenario: >
+      Fusing separate input components where A imports an interface B
+      exports internalises the call at the CORE level (resolver wires
+      it; the fused module carries no such import), but component_wrap
+      replayed the consumer's component-level import declarations
+      verbatim — the wrapped component still DEMANDED an implementation
+      of the satisfied interface, so it could not instantiate
+      standalone (#212.1, observed live: wasmtime "matching
+      implementation was not found in the linker"). The dual failure is
+      worse: dropping an import that is NOT satisfied (e.g. a WASI
+      interface still referenced by remaining core imports), or
+      mis-renumbering the surviving instance indices, silently rewires
+      every later alias to the wrong instance [H-1, H-5].
+    causal-factors:
+      - >-
+        replaying depth-0 import sections raw, with no knowledge of
+        which interfaces the resolver satisfied
+      - >-
+        dropping by name without checking the fused module's REMAINING
+        imports (would break WASI passthrough)
+      - >-
+        forgetting a consumer of the instance index space after
+        renumbering (resolution aliases; the component-instance base
+        that starts after import instances)
+    process-model-flaw: >
+      The wrap's model was "the source component's interface surface is
+      the output's interface surface" — true for exports, false for
+      imports once fusion satisfies some of them internally. The
+      output's import surface must be derived from the FUSED module's
+      remaining imports, not the source's declarations.
+    status: approved
+    priority: high
+    fix: >
+      component_wrap drops an instance import IFF its name was imported
+      by some input core module AND is absent from the fused module's
+      remaining imports (structurally: satisfied internally); survivors
+      are renumbered and the map applied at every consumer (resolution
+      aliases via a loud error on any impossible dropped-instance
+      reference; the component-instance base counts kept imports only).
+      Pinned by ls_cp_6_separate_inputs_internalise_link (the formerly
+      #[ignore]d golden-e2e acceptance: fused consumer+provider runs
+      standalone, compute()==42 ∧ greet()==7) and the full wit-bindgen
+      runtime suite (WASI imports stay declared — wrong-drop
+      regression).
