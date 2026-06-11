@@ -4,6 +4,47 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.29.0] - 2026-06-11
+
+### Added
+
+- **Cross-component stream-bridge emitter** (#141, closes #141 and the
+  #94 deliverable-A audit gap; SR-33 → implemented, LS-ST-1; PRs
+  #238/#239). When the fused module's `StreamPairGraph` is non-empty,
+  meld emits a bridge memory (slot headers + 8×4096-byte rings),
+  per-component shims for the five stream intrinsics (memory index
+  hardwired per component), and rewires intrinsic call sites to the
+  shims. Locally-minted handles (bit 31 tagged) take the in-module
+  ring — NO host crossing; foreign handles route to the retained
+  `pulseengine:async` imports; slot exhaustion degrades gracefully to
+  host streams. ADR-2 contract preserved: write returns accepted count
+  (0 = backpressure; Closed after either end drops), read returns
+  bytes (0 = EOF only after writer-drop AND drain; Pending while open
+  and empty, including zero-length probes). Five runtime oracles
+  execute fused output under wasmtime with host stubs that TRAP on
+  any tagged handle. ADR-3 amendment recorded: "zero-copy" is
+  "no host crossing, single copy" (the ABI's caller-buffer contract
+  requires the copy).
+
+### Pre-release Mythos note
+
+Tier-5 files changed since v0.28.0: `p3_bridge.rs` (new, registered
+in #238 ahead of the code per the workflow-separation constraint),
+plus merger/dwarf/lib wiring. Clean-room pass: NO PROVABLE FINDING
+across ring arithmetic, memory immediates (including a shared-memory
+PoC covering the config the oracles omit), dispatch, and the slot
+state machine; two contract suspicions (zero-length-read sentinel,
+write-after-drop) fixed defensively in-PR; the module-wide
+`stream_new` takeover is the documented static-pairing
+over-approximation, carried in SR-33.
+
+### Falsification statement
+
+Claim: a stream minted and consumed between two fused components
+never crosses the host. Refute via the trap-stub oracles in
+`tests/p3_bridge_runtime.rs` (`ls_st_1_*`): any host stream call
+with a tagged handle traps the test.
+
 ## [0.28.0] - 2026-06-11
 
 ### Added
