@@ -4,6 +4,43 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.24.0] - 2026-06-11
+
+### Added
+
+- **Per-class `<meld-adapter>` lines + FACT-adapter coverage** (#144
+  inc 4, closes #144; SR-36; PR #228). Synthetic functions are now
+  tagged at generation time (`MergedFunction::synthetic_kind`:
+  handle-table / start-wrapper / adapter-shim / task-return-shim;
+  `AdapterFunction::class`: direct / memory-copy / transcode / async)
+  and `dwarf::adapter_spans` additionally enumerates the FACT
+  trampolines appended after the merged functions — previously a
+  coverage gap that left every FACT adapter unattributed. Stable line
+  contract (`AdapterRole::adapter_line`): 1 unclassified · 2 direct ·
+  3 memory-copy · 4 transcode · 5 async · 6 handle-table · 7 start-
+  wrapper · 8 adapter-shim · 9 task-return-shim. Granularity
+  correction vs #130's sketch recorded in SR-36 (meld emits ONE fused
+  trampoline per call site, so the class unit is the trampoline kind).
+- Multi-DWARF-source fusion under `Remap` still emits the synthetic
+  adapter unit (no source addresses involved); the policy test now
+  pins "no SOURCE DWARF leaks" rather than total strip.
+
+### Pre-release Mythos note
+
+Tier-5 files changed since v0.23.0: `merger.rs`, `adapter/mod.rs`,
+`adapter/fact.rs` (PR #228 — additive classification fields).
+Clean-room pass: NO PROVABLE FINDING across five falsification
+attempts incl. an adversarial index-alignment PoC on the SR-12
+cross-memory fixture; report on the PR, `mythos-pass-done` applied.
+
+### Falsification statement
+
+Claim: each adapter class resolves to its distinct documented
+`<meld-adapter>` line, including FACT trampolines at appended output
+indices. Refute via `per_class_spans_round_trip_to_distinct_lines`,
+`adapter_lines_are_distinct_and_nonzero`, or the upgraded
+`ls_d_2_generated_start_wrapper_is_attributed_to_meld_adapter`.
+
 ## [0.23.0] - 2026-06-11
 
 ### Added
