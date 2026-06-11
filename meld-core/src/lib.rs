@@ -2684,4 +2684,137 @@ mod tests {
             result
         );
     }
+
+    /// LS-R-13: the stream-cycle detector must not exhaust the call
+    /// stack on a deep linear chain. Re-pins, at lib scope where the LS
+    /// verification gate discovers it, what
+    /// `p3_stream::tests::deep_linear_chain_does_not_overflow_stack`
+    /// pins module-internally: a 50 000-component producer→consumer
+    /// chain (deep enough to overflow the default 8 MB thread stack
+    /// under a recursive Tarjan, which both the first draft and
+    /// petgraph 0.8's tarjan_scc were) is validated without a stack
+    /// overflow and without flagging a spurious cycle. Built entirely
+    /// through the public `p3_stream` API.
+    #[test]
+    fn ls_r_13_deep_linear_chain_does_not_overflow_stack() {
+        use crate::p3_stream::{
+            StreamElement, StreamEndpoint, StreamMemoryMode, StreamPair, StreamPairGraph,
+            StreamRole, cycle_issues_from_pairs,
+        };
+
+        let n = 50_000usize;
+        let mut pairs = Vec::with_capacity(n - 1);
+        for i in 0..(n - 1) {
+            pairs.push(StreamPair {
+                producer: StreamEndpoint {
+                    component: i,
+                    role: StreamRole::Producer,
+                },
+                consumer: StreamEndpoint {
+                    component: i + 1,
+                    role: StreamRole::Consumer,
+                },
+                element: StreamElement::Typed("U8".to_string()),
+                mode: StreamMemoryMode::CrossMemory,
+            });
+        }
+        let graph = StreamPairGraph { pairs };
+        let issues = cycle_issues_from_pairs(&graph);
+        assert!(
+            issues.is_empty(),
+            "linear chain of {n} components must not flag a cycle; got {issues:?}"
+        );
+    }
+
+    /// LS-M-6: the `component-provenance` custom section must be
+    /// present in fused output under the default config (provenance and
+    /// attestation both enabled). The full round-trip/attribution
+    /// oracle lives in tests/component_provenance.rs (an integration
+    /// test, invisible to the LS verification gate's lib scan); this
+    /// lib-scope test pins the minimal contract: fuse two trivial
+    /// components and assert exactly one section named
+    /// `provenance::SECTION_NAME` exists with a non-empty payload.
+    #[test]
+    fn ls_m_6_provenance_section_present_in_fused_output() {
+        use wasm_encoder::{
+            CodeSection, Component, ExportKind, ExportSection, Function, FunctionSection,
+            Instruction, MemorySection, MemoryType, Module as EncoderModule, ModuleSection,
+            TypeSection,
+        };
+
+        /// Minimal valid component: one core module with one function
+        /// returning a constant, one exported memory.
+        fn build_trivial_component(func_export: &str, value: i32) -> Vec<u8> {
+            let mut types = TypeSection::new();
+            types.ty().function([], [wasm_encoder::ValType::I32]);
+
+            let mut functions = FunctionSection::new();
+            functions.function(0);
+
+            let mut memory = MemorySection::new();
+            memory.memory(MemoryType {
+                minimum: 1,
+                maximum: None,
+                memory64: false,
+                shared: false,
+                page_size_log2: None,
+            });
+
+            let mut exports = ExportSection::new();
+            exports.export(func_export, ExportKind::Func, 0);
+            exports.export("memory", ExportKind::Memory, 0);
+
+            let mut code = CodeSection::new();
+            let mut func = Function::new([]);
+            func.instruction(&Instruction::I32Const(value));
+            func.instruction(&Instruction::End);
+            code.function(&func);
+
+            let mut module = EncoderModule::new();
+            module
+                .section(&types)
+                .section(&functions)
+                .section(&memory)
+                .section(&exports)
+                .section(&code);
+
+            let mut component = Component::new();
+            component.section(&ModuleSection(&module));
+            component.finish()
+        }
+
+        // Default config: component_provenance = true, attestation = true.
+        let config = FuserConfig::default();
+        assert!(config.component_provenance && config.attestation);
+
+        let mut fuser = Fuser::new(config);
+        fuser
+            .add_component_named(&build_trivial_component("run-a", 1), Some("comp-a"))
+            .expect("add component a");
+        fuser
+            .add_component_named(&build_trivial_component("run-b", 2), Some("comp-b"))
+            .expect("add component b");
+        let output = fuser.fuse().expect("fuse");
+
+        let mut provenance_payloads: Vec<&[u8]> = Vec::new();
+        for payload in wasmparser::Parser::new(0).parse_all(&output) {
+            if let wasmparser::Payload::CustomSection(reader) =
+                payload.expect("fused output must parse")
+                && reader.name() == provenance::SECTION_NAME
+            {
+                provenance_payloads.push(reader.data());
+            }
+        }
+        assert_eq!(
+            provenance_payloads.len(),
+            1,
+            "fused output must carry exactly one `{}` custom section (LS-M-6)",
+            provenance::SECTION_NAME
+        );
+        assert!(
+            !provenance_payloads[0].is_empty(),
+            "`{}` section payload must not be empty",
+            provenance::SECTION_NAME
+        );
+    }
 }
