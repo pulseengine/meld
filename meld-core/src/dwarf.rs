@@ -1820,12 +1820,11 @@ mod tests {
             // relocation for the second unit.
             {
                 let mut entries = unit.entries();
-                if let Some((_, root)) = entries.next_dfs().expect("root") {
-                    if let Some(attr) = root.attr(constants::DW_AT_producer).expect("attr read") {
-                        if let Ok(sref) = dwarf.attr_string(&unit, attr.value()) {
-                            producers.push(String::from_utf8_lossy(sref.slice()).into_owned());
-                        }
-                    }
+                if let Some((_, root)) = entries.next_dfs().expect("root")
+                    && let Some(attr) = root.attr(constants::DW_AT_producer).expect("attr read")
+                    && let Ok(sref) = dwarf.attr_string(&unit, attr.value())
+                {
+                    producers.push(String::from_utf8_lossy(sref.slice()).into_owned());
                 }
             }
             let Some(program) = unit.line_program.clone() else {

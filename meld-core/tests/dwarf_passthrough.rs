@@ -470,10 +470,10 @@ fn remap_policy_falls_back_to_strip_on_multi_dwarf_source() {
             if row.end_sequence() {
                 continue;
             }
-            if let Some(f) = row.file(hdr) {
-                if let gimli::AttributeValue::String(sl) = f.path_name() {
-                    files_seen.insert(String::from_utf8_lossy(sl.slice()).into_owned());
-                }
+            if let Some(f) = row.file(hdr)
+                && let gimli::AttributeValue::String(sl) = f.path_name()
+            {
+                files_seen.insert(String::from_utf8_lossy(sl.slice()).into_owned());
             }
         }
     }
