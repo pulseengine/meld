@@ -46,6 +46,7 @@
 //! - **Shared memory**: All components share one memory. Broken when
 //!   any component uses `memory.grow`.
 
+pub mod abi_proofs;
 pub mod adapter;
 pub mod attestation;
 pub mod component_wrap;

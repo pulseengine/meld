@@ -978,3 +978,50 @@ artifacts:
         golden equivalence). The full wit-bindgen runtime suite guards
         the dual failure (WASI imports must remain declared).
       milestone: v0.28.0
+
+  - id: SR-40
+    type: requirement
+    title: Machine-checked Canonical-ABI layout invariants (Kani)
+    description: >
+      The canonical-ABI layout functions shall carry machine-checked
+      proofs of the invariants the code already claims: element size is
+      a positive multiple of alignment with alignment a power of two
+      <= 8 (leaves, single-level containers, and padded aggregates);
+      flags<N> follows the spec storage classes for all N <= 64
+      (exhaustive); total_flat_params is panic-free and monotone
+      (LS-P-9); and the #141 stream-bridge ring-cursor arithmetic
+      preserves fill <= CAP inductively under u32 wraparound with both
+      wrapping-copy segments in-bounds (model proof, parameters
+      compile-tied to the emitter's constants).
+    status: implemented
+    tags: [roadmap, proofs, v0.30.0]
+    links:
+      - type: derives-from
+        target: "#218"
+      - type: tracked-by
+        target: "#218"
+    fields:
+      implementation:
+        - meld-core/src/abi_proofs.rs
+      verification-method: proof
+      verification-description: >
+        Three Kani harnesses in abi_proofs.rs, each VERIFICATION
+        SUCCESSFUL locally on 2026-06-11 via `cargo kani --harness
+        <name>` (smithy runners do not ship the Kani toolchain; CI
+        wiring is follow-up): flags_layout_matches_spec (LS-A-20
+        storage classes at every boundary N in {1,8,9,16,17,32,33,64}),
+        total_flat_params_saturating_monotone (LS-P-9), and
+        ring_cursor_invariant_inductive (#141 bridge cursor math under
+        u32 wraparound, model compile-tied to the emitter's constants;
+        the codegen itself is pinned by the runtime trap-stub oracles).
+        HONEST SCOPE CUTS recorded in-module: nondet leaf/container and
+        aggregate-padding harnesses for the size-multiple-of-align
+        contract do not converge in CBMC against the current
+        ParsedComponent shape (heap-state explosion) — that contract
+        stays pinned by the exhaustive unit tests
+        (test_canonical_abi_element_size_*, test_sr17_alignment_*);
+        a Kani proof becomes tractable once the layout core is
+        factored allocation-free. Scope note: the Rocq side carries
+        286 closed proofs (proofs/STATUS.md); these harnesses target
+        the parser-layer gap STATUS.md marks as placeholder.
+      milestone: v0.30.0
