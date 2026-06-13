@@ -3031,6 +3031,63 @@ loss-scenarios:
       output that validates without multi-memory and behaves
       correctly at runtime (B's data at its rebased base).
 
+  - id: LS-M-8
+    title: Element/data segment index operands not relocated during fusion
+    uca: UCA-M-1
+    hazards: [H-1, H-3]
+    type: inadequate-control-algorithm
+    scenario: >
+      The rewriter relocated function/type/global/table/memory index
+      operands but passed element/data SEGMENT index operands through
+      verbatim in `memory.init` / `data.drop` / `table.init` /
+      `elem.drop` — and `IndexMaps` carried no segment maps at all. The
+      merger, however, concatenates every module's passive segments into
+      one shared section (merge order), so module B's segment 0 becomes
+      ordinal 1 in the fused module. B's `memory.init … data_index:0`
+      therefore reads module A's segment. End-to-end reproduced: a fused
+      two-module component validated and RAN, but `probe_b` read
+      0xAAAAAAAA (A's data) instead of 0xBBBBBBBB — silent
+      semantic divergence [H-1 behaves differently from the composed
+      input / H-3 wrong-entity reference]. For an out-of-range stale
+      index it instead yields an invalid module (downstream
+      parse/validate failure). Reachable for any fusion where a
+      non-first module uses bulk-memory/table segment-index
+      instructions. Surfaced by a Mythos discovery pass on rewriter.rs.
+    causal-factors:
+      - >-
+        IndexMaps had no element/data segment index space; the four
+        segment-index-bearing ops copied their operand unchanged
+      - >-
+        These ops were explicitly handled (so they looked correct) but
+        incompletely — only their memory/table index was remapped, not
+        the segment index
+      - >-
+        No test exercised a passive segment instruction in a
+        non-first merged module (the only place the ordinal shifts)
+    process-model-flaw: >
+      The relocation model enumerated the "entity" index spaces
+      (functions, types, globals, tables, memories) but omitted the
+      element/data segment ordinal spaces, which the merger likewise
+      concatenates and therefore must also be relocated.
+    status: approved
+    priority: high
+    fix: >
+      IndexMaps gains `data_segments`/`elements` maps (+ identity-default
+      remap_data_segment/remap_elem mirroring remap_func). merge_core_module
+      captures the segment base (= count of prior modules' segments,
+      before this module's are appended — same timing as func_offset, the
+      sole deterministic append site) and populates local→base+local;
+      the base is recorded in MergedModule.segment_bases so the four
+      post-merge re-rewrite callers use the correct base (they re-parse
+      original module bytes with a fresh IndexMaps, so segment indices are
+      remapped exactly once — Mythos-verified, no double-remap). The
+      rewriter remaps elem_index (TableInit/ElemDrop) and data_index
+      (DataDrop, rewrite_memory_init). Pinned by tests/segidx_remap.rs:
+      two-module data + element distinct-segment round-trips (each probe
+      reads its OWN segment), a three-module base-offset>1 case, and a
+      single-module identity case; the multi-module cases fail on
+      pre-fix code (non-vacuity confirmed).
+
   - id: LS-D-1
     title: remapped DWARF emits a wrong code address for a fused function
     uca: UCA-M-9
