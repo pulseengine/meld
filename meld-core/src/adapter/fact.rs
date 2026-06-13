@@ -3070,6 +3070,12 @@ impl FactStyleGenerator {
                 self.emit_latin1_to_utf8_transcode(&mut func, param_count, target_func, options);
             }
 
+            (StringEncoding::Latin1, StringEncoding::Utf16) => {
+                // #253 inc 2: Latin-1 to UTF-16 is total and unambiguous — each
+                // byte 0x00–0xFF zero-extends to one code unit U+0000–U+00FF.
+                self.emit_latin1_to_utf16_transcode(&mut func, param_count, target_func, options);
+            }
+
             (caller_enc, callee_enc) if caller_enc == callee_enc => {
                 // Same encoding (e.g. Utf16→Utf16, Latin1→Latin1): no
                 // transcoding needed, a verbatim copy is correct.
@@ -4259,6 +4265,144 @@ impl FactStyleGenerator {
         func.instruction(&Instruction::LocalGet(out_ptr_local));
         func.instruction(&Instruction::LocalGet(dst_idx_local));
         // Pass remaining params through
+        for i in 2..param_count {
+            func.instruction(&Instruction::LocalGet(i as u32));
+        }
+        func.instruction(&Instruction::Call(target_func));
+    }
+
+    /// Emit Latin-1 to UTF-16 transcoding (#253 increment 2).
+    ///
+    /// This direction is **total and unambiguous**: every Latin-1 byte
+    /// 0x00–0xFF maps to exactly one UTF-16 code unit U+0000–U+00FF by
+    /// zero-extension. There are no surrogates, no multi-unit forms, and no
+    /// malformed inputs to reject — a u8 load is already the final code unit.
+    /// The UTF-16 code-unit count therefore equals the Latin-1 byte count
+    /// (1:1), and the output buffer is exactly `2 * byte_len` bytes.
+    ///
+    /// Assumes params start with (ptr: i32, byte_len: i32) where byte_len is
+    /// the Latin-1 byte count (== char count). Calls target with
+    /// (out_ptr: i32, code_unit_count: i32, ...rest); code_unit_count ==
+    /// byte_len.
+    fn emit_latin1_to_utf16_transcode(
+        &self,
+        func: &mut Function,
+        param_count: usize,
+        target_func: u32,
+        options: &AdapterOptions,
+    ) {
+        let callee_realloc = match options.callee_realloc {
+            Some(idx) => idx,
+            None => {
+                // No realloc available — fall back to direct call.
+                log::warn!(
+                    "Latin-1→UTF-16 transcode: no callee realloc, falling back to direct call"
+                );
+                for i in 0..param_count {
+                    func.instruction(&Instruction::LocalGet(i as u32));
+                }
+                func.instruction(&Instruction::Call(target_func));
+                return;
+            }
+        };
+
+        // Scratch locals start after the function's original params:
+        //   param_count+0 = src_idx (also the destination code-unit index, 1:1)
+        //   param_count+1 = out_ptr
+        //   param_count+2 = byte
+        // Stays within the shared scratch-local budget (param_count+0..+5).
+        let src_idx_local = param_count as u32;
+        let out_ptr_local = param_count as u32 + 1;
+        let byte_local = param_count as u32 + 2;
+
+        // Source reads (Latin-1, 1 byte) use caller_memory; destination writes
+        // (UTF-16, 2 bytes per code unit) use callee_memory.
+        let src_mem = wasm_encoder::MemArg {
+            offset: 0,
+            align: 0,
+            memory_index: options.caller_memory,
+        };
+        let dst_mem16 = wasm_encoder::MemArg {
+            offset: 0,
+            align: 1,
+            memory_index: options.callee_memory,
+        };
+
+        // Step 1: Allocate output buffer = 2 * byte_len via cabi_realloc (each
+        // Latin-1 byte produces exactly one UTF-16 code unit = 2 bytes). See
+        // LS-A-7: guard against i32.mul wrap (leg a) and cabi_realloc OOM
+        // (leg b) before writing into callee memory.
+        let callee_align = alignment_for_encoding(options.callee_string_encoding);
+        func.instruction(&Instruction::LocalGet(1)); // byte_len
+        func.instruction(&Instruction::I32Const((u32::MAX / 2) as i32));
+        func.instruction(&Instruction::I32GtU);
+        func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+        func.instruction(&Instruction::Unreachable);
+        func.instruction(&Instruction::End);
+
+        func.instruction(&Instruction::I32Const(0)); // original_ptr
+        func.instruction(&Instruction::I32Const(0)); // original_size
+        func.instruction(&Instruction::I32Const(callee_align)); // alignment
+        func.instruction(&Instruction::LocalGet(1)); // byte_len
+        func.instruction(&Instruction::I32Const(2));
+        func.instruction(&Instruction::I32Mul); // alloc_size = 2 * byte_len
+        func.instruction(&Instruction::Call(callee_realloc));
+        func.instruction(&Instruction::LocalSet(out_ptr_local));
+
+        // Trap on null return from cabi_realloc (LS-A-7 leg b).
+        func.instruction(&Instruction::LocalGet(out_ptr_local));
+        func.instruction(&Instruction::I32Eqz);
+        func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+        func.instruction(&Instruction::Unreachable);
+        func.instruction(&Instruction::End);
+
+        // Step 2: Initialize loop counter.
+        func.instruction(&Instruction::I32Const(0));
+        func.instruction(&Instruction::LocalSet(src_idx_local));
+
+        // Step 3: Transcoding loop over each source byte.
+        func.instruction(&Instruction::Block(wasm_encoder::BlockType::Empty));
+        func.instruction(&Instruction::Loop(wasm_encoder::BlockType::Empty));
+
+        // if src_idx >= byte_len, break
+        func.instruction(&Instruction::LocalGet(src_idx_local));
+        func.instruction(&Instruction::LocalGet(1)); // byte_len
+        func.instruction(&Instruction::I32GeU);
+        func.instruction(&Instruction::BrIf(1)); // br to outer block (done)
+
+        // Read byte from source: memory[string_ptr + src_idx].
+        // A u8 load is already zero-extended, so it IS the UTF-16 code unit.
+        func.instruction(&Instruction::LocalGet(0)); // string_ptr
+        func.instruction(&Instruction::LocalGet(src_idx_local));
+        func.instruction(&Instruction::I32Add);
+        func.instruction(&Instruction::I32Load8U(src_mem));
+        func.instruction(&Instruction::LocalSet(byte_local));
+
+        // Store as a 16-bit code unit: out[src_idx * 2] = byte.
+        func.instruction(&Instruction::LocalGet(out_ptr_local));
+        func.instruction(&Instruction::LocalGet(src_idx_local));
+        func.instruction(&Instruction::I32Const(1));
+        func.instruction(&Instruction::I32Shl); // src_idx * 2
+        func.instruction(&Instruction::I32Add);
+        func.instruction(&Instruction::LocalGet(byte_local));
+        func.instruction(&Instruction::I32Store16(dst_mem16));
+
+        // src_idx += 1
+        func.instruction(&Instruction::LocalGet(src_idx_local));
+        func.instruction(&Instruction::I32Const(1));
+        func.instruction(&Instruction::I32Add);
+        func.instruction(&Instruction::LocalSet(src_idx_local));
+
+        // Continue loop
+        func.instruction(&Instruction::Br(0));
+
+        func.instruction(&Instruction::End); // end loop
+        func.instruction(&Instruction::End); // end block
+
+        // Step 4: Call target with (out_ptr, code_unit_count, ...rest params).
+        // code_unit_count == byte_len (1:1 Latin-1 byte → UTF-16 code unit).
+        func.instruction(&Instruction::LocalGet(out_ptr_local));
+        func.instruction(&Instruction::LocalGet(1)); // byte_len == code_unit_count
         for i in 2..param_count {
             func.instruction(&Instruction::LocalGet(i as u32));
         }
