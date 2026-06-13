@@ -2565,6 +2565,72 @@ loss-scenarios:
       parser.rs::convert_ref_type (used for value/global types) is a
       related latent gap, out of scope for this segments.rs fix.
 
+  - id: LS-A-22
+    title: Reference-type collapse in value/table/global types — concrete/GC refs flattened to funcref through fusion
+    uca: UCA-M-4
+    hazards: [H-3]
+    type: inadequate-control-algorithm
+    scenario: >
+      `parser.rs::convert_ref_type` (the value-type sibling of the
+      LS-A-21 element-segment bug) collapsed every reference type with
+      `if is_func_ref() { funcref } else if is_extern_ref() { externref }
+      else { funcref }`, dropping concrete typed function references
+      `(ref null $t)` / `(ref $t)` and GC abstract heap types — and the
+      final `else` defaulted unknown ref types to FUNCREF. This fed
+      table element types (CoreModule.tables[].element_type), func-type
+      signatures (params/results), and global content types. Because
+      neither table emission (`convert_table_type`), the func-type
+      build, nor global emission (`convert_global_type`) remapped
+      concrete heap-type indices, the merged output's tables / signatures
+      / globals carried the WRONG type (funcref instead of the concrete
+      typed ref). Runtime-PoC-confirmed: fusing a core module with
+      `(table 1 (ref null $ft))` produced an output table of element type
+      `funcref` (the concrete typed-func-ref lost). The output often
+      still VALIDATES (silent type weakening / H-3 type confusion rather
+      than an invalid module), but a module that USES the typed-ref table
+      with concrete-type operations (`call_indirect (type $ft)`,
+      `table.get` expecting `(ref $ft)`) hits a type mismatch or semantic
+      divergence. Surfaced as the value-type sibling while fixing the
+      element-segment case (LS-A-21 / #257); filed as #258.
+    causal-factors:
+      - >-
+        parser.rs::convert_ref_type bucketed to funcref/externref with an
+        else→funcref default, discarding concrete index + GC heap type
+      - >-
+        merger table/func-type/global emission applied no concrete
+        heap-type index remap, so even a faithful parse left stale indices
+        after the merge renumbered types
+      - >-
+        no test exercised a typed-ref/GC table, signature, or global —
+        all fixtures used funcref/externref
+    process-model-flaw: >
+      Same pre-GC/pre-typed-refs assumption as LS-A-21, but for the
+      value-type/table/global path: reference types were assumed to be
+      funcref-or-externref, while meld's default feature set enables
+      typed function references and GC, whose concrete/abstract heap
+      types must be preserved and index-remapped.
+    status: approved
+    priority: high
+    fix: >
+      parser.rs::convert_ref_type now converts faithfully (nullability +
+      abstract heap type via convert_abstract_heap_type + concrete module
+      index), mirroring segments.rs (#257). merger.rs remaps concrete
+      heap-type indices when emitting tables (convert_table_type),
+      func-type signatures (a two-pass build so same-module forward
+      references resolve), and globals (convert_global_type), via
+      type_index_map keyed by (comp_idx, mod_idx, old_idx) — disjoint
+      from the existing const-expr-operand remap (convert_const_expr
+      RefNull arm), so no index is remapped twice (Mythos-verified with a
+      global whose declared type and ref.null init both carry a concrete
+      index — each remapped exactly once). Pinned by the runtime matrix
+      tests/reftype_fidelity.rs: typed-ref table preserved, typed-ref
+      table used by call_indirect validates, a two-component fusion where
+      each table's concrete index resolves to its correct distinct
+      signature (proves the remap lands on the right type, not merely a
+      valid one), a GC abstract global preserved, a concrete-ref
+      func-signature param preserved, and a plain-funcref regression
+      control. Closes #258.
+
   - id: LS-A-12
     title: uses_stackful_lift mis-classifies mixed-mode components
     uca: UCA-A-3
