@@ -190,6 +190,7 @@ verification-status:
     tests:
       - adapter_safety::test_sr17_utf8_to_utf16_string_transcoding
       - adapter_safety::test_sr17_utf8_to_utf16_supplementary_plane_transcoding
+      - adapter_safety::test_sr17_utf16_to_utf8_supplementary_plane_transcoding
       - resolver::tests::test_sr17_all_encoding_pairs_transcoding_matrix
     proofs: []
     status: verified
@@ -201,10 +202,11 @@ verification-status:
       and asserts the received code units are [0x0041, 0xD83D, 0xDE00]
       (correct surrogate pair), executed under wasmtime. Combined with
       the ASCII round-trip and the resolver transcoding-requirement
-      matrix, SR-17 is verified. Narrowed carried gap: the UTF-16→UTF-8
-      reverse direction and lone-surrogate U+FFFD substitution are
-      covered structurally (LS-P-16) but lack a non-BMP runtime
-      round-trip — desirable, not blocking.
+      matrix, SR-17 is verified. Both transcode directions now have non-BMP runtime oracles
+      (forward #244, reverse via build_caller_utf16_lowering_component,
+      which also pins #245). Residual: lone-surrogate U+FFFD
+      substitution is covered structurally (LS-P-16) without a runtime
+      assertion — desirable, not blocking.
 
   SR-18:
     implementation-files: [meld-core/src/adapter/fact.rs]
