@@ -2461,3 +2461,67 @@ fn test_sr17_utf16_to_utf8_supplementary_plane_transcoding() {
          mis-handles the supplementary-plane code point."
     );
 }
+
+/// LS-P-16 (runtime): a **lone high surrogate at end of input** must be
+/// lossily replaced with U+FFFD during UTF-16 → UTF-8 transcoding, not
+/// trapped (the pre-v0.11 behaviour) and not read past the buffer (the
+/// 2-byte OOB this scenario originally guarded). Until now LS-P-16 was
+/// covered only structurally; this is its first executing oracle, reusing
+/// the UTF-16-lowering caller landed with #246.
+///
+/// Input UTF-16 code units [0x0041, 0xD800]: 'A' then a high surrogate
+/// with no following low surrogate (it is the last unit). The transcoder
+/// must emit 'A' (0x41) then U+FFFD (UTF-8 `EF BF BD`). The callee sums
+/// received UTF-8 bytes: 0x41 + 0xEF + 0xBF + 0xBD = 65 + 239 + 191 + 189
+/// = 684. A trap or OOB read would not return 684.
+#[test]
+fn test_sr17_utf16_to_utf8_lone_high_surrogate_replacement() {
+    let callee = build_callee_string_component(); // UTF-8 lift, sums bytes
+    let caller = build_caller_utf16_lowering_component(&[0x0041, 0xD800]);
+
+    let config = FuserConfig {
+        memory_strategy: MemoryStrategy::MultiMemory,
+        attestation: false,
+        component_provenance: false,
+        address_rebasing: false,
+        preserve_names: false,
+        custom_sections: meld_core::CustomSectionHandling::Drop,
+        dwarf_handling: meld_core::DwarfHandling::Strip,
+        output_format: meld_core::OutputFormat::CoreModule,
+        opaque_resources: Vec::new(),
+    };
+
+    let mut fuser = Fuser::new(config);
+    fuser
+        .add_component_named(&callee, Some("callee-utf8"))
+        .expect("callee component should parse");
+    fuser
+        .add_component_named(&caller, Some("caller-utf16"))
+        .expect("caller component should parse");
+
+    let (fused, _stats) = fuser.fuse_with_stats().expect("fusion should succeed");
+
+    let mut validator = wasmparser::Validator::new();
+    validator
+        .validate_all(&fused)
+        .expect("LS-P-16: fused output should validate");
+
+    let mut engine_config = Config::new();
+    engine_config.wasm_multi_memory(true);
+    let engine = Engine::new(&engine_config).unwrap();
+    let module = RuntimeModule::new(&engine, &fused).unwrap();
+    let mut store = Store::new(&engine, ());
+    let instance = Instance::new(&mut store, &module, &[]).unwrap();
+
+    let run = instance
+        .get_typed_func::<(), i32>(&mut store, "run")
+        .expect("LS-P-16: fused module should export 'run'");
+    let result = run.call(&mut store, ()).unwrap();
+
+    assert_eq!(
+        result, 684,
+        "LS-P-16: a lone trailing high surrogate [.., 0xD800] must become \
+         U+FFFD (UTF-8 EF BF BD), so 'A' + U+FFFD sums to 684. A trap, OOB \
+         read, or a wrong replacement would not produce 684."
+    );
+}

@@ -191,22 +191,26 @@ verification-status:
       - adapter_safety::test_sr17_utf8_to_utf16_string_transcoding
       - adapter_safety::test_sr17_utf8_to_utf16_supplementary_plane_transcoding
       - adapter_safety::test_sr17_utf16_to_utf8_supplementary_plane_transcoding
+      - adapter_safety::test_sr17_utf16_to_utf8_lone_high_surrogate_replacement
       - resolver::tests::test_sr17_all_encoding_pairs_transcoding_matrix
     proofs: []
     status: verified
     note: >-
-      Refreshed 2026-06-13: the non-BMP / surrogate-pair clause is now
-      covered by a runtime oracle —
-      test_sr17_utf8_to_utf16_supplementary_plane_transcoding fuses a
-      UTF-8 caller passing "A😀" (U+0041 + U+1F600) into a UTF-16 callee
-      and asserts the received code units are [0x0041, 0xD83D, 0xDE00]
-      (correct surrogate pair), executed under wasmtime. Combined with
-      the ASCII round-trip and the resolver transcoding-requirement
-      matrix, SR-17 is verified. Both transcode directions now have non-BMP runtime oracles
-      (forward #244, reverse via build_caller_utf16_lowering_component,
-      which also pins #245). Residual: lone-surrogate U+FFFD
-      substitution is covered structurally (LS-P-16) without a runtime
-      assertion — desirable, not blocking.
+      Refreshed 2026-06-13: both transcode directions now have non-BMP
+      runtime oracles executed under wasmtime —
+      test_sr17_utf8_to_utf16_supplementary_plane_transcoding (forward,
+      "A😀" → code units [0x0041, 0xD83D, 0xDE00], #244) and
+      test_sr17_utf16_to_utf8_supplementary_plane_transcoding (reverse,
+      surrogate pair → UTF-8 [F0 9F 98 80], #246, which also pins #245)
+      — plus the ASCII round-trip and the resolver transcoding-
+      requirement matrix. The LS-P-16 lone-surrogate path now also has
+      a runtime assertion
+      (test_sr17_utf16_to_utf8_lone_high_surrogate_replacement: a lone
+      trailing high surrogate → U+FFFD, byte sum 684). SR-17 verified.
+      Residual: the MID-string lone surrogate (high surrogate followed
+      by a non-low unit) relies on the end-of-input guard — only the
+      end-of-input lone surrogate has a defined U+FFFD path (recorded
+      in LS-P-16).
 
   SR-18:
     implementation-files: [meld-core/src/adapter/fact.rs]
