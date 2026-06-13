@@ -2589,3 +2589,87 @@ fn test_sr17_utf16_to_utf8_midstring_lone_surrogate_replacement() {
          code point from the unvalidated second unit)."
     );
 }
+
+/// Comprehensive malformed-UTF-16 matrix for UTF-16 → UTF-8 transcoding
+/// (#249): every unpaired surrogate, at every position, must become U+FFFD
+/// (UTF-8 `EF BF BD`, byte sum 619), and valid pairs must still decode.
+/// The callee sums received UTF-8 bytes; expected sums are hand-computed
+/// from: U+FFFD=619, 'A'=0x41=65, 'B'=0x42=66, U+1F600 → `F0 9F 98 80`=679.
+///
+/// This closes the lone-LOW-surrogate gap (#249, surfaced by PR #248's
+/// Mythos pass) alongside the lone-HIGH cases fixed in v0.11 / #248, and
+/// pins the whole class so a regression in any single arm is caught.
+#[test]
+fn test_sr17_utf16_to_utf8_malformed_surrogate_matrix() {
+    // (input UTF-16 code units, expected callee byte-sum, label)
+    let cases: &[(&[u16], i32, &str)] = &[
+        (&[0xDC00, 0x0041], 684, "leading lone low → FFFD + A"),
+        (&[0x0041, 0xDC00], 684, "trailing lone low → A + FFFD"),
+        (
+            &[0x0041, 0xDC00, 0x0042],
+            750,
+            "mid lone low → A + FFFD + B",
+        ),
+        (
+            &[0xDC00, 0xDC00],
+            1238,
+            "consecutive lone lows → FFFD + FFFD",
+        ),
+        (&[0xDFFF], 619, "last low surrogate value alone → FFFD"),
+        (&[0xD83D, 0xDE00], 679, "valid pair U+1F600 still decodes"),
+        (
+            &[0xDC00, 0xD83D, 0xDE00],
+            1298,
+            "lone low then valid pair → FFFD + U+1F600",
+        ),
+        (
+            &[0xD800, 0xD800, 0x0041],
+            1303,
+            "consecutive lone highs → FFFD + FFFD + A",
+        ),
+    ];
+
+    for (units, expected, label) in cases {
+        let callee = build_callee_string_component();
+        let caller = build_caller_utf16_lowering_component(units);
+        let config = FuserConfig {
+            memory_strategy: MemoryStrategy::MultiMemory,
+            attestation: false,
+            component_provenance: false,
+            address_rebasing: false,
+            preserve_names: false,
+            custom_sections: meld_core::CustomSectionHandling::Drop,
+            dwarf_handling: meld_core::DwarfHandling::Strip,
+            output_format: meld_core::OutputFormat::CoreModule,
+            opaque_resources: Vec::new(),
+        };
+        let mut fuser = Fuser::new(config);
+        fuser
+            .add_component_named(&callee, Some("callee-utf8"))
+            .expect("callee parse");
+        fuser
+            .add_component_named(&caller, Some("caller-utf16"))
+            .expect("caller parse");
+        let (fused, _) = fuser.fuse_with_stats().expect("fusion");
+
+        let mut validator = wasmparser::Validator::new();
+        validator
+            .validate_all(&fused)
+            .unwrap_or_else(|e| panic!("#249 [{label}]: output must validate: {e}"));
+
+        let mut ec = Config::new();
+        ec.wasm_multi_memory(true);
+        let engine = Engine::new(&ec).unwrap();
+        let module = RuntimeModule::new(&engine, &fused).unwrap();
+        let mut store = Store::new(&engine, ());
+        let instance = Instance::new(&mut store, &module, &[]).unwrap();
+        let run = instance
+            .get_typed_func::<(), i32>(&mut store, "run")
+            .unwrap();
+        let result = run.call(&mut store, ()).unwrap();
+        assert_eq!(
+            result, *expected,
+            "#249 [{label}]: input {units:#06x?} expected byte-sum {expected}, got {result}"
+        );
+    }
+}
