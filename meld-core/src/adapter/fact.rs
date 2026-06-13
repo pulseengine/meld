@@ -3721,9 +3721,34 @@ impl FactStyleGenerator {
         }
         func.instruction(&Instruction::Else);
         {
-            // BMP character: code_point = cu
+            // Not a high surrogate. A lone LOW surrogate (cu in
+            // [0xDC00, 0xE000)) cannot legitimately appear unpaired here —
+            // the high-surrogate arm above consumes both halves of every
+            // valid pair, so any low surrogate reaching this branch is
+            // malformed input. Replace it with U+FFFD per the Canonical
+            // ABI (#249) rather than emitting the malformed 3-byte UTF-8 of
+            // a surrogate code point (ED B0 80 .. ED BF BF). Any other unit
+            // is a genuine BMP scalar value, encoded directly. Either way
+            // exactly one code unit is consumed.
+            // cp = is_low_surrogate(cu) ? 0xFFFD : cu
             func.instruction(&Instruction::LocalGet(cu_local));
-            func.instruction(&Instruction::LocalSet(cp_local));
+            func.instruction(&Instruction::I32Const(0xDC00_u32 as i32));
+            func.instruction(&Instruction::I32GeU);
+            func.instruction(&Instruction::LocalGet(cu_local));
+            func.instruction(&Instruction::I32Const(0xE000_u32 as i32));
+            func.instruction(&Instruction::I32LtU);
+            func.instruction(&Instruction::I32And);
+            func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+            {
+                func.instruction(&Instruction::I32Const(0xFFFD));
+                func.instruction(&Instruction::LocalSet(cp_local));
+            }
+            func.instruction(&Instruction::Else);
+            {
+                func.instruction(&Instruction::LocalGet(cu_local));
+                func.instruction(&Instruction::LocalSet(cp_local));
+            }
+            func.instruction(&Instruction::End); // end lone-low-surrogate check
             // src_idx += 1
             func.instruction(&Instruction::LocalGet(src_idx_local));
             func.instruction(&Instruction::I32Const(1));

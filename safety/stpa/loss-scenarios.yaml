@@ -987,6 +987,16 @@ loss-scenarios:
       (run() == 500); after, it is U+FFFD + 'A' (sum 684). Runtime
       oracle: test_sr17_utf16_to_utf8_midstring_lone_surrogate_replacement.
       All causal factors of LS-P-16 are now mitigated and runtime-pinned.
+      Extended 2026-06-13 (#249): the symmetric LOW-surrogate gap is also
+      closed — a lone low surrogate (cu in [0xDC00, 0xE000) reaching the
+      non-high branch, which can only be malformed input since the high
+      arm consumes both halves of every valid pair) was previously
+      emitted as the malformed 3-byte UTF-8 of a surrogate code point
+      (ED B0 80 .. ED BF BF); it is now replaced with U+FFFD. The whole
+      malformed-UTF-16 class for emit_utf16_to_utf8_transcode is pinned
+      by test_sr17_utf16_to_utf8_malformed_surrogate_matrix (lone low at
+      leading/trailing/mid positions, consecutive lone lows, consecutive
+      lone highs, valid pair, and lone-surrogate-adjacent-to-valid-pair).
 
   - id: LS-P-18
     title: LS-P-12 bypassed when a record mixes a covered pointer with a hidden conditional one
