@@ -63,6 +63,19 @@ pub struct IndexMaps {
     pub tables: HashMap<u32, u32>,
     /// Memory index remapping: old -> new
     pub memories: HashMap<u32, u32>,
+    /// Data-segment index remapping: old -> new
+    ///
+    /// The merger concatenates every module's passive/active data segments
+    /// into one shared section, so a module's local segment 0 becomes some
+    /// non-zero ordinal in the fused module. `memory.init` / `data.drop`
+    /// operands must be remapped through this map or they read the wrong
+    /// segment.
+    pub data_segments: HashMap<u32, u32>,
+    /// Element-segment index remapping: old -> new
+    ///
+    /// Same concatenation concern as `data_segments`, for `table.init` /
+    /// `elem.drop`.
+    pub elements: HashMap<u32, u32>,
     /// Memory base offset in bytes (for shared-memory rebasing)
     pub memory_base_offset: u64,
     /// Whether address rebasing is enabled
@@ -112,6 +125,16 @@ impl IndexMaps {
     /// Remap a memory index
     pub fn remap_memory(&self, idx: u32) -> u32 {
         *self.memories.get(&idx).unwrap_or(&idx)
+    }
+
+    /// Remap a data-segment index (`memory.init` / `data.drop`).
+    pub fn remap_data_segment(&self, idx: u32) -> u32 {
+        *self.data_segments.get(&idx).unwrap_or(&idx)
+    }
+
+    /// Remap an element-segment index (`table.init` / `elem.drop`).
+    pub fn remap_elem(&self, idx: u32) -> u32 {
+        *self.elements.get(&idx).unwrap_or(&idx)
     }
 }
 
@@ -316,10 +339,10 @@ fn rewrite_operator(op: Operator<'_>, maps: &IndexMaps) -> Result<Vec<Instructio
             dst_table: maps.remap_table(dst_table),
         },
         TableInit { elem_index, table } => Instruction::TableInit {
-            elem_index,
+            elem_index: maps.remap_elem(elem_index),
             table: maps.remap_table(table),
         },
-        ElemDrop { elem_index } => Instruction::ElemDrop(elem_index),
+        ElemDrop { elem_index } => Instruction::ElemDrop(maps.remap_elem(elem_index)),
 
         // Memory operations - need memory index remapping
         I32Load { memarg } => Instruction::I32Load(convert_memarg(memarg, maps)?),
@@ -380,7 +403,7 @@ fn rewrite_operator(op: Operator<'_>, maps: &IndexMaps) -> Result<Vec<Instructio
         MemoryInit { data_index, mem } => {
             return rewrite_memory_init(data_index, mem, maps);
         }
-        DataDrop { data_index } => Instruction::DataDrop(data_index),
+        DataDrop { data_index } => Instruction::DataDrop(maps.remap_data_segment(data_index)),
         MemoryCopy { dst_mem, src_mem } => {
             return rewrite_memory_copy(src_mem, dst_mem, maps);
         }
@@ -609,6 +632,7 @@ fn rewrite_memory_init(
     mem: u32,
     maps: &IndexMaps,
 ) -> Result<Vec<Instruction<'static>>> {
+    let data_index = maps.remap_data_segment(data_index);
     if !maps.address_rebasing {
         return Ok(vec![Instruction::MemoryInit {
             mem: maps.remap_memory(mem),

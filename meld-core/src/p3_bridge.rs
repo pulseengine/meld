@@ -386,6 +386,8 @@ pub fn emit_stream_bridge(
             .unwrap_or(false);
         let memory_initial_pages = module_memory.as_ref().map(|mem| mem.initial);
 
+        let (data_segment_base, elem_segment_base) =
+            merged.segment_bases.get(&(c, m)).copied().unwrap_or((0, 0));
         let index_maps = crate::merger::build_index_maps_for_module(
             c,
             m,
@@ -396,6 +398,8 @@ pub fn emit_stream_bridge(
             0, // memory_base_offset — matches wire_adapter_indices
             memory64,
             memory_initial_pages,
+            data_segment_base,
+            elem_segment_base,
         );
 
         let import_func_count = module

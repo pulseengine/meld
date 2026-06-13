@@ -291,6 +291,38 @@ pub fn parse_data_segments(module: &CoreModule) -> Result<Vec<ParsedDataSegment>
     Ok(segments)
 }
 
+/// Count a module's element segments without fully parsing each entry.
+///
+/// Used to size the per-module element-segment index map: the local indices
+/// `0..count` must each be remapped to `base + local`. Returns 0 when the
+/// module has no element section or the section header cannot be read (the
+/// rewriter then falls back to identity remapping, which is the pre-fix
+/// behaviour for an unmappable index).
+pub fn count_element_segments(module: &CoreModule) -> u32 {
+    let Some((start, end)) = module.element_section_range else {
+        return 0;
+    };
+    let binary_reader = wasmparser::BinaryReader::new(&module.bytes[start..end], 0);
+    match ElementSectionReader::new(binary_reader) {
+        Ok(reader) => reader.count(),
+        Err(_) => 0,
+    }
+}
+
+/// Count a module's data segments without fully parsing each entry.
+///
+/// See [`count_element_segments`] for the sizing rationale.
+pub fn count_data_segments(module: &CoreModule) -> u32 {
+    let Some((start, end)) = module.data_section_range else {
+        return 0;
+    };
+    let binary_reader = wasmparser::BinaryReader::new(&module.bytes[start..end], 0);
+    match DataSectionReader::new(binary_reader) {
+        Ok(reader) => reader.count(),
+        Err(_) => 0,
+    }
+}
+
 /// Reindex an element segment with new index mappings
 /// Faithfully convert a `wasmparser::RefType` to a `wasm_encoder::RefType`,
 /// preserving nullability, abstract heap types, and concrete type indices.

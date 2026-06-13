@@ -146,6 +146,17 @@ pub struct MergedModule {
     /// Maps (component_idx, func_name) → shim globals for async result delivery.
     /// Built after element segment patching. Used by the callback-driving adapter.
     pub async_result_globals: HashMap<(usize, String), Vec<(u32, ValType)>>,
+
+    /// Per-module base offsets into the concatenated `data_segments` / `elements`
+    /// vectors: maps (component_idx, module_idx) → (data_segment_base, elem_base).
+    ///
+    /// Recorded in `merge_core_module` at the point the module's `IndexMaps` is
+    /// built — i.e. BEFORE this module's own segments are appended — so the base
+    /// equals the count of segments contributed by all PRIOR modules, which is
+    /// exactly where this module's local segment indices land in the fused
+    /// section. Re-rewrite passes that run after the full merge (when `.len()`
+    /// no longer equals the base) look the base up here.
+    pub segment_bases: HashMap<(usize, usize), (u32, u32)>,
 }
 
 /// Info about a generated task.return shim function.
@@ -992,6 +1003,7 @@ impl Merger {
             handle_tables: HashMap::new(),
             task_return_shims: HashMap::new(),
             async_result_globals: HashMap::new(),
+            segment_bases: HashMap::new(),
         };
 
         // Process components in topological order
@@ -1206,6 +1218,14 @@ impl Merger {
             // redirected to handle table functions.
             for &(comp_idx, mod_idx) in &affected_modules {
                 let module = &components[comp_idx].core_modules[mod_idx];
+                // This pass runs AFTER the full merge, so `merged.*.len()` is
+                // the total segment count, not this module's base. Recover the
+                // correct per-module base recorded during the main merge loop.
+                let (data_segment_base, elem_segment_base) = merged
+                    .segment_bases
+                    .get(&(comp_idx, mod_idx))
+                    .copied()
+                    .unwrap_or((0, 0));
                 let index_maps = build_index_maps_for_module(
                     comp_idx,
                     mod_idx,
@@ -1216,6 +1236,8 @@ impl Merger {
                     0u64,  // memory_base_offset
                     false, // memory64
                     None,  // memory_initial_pages
+                    data_segment_base,
+                    elem_segment_base,
                 );
                 let import_func_count = module
                     .imports
@@ -1862,6 +1884,21 @@ impl Merger {
             .map(|mem| mem.memory64)
             .unwrap_or(false);
         let memory_initial_pages = module_memory.as_ref().map(|mem| mem.initial);
+
+        // Segment base offsets: this module's local segment indices land in
+        // the concatenated section at `base + local`. Capture the bases NOW,
+        // before this module's own segments are appended (lines below), so
+        // they count only PRIOR modules' segments — exactly mirroring how
+        // `func_offset = merged.functions.len()` is captured before this
+        // module's functions are pushed. Record them on `merged` so the
+        // post-merge re-rewrite pass (resource-import redirect) can recover
+        // the correct base after `.len()` no longer equals it.
+        let data_segment_base = merged.data_segments.len() as u32;
+        let elem_segment_base = merged.elements.len() as u32;
+        merged
+            .segment_bases
+            .insert((comp_idx, mod_idx), (data_segment_base, elem_segment_base));
+
         let index_maps = build_index_maps_for_module(
             comp_idx,
             mod_idx,
@@ -1872,6 +1909,8 @@ impl Merger {
             memory_base_offset,
             memory64,
             memory_initial_pages,
+            data_segment_base,
+            elem_segment_base,
         );
 
         // Second pass: extract and rewrite function bodies
@@ -2836,6 +2875,8 @@ pub(crate) fn build_index_maps_for_module(
     memory_base_offset: u64,
     memory64: bool,
     memory_initial_pages: Option<u64>,
+    data_segment_base: u32,
+    elem_segment_base: u32,
 ) -> IndexMaps {
     let mut maps = IndexMaps::new();
     maps.address_rebasing = address_rebasing;
@@ -2944,6 +2985,27 @@ pub(crate) fn build_index_maps_for_module(
                 maps.memories.insert(full_idx, new_idx);
             }
         }
+    }
+
+    // Build data-segment and element-segment maps.
+    //
+    // The merger concatenates every module's segments into one shared
+    // section in deterministic merge order, so this module's local segment
+    // `local` lands at fused ordinal `base + local`, where `base` is the
+    // number of segments contributed by all PRIOR modules. The caller
+    // supplies that base (captured from `merged.data_segments.len()` /
+    // `merged.elements.len()` BEFORE this module's segments are appended —
+    // the same timing as `func_offset = merged.functions.len()`).
+    //
+    // Data/element segments are never imported in core wasm, so there is
+    // no import-count adjustment as there is for funcs/globals/tables/mems.
+    let data_segment_count = crate::segments::count_data_segments(module);
+    for local in 0..data_segment_count {
+        maps.data_segments.insert(local, data_segment_base + local);
+    }
+    let elem_segment_count = crate::segments::count_element_segments(module);
+    for local in 0..elem_segment_count {
+        maps.elements.insert(local, elem_segment_base + local);
     }
 
     maps
@@ -3511,6 +3573,7 @@ mod tests {
             handle_tables: HashMap::new(),
             task_return_shims: HashMap::new(),
             async_result_globals: HashMap::new(),
+            segment_bases: HashMap::new(),
         };
 
         // Simulate multi-memory merging for module A (comp 0, mod 0)
@@ -3547,6 +3610,8 @@ mod tests {
             0,
             false,
             None,
+            0,
+            0,
         );
         assert_eq!(maps_a.remap_memory(0), 0);
 
@@ -3560,6 +3625,8 @@ mod tests {
             0,
             false,
             None,
+            0,
+            0,
         );
         assert_eq!(maps_b.remap_memory(0), 1);
     }
@@ -4950,6 +5017,7 @@ mod tests {
             handle_tables: std::collections::HashMap::new(),
             task_return_shims: std::collections::HashMap::new(),
             async_result_globals: std::collections::HashMap::new(),
+            segment_bases: std::collections::HashMap::new(),
         }
     }
 

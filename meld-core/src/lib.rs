@@ -865,6 +865,15 @@ impl Fuser {
                 .unwrap_or(false);
             let memory_initial_pages = module_memory.as_ref().map(|mem| mem.initial);
 
+            // Post-merge re-rewrite: recover this module's segment bases from
+            // the merge-time record (`merged.*.len()` is now the total, not
+            // the base).
+            let (data_segment_base, elem_segment_base) = merged
+                .segment_bases
+                .get(&(comp_idx, mod_idx))
+                .copied()
+                .unwrap_or((0, 0));
+
             let index_maps = merger::build_index_maps_for_module(
                 comp_idx,
                 mod_idx,
@@ -875,6 +884,8 @@ impl Fuser {
                 memory_base_offset,
                 memory64,
                 memory_initial_pages,
+                data_segment_base,
+                elem_segment_base,
             );
 
             let import_func_count = module
@@ -1376,6 +1387,11 @@ impl Fuser {
         // Re-rewrite function bodies for affected modules
         for &(comp_idx, mod_idx) in &affected_modules {
             let module = &self.components[comp_idx].core_modules[mod_idx];
+            let (data_segment_base, elem_segment_base) = merged
+                .segment_bases
+                .get(&(comp_idx, mod_idx))
+                .copied()
+                .unwrap_or((0, 0));
             let index_maps = merger::build_index_maps_for_module(
                 comp_idx,
                 mod_idx,
@@ -1386,6 +1402,8 @@ impl Fuser {
                 0u64,
                 false,
                 None,
+                data_segment_base,
+                elem_segment_base,
             );
             let import_func_count = module
                 .imports
