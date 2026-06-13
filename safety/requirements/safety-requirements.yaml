@@ -408,7 +408,7 @@ artifacts:
       String transcoding adapters shall produce valid output encoding
       for all valid input, including characters outside the BMP
       (surrogate pair handling for UTF-16).
-    status: implemented
+    status: verified
     tags: [stpa-derived]
     links:
       - type: derives-from
@@ -417,8 +417,18 @@ artifacts:
       implementation: meld-core/src/adapter/fact.rs
       verification-method: test
       verification-description: >
-        Test with strings containing BMP and non-BMP characters;
-        verify round-trip correctness
+        Runtime oracles in tests/adapter_safety.rs, fused and executed
+        under wasmtime: test_sr17_utf8_to_utf16_string_transcoding
+        (BMP/ASCII round-trip) and, since the v0.31.0 audit,
+        test_sr17_utf8_to_utf16_supplementary_plane_transcoding —
+        "A😀" (U+0041 + U+1F600) must transcode to UTF-16 code units
+        [0x0041, 0xD83D, 0xDE00], proving the supplementary-plane
+        surrogate-pair branch of emit_utf8_to_utf16_transcode encodes
+        the high/low surrogates correctly and advances the destination
+        cursor by one then two units. Carried gap: the UTF-16 → UTF-8
+        reverse direction and lone-surrogate U+FFFD substitution are
+        covered structurally (LS-P-16) but not yet by a non-BMP runtime
+        round-trip.
 
   - id: SR-18
     type: requirement
