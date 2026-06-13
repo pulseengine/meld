@@ -2872,6 +2872,43 @@ impl ParsedComponent {
         }
     }
 
+    /// Whether `ty` contains a resource handle (`own<R>`/`borrow<R>`) at any
+    /// depth. Mirror of [`Self::type_contains_pointers`] for the resource
+    /// path: used by `element_inner_resources` to prune option/result/variant
+    /// cases that carry no handle (so no spurious guard-only descriptors are
+    /// emitted), exactly as the pointer arms gate on `type_contains_pointers`
+    /// (UCA-A-16).
+    pub fn type_contains_resources(&self, ty: &ComponentValType) -> bool {
+        match ty {
+            ComponentValType::Own(_) | ComponentValType::Borrow(_) => true,
+            ComponentValType::FixedSizeList(elem, _) => self.type_contains_resources(elem),
+            ComponentValType::Option(inner) => self.type_contains_resources(inner),
+            ComponentValType::Result { ok, err } => {
+                ok.as_ref().is_some_and(|t| self.type_contains_resources(t))
+                    || err
+                        .as_ref()
+                        .is_some_and(|t| self.type_contains_resources(t))
+            }
+            ComponentValType::Record(fields) => {
+                fields.iter().any(|(_, t)| self.type_contains_resources(t))
+            }
+            ComponentValType::Tuple(elems) => elems.iter().any(|t| self.type_contains_resources(t)),
+            ComponentValType::Variant(cases) => cases
+                .iter()
+                .any(|(_, t)| t.as_ref().is_some_and(|t| self.type_contains_resources(t))),
+            ComponentValType::Type(idx) => {
+                if let Some(ct) = self.get_type_definition(*idx)
+                    && let ComponentTypeKind::Defined(inner) = &ct.kind
+                {
+                    self.type_contains_resources(inner)
+                } else {
+                    false
+                }
+            }
+            _ => false,
+        }
+    }
+
     /// Count the number of flat core wasm values a component type flattens to.
     pub fn flat_count(&self, ty: &ComponentValType) -> u32 {
         match ty {
@@ -3139,7 +3176,7 @@ impl ParsedComponent {
                 // `has_pointer_bearing_conditional` check + panic is gone.
                 let element_size = self.canonical_abi_element_size(inner);
                 let inner_ptrs = self.element_inner_pointers(inner, 0, &[]);
-                let inner_res = self.element_inner_resources(inner, 0);
+                let inner_res = self.element_inner_resources(inner, 0, &[]);
                 if inner_ptrs.is_empty() && inner_res.is_empty() {
                     CopyLayout::Bulk {
                         byte_multiplier: element_size,
@@ -3305,14 +3342,28 @@ impl ParsedComponent {
         result
     }
 
-    /// Find resource handles embedded within a composite type's memory layout.
-    /// Returns `(byte_offset, resource_type_id, is_owned)` for each resource found.
+    /// Find resource handles (`own<R>`/`borrow<R>`) embedded within a
+    /// composite type's memory layout.
+    ///
+    /// Each emitted [`InnerResource`] has a byte offset within the element,
+    /// resource type id / ownership, and a `guards` chain that the FACT
+    /// adapter AND-evaluates per element before firing the borrow→rep
+    /// conversion. For resource-bearing option / result / variant payloads,
+    /// the guard chain pins the enclosing discriminant(s) — UCA-A-16 /
+    /// H-11.5. This mirrors [`Self::element_inner_pointers`] exactly: same
+    /// `disc_size`, payload-offset (`align_up(ds, max_case_align)`), and
+    /// per-case `DiscriminantGuard` chain. Record / Tuple / Type / inline
+    /// FixedSizeList handles thread `outer_guards` straight through (empty
+    /// at the top, so they remain unconditional). Guard byte offsets are
+    /// relative to the element base passed in by the outer list's
+    /// per-element loop.
     fn element_inner_resources(
         &self,
         ty: &ComponentValType,
         base: u32,
+        outer_guards: &[crate::resolver::DiscriminantGuard],
     ) -> Vec<crate::resolver::InnerResource> {
-        use crate::resolver::InnerResource;
+        use crate::resolver::{DiscriminantGuard, InnerResource};
         let mut result = Vec::new();
         match ty {
             ComponentValType::Own(id) => {
@@ -3321,6 +3372,7 @@ impl ParsedComponent {
                     resource_type_id: *id,
                     is_owned: true,
                     rep_import: None,
+                    guards: outer_guards.to_vec(),
                 });
             }
             ComponentValType::Borrow(id) => {
@@ -3329,6 +3381,7 @@ impl ParsedComponent {
                     resource_type_id: *id,
                     is_owned: false,
                     rep_import: None,
+                    guards: outer_guards.to_vec(),
                 });
             }
             ComponentValType::Record(fields) => {
@@ -3336,7 +3389,7 @@ impl ParsedComponent {
                 for (_, field_ty) in fields {
                     let align = self.canonical_abi_align(field_ty);
                     offset = align_up(offset, align);
-                    result.extend(self.element_inner_resources(field_ty, offset));
+                    result.extend(self.element_inner_resources(field_ty, offset, outer_guards));
                     offset = offset.saturating_add(self.canonical_abi_element_size(field_ty));
                 }
             }
@@ -3345,18 +3398,105 @@ impl ParsedComponent {
                 for elem_ty in elems {
                     let align = self.canonical_abi_align(elem_ty);
                     offset = align_up(offset, align);
-                    result.extend(self.element_inner_resources(elem_ty, offset));
+                    result.extend(self.element_inner_resources(elem_ty, offset, outer_guards));
                     offset = offset.saturating_add(self.canonical_abi_element_size(elem_ty));
+                }
+            }
+            // Inline FixedSizeList: recurse into each element at its stride —
+            // mirrors the FixedSizeList arm of `element_inner_pointers`. The
+            // handles live within this element's bytes (unlike a dynamic
+            // `List`, which is a separate heap buffer and so is not walked
+            // here, matching the pointer path).
+            ComponentValType::FixedSizeList(elem, len) => {
+                let elem_size = self.canonical_abi_element_size(elem);
+                let mut offset = base;
+                for _ in 0..*len {
+                    result.extend(self.element_inner_resources(elem, offset, outer_guards));
+                    offset = offset.saturating_add(elem_size);
+                }
+            }
+            // UCA-A-16 structural: resource-bearing option/result/variant
+            // payloads emit InnerResource descriptors whose `guards` chain
+            // includes the enclosing discriminant. The adapter AND-evaluates
+            // the chain per element before the borrow→rep conversion, so a
+            // `Some(borrow)` is translated while a `None` slot is left alone.
+            ComponentValType::Option(inner) if self.type_contains_resources(inner) => {
+                let ds = disc_size(2);
+                let payload_align = self.canonical_abi_align(inner);
+                let payload_offset = base + align_up(ds, payload_align);
+                let mut nested = outer_guards.to_vec();
+                nested.push(DiscriminantGuard {
+                    position: base,
+                    value: 1, // option discriminant: 1 = Some
+                    byte_size: ds,
+                });
+                result.extend(self.element_inner_resources(inner, payload_offset, &nested));
+            }
+            ComponentValType::Result { ok, err } => {
+                let ds = disc_size(2);
+                let ok_align = ok
+                    .as_ref()
+                    .map(|t| self.canonical_abi_align(t))
+                    .unwrap_or(1);
+                let err_align = err
+                    .as_ref()
+                    .map(|t| self.canonical_abi_align(t))
+                    .unwrap_or(1);
+                let max_case_align = ok_align.max(err_align);
+                let payload_offset = base + align_up(ds, max_case_align);
+                if let Some(ok_ty) = ok
+                    && self.type_contains_resources(ok_ty)
+                {
+                    let mut nested = outer_guards.to_vec();
+                    nested.push(DiscriminantGuard {
+                        position: base,
+                        value: 0, // result discriminant: 0 = Ok
+                        byte_size: ds,
+                    });
+                    result.extend(self.element_inner_resources(ok_ty, payload_offset, &nested));
+                }
+                if let Some(err_ty) = err
+                    && self.type_contains_resources(err_ty)
+                {
+                    let mut nested = outer_guards.to_vec();
+                    nested.push(DiscriminantGuard {
+                        position: base,
+                        value: 1, // result discriminant: 1 = Err
+                        byte_size: ds,
+                    });
+                    result.extend(self.element_inner_resources(err_ty, payload_offset, &nested));
+                }
+            }
+            ComponentValType::Variant(cases) => {
+                let ds = disc_size(cases.len());
+                let max_case_align = cases
+                    .iter()
+                    .filter_map(|(_, t)| t.as_ref().map(|t| self.canonical_abi_align(t)))
+                    .max()
+                    .unwrap_or(1);
+                let payload_offset = base + align_up(ds, max_case_align);
+                for (case_idx, (_, case_ty)) in cases.iter().enumerate() {
+                    if let Some(t) = case_ty
+                        && self.type_contains_resources(t)
+                    {
+                        let mut nested = outer_guards.to_vec();
+                        nested.push(DiscriminantGuard {
+                            position: base,
+                            value: case_idx as u32,
+                            byte_size: ds,
+                        });
+                        result.extend(self.element_inner_resources(t, payload_offset, &nested));
+                    }
                 }
             }
             ComponentValType::Type(idx) => {
                 if let Some(ct) = self.get_type_definition(*idx)
                     && let ComponentTypeKind::Defined(inner) = &ct.kind
                 {
-                    return self.element_inner_resources(inner, base);
+                    return self.element_inner_resources(inner, base, outer_guards);
                 }
             }
-            _ => {} // scalars, strings, lists, options, variants — skip
+            _ => {} // scalars, strings, dynamic lists — no in-element handle
         }
         result
     }
@@ -5317,6 +5457,226 @@ mod tests {
             CopyLayout::Elements { .. } => {
                 panic!("list<option<u32>> must still be Bulk (no inner pointers)")
             }
+        }
+    }
+
+    // ----------------------------------------------------------------
+    // UCA-A-16 / H-11.5 — resource handles nested in option/result/
+    // variant/fixed-size-list aggregates. Pre-fix, `element_inner_resources`
+    // swallowed these via its catch-all `_ => {}`, so the FACT adapter bulk-
+    // copied the raw handle integer across the instance boundary (no
+    // borrow→rep translation) — wrong-resource / use-after-free / type
+    // confusion. These mirror the LS-P-12 pointer-path matrix above and FAIL
+    // on origin/main (where the count is 0 / Bulk).
+    // ----------------------------------------------------------------
+
+    /// `list<option<borrow<R>>>` → Elements with exactly one inner resource,
+    /// guarded by the option's Some discriminant (value=1).
+    #[test]
+    fn uca_a16_list_of_option_borrow_emits_guarded_inner_resource() {
+        use crate::resolver::CopyLayout;
+        let pc = empty_parsed_component();
+        let ty = ComponentValType::List(Box::new(ComponentValType::Option(Box::new(
+            ComponentValType::Borrow(7),
+        ))));
+        match pc.copy_layout(&ty) {
+            CopyLayout::Elements {
+                inner_resources, ..
+            } => {
+                assert_eq!(
+                    inner_resources.len(),
+                    1,
+                    "exactly one inner resource (the borrow in the Some arm)",
+                );
+                let ir = &inner_resources[0];
+                assert_eq!(ir.resource_type_id, 7);
+                assert!(!ir.is_owned, "borrow → not owned");
+                assert_eq!(
+                    ir.byte_offset, 4,
+                    "borrow handle lives at element-relative byte 4 \
+                     (disc(1) + align pad to i32)",
+                );
+                assert_eq!(ir.guards.len(), 1, "exactly one guard (the option)");
+                let g = &ir.guards[0];
+                assert_eq!(g.position, 0, "option disc at element-relative byte 0");
+                assert_eq!(g.value, 1, "Some = 1");
+                assert_eq!(g.byte_size, 1, "option disc is 1 byte");
+            }
+            CopyLayout::Bulk { .. } => panic!(
+                "list<option<borrow<R>>> must produce Elements with a guarded \
+                 inner resource (UCA-A-16), not Bulk",
+            ),
+        }
+    }
+
+    /// `list<result<borrow<R>, E>>` → inner resource in the Ok arm guarded by
+    /// disc=0; the Err scalar arm carries no resource.
+    #[test]
+    fn uca_a16_list_of_result_borrow_emits_ok_guarded_inner_resource() {
+        use crate::resolver::CopyLayout;
+        let pc = empty_parsed_component();
+        let ty = ComponentValType::List(Box::new(ComponentValType::Result {
+            ok: Some(Box::new(ComponentValType::Borrow(9))),
+            err: Some(Box::new(ComponentValType::Primitive(PrimitiveValType::U32))),
+        }));
+        match pc.copy_layout(&ty) {
+            CopyLayout::Elements {
+                inner_resources, ..
+            } => {
+                assert_eq!(inner_resources.len(), 1, "only the Ok arm carries a borrow");
+                let ir = &inner_resources[0];
+                assert_eq!(ir.resource_type_id, 9);
+                assert!(!ir.is_owned);
+                assert_eq!(ir.guards.len(), 1);
+                assert_eq!(ir.guards[0].value, 0, "result Ok = 0");
+            }
+            CopyLayout::Bulk { .. } => panic!("expected Elements (UCA-A-16)"),
+        }
+    }
+
+    /// `list<variant{a, b(borrow<R>)}>` → inner resource guarded by the
+    /// payload-bearing case's index (case 1).
+    #[test]
+    fn uca_a16_list_of_variant_borrow_emits_case_guarded_inner_resource() {
+        use crate::resolver::CopyLayout;
+        let pc = empty_parsed_component();
+        let ty = ComponentValType::List(Box::new(ComponentValType::Variant(vec![
+            ("a".to_string(), None),
+            ("b".to_string(), Some(ComponentValType::Borrow(13))),
+        ])));
+        match pc.copy_layout(&ty) {
+            CopyLayout::Elements {
+                inner_resources, ..
+            } => {
+                assert_eq!(inner_resources.len(), 1, "only case b carries a borrow");
+                let ir = &inner_resources[0];
+                assert_eq!(ir.resource_type_id, 13);
+                assert!(!ir.is_owned);
+                assert_eq!(ir.guards.len(), 1);
+                assert_eq!(
+                    ir.guards[0].value, 1,
+                    "guard pins the payload-bearing case index (b = 1)",
+                );
+            }
+            CopyLayout::Bulk { .. } => panic!("expected Elements (UCA-A-16)"),
+        }
+    }
+
+    /// `list<fixedlist<own<R>, 2>>` → two unconditional inner resources (the
+    /// inline fixed-size-list elements), one per stride. `own<R>` is detected
+    /// here (the adapter skips translating own at fact.rs, but detection must
+    /// still descend into the FixedSizeList — pre-fix it was swallowed).
+    #[test]
+    fn uca_a16_list_of_fixedlist_own_emits_per_element_inner_resources() {
+        use crate::resolver::CopyLayout;
+        let pc = empty_parsed_component();
+        let ty = ComponentValType::List(Box::new(ComponentValType::FixedSizeList(
+            Box::new(ComponentValType::Own(21)),
+            2,
+        )));
+        match pc.copy_layout(&ty) {
+            CopyLayout::Elements {
+                inner_resources, ..
+            } => {
+                assert_eq!(
+                    inner_resources.len(),
+                    2,
+                    "one inner resource per fixed-list element (stride loop)",
+                );
+                assert_eq!(inner_resources[0].byte_offset, 0);
+                assert_eq!(
+                    inner_resources[1].byte_offset, 4,
+                    "second handle one i32 over"
+                );
+                for ir in &inner_resources {
+                    assert_eq!(ir.resource_type_id, 21);
+                    assert!(ir.is_owned, "own → owned");
+                    assert!(
+                        ir.guards.is_empty(),
+                        "inline fixed-list elements are unconditional (no enclosing disc)",
+                    );
+                }
+            }
+            CopyLayout::Bulk { .. } => panic!("expected Elements (UCA-A-16)"),
+        }
+    }
+
+    /// Regression: `list<record{borrow<R>}>` (the case that ALREADY worked)
+    /// must still be detected, with an EMPTY guard chain (unconditional —
+    /// every element carries the handle).
+    #[test]
+    fn uca_a16_regression_list_of_record_borrow_unconditional() {
+        use crate::resolver::CopyLayout;
+        let pc = empty_parsed_component();
+        let ty = ComponentValType::List(Box::new(ComponentValType::Record(vec![(
+            "h".to_string(),
+            ComponentValType::Borrow(3),
+        )])));
+        match pc.copy_layout(&ty) {
+            CopyLayout::Elements {
+                inner_resources, ..
+            } => {
+                assert_eq!(inner_resources.len(), 1);
+                let ir = &inner_resources[0];
+                assert_eq!(ir.resource_type_id, 3);
+                assert_eq!(ir.byte_offset, 0);
+                assert!(
+                    ir.guards.is_empty(),
+                    "record field handle fires for every element — empty guard chain",
+                );
+            }
+            CopyLayout::Bulk { .. } => panic!("list<record{{borrow}}> must be Elements"),
+        }
+    }
+
+    /// Regression: the POINTER path is unchanged — `list<option<string>>`
+    /// still yields exactly one guarded inner pointer and no inner resources.
+    #[test]
+    fn uca_a16_regression_pointer_path_option_string_unchanged() {
+        use crate::resolver::CopyLayout;
+        let pc = empty_parsed_component();
+        let ty = ComponentValType::List(Box::new(ComponentValType::Option(Box::new(
+            ComponentValType::String,
+        ))));
+        match pc.copy_layout(&ty) {
+            CopyLayout::Elements {
+                inner_pointers,
+                inner_resources,
+                ..
+            } => {
+                assert_eq!(
+                    inner_pointers.len(),
+                    1,
+                    "pointer path: one guarded string ptr"
+                );
+                assert_eq!(inner_pointers[0].guards.len(), 1);
+                assert!(
+                    inner_resources.is_empty(),
+                    "no resource handles in list<option<string>>",
+                );
+            }
+            CopyLayout::Bulk { .. } => panic!("expected Elements"),
+        }
+    }
+
+    /// A pure-scalar option/variant payload (no handle) must NOT emit a
+    /// guard-only inner resource — `type_contains_resources` prunes it, exactly
+    /// as `type_contains_pointers` prunes the pointer path.
+    #[test]
+    fn uca_a16_pure_scalar_option_emits_no_inner_resource() {
+        use crate::resolver::CopyLayout;
+        let pc = empty_parsed_component();
+        let ty = ComponentValType::List(Box::new(ComponentValType::Option(Box::new(
+            ComponentValType::Primitive(PrimitiveValType::U32),
+        ))));
+        match pc.copy_layout(&ty) {
+            CopyLayout::Bulk { .. } => {} // no pointers, no resources
+            CopyLayout::Elements {
+                inner_resources, ..
+            } => assert!(
+                inner_resources.is_empty(),
+                "option<u32> carries no resource handle — must emit none",
+            ),
         }
     }
 

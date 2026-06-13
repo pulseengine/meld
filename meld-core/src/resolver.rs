@@ -131,6 +131,32 @@ pub struct InnerResource {
     /// the fact.rs fallback is logged as a warning and the borrow conversion
     /// is conservatively skipped).
     pub rep_import: Option<(String, String)>,
+    /// A chain of discriminant checks that must ALL hold (AND-evaluated by
+    /// the adapter) before the per-element borrow→rep conversion fires —
+    /// non-empty when the resource handle lives inside an
+    /// option/result/variant payload (UCA-A-16 / H-11.5). Mirrors
+    /// [`InnerPointer::guards`]. All discriminant byte offsets are RELATIVE
+    /// to each element's base, not absolute. Empty = unconditional (fires
+    /// for every element, as for Record / Tuple / FixedSizeList).
+    pub guards: Vec<DiscriminantGuard>,
+}
+
+impl InnerResource {
+    /// Convenience: construct an unconditional inner resource (empty guard
+    /// chain — fires for every element). Used by the Record / Tuple / Type
+    /// paths in `element_inner_resources`, which carry a resource handle at a
+    /// fixed offset present in every element. `rep_import` is left `None`
+    /// here and resolved later by the caller against the callee's resource
+    /// type map.
+    pub fn unconditional(byte_offset: u32, resource_type_id: u32, is_owned: bool) -> Self {
+        Self {
+            byte_offset,
+            resource_type_id,
+            is_owned,
+            rep_import: None,
+            guards: Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]

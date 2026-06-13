@@ -2695,6 +2695,75 @@ loss-scenarios:
       func-signature param preserved, and a plain-funcref regression
       control. Closes #258.
 
+  - id: LS-A-23
+    title: Resource handles in option/result/variant/fixed-list inside a list element not detected for translation
+    uca: UCA-A-16
+    hazards: [H-3, H-11.5]
+    type: inadequate-control-algorithm
+    scenario: >
+      `parser.rs::element_inner_resources` (which populates
+      `CopyLayout::Elements.inner_resources` so the FACT adapter can
+      translate `borrow<R>` handles element-by-element across an instance
+      boundary) detected resources nested in Record/Tuple/Type but its
+      catch-all `_ => {}` SWALLOWED Option/Result/Variant/FixedSizeList —
+      while the sibling `element_inner_pointers` (for string/list pointer
+      fixups) DID recurse into all of them. So a `borrow<R>` inside e.g.
+      `list<option<borrow<R>>>` / `list<result<borrow<R>,E>>` /
+      `list<variant{..(borrow<R>)}>` / `list<list<own<R>, N>>` was not
+      detected, and the adapter bulk-copied the raw caller-side handle
+      INTEGER into callee memory instead of translating it through the
+      callee's resource table. The callee then indexes its handle table
+      with the caller's index → wrong resource / use-after-free / type
+      confusion in the fused output [UCA-A-16 / H-11.5 resource nested in
+      aggregate not detected / H-3 wrong-entity reference]. The
+      asymmetric sibling of the LS-P-12 pointer-fixup path and the
+      LS-R-15 copy-layout desync — the same "two parallel walkers over
+      one type tree drifted" root cause. UCA-A-16 / H-11.5 named this
+      hazard explicitly; the Record/Tuple recursion had landed but the
+      Option/Result/Variant/FixedSizeList arms were never closed.
+      Surfaced by a Mythos discovery pass on parser.rs.
+    causal-factors:
+      - >-
+        element_inner_resources omitted Option/Result/Variant/FixedSizeList
+        (catch-all `_ => {}`) while element_inner_pointers recursed into them
+      - >-
+        InnerResource carried no discriminant-guard chain, so even once
+        detected a handle inside an option/variant could not be translated
+        conditionally on the live case
+      - >-
+        no test exercised a resource nested in an option/result/variant/
+        fixed-list inside a list element (only Record/Tuple were covered)
+    process-model-flaw: >
+      The resource-detection model of "aggregates to descend into" lagged
+      the pointer-detection model — a parallel-walker invariant maintained
+      by two independently-edited functions that drifted, identical in
+      shape to LS-R-15.
+    status: approved
+    priority: high
+    fix: >
+      InnerResource gains a `guards: Vec<DiscriminantGuard>` chain (+
+      `unconditional` constructor) mirroring InnerPointer.
+      element_inner_resources gains an `outer_guards` param and
+      Option/Result/Variant/FixedSizeList recursion arms identical to
+      element_inner_pointers (same disc_size, align_up(ds,
+      max_case_align) payload offset, per-case guard values), gated by a
+      new `type_contains_resources`. The adapter (fact.rs) wraps each
+      borrow→rep conversion in `emit_inner_resource_guard_chain` — the
+      byte-identical mirror of the pointer path's guard block — so the
+      handle is translated ONLY when the live discriminant selects its
+      case (empty chain = unconditional, preserving Record/Tuple).
+      `own<R>` remains skipped by the adapter (not translated). Pinned by
+      7 parser tests (resource in option/result/variant/fixed-list
+      detected with correct guard values; Record stays unconditional;
+      pointer path unchanged). Mythos-verified: the resource guard
+      emission is byte-identical to the already-runtime-validated
+      InnerPointer guard path (option-Some, variant-case, nested
+      result-Ok+option-Some chains), so it fires exactly on the live case;
+      resource_borrow / resource_borrow_in_record / resource_import_and_export
+      runtime suites stay green. Carried: no two-component runtime fixture
+      through list<option<borrow>> (behaviour inferred from byte-identity
+      to the LS-P-12 pointer path).
+
   - id: LS-A-12
     title: uses_stackful_lift mis-classifies mixed-mode components
     uca: UCA-A-3

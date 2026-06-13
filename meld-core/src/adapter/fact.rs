@@ -1109,7 +1109,11 @@ impl FactStyleGenerator {
                     if let Some(rep_func) = rep_func {
                         options
                             .inner_resource_fixups
-                            .push((inner.byte_offset, rep_func));
+                            .push(super::InnerResourceFixup {
+                                byte_offset: inner.byte_offset,
+                                rep_func,
+                                guards: inner.guards.clone(),
+                            });
                     } else {
                         log::warn!(
                             "inner-list borrow at offset {} (resource_type_id={}): \
@@ -1634,7 +1638,23 @@ impl FactStyleGenerator {
                 func.instruction(&Instruction::LocalGet(1)); // len
                 func.instruction(&Instruction::I32GeU);
                 func.instruction(&Instruction::BrIf(1));
-                for &(byte_offset, rep_func) in &options.inner_resource_fixups {
+                for fixup in &options.inner_resource_fixups {
+                    let byte_offset = fixup.byte_offset;
+                    let rep_func = fixup.rep_func;
+                    // UCA-A-16: AND-evaluate this fixup's per-element
+                    // discriminant guards before the borrow→rep conversion.
+                    // Empty guards → unconditional (Record/Tuple path). Mirrors
+                    // `emit_inner_pointer_fixup`: load each guard's disc byte
+                    // from the per-element base at the right width, compare,
+                    // AND-chain, and wrap the conversion in an `If`.
+                    let guarded = Self::emit_inner_resource_guard_chain(
+                        &mut func,
+                        &fixup.guards,
+                        dest_ptr_local,
+                        loop_idx,
+                        element_size,
+                        options.callee_memory,
+                    );
                     // addr = dest_ptr + loop_idx * element_size + byte_offset
                     // i32.store needs [addr, value] on stack.
                     // Emit: addr, addr, i32.load → handle, call rep → rep, i32.store
@@ -1664,6 +1684,9 @@ impl FactStyleGenerator {
                         align: 2,
                         memory_index: options.callee_memory,
                     }));
+                    if guarded {
+                        func.instruction(&Instruction::End); // end UCA-A-16 guard If
+                    }
                 }
                 // loop_idx++
                 func.instruction(&Instruction::LocalGet(loop_idx));
@@ -2373,7 +2396,20 @@ impl FactStyleGenerator {
                     func.instruction(&Instruction::LocalGet(len_pos));
                     func.instruction(&Instruction::I32GeU);
                     func.instruction(&Instruction::BrIf(1));
-                    for &(byte_offset, rep_func) in &options.inner_resource_fixups {
+                    for fixup in &options.inner_resource_fixups {
+                        let byte_offset = fixup.byte_offset;
+                        let rep_func = fixup.rep_func;
+                        // UCA-A-16: per-element discriminant guards (see the
+                        // sibling loop in `generate_adapter`). Empty =
+                        // unconditional; mirrors `emit_inner_pointer_fixup`.
+                        let guarded = Self::emit_inner_resource_guard_chain(
+                            &mut func,
+                            &fixup.guards,
+                            dest_local,
+                            res_loop_idx,
+                            element_size,
+                            options.callee_memory,
+                        );
                         // Push addr for store
                         func.instruction(&Instruction::LocalGet(dest_local));
                         func.instruction(&Instruction::LocalGet(res_loop_idx));
@@ -2397,6 +2433,9 @@ impl FactStyleGenerator {
                             align: 2,
                             memory_index: options.callee_memory,
                         }));
+                        if guarded {
+                            func.instruction(&Instruction::End); // end UCA-A-16 guard If
+                        }
                     }
                     func.instruction(&Instruction::LocalGet(res_loop_idx));
                     func.instruction(&Instruction::I32Const(1));
@@ -2766,6 +2805,59 @@ impl FactStyleGenerator {
             }
         }
         layouts.iter().map(depth).max().unwrap_or(0)
+    }
+
+    /// Emit the per-element discriminant-guard chain for an inner-resource
+    /// fixup, returning `true` if an `If` was opened (caller must close it
+    /// with `End` after the conversion). Mirrors the guard emission inside
+    /// [`Self::emit_inner_pointer_fixup`] (UCA-A-16): each guard's
+    /// discriminant byte is loaded from the per-element base
+    /// (`dst_base + loop_idx * element_size + guard.position`) at the width
+    /// selected by `guard.byte_size`, compared to `guard.value`, AND-chained,
+    /// and the result drives an `If`. Empty guards → no `If` (unconditional).
+    fn emit_inner_resource_guard_chain(
+        func: &mut Function,
+        guards: &[crate::resolver::DiscriminantGuard],
+        dst_base_local: u32,
+        loop_idx: u32,
+        element_size: u32,
+        dst_mem: u32,
+    ) -> bool {
+        if guards.is_empty() {
+            return false;
+        }
+        let mut emitted_any = false;
+        for guard in guards {
+            func.instruction(&Instruction::LocalGet(dst_base_local));
+            func.instruction(&Instruction::LocalGet(loop_idx));
+            func.instruction(&Instruction::I32Const(element_size as i32));
+            func.instruction(&Instruction::I32Mul);
+            func.instruction(&Instruction::I32Add);
+            let mem_arg = wasm_encoder::MemArg {
+                offset: guard.position as u64,
+                align: 0,
+                memory_index: dst_mem,
+            };
+            match guard.byte_size {
+                1 => func.instruction(&Instruction::I32Load8U(mem_arg)),
+                2 => func.instruction(&Instruction::I32Load16U(wasm_encoder::MemArg {
+                    align: 1,
+                    ..mem_arg
+                })),
+                _ => func.instruction(&Instruction::I32Load(wasm_encoder::MemArg {
+                    align: 2,
+                    ..mem_arg
+                })),
+            };
+            func.instruction(&Instruction::I32Const(guard.value as i32));
+            func.instruction(&Instruction::I32Eq);
+            if emitted_any {
+                func.instruction(&Instruction::I32And);
+            }
+            emitted_any = true;
+        }
+        func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+        true
     }
 
     /// Emit wasm instructions that fix up inner pointers after a bulk copy.
@@ -6573,12 +6665,14 @@ mod tests {
             resource_type_id: 100,
             is_owned: false,
             rep_import: Some(rep_a_key.clone()),
+            guards: Vec::new(),
         };
         let inner_b = InnerResource {
             byte_offset: 4,
             resource_type_id: 200,
             is_owned: false,
             rep_import: Some(rep_b_key.clone()),
+            guards: Vec::new(),
         };
 
         // Build a single Elements layout carrying both inner-
@@ -6626,19 +6720,19 @@ mod tests {
             let off_0 = options
                 .inner_resource_fixups
                 .iter()
-                .find(|(off, _)| *off == 0)
+                .find(|f| f.byte_offset == 0)
                 .expect("must have fixup at offset 0");
             let off_4 = options
                 .inner_resource_fixups
                 .iter()
-                .find(|(off, _)| *off == 4)
+                .find(|f| f.byte_offset == 4)
                 .expect("must have fixup at offset 4");
             assert_eq!(
-                off_0.1, 100,
+                off_0.rep_func, 100,
                 "borrow<A> at offset 0 must select rep_a's func (100); got {off_0:?}",
             );
             assert_eq!(
-                off_4.1, 200,
+                off_4.rep_func, 200,
                 "borrow<B> at offset 4 must select rep_b's func (200); got {off_4:?}",
             );
         }
@@ -6661,6 +6755,7 @@ mod tests {
             resource_type_id: 999,
             is_owned: false,
             rep_import: None, // resolver failed to map; pre-fix would `.values().next()`
+            guards: Vec::new(),
         };
 
         let requirements = AdapterRequirements {
