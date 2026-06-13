@@ -1381,16 +1381,32 @@ impl Merger {
         shared_memory_plan: Option<&SharedMemoryPlan>,
         unresolved_assignments: &UnresolvedImportAssignments,
     ) -> Result<()> {
-        // Merge types
+        // Merge types.
+        //
+        // Two passes: first record every type's old->merged index mapping, then
+        // build the merged types. The split is required because a func type's
+        // param/result may be a concrete typed-ref `(ref $t)` whose index `t`
+        // can forward-reference another type in this same module; remapping it
+        // needs the *complete* mapping for the module to already be in place.
         let type_offset = merged.types.len() as u32;
-        for (old_idx, ty) in module.types.iter().enumerate() {
+        for (old_idx, _ty) in module.types.iter().enumerate() {
             merged.type_index_map.insert(
                 (comp_idx, mod_idx, old_idx as u32),
                 type_offset + old_idx as u32,
             );
+        }
+        for ty in module.types.iter() {
             merged.types.push(MergedFuncType {
-                params: ty.params.clone(),
-                results: ty.results.clone(),
+                params: ty
+                    .params
+                    .iter()
+                    .map(|&p| remap_concrete_val_type(p, comp_idx, mod_idx, merged))
+                    .collect(),
+                results: ty
+                    .results
+                    .iter()
+                    .map(|&r| remap_concrete_val_type(r, comp_idx, mod_idx, merged))
+                    .collect(),
             });
         }
 
@@ -1510,7 +1526,9 @@ impl Merger {
             merged
                 .table_index_map
                 .insert((comp_idx, mod_idx, old_table_idx), new_idx);
-            merged.tables.push(convert_table_type(table));
+            merged
+                .tables
+                .push(convert_table_type(table, comp_idx, mod_idx, merged));
         }
 
         // Merge globals (defined globals only; imported globals handled below)
@@ -1528,10 +1546,8 @@ impl Merger {
                 merged,
                 &global.content_type,
             );
-            merged.globals.push(MergedGlobal {
-                ty: convert_global_type(global),
-                init_expr,
-            });
+            let ty = convert_global_type(global, comp_idx, mod_idx, merged);
+            merged.globals.push(MergedGlobal { ty, init_expr });
         }
 
         // Resolve imported global indices via intra-component module_resolutions.
@@ -2363,7 +2379,12 @@ impl Merger {
                     merged.imports.push(MergedImport {
                         module,
                         name,
-                        entity_type: EntityType::Table(convert_table_type(t)),
+                        entity_type: EntityType::Table(convert_table_type(
+                            t,
+                            unresolved.component_idx,
+                            unresolved.module_idx,
+                            merged,
+                        )),
                         component_idx: Some(unresolved.component_idx),
                     });
                 }
@@ -2418,7 +2439,12 @@ impl Merger {
                     merged.imports.push(MergedImport {
                         module,
                         name,
-                        entity_type: EntityType::Global(convert_global_type(g)),
+                        entity_type: EntityType::Global(convert_global_type(
+                            g,
+                            unresolved.component_idx,
+                            unresolved.module_idx,
+                            merged,
+                        )),
                         component_idx: Some(unresolved.component_idx),
                     });
                 }
@@ -2705,11 +2731,70 @@ fn convert_memory_type(mem: &MemoryType) -> EncoderMemoryType {
     }
 }
 
-/// Convert parser TableType to encoder TableType
-fn convert_table_type(table: &TableType) -> EncoderTableType {
+/// Remap a concrete heap-type index embedded in a `RefType` through the
+/// per-module type index map, so it points at the correct merged type.
+///
+/// Concrete indices on `RefType`s produced by the parser are *module-level*
+/// (see `parser.rs::convert_ref_type`). When the merger renumbers types it
+/// records `(comp_idx, mod_idx, old_idx) -> merged_idx` in
+/// `merged.type_index_map` (built at the top of `merge_module`). This applies
+/// that same mapping. Abstract heap types carry no index and are returned
+/// unchanged.
+///
+/// This mirrors the concrete-heap-type remap already done for `ref.null` const
+/// expressions (the `RefNull` arm in `convert_const_expr`); that path remaps
+/// indices in *const-expression operands*, whereas this remaps the indices in
+/// *type/table/global section declarations*. The two cover disjoint structures,
+/// so applying this does not double-remap anything that path already handles.
+fn remap_concrete_ref_type(
+    rt: RefType,
+    comp_idx: usize,
+    mod_idx: usize,
+    merged: &MergedModule,
+) -> RefType {
+    let heap_type = match rt.heap_type {
+        wasm_encoder::HeapType::Concrete(old_idx) => {
+            let new_idx = merged
+                .type_index_map
+                .get(&(comp_idx, mod_idx, old_idx))
+                .copied()
+                .unwrap_or(old_idx);
+            wasm_encoder::HeapType::Concrete(new_idx)
+        }
+        other => other,
+    };
+    RefType { heap_type, ..rt }
+}
+
+/// Remap a concrete heap-type index embedded in a `ValType` (no-op for
+/// non-reference value types). Used for func-signature params/results and
+/// global content types. See [`remap_concrete_ref_type`].
+fn remap_concrete_val_type(
+    ty: ValType,
+    comp_idx: usize,
+    mod_idx: usize,
+    merged: &MergedModule,
+) -> ValType {
+    match ty {
+        ValType::Ref(rt) => ValType::Ref(remap_concrete_ref_type(rt, comp_idx, mod_idx, merged)),
+        other => other,
+    }
+}
+
+/// Convert parser TableType to encoder TableType.
+///
+/// `element_type` may be a concrete typed-ref (`(ref null $t)`); its
+/// module-level type index is remapped to the merged-module index via
+/// [`remap_concrete_ref_type`].
+fn convert_table_type(
+    table: &TableType,
+    comp_idx: usize,
+    mod_idx: usize,
+    merged: &MergedModule,
+) -> EncoderTableType {
     EncoderTableType {
         element_type: match table.element_type {
-            ValType::Ref(rt) => rt,
+            ValType::Ref(rt) => remap_concrete_ref_type(rt, comp_idx, mod_idx, merged),
             _ => RefType::FUNCREF,
         },
         table64: false,
@@ -2719,10 +2804,18 @@ fn convert_table_type(table: &TableType) -> EncoderTableType {
     }
 }
 
-/// Convert parser GlobalType to encoder GlobalType
-fn convert_global_type(global: &GlobalType) -> EncoderGlobalType {
+/// Convert parser GlobalType to encoder GlobalType.
+///
+/// `content_type` may be a concrete typed-ref; its module-level type index is
+/// remapped to the merged-module index via [`remap_concrete_val_type`].
+fn convert_global_type(
+    global: &GlobalType,
+    comp_idx: usize,
+    mod_idx: usize,
+    merged: &MergedModule,
+) -> EncoderGlobalType {
     EncoderGlobalType {
-        val_type: global.content_type,
+        val_type: remap_concrete_val_type(global.content_type, comp_idx, mod_idx, merged),
         mutable: global.mutable,
         shared: false,
     }
