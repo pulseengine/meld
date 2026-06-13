@@ -3349,6 +3349,74 @@ loss-scenarios:
       byte-identical to the prior eager path across all ParsedConstExpr
       kinds × all segment modes, and only RefFunc is bumped.
 
+  - id: LS-M-10
+    title: Global/table import dedup collapses type-incompatible imports into one slot
+    uca: UCA-M-9
+    hazards: [H-1, H-10]
+    type: inadequate-control-algorithm
+    scenario: >
+      The merger's unresolved-import dedup (`compute_unresolved_import_assignments`
+      + `add_unresolved_imports`) checks structural type compatibility for
+      FUNCTION imports — two same-named function imports with different
+      signatures are recorded in `type_mismatch_entries` and given separate
+      slots — but the TABLE and GLOBAL arms did NOT: they keyed solely on
+      `(normalized_module, field, comp_dim)` and unconditionally reused the
+      first slot. So when two fused components import the same-named global
+      or table at DIFFERENT types (e.g. comp0 `env.g : i32 immutable`,
+      comp1 `env.g : i64 mutable`; or comp0 `env.t : funcref[1..]`, comp1
+      `env.t : externref[5..]`), they collapsed into ONE merged import
+      emitted with the FIRST importer's type. The other component's
+      `global_index_map`/`table_index_map` then pointed at the wrong-typed
+      import, so its code performed type-incompatible operations (a
+      `global.set` on an i32-immutable global; a `call_indirect`/`table.get`
+      on a funcref table that is really externref) → an invalid fused core
+      module / type-system confusion [UCA-M-9 / H-1 / H-10]. Same
+      "guard present on one arm, missing on its siblings" asymmetry as the
+      rest of this sweep, and the same false-key class as #245. UCA-M-9 /
+      SC-12 described this hazard but were scoped to "function imports."
+      Confirmed at the merger API level via `Merger::merge`; end-to-end
+      from a real two-subcomponent fusion is reachable but contrived
+      (requires two core modules importing the same host global/table name
+      at mismatched types, e.g. differing toolchain `env.__stack_pointer`
+      / `GOT.*` / indirect-function-table imports). Surfaced by a Mythos
+      discovery pass on merger.rs.
+    causal-factors:
+      - >-
+        The table/global dedup arms keyed on name only, with no structural
+        type-compatibility check (unlike the function arm's first_type guard)
+      - >-
+        SC-12 / UCA-M-9's type-equality requirement was implemented only for
+        function imports, leaving globals and tables an unguarded index space
+      - >-
+        no test imported the same-named global/table at mismatched types
+        across two fused components
+    process-model-flaw: >
+      The dedup model treated a shared (module, field) name as sufficient
+      identity for globals/tables, but the canonical identity is
+      name + structural type (GlobalType content+mutability; TableType
+      element+limits) — the same model flaw the function path already fixed.
+    status: approved
+    priority: high
+    fix: >
+      `seen_table`/`seen_global` now store the entity type signature
+      (TableSig = element_type + initial + maximum; GlobalSig = content_type
+      + mutability) alongside the position; on an Occupied key whose sig
+      DIFFERS, a fresh slot is allocated and the entry recorded in
+      `type_mismatch_entries`, and `add_unresolved_imports` emits a separate
+      import (with the MultiMemory `$comp` suffix) — mirroring the function
+      path exactly. Same-typed duplicates still dedup to one slot. Pinned by
+      merger unit tests (global/table type-mismatch → 2 slots, distinct
+      index-map positions; same-type → 1 slot regression). Mythos-verified:
+      the compute/emit position-invariant holds across multi-component
+      cases (incl. A,B,A → comp2 dedups to comp0); each component's
+      index-map resolves to a slot of its own type; and shared-mode
+      duplicate import names with differing types are legal core wasm
+      (encoded + validated), so the fix never emits an invalid module.
+      Known minor limitation (matches the pre-existing function arm): a
+      third importer matching the SECOND distinct type gets a redundant
+      slot (`seen` holds only the first sig) — a dedup-completeness gap,
+      not a correctness issue (compute and emit stay in lockstep).
+
   - id: LS-D-1
     title: remapped DWARF emits a wrong code address for a fused function
     uca: UCA-M-9
