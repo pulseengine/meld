@@ -3,7 +3,11 @@ repos:
     rev: v4.6.0
     hooks:
       - id: trailing-whitespace
+        # Fuzz corpus seed files are byte-exact wasm fragments — do not
+        # touch them.
+        exclude: ^fuzz/corpus/
       - id: end-of-file-fixer
+        exclude: ^fuzz/corpus/
       - id: check-yaml
       - id: check-added-large-files
 

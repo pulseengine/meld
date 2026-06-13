@@ -15,7 +15,9 @@
 //! For static fusion, we generate similar adapters but inline them directly
 //! into the fused module rather than keeping them as separate adapter modules.
 
-use super::{AdapterConfig, AdapterFunction, AdapterGenerator, AdapterOptions, StringEncoding};
+use super::{
+    AdapterClass, AdapterConfig, AdapterFunction, AdapterGenerator, AdapterOptions, StringEncoding,
+};
 use crate::Result;
 use crate::merger::MergedModule;
 use crate::parser::CanonStringEncoding;
@@ -23,6 +25,27 @@ use crate::resolver::{AdapterSite, DependencyGraph};
 use wasm_encoder::{Function, Instruction};
 
 /// Convert a canonical string encoding from the parser to the adapter's encoding enum
+/// Parse a wit-bindgen-style `(import_module, import_field)` pair to extract
+/// the interface name and (when present) the resource name.
+///
+/// `import_module` may carry the wit-bindgen `[export]` prefix when the
+/// import refers to the importer's own export resource — strip it.
+/// `import_field` looks like `[resource-rep]X`, `[resource-new]X`, or
+/// `[resource-drop]X` for resource helpers; otherwise no resource name
+/// is returned.
+fn parse_resource_import(import_module: &str, import_field: &str) -> (String, Option<String>) {
+    let iface = import_module
+        .strip_prefix("[export]")
+        .unwrap_or(import_module)
+        .to_string();
+    let rn = import_field
+        .strip_prefix("[resource-rep]")
+        .or_else(|| import_field.strip_prefix("[resource-new]"))
+        .or_else(|| import_field.strip_prefix("[resource-drop]"))
+        .map(|s| s.to_string());
+    (iface, rn)
+}
+
 fn canon_to_string_encoding(enc: CanonStringEncoding) -> StringEncoding {
     match enc {
         CanonStringEncoding::Utf8 => StringEncoding::Utf8,
@@ -78,6 +101,113 @@ pub(crate) fn emit_overflow_guard(body: &mut Function, len_local: u32, k: u32) {
     body.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
     body.instruction(&Instruction::Unreachable);
     body.instruction(&Instruction::End);
+}
+
+/// Emit a chain of `(disc == value)` checks for a [`ConditionalPointerPair`]'s
+/// guards on the **flat-local** path — every guard in `cond.outer_guards`
+/// followed by the pair's innermost discriminant. All checks are ANDed; the
+/// resulting i32 (0/1) is left on the wasm stack so the caller can immediately
+/// emit `If`. `flat_base` is added to every guard's `position` (use 0 for
+/// param paths, `result_save_base` for the flat-result path).
+///
+/// Without this AND-chain, a `ConditionalPointerPair` inside a nested
+/// option/result/variant payload would fire whenever the *inner* discriminant
+/// slot happens to read as the inner value — *even in arms where the payload
+/// type is something else entirely* — yielding an arbitrary cross-memory copy
+/// with attacker-controlled `(ptr, len)` (LS-P-10).
+pub(crate) fn emit_conditional_guard_chain_flat(
+    body: &mut Function,
+    cond: &crate::resolver::ConditionalPointerPair,
+    flat_base: u32,
+) {
+    let mut emitted_any = false;
+    for guard in &cond.outer_guards {
+        body.instruction(&Instruction::LocalGet(flat_base + guard.position));
+        body.instruction(&Instruction::I32Const(guard.value as i32));
+        body.instruction(&Instruction::I32Eq);
+        if emitted_any {
+            body.instruction(&Instruction::I32And);
+        }
+        emitted_any = true;
+    }
+    // Innermost (current-level) guard.
+    body.instruction(&Instruction::LocalGet(
+        flat_base + cond.discriminant_position,
+    ));
+    body.instruction(&Instruction::I32Const(cond.discriminant_value as i32));
+    body.instruction(&Instruction::I32Eq);
+    if emitted_any {
+        body.instruction(&Instruction::I32And);
+    }
+}
+
+/// Emit a chain of `(disc == value)` checks for a [`ConditionalPointerPair`]'s
+/// guards on the **byte-offset** path — every guard in `cond.outer_guards`
+/// followed by the innermost discriminant, all ANDed. `base_ptr_local` holds
+/// the pointer to the buffer (callee result area, etc.); each guard's
+/// `byte_size` selects the load width (`I32Load8U` / `I32Load16U` /
+/// `I32Load`). See [`emit_conditional_guard_chain_flat`] for the LS-P-10
+/// rationale.
+pub(crate) fn emit_conditional_guard_chain_byte(
+    body: &mut Function,
+    cond: &crate::resolver::ConditionalPointerPair,
+    base_ptr_local: u32,
+    memory_index: u32,
+) {
+    fn emit_disc_load(
+        body: &mut Function,
+        base_ptr_local: u32,
+        byte_size: u32,
+        offset: u32,
+        memory_index: u32,
+    ) {
+        body.instruction(&Instruction::LocalGet(base_ptr_local));
+        match byte_size {
+            1 => body.instruction(&Instruction::I32Load8U(wasm_encoder::MemArg {
+                offset: offset as u64,
+                align: 0,
+                memory_index,
+            })),
+            2 => body.instruction(&Instruction::I32Load16U(wasm_encoder::MemArg {
+                offset: offset as u64,
+                align: 1,
+                memory_index,
+            })),
+            _ => body.instruction(&Instruction::I32Load(wasm_encoder::MemArg {
+                offset: offset as u64,
+                align: 2,
+                memory_index,
+            })),
+        };
+    }
+    let mut emitted_any = false;
+    for guard in &cond.outer_guards {
+        emit_disc_load(
+            body,
+            base_ptr_local,
+            guard.byte_size,
+            guard.position,
+            memory_index,
+        );
+        body.instruction(&Instruction::I32Const(guard.value as i32));
+        body.instruction(&Instruction::I32Eq);
+        if emitted_any {
+            body.instruction(&Instruction::I32And);
+        }
+        emitted_any = true;
+    }
+    emit_disc_load(
+        body,
+        base_ptr_local,
+        cond.discriminant_byte_size,
+        cond.discriminant_position,
+        memory_index,
+    );
+    body.instruction(&Instruction::I32Const(cond.discriminant_value as i32));
+    body.instruction(&Instruction::I32Eq);
+    if emitted_any {
+        body.instruction(&Instruction::I32And);
+    }
 }
 
 /// Compute Canonical ABI (size, alignment) in bytes for a component value type.
@@ -156,6 +286,18 @@ pub(crate) fn cabi_size_align(ty: &crate::parser::ComponentValType) -> (u32, u32
             }
             let body = align_up(1, align) + max_size;
             (align_up(body, align), align)
+        }
+        CVT::Flags(names) => {
+            // flags<N>: ceil(N/8) bytes padded to power-of-2 storage
+            // class; align ∈ {1, 2, 4} per LS-A-20.
+            let n = names.len() as u32;
+            if n <= 8 {
+                (1, 1)
+            } else if n <= 16 {
+                (2, 2)
+            } else {
+                (4u32.saturating_mul(n.div_ceil(32)), 4)
+            }
         }
         CVT::Own(_) | CVT::Borrow(_) | CVT::Type(_) => (4, 4),
     }
@@ -258,11 +400,23 @@ fn emit_patch_nested_indirections(
 
         body.instruction(&Instruction::LocalGet(l_rec_src));
         body.instruction(&Instruction::I32Load(src_mem_arg_len));
+        body.instruction(&Instruction::LocalSet(l_buf_len));
+        // LS-P-14: trap if `len * sub_elem_size` would wrap mod 2^32. Without
+        // this guard a callee-supplied `len` near `u32::MAX / sub_elem_size`
+        // wraps `buf_len` to a small value; the bounds check below uses
+        // `old_ptr + buf_len > mem_bytes` (also `i32.add`-based and wrapping)
+        // and is bypassed; the adapter then under-allocates the caller
+        // buffer and under-copies the inner list contents while the caller-
+        // side bulk-copy of the outer (ptr, len) keeps the original large
+        // `len` — silent truncation and semantic drift between the fused
+        // and composed executions.
+        emit_overflow_guard(body, l_buf_len, *sub_elem_size);
         if *sub_elem_size != 1 {
+            body.instruction(&Instruction::LocalGet(l_buf_len));
             body.instruction(&Instruction::I32Const(*sub_elem_size as i32));
             body.instruction(&Instruction::I32Mul);
+            body.instruction(&Instruction::LocalSet(l_buf_len));
         }
-        body.instruction(&Instruction::LocalSet(l_buf_len));
 
         // Skip patch if (old_ptr, buf_len) doesn't fit in callee mem — guards
         // against garbage values triggering an unrecoverable trap.
@@ -459,12 +613,16 @@ impl FactStyleGenerator {
             self.analyze_call_site(site, merged, resource_rep_imports, resource_new_imports);
 
         // Generate the adapter function body
-        let (type_idx, body) = if site.crosses_memory && options.needs_transcoding() {
-            self.generate_transcoding_adapter(site, merged, &options)?
+        let (type_idx, body, class) = if site.crosses_memory && options.needs_transcoding() {
+            let (t, b) = self.generate_transcoding_adapter(site, merged, &options)?;
+            (t, b, AdapterClass::Transcode)
         } else if site.crosses_memory {
-            self.generate_memory_copy_adapter(site, merged, &options)?
+            let (t, b) =
+                self.generate_memory_copy_adapter(site, merged, &options, resource_rep_imports)?;
+            (t, b, AdapterClass::MemoryCopy)
         } else {
-            self.generate_direct_adapter(site, merged, &options)?
+            let (t, b) = self.generate_direct_adapter(site, merged, &options)?;
+            (t, b, AdapterClass::Direct)
         };
 
         Ok(AdapterFunction {
@@ -476,6 +634,7 @@ impl FactStyleGenerator {
             target_component: site.to_component,
             target_module: site.to_module,
             target_function: self.resolve_target_function(site, merged)?,
+            class,
         })
     }
 
@@ -578,24 +737,96 @@ impl FactStyleGenerator {
                 // Callee defines the resource — convert handle→rep.
                 // Skip if upstream adapter already converted (avoids double resource.rep).
                 if !op.caller_already_converted {
-                    // If the caller has a handle table, use ht_rep to extract rep
-                    // from the memory-pointer handle. Otherwise use canonical resource.rep.
-                    let rep_func = merged
-                        .handle_tables
-                        .get(&site.from_component)
-                        .map(|ht| ht.rep_func)
+                    // If the caller has a handle table for THIS specific
+                    // resource, use ht_rep to extract rep from the memory-
+                    // pointer handle. Otherwise use canonical resource.rep.
+                    let (iface, rn_opt) =
+                        parse_resource_import(&op.import_module, &op.import_field);
+                    let rep_func = rn_opt
+                        .as_deref()
+                        .and_then(|rn| {
+                            merged
+                                .handle_tables
+                                .get(&(site.from_component, iface.to_string(), rn.to_string()))
+                                .map(|ht| ht.rep_func)
+                        })
                         .or_else(|| {
                             resource_rep_imports
                                 .get(&(op.import_module.clone(), op.import_field.clone()))
                                 .copied()
                         });
+                    // Option A Phase 3: when the callee ALSO has its own ht
+                    // for the same resource (post-Phase-1 per-component-ht),
+                    // bridge by also calling callee.ht_new(rep) so the
+                    // value lands in callee's namespace. Without this the
+                    // caller's memory-pointer handle would be deref'd by
+                    // callee in CALLEE's memory at that offset → garbage
+                    // (the resource_with_lists symptom). Match callee's ht
+                    // by resource_name only (caller iface may differ from
+                    // callee iface via `use` aliasing).
+                    // Only bridge when ALL of:
+                    //   - caller and callee are different components
+                    //   - caller has its OWN ht for the resource (the
+                    //     caller's rep_func came from the ht lookup, not
+                    //     the canonical [resource-rep] fallback)
+                    //   - callee has its own ht too
+                    // Without ALL three, the bridge double-translates or
+                    // converts canonical handles to memory pointers,
+                    // either of which corrupts the value.
+                    let caller_has_ht = rn_opt.as_deref().is_some_and(|rn| {
+                        merged
+                            .handle_tables
+                            .iter()
+                            .any(|((c, _, r), _)| *c == site.from_component && r == rn)
+                    });
+                    // For `[method]/[static]/[constructor]` exported by a
+                    // component that LOCALLY defines the resource, the
+                    // wit-bindgen cabi expects arg0 to be the REP (memory
+                    // pointer to `_ThingRep<T>`). Adding callee.new would
+                    // mint a fresh slot in callee's ht; the slot's address
+                    // gets passed as arg0; the deref reads 4 bytes at the
+                    // slot (the just-stored rep) but Option's discriminant
+                    // is the LOW BYTE of that rep — 0 for typical aligned
+                    // box pointers → Option::unwrap on None.
+                    //
+                    // For top-level functions or when the callee just uses
+                    // the resource (not locally defines it), the cabi
+                    // treats arg0 as a HANDLE — keep callee.new so the
+                    // value lands in callee's namespace.
+                    let is_method_like = site.import_name.starts_with("[method]")
+                        || site.import_name.starts_with("[static]")
+                        || site.import_name.starts_with("[constructor]");
+                    let callee_new_func = if site.from_component != site.to_component
+                        && caller_has_ht
+                        && !is_method_like
+                    {
+                        rn_opt.as_deref().and_then(|rn| {
+                            merged
+                                .handle_tables
+                                .iter()
+                                .find(|((c, _, r), _)| *c == site.to_component && r == rn)
+                                .map(|(_, ht)| ht.new_func)
+                        })
+                    } else {
+                        None
+                    };
                     if let Some(rep_func) = rep_func {
+                        if let Some(new_func) = callee_new_func {
+                            log::info!(
+                                "borrow bridge: rn={:?} from={} to={} caller_rep={} callee_new={}",
+                                rn_opt,
+                                site.from_component,
+                                site.to_component,
+                                rep_func,
+                                new_func,
+                            );
+                        }
                         options
                             .resource_rep_calls
                             .push(super::ResourceBorrowTransfer {
                                 param_idx: op.flat_idx,
                                 rep_func,
-                                new_func: None,
+                                new_func: callee_new_func,
                             });
                     }
                 }
@@ -637,9 +868,16 @@ impl FactStyleGenerator {
 
                 // For re-exporter callees with handle tables, use ht_new
                 // which returns memory-pointer handles that wit-bindgen expects.
+                // Look up by (to_component, iface, resource_name) so multi-resource
+                // re-exporters route per-resource, not per-component.
+                let (callee_iface, _) = parse_resource_import(&op.import_module, &op.import_field);
                 let callee_new_func = merged
                     .handle_tables
-                    .get(&site.to_component)
+                    .get(&(
+                        site.to_component,
+                        callee_iface.to_string(),
+                        resource_name.to_string(),
+                    ))
                     .map(|ht| ht.new_func)
                     .or_else(|| {
                         merged
@@ -654,13 +892,53 @@ impl FactStyleGenerator {
                             .copied()
                     });
 
+                // Distinguish two sub-cases of the 3-component branch:
+                //
+                // (a) Callee's exported function is a `[method]/[static]/
+                //     [constructor]` on a resource the callee LOCALLY
+                //     DEFINES via its own ht. wit-bindgen's `_export_*_cabi`
+                //     wraps the rep in `_ThingRep<T>` and the cabi expects
+                //     arg0 to be the REP (memory pointer). Emit
+                //     `caller.rep` ONLY — callee.new would mint a new
+                //     slot whose address gets passed as the rep, and the
+                //     deref reads adjacent fresh memory → Option=None.
+                //     This is the resource_with_lists `[method]thing.foo`
+                //     case where the re-exporter classification masks the
+                //     fact that the cabi still uses _ThingRep wrapping.
+                //
+                // (b) Top-level functions (no `[method]/[static]/
+                //     [constructor]` prefix) taking borrow<T> on a
+                //     `use`d resource. wit-bindgen's cabi calls
+                //     `Float::from_handle(arg0 as u32)` and treats arg0 as
+                //     a HANDLE. Emit `caller.rep + callee.new` so the
+                //     value lands in callee's namespace as a fresh slot
+                //     index the callee can pass back across downstream
+                //     adapters. This is the resource_floats `add` case.
+                //
+                // Discriminator: function name prefix. Methods/statics/
+                // constructors → case (a); top-level → case (b). Combined
+                // with a sanity check that the callee has SOME ht for the
+                // resource_name (so the rep-only path has somewhere
+                // sensible to derive the rep from).
+                let is_method_like = site.import_name.starts_with("[method]")
+                    || site.import_name.starts_with("[static]")
+                    || site.import_name.starts_with("[constructor]");
+                let callee_has_any_ht = merged
+                    .handle_tables
+                    .iter()
+                    .any(|((c, _, r), _)| *c == site.to_component && r == resource_name);
+                let new_func_for_emit = if is_method_like && callee_has_any_ht {
+                    None
+                } else {
+                    callee_new_func
+                };
                 if let Some(rep_func) = caller_rep_func {
                     options
                         .resource_rep_calls
                         .push(super::ResourceBorrowTransfer {
                             param_idx: op.flat_idx,
                             rep_func,
-                            new_func: callee_new_func,
+                            new_func: new_func_for_emit,
                         });
                 } else {
                     log::warn!(
@@ -675,10 +953,63 @@ impl FactStyleGenerator {
         }
 
         // Resolve own<T> results that need [resource-rep] + [resource-new].
-        // When callee_defines_resource is true, the P2 wrapper's canon lift/lower
-        // handles the conversion — the adapter passes the handle directly.
+        //
+        // Three cases:
+        // 1. callee_defines_resource=false (3-component): caller and callee
+        //    have separate tables, bridge via callee.rep + caller.new.
+        // 2. callee_defines_resource=true AND both caller+callee have their
+        //    own ht (post-Option-A-Phase-1): bridge via callee.ht_rep +
+        //    caller.ht_new so the handle ends up in caller's namespace
+        //    (memory-pointer in caller's memory). Without this bridge,
+        //    caller stores callee's memory-pointer handle but later passes
+        //    it back to callee for method calls — works for callee but
+        //    breaks for any caller-side _resource_rep call (cross-memory
+        //    deref of leaf-allocated rep in intermediate's memory →
+        //    Option::unwrap on garbage).
+        // 3. callee_defines_resource=true AND no caller ht: pass through
+        //    (the wrapper's canon lift handles conversion).
         for op in &site.requirements.resource_results {
-            if !op.is_owned || op.callee_defines_resource {
+            if !op.is_owned {
+                continue;
+            }
+            if op.callee_defines_resource {
+                // Case 2 vs 3: only emit a bridge when BOTH sides have ht
+                // for the same (iface, rn). Match by resource_name across
+                // both sides (caller's iface may differ from callee's via
+                // `use` aliasing).
+                let resource_name = op
+                    .import_field
+                    .strip_prefix("[resource-new]")
+                    .or_else(|| op.import_field.strip_prefix("[resource-rep]"))
+                    .unwrap_or(&op.import_field);
+                let callee_ht = merged
+                    .handle_tables
+                    .iter()
+                    .find(|((c, _, r), _)| *c == site.to_component && r == resource_name)
+                    .map(|(_, ht)| (ht.rep_func, ht.new_func));
+                let caller_ht = merged
+                    .handle_tables
+                    .iter()
+                    .find(|((c, _, r), _)| *c == site.from_component && r == resource_name)
+                    .map(|(_, ht)| (ht.rep_func, ht.new_func));
+                if let (Some((rep_func, _)), Some((_, new_func))) = (callee_ht, caller_ht) {
+                    log::info!(
+                        "own<T> bridge: resource '{}' from comp {} (callee) → comp {} (caller); rep={} new={}",
+                        resource_name,
+                        site.to_component,
+                        site.from_component,
+                        rep_func,
+                        new_func,
+                    );
+                    options
+                        .resource_new_calls
+                        .push(super::ResourceOwnResultTransfer {
+                            position: op.flat_idx,
+                            byte_offset: op.byte_offset,
+                            rep_func,
+                            new_func,
+                        });
+                }
                 continue;
             }
             let resource_name = op
@@ -698,11 +1029,17 @@ impl FactStyleGenerator {
                 });
 
             // Callee's [resource-rep] (callee handle → rep).
-            // For re-exporter callees with handle tables, use ht_rep.
+            // For re-exporter callees with handle tables, use ht_rep —
+            // per-resource lookup so multi-resource re-exporters work.
+            let (callee_iface_r, _) = parse_resource_import(&op.import_module, &op.import_field);
             let rep_field = format!("[resource-rep]{}", resource_name);
             let rep_func = merged
                 .handle_tables
-                .get(&site.to_component)
+                .get(&(
+                    site.to_component,
+                    callee_iface_r.to_string(),
+                    resource_name.to_string(),
+                ))
                 .map(|ht| ht.rep_func)
                 .or_else(|| {
                     merged
@@ -749,21 +1086,45 @@ impl FactStyleGenerator {
         // Resolve inner resource handles from param copy layouts.
         // When list elements contain borrow<T>, the adapter must convert
         // each handle after bulk-copying the list data to callee memory.
+        // Each inner resource carries its own pre-resolved (module, field)
+        // for the matching [resource-rep] import (filled in by the
+        // resolver via the callee's resource_type_to_import map). Using
+        // that lookup ensures the right rep_func per resource type even
+        // when the callee imports multiple resources — the previous
+        // `.values().next()` heuristic picked an arbitrary first match
+        // and silently routed handle A through resource B's rep_func.
         for layout in &site.requirements.param_copy_layouts {
             if let crate::resolver::CopyLayout::Elements {
                 inner_resources, ..
             } = layout
             {
-                for &(byte_offset, _resource_type_id, is_owned) in inner_resources {
-                    if is_owned {
+                for inner in inner_resources {
+                    if inner.is_owned {
                         continue; // own<T> in lists — callee handles internally
                     }
-                    // Find any [resource-rep] import for borrow handles.
-                    // For 2-component (callee defines), use callee's rep.
-                    // For 3-component, would need caller's rep + callee's new.
-                    // For now, find ANY matching [resource-rep] import.
-                    if let Some(&rep_func) = resource_rep_imports.values().next() {
-                        options.inner_resource_fixups.push((byte_offset, rep_func));
+                    let rep_func = inner
+                        .rep_import
+                        .as_ref()
+                        .and_then(|key| resource_rep_imports.get(key).copied());
+                    if let Some(rep_func) = rep_func {
+                        options
+                            .inner_resource_fixups
+                            .push(super::InnerResourceFixup {
+                                byte_offset: inner.byte_offset,
+                                rep_func,
+                                guards: inner.guards.clone(),
+                            });
+                    } else {
+                        log::warn!(
+                            "inner-list borrow at offset {} (resource_type_id={}): \
+                             no [resource-rep] import resolved — skipping fixup. \
+                             from={} to={} import_name={:?}",
+                            inner.byte_offset,
+                            inner.resource_type_id,
+                            site.from_component,
+                            site.to_component,
+                            site.import_name,
+                        );
                     }
                 }
             }
@@ -928,6 +1289,7 @@ impl FactStyleGenerator {
         site: &AdapterSite,
         merged: &MergedModule,
         options: &AdapterOptions,
+        resource_rep_imports: &std::collections::HashMap<(String, String), u32>,
     ) -> Result<(u32, Function)> {
         let target_func = self.resolve_target_function(site, merged)?;
 
@@ -1002,7 +1364,13 @@ impl FactStyleGenerator {
                     .filter(|p| !p.is_owned && p.callee_defines_resource)
                     .count(),
             );
-            return self.generate_params_ptr_adapter(site, options, target_func, caller_type_idx);
+            return self.generate_params_ptr_adapter(
+                site,
+                options,
+                target_func,
+                caller_type_idx,
+                resource_rep_imports,
+            );
         }
 
         // --- Non-retptr path: use callee's type so body is valid ---
@@ -1270,7 +1638,23 @@ impl FactStyleGenerator {
                 func.instruction(&Instruction::LocalGet(1)); // len
                 func.instruction(&Instruction::I32GeU);
                 func.instruction(&Instruction::BrIf(1));
-                for &(byte_offset, rep_func) in &options.inner_resource_fixups {
+                for fixup in &options.inner_resource_fixups {
+                    let byte_offset = fixup.byte_offset;
+                    let rep_func = fixup.rep_func;
+                    // UCA-A-16: AND-evaluate this fixup's per-element
+                    // discriminant guards before the borrow→rep conversion.
+                    // Empty guards → unconditional (Record/Tuple path). Mirrors
+                    // `emit_inner_pointer_fixup`: load each guard's disc byte
+                    // from the per-element base at the right width, compare,
+                    // AND-chain, and wrap the conversion in an `If`.
+                    let guarded = Self::emit_inner_resource_guard_chain(
+                        &mut func,
+                        &fixup.guards,
+                        dest_ptr_local,
+                        loop_idx,
+                        element_size,
+                        options.callee_memory,
+                    );
                     // addr = dest_ptr + loop_idx * element_size + byte_offset
                     // i32.store needs [addr, value] on stack.
                     // Emit: addr, addr, i32.load → handle, call rep → rep, i32.store
@@ -1300,6 +1684,9 @@ impl FactStyleGenerator {
                         align: 2,
                         memory_index: options.callee_memory,
                     }));
+                    if guarded {
+                        func.instruction(&Instruction::End); // end UCA-A-16 guard If
+                    }
                 }
                 // loop_idx++
                 func.instruction(&Instruction::LocalGet(loop_idx));
@@ -1333,7 +1720,6 @@ impl FactStyleGenerator {
             // NOTE: We handle this by modifying the params in-place using
             // local.set on the original param slots.
             for cond in &site.requirements.conditional_pointer_pairs {
-                let disc_local = cond.discriminant_position;
                 let ptr_local = cond.ptr_position;
                 let len_local = cond.ptr_position + 1;
                 let byte_mult = match &cond.copy_layout {
@@ -1341,10 +1727,11 @@ impl FactStyleGenerator {
                     crate::resolver::CopyLayout::Elements { element_size, .. } => *element_size,
                 };
 
-                // if (disc == expected_value) { copy and replace ptr }
-                func.instruction(&Instruction::LocalGet(disc_local));
-                func.instruction(&Instruction::I32Const(cond.discriminant_value as i32));
-                func.instruction(&Instruction::I32Eq);
+                // if (all guards in chain hold) { copy and replace ptr }
+                // — outer-guard ANDing matters for nested option/result/variant
+                // payloads where reading only the inner disc byte could be
+                // sampling unrelated payload bytes in another arm (LS-P-10).
+                emit_conditional_guard_chain_flat(&mut func, cond, 0);
                 func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
 
                 // Allocate: new_ptr = cabi_realloc(0, 0, 1, len * byte_mult)
@@ -1484,7 +1871,6 @@ impl FactStyleGenerator {
             if needs_conditional_result_copy && result_count > 0 {
                 let caller_realloc = options.caller_realloc.unwrap();
                 for cond in &site.requirements.conditional_result_flat_pairs {
-                    let disc_local = result_save_base + cond.discriminant_position;
                     let ptr_local = result_save_base + cond.ptr_position;
                     let len_local = result_save_base + cond.ptr_position + 1;
                     let byte_mult = match &cond.copy_layout {
@@ -1492,10 +1878,9 @@ impl FactStyleGenerator {
                         crate::resolver::CopyLayout::Elements { element_size, .. } => *element_size,
                     };
 
-                    // if (disc == expected_value) { allocate in caller, copy, replace ptr }
-                    func.instruction(&Instruction::LocalGet(disc_local));
-                    func.instruction(&Instruction::I32Const(cond.discriminant_value as i32));
-                    func.instruction(&Instruction::I32Eq);
+                    // if (all guards in chain hold) { allocate in caller,
+                    // copy, replace ptr } — outer-guard ANDing per LS-P-10.
+                    emit_conditional_guard_chain_flat(&mut func, cond, result_save_base);
                     func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
 
                     // Allocate in caller memory
@@ -1563,6 +1948,7 @@ impl FactStyleGenerator {
         options: &AdapterOptions,
         target_func: u32,
         caller_type_idx: u32,
+        resource_rep_imports: &std::collections::HashMap<(String, String), u32>,
     ) -> Result<(u32, Function)> {
         let params_area_size = site.requirements.params_area_byte_size.unwrap_or(0);
         let params_area_align = site.requirements.params_area_max_align.max(1);
@@ -1749,17 +2135,22 @@ impl FactStyleGenerator {
                 func.instruction(&Instruction::I32GeU);
                 func.instruction(&Instruction::BrIf(1)); // break to $exit
 
-                for &(res_byte_offset, _resource_type_id, is_owned) in inner_resources {
-                    if is_owned {
+                for inner in inner_resources {
+                    if inner.is_owned {
                         continue; // own<T>: callee handles internally
                     }
-                    // Find [resource-rep] for this resource
-                    if let Some(&rep_func) = options
-                        .params_area_borrow_fixups
-                        .first()
-                        .map(|f| &f.rep_func)
-                        .or_else(|| options.resource_rep_calls.first().map(|t| &t.rep_func))
-                    {
+                    // Use the per-element pre-resolved [resource-rep]
+                    // (filled at site-requirements time via the callee's
+                    // resource_type_to_import map). The previous code
+                    // picked an arbitrary first-fixup which silently
+                    // routed handle A through resource B's rep_func when
+                    // the callee imported >1 resource.
+                    let res_byte_offset = inner.byte_offset;
+                    let rep_func_opt = inner
+                        .rep_import
+                        .as_ref()
+                        .and_then(|key| resource_rep_imports.get(key).copied());
+                    if let Some(rep_func) = rep_func_opt {
                         // addr = dest_ptr + loop_counter * element_size + res_byte_offset
                         // Push addr for store
                         func.instruction(&Instruction::LocalGet(dest_local));
@@ -2005,7 +2396,20 @@ impl FactStyleGenerator {
                     func.instruction(&Instruction::LocalGet(len_pos));
                     func.instruction(&Instruction::I32GeU);
                     func.instruction(&Instruction::BrIf(1));
-                    for &(byte_offset, rep_func) in &options.inner_resource_fixups {
+                    for fixup in &options.inner_resource_fixups {
+                        let byte_offset = fixup.byte_offset;
+                        let rep_func = fixup.rep_func;
+                        // UCA-A-16: per-element discriminant guards (see the
+                        // sibling loop in `generate_adapter`). Empty =
+                        // unconditional; mirrors `emit_inner_pointer_fixup`.
+                        let guarded = Self::emit_inner_resource_guard_chain(
+                            &mut func,
+                            &fixup.guards,
+                            dest_local,
+                            res_loop_idx,
+                            element_size,
+                            options.callee_memory,
+                        );
                         // Push addr for store
                         func.instruction(&Instruction::LocalGet(dest_local));
                         func.instruction(&Instruction::LocalGet(res_loop_idx));
@@ -2029,6 +2433,9 @@ impl FactStyleGenerator {
                             align: 2,
                             memory_index: options.callee_memory,
                         }));
+                        if guarded {
+                            func.instruction(&Instruction::End); // end UCA-A-16 guard If
+                        }
                     }
                     func.instruction(&Instruction::LocalGet(res_loop_idx));
                     func.instruction(&Instruction::I32Const(1));
@@ -2044,7 +2451,6 @@ impl FactStyleGenerator {
         // --- Phase 1b: Conditional param copy (option/result/variant params) ---
         if let Some(callee_realloc) = options.callee_realloc.filter(|_| has_cond_param_pairs) {
             for cond in &site.requirements.conditional_pointer_pairs {
-                let disc_local = cond.discriminant_position;
                 let ptr_local = cond.ptr_position;
                 let len_local = cond.ptr_position + 1;
                 let byte_mult = match &cond.copy_layout {
@@ -2052,9 +2458,8 @@ impl FactStyleGenerator {
                     crate::resolver::CopyLayout::Elements { element_size, .. } => *element_size,
                 };
 
-                func.instruction(&Instruction::LocalGet(disc_local));
-                func.instruction(&Instruction::I32Const(cond.discriminant_value as i32));
-                func.instruction(&Instruction::I32Eq);
+                // Outer-guard AND-chain (LS-P-10) before firing the copy.
+                emit_conditional_guard_chain_flat(&mut func, cond, 0);
                 func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
 
                 // Allocate in callee memory
@@ -2295,7 +2700,6 @@ impl FactStyleGenerator {
         // --- Phase 5b: Conditional result copy (option/result/variant in return area) ---
         if let Some(caller_realloc) = options.caller_realloc.filter(|_| has_cond_result_pairs) {
             for cond in &site.requirements.conditional_result_pointer_pairs {
-                let disc_offset = cond.discriminant_position;
                 let ptr_offset = cond.ptr_position;
                 let len_offset = cond.ptr_position + 4;
                 let byte_mult = match &cond.copy_layout {
@@ -2303,27 +2707,15 @@ impl FactStyleGenerator {
                     crate::resolver::CopyLayout::Elements { element_size, .. } => *element_size,
                 };
 
-                // Load discriminant from callee's return area using correct byte width
-                func.instruction(&Instruction::LocalGet(result_ptr_local));
-                match cond.discriminant_byte_size {
-                    1 => func.instruction(&Instruction::I32Load8U(wasm_encoder::MemArg {
-                        offset: disc_offset as u64,
-                        align: 0,
-                        memory_index: options.callee_memory,
-                    })),
-                    2 => func.instruction(&Instruction::I32Load16U(wasm_encoder::MemArg {
-                        offset: disc_offset as u64,
-                        align: 1,
-                        memory_index: options.callee_memory,
-                    })),
-                    _ => func.instruction(&Instruction::I32Load(wasm_encoder::MemArg {
-                        offset: disc_offset as u64,
-                        align: 2,
-                        memory_index: options.callee_memory,
-                    })),
-                };
-                func.instruction(&Instruction::I32Const(cond.discriminant_value as i32));
-                func.instruction(&Instruction::I32Eq);
+                // Outer-guard AND-chain (LS-P-10) before firing the copy.
+                // Each guard's discriminant is loaded from the callee's
+                // return area at its byte offset using the matching width.
+                emit_conditional_guard_chain_byte(
+                    &mut func,
+                    cond,
+                    result_ptr_local,
+                    options.callee_memory,
+                );
                 func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
 
                 // Load ptr and len from callee's return area
@@ -2405,7 +2797,7 @@ impl FactStyleGenerator {
                     } else {
                         1 + inner_pointers
                             .iter()
-                            .map(|(_, cl)| depth(cl))
+                            .map(|ip| depth(&ip.copy_layout))
                             .max()
                             .unwrap_or(0)
                     }
@@ -2413,6 +2805,59 @@ impl FactStyleGenerator {
             }
         }
         layouts.iter().map(depth).max().unwrap_or(0)
+    }
+
+    /// Emit the per-element discriminant-guard chain for an inner-resource
+    /// fixup, returning `true` if an `If` was opened (caller must close it
+    /// with `End` after the conversion). Mirrors the guard emission inside
+    /// [`Self::emit_inner_pointer_fixup`] (UCA-A-16): each guard's
+    /// discriminant byte is loaded from the per-element base
+    /// (`dst_base + loop_idx * element_size + guard.position`) at the width
+    /// selected by `guard.byte_size`, compared to `guard.value`, AND-chained,
+    /// and the result drives an `If`. Empty guards → no `If` (unconditional).
+    fn emit_inner_resource_guard_chain(
+        func: &mut Function,
+        guards: &[crate::resolver::DiscriminantGuard],
+        dst_base_local: u32,
+        loop_idx: u32,
+        element_size: u32,
+        dst_mem: u32,
+    ) -> bool {
+        if guards.is_empty() {
+            return false;
+        }
+        let mut emitted_any = false;
+        for guard in guards {
+            func.instruction(&Instruction::LocalGet(dst_base_local));
+            func.instruction(&Instruction::LocalGet(loop_idx));
+            func.instruction(&Instruction::I32Const(element_size as i32));
+            func.instruction(&Instruction::I32Mul);
+            func.instruction(&Instruction::I32Add);
+            let mem_arg = wasm_encoder::MemArg {
+                offset: guard.position as u64,
+                align: 0,
+                memory_index: dst_mem,
+            };
+            match guard.byte_size {
+                1 => func.instruction(&Instruction::I32Load8U(mem_arg)),
+                2 => func.instruction(&Instruction::I32Load16U(wasm_encoder::MemArg {
+                    align: 1,
+                    ..mem_arg
+                })),
+                _ => func.instruction(&Instruction::I32Load(wasm_encoder::MemArg {
+                    align: 2,
+                    ..mem_arg
+                })),
+            };
+            func.instruction(&Instruction::I32Const(guard.value as i32));
+            func.instruction(&Instruction::I32Eq);
+            if emitted_any {
+                func.instruction(&Instruction::I32And);
+            }
+            emitted_any = true;
+        }
+        func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+        true
     }
 
     /// Emit wasm instructions that fix up inner pointers after a bulk copy.
@@ -2432,7 +2877,7 @@ impl FactStyleGenerator {
     #[allow(clippy::too_many_arguments)]
     fn emit_inner_pointer_fixup(
         func: &mut Function,
-        inner_pointers: &[(u32, crate::resolver::CopyLayout)],
+        inner_pointers: &[crate::resolver::InnerPointer],
         element_size: u32,
         _src_base_local: u32, // local holding source array base pointer (reserved for future deep copy)
         dst_base_local: u32,  // local holding destination array base pointer
@@ -2464,12 +2909,58 @@ impl FactStyleGenerator {
         func.instruction(&Instruction::I32GeU);
         func.instruction(&Instruction::BrIf(1)); // break to $exit
 
-        // For each inner pointer pair in the element:
-        for (inner_offset, inner_layout) in inner_pointers {
+        // For each inner pointer descriptor:
+        for ip in inner_pointers {
+            let inner_offset = ip.byte_offset;
+            let inner_layout = &ip.copy_layout;
             let byte_mult = match inner_layout {
                 crate::resolver::CopyLayout::Bulk { byte_multiplier } => *byte_multiplier,
                 crate::resolver::CopyLayout::Elements { element_size, .. } => *element_size,
             };
+
+            // LS-P-12: AND-evaluate this descriptor's per-element discriminant
+            // guards. Empty guards → unconditional fixup (the historic
+            // Record/Tuple/List path). Non-empty → load each guard's
+            // discriminant byte from the per-element base
+            // (`dst_base + loop_idx * element_size + guard.position`) at the
+            // right width (`I32Load{8U,16U,_}` per `guard.byte_size`),
+            // compare with `guard.value`, AND-chain the results, and wrap
+            // the entire fixup body in an `If` so it only fires when every
+            // enclosing option/result/variant arm holds.
+            let guarded = !ip.guards.is_empty();
+            if guarded {
+                let mut emitted_any = false;
+                for guard in &ip.guards {
+                    func.instruction(&Instruction::LocalGet(dst_base_local));
+                    func.instruction(&Instruction::LocalGet(loop_idx));
+                    func.instruction(&Instruction::I32Const(element_size as i32));
+                    func.instruction(&Instruction::I32Mul);
+                    func.instruction(&Instruction::I32Add);
+                    let mem_arg = wasm_encoder::MemArg {
+                        offset: guard.position as u64,
+                        align: 0,
+                        memory_index: dst_mem,
+                    };
+                    match guard.byte_size {
+                        1 => func.instruction(&Instruction::I32Load8U(mem_arg)),
+                        2 => func.instruction(&Instruction::I32Load16U(wasm_encoder::MemArg {
+                            align: 1,
+                            ..mem_arg
+                        })),
+                        _ => func.instruction(&Instruction::I32Load(wasm_encoder::MemArg {
+                            align: 2,
+                            ..mem_arg
+                        })),
+                    };
+                    func.instruction(&Instruction::I32Const(guard.value as i32));
+                    func.instruction(&Instruction::I32Eq);
+                    if emitted_any {
+                        func.instruction(&Instruction::I32And);
+                    }
+                    emitted_any = true;
+                }
+                func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+            }
 
             // elem_offset = loop_idx * element_size + inner_offset
             // Read inner_ptr from dst_base[elem_offset]
@@ -2478,7 +2969,7 @@ impl FactStyleGenerator {
             func.instruction(&Instruction::I32Const(element_size as i32));
             func.instruction(&Instruction::I32Mul);
             func.instruction(&Instruction::I32Add);
-            func.instruction(&Instruction::I32Const(*inner_offset as i32));
+            func.instruction(&Instruction::I32Const(inner_offset as i32));
             func.instruction(&Instruction::I32Add);
             // Now stack has: dst_base + loop_idx * element_size + inner_offset
             // But we need to load from the SOURCE memory (the pointer values
@@ -2496,7 +2987,7 @@ impl FactStyleGenerator {
             func.instruction(&Instruction::I32Const(element_size as i32));
             func.instruction(&Instruction::I32Mul);
             func.instruction(&Instruction::I32Add);
-            func.instruction(&Instruction::I32Const(*inner_offset as i32 + 4));
+            func.instruction(&Instruction::I32Const(inner_offset as i32 + 4));
             func.instruction(&Instruction::I32Add);
             func.instruction(&Instruction::I32Load(wasm_encoder::MemArg {
                 offset: 0,
@@ -2558,7 +3049,7 @@ impl FactStyleGenerator {
             func.instruction(&Instruction::I32Const(element_size as i32));
             func.instruction(&Instruction::I32Mul);
             func.instruction(&Instruction::I32Add);
-            func.instruction(&Instruction::I32Const(*inner_offset as i32));
+            func.instruction(&Instruction::I32Const(inner_offset as i32));
             func.instruction(&Instruction::I32Add);
             func.instruction(&Instruction::LocalGet(new_ptr));
             func.instruction(&Instruction::I32Store(wasm_encoder::MemArg {
@@ -2567,6 +3058,10 @@ impl FactStyleGenerator {
                 memory_index: dst_mem,
             }));
             // len stays the same — no need to update it
+
+            if guarded {
+                func.instruction(&Instruction::End); // end LS-P-12 per-element guard If
+            }
         }
 
         // Increment loop counter
@@ -2612,8 +3107,15 @@ impl FactStyleGenerator {
             (StringEncoding::Utf8, StringEncoding::Utf8)
         );
 
-        // Scratch locals: src_idx, dst_idx, out_ptr, byte (+ code_point for UTF-8/16)
-        let scratch_locals: u32 = if needs_transcoding_locals { 5 } else { 0 };
+        // Scratch locals: src_idx, dst_idx, out_ptr, cu/byte, code_point, and
+        // a 6th unit. In the UTF-16→UTF-8 direction the 6th unit is `cu2`
+        // (the second surrogate unit, used by the low-surrogate validation —
+        // LS-P-16 mid-string mitigation). In the UTF-8→UTF-16 direction the
+        // 6th unit is `cont` (a continuation byte being validated — #251
+        // malformed-UTF-8 hardening: invalid continuation / lead / overlong /
+        // surrogate / out-of-range detection). Only one direction's transcoder
+        // runs per generated function, so the two uses never alias.
+        let scratch_locals: u32 = if needs_transcoding_locals { 6 } else { 0 };
         let post_return_base = param_count as u32 + scratch_locals;
 
         let mut local_decls: Vec<(u32, wasm_encoder::ValType)> = Vec::new();
@@ -2660,12 +3162,35 @@ impl FactStyleGenerator {
                 self.emit_latin1_to_utf8_transcode(&mut func, param_count, target_func, options);
             }
 
-            _ => {
-                // Other combinations - fall back to direct call for now
+            (StringEncoding::Latin1, StringEncoding::Utf16) => {
+                // #253 inc 2: Latin-1 to UTF-16 is total and unambiguous — each
+                // byte 0x00–0xFF zero-extends to one code unit U+0000–U+00FF.
+                self.emit_latin1_to_utf16_transcode(&mut func, param_count, target_func, options);
+            }
+
+            (caller_enc, callee_enc) if caller_enc == callee_enc => {
+                // Same encoding (e.g. Utf16→Utf16, Latin1→Latin1): no
+                // transcoding needed, a verbatim copy is correct.
                 for i in 0..param_count {
                     func.instruction(&Instruction::LocalGet(i as u32));
                 }
                 func.instruction(&Instruction::Call(target_func));
+            }
+
+            (caller_enc, callee_enc) => {
+                // #253: a cross-encoding pair with no transcoder implemented
+                // (e.g. Latin1→Utf16, Utf8→Latin1, Utf16→Latin1 — note
+                // CompactUTF16 maps to Latin1). Previously this fell through
+                // to a verbatim byte copy, silently MIS-transcoding
+                // well-formed input (H-4.4). Fail loudly instead of emitting
+                // a wrong adapter — the per-pair transcoders are tracked as
+                // follow-up work. Reaching here means the resolver requested
+                // a transcoding meld cannot yet perform correctly.
+                return Err(crate::Error::AdapterGeneration(format!(
+                    "unsupported string transcoding: {caller_enc:?} -> {callee_enc:?} \
+                     (no transcoder implemented; a verbatim copy would silently \
+                     corrupt well-formed input — see #253)"
+                )));
             }
         }
 
@@ -2725,12 +3250,14 @@ impl FactStyleGenerator {
             }
         };
 
-        // Scratch locals: src_idx, dst_idx (code units), out_ptr, byte, code_point
+        // Scratch locals: src_idx, dst_idx (code units), out_ptr, byte,
+        // code_point, and cont (a continuation byte being validated — #251).
         let src_idx_local = param_count as u32;
         let dst_idx_local = param_count as u32 + 1;
         let out_ptr_local = param_count as u32 + 2;
         let byte_local = param_count as u32 + 3;
         let cp_local = param_count as u32 + 4;
+        let cont_local = param_count as u32 + 5;
 
         // Source reads use caller_memory, destination writes use callee_memory
         let src_mem8 = wasm_encoder::MemArg {
@@ -2800,6 +3327,49 @@ impl FactStyleGenerator {
         func.instruction(&Instruction::LocalSet(byte_local));
 
         // --- Decode UTF-8 sequence into code_point, advance src_idx ---
+        //
+        // #251 malformed-UTF-8 hardening. The decode arms below validate the
+        // *content* of every multi-byte sequence, not just (LS-P-19)
+        // truncation. The Canonical ABI mandates lossy U+FFFD replacement for
+        // any ill-formed UTF-8 (H-4.4 incorrect transcoding); on detection we
+        // follow the established LS-P-19 convention of emitting U+FFFD (one
+        // UTF-16 code unit) and consuming ONLY the lead byte (src_idx += 1),
+        // so the offending continuation/trailing byte is reprocessed on the
+        // next iteration. This always makes progress (>= 1 byte consumed) and
+        // is consistent with the existing truncation handling. It can emit
+        // more U+FFFDs than the strict Unicode "maximal subpart" rule for
+        // some multi-continuation cases, but never decodes to a wrong scalar.
+        //
+        // Helper closures keep the repeated WASM emission DRY:
+
+        // Emit: cp = U+FFFD; src_idx += 1 (replacement, consume lead only).
+        let emit_fffd_consume_lead = |func: &mut Function| {
+            func.instruction(&Instruction::I32Const(0xFFFD));
+            func.instruction(&Instruction::LocalSet(cp_local));
+            func.instruction(&Instruction::LocalGet(src_idx_local));
+            func.instruction(&Instruction::I32Const(1));
+            func.instruction(&Instruction::I32Add);
+            func.instruction(&Instruction::LocalSet(src_idx_local));
+        };
+
+        // Push mem8[ptr + src_idx + off] onto the stack (a continuation byte).
+        let push_byte_at = |func: &mut Function, off: i32| {
+            func.instruction(&Instruction::LocalGet(0));
+            func.instruction(&Instruction::LocalGet(src_idx_local));
+            func.instruction(&Instruction::I32Add);
+            func.instruction(&Instruction::I32Const(off));
+            func.instruction(&Instruction::I32Add);
+            func.instruction(&Instruction::I32Load8U(src_mem8));
+        };
+
+        // Push: (cont_local & 0xC0) != 0x80  (true => NOT a continuation byte).
+        let push_not_continuation = |func: &mut Function| {
+            func.instruction(&Instruction::LocalGet(cont_local));
+            func.instruction(&Instruction::I32Const(0xC0));
+            func.instruction(&Instruction::I32And);
+            func.instruction(&Instruction::I32Const(0x80));
+            func.instruction(&Instruction::I32Ne);
+        };
 
         // if byte < 0x80: 1-byte ASCII
         func.instruction(&Instruction::LocalGet(byte_local));
@@ -2818,130 +3388,292 @@ impl FactStyleGenerator {
         }
         func.instruction(&Instruction::Else);
         {
-            // if byte < 0xE0: 2-byte sequence
+            // if byte < 0xC2: invalid lead — a lone continuation byte
+            // (0x80–0xBF) masquerading as a lead, or an overlong 2-byte lead
+            // (0xC0, 0xC1). #251 case 2. Reject before the 2-byte arm so these
+            // never enter the decoder. → U+FFFD, consume lead only.
             func.instruction(&Instruction::LocalGet(byte_local));
-            func.instruction(&Instruction::I32Const(0xE0));
+            func.instruction(&Instruction::I32Const(0xC2));
             func.instruction(&Instruction::I32LtU);
             func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
             {
-                // cp = (byte & 0x1F) << 6 | (b1 & 0x3F)
-                func.instruction(&Instruction::LocalGet(byte_local));
-                func.instruction(&Instruction::I32Const(0x1F));
-                func.instruction(&Instruction::I32And);
-                func.instruction(&Instruction::I32Const(6));
-                func.instruction(&Instruction::I32Shl);
-                func.instruction(&Instruction::LocalGet(0));
-                func.instruction(&Instruction::LocalGet(src_idx_local));
-                func.instruction(&Instruction::I32Add);
-                func.instruction(&Instruction::I32Const(1));
-                func.instruction(&Instruction::I32Add);
-                func.instruction(&Instruction::I32Load8U(src_mem8));
-                func.instruction(&Instruction::I32Const(0x3F));
-                func.instruction(&Instruction::I32And);
-                func.instruction(&Instruction::I32Or);
-                func.instruction(&Instruction::LocalSet(cp_local));
-                // src_idx += 2
-                func.instruction(&Instruction::LocalGet(src_idx_local));
-                func.instruction(&Instruction::I32Const(2));
-                func.instruction(&Instruction::I32Add);
-                func.instruction(&Instruction::LocalSet(src_idx_local));
+                emit_fffd_consume_lead(func);
             }
             func.instruction(&Instruction::Else);
             {
-                // if byte < 0xF0: 3-byte sequence
+                // if byte < 0xE0: 2-byte sequence (lead 0xC2–0xDF, well-formed).
                 func.instruction(&Instruction::LocalGet(byte_local));
-                func.instruction(&Instruction::I32Const(0xF0));
+                func.instruction(&Instruction::I32Const(0xE0));
                 func.instruction(&Instruction::I32LtU);
                 func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
                 {
-                    // cp = (byte & 0x0F) << 12 | (b1 & 0x3F) << 6 | (b2 & 0x3F)
-                    func.instruction(&Instruction::LocalGet(byte_local));
-                    func.instruction(&Instruction::I32Const(0x0F));
-                    func.instruction(&Instruction::I32And);
-                    func.instruction(&Instruction::I32Const(12));
-                    func.instruction(&Instruction::I32Shl);
-                    // b1
-                    func.instruction(&Instruction::LocalGet(0));
+                    // LS-P-19: emit U+FFFD when the 2-byte sequence's
+                    // continuation byte would be read past the end of input
+                    // (truncated multi-byte lead). Pre-v0.11 trapped via
+                    // `unreachable`; the Canonical-ABI-correct behaviour is
+                    // lossy replacement with U+FFFD (a single UTF-16 code
+                    // unit), consuming only the lead byte. The continuations
+                    // would have started a valid sequence in another world;
+                    // by not consuming bytes past the lead we leave that
+                    // possibility open for the next iteration.
                     func.instruction(&Instruction::LocalGet(src_idx_local));
-                    func.instruction(&Instruction::I32Add);
                     func.instruction(&Instruction::I32Const(1));
                     func.instruction(&Instruction::I32Add);
-                    func.instruction(&Instruction::I32Load8U(src_mem8));
-                    func.instruction(&Instruction::I32Const(0x3F));
-                    func.instruction(&Instruction::I32And);
-                    func.instruction(&Instruction::I32Const(6));
-                    func.instruction(&Instruction::I32Shl);
-                    func.instruction(&Instruction::I32Or);
-                    // b2
-                    func.instruction(&Instruction::LocalGet(0));
-                    func.instruction(&Instruction::LocalGet(src_idx_local));
-                    func.instruction(&Instruction::I32Add);
-                    func.instruction(&Instruction::I32Const(2));
-                    func.instruction(&Instruction::I32Add);
-                    func.instruction(&Instruction::I32Load8U(src_mem8));
-                    func.instruction(&Instruction::I32Const(0x3F));
-                    func.instruction(&Instruction::I32And);
-                    func.instruction(&Instruction::I32Or);
-                    func.instruction(&Instruction::LocalSet(cp_local));
-                    // src_idx += 3
-                    func.instruction(&Instruction::LocalGet(src_idx_local));
-                    func.instruction(&Instruction::I32Const(3));
-                    func.instruction(&Instruction::I32Add);
-                    func.instruction(&Instruction::LocalSet(src_idx_local));
+                    func.instruction(&Instruction::LocalGet(1));
+                    func.instruction(&Instruction::I32GeU);
+                    func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+                    {
+                        // Truncated 2-byte lead → U+FFFD.
+                        emit_fffd_consume_lead(func);
+                    }
+                    func.instruction(&Instruction::Else);
+                    {
+                        // #251 case 1: validate the continuation byte.
+                        push_byte_at(func, 1);
+                        func.instruction(&Instruction::LocalSet(cont_local));
+                        push_not_continuation(func);
+                        func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+                        {
+                            // b1 is not a continuation byte → U+FFFD, consume lead.
+                            emit_fffd_consume_lead(func);
+                        }
+                        func.instruction(&Instruction::Else);
+                        {
+                            // cp = (byte & 0x1F) << 6 | (b1 & 0x3F).
+                            // Lead >= 0xC2 guarantees cp >= 0x80, so no overlong
+                            // check is needed (the 0xC0/0xC1 leads were rejected
+                            // above).
+                            func.instruction(&Instruction::LocalGet(byte_local));
+                            func.instruction(&Instruction::I32Const(0x1F));
+                            func.instruction(&Instruction::I32And);
+                            func.instruction(&Instruction::I32Const(6));
+                            func.instruction(&Instruction::I32Shl);
+                            func.instruction(&Instruction::LocalGet(cont_local));
+                            func.instruction(&Instruction::I32Const(0x3F));
+                            func.instruction(&Instruction::I32And);
+                            func.instruction(&Instruction::I32Or);
+                            func.instruction(&Instruction::LocalSet(cp_local));
+                            // src_idx += 2
+                            func.instruction(&Instruction::LocalGet(src_idx_local));
+                            func.instruction(&Instruction::I32Const(2));
+                            func.instruction(&Instruction::I32Add);
+                            func.instruction(&Instruction::LocalSet(src_idx_local));
+                        }
+                        func.instruction(&Instruction::End); // end 2-byte continuation check
+                    }
+                    func.instruction(&Instruction::End); // end LS-P-19 (2-byte) check
                 }
                 func.instruction(&Instruction::Else);
                 {
-                    // 4-byte sequence (byte >= 0xF0)
-                    // cp = (byte & 0x07) << 18 | (b1 & 0x3F) << 12 | (b2 & 0x3F) << 6 | (b3 & 0x3F)
+                    // if byte < 0xF0: 3-byte sequence (lead 0xE0–0xEF).
                     func.instruction(&Instruction::LocalGet(byte_local));
-                    func.instruction(&Instruction::I32Const(0x07));
-                    func.instruction(&Instruction::I32And);
-                    func.instruction(&Instruction::I32Const(18));
-                    func.instruction(&Instruction::I32Shl);
-                    // b1
-                    func.instruction(&Instruction::LocalGet(0));
-                    func.instruction(&Instruction::LocalGet(src_idx_local));
-                    func.instruction(&Instruction::I32Add);
-                    func.instruction(&Instruction::I32Const(1));
-                    func.instruction(&Instruction::I32Add);
-                    func.instruction(&Instruction::I32Load8U(src_mem8));
-                    func.instruction(&Instruction::I32Const(0x3F));
-                    func.instruction(&Instruction::I32And);
-                    func.instruction(&Instruction::I32Const(12));
-                    func.instruction(&Instruction::I32Shl);
-                    func.instruction(&Instruction::I32Or);
-                    // b2
-                    func.instruction(&Instruction::LocalGet(0));
-                    func.instruction(&Instruction::LocalGet(src_idx_local));
-                    func.instruction(&Instruction::I32Add);
-                    func.instruction(&Instruction::I32Const(2));
-                    func.instruction(&Instruction::I32Add);
-                    func.instruction(&Instruction::I32Load8U(src_mem8));
-                    func.instruction(&Instruction::I32Const(0x3F));
-                    func.instruction(&Instruction::I32And);
-                    func.instruction(&Instruction::I32Const(6));
-                    func.instruction(&Instruction::I32Shl);
-                    func.instruction(&Instruction::I32Or);
-                    // b3
-                    func.instruction(&Instruction::LocalGet(0));
-                    func.instruction(&Instruction::LocalGet(src_idx_local));
-                    func.instruction(&Instruction::I32Add);
-                    func.instruction(&Instruction::I32Const(3));
-                    func.instruction(&Instruction::I32Add);
-                    func.instruction(&Instruction::I32Load8U(src_mem8));
-                    func.instruction(&Instruction::I32Const(0x3F));
-                    func.instruction(&Instruction::I32And);
-                    func.instruction(&Instruction::I32Or);
-                    func.instruction(&Instruction::LocalSet(cp_local));
-                    // src_idx += 4
-                    func.instruction(&Instruction::LocalGet(src_idx_local));
-                    func.instruction(&Instruction::I32Const(4));
-                    func.instruction(&Instruction::I32Add);
-                    func.instruction(&Instruction::LocalSet(src_idx_local));
+                    func.instruction(&Instruction::I32Const(0xF0));
+                    func.instruction(&Instruction::I32LtU);
+                    func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+                    {
+                        // LS-P-19: emit U+FFFD when the 3-byte sequence's
+                        // continuation bytes would extend past the end of
+                        // input. Pre-v0.11 trapped; now substitutes the
+                        // truncated lead with U+FFFD and consumes only the
+                        // lead byte.
+                        func.instruction(&Instruction::LocalGet(src_idx_local));
+                        func.instruction(&Instruction::I32Const(2));
+                        func.instruction(&Instruction::I32Add);
+                        func.instruction(&Instruction::LocalGet(1));
+                        func.instruction(&Instruction::I32GeU);
+                        func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+                        {
+                            // Truncated 3-byte lead → U+FFFD.
+                            emit_fffd_consume_lead(func);
+                        }
+                        func.instruction(&Instruction::Else);
+                        {
+                            // #251 case 1: validate BOTH continuation bytes.
+                            // not_cont(b1) | not_cont(b2) → reject.
+                            push_byte_at(func, 1);
+                            func.instruction(&Instruction::LocalSet(cont_local));
+                            push_not_continuation(func);
+                            push_byte_at(func, 2);
+                            func.instruction(&Instruction::LocalSet(cont_local));
+                            push_not_continuation(func);
+                            func.instruction(&Instruction::I32Or);
+                            func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+                            {
+                                // A continuation byte is not 10xxxxxx → U+FFFD.
+                                emit_fffd_consume_lead(func);
+                            }
+                            func.instruction(&Instruction::Else);
+                            {
+                                // cp = (byte & 0x0F) << 12 | (b1 & 0x3F) << 6 | (b2 & 0x3F)
+                                func.instruction(&Instruction::LocalGet(byte_local));
+                                func.instruction(&Instruction::I32Const(0x0F));
+                                func.instruction(&Instruction::I32And);
+                                func.instruction(&Instruction::I32Const(12));
+                                func.instruction(&Instruction::I32Shl);
+                                // b1
+                                push_byte_at(func, 1);
+                                func.instruction(&Instruction::I32Const(0x3F));
+                                func.instruction(&Instruction::I32And);
+                                func.instruction(&Instruction::I32Const(6));
+                                func.instruction(&Instruction::I32Shl);
+                                func.instruction(&Instruction::I32Or);
+                                // b2
+                                push_byte_at(func, 2);
+                                func.instruction(&Instruction::I32Const(0x3F));
+                                func.instruction(&Instruction::I32And);
+                                func.instruction(&Instruction::I32Or);
+                                func.instruction(&Instruction::LocalSet(cp_local));
+                                // #251 cases 3 & 4: reject overlong
+                                // (cp < 0x800) and UTF-8-encoded surrogates
+                                // (0xD800 <= cp < 0xE000). overlong | surrogate.
+                                func.instruction(&Instruction::LocalGet(cp_local));
+                                func.instruction(&Instruction::I32Const(0x800));
+                                func.instruction(&Instruction::I32LtU);
+                                func.instruction(&Instruction::LocalGet(cp_local));
+                                func.instruction(&Instruction::I32Const(0xD800));
+                                func.instruction(&Instruction::I32GeU);
+                                func.instruction(&Instruction::LocalGet(cp_local));
+                                func.instruction(&Instruction::I32Const(0xE000));
+                                func.instruction(&Instruction::I32LtU);
+                                func.instruction(&Instruction::I32And);
+                                func.instruction(&Instruction::I32Or);
+                                func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+                                {
+                                    // Overlong or surrogate → U+FFFD, consume lead.
+                                    emit_fffd_consume_lead(func);
+                                }
+                                func.instruction(&Instruction::Else);
+                                {
+                                    // Well-formed 3-byte. src_idx += 3.
+                                    func.instruction(&Instruction::LocalGet(src_idx_local));
+                                    func.instruction(&Instruction::I32Const(3));
+                                    func.instruction(&Instruction::I32Add);
+                                    func.instruction(&Instruction::LocalSet(src_idx_local));
+                                }
+                                func.instruction(&Instruction::End); // end 3-byte overlong/surrogate check
+                            }
+                            func.instruction(&Instruction::End); // end 3-byte continuation check
+                        }
+                        func.instruction(&Instruction::End); // end LS-P-19 (3-byte) check
+                    }
+                    func.instruction(&Instruction::Else);
+                    {
+                        // 4-byte sequence (byte >= 0xF0).
+                        // #251 case 2: leads 0xF5–0xFF can only produce
+                        // out-of-range code points; reject them up front so
+                        // they never enter the 4-byte decoder.
+                        func.instruction(&Instruction::LocalGet(byte_local));
+                        func.instruction(&Instruction::I32Const(0xF5));
+                        func.instruction(&Instruction::I32GeU);
+                        func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+                        {
+                            emit_fffd_consume_lead(func);
+                        }
+                        func.instruction(&Instruction::Else);
+                        {
+                            // LS-P-19: emit U+FFFD when the 4-byte sequence's
+                            // continuation bytes would extend past the end of
+                            // input — without this guard a truncated 4-byte
+                            // lead at the buffer tail reads up to 3 bytes of
+                            // attacker-adjacent caller memory and folds them
+                            // into the encoded code point. Pre-v0.11 trapped;
+                            // now substitutes the truncated lead with U+FFFD
+                            // and consumes only the lead byte.
+                            func.instruction(&Instruction::LocalGet(src_idx_local));
+                            func.instruction(&Instruction::I32Const(3));
+                            func.instruction(&Instruction::I32Add);
+                            func.instruction(&Instruction::LocalGet(1));
+                            func.instruction(&Instruction::I32GeU);
+                            func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+                            {
+                                // Truncated 4-byte lead → U+FFFD.
+                                emit_fffd_consume_lead(func);
+                            }
+                            func.instruction(&Instruction::Else);
+                            {
+                                // #251 case 1: validate all THREE continuation bytes.
+                                push_byte_at(func, 1);
+                                func.instruction(&Instruction::LocalSet(cont_local));
+                                push_not_continuation(func);
+                                push_byte_at(func, 2);
+                                func.instruction(&Instruction::LocalSet(cont_local));
+                                push_not_continuation(func);
+                                func.instruction(&Instruction::I32Or);
+                                push_byte_at(func, 3);
+                                func.instruction(&Instruction::LocalSet(cont_local));
+                                push_not_continuation(func);
+                                func.instruction(&Instruction::I32Or);
+                                func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+                                {
+                                    // A continuation byte is not 10xxxxxx → U+FFFD.
+                                    emit_fffd_consume_lead(func);
+                                }
+                                func.instruction(&Instruction::Else);
+                                {
+                                    // cp = (byte & 0x07) << 18 | (b1 & 0x3F) << 12 | (b2 & 0x3F) << 6 | (b3 & 0x3F)
+                                    func.instruction(&Instruction::LocalGet(byte_local));
+                                    func.instruction(&Instruction::I32Const(0x07));
+                                    func.instruction(&Instruction::I32And);
+                                    func.instruction(&Instruction::I32Const(18));
+                                    func.instruction(&Instruction::I32Shl);
+                                    // b1
+                                    push_byte_at(func, 1);
+                                    func.instruction(&Instruction::I32Const(0x3F));
+                                    func.instruction(&Instruction::I32And);
+                                    func.instruction(&Instruction::I32Const(12));
+                                    func.instruction(&Instruction::I32Shl);
+                                    func.instruction(&Instruction::I32Or);
+                                    // b2
+                                    push_byte_at(func, 2);
+                                    func.instruction(&Instruction::I32Const(0x3F));
+                                    func.instruction(&Instruction::I32And);
+                                    func.instruction(&Instruction::I32Const(6));
+                                    func.instruction(&Instruction::I32Shl);
+                                    func.instruction(&Instruction::I32Or);
+                                    // b3
+                                    push_byte_at(func, 3);
+                                    func.instruction(&Instruction::I32Const(0x3F));
+                                    func.instruction(&Instruction::I32And);
+                                    func.instruction(&Instruction::I32Or);
+                                    func.instruction(&Instruction::LocalSet(cp_local));
+                                    // #251 cases 3 & 5: reject overlong
+                                    // (cp < 0x10000) and out-of-range
+                                    // (cp > 0x10FFFF). overlong | oor.
+                                    func.instruction(&Instruction::LocalGet(cp_local));
+                                    func.instruction(&Instruction::I32Const(0x10000));
+                                    func.instruction(&Instruction::I32LtU);
+                                    func.instruction(&Instruction::LocalGet(cp_local));
+                                    func.instruction(&Instruction::I32Const(0x10FFFF));
+                                    func.instruction(&Instruction::I32GtU);
+                                    func.instruction(&Instruction::I32Or);
+                                    func.instruction(&Instruction::If(
+                                        wasm_encoder::BlockType::Empty,
+                                    ));
+                                    {
+                                        // Overlong or out-of-range → U+FFFD, consume lead.
+                                        emit_fffd_consume_lead(func);
+                                    }
+                                    func.instruction(&Instruction::Else);
+                                    {
+                                        // Well-formed 4-byte. src_idx += 4.
+                                        func.instruction(&Instruction::LocalGet(src_idx_local));
+                                        func.instruction(&Instruction::I32Const(4));
+                                        func.instruction(&Instruction::I32Add);
+                                        func.instruction(&Instruction::LocalSet(src_idx_local));
+                                    }
+                                    func.instruction(&Instruction::End); // end 4-byte overlong/oor check
+                                }
+                                func.instruction(&Instruction::End); // end 4-byte continuation check
+                            }
+                            func.instruction(&Instruction::End); // end LS-P-19 (4-byte) check
+                        }
+                        func.instruction(&Instruction::End); // end 4-byte invalid-lead check
+                    }
+                    func.instruction(&Instruction::End); // end 3-byte vs 4-byte
                 }
-                func.instruction(&Instruction::End); // end 3-byte vs 4-byte
+                func.instruction(&Instruction::End); // end 2-byte vs 3+byte
             }
-            func.instruction(&Instruction::End); // end 2-byte vs 3+byte
+            func.instruction(&Instruction::End); // end invalid-lead vs valid-multibyte
         }
         func.instruction(&Instruction::End); // end 1-byte vs 2+byte
 
@@ -3059,6 +3791,7 @@ impl FactStyleGenerator {
         let out_ptr_local = param_count as u32 + 2;
         let cu_local = param_count as u32 + 3;
         let cp_local = param_count as u32 + 4;
+        let cu2_local = param_count as u32 + 5;
 
         // Source reads (UTF-16) use caller_memory, destination writes (UTF-8) use callee_memory
         let src_mem16 = wasm_encoder::MemArg {
@@ -3136,40 +3869,132 @@ impl FactStyleGenerator {
         func.instruction(&Instruction::I32And);
         func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
         {
-            // Surrogate pair: read low surrogate
-            // cu2 = mem16[ptr + (src_idx + 1) * 2]
-            // code_point = 0x10000 + ((cu - 0xD800) << 10) + (cu2 - 0xDC00)
-            func.instruction(&Instruction::I32Const(0x10000));
-            func.instruction(&Instruction::LocalGet(cu_local));
-            func.instruction(&Instruction::I32Const(0xD800_u32 as i32));
-            func.instruction(&Instruction::I32Sub);
-            func.instruction(&Instruction::I32Const(10));
-            func.instruction(&Instruction::I32Shl);
-            func.instruction(&Instruction::I32Add);
-            // Load low surrogate
-            func.instruction(&Instruction::LocalGet(0));
+            // LS-P-16: emit U+FFFD replacement when a lone high surrogate
+            // sits at the last code unit of the input. Pre-v0.11, this site
+            // trapped via `unreachable` (the conservative mitigation that
+            // closed a 2-byte OOB read into adjacent caller linear memory).
+            // The Canonical ABI's correct behaviour for malformed UTF-16 is
+            // **lossy replacement**, not abort — so we now substitute the
+            // lone high surrogate with the Unicode replacement character
+            // U+FFFD (3-byte UTF-8 `EF BF BD`) and continue. The existing
+            // 3-byte UTF-8 encoder below handles `cp = 0xFFFD` directly
+            // (it lives in the BMP), so the only restructure here is to
+            // turn the trap into an `If/Else`: when `src_idx + 1 >=
+            // input_len`, take the replacement path; otherwise read the
+            // low surrogate and compute the full code point.
             func.instruction(&Instruction::LocalGet(src_idx_local));
             func.instruction(&Instruction::I32Const(1));
             func.instruction(&Instruction::I32Add);
-            func.instruction(&Instruction::I32Const(1));
-            func.instruction(&Instruction::I32Shl);
-            func.instruction(&Instruction::I32Add);
-            func.instruction(&Instruction::I32Load16U(src_mem16));
-            func.instruction(&Instruction::I32Const(0xDC00_u32 as i32));
-            func.instruction(&Instruction::I32Sub);
-            func.instruction(&Instruction::I32Add);
-            func.instruction(&Instruction::LocalSet(cp_local));
-            // src_idx += 2
-            func.instruction(&Instruction::LocalGet(src_idx_local));
-            func.instruction(&Instruction::I32Const(2));
-            func.instruction(&Instruction::I32Add);
-            func.instruction(&Instruction::LocalSet(src_idx_local));
+            func.instruction(&Instruction::LocalGet(1));
+            func.instruction(&Instruction::I32GeU);
+            func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+            {
+                // Lone high surrogate at end of input → U+FFFD replacement.
+                func.instruction(&Instruction::I32Const(0xFFFD));
+                func.instruction(&Instruction::LocalSet(cp_local));
+                // Consume only the lone high surrogate.
+                func.instruction(&Instruction::LocalGet(src_idx_local));
+                func.instruction(&Instruction::I32Const(1));
+                func.instruction(&Instruction::I32Add);
+                func.instruction(&Instruction::LocalSet(src_idx_local));
+            }
+            func.instruction(&Instruction::Else);
+            {
+                // High surrogate with at least one more code unit available.
+                // LS-P-16 (mid-string mitigation): validate that the next
+                // unit is actually a low surrogate before treating this as a
+                // pair. An unvalidated second unit (e.g. a high surrogate
+                // followed by an ASCII char) underflows `cu2 - 0xDC00` and
+                // yields a garbage code point that the 4-byte encoder writes
+                // into callee memory (H-4.4 incorrect transcoding). The
+                // Canonical ABI mandates lossy U+FFFD replacement instead.
+                // cu2 = mem16[ptr + (src_idx + 1) * 2]
+                func.instruction(&Instruction::LocalGet(0));
+                func.instruction(&Instruction::LocalGet(src_idx_local));
+                func.instruction(&Instruction::I32Const(1));
+                func.instruction(&Instruction::I32Add);
+                func.instruction(&Instruction::I32Const(1));
+                func.instruction(&Instruction::I32Shl);
+                func.instruction(&Instruction::I32Add);
+                func.instruction(&Instruction::I32Load16U(src_mem16));
+                func.instruction(&Instruction::LocalSet(cu2_local));
+
+                // is_low_surrogate = (cu2 >= 0xDC00) && (cu2 < 0xE000)
+                func.instruction(&Instruction::LocalGet(cu2_local));
+                func.instruction(&Instruction::I32Const(0xDC00_u32 as i32));
+                func.instruction(&Instruction::I32GeU);
+                func.instruction(&Instruction::LocalGet(cu2_local));
+                func.instruction(&Instruction::I32Const(0xE000_u32 as i32));
+                func.instruction(&Instruction::I32LtU);
+                func.instruction(&Instruction::I32And);
+                func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+                {
+                    // Valid surrogate pair:
+                    // cp = 0x10000 + ((cu - 0xD800) << 10) + (cu2 - 0xDC00)
+                    func.instruction(&Instruction::I32Const(0x10000));
+                    func.instruction(&Instruction::LocalGet(cu_local));
+                    func.instruction(&Instruction::I32Const(0xD800_u32 as i32));
+                    func.instruction(&Instruction::I32Sub);
+                    func.instruction(&Instruction::I32Const(10));
+                    func.instruction(&Instruction::I32Shl);
+                    func.instruction(&Instruction::I32Add);
+                    func.instruction(&Instruction::LocalGet(cu2_local));
+                    func.instruction(&Instruction::I32Const(0xDC00_u32 as i32));
+                    func.instruction(&Instruction::I32Sub);
+                    func.instruction(&Instruction::I32Add);
+                    func.instruction(&Instruction::LocalSet(cp_local));
+                    // src_idx += 2 (consume both units)
+                    func.instruction(&Instruction::LocalGet(src_idx_local));
+                    func.instruction(&Instruction::I32Const(2));
+                    func.instruction(&Instruction::I32Add);
+                    func.instruction(&Instruction::LocalSet(src_idx_local));
+                }
+                func.instruction(&Instruction::Else);
+                {
+                    // Mid-string lone high surrogate → U+FFFD, consuming only
+                    // the high surrogate so the next unit is reprocessed
+                    // normally on the following iteration.
+                    func.instruction(&Instruction::I32Const(0xFFFD));
+                    func.instruction(&Instruction::LocalSet(cp_local));
+                    func.instruction(&Instruction::LocalGet(src_idx_local));
+                    func.instruction(&Instruction::I32Const(1));
+                    func.instruction(&Instruction::I32Add);
+                    func.instruction(&Instruction::LocalSet(src_idx_local));
+                }
+                func.instruction(&Instruction::End); // end low-surrogate validation
+            }
+            func.instruction(&Instruction::End); // end LS-P-16 lone-surrogate check
         }
         func.instruction(&Instruction::Else);
         {
-            // BMP character: code_point = cu
+            // Not a high surrogate. A lone LOW surrogate (cu in
+            // [0xDC00, 0xE000)) cannot legitimately appear unpaired here —
+            // the high-surrogate arm above consumes both halves of every
+            // valid pair, so any low surrogate reaching this branch is
+            // malformed input. Replace it with U+FFFD per the Canonical
+            // ABI (#249) rather than emitting the malformed 3-byte UTF-8 of
+            // a surrogate code point (ED B0 80 .. ED BF BF). Any other unit
+            // is a genuine BMP scalar value, encoded directly. Either way
+            // exactly one code unit is consumed.
+            // cp = is_low_surrogate(cu) ? 0xFFFD : cu
             func.instruction(&Instruction::LocalGet(cu_local));
-            func.instruction(&Instruction::LocalSet(cp_local));
+            func.instruction(&Instruction::I32Const(0xDC00_u32 as i32));
+            func.instruction(&Instruction::I32GeU);
+            func.instruction(&Instruction::LocalGet(cu_local));
+            func.instruction(&Instruction::I32Const(0xE000_u32 as i32));
+            func.instruction(&Instruction::I32LtU);
+            func.instruction(&Instruction::I32And);
+            func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+            {
+                func.instruction(&Instruction::I32Const(0xFFFD));
+                func.instruction(&Instruction::LocalSet(cp_local));
+            }
+            func.instruction(&Instruction::Else);
+            {
+                func.instruction(&Instruction::LocalGet(cu_local));
+                func.instruction(&Instruction::LocalSet(cp_local));
+            }
+            func.instruction(&Instruction::End); // end lone-low-surrogate check
             // src_idx += 1
             func.instruction(&Instruction::LocalGet(src_idx_local));
             func.instruction(&Instruction::I32Const(1));
@@ -3538,6 +4363,144 @@ impl FactStyleGenerator {
         func.instruction(&Instruction::Call(target_func));
     }
 
+    /// Emit Latin-1 to UTF-16 transcoding (#253 increment 2).
+    ///
+    /// This direction is **total and unambiguous**: every Latin-1 byte
+    /// 0x00–0xFF maps to exactly one UTF-16 code unit U+0000–U+00FF by
+    /// zero-extension. There are no surrogates, no multi-unit forms, and no
+    /// malformed inputs to reject — a u8 load is already the final code unit.
+    /// The UTF-16 code-unit count therefore equals the Latin-1 byte count
+    /// (1:1), and the output buffer is exactly `2 * byte_len` bytes.
+    ///
+    /// Assumes params start with (ptr: i32, byte_len: i32) where byte_len is
+    /// the Latin-1 byte count (== char count). Calls target with
+    /// (out_ptr: i32, code_unit_count: i32, ...rest); code_unit_count ==
+    /// byte_len.
+    fn emit_latin1_to_utf16_transcode(
+        &self,
+        func: &mut Function,
+        param_count: usize,
+        target_func: u32,
+        options: &AdapterOptions,
+    ) {
+        let callee_realloc = match options.callee_realloc {
+            Some(idx) => idx,
+            None => {
+                // No realloc available — fall back to direct call.
+                log::warn!(
+                    "Latin-1→UTF-16 transcode: no callee realloc, falling back to direct call"
+                );
+                for i in 0..param_count {
+                    func.instruction(&Instruction::LocalGet(i as u32));
+                }
+                func.instruction(&Instruction::Call(target_func));
+                return;
+            }
+        };
+
+        // Scratch locals start after the function's original params:
+        //   param_count+0 = src_idx (also the destination code-unit index, 1:1)
+        //   param_count+1 = out_ptr
+        //   param_count+2 = byte
+        // Stays within the shared scratch-local budget (param_count+0..+5).
+        let src_idx_local = param_count as u32;
+        let out_ptr_local = param_count as u32 + 1;
+        let byte_local = param_count as u32 + 2;
+
+        // Source reads (Latin-1, 1 byte) use caller_memory; destination writes
+        // (UTF-16, 2 bytes per code unit) use callee_memory.
+        let src_mem = wasm_encoder::MemArg {
+            offset: 0,
+            align: 0,
+            memory_index: options.caller_memory,
+        };
+        let dst_mem16 = wasm_encoder::MemArg {
+            offset: 0,
+            align: 1,
+            memory_index: options.callee_memory,
+        };
+
+        // Step 1: Allocate output buffer = 2 * byte_len via cabi_realloc (each
+        // Latin-1 byte produces exactly one UTF-16 code unit = 2 bytes). See
+        // LS-A-7: guard against i32.mul wrap (leg a) and cabi_realloc OOM
+        // (leg b) before writing into callee memory.
+        let callee_align = alignment_for_encoding(options.callee_string_encoding);
+        func.instruction(&Instruction::LocalGet(1)); // byte_len
+        func.instruction(&Instruction::I32Const((u32::MAX / 2) as i32));
+        func.instruction(&Instruction::I32GtU);
+        func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+        func.instruction(&Instruction::Unreachable);
+        func.instruction(&Instruction::End);
+
+        func.instruction(&Instruction::I32Const(0)); // original_ptr
+        func.instruction(&Instruction::I32Const(0)); // original_size
+        func.instruction(&Instruction::I32Const(callee_align)); // alignment
+        func.instruction(&Instruction::LocalGet(1)); // byte_len
+        func.instruction(&Instruction::I32Const(2));
+        func.instruction(&Instruction::I32Mul); // alloc_size = 2 * byte_len
+        func.instruction(&Instruction::Call(callee_realloc));
+        func.instruction(&Instruction::LocalSet(out_ptr_local));
+
+        // Trap on null return from cabi_realloc (LS-A-7 leg b).
+        func.instruction(&Instruction::LocalGet(out_ptr_local));
+        func.instruction(&Instruction::I32Eqz);
+        func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+        func.instruction(&Instruction::Unreachable);
+        func.instruction(&Instruction::End);
+
+        // Step 2: Initialize loop counter.
+        func.instruction(&Instruction::I32Const(0));
+        func.instruction(&Instruction::LocalSet(src_idx_local));
+
+        // Step 3: Transcoding loop over each source byte.
+        func.instruction(&Instruction::Block(wasm_encoder::BlockType::Empty));
+        func.instruction(&Instruction::Loop(wasm_encoder::BlockType::Empty));
+
+        // if src_idx >= byte_len, break
+        func.instruction(&Instruction::LocalGet(src_idx_local));
+        func.instruction(&Instruction::LocalGet(1)); // byte_len
+        func.instruction(&Instruction::I32GeU);
+        func.instruction(&Instruction::BrIf(1)); // br to outer block (done)
+
+        // Read byte from source: memory[string_ptr + src_idx].
+        // A u8 load is already zero-extended, so it IS the UTF-16 code unit.
+        func.instruction(&Instruction::LocalGet(0)); // string_ptr
+        func.instruction(&Instruction::LocalGet(src_idx_local));
+        func.instruction(&Instruction::I32Add);
+        func.instruction(&Instruction::I32Load8U(src_mem));
+        func.instruction(&Instruction::LocalSet(byte_local));
+
+        // Store as a 16-bit code unit: out[src_idx * 2] = byte.
+        func.instruction(&Instruction::LocalGet(out_ptr_local));
+        func.instruction(&Instruction::LocalGet(src_idx_local));
+        func.instruction(&Instruction::I32Const(1));
+        func.instruction(&Instruction::I32Shl); // src_idx * 2
+        func.instruction(&Instruction::I32Add);
+        func.instruction(&Instruction::LocalGet(byte_local));
+        func.instruction(&Instruction::I32Store16(dst_mem16));
+
+        // src_idx += 1
+        func.instruction(&Instruction::LocalGet(src_idx_local));
+        func.instruction(&Instruction::I32Const(1));
+        func.instruction(&Instruction::I32Add);
+        func.instruction(&Instruction::LocalSet(src_idx_local));
+
+        // Continue loop
+        func.instruction(&Instruction::Br(0));
+
+        func.instruction(&Instruction::End); // end loop
+        func.instruction(&Instruction::End); // end block
+
+        // Step 4: Call target with (out_ptr, code_unit_count, ...rest params).
+        // code_unit_count == byte_len (1:1 Latin-1 byte → UTF-16 code unit).
+        func.instruction(&Instruction::LocalGet(out_ptr_local));
+        func.instruction(&Instruction::LocalGet(1)); // byte_len == code_unit_count
+        for i in 2..param_count {
+            func.instruction(&Instruction::LocalGet(i as u32));
+        }
+        func.instruction(&Instruction::Call(target_func));
+    }
+
     /// Resolve the target function index in the merged module
     fn resolve_target_function(&self, site: &AdapterSite, merged: &MergedModule) -> Result<u32> {
         // Look up the exported function's merged index using the original export index.
@@ -3566,11 +4529,24 @@ impl FactStyleGenerator {
     /// Generate a callback-driving adapter for P3 async cross-component calls.
     ///
     /// Instead of canon lift/lower (which triggers call_might_be_recursive),
-    /// the adapter drives the callee's [async-lift] + [callback] loop directly
-    /// in core wasm. The protocol:
-    ///   1. Call [async-lift] entry → packed i32 (EXIT/WAIT/YIELD)
-    ///   2. Loop: poll waitable-set, call [callback] with events
-    ///   3. After EXIT, call [task-get-result] host import for result
+    /// the adapter drives the callee's `[async-lift]` + `[callback]` loop
+    /// directly in core wasm. This emits the **single canonical trampoline
+    /// shape** documented in [`crate::p3_async`] (see "Async-export callback
+    /// trampoline"). The shape is the same regardless of which P3 built-ins
+    /// the guest happens to use — `stream.read`, `future.read`,
+    /// `task.wait`, etc. — because the trampoline only speaks to the
+    /// callee through `[async-lift]` / `[callback]` and to the host
+    /// through `[waitable-set-poll]`.
+    ///
+    /// Protocol:
+    ///   1. Call `[async-lift]` entry → packed i32; low 4 bits =
+    ///      [`crate::p3_async::callback::EXIT`] / `YIELD` / `WAIT` / `POLL`,
+    ///      high 28 bits = waitable-set payload.
+    ///   2. Loop: on `WAIT`/`POLL`, dispatch `[waitable-set-poll]`,
+    ///      read the `(event_code, p1, p2)` tuple from scratch memory
+    ///      (event codes per [`crate::p3_async::event`]), call `[callback]`.
+    ///   3. After `EXIT`, read result globals written by the task.return
+    ///      shim and return to the caller.
     fn generate_async_callback_adapter(
         &self,
         site: &AdapterSite,
@@ -3668,114 +4644,18 @@ impl FactStyleGenerator {
         // + 6 for nested indirection patching (i, rec_dst, old_ptr, buf_len, new_ptr, rec_src)
         let mut body = Function::new([(16, wasm_encoder::ValType::I32)]);
 
-        // Step 0.5: Copy string/list params from caller to callee memory.
-        //
-        // The pointer_pair_positions from the resolver are in CALLEE component
-        // type order. But the adapter's locals are in CALLER order (from the
-        // caller's canon lower). These may differ if the component type
-        // reorders params.
-        //
-        // Instead of using the resolver's positions, compute positions from
-        // the caller's flat param types: find (i32, i32) pairs that could be
-        // (ptr, len) strings/lists.
-        let callee_realloc = crate::merger::component_realloc_index(merged, site.to_component);
-
-        // Detect pointer pairs in caller params: consecutive (i32, i32) pairs
-        // that aren't the last param (retptr). This is a heuristic — works for
-        // string and list params which are always (ptr: i32, len: i32).
-        let caller_ptr_positions: Vec<u32> = if site.crosses_memory && callee_realloc.is_some() {
-            let params = &caller_type.params;
-            let has_retptr =
-                caller_type.results.is_empty() && caller_param_count > callee_param_count;
-            let effective_len = if has_retptr {
-                params.len() - 1
-            } else {
-                params.len()
-            };
-            let mut positions = Vec::new();
-            let mut i = 0;
-            while i + 1 < effective_len {
-                if params[i] == wasm_encoder::ValType::I32
-                    && params[i + 1] == wasm_encoder::ValType::I32
-                {
-                    // Check if the resolver also thinks this is a pointer pair
-                    // (the resolver uses component type info to confirm)
-                    if site
-                        .requirements
-                        .pointer_pair_positions
-                        .iter()
-                        .any(|_| true)
-                    {
-                        positions.push(i as u32);
-                        i += 2; // skip the len
-                        continue;
-                    }
-                }
-                i += 1;
-            }
-            positions
-        } else {
-            Vec::new()
-        };
-
-        let has_param_copies = !caller_ptr_positions.is_empty();
-
-        if has_param_copies {
-            log::debug!(
-                "async adapter param copy: export={} caller_positions={:?} resolver_positions={:?}",
-                site.export_name,
-                caller_ptr_positions,
-                site.requirements.pointer_pair_positions,
-            );
-            let realloc = callee_realloc.unwrap();
-            // For each (ptr, len) pair in the caller's params, allocate in
-            // callee memory and copy the data from caller memory. Use the
-            // resolver's param_copy_layouts to get the per-element byte
-            // size so list<u32>/list<u64>/etc. copy the correct total size.
-            let param_layouts = &site.requirements.param_copy_layouts;
-            for (pair_idx, &ptr_pos) in caller_ptr_positions.iter().enumerate() {
-                let ptr_local = ptr_pos;
-                let len_local = ptr_local + 1;
-                let l_new_ptr = l_p2 + 4; // reuse scratch local
-
-                let byte_mult = param_layouts
-                    .get(pair_idx)
-                    .map(|cl| match cl {
-                        crate::resolver::CopyLayout::Bulk { byte_multiplier } => *byte_multiplier,
-                        crate::resolver::CopyLayout::Elements { element_size, .. } => *element_size,
-                    })
-                    .unwrap_or(1);
-
-                // Allocate: cabi_realloc(0, 0, 1, len * byte_mult)
-                emit_overflow_guard(&mut body, len_local, byte_mult);
-                body.instruction(&Instruction::I32Const(0));
-                body.instruction(&Instruction::I32Const(0));
-                body.instruction(&Instruction::I32Const(1));
-                body.instruction(&Instruction::LocalGet(len_local));
-                if byte_mult > 1 {
-                    body.instruction(&Instruction::I32Const(byte_mult as i32));
-                    body.instruction(&Instruction::I32Mul);
-                }
-                emit_checked_realloc(&mut body, realloc, l_new_ptr);
-
-                // Copy: memory.copy new_ptr <- old_ptr, len * byte_mult
-                body.instruction(&Instruction::LocalGet(l_new_ptr));
-                body.instruction(&Instruction::LocalGet(ptr_local));
-                body.instruction(&Instruction::LocalGet(len_local));
-                if byte_mult > 1 {
-                    body.instruction(&Instruction::I32Const(byte_mult as i32));
-                    body.instruction(&Instruction::I32Mul);
-                }
-                body.instruction(&Instruction::MemoryCopy {
-                    dst_mem: callee_memory,
-                    src_mem: caller_memory,
-                });
-
-                // Replace the ptr param with the new callee-memory ptr
-                body.instruction(&Instruction::LocalGet(l_new_ptr));
-                body.instruction(&Instruction::LocalSet(ptr_local));
-            }
-        }
+        // Step 0.5: copy string/list params from caller to callee memory.
+        // Shared with the stackful emitter (SR-32, #140); see
+        // `emit_param_copy_step` for the full contract.
+        self.emit_param_copy_step(
+            &mut body,
+            site,
+            merged,
+            &caller_type,
+            caller_param_count,
+            callee_param_count,
+            l_p2 + 4,
+        );
 
         // Step 1: Call [async-lift] entry with callee's params
         // (skip retptr if caller has more params than callee)
@@ -3785,21 +4665,26 @@ impl FactStyleGenerator {
         body.instruction(&Instruction::Call(async_lift_func));
         body.instruction(&Instruction::LocalSet(l_packed));
 
-        // Unpack: code = packed & 0xF, payload = packed >> 4
+        // Unpack: code = packed & CODE_MASK, payload = packed >> PAYLOAD_SHIFT
+        // (constants: see meld_core::p3_async::callback)
         body.instruction(&Instruction::LocalGet(l_packed));
-        body.instruction(&Instruction::I32Const(0xF));
+        body.instruction(&Instruction::I32Const(crate::p3_async::callback::CODE_MASK));
         body.instruction(&Instruction::I32And);
         body.instruction(&Instruction::LocalSet(l_code));
         body.instruction(&Instruction::LocalGet(l_packed));
-        body.instruction(&Instruction::I32Const(4));
+        body.instruction(&Instruction::I32Const(
+            crate::p3_async::callback::PAYLOAD_SHIFT as i32,
+        ));
         body.instruction(&Instruction::I32ShrU);
         body.instruction(&Instruction::LocalSet(l_payload));
 
-        // Step 2: Callback-driving loop
+        // Step 2: Callback-driving loop — single canonical shape per
+        // meld_core::p3_async docs ("Async-export callback trampoline").
         // block $exit
         //   loop $drive
-        //     if code == EXIT(0): break
-        //     if code == WAIT(2): call waitable-set-poll
+        //     if code == EXIT: break
+        //     if code == WAIT: call waitable-set-poll
+        //     else (YIELD): event = (EVENT_NONE, 0, 0)
         //     call callback(event_code, p1, p2)
         //     unpack result
         //     br $drive
@@ -3808,17 +4693,28 @@ impl FactStyleGenerator {
         body.instruction(&Instruction::Block(wasm_encoder::BlockType::Empty));
         body.instruction(&Instruction::Loop(wasm_encoder::BlockType::Empty));
 
-        // if code == 0 (EXIT): br $exit (block index 1)
+        // if code == EXIT (0): br $exit (block index 1)
         body.instruction(&Instruction::LocalGet(l_code));
         body.instruction(&Instruction::I32Eqz);
         body.instruction(&Instruction::BrIf(1)); // break to $exit block
 
-        // if code == 2 (WAIT): call waitable-set-poll(payload, event_ptr)
+        // if code == WAIT (2) OR code == POLL (3): call
+        // waitable-set-poll(payload, event_ptr).
         // Use scratch space at address 0 in callee memory for the 3xi32 event tuple
-        // (This is safe because the callee isn't running — we're driving it)
+        // (This is safe because the callee isn't running — we're driving it).
+        // POLL is the non-blocking variant of WAIT against the same call;
+        // both must dispatch to the host. LS-A-9: a previous version
+        // matched only WAIT, silently treating POLL as YIELD which sent
+        // (EVENT_NONE, 0, 0) to [callback] and dropped the event the host
+        // had ready, producing semantic drift between fused and composed
+        // modules.
         body.instruction(&Instruction::LocalGet(l_code));
-        body.instruction(&Instruction::I32Const(2));
+        body.instruction(&Instruction::I32Const(crate::p3_async::callback::WAIT));
         body.instruction(&Instruction::I32Eq);
+        body.instruction(&Instruction::LocalGet(l_code));
+        body.instruction(&Instruction::I32Const(crate::p3_async::callback::POLL));
+        body.instruction(&Instruction::I32Eq);
+        body.instruction(&Instruction::I32Or);
         body.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
         {
             // waitable-set-poll(set_handle, event_ptr) → i32
@@ -3857,8 +4753,8 @@ impl FactStyleGenerator {
         }
         body.instruction(&Instruction::Else);
         {
-            // YIELD(1): set event to (NONE, 0, 0)
-            body.instruction(&Instruction::I32Const(0));
+            // YIELD (1): set event to (EVENT_NONE, 0, 0)
+            body.instruction(&Instruction::I32Const(crate::p3_async::event::NONE));
             body.instruction(&Instruction::LocalSet(l_event_code));
             body.instruction(&Instruction::I32Const(0));
             body.instruction(&Instruction::LocalSet(l_p1));
@@ -3874,13 +4770,15 @@ impl FactStyleGenerator {
         body.instruction(&Instruction::Call(callback_func));
         body.instruction(&Instruction::LocalSet(l_packed));
 
-        // Unpack new result
+        // Unpack new result (same scheme as initial unpack above)
         body.instruction(&Instruction::LocalGet(l_packed));
-        body.instruction(&Instruction::I32Const(0xF));
+        body.instruction(&Instruction::I32Const(crate::p3_async::callback::CODE_MASK));
         body.instruction(&Instruction::I32And);
         body.instruction(&Instruction::LocalSet(l_code));
         body.instruction(&Instruction::LocalGet(l_packed));
-        body.instruction(&Instruction::I32Const(4));
+        body.instruction(&Instruction::I32Const(
+            crate::p3_async::callback::PAYLOAD_SHIFT as i32,
+        ));
         body.instruction(&Instruction::I32ShrU);
         body.instruction(&Instruction::LocalSet(l_payload));
 
@@ -3978,135 +4876,26 @@ impl FactStyleGenerator {
                     && caller_realloc.is_some();
 
                 if is_ptr_len_pair {
-                    let realloc_func = caller_realloc.unwrap();
-                    let (ptr_global, _) = info.result_globals[0];
-                    let (len_global, _) = info.result_globals[1];
-
-                    // Determine the per-element byte size and alignment from
-                    // the WIT result type. For string the element is 1 byte;
-                    // for list<u32> it's 4; for list<record{...}> it's the
-                    // record's CABI size (with internal alignment padding).
-                    // Without a known type we fall back to 1 (string-like).
-                    let (elem_size, elem_align, list_elem_ty) = match &info.result_type {
-                        Some(crate::parser::ComponentValType::List(elem))
-                        | Some(crate::parser::ComponentValType::FixedSizeList(elem, _)) => {
-                            let (s, a) = cabi_size_align(elem);
-                            (s, a, Some(elem.as_ref().clone()))
-                        }
-                        Some(crate::parser::ComponentValType::String) => (1, 1, None),
-                        _ => (1, 1, None),
-                    };
-
-                    // locals
-                    let l_src_ptr = l_p2 + 1;
-                    let l_src_len = l_p2 + 2;
-                    let l_dst_ptr = l_p2 + 3;
-                    let l_byte_count = l_p2 + 4;
-
-                    // Read source ptr and len from shim globals
-                    body.instruction(&Instruction::GlobalGet(ptr_global));
-                    body.instruction(&Instruction::LocalSet(l_src_ptr));
-                    body.instruction(&Instruction::GlobalGet(len_global));
-                    body.instruction(&Instruction::LocalSet(l_src_len));
-
-                    // byte_count = len * elem_size
-                    emit_overflow_guard(&mut body, l_src_len, elem_size);
-                    body.instruction(&Instruction::LocalGet(l_src_len));
-                    if elem_size != 1 {
-                        body.instruction(&Instruction::I32Const(elem_size as i32));
-                        body.instruction(&Instruction::I32Mul);
-                    }
-                    body.instruction(&Instruction::LocalSet(l_byte_count));
-
-                    // Allocate in caller memory: cabi_realloc(0, 0, align, byte_count)
-                    body.instruction(&Instruction::I32Const(0)); // old_ptr
-                    body.instruction(&Instruction::I32Const(0)); // old_size
-                    body.instruction(&Instruction::I32Const(elem_align as i32));
-                    body.instruction(&Instruction::LocalGet(l_byte_count));
-                    emit_checked_realloc(&mut body, realloc_func, l_dst_ptr);
-
-                    // Copy from callee memory to caller memory
-                    body.instruction(&Instruction::LocalGet(l_dst_ptr));
-                    body.instruction(&Instruction::LocalGet(l_src_ptr));
-                    body.instruction(&Instruction::LocalGet(l_byte_count));
-                    body.instruction(&Instruction::MemoryCopy {
-                        dst_mem: caller_memory,
-                        src_mem: callee_memory,
-                    });
-
-                    // If the list element contains nested indirections
-                    // (string fields, nested lists), walk each element and
-                    // copy each indirect buffer into caller memory, then
-                    // patch the (ptr, len) pair stored in the copied record.
-                    if let Some(elem_ty) = &list_elem_ty {
-                        emit_patch_nested_indirections(
-                            &mut body,
-                            elem_ty,
-                            l_dst_ptr,
-                            l_src_ptr,
-                            l_src_len,
-                            elem_size,
-                            l_p2 + 5,
-                            realloc_func,
-                            caller_memory,
-                            callee_memory,
-                        );
-                    }
-
-                    // Write (new_ptr, len) to retptr
-                    let mem_arg_0 = wasm_encoder::MemArg {
-                        offset: 0,
-                        align: 2,
-                        memory_index: caller_memory,
-                    };
-                    let mem_arg_4 = wasm_encoder::MemArg {
-                        offset: 4,
-                        align: 2,
-                        memory_index: caller_memory,
-                    };
-                    body.instruction(&Instruction::LocalGet(retptr_local));
-                    body.instruction(&Instruction::LocalGet(l_dst_ptr));
-                    body.instruction(&Instruction::I32Store(mem_arg_0));
-                    body.instruction(&Instruction::LocalGet(retptr_local));
-                    body.instruction(&Instruction::LocalGet(l_src_len));
-                    body.instruction(&Instruction::I32Store(mem_arg_4));
+                    // Shared helper handles realloc + memory.copy +
+                    // nested-indirection walk + retptr writeback.
+                    self.emit_ptr_pair_result_writeback(
+                        &mut body,
+                        info,
+                        retptr_local,
+                        caller_realloc.unwrap(),
+                        caller_memory,
+                        callee_memory,
+                        l_p2 + 1,
+                    );
                 } else {
                     // Non-pointer results: write globals directly to retptr
-                    let mut offset = 0u32;
-                    for (global_idx, val_ty) in &info.result_globals {
-                        body.instruction(&Instruction::LocalGet(retptr_local));
-                        body.instruction(&Instruction::GlobalGet(*global_idx));
-                        let mem_arg = wasm_encoder::MemArg {
-                            offset: offset as u64,
-                            align: match val_ty {
-                                wasm_encoder::ValType::I64 | wasm_encoder::ValType::F64 => 3,
-                                _ => 2,
-                            },
-                            memory_index: caller_memory,
-                        };
-                        match val_ty {
-                            wasm_encoder::ValType::I32 => {
-                                body.instruction(&Instruction::I32Store(mem_arg));
-                                offset += 4;
-                            }
-                            wasm_encoder::ValType::I64 => {
-                                body.instruction(&Instruction::I64Store(mem_arg));
-                                offset += 8;
-                            }
-                            wasm_encoder::ValType::F32 => {
-                                body.instruction(&Instruction::F32Store(mem_arg));
-                                offset += 4;
-                            }
-                            wasm_encoder::ValType::F64 => {
-                                body.instruction(&Instruction::F64Store(mem_arg));
-                                offset += 8;
-                            }
-                            _ => {
-                                body.instruction(&Instruction::I32Store(mem_arg));
-                                offset += 4;
-                            }
-                        }
-                    }
+                    // with canonical-ABI alignment padding between fields.
+                    self.emit_globals_to_retptr_cabi(
+                        &mut body,
+                        retptr_local,
+                        &info.result_globals,
+                        caller_memory,
+                    );
                 }
             } else {
                 // Push result values onto the stack
@@ -4150,6 +4939,569 @@ impl FactStyleGenerator {
             target_component: site.to_component,
             target_module: site.to_module,
             target_function: target_func,
+            class: AdapterClass::Async,
+        })
+    }
+
+    /// Step 0.5 of any async-lift adapter: copy `string` / `list<T>` params
+    /// from caller memory into callee memory, allocating callee buffers via
+    /// `cabi_realloc` and patching the caller's locals to point at the new
+    /// callee-side buffers. Shared between callback and stackful emitters so
+    /// the cross-memory contract has a single source of truth (SR-12,
+    /// SR-17).
+    ///
+    /// `scratch_local` is the local index the helper uses to hold the
+    /// realloc result. Callers must reserve at least one i32 local at that
+    /// index. Both emitters allocate their local layout so the scratch sits
+    /// just past the caller's params and per-emitter loop locals.
+    #[allow(clippy::too_many_arguments)]
+    fn emit_param_copy_step(
+        &self,
+        body: &mut Function,
+        site: &AdapterSite,
+        merged: &MergedModule,
+        caller_type: &crate::merger::MergedFuncType,
+        caller_param_count: usize,
+        callee_param_count: usize,
+        scratch_local: u32,
+    ) {
+        // `pointer_pair_positions` from the resolver are flat indices into
+        // the component-type param list, computed by
+        // `pointer_pair_param_positions` walking the function's params with
+        // `flat_count`. Canonical lowering preserves param order, so those
+        // flat indices apply equally to the caller's lowered param locals
+        // (the retptr the adapter inserts for results is appended after the
+        // component-type params, so it never collides with a position from
+        // this slice). LS-P-13: the previous code walked `caller_type.params`
+        // looking for consecutive `(i32, i32)` slots and joined each with
+        // `pointer_pair_positions.iter().any(|_| true)` — semantically
+        // `!is_empty()`. Every adjacent integer-pair argument was then
+        // treated as a (ptr, len) string/list and rewritten via
+        // `cabi_realloc` + `memory.copy`, corrupting plain integer args at
+        // the callee. Replaces that with the resolver's positions directly.
+        let _ = (caller_type, caller_param_count, callee_param_count);
+        let callee_realloc = crate::merger::component_realloc_index(merged, site.to_component);
+        let callee_memory = crate::merger::component_memory_index(merged, site.to_component);
+        let caller_memory = crate::merger::component_memory_index(merged, site.from_component);
+
+        let caller_ptr_positions: Vec<u32> = if site.crosses_memory && callee_realloc.is_some() {
+            site.requirements.pointer_pair_positions.clone()
+        } else {
+            Vec::new()
+        };
+
+        if caller_ptr_positions.is_empty() {
+            return;
+        }
+
+        log::debug!(
+            "async adapter param copy: export={} caller_positions={:?} resolver_positions={:?}",
+            site.export_name,
+            caller_ptr_positions,
+            site.requirements.pointer_pair_positions,
+        );
+        let realloc = callee_realloc.unwrap();
+        let param_layouts = &site.requirements.param_copy_layouts;
+        for (pair_idx, &ptr_pos) in caller_ptr_positions.iter().enumerate() {
+            let ptr_local = ptr_pos;
+            let len_local = ptr_local + 1;
+            let l_new_ptr = scratch_local;
+
+            let byte_mult = param_layouts
+                .get(pair_idx)
+                .map(|cl| match cl {
+                    crate::resolver::CopyLayout::Bulk { byte_multiplier } => *byte_multiplier,
+                    crate::resolver::CopyLayout::Elements { element_size, .. } => *element_size,
+                })
+                .unwrap_or(1);
+
+            // Allocate: cabi_realloc(0, 0, 1, len * byte_mult)
+            emit_overflow_guard(body, len_local, byte_mult);
+            body.instruction(&Instruction::I32Const(0));
+            body.instruction(&Instruction::I32Const(0));
+            body.instruction(&Instruction::I32Const(1));
+            body.instruction(&Instruction::LocalGet(len_local));
+            if byte_mult > 1 {
+                body.instruction(&Instruction::I32Const(byte_mult as i32));
+                body.instruction(&Instruction::I32Mul);
+            }
+            emit_checked_realloc(body, realloc, l_new_ptr);
+
+            // Copy: memory.copy new_ptr <- old_ptr, len * byte_mult
+            body.instruction(&Instruction::LocalGet(l_new_ptr));
+            body.instruction(&Instruction::LocalGet(ptr_local));
+            body.instruction(&Instruction::LocalGet(len_local));
+            if byte_mult > 1 {
+                body.instruction(&Instruction::I32Const(byte_mult as i32));
+                body.instruction(&Instruction::I32Mul);
+            }
+            body.instruction(&Instruction::MemoryCopy {
+                dst_mem: callee_memory,
+                src_mem: caller_memory,
+            });
+
+            // Replace the ptr param with the new callee-memory ptr
+            body.instruction(&Instruction::LocalGet(l_new_ptr));
+            body.instruction(&Instruction::LocalSet(ptr_local));
+        }
+    }
+
+    /// Return true if a `[callback]<export>` companion export exists in the
+    /// merged module. The Component Model spec attaches `(callback ...)` to a
+    /// canonical lift to opt into callback-mode async; meld surfaces that
+    /// option as a sibling export so the adapter can find the callback by
+    /// name. Absence of the companion means the canonical used stackful
+    /// lifting (SR-32, #140).
+    fn has_callback_export(&self, site: &AdapterSite, merged: &MergedModule) -> bool {
+        let callback_export_name = format!("[callback]{}", site.export_name);
+        merged
+            .exports
+            .iter()
+            .any(|e| e.kind == wasm_encoder::ExportKind::Func && e.name == callback_export_name)
+    }
+
+    /// Emit the cross-memory writeback for an async-lift result that is a
+    /// `(ptr, len)` pair (string / list<T>). Allocates a buffer in caller
+    /// memory via `cabi_realloc`, copies the source bytes from callee
+    /// memory, walks nested indirections if the list element type
+    /// contains them, and writes `(new_ptr, len)` to the caller's retptr.
+    ///
+    /// Shared between callback and stackful async-lift emitters so the
+    /// cross-memory contract has a single source of truth (SR-12 /
+    /// SR-17). The caller must reserve at least 4 consecutive scratch
+    /// i32 locals starting at `scratch_base`, plus the 6 locals
+    /// `emit_patch_nested_indirections` consumes starting at
+    /// `scratch_base + 4`.
+    #[allow(clippy::too_many_arguments)]
+    fn emit_ptr_pair_result_writeback(
+        &self,
+        body: &mut Function,
+        info: &crate::merger::TaskReturnShimInfo,
+        retptr_local: u32,
+        caller_realloc_func: u32,
+        caller_memory: u32,
+        callee_memory: u32,
+        scratch_base: u32,
+    ) {
+        let (ptr_global, _) = info.result_globals[0];
+        let (len_global, _) = info.result_globals[1];
+
+        // Determine the per-element byte size and alignment from the
+        // WIT result type. For string the element is 1 byte; for
+        // list<u32> it's 4; for list<record{...}> it's the record's
+        // CABI size. Without a known type we fall back to 1 (string-
+        // like).
+        let (elem_size, elem_align, list_elem_ty) = match &info.result_type {
+            Some(crate::parser::ComponentValType::List(elem))
+            | Some(crate::parser::ComponentValType::FixedSizeList(elem, _)) => {
+                let (s, a) = cabi_size_align(elem);
+                (s, a, Some(elem.as_ref().clone()))
+            }
+            Some(crate::parser::ComponentValType::String) => (1, 1, None),
+            _ => (1, 1, None),
+        };
+
+        let l_src_ptr = scratch_base;
+        let l_src_len = scratch_base + 1;
+        let l_dst_ptr = scratch_base + 2;
+        let l_byte_count = scratch_base + 3;
+
+        // Read source ptr and len from shim globals
+        body.instruction(&Instruction::GlobalGet(ptr_global));
+        body.instruction(&Instruction::LocalSet(l_src_ptr));
+        body.instruction(&Instruction::GlobalGet(len_global));
+        body.instruction(&Instruction::LocalSet(l_src_len));
+
+        // byte_count = len * elem_size, with LS-A-7 overflow guard
+        emit_overflow_guard(body, l_src_len, elem_size);
+        body.instruction(&Instruction::LocalGet(l_src_len));
+        if elem_size != 1 {
+            body.instruction(&Instruction::I32Const(elem_size as i32));
+            body.instruction(&Instruction::I32Mul);
+        }
+        body.instruction(&Instruction::LocalSet(l_byte_count));
+
+        // Allocate in caller memory: cabi_realloc(0, 0, align, byte_count)
+        body.instruction(&Instruction::I32Const(0)); // old_ptr
+        body.instruction(&Instruction::I32Const(0)); // old_size
+        body.instruction(&Instruction::I32Const(elem_align as i32));
+        body.instruction(&Instruction::LocalGet(l_byte_count));
+        emit_checked_realloc(body, caller_realloc_func, l_dst_ptr);
+
+        // Copy from callee memory to caller memory
+        body.instruction(&Instruction::LocalGet(l_dst_ptr));
+        body.instruction(&Instruction::LocalGet(l_src_ptr));
+        body.instruction(&Instruction::LocalGet(l_byte_count));
+        body.instruction(&Instruction::MemoryCopy {
+            dst_mem: caller_memory,
+            src_mem: callee_memory,
+        });
+
+        // Walk nested indirections (string fields, nested lists) if the
+        // list element type carries them.
+        if let Some(elem_ty) = &list_elem_ty {
+            emit_patch_nested_indirections(
+                body,
+                elem_ty,
+                l_dst_ptr,
+                l_src_ptr,
+                l_src_len,
+                elem_size,
+                scratch_base + 4,
+                caller_realloc_func,
+                caller_memory,
+                callee_memory,
+            );
+        }
+
+        // Write (new_ptr, len) to retptr at offsets 0 and 4 (both i32,
+        // align 2). The pair layout is fixed by the canonical ABI for
+        // string and list<T> returns, so no align_up needed here.
+        let mem_arg_0 = wasm_encoder::MemArg {
+            offset: 0,
+            align: 2,
+            memory_index: caller_memory,
+        };
+        let mem_arg_4 = wasm_encoder::MemArg {
+            offset: 4,
+            align: 2,
+            memory_index: caller_memory,
+        };
+        body.instruction(&Instruction::LocalGet(retptr_local));
+        body.instruction(&Instruction::LocalGet(l_dst_ptr));
+        body.instruction(&Instruction::I32Store(mem_arg_0));
+        body.instruction(&Instruction::LocalGet(retptr_local));
+        body.instruction(&Instruction::LocalGet(l_src_len));
+        body.instruction(&Instruction::I32Store(mem_arg_4));
+    }
+
+    /// Emit the canonical-ABI store sequence that writes each task.return
+    /// result global to the caller's retptr buffer at the spec-required
+    /// offset. Both the callback and stackful async-lift emitters use
+    /// this so the writeback contract has a single source of truth.
+    ///
+    /// Critical invariant — alignment padding between fields:
+    ///
+    /// The canonical ABI aligns every record/tuple field up to its
+    /// natural alignment before placing it. For example, a result whose
+    /// flat lowering contains `[I32, I64]` lays out as i32 at offset 0,
+    /// 4 bytes of padding, i64 at offset 8 (record size 16). A naïve
+    /// "advance offset by flat byte size" loop would write the i64 at
+    /// offset 4 — the caller's canon.lower then reads stale/zero bytes
+    /// at offset 8. Wasm engines treat `MemArg.align` as a hint and do
+    /// not trap on misalignment, so the bug is silent data corruption.
+    ///
+    /// Surfaced by the v0.8.0 pre-release Mythos delta-pass; pinned by
+    /// `cabi_alignment_stackful_retptr_writes_i64_at_offset_8`.
+    fn emit_globals_to_retptr_cabi(
+        &self,
+        body: &mut Function,
+        retptr_local: u32,
+        result_globals: &[(u32, wasm_encoder::ValType)],
+        caller_memory: u32,
+    ) {
+        fn align_up(n: u32, a: u32) -> u32 {
+            (n + a - 1) & !(a - 1)
+        }
+        fn natural(val_ty: &wasm_encoder::ValType) -> (u32, u32) {
+            // (size, alignment) per canonical-ABI flattening; align is
+            // identical to size for primitive numeric types.
+            match val_ty {
+                wasm_encoder::ValType::I64 | wasm_encoder::ValType::F64 => (8, 8),
+                wasm_encoder::ValType::I32 | wasm_encoder::ValType::F32 => (4, 4),
+                _ => (4, 4),
+            }
+        }
+
+        let mut offset = 0u32;
+        for (global_idx, val_ty) in result_globals {
+            let (size, align) = natural(val_ty);
+            offset = align_up(offset, align);
+            body.instruction(&Instruction::LocalGet(retptr_local));
+            body.instruction(&Instruction::GlobalGet(*global_idx));
+            let mem_arg = wasm_encoder::MemArg {
+                offset: offset as u64,
+                align: match val_ty {
+                    wasm_encoder::ValType::I64 | wasm_encoder::ValType::F64 => 3,
+                    _ => 2,
+                },
+                memory_index: caller_memory,
+            };
+            match val_ty {
+                wasm_encoder::ValType::I32 => {
+                    body.instruction(&Instruction::I32Store(mem_arg));
+                }
+                wasm_encoder::ValType::I64 => {
+                    body.instruction(&Instruction::I64Store(mem_arg));
+                }
+                wasm_encoder::ValType::F32 => {
+                    body.instruction(&Instruction::F32Store(mem_arg));
+                }
+                wasm_encoder::ValType::F64 => {
+                    body.instruction(&Instruction::F64Store(mem_arg));
+                }
+                _ => {
+                    body.instruction(&Instruction::I32Store(mem_arg));
+                }
+            }
+            offset += size;
+        }
+    }
+
+    /// Emit the stackful-mode async-lift trampoline (SR-32, #140).
+    ///
+    /// Stackful lifting per the Component Model spec: a canonical lift
+    /// with `(canon lift ... async ...)` but **no** `(callback ...)`
+    /// option. The runtime treats the lifted call as a fiber boundary —
+    /// the wasm code inside may call `task.wait`/`task.yield` to suspend,
+    /// and the runtime resumes the fiber transparently. From the
+    /// adapter's perspective, the call looks synchronous: invoke the
+    /// lift, await its return, read result globals.
+    ///
+    /// Generated wasm shape:
+    ///
+    /// ```wat
+    /// (func $async_stackful_adapter_<from>_to_<to>
+    ///   ;; step 0.5: cross-memory param copy (shared with callback path)
+    ///   ;; step 1:   call [async-lift]<export> — runtime-managed fiber
+    ///   ;; step 1.5: drop the lift's stackful return value (irrelevant —
+    ///   ;;           result has already been written via task.return)
+    ///   ;; step 3:   read result from async_result_globals and return
+    ///   ;;           to caller (push-on-stack OR write-to-retptr)
+    /// )
+    /// ```
+    ///
+    /// The Phase 1 `thread::*` host-intrinsic ABI (thread_new,
+    /// thread_switch_to, thread_yield, thread_exit) remains valid for
+    /// component-internal concurrency but is **not** consumed by this
+    /// trampoline; see ADR-1's 2026-05-13 addendum.
+    ///
+    /// Result readback covers:
+    /// - Push-results-onto-stack: caller expects direct results
+    /// - Retptr with non-pointer scalars: write globals at offset to
+    ///   caller's return buffer
+    ///
+    /// Returning lists / strings from stackful mode (cross-memory copy
+    /// of `(ptr, len)` results) is deferred to a follow-up; this emitter
+    /// errors clearly if asked to handle that case for now.
+    fn generate_async_stackful_adapter(
+        &self,
+        site: &AdapterSite,
+        merged: &MergedModule,
+    ) -> Result<AdapterFunction> {
+        let name = format!(
+            "$async_stackful_adapter_{}_to_{}",
+            site.from_component, site.to_component
+        );
+
+        let async_lift_func = self.resolve_target_function(site, merged)?;
+
+        let caller_type_idx = site
+            .import_func_type_idx
+            .and_then(|local_ti| {
+                merged
+                    .type_index_map
+                    .get(&(site.from_component, site.from_module, local_ti))
+                    .copied()
+            })
+            .unwrap_or(0);
+
+        let caller_type = merged
+            .types
+            .get(caller_type_idx as usize)
+            .cloned()
+            .unwrap_or_else(|| crate::merger::MergedFuncType {
+                params: Vec::new(),
+                results: Vec::new(),
+            });
+        let caller_param_count = caller_type.params.len();
+
+        let caller_memory = crate::merger::component_memory_index(merged, site.from_component);
+
+        let callee_param_count = merged
+            .defined_func(async_lift_func)
+            .and_then(|f| merged.types.get(f.type_idx as usize))
+            .map(|t| t.params.len())
+            .unwrap_or(caller_param_count);
+
+        // Locals layout (simpler than callback mode — no packed/code/payload):
+        //   0..caller_param_count: params from caller
+        //   +0:        $scratch — used by step 0.5 helper for new_ptr
+        //   +1..+4:    ptr-pair result writeback scratch (src_ptr,
+        //              src_len, dst_ptr, byte_count)
+        //   +5..+10:   nested-indirection patching scratch (consumed by
+        //              `emit_patch_nested_indirections`)
+        let l_scratch = caller_param_count as u32;
+
+        // 11 locals total: 1 for step 0.5 + 4 for ptr-pair writeback +
+        // 6 for nested-indirection patching. Plus 1 headroom = 12.
+        let mut body = Function::new([(12, wasm_encoder::ValType::I32)]);
+
+        // Step 0.5: cross-memory param copy (shared with callback path)
+        self.emit_param_copy_step(
+            &mut body,
+            site,
+            merged,
+            &caller_type,
+            caller_param_count,
+            callee_param_count,
+            l_scratch,
+        );
+
+        // Step 1: call [async-lift] entry. In stackful mode the runtime
+        // treats this call as a fiber boundary; control returns once the
+        // fiber has run to completion (including any task.wait suspensions
+        // the body issues internally).
+        for i in 0..callee_param_count {
+            body.instruction(&Instruction::LocalGet(i as u32));
+        }
+        body.instruction(&Instruction::Call(async_lift_func));
+
+        // Step 1.5: drop any return value the lift function produces. In
+        // stackful mode the real result has already been written to the
+        // task.return shim globals from inside the lift body; the wasm-
+        // level return value (if any) is a control word the runtime owns.
+        let lift_result_count = merged
+            .defined_func(async_lift_func)
+            .and_then(|f| merged.types.get(f.type_idx as usize))
+            .map(|t| t.results.len())
+            .unwrap_or(0);
+        for _ in 0..lift_result_count {
+            body.instruction(&Instruction::Drop);
+        }
+
+        // Step 3: read result values from task.return shim globals.
+        let adapter_func_name = site
+            .export_name
+            .rsplit_once('#')
+            .map(|(_, name)| name)
+            .unwrap_or(&site.export_name);
+
+        let result_globals_direct = merged
+            .async_result_globals
+            .get(&(site.to_component, adapter_func_name.to_string()));
+
+        let shim_info = if let Some(globals) = result_globals_direct {
+            let result_type = merged
+                .task_return_shims
+                .values()
+                .find(|info| {
+                    info.component_idx == site.to_component && info.result_globals == *globals
+                })
+                .and_then(|info| info.result_type.clone());
+            Some(crate::merger::TaskReturnShimInfo {
+                shim_func: 0,
+                result_globals: globals.clone(),
+                component_idx: site.to_component,
+                import_name: String::new(),
+                original_func_name: adapter_func_name.to_string(),
+                result_type,
+            })
+        } else {
+            merged
+                .task_return_shims
+                .values()
+                .find(|info| {
+                    info.component_idx == site.to_component
+                        && info.original_func_name == adapter_func_name
+                })
+                .cloned()
+        };
+
+        let uses_retptr = caller_type.results.is_empty() && caller_param_count > callee_param_count;
+
+        if let Some(info) = shim_info.as_ref() {
+            if uses_retptr {
+                let retptr_local = callee_param_count as u32;
+                let callee_memory =
+                    crate::merger::component_memory_index(merged, site.to_component);
+                let caller_realloc =
+                    crate::merger::component_realloc_index(merged, site.from_component);
+                let is_ptr_pair = info.result_globals.len() == 2
+                    && info
+                        .result_globals
+                        .iter()
+                        .all(|(_, t)| *t == wasm_encoder::ValType::I32)
+                    && callee_memory != caller_memory
+                    && caller_realloc.is_some();
+
+                if is_ptr_pair {
+                    // Cross-memory (string / list<T>) return: realloc
+                    // in caller memory, copy, walk nested indirections,
+                    // write (new_ptr, len) to retptr. Shared with the
+                    // callback path; see `emit_ptr_pair_result_writeback`.
+                    self.emit_ptr_pair_result_writeback(
+                        &mut body,
+                        info,
+                        retptr_local,
+                        caller_realloc.unwrap(),
+                        caller_memory,
+                        callee_memory,
+                        l_scratch + 1,
+                    );
+                } else {
+                    // Non-pointer results: write globals directly to retptr
+                    // with canonical-ABI alignment padding between fields
+                    // (shared helper, see `emit_globals_to_retptr_cabi`).
+                    self.emit_globals_to_retptr_cabi(
+                        &mut body,
+                        retptr_local,
+                        &info.result_globals,
+                        caller_memory,
+                    );
+                }
+            } else {
+                // Push result values onto the stack for the caller.
+                for (global_idx, _) in &info.result_globals {
+                    body.instruction(&Instruction::GlobalGet(*global_idx));
+                }
+            }
+        } else {
+            // No matching task.return shim — emit default values per
+            // caller result types so the adapter is still a valid wasm
+            // function. The merger should always wire shims for
+            // async-lifted exports, so reaching here implies a parse-
+            // time invariant violation; logging keeps the path visible.
+            log::warn!(
+                "stackful adapter '{}': no task.return shim found; \
+                 emitting default results",
+                site.export_name,
+            );
+            for result_ty in &caller_type.results {
+                match result_ty {
+                    wasm_encoder::ValType::I32 => {
+                        body.instruction(&Instruction::I32Const(0));
+                    }
+                    wasm_encoder::ValType::I64 => {
+                        body.instruction(&Instruction::I64Const(0));
+                    }
+                    wasm_encoder::ValType::F32 => {
+                        body.instruction(&Instruction::F32Const(0.0_f32.into()));
+                    }
+                    wasm_encoder::ValType::F64 => {
+                        body.instruction(&Instruction::F64Const(0.0_f64.into()));
+                    }
+                    _ => {
+                        body.instruction(&Instruction::I32Const(0));
+                    }
+                }
+            }
+        }
+
+        body.instruction(&Instruction::End);
+
+        let target_func = self.resolve_target_function(site, merged)?;
+
+        Ok(AdapterFunction {
+            name,
+            type_idx: caller_type_idx,
+            body,
+            source_component: site.from_component,
+            source_module: site.from_module,
+            target_component: site.to_component,
+            target_module: site.to_module,
+            target_function: target_func,
+            class: AdapterClass::Async,
         })
     }
 }
@@ -4165,7 +5517,11 @@ impl AdapterGenerator for FactStyleGenerator {
 
         for (idx, site) in graph.adapter_sites.iter().enumerate() {
             if site.is_async_lift {
-                let adapter = self.generate_async_callback_adapter(site, merged)?;
+                let adapter = if self.has_callback_export(site, merged) {
+                    self.generate_async_callback_adapter(site, merged)?
+                } else {
+                    self.generate_async_stackful_adapter(site, merged)?
+                };
                 adapters.push(adapter);
                 continue;
             }
@@ -4205,6 +5561,172 @@ mod tests {
         assert_eq!(options.caller_string_encoding, StringEncoding::Utf8);
         assert_eq!(options.callee_string_encoding, StringEncoding::Utf8);
         assert!(!options.needs_transcoding());
+    }
+
+    /// LS-P-19 — `emit_utf8_to_utf16_transcode` must replace truncated
+    /// multi-byte UTF-8 sequences with U+FFFD instead of reading past the
+    /// end of the input buffer.
+    ///
+    /// The mirror of LS-P-16 on the UTF-8→UTF-16 direction. Before the
+    /// v0.10 mitigation, each multi-byte branch (2-byte, 3-byte, 4-byte)
+    /// unconditionally read continuation bytes at `src_idx + 1`, `+2`,
+    /// `+3` via `I32Load8U` without checking against `input_len` — a
+    /// UTF-8 string ending on a truncated multi-byte lead byte caused
+    /// the adapter to load 1–3 bytes of attacker-adjacent caller memory,
+    /// incorporate them into a synthesized code point, and emit the
+    /// result as UTF-16 in the callee. v0.10 trapped via `unreachable`
+    /// (conservative). **v0.11.0 substitutes U+FFFD per the Canonical
+    /// ABI's lossy-replacement rule**: when the continuation bytes are
+    /// out of range, set `cp = 0xFFFD` and consume only the lead byte;
+    /// the loop continues with the next byte as a potential new lead.
+    ///
+    /// Pinned structurally: the LS-P-19 marker must appear at all three
+    /// branches AND the U+FFFD code point must be emitted at each.
+    #[test]
+    fn ls_p_19_utf8_to_utf16_continuation_byte_emits_replacement() {
+        const SRC: &str = include_str!("fact.rs");
+        let marker = "LS-P-19: emit U+FFFD when the";
+        let marker_count = SRC.matches(marker).count();
+        assert!(
+            marker_count >= 3,
+            "fact.rs must retain LS-P-19 U+FFFD markers for all three \
+             multi-byte branches (2-byte, 3-byte, 4-byte) in \
+             emit_utf8_to_utf16_transcode; found {marker_count}",
+        );
+        // The Canonical ABI's replacement character is U+FFFD (decimal
+        // 65533). The emitter sets `cp_local = 0xFFFD` at each of the
+        // three multi-byte truncation paths, plus once at the LS-P-16
+        // lone-high-surrogate path in emit_utf16_to_utf8_transcode →
+        // at least 4 occurrences of `I32Const(0xFFFD)` in fact.rs.
+        let fffd_count = SRC.matches("I32Const(0xFFFD)").count();
+        assert!(
+            fffd_count >= 4,
+            "expected at least 4 I32Const(0xFFFD) emissions in fact.rs \
+             (LS-P-16 + LS-P-19 replacement paths); found {fffd_count}",
+        );
+    }
+
+    /// LS-P-16 — `emit_utf16_to_utf8_transcode` must replace a lone high
+    /// surrogate at end-of-input with U+FFFD rather than reading past the
+    /// buffer.
+    ///
+    /// Before the v0.10 mitigation, the surrogate-pair `If` arm
+    /// unconditionally emitted a second `I32Load16U` at `mem16[ptr +
+    /// (src_idx + 1) * 2]` — for an input whose last code unit is a high
+    /// surrogate, that read 2 bytes past the buffer. v0.10 added a
+    /// `src_idx + 1 >= input_len` trap (conservative mitigation).
+    /// **v0.11.0 substitutes U+FFFD** (3-byte UTF-8 `EF BF BD`) per the
+    /// Canonical ABI's lossy-replacement rule, consuming only the lone
+    /// high surrogate and continuing the loop. The existing 3-byte UTF-8
+    /// encoder handles `cp = 0xFFFD` directly (it lives in the BMP).
+    ///
+    /// Pinned structurally: the LS-P-16 U+FFFD marker must remain in the
+    /// source AND `cp_local` must be set to `0xFFFD` in the bounds-
+    /// failure path. A refactor that drops the marker or the replacement
+    /// code point is caught here.
+    #[test]
+    fn ls_p_16_utf16_lone_high_surrogate_emits_replacement() {
+        const SRC: &str = include_str!("fact.rs");
+        let marker = "LS-P-16: emit U+FFFD replacement";
+        let pos = SRC.find(marker).unwrap_or_else(|| {
+            panic!(
+                "fact.rs must retain the LS-P-16 U+FFFD marker `{marker}`; \
+                 without the replacement, the surrogate-pair If arm reads \
+                 2 bytes past the UTF-16 input buffer when input ends on a \
+                 lone high surrogate",
+            )
+        });
+        // The replacement-code-point emission lives within ~2000 bytes of
+        // the marker; assert U+FFFD is set there.
+        let after = &SRC[pos..];
+        let block = &after[..after.len().min(3000)];
+        assert!(
+            block.contains("I32Const(0xFFFD)"),
+            "LS-P-16 replacement path must set cp_local = 0xFFFD via \
+             I32Const(0xFFFD); the segment after the LS-P-16 marker is \
+             missing the replacement code point",
+        );
+        // Bounds-check still has to be there — the replacement path is
+        // gated on `src_idx + 1 >= input_len`.
+        assert!(
+            block.contains("I32GeU"),
+            "LS-P-16 path must still gate on an I32GeU comparison against \
+             input_len",
+        );
+    }
+
+    /// LS-P-14 — the nested-list inner copy in `emit_patch_nested_indirections`
+    /// must guard `len * sub_elem_size` against 32-bit overflow before
+    /// computing `buf_len` for `cabi_realloc` + `memory.copy`.
+    ///
+    /// Before the fix, the inner copy path loaded the callee-supplied `len`
+    /// from callee memory, multiplied by `sub_elem_size` with a bare
+    /// `i32.mul` (wrapping mod 2³²), stored to `l_buf_len`, then used
+    /// `l_buf_len` for the buffer allocation and `memory.copy`. A callee-
+    /// controlled `len` near `u32::MAX / sub_elem_size` wrapped `buf_len`
+    /// to a small value; the subsequent `old_ptr + buf_len > mem_bytes`
+    /// bounds check used `i32.add` which also wrapped and was bypassed;
+    /// the adapter then under-allocated and under-copied the inner list
+    /// while the caller's bulk-copied outer `(ptr, len)` retained the
+    /// original large `len` — silent truncation. Surfaced by the mythos-
+    /// auto delta-pass on PR #179. Fix calls `emit_overflow_guard(body,
+    /// l_buf_len, sub_elem_size as u32)` after loading `len` and before
+    /// the multiplication.
+    ///
+    /// This test pins the contract by emitting the function via
+    /// `emit_patch_nested_indirections` for an element type that has an
+    /// inner `list<u32>` indirection (`sub_elem_size = 4`, non-trivial),
+    /// extracts the encoded body bytes, and asserts they contain at least
+    /// one `Unreachable` opcode (`0x00`) — the only place that opcode is
+    /// emitted along this path is inside `emit_overflow_guard`.
+    #[test]
+    fn ls_p_14_nested_list_inner_copy_emits_overflow_guard() {
+        use crate::parser::{ComponentValType, PrimitiveValType};
+        use wasm_encoder::{Function, ValType};
+
+        // Element type: `record { items: list<u32> }`. The record has one
+        // inner pointer pair (the list) with sub_elem_size = element_size
+        // of u32 = 4. That's the dangerous `len * 4` multiplication path.
+        let elem_ty = ComponentValType::Record(vec![(
+            "items".to_string(),
+            ComponentValType::List(Box::new(ComponentValType::Primitive(PrimitiveValType::U32))),
+        )]);
+
+        // Function with enough locals to cover l_first_scratch..+5 plus a
+        // few spare. Six i32 locals starting at index 0.
+        let mut func = Function::new(vec![(12, ValType::I32)]);
+
+        // The dst/src/len locals and the scratch base are all i32 indices
+        // we just point at slots 0..11 — the function body only cares
+        // about local references being in-range.
+        emit_patch_nested_indirections(
+            &mut func, &elem_ty, /* l_dst_ptr = */ 0, /* l_callee_src = */ 1,
+            /* l_src_len = */ 2,
+            /* elem_size = */ 8, // record { ptr:i32, len:i32 } = 8 bytes
+            /* l_first_scratch = */ 3, /* realloc_func = */ 99,
+            /* caller_memory = */ 0, /* callee_memory = */ 1,
+        );
+
+        // wasm_encoder::Function has no public bytes() accessor on stable;
+        // round-trip through a Module to get encoded bytes we can scan.
+        func.instruction(&wasm_encoder::Instruction::End);
+        let mut module = wasm_encoder::Module::new();
+        let mut code_section = wasm_encoder::CodeSection::new();
+        code_section.function(&func);
+        module.section(&code_section);
+        let body_bytes: Vec<u8> = module.finish();
+
+        // Unreachable opcode is 0x00; it only appears in
+        // emit_overflow_guard along this path. Without the fix, no
+        // Unreachable is emitted by the inner copy and the buf_len
+        // computation wraps silently.
+        assert!(
+            body_bytes.contains(&0x00),
+            "emit_patch_nested_indirections must emit an Unreachable \
+             (LS-P-14 overflow guard) for the inner len * sub_elem_size \
+             multiplication; before the fix, no Unreachable was emitted \
+             and a callee-controlled len could wrap buf_len silently",
+        );
     }
 
     #[test]
@@ -4538,6 +6060,732 @@ mod tests {
         assert!(
             body_has_eqz_if_unreachable(&body),
             "LS-A-7: Latin-1→UTF-8 transcoder missing cabi_realloc null guard"
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // SR-32 / #140 phase 2 — stackful lifting routing
+    //
+    // The dispatcher must detect a stackful lift (an `[async-lift]`
+    // export with no `[callback]<export>` companion in the merged
+    // module) and route it to the stackful emitter rather than the
+    // callback emitter. Until commit 3 lands the trampoline body, the
+    // stackful emitter returns a clear error that names SR-32 / #140
+    // so audit and CI surface the path.
+
+    fn empty_merged() -> crate::merger::MergedModule {
+        use crate::merger::MergedModule;
+        MergedModule {
+            types: Vec::new(),
+            imports: Vec::new(),
+            functions: Vec::new(),
+            tables: Vec::new(),
+            memories: Vec::new(),
+            globals: Vec::new(),
+            exports: Vec::new(),
+            start_function: None,
+            elements: Vec::new(),
+            data_segments: Vec::new(),
+            custom_sections: Vec::new(),
+            function_index_map: std::collections::HashMap::new(),
+            memory_index_map: std::collections::HashMap::new(),
+            table_index_map: std::collections::HashMap::new(),
+            global_index_map: std::collections::HashMap::new(),
+            type_index_map: std::collections::HashMap::new(),
+            realloc_map: std::collections::HashMap::new(),
+            import_counts: Default::default(),
+            import_memory_indices: Vec::new(),
+            import_realloc_indices: Vec::new(),
+            resource_rep_by_component: std::collections::HashMap::new(),
+            resource_new_by_component: std::collections::HashMap::new(),
+            handle_tables: std::collections::HashMap::new(),
+            task_return_shims: std::collections::HashMap::new(),
+            async_result_globals: std::collections::HashMap::new(),
+            segment_bases: std::collections::HashMap::new(),
+        }
+    }
+
+    fn async_lift_site(export_name: &str) -> crate::resolver::AdapterSite {
+        use crate::resolver::AdapterSite;
+        AdapterSite {
+            from_component: 0,
+            from_module: 0,
+            import_name: "x".into(),
+            import_module: "m".into(),
+            import_func_type_idx: None,
+            to_component: 1,
+            to_module: 0,
+            export_name: export_name.into(),
+            export_func_idx: 0,
+            crosses_memory: false,
+            is_async_lift: true,
+            requirements: Default::default(),
+        }
+    }
+
+    #[test]
+    fn sr32_has_callback_export_detects_companion() {
+        let gen_ = FactStyleGenerator::new(AdapterConfig::default());
+        let site = async_lift_site("[async-lift]foo");
+
+        let mut with_cb = empty_merged();
+        with_cb.exports.push(crate::merger::MergedExport {
+            name: "[callback][async-lift]foo".into(),
+            kind: wasm_encoder::ExportKind::Func,
+            index: 0,
+        });
+        assert!(gen_.has_callback_export(&site, &with_cb));
+
+        let without_cb = empty_merged();
+        assert!(!gen_.has_callback_export(&site, &without_cb));
+    }
+
+    #[test]
+    fn sr32_stackful_emitter_handles_no_shim_with_default_results() {
+        // With no task.return shim in the empty merged module and an
+        // empty caller_type (no results), the emitter should still emit
+        // a valid adapter — body just ends. The path is the "no shim,
+        // no results" branch (warns via log) and validates that the
+        // overall emitter wiring compiles and produces an
+        // AdapterFunction without panicking.
+        let gen_ = FactStyleGenerator::new(AdapterConfig::default());
+        let site = async_lift_site("[async-lift]bar");
+        let mut merged = empty_merged();
+        // Make resolve_target_function succeed by providing a defined
+        // function the site can point at; the emitter doesn't actually
+        // require the function to be well-typed for this minimal test.
+        merged.functions.push(crate::merger::MergedFunction {
+            type_idx: 0,
+            body: wasm_encoder::Function::new([]),
+            origin: (1, 0, 0),
+            synthetic_kind: None,
+        });
+        merged.types.push(crate::merger::MergedFuncType {
+            params: Vec::new(),
+            results: Vec::new(),
+        });
+        merged.function_index_map.insert((1, 0, 0), 0);
+
+        let adapter = gen_
+            .generate_async_stackful_adapter(&site, &merged)
+            .expect("stackful emitter must succeed for trivial site");
+        assert_eq!(
+            adapter.name, "$async_stackful_adapter_0_to_1",
+            "adapter name must follow the stackful naming convention"
+        );
+    }
+
+    #[test]
+    fn sr32_stackful_emitter_shape_pins_call_drop_globalget() {
+        // SR-32 acceptance: with a real shim wired into the merged
+        // module, the stackful emitter must produce a body that
+        // structurally matches the documented trampoline shape — call
+        // the lift function, drop its return, read the result global,
+        // end. Pin the wasm opcodes so future refactors that drift
+        // away from this shape break the test loudly.
+        //
+        // Opcodes:
+        //   local.get  = 0x20
+        //   call       = 0x10
+        //   drop       = 0x1A
+        //   global.get = 0x23
+        //   end        = 0x0B
+
+        let gen_ = FactStyleGenerator::new(AdapterConfig::default());
+        let mut merged = empty_merged();
+
+        // Type 0: () -> i32 — minimal lift signature returning one i32
+        // that the stackful trampoline will drop.
+        merged.types.push(crate::merger::MergedFuncType {
+            params: Vec::new(),
+            results: vec![wasm_encoder::ValType::I32],
+        });
+        // The lift function lives at merged index 0.
+        merged.functions.push(crate::merger::MergedFunction {
+            type_idx: 0,
+            body: wasm_encoder::Function::new([]),
+            origin: (1, 0, 0),
+            synthetic_kind: None,
+        });
+        merged.function_index_map.insert((1, 0, 0), 0);
+
+        // A result global at index 7 — the stackful trampoline must
+        // emit `global.get 7` followed by the function epilogue.
+        // We register it both in async_result_globals (the primary
+        // lookup) and in task_return_shims (for the fallback path the
+        // emitter consults to recover the result type).
+        // The emitter looks up shims by `adapter_func_name`, derived
+        // from `export_name.rsplit_once('#')`. When the export has no
+        // '#', the lookup uses the full export name verbatim — match
+        // that here.
+        let lookup_name = "[async-lift]ping".to_string();
+        let globals = vec![(7u32, wasm_encoder::ValType::I32)];
+        merged
+            .async_result_globals
+            .insert((1, lookup_name.clone()), globals.clone());
+        merged.task_return_shims.insert(
+            0,
+            crate::merger::TaskReturnShimInfo {
+                shim_func: 0,
+                result_globals: globals.clone(),
+                component_idx: 1,
+                import_name: "[task-return]0".into(),
+                original_func_name: lookup_name.clone(),
+                result_type: None,
+            },
+        );
+
+        // Site: caller has the same result shape so we hit the
+        // push-results-on-stack branch (no retptr), which is the
+        // simplest readback the structural pin needs to cover.
+        let mut site = async_lift_site("[async-lift]ping");
+        site.import_func_type_idx = Some(0);
+        site.crosses_memory = false;
+
+        let adapter = gen_
+            .generate_async_stackful_adapter(&site, &merged)
+            .expect("stackful emitter must succeed");
+
+        let body = adapter.body.into_raw_body();
+
+        assert!(
+            body.contains(&0x10),
+            "stackful trampoline must emit `call` (0x10) to lift func; \
+             body={body:?}",
+        );
+        assert!(
+            body.contains(&0x1A),
+            "stackful trampoline must emit `drop` (0x1A) after the lift \
+             call (lift result is owned by runtime, not caller); body={body:?}",
+        );
+        assert!(
+            body.contains(&0x23),
+            "stackful trampoline must emit `global.get` (0x23) for \
+             result readback; body={body:?}",
+        );
+        assert_eq!(
+            body.last(),
+            Some(&0x0B),
+            "stackful trampoline body must end with `end` (0x0B); \
+             body={body:?}",
+        );
+    }
+
+    fn read_uleb(buf: &[u8]) -> (u64, usize) {
+        let mut result: u64 = 0;
+        let mut shift = 0;
+        let mut consumed = 0;
+        for b in buf {
+            consumed += 1;
+            result |= ((b & 0x7f) as u64) << shift;
+            if b & 0x80 == 0 {
+                break;
+            }
+            shift += 7;
+        }
+        (result, consumed)
+    }
+
+    /// Regression test for the cross-memory ptr-pair stackful return
+    /// path. Before v0.8.1 this returned an explicit "deferred to
+    /// follow-up" error rather than emit wasm. The fix routes through
+    /// `emit_ptr_pair_result_writeback` (shared with the callback
+    /// path) so the emitter produces the realloc + memory.copy +
+    /// retptr write sequence required by SR-12 / SR-17 for cross-
+    /// memory string / list<T> returns.
+    ///
+    /// The byte-scan asserts the body contains the marker opcodes:
+    ///   call             = 0x10  (cabi_realloc + lift call)
+    ///   memory.copy      = 0xFC 0x0A  (cross-memory copy of the buffer)
+    ///   i32.store        = 0x36  (writing new_ptr and len to retptr)
+    ///   end              = 0x0B
+    #[test]
+    fn stackful_ptr_pair_return_emits_realloc_memcopy_retptr_writes() {
+        let gen_ = FactStyleGenerator::new(AdapterConfig::default());
+        let mut merged = empty_merged();
+
+        // Caller type: (retptr: i32) -> ()
+        merged.types.push(crate::merger::MergedFuncType {
+            params: vec![wasm_encoder::ValType::I32],
+            results: vec![],
+        });
+        // Lift type: () -> ()
+        merged.types.push(crate::merger::MergedFuncType {
+            params: vec![],
+            results: vec![],
+        });
+
+        // Lift function lives in callee (component 1) at merged idx 0.
+        merged.functions.push(crate::merger::MergedFunction {
+            type_idx: 1,
+            body: wasm_encoder::Function::new([]),
+            origin: (1, 0, 0),
+            synthetic_kind: None,
+        });
+        merged.function_index_map.insert((1, 0, 0), 0);
+
+        // Caller's cabi_realloc lives at merged idx 1 (defined function).
+        merged.functions.push(crate::merger::MergedFunction {
+            type_idx: 1,
+            body: wasm_encoder::Function::new([]),
+            origin: (0, 0, 0),
+            synthetic_kind: None,
+        });
+        merged.realloc_map.insert((0, 0), 1);
+
+        // Two memories: caller at idx 0, callee at idx 1.
+        merged.memory_index_map.insert((0, 0, 0), 0);
+        merged.memory_index_map.insert((1, 0, 0), 1);
+
+        // Result globals: a (ptr, len) pair both i32, with a String
+        // result_type so elem_size = 1.
+        let lookup_name = "[async-lift]greet".to_string();
+        let globals = vec![
+            (20u32, wasm_encoder::ValType::I32),
+            (21u32, wasm_encoder::ValType::I32),
+        ];
+        merged
+            .async_result_globals
+            .insert((1, lookup_name.clone()), globals.clone());
+        merged.task_return_shims.insert(
+            0,
+            crate::merger::TaskReturnShimInfo {
+                shim_func: 0,
+                result_globals: globals.clone(),
+                component_idx: 1,
+                import_name: "[task-return]0".into(),
+                original_func_name: lookup_name.clone(),
+                result_type: Some(crate::parser::ComponentValType::String),
+            },
+        );
+
+        // Site: from=0 (caller), to=1 (callee), crosses_memory=true.
+        let mut site = async_lift_site("[async-lift]greet");
+        site.from_component = 0;
+        site.to_component = 1;
+        site.import_func_type_idx = Some(0);
+        site.crosses_memory = true;
+
+        let adapter = gen_
+            .generate_async_stackful_adapter(&site, &merged)
+            .expect("stackful emitter must succeed for ptr-pair return");
+
+        let body = adapter.body.into_raw_body();
+
+        // memory.copy is encoded as 0xFC 0x0A followed by dst-mem and
+        // src-mem indices. The 2-byte prefix is the deterministic marker.
+        let has_memcopy = body.windows(2).any(|w| w == [0xFC, 0x0A]);
+        assert!(
+            has_memcopy,
+            "stackful ptr-pair return must emit memory.copy (0xFC 0x0A) \
+             for cross-memory buffer copy; body={body:?}",
+        );
+
+        // i32.store is opcode 0x36 — must appear at least twice for
+        // the retptr (new_ptr at offset 0, len at offset 4).
+        let i32_store_count = body.iter().filter(|&&b| b == 0x36).count();
+        assert!(
+            i32_store_count >= 2,
+            "stackful ptr-pair return must emit >=2 i32.store (0x36) \
+             for retptr (new_ptr, len); found {i32_store_count} in body \
+             ={body:?}",
+        );
+
+        // The body must include a call (0x10) — at minimum the
+        // cabi_realloc call inside emit_checked_realloc plus the lift
+        // call. >=2 is the spec-required minimum.
+        let call_count = body.iter().filter(|&&b| b == 0x10).count();
+        assert!(
+            call_count >= 2,
+            "stackful ptr-pair return must emit >=2 call (0x10) — at \
+             least cabi_realloc + lift; found {call_count} in body={body:?}",
+        );
+
+        assert_eq!(
+            body.last(),
+            Some(&0x0B),
+            "body must end with `end` (0x0B); body={body:?}",
+        );
+    }
+
+    /// Regression test for the alignment-padding bug surfaced by the
+    /// v0.8.0 pre-release Mythos delta-pass on adapter/fact.rs.
+    ///
+    /// The stackful and callback emitters both advance the retptr
+    /// write offset by only the flat size of each result global (4 or
+    /// 8 bytes) without aligning up to the next field's natural
+    /// alignment. For a result whose flat lowering contains
+    /// `[I32, I64]` (record `{u32, u64}`, tuple `(s32, s64)`,
+    /// `result<u64, u32>`, etc.), the canonical-ABI offset of the i64
+    /// is 8 (i32 at 0, 4 bytes padding, i64 at 8 — record size 16).
+    /// The emitter produced 4. Callers reading the retptr per CABI
+    /// see stale/zero bytes for the high-order field.
+    ///
+    /// Hazard: H-4 (canonical ABI lowering mismatch). Maps to UCA-A-13
+    /// generically — the stated context is "variants with i64/f64
+    /// payload" but any aggregate whose flat lowering interleaves
+    /// 4-byte and 8-byte fields realises the same defect.
+    ///
+    /// Engines treat MemArg `align` as a hint, so this is silent data
+    /// corruption with no trap.
+    #[test]
+    fn cabi_alignment_stackful_retptr_writes_i64_at_offset_8() {
+        let gen_ = FactStyleGenerator::new(AdapterConfig::default());
+        let mut merged = empty_merged();
+
+        // Caller type: (retptr: i32) -> ()
+        merged.types.push(crate::merger::MergedFuncType {
+            params: vec![wasm_encoder::ValType::I32],
+            results: vec![],
+        });
+        // Lift type: () -> ()
+        merged.types.push(crate::merger::MergedFuncType {
+            params: vec![],
+            results: vec![],
+        });
+        merged.functions.push(crate::merger::MergedFunction {
+            type_idx: 1,
+            body: wasm_encoder::Function::new([]),
+            origin: (1, 0, 0),
+            synthetic_kind: None,
+        });
+        merged.function_index_map.insert((1, 0, 0), 0);
+
+        let lookup_name = "[async-lift]mixed".to_string();
+        let globals = vec![
+            (10u32, wasm_encoder::ValType::I32),
+            (11u32, wasm_encoder::ValType::I64),
+        ];
+        merged
+            .async_result_globals
+            .insert((1, lookup_name.clone()), globals.clone());
+        merged.task_return_shims.insert(
+            0,
+            crate::merger::TaskReturnShimInfo {
+                shim_func: 0,
+                result_globals: globals.clone(),
+                component_idx: 1,
+                import_name: "[task-return]0".into(),
+                original_func_name: lookup_name.clone(),
+                result_type: None,
+            },
+        );
+
+        let mut site = async_lift_site("[async-lift]mixed");
+        site.import_func_type_idx = Some(0);
+        site.crosses_memory = false;
+
+        let adapter = gen_
+            .generate_async_stackful_adapter(&site, &merged)
+            .expect("stackful emitter must succeed");
+
+        let raw = adapter.body.into_raw_body();
+
+        // i64.store opcode is 0x37 followed by LEB align then LEB offset.
+        let mut i = 0;
+        let mut found_offset: Option<u64> = None;
+        while i < raw.len() {
+            if raw[i] == 0x37 {
+                let (_align, n1) = read_uleb(&raw[i + 1..]);
+                let (offset, _n2) = read_uleb(&raw[i + 1 + n1..]);
+                found_offset = Some(offset);
+                break;
+            }
+            i += 1;
+        }
+
+        let offset = found_offset.expect("body must contain i64.store");
+        assert_eq!(
+            offset, 8,
+            "i64 result must store at CABI-aligned offset 8 for record \
+             {{i32, i64}} (i32 at 0, 4 bytes padding, i64 at 8); emitter \
+             produced offset {offset} — callers reading retptr per CABI \
+             would see stale bytes",
+        );
+    }
+
+    /// LS-N verification gate convention alias. Pins LS-A-10
+    /// (async-lift retptr writeback skips CABI alignment padding)
+    /// via the discoverable `ls_a_10_*` name. Same body as the
+    /// pre-existing `cabi_alignment_stackful_retptr_writes_i64_at_offset_8`
+    /// regression test.
+    #[test]
+    fn ls_a_10_cabi_align_retptr_writeback() {
+        cabi_alignment_stackful_retptr_writes_i64_at_offset_8();
+    }
+
+    /// LS-A-9: `generate_async_callback_adapter` must dispatch
+    /// `[waitable-set-poll]` on **both** `WAIT (2)` and `POLL (3)`.
+    /// The pre-fix `if code == WAIT` branch let POLL fall through to
+    /// the YIELD path, which sent `(EVENT_NONE, 0, 0)` to `[callback]`
+    /// and dropped any event the host had ready — silent semantic
+    /// drift between fused and composed modules with no host trap.
+    ///
+    /// Asserts the WAIT/POLL OR-pattern is present in the emitted
+    /// adapter body: the byte sequence
+    ///
+    ///     local.get l_code (0x20 <leb128>)
+    ///     i32.const WAIT=2 (0x41 0x02)
+    ///     i32.eq           (0x46)
+    ///     local.get l_code (0x20 <leb128>)
+    ///     i32.const POLL=3 (0x41 0x03)
+    ///     i32.eq           (0x46)
+    ///     i32.or           (0x72)
+    ///
+    /// Pin-by-substring is robust against unrelated body changes
+    /// (locals layout, surrounding control flow) — what we care about
+    /// is that `i32.const 2 / i32.eq / i32.const 3 / i32.eq / i32.or`
+    /// appears in that order somewhere in the loop body.
+    #[test]
+    fn ls_a_9_callback_adapter_dispatches_both_wait_and_poll() {
+        let gen_ = FactStyleGenerator::new(AdapterConfig::default());
+        let mut merged = empty_merged();
+
+        // Type 0: () -> i32 — minimal lift signature matching the
+        // callback-mode return convention (packed callback code i32).
+        merged.types.push(crate::merger::MergedFuncType {
+            params: Vec::new(),
+            results: vec![wasm_encoder::ValType::I32],
+        });
+
+        // The lift function lives at merged index 0.
+        merged.functions.push(crate::merger::MergedFunction {
+            type_idx: 0,
+            body: wasm_encoder::Function::new([]),
+            origin: (1, 0, 0),
+            synthetic_kind: None,
+        });
+        merged.function_index_map.insert((1, 0, 0), 0);
+
+        // The [callback] companion export — the callback adapter
+        // resolves this by name (`[callback]<export_name>`).
+        let export_name = "[async-lift]async_export";
+        merged.exports.push(crate::merger::MergedExport {
+            name: format!("[callback]{export_name}"),
+            kind: wasm_encoder::ExportKind::Func,
+            index: 0,
+        });
+
+        // Required host import — the adapter looks up
+        // [waitable-set-poll] by name prefix.
+        merged.imports.push(crate::merger::MergedImport {
+            module: "$root".into(),
+            name: "[waitable-set-poll]".into(),
+            entity_type: wasm_encoder::EntityType::Function(0),
+            component_idx: None,
+        });
+
+        let mut site = async_lift_site(export_name);
+        site.import_func_type_idx = Some(0);
+        site.crosses_memory = false;
+
+        let adapter = gen_
+            .generate_async_callback_adapter(&site, &merged)
+            .expect("callback emitter must succeed with [callback] + [waitable-set-poll] wired");
+
+        let body = adapter.body.into_raw_body();
+
+        // The WAIT/POLL OR-pattern as raw bytes. WAIT=2 / POLL=3 both
+        // fit in single-byte sleb128. We omit the `local.get l_code`
+        // bytes from the pattern (their leb128 encoding depends on
+        // local index) and assert the constant+compare+or skeleton
+        // appears in order.
+        const WAIT_POLL_OR_TAIL: &[u8] = &[
+            0x41, 0x02, // i32.const WAIT (2)
+            0x46, // i32.eq
+            0x20, // local.get … (l_code; one-byte leb when index<128)
+        ];
+        const POLL_OR: &[u8] = &[
+            0x41, 0x03, // i32.const POLL (3)
+            0x46, // i32.eq
+            0x72, // i32.or
+        ];
+
+        let wait_idx = body
+            .windows(WAIT_POLL_OR_TAIL.len())
+            .position(|w| w == WAIT_POLL_OR_TAIL)
+            .unwrap_or_else(|| {
+                panic!(
+                    "callback adapter body must contain WAIT(2)/eq/local.get \
+                     prefix of the OR-pattern; body={body:?}"
+                )
+            });
+        let poll_idx = body[wait_idx..]
+            .windows(POLL_OR.len())
+            .position(|w| w == POLL_OR)
+            .unwrap_or_else(|| {
+                panic!(
+                    "callback adapter body must contain POLL(3)/eq/or \
+                     tail of the OR-pattern AFTER the WAIT match at \
+                     offset {wait_idx}; body={body:?}"
+                )
+            });
+        assert!(
+            poll_idx > 0,
+            "POLL_OR pattern must come after WAIT pattern in body \
+             (locals interleave between them); poll_idx={poll_idx}"
+        );
+    }
+
+    /// LS-A-8: For a `list<record { x: borrow<A>, y: borrow<B> }>` (or
+    /// any list whose elements carry borrows to multiple distinct
+    /// resource types), `analyze_call_site` must select the **correct
+    /// per-type** `[resource-rep]` import for each inner-resource
+    /// slot. A previous version did `resource_rep_imports.values()
+    /// .next()` — HashMap iteration order, so the rep_func picked for
+    /// each slot was effectively random, routing borrow handles of
+    /// resource A through resource B's rep_func and vice versa
+    /// (silent rep-vs-handle confusion across the cross-component
+    /// handle boundary, H-4/H-4.2, UCA-A-7).
+    ///
+    /// The fix threads a pre-resolved `rep_import: Option<(String,
+    /// String)>` through `InnerResource`, populated at site-
+    /// requirements time; fact.rs looks the rep_func up per-type
+    /// rather than via `.values().next()`.
+    ///
+    /// This test pins the per-type lookup. It builds adversarial
+    /// inputs: two `InnerResource`s pointing at distinct rep_import
+    /// keys, a `resource_rep_imports` map binding each key to a
+    /// distinct func index, and asserts the resulting
+    /// `options.inner_resource_fixups` pair each byte_offset with
+    /// the **correct** func — never crossed.
+    #[test]
+    fn ls_a_8_inner_list_rep_func_selected_by_type_not_iteration_order() {
+        use crate::resolver::{AdapterRequirements, CopyLayout, InnerResource};
+
+        let gen_ = FactStyleGenerator::new(AdapterConfig::default());
+        let merged = empty_merged();
+
+        // Adversarial inner-resources: borrow<A> at offset 0 and
+        // borrow<B> at offset 4 (two i32 handles in the record).
+        let rep_a_key = ("$root".to_string(), "[resource-rep]res_a".to_string());
+        let rep_b_key = ("$root".to_string(), "[resource-rep]res_b".to_string());
+        let inner_a = InnerResource {
+            byte_offset: 0,
+            resource_type_id: 100,
+            is_owned: false,
+            rep_import: Some(rep_a_key.clone()),
+            guards: Vec::new(),
+        };
+        let inner_b = InnerResource {
+            byte_offset: 4,
+            resource_type_id: 200,
+            is_owned: false,
+            rep_import: Some(rep_b_key.clone()),
+            guards: Vec::new(),
+        };
+
+        // Build a single Elements layout carrying both inner-
+        // resources. The element_size + inner_pointers fields don't
+        // matter for this assertion — `analyze_call_site` only walks
+        // `inner_resources`.
+        let layout = CopyLayout::Elements {
+            element_size: 8,
+            inner_pointers: Vec::new(),
+            inner_resources: vec![inner_a, inner_b],
+        };
+
+        let requirements = AdapterRequirements {
+            param_copy_layouts: vec![layout],
+            ..Default::default()
+        };
+
+        let mut site = async_lift_site("[lift]list_of_borrows");
+        site.requirements = requirements;
+        site.is_async_lift = false;
+
+        // Two distinct rep_func indices, deliberately chosen so a
+        // HashMap-iteration `.values().next()` would pick wrongly
+        // for at least one of them.
+        let mut rep_imports = std::collections::HashMap::new();
+        rep_imports.insert(rep_a_key.clone(), 100u32);
+        rep_imports.insert(rep_b_key.clone(), 200u32);
+        let new_imports = std::collections::HashMap::new();
+
+        // Sample many times to make non-determinism observable. If the
+        // impl picked `.values().next()`, hash-seed-randomised
+        // iteration order would yield the wrong pairing under at
+        // least some seeds; with the type-pinned lookup the result is
+        // identical every run.
+        for _ in 0..32 {
+            let options = gen_.analyze_call_site(&site, &merged, &rep_imports, &new_imports);
+            assert_eq!(
+                options.inner_resource_fixups.len(),
+                2,
+                "both inner-resources must produce fixups; got {options:?}",
+            );
+            // Find the fixup tagged at offset 0 and 4 — they MUST map
+            // to rep_func 100 and 200 respectively (i.e., the
+            // resource type's own rep_func, not the other one).
+            let off_0 = options
+                .inner_resource_fixups
+                .iter()
+                .find(|f| f.byte_offset == 0)
+                .expect("must have fixup at offset 0");
+            let off_4 = options
+                .inner_resource_fixups
+                .iter()
+                .find(|f| f.byte_offset == 4)
+                .expect("must have fixup at offset 4");
+            assert_eq!(
+                off_0.rep_func, 100,
+                "borrow<A> at offset 0 must select rep_a's func (100); got {off_0:?}",
+            );
+            assert_eq!(
+                off_4.rep_func, 200,
+                "borrow<B> at offset 4 must select rep_b's func (200); got {off_4:?}",
+            );
+        }
+    }
+
+    /// LS-A-8 sibling case: when an `InnerResource` has no
+    /// `rep_import` (i.e., the resolver couldn't map the type id to
+    /// an import), the fixup must be **skipped** with a warning —
+    /// NOT fall back to an arbitrary HashMap entry, which was the
+    /// pre-fix behavior.
+    #[test]
+    fn ls_a_8_no_rep_import_skips_fixup_rather_than_picking_arbitrary() {
+        use crate::resolver::{AdapterRequirements, CopyLayout, InnerResource};
+
+        let gen_ = FactStyleGenerator::new(AdapterConfig::default());
+        let merged = empty_merged();
+
+        let inner = InnerResource {
+            byte_offset: 0,
+            resource_type_id: 999,
+            is_owned: false,
+            rep_import: None, // resolver failed to map; pre-fix would `.values().next()`
+            guards: Vec::new(),
+        };
+
+        let requirements = AdapterRequirements {
+            param_copy_layouts: vec![CopyLayout::Elements {
+                element_size: 4,
+                inner_pointers: Vec::new(),
+                inner_resources: vec![inner],
+            }],
+            ..Default::default()
+        };
+
+        let mut site = async_lift_site("[lift]list_borrow_unmapped");
+        site.requirements = requirements;
+        site.is_async_lift = false;
+
+        // Even though imports are present, the lookup must skip when
+        // rep_import is None — not silently fall back.
+        let mut rep_imports = std::collections::HashMap::new();
+        rep_imports.insert(
+            ("$root".to_string(), "[resource-rep]res_other".to_string()),
+            777u32,
+        );
+        let new_imports = std::collections::HashMap::new();
+
+        let options = gen_.analyze_call_site(&site, &merged, &rep_imports, &new_imports);
+        assert!(
+            options.inner_resource_fixups.is_empty(),
+            "InnerResource with rep_import=None must NOT produce a \
+             fixup (pre-fix bug fell back to HashMap.values().next() \
+             yielding 777 arbitrarily); got {options:?}",
         );
     }
 }

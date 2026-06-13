@@ -34,6 +34,14 @@ pub enum GraphEdge {
     ResolvesTo { interface: String },
 }
 
+/// Which `[resource-*]` prefix a core import carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResourcePrefixKind {
+    Rep,
+    New,
+    Drop,
+}
+
 /// The resource ownership graph.
 pub struct ResourceGraph {
     graph: DiGraph<GraphNode, GraphEdge>,
@@ -124,14 +132,25 @@ impl ResourceGraph {
             if has_rep || has_new {
                 // This component participates in resource handling.
                 // Determine which resources it handles by scanning core module imports.
+                //
+                // LS-A-18: also register a resource node for any
+                // [resource-drop]X import even if X is a *foreign*
+                // resource that the component neither reps nor news.
+                // Prior to the fix, drop-only imports against foreign
+                // resources were silently invisible to the graph (the
+                // second pass that strips [resource-drop] only fires
+                // when `!has_any_canon`), so the merger would route
+                // the drop to a wrong handle table.
                 for module in &comp.core_modules {
                     for imp in &module.imports {
                         if let crate::parser::ImportKind::Function(_) = &imp.kind {
-                            let (prefix, is_rep) =
+                            let (prefix, kind) =
                                 if let Some(rn) = imp.name.strip_prefix("[resource-rep]") {
-                                    (rn, true)
+                                    (rn, ResourcePrefixKind::Rep)
                                 } else if let Some(rn) = imp.name.strip_prefix("[resource-new]") {
-                                    (rn, false)
+                                    (rn, ResourcePrefixKind::New)
+                                } else if let Some(rn) = imp.name.strip_prefix("[resource-drop]") {
+                                    (rn, ResourcePrefixKind::Drop)
                                 } else {
                                     continue;
                                 };
@@ -150,20 +169,38 @@ impl ResourceGraph {
                                 });
 
                             if let Some(&comp_node) = comp_nodes.get(&comp_idx) {
-                                if is_rep && has_rep {
-                                    // Component has canonical ResourceRep AND imports [resource-rep]
-                                    // → it defines this resource
-                                    graph.add_edge(comp_node, resource_node, GraphEdge::Defines);
-                                } else if !has_rep && has_new {
-                                    // Only ResourceNew, no ResourceRep → re-exporter
-                                    graph.add_edge(comp_node, resource_node, GraphEdge::Reexports);
-                                } else {
-                                    // Has imports but no canonical entries → pure consumer
-                                    graph.add_edge(
-                                        comp_node,
-                                        resource_node,
-                                        GraphEdge::ImportsFrom,
-                                    );
+                                match kind {
+                                    ResourcePrefixKind::Rep if has_rep => {
+                                        // Canonical ResourceRep AND imports [resource-rep]
+                                        // → it defines this resource
+                                        graph.add_edge(
+                                            comp_node,
+                                            resource_node,
+                                            GraphEdge::Defines,
+                                        );
+                                    }
+                                    ResourcePrefixKind::New if !has_rep && has_new => {
+                                        // Only ResourceNew, no ResourceRep → re-exporter
+                                        graph.add_edge(
+                                            comp_node,
+                                            resource_node,
+                                            GraphEdge::Reexports,
+                                        );
+                                    }
+                                    _ => {
+                                        // Includes:
+                                        //   - [resource-drop]X imports (foreign
+                                        //     resource being dropped — pure
+                                        //     consumer of X)
+                                        //   - Rep / New imports that don't
+                                        //     match the canonical entries
+                                        //     (also pure consumer behavior)
+                                        graph.add_edge(
+                                            comp_node,
+                                            resource_node,
+                                            GraphEdge::ImportsFrom,
+                                        );
+                                    }
                                 }
                             }
                         }
@@ -240,12 +277,22 @@ impl ResourceGraph {
         // exports but doesn't import (no outgoing ResolvesTo for this interface).
         // This handles cases where canonical_functions is empty after flattening.
         for ((_from_comp, import_name), (to_comp, _)) in resolved_imports {
-            // Check if to_comp also imports an interface that involves the same
-            // resource name. A component that imports "test:X/test" (with float)
-            // AND exports "exports" (with float) is a re-exporter even though
-            // the interface names differ.
+            // Determine whether `to_comp` is a re-exporter for *this
+            // specific interface* (i.e. it imports an interface that
+            // carries the resources we're about to attribute) or a
+            // terminal definer.
+            //
+            // Prior to the LS-A-17 fix this check ran
+            // `resource_nodes.keys().any(...)` against ANY iface, so
+            // any consumer that imported `wasi:io/poll` alongside the
+            // app's resources would mis-classify the app's true
+            // definer as a re-exporter. The fix scopes the check to
+            // `import_name` (and its `[export]`-prefixed variants).
             let to_also_imports_resource = resolved_imports.keys().any(|(comp, iname)| {
                 *comp == *to_comp
+                    && (iname == import_name
+                        || iname.strip_prefix("[export]") == Some(import_name.as_str())
+                        || import_name.strip_prefix("[export]") == Some(iname.as_str()))
                     && resource_nodes.keys().any(|(ri, _)| {
                         ri == iname || ri.strip_prefix("[export]") == Some(iname.as_str())
                     })
@@ -286,14 +333,20 @@ impl ResourceGraph {
                 })
                 .cloned()
                 .collect();
-            for (_ri, rn) in &matching_resource_ifaces {
-                // Check all interface name variants for this resource
-                // A component that imports a resource cannot be its definer,
-                // regardless of what interface name it exports under. Remove
-                // ALL defines entries for this component + resource name.
+            for (ri, rn) in &matching_resource_ifaces {
+                // Remove the component's definer entry **only** for the
+                // specific (interface, resource_name) pair matched here.
+                //
+                // Prior to the LS-A-17 fix this filter ignored the
+                // interface (`|(idx, _iface, r)| ...`), so a component
+                // that imported `[resource-drop]X` from interface `I_x`
+                // AND defined its own resource `X` in unrelated
+                // interface `I_y` lost the `(comp, I_y, X)` definer
+                // entry too. Same-resource-name across different
+                // interfaces is permitted by the Component Model.
                 let keys_to_remove: Vec<_> = defines_cache
                     .keys()
-                    .filter(|(idx, _iface, r)| *idx == *from_comp && r == rn)
+                    .filter(|(idx, iface, r)| *idx == *from_comp && iface == ri && r == rn)
                     .cloned()
                     .collect();
                 for key in keys_to_remove {
@@ -411,5 +464,177 @@ impl ResourceGraph {
                 eprintln!("  {:?}: {}", node, edges.join(", "));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::parser::{CanonicalEntry, CoreModule, ImportKind, ModuleImport, ParsedComponent};
+
+    fn empty_pc() -> ParsedComponent {
+        ParsedComponent {
+            name: None,
+            core_modules: vec![],
+            imports: vec![],
+            exports: vec![],
+            types: vec![],
+            instances: vec![],
+            canonical_functions: vec![],
+            sub_components: vec![],
+            component_aliases: vec![],
+            component_instances: vec![],
+            core_entity_order: vec![],
+            component_func_defs: vec![],
+            component_instance_defs: vec![],
+            component_type_defs: vec![],
+            original_size: 0,
+            original_hash: String::new(),
+            depth_0_sections: vec![],
+            p3_async_features: vec![],
+        }
+    }
+
+    fn empty_cm() -> CoreModule {
+        CoreModule {
+            index: 0,
+            bytes: vec![],
+            types: vec![],
+            imports: vec![],
+            exports: vec![],
+            functions: vec![],
+            memories: vec![],
+            tables: vec![],
+            globals: vec![],
+            start: None,
+            data_count: None,
+            element_count: 0,
+            custom_sections: vec![],
+            code_section_range: None,
+            global_section_range: None,
+            element_section_range: None,
+            data_section_range: None,
+        }
+    }
+
+    fn imp(module: &str, name: &str) -> ModuleImport {
+        ModuleImport {
+            module: module.into(),
+            name: name.into(),
+            kind: ImportKind::Function(0),
+        }
+    }
+
+    /// LS-A-17 F1 — definer purge ignores interface name.
+    ///
+    /// Component 0 imports a resource named "data" from `shared:lib/storage`.
+    /// Component 1 ALSO has a resource named "data" — but in interface
+    /// `ns:other/cache`, completely unrelated. Prior to the fix, the
+    /// cleanup loop filtered the defines_cache by `(comp == 1) &&
+    /// (resource_name == "data")` ignoring iface, purging component 1's
+    /// legitimate definer entry for (ns:other/cache, data).
+    #[test]
+    fn ls_a_17_definer_survives_unrelated_import_with_same_resource_name() {
+        let mut c0 = empty_pc();
+        c0.canonical_functions
+            .push(CanonicalEntry::ResourceRep { resource: 0 });
+        let mut m0 = empty_cm();
+        m0.imports
+            .push(imp("shared:lib/storage", "[resource-rep]data"));
+        c0.core_modules.push(m0);
+
+        let mut c1 = empty_pc();
+        c1.canonical_functions
+            .push(CanonicalEntry::ResourceRep { resource: 0 });
+        let mut m1 = empty_cm();
+        m1.imports.push(imp("ns:other/cache", "[resource-rep]data"));
+        c1.core_modules.push(m1);
+
+        let mut resolved = HashMap::new();
+        resolved.insert(
+            (1usize, "shared:lib/storage".to_string()),
+            (0usize, "shared:lib/storage".to_string()),
+        );
+
+        let rg = ResourceGraph::build(&resolved, &[c0, c1]);
+        assert!(
+            rg.defines_resource(1, "ns:other/cache", "data"),
+            "comp 1's definer entry for ns:other/cache#data was purged \
+             by an unrelated import that shares the resource name"
+        );
+        assert_eq!(rg.resource_definer("ns:other/cache", "data"), Some(1));
+    }
+
+    /// LS-A-17 F2 — terminal exporter pass uses an over-broad
+    /// `to_also_imports_resource` check.
+    ///
+    /// Component 0 imports two unrelated resource interfaces:
+    /// `svc:bridge/api` and `wasi:io/poll`. Component 1 is the definer
+    /// of `svc:bridge/api#thing`. Prior to the fix, the terminal
+    /// exporter pass marked comp 1 as NOT terminal because comp 0
+    /// imported "any resource interface" — including the unrelated
+    /// wasi:io/poll. The fix scopes the check to the specific iface
+    /// being attributed.
+    #[test]
+    fn ls_a_17_terminal_definer_with_unrelated_resource_import() {
+        let mut c0 = empty_pc();
+        let mut m0 = empty_cm();
+        m0.imports
+            .push(imp("svc:bridge/api", "[resource-drop]thing"));
+        m0.imports
+            .push(imp("wasi:io/poll", "[resource-drop]pollable"));
+        c0.core_modules.push(m0);
+
+        // Comp 1 — terminal definer for svc:bridge/api#thing, but with
+        // empty canonical_functions (post-flatten case).
+        let c1 = empty_pc();
+
+        let mut resolved = HashMap::new();
+        resolved.insert(
+            (0usize, "svc:bridge/api".to_string()),
+            (1usize, "svc:bridge/api".to_string()),
+        );
+        // External host import — also produces a resource_node from
+        // c0's [resource-drop] but should not affect comp 1's
+        // attribution.
+        resolved.insert(
+            (0usize, "wasi:io/poll".to_string()),
+            (usize::MAX, "wasi:io/poll".to_string()),
+        );
+
+        let rg = ResourceGraph::build(&resolved, &[c0, c1]);
+        assert_eq!(
+            rg.resource_definer("svc:bridge/api", "thing"),
+            Some(1),
+            "terminal-exporter pass mis-classified comp 1 as a re-exporter \
+             because comp 0 imports an unrelated resource interface"
+        );
+    }
+
+    /// LS-A-18 — [resource-drop] only handled when !has_any_canon.
+    ///
+    /// A re-exporter (has ResourceNew) that ALSO drops a foreign
+    /// resource Y must register Y in the graph. Prior to the fix, the
+    /// first pass stripped only [resource-rep] and [resource-new]; the
+    /// second pass that handles [resource-drop] only ran when
+    /// `!has_any_canon`, so a re-exporter dropping a foreign resource
+    /// had its drop call invisible to the graph.
+    #[test]
+    fn ls_a_18_drop_on_foreign_resource_registers_node_for_reexporter() {
+        let mut c0 = empty_pc();
+        c0.canonical_functions
+            .push(CanonicalEntry::ResourceNew { resource: 0 });
+        let mut m = empty_cm();
+        m.imports.push(imp("iface:a/x", "[resource-new]thingX"));
+        m.imports.push(imp("iface:b/y", "[resource-drop]thingY"));
+        c0.core_modules.push(m);
+
+        let rg = ResourceGraph::build(&HashMap::new(), &[c0]);
+        assert!(
+            rg.uses_resource(0, "iface:b/y", "thingY"),
+            "re-exporter that drops a foreign resource must register \
+             a graph node for that resource (LS-A-18); otherwise the \
+             merger routes the drop to the wrong handle table"
+        );
     }
 }

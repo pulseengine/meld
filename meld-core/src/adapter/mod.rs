@@ -47,6 +47,31 @@ impl Default for AdapterConfig {
     }
 }
 
+/// Class of a generated adapter, at the granularity meld actually emits
+/// (#144 inc 4 / #130 §Phase 3).
+///
+/// #130 sketched per-class attribution as "transcode / cabi_realloc /
+/// lift / lower", assuming wasmtime-FACT-style separate functions. meld
+/// emits ONE fused trampoline per call site, with lowering, allocation
+/// (a call to the callee's own `cabi_realloc`, not a meld-emitted one),
+/// copying, and lifting inline in that body — so the honest class
+/// granularity is per-trampoline-kind, matching the generator's actual
+/// dispatch. Consumed by `dwarf::adapter_spans` to assign per-class
+/// `<meld-adapter>` line numbers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdapterClass {
+    /// Thin call shim — same memory, no transcoding (direct adapter).
+    Direct,
+    /// Cross-memory `(ptr, len)` copy chain: lower → `cabi_realloc`
+    /// call → `memory.copy` → lift, fused in one body.
+    MemoryCopy,
+    /// Cross-memory + string-encoding conversion (UTF-8/UTF-16/Latin-1
+    /// transcode loop) fused in one body.
+    Transcode,
+    /// P3 async adapter (callback-driving or stackful trampoline).
+    Async,
+}
+
 /// A generated adapter function
 #[derive(Debug, Clone)]
 pub struct AdapterFunction {
@@ -67,6 +92,9 @@ pub struct AdapterFunction {
     pub target_component: usize,
     pub target_module: usize,
     pub target_function: u32,
+
+    /// Emitter class, for synthetic DWARF attribution (#144 inc 4).
+    pub class: AdapterClass,
 }
 
 /// Trait for adapter generators
@@ -141,13 +169,31 @@ pub struct AdapterOptions {
     /// Resource own<T> results needing rep→handle conversion (3-component chains).
     pub resource_new_calls: Vec<ResourceOwnResultTransfer>,
     /// Resolved inner resource handles for list elements.
-    /// Each entry: (byte_offset_in_element, merged_func_idx of [resource-rep]).
-    /// Used after bulk list copy to convert handles in callee memory.
-    pub inner_resource_fixups: Vec<(u32, u32)>,
+    /// Used after bulk list copy to convert `borrow<T>` handles in callee
+    /// memory. See [`InnerResourceFixup`] — each carries a per-element
+    /// discriminant-guard chain (UCA-A-16) so handles inside
+    /// option/result/variant payloads are translated only when their case is
+    /// live. An empty chain = unconditional (Record/Tuple/FixedSizeList).
+    pub inner_resource_fixups: Vec<InnerResourceFixup>,
     /// Resource borrow handles inside the params-ptr buffer that need
     /// handle→rep conversion. Each entry contains the byte offset within the
     /// buffer and the merged function index of `[resource-rep]`.
     pub params_area_borrow_fixups: Vec<ParamsAreaResourceFixup>,
+}
+
+/// A per-element `borrow<T>` → rep conversion for a list element, applied
+/// after the bulk copy. `byte_offset` is relative to each element's base and
+/// `rep_func` is the merged function index of the matching `[resource-rep]`
+/// import. `guards` is a chain of [`crate::resolver::DiscriminantGuard`]s the
+/// adapter AND-evaluates per element before firing the conversion — non-empty
+/// when the handle lives inside an option/result/variant payload (UCA-A-16 /
+/// H-11.5). Empty = unconditional. Mirrors [`crate::resolver::InnerPointer`]'s
+/// guard handling.
+#[derive(Debug, Clone)]
+pub struct InnerResourceFixup {
+    pub byte_offset: u32,
+    pub rep_func: u32,
+    pub guards: Vec<crate::resolver::DiscriminantGuard>,
 }
 
 /// Describes a resource handle inside the params-ptr buffer that needs conversion.

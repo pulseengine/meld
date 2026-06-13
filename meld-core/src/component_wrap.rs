@@ -33,7 +33,7 @@
 //! 3. `canon lower` uses the fused module's real `cabi_realloc`.
 //! 4. A fixup module fills the indirect table with the lowered functions.
 
-use crate::merger::MergedModule;
+use crate::merger::{MergedModule, ht_export_suffix};
 use crate::parser::{self, ParsedComponent};
 use crate::resolver::DependencyGraph;
 use crate::{Error, MemoryStrategy, Result};
@@ -50,14 +50,45 @@ pub fn wrap_as_component(
     _graph: &DependencyGraph,
     merged: &MergedModule,
     memory_strategy: MemoryStrategy,
+    opaque_resources: &[(String, String)],
 ) -> Result<Vec<u8>> {
-    // Pick the component with the most depth_0_sections (widest interface).
-    // Prefer original (un-flattened) components since flattening may drop
-    // the outer shell that carries the depth_0_sections.
+    // Unresolved `MemoryStrategy::Auto` (direct API use only — the Fuser
+    // resolves it before calling here) behaves as `MultiMemory`, matching
+    // the same normalization in `Merger::new` and `Resolver::with_strategy`
+    // so the `== MultiMemory` comparisons below stay coherent (PR #220).
+    let memory_strategy = match memory_strategy {
+        MemoryStrategy::Auto => MemoryStrategy::MultiMemory,
+        concrete => concrete,
+    };
+    // Pick the source component that carries the widest *top-level*
+    // interface. Ranking by `depth_0_sections` alone is ambiguous when
+    // every candidate ties at 0 — e.g. a `wac`-composed input whose
+    // flattened sub-components have no captured depth-0 sections. There
+    // `max_by_key` returns the *last* candidate, often a flattened
+    // sub-component exporting a single bare func, so the real top-level
+    // instance export is lost and the wrapped component comes out with an
+    // empty world (#212). Rank by (depth-0 sections, top-level
+    // instance-export count, prefer-original): instance-export count
+    // surfaces the component holding the composition's real exports, and
+    // preferring the un-flattened `original` on ties keeps the outer shell.
+    let instance_export_count = |c: &ParsedComponent| {
+        c.exports
+            .iter()
+            .filter(|e| e.kind == wasmparser::ComponentExternalKind::Instance)
+            .count()
+    };
     let source = original_components
         .iter()
-        .chain(components.iter())
-        .max_by_key(|c| c.depth_0_sections.len())
+        .map(|c| (2u8, c))
+        .chain(components.iter().map(|c| (1u8, c)))
+        .max_by_key(|(origin_rank, c)| {
+            (
+                c.depth_0_sections.len(),
+                instance_export_count(c),
+                *origin_rank,
+            )
+        })
+        .map(|(_, c)| c)
         .ok_or(Error::NoComponents)?;
 
     // Parse the fused module to extract its imports, exports, and memory info
@@ -106,6 +137,7 @@ pub fn wrap_as_component(
         merged,
         memory_strategy,
         components,
+        opaque_resources,
     )
 }
 
@@ -157,6 +189,14 @@ enum ImportResolution {
         /// Source component index (reserved for future handle table routing)
         #[allow(dead_code)]
         component_idx: Option<usize>,
+        /// `true` when the import came from an `[export]`-prefixed module —
+        /// meaning the importer is the DEFINER of the resource (its own
+        /// export). `false` when the importer is a CONSUMER of someone
+        /// else's resource (just calls into it). The two cases route
+        /// differently: definers must use canonical resource ops or their
+        /// own handle table; consumers may fall back to any re-exporter's
+        /// handle table for the same (interface, resource).
+        is_definer: bool,
     },
     /// Import resolves to a P3 task/async canonical built-in.
     ///
@@ -763,6 +803,10 @@ fn assemble_component(
     merged: &MergedModule,
     memory_strategy: MemoryStrategy,
     all_components: &[ParsedComponent],
+    // Currently consumed only by debug logging — the conditional behavior is
+    // not yet implemented. Threaded through the API so future work can use
+    // it without re-doing the plumbing.
+    _opaque_resources: &[(String, String)],
 ) -> Result<Vec<u8>> {
     use wasm_encoder::*;
 
@@ -770,15 +814,115 @@ fn assemble_component(
     let n = fused_info.func_imports.len();
 
     // -----------------------------------------------------------------------
+    // 0. Internalised-import elimination (#212.1). An instance import in
+    //    the wrapped component is needed IFF some import remaining in the
+    //    FUSED core module references it (module name == instance name).
+    //    An interface that an input module imported but the fused module
+    //    no longer does was satisfied internally by the resolver — its
+    //    component-level import declaration must be dropped, or the
+    //    wrapped component demands an implementation the linker cannot
+    //    have. Dropping shifts later instance indices, so a renumber map
+    //    is threaded to every consumer below.
+    // -----------------------------------------------------------------------
+    let remaining_modules: std::collections::BTreeSet<&str> = fused_info
+        .func_imports
+        .iter()
+        .map(|(m, _, _)| m.as_str())
+        .collect();
+    let original_modules: std::collections::BTreeSet<&str> = all_components
+        .iter()
+        .flat_map(|c| c.core_modules.iter())
+        .flat_map(|m| m.imports.iter())
+        .map(|imp| imp.module.as_str())
+        .collect();
+    // INVARIANT (Mythos pass, PR #236): `instance_renum` keys are import
+    // ordinals but are consumed with component-instance indices from
+    // `component_instance_defs` — these coincide only while import
+    // instances occupy the contiguous LEADING slots of the component
+    // instance space, which every real producer (wit-component, wac,
+    // wit-bindgen) satisfies. Likewise the depth-0 replay only filters
+    // the Import section; a depth-0 Alias/Type section referencing an
+    // import instance by index would dangle after a drop — unreachable
+    // from real producers (their instance-referencing aliases come after
+    // the first core module and are not captured as depth-0). If either
+    // assumption breaks, the loud dropped-instance error below fires
+    // rather than emitting a wrong index.
+    let mut dropped_import_names: std::collections::BTreeSet<String> = Default::default();
+    let mut instance_renum: std::collections::HashMap<u32, u32> = Default::default();
+    {
+        let mut old_idx = 0u32;
+        let mut new_idx = 0u32;
+        for imp in &source.imports {
+            if !matches!(imp.ty, wasmparser::ComponentTypeRef::Instance(_)) {
+                continue;
+            }
+            let internalised = original_modules.contains(imp.name.as_str())
+                && !remaining_modules.contains(imp.name.as_str());
+            if internalised {
+                log::debug!(
+                    "component wrap: dropping internalised import `{}` (#212.1)",
+                    imp.name
+                );
+                dropped_import_names.insert(imp.name.clone());
+            } else {
+                instance_renum.insert(old_idx, new_idx);
+                new_idx += 1;
+            }
+            old_idx += 1;
+        }
+    }
+
+    // -----------------------------------------------------------------------
     // 1. Replay depth-0 Type and Import sections from the original component.
     //    These define the component-level instance types and import declarations
-    //    that the runtime validates against.
+    //    that the runtime validates against. Import sections are filtered
+    //    through the internalised-import drop set (#212.1).
     // -----------------------------------------------------------------------
     for (section_id, data) in &source.depth_0_sections {
-        component.section(&RawSection {
-            id: *section_id,
-            data,
-        });
+        if *section_id == ComponentSectionId::Import as u8 && !dropped_import_names.is_empty() {
+            let reader = wasmparser::ComponentImportSectionReader::new(
+                wasmparser::BinaryReader::new(data, 0),
+            )
+            .map_err(|e| Error::EncodingError(format!("replay import section: {e}")))?;
+            let mut imports = ComponentImportSection::new();
+            for entry in reader {
+                let entry =
+                    entry.map_err(|e| Error::EncodingError(format!("import entry: {e}")))?;
+                if dropped_import_names.contains(entry.name.0) {
+                    continue;
+                }
+                let ty = match entry.ty {
+                    wasmparser::ComponentTypeRef::Module(i) => ComponentTypeRef::Module(i),
+                    wasmparser::ComponentTypeRef::Func(i) => ComponentTypeRef::Func(i),
+                    wasmparser::ComponentTypeRef::Value(_) => {
+                        return Err(Error::EncodingError(
+                            "value imports are not supported in wrap replay".into(),
+                        ));
+                    }
+                    wasmparser::ComponentTypeRef::Type(_) => {
+                        ComponentTypeRef::Type(TypeBounds::Eq(0))
+                    }
+                    wasmparser::ComponentTypeRef::Instance(i) => ComponentTypeRef::Instance(i),
+                    wasmparser::ComponentTypeRef::Component(i) => ComponentTypeRef::Component(i),
+                };
+                // Type imports carry bounds we must preserve precisely.
+                let ty = if let wasmparser::ComponentTypeRef::Type(bounds) = entry.ty {
+                    ComponentTypeRef::Type(match bounds {
+                        wasmparser::TypeBounds::Eq(i) => TypeBounds::Eq(i),
+                        wasmparser::TypeBounds::SubResource => TypeBounds::SubResource,
+                    })
+                } else {
+                    ty
+                };
+                imports.import(entry.name.0, ty);
+            }
+            component.section(&imports);
+        } else {
+            component.section(&RawSection {
+                id: *section_id,
+                data,
+            });
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -844,6 +988,7 @@ fn assemble_component(
                 resource_name,
                 interface_name: inner_module.to_string(),
                 component_idx: comp_idx,
+                is_definer: true,
             });
             continue;
         }
@@ -876,8 +1021,20 @@ fn assemble_component(
         if let Some((inst_idx, func_name)) =
             resolve_import_to_instance(source, module_name, field_name, &instance_map)
         {
+            // Source-numbered instance index → output numbering after the
+            // internalised-import drops (#212.1). A miss here would mean a
+            // resolution references a DROPPED instance — impossible by
+            // construction (drops require the module absent from the fused
+            // imports, and resolutions exist only for present ones), so
+            // surface it loudly rather than emit a wrong index.
+            let renumbered = *instance_renum.get(&inst_idx).ok_or_else(|| {
+                Error::EncodingError(format!(
+                    "import resolution references dropped instance {inst_idx} \
+                     ({module_name}::{field_name})"
+                ))
+            })?;
             import_resolutions.push(ImportResolution::Instance {
-                instance_idx: inst_idx,
+                instance_idx: renumbered,
                 func_name,
             });
             continue;
@@ -892,6 +1049,7 @@ fn assemble_component(
                 resource_name,
                 interface_name: module_name.clone(),
                 component_idx: comp_idx,
+                is_definer: false,
             });
             continue;
         }
@@ -1158,12 +1316,23 @@ fn assemble_component(
     // Shared between import resolution (P3 task-return types) and export lifting.
     let mut type_remap: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
 
-    // Cache: resource_name → component type index.
+    // Cache: (Option<component_idx>, resource_name) → component type index.
+    //
+    // STANDARD resources (Box-pattern wit-bindgen): keyed by `(None, name)`.
     // All components share one canonical resource type per resource name,
     // regardless of interface. Re-exporters import and export the same
     // resource under different interface names (imports, exports, test:…/test)
-    // but must share one wasmtime handle table.
-    let mut local_resource_types: std::collections::HashMap<String, u32> =
+    // but must share one wasmtime handle table so Box-pointer reps round-trip
+    // through the re-exporter chain.
+    //
+    // OPAQUE-REP resources (pulseengine/wit-bindgen feat/opaque-rep-attribute):
+    // keyed by `(Some(component_idx), name)`. Each component gets its OWN
+    // wasmtime resource type and table. The opaque-rep pattern relies on
+    // intermediate's small-integer rep being stored in its OWN table —
+    // sharing a table with leaf would mix value spaces (intermediate's rep=1
+    // would be retrieved by leaf as the rep for its own handle=1, then
+    // dereferenced as a Box pointer → trap).
+    let mut local_resource_types: std::collections::HashMap<(Option<usize>, String), u32> =
         std::collections::HashMap::new();
 
     // Pre-define component function types for async lift/lower imports.
@@ -1176,26 +1345,61 @@ fn assemble_component(
                 let field_name = &fused_info.func_imports[i].1;
 
                 if field_name.starts_with("[resource-drop]") {
-                    // Resource-drop from an external instance: alias the TYPE
-                    // from the instance, then canon resource.drop.
-                    let type_name = func_name
+                    // Resource-drop from an external instance.
+                    //
+                    // First check if a re-exporter handle table exists for
+                    // this resource (any iface, matching by name only). If
+                    // so, alias its ht_drop instead of emitting canonical
+                    // resource.drop — same alias-fallback as LocalResource.
+                    let resource_name = func_name
                         .strip_prefix("[resource-drop]")
                         .unwrap_or(func_name);
-                    let mut alias_section = ComponentAliasSection::new();
-                    alias_section.alias(Alias::InstanceExport {
-                        instance: *instance_idx,
-                        kind: ComponentExportKind::Type,
-                        name: type_name,
-                    });
-                    component.section(&alias_section);
+                    let stripped_rn = crate::merger::strip_dollar_suffix(resource_name);
+                    let alias_tail = format!("_{}", stripped_rn);
+                    let ht_drop_alias = fused_info
+                        .exports
+                        .iter()
+                        .find(|(n, k, _)| {
+                            *k == wasmparser::ExternalKind::Func
+                                && n.starts_with("$ht_drop_")
+                                && n.ends_with(&alias_tail)
+                        })
+                        .map(|(n, _, _)| n.clone());
+                    if let Some(ht_name) = ht_drop_alias {
+                        log::debug!(
+                            "Instance::ResourceDrop alias-fallback: import {} → {}",
+                            field_name,
+                            ht_name
+                        );
+                        let mut aliases = ComponentAliasSection::new();
+                        aliases.alias(Alias::CoreInstanceExport {
+                            instance: fused_instance,
+                            kind: ExportKind::Func,
+                            name: &ht_name,
+                        });
+                        component.section(&aliases);
+                        lowered_func_indices.push(core_func_idx);
+                        core_func_idx += 1;
+                    } else {
+                        let type_name = func_name
+                            .strip_prefix("[resource-drop]")
+                            .unwrap_or(func_name);
+                        let mut alias_section = ComponentAliasSection::new();
+                        alias_section.alias(Alias::InstanceExport {
+                            instance: *instance_idx,
+                            kind: ComponentExportKind::Type,
+                            name: type_name,
+                        });
+                        component.section(&alias_section);
 
-                    let mut canon = CanonicalFunctionSection::new();
-                    canon.resource_drop(component_type_idx);
-                    component.section(&canon);
+                        let mut canon = CanonicalFunctionSection::new();
+                        canon.resource_drop(component_type_idx);
+                        component.section(&canon);
 
-                    component_type_idx += 1;
-                    lowered_func_indices.push(core_func_idx);
-                    core_func_idx += 1;
+                        component_type_idx += 1;
+                        lowered_func_indices.push(core_func_idx);
+                        core_func_idx += 1;
+                    }
                 } else {
                     // Regular function: alias from instance, then canon lower
                     // with correct memory and realloc for the importing component.
@@ -1246,24 +1450,117 @@ fn assemble_component(
                 resource_name,
                 interface_name,
                 component_idx,
+                is_definer,
             } => {
-                // Check if this component has handle table exports
-                // ($ht_new_N, $ht_rep_N, $ht_drop_N) for re-exporter routing.
-                let ht_export = component_idx.and_then(|cidx| {
-                    let name = match operation {
-                        ResourceOp::New => format!("$ht_new_{}", cidx),
-                        ResourceOp::Rep => format!("$ht_rep_{}", cidx),
-                        ResourceOp::Drop => format!("$ht_drop_{}", cidx),
-                    };
-                    if fused_info
+                // Look up a handle table export for this (interface, resource).
+                //
+                // Definers (importer owns the resource — `[export]`-prefixed
+                // import) MUST use either their OWN component's handle table
+                // or canonical resource ops. Falling back to a re-exporter's
+                // ht_new would store the rep in the wrong table; the definer's
+                // own canonical [resource-rep] would later return whatever was
+                // there (a small handle integer, not the actual Box pointer)
+                // and the user code's deref would trap.
+                //
+                // Consumers (importer holds someone else's handle — no
+                // `[export]` prefix) MUST route to whoever allocated the
+                // handle. After fusion that's the re-exporter component, so
+                // fall back to ANY handle table matching (iface, rn).
+                let op_prefix = match operation {
+                    ResourceOp::New => "$ht_new_",
+                    ResourceOp::Rep => "$ht_rep_",
+                    ResourceOp::Drop => "$ht_drop_",
+                };
+                let direct = component_idx.and_then(|cidx| {
+                    let suffix = ht_export_suffix(cidx, interface_name, resource_name);
+                    let name = format!("{}{}", op_prefix, suffix);
+                    fused_info
                         .exports
                         .iter()
-                        .any(|(n, k, _)| *k == wasmparser::ExternalKind::Func && *n == name)
-                    {
-                        Some(name)
-                    } else {
-                        None
+                        .find(|(n, k, _)| *k == wasmparser::ExternalKind::Func && *n == name)
+                        .map(|_| name)
+                });
+                let ht_export: Option<String> = direct.or_else(|| {
+                    if *is_definer {
+                        // Definer with no own handle table: try the
+                        // resource-alias fallback first. When another
+                        // component re-exports THIS resource via `use`
+                        // (intermediate's `use test.{float}` re-exports
+                        // leaf's test.float as exports.float), wasmtime
+                        // unifies both into one canonical type but the
+                        // re-exporter's handle table is the only storage
+                        // that knows the memory-pointer handles. The
+                        // definer's [resource-rep]/[resource-new]/
+                        // [resource-drop] must route through that same
+                        // table or peer components hand it pointers it
+                        // cannot dereference. Match by resource_name only
+                        // since the iface differs across the alias.
+                        let alias_tail = format!("_{}", resource_name);
+                        return fused_info
+                            .exports
+                            .iter()
+                            .find(|(n, k, _)| {
+                                *k == wasmparser::ExternalKind::Func
+                                    && n.starts_with(op_prefix)
+                                    && n.ends_with(&alias_tail)
+                            })
+                            .map(|(n, _, _)| n.clone());
                     }
+                    // Consumer-side. If THIS component itself owns a handle
+                    // table for the same (iface, rn), this import is its
+                    // own inner-component view (e.g. a re-exporter that
+                    // also imports the resource from its leaf). Use
+                    // canonical resource ops, not the re-exporter's table.
+                    let safe_iface: String = interface_name
+                        .chars()
+                        .map(|c| match c {
+                            ':' | '/' | '@' | '.' | '-' => '_',
+                            other => other,
+                        })
+                        .collect();
+                    let tail = format!("_{}_{}", safe_iface, resource_name);
+                    let alias_tail = format!("_{}", resource_name);
+                    if let Some(cidx) = component_idx {
+                        // Self-owns check: this component owns a handle table
+                        // for the SPECIFIC (iface, resource) pair. Don't
+                        // borrow another component's ht for that exact pair.
+                        // We do NOT block when the iface differs but the
+                        // resource is the same — those are `use`-aliased
+                        // resources unified at canon-type level, and they
+                        // SHOULD route through the re-exporter's ht.
+                        let self_specific = format!(
+                            "$ht_new_{}",
+                            ht_export_suffix(*cidx, interface_name, resource_name)
+                        );
+                        let owns_specific = fused_info.exports.iter().any(|(n, k, _)| {
+                            *k == wasmparser::ExternalKind::Func && *n == self_specific
+                        });
+                        if owns_specific {
+                            return None;
+                        }
+                    }
+                    // Strict iface match first; alias-fallback by resource_name
+                    // only if strict misses (mirrors the definer-side fix).
+                    fused_info
+                        .exports
+                        .iter()
+                        .find(|(n, k, _)| {
+                            *k == wasmparser::ExternalKind::Func
+                                && n.starts_with(op_prefix)
+                                && n.ends_with(&tail)
+                        })
+                        .map(|(n, _, _)| n.clone())
+                        .or_else(|| {
+                            fused_info
+                                .exports
+                                .iter()
+                                .find(|(n, k, _)| {
+                                    *k == wasmparser::ExternalKind::Func
+                                        && n.starts_with(op_prefix)
+                                        && n.ends_with(&alias_tail)
+                                })
+                                .map(|(n, _, _)| n.clone())
+                        })
                 });
 
                 if let Some(ht_name) = ht_export {
@@ -1287,7 +1584,7 @@ fn assemble_component(
                     core_func_idx += 1;
                 } else {
                     // Standard path: canonical resource operations.
-                    let res_type_key = resource_name.clone();
+                    let res_type_key = (None, resource_name.clone());
                     let res_type_idx =
                         if let Some(&existing) = local_resource_types.get(&res_type_key) {
                             existing
@@ -1554,12 +1851,9 @@ fn assemble_component(
         }
     }
 
-    // Track component instance index (starts after import instances)
-    let mut component_instance_idx = source
-        .imports
-        .iter()
-        .filter(|imp| matches!(imp.ty, wasmparser::ComponentTypeRef::Instance(_)))
-        .count() as u32;
+    // Track component instance index (starts after the KEPT import
+    // instances — internalised imports were dropped above, #212.1).
+    let mut component_instance_idx = instance_renum.len() as u32;
 
     for comp_export in &source.exports {
         if comp_export.kind != wasmparser::ComponentExternalKind::Instance {
@@ -1603,16 +1897,22 @@ fn assemble_component(
                 None
             };
 
-            // Find the source component's lift type and canonical options for
-            // this export function.
-            let lift_info =
-                find_lift_type_for_interface_func(source, interface_name, &func_info.func_name);
+            // Find the lift type + options for this export and the
+            // component that owns the lift — which, for a multi-component
+            // composition, may differ from `source`; the type index is
+            // then resolved against that owning component (#212).
+            let lift_info = find_lift_type_for_interface_func(
+                source,
+                all_components,
+                interface_name,
+                &func_info.func_name,
+            );
 
             // Define the component function type in our wrapper
-            let wrapper_func_type = if let Some((source_type_idx, _)) = &lift_info {
+            let wrapper_func_type = if let Some((lift_comp, source_type_idx, _)) = &lift_info {
                 define_source_type_in_wrapper(
                     &mut component,
-                    source,
+                    lift_comp,
                     *source_type_idx,
                     &mut component_type_idx,
                     &mut type_remap,
@@ -1622,18 +1922,28 @@ fn assemble_component(
                 define_default_run_type(&mut component, &mut component_type_idx)
             };
 
-            // Canon lift with appropriate options
+            // Canon lift with appropriate options.
+            //
+            // String encoding is propagated from the source component's
+            // canon lift rather than hardcoded to UTF-8 (LS-A-16). A
+            // guest compiled with `--string-encoding=utf16` previously
+            // had its option silently downgraded, producing wrong-ABI
+            // strings downstream with no trap.
+            let source_string_encoding = lift_info
+                .as_ref()
+                .map(|(_, _, opts)| source_string_encoding_option(opts.string_encoding))
+                .unwrap_or(CanonicalOption::UTF8);
             let mut lift_options: Vec<CanonicalOption> = Vec::new();
             if func_info.has_post_return {
                 // String/list-returning functions need memory + encoding + post-return
                 lift_options.push(CanonicalOption::Memory(0)); // shim memory = shared memory
-                lift_options.push(CanonicalOption::UTF8);
+                lift_options.push(source_string_encoding);
                 if let Some(pr_idx) = post_return_core_idx {
                     lift_options.push(CanonicalOption::PostReturn(pr_idx));
                 }
             }
             // Propagate P3 async/callback from source component's canon lift
-            if let Some((_, ref source_opts)) = lift_info {
+            if let Some((_, _, ref source_opts)) = lift_info {
                 if source_opts.async_ {
                     lift_options.push(CanonicalOption::Async);
                     // async requires memory
@@ -1651,7 +1961,7 @@ fn assemble_component(
                                 | CanonicalOption::CompactUTF16
                         )
                     }) {
-                        lift_options.push(CanonicalOption::UTF8);
+                        lift_options.push(source_string_encoding);
                     }
                 }
                 if source_opts.callback.is_some() {
@@ -2187,7 +2497,9 @@ pub(crate) fn resolve_component_val_type(
                 })
                 .collect(),
         ),
-        CVT::Primitive(_) | CVT::String | CVT::Own(_) | CVT::Borrow(_) => ty.clone(),
+        CVT::Primitive(_) | CVT::String | CVT::Own(_) | CVT::Borrow(_) | CVT::Flags(_) => {
+            ty.clone()
+        }
     }
 }
 
@@ -2299,6 +2611,13 @@ fn flat_component_val_type_resolved(
         parser::ComponentValType::Own(_) | parser::ComponentValType::Borrow(_) => {
             vec![wasm_encoder::ValType::I32]
         }
+        parser::ComponentValType::Flags(names) => {
+            // flags<N> flattens to ceil(N/32) i32 storage words per
+            // canonical ABI (LS-A-20).
+            let n = names.len() as u32;
+            let words = n.div_ceil(32);
+            vec![ValType::I32; words as usize]
+        }
     }
 }
 
@@ -2321,56 +2640,146 @@ struct ExportFuncInfo {
 /// matches the `<interface>#<func_name>` pattern.
 /// Returns (type_index, canonical_options) for the source component's lift
 /// entry that matches the given interface function.
-fn find_lift_type_for_interface_func(
-    source: &ParsedComponent,
+/// Translate the source component's `CanonStringEncoding` enum into the
+/// `wasm_encoder::CanonicalOption` byte the wrapper emits. Without this
+/// helper the wrapper hardcoded `UTF8` regardless of what the source
+/// declared, silently downgrading UTF-16 / CompactUTF16 lifts (LS-A-16).
+fn source_string_encoding_option(
+    enc: parser::CanonStringEncoding,
+) -> wasm_encoder::CanonicalOption {
+    match enc {
+        parser::CanonStringEncoding::Utf8 => wasm_encoder::CanonicalOption::UTF8,
+        parser::CanonStringEncoding::Utf16 => wasm_encoder::CanonicalOption::UTF16,
+        parser::CanonStringEncoding::CompactUtf16 => wasm_encoder::CanonicalOption::CompactUTF16,
+    }
+}
+
+/// Resolve the canon-lift type index + options for an exported function,
+/// returning the **owning component** (the type index is component-relative
+/// and must be resolved against the component that holds the lift).
+///
+/// A `wac`-composed multi-component spreads the top-level export, the
+/// interface-instance export, and the canon-lift across *different* parsed
+/// components, so the lift can live in a component other than the export
+/// shell (#212). Per component (source first, then the rest):
+///
+///  - **(A)** A component-level `{iface}#{func}` Func export → its lift.
+///    The wit-bindgen single-component convention (preserves LS-A-16's
+///    per-export type/option fidelity).
+///  - **(B, #212)** No flat Func export, but a canon-lift's
+///    `core_func_index` resolves (through the component's `core_entity_order`
+///    core-function space) to a core export named `{iface}#{func}`. This is
+///    the interface-*instance* export shape `wac` produces. Matching by the
+///    resolved **name** — not by raw index — is essential: `core_func_index`
+///    is a *component-level* index in the flattened alias space, which does
+///    NOT equal the lifted function's module-local export index whenever the
+///    core module has imported funcs or earlier aliases (Mythos finding on
+///    the first #212.2 attempt).
+///
+/// Fuzz-safety fallback (`fuzz_fusion_roundtrip`): the first lift of
+/// `source`, so emission stays structurally valid when nothing matched.
+fn find_lift_type_for_interface_func<'a>(
+    source: &'a ParsedComponent,
+    others: &'a [ParsedComponent],
     interface_name: &str,
     func_name: &str,
-) -> Option<(u32, parser::CanonicalOptions)> {
-    let target_export_name = format!("{}#{}", interface_name, func_name);
+) -> Option<(&'a ParsedComponent, u32, parser::CanonicalOptions)> {
+    let qualified = format!("{}#{}", interface_name, func_name);
 
-    // Strategy 1: Find a Lift entry whose core function is exported with the
-    // target name. Walk canonical_functions for Lift entries, then check if
-    // the core_func_index matches an export with our target name.
-    //
-    // The source component's core module exports include the target name.
-    // The Lift entry references the core function by its core_func_index.
-    // We can match by looking at core aliases that reference the export name.
-    for (canon_idx, canon) in source.canonical_functions.iter().enumerate() {
-        if let parser::CanonicalEntry::Lift {
-            type_index,
-            options,
-            ..
-        } = canon
-        {
-            // Check if any component_func_def points to this lift, and if
-            // the corresponding export matches our interface
-            for func_def in &source.component_func_defs {
-                if let parser::ComponentFuncDef::Lift(idx) = func_def
-                    && *idx == canon_idx
-                {
-                    // This is a lifted function. Check if the source
-                    // component exports it as our interface.
-                    return Some((*type_index, options.clone()));
-                }
+    for c in std::iter::once(source).chain(others.iter()) {
+        // (A) component-level `{iface}#{func}` Func export → its lift.
+        for export in &c.exports {
+            if export.name == qualified
+                && matches!(export.kind, wasmparser::ComponentExternalKind::Func)
+                && let Some(parser::ComponentFuncDef::Lift(canon_idx)) =
+                    c.component_func_defs.get(export.index as usize)
+                && let Some(parser::CanonicalEntry::Lift {
+                    type_index,
+                    options,
+                    ..
+                }) = c.canonical_functions.get(*canon_idx)
+            {
+                return Some((c, *type_index, options.clone()));
             }
         }
-    }
-
-    // Strategy 2: Look for any Lift entry (fallback for simple components
-    // with only one export).
-    for canon in &source.canonical_functions {
-        if let parser::CanonicalEntry::Lift {
-            type_index,
-            options,
-            ..
-        } = canon
-        {
-            return Some((*type_index, options.clone()));
+        // (B, #212) a canon-lift whose core_func_index resolves (via the
+        // component-level core-function space) to a core export named
+        // `{iface}#{func}`. Matched by NAME, not raw index.
+        if let Some(found) = c.canonical_functions.iter().find_map(|ce| match ce {
+            parser::CanonicalEntry::Lift {
+                core_func_index,
+                type_index,
+                options,
+            } if core_func_name(c, *core_func_index) == Some(qualified.as_str()) => {
+                Some((*type_index, options.clone()))
+            }
+            _ => None,
+        }) {
+            return Some((c, found.0, found.1));
         }
     }
 
-    // No lift found — export type unknown
-    let _ = target_export_name; // suppress unused warning
+    // Fuzz-safety fallback: the first lift of `source`.
+    let mut lifts = source.canonical_functions.iter().filter_map(|c| match c {
+        parser::CanonicalEntry::Lift {
+            type_index,
+            options,
+            ..
+        } => Some((*type_index, options.clone())),
+        _ => None,
+    });
+    let first = lifts.next()?;
+    let extra = lifts.count();
+    if extra > 0 {
+        log::warn!(
+            "find_lift_type_for_interface_func: no export matched \
+             {interface_name}#{func_name} across components but source has {} \
+             lifts; falling back to first lift's type/options to keep the \
+             wrapper output valid (LS-A-16 fuzz-safety fallback).",
+            extra + 1,
+        );
+    }
+    Some((source, first.0, first.1))
+}
+
+/// Resolve a component-level core-function index to the name it was aliased
+/// under, or `None` for an unnamed (canonical-builtin) core function.
+///
+/// The component's core-function index space is the subsequence of
+/// `core_entity_order` that produces core *functions*, in order:
+///  - `CoreEntityDef::CanonicalFunction(_)` — always a core func (the
+///    parser only records non-`Lift` canon entries here, all of which
+///    lower to a core function).
+///  - `CoreEntityDef::CoreAlias(_)` — a core func *only* when the aliased
+///    core-instance export is a `Func` (Table/Memory/Global aliases live in
+///    other index spaces and must not be counted).
+///
+/// This is the index space `CanonicalEntry::Lift::core_func_index` and
+/// `canon lift` reference — distinct from any core module's module-local
+/// function indices.
+fn core_func_name(c: &ParsedComponent, core_func_index: u32) -> Option<&str> {
+    let mut func_i = 0u32;
+    for def in &c.core_entity_order {
+        let (is_func, name) = match def {
+            parser::CoreEntityDef::CanonicalFunction(_) => (true, None),
+            parser::CoreEntityDef::CoreAlias(alias_idx) => {
+                match c.component_aliases.get(*alias_idx) {
+                    Some(parser::ComponentAliasEntry::CoreInstanceExport {
+                        kind: wasmparser::ExternalKind::Func,
+                        name,
+                        ..
+                    }) => (true, Some(name.as_str())),
+                    _ => (false, None),
+                }
+            }
+        };
+        if is_func {
+            if func_i == core_func_index {
+                return name;
+            }
+            func_i += 1;
+        }
+    }
     None
 }
 
@@ -2864,6 +3273,7 @@ fn convert_type_ref(ty: wasmparser::TypeRef) -> Result<wasm_encoder::EntityType>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use wasm_encoder::CanonicalOption;
 
     #[test]
     fn test_count_replayed_types_hello_c_cli() {
@@ -3299,5 +3709,242 @@ mod tests {
             &instance_func_map,
         );
         assert!(result.is_none(), "unknown module should not resolve");
+    }
+
+    // ---------------------------------------------------------------
+    // LS-A-16 — find_lift_type_for_interface_func ignored its iface/func
+    // arguments and returned the first lift entry. For a multi-export
+    // component, every export silently received the first lift's type
+    // and canonical options (including string_encoding, breaking UTF-16
+    // lifts down to UTF-8).
+    // ---------------------------------------------------------------
+
+    fn empty_parsed_component_for_lift_test() -> parser::ParsedComponent {
+        parser::ParsedComponent {
+            name: None,
+            core_modules: vec![],
+            imports: vec![],
+            exports: vec![],
+            types: vec![],
+            instances: vec![],
+            canonical_functions: vec![],
+            sub_components: vec![],
+            component_aliases: vec![],
+            component_instances: vec![],
+            core_entity_order: vec![],
+            component_func_defs: vec![],
+            component_instance_defs: vec![],
+            component_type_defs: vec![],
+            original_size: 0,
+            original_hash: String::new(),
+            depth_0_sections: vec![],
+            p3_async_features: vec![],
+        }
+    }
+
+    fn lift_entry(
+        type_index: u32,
+        encoding: parser::CanonStringEncoding,
+    ) -> parser::CanonicalEntry {
+        parser::CanonicalEntry::Lift {
+            core_func_index: 0,
+            type_index,
+            options: parser::CanonicalOptions {
+                string_encoding: encoding,
+                memory: Some(0),
+                realloc: None,
+                post_return: None,
+                async_: false,
+                callback: None,
+            },
+        }
+    }
+
+    #[test]
+    fn ls_a_16_find_lift_distinguishes_between_two_exports() {
+        // Two lifts: lift 0 carries type 10 UTF-8, lift 1 carries type
+        // 20 UTF-16. Two exports map func_def 0 → lift 0 and func_def
+        // 1 → lift 1, with names "iface:a#fa" and "iface:b#fb"
+        // respectively. The lookup must return the correct lift per
+        // (iface, func) — prior to the fix it returned lift 0 for both.
+        let mut comp = empty_parsed_component_for_lift_test();
+        comp.canonical_functions
+            .push(lift_entry(10, parser::CanonStringEncoding::Utf8));
+        comp.canonical_functions
+            .push(lift_entry(20, parser::CanonStringEncoding::Utf16));
+        comp.component_func_defs
+            .push(parser::ComponentFuncDef::Lift(0));
+        comp.component_func_defs
+            .push(parser::ComponentFuncDef::Lift(1));
+        comp.exports.push(parser::ComponentExport {
+            name: "iface:a#fa".to_string(),
+            kind: wasmparser::ComponentExternalKind::Func,
+            index: 0,
+        });
+        comp.exports.push(parser::ComponentExport {
+            name: "iface:b#fb".to_string(),
+            kind: wasmparser::ComponentExternalKind::Func,
+            index: 1,
+        });
+
+        let a = find_lift_type_for_interface_func(&comp, &[], "iface:a", "fa");
+        let b = find_lift_type_for_interface_func(&comp, &[], "iface:b", "fb");
+
+        let (_, a_type, a_opts) = a.expect("lift for iface:a#fa must resolve");
+        let (_, b_type, b_opts) = b.expect("lift for iface:b#fb must resolve");
+        assert_eq!(a_type, 10);
+        assert_eq!(a_opts.string_encoding, parser::CanonStringEncoding::Utf8);
+        assert_eq!(
+            b_type, 20,
+            "iface:b#fb must resolve to lift 1 (type 20), not first-lift fallback"
+        );
+        assert_eq!(
+            b_opts.string_encoding,
+            parser::CanonStringEncoding::Utf16,
+            "iface:b#fb's string encoding must be UTF-16 from its own lift"
+        );
+    }
+
+    #[test]
+    fn ls_a_16_find_lift_single_lift_fallback_still_works() {
+        // Regression: a component with exactly one lift but no
+        // matching export should still resolve via the single-lift
+        // fallback (preserves existing behavior for simple fixtures).
+        let mut comp = empty_parsed_component_for_lift_test();
+        comp.canonical_functions
+            .push(lift_entry(7, parser::CanonStringEncoding::Utf8));
+        comp.component_func_defs
+            .push(parser::ComponentFuncDef::Lift(0));
+
+        let r = find_lift_type_for_interface_func(&comp, &[], "any", "thing");
+        let (_, ty, _) = r.expect("single-lift fallback must resolve");
+        assert_eq!(ty, 7);
+    }
+
+    #[test]
+    fn ls_a_16_find_lift_two_lifts_without_matching_export_fuzz_safe_fallback() {
+        // Without a matching export AND with multiple lifts, the
+        // function falls back to the FIRST lift's type/options to
+        // keep downstream wasm emission valid. This preserves
+        // fuzz-safety (`fuzz_fusion_roundtrip`) at the cost of
+        // misclassifying — real wit-bindgen components always hit
+        // the export-match path. A `log::warn` documents the guess.
+        let mut comp = empty_parsed_component_for_lift_test();
+        comp.canonical_functions
+            .push(lift_entry(10, parser::CanonStringEncoding::Utf8));
+        comp.canonical_functions
+            .push(lift_entry(20, parser::CanonStringEncoding::Utf16));
+
+        let r = find_lift_type_for_interface_func(&comp, &[], "any", "thing");
+        let (_, ty, _opts) = r.expect("fallback must return first lift, not None");
+        assert_eq!(
+            ty, 10,
+            "fallback must return the FIRST lift's type (10) for fuzz \
+             safety; returning None caused downstream invalid wasm in \
+             `fuzz_fusion_roundtrip`"
+        );
+    }
+
+    fn opts_utf8() -> parser::CanonicalOptions {
+        parser::CanonicalOptions {
+            string_encoding: parser::CanonStringEncoding::Utf8,
+            memory: Some(0),
+            realloc: None,
+            post_return: None,
+            async_: false,
+            callback: None,
+        }
+    }
+
+    /// LS-CP-5 (#212.2): when a `wac`-composed multi-component's lift lives
+    /// in a *different* parsed component than the export shell — exported
+    /// as an interface *instance*, not a flat `{iface}#{func}` Func — the
+    /// resolver must find the correct lift via name resolution through the
+    /// owning component's `core_entity_order` core-function space.
+    ///
+    /// **Adversarial:** the compute lift's `core_func_index` is **1**, not
+    /// 0 — an unnamed canonical core func (a lowered import) precedes it in
+    /// the component core-func space. The first #212.2 attempt matched the
+    /// raw index against a module-local export index and was caught by the
+    /// Mythos scan; this fixture makes those spaces diverge, so only the
+    /// name-resolution path (`core_func_name`) gets it right.
+    #[test]
+    fn ls_cp_5_lift_resolved_cross_component_via_core_export() {
+        // `source` is the bare export shell: interface-instance export only,
+        // no lift, no flat Func export.
+        let source = empty_parsed_component_for_lift_test();
+
+        let mut owner = empty_parsed_component_for_lift_test();
+        // canon 0 — a lowered import: an *unnamed* core func at core-func
+        // index 0, shifting the lift's core_func_index off 0.
+        owner
+            .canonical_functions
+            .push(parser::CanonicalEntry::Lower {
+                func_index: 0,
+                options: opts_utf8(),
+            });
+        // canon 1 — the compute lift, referencing core func index 1.
+        owner
+            .canonical_functions
+            .push(parser::CanonicalEntry::Lift {
+                core_func_index: 1,
+                type_index: 77,
+                options: opts_utf8(),
+            });
+        // alias 0 — the named core export `…#compute` (core func index 1).
+        owner
+            .component_aliases
+            .push(parser::ComponentAliasEntry::CoreInstanceExport {
+                kind: wasmparser::ExternalKind::Func,
+                instance_index: 0,
+                name: "golden:app/runner@0.1.0#compute".to_string(),
+            });
+        // core-func space order: [Lower (idx 0), CoreAlias compute (idx 1)].
+        owner
+            .core_entity_order
+            .push(parser::CoreEntityDef::CanonicalFunction(0));
+        owner
+            .core_entity_order
+            .push(parser::CoreEntityDef::CoreAlias(0));
+
+        // Sanity: name resolution maps core-func index 1 → compute, 0 → none.
+        assert_eq!(
+            core_func_name(&owner, 1),
+            Some("golden:app/runner@0.1.0#compute")
+        );
+        assert_eq!(core_func_name(&owner, 0), None);
+
+        let (comp, ty, _opts) = find_lift_type_for_interface_func(
+            &source,
+            std::slice::from_ref(&owner),
+            "golden:app/runner@0.1.0",
+            "compute",
+        )
+        .expect("cross-component lift must resolve via core_entity_order name");
+        assert_eq!(
+            ty, 77,
+            "must resolve compute's lift by NAME (core_func_index=1), not a naive index match"
+        );
+        assert!(
+            std::ptr::eq(comp, &owner),
+            "must return the OWNING component so its type index resolves correctly"
+        );
+    }
+
+    #[test]
+    fn ls_a_16_source_string_encoding_option_round_trips() {
+        // All three encodings must map to the correct CanonicalOption.
+        assert!(matches!(
+            source_string_encoding_option(parser::CanonStringEncoding::Utf8),
+            CanonicalOption::UTF8
+        ));
+        assert!(matches!(
+            source_string_encoding_option(parser::CanonStringEncoding::Utf16),
+            CanonicalOption::UTF16
+        ));
+        assert!(matches!(
+            source_string_encoding_option(parser::CanonStringEncoding::CompactUtf16),
+            CanonicalOption::CompactUTF16
+        ));
     }
 }

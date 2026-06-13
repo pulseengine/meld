@@ -58,10 +58,13 @@ fn fuse_fixture(name: &str, output_format: OutputFormat) -> anyhow::Result<Vec<u
     let config = FuserConfig {
         memory_strategy: MemoryStrategy::MultiMemory,
         attestation: false,
+        component_provenance: false,
         address_rebasing: false,
         preserve_names: false,
         custom_sections: CustomSectionHandling::Drop,
+        dwarf_handling: meld_core::DwarfHandling::Strip,
         output_format,
+        opaque_resources: Vec::new(),
     };
 
     let mut fuser = Fuser::new(config);
@@ -671,20 +674,20 @@ runtime_test!(
     test_runtime_wit_bindgen_resource_aggregates,
     "resource_aggregates"
 );
-fuse_only_test!(test_fuse_wit_bindgen_resource_floats, "resource_floats");
+runtime_test!(test_runtime_wit_bindgen_resource_floats, "resource_floats");
 runtime_test!(
     test_runtime_wit_bindgen_resource_borrow_in_record,
     "resource_borrow_in_record"
 );
-fuse_only_test!(
-    test_fuse_wit_bindgen_resource_with_lists,
+runtime_test!(
+    test_runtime_wit_bindgen_resource_with_lists,
     "resource_with_lists"
 );
 runtime_test!(test_runtime_wit_bindgen_ownership, "ownership");
 runtime_test!(test_runtime_wit_bindgen_xcrate, "xcrate");
 
-fuse_only_test!(
-    test_fuse_wit_bindgen_resource_import_and_export,
+runtime_test!(
+    test_runtime_wit_bindgen_resource_import_and_export,
     "resource-import-and-export"
 );
 

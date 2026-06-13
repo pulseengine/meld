@@ -1,0 +1,157 @@
+name: Mythos delta-pass gate
+
+# Blocks merge of PRs that touch Tier-5 source files until a Mythos
+# delta-pass has been recorded on the PR (label `mythos-pass-done`).
+#
+# Why this exists: LS-A-10 (CABI alignment padding in async-lift retptr
+# writeback) was found by the v0.8.0 pre-release Mythos pass on
+# `adapter/fact.rs` — but it had silently lived in the callback emitter
+# since #128 (~6 releases). A PR-time gate would have caught it then
+# instead of at release time.
+#
+# This is a gate, not an automated scan: the actual Mythos pass is run
+# by a human applying scripts/mythos/discover.md against the touched
+# file(s), then attaching the finding (or "no findings") as a PR
+# comment and adding the `mythos-pass-done` label. The gate fails until
+# the label is present.
+#
+# Tier-5 set tracks scripts/mythos/rank.md. Path globs encode the
+# rubric's "5 (fusion correctness)" tier in concrete repo paths. Drift
+# review: if a Tier-5 file is added that isn't listed here, the gate
+# silently lets it through — review the path list whenever rank.md
+# changes.
+
+concurrency:
+  group: mythos-gate-${{ github.ref }}
+  cancel-in-progress: true
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  gate:
+    name: Mythos delta-pass gate
+    runs-on: [self-hosted, linux, x64, light]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Detect Tier-5 file changes
+        id: detect
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          # Tier-5 path patterns per scripts/mythos/rank.md — concrete
+          # globs that match the current repo layout. Add new patterns
+          # here when rank.md grows.
+          patterns=(
+            "meld-core/src/parser.rs"
+            "meld-core/src/merger.rs"
+            "meld-core/src/resolver.rs"
+            "meld-core/src/rewriter.rs"
+            "meld-core/src/component_wrap.rs"
+            "meld-core/src/p3_async.rs"
+            "meld-core/src/p3_stream.rs"
+            "meld-core/src/p3_bridge.rs"
+            "meld-core/src/adapter/"
+            "meld-core/src/resource_graph.rs"
+            "meld-core/src/segments.rs"
+          )
+
+          # Diff base...head to find changed files in this PR.
+          changed=$(git diff --name-only "$BASE_SHA"..."$HEAD_SHA")
+
+          touched=()
+          while IFS= read -r f; do
+            [ -z "$f" ] && continue
+            for p in "${patterns[@]}"; do
+              case "$f" in
+                $p*) touched+=("$f"); break;;
+              esac
+            done
+          done <<< "$changed"
+
+          if [ ${#touched[@]} -eq 0 ]; then
+            echo "tier5_touched=false" >> "$GITHUB_OUTPUT"
+            echo "No Tier-5 files touched — gate passes by default."
+            exit 0
+          fi
+
+          echo "tier5_touched=true" >> "$GITHUB_OUTPUT"
+          {
+            echo "files<<MYTHOSEOF"
+            printf '%s\n' "${touched[@]}"
+            echo "MYTHOSEOF"
+          } >> "$GITHUB_OUTPUT"
+          echo "Tier-5 files touched:"
+          printf '  - %s\n' "${touched[@]}"
+
+      - name: Check for mythos-pass-done label
+        id: label-check
+        if: steps.detect.outputs.tier5_touched == 'true'
+        env:
+          LABELS: ${{ toJSON(github.event.pull_request.labels) }}
+        run: |
+          set -euo pipefail
+          if printf '%s' "$LABELS" | grep -q '"mythos-pass-done"'; then
+            echo "has_label=true" >> "$GITHUB_OUTPUT"
+            echo "Label mythos-pass-done present — gate passes."
+          else
+            echo "has_label=false" >> "$GITHUB_OUTPUT"
+            echo "Label mythos-pass-done missing — gate will fail."
+          fi
+
+      - name: Post / refresh sticky comment
+        if: steps.detect.outputs.tier5_touched == 'true'
+        uses: marocchino/sticky-pull-request-comment@v2
+        with:
+          header: mythos-gate
+          message: |
+            ## Mythos delta-pass required
+
+            This PR modifies one or more Tier-5 source files (per
+            [`scripts/mythos/rank.md`](../blob/main/scripts/mythos/rank.md)):
+
+            ```
+            ${{ steps.detect.outputs.files }}
+            ```
+
+            **Before merge**, run the Mythos discover protocol on the
+            modified Tier-5 files:
+
+            1. Follow [`scripts/mythos/discover.md`](../blob/main/scripts/mythos/discover.md)
+               — one fresh agent session per touched Tier-5 file.
+            2. For each finding, the agent must produce **both** a Kani
+               harness and a failing PoC test (per the protocol's
+               "if you cannot produce both, do not report" rule).
+            3. Attach a comment on this PR with either the findings
+               (formatted per `discover.md`'s output schema) or
+               **NO FINDINGS**.
+            4. Add the `mythos-pass-done` label to this PR.
+
+            **Why this gate exists:** [LS-A-10](../blob/main/safety/stpa/loss-scenarios.yaml)
+            (CABI alignment padding in async-lift retptr writeback) was
+            found by the v0.8.0 pre-release Mythos pass — but it had
+            lived in the callback emitter since #128, across six
+            releases. A PR-time gate would have caught it at review
+            time instead of at the release boundary.
+
+            The gate check on this PR will pass once the label is
+            applied.
+
+      - name: Fail if label missing
+        if: >-
+          steps.detect.outputs.tier5_touched == 'true' &&
+          steps.label-check.outputs.has_label != 'true'
+        run: |
+          echo "::error::Mythos delta-pass gate: Tier-5 files modified but mythos-pass-done label is not applied. Run discover.md and attach findings, then add the label."
+          exit 1

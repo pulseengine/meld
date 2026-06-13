@@ -504,10 +504,13 @@ fn ls_a_7_every_realloc_call_has_null_guard() {
     let config = FuserConfig {
         memory_strategy: MemoryStrategy::MultiMemory,
         attestation: false,
+        component_provenance: false,
         address_rebasing: false,
         preserve_names: false,
         custom_sections: meld_core::CustomSectionHandling::Drop,
+        dwarf_handling: meld_core::DwarfHandling::Strip,
         output_format: meld_core::OutputFormat::CoreModule,
+        opaque_resources: Vec::new(),
     };
 
     let mut fuser = Fuser::new(config);

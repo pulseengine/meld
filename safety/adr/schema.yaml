@@ -1,0 +1,135 @@
+# Schema for design ADRs (Architecture Decision Records).
+#
+# ADRs live in `safety/adr/ADR-N.md` as YAML front-matter + a markdown
+# body. They are emitted by the explore pipeline (see
+# `scripts/explore/emit.md`) and grouped under parent design questions
+# (`safety/adr/ADR-0.md` etc).
+#
+# This schema enforces structure so design decisions are comparable
+# across alternatives.
+
+schema-version: 1
+
+# An ADR is one of two shapes:
+#
+#   1. A PARENT design question — `type: design-question`. States the
+#      problem. Lists the gating fixtures. Identifies the design space.
+#      Children are `type: design-adr` siblings linked back via
+#      `parent`.
+#
+#   2. A DESIGN ADR — `type: design-adr`. Represents one alternative
+#      within the parent question's design space. Always emits as
+#      `status: draft`; humans promote.
+
+types:
+  - design-question
+  - design-adr
+
+# Required fields for `type: design-question`.
+design-question-required:
+  - id           # ADR-N
+  - type         # design-question
+  - title
+  - status       # open | resolved
+  - context      # markdown body of the file
+  - gating-fixtures  # list of test names
+  - design-paths     # list of brief path descriptions (D, E, F, G, H, I, J, ...)
+
+# Required fields for `type: design-adr`.
+design-adr-required:
+  - id              # ADR-N (different N from parent)
+  - parent          # ADR-N referencing the design-question
+  - type            # design-adr
+  - title           # one line; names the path, not the verdict
+  - status          # draft | accepted | rejected | superseded
+  - description     # markdown body
+  - fields          # see below
+  - links           # see below
+
+design-adr-fields:
+  locus-of-fix:
+    type: enum
+    values: [meld, wit-bindgen, spec, wasm-tools, hybrid]
+    description: >
+      Where the change properly belongs. `wit-bindgen` means the
+      pulseengine fork (or upstream Bytecode Alliance, if we choose
+      to send a PR). `hybrid` means meld must do part; an upstream
+      change makes the other part correct.
+
+  viability:
+    type: integer
+    range: [1, 5]
+    description: >
+      Inherited from the rank pass. 5 = prototype is straightforward;
+      1 = speculative, no concrete prototype possible today.
+
+  generalization:
+    type: enum
+    values: [low, medium, high]
+    description: >
+      Validator's read of how well this approach extends beyond the
+      gating fixture to the other failing cases under the parent.
+
+  maintenance-cost:
+    type: enum
+    values: [low, medium, high]
+    description: >
+      Ongoing cost of the new code: new abstractions, new invariants
+      the rest of the codebase must respect, ongoing upstream tracking.
+
+  fixture-coverage:
+    type: list-of-strings
+    description: >
+      Specific fixtures the prototype demonstrably handles. At least
+      the gating fixture; ideally siblings under the same parent.
+
+  upstream-dependency:
+    type: string
+    description: >
+      Free-form description of what the path requires from outside
+      this repo. `independent` if none.
+
+design-adr-links:
+  parent:
+    type: adr-id
+    required: true
+    description: ADR-N of the design-question this ADR resolves.
+
+  alternative-to:
+    type: list-of-adr-ids
+    required: true
+    description: Sibling ADRs under the same parent (may be empty).
+
+  prototype-branch:
+    type: git-ref
+    required: true
+    description: Full git branch name where the prototype lives.
+
+  oracle:
+    type: string
+    required: true
+    description: >
+      Fully-qualified test name that the prototype causes to pass.
+      e.g., meld-core::tests::wit_bindgen_runtime::test_runtime_wit_bindgen_resource_floats
+
+  references:
+    type: list-of-strings
+    required: false
+    description: >
+      Prior art, RFCs, upstream issues. Include the hypothesis-priors
+      paragraph from the prototype's invocation so future readers
+      know what the explorer was told to consider.
+
+# Promotion rules (enforced by humans, not by tooling today):
+#
+#   draft       — emitted by `explore/emit.md`. Awaiting human review.
+#   accepted    — humans chose this as the path forward. There should
+#                 be at most one `accepted` ADR per parent at a time.
+#                 Sibling ADRs typically move to `rejected` when one
+#                 is accepted.
+#   rejected    — humans considered this and chose another sibling.
+#                 The branch may be deleted; the ADR remains as a
+#                 record.
+#   superseded  — was accepted; later replaced by another ADR. Link
+#                 to the superseding ADR via `superseded-by` (added
+#                 to links when this transition happens).

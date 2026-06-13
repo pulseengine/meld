@@ -130,8 +130,13 @@ pub struct MergedModule {
     /// Maps (component_idx, resource_name) → merged function index for [resource-new].
     pub resource_new_by_component: HashMap<(usize, String), u32>,
 
-    /// Per-component handle table info for re-exporters.
-    pub handle_tables: HashMap<usize, HandleTableInfo>,
+    /// Per-resource handle table info for re-exporters.
+    /// Key is (owning_component_idx, interface, resource_name) — a single
+    /// re-exporter component may have multiple entries when it re-exports
+    /// multiple resources, and routing must discriminate per-resource so the
+    /// re-exporter's own export resource gets a handle table while imports
+    /// it passes through do not.
+    pub handle_tables: HashMap<(usize, String, String), HandleTableInfo>,
 
     /// Task.return shim info: maps merged import index of [task-return]N
     /// to the global indices where the shim stores result values.
@@ -141,6 +146,17 @@ pub struct MergedModule {
     /// Maps (component_idx, func_name) → shim globals for async result delivery.
     /// Built after element segment patching. Used by the callback-driving adapter.
     pub async_result_globals: HashMap<(usize, String), Vec<(u32, ValType)>>,
+
+    /// Per-module base offsets into the concatenated `data_segments` / `elements`
+    /// vectors: maps (component_idx, module_idx) → (data_segment_base, elem_base).
+    ///
+    /// Recorded in `merge_core_module` at the point the module's `IndexMaps` is
+    /// built — i.e. BEFORE this module's own segments are appended — so the base
+    /// equals the count of segments contributed by all PRIOR modules, which is
+    /// exactly where this module's local segment indices land in the fused
+    /// section. Re-rewrite passes that run after the full merge (when `.len()`
+    /// no longer equals the base) look the base up here.
+    pub segment_bases: HashMap<(usize, usize), (u32, u32)>,
 }
 
 /// Info about a generated task.return shim function.
@@ -213,6 +229,31 @@ pub struct MergedFunction {
     pub body: Function,
     /// Original location (component_idx, module_idx, function_idx)
     pub origin: (usize, usize, u32),
+    /// What kind of meld-generated helper this is, when the function is
+    /// synthetic (`origin` carries a sentinel). `None` for functions
+    /// copied from input modules. Consumed by `dwarf::adapter_spans`
+    /// for per-class `<meld-adapter>` attribution (#144 inc 4).
+    pub synthetic_kind: Option<SyntheticKind>,
+}
+
+/// Kind of merger-emitted synthetic function (#144 inc 4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SyntheticKind {
+    /// Per-resource handle-table helper (`ht_new` / `ht_rep` / `ht_drop`).
+    HandleTable,
+    /// Wrapper calling every input module's `start` function in order.
+    StartWrapper,
+    /// Type-coercion shim wrapping a call to a FACT adapter (i32/i64
+    /// widening glue between the caller's import type and the adapter).
+    AdapterShim,
+    /// P3 async `task.return` shim storing results into result globals.
+    TaskReturnShim,
+    /// Cross-component stream-bridge shim (#141): per-component
+    /// `stream_*` dispatch function emitted by `crate::p3_bridge` that
+    /// routes locally-minted (bit-31-tagged) handles to the in-module
+    /// bridge ring memory and forwards host handles to the retained
+    /// `pulseengine:async` imports.
+    StreamBridge,
 }
 
 /// Global in merged module
@@ -277,6 +318,37 @@ struct ImportDedupInfo {
 /// Strip `@major.minor.patch` version suffix from a WASI module name.
 ///
 /// `"wasi:io/error@0.2.0"` → `"wasi:io/error"`; `"env"` → `"env"`
+/// Build a unique export-name suffix for a per-resource handle table.
+///
+/// Combines component index, sanitised interface, and resource name into
+/// one identifier. The interface sanitisation replaces ':', '/', '@', '.'
+/// (illegal in WASM export names? all are legal but conventionally avoided)
+/// with '_'.
+/// Strip a trailing `$N` dedup suffix from a resource name. Meld appends
+/// these when multiple components import the same `[resource-*]X` helper —
+/// the canonical resource name (used for handle-table lookup and the
+/// canonical-ABI) doesn't include the suffix.
+pub(crate) fn strip_dollar_suffix(s: &str) -> &str {
+    if let Some(dollar_pos) = s.rfind('$') {
+        let suffix = &s[dollar_pos + 1..];
+        if !suffix.is_empty() && suffix.chars().all(|c| c.is_ascii_digit()) {
+            return &s[..dollar_pos];
+        }
+    }
+    s
+}
+
+pub(crate) fn ht_export_suffix(comp_idx: usize, interface: &str, resource_name: &str) -> String {
+    let safe_iface: String = interface
+        .chars()
+        .map(|c| match c {
+            ':' | '/' | '@' | '.' | '-' => '_',
+            other => other,
+        })
+        .collect();
+    format!("{}_{}_{}", comp_idx, safe_iface, resource_name)
+}
+
 fn normalize_wasi_module_name(name: &str) -> &str {
     match name.rfind('@') {
         Some(pos) if name[..pos].contains(':') => &name[..pos],
@@ -286,13 +358,98 @@ fn normalize_wasi_module_name(name: &str) -> &str {
 
 /// Compare two semver-like version strings.
 ///
-/// `"0.2.6"` > `"0.2.0"`. Falls back to lexicographic comparison when
-/// versions don't parse as numeric triples.
+/// Implements a small subset of [semver 2.0.0] precedence rules sufficient
+/// for the WASI version strings meld encounters:
+///
+/// * Build metadata (`+...`) is ignored.
+/// * The main `MAJOR.MINOR.PATCH` triple is compared numerically; missing
+///   trailing segments default to `0` (so `"0.2"` == `"0.2.0"`).
+/// * A version *with* a pre-release suffix sorts BEFORE the same version
+///   without one (`0.2.0-rc1 < 0.2.0`).
+/// * Pre-release identifiers are compared dot-segment-wise: numeric
+///   identifiers numerically, alphanumeric identifiers lexically, and
+///   numeric identifiers always sort below alphanumeric ones.
+/// * Non-numeric main segments fall back to a lexical comparison of that
+///   segment (covers exotic inputs like `"0.2.x"`).
+///
+/// [semver 2.0.0]: https://semver.org/spec/v2.0.0.html
 fn compare_version(a: &str, b: &str) -> std::cmp::Ordering {
-    let parse = |s: &str| -> Vec<u32> { s.split('.').filter_map(|p| p.parse().ok()).collect() };
-    let va = parse(a);
-    let vb = parse(b);
-    va.cmp(&vb)
+    use std::cmp::Ordering;
+
+    // Strip build metadata: it does not affect precedence.
+    fn strip_build(s: &str) -> &str {
+        match s.find('+') {
+            Some(i) => &s[..i],
+            None => s,
+        }
+    }
+    // Split off pre-release suffix on the first '-'.
+    fn split_pre(s: &str) -> (&str, Option<&str>) {
+        match s.find('-') {
+            Some(i) => (&s[..i], Some(&s[i + 1..])),
+            None => (s, None),
+        }
+    }
+
+    let (main_a, pre_a) = split_pre(strip_build(a));
+    let (main_b, pre_b) = split_pre(strip_build(b));
+
+    // Compare the MAJOR.MINOR.PATCH... segments. Treat missing trailing
+    // segments as 0 so "0.2" == "0.2.0".
+    let segs_a: Vec<&str> = main_a.split('.').collect();
+    let segs_b: Vec<&str> = main_b.split('.').collect();
+    let max_len = segs_a.len().max(segs_b.len());
+    for i in 0..max_len {
+        let sa = segs_a.get(i).copied().unwrap_or("0");
+        let sb = segs_b.get(i).copied().unwrap_or("0");
+        let cmp = match (sa.parse::<u64>(), sb.parse::<u64>()) {
+            (Ok(na), Ok(nb)) => na.cmp(&nb),
+            // Fall back to lexical compare for non-numeric main segments.
+            _ => sa.cmp(sb),
+        };
+        if cmp != Ordering::Equal {
+            return cmp;
+        }
+    }
+
+    // Main triples are equal — compare pre-release suffixes per semver.
+    match (pre_a, pre_b) {
+        (None, None) => Ordering::Equal,
+        // No-prerelease > has-prerelease.
+        (None, Some(_)) => Ordering::Greater,
+        (Some(_), None) => Ordering::Less,
+        (Some(pa), Some(pb)) => compare_prerelease(pa, pb),
+    }
+}
+
+/// Compare two semver pre-release strings dot-segment-wise.
+///
+/// Numeric identifiers compare numerically and sort below alphanumeric
+/// identifiers; alphanumerics compare lexically; if all shared segments
+/// are equal, the longer suffix wins.
+fn compare_prerelease(a: &str, b: &str) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    let mut ia = a.split('.');
+    let mut ib = b.split('.');
+    loop {
+        match (ia.next(), ib.next()) {
+            (None, None) => return Ordering::Equal,
+            (None, Some(_)) => return Ordering::Less,
+            (Some(_), None) => return Ordering::Greater,
+            (Some(sa), Some(sb)) => {
+                let cmp = match (sa.parse::<u64>(), sb.parse::<u64>()) {
+                    (Ok(na), Ok(nb)) => na.cmp(&nb),
+                    // Numeric < alphanumeric per semver §11.4.3.
+                    (Ok(_), Err(_)) => Ordering::Less,
+                    (Err(_), Ok(_)) => Ordering::Greater,
+                    (Err(_), Err(_)) => sa.cmp(sb),
+                };
+                if cmp != Ordering::Equal {
+                    return cmp;
+                }
+            }
+        }
+    }
 }
 
 /// Extract the version suffix from a WASI module name, if any.
@@ -334,10 +491,34 @@ fn effective_module_name(unresolved: &crate::resolver::UnresolvedImport) -> &str
         .unwrap_or(&unresolved.module_name)
 }
 
+/// Resolve the imports-vector index whose name exactly matches
+/// `expected_name` by scanning the values of a per-component
+/// resource-tracking map. Exact match (not `ends_with`) — the prior
+/// `imp.name.ends_with(rn)` form silently conflated two resources
+/// whose names shared a suffix (e.g. `float` matched both
+/// `[resource-rep]float` and `[resource-rep]bigfloat`), letting the
+/// dedup-skip path register the wrong import for the wrong-suffix
+/// component. See LS-A-19 for the regression.
+fn find_exact_resource_import_idx(
+    tracking: &HashMap<(usize, String), u32>,
+    imports: &[MergedImport],
+    expected_name: &str,
+) -> Option<u32> {
+    tracking.values().copied().find(|&idx| {
+        imports
+            .get(idx as usize)
+            .is_some_and(|imp| imp.name == expected_name)
+    })
+}
+
 /// Module merger
 pub struct Merger {
     memory_strategy: MemoryStrategy,
     address_rebasing: bool,
+    /// (interface, resource_name) tuples marked opaque-rep — skip handle
+    /// table allocation for these resources because their reps are already
+    /// valid integer handles (no Box dereferencing in user code).
+    opaque_resources: Vec<(String, String)>,
 }
 
 #[derive(Debug, Clone)]
@@ -350,10 +531,30 @@ struct SharedMemoryPlan {
 impl Merger {
     /// Create a new merger with the specified memory strategy
     pub fn new(memory_strategy: MemoryStrategy, address_rebasing: bool) -> Self {
+        // `Auto` is resolved to a concrete strategy by
+        // `Fuser::fuse_with_stats` before the merger is constructed. If an
+        // unresolved `Auto` arrives via direct API use, normalize it to
+        // `MultiMemory` (the always-sound strategy) HERE — the strategy
+        // comparisons throughout this file are a mix of `== SharedMemory`
+        // and `== MultiMemory`, and an un-normalized third variant would
+        // satisfy neither consistently (Mythos finding B, PR #220: multi
+        // memory layout with shared-style export dedup silently drops the
+        // second component's memory export).
+        let memory_strategy = match memory_strategy {
+            MemoryStrategy::Auto => MemoryStrategy::MultiMemory,
+            concrete => concrete,
+        };
         Self {
             memory_strategy,
             address_rebasing,
+            opaque_resources: Vec::new(),
         }
+    }
+
+    /// Mark resources as opaque-rep so handle table allocation skips them.
+    pub fn with_opaque_resources(mut self, opaque: Vec<(String, String)>) -> Self {
+        self.opaque_resources = opaque;
+        self
     }
 
     fn compute_shared_memory_plan(
@@ -472,19 +673,45 @@ impl Merger {
     /// table at the start of the new page. Adds a mutable global for the
     /// next-allocation pointer and generates ht_new/ht_rep/ht_drop functions.
     #[allow(dead_code)]
-    fn allocate_handle_tables(graph: &DependencyGraph, merged: &mut MergedModule) -> Result<()> {
+    fn allocate_handle_tables(
+        graph: &DependencyGraph,
+        merged: &mut MergedModule,
+        opaque_resources: &[(String, String)],
+    ) -> Result<()> {
         // Handle table capacity: 256 entries = 1024 bytes (fits in 1 page)
         const HT_CAPACITY: u32 = 256;
         const ENTRY_SIZE: u32 = 4; // i32
 
-        for &comp_idx in &graph.reexporter_components {
+        for (comp_idx, iface, rn) in &graph.reexporter_resources {
+            let comp_idx = *comp_idx;
+            // Opaque-rep resources still get ht_* slots in handle_tables, but
+            // the function bodies are pure identity (no memory storage):
+            //   ht_new(rep)  → rep   (the rep IS the handle)
+            //   ht_rep(h)    → h     (the handle IS the rep)
+            //   ht_drop(h)   → ()    (no cleanup needed)
+            // Path B's redirect routes [resource-*] imports through these
+            // same ht_* functions whether opaque or not, so opaque imports
+            // bypass wasmtime's canonical resource layer entirely (which
+            // would otherwise reject cross-component handle passing for
+            // per-component-typed resources).
+            // Opaque-rep gets the same memory-backed ht_* as standard
+            // resources — the rep storage semantics are the same (ht_new
+            // allocates a fresh handle and stores the rep, ht_rep reads
+            // it back). The DIFFERENCE with --opaque-rep is in the wrapper:
+            // opaque resources use a separate-typed local_resource_types
+            // entry so wasmtime's canonical resource layer doesn't conflate
+            // them with standard Box-pattern reps.
+            let _is_opaque = opaque_resources.iter().any(|(i, r)| i == iface && r == rn);
+
             // Find merged memory index for this component's memory 0
             let memory_idx = match merged.memory_index_map.get(&(comp_idx, 0, 0)) {
                 Some(&idx) => idx,
                 None => continue, // No memory — skip (shouldn't happen for real components)
             };
 
-            // Determine table base: grow memory by 1 page, place table at start of new page
+            // Determine table base: grow memory by 1 page, place table at start
+            // of new page. Each (component, resource) gets its own page so the
+            // tables don't collide.
             let mem_slot = (memory_idx - merged.import_counts.memory) as usize;
             let current_pages = if mem_slot < merged.memories.len() {
                 merged.memories[mem_slot].minimum
@@ -546,6 +773,7 @@ impl Merger {
                     type_idx: type_i32_to_i32,
                     body,
                     origin: (comp_idx, 0, u32::MAX), // synthetic
+                    synthetic_kind: Some(SyntheticKind::HandleTable),
                 });
             }
 
@@ -560,26 +788,102 @@ impl Merger {
                     type_idx: type_i32_to_i32,
                     body,
                     origin: (comp_idx, 0, u32::MAX),
+                    synthetic_kind: Some(SyntheticKind::HandleTable),
                 });
             }
 
-            // Generate ht_drop: mem[handle] = 0
+            // Find the resource's dtor function (if any) so ht_drop can
+            // invoke it before zeroing the slot. wit-bindgen-rust emits
+            // `<iface>#[dtor]<rn>` as a core export for each component that
+            // owns a Box-backed rep.
+            //
+            // Match by EXACT `<iface>#[dtor]<rn>` (with optional `$N` dedup
+            // suffix tolerance). A previous version used `name.contains(...)`
+            // which collided when one component defines the same resource
+            // name across multiple interfaces (e.g. `resource_floats` has
+            // dtors for `exports#[dtor]float`, `imports#[dtor]float`, and
+            // `test:resource-floats/test#[dtor]float` — the contains-match
+            // picked the first regardless of iface). Exact match plus the
+            // origin-comp filter selects the right dtor unambiguously.
+            let exact_dtor_export = format!("{}#[dtor]{}", iface, rn);
+            let exact_dtor_dollar = format!("{}#[dtor]{}$", iface, rn);
+            let dtor_func_idx: Option<u32> = merged
+                .exports
+                .iter()
+                .filter(|e| {
+                    matches!(e.kind, EncoderExportKind::Func)
+                        && (e.name == exact_dtor_export || e.name.starts_with(&exact_dtor_dollar))
+                })
+                .find_map(|e| {
+                    let import_count = merged.import_counts.func;
+                    if e.index < import_count {
+                        return None;
+                    }
+                    let local_idx = (e.index - import_count) as usize;
+                    let func = merged.functions.get(local_idx)?;
+                    if func.origin.0 == comp_idx {
+                        Some(e.index)
+                    } else {
+                        None
+                    }
+                });
+            if let Some(idx) = dtor_func_idx {
+                log::info!(
+                    "ht_drop for {}/{} in component {} will invoke dtor func {}",
+                    iface,
+                    rn,
+                    comp_idx,
+                    idx,
+                );
+            }
+
+            // Generate ht_drop: load rep, optionally call dtor(rep), zero slot.
+            // Skip the dtor invocation when ht_drop is called with handle=0
+            // (used as a sentinel by the canonical ABI). Using if-then to
+            // avoid double-free if the same handle is dropped twice.
+            //
+            // For re-exporters whose ht stores foreign reps (placed there by
+            // the own bridge), invoking the local dtor on a foreign rep is
+            // undefined behavior — the dtor casts the rep as `*mut
+            // _ThingRep<LocalT>` and Box::from_raw drops what it thinks is a
+            // local box. When the foreign rep is actually a leaf-allocated
+            // box, this misinterprets memory and leads to recursion through
+            // the import drop chain. Suppress the dtor for re-exporter
+            // components whose ht is also fed via own bridges (the standard
+            // Box-pattern wit-bindgen design assumes the rep is always
+            // owned by the component whose ht stores it, but Phase 1's
+            // per-component-ht-for-definers broke that invariant).
+            let invoke_dtor =
+                dtor_func_idx.filter(|_| !graph.reexporter_components.contains(&comp_idx));
             let drop_func_idx = merged.import_counts.func + merged.functions.len() as u32;
             {
                 let mut body = Function::new([]);
                 body.instruction(&Instruction::LocalGet(0)); // [handle]
+                body.instruction(&Instruction::I32Eqz); // [handle == 0]
+                body.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+                body.instruction(&Instruction::Else);
+                if let Some(dtor_idx) = invoke_dtor {
+                    // Load the rep stored at this handle slot, then call dtor(rep).
+                    body.instruction(&Instruction::LocalGet(0));
+                    body.instruction(&Instruction::I32Load(mem_arg));
+                    body.instruction(&Instruction::Call(dtor_idx));
+                }
+                // Zero the slot regardless of whether a dtor was called.
+                body.instruction(&Instruction::LocalGet(0));
                 body.instruction(&Instruction::I32Const(0));
-                body.instruction(&Instruction::I32Store(mem_arg)); // mem[handle] = 0
-                body.instruction(&Instruction::End);
+                body.instruction(&Instruction::I32Store(mem_arg));
+                body.instruction(&Instruction::End); // end if
+                body.instruction(&Instruction::End); // end function
                 merged.functions.push(MergedFunction {
                     type_idx: type_i32_to_void,
                     body,
                     origin: (comp_idx, 0, u32::MAX),
+                    synthetic_kind: Some(SyntheticKind::HandleTable),
                 });
             }
 
             merged.handle_tables.insert(
-                comp_idx,
+                (comp_idx, iface.clone(), rn.clone()),
                 HandleTableInfo {
                     memory_idx,
                     next_ptr_global,
@@ -592,25 +896,30 @@ impl Merger {
             );
 
             // Export handle table functions so the P2 wrapper can alias them.
+            // Naming: $ht_new_{comp}_{iface_safe}_{rn} so multiple resources
+            // per component don't collide.
+            let suffix = ht_export_suffix(comp_idx, iface, rn);
             merged.exports.push(MergedExport {
-                name: format!("$ht_new_{}", comp_idx),
+                name: format!("$ht_new_{}", suffix),
                 kind: EncoderExportKind::Func,
                 index: new_func_idx,
             });
             merged.exports.push(MergedExport {
-                name: format!("$ht_rep_{}", comp_idx),
+                name: format!("$ht_rep_{}", suffix),
                 kind: EncoderExportKind::Func,
                 index: rep_func_idx,
             });
             merged.exports.push(MergedExport {
-                name: format!("$ht_drop_{}", comp_idx),
+                name: format!("$ht_drop_{}", suffix),
                 kind: EncoderExportKind::Func,
                 index: drop_func_idx,
             });
 
             log::info!(
-                "handle table for component {}: memory={}, base=0x{:x}, global={}, funcs=({},{},{})",
+                "handle table for component {} resource {}/{}: memory={}, base=0x{:x}, global={}, funcs=({},{},{})",
                 comp_idx,
+                iface,
+                rn,
                 memory_idx,
                 table_base_addr,
                 next_ptr_global,
@@ -694,6 +1003,7 @@ impl Merger {
             handle_tables: HashMap::new(),
             task_return_shims: HashMap::new(),
             async_result_globals: HashMap::new(),
+            segment_bases: HashMap::new(),
         };
 
         // Process components in topological order
@@ -720,14 +1030,30 @@ impl Merger {
         // These are needed for 3-component resource chains where the
         // re-exporter's wit-bindgen code expects 4-byte-aligned memory
         // pointers as handles, not sequential canonical ABI handles.
-        if !graph.reexporter_components.is_empty() {
-            Self::allocate_handle_tables(graph, &mut merged)?;
+        if !graph.reexporter_resources.is_empty() {
+            Self::allocate_handle_tables(graph, &mut merged, &self.opaque_resources)?;
 
-            // Remap re-exporter's resource.rep/new/drop imports to handle table
-            // functions, then re-rewrite affected function bodies so call
-            // instructions pick up the corrected indices.
+            // Remap [resource-*] imports to handle-table functions, with
+            // per-resource discrimination. For each component that owns a
+            // handle table, walk its core modules' imports and redirect only
+            // those imports whose (interface, resource_name) matches a
+            // registered handle table for this component as owner.
+            //
+            // The owner of `[export]<iface>.[resource-*]<rn>` is the
+            // importing component itself (it's the component's own export
+            // resource). The owner of `<iface>.[resource-*]<rn>` (no
+            // [export] prefix) is whatever component DEFINES the resource —
+            // that's resource_graph.resource_definer(iface, rn). Imports
+            // routed at the leaf-definer's helpers should NOT be rewritten
+            // through any other component's handle table; they must call
+            // the natural canonical-ABI handler in their owning component.
             let mut affected_modules: Vec<(usize, usize)> = Vec::new();
-            for (&comp_idx, ht) in &merged.handle_tables {
+            // Iterate ALL components, not just those with handle tables.
+            // A pure consumer (e.g. the runner in a 3-component chain) holds
+            // handles allocated by the re-exporter's ht_new and must drop
+            // them through the same handle table — its [resource-drop]
+            // imports also need redirection.
+            for (comp_idx, _component) in components.iter().enumerate() {
                 let component = &components[comp_idx];
                 for (mod_idx, module) in component.core_modules.iter().enumerate() {
                     let mut import_func_idx = 0u32;
@@ -736,20 +1062,148 @@ impl Merger {
                         if !matches!(imp.kind, crate::parser::ImportKind::Function(_)) {
                             continue;
                         }
-                        if imp.name.starts_with("[resource-rep]") {
+                        // Parse: which (iface, resource_name) and which op?
+                        // Strip optional `$N` dedup suffix that meld appends
+                        // when multiple components import the same resource
+                        // helper — the canonical resource name is the same.
+                        let (op_kind, rn_raw) =
+                            if let Some(rn) = imp.name.strip_prefix("[resource-rep]") {
+                                (Some("rep"), rn)
+                            } else if let Some(rn) = imp.name.strip_prefix("[resource-new]") {
+                                (Some("new"), rn)
+                            } else if let Some(rn) = imp.name.strip_prefix("[resource-drop]") {
+                                (Some("drop"), rn)
+                            } else {
+                                (None, "")
+                            };
+                        if op_kind.is_none() {
+                            import_func_idx += 1;
+                            continue;
+                        }
+                        let rn = strip_dollar_suffix(rn_raw);
+                        // Strip [export] prefix from the import module name.
+                        // If present (importer's own export resource), the
+                        // owner is self. Otherwise the importer is consuming
+                        // a resource from elsewhere — find ANY component that
+                        // has a handle table for (iface, rn). That's the
+                        // re-exporter that allocated the handles being passed
+                        // around; consumers must route their [resource-*]
+                        // calls through that same table to stay consistent.
+                        let iface_with_prefix = imp.module.as_str();
+                        let iface = iface_with_prefix
+                            .strip_prefix("[export]")
+                            .unwrap_or(iface_with_prefix);
+                        let key_target = if iface_with_prefix.starts_with("[export]") {
+                            // Importer's own export — look up by self first.
+                            let key = (comp_idx, iface.to_string(), rn.to_string());
+                            merged.handle_tables.get(&key).or_else(|| {
+                                // Resource-alias fallback: when a different
+                                // component re-exports THIS resource via
+                                // `use` (e.g., intermediate has `use
+                                // test.{float}` re-exporting leaf's
+                                // test.float as exports.float), wasmtime
+                                // unifies them into one canonical type. The
+                                // re-exporter's handle table is the only
+                                // storage that knows the memory-pointer
+                                // handles minted by ht_new — definer-side
+                                // [resource-*] must route there too, or
+                                // peers will hand it pointers it can't
+                                // dereference. Match by resource_name only
+                                // since the iface differs across the alias.
+                                // Sort keys for deterministic tie-breaking
+                                // (LS-A-15).
+                                let mut keys: Vec<&(
+                                    usize,
+                                    String,
+                                    String,
+                                )> = merged
+                                    .handle_tables
+                                    .keys()
+                                    .filter(|(_, _, r)| r == rn)
+                                    .collect();
+                                keys.sort();
+                                let found = keys
+                                    .first()
+                                    .and_then(|k| merged.handle_tables.get(*k));
+                                if found.is_some() {
+                                    log::info!(
+                                        "alias-fallback: comp {} mod {} import {}/{} → ht for resource '{}'",
+                                        comp_idx,
+                                        mod_idx,
+                                        iface,
+                                        imp.name,
+                                        rn,
+                                    );
+                                }
+                                found
+                            })
+                        } else {
+                            // Consumer-side import. If THIS component itself
+                            // re-exports (iface, rn) — has its own handle
+                            // table for the same resource — then this import
+                            // is the inner-component (definer) view, NOT the
+                            // re-exporter view. Use canonical resource ops
+                            // (don't redirect). Otherwise the importer is a
+                            // pure consumer and the handle was minted by the
+                            // re-exporter's ht_new — route through that table.
+                            //
+                            // Same alias-fallback as the definer branch: when
+                            // strict `(i, r)` matches no handle table, fall
+                            // back to matching by resource_name only. This
+                            // catches consumer imports of resources unified
+                            // via `use other-iface.{rn}` (e.g. runner's
+                            // `test:resource-floats/test [resource-drop]float`
+                            // when only `(3, "exports", "float")` ht exists).
+                            //
+                            // Self-owns check: this component owns a handle
+                            // table for the SPECIFIC (iface, rn) pair. We do
+                            // NOT block when the iface differs but the
+                            // resource name is the same — those are
+                            // `use`-aliased resources unified at canon-type
+                            // level, and they SHOULD route through the
+                            // re-exporter's ht.
+                            let self_owns_specific = merged.handle_tables.contains_key(&(
+                                comp_idx,
+                                iface.to_string(),
+                                rn.to_string(),
+                            ));
+                            if self_owns_specific {
+                                None
+                            } else {
+                                // Look up (any-owner, iface, rn) first, then
+                                // fall back to (any-owner, any-iface, rn).
+                                // Iterate in sorted-key order so ties are
+                                // broken deterministically (LS-A-15).
+                                let mut iface_keys: Vec<&(usize, String, String)> = merged
+                                    .handle_tables
+                                    .keys()
+                                    .filter(|(_, i, r)| i == iface && r == rn)
+                                    .collect();
+                                iface_keys.sort();
+                                iface_keys
+                                    .first()
+                                    .and_then(|k| merged.handle_tables.get(*k))
+                                    .or_else(|| {
+                                        let mut any_keys: Vec<&(usize, String, String)> = merged
+                                            .handle_tables
+                                            .keys()
+                                            .filter(|(_, _, r)| r == rn)
+                                            .collect();
+                                        any_keys.sort();
+                                        any_keys.first().and_then(|k| merged.handle_tables.get(*k))
+                                    })
+                            }
+                        };
+                        if let Some(ht) = key_target {
+                            let target = match op_kind.unwrap() {
+                                "rep" => ht.rep_func,
+                                "new" => ht.new_func,
+                                "drop" => ht.drop_func,
+                                _ => unreachable!(),
+                            };
                             merged
                                 .function_index_map
-                                .insert((comp_idx, mod_idx, import_func_idx), ht.rep_func);
-                            changed = true;
-                        } else if imp.name.starts_with("[resource-new]") {
-                            merged
-                                .function_index_map
-                                .insert((comp_idx, mod_idx, import_func_idx), ht.new_func);
-                            changed = true;
-                        } else if imp.name.starts_with("[resource-drop]") {
-                            merged
-                                .function_index_map
-                                .insert((comp_idx, mod_idx, import_func_idx), ht.drop_func);
+                                .insert((comp_idx, mod_idx, import_func_idx), target);
                             changed = true;
                         }
                         import_func_idx += 1;
@@ -764,6 +1218,14 @@ impl Merger {
             // redirected to handle table functions.
             for &(comp_idx, mod_idx) in &affected_modules {
                 let module = &components[comp_idx].core_modules[mod_idx];
+                // This pass runs AFTER the full merge, so `merged.*.len()` is
+                // the total segment count, not this module's base. Recover the
+                // correct per-module base recorded during the main merge loop.
+                let (data_segment_base, elem_segment_base) = merged
+                    .segment_bases
+                    .get(&(comp_idx, mod_idx))
+                    .copied()
+                    .unwrap_or((0, 0));
                 let index_maps = build_index_maps_for_module(
                     comp_idx,
                     mod_idx,
@@ -774,6 +1236,8 @@ impl Merger {
                     0u64,  // memory_base_offset
                     false, // memory64
                     None,  // memory_initial_pages
+                    data_segment_base,
+                    elem_segment_base,
                 );
                 let import_func_count = module
                     .imports
@@ -939,16 +1403,32 @@ impl Merger {
         shared_memory_plan: Option<&SharedMemoryPlan>,
         unresolved_assignments: &UnresolvedImportAssignments,
     ) -> Result<()> {
-        // Merge types
+        // Merge types.
+        //
+        // Two passes: first record every type's old->merged index mapping, then
+        // build the merged types. The split is required because a func type's
+        // param/result may be a concrete typed-ref `(ref $t)` whose index `t`
+        // can forward-reference another type in this same module; remapping it
+        // needs the *complete* mapping for the module to already be in place.
         let type_offset = merged.types.len() as u32;
-        for (old_idx, ty) in module.types.iter().enumerate() {
+        for (old_idx, _ty) in module.types.iter().enumerate() {
             merged.type_index_map.insert(
                 (comp_idx, mod_idx, old_idx as u32),
                 type_offset + old_idx as u32,
             );
+        }
+        for ty in module.types.iter() {
             merged.types.push(MergedFuncType {
-                params: ty.params.clone(),
-                results: ty.results.clone(),
+                params: ty
+                    .params
+                    .iter()
+                    .map(|&p| remap_concrete_val_type(p, comp_idx, mod_idx, merged))
+                    .collect(),
+                results: ty
+                    .results
+                    .iter()
+                    .map(|&r| remap_concrete_val_type(r, comp_idx, mod_idx, merged))
+                    .collect(),
             });
         }
 
@@ -1068,7 +1548,9 @@ impl Merger {
             merged
                 .table_index_map
                 .insert((comp_idx, mod_idx, old_table_idx), new_idx);
-            merged.tables.push(convert_table_type(table));
+            merged
+                .tables
+                .push(convert_table_type(table, comp_idx, mod_idx, merged));
         }
 
         // Merge globals (defined globals only; imported globals handled below)
@@ -1086,10 +1568,8 @@ impl Merger {
                 merged,
                 &global.content_type,
             );
-            merged.globals.push(MergedGlobal {
-                ty: convert_global_type(global),
-                init_expr,
-            });
+            let ty = convert_global_type(global, comp_idx, mod_idx, merged);
+            merged.globals.push(MergedGlobal { ty, init_expr });
         }
 
         // Resolve imported global indices via intra-component module_resolutions.
@@ -1404,6 +1884,21 @@ impl Merger {
             .map(|mem| mem.memory64)
             .unwrap_or(false);
         let memory_initial_pages = module_memory.as_ref().map(|mem| mem.initial);
+
+        // Segment base offsets: this module's local segment indices land in
+        // the concatenated section at `base + local`. Capture the bases NOW,
+        // before this module's own segments are appended (lines below), so
+        // they count only PRIOR modules' segments — exactly mirroring how
+        // `func_offset = merged.functions.len()` is captured before this
+        // module's functions are pushed. Record them on `merged` so the
+        // post-merge re-rewrite pass (resource-import redirect) can recover
+        // the correct base after `.len()` no longer equals it.
+        let data_segment_base = merged.data_segments.len() as u32;
+        let elem_segment_base = merged.elements.len() as u32;
+        merged
+            .segment_bases
+            .insert((comp_idx, mod_idx), (data_segment_base, elem_segment_base));
+
         let index_maps = build_index_maps_for_module(
             comp_idx,
             mod_idx,
@@ -1414,6 +1909,8 @@ impl Merger {
             memory_base_offset,
             memory64,
             memory_initial_pages,
+            data_segment_base,
+            elem_segment_base,
         );
 
         // Second pass: extract and rewrite function bodies
@@ -1429,6 +1926,7 @@ impl Merger {
                 type_idx: new_type_idx,
                 body,
                 origin: (comp_idx, mod_idx, old_func_idx),
+                synthetic_kind: None,
             });
         }
 
@@ -1472,6 +1970,25 @@ impl Merger {
             // would wire the fixup module to the wrong component's indirect
             // table. In shared-memory mode, first-wins dedup is correct
             // since all components share one memory.
+            // #245: `cabi_realloc` is named by the per-memory path below
+            // (`cabi_realloc$<mem_idx>`), which is the convention the P2
+            // wrapper consumes (component_wrap.rs looks reallocs up by
+            // memory index). The generic comp_idx-suffixed dedup here must
+            // NOT also mint into that namespace: when a colliding export's
+            // comp_idx coincides with another realloc's mem_idx the two
+            // schemes emit the same `cabi_realloc$N` twice and the output
+            // fails validation ("duplicate export name"). A colliding
+            // `cabi_realloc` is always comp_idx >= 1 with its own mem_idx
+            // >= 1, so the per-memory path is guaranteed to publish it;
+            // skip the redundant generic copy here. (Component 0's realloc
+            // is the non-colliding first occurrence and still flows through
+            // the else branch as plain `cabi_realloc`.)
+            if self.memory_strategy == MemoryStrategy::MultiMemory
+                && export.name == "cabi_realloc"
+                && merged.exports.iter().any(|e| e.name == export.name)
+            {
+                continue;
+            }
             let export_name = if self.memory_strategy == MemoryStrategy::MultiMemory
                 && merged.exports.iter().any(|e| e.name == export.name)
             {
@@ -1763,28 +2280,32 @@ impl Merger {
                         // Still record per-component resource tracking: find the
                         // func index already assigned to this resource name.
                         let eff_field = &dedup_key.1;
+                        // Exact-match the full `[resource-{rep,new}]<name>`
+                        // import name. The prior `ends_with(rn)` matched any
+                        // resource whose name had `rn` as a suffix (e.g.
+                        // `rn = "float"` collided with both
+                        // `[resource-rep]float` and `[resource-rep]bigfloat`),
+                        // letting `resource_rep_by_component` track the
+                        // wrong import for the wrong-suffix collision — silent
+                        // cross-resource confusion (LS-A-19).
                         if let Some(rn) = eff_field.strip_prefix("[resource-rep]") {
-                            if let Some(&idx) =
-                                merged.resource_rep_by_component.values().find(|&&idx| {
-                                    merged.imports.get(idx as usize).is_some_and(|imp| {
-                                        imp.name.starts_with("[resource-rep]")
-                                            && imp.name.ends_with(rn)
-                                    })
-                                })
-                            {
+                            let expected = format!("[resource-rep]{rn}");
+                            if let Some(idx) = find_exact_resource_import_idx(
+                                &merged.resource_rep_by_component,
+                                &merged.imports,
+                                &expected,
+                            ) {
                                 merged
                                     .resource_rep_by_component
                                     .insert((unresolved.component_idx, rn.to_string()), idx);
                             }
                         } else if let Some(rn) = eff_field.strip_prefix("[resource-new]") {
-                            if let Some(&idx) =
-                                merged.resource_new_by_component.values().find(|&&idx| {
-                                    merged.imports.get(idx as usize).is_some_and(|imp| {
-                                        imp.name.starts_with("[resource-new]")
-                                            && imp.name.ends_with(rn)
-                                    })
-                                })
-                            {
+                            let expected = format!("[resource-new]{rn}");
+                            if let Some(idx) = find_exact_resource_import_idx(
+                                &merged.resource_new_by_component,
+                                &merged.imports,
+                                &expected,
+                            ) {
                                 merged
                                     .resource_new_by_component
                                     .insert((unresolved.component_idx, rn.to_string()), idx);
@@ -1897,7 +2418,12 @@ impl Merger {
                     merged.imports.push(MergedImport {
                         module,
                         name,
-                        entity_type: EntityType::Table(convert_table_type(t)),
+                        entity_type: EntityType::Table(convert_table_type(
+                            t,
+                            unresolved.component_idx,
+                            unresolved.module_idx,
+                            merged,
+                        )),
                         component_idx: Some(unresolved.component_idx),
                     });
                 }
@@ -1952,7 +2478,12 @@ impl Merger {
                     merged.imports.push(MergedImport {
                         module,
                         name,
-                        entity_type: EntityType::Global(convert_global_type(g)),
+                        entity_type: EntityType::Global(convert_global_type(
+                            g,
+                            unresolved.component_idx,
+                            unresolved.module_idx,
+                            merged,
+                        )),
                         component_idx: Some(unresolved.component_idx),
                     });
                 }
@@ -2056,6 +2587,7 @@ impl Merger {
                 type_idx: empty_type_idx,
                 body: wrapper,
                 origin: (usize::MAX, usize::MAX, 0), // synthetic function
+                synthetic_kind: Some(SyntheticKind::StartWrapper),
             });
 
             log::info!(
@@ -2238,11 +2770,70 @@ fn convert_memory_type(mem: &MemoryType) -> EncoderMemoryType {
     }
 }
 
-/// Convert parser TableType to encoder TableType
-fn convert_table_type(table: &TableType) -> EncoderTableType {
+/// Remap a concrete heap-type index embedded in a `RefType` through the
+/// per-module type index map, so it points at the correct merged type.
+///
+/// Concrete indices on `RefType`s produced by the parser are *module-level*
+/// (see `parser.rs::convert_ref_type`). When the merger renumbers types it
+/// records `(comp_idx, mod_idx, old_idx) -> merged_idx` in
+/// `merged.type_index_map` (built at the top of `merge_module`). This applies
+/// that same mapping. Abstract heap types carry no index and are returned
+/// unchanged.
+///
+/// This mirrors the concrete-heap-type remap already done for `ref.null` const
+/// expressions (the `RefNull` arm in `convert_const_expr`); that path remaps
+/// indices in *const-expression operands*, whereas this remaps the indices in
+/// *type/table/global section declarations*. The two cover disjoint structures,
+/// so applying this does not double-remap anything that path already handles.
+fn remap_concrete_ref_type(
+    rt: RefType,
+    comp_idx: usize,
+    mod_idx: usize,
+    merged: &MergedModule,
+) -> RefType {
+    let heap_type = match rt.heap_type {
+        wasm_encoder::HeapType::Concrete(old_idx) => {
+            let new_idx = merged
+                .type_index_map
+                .get(&(comp_idx, mod_idx, old_idx))
+                .copied()
+                .unwrap_or(old_idx);
+            wasm_encoder::HeapType::Concrete(new_idx)
+        }
+        other => other,
+    };
+    RefType { heap_type, ..rt }
+}
+
+/// Remap a concrete heap-type index embedded in a `ValType` (no-op for
+/// non-reference value types). Used for func-signature params/results and
+/// global content types. See [`remap_concrete_ref_type`].
+fn remap_concrete_val_type(
+    ty: ValType,
+    comp_idx: usize,
+    mod_idx: usize,
+    merged: &MergedModule,
+) -> ValType {
+    match ty {
+        ValType::Ref(rt) => ValType::Ref(remap_concrete_ref_type(rt, comp_idx, mod_idx, merged)),
+        other => other,
+    }
+}
+
+/// Convert parser TableType to encoder TableType.
+///
+/// `element_type` may be a concrete typed-ref (`(ref null $t)`); its
+/// module-level type index is remapped to the merged-module index via
+/// [`remap_concrete_ref_type`].
+fn convert_table_type(
+    table: &TableType,
+    comp_idx: usize,
+    mod_idx: usize,
+    merged: &MergedModule,
+) -> EncoderTableType {
     EncoderTableType {
         element_type: match table.element_type {
-            ValType::Ref(rt) => rt,
+            ValType::Ref(rt) => remap_concrete_ref_type(rt, comp_idx, mod_idx, merged),
             _ => RefType::FUNCREF,
         },
         table64: false,
@@ -2252,10 +2843,18 @@ fn convert_table_type(table: &TableType) -> EncoderTableType {
     }
 }
 
-/// Convert parser GlobalType to encoder GlobalType
-fn convert_global_type(global: &GlobalType) -> EncoderGlobalType {
+/// Convert parser GlobalType to encoder GlobalType.
+///
+/// `content_type` may be a concrete typed-ref; its module-level type index is
+/// remapped to the merged-module index via [`remap_concrete_val_type`].
+fn convert_global_type(
+    global: &GlobalType,
+    comp_idx: usize,
+    mod_idx: usize,
+    merged: &MergedModule,
+) -> EncoderGlobalType {
     EncoderGlobalType {
-        val_type: global.content_type,
+        val_type: remap_concrete_val_type(global.content_type, comp_idx, mod_idx, merged),
         mutable: global.mutable,
         shared: false,
     }
@@ -2276,6 +2875,8 @@ pub(crate) fn build_index_maps_for_module(
     memory_base_offset: u64,
     memory64: bool,
     memory_initial_pages: Option<u64>,
+    data_segment_base: u32,
+    elem_segment_base: u32,
 ) -> IndexMaps {
     let mut maps = IndexMaps::new();
     maps.address_rebasing = address_rebasing;
@@ -2386,6 +2987,27 @@ pub(crate) fn build_index_maps_for_module(
         }
     }
 
+    // Build data-segment and element-segment maps.
+    //
+    // The merger concatenates every module's segments into one shared
+    // section in deterministic merge order, so this module's local segment
+    // `local` lands at fused ordinal `base + local`, where `base` is the
+    // number of segments contributed by all PRIOR modules. The caller
+    // supplies that base (captured from `merged.data_segments.len()` /
+    // `merged.elements.len()` BEFORE this module's segments are appended —
+    // the same timing as `func_offset = merged.functions.len()`).
+    //
+    // Data/element segments are never imported in core wasm, so there is
+    // no import-count adjustment as there is for funcs/globals/tables/mems.
+    let data_segment_count = crate::segments::count_data_segments(module);
+    for local in 0..data_segment_count {
+        maps.data_segments.insert(local, data_segment_base + local);
+    }
+    let elem_segment_count = crate::segments::count_element_segments(module);
+    for local in 0..elem_segment_count {
+        maps.elements.insert(local, elem_segment_base + local);
+    }
+
     maps
 }
 
@@ -2432,8 +3054,25 @@ fn convert_init_expr(
     };
 
     match op {
-        wasmparser::Operator::I32Const { value } => ConstExpr::i32_const(value),
-        wasmparser::Operator::I64Const { value } => ConstExpr::i64_const(value),
+        // For an i32 / i64 const, the wasm 2.0 extended-const proposal
+        // permits further `i32.add` / `i32.sub` / `i32.mul` (and i64
+        // counterparts) before `end`. Fold them into a single value via
+        // the shared helper so the merged global preserves the source's
+        // semantic initializer. Prior versions of this function read
+        // only the first op and silently dropped the rest, producing a
+        // wrong-valued global (LS-A-11).
+        wasmparser::Operator::I32Const { value } => {
+            match crate::segments::fold_extended_const_i32(&mut ops, value) {
+                Ok(folded) => ConstExpr::i32_const(folded),
+                Err(_) => ConstExpr::raw(bytes.iter().copied()),
+            }
+        }
+        wasmparser::Operator::I64Const { value } => {
+            match crate::segments::fold_extended_const_i64(&mut ops, value) {
+                Ok(folded) => ConstExpr::i64_const(folded),
+                Err(_) => ConstExpr::raw(bytes.iter().copied()),
+            }
+        }
         wasmparser::Operator::F32Const { value } => {
             ConstExpr::f32_const(f32::from_bits(value.bits()).into())
         }
@@ -2543,18 +3182,32 @@ pub(crate) fn component_memory_index(merged: &MergedModule, comp_idx: usize) -> 
 }
 
 /// Find the merged function index of a component's cabi_realloc.
+///
+/// Prefers module 0's realloc (the main module). If module 0 has no
+/// realloc, falls back to the realloc bound to the **lowest** module
+/// index for this component — chosen deterministically rather than via
+/// HashMap iteration order, which would let the hasher state pick a
+/// different module on every run and produce non-reproducible output
+/// (LS-A-15).
 pub(crate) fn component_realloc_index(merged: &MergedModule, comp_idx: usize) -> Option<u32> {
     // Prefer module 0's realloc (the main module)
     if let Some(&idx) = merged.realloc_map.get(&(comp_idx, 0)) {
         return Some(idx);
     }
-    // Fallback: any module's realloc for this component
-    for (&(ci, _mi), &merged_idx) in &merged.realloc_map {
-        if ci == comp_idx {
-            return Some(merged_idx);
-        }
-    }
-    None
+    // Fallback: pick the smallest module index belonging to this component,
+    // deterministically. HashMap.iter() returns entries in hash-seed
+    // order, which varies per process; collect-and-sort gives reproducible
+    // output and removes the multi-realloc race condition.
+    let mut module_idxs: Vec<usize> = merged
+        .realloc_map
+        .keys()
+        .filter(|(ci, _)| *ci == comp_idx)
+        .map(|(_, mi)| *mi)
+        .collect();
+    module_idxs.sort_unstable();
+    module_idxs
+        .first()
+        .and_then(|mi| merged.realloc_map.get(&(comp_idx, *mi)).copied())
 }
 
 ///
@@ -2920,6 +3573,7 @@ mod tests {
             handle_tables: HashMap::new(),
             task_return_shims: HashMap::new(),
             async_result_globals: HashMap::new(),
+            segment_bases: HashMap::new(),
         };
 
         // Simulate multi-memory merging for module A (comp 0, mod 0)
@@ -2956,6 +3610,8 @@ mod tests {
             0,
             false,
             None,
+            0,
+            0,
         );
         assert_eq!(maps_a.remap_memory(0), 0);
 
@@ -2969,8 +3625,25 @@ mod tests {
             0,
             false,
             None,
+            0,
+            0,
         );
         assert_eq!(maps_b.remap_memory(0), 1);
+    }
+
+    /// Mythos finding B (PR #220): an unresolved `MemoryStrategy::Auto`
+    /// reaching `Merger::new` directly must normalize to MultiMemory.
+    /// Without normalization the merger is split-brained — `== SharedMemory`
+    /// sites treat Auto as multi while `== MultiMemory` sites treat it as
+    /// shared, silently dropping the second component's memory export.
+    #[test]
+    fn test_merger_new_normalizes_auto_to_multi_memory() {
+        let merger = Merger::new(MemoryStrategy::Auto, false);
+        assert_eq!(
+            merger.memory_strategy,
+            MemoryStrategy::MultiMemory,
+            "Merger::new(Auto, _) must normalize to MultiMemory"
+        );
     }
 
     /// Regression test for Bug #7: Merger::default() must use MultiMemory strategy.
@@ -3256,7 +3929,9 @@ mod tests {
             adapter_sites: Vec::new(),
             module_resolutions: Vec::new(),
             resource_graph: None,
+            stream_pair_graph: None,
             reexporter_components: Vec::new(),
+            reexporter_resources: Vec::new(),
             unresolved_imports: vec![
                 UnresolvedImport {
                     component_idx: 0,
@@ -3351,11 +4026,103 @@ mod tests {
     #[test]
     fn test_compare_version() {
         use std::cmp::Ordering;
+        // Pure numeric triples (existing coverage).
         assert_eq!(compare_version("0.2.6", "0.2.0"), Ordering::Greater);
         assert_eq!(compare_version("0.2.0", "0.2.6"), Ordering::Less);
         assert_eq!(compare_version("0.2.6", "0.2.6"), Ordering::Equal);
         assert_eq!(compare_version("1.0.0", "0.9.9"), Ordering::Greater);
         assert_eq!(compare_version("0.3.0", "0.2.9"), Ordering::Greater);
+    }
+
+    #[test]
+    fn test_compare_version_prerelease_regression_issue_98() {
+        use std::cmp::Ordering;
+        // Issue #98: previously returned Less because filter_map(parse::<u32>)
+        // dropped the "99-rc1" segment, leaving [0, 2] vs [0, 2, 0]. After the
+        // fix the pre-release suffix is split off and 99 > 0 wins.
+        assert_eq!(compare_version("0.2.99-rc1", "0.2.0"), Ordering::Greater);
+    }
+
+    #[test]
+    fn test_compare_version_prerelease_below_release() {
+        use std::cmp::Ordering;
+        // Per semver §11: a pre-release version sorts BELOW the same version
+        // without a pre-release suffix.
+        assert_eq!(compare_version("0.2.0-rc1", "0.2.0"), Ordering::Less);
+        assert_eq!(compare_version("0.2.0", "0.2.0-rc1"), Ordering::Greater);
+        assert_eq!(compare_version("1.0.0-alpha", "1.0.0"), Ordering::Less);
+    }
+
+    #[test]
+    fn test_compare_version_prerelease_ordering() {
+        use std::cmp::Ordering;
+        // Both have pre-release: compare identifier-wise.
+        assert_eq!(compare_version("1.0.0-alpha", "1.0.0-beta"), Ordering::Less);
+        assert_eq!(compare_version("1.0.0-rc1", "1.0.0-rc2"), Ordering::Less);
+        // Numeric identifiers sort below alphanumeric ones (semver §11.4.3).
+        assert_eq!(compare_version("1.0.0-1", "1.0.0-alpha"), Ordering::Less);
+        // Longer pre-release wins when shared segments match.
+        assert_eq!(
+            compare_version("1.0.0-alpha", "1.0.0-alpha.1"),
+            Ordering::Less
+        );
+        assert_eq!(
+            compare_version("1.0.0-alpha.1", "1.0.0-alpha.1"),
+            Ordering::Equal
+        );
+    }
+
+    #[test]
+    fn test_compare_version_build_metadata_ignored() {
+        use std::cmp::Ordering;
+        // Build metadata (+...) does not affect precedence.
+        assert_eq!(
+            compare_version("1.0.0+meta", "1.0.0+other"),
+            Ordering::Equal
+        );
+        assert_eq!(compare_version("1.0.0+meta", "1.0.0"), Ordering::Equal);
+        assert_eq!(compare_version("0.2.6+sha.abc", "0.2.0"), Ordering::Greater);
+        // Build metadata after pre-release is also ignored.
+        assert_eq!(
+            compare_version("1.0.0-rc1+build.5", "1.0.0-rc1"),
+            Ordering::Equal
+        );
+    }
+
+    #[test]
+    fn test_compare_version_missing_segments() {
+        use std::cmp::Ordering;
+        // Missing trailing segments default to 0.
+        assert_eq!(compare_version("0.2", "0.2.0"), Ordering::Equal);
+        assert_eq!(compare_version("1", "1.0.0"), Ordering::Equal);
+        assert_eq!(compare_version("0.3", "0.2.99"), Ordering::Greater);
+        assert_eq!(compare_version("0.2", "0.2.1"), Ordering::Less);
+    }
+
+    #[test]
+    fn test_compare_version_mixed_alphanumeric() {
+        use std::cmp::Ordering;
+        // Non-numeric main segments fall back to lexical comparison of that
+        // segment so we never silently drop them like the old impl did.
+        assert_eq!(compare_version("0.2.x", "0.2.x"), Ordering::Equal);
+        // Different non-numeric segments compare lexically.
+        assert_ne!(compare_version("0.2.a", "0.2.b"), Ordering::Equal);
+        // A numeric segment vs a non-numeric one is decidable (not silently
+        // dropped) — exact ordering depends on lexical fallback, but it
+        // must not be Equal.
+        assert_ne!(compare_version("0.2.0", "0.2.x"), Ordering::Equal);
+    }
+
+    #[test]
+    fn test_compare_version_large_numbers() {
+        use std::cmp::Ordering;
+        // u64-range segments must compare numerically, not lexically.
+        // Lexical "10" < "9" but numeric 10 > 9.
+        assert_eq!(compare_version("0.0.10", "0.0.9"), Ordering::Greater);
+        assert_eq!(
+            compare_version("0.0.4294967296", "0.0.4294967295"),
+            Ordering::Greater
+        );
     }
 
     #[test]
@@ -3377,7 +4144,9 @@ mod tests {
             adapter_sites: Vec::new(),
             module_resolutions: Vec::new(),
             resource_graph: None,
+            stream_pair_graph: None,
             reexporter_components: Vec::new(),
+            reexporter_resources: Vec::new(),
             unresolved_imports: vec![
                 UnresolvedImport {
                     component_idx: 0,
@@ -3428,7 +4197,9 @@ mod tests {
             adapter_sites: Vec::new(),
             module_resolutions: Vec::new(),
             resource_graph: None,
+            stream_pair_graph: None,
             reexporter_components: Vec::new(),
+            reexporter_resources: Vec::new(),
             unresolved_imports: vec![
                 UnresolvedImport {
                     component_idx: 0,
@@ -3487,7 +4258,9 @@ mod tests {
             adapter_sites: Vec::new(),
             module_resolutions: Vec::new(),
             resource_graph: None,
+            stream_pair_graph: None,
             reexporter_components: Vec::new(),
+            reexporter_resources: Vec::new(),
             unresolved_imports: vec![
                 UnresolvedImport {
                     component_idx: 0,
@@ -3537,7 +4310,9 @@ mod tests {
             adapter_sites: Vec::new(),
             module_resolutions: Vec::new(),
             resource_graph: None,
+            stream_pair_graph: None,
             reexporter_components: Vec::new(),
+            reexporter_resources: Vec::new(),
             unresolved_imports: vec![
                 UnresolvedImport {
                     component_idx: 0,
@@ -3591,7 +4366,9 @@ mod tests {
             adapter_sites: Vec::new(),
             module_resolutions: Vec::new(),
             resource_graph: None,
+            stream_pair_graph: None,
             reexporter_components: Vec::new(),
+            reexporter_resources: Vec::new(),
             unresolved_imports: vec![
                 UnresolvedImport {
                     component_idx: 0,
@@ -3722,7 +4499,9 @@ mod tests {
             adapter_sites: Vec::new(),
             module_resolutions: Vec::new(),
             resource_graph: None,
+            stream_pair_graph: None,
             reexporter_components: Vec::new(),
+            reexporter_resources: Vec::new(),
             unresolved_imports: vec![
                 UnresolvedImport {
                     component_idx: 0,
@@ -3879,7 +4658,9 @@ mod tests {
             adapter_sites: Vec::new(),
             module_resolutions: Vec::new(),
             resource_graph: None,
+            stream_pair_graph: None,
             reexporter_components: Vec::new(),
+            reexporter_resources: Vec::new(),
             unresolved_imports: vec![
                 UnresolvedImport {
                     component_idx: 0,
@@ -4029,7 +4810,9 @@ mod tests {
             adapter_sites: Vec::new(),
             module_resolutions: Vec::new(),
             resource_graph: None,
+            stream_pair_graph: None,
             reexporter_components: Vec::new(),
+            reexporter_resources: Vec::new(),
             unresolved_imports: vec![
                 UnresolvedImport {
                     component_idx: 0,
@@ -4103,6 +4886,46 @@ mod tests {
         }
     }
 
+    /// LS-M-5 gate-convention regression: a component that
+    /// instantiates the same core module twice must be rejected at
+    /// merge time with `DuplicateModuleInstantiation`, never silently
+    /// mis-merged. This pins the detection-and-reject mitigation that
+    /// closes the LS-M-5 silent-corruption hazard. (Named to satisfy
+    /// the LS-N verification gate's `ls_<letter>_<num>_*` convention;
+    /// `test_duplicate_module_instantiation_rejected` below predates
+    /// the convention and is kept as-is.)
+    #[test]
+    fn ls_m_5_multiply_instantiated_module_rejected() {
+        let comp = make_component_with_instances(vec![
+            crate::parser::ComponentInstance {
+                index: 0,
+                kind: crate::parser::InstanceKind::Instantiate {
+                    module_idx: 2,
+                    args: vec![],
+                },
+            },
+            crate::parser::ComponentInstance {
+                index: 1,
+                kind: crate::parser::InstanceKind::Instantiate {
+                    module_idx: 2, // same module instantiated again
+                    args: vec![],
+                },
+            },
+        ]);
+        let err = Merger::check_no_duplicate_instantiations(&[comp])
+            .expect_err("multiply-instantiated module must be rejected");
+        match err {
+            Error::DuplicateModuleInstantiation {
+                component_idx,
+                module_idx,
+            } => {
+                assert_eq!(component_idx, 0);
+                assert_eq!(module_idx, 2);
+            }
+            other => panic!("expected DuplicateModuleInstantiation, got {other:?}"),
+        }
+    }
+
     #[test]
     fn test_duplicate_module_instantiation_rejected() {
         let comp = make_component_with_instances(vec![
@@ -4158,6 +4981,219 @@ mod tests {
         let comp = make_component_with_instances(vec![]);
         let result = Merger::check_no_duplicate_instantiations(&[comp]);
         assert!(result.is_ok());
+    }
+
+    // ---------------------------------------------------------------
+    // LS-A-11 — extended-const truncation in global initializers
+    // LS-A-15 — HashMap iteration non-determinism
+    //
+    // Shared empty-merged fixture used by both regression suites.
+    // ---------------------------------------------------------------
+
+    fn empty_merged_fixture() -> MergedModule {
+        MergedModule {
+            types: Vec::new(),
+            imports: Vec::new(),
+            functions: Vec::new(),
+            tables: Vec::new(),
+            memories: Vec::new(),
+            globals: Vec::new(),
+            exports: Vec::new(),
+            start_function: None,
+            elements: Vec::new(),
+            data_segments: Vec::new(),
+            custom_sections: Vec::new(),
+            function_index_map: std::collections::HashMap::new(),
+            memory_index_map: std::collections::HashMap::new(),
+            table_index_map: std::collections::HashMap::new(),
+            global_index_map: std::collections::HashMap::new(),
+            type_index_map: std::collections::HashMap::new(),
+            realloc_map: std::collections::HashMap::new(),
+            import_counts: Default::default(),
+            import_memory_indices: Vec::new(),
+            import_realloc_indices: Vec::new(),
+            resource_rep_by_component: std::collections::HashMap::new(),
+            resource_new_by_component: std::collections::HashMap::new(),
+            handle_tables: std::collections::HashMap::new(),
+            task_return_shims: std::collections::HashMap::new(),
+            async_result_globals: std::collections::HashMap::new(),
+            segment_bases: std::collections::HashMap::new(),
+        }
+    }
+
+    // LS-A-11: convert_init_expr must fold multi-op extended-const
+    // expressions (was previously truncating to the first operator).
+    #[test]
+    fn ls_a_11_convert_init_expr_folds_extended_const_i32_add() {
+        // Init expr bytes WITHOUT trailing `end` (the function appends
+        // it). Use small operands that fit in single-byte sleb (no sign
+        // bit at position 6): i32.const 5, i32.const 10, i32.add → 15.
+        let bytes: Vec<u8> = vec![0x41, 5, 0x41, 10, 0x6A];
+        let merged = empty_merged_fixture();
+
+        let expr = convert_init_expr(&bytes, 0, 0, &merged, &ValType::I32);
+
+        let mut encoded = Vec::new();
+        wasm_encoder::Encode::encode(&expr, &mut encoded);
+        let mut expected = Vec::new();
+        wasm_encoder::Encode::encode(&ConstExpr::i32_const(15), &mut expected);
+
+        assert_eq!(
+            encoded, expected,
+            "convert_init_expr must fold (i32.const 5)(i32.const 10) i32.add \
+             to i32.const 15; got bytes {encoded:?}",
+        );
+    }
+
+    #[test]
+    fn ls_a_11_convert_init_expr_preserves_single_const() {
+        // Regression: the fold path must not change behavior for a
+        // simple single-const initializer.
+        let bytes: Vec<u8> = vec![0x41, 5];
+        let merged = empty_merged_fixture();
+
+        let expr = convert_init_expr(&bytes, 0, 0, &merged, &ValType::I32);
+        let mut encoded = Vec::new();
+        wasm_encoder::Encode::encode(&expr, &mut encoded);
+        let mut expected = Vec::new();
+        wasm_encoder::Encode::encode(&ConstExpr::i32_const(5), &mut expected);
+        assert_eq!(encoded, expected);
+    }
+
+    // LS-A-15: component_realloc_index fallback must be deterministic
+    // when multiple modules carry cabi_realloc (was hash-seed dependent).
+    #[test]
+    fn ls_a_15_component_realloc_index_picks_lowest_module_deterministically() {
+        // Component 0 has reallocs at modules 1 (idx 10), 2 (idx 11),
+        // and 3 (idx 12), but no module 0. The function must
+        // deterministically pick the realloc bound to the LOWEST module
+        // index (module 1 → idx 10), not whatever HashMap happens to
+        // iterate first.
+        //
+        // Rebuilding the HashMap from scratch each iteration gives
+        // each instance a fresh hash seed, so iteration order varies
+        // across iterations — if the impl picked an arbitrary entry,
+        // we'd see more than one observed value.
+        let mut observed = std::collections::HashSet::new();
+        for _ in 0..64 {
+            let mut merged = empty_merged_fixture();
+            merged.realloc_map.insert((0, 1), 10);
+            merged.realloc_map.insert((0, 2), 11);
+            merged.realloc_map.insert((0, 3), 12);
+            let got = component_realloc_index(&merged, 0).unwrap();
+            observed.insert(got);
+        }
+        assert_eq!(
+            observed.len(),
+            1,
+            "component_realloc_index must return a deterministic value \
+             across runs; saw {observed:?}",
+        );
+        assert!(
+            observed.contains(&10),
+            "lowest module index (1 → realloc 10) must be selected; \
+             observed {observed:?}",
+        );
+    }
+
+    #[test]
+    fn ls_a_15_component_realloc_index_prefers_module_0() {
+        // Regression: when module 0 has a realloc, the function must
+        // return it regardless of other modules in the map.
+        let mut merged = empty_merged_fixture();
+        merged.realloc_map.insert((0, 0), 100);
+        merged.realloc_map.insert((0, 1), 200);
+        assert_eq!(component_realloc_index(&merged, 0), Some(100));
+    }
+
+    // LS-A-19: find_exact_resource_import_idx must match the full
+    // `[resource-{rep,new}]<name>` import string exactly. The prior
+    // `imp.name.ends_with(rn)` form let `float` match both
+    // `[resource-rep]float` and `[resource-rep]bigfloat`, so the
+    // dedup-skip path would register the wrong import for the
+    // wrong-suffix component (silent cross-resource confusion at
+    // runtime, no host trap).
+    fn merged_import(name: &str) -> MergedImport {
+        MergedImport {
+            module: "test".to_string(),
+            name: name.to_string(),
+            entity_type: EntityType::Function(0),
+            component_idx: None,
+        }
+    }
+
+    #[test]
+    fn ls_a_19_exact_match_picks_float_not_bigfloat() {
+        // imports[0] = [resource-rep]bigfloat
+        // imports[1] = [resource-rep]float
+        // Tracking has both indices. Asking for "[resource-rep]float"
+        // must return 1, not 0 — even though the buggy ends_with
+        // would have matched bigfloat first under some iteration
+        // orders.
+        let mut merged = empty_merged_fixture();
+        merged.imports.push(merged_import("[resource-rep]bigfloat"));
+        merged.imports.push(merged_import("[resource-rep]float"));
+        merged
+            .resource_rep_by_component
+            .insert((0, "bigfloat".to_string()), 0);
+        merged
+            .resource_rep_by_component
+            .insert((1, "float".to_string()), 1);
+
+        let idx = find_exact_resource_import_idx(
+            &merged.resource_rep_by_component,
+            &merged.imports,
+            "[resource-rep]float",
+        );
+        assert_eq!(
+            idx,
+            Some(1),
+            "exact match must pick float (idx 1), not bigfloat"
+        );
+    }
+
+    #[test]
+    fn ls_a_19_no_match_returns_none_even_with_suffix_collision() {
+        // Only bigfloat in tracking, but caller asks for plain float.
+        // The buggy ends_with("float") would have returned bigfloat's
+        // index. Exact match must return None.
+        let mut merged = empty_merged_fixture();
+        merged.imports.push(merged_import("[resource-rep]bigfloat"));
+        merged
+            .resource_rep_by_component
+            .insert((0, "bigfloat".to_string()), 0);
+
+        let idx = find_exact_resource_import_idx(
+            &merged.resource_rep_by_component,
+            &merged.imports,
+            "[resource-rep]float",
+        );
+        assert_eq!(
+            idx, None,
+            "no exact match for 'float' must return None even though \
+             'bigfloat' shares the suffix",
+        );
+    }
+
+    #[test]
+    fn ls_a_19_resource_new_lookup_is_also_exact() {
+        // Same suffix-collision case for [resource-new] table.
+        let mut merged = empty_merged_fixture();
+        merged.imports.push(merged_import("[resource-new]bigfloat"));
+        merged.imports.push(merged_import("[resource-new]float"));
+        merged
+            .resource_new_by_component
+            .insert((0, "bigfloat".to_string()), 0);
+        merged
+            .resource_new_by_component
+            .insert((1, "float".to_string()), 1);
+
+        let idx = find_exact_resource_import_idx(
+            &merged.resource_new_by_component,
+            &merged.imports,
+            "[resource-new]float",
+        );
+        assert_eq!(idx, Some(1));
     }
 }
 

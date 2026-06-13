@@ -1,0 +1,114 @@
+# Performance Benchmarks
+#
+# Criterion benchmark groups for the meld fusion pipeline. These artifacts
+# document the regression gate evidence required by ISO 26262-6 Table 10
+# row 1e ("performance test", HR at ASIL D) and DO-178C Table A-6 Obj 3
+# ("compliance with performance requirements").
+#
+# Each TEST-BENCH-* entry corresponds to one criterion group in
+# `meld-core/benches/fusion_benchmarks.rs`. The CI smoke job
+# (.github/workflows/bench.yml) runs `cargo bench --no-run` on every PR to
+# guarantee the harness keeps compiling. Full benchmark execution and
+# baseline persistence are intended for a dedicated host outside the PR
+# fast-feedback loop.
+#
+# Format: rivet generic-yaml
+
+artifacts:
+
+  - id: TEST-BENCH-PARSER
+    type: requirement
+    title: Parser throughput benchmark
+    description: >
+      Criterion group `parser` measures `ComponentParser::parse` throughput
+      per input byte across a curated set of wit-bindgen P2 fixtures.
+      Detects regressions in the parser hot path (validation, depth-aware
+      core-module extraction, canonical ABI section walking).
+    status: implemented
+    tags: [bench, performance, regression-gate]
+    links:
+      - type: derives-from
+        target: SR-1
+      - type: derives-from
+        target: SR-2
+    fields:
+      implementation:
+        - meld-core/benches/fusion_benchmarks.rs
+        - meld-core/src/parser.rs
+      verification-method: test
+      verification-description: >
+        cargo bench -p meld-core --bench fusion_benchmarks -- parser
+      ci-smoke: .github/workflows/bench.yml
+
+  - id: TEST-BENCH-MERGER
+    type: requirement
+    title: Merger throughput benchmark
+    description: >
+      Criterion group `merger` measures `Merger::merge` throughput per
+      flattened component count, with the dependency graph pre-built so
+      only merge cost is observed. Detects regressions in index-space
+      merging, function-table assembly, and shared-memory plan computation.
+    status: implemented
+    tags: [bench, performance, regression-gate]
+    links:
+      - type: derives-from
+        target: SR-23
+      - type: derives-from
+        target: SR-31
+    fields:
+      implementation:
+        - meld-core/benches/fusion_benchmarks.rs
+        - meld-core/src/merger.rs
+      verification-method: test
+      verification-description: >
+        cargo bench -p meld-core --bench fusion_benchmarks -- merger
+      ci-smoke: .github/workflows/bench.yml
+
+  - id: TEST-BENCH-RESOLVER
+    type: requirement
+    title: Resolver throughput benchmark
+    description: >
+      Criterion group `resolver` measures `Resolver::resolve_with_hints`
+      throughput per resolved-symbol count. Detects regressions in
+      cross-component import matching, instance-graph resolution, and the
+      resource-ownership graph build.
+    status: implemented
+    tags: [bench, performance, regression-gate]
+    links:
+      - type: derives-from
+        target: SR-25
+    fields:
+      implementation:
+        - meld-core/benches/fusion_benchmarks.rs
+        - meld-core/src/resolver.rs
+      verification-method: test
+      verification-description: >
+        cargo bench -p meld-core --bench fusion_benchmarks -- resolver
+      ci-smoke: .github/workflows/bench.yml
+
+  - id: TEST-BENCH-FUSION-E2E
+    type: requirement
+    title: End-to-end fusion throughput benchmark
+    description: >
+      Criterion group `end_to_end` measures `Fuser::fuse_with_stats` over
+      small (1 fixture), medium (5 fixtures), and large (12 fixtures)
+      component graphs. Catches whole-pipeline regressions (parse +
+      resolve + merge + adapter + encode) that aren't visible from any
+      single-stage benchmark.
+    status: implemented
+    tags: [bench, performance, regression-gate]
+    links:
+      - type: derives-from
+        target: SR-1
+      - type: derives-from
+        target: SR-23
+      - type: derives-from
+        target: SR-31
+    fields:
+      implementation:
+        - meld-core/benches/fusion_benchmarks.rs
+        - meld-core/src/lib.rs
+      verification-method: test
+      verification-description: >
+        cargo bench -p meld-core --bench fusion_benchmarks -- end_to_end
+      ci-smoke: .github/workflows/bench.yml

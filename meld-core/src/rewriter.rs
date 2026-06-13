@@ -6,10 +6,49 @@
 
 use crate::{Error, Result};
 use std::collections::HashMap;
-use wasm_encoder::{BlockType, Function, Instruction, MemArg};
+use wasm_encoder::{BlockType, Encode, Function, Instruction, MemArg};
 use wasmparser::{
     BlockType as WpBlockType, FunctionBody, MemArg as WpMemArg, Operator, OperatorsReader,
 };
+
+/// One instruction-boundary offset pair (DWARF Phase 2 inc 2, #143).
+///
+/// `old` and `new` are byte offsets relative to the start of their
+/// respective function body's **instruction stream** (the byte
+/// immediately after the locals-declaration vector). The rewriter
+/// changes operand values (function/global/etc. indices) whose
+/// LEB128 encodings can change length, so `new` drifts away from
+/// `old` at every instruction past the first length change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InstrOffset {
+    pub old: u32,
+    pub new: u32,
+}
+
+/// Per-function instruction offset map (DWARF Phase 2 inc 2, #143).
+///
+/// One [`InstrOffset`] per input operator, in stream order. When an
+/// input operator rewrites to multiple output instructions, `new` is
+/// the offset of the **first** emitted instruction — the address
+/// DWARF line-number programs attribute to that source operator.
+/// Increment 3 composes these intra-function offsets with the
+/// per-function base from the component-provenance v2 `code_range`
+/// to translate DWARF code addresses from input to fused output.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct InstrOffsetMap {
+    pub entries: Vec<InstrOffset>,
+}
+
+impl InstrOffsetMap {
+    /// Translate an old intra-function instruction-stream offset to
+    /// the corresponding new offset. Returns `None` if `old` does not
+    /// fall on a recorded instruction boundary (DWARF addresses
+    /// always point at instruction starts, so a miss signals either a
+    /// malformed address or an offset past the function end).
+    pub fn translate(&self, old: u32) -> Option<u32> {
+        self.entries.iter().find(|e| e.old == old).map(|e| e.new)
+    }
+}
 
 /// Index mappings for rewriting
 #[derive(Debug, Clone, Default)]
@@ -24,6 +63,19 @@ pub struct IndexMaps {
     pub tables: HashMap<u32, u32>,
     /// Memory index remapping: old -> new
     pub memories: HashMap<u32, u32>,
+    /// Data-segment index remapping: old -> new
+    ///
+    /// The merger concatenates every module's passive/active data segments
+    /// into one shared section, so a module's local segment 0 becomes some
+    /// non-zero ordinal in the fused module. `memory.init` / `data.drop`
+    /// operands must be remapped through this map or they read the wrong
+    /// segment.
+    pub data_segments: HashMap<u32, u32>,
+    /// Element-segment index remapping: old -> new
+    ///
+    /// Same concatenation concern as `data_segments`, for `table.init` /
+    /// `elem.drop`.
+    pub elements: HashMap<u32, u32>,
     /// Memory base offset in bytes (for shared-memory rebasing)
     pub memory_base_offset: u64,
     /// Whether address rebasing is enabled
@@ -74,6 +126,16 @@ impl IndexMaps {
     pub fn remap_memory(&self, idx: u32) -> u32 {
         *self.memories.get(&idx).unwrap_or(&idx)
     }
+
+    /// Remap a data-segment index (`memory.init` / `data.drop`).
+    pub fn remap_data_segment(&self, idx: u32) -> u32 {
+        *self.data_segments.get(&idx).unwrap_or(&idx)
+    }
+
+    /// Remap an element-segment index (`table.init` / `elem.drop`).
+    pub fn remap_elem(&self, idx: u32) -> u32 {
+        *self.elements.get(&idx).unwrap_or(&idx)
+    }
 }
 
 /// Rewrite a function body with new index mappings
@@ -82,6 +144,32 @@ pub fn rewrite_function_body(
     param_count: u32,
     maps: &IndexMaps,
 ) -> Result<Function> {
+    Ok(rewrite_function_body_core(body, param_count, maps, false)?.0)
+}
+
+/// Like [`rewrite_function_body`], but also returns the per-function
+/// [`InstrOffsetMap`] mapping each input operator's instruction-stream
+/// byte offset to its rewritten offset (DWARF Phase 2 inc 2, #143).
+///
+/// The offset map is collected by measuring each emitted instruction's
+/// encoded length — a hot-path cost, so this entry point is only used
+/// when DWARF address remapping is requested. The plain
+/// [`rewrite_function_body`] path pays nothing.
+pub fn rewrite_function_body_with_offsets(
+    body: &FunctionBody<'_>,
+    param_count: u32,
+    maps: &IndexMaps,
+) -> Result<(Function, InstrOffsetMap)> {
+    let (func, map) = rewrite_function_body_core(body, param_count, maps, true)?;
+    Ok((func, map.unwrap_or_default()))
+}
+
+fn rewrite_function_body_core(
+    body: &FunctionBody<'_>,
+    param_count: u32,
+    maps: &IndexMaps,
+    collect_offsets: bool,
+) -> Result<(Function, Option<InstrOffsetMap>)> {
     let locals_reader = body.get_locals_reader()?;
 
     // Collect locals
@@ -137,25 +225,55 @@ pub fn rewrite_function_body(
 
     // Get operators and rewrite them
     let ops_reader = body.get_operators_reader()?;
-    rewrite_operators(ops_reader, &maps, &mut func)?;
+    let offset_map = rewrite_operators(ops_reader, &maps, &mut func, collect_offsets)?;
 
-    Ok(func)
+    Ok((func, offset_map))
 }
 
-/// Rewrite operators in a function body
+/// Rewrite operators in a function body, optionally collecting an
+/// [`InstrOffsetMap`].
+///
+/// When `collect_offsets` is true, the new offset is accumulated by
+/// measuring each emitted instruction's encoded byte length —
+/// identical to what `Function::instruction` appends, since both
+/// route through `wasm_encoder::Encode`. The map records, per input
+/// operator, the (old, new) instruction-stream offsets; for an
+/// operator that expands to several instructions the `new` offset is
+/// captured *before* the group is emitted (the first instruction's
+/// position). When false, no measurement happens and `None` is
+/// returned — the zero-cost default path.
 fn rewrite_operators(
     reader: OperatorsReader<'_>,
     maps: &IndexMaps,
     func: &mut Function,
-) -> Result<()> {
-    for op in reader {
-        let op = op?;
+    collect_offsets: bool,
+) -> Result<Option<InstrOffsetMap>> {
+    let mut map = collect_offsets.then(InstrOffsetMap::default);
+    let mut new_offset: u32 = 0;
+    let mut base_old: Option<usize> = None;
+
+    for res in reader.into_iter_with_offsets() {
+        let (op, old_pos) = res?;
         let instrs = rewrite_operator(op, maps)?;
-        for instr in instrs {
-            func.instruction(&instr);
+        if let Some(m) = map.as_mut() {
+            // First operator's absolute position defines the
+            // instruction-stream base; subsequent offsets are relative.
+            let base = *base_old.get_or_insert(old_pos);
+            m.entries.push(InstrOffset {
+                old: (old_pos - base) as u32,
+                new: new_offset,
+            });
+        }
+        for instr in &instrs {
+            if map.is_some() {
+                let mut buf = Vec::new();
+                instr.encode(&mut buf);
+                new_offset = new_offset.saturating_add(buf.len() as u32);
+            }
+            func.instruction(instr);
         }
     }
-    Ok(())
+    Ok(map)
 }
 
 /// Convert a wasmparser operator to wasm-encoder instruction with index remapping
@@ -221,10 +339,10 @@ fn rewrite_operator(op: Operator<'_>, maps: &IndexMaps) -> Result<Vec<Instructio
             dst_table: maps.remap_table(dst_table),
         },
         TableInit { elem_index, table } => Instruction::TableInit {
-            elem_index,
+            elem_index: maps.remap_elem(elem_index),
             table: maps.remap_table(table),
         },
-        ElemDrop { elem_index } => Instruction::ElemDrop(elem_index),
+        ElemDrop { elem_index } => Instruction::ElemDrop(maps.remap_elem(elem_index)),
 
         // Memory operations - need memory index remapping
         I32Load { memarg } => Instruction::I32Load(convert_memarg(memarg, maps)?),
@@ -285,7 +403,7 @@ fn rewrite_operator(op: Operator<'_>, maps: &IndexMaps) -> Result<Vec<Instructio
         MemoryInit { data_index, mem } => {
             return rewrite_memory_init(data_index, mem, maps);
         }
-        DataDrop { data_index } => Instruction::DataDrop(data_index),
+        DataDrop { data_index } => Instruction::DataDrop(maps.remap_data_segment(data_index)),
         MemoryCopy { dst_mem, src_mem } => {
             return rewrite_memory_copy(src_mem, dst_mem, maps);
         }
@@ -514,6 +632,7 @@ fn rewrite_memory_init(
     mem: u32,
     maps: &IndexMaps,
 ) -> Result<Vec<Instruction<'static>>> {
+    let data_index = maps.remap_data_segment(data_index);
     if !maps.address_rebasing {
         return Ok(vec![Instruction::MemoryInit {
             mem: maps.remap_memory(mem),
@@ -1219,5 +1338,153 @@ mod tests {
                 input
             );
         }
+    }
+
+    // ─── DWARF Phase 2 inc 2: instruction offset map (#143) ───────────
+
+    /// Run `rewrite_function_body_with_offsets` on function `func_idx`
+    /// of a wat module and return the collected offset map.
+    fn offsets_for_wat_func(wat_src: &str, func_idx: usize, maps: &IndexMaps) -> InstrOffsetMap {
+        let wasm = wat::parse_str(wat_src).expect("wat parse");
+        let mut idx = 0;
+        for payload in wasmparser::Parser::new(0).parse_all(&wasm) {
+            if let wasmparser::Payload::CodeSectionEntry(body) = payload.expect("payload") {
+                if idx == func_idx {
+                    let (_func, map) = rewrite_function_body_with_offsets(&body, 0, maps)
+                        .expect("rewrite with offsets");
+                    return map;
+                }
+                idx += 1;
+            }
+        }
+        panic!("function index {func_idx} not found in code section");
+    }
+
+    /// LEB-growth tracking: remapping `call 0` → `call 200` grows each
+    /// call's operand LEB from 1 to 2 bytes. The offset map's `new`
+    /// must diverge from `old` by the *accumulated* growth — +1 after
+    /// the first remapped call, +2 after the second. This is the
+    /// property DWARF line-table remapping (inc 3) depends on.
+    #[test]
+    fn instr_offset_map_tracks_leb_growth_from_index_remap() {
+        let mut maps = IndexMaps::new();
+        maps.functions.insert(0, 200); // 1-byte LEB → 2-byte LEB
+
+        // func 1 body: call 0; drop; call 0; drop; i32.const 2  (+ end)
+        let map = offsets_for_wat_func(
+            r#"(module
+                (func (result i32) i32.const 1)
+                (func (result i32)
+                    call 0 drop
+                    call 0 drop
+                    i32.const 2))"#,
+            1,
+            &maps,
+        );
+
+        // Six operators: call, drop, call, drop, const, end.
+        assert_eq!(map.entries.len(), 6, "one entry per operator: {map:?}");
+
+        // The divergence (new - old) per entry must be the accumulated
+        // LEB growth: 0 before any remapped call completes, +1 after
+        // the first call, +2 after the second. Sequence: [0,1,1,2,2,2].
+        let divergence: Vec<i64> = map
+            .entries
+            .iter()
+            .map(|e| e.new as i64 - e.old as i64)
+            .collect();
+        assert_eq!(
+            divergence,
+            vec![0, 1, 1, 2, 2, 2],
+            "new offsets must diverge by accumulated LEB growth: {map:?}"
+        );
+
+        // Old and new offsets are each strictly increasing.
+        for w in map.entries.windows(2) {
+            assert!(w[0].old < w[1].old, "old offsets must increase: {map:?}");
+            assert!(w[0].new < w[1].new, "new offsets must increase: {map:?}");
+        }
+        // First instruction anchors both streams at 0.
+        assert_eq!(map.entries[0].old, 0);
+        assert_eq!(map.entries[0].new, 0);
+    }
+
+    /// Identity case: when no remap changes an operand's LEB length,
+    /// `new` must equal `old` at every instruction boundary — the map
+    /// is the identity. Remapping 0→1 keeps the `call` operand a
+    /// single LEB byte.
+    #[test]
+    fn instr_offset_map_is_identity_when_no_leb_length_change() {
+        let mut maps = IndexMaps::new();
+        maps.functions.insert(0, 1); // both 1-byte LEBs
+
+        let map = offsets_for_wat_func(
+            r#"(module
+                (func (result i32) i32.const 1)
+                (func (result i32) call 0 drop i32.const 2))"#,
+            1,
+            &maps,
+        );
+
+        assert!(!map.entries.is_empty());
+        for e in &map.entries {
+            assert_eq!(e.old, e.new, "no LEB change ⇒ identity offsets: {e:?}");
+        }
+    }
+
+    /// `translate` resolves recorded boundaries and rejects offsets
+    /// that don't land on an instruction start.
+    #[test]
+    fn instr_offset_map_translate_hits_and_misses() {
+        let map = InstrOffsetMap {
+            entries: vec![
+                InstrOffset { old: 0, new: 0 },
+                InstrOffset { old: 2, new: 3 },
+                InstrOffset { old: 5, new: 7 },
+            ],
+        };
+        assert_eq!(map.translate(0), Some(0));
+        assert_eq!(map.translate(2), Some(3));
+        assert_eq!(map.translate(5), Some(7));
+        // Offsets mid-instruction (not a recorded boundary) miss.
+        assert_eq!(map.translate(1), None);
+        assert_eq!(map.translate(99), None);
+    }
+
+    /// The plain `rewrite_function_body` path is unaffected: it still
+    /// returns a `Function` and pays no offset-collection cost. Verify
+    /// it produces byte-identical output to the with-offsets variant's
+    /// `Function` (the offset collection must not change the emitted
+    /// code).
+    #[test]
+    fn with_offsets_emits_identical_function_bytes() {
+        let mut maps = IndexMaps::new();
+        maps.functions.insert(0, 200);
+        let src = r#"(module
+            (func (result i32) i32.const 1)
+            (func (result i32) call 0 drop call 0 drop i32.const 2))"#;
+        let wasm = wat::parse_str(src).expect("wat");
+
+        let mut bodies = Vec::new();
+        for payload in wasmparser::Parser::new(0).parse_all(&wasm) {
+            if let wasmparser::Payload::CodeSectionEntry(body) = payload.expect("payload") {
+                bodies.push(body);
+            }
+        }
+        let target = &bodies[1];
+
+        let plain = rewrite_function_body(target, 0, &maps).expect("plain");
+        let (with_off, _map) =
+            rewrite_function_body_with_offsets(target, 0, &maps).expect("with offsets");
+
+        // Encode both into a CodeSection and compare bytes.
+        let mut a = wasm_encoder::CodeSection::new();
+        a.function(&plain);
+        let mut b = wasm_encoder::CodeSection::new();
+        b.function(&with_off);
+        let (mut ab, mut bb) = (Vec::new(), Vec::new());
+        a.encode(&mut ab);
+        b.encode(&mut bb);
+        assert_eq!(ab, bb, "offset collection must not change emitted code");
     }
 }

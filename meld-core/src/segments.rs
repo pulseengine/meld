@@ -20,7 +20,8 @@ use crate::parser::CoreModule;
 use crate::rewriter::{IndexMaps, convert_abstract_heap_type};
 use crate::{Error, Result};
 use wasm_encoder::{
-    ConstExpr, DataSegment, DataSegmentMode, ElementMode, ElementSegment, Elements, RefType,
+    ConstExpr, DataSegment, DataSegmentMode, ElementMode, ElementSection, ElementSegment, Elements,
+    RefType,
 };
 use wasmparser::{DataSectionReader, ElementItems, ElementKind, ElementSectionReader, Operator};
 
@@ -164,8 +165,13 @@ pub struct ReindexedElementSegment {
 pub enum ReindexedElementItems {
     /// Simple function indices (reindexed)
     Functions(Vec<u32>),
-    /// Expressions (reindexed)
-    Expressions(Vec<ConstExpr>),
+    /// Expressions (reindexed). Held in STRUCTURED `ParsedConstExpr` form —
+    /// already remapped by the merger via [`reindex_element_segment`] — rather
+    /// than opaque encoded `ConstExpr` bytes, so that a later pass (notably the
+    /// P3-async function-index shift, see `p3_async::shift_function_indices`)
+    /// can still read and bump the `ref.func` index inside the expression.
+    /// Encoded to `ConstExpr` only at final emit (see [`encode_element_segment`]).
+    Expressions(Vec<ParsedConstExpr>),
 }
 
 /// Reindexed data segment ready for encoding
@@ -210,11 +216,15 @@ pub fn parse_element_segments(module: &CoreModule) -> Result<Vec<ParsedElementSe
                 (RefType::FUNCREF, ElementItems_::Functions(funcs))
             }
             ElementItems::Expressions(ref_type, expr_reader) => {
-                let element_type = if ref_type.is_func_ref() {
-                    RefType::FUNCREF
-                } else {
-                    RefType::EXTERNREF
-                };
+                // Carry the FULL ref type faithfully — bucketing every
+                // non-funcref to externref (the prior behaviour) dropped
+                // concrete typed function references `(ref $t)` and GC
+                // abstract heap types (struct/array/eq/any/i31/none), and
+                // lost the concrete type index entirely, producing a fused
+                // module that fails wasm validation ("type mismatch:
+                // expected externref, found (ref $type)"). The concrete
+                // index is remapped during reindexing (see remap_ref_type).
+                let element_type = convert_ref_type(ref_type);
                 let mut exprs = Vec::new();
                 for expr in expr_reader {
                     let expr = expr?;
@@ -287,7 +297,73 @@ pub fn parse_data_segments(module: &CoreModule) -> Result<Vec<ParsedDataSegment>
     Ok(segments)
 }
 
+/// Count a module's element segments without fully parsing each entry.
+///
+/// Used to size the per-module element-segment index map: the local indices
+/// `0..count` must each be remapped to `base + local`. Returns 0 when the
+/// module has no element section or the section header cannot be read (the
+/// rewriter then falls back to identity remapping, which is the pre-fix
+/// behaviour for an unmappable index).
+pub fn count_element_segments(module: &CoreModule) -> u32 {
+    let Some((start, end)) = module.element_section_range else {
+        return 0;
+    };
+    let binary_reader = wasmparser::BinaryReader::new(&module.bytes[start..end], 0);
+    match ElementSectionReader::new(binary_reader) {
+        Ok(reader) => reader.count(),
+        Err(_) => 0,
+    }
+}
+
+/// Count a module's data segments without fully parsing each entry.
+///
+/// See [`count_element_segments`] for the sizing rationale.
+pub fn count_data_segments(module: &CoreModule) -> u32 {
+    let Some((start, end)) = module.data_section_range else {
+        return 0;
+    };
+    let binary_reader = wasmparser::BinaryReader::new(&module.bytes[start..end], 0);
+    match DataSectionReader::new(binary_reader) {
+        Ok(reader) => reader.count(),
+        Err(_) => 0,
+    }
+}
+
 /// Reindex an element segment with new index mappings
+/// Faithfully convert a `wasmparser::RefType` to a `wasm_encoder::RefType`,
+/// preserving nullability, abstract heap types, and concrete type indices.
+/// (Concrete indices are module-level here; they are remapped later by
+/// [`remap_ref_type`].) Replaces the lossy funcref/externref bucketing that
+/// previously corrupted typed-ref and GC element segments.
+fn convert_ref_type(rt: wasmparser::RefType) -> RefType {
+    let heap_type = match rt.heap_type() {
+        wasmparser::HeapType::Abstract { shared, ty } => wasm_encoder::HeapType::Abstract {
+            shared,
+            ty: convert_abstract_heap_type(ty),
+        },
+        wasmparser::HeapType::Concrete(idx) | wasmparser::HeapType::Exact(idx) => {
+            wasm_encoder::HeapType::Concrete(idx.as_module_index().unwrap_or(0))
+        }
+    };
+    RefType {
+        nullable: rt.is_nullable(),
+        heap_type,
+    }
+}
+
+/// Remap a ref type's concrete heap-type index through the merge index maps;
+/// abstract heap types carry no index. Mirrors the `RefNull` heap-type
+/// handling in [`ParsedConstExpr::reindex`].
+fn remap_ref_type(rt: RefType, maps: &IndexMaps) -> RefType {
+    let heap_type = match rt.heap_type {
+        wasm_encoder::HeapType::Concrete(idx) => {
+            wasm_encoder::HeapType::Concrete(maps.remap_type(idx))
+        }
+        other => other,
+    };
+    RefType { heap_type, ..rt }
+}
+
 pub fn reindex_element_segment(
     segment: &ParsedElementSegment,
     maps: &IndexMaps,
@@ -310,17 +386,17 @@ pub fn reindex_element_segment(
             ReindexedElementItems::Functions(remapped)
         }
         ElementItems_::Expressions(exprs) => {
-            let remapped: Vec<ConstExpr> = exprs
-                .iter()
-                .map(|e| e.reindex(maps).to_const_expr())
-                .collect();
+            // Keep the STRUCTURED, merger-reindexed form so a later
+            // function-index shift (P3-async) can still bump `ref.func`.
+            // Encoding is deferred to `encode_element_segment`.
+            let remapped: Vec<ParsedConstExpr> = exprs.iter().map(|e| e.reindex(maps)).collect();
             ReindexedElementItems::Expressions(remapped)
         }
     };
 
     ReindexedElementSegment {
         mode,
-        element_type: segment.element_type,
+        element_type: remap_ref_type(segment.element_type, maps),
         items,
     }
 }
@@ -366,23 +442,130 @@ fn parse_const_expr(expr: &wasmparser::ConstExpr<'_>) -> Result<ParsedConstExpr>
     parse_const_expr_with_value(expr).map(|(expr, _)| expr)
 }
 
+/// Fold a wasm 2.0 extended-const i32 expression that has already had its
+/// first `i32.const <initial>` consumed by the caller. Continues reading
+/// operators from `ops` until `End`, applying `i32.add` / `i32.sub` /
+/// `i32.mul` / further `i32.const` to a small evaluation stack with
+/// wrapping semantics per the wasm execution model.
+///
+/// Returns the final stack value if exactly one value remains at `End`.
+/// Rejects unsupported operators (any non-extended-const op) with a
+/// clear error so audit and CI surface the path instead of silently
+/// dropping operators (LS-A-11).
+pub(crate) fn fold_extended_const_i32(
+    ops: &mut wasmparser::OperatorsReader<'_>,
+    initial: i32,
+) -> Result<i32> {
+    let mut stack: Vec<i32> = vec![initial];
+    loop {
+        let op = ops.read()?;
+        match op {
+            Operator::End => break,
+            Operator::I32Const { value } => stack.push(value),
+            Operator::I32Add => fold_i32_binop(&mut stack, i32::wrapping_add)?,
+            Operator::I32Sub => fold_i32_binop(&mut stack, i32::wrapping_sub)?,
+            Operator::I32Mul => fold_i32_binop(&mut stack, i32::wrapping_mul)?,
+            other => {
+                return Err(Error::UnsupportedFeature(format!(
+                    "unsupported i32 extended-const operator: {other:?}"
+                )));
+            }
+        }
+    }
+    if stack.len() != 1 {
+        return Err(Error::UnsupportedFeature(format!(
+            "extended-const i32 expression left {} values on the stack \
+             (expected 1)",
+            stack.len()
+        )));
+    }
+    Ok(stack[0])
+}
+
+fn fold_i32_binop(stack: &mut Vec<i32>, op: fn(i32, i32) -> i32) -> Result<()> {
+    let b = stack.pop().ok_or_else(|| {
+        Error::UnsupportedFeature("i32 extended-const binop with empty stack".to_string())
+    })?;
+    let a = stack.pop().ok_or_else(|| {
+        Error::UnsupportedFeature("i32 extended-const binop with single operand".to_string())
+    })?;
+    stack.push(op(a, b));
+    Ok(())
+}
+
+/// i64 counterpart to `fold_extended_const_i32`.
+pub(crate) fn fold_extended_const_i64(
+    ops: &mut wasmparser::OperatorsReader<'_>,
+    initial: i64,
+) -> Result<i64> {
+    let mut stack: Vec<i64> = vec![initial];
+    loop {
+        let op = ops.read()?;
+        match op {
+            Operator::End => break,
+            Operator::I64Const { value } => stack.push(value),
+            Operator::I64Add => fold_i64_binop(&mut stack, i64::wrapping_add)?,
+            Operator::I64Sub => fold_i64_binop(&mut stack, i64::wrapping_sub)?,
+            Operator::I64Mul => fold_i64_binop(&mut stack, i64::wrapping_mul)?,
+            other => {
+                return Err(Error::UnsupportedFeature(format!(
+                    "unsupported i64 extended-const operator: {other:?}"
+                )));
+            }
+        }
+    }
+    if stack.len() != 1 {
+        return Err(Error::UnsupportedFeature(format!(
+            "extended-const i64 expression left {} values on the stack \
+             (expected 1)",
+            stack.len()
+        )));
+    }
+    Ok(stack[0])
+}
+
+fn fold_i64_binop(stack: &mut Vec<i64>, op: fn(i64, i64) -> i64) -> Result<()> {
+    let b = stack.pop().ok_or_else(|| {
+        Error::UnsupportedFeature("i64 extended-const binop with empty stack".to_string())
+    })?;
+    let a = stack.pop().ok_or_else(|| {
+        Error::UnsupportedFeature("i64 extended-const binop with single operand".to_string())
+    })?;
+    stack.push(op(a, b));
+    Ok(())
+}
+
 fn parse_const_expr_with_value(
     expr: &wasmparser::ConstExpr<'_>,
 ) -> Result<(ParsedConstExpr, Option<ConstExprValue>)> {
     let mut ops = expr.get_operators_reader();
 
-    // Read the first (and usually only) operator
+    // Read the first operator. For an i32 / i64 const, the expression may
+    // continue with extended-const ops (i32.add / i32.sub / i32.mul and
+    // their i64 counterparts) per the WebAssembly 2.0 extended-const
+    // proposal. Fold those into a single value via `fold_extended_const_*`
+    // so downstream consumers see the semantically correct initializer.
+    //
+    // LS-A-11 — silent extended-const truncation: prior versions returned
+    // only the first const and dropped the remaining operators, producing
+    // a global / data / element offset that differed from the source.
     let op = ops.read()?;
 
     let (const_expr, value) = match op {
-        Operator::I32Const { value } => (
-            ParsedConstExpr::I32Const(value),
-            Some(ConstExprValue::I32(value)),
-        ),
-        Operator::I64Const { value } => (
-            ParsedConstExpr::I64Const(value),
-            Some(ConstExprValue::I64(value)),
-        ),
+        Operator::I32Const { value } => {
+            let folded = fold_extended_const_i32(&mut ops, value)?;
+            (
+                ParsedConstExpr::I32Const(folded),
+                Some(ConstExprValue::I32(folded)),
+            )
+        }
+        Operator::I64Const { value } => {
+            let folded = fold_extended_const_i64(&mut ops, value)?;
+            (
+                ParsedConstExpr::I64Const(folded),
+                Some(ConstExprValue::I64(folded)),
+            )
+        }
         Operator::F32Const { value } => (
             ParsedConstExpr::F32Const(f32::from_bits(value.bits())),
             None,
@@ -460,7 +643,14 @@ fn rebase_const_expr_value(value: ConstExprValue, base: u64) -> Result<ConstExpr
 }
 
 /// Convert a reindexed element segment to wasm_encoder format for encoding
-pub fn encode_element_segment(segment: &ReindexedElementSegment) -> ElementSegment<'_> {
+/// Encode a reindexed element segment into the given element section.
+///
+/// Takes a `&mut ElementSection` rather than returning an `ElementSegment`
+/// because the `Expressions` arm now holds structured [`ParsedConstExpr`]
+/// values that must be encoded into a temporary `Vec<ConstExpr>` here; that
+/// temporary would not outlive a returned borrowing `ElementSegment`, so the
+/// segment is pushed directly while the temporary is still live.
+pub fn encode_element_segment(section: &mut ElementSection, segment: &ReindexedElementSegment) {
     let mode = match &segment.mode {
         ElementSegmentMode::Active {
             table_index,
@@ -473,14 +663,22 @@ pub fn encode_element_segment(segment: &ReindexedElementSegment) -> ElementSegme
         ElementSegmentMode::Declared => ElementMode::Declared,
     };
 
-    let elements = match &segment.items {
-        ReindexedElementItems::Functions(funcs) => Elements::Functions(funcs.as_slice().into()),
-        ReindexedElementItems::Expressions(exprs) => {
-            Elements::Expressions(segment.element_type, exprs.as_slice().into())
+    match &segment.items {
+        ReindexedElementItems::Functions(funcs) => {
+            section.segment(ElementSegment {
+                mode,
+                elements: Elements::Functions(funcs.as_slice().into()),
+            });
         }
-    };
-
-    ElementSegment { mode, elements }
+        ReindexedElementItems::Expressions(exprs) => {
+            // Encode the structured form at the last possible moment.
+            let encoded: Vec<ConstExpr> = exprs.iter().map(|e| e.to_const_expr()).collect();
+            section.segment(ElementSegment {
+                mode,
+                elements: Elements::Expressions(segment.element_type, encoded.as_slice().into()),
+            });
+        }
+    }
 }
 
 /// Convert a reindexed data segment to wasm_encoder format for encoding
@@ -757,8 +955,10 @@ mod tests {
         assert_eq!(exprs.len(), 1, "should have exactly one expression");
 
         // Encode both the actual and expected ConstExpr to compare bytes.
+        // `Expressions` now holds structured `ParsedConstExpr`; encode it the
+        // same way `encode_element_segment` does (deferred `to_const_expr`).
         let mut actual = Vec::new();
-        exprs[0].encode(&mut actual);
+        exprs[0].to_const_expr().encode(&mut actual);
 
         let mut expected = Vec::new();
         ConstExpr::ref_null(wasm_encoder::HeapType::Concrete(4)).encode(&mut expected);
@@ -767,5 +967,197 @@ mod tests {
             actual, expected,
             "concrete type index should be remapped from 0 to 4"
         );
+    }
+
+    /// Regression for the element-segment ref-type collapse: reindexing a
+    /// segment whose element type is a CONCRETE typed reference `(ref null
+    /// $t)` must preserve the concrete heap type and remap its index — not
+    /// collapse it to externref (the prior bug dropped the type entirely).
+    #[test]
+    fn test_reindex_element_segment_preserves_and_remaps_concrete_element_type() {
+        let segment = ParsedElementSegment {
+            mode: ParsedElementSegmentMode::Passive,
+            element_type: RefType {
+                nullable: true,
+                heap_type: wasm_encoder::HeapType::Concrete(0),
+            },
+            items: ElementItems_::Expressions(vec![ParsedConstExpr::RefFunc(0)]),
+        };
+        let mut maps = IndexMaps::new();
+        maps.types.insert(0, 4);
+
+        let reindexed = reindex_element_segment(&segment, &maps);
+        assert_eq!(
+            reindexed.element_type,
+            RefType {
+                nullable: true,
+                heap_type: wasm_encoder::HeapType::Concrete(4),
+            },
+            "concrete element type must be preserved and its index remapped 0->4, \
+             not collapsed to externref"
+        );
+    }
+
+    /// End-to-end regression (the discovery-pass PoC): a core module with a
+    /// concrete typed-ref element segment `(elem (ref null 0) (ref.func 0))`
+    /// must survive parse -> reindex -> encode and still VALIDATE. Before the
+    /// fix the segment was re-typed externref while its items stayed funcref,
+    /// so the re-emitted module was rejected ("type mismatch: expected
+    /// externref, found (ref $type)").
+    #[test]
+    fn test_typed_ref_element_segment_roundtrips_and_validates() {
+        let src = r#"(module (type (func)) (func) (elem (ref null 0) (ref.func 0)))"#;
+        let module_bytes = wat::parse_str(src).expect("wat compiles");
+
+        // Locate the element section payload range.
+        let mut elem_range = None;
+        for payload in wasmparser::Parser::new(0).parse_all(&module_bytes) {
+            if let wasmparser::Payload::ElementSection(reader) = payload.expect("payload") {
+                elem_range = Some((reader.range().start, reader.range().end));
+            }
+        }
+        let elem_range = elem_range.expect("module has an element section");
+
+        let module = crate::parser::CoreModule {
+            index: 0,
+            bytes: module_bytes.clone(),
+            types: Vec::new(),
+            imports: Vec::new(),
+            exports: Vec::new(),
+            functions: Vec::new(),
+            memories: Vec::new(),
+            tables: Vec::new(),
+            globals: Vec::new(),
+            start: None,
+            data_count: None,
+            element_count: 1,
+            custom_sections: Vec::new(),
+            code_section_range: None,
+            global_section_range: None,
+            element_section_range: Some(elem_range),
+            data_section_range: None,
+        };
+
+        let parsed = parse_element_segments(&module).expect("parse element segments");
+        assert_eq!(parsed.len(), 1);
+        assert!(
+            matches!(
+                parsed[0].element_type.heap_type,
+                wasm_encoder::HeapType::Concrete(_)
+            ),
+            "parsed element type must stay a concrete typed ref, got {:?}",
+            parsed[0].element_type
+        );
+
+        // Reindex with identity maps (single module), re-encode the segment
+        // into a fresh module, and validate it.
+        let maps = IndexMaps::new();
+        let reindexed = reindex_element_segment(&parsed[0], &maps);
+
+        let mut types = wasm_encoder::TypeSection::new();
+        types.ty().function([], []);
+        let mut funcs = wasm_encoder::FunctionSection::new();
+        funcs.function(0);
+        let mut elems = wasm_encoder::ElementSection::new();
+        encode_element_segment(&mut elems, &reindexed);
+        let mut code = wasm_encoder::CodeSection::new();
+        let mut f = wasm_encoder::Function::new([]);
+        f.instruction(&wasm_encoder::Instruction::End);
+        code.function(&f);
+
+        let mut out = wasm_encoder::Module::new();
+        out.section(&types);
+        out.section(&funcs);
+        out.section(&elems);
+        out.section(&code);
+        let out_bytes = out.finish();
+
+        wasmparser::Validator::new()
+            .validate_all(&out_bytes)
+            .expect("re-encoded module with a typed-ref element segment must validate");
+    }
+
+    // ---------------------------------------------------------------
+    // LS-A-11 — extended-const truncation
+    //
+    // Prior to this fix, `parse_const_expr_with_value` read only the
+    // first operator and silently dropped the rest. Any wasm 2.0
+    // extended-const expression — e.g. `(i32.const 5)(i32.const 10)
+    // i32.add` — parsed as `i32.const 5` (value 5), producing data /
+    // element segment offsets at the wrong addresses.
+    // ---------------------------------------------------------------
+
+    /// Build a minimal active-data section with one segment whose offset
+    /// is an extended-const expression `(i32.const a)(i32.const b)(op)`,
+    /// then run parse_const_expr_with_value on it and return the
+    /// computed offset value.
+    fn parse_i32_extended_offset(a: i32, b: i32, opcode: u8) -> i32 {
+        let body: Vec<u8> = vec![
+            0x01, // segment count = 1
+            0x00, // flags = active mem 0
+            0x41, a as u8, // i32.const a
+            0x41, b as u8, // i32.const b
+            opcode,  // i32.add / sub / mul
+            0x0B,    // end
+            0x00,    // data count = 0
+        ];
+
+        let br = wasmparser::BinaryReader::new(&body, 0);
+        let reader = wasmparser::DataSectionReader::new(br).unwrap();
+        let mut value: Option<i32> = None;
+        for d in reader {
+            let d = d.unwrap();
+            if let wasmparser::DataKind::Active { offset_expr, .. } = d.kind {
+                let (_pce, v) = parse_const_expr_with_value(&offset_expr).unwrap();
+                if let Some(ConstExprValue::I32(n)) = v {
+                    value = Some(n);
+                }
+            }
+        }
+        value.expect("offset value present")
+    }
+
+    #[test]
+    fn ls_a_11_extended_const_i32_add_is_folded() {
+        // (i32.const 5)(i32.const 10) i32.add  →  15
+        assert_eq!(parse_i32_extended_offset(5, 10, 0x6A), 15);
+    }
+
+    #[test]
+    fn ls_a_11_extended_const_i32_sub_is_folded() {
+        // (i32.const 20)(i32.const 7) i32.sub  →  13
+        assert_eq!(parse_i32_extended_offset(20, 7, 0x6B), 13);
+    }
+
+    #[test]
+    fn ls_a_11_extended_const_i32_mul_is_folded() {
+        // (i32.const 6)(i32.const 7) i32.mul  →  42
+        assert_eq!(parse_i32_extended_offset(6, 7, 0x6C), 42);
+    }
+
+    #[test]
+    fn ls_a_11_single_const_still_works() {
+        // Plain `(i32.const 42) end` — no extended-const ops, must still
+        // round-trip as before. (42 fits in single-byte sleb128; 99 would
+        // need a 2-byte encoding due to sign-bit at position 6.)
+        let body: Vec<u8> = vec![
+            0x01, // segment count = 1
+            0x00, // flags = active mem 0
+            0x41, 42,   // i32.const 42
+            0x0B, // end
+            0x00, // data count = 0
+        ];
+        let br = wasmparser::BinaryReader::new(&body, 0);
+        let reader = wasmparser::DataSectionReader::new(br).unwrap();
+        for d in reader {
+            let d = d.unwrap();
+            if let wasmparser::DataKind::Active { offset_expr, .. } = d.kind {
+                let (_pce, v) = parse_const_expr_with_value(&offset_expr).unwrap();
+                assert!(
+                    matches!(v, Some(ConstExprValue::I32(42))),
+                    "expected Some(I32(42)), got {v:?}",
+                );
+            }
+        }
     }
 }

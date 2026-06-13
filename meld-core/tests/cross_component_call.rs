@@ -120,6 +120,7 @@ fn test_cross_module_call() {
     let config = FuserConfig {
         memory_strategy: MemoryStrategy::SharedMemory,
         attestation: false,
+        component_provenance: false,
         ..Default::default()
     };
 
@@ -156,6 +157,7 @@ fn test_cross_module_call_with_different_args() {
     let config = FuserConfig {
         memory_strategy: MemoryStrategy::SharedMemory,
         attestation: false,
+        component_provenance: false,
         ..Default::default()
     };
 
@@ -300,6 +302,7 @@ fn test_unresolved_import_index_offset() {
     let config = FuserConfig {
         memory_strategy: MemoryStrategy::MultiMemory,
         attestation: false,
+        component_provenance: false,
         ..Default::default()
     };
 

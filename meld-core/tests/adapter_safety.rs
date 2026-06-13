@@ -276,6 +276,13 @@ fn build_callee_string_component() -> Vec<u8> {
 ///   - Exports `run() -> i32` which calls process-string(0, 5)
 ///   - Exports `cabi_realloc` (needed for result copy if any)
 fn build_caller_string_component() -> Vec<u8> {
+    // Default caller passes ASCII "Hello"; the data-parameterized helper
+    // lets transcoding tests vary the source string (e.g. non-BMP code
+    // points that force UTF-16 surrogate pairs — SR-17).
+    build_caller_string_component_data(b"Hello")
+}
+
+fn build_caller_string_component_data(string_bytes: &[u8]) -> Vec<u8> {
     let core_module = {
         let mut types = TypeSection::new();
         // type 0: (i32, i32) -> i32  -- imported process-string
@@ -339,7 +346,7 @@ fn build_caller_string_component() -> Vec<u8> {
         {
             let mut f = Function::new([]);
             f.instruction(&Instruction::I32Const(0)); // ptr
-            f.instruction(&Instruction::I32Const(5)); // len
+            f.instruction(&Instruction::I32Const(string_bytes.len() as i32)); // byte len
             f.instruction(&Instruction::Call(0)); // process-string (import)
             f.instruction(&Instruction::End);
             code.function(&f);
@@ -359,7 +366,7 @@ fn build_caller_string_component() -> Vec<u8> {
                 memory_index: 0,
                 offset: &ConstExpr::i32_const(0),
             },
-            data: b"Hello".to_vec(),
+            data: string_bytes.to_vec(),
         });
 
         let mut module = Module::new();
@@ -424,10 +431,13 @@ fn test_sr12_adapter_generation_for_string_param() {
     let config = FuserConfig {
         memory_strategy: MemoryStrategy::MultiMemory,
         attestation: false,
+        component_provenance: false,
         address_rebasing: false,
         preserve_names: false,
         custom_sections: meld_core::CustomSectionHandling::Drop,
+        dwarf_handling: meld_core::DwarfHandling::Strip,
         output_format: meld_core::OutputFormat::CoreModule,
+        opaque_resources: Vec::new(),
     };
 
     let mut fuser = Fuser::new(config);
@@ -809,10 +819,13 @@ fn test_sr13_cabi_realloc_targets_correct_memory() {
     let config = FuserConfig {
         memory_strategy: MemoryStrategy::MultiMemory,
         attestation: false,
+        component_provenance: false,
         address_rebasing: false,
         preserve_names: false,
         custom_sections: meld_core::CustomSectionHandling::Drop,
+        dwarf_handling: meld_core::DwarfHandling::Strip,
         output_format: meld_core::OutputFormat::CoreModule,
+        opaque_resources: Vec::new(),
     };
 
     let mut fuser = Fuser::new(config);
@@ -1222,10 +1235,13 @@ fn test_sr15_list_copy_length() {
     let config = FuserConfig {
         memory_strategy: MemoryStrategy::MultiMemory,
         attestation: false,
+        component_provenance: false,
         address_rebasing: false,
         preserve_names: false,
         custom_sections: meld_core::CustomSectionHandling::Drop,
+        dwarf_handling: meld_core::DwarfHandling::Strip,
         output_format: meld_core::OutputFormat::CoreModule,
+        opaque_resources: Vec::new(),
     };
 
     let mut fuser = Fuser::new(config);
@@ -1715,10 +1731,13 @@ fn test_sr16_inner_pointer_fixup_list_string() {
     let config = FuserConfig {
         memory_strategy: MemoryStrategy::MultiMemory,
         attestation: false,
+        component_provenance: false,
         address_rebasing: false,
         preserve_names: false,
         custom_sections: meld_core::CustomSectionHandling::Drop,
+        dwarf_handling: meld_core::DwarfHandling::Strip,
         output_format: meld_core::OutputFormat::CoreModule,
+        opaque_resources: Vec::new(),
     };
 
     let mut fuser = Fuser::new(config);
@@ -1782,6 +1801,17 @@ fn test_sr16_inner_pointer_fixup_list_string() {
 /// Core function: sum_utf16(ptr: i32, len: i32) -> i32
 ///   Sums all UTF-16 code units as u16 values: total += load16u(ptr + i*2)
 fn build_callee_utf16_string_component() -> Vec<u8> {
+    build_callee_codeunit_summing_component(CanonicalOption::UTF16)
+}
+
+/// A code-unit-summing callee parameterized on the `canon lift` string
+/// encoding. With `UTF16` it is the UTF-16 callee used by the SR-17 tests;
+/// with `CompactUTF16` (which meld maps to `Latin1`) it produces a
+/// Latin1-lifting callee. The latter, paired with a UTF-16-lowering caller,
+/// drives the still-unsupported (Utf16, Latin1) down-conversion onto the
+/// #253 fail-loud catch-all (fusion errors before any code runs, so the
+/// core body's 16-bit reads are never executed for that case).
+fn build_callee_codeunit_summing_component(lift_encoding: CanonicalOption) -> Vec<u8> {
     let core_module = {
         let mut types = TypeSection::new();
         // type 0: (i32, i32, i32, i32) -> i32 -- cabi_realloc
@@ -1952,15 +1982,15 @@ fn build_callee_utf16_string_component() -> Vec<u8> {
         component.section(&aliases);
     }
 
-    // 5. Canon lift with **UTF-16** encoding
-    //    Core func 1 expects UTF-16 data: (ptr, code_unit_count) -> sum
+    // 5. Canon lift with the parameterized encoding.
+    //    Core func 1 expects (ptr, code_unit_count) -> sum.
     {
         let mut canon = CanonicalFunctionSection::new();
         canon.lift(
             1, // core func index: process-string
             0, // component type index
             [
-                CanonicalOption::UTF16, // <-- UTF-16 encoding
+                lift_encoding, // <-- parameterized string encoding
                 CanonicalOption::Memory(0),
                 CanonicalOption::Realloc(0),
             ],
@@ -2001,10 +2031,13 @@ fn test_sr17_utf8_to_utf16_string_transcoding() {
     let config = FuserConfig {
         memory_strategy: MemoryStrategy::MultiMemory,
         attestation: false,
+        component_provenance: false,
         address_rebasing: false,
         preserve_names: false,
         custom_sections: meld_core::CustomSectionHandling::Drop,
+        dwarf_handling: meld_core::DwarfHandling::Strip,
         output_format: meld_core::OutputFormat::CoreModule,
+        opaque_resources: Vec::new(),
     };
 
     let mut fuser = Fuser::new(config);
@@ -2054,5 +2087,1086 @@ fn test_sr17_utf8_to_utf16_string_transcoding() {
     assert_eq!(
         result, 500,
         "SR-17: run() should return 500 (sum of UTF-16 code units for 'Hello')"
+    );
+}
+
+/// SR-17 (surrogate-pair clause): a supplementary-plane code point
+/// (U+10000 and above) transcoded UTF-8 → UTF-16 must be encoded as a
+/// surrogate PAIR — two code units — not a single truncated unit. The
+/// pre-existing SR-17 transcoding test only exercised ASCII (1 UTF-8
+/// byte → 1 BMP code unit), leaving the `code_point >= 0x10000` branch
+/// of `emit_utf8_to_utf16_transcode` (fact.rs) unexecuted. The
+/// v0.31.0 traceability audit flagged this as SR-17's one open
+/// requirement-text verification gap; this fixture closes it.
+///
+/// Oracle: U+1F600 (😀) is UTF-8 `F0 9F 98 80` (4 bytes). The canonical
+/// surrogate decomposition is:
+///   cp - 0x10000 = 0xF600
+///   high = 0xD800 + (0xF600 >> 10)   = 0xD800 + 0x3D  = 0xD83D
+///   low  = 0xDC00 + (0xF600 & 0x3FF) = 0xDC00 + 0x200 = 0xDE00
+/// The callee sums the received UTF-16 code units, so a correct
+/// surrogate pair yields 0xD83D + 0xDE00 = 55357 + 56832 = 112189.
+/// A buggy single-unit or truncated encoding cannot produce this sum.
+#[test]
+fn test_sr17_utf8_to_utf16_supplementary_plane_transcoding() {
+    let callee = build_callee_utf16_string_component();
+    // "A😀": one BMP code point then one supplementary, to also prove
+    // the dst-cursor advances by 1 then 2 and the units interleave.
+    //   'A'  = 0x0041 (1 UTF-8 byte, 1 code unit)
+    //   '😀' = U+1F600 → D83D DE00 (4 UTF-8 bytes, 2 code units)
+    // Sum = 0x0041 + 0xD83D + 0xDE00 = 65 + 55357 + 56832 = 112254.
+    let caller = build_caller_string_component_data(&[0x41, 0xF0, 0x9F, 0x98, 0x80]);
+
+    let config = FuserConfig {
+        memory_strategy: MemoryStrategy::MultiMemory,
+        attestation: false,
+        component_provenance: false,
+        address_rebasing: false,
+        preserve_names: false,
+        custom_sections: meld_core::CustomSectionHandling::Drop,
+        dwarf_handling: meld_core::DwarfHandling::Strip,
+        output_format: meld_core::OutputFormat::CoreModule,
+        opaque_resources: Vec::new(),
+    };
+
+    let mut fuser = Fuser::new(config);
+    fuser
+        .add_component_named(&callee, Some("callee-utf16"))
+        .expect("callee component should parse");
+    fuser
+        .add_component_named(&caller, Some("caller-utf8"))
+        .expect("caller component should parse");
+
+    let (fused, stats) = fuser.fuse_with_stats().expect("fusion should succeed");
+    assert!(
+        stats.adapter_functions > 0,
+        "SR-17: expected a transcoding adapter, got 0"
+    );
+
+    let mut validator = wasmparser::Validator::new();
+    validator
+        .validate_all(&fused)
+        .expect("SR-17: fused output should validate");
+
+    let mut engine_config = Config::new();
+    engine_config.wasm_multi_memory(true);
+    let engine = Engine::new(&engine_config).unwrap();
+    let module = RuntimeModule::new(&engine, &fused).unwrap();
+    let mut store = Store::new(&engine, ());
+    let instance = Instance::new(&mut store, &module, &[]).unwrap();
+
+    let run = instance
+        .get_typed_func::<(), i32>(&mut store, "run")
+        .expect("SR-17: fused module should export 'run'");
+    let result = run.call(&mut store, ()).unwrap();
+
+    assert_eq!(
+        result, 112254,
+        "SR-17: 'A😀' must transcode to UTF-16 code units \
+         [0x0041, 0xD83D, 0xDE00] (surrogate pair for U+1F600); \
+         sum 112254. A wrong sum means the supplementary-plane branch \
+         mis-encodes the surrogate pair."
+    );
+}
+
+/// A caller component whose import is lowered with **UTF-16** encoding, so
+/// the resolver attributes `caller_encoding = UTF16`. Paired with the
+/// UTF-8 byte-summing callee (`build_callee_string_component`), this drives
+/// meld to emit the *reverse* transcoder (`emit_utf16_to_utf8_transcode`).
+///
+/// A string `canon lower` requires a core memory + realloc, which cycles
+/// with the caller module importing the lowered function. We break the
+/// cycle with a tiny memory/realloc helper module instantiated first; the
+/// lower references the helper's memory purely so the component parses,
+/// and meld reads the lower only as encoding metadata while fusing the
+/// real caller module by its core imports.
+///
+/// `code_units` are stored little-endian at offset 0 of the caller's
+/// memory, and `run` calls `process-string(0, code_units.len())` — the
+/// length is a UTF-16 code-unit count, per the canonical ABI.
+fn build_caller_utf16_lowering_component(code_units: &[u16]) -> Vec<u8> {
+    build_caller_lowering_component(code_units, CanonicalOption::UTF16)
+}
+
+/// Like `build_caller_utf16_lowering_component` but parameterized on the
+/// `canon lower` string encoding, so tests can drive other caller-side
+/// encodings (e.g. CompactUTF16 → Latin1) through the resolver.
+fn build_caller_lowering_component(code_units: &[u16], lower_encoding: CanonicalOption) -> Vec<u8> {
+    let mut data_bytes = Vec::new();
+    for cu in code_units {
+        data_bytes.extend_from_slice(&cu.to_le_bytes());
+    }
+    let code_unit_count = code_units.len() as i32;
+
+    let core_module = {
+        let mut types = TypeSection::new();
+        types.ty().function(
+            [wasm_encoder::ValType::I32, wasm_encoder::ValType::I32],
+            [wasm_encoder::ValType::I32],
+        );
+        types.ty().function([], [wasm_encoder::ValType::I32]);
+        types.ty().function(
+            [
+                wasm_encoder::ValType::I32,
+                wasm_encoder::ValType::I32,
+                wasm_encoder::ValType::I32,
+                wasm_encoder::ValType::I32,
+            ],
+            [wasm_encoder::ValType::I32],
+        );
+
+        let mut imports = ImportSection::new();
+        imports.import(
+            "test:api/api",
+            "process-string",
+            wasm_encoder::EntityType::Function(0),
+        );
+
+        let mut functions = FunctionSection::new();
+        functions.function(1); // run
+        functions.function(2); // cabi_realloc
+
+        let mut memory = MemorySection::new();
+        memory.memory(MemoryType {
+            minimum: 1,
+            maximum: None,
+            memory64: false,
+            shared: false,
+            page_size_log2: None,
+        });
+
+        let mut globals = GlobalSection::new();
+        globals.global(
+            GlobalType {
+                val_type: wasm_encoder::ValType::I32,
+                mutable: true,
+                shared: false,
+            },
+            &ConstExpr::i32_const(1024),
+        );
+
+        let mut exports = ExportSection::new();
+        exports.export("run", ExportKind::Func, 1);
+        exports.export("cabi_realloc", ExportKind::Func, 2);
+        exports.export("memory", ExportKind::Memory, 0);
+
+        let mut code = CodeSection::new();
+        {
+            let mut f = Function::new([]);
+            f.instruction(&Instruction::I32Const(0)); // ptr
+            f.instruction(&Instruction::I32Const(code_unit_count)); // UTF-16 code-unit count
+            f.instruction(&Instruction::Call(0)); // process-string (import)
+            f.instruction(&Instruction::End);
+            code.function(&f);
+        }
+        {
+            let mut f = Function::new([]);
+            emit_cabi_realloc(&mut f, 0);
+            code.function(&f);
+        }
+
+        let mut data = DataSection::new();
+        data.segment(DataSegment {
+            mode: DataSegmentMode::Active {
+                memory_index: 0,
+                offset: &ConstExpr::i32_const(0),
+            },
+            data: data_bytes,
+        });
+
+        let mut module = Module::new();
+        module
+            .section(&types)
+            .section(&imports)
+            .section(&functions)
+            .section(&memory)
+            .section(&globals)
+            .section(&exports)
+            .section(&code)
+            .section(&data);
+        module
+    };
+
+    // Helper module providing a memory + realloc for the string lower to
+    // reference (distinct export names so it is not a third "cabi_realloc"
+    // in the fused output's namespace).
+    let mem_provider = {
+        let mut types = TypeSection::new();
+        types.ty().function(
+            [
+                wasm_encoder::ValType::I32,
+                wasm_encoder::ValType::I32,
+                wasm_encoder::ValType::I32,
+                wasm_encoder::ValType::I32,
+            ],
+            [wasm_encoder::ValType::I32],
+        );
+        let mut functions = FunctionSection::new();
+        functions.function(0);
+        let mut memory = MemorySection::new();
+        memory.memory(MemoryType {
+            minimum: 1,
+            maximum: None,
+            memory64: false,
+            shared: false,
+            page_size_log2: None,
+        });
+        let mut globals = GlobalSection::new();
+        globals.global(
+            GlobalType {
+                val_type: wasm_encoder::ValType::I32,
+                mutable: true,
+                shared: false,
+            },
+            &ConstExpr::i32_const(1024),
+        );
+        let mut exports = ExportSection::new();
+        exports.export("mp_realloc", ExportKind::Func, 0);
+        exports.export("mp_memory", ExportKind::Memory, 0);
+        let mut code = CodeSection::new();
+        {
+            let mut f = Function::new([]);
+            emit_cabi_realloc(&mut f, 0);
+            code.function(&f);
+        }
+        let mut module = Module::new();
+        module
+            .section(&types)
+            .section(&functions)
+            .section(&memory)
+            .section(&globals)
+            .section(&exports)
+            .section(&code);
+        module
+    };
+
+    let mut component = Component::new();
+
+    {
+        let mut types = ComponentTypeSection::new();
+        types
+            .function()
+            .params([(
+                "s",
+                wasm_encoder::ComponentValType::Primitive(wasm_encoder::PrimitiveValType::String),
+            )])
+            .result(Some(wasm_encoder::ComponentValType::Primitive(
+                wasm_encoder::PrimitiveValType::U32,
+            )));
+        component.section(&types);
+    }
+    {
+        let mut imports = ComponentImportSection::new();
+        imports.import("test:api/api", ComponentTypeRef::Func(0));
+        component.section(&imports);
+    }
+
+    component.section(&ModuleSection(&mem_provider));
+    {
+        let mut inst = InstanceSection::new();
+        let no_args: Vec<(&str, ModuleArg)> = vec![];
+        inst.instantiate(0, no_args);
+        component.section(&inst);
+    }
+    {
+        let mut aliases = ComponentAliasSection::new();
+        aliases.alias(Alias::CoreInstanceExport {
+            instance: 0,
+            kind: ExportKind::Func,
+            name: "mp_realloc",
+        });
+        component.section(&aliases);
+    }
+    {
+        let mut aliases = ComponentAliasSection::new();
+        aliases.alias(Alias::CoreInstanceExport {
+            instance: 0,
+            kind: ExportKind::Memory,
+            name: "mp_memory",
+        });
+        component.section(&aliases);
+    }
+    {
+        let mut canon = CanonicalFunctionSection::new();
+        canon.lower(
+            0,
+            [
+                lower_encoding,
+                CanonicalOption::Memory(0),
+                CanonicalOption::Realloc(0),
+            ],
+        );
+        component.section(&canon);
+    }
+
+    component.section(&ModuleSection(&core_module));
+    component.finish()
+}
+
+/// A Latin-1 caller: like [`build_caller_lowering_component`] but stores the
+/// raw input as **1 byte per character** (Latin-1's on-the-wire form) and
+/// passes `process-string(0, bytes.len())` — for Latin-1 the byte count IS
+/// the character count. The import is lowered with `CompactUTF16`, which meld
+/// maps to the `Latin1` string encoding, so this drives the resolver to the
+/// (Latin1, Utf16) transcoder when paired with a UTF-16 callee.
+///
+/// This is distinct from `build_caller_lowering_component`, which stores 2
+/// bytes per `u16` (correct for UTF-16/CompactUTF16-as-2-byte fixtures but
+/// WRONG for Latin-1, where each char is a single byte).
+fn build_caller_latin1_lowering_component(bytes: &[u8]) -> Vec<u8> {
+    let data_bytes: Vec<u8> = bytes.to_vec();
+    let byte_count = bytes.len() as i32;
+
+    let core_module = {
+        let mut types = TypeSection::new();
+        types.ty().function(
+            [wasm_encoder::ValType::I32, wasm_encoder::ValType::I32],
+            [wasm_encoder::ValType::I32],
+        );
+        types.ty().function([], [wasm_encoder::ValType::I32]);
+        types.ty().function(
+            [
+                wasm_encoder::ValType::I32,
+                wasm_encoder::ValType::I32,
+                wasm_encoder::ValType::I32,
+                wasm_encoder::ValType::I32,
+            ],
+            [wasm_encoder::ValType::I32],
+        );
+
+        let mut imports = ImportSection::new();
+        imports.import(
+            "test:api/api",
+            "process-string",
+            wasm_encoder::EntityType::Function(0),
+        );
+
+        let mut functions = FunctionSection::new();
+        functions.function(1); // run
+        functions.function(2); // cabi_realloc
+
+        let mut memory = MemorySection::new();
+        memory.memory(MemoryType {
+            minimum: 1,
+            maximum: None,
+            memory64: false,
+            shared: false,
+            page_size_log2: None,
+        });
+
+        let mut globals = GlobalSection::new();
+        globals.global(
+            GlobalType {
+                val_type: wasm_encoder::ValType::I32,
+                mutable: true,
+                shared: false,
+            },
+            &ConstExpr::i32_const(1024),
+        );
+
+        let mut exports = ExportSection::new();
+        exports.export("run", ExportKind::Func, 1);
+        exports.export("cabi_realloc", ExportKind::Func, 2);
+        exports.export("memory", ExportKind::Memory, 0);
+
+        let mut code = CodeSection::new();
+        {
+            let mut f = Function::new([]);
+            f.instruction(&Instruction::I32Const(0)); // ptr
+            f.instruction(&Instruction::I32Const(byte_count)); // Latin-1 byte count == char count
+            f.instruction(&Instruction::Call(0)); // process-string (import)
+            f.instruction(&Instruction::End);
+            code.function(&f);
+        }
+        {
+            let mut f = Function::new([]);
+            emit_cabi_realloc(&mut f, 0);
+            code.function(&f);
+        }
+
+        let mut data = DataSection::new();
+        data.segment(DataSegment {
+            mode: DataSegmentMode::Active {
+                memory_index: 0,
+                offset: &ConstExpr::i32_const(0),
+            },
+            data: data_bytes,
+        });
+
+        let mut module = Module::new();
+        module
+            .section(&types)
+            .section(&imports)
+            .section(&functions)
+            .section(&memory)
+            .section(&globals)
+            .section(&exports)
+            .section(&code)
+            .section(&data);
+        module
+    };
+
+    // Helper module providing a memory + realloc for the string lower to
+    // reference (distinct export names, matching build_caller_lowering_component).
+    let mem_provider = {
+        let mut types = TypeSection::new();
+        types.ty().function(
+            [
+                wasm_encoder::ValType::I32,
+                wasm_encoder::ValType::I32,
+                wasm_encoder::ValType::I32,
+                wasm_encoder::ValType::I32,
+            ],
+            [wasm_encoder::ValType::I32],
+        );
+        let mut functions = FunctionSection::new();
+        functions.function(0);
+        let mut memory = MemorySection::new();
+        memory.memory(MemoryType {
+            minimum: 1,
+            maximum: None,
+            memory64: false,
+            shared: false,
+            page_size_log2: None,
+        });
+        let mut globals = GlobalSection::new();
+        globals.global(
+            GlobalType {
+                val_type: wasm_encoder::ValType::I32,
+                mutable: true,
+                shared: false,
+            },
+            &ConstExpr::i32_const(1024),
+        );
+        let mut exports = ExportSection::new();
+        exports.export("mp_realloc", ExportKind::Func, 0);
+        exports.export("mp_memory", ExportKind::Memory, 0);
+        let mut code = CodeSection::new();
+        {
+            let mut f = Function::new([]);
+            emit_cabi_realloc(&mut f, 0);
+            code.function(&f);
+        }
+        let mut module = Module::new();
+        module
+            .section(&types)
+            .section(&functions)
+            .section(&memory)
+            .section(&globals)
+            .section(&exports)
+            .section(&code);
+        module
+    };
+
+    let mut component = Component::new();
+
+    {
+        let mut types = ComponentTypeSection::new();
+        types
+            .function()
+            .params([(
+                "s",
+                wasm_encoder::ComponentValType::Primitive(wasm_encoder::PrimitiveValType::String),
+            )])
+            .result(Some(wasm_encoder::ComponentValType::Primitive(
+                wasm_encoder::PrimitiveValType::U32,
+            )));
+        component.section(&types);
+    }
+    {
+        let mut imports = ComponentImportSection::new();
+        imports.import("test:api/api", ComponentTypeRef::Func(0));
+        component.section(&imports);
+    }
+
+    component.section(&ModuleSection(&mem_provider));
+    {
+        let mut inst = InstanceSection::new();
+        let no_args: Vec<(&str, ModuleArg)> = vec![];
+        inst.instantiate(0, no_args);
+        component.section(&inst);
+    }
+    {
+        let mut aliases = ComponentAliasSection::new();
+        aliases.alias(Alias::CoreInstanceExport {
+            instance: 0,
+            kind: ExportKind::Func,
+            name: "mp_realloc",
+        });
+        component.section(&aliases);
+    }
+    {
+        let mut aliases = ComponentAliasSection::new();
+        aliases.alias(Alias::CoreInstanceExport {
+            instance: 0,
+            kind: ExportKind::Memory,
+            name: "mp_memory",
+        });
+        component.section(&aliases);
+    }
+    {
+        let mut canon = CanonicalFunctionSection::new();
+        canon.lower(
+            0,
+            [
+                // meld maps CompactUTF16 → Latin1.
+                CanonicalOption::CompactUTF16,
+                CanonicalOption::Memory(0),
+                CanonicalOption::Realloc(0),
+            ],
+        );
+        component.section(&canon);
+    }
+
+    component.section(&ModuleSection(&core_module));
+    component.finish()
+}
+
+/// SR-17 (reverse direction): a supplementary-plane code point carried
+/// UTF-16 → UTF-8 must decode the surrogate PAIR back to a single 4-byte
+/// UTF-8 sequence. The forward gap was closed in #244; this exercises
+/// `emit_utf16_to_utf8_transcode`'s surrogate-decode branch at runtime —
+/// previously only the resolver's *requirement* for this direction was
+/// unit-tested and lone-surrogate handling was structural (LS-P-16); the
+/// end-to-end non-BMP round-trip had no executing oracle.
+///
+/// This fixture also pins #245: its two-core-module caller is the exact
+/// shape that previously collided `cabi_realloc$1` in the fused output.
+///
+/// Oracle: "A😀" as UTF-16 code units [0x0041, 0xD83D, 0xDE00] must
+/// transcode to UTF-8 bytes [0x41, 0xF0, 0x9F, 0x98, 0x80] ('A' +
+/// U+1F600). The callee sums received UTF-8 bytes, so a correct
+/// surrogate-pair *decode* yields 65 + 240 + 159 + 152 + 128 = 744.
+#[test]
+fn test_sr17_utf16_to_utf8_supplementary_plane_transcoding() {
+    let callee = build_callee_string_component(); // UTF-8 lift, sums bytes
+    let caller = build_caller_utf16_lowering_component(&[0x0041, 0xD83D, 0xDE00]);
+
+    let config = FuserConfig {
+        memory_strategy: MemoryStrategy::MultiMemory,
+        attestation: false,
+        component_provenance: false,
+        address_rebasing: false,
+        preserve_names: false,
+        custom_sections: meld_core::CustomSectionHandling::Drop,
+        dwarf_handling: meld_core::DwarfHandling::Strip,
+        output_format: meld_core::OutputFormat::CoreModule,
+        opaque_resources: Vec::new(),
+    };
+
+    let mut fuser = Fuser::new(config);
+    fuser
+        .add_component_named(&callee, Some("callee-utf8"))
+        .expect("callee component should parse");
+    fuser
+        .add_component_named(&caller, Some("caller-utf16"))
+        .expect("caller component should parse");
+
+    let (fused, stats) = fuser.fuse_with_stats().expect("fusion should succeed");
+    eprintln!(
+        "SR-17 UTF-16->UTF-8: {} bytes, {} adapters, {} imports resolved",
+        stats.output_size, stats.adapter_functions, stats.imports_resolved,
+    );
+    assert!(
+        stats.adapter_functions > 0,
+        "SR-17 reverse: expected a UTF-16->UTF-8 transcoding adapter, got 0 \
+         (caller_encoding may not have been read as UTF-16)"
+    );
+
+    let mut validator = wasmparser::Validator::new();
+    validator
+        .validate_all(&fused)
+        .expect("SR-17 reverse: fused output should validate (also pins #245)");
+
+    let mut engine_config = Config::new();
+    engine_config.wasm_multi_memory(true);
+    let engine = Engine::new(&engine_config).unwrap();
+    let module = RuntimeModule::new(&engine, &fused).unwrap();
+    let mut store = Store::new(&engine, ());
+    let instance = Instance::new(&mut store, &module, &[]).unwrap();
+
+    let run = instance
+        .get_typed_func::<(), i32>(&mut store, "run")
+        .expect("SR-17 reverse: fused module should export 'run'");
+    let result = run.call(&mut store, ()).unwrap();
+
+    assert_eq!(
+        result, 744,
+        "SR-17 reverse: UTF-16 [0x0041, 0xD83D, 0xDE00] must decode the \
+         surrogate pair to UTF-8 [0x41, F0 9F 98 80] (sum 744). A wrong \
+         sum means the surrogate-decode branch of emit_utf16_to_utf8_transcode \
+         mis-handles the supplementary-plane code point."
+    );
+}
+
+/// LS-P-16 (runtime): a **lone high surrogate at end of input** must be
+/// lossily replaced with U+FFFD during UTF-16 → UTF-8 transcoding, not
+/// trapped (the pre-v0.11 behaviour) and not read past the buffer (the
+/// 2-byte OOB this scenario originally guarded). Until now LS-P-16 was
+/// covered only structurally; this is its first executing oracle, reusing
+/// the UTF-16-lowering caller landed with #246.
+///
+/// Input UTF-16 code units [0x0041, 0xD800]: 'A' then a high surrogate
+/// with no following low surrogate (it is the last unit). The transcoder
+/// must emit 'A' (0x41) then U+FFFD (UTF-8 `EF BF BD`). The callee sums
+/// received UTF-8 bytes: 0x41 + 0xEF + 0xBF + 0xBD = 65 + 239 + 191 + 189
+/// = 684. A trap or OOB read would not return 684.
+#[test]
+fn test_sr17_utf16_to_utf8_lone_high_surrogate_replacement() {
+    let callee = build_callee_string_component(); // UTF-8 lift, sums bytes
+    let caller = build_caller_utf16_lowering_component(&[0x0041, 0xD800]);
+
+    let config = FuserConfig {
+        memory_strategy: MemoryStrategy::MultiMemory,
+        attestation: false,
+        component_provenance: false,
+        address_rebasing: false,
+        preserve_names: false,
+        custom_sections: meld_core::CustomSectionHandling::Drop,
+        dwarf_handling: meld_core::DwarfHandling::Strip,
+        output_format: meld_core::OutputFormat::CoreModule,
+        opaque_resources: Vec::new(),
+    };
+
+    let mut fuser = Fuser::new(config);
+    fuser
+        .add_component_named(&callee, Some("callee-utf8"))
+        .expect("callee component should parse");
+    fuser
+        .add_component_named(&caller, Some("caller-utf16"))
+        .expect("caller component should parse");
+
+    let (fused, _stats) = fuser.fuse_with_stats().expect("fusion should succeed");
+
+    let mut validator = wasmparser::Validator::new();
+    validator
+        .validate_all(&fused)
+        .expect("LS-P-16: fused output should validate");
+
+    let mut engine_config = Config::new();
+    engine_config.wasm_multi_memory(true);
+    let engine = Engine::new(&engine_config).unwrap();
+    let module = RuntimeModule::new(&engine, &fused).unwrap();
+    let mut store = Store::new(&engine, ());
+    let instance = Instance::new(&mut store, &module, &[]).unwrap();
+
+    let run = instance
+        .get_typed_func::<(), i32>(&mut store, "run")
+        .expect("LS-P-16: fused module should export 'run'");
+    let result = run.call(&mut store, ()).unwrap();
+
+    assert_eq!(
+        result, 684,
+        "LS-P-16: a lone trailing high surrogate [.., 0xD800] must become \
+         U+FFFD (UTF-8 EF BF BD), so 'A' + U+FFFD sums to 684. A trap, OOB \
+         read, or a wrong replacement would not produce 684."
+    );
+}
+
+/// LS-P-16 (mid-string, runtime): a high surrogate NOT at end-of-input,
+/// followed by a unit that is **not** a low surrogate, is still a lone
+/// surrogate and must be replaced with U+FFFD — the second unit then
+/// reprocessed on its own. The v0.11 mitigation only handled the
+/// end-of-input case; the unvalidated-second-unit causal factor recorded
+/// in LS-P-16 stayed open until this fix. Before it, `[0xD800, 0x0041]`
+/// computed a garbage code point from `0x0041 - 0xDC00` (u32 underflow)
+/// and emitted wrong UTF-8 (observed run() == 500).
+///
+/// Input [0xD800, 0x0041]: lone high surrogate then 'A'. Correct output
+/// is U+FFFD (UTF-8 EF BF BD) then 'A' (0x41). The callee sums received
+/// UTF-8 bytes: 0xEF + 0xBF + 0xBD + 0x41 = 239 + 191 + 189 + 65 = 684.
+#[test]
+fn test_sr17_utf16_to_utf8_midstring_lone_surrogate_replacement() {
+    let callee = build_callee_string_component(); // UTF-8 lift, sums bytes
+    let caller = build_caller_utf16_lowering_component(&[0xD800, 0x0041]);
+
+    let config = FuserConfig {
+        memory_strategy: MemoryStrategy::MultiMemory,
+        attestation: false,
+        component_provenance: false,
+        address_rebasing: false,
+        preserve_names: false,
+        custom_sections: meld_core::CustomSectionHandling::Drop,
+        dwarf_handling: meld_core::DwarfHandling::Strip,
+        output_format: meld_core::OutputFormat::CoreModule,
+        opaque_resources: Vec::new(),
+    };
+
+    let mut fuser = Fuser::new(config);
+    fuser
+        .add_component_named(&callee, Some("callee-utf8"))
+        .expect("callee component should parse");
+    fuser
+        .add_component_named(&caller, Some("caller-utf16"))
+        .expect("caller component should parse");
+
+    let (fused, _stats) = fuser.fuse_with_stats().expect("fusion should succeed");
+
+    let mut validator = wasmparser::Validator::new();
+    validator
+        .validate_all(&fused)
+        .expect("LS-P-16 mid-string: fused output should validate");
+
+    let mut engine_config = Config::new();
+    engine_config.wasm_multi_memory(true);
+    let engine = Engine::new(&engine_config).unwrap();
+    let module = RuntimeModule::new(&engine, &fused).unwrap();
+    let mut store = Store::new(&engine, ());
+    let instance = Instance::new(&mut store, &module, &[]).unwrap();
+
+    let run = instance
+        .get_typed_func::<(), i32>(&mut store, "run")
+        .expect("LS-P-16 mid-string: fused module should export 'run'");
+    let result = run.call(&mut store, ()).unwrap();
+
+    assert_eq!(
+        result, 684,
+        "LS-P-16 mid-string: [0xD800, 0x0041] must transcode to U+FFFD + 'A' \
+         (UTF-8 EF BF BD 41, sum 684). Pre-fix this returned 500 (garbage \
+         code point from the unvalidated second unit)."
+    );
+}
+
+/// Comprehensive malformed-UTF-16 matrix for UTF-16 → UTF-8 transcoding
+/// (#249): every unpaired surrogate, at every position, must become U+FFFD
+/// (UTF-8 `EF BF BD`, byte sum 619), and valid pairs must still decode.
+/// The callee sums received UTF-8 bytes; expected sums are hand-computed
+/// from: U+FFFD=619, 'A'=0x41=65, 'B'=0x42=66, U+1F600 → `F0 9F 98 80`=679.
+///
+/// This closes the lone-LOW-surrogate gap (#249, surfaced by PR #248's
+/// Mythos pass) alongside the lone-HIGH cases fixed in v0.11 / #248, and
+/// pins the whole class so a regression in any single arm is caught.
+#[test]
+fn test_sr17_utf16_to_utf8_malformed_surrogate_matrix() {
+    // (input UTF-16 code units, expected callee byte-sum, label)
+    let cases: &[(&[u16], i32, &str)] = &[
+        (&[0xDC00, 0x0041], 684, "leading lone low → FFFD + A"),
+        (&[0x0041, 0xDC00], 684, "trailing lone low → A + FFFD"),
+        (
+            &[0x0041, 0xDC00, 0x0042],
+            750,
+            "mid lone low → A + FFFD + B",
+        ),
+        (
+            &[0xDC00, 0xDC00],
+            1238,
+            "consecutive lone lows → FFFD + FFFD",
+        ),
+        (&[0xDFFF], 619, "last low surrogate value alone → FFFD"),
+        (&[0xD83D, 0xDE00], 679, "valid pair U+1F600 still decodes"),
+        (
+            &[0xDC00, 0xD83D, 0xDE00],
+            1298,
+            "lone low then valid pair → FFFD + U+1F600",
+        ),
+        (
+            &[0xD800, 0xD800, 0x0041],
+            1303,
+            "consecutive lone highs → FFFD + FFFD + A",
+        ),
+    ];
+
+    for (units, expected, label) in cases {
+        let callee = build_callee_string_component();
+        let caller = build_caller_utf16_lowering_component(units);
+        let config = FuserConfig {
+            memory_strategy: MemoryStrategy::MultiMemory,
+            attestation: false,
+            component_provenance: false,
+            address_rebasing: false,
+            preserve_names: false,
+            custom_sections: meld_core::CustomSectionHandling::Drop,
+            dwarf_handling: meld_core::DwarfHandling::Strip,
+            output_format: meld_core::OutputFormat::CoreModule,
+            opaque_resources: Vec::new(),
+        };
+        let mut fuser = Fuser::new(config);
+        fuser
+            .add_component_named(&callee, Some("callee-utf8"))
+            .expect("callee parse");
+        fuser
+            .add_component_named(&caller, Some("caller-utf16"))
+            .expect("caller parse");
+        let (fused, _) = fuser.fuse_with_stats().expect("fusion");
+
+        let mut validator = wasmparser::Validator::new();
+        validator
+            .validate_all(&fused)
+            .unwrap_or_else(|e| panic!("#249 [{label}]: output must validate: {e}"));
+
+        let mut ec = Config::new();
+        ec.wasm_multi_memory(true);
+        let engine = Engine::new(&ec).unwrap();
+        let module = RuntimeModule::new(&engine, &fused).unwrap();
+        let mut store = Store::new(&engine, ());
+        let instance = Instance::new(&mut store, &module, &[]).unwrap();
+        let run = instance
+            .get_typed_func::<(), i32>(&mut store, "run")
+            .unwrap();
+        let result = run.call(&mut store, ()).unwrap();
+        assert_eq!(
+            result, *expected,
+            "#249 [{label}]: input {units:#06x?} expected byte-sum {expected}, got {result}"
+        );
+    }
+}
+
+/// Comprehensive malformed-UTF-8 matrix for UTF-8 → UTF-16 transcoding
+/// (#251): the forward-direction analogue of the #249 reverse matrix above.
+/// Every ill-formed UTF-8 sequence — invalid continuation, invalid lead
+/// (lone continuation / overlong 2-byte lead / out-of-range lead), overlong
+/// encoding, UTF-8-encoded surrogate, and out-of-range 4-byte code point —
+/// must transcode to U+FFFD (one UTF-16 code unit, 0xFFFD = 65533) per the
+/// Canonical ABI, never to a wrong scalar. Valid inputs must be unchanged.
+///
+/// The callee sums received UTF-16 code units. Constants: U+FFFD = 65533,
+/// 'A' = 0x41 = 65. Expected sums are hand-derived under the codebase's
+/// established LS-P-19 "emit U+FFFD, consume ONLY the lead byte" convention:
+/// on malformed detection src_idx advances by 1, so any trailing
+/// continuation byte (0x80–0xBF) is reprocessed and — being a lone
+/// continuation acting as a lead — itself becomes another U+FFFD. This makes
+/// several cases emit MORE than one U+FFFD; the per-case derivations spell
+/// out the exact count.
+#[test]
+fn test_sr17_utf8_to_utf16_malformed_matrix() {
+    // (input UTF-8 bytes, expected callee code-unit-sum, label)
+    //
+    // Hand-derivations for the malformed cases (FFFD = 65533):
+    //   [0xC2,0x41]            2-byte lead, 0x41 not a continuation
+    //                          → FFFD (consume lead 0xC2), then 0x41 = 'A' = 65
+    //                          → 65533 + 65 = 65598
+    //   [0x80,0x41]            0x80 is a lone continuation < 0xC2 → invalid lead
+    //                          → FFFD (consume 1), then 0x41 = 65
+    //                          → 65533 + 65 = 65598
+    //   [0xC0,0x80]            0xC0 < 0xC2 → invalid (overlong) lead → FFFD
+    //                          (consume 1); reprocess 0x80, a lone continuation
+    //                          < 0xC2 → invalid lead → FFFD (consume 1)
+    //                          → 65533 + 65533 = 131066
+    //   [0xED,0xA0,0x80]       0xED is a 3-byte lead; conts 0xA0,0x80 are valid
+    //                          continuation bytes, decoding to cp = 0xD800 (a
+    //                          UTF-8-encoded surrogate) → rejected → FFFD,
+    //                          consume ONLY the lead. src_idx now 1: reprocess
+    //                          0xA0 (lone cont) → FFFD, consume 1. src_idx 2:
+    //                          reprocess 0x80 (lone cont) → FFFD, consume 1.
+    //                          THREE U+FFFD → 65533 * 3 = 196599
+    //   [0xF5,0x80,0x80,0x80]  0xF5 >= 0xF5 → out-of-range lead → FFFD,
+    //                          consume 1; the three trailing 0x80 are each lone
+    //                          continuations → FFFD each. FOUR U+FFFD
+    //                          → 65533 * 4 = 262132
+    //   [0xF4,0x90,0x80,0x80]  0xF4 is an in-range 4-byte lead; conts valid,
+    //                          cp = 0x110000 > U+10FFFF (out of range) →
+    //                          rejected → FFFD, consume ONLY the lead. The
+    //                          three trailing bytes 0x90,0x80,0x80 are then
+    //                          each lone continuations → FFFD each. FOUR U+FFFD
+    //                          → 65533 * 4 = 262132
+    //
+    // Valid controls (must be byte-for-byte unchanged from the fast paths):
+    //   [0x41]                 'A' = 65
+    //   [0xC3,0xA9]            é = U+00E9 = 233
+    //   [0xE2,0x82,0xAC]       € = U+20AC = 8364
+    //   [0xF0,0x9F,0x98,0x80]  😀 = U+1F600 → surrogate pair 0xD83D + 0xDE00
+    //                          = 55357 + 56832 = 112189
+    let cases: &[(&[u8], i32, &str)] = &[
+        // Malformed.
+        (&[0xC2, 0x41], 65598, "2-byte bad continuation → FFFD + A"),
+        (&[0x80, 0x41], 65598, "lone continuation as lead → FFFD + A"),
+        (
+            &[0xC0, 0x80],
+            131066,
+            "overlong 2-byte lead 0xC0 + lone cont → FFFD + FFFD",
+        ),
+        (
+            &[0xED, 0xA0, 0x80],
+            196599,
+            "UTF-8-encoded surrogate U+D800 → FFFD x3 (lead + 2 reprocessed conts)",
+        ),
+        (
+            &[0xF5, 0x80, 0x80, 0x80],
+            262132,
+            "out-of-range lead 0xF5 → FFFD x4",
+        ),
+        (
+            &[0xF4, 0x90, 0x80, 0x80],
+            262132,
+            "4-byte > U+10FFFF → FFFD x4 (lead + 3 reprocessed conts)",
+        ),
+        // Valid controls.
+        (&[0x41], 65, "valid ASCII 'A'"),
+        (&[0xC3, 0xA9], 233, "valid 2-byte é U+00E9"),
+        (&[0xE2, 0x82, 0xAC], 8364, "valid 3-byte € U+20AC"),
+        (
+            &[0xF0, 0x9F, 0x98, 0x80],
+            112189,
+            "valid 4-byte 😀 U+1F600 → surrogate pair",
+        ),
+    ];
+
+    for (bytes, expected, label) in cases {
+        let callee = build_callee_utf16_string_component();
+        let caller = build_caller_string_component_data(bytes);
+        let config = FuserConfig {
+            memory_strategy: MemoryStrategy::MultiMemory,
+            attestation: false,
+            component_provenance: false,
+            address_rebasing: false,
+            preserve_names: false,
+            custom_sections: meld_core::CustomSectionHandling::Drop,
+            dwarf_handling: meld_core::DwarfHandling::Strip,
+            output_format: meld_core::OutputFormat::CoreModule,
+            opaque_resources: Vec::new(),
+        };
+        let mut fuser = Fuser::new(config);
+        fuser
+            .add_component_named(&callee, Some("callee-utf16"))
+            .expect("callee parse");
+        fuser
+            .add_component_named(&caller, Some("caller-utf8"))
+            .expect("caller parse");
+        let (fused, _) = fuser.fuse_with_stats().expect("fusion");
+
+        let mut validator = wasmparser::Validator::new();
+        validator
+            .validate_all(&fused)
+            .unwrap_or_else(|e| panic!("#251 [{label}]: output must validate: {e}"));
+
+        let mut ec = Config::new();
+        ec.wasm_multi_memory(true);
+        let engine = Engine::new(&ec).unwrap();
+        let module = RuntimeModule::new(&engine, &fused).unwrap();
+        let mut store = Store::new(&engine, ());
+        let instance = Instance::new(&mut store, &module, &[]).unwrap();
+        let run = instance
+            .get_typed_func::<(), i32>(&mut store, "run")
+            .unwrap();
+        let result = run.call(&mut store, ()).unwrap();
+        assert_eq!(
+            result, *expected,
+            "#251 [{label}]: input {bytes:#04x?} expected code-unit-sum {expected}, got {result}"
+        );
+    }
+}
+
+/// SR-17 (#253 increment 2): Latin-1 → UTF-16 string transcoding at runtime.
+///
+/// This direction is total and unambiguous — each Latin-1 byte 0x00–0xFF
+/// zero-extends to exactly one UTF-16 code unit U+0000–U+00FF (no surrogates,
+/// no malformed forms). Increment 1 (#254) refused this pair on the fail-loud
+/// arm; increment 2 implements `emit_latin1_to_utf16_transcode`, so the
+/// (Latin1, Utf16) pair now SUCCEEDS.
+///
+/// Fixture: a CompactUTF16-lowering caller (meld maps CompactUTF16 → Latin1)
+/// storing 1 byte/char, fused into the UTF-16 code-unit-summing callee. The
+/// callee sums the received code units, so the oracle is the sum of the
+/// zero-extended bytes.
+///
+/// Hand-computed cases:
+///   [] (empty)                  → []                       → sum 0
+///   [0x00] (NUL)                → [0x0000]                 → sum 0
+///   [0x7F] (ASCII boundary)     → [0x007F]                 → sum 127
+///   [0x41, 0xE9, 0xFF]          → [0x0041, 0x00E9, 0x00FF] → 65+233+255 = 553
+///   [0xFF, 0xFF]                → [0x00FF, 0x00FF]         → 255+255   = 510
+#[test]
+fn test_sr17_latin1_to_utf16_transcoding() {
+    let cases: &[(&[u8], i32, &str)] = &[
+        (&[], 0, "empty"),
+        (&[0x00], 0, "NUL → U+0000"),
+        (&[0x7F], 127, "ASCII boundary U+007F"),
+        (&[0x41, 0xE9, 0xFF], 553, "A é ÿ → U+0041 U+00E9 U+00FF"),
+        (&[0xFF, 0xFF], 510, "two U+00FF"),
+    ];
+
+    for (bytes, expected, label) in cases {
+        let callee = build_callee_utf16_string_component(); // lifts UTF-16, sums code units
+        let caller = build_caller_latin1_lowering_component(bytes);
+
+        let config = FuserConfig {
+            memory_strategy: MemoryStrategy::MultiMemory,
+            attestation: false,
+            component_provenance: false,
+            address_rebasing: false,
+            preserve_names: false,
+            custom_sections: meld_core::CustomSectionHandling::Drop,
+            dwarf_handling: meld_core::DwarfHandling::Strip,
+            output_format: meld_core::OutputFormat::CoreModule,
+            opaque_resources: Vec::new(),
+        };
+        let mut fuser = Fuser::new(config);
+        fuser
+            .add_component_named(&callee, Some("callee-utf16"))
+            .expect("callee parse");
+        fuser
+            .add_component_named(&caller, Some("caller-latin1"))
+            .expect("caller parse");
+        let (fused, _) = fuser
+            .fuse_with_stats()
+            .unwrap_or_else(|e| panic!("#253 [{label}]: Latin1→Utf16 fusion must succeed: {e:?}"));
+
+        let mut validator = wasmparser::Validator::new();
+        validator
+            .validate_all(&fused)
+            .unwrap_or_else(|e| panic!("#253 [{label}]: output must validate: {e}"));
+
+        let mut ec = Config::new();
+        ec.wasm_multi_memory(true);
+        let engine = Engine::new(&ec).unwrap();
+        let module = RuntimeModule::new(&engine, &fused).unwrap();
+        let mut store = Store::new(&engine, ());
+        let instance = Instance::new(&mut store, &module, &[]).unwrap();
+        let run = instance
+            .get_typed_func::<(), i32>(&mut store, "run")
+            .unwrap();
+        let result = run.call(&mut store, ()).unwrap();
+        assert_eq!(
+            result, *expected,
+            "#253 [{label}]: input {bytes:#04x?} expected code-unit-sum {expected}, got {result}"
+        );
+    }
+}
+
+/// #253 fail-loud guard (still-unsupported direction): the down-conversion
+/// directions remain genuinely ambiguous and stay on the unchanged catch-all
+/// `Err` arm. Increment 2 only added (Latin1 → Utf16); (Utf16 → Latin1) is
+/// NOT implemented (code points > 0xFF are unrepresentable in Latin-1), so it
+/// must still FAIL fusion loudly rather than silently emit a wrong adapter.
+///
+/// Fixture: a UTF-16-lowering caller fused into a CompactUTF16-lifting callee
+/// (meld maps CompactUTF16 → Latin1), producing the (Utf16, Latin1) pair.
+/// Fusion must return Err. (The complementary (Utf8 → Latin1) pair shares the
+/// same unchanged catch-all and is not separately fixtured here.)
+#[test]
+fn test_253_utf16_to_latin1_transcode_fails_loud() {
+    let callee = build_callee_codeunit_summing_component(CanonicalOption::CompactUTF16); // → Latin1
+    let caller = build_caller_utf16_lowering_component(&[0x0041]);
+
+    let config = FuserConfig {
+        memory_strategy: MemoryStrategy::MultiMemory,
+        attestation: false,
+        component_provenance: false,
+        address_rebasing: false,
+        preserve_names: false,
+        custom_sections: meld_core::CustomSectionHandling::Drop,
+        dwarf_handling: meld_core::DwarfHandling::Strip,
+        output_format: meld_core::OutputFormat::CoreModule,
+        opaque_resources: Vec::new(),
+    };
+
+    let mut fuser = Fuser::new(config);
+    fuser
+        .add_component_named(&callee, Some("callee-latin1"))
+        .expect("callee parse");
+    fuser
+        .add_component_named(&caller, Some("caller-utf16"))
+        .expect("caller parse");
+
+    let result = fuser.fuse_with_stats();
+    assert!(
+        result.is_err(),
+        "#253: (Utf16 -> Latin1) is a lossy down-conversion with no transcoder; \
+         fusion must fail loudly rather than emit a silently-wrong copy. Got Ok."
+    );
+    let msg = format!("{:?}", result.err().unwrap());
+    assert!(
+        msg.contains("transcoding") || msg.contains("#253"),
+        "#253: error should name the unsupported transcoding; got: {msg}"
     );
 }

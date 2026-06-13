@@ -1,0 +1,53 @@
+# Companion to ci.yml's `paths-ignore` (#172-era fleet-draw reduction)
+# now that `Test` / `Clippy` / `Format` are REQUIRED status checks on
+# main: a docs/safety-only PR never triggers ci.yml, so without this
+# stub those required contexts never report and the PR is unmergeable
+# (observed on the roadmap PR #221, 2026-06-10). This workflow runs on
+# EXACTLY the paths ci.yml ignores and reports the same three contexts
+# as instant successes from GitHub-hosted runners — zero smithy fleet
+# draw, and the merge gate stays meaningful for code changes.
+#
+# Keep the `paths:` list byte-aligned with ci.yml's `paths-ignore`.
+# A PR touching BOTH sets triggers both workflows; the real CI runs
+# carry the verdicts that matter and the stub's successes are
+# redundant, not masking (branch protection requires every reported
+# run of a context to pass).
+#
+# NOTE: deliberately a different workflow name and concurrency group
+# than ci.yml — sharing ci.yml's `${{ github.workflow }}-${{ github.ref }}`
+# group with cancel-in-progress would let the stub cancel a real CI run
+# on mixed PRs.
+
+name: CI (docs-only stub)
+
+concurrency:
+  group: ci-docs-stub-${{ github.ref }}
+  cancel-in-progress: true
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '**/*.md'
+      - 'safety/**'
+      - 'scripts/mythos/**'
+      - 'tools/*.py'
+
+jobs:
+  test-stub:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "docs/safety-only change — code CI not applicable (see ci.yml paths-ignore)"
+
+  clippy-stub:
+    name: Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "docs/safety-only change — code CI not applicable (see ci.yml paths-ignore)"
+
+  format-stub:
+    name: Format
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "docs/safety-only change — code CI not applicable (see ci.yml paths-ignore)"

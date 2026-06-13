@@ -1,0 +1,9 @@
+target
+artifacts
+coverage
+
+# Ignore libfuzzer-generated corpus entries (40-hex-char names) so only the
+# hand-crafted seed files (committed with .bin extension) end up in git.
+# Long-running campaigns will accumulate thousands of corpus entries; those
+# belong in a sidecar repo or fuzz-runner storage, not here.
+corpus/*/[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]

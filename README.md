@@ -7,6 +7,7 @@
 &nbsp;
 
 [![CI](https://github.com/pulseengine/meld/actions/workflows/ci.yml/badge.svg)](https://github.com/pulseengine/meld/actions/workflows/ci.yml)
+[![Bench](https://github.com/pulseengine/meld/actions/workflows/bench.yml/badge.svg)](https://github.com/pulseengine/meld/actions/workflows/bench.yml)
 [![codecov](https://codecov.io/gh/pulseengine/meld/graph/badge.svg)](https://codecov.io/gh/pulseengine/meld)
 ![Rust](https://img.shields.io/badge/Rust-CE422B?style=flat-square&logo=rust&logoColor=white&labelColor=1a1b27)
 ![WebAssembly](https://img.shields.io/badge/WebAssembly-654FF0?style=flat-square&logo=webassembly&logoColor=white&labelColor=1a1b27)
@@ -95,25 +96,65 @@ Cross-component calls may require adapters that handle string transcoding (UTF-8
 
 ## Memory Strategies
 
-### Multi-Memory (Default)
+### Auto (Default)
 
-Each component retains its own linear memory. Cross-component calls use adapters that allocate in the callee's memory via `cabi_realloc` and copy data with `memory.copy`. Requires multi-memory support (WebAssembly Core Spec 3.0).
+Resolves to shared memory + address rebasing when that is provably sound — no input module contains `memory.grow` and there are at least two memories to merge — and to multi-memory otherwise. The point: out-of-the-box output flows through `wasm-opt → synth` with no extra flags whenever soundness permits a single-memory form (issue #172).
 
 ```bash
 meld fuse a.wasm b.wasm -o fused.wasm
+wasm-opt -Os fused.wasm -o fused.opt.wasm   # no --enable-multimemory needed
 ```
 
-### Shared Memory (Legacy)
+### Multi-Memory
 
-All components share a single linear memory. Simpler but one component's `memory.grow` corrupts every other component's address space.
+Each component retains its own linear memory. Cross-component calls use adapters that allocate in the callee's memory via `cabi_realloc` and copy data with `memory.copy`. Requires multi-memory support (WebAssembly Core Spec 3.0) — downstream tools need `wasm-opt --enable-multimemory`, and single-address-space (MCU) targets have no lowering for it.
 
 ```bash
-meld fuse --memory shared a.wasm b.wasm -o fused.wasm
+meld fuse --memory multi a.wasm b.wasm -o fused.wasm
+```
+
+### Shared Memory
+
+All components share a single linear memory; pair with `--address-rebase`. Unsound if any component uses `memory.grow` — one component's growth corrupts every other component's address space, which is why `auto` only selects this form when no input can grow.
+
+```bash
+meld fuse --memory shared --address-rebase a.wasm b.wasm -o fused.wasm
 ```
 
 ## Supply Chain Security
 
 Meld integrates with [Sigil](https://github.com/pulseengine/sigil) for supply chain attestation. Each fusion operation records input component hashes, tool version and configuration, and transformation metadata. The attestation is embedded in the output module's custom section.
+
+### Verifying a Release
+
+Every tagged release ships with a CycloneDX SBOM, a cosign-signed `SHA256SUMS.txt`, and a SLSA v1 build-provenance attestation. To verify an installed binary against what GitHub Actions actually built:
+
+```bash
+# 1. Download an archive plus the signed checksum manifest from the release page.
+TAG=v0.11.0
+TARGET=x86_64-unknown-linux-gnu
+gh release download "$TAG" --repo pulseengine/meld \
+  --pattern "meld-${TAG}-${TARGET}.tar.gz" \
+  --pattern 'SHA256SUMS.txt' \
+  --pattern 'SHA256SUMS.txt.cosign.bundle'
+
+# 2. Verify SHA256SUMS.txt was signed by meld's release workflow (Sigstore keyless).
+cosign verify-blob \
+  --certificate-identity-regexp \
+    'https://github.com/pulseengine/meld/.github/workflows/release.yml@.*' \
+  --certificate-oidc-issuer \
+    'https://token.actions.githubusercontent.com' \
+  --bundle SHA256SUMS.txt.cosign.bundle \
+  SHA256SUMS.txt
+
+# 3. Verify the archive's digest is in the signed manifest.
+sha256sum --ignore-missing -c SHA256SUMS.txt
+
+# 4. (Optional) Verify the SLSA v1 build provenance attestation.
+gh attestation verify "meld-${TAG}-${TARGET}.tar.gz" --repo pulseengine/meld
+```
+
+Step 2 proves the checksum file came from this repo's `release.yml`; step 3 ties the archive on disk to that signed manifest; step 4 independently confirms the archive was built by the same workflow run via GitHub's attestation API. Each release also includes a `meld-<version>.cdx.json` (CycloneDX SBOM, transitively covered by the signature on `SHA256SUMS.txt`) and `build-env.txt` capturing the runner toolchain versions.
 
 ## Formal Verification
 
@@ -151,6 +192,27 @@ cargo test                 # Test
 bazel build //...          # Bazel build
 RUST_LOG=debug cargo run -- fuse a.wasm b.wasm -o out.wasm
 ```
+
+### Benchmarks
+
+Criterion benchmarks for the fusion pipeline live in
+`meld-core/benches/fusion_benchmarks.rs` and exercise four groups:
+
+- `parser` — `ComponentParser::parse` throughput per input byte.
+- `merger` — `Merger::merge` throughput per component count.
+- `resolver` — `Resolver::resolve_with_hints` throughput per resolved-symbol count.
+- `end_to_end` — `Fuser::fuse_with_stats` over small / medium / large
+  graphs.
+
+```bash
+cargo bench -p meld-core                          # full run
+cargo bench -p meld-core --bench fusion_benchmarks -- parser   # one group
+cargo bench -p meld-core --no-run                 # compile-only sanity (CI smoke)
+```
+
+CI runs `cargo bench --no-run` on every PR (`.github/workflows/bench.yml`)
+to prevent the bench harness from rotting. Full benches are not run in CI
+to keep PRs fast and avoid noisy regressions on shared runners.
 
 ## License
 

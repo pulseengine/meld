@@ -703,6 +703,72 @@ Block the release if any `confirmed` finding lacks an `approved LS-N` in
 `safety/stpa/loss-scenarios.yaml` with a shipped fix or an explicit
 risk-acceptance note.
 
+#### Auto-runner (`.github/workflows/mythos-auto.yml`)
+
+The Mythos discover protocol is automated for the repository
+maintainer (`avrabe`, immutable user id `10056645`) via the
+`anthropics/claude-code-action` running against the maintainer's Max-
+plan OAuth token. On every PR that touches a Tier-5 file:
+
+1. The detect job lists touched Tier-5 paths (same path-list as
+   `mythos-gate.yml`) and **path-shape-validates** each one before
+   passing into the matrix.
+2. Per-file matrix runs the `claude-code-action`-pinned-by-SHA with
+   the discover.md prompt, asking for a structured JSON verdict
+   (`NO_FINDINGS` or `FINDING`).
+3. The aggregate job composes a sticky `<!-- mythos-auto-gate -->`
+   PR comment with the per-file table, and applies the
+   `mythos-pass-done` label when every file is `NO_FINDINGS`.
+4. If any file is `FINDING`, the job fails and the label is not
+   applied; the label-only `mythos-gate.yml` then keeps the PR
+   blocked until a human reviews the finding.
+
+**This auto-runner is single-actor scoped.** The job has a top-level
+`if: github.actor == 'avrabe' && github.actor_id == '10056645'`
+guard, and the `pull_request` trigger (not `pull_request_target`)
+means fork PRs don't get the OAuth token. Contributors should
+continue to expect the honor-system flow documented above (`Read
+scripts/mythos/discover.md ...`); the auto-runner is *one way* the
+label gets applied, not the only way.
+
+If you fork this repo and want to run the auto-runner under your own
+account: change the actor allow-list in `mythos-auto.yml`, set up
+your own `CLAUDE_CODE_OAUTH_TOKEN` secret, and remove `avrabe`'s id.
+
+### LS-N verification gate
+
+CI workflow `.github/workflows/verification-gate.yml` enforces the
+test-naming contract on every PR: each `status: approved` entry in
+`safety/stpa/loss-scenarios.yaml` must have at least one `#[test] fn
+ls_<letter>_<num>_*` in `meld-core` (e.g. `LS-A-11` → `ls_a_11_*`).
+
+The gate runs `tools/run_ls_verification.py`, which iterates approved
+LS IDs and invokes `cargo test --lib --no-fail-fast <prefix>` per
+entry, then posts a single sticky PR comment with passed / failed /
+missing counts via `tools/post_verification_comment.py`.
+
+Same script runs locally:
+
+```bash
+python3 tools/run_ls_verification.py --results-json /tmp/ls.json
+```
+
+Buckets and gate behaviour:
+
+- **Passed** — ≥1 matching test, all green. Approved entry is verified.
+- **Failed** — ≥1 matching test failed. **Hard-fails the gate** (block merge).
+- **Missing** — zero tests match the `ls_<letter>_<num>_*` prefix.
+  Advisory only; surfaces as a warning so older approved scenarios
+  with ad-hoc test names (e.g. PR #114's
+  `test_canonical_abi_size_fixed_size_list_saturates_on_overflow` for
+  LS-P-4) can be migrated incrementally rather than blocking every PR.
+
+Adapted from spar's rivet-driven verification gate
+(pulseengine/spar@ba329f3d), with meld's STPA loss-scenario artifacts
+substituted for rivet's executable artifacts. Same sticky-comment
+pattern (marker `<!-- meld-ls-verification-gate -->`, upsert via
+GitHub REST API).
+
 ### Release Process
 
 #### Pre-Release Checklist (MANDATORY)

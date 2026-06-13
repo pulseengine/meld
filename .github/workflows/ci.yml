@@ -1,10 +1,29 @@
 name: CI
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 on:
   push:
     branches: [main]
+    # Skip CI on docs/safety-only changes — they don't affect code
+    # behavior. Reduces meld's draw on the shared smithy rust-cpu
+    # fleet. Conservative exclusion: anything that could affect
+    # cargo build/test/clippy/fmt outputs (.rs, Cargo.{toml,lock},
+    # workflows themselves) still triggers.
+    paths-ignore:
+      - '**/*.md'
+      - 'safety/**'
+      - 'scripts/mythos/**'
+      - 'tools/*.py'
   pull_request:
     branches: [main]
+    paths-ignore:
+      - '**/*.md'
+      - 'safety/**'
+      - 'scripts/mythos/**'
+      - 'tools/*.py'
 
 env:
   CARGO_TERM_COLOR: always
@@ -13,7 +32,7 @@ env:
 jobs:
   test:
     name: Test
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64, rust-cpu]
     steps:
       - uses: actions/checkout@v4
 
@@ -43,7 +62,7 @@ jobs:
 
   coverage:
     name: Coverage
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64, rust-cpu]
     steps:
       - uses: actions/checkout@v4
 
@@ -79,7 +98,7 @@ jobs:
 
   clippy:
     name: Clippy
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64, rust-cpu]
     steps:
       - uses: actions/checkout@v4
 
@@ -95,7 +114,7 @@ jobs:
 
   fmt:
     name: Format
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64, light]
     steps:
       - uses: actions/checkout@v4
 

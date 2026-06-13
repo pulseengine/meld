@@ -18,6 +18,9 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }
 wasmparser.workspace = true
 wasm-encoder.workspace = true
 
+# DWARF read/write for address remapping (#143 Phase 2 — DwarfHandling::Remap)
+gimli.workspace = true
+
 # Error handling
 anyhow.workspace = true
 thiserror.workspace = true
@@ -40,12 +43,20 @@ petgraph = "0.8.3"
 [dev-dependencies]
 proptest.workspace = true
 wasmprinter.workspace = true
+# Re-declared for integration tests (tests/dwarf_remap_witness.rs) to
+# parse and validate the remapped DWARF in the fused output.
+gimli.workspace = true
 wat = "1.219"
 wasmtime = "41.0.1"
 wasmtime-wasi = "41.0.4"
 bitflags.workspace = true  # Required for wit-bindgen component bindings
+criterion.workspace = true
 
 [features]
 default = []
 # Enable wsc-attestation integration for supply chain tracking
 attestation = ["wsc-attestation"]
+
+[[bench]]
+name = "fusion_benchmarks"
+harness = false

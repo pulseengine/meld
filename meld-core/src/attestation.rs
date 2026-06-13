@@ -575,6 +575,7 @@ mod tests {
             "address_rebasing",
             "preserve_names",
             "custom_sections",
+            "dwarf_handling",
             "output_format",
         ];
 
@@ -584,6 +585,7 @@ mod tests {
         tool_parameters.insert("address_rebasing".to_string(), serde_json::json!(false));
         tool_parameters.insert("preserve_names".to_string(), serde_json::json!(false));
         tool_parameters.insert("custom_sections".to_string(), serde_json::json!("merge"));
+        tool_parameters.insert("dwarf_handling".to_string(), serde_json::json!("strip"));
         tool_parameters.insert(
             "output_format".to_string(),
             serde_json::json!("core-module"),

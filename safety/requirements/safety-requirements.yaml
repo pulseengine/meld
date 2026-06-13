@@ -25,7 +25,7 @@ artifacts:
     description: >
       The parser shall extract all core modules from a component,
       including those nested within component instances at any depth.
-    status: draft
+    status: implemented
     tags: [stpa-derived]
     links:
       - type: derives-from
@@ -46,7 +46,7 @@ artifacts:
     description: >
       The parser shall extract every import and export entry declared
       by a component, preserving names, types, and kind.
-    status: draft
+    status: implemented
     tags: [stpa-derived]
     links:
       - type: derives-from
@@ -65,7 +65,7 @@ artifacts:
       canonical_abi_element_size shall return the correctly aligned
       element size for all Canonical ABI types, including records with
       heterogeneous field alignments.
-    status: draft
+    status: implemented
     tags: [stpa-derived]
     links:
       - type: derives-from
@@ -91,7 +91,7 @@ artifacts:
       The parser shall reject components that do not pass wasmparser
       validation with feature flags locked to the Component Model
       baseline spec.
-    status: draft
+    status: implemented
     tags: [stpa-derived]
     links:
       - type: derives-from
@@ -116,7 +116,7 @@ artifacts:
       The resolver shall match every import to exactly one export with
       a matching interface name and compatible type. Ambiguous matches
       (multiple exports with the same name) shall produce an error.
-    status: draft
+    status: implemented
     tags: [stpa-derived]
     links:
       - type: derives-from
@@ -141,7 +141,7 @@ artifacts:
       type into the correct CopyLayout. Types with inner pointer fields
       (strings, lists, records containing pointers) shall be classified
       as Elements with inner_pointers, not as Bulk.
-    status: draft
+    status: implemented
     tags: [stpa-derived]
     links:
       - type: derives-from
@@ -158,7 +158,8 @@ artifacts:
       verification-description: >
         Test CopyLayout for: list<u32> (Bulk), list<string> (Elements),
         list<record{name:string, val:u32}> (Elements with inner ptrs).
-        CopyLayout consistency proof (proofs/adapter/).
+        CopyLayout consistency proof
+        (proofs/transformations/adapter/copy_layout_proofs.v).
 
   - id: SR-7
     type: requirement
@@ -168,7 +169,7 @@ artifacts:
       component appears after all components it imports from. Dependency
       cycles shall be detected and reported as an error (or handled by
       cycle-tolerant sort with documented semantics).
-    status: draft
+    status: implemented
     tags: [stpa-derived]
     links:
       - type: derives-from
@@ -198,7 +199,7 @@ artifacts:
       The merger shall compute each component's function base offset
       as the cumulative sum of all preceding components' total function
       counts (imports + defined functions).
-    status: draft
+    status: implemented
     tags: [stpa-derived]
     links:
       - type: derives-from
@@ -220,7 +221,7 @@ artifacts:
       The rewriter shall remap indices in all instruction types that
       reference functions, memories, tables, globals, or types. This
       includes multi-index instructions (memory.copy, memory.init).
-    status: draft
+    status: implemented
     tags: [stpa-derived]
     links:
       - type: derives-from
@@ -248,7 +249,7 @@ artifacts:
       The merger shall reindex data segment memory indices, element
       segment table indices, and global indices in init expressions
       using the correct per-kind base offset.
-    status: draft
+    status: implemented
     tags: [stpa-derived]
     links:
       - type: derives-from
@@ -269,7 +270,7 @@ artifacts:
     description: >
       The merger shall process components in the same order as the
       resolver's topological sort output.
-    status: draft
+    status: implemented
     tags: [stpa-derived]
     links:
       - type: derives-from
@@ -292,7 +293,7 @@ artifacts:
       resolved cross-component call whose signature includes pointer
       types (string, list, record with pointer fields) in multi-memory
       mode.
-    status: draft
+    status: verified
     tags: [stpa-derived]
     links:
       - type: derives-from
@@ -310,7 +311,7 @@ artifacts:
     description: >
       The adapter shall call cabi_realloc using the post-merge function
       index of the destination component's allocator.
-    status: draft
+    status: verified
     tags: [stpa-derived]
     links:
       - type: derives-from
@@ -334,7 +335,7 @@ artifacts:
       indices for all memory.copy, i32.load, and i32.store instructions.
       Source = caller's memory, destination = callee's memory for
       arguments; reversed for return values.
-    status: draft
+    status: implemented
     tags: [stpa-derived]
     links:
       - type: derives-from
@@ -359,7 +360,7 @@ artifacts:
     description: >
       The adapter shall compute list copy byte length as element_count
       multiplied by canonical_abi_element_size of the element type.
-    status: draft
+    status: verified
     tags: [stpa-derived]
     links:
       - type: derives-from
@@ -381,7 +382,7 @@ artifacts:
       each inner pointer to reference the destination memory. The loop
       stride shall equal canonical_abi_element_size. The loop shall
       process exactly element_count iterations.
-    status: draft
+    status: implemented
     tags: [stpa-derived]
     links:
       - type: derives-from
@@ -407,7 +408,7 @@ artifacts:
       String transcoding adapters shall produce valid output encoding
       for all valid input, including characters outside the BMP
       (surrogate pair handling for UTF-16).
-    status: draft
+    status: verified
     tags: [stpa-derived]
     links:
       - type: derives-from
@@ -416,8 +417,18 @@ artifacts:
       implementation: meld-core/src/adapter/fact.rs
       verification-method: test
       verification-description: >
-        Test with strings containing BMP and non-BMP characters;
-        verify round-trip correctness
+        Runtime oracles in tests/adapter_safety.rs, fused and executed
+        under wasmtime: test_sr17_utf8_to_utf16_string_transcoding
+        (BMP/ASCII round-trip) and, since the v0.31.0 audit,
+        test_sr17_utf8_to_utf16_supplementary_plane_transcoding —
+        "A😀" (U+0041 + U+1F600) must transcode to UTF-16 code units
+        [0x0041, 0xD83D, 0xDE00], proving the supplementary-plane
+        surrogate-pair branch of emit_utf8_to_utf16_transcode encodes
+        the high/low surrogates correctly and advances the destination
+        cursor by one then two units. Carried gap: the UTF-16 → UTF-8
+        reverse direction and lone-surrogate U+FFFD substitution are
+        covered structurally (LS-P-16) but not yet by a non-BMP runtime
+        round-trip.
 
   - id: SR-18
     type: requirement
@@ -426,7 +437,7 @@ artifacts:
       The adapter shall emit instructions in the correct order:
       cabi_realloc before memory.copy, memory.copy before callee
       function call.
-    status: draft
+    status: implemented
     tags: [stpa-derived]
     links:
       - type: derives-from
@@ -448,7 +459,7 @@ artifacts:
     description: >
       Given identical input component bytes and identical FuserConfig,
       meld shall produce byte-identical output across invocations.
-    status: draft
+    status: verified
     tags: [stpa-derived]
     links:
       - type: derives-from
@@ -469,7 +480,7 @@ artifacts:
       out-of-bounds index, malformed input), meld shall abort with a
       diagnostic error. Partial or best-effort output shall not be
       produced.
-    status: draft
+    status: verified
     tags: [stpa-derived]
     links:
       - type: derives-from
@@ -496,7 +507,7 @@ artifacts:
       each canon lower shall reference the correct memory index and
       cabi_realloc for the importing component. The stubs module shall
       define all memories needed by the fused module.
-    status: draft
+    status: verified
     tags: [stpa-derived]
     links:
       - type: derives-from
@@ -523,7 +534,7 @@ artifacts:
       only occur when the discriminant indicates a variant case that
       contains pointer fields. When the discriminant indicates no pointer
       payload, the adapter shall skip the pointer copy entirely.
-    status: implemented
+    status: verified
     tags: [stpa-derived]
     links:
       - type: derives-from
@@ -545,7 +556,7 @@ artifacts:
       module:field name but different type signatures. In multi-memory mode,
       imports from different components shall be kept separate even if they
       share the same name, to allow per-component canon lower configuration.
-    status: draft
+    status: verified
     tags: [stpa-derived]
     links:
       - type: derives-from
@@ -570,7 +581,7 @@ artifacts:
       accounting for alignment padding in variant payloads. Return area
       slot metadata (offset, size, is_pointer_pair) shall be computed by
       the resolver and used by the adapter for per-slot copy instructions.
-    status: implemented
+    status: verified
     tags: [stpa-derived]
     links:
       - type: derives-from
@@ -596,7 +607,7 @@ artifacts:
       The adapter shall pass resource handles through cross-component calls
       without modification (no pointer copy or fixup). Resource drop
       functions shall be forwarded directly.
-    status: draft
+    status: verified
     tags: [stpa-derived]
     links:
       - type: derives-from
@@ -617,7 +628,7 @@ artifacts:
       imports, instance export aliases, and component exports. The type
       index mapping (get_type_definition) shall correctly resolve any
       valid type index to its definition.
-    status: implemented
+    status: verified
     tags: [stpa-derived]
     links:
       - type: derives-from
@@ -630,6 +641,124 @@ artifacts:
       verification-description: >
         Test with component using types from imports, aliases, and
         exports; verify correct type index resolution
+
+  # ==========================================================================
+  # Attestation / supply-chain requirements (SR-27..SR-30, from H-6 / SC-6)
+  #
+  # Authored retroactively in the v0.31.0 traceability audit: these four
+  # requirements had verification-status entries in traceability.yaml and
+  # passing tests (attestation.rs test_sr27..test_sr30) since 2026-03, but
+  # the requirement artifacts themselves were never written down.
+  # ==========================================================================
+
+  - id: SR-27
+    type: requirement
+    title: Attestation input hash integrity
+    description: >
+      For every input component added to a fusion, the attestation shall
+      record a SHA-256 hash and byte size that match an independently
+      computed digest and length of the exact input bytes. The recorded
+      hash identifies the input for supply-chain verification; a
+      mismatch means the attestation does not describe the artifact
+      that was actually fused.
+    status: verified
+    tags: [stpa-derived, attestation, supply-chain]
+    links:
+      - type: derives-from
+        target: SC-6
+      - type: mitigates
+        target: H-6
+    fields:
+      implementation: meld-core/src/attestation.rs
+      verification-method: test
+      verification-description: >
+        attestation::tests::test_sr27_input_hash_integrity — builds an
+        attestation over known input bytes and asserts the recorded
+        hash equals an independently computed SHA-256 and the recorded
+        size equals the actual byte length.
+
+  - id: SR-28
+    type: requirement
+    title: Attestation configuration completeness
+    description: >
+      The attestation metadata shall record every FuserConfig field
+      that influences the fused output (memory_strategy,
+      address_rebasing, preserve_names, custom_sections,
+      dwarf_handling, output_format), so an auditor can reconstruct
+      the exact configuration used for the transformation. Adding a
+      FuserConfig field without recording it in the attestation is a
+      requirement violation; the sentinel test enumerates the required
+      keys and must be updated in the same change.
+    status: verified
+    tags: [stpa-derived, attestation, supply-chain]
+    links:
+      - type: derives-from
+        target: SC-6
+      - type: mitigates
+        target: H-6
+    fields:
+      implementation:
+        - meld-core/src/attestation.rs
+        - meld-core/src/lib.rs
+      verification-method: test
+      verification-description: >
+        attestation::tests::test_sr28_config_completeness — sentinel
+        list of required config keys checked against the
+        tool_parameters map (wsc path) plus a serialization round-trip
+        asserting metadata.memory_strategy survives to JSON.
+
+  - id: SR-29
+    type: requirement
+    title: Attestation serialization round-trip
+    description: >
+      The attestation shall serialize to JSON and deserialize back with
+      all fields intact and non-empty (version, attestation_id,
+      transformation_type, timestamp, per-input hash/name/size, output
+      hash/size, tool name/version, fusion metadata counts).
+      Serialization failures shall surface as Err — to_bytes shall
+      never silently substitute an empty payload, since a downstream
+      consumer would accept the truncated attestation as valid.
+    status: verified
+    tags: [stpa-derived, attestation, supply-chain]
+    links:
+      - type: derives-from
+        target: SC-6
+      - type: mitigates
+        target: H-6
+    fields:
+      implementation: meld-core/src/attestation.rs
+      verification-method: test
+      verification-description: >
+        attestation::tests::test_sr29_attestation_round_trip —
+        to_bytes → from_json round-trip with every field asserted
+        populated; attestation::tests::test_to_bytes_returns_result —
+        regression for the silent `{}` fallback bug (Result-based
+        signature, output is valid non-empty JSON).
+
+  - id: SR-30
+    type: requirement
+    title: Attestation output hash integrity
+    description: >
+      The attestation shall record a SHA-256 hash and byte size of the
+      fused output that match an independently computed digest and
+      length of the output bytes (the dual of SR-27: downstream
+      consumers verify the artifact they received is the artifact the
+      attestation describes).
+    status: verified
+    tags: [stpa-derived, attestation, supply-chain]
+    links:
+      - type: derives-from
+        target: SC-6
+      - type: mitigates
+        target: H-6
+    fields:
+      implementation: meld-core/src/attestation.rs
+      verification-method: test
+      verification-description: >
+        attestation::tests::test_sr30_output_hash_integrity — builds an
+        attestation over known output bytes and asserts the recorded
+        output hash equals an independently computed SHA-256 and the
+        recorded size equals the actual byte length.
 
   # ==========================================================================
   # Requirements from weighted gap analysis (SR-31+)
@@ -645,7 +774,7 @@ artifacts:
       may support multi-module component output (per cfallin's "simple
       component" proposal), but until then, fail-fast rejection is
       required.
-    status: draft
+    status: verified
     tags: [stpa-derived]
     links:
       - type: derives-from
@@ -663,3 +792,422 @@ artifacts:
       references:
         - "BA RFC #46 discussion: cfallin on multiply-instantiated modules"
         - "safety/stpa/rfc46-comparative-analysis.md section 4 Q1"
+
+  # ==========================================================================
+  # Roadmap requirements v0.8 → v0.11 (SR-32..SR-36)
+  #
+  # Each entry tracks a deliverable from docs/roadmap.md. `status` starts at
+  # `planned`, moves to `in-progress` when a PR opens, and to `implemented`
+  # when the release that contains it ships. Tagged `roadmap` so a future
+  # validation tool can cross-check open milestones against requirement
+  # status.
+  # ==========================================================================
+
+  - id: SR-32
+    type: requirement
+    title: Stackful P3 lifting mode emission
+    description: >
+      In addition to the callback trampoline (shipped #128), meld shall
+      emit a stackful lifting trampoline for components that declare
+      `(canon lift ... async ...)` without a `(callback ...)` option.
+      The Phase 1 ABI surface (`pulseengine:async::thread_new`,
+      `thread_switch_to`, `thread_yield`, `thread_exit`) is reserved
+      for component-internal concurrency primitives. The shipped
+      trampoline calls the lift function directly and relies on the
+      runtime to treat the call as a fiber boundary (transparent
+      suspension on `task.wait`). Cross-memory `(ptr, len)` result
+      returns from stackful mode are deferred to a follow-up under
+      the same issue. Documented in ADR-1 addendums 2026-05-13 (a)
+      and 2026-05-13 (b).
+    status: verified
+    tags: [roadmap, p3-async, v0.8.0]
+    links:
+      - type: derives-from
+        target: "#94"
+      - type: tracked-by
+        target: "#140"
+    fields:
+      implementation:
+        - meld-core/src/p3_async.rs        # ABI foundation (Phase 1)
+        - meld-core/src/adapter/fact.rs    # trampoline emitter (Phase 2)
+      verification-method: test
+      verification-description: >
+        Foundation: stackful_intrinsic_signatures_pinned +
+        stackful_lift_is_async_without_callback. Emitter:
+        sr32_has_callback_export_detects_companion (detection),
+        sr32_stackful_emitter_handles_no_shim_with_default_results
+        (no-shim fallback), and
+        sr32_stackful_emitter_shape_pins_call_drop_globalget
+        (byte-scan structural pin on the emitted wasm trampoline).
+      milestone: v0.8.0
+
+  - id: SR-33
+    type: requirement
+    title: Cross-component `stream<T>` fusion at merge time
+    description: >
+      When two fused components share a `stream<T>` endpoint, meld shall
+      emit an in-module adapter that bridges the two sides without round-
+      tripping through the host. Shipped shape (shim-dispatch bridge,
+      #141 design comment + ADR-3 amendment): one bridge ring memory +
+      per-component dispatch shims with hardwired memory immediates;
+      handles minted in-module carry bit 31 (LOCAL_TAG) and route to the
+      ring, host handles keep routing to the retained pulseengine:async
+      imports. Same-memory fusion is the identical codegen with caller-
+      memory immediates 0 — the original "zero-copy same-memory ring"
+      claim is amended to "no host crossing, single copy", because the
+      ABI's caller-buffer contract (stream_read(handle, buf_ptr, …))
+      requires a copy into the caller's buffer regardless; fusion removes
+      the double host round-trip per chunk.
+    status: verified
+    tags: [roadmap, p3-async, v0.29.0]
+    links:
+      - type: derives-from
+        target: "#94"
+      - type: tracked-by
+        target: "#141"
+    fields:
+      implementation:
+        - meld-core/src/p3_bridge.rs
+        - meld-core/src/p3_stream.rs
+        - meld-core/src/resolver.rs
+      verification-method: test
+      verification-description: >
+        Honest history: only the DETECTION half shipped in v0.9.0 (#173)
+        — `StreamPairGraph` built at resolve time, gated by the four
+        ADR-3 detection fixtures — and the emitter was MISSING until
+        v0.29.0 (the v0.9.0-era `implemented` status was a bulk-sync
+        error, reverted in PR #221 after the 2026-06-10 audit). The
+        v0.29.0 emitter (p3_bridge.rs, consuming the StreamPairGraph) is
+        verified by four RUNTIME oracles in tests/p3_bridge_runtime.rs
+        that fuse two hand-built components through the real pipeline
+        and execute the fused module under wasmtime with host stubs that
+        trap on any bridge-local (bit-31-tagged) handle:
+        (1) ls_st_1_round_trip_local_stream_never_crosses_host — bytes
+        [1,2,3,4] producer→consumer through a local stream, zero host
+        intrinsic calls; (2)
+        cross_memory_chain_preserves_data_across_distinct_memories —
+        multi-memory fusion (producer mem ≠ consumer mem ≠ bridge mem),
+        300-byte pattern intact across both memory.copy hops; (3)
+        backpressure_partial_write_then_drain_then_resume — write >
+        RING_CAP returns the accepted count (ADR-2 Partial), 0 on a full
+        ring, remainder accepted after drain, two-part ring-wrap copy
+        exercised on write and read; (4)
+        ls_st_1_eof_only_after_writer_drop_and_drain — read is -5
+        (Pending) while open+empty, drains buffered bytes after
+        drop_writable, returns 0 (EOF, sticky) only once drained.
+        slot_exhaustion_falls_back_to_host_stream additionally pins the
+        graceful host fallback (9th stream is host-minted and its ops
+        reach the host imports). LS-ST-1 records the hazard analysis.
+      milestone: v0.29.0
+
+  - id: SR-34
+    type: requirement
+    title: Static `stream<T>` validation
+    description: >
+      Build-time validation passes for cross-component streams:
+      (i) source `stream<A>` and sink `stream<B>` types must match;
+      (ii) bounded channels must declare capacity;
+      (iii) the stream-endpoint graph must be acyclic (no deadlock);
+      (iv) `own<T>` handles passed through a stream must outlive every
+      receiver. Each violation returns a typed `Error::ValidationError`
+      with the offending site.
+      v0.31.0 audit disposition: the Kani cycle-detection harness
+      recorded as a gap was never produced; verification is accepted on
+      the test oracle (ls_r_11_* 3/3 via the LS gate +
+      deep_linear_chain_does_not_overflow_stack pinning LS-R-13). A
+      future Kani harness remains desirable, not blocking.
+    status: verified
+    tags: [roadmap, p3-async, v0.12.0, v0.21.0]
+    links:
+      - type: derives-from
+        target: "#94"
+      - type: tracked-by
+        target: "#142"
+      - type: depends-on
+        target: SR-33
+    fields:
+      implementation:
+        - meld-core/src/p3_stream.rs
+        - meld-core/src/resolver.rs
+      verification-method: test
+      verification-description: >
+        Shipped incrementally: (i)+(iii) v0.12.0, LS-R-11 per-edge
+        precision v0.13.0/v0.15.0, (ii)+(iv) v0.21.0 (#142, PR #210).
+        Pinned by `ls_r_11_*` tests in p3_stream.rs plus the per-check
+        regression suites. The originally-planned Kani harness for
+        cycle detection was NOT produced (iterative SCC is test-pinned
+        only) — carried as a proof gap to the v0.31.0 traceability
+        audit (docs/roadmap.md).
+      milestone: v0.21.0
+
+  - id: SR-35
+    type: requirement
+    title: DWARF address remap into merged code section
+    description: >
+      A new `DwarfHandling::Remap` policy on `FuserConfig` shall rewrite
+      `.debug_line`, `.debug_info` (address-bearing DIEs), `.debug_ranges`
+      / `.debug_rnglists` so addresses inside those sections reference the
+      merged code section rather than per-input code sections.
+      `.debug_str` / `.debug_abbrev` pass through with string-pool dedup /
+      byte-equal merge. End-to-end verified by witness MC/DC integration:
+      ≥ X% of `br_if` byte offsets in fused output resolve to source.
+    status: verified
+    tags: [roadmap, dwarf, witness-mc-dc, v0.10.0]
+    links:
+      - type: derives-from
+        target: "#130"
+      - type: tracked-by
+        target: "#143"
+      - type: supersedes-default-of
+        target: LS-CP-4
+    fields:
+      implementation: meld-core/src/dwarf.rs
+      verification-method: test+cross-repo
+      verification-description: >
+        Unit tests on `.debug_line` rewrite; cross-repo smoke against
+        `pulseengine/witness` confirming attribution coverage on a fused
+        wit-bindgen fixture.
+      milestone: v0.10.0
+
+  - id: SR-36
+    type: requirement
+    title: Synthesised DWARF DIEs for meld-generated adapter functions
+    description: >
+      For every adapter function meld emits (cross-component lift/lower,
+      `cabi_realloc` trampoline, `memory.copy` transcode loop), the
+      output module shall carry a synthesised DIE pointing at a
+      placeholder source file `<meld-adapter>` line N where N encodes
+      the adapter class. Witness then surfaces these as "adapter"
+      branches in its MC/DC line map rather than as un-attributed gaps.
+
+      Delivered incrementally. Increment 1 (`dwarf::adapter_spans`):
+      the enumeration seam — reports which fused-output code ranges are
+      meld-generated (identified via the merger's synthetic-origin
+      sentinels). Increment 2 (`dwarf::build_adapter_dwarf`): the
+      synthetic-unit builder with a write→read round-trip oracle.
+      Increment 3 (`dwarf::append_adapter_unit` + `remap_for_output`):
+      pipeline emission under `DwarfHandling::Remap` — the synthetic
+      unit rides the SAME `gimli::write::Dwarf` write as the remapped
+      source units (one shared offset space; concatenating separately
+      serialised `.debug_*` bytes would collide), and is emitted even
+      when no input carries DWARF, so adapter attribution never depends
+      on debug-built inputs. Increment 4 (v0.24.0): per-class
+      `<meld-adapter>` lines. The merger tags synthetic functions
+      (`MergedFunction::synthetic_kind`: handle-table, start wrapper,
+      adapter shim, task-return shim) and the FACT generator tags each
+      `AdapterFunction` (`AdapterClass`: direct, memory-copy, transcode,
+      async); `dwarf::adapter_spans` additionally enumerates the FACT
+      trampolines appended after the merged functions — previously a
+      coverage gap leaving every FACT adapter unattributed. Stable line
+      contract (`AdapterRole::adapter_line`): 1 unclassified, 2 direct,
+      3 memory-copy, 4 transcode, 5 async, 6 handle-table, 7 start
+      wrapper, 8 adapter shim, 9 task-return shim. Granularity
+      correction vs #130's sketch ("transcode/cabi_realloc/lift/lower"):
+      meld emits ONE fused trampoline per call site with lowering,
+      allocation (a call to the callee's own cabi_realloc) and lifting
+      inline, so the honest class unit is the trampoline kind.
+    status: implemented
+    tags: [roadmap, dwarf, witness-mc-dc, v0.23.0, v0.24.0]
+    links:
+      - type: derives-from
+        target: "#130"
+      - type: tracked-by
+        target: "#144"
+      - type: depends-on
+        target: SR-35
+    fields:
+      implementation:
+        - meld-core/src/dwarf.rs
+        - meld-core/src/adapter/fact.rs
+      verification-method: test+cross-repo
+      verification-description: >
+        Increment 1: `dwarf::tests::adapter_spans_*` pin enumeration at
+        correct output ranges, disjoint from source ranges. Increment 2:
+        `build_adapter_dwarf_attributes_ranges_to_meld_adapter` is the
+        write→read round-trip oracle. Increment 3:
+        `ls_d_2_rewrite_emits_source_and_adapter_units_in_one_write`
+        (combined single-write: remapped source row AND adapter row
+        coexist in one .debug_line) and tests/adapter_dwarf_e2e.rs
+        (`ls_d_2_generated_start_wrapper_is_attributed_to_meld_adapter`:
+        dwarf-less inputs whose fusion generates a start wrapper yield
+        output attributing the wrapper to `<meld-adapter>:1` at an
+        independently-derived real body address, plus a runtime guard
+        that emission does not perturb behaviour). `verified` after the
+        cross-repo witness re-run (v0.25.0 gate) confirms adapter ranges
+        resolve to `<meld-adapter>` rather than `unknown` on a real
+        fixture.
+      milestone: v0.23.0
+
+  # SR-37 was accidentally deleted by PR #226 (commit fafd00c); restored
+  # verbatim from c50d9d5 in the v0.31.0 traceability audit, with status
+  # upgraded implemented → verified on the recorded evidence.
+  - id: SR-37
+    type: requirement
+    title: Automatic memory-strategy resolution (sound-by-construction default)
+    description: >
+      `MemoryStrategy::Auto` — the default for both `FuserConfig` and the
+      `meld fuse` CLI — shall resolve to shared memory + address rebasing
+      if and only if (a) no input core module contains a `memory.grow`
+      instruction (static probe, conservative on parse failure) and
+      (b) the inputs carry at least two linear memories. Otherwise it
+      shall resolve to multi-memory. If the shared-memory plan refuses
+      the input, fusion shall retry with multi-memory, so Auto accepts
+      every input multi-memory accepts. The resolved strategy shall be
+      reported in `FusionStats` and recorded in the attestation /
+      provenance metadata as the concrete strategy, never as "auto".
+      Rationale: out-of-the-box `meld fuse` output must flow through the
+      `wasm-opt → synth` chain with no extra flags (#172) without ever
+      selecting the shared form where `memory.grow` makes it unsound
+      (merger Bug #7, LS-M-7).
+    status: verified
+    tags: [usability, memory-strategy, v0.22.0]
+    links:
+      - type: tracked-by
+        target: "#172"
+      - type: mitigates
+        target: LS-M-7
+    fields:
+      implementation:
+        - meld-core/src/memory_probe.rs
+        - meld-core/src/lib.rs
+      verification-method: test
+      verification-description: >
+        Unit tests on the probe (grow detected anywhere in any body;
+        memory.size not a false positive; malformed input counts as
+        growing — `ls_m_7_malformed_input_counts_as_grow`). Integration
+        oracle in tests/auto_memory.rs: grow-free inputs fuse to a
+        single-memory output that validates with multi-memory disabled
+        (the `wasm-opt -Os` feature set) and behaves correctly at
+        runtime; a growing input resolves to multi with both memories
+        preserved (`ls_m_7_auto_keeps_multi_when_input_grows`);
+        explicit strategies are never overridden. Manual evidence on
+        the issue repro: `meld fuse a b -o fused.wasm` then
+        `wasm-opt -Os fused.wasm` succeeds with no flags; the explicit
+        `--memory multi` control still reproduces the rejection.
+        Verified (v0.31.0 audit): tests/auto_memory.rs suite 5/5 green
+        plus the ls_m_7_* tests discovered and passing through the LS
+        verification gate.
+      milestone: v0.22.0
+
+  - id: SR-38
+    type: requirement
+    title: Multi-source DWARF merge (bounded relocator)
+    description: >
+      When more than one input core module carries `.debug_*` sections,
+      `DwarfHandling::Remap` shall convert and address-remap EACH
+      source independently (per-module `AddressRemap`) and merge the
+      resulting section sets into one coherent set via concatenation
+      plus bounded relocation of the known cross-section references
+      (CU abbrev offset, `strp`, `stmt_list`/`ranges`/location
+      sec_offsets, `ref_addr`). Inputs outside the bounded repertoire
+      (DWARF64, version != 4, unexpected sections or forms) shall
+      abort the merge and fall back to synthetic-only emission —
+      never a guessed offset. A source whose remap fails is dropped
+      individually; the others proceed.
+    status: verified
+    tags: [roadmap, dwarf, witness-mc-dc, v0.26.0]
+    links:
+      - type: derives-from
+        target: "#130"
+      - type: tracked-by
+        target: "#208"
+      - type: depends-on
+        target: SR-35
+      - type: mitigates
+        target: LS-D-3
+    fields:
+      implementation:
+        - meld-core/src/dwarf.rs
+      verification-method: test
+      verification-description: >
+        ls_d_3_multi_source_merge_round_trips_both_units (gimli-built
+        two-source round-trip: units, files, lines, strp strings all
+        survive relocation) plus the dwarf_passthrough multi-source
+        policy test on the real lists.wasm fixture (287 units merge,
+        23k line rows parse via llvm-dwarfdump locally). Known
+        limitation carried to #208 follow-up: DW_AT_location
+        expressions show pre-existing convert-path verifier warnings
+        (4 on single-source, 11 on multi) — variable-location data,
+        explicitly out of #130 scope.
+      milestone: v0.26.0
+
+  - id: SR-39
+    type: requirement
+    title: Separate-input cross-component linking (import internalisation)
+    description: >
+      `meld fuse a.wasm b.wasm --component` shall resolve one input's
+      instance imports against another input's matching exports and
+      internalise the calls, producing a self-contained component: the
+      wrapped output declares an instance import IFF the fused core
+      module still references it. Satisfied imports are dropped from
+      the component's import surface with the surviving instance
+      indices renumbered consistently at every consumer.
+    status: verified
+    tags: [roadmap, composition, v0.28.0]
+    links:
+      - type: derives-from
+        target: "#94"
+      - type: tracked-by
+        target: "#212"
+      - type: mitigates
+        target: LS-CP-6
+    fields:
+      implementation:
+        - meld-core/src/component_wrap.rs
+      verification-method: test
+      verification-description: >
+        ls_cp_6_separate_inputs_internalise_link — the golden-e2e
+        acceptance authored with #212: fuse consumer.wasm+provider.wasm
+        --component, instantiate standalone in wasmtime with no linker
+        definitions, assert compute()==42 and greet()==7 (host-linked
+        golden equivalence). The full wit-bindgen runtime suite guards
+        the dual failure (WASI imports must remain declared).
+      milestone: v0.28.0
+
+  - id: SR-40
+    type: requirement
+    title: Machine-checked Canonical-ABI layout invariants (Kani)
+    description: >
+      The canonical-ABI layout functions shall carry machine-checked
+      proofs of the invariants the code already claims: element size is
+      a positive multiple of alignment with alignment a power of two
+      <= 8 (leaves, single-level containers, and padded aggregates);
+      flags<N> follows the spec storage classes for all N <= 64
+      (exhaustive); total_flat_params is panic-free and monotone
+      (LS-P-9); and the #141 stream-bridge ring-cursor arithmetic
+      preserves fill <= CAP inductively under u32 wraparound with both
+      wrapping-copy segments in-bounds (model proof, parameters
+      compile-tied to the emitter's constants).
+    status: verified
+    tags: [roadmap, proofs, v0.30.0]
+    links:
+      - type: derives-from
+        target: "#218"
+      - type: tracked-by
+        target: "#218"
+    fields:
+      implementation:
+        - meld-core/src/abi_proofs.rs
+      verification-method: proof
+      verification-description: >
+        Three Kani harnesses in abi_proofs.rs, each VERIFICATION
+        SUCCESSFUL locally on 2026-06-11 via `cargo kani --harness
+        <name>` (smithy runners do not ship the Kani toolchain; CI
+        wiring is follow-up): flags_layout_matches_spec (LS-A-20
+        storage classes at every boundary N in {1,8,9,16,17,32,33,64}),
+        total_flat_params_saturating_monotone (LS-P-9), and
+        ring_cursor_invariant_inductive (#141 bridge cursor math under
+        u32 wraparound, model compile-tied to the emitter's constants;
+        the codegen itself is pinned by the runtime trap-stub oracles).
+        HONEST SCOPE CUTS recorded in-module: nondet leaf/container and
+        aggregate-padding harnesses for the size-multiple-of-align
+        contract do not converge in CBMC against the current
+        ParsedComponent shape (heap-state explosion) — that contract
+        stays pinned by the exhaustive unit tests
+        (test_canonical_abi_element_size_*, test_sr17_alignment_*);
+        a Kani proof becomes tractable once the layout core is
+        factored allocation-free. Scope note: the Rocq side carries
+        350 closed proofs (28 files, 2026-06-11 count)
+        (proofs/STATUS.md); these harnesses target
+        the parser-layer gap STATUS.md marks as placeholder.
+      milestone: v0.30.0

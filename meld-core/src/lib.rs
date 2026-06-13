@@ -23,7 +23,7 @@
 //! use meld_core::{Fuser, FuserConfig};
 //!
 //! let config = FuserConfig::default();
-//! let fuser = Fuser::new(config);
+//! let mut fuser = Fuser::new(config);
 //!
 //! // Add components to fuse
 //! fuser.add_component(&component_a_bytes)?;
@@ -35,18 +35,31 @@
 //!
 //! ## Memory Strategy
 //!
-//! - **Multi-memory** (default): Each component keeps its own linear memory.
+//! - **Auto** (default): Resolves to shared memory + address rebasing when
+//!   no input module contains `memory.grow` and the inputs carry two or
+//!   more memories; multi-memory otherwise. See [`MemoryStrategy::Auto`]
+//!   and issue #172.
+//! - **Multi-memory**: Each component keeps its own linear memory.
 //!   Cross-component pointer-passing calls use adapters with `cabi_realloc`
-//!   and `memory.copy`.
-//! - **Shared memory** (legacy): All components share one memory. Broken when
+//!   and `memory.copy`. Downstream tools need multi-memory support
+//!   (`wasm-opt --enable-multimemory`); no single-address-space lowering.
+//! - **Shared memory**: All components share one memory. Broken when
 //!   any component uses `memory.grow`.
 
+pub mod abi_proofs;
 pub mod adapter;
 pub mod attestation;
 pub mod component_wrap;
+pub mod custom_merge;
+pub mod dwarf;
 mod error;
+pub mod memory_probe;
 pub mod merger;
+pub mod p3_async;
+pub mod p3_bridge;
+pub mod p3_stream;
 pub mod parser;
+pub mod provenance;
 pub mod resolver;
 pub mod resource_graph;
 pub mod rewriter;
@@ -71,6 +84,18 @@ pub struct FuserConfig {
     /// Whether to generate attestation data
     pub attestation: bool,
 
+    /// Whether to emit the `component-provenance` custom section
+    /// (issue #192). When enabled (the default), every defined
+    /// function in the fused module gets a back-pointer entry
+    /// `{ component_id, originating_func_idx }` in a JSON payload
+    /// under the section name `component-provenance`. Consumers
+    /// (notably `pulseengine/scry`'s sound abstract interpreter)
+    /// use this to project Component-Model invariants onto fused-
+    /// module locations. Section overhead is ~120 bytes per fused
+    /// function; opting out via `--no-component-provenance` is
+    /// supported for size-sensitive builds.
+    pub component_provenance: bool,
+
     /// Whether to rebase per-module memory addresses into a shared memory
     pub address_rebasing: bool,
 
@@ -80,19 +105,52 @@ pub struct FuserConfig {
     /// Custom section handling
     pub custom_sections: CustomSectionHandling,
 
+    /// DWARF (`.debug_*`) section handling.
+    ///
+    /// Default `Remap` since v0.25.0 (#143/#144 complete): single-source
+    /// input DWARF is address-remapped against the fused code section
+    /// (correct-or-tombstone per address, LS-D-1), meld-generated code
+    /// gets the synthetic `<meld-adapter>` per-class unit (LS-D-2), and
+    /// the multi-source case drops source DWARF rather than emit wrong
+    /// addresses (#208 lifts that). Witness-measured on hello_rust:
+    /// 75.9% of fused branch offsets resolve to source (83.0% unfused;
+    /// the unfused 17% is debug-info-less libc, the fusion delta is
+    /// tombstoned/dropped ranges — tracked under #208). `Strip` remains
+    /// available; `PassThrough` is opt-in and lossy (its addresses are
+    /// wrong against the fused code section).
+    pub dwarf_handling: DwarfHandling,
+
     /// Output format: core module (default) or P2 component
     pub output_format: OutputFormat,
+
+    /// Resources whose representation is opaque to wit-bindgen-rust user code
+    /// (constructed by `pulseengine/wit-bindgen feat/opaque-rep-attribute` with
+    /// `--opaque-export-resources`). Each entry is `(interface, resource_name)`.
+    ///
+    /// Opaque-rep resources are routed differently than standard Box-pattern
+    /// resources:
+    /// 1. `merger.rs::allocate_handle_tables` skips them — their reps are
+    ///    already valid integer handles, no parallel handle table needed.
+    /// 2. `component_wrap.rs::local_resource_types` keys them by
+    ///    `(component_idx, resource_name)` rather than `resource_name` alone,
+    ///    giving each component its own wasmtime resource type. This matches
+    ///    the un-fused composition's semantics where each component owns
+    ///    its own resource table.
+    pub opaque_resources: Vec<(String, String)>,
 }
 
 impl Default for FuserConfig {
     fn default() -> Self {
         Self {
-            memory_strategy: MemoryStrategy::MultiMemory,
+            memory_strategy: MemoryStrategy::Auto,
             attestation: true,
+            component_provenance: true,
             address_rebasing: false,
             preserve_names: false,
             custom_sections: CustomSectionHandling::Merge,
+            dwarf_handling: DwarfHandling::Remap,
             output_format: OutputFormat::CoreModule,
+            opaque_resources: Vec::new(),
         }
     }
 }
@@ -105,11 +163,31 @@ pub enum MemoryStrategy {
     /// growth corrupts every other component's address space.
     SharedMemory,
 
-    /// Each component keeps its own memory (default).
+    /// Each component keeps its own memory.
     /// Cross-component pointer-passing calls use adapters with
     /// `cabi_realloc` and `memory.copy`. Requires WebAssembly
-    /// multi-memory (Core Spec 3.0).
+    /// multi-memory (Core Spec 3.0) — downstream tools such as
+    /// `wasm-opt` need `--enable-multimemory`, and single-address-
+    /// space (MCU) targets have no lowering for it (issue #172).
     MultiMemory,
+
+    /// Resolve to `SharedMemory` + address rebasing when that is
+    /// provably sound, `MultiMemory` otherwise (default; issue #172).
+    ///
+    /// Resolution happens once, at the start of fusion, from two
+    /// static facts about the inputs:
+    /// 1. No input module contains a `memory.grow` instruction
+    ///    (`memory_probe`) — growth is what breaks shared memory.
+    /// 2. The inputs carry two or more linear memories — with at most
+    ///    one, multi-memory output is already single-memory, so the
+    ///    rebasing path adds risk without benefit.
+    ///
+    /// Both hold → `SharedMemory` with address rebasing. Otherwise →
+    /// `MultiMemory`. If the shared-memory plan itself refuses the
+    /// input (`Error::MemoryStrategyUnsupported`), fusion retries as
+    /// `MultiMemory`, so `Auto` never fails on input that the
+    /// multi-memory strategy accepts.
+    Auto,
 }
 
 /// Output format for the fused binary
@@ -131,6 +209,41 @@ pub enum CustomSectionHandling {
     Prefix,
     /// Drop all custom sections
     Drop,
+}
+
+/// How to handle DWARF (`.debug_*`) custom sections during fusion.
+///
+/// Distinct from [`CustomSectionHandling`] because DWARF sections carry
+/// code-section byte offsets that meld does NOT yet remap (issue #130
+/// Phase 2). Passing them through unchanged is strictly worse than
+/// dropping them — downstream consumers like `pulseengine/witness`
+/// would silently produce wrong source-line attribution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DwarfHandling {
+    /// Drop all `.debug_*` sections (default).
+    ///
+    /// The fused module carries no DWARF; downstream MC/DC tooling
+    /// degrades to its no-DWARF fallback. Correct, lossy.
+    Strip,
+
+    /// Pass DWARF sections through verbatim from each input core
+    /// module.
+    ///
+    /// Addresses inside the sections refer to per-input code-section
+    /// offsets and will be wrong against the merged code section.
+    /// Use only if the consumer can tolerate or detect that.
+    PassThrough,
+
+    /// Remap DWARF code addresses to the fused code section (#143).
+    ///
+    /// Reads the input `.debug_*` sections, translates every code
+    /// address through an [`crate::dwarf::AddressRemap`] built from the
+    /// actual input→output instruction layout, and emits a single
+    /// rewritten DWARF set. Currently supports the case where exactly
+    /// one input core module carries DWARF; with zero or more than one
+    /// DWARF source — or if any address fails to map — it falls back to
+    /// [`DwarfHandling::Strip`] (never emitting a wrong address).
+    Remap,
 }
 
 /// Statistics about the fusion process
@@ -159,6 +272,11 @@ pub struct FusionStats {
 
     /// Size of fused output (bytes)
     pub output_size: usize,
+
+    /// The memory strategy the output was actually built with ("shared" or
+    /// "multi"). With `MemoryStrategy::Auto` this reports the resolution
+    /// outcome (#172), so callers can tell the user what was selected.
+    pub memory_strategy: String,
 }
 
 /// Main fuser interface for static component fusion
@@ -170,6 +288,13 @@ pub struct Fuser {
     original_components: Vec<ParsedComponent>,
     /// Directed wiring hints from composition graph.
     wiring_hints: WiringHints,
+    /// The memory strategy/rebasing pair as originally requested, captured
+    /// before `MemoryStrategy::Auto` resolution mutates `config`. Restored
+    /// at the start of every fuse so resolution is re-derived from the
+    /// CURRENT component set — without this, a fuse → `add_component` →
+    /// fuse sequence would reuse a stale resolution (Mythos finding A,
+    /// PR #220 / UCA-M-11).
+    requested_memory: Option<(MemoryStrategy, bool)>,
 }
 
 impl Fuser {
@@ -180,6 +305,7 @@ impl Fuser {
             components: Vec::new(),
             original_components: Vec::new(),
             wiring_hints: std::collections::HashMap::new(),
+            requested_memory: None,
         }
     }
 
@@ -221,17 +347,135 @@ impl Fuser {
         self.components.len()
     }
 
+    /// Inspect P3 async usage across all added components.
+    ///
+    /// Returns a per-component summary of stream/future types and async
+    /// canonical built-ins. Pure inspection — does not consume the fuser.
+    /// See [`crate::p3_async`] for the host-intrinsic ABI meld lowers
+    /// these constructs to.
+    pub fn p3_async_summary(&self) -> Vec<(Option<String>, p3_async::P3AsyncFeatures)> {
+        self.components
+            .iter()
+            .map(|c| (c.name.clone(), p3_async::detect_features(c)))
+            .collect()
+    }
+
+    /// Borrow the flattened parsed components.
+    ///
+    /// Useful for benchmarks and tools that want to drive `Resolver` /
+    /// `Merger` directly with the same flattened slice the fusion pipeline
+    /// uses internally, without having to re-implement
+    /// `flatten_nested_components`.
+    pub fn components(&self) -> &[ParsedComponent] {
+        &self.components
+    }
+
+    /// Borrow the wiring hints derived from composition graphs (component
+    /// instance / alias wiring). Pair with `components()` when calling
+    /// `Resolver::resolve_with_hints` for parity with the in-pipeline call.
+    pub fn wiring_hints(&self) -> &WiringHints {
+        &self.wiring_hints
+    }
+
     /// Perform the fusion and return the fused module bytes
-    pub fn fuse(&self) -> Result<Vec<u8>> {
+    pub fn fuse(&mut self) -> Result<Vec<u8>> {
         let (bytes, _stats) = self.fuse_with_stats()?;
         Ok(bytes)
     }
 
     /// Perform fusion and return both the bytes and statistics
-    pub fn fuse_with_stats(&self) -> Result<(Vec<u8>, FusionStats)> {
+    ///
+    /// Takes `&mut self` because `MemoryStrategy::Auto` is resolved here,
+    /// in place, to a concrete strategy before the pipeline runs (#172) —
+    /// every later read of `self.config` then sees the resolved values.
+    pub fn fuse_with_stats(&mut self) -> Result<(Vec<u8>, FusionStats)> {
         if self.components.is_empty() {
             return Err(Error::NoComponents);
         }
+        // Restore the originally-requested strategy before resolving, so a
+        // repeated fuse (e.g. after another `add_component`) re-derives the
+        // resolution from the CURRENT component set instead of reusing a
+        // stale one (Mythos finding A, PR #220).
+        let (requested_strategy, requested_rebasing) = *self
+            .requested_memory
+            .get_or_insert((self.config.memory_strategy, self.config.address_rebasing));
+        self.config.memory_strategy = requested_strategy;
+        self.config.address_rebasing = requested_rebasing;
+        if self.config.memory_strategy == MemoryStrategy::Auto {
+            self.resolve_auto_memory_strategy();
+            if self.config.memory_strategy == MemoryStrategy::SharedMemory {
+                return match self.fuse_with_stats_resolved() {
+                    Err(Error::MemoryStrategyUnsupported(msg)) => {
+                        // Auto must never fail on input multi-memory accepts:
+                        // a shared-plan refusal downgrades to multi-memory
+                        // instead of surfacing as an error.
+                        log::warn!(
+                            "memory strategy auto: shared-memory fusion refused \
+                             ({msg}); retrying with multi-memory"
+                        );
+                        self.config.memory_strategy = MemoryStrategy::MultiMemory;
+                        self.config.address_rebasing = false;
+                        self.fuse_with_stats_resolved()
+                    }
+                    other => other,
+                };
+            }
+        }
+        self.fuse_with_stats_resolved()
+    }
+
+    /// Resolve `MemoryStrategy::Auto` against the added components.
+    ///
+    /// Shared memory + address rebasing is selected only when it is
+    /// statically sound AND buys anything: no input module can grow its
+    /// memory (`memory_probe`, merger Bug #7) and the inputs carry at
+    /// least two memories (with fewer, multi-memory output is already
+    /// single-memory). Any user-supplied `address_rebasing` value is
+    /// overridden — Auto owns both knobs.
+    fn resolve_auto_memory_strategy(&mut self) {
+        let mut memory_count = 0usize;
+        let mut grows = false;
+        for component in &self.components {
+            for module in &component.core_modules {
+                memory_count += module.memories.len();
+                memory_count += module
+                    .imports
+                    .iter()
+                    .filter(|imp| matches!(imp.kind, parser::ImportKind::Memory(_)))
+                    .count();
+                if !grows && memory_probe::module_uses_memory_grow(&module.bytes) {
+                    grows = true;
+                }
+            }
+        }
+
+        if grows {
+            log::info!(
+                "memory strategy auto: input uses memory.grow; selecting multi-memory \
+                 (shared memory is unsound under growth)"
+            );
+            self.config.memory_strategy = MemoryStrategy::MultiMemory;
+            self.config.address_rebasing = false;
+        } else if memory_count < 2 {
+            log::info!(
+                "memory strategy auto: {memory_count} input memory(ies); selecting \
+                 multi-memory (output is already single-memory)"
+            );
+            self.config.memory_strategy = MemoryStrategy::MultiMemory;
+            self.config.address_rebasing = false;
+        } else {
+            log::info!(
+                "memory strategy auto: {memory_count} memories, no memory.grow; \
+                 selecting shared memory with address rebasing"
+            );
+            self.config.memory_strategy = MemoryStrategy::SharedMemory;
+            self.config.address_rebasing = true;
+        }
+    }
+
+    /// The fusion pipeline proper. `self.config.memory_strategy` is a
+    /// concrete strategy here — `Auto` has been resolved by the caller.
+    fn fuse_with_stats_resolved(&self) -> Result<(Vec<u8>, FusionStats)> {
         if self.config.address_rebasing
             && self.config.memory_strategy != MemoryStrategy::SharedMemory
         {
@@ -254,6 +498,7 @@ impl Fuser {
 
         let mut stats = FusionStats {
             components_fused: self.components.len(),
+            memory_strategy: self.memory_strategy_label().to_string(),
             ..Default::default()
         };
 
@@ -274,10 +519,20 @@ impl Fuser {
 
         // Step 2: Merge modules
         log::info!("Merging {} core modules", stats.modules_merged);
-        let merger = Merger::new(self.config.memory_strategy, self.config.address_rebasing);
+        let merger = Merger::new(self.config.memory_strategy, self.config.address_rebasing)
+            .with_opaque_resources(self.config.opaque_resources.clone());
         let mut merged = merger.merge(&self.components, &graph)?;
         stats.total_functions = merged.functions.len();
         stats.total_exports = merged.exports.len();
+
+        // Step 2.4: Lower P3 async canonical built-ins to `pulseengine:async`
+        // core-module imports. This adds one import per distinct intrinsic
+        // (stream.new, stream.read, …, future.drop-writable) and shifts
+        // every reference to defined functions up to make room. No-op when
+        // the components contain no P3 async data-plane constructs (the
+        // 73-test wit_bindgen_runtime suite). See `p3_async::lower_p3_async_intrinsics`
+        // and ADR-1 for the full design.
+        let _p3_lowering_plan = p3_async::lower_p3_async_intrinsics(&mut merged, &self.components)?;
 
         // Step 2.5: Generate task.return shims for internal fused async calls.
         //
@@ -287,6 +542,30 @@ impl Fuser {
         // after EXIT. Must run BEFORE adapter generation so shim info
         // is available to the async adapter.
         self.generate_task_return_shims(&mut merged, &graph)?;
+
+        // Step 2.6: Cross-component stream-bridge emitter (#141, SR-33).
+        //
+        // When the resolver detected cross-component stream pairs
+        // (graph.stream_pair_graph, ADR-3 detection foundation), emit the
+        // bridge memory + per-component dispatch shims and rewire every
+        // stream-intrinsic call site to its component's shim. This MUST
+        // run before adapter generation/wiring: adapters are encoded
+        // after merged.functions, so wire_adapter_indices bakes adapter
+        // indices derived from functions.len() into call sites —
+        // appending shim functions any later would shift those indices
+        // off-target. Running here, the shims are plain merged functions
+        // that every later index computation already accounts for.
+        if let Some(stream_pairs) = graph.stream_pair_graph.as_ref()
+            && !stream_pairs.is_empty()
+        {
+            p3_bridge::emit_stream_bridge(
+                &mut merged,
+                &self.components,
+                stream_pairs,
+                self.config.memory_strategy,
+                self.config.address_rebasing,
+            )?;
+        }
 
         // Step 3: Generate adapters
         log::info!("Generating adapters");
@@ -310,20 +589,74 @@ impl Fuser {
             self.wire_adapter_indices(&mut merged, &adapters, &graph)?;
         }
 
-        // Step 4: Encode output module
+        // Step 4: Encode output module.
+        //
+        // Two-pass dance: first encode without any self-referential
+        // custom sections, then build attestation (#wsc) and
+        // provenance (#192) over THAT byte sequence and re-encode
+        // with both as extras. Both sections' SHA-256 hashes refer
+        // to the bytes-without-extras, so consumers strip both
+        // sections before verifying.
         log::info!("Encoding fused module");
-        let output_without_attestation = self.encode_output(&merged, &adapters, &[])?;
-        let output = if self.config.attestation {
-            // Build attestation from the output without the attestation section to avoid
-            // self-referential hashing.
-            let mut attestation_stats = stats.clone();
-            attestation_stats.output_size = output_without_attestation.len();
-            let (section_name, payload) =
-                self.build_attestation_payload(&output_without_attestation, &attestation_stats)?;
-            let extra_sections = vec![(section_name, payload)];
-            self.encode_output(&merged, &adapters, &extra_sections)?
+        // Pass A: encode without DWARF and without meld-extras. Its
+        // code-section offsets are what the DWARF remap targets (trailing
+        // custom sections do not shift code offsets, so the same offsets
+        // hold in passes B and C).
+        let bytes_for_remap = self.encode_output(&merged, &adapters, &[], &[])?;
+
+        // Build the remapped `.debug_*` sections (only under Remap; a
+        // miss or unsupported shape returns no sections → DWARF stripped).
+        let dwarf_sections: Vec<(String, Vec<u8>)> =
+            if self.config.dwarf_handling == DwarfHandling::Remap {
+                {
+                    let adapter_classes: Vec<adapter::AdapterClass> =
+                        adapters.iter().map(|a| a.class).collect();
+                    dwarf::remap_for_output(
+                        &self.components,
+                        &merged,
+                        &adapter_classes,
+                        &bytes_for_remap,
+                    )
+                    .unwrap_or_default()
+                }
+            } else {
+                Vec::new()
+            };
+
+        // Pass B: re-encode with the remapped DWARF embedded. These are
+        // the bytes the attestation/provenance hashes cover.
+        let output_without_extras = if dwarf_sections.is_empty() {
+            bytes_for_remap
         } else {
-            output_without_attestation
+            log::info!(
+                "Embedding {} remapped DWARF section(s)",
+                dwarf_sections.len()
+            );
+            self.encode_output(&merged, &adapters, &[], &dwarf_sections)?
+        };
+
+        let mut extra_sections: Vec<(&str, Vec<u8>)> = Vec::new();
+
+        if self.config.attestation {
+            let mut attestation_stats = stats.clone();
+            attestation_stats.output_size = output_without_extras.len();
+            let (section_name, payload) =
+                self.build_attestation_payload(&output_without_extras, &attestation_stats)?;
+            extra_sections.push((section_name, payload));
+        }
+
+        if self.config.component_provenance {
+            let provenance = provenance::build(&merged, &self.components, &output_without_extras);
+            let payload = provenance.to_bytes().map_err(|e| {
+                Error::EncodingError(format!("component-provenance serialization failed: {e}"))
+            })?;
+            extra_sections.push((provenance::SECTION_NAME, payload));
+        }
+
+        let output = if extra_sections.is_empty() {
+            output_without_extras
+        } else {
+            self.encode_output(&merged, &adapters, &extra_sections, &dwarf_sections)?
         };
 
         // Optionally wrap the fused core module as a P2 component
@@ -336,6 +669,7 @@ impl Fuser {
                 &graph,
                 &merged,
                 self.config.memory_strategy,
+                &self.config.opaque_resources,
             )?
         } else {
             output
@@ -508,6 +842,7 @@ impl Fuser {
                 type_idx: info.caller_type_idx,
                 body,
                 origin: (info.comp_idx, info.mod_idx, u32::MAX),
+                synthetic_kind: Some(merger::SyntheticKind::AdapterShim),
             });
             affected_modules.insert((info.comp_idx, info.mod_idx));
         }
@@ -530,6 +865,15 @@ impl Fuser {
                 .unwrap_or(false);
             let memory_initial_pages = module_memory.as_ref().map(|mem| mem.initial);
 
+            // Post-merge re-rewrite: recover this module's segment bases from
+            // the merge-time record (`merged.*.len()` is now the total, not
+            // the base).
+            let (data_segment_base, elem_segment_base) = merged
+                .segment_bases
+                .get(&(comp_idx, mod_idx))
+                .copied()
+                .unwrap_or((0, 0));
+
             let index_maps = merger::build_index_maps_for_module(
                 comp_idx,
                 mod_idx,
@@ -540,6 +884,8 @@ impl Fuser {
                 memory_base_offset,
                 memory64,
                 memory_initial_pages,
+                data_segment_base,
+                elem_segment_base,
             );
 
             let import_func_count = module
@@ -926,6 +1272,7 @@ impl Fuser {
                 type_idx: shim_type,
                 body,
                 origin: (comp_idx, 0, u32::MAX),
+                synthetic_kind: Some(merger::SyntheticKind::TaskReturnShim),
             });
 
             // Export the shim so the component wrapper can alias it
@@ -1040,6 +1387,11 @@ impl Fuser {
         // Re-rewrite function bodies for affected modules
         for &(comp_idx, mod_idx) in &affected_modules {
             let module = &self.components[comp_idx].core_modules[mod_idx];
+            let (data_segment_base, elem_segment_base) = merged
+                .segment_bases
+                .get(&(comp_idx, mod_idx))
+                .copied()
+                .unwrap_or((0, 0));
             let index_maps = merger::build_index_maps_for_module(
                 comp_idx,
                 mod_idx,
@@ -1050,6 +1402,8 @@ impl Fuser {
                 0u64,
                 false,
                 None,
+                data_segment_base,
+                elem_segment_base,
             );
             let import_func_count = module
                 .imports
@@ -1163,6 +1517,7 @@ impl Fuser {
         merged: &MergedModule,
         adapters: &[adapter::AdapterFunction],
         extra_custom_sections: &[(&str, Vec<u8>)],
+        dwarf_sections: &[(String, Vec<u8>)],
     ) -> Result<Vec<u8>> {
         let mut module = EncodedModule::new();
 
@@ -1246,7 +1601,7 @@ impl Fuser {
         if !merged.elements.is_empty() {
             let mut elements = wasm_encoder::ElementSection::new();
             for segment in &merged.elements {
-                elements.segment(segments::encode_element_segment(segment));
+                segments::encode_element_segment(&mut elements, segment);
             }
             module.section(&elements);
         }
@@ -1286,15 +1641,54 @@ impl Fuser {
 
         // Handle custom sections based on config
         if self.config.custom_sections != CustomSectionHandling::Drop {
-            for (name, contents) in &merged.custom_sections {
-                if !self.config.preserve_names && name == "name" {
-                    continue;
-                }
+            let kept: Vec<(String, Vec<u8>)> = merged
+                .custom_sections
+                .iter()
+                .filter(|(name, _)| {
+                    if !self.config.preserve_names && name == "name" {
+                        return false;
+                    }
+                    // Only PassThrough emits raw per-input `.debug_*`
+                    // sections. Strip drops them; Remap drops them here and
+                    // emits a single remapped set below.
+                    if self.config.dwarf_handling != DwarfHandling::PassThrough
+                        && name.starts_with(".debug_")
+                    {
+                        return false;
+                    }
+                    true
+                })
+                .cloned()
+                .collect();
+            // Under Merge, coalesce same-name tool-metadata sections
+            // (`producers`, `target_features`) into one section each, in
+            // the canonical order LLVM's wasm reader enforces (#222) —
+            // duplicate `producers` sections make llvm-dwarfdump reject
+            // the whole module.
+            let kept = if self.config.custom_sections == CustomSectionHandling::Merge {
+                custom_merge::coalesce(&kept)
+            } else {
+                kept
+            };
+            for (name, contents) in &kept {
                 module.section(&wasm_encoder::CustomSection {
                     name: std::borrow::Cow::Borrowed(name),
                     data: std::borrow::Cow::Borrowed(contents),
                 });
             }
+        }
+
+        // Remapped DWARF (DwarfHandling::Remap): a single `.debug_*` set
+        // whose code addresses target the fused code section, replacing
+        // the per-input sections skipped above. Emitted before the
+        // meld-metadata extras so they sit at a stable byte offset
+        // across the encode passes (the attestation/provenance hash
+        // covers these bytes; the extras are stripped before verifying).
+        for (name, contents) in dwarf_sections {
+            module.section(&wasm_encoder::CustomSection {
+                name: std::borrow::Cow::Borrowed(name),
+                data: std::borrow::Cow::Borrowed(contents),
+            });
         }
 
         for (name, contents) in extra_custom_sections {
@@ -1412,6 +1806,10 @@ impl Fuser {
             serde_json::json!(self.custom_sections_label()),
         );
         tool_parameters.insert(
+            "dwarf_handling".to_string(),
+            serde_json::json!(self.dwarf_handling_label()),
+        );
+        tool_parameters.insert(
             "output_format".to_string(),
             serde_json::json!(self.output_format_label()),
         );
@@ -1482,6 +1880,9 @@ impl Fuser {
         match self.config.memory_strategy {
             MemoryStrategy::SharedMemory => "shared",
             MemoryStrategy::MultiMemory => "multi",
+            // Unreachable after `resolve_auto_memory_strategy`; kept as an
+            // honest label in case attestation is ever built pre-resolution.
+            MemoryStrategy::Auto => "auto",
         }
     }
 
@@ -1491,6 +1892,15 @@ impl Fuser {
             CustomSectionHandling::Merge => "merge",
             CustomSectionHandling::Prefix => "prefix",
             CustomSectionHandling::Drop => "drop",
+        }
+    }
+
+    #[cfg(feature = "attestation")]
+    fn dwarf_handling_label(&self) -> &'static str {
+        match self.config.dwarf_handling {
+            DwarfHandling::Strip => "strip",
+            DwarfHandling::PassThrough => "passthrough",
+            DwarfHandling::Remap => "remap",
         }
     }
 
@@ -1583,7 +1993,7 @@ fn flatten_nested_components(
 /// propagated to whichever sub-component consumes them.
 /// Directed resolution hints from the composition graph.
 /// Maps (importer_flat_idx, interface_name) → exporter_flat_idx.
-type WiringHints = std::collections::HashMap<(usize, String), usize>;
+pub type WiringHints = std::collections::HashMap<(usize, String), usize>;
 
 #[allow(clippy::collapsible_if)]
 fn propagate_outer_wiring(
@@ -2070,10 +2480,12 @@ fn generate_stabilizing_shim(
 mod tests {
     use super::*;
 
+    /// #172: the library default is `Auto` — shared+rebase when provably
+    /// safe, multi-memory otherwise. Pin it so a change is deliberate.
     #[test]
     fn test_fuser_config_default() {
         let config = FuserConfig::default();
-        assert_eq!(config.memory_strategy, MemoryStrategy::MultiMemory);
+        assert_eq!(config.memory_strategy, MemoryStrategy::Auto);
         assert!(config.attestation);
         assert!(!config.address_rebasing);
         assert!(!config.preserve_names);
@@ -2081,7 +2493,7 @@ mod tests {
 
     #[test]
     fn test_fuser_empty_components_error() {
-        let fuser = Fuser::with_defaults();
+        let mut fuser = Fuser::with_defaults();
         let result = fuser.fuse();
         assert!(matches!(result, Err(Error::NoComponents)));
     }
@@ -2288,6 +2700,139 @@ mod tests {
             matches!(result, Err(Error::InvalidWasm(_))),
             "expected Error::InvalidWasm for garbage bytes, got: {:?}",
             result
+        );
+    }
+
+    /// LS-R-13: the stream-cycle detector must not exhaust the call
+    /// stack on a deep linear chain. Re-pins, at lib scope where the LS
+    /// verification gate discovers it, what
+    /// `p3_stream::tests::deep_linear_chain_does_not_overflow_stack`
+    /// pins module-internally: a 50 000-component producer→consumer
+    /// chain (deep enough to overflow the default 8 MB thread stack
+    /// under a recursive Tarjan, which both the first draft and
+    /// petgraph 0.8's tarjan_scc were) is validated without a stack
+    /// overflow and without flagging a spurious cycle. Built entirely
+    /// through the public `p3_stream` API.
+    #[test]
+    fn ls_r_13_deep_linear_chain_does_not_overflow_stack() {
+        use crate::p3_stream::{
+            StreamElement, StreamEndpoint, StreamMemoryMode, StreamPair, StreamPairGraph,
+            StreamRole, cycle_issues_from_pairs,
+        };
+
+        let n = 50_000usize;
+        let mut pairs = Vec::with_capacity(n - 1);
+        for i in 0..(n - 1) {
+            pairs.push(StreamPair {
+                producer: StreamEndpoint {
+                    component: i,
+                    role: StreamRole::Producer,
+                },
+                consumer: StreamEndpoint {
+                    component: i + 1,
+                    role: StreamRole::Consumer,
+                },
+                element: StreamElement::Typed("U8".to_string()),
+                mode: StreamMemoryMode::CrossMemory,
+            });
+        }
+        let graph = StreamPairGraph { pairs };
+        let issues = cycle_issues_from_pairs(&graph);
+        assert!(
+            issues.is_empty(),
+            "linear chain of {n} components must not flag a cycle; got {issues:?}"
+        );
+    }
+
+    /// LS-M-6: the `component-provenance` custom section must be
+    /// present in fused output under the default config (provenance and
+    /// attestation both enabled). The full round-trip/attribution
+    /// oracle lives in tests/component_provenance.rs (an integration
+    /// test, invisible to the LS verification gate's lib scan); this
+    /// lib-scope test pins the minimal contract: fuse two trivial
+    /// components and assert exactly one section named
+    /// `provenance::SECTION_NAME` exists with a non-empty payload.
+    #[test]
+    fn ls_m_6_provenance_section_present_in_fused_output() {
+        use wasm_encoder::{
+            CodeSection, Component, ExportKind, ExportSection, Function, FunctionSection,
+            Instruction, MemorySection, MemoryType, Module as EncoderModule, ModuleSection,
+            TypeSection,
+        };
+
+        /// Minimal valid component: one core module with one function
+        /// returning a constant, one exported memory.
+        fn build_trivial_component(func_export: &str, value: i32) -> Vec<u8> {
+            let mut types = TypeSection::new();
+            types.ty().function([], [wasm_encoder::ValType::I32]);
+
+            let mut functions = FunctionSection::new();
+            functions.function(0);
+
+            let mut memory = MemorySection::new();
+            memory.memory(MemoryType {
+                minimum: 1,
+                maximum: None,
+                memory64: false,
+                shared: false,
+                page_size_log2: None,
+            });
+
+            let mut exports = ExportSection::new();
+            exports.export(func_export, ExportKind::Func, 0);
+            exports.export("memory", ExportKind::Memory, 0);
+
+            let mut code = CodeSection::new();
+            let mut func = Function::new([]);
+            func.instruction(&Instruction::I32Const(value));
+            func.instruction(&Instruction::End);
+            code.function(&func);
+
+            let mut module = EncoderModule::new();
+            module
+                .section(&types)
+                .section(&functions)
+                .section(&memory)
+                .section(&exports)
+                .section(&code);
+
+            let mut component = Component::new();
+            component.section(&ModuleSection(&module));
+            component.finish()
+        }
+
+        // Default config: component_provenance = true, attestation = true.
+        let config = FuserConfig::default();
+        assert!(config.component_provenance && config.attestation);
+
+        let mut fuser = Fuser::new(config);
+        fuser
+            .add_component_named(&build_trivial_component("run-a", 1), Some("comp-a"))
+            .expect("add component a");
+        fuser
+            .add_component_named(&build_trivial_component("run-b", 2), Some("comp-b"))
+            .expect("add component b");
+        let output = fuser.fuse().expect("fuse");
+
+        let mut provenance_payloads: Vec<&[u8]> = Vec::new();
+        for payload in wasmparser::Parser::new(0).parse_all(&output) {
+            if let wasmparser::Payload::CustomSection(reader) =
+                payload.expect("fused output must parse")
+                && reader.name() == provenance::SECTION_NAME
+            {
+                provenance_payloads.push(reader.data());
+            }
+        }
+        assert_eq!(
+            provenance_payloads.len(),
+            1,
+            "fused output must carry exactly one `{}` custom section (LS-M-6)",
+            provenance::SECTION_NAME
+        );
+        assert!(
+            !provenance_payloads[0].is_empty(),
+            "`{}` section payload must not be empty",
+            provenance::SECTION_NAME
         );
     }
 }

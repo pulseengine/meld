@@ -1,5 +1,9 @@
 name: Update wit-bindgen Fixtures
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.run_id }}
+  cancel-in-progress: false
+
 on:
   workflow_dispatch:
   schedule:
@@ -13,7 +17,7 @@ env:
 jobs:
   update-fixtures:
     name: Generate wit-bindgen fixtures
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64, rust-cpu]
     permissions:
       contents: write
       pull-requests: write

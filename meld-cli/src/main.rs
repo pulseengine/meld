@@ -18,7 +18,7 @@
 
 use anyhow::{Context, Result, anyhow};
 use clap::{Parser, Subcommand};
-use meld_core::{Fuser, FuserConfig, FusionStats, MemoryStrategy, OutputFormat};
+use meld_core::{DwarfHandling, Fuser, FuserConfig, FusionStats, MemoryStrategy, OutputFormat};
 use std::fs;
 use std::path::Path;
 use std::time::Instant;
@@ -50,11 +50,21 @@ enum Commands {
         #[arg(short, long, default_value = "fused.wasm")]
         output: String,
 
-        /// Memory strategy: "multi" (default) or "shared"
-        #[arg(long, default_value = "multi")]
+        /// Memory strategy. "auto" (default) picks shared memory with
+        /// address rebasing when no input module contains `memory.grow`
+        /// and there are two or more memories to merge — the resulting
+        /// single-memory module flows through wasm-opt → synth with no
+        /// extra flags — and multi-memory otherwise. "multi" keeps one
+        /// linear memory per input component; the fused module then
+        /// needs `wasm-opt --enable-multimemory` and has no single-
+        /// address-space (MCU) lowering. "shared" forces one merged
+        /// memory; pair it with --address-rebase. Unsound if any input
+        /// grows memory. See issue #172.
+        #[arg(long, default_value = "auto")]
         memory: String,
 
-        /// Rebase memory addresses for shared memory (experimental)
+        /// Rebase memory addresses for shared memory (experimental).
+        /// Only valid with --memory shared; "auto" decides it itself.
         #[arg(long)]
         address_rebase: bool,
 
@@ -65,6 +75,26 @@ enum Commands {
         /// Disable attestation in output
         #[arg(long)]
         no_attestation: bool,
+
+        /// Disable the `component-provenance` custom section (#192).
+        /// The section maps each fused-module function index back to
+        /// its originating component + function index; downstream
+        /// consumers (pulseengine/scry) use it to project
+        /// Component-Model invariants onto fused-module locations.
+        /// Section overhead is ~120 bytes per fused function.
+        #[arg(long)]
+        no_component_provenance: bool,
+
+        /// DWARF debug-info handling: `remap` (default since v0.25.0 —
+        /// translate code addresses to the fused code section; meld-
+        /// generated code is attributed to per-class `<meld-adapter>`
+        /// lines), `strip` (drop all `.debug_*`), or `passthrough`
+        /// (copy verbatim; addresses are wrong against the fused code
+        /// section). With multiple DWARF-bearing input modules, `remap`
+        /// drops the source DWARF (never wrong addresses, #208) but
+        /// still emits the synthetic adapter unit.
+        #[arg(long, value_name = "MODE", default_value = "remap")]
+        dwarf: String,
 
         /// Preserve debug names in output
         #[arg(long)]
@@ -81,6 +111,19 @@ enum Commands {
         /// Write a JSON import map to the given path (for synth/kiln integration)
         #[arg(long, value_name = "PATH")]
         emit_import_map: Option<String>,
+
+        /// Mark a resource as opaque-rep (for re-exporters whose representation
+        /// is treated as a `u32` rather than a boxed pointer). Repeatable.
+        ///
+        /// Format: `<interface>.<resource>` (qualified). Example:
+        /// `--opaque-rep test:resource-floats-opaque/chain.float`
+        ///
+        /// Opaque-rep resources skip meld's per-resource handle table layer
+        /// and get their own wasmtime resource type per component (rather
+        /// than the shared-by-name default). This matches the architecture
+        /// of pulseengine/wit-bindgen `feat/opaque-rep-attribute`.
+        #[arg(long, value_name = "IFACE.RESOURCE")]
+        opaque_rep: Vec<String>,
     },
 
     /// Inspect a WebAssembly component
@@ -120,10 +163,13 @@ fn main() -> Result<()> {
             address_rebase,
             stats,
             no_attestation,
+            no_component_provenance,
+            dwarf,
             preserve_names,
             validate,
             component,
             emit_import_map,
+            opaque_rep,
         }) => {
             fuse_command(
                 inputs,
@@ -132,10 +178,13 @@ fn main() -> Result<()> {
                 address_rebase,
                 stats,
                 no_attestation,
+                no_component_provenance,
+                dwarf,
                 preserve_names,
                 validate,
                 component,
                 emit_import_map,
+                opaque_rep,
             )?;
         }
 
@@ -186,10 +235,13 @@ fn fuse_command(
     address_rebase: bool,
     show_stats: bool,
     no_attestation: bool,
+    no_component_provenance: bool,
+    dwarf: String,
     preserve_names: bool,
     validate: bool,
     component: bool,
     emit_import_map: Option<String>,
+    opaque_rep: Vec<String>,
 ) -> Result<()> {
     println!(
         "Meld v{} - Static Component Fusion",
@@ -198,14 +250,38 @@ fn fuse_command(
 
     // Parse memory strategy
     let memory_strategy = match memory.as_str() {
-        "multi" => MemoryStrategy::MultiMemory,
+        "auto" => {
+            // #172: resolved during fusion — shared+rebase when no input
+            // can grow memory and ≥2 memories exist, multi otherwise.
+            if address_rebase {
+                return Err(anyhow!(
+                    "--address-rebase requires --memory shared; \
+                     'auto' decides address rebasing itself"
+                ));
+            }
+            MemoryStrategy::Auto
+        }
+        "multi" => {
+            // #172: multi-memory output needs --enable-multimemory in
+            // wasm-opt and has no MCU (single-address-space) lowering.
+            // Warn so a user who picked it deliberately still knows what
+            // the next tool in the chain will require.
+            eprintln!(
+                "warning: --memory multi produces a multi-memory module \
+                 when inputs carry more than one memory. wasm-opt needs \
+                 --enable-multimemory to consume it, and it has no \
+                 single-address-space (MCU) lowering. `--memory auto` \
+                 (the default) picks a single-memory form when sound."
+            );
+            MemoryStrategy::MultiMemory
+        }
         "shared" => {
-            println!("Using shared memory (legacy mode)");
+            println!("Using shared memory");
             MemoryStrategy::SharedMemory
         }
         _ => {
             return Err(anyhow!(
-                "Invalid memory strategy: {}. Use 'multi' or 'shared'",
+                "Invalid memory strategy: {}. Use 'auto', 'multi', or 'shared'",
                 memory
             ));
         }
@@ -221,12 +297,48 @@ fn fuse_command(
     } else {
         OutputFormat::CoreModule
     };
+    // Parse --opaque-rep <iface>.<resource> values into (iface, resource)
+    // tuples. Split on the LAST '.' so qualified interface names like
+    // `test:resource-floats-opaque/chain` (which contain no '.') are kept
+    // intact and only the trailing resource name is split off.
+    let opaque_resources: Vec<(String, String)> = opaque_rep
+        .iter()
+        .map(|s| match s.rsplit_once('.') {
+            Some((iface, rn)) => Ok((iface.to_string(), rn.to_string())),
+            None => Err(anyhow!(
+                "--opaque-rep value '{}' must be 'iface.resource' (e.g. 'test:foo/bar.baz')",
+                s
+            )),
+        })
+        .collect::<Result<_>>()?;
+    if !opaque_resources.is_empty() {
+        println!("Opaque-rep resources:");
+        for (iface, rn) in &opaque_resources {
+            println!("  {}.{}", iface, rn);
+        }
+    }
+
+    let dwarf_handling = match dwarf.as_str() {
+        "strip" => DwarfHandling::Strip,
+        "passthrough" => DwarfHandling::PassThrough,
+        "remap" => DwarfHandling::Remap,
+        other => {
+            return Err(anyhow!(
+                "Invalid --dwarf mode: {}. Use 'strip', 'passthrough', or 'remap'",
+                other
+            ));
+        }
+    };
+
     let config = FuserConfig {
         memory_strategy,
         attestation: !no_attestation,
+        component_provenance: !no_component_provenance,
         address_rebasing: address_rebase,
         preserve_names,
         output_format,
+        opaque_resources,
+        dwarf_handling,
         ..Default::default()
     };
 
@@ -263,6 +375,25 @@ fn fuse_command(
     // Perform fusion
     let (fused_bytes, stats) = fuser.fuse_with_stats().context("Fusion failed")?;
 
+    if memory_strategy == MemoryStrategy::Auto {
+        match stats.memory_strategy.as_str() {
+            "shared" => println!(
+                "Memory strategy: shared + address rebasing (auto: no \
+                 memory.grow in inputs) — single-memory output"
+            ),
+            resolved => {
+                println!("Memory strategy: {resolved} (auto)");
+                if resolved == "multi" {
+                    eprintln!(
+                        "note: multi-memory output needs `wasm-opt \
+                         --enable-multimemory` and has no single-address-\
+                         space (MCU) lowering. See issue #172."
+                    );
+                }
+            }
+        }
+    }
+
     let elapsed = start.elapsed();
 
     // Validate if requested
@@ -291,12 +422,18 @@ fn fuse_command(
     if show_stats {
         print_stats(&stats, total_input_size, elapsed);
     } else {
-        let reduction = if total_input_size > 0 {
-            ((total_input_size - fused_bytes.len()) as f64 / total_input_size as f64) * 100.0
+        // Fused output can be larger than tiny inputs (adapters, wrapper
+        // sections), so this is a signed delta, not an unsigned reduction.
+        let delta = if total_input_size > 0 {
+            (total_input_size as f64 - fused_bytes.len() as f64) / total_input_size as f64 * 100.0
         } else {
             0.0
         };
-        println!("  Size reduction: {:.1}%", reduction);
+        if delta >= 0.0 {
+            println!("  Size reduction: {:.1}%", delta);
+        } else {
+            println!("  Size increase: {:.1}%", -delta);
+        }
         println!("  Time: {:?}", elapsed);
     }
 
@@ -560,6 +697,44 @@ mod tests {
             assert_eq!(emit_import_map, Some("/tmp/imports.json".to_string()));
         } else {
             panic!("Expected Fuse command");
+        }
+    }
+
+    #[test]
+    fn test_cli_memory_default_is_auto() {
+        // #172: the `--memory` default is `auto` — shared+rebase when no
+        // input can grow memory, multi otherwise. Pin it so a future
+        // change to the default is a deliberate edit to this test
+        // (flipping it is a high-blast-radius decision — see #172).
+        let cli = Cli::try_parse_from(["meld", "fuse", "a.wasm", "-o", "out.wasm"])
+            .expect("fuse args parse");
+        match cli.command {
+            Some(Commands::Fuse { memory, .. }) => assert_eq!(memory, "auto"),
+            _ => panic!("Expected Fuse command"),
+        }
+    }
+
+    #[test]
+    fn test_cli_memory_shared_parses() {
+        let cli = Cli::try_parse_from([
+            "meld", "fuse", "a.wasm", "-o", "out.wasm", "--memory", "shared",
+        ])
+        .expect("fuse args parse");
+        match cli.command {
+            Some(Commands::Fuse { memory, .. }) => assert_eq!(memory, "shared"),
+            _ => panic!("Expected Fuse command"),
+        }
+    }
+
+    #[test]
+    fn test_cli_memory_multi_parses() {
+        let cli = Cli::try_parse_from([
+            "meld", "fuse", "a.wasm", "-o", "out.wasm", "--memory", "multi",
+        ])
+        .expect("fuse args parse");
+        match cli.command {
+            Some(Commands::Fuse { memory, .. }) => assert_eq!(memory, "multi"),
+            _ => panic!("Expected Fuse command"),
         }
     }
 

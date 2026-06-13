@@ -1,0 +1,92 @@
+name: LS-N verification gate
+
+# Verifies that every approved loss-scenario in
+# `safety/stpa/loss-scenarios.yaml` has a passing regression test by
+# naming convention (`LS-A-11` -> `ls_a_11_*`). Posts a single sticky PR
+# comment summarising passed / failed / missing counts. Fails the job
+# only when an existing test fails; missing tests are reported as a
+# warning (advisory) so older approved scenarios with ad-hoc test names
+# can be migrated incrementally rather than blocking every PR.
+#
+# Adapted from spar's rivet-driven verification gate
+# (pulseengine/spar@ba329f3d). meld has no rivet-style executable
+# artifact, but `status: approved` LS entries pair with regression tests
+# by the established `ls_<letter>_<num>_*` naming convention; this gate
+# makes that pairing a verifiable contract.
+#
+# Inputs are all integer/metadata fields (PR number, head_ref); no
+# untrusted free-form text from PR titles/bodies/comments is read in
+# `run:` blocks, so the standard injection vectors do not apply.
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  verify:
+    name: LS-N verification gate
+    runs-on: [self-hosted, linux, x64, rust-cpu]
+    timeout-minutes: 30
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_INCREMENTAL: 0
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install PyYAML
+        # Self-hosted runners ship Debian/Ubuntu Python with PEP 668
+        # protection; `--break-system-packages` is the documented opt-out
+        # for CI environments where the runner's Python install is
+        # disposable per workflow run.
+        run: pip install --user --break-system-packages pyyaml
+
+      - name: Run LS-N verification
+        id: verify
+        continue-on-error: true
+        run: |
+          python3 tools/run_ls_verification.py \
+            --results-json verification-results.json
+
+      - name: Upload results artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: verification-results
+          path: verification-results.json
+          if-no-files-found: warn
+
+      - name: Post sticky PR comment
+        if: github.event_name == 'pull_request' && always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          python3 tools/post_verification_comment.py "$PR_NUMBER"
+
+      - name: Fail job if any approved LS-N test failed
+        # Exit code 1 from run_ls_verification.py = a regression test
+        # for an approved LS entry failed. Exit 2 = missing tests only;
+        # treated as advisory. Exit 0 = all approved entries verified.
+        if: steps.verify.outcome == 'failure'
+        run: |
+          # Re-check: outcome == failure can mean exit 1 (real fail) or
+          # exit 2 (missing only). Inspect the JSON to decide.
+          failed=$(python3 -c "import json; print(json.load(open('verification-results.json'))['failed_count'])")
+          if [ "$failed" -gt 0 ]; then
+            echo "::error::$failed approved LS-N entries have failing regression tests; see PR comment"
+            exit 1
+          fi
+          echo "::warning::Some approved LS-N entries are missing regression tests (advisory only)"
