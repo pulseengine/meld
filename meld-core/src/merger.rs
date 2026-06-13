@@ -1915,6 +1915,25 @@ impl Merger {
             // would wire the fixup module to the wrong component's indirect
             // table. In shared-memory mode, first-wins dedup is correct
             // since all components share one memory.
+            // #245: `cabi_realloc` is named by the per-memory path below
+            // (`cabi_realloc$<mem_idx>`), which is the convention the P2
+            // wrapper consumes (component_wrap.rs looks reallocs up by
+            // memory index). The generic comp_idx-suffixed dedup here must
+            // NOT also mint into that namespace: when a colliding export's
+            // comp_idx coincides with another realloc's mem_idx the two
+            // schemes emit the same `cabi_realloc$N` twice and the output
+            // fails validation ("duplicate export name"). A colliding
+            // `cabi_realloc` is always comp_idx >= 1 with its own mem_idx
+            // >= 1, so the per-memory path is guaranteed to publish it;
+            // skip the redundant generic copy here. (Component 0's realloc
+            // is the non-colliding first occurrence and still flows through
+            // the else branch as plain `cabi_realloc`.)
+            if self.memory_strategy == MemoryStrategy::MultiMemory
+                && export.name == "cabi_realloc"
+                && merged.exports.iter().any(|e| e.name == export.name)
+            {
+                continue;
+            }
             let export_name = if self.memory_strategy == MemoryStrategy::MultiMemory
                 && merged.exports.iter().any(|e| e.name == export.name)
             {
