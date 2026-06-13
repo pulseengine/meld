@@ -1337,6 +1337,11 @@ fn shift_function_indices(
         let memory64 = module_memory.as_ref().map(|m| m.memory64).unwrap_or(false);
         let memory_initial_pages = module_memory.as_ref().map(|m| m.initial);
 
+        let (data_segment_base, elem_segment_base) = merged
+            .segment_bases
+            .get(&(comp_idx, mod_idx))
+            .copied()
+            .unwrap_or((0, 0));
         let index_maps = crate::merger::build_index_maps_for_module(
             comp_idx,
             mod_idx,
@@ -1347,6 +1352,8 @@ fn shift_function_indices(
             0,
             memory64,
             memory_initial_pages,
+            data_segment_base,
+            elem_segment_base,
         );
 
         let import_func_count = module
