@@ -2500,6 +2500,71 @@ loss-scenarios:
     status: approved
     priority: high
 
+  - id: LS-A-21
+    title: Element-segment reference-type collapse — concrete/GC ref types re-typed externref
+    uca: UCA-M-4
+    hazards: [H-3]
+    type: inadequate-control-algorithm
+    scenario: >
+      `meld-core/src/segments.rs::parse_element_segments` decoded an
+      expression-encoded element segment's reference type with
+      `if ref_type.is_func_ref() { FUNCREF } else { EXTERNREF }`,
+      collapsing EVERY non-funcref element type to externref. A
+      concrete typed function reference `(ref null $t)` / `(ref $t)`
+      lost its heap type AND its concrete type index entirely (the
+      index was never carried into `ParsedElementSegment`, so the
+      `maps.types` remap could never run on it), and GC abstract heap
+      types (struct/array/eq/any/i31/none) were likewise flattened to
+      externref. Because the element ITEMS (e.g. `ref.func 0`) kept
+      their real funcref type while the segment was declared externref,
+      the re-emitted fused module is INVALID — `wasmparser::Validator`
+      rejects it with "type mismatch: expected externref, found
+      (ref $type)". meld turns a valid input module into an invalid
+      output [UCA-M-4 / H-3 index-and-type confusion]. meld's parser
+      enables gc + function-references + reference-types by default
+      (parser.rs), and the merger calls parse → reindex → encode
+      back-to-back with no transformation, so any fused component
+      embedding such a core module carries the corruption verbatim.
+      A silently invalid fused module is a downstream parse/exec
+      failure in every consumer (kiln, wasmtime, browsers). Surfaced
+      by a Mythos discovery pass on segments.rs.
+    causal-factors:
+      - >-
+        Expression-encoded element types bucketed to FUNCREF/EXTERNREF
+        instead of carrying the full RefType (heap type + nullability +
+        concrete index) — the same is_func_ref()-else-externref
+        anti-pattern that also exists in parser.rs::convert_ref_type
+      - >-
+        The concrete type index was dropped at parse time, so the
+        type-index remap in reindex_element_segment had nothing to act on
+      - >-
+        No test exercised a non-funcref expression-encoded element
+        segment (all fixtures used funcref), so validation of the
+        re-emitted module was never checked for typed-ref/GC element
+        segments
+    process-model-flaw: >
+      The model assumed element segments are funcref-or-externref (the
+      pre-GC/pre-typed-refs world). With the typed-function-references
+      and GC proposals — enabled by meld's default feature set —
+      element segments carry concrete and abstract heap types that must
+      be preserved and index-remapped, not bucketed.
+    status: approved
+    priority: high
+    fix: >
+      parse_element_segments now converts the full reference type
+      faithfully (convert_ref_type: nullability + abstract heap type via
+      convert_abstract_heap_type + concrete module index), and
+      reindex_element_segment remaps a concrete heap-type index through
+      maps.remap_type (remap_ref_type), mirroring the existing RefNull
+      const-expr handling. Pinned by
+      segments::tests::test_typed_ref_element_segment_roundtrips_and_validates
+      (a `(elem (ref null 0) (ref.func 0))` module parses → reindexes →
+      re-encodes → VALIDATES) and
+      test_reindex_element_segment_preserves_and_remaps_concrete_element_type.
+      Note: the symmetric is_func_ref()-else-externref site in
+      parser.rs::convert_ref_type (used for value/global types) is a
+      related latent gap, out of scope for this segments.rs fix.
+
   - id: LS-A-12
     title: uses_stackful_lift mis-classifies mixed-mode components
     uca: UCA-A-3

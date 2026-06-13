@@ -210,11 +210,15 @@ pub fn parse_element_segments(module: &CoreModule) -> Result<Vec<ParsedElementSe
                 (RefType::FUNCREF, ElementItems_::Functions(funcs))
             }
             ElementItems::Expressions(ref_type, expr_reader) => {
-                let element_type = if ref_type.is_func_ref() {
-                    RefType::FUNCREF
-                } else {
-                    RefType::EXTERNREF
-                };
+                // Carry the FULL ref type faithfully — bucketing every
+                // non-funcref to externref (the prior behaviour) dropped
+                // concrete typed function references `(ref $t)` and GC
+                // abstract heap types (struct/array/eq/any/i31/none), and
+                // lost the concrete type index entirely, producing a fused
+                // module that fails wasm validation ("type mismatch:
+                // expected externref, found (ref $type)"). The concrete
+                // index is remapped during reindexing (see remap_ref_type).
+                let element_type = convert_ref_type(ref_type);
                 let mut exprs = Vec::new();
                 for expr in expr_reader {
                     let expr = expr?;
@@ -288,6 +292,40 @@ pub fn parse_data_segments(module: &CoreModule) -> Result<Vec<ParsedDataSegment>
 }
 
 /// Reindex an element segment with new index mappings
+/// Faithfully convert a `wasmparser::RefType` to a `wasm_encoder::RefType`,
+/// preserving nullability, abstract heap types, and concrete type indices.
+/// (Concrete indices are module-level here; they are remapped later by
+/// [`remap_ref_type`].) Replaces the lossy funcref/externref bucketing that
+/// previously corrupted typed-ref and GC element segments.
+fn convert_ref_type(rt: wasmparser::RefType) -> RefType {
+    let heap_type = match rt.heap_type() {
+        wasmparser::HeapType::Abstract { shared, ty } => wasm_encoder::HeapType::Abstract {
+            shared,
+            ty: convert_abstract_heap_type(ty),
+        },
+        wasmparser::HeapType::Concrete(idx) | wasmparser::HeapType::Exact(idx) => {
+            wasm_encoder::HeapType::Concrete(idx.as_module_index().unwrap_or(0))
+        }
+    };
+    RefType {
+        nullable: rt.is_nullable(),
+        heap_type,
+    }
+}
+
+/// Remap a ref type's concrete heap-type index through the merge index maps;
+/// abstract heap types carry no index. Mirrors the `RefNull` heap-type
+/// handling in [`ParsedConstExpr::reindex`].
+fn remap_ref_type(rt: RefType, maps: &IndexMaps) -> RefType {
+    let heap_type = match rt.heap_type {
+        wasm_encoder::HeapType::Concrete(idx) => {
+            wasm_encoder::HeapType::Concrete(maps.remap_type(idx))
+        }
+        other => other,
+    };
+    RefType { heap_type, ..rt }
+}
+
 pub fn reindex_element_segment(
     segment: &ParsedElementSegment,
     maps: &IndexMaps,
@@ -320,7 +358,7 @@ pub fn reindex_element_segment(
 
     ReindexedElementSegment {
         mode,
-        element_type: segment.element_type,
+        element_type: remap_ref_type(segment.element_type, maps),
         items,
     }
 }
@@ -874,6 +912,115 @@ mod tests {
             actual, expected,
             "concrete type index should be remapped from 0 to 4"
         );
+    }
+
+    /// Regression for the element-segment ref-type collapse: reindexing a
+    /// segment whose element type is a CONCRETE typed reference `(ref null
+    /// $t)` must preserve the concrete heap type and remap its index — not
+    /// collapse it to externref (the prior bug dropped the type entirely).
+    #[test]
+    fn test_reindex_element_segment_preserves_and_remaps_concrete_element_type() {
+        let segment = ParsedElementSegment {
+            mode: ParsedElementSegmentMode::Passive,
+            element_type: RefType {
+                nullable: true,
+                heap_type: wasm_encoder::HeapType::Concrete(0),
+            },
+            items: ElementItems_::Expressions(vec![ParsedConstExpr::RefFunc(0)]),
+        };
+        let mut maps = IndexMaps::new();
+        maps.types.insert(0, 4);
+
+        let reindexed = reindex_element_segment(&segment, &maps);
+        assert_eq!(
+            reindexed.element_type,
+            RefType {
+                nullable: true,
+                heap_type: wasm_encoder::HeapType::Concrete(4),
+            },
+            "concrete element type must be preserved and its index remapped 0->4, \
+             not collapsed to externref"
+        );
+    }
+
+    /// End-to-end regression (the discovery-pass PoC): a core module with a
+    /// concrete typed-ref element segment `(elem (ref null 0) (ref.func 0))`
+    /// must survive parse -> reindex -> encode and still VALIDATE. Before the
+    /// fix the segment was re-typed externref while its items stayed funcref,
+    /// so the re-emitted module was rejected ("type mismatch: expected
+    /// externref, found (ref $type)").
+    #[test]
+    fn test_typed_ref_element_segment_roundtrips_and_validates() {
+        let src = r#"(module (type (func)) (func) (elem (ref null 0) (ref.func 0)))"#;
+        let module_bytes = wat::parse_str(src).expect("wat compiles");
+
+        // Locate the element section payload range.
+        let mut elem_range = None;
+        for payload in wasmparser::Parser::new(0).parse_all(&module_bytes) {
+            if let wasmparser::Payload::ElementSection(reader) = payload.expect("payload") {
+                elem_range = Some((reader.range().start, reader.range().end));
+            }
+        }
+        let elem_range = elem_range.expect("module has an element section");
+
+        let module = crate::parser::CoreModule {
+            index: 0,
+            bytes: module_bytes.clone(),
+            types: Vec::new(),
+            imports: Vec::new(),
+            exports: Vec::new(),
+            functions: Vec::new(),
+            memories: Vec::new(),
+            tables: Vec::new(),
+            globals: Vec::new(),
+            start: None,
+            data_count: None,
+            element_count: 1,
+            custom_sections: Vec::new(),
+            code_section_range: None,
+            global_section_range: None,
+            element_section_range: Some(elem_range),
+            data_section_range: None,
+        };
+
+        let parsed = parse_element_segments(&module).expect("parse element segments");
+        assert_eq!(parsed.len(), 1);
+        assert!(
+            matches!(
+                parsed[0].element_type.heap_type,
+                wasm_encoder::HeapType::Concrete(_)
+            ),
+            "parsed element type must stay a concrete typed ref, got {:?}",
+            parsed[0].element_type
+        );
+
+        // Reindex with identity maps (single module), re-encode the segment
+        // into a fresh module, and validate it.
+        let maps = IndexMaps::new();
+        let reindexed = reindex_element_segment(&parsed[0], &maps);
+        let encoded = encode_element_segment(&reindexed);
+
+        let mut types = wasm_encoder::TypeSection::new();
+        types.ty().function([], []);
+        let mut funcs = wasm_encoder::FunctionSection::new();
+        funcs.function(0);
+        let mut elems = wasm_encoder::ElementSection::new();
+        elems.segment(encoded);
+        let mut code = wasm_encoder::CodeSection::new();
+        let mut f = wasm_encoder::Function::new([]);
+        f.instruction(&wasm_encoder::Instruction::End);
+        code.function(&f);
+
+        let mut out = wasm_encoder::Module::new();
+        out.section(&types);
+        out.section(&funcs);
+        out.section(&elems);
+        out.section(&code);
+        let out_bytes = out.finish();
+
+        wasmparser::Validator::new()
+            .validate_all(&out_bytes)
+            .expect("re-encoded module with a typed-ref element segment must validate");
     }
 
     // ---------------------------------------------------------------
