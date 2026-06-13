@@ -20,7 +20,8 @@ use crate::parser::CoreModule;
 use crate::rewriter::{IndexMaps, convert_abstract_heap_type};
 use crate::{Error, Result};
 use wasm_encoder::{
-    ConstExpr, DataSegment, DataSegmentMode, ElementMode, ElementSegment, Elements, RefType,
+    ConstExpr, DataSegment, DataSegmentMode, ElementMode, ElementSection, ElementSegment, Elements,
+    RefType,
 };
 use wasmparser::{DataSectionReader, ElementItems, ElementKind, ElementSectionReader, Operator};
 
@@ -164,8 +165,13 @@ pub struct ReindexedElementSegment {
 pub enum ReindexedElementItems {
     /// Simple function indices (reindexed)
     Functions(Vec<u32>),
-    /// Expressions (reindexed)
-    Expressions(Vec<ConstExpr>),
+    /// Expressions (reindexed). Held in STRUCTURED `ParsedConstExpr` form —
+    /// already remapped by the merger via [`reindex_element_segment`] — rather
+    /// than opaque encoded `ConstExpr` bytes, so that a later pass (notably the
+    /// P3-async function-index shift, see `p3_async::shift_function_indices`)
+    /// can still read and bump the `ref.func` index inside the expression.
+    /// Encoded to `ConstExpr` only at final emit (see [`encode_element_segment`]).
+    Expressions(Vec<ParsedConstExpr>),
 }
 
 /// Reindexed data segment ready for encoding
@@ -380,10 +386,10 @@ pub fn reindex_element_segment(
             ReindexedElementItems::Functions(remapped)
         }
         ElementItems_::Expressions(exprs) => {
-            let remapped: Vec<ConstExpr> = exprs
-                .iter()
-                .map(|e| e.reindex(maps).to_const_expr())
-                .collect();
+            // Keep the STRUCTURED, merger-reindexed form so a later
+            // function-index shift (P3-async) can still bump `ref.func`.
+            // Encoding is deferred to `encode_element_segment`.
+            let remapped: Vec<ParsedConstExpr> = exprs.iter().map(|e| e.reindex(maps)).collect();
             ReindexedElementItems::Expressions(remapped)
         }
     };
@@ -637,7 +643,14 @@ fn rebase_const_expr_value(value: ConstExprValue, base: u64) -> Result<ConstExpr
 }
 
 /// Convert a reindexed element segment to wasm_encoder format for encoding
-pub fn encode_element_segment(segment: &ReindexedElementSegment) -> ElementSegment<'_> {
+/// Encode a reindexed element segment into the given element section.
+///
+/// Takes a `&mut ElementSection` rather than returning an `ElementSegment`
+/// because the `Expressions` arm now holds structured [`ParsedConstExpr`]
+/// values that must be encoded into a temporary `Vec<ConstExpr>` here; that
+/// temporary would not outlive a returned borrowing `ElementSegment`, so the
+/// segment is pushed directly while the temporary is still live.
+pub fn encode_element_segment(section: &mut ElementSection, segment: &ReindexedElementSegment) {
     let mode = match &segment.mode {
         ElementSegmentMode::Active {
             table_index,
@@ -650,14 +663,22 @@ pub fn encode_element_segment(segment: &ReindexedElementSegment) -> ElementSegme
         ElementSegmentMode::Declared => ElementMode::Declared,
     };
 
-    let elements = match &segment.items {
-        ReindexedElementItems::Functions(funcs) => Elements::Functions(funcs.as_slice().into()),
-        ReindexedElementItems::Expressions(exprs) => {
-            Elements::Expressions(segment.element_type, exprs.as_slice().into())
+    match &segment.items {
+        ReindexedElementItems::Functions(funcs) => {
+            section.segment(ElementSegment {
+                mode,
+                elements: Elements::Functions(funcs.as_slice().into()),
+            });
         }
-    };
-
-    ElementSegment { mode, elements }
+        ReindexedElementItems::Expressions(exprs) => {
+            // Encode the structured form at the last possible moment.
+            let encoded: Vec<ConstExpr> = exprs.iter().map(|e| e.to_const_expr()).collect();
+            section.segment(ElementSegment {
+                mode,
+                elements: Elements::Expressions(segment.element_type, encoded.as_slice().into()),
+            });
+        }
+    }
 }
 
 /// Convert a reindexed data segment to wasm_encoder format for encoding
@@ -934,8 +955,10 @@ mod tests {
         assert_eq!(exprs.len(), 1, "should have exactly one expression");
 
         // Encode both the actual and expected ConstExpr to compare bytes.
+        // `Expressions` now holds structured `ParsedConstExpr`; encode it the
+        // same way `encode_element_segment` does (deferred `to_const_expr`).
         let mut actual = Vec::new();
-        exprs[0].encode(&mut actual);
+        exprs[0].to_const_expr().encode(&mut actual);
 
         let mut expected = Vec::new();
         ConstExpr::ref_null(wasm_encoder::HeapType::Concrete(4)).encode(&mut expected);
@@ -1030,14 +1053,13 @@ mod tests {
         // into a fresh module, and validate it.
         let maps = IndexMaps::new();
         let reindexed = reindex_element_segment(&parsed[0], &maps);
-        let encoded = encode_element_segment(&reindexed);
 
         let mut types = wasm_encoder::TypeSection::new();
         types.ty().function([], []);
         let mut funcs = wasm_encoder::FunctionSection::new();
         funcs.function(0);
         let mut elems = wasm_encoder::ElementSection::new();
-        elems.segment(encoded);
+        encode_element_segment(&mut elems, &reindexed);
         let mut code = wasm_encoder::CodeSection::new();
         let mut f = wasm_encoder::Function::new([]);
         f.instruction(&wasm_encoder::Instruction::End);

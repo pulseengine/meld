@@ -635,3 +635,181 @@ fn async_callback_trampoline_shape_canonical() {
     assert_eq!(i32_size, 4);
     assert_eq!(3 * i32_size, 12, "event tuple is 3 × i32 = 12 bytes");
 }
+
+// ---------------------------------------------------------------------------
+// Regression: expression-form element-segment ref.func relocation under the
+// P3-async function-index shift (fix/p3-elem-expr-reffunc).
+//
+// `shift_function_indices` prepends `k` `pulseengine:async` function imports
+// and bumps every defined-function reference up by `k`. The
+// expression-form element-segment arm used to be a NO-OP, leaving a
+// `(ref.func $b)` inside an `(elem ... funcref (ref.func $b))` STALE: the
+// export for `$b` shifted but the table slot kept pointing at the old index —
+// now a prepended intrinsic import — so `call_indirect` reached the wrong
+// function (SC-3 violation). This test fuses such a component and asserts the
+// element segment's `ref.func` equals `$b`'s (shifted) exported index.
+// ---------------------------------------------------------------------------
+
+/// A P3-async component whose core module exports a function `$b` and has an
+/// EXPRESSION-FORM active element segment `(elem (i32.const 0) funcref
+/// (ref.func $b))`. The `stream<u8>` canonicals force `k` `pulseengine:async`
+/// function imports to be prepended, triggering the index shift.
+fn build_stream_u8_component_with_expr_elem_wat() -> &'static str {
+    r#"
+(component
+  (core module $m
+    (memory (export "memory") 1)
+    (table (export "tab") 4 funcref)
+    (func $a (export "cabi_realloc") (param i32 i32 i32 i32) (result i32)
+      i32.const 0)
+    (func $b (export "b") (result i32) i32.const 42)
+    (elem (i32.const 0) funcref (ref.func $b))
+  )
+  (core instance $i (instantiate $m))
+  (alias core export $i "memory" (core memory $mem))
+  (alias core export $i "cabi_realloc" (core func $rea))
+
+  (type $st (stream u8))
+
+  (canon stream.new $st (core func $sn))
+  (canon stream.read $st async (memory $mem) (realloc $rea) (core func $sr))
+  (canon stream.write $st async (memory $mem) (realloc $rea) (core func $sw))
+  (canon stream.drop-readable $st (core func $sdr))
+  (canon stream.drop-writable $st (core func $sdw))
+)
+"#
+}
+
+/// A k=0 control: the same core module/element segment but a pure-P2
+/// component (no stream/future) so NO intrinsic imports are prepended and no
+/// shift occurs. The elem ref must still equal the exported index of `$b`.
+fn build_p2_component_with_expr_elem_wat() -> &'static str {
+    r#"
+(component
+  (core module $m
+    (memory (export "memory") 1)
+    (table (export "tab") 4 funcref)
+    (func $a (export "cabi_realloc") (param i32 i32 i32 i32) (result i32)
+      i32.const 0)
+    (func $b (export "b") (result i32) i32.const 42)
+    (elem (i32.const 0) funcref (ref.func $b))
+  )
+  (core instance $i (instantiate $m))
+)
+"#
+}
+
+/// Return the function index of the core-module export named `name`, if any.
+fn func_export_index(fused: &[u8], name: &str) -> Option<u32> {
+    for payload in wasmparser::Parser::new(0).parse_all(fused) {
+        if let Ok(wasmparser::Payload::ExportSection(reader)) = payload {
+            for exp in reader.into_iter().flatten() {
+                if exp.name == name && matches!(exp.kind, wasmparser::ExternalKind::Func) {
+                    return Some(exp.index);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Return every `ref.func` function index found in expression-form element
+/// segments of the (single) core module in `fused`.
+fn elem_expr_ref_func_indices(fused: &[u8]) -> Vec<u32> {
+    let mut out = Vec::new();
+    for payload in wasmparser::Parser::new(0).parse_all(fused) {
+        if let Ok(wasmparser::Payload::ElementSection(reader)) = payload {
+            for elem in reader.into_iter().flatten() {
+                if let wasmparser::ElementItems::Expressions(_, exprs) = elem.items {
+                    for ce in exprs.into_iter().flatten() {
+                        for op in ce.get_operators_reader().into_iter().flatten() {
+                            if let wasmparser::Operator::RefFunc { function_index } = op {
+                                out.push(function_index);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+#[test]
+fn p3_shift_relocates_expr_form_elem_ref_func() {
+    let wat_src = build_stream_u8_component_with_expr_elem_wat();
+    let bytes = match wat::parse_str(wat_src) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: wat crate cannot parse P3 stream syntax: {e}");
+            return;
+        }
+    };
+
+    let mut fuser = Fuser::new(FuserConfig::default());
+    fuser
+        .add_component_named(&bytes, Some("stream-u8-expr-elem"))
+        .expect("parser should accept the P3 component");
+
+    // Sanity: this fixture must actually trigger a non-zero shift, i.e. some
+    // pulseengine:async imports get prepended. Otherwise the test is vacuous.
+    let fused = fuser.fuse().expect("fuse should succeed");
+    let k = collect_pulseengine_async_imports(&fused).len();
+    assert!(
+        k > 0,
+        "fixture must prepend at least one pulseengine:async import to \
+         exercise the shift; got {k}"
+    );
+
+    let b_idx = func_export_index(&fused, "b").expect("fused core module must export function `b`");
+    let elem_refs = elem_expr_ref_func_indices(&fused);
+    assert_eq!(
+        elem_refs.len(),
+        1,
+        "expected exactly one expression-form elem ref.func, got {elem_refs:?}"
+    );
+    assert_eq!(
+        elem_refs[0], b_idx,
+        "element-segment ref.func must be relocated to track the (shifted) \
+         exported index of `$b` ({b_idx}), not left stale at an intrinsic \
+         import slot (was {})",
+        elem_refs[0]
+    );
+}
+
+#[test]
+fn p3_k0_control_expr_form_elem_ref_func_unchanged() {
+    let wat_src = build_p2_component_with_expr_elem_wat();
+    let bytes = match wat::parse_str(wat_src) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: wat crate cannot parse this fixture: {e}");
+            return;
+        }
+    };
+
+    let mut fuser = Fuser::new(FuserConfig::default());
+    fuser
+        .add_component_named(&bytes, Some("p2-expr-elem"))
+        .expect("parser should accept the P2 component");
+
+    let fused = fuser.fuse().expect("fuse should succeed");
+    // Control: no intrinsic imports, so no shift.
+    assert_eq!(
+        collect_pulseengine_async_imports(&fused).len(),
+        0,
+        "k=0 control must not prepend any pulseengine:async imports"
+    );
+
+    let b_idx = func_export_index(&fused, "b").expect("fused core module must export function `b`");
+    let elem_refs = elem_expr_ref_func_indices(&fused);
+    assert_eq!(
+        elem_refs.len(),
+        1,
+        "expected one elem ref.func, got {elem_refs:?}"
+    );
+    assert_eq!(
+        elem_refs[0], b_idx,
+        "k=0: element-segment ref.func must match `$b`'s exported index"
+    );
+}

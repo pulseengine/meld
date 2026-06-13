@@ -1287,14 +1287,26 @@ fn shift_function_indices(
                     *f = bump(*f);
                 }
             }
-            crate::segments::ReindexedElementItems::Expressions(_) => {
-                // Expressions hold encoded ConstExpr bytes (already
-                // baked). For ref.func the function index is encoded
-                // inside; we cannot easily rewrite without re-parsing.
-                // P3 async lowering does not currently support this
-                // case and components that hit it will be flagged.
-                // The vast majority of element segments in fused
-                // output use Functions(_) form.
+            crate::segments::ReindexedElementItems::Expressions(exprs) => {
+                // Expressions now carry the STRUCTURED, merger-reindexed
+                // `ParsedConstExpr` form, so the `ref.func` index is
+                // accessible and can be shifted just like the Functions
+                // arm. Only `RefFunc` carries a defined-function index
+                // that this P3 shift moves; the other variants are left
+                // untouched (see below).
+                for e in exprs.iter_mut() {
+                    if let crate::segments::ParsedConstExpr::RefFunc(idx) = e {
+                        *idx = bump(*idx);
+                    }
+                    // RefNull/GlobalGet/I32Const/I64Const/F32Const/
+                    // F64Const/V128Const need no +k shift here:
+                    //  - GlobalGet was already remapped to its final
+                    //    global index by the merger, and P3 prepends only
+                    //    FUNCTION imports — it does not shift globals.
+                    //  - RefNull carries a (type) heap index, not a
+                    //    function index; P3 prepends no types either.
+                    //  - the scalar/vector consts carry no index at all.
+                }
             }
         }
     }

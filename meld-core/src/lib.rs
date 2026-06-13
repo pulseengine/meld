@@ -1601,7 +1601,7 @@ impl Fuser {
         if !merged.elements.is_empty() {
             let mut elements = wasm_encoder::ElementSection::new();
             for segment in &merged.elements {
-                elements.segment(segments::encode_element_segment(segment));
+                segments::encode_element_segment(&mut elements, segment);
             }
             module.section(&elements);
         }
