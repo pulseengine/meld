@@ -276,6 +276,13 @@ fn build_callee_string_component() -> Vec<u8> {
 ///   - Exports `run() -> i32` which calls process-string(0, 5)
 ///   - Exports `cabi_realloc` (needed for result copy if any)
 fn build_caller_string_component() -> Vec<u8> {
+    // Default caller passes ASCII "Hello"; the data-parameterized helper
+    // lets transcoding tests vary the source string (e.g. non-BMP code
+    // points that force UTF-16 surrogate pairs — SR-17).
+    build_caller_string_component_data(b"Hello")
+}
+
+fn build_caller_string_component_data(string_bytes: &[u8]) -> Vec<u8> {
     let core_module = {
         let mut types = TypeSection::new();
         // type 0: (i32, i32) -> i32  -- imported process-string
@@ -339,7 +346,7 @@ fn build_caller_string_component() -> Vec<u8> {
         {
             let mut f = Function::new([]);
             f.instruction(&Instruction::I32Const(0)); // ptr
-            f.instruction(&Instruction::I32Const(5)); // len
+            f.instruction(&Instruction::I32Const(string_bytes.len() as i32)); // byte len
             f.instruction(&Instruction::Call(0)); // process-string (import)
             f.instruction(&Instruction::End);
             code.function(&f);
@@ -359,7 +366,7 @@ fn build_caller_string_component() -> Vec<u8> {
                 memory_index: 0,
                 offset: &ConstExpr::i32_const(0),
             },
-            data: b"Hello".to_vec(),
+            data: string_bytes.to_vec(),
         });
 
         let mut module = Module::new();
@@ -2069,5 +2076,84 @@ fn test_sr17_utf8_to_utf16_string_transcoding() {
     assert_eq!(
         result, 500,
         "SR-17: run() should return 500 (sum of UTF-16 code units for 'Hello')"
+    );
+}
+
+/// SR-17 (surrogate-pair clause): a supplementary-plane code point
+/// (U+10000 and above) transcoded UTF-8 → UTF-16 must be encoded as a
+/// surrogate PAIR — two code units — not a single truncated unit. The
+/// pre-existing SR-17 transcoding test only exercised ASCII (1 UTF-8
+/// byte → 1 BMP code unit), leaving the `code_point >= 0x10000` branch
+/// of `emit_utf8_to_utf16_transcode` (fact.rs) unexecuted. The
+/// v0.31.0 traceability audit flagged this as SR-17's one open
+/// requirement-text verification gap; this fixture closes it.
+///
+/// Oracle: U+1F600 (😀) is UTF-8 `F0 9F 98 80` (4 bytes). The canonical
+/// surrogate decomposition is:
+///   cp - 0x10000 = 0xF600
+///   high = 0xD800 + (0xF600 >> 10)   = 0xD800 + 0x3D  = 0xD83D
+///   low  = 0xDC00 + (0xF600 & 0x3FF) = 0xDC00 + 0x200 = 0xDE00
+/// The callee sums the received UTF-16 code units, so a correct
+/// surrogate pair yields 0xD83D + 0xDE00 = 55357 + 56832 = 112189.
+/// A buggy single-unit or truncated encoding cannot produce this sum.
+#[test]
+fn test_sr17_utf8_to_utf16_supplementary_plane_transcoding() {
+    let callee = build_callee_utf16_string_component();
+    // "A😀": one BMP code point then one supplementary, to also prove
+    // the dst-cursor advances by 1 then 2 and the units interleave.
+    //   'A'  = 0x0041 (1 UTF-8 byte, 1 code unit)
+    //   '😀' = U+1F600 → D83D DE00 (4 UTF-8 bytes, 2 code units)
+    // Sum = 0x0041 + 0xD83D + 0xDE00 = 65 + 55357 + 56832 = 112254.
+    let caller = build_caller_string_component_data(&[0x41, 0xF0, 0x9F, 0x98, 0x80]);
+
+    let config = FuserConfig {
+        memory_strategy: MemoryStrategy::MultiMemory,
+        attestation: false,
+        component_provenance: false,
+        address_rebasing: false,
+        preserve_names: false,
+        custom_sections: meld_core::CustomSectionHandling::Drop,
+        dwarf_handling: meld_core::DwarfHandling::Strip,
+        output_format: meld_core::OutputFormat::CoreModule,
+        opaque_resources: Vec::new(),
+    };
+
+    let mut fuser = Fuser::new(config);
+    fuser
+        .add_component_named(&callee, Some("callee-utf16"))
+        .expect("callee component should parse");
+    fuser
+        .add_component_named(&caller, Some("caller-utf8"))
+        .expect("caller component should parse");
+
+    let (fused, stats) = fuser.fuse_with_stats().expect("fusion should succeed");
+    assert!(
+        stats.adapter_functions > 0,
+        "SR-17: expected a transcoding adapter, got 0"
+    );
+
+    let mut validator = wasmparser::Validator::new();
+    validator
+        .validate_all(&fused)
+        .expect("SR-17: fused output should validate");
+
+    let mut engine_config = Config::new();
+    engine_config.wasm_multi_memory(true);
+    let engine = Engine::new(&engine_config).unwrap();
+    let module = RuntimeModule::new(&engine, &fused).unwrap();
+    let mut store = Store::new(&engine, ());
+    let instance = Instance::new(&mut store, &module, &[]).unwrap();
+
+    let run = instance
+        .get_typed_func::<(), i32>(&mut store, "run")
+        .expect("SR-17: fused module should export 'run'");
+    let result = run.call(&mut store, ()).unwrap();
+
+    assert_eq!(
+        result, 112254,
+        "SR-17: 'A😀' must transcode to UTF-16 code units \
+         [0x0041, 0xD83D, 0xDE00] (surrogate pair for U+1F600); \
+         sum 112254. A wrong sum means the supplementary-plane branch \
+         mis-encodes the surrogate pair."
     );
 }
