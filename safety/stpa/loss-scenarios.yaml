@@ -1116,6 +1116,63 @@ loss-scenarios:
     status: approved
     priority: high
 
+  - id: LS-P-20
+    title: UTF-8→UTF-16 transcoder mis-decodes malformed (non-truncated) UTF-8 instead of U+FFFD
+    uca: UCA-P-3
+    hazards: [H-4, H-4.4]
+    type: inadequate-control-algorithm
+    scenario: >
+      `emit_utf8_to_utf16_transcode` (the canonical mirror of the
+      UTF-16→UTF-8 LS-P-16 family) guarded TRUNCATION (LS-P-19) but did
+      not validate the CONTENT of multi-byte sequences. Each arm masked
+      continuation bytes (`& 0x3F`) and lead bits without checking that
+      continuations are actually continuation bytes, that the lead is a
+      valid lead, or that the decoded code point is not overlong / a
+      surrogate / out of range. Malformed-but-in-bounds UTF-8 was
+      therefore decoded to a WRONG code point and emitted as UTF-16
+      [UCA-P-3 / H-4.4 incorrect string transcoding]. Confirmed by PoC:
+      a UTF-8 caller passing `[0xC2, 0x41]` (2-byte lead then an ASCII
+      byte that is not a continuation) transcoded to U+0081
+      (`(0xC2 & 0x1F)<<6 | (0x41 & 0x3F)`), summing to 129 at a
+      code-unit-summing callee, instead of the Canonical-ABI-correct
+      U+FFFD + 'A' (65598). Distinct from LS-P-19 (truncation / OOB
+      read): this is in-bounds content mis-decoding (H-4.4 only, no
+      H-2). Reachable for any cross-memory UTF-8→UTF-16 fusion whose
+      caller string contains malformed UTF-8 (invalid continuation,
+      lone continuation as lead, overlong lead 0xC0/0xC1, out-of-range
+      lead 0xF5-0xFF, overlong encoding, UTF-8-encoded surrogate, or a
+      4-byte value > U+10FFFF). Surfaced while completing the
+      reverse-direction surrogate hardening (#249/#250); filed as #251.
+    causal-factors:
+      - >-
+        No validation that each continuation byte satisfies
+        (b & 0xC0) == 0x80 before masking it into the code point
+      - >-
+        No lead-byte classification — lone continuations (0x80-0xBF)
+        were treated as 2-byte leads and 0xF5-0xFF as 4-byte leads
+      - >-
+        No post-decode validation for overlong encodings, surrogate
+        code points, or values above U+10FFFF
+    process-model-flaw: >
+      The decoder assumed well-formed UTF-8 (mirroring the pre-fix
+      UTF-16 side's "high surrogate implies a valid pair" flaw); fused
+      adapters consume untrusted caller buffers where every malformed
+      form is reachable. The Canonical ABI mandates U+FFFD replacement.
+    status: approved
+    priority: high
+    fix: >
+      Each arm now rejects invalid leads (< 0xC2 before the 2-byte
+      path; >= 0xF5 before the 4-byte path), validates every
+      continuation byte, and rejects overlong (3-byte cp < 0x800,
+      4-byte cp < 0x10000), surrogate (3-byte cp in [0xD800, 0xE000)),
+      and out-of-range (4-byte cp > 0x10FFFF) results — each emitting
+      U+FFFD and consuming only the lead byte (the established LS-P-19
+      convention; always makes progress, may emit more U+FFFDs than the
+      strict maximal-subpart rule). Pinned by the runtime matrix
+      test_sr17_utf8_to_utf16_malformed_matrix (invalid continuation,
+      lone-continuation lead, overlong, UTF-8 surrogate, out-of-range,
+      and valid 1/2/3/4-byte controls incl. boundary code points).
+
   - id: LS-P-17
     title: Caller-encoding match filters on Func only, miscalibrates mixed-encoding callers
     uca: UCA-R-3
