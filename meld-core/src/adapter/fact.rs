@@ -3070,12 +3070,29 @@ impl FactStyleGenerator {
                 self.emit_latin1_to_utf8_transcode(&mut func, param_count, target_func, options);
             }
 
-            _ => {
-                // Other combinations - fall back to direct call for now
+            (caller_enc, callee_enc) if caller_enc == callee_enc => {
+                // Same encoding (e.g. Utf16→Utf16, Latin1→Latin1): no
+                // transcoding needed, a verbatim copy is correct.
                 for i in 0..param_count {
                     func.instruction(&Instruction::LocalGet(i as u32));
                 }
                 func.instruction(&Instruction::Call(target_func));
+            }
+
+            (caller_enc, callee_enc) => {
+                // #253: a cross-encoding pair with no transcoder implemented
+                // (e.g. Latin1→Utf16, Utf8→Latin1, Utf16→Latin1 — note
+                // CompactUTF16 maps to Latin1). Previously this fell through
+                // to a verbatim byte copy, silently MIS-transcoding
+                // well-formed input (H-4.4). Fail loudly instead of emitting
+                // a wrong adapter — the per-pair transcoders are tracked as
+                // follow-up work. Reaching here means the resolver requested
+                // a transcoding meld cannot yet perform correctly.
+                return Err(crate::Error::AdapterGeneration(format!(
+                    "unsupported string transcoding: {caller_enc:?} -> {callee_enc:?} \
+                     (no transcoder implemented; a verbatim copy would silently \
+                     corrupt well-formed input — see #253)"
+                )));
             }
         }
 
