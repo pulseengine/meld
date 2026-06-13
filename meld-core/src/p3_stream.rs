@@ -69,6 +69,24 @@ impl StreamElement {
         let inner = desc.strip_prefix("stream<")?.strip_suffix('>')?;
         Some(StreamElement::Typed(inner.trim().to_string()))
     }
+
+    /// Whether this element type is safe to PAIR across components.
+    ///
+    /// A bare `Type(N)` descriptor is a component-LOCAL type index —
+    /// component A's `Type(5)` and component B's `Type(5)` are unrelated —
+    /// so it is not a valid cross-component key (LS-R-16). Primitive
+    /// descriptors (`Primitive(..)` / scalar names) and the untyped stream
+    /// are globally stable and pairable; a local-index descriptor is not
+    /// (pairing on it risks an over-match that drives the bridge emitter to
+    /// wire incompatible streams). Canonicalising `Type(N)` to a structural
+    /// descriptor — which would make aggregate-element streams pairable — is
+    /// tracked follow-up; until then such streams stay host-routed.
+    fn is_cross_component_pairable(&self) -> bool {
+        match self {
+            StreamElement::Untyped => true,
+            StreamElement::Typed(s) => !s.contains("Type("),
+        }
+    }
 }
 
 /// A component's role on a particular stream element type.
@@ -230,6 +248,22 @@ pub fn pair_streams(
                     // Honest candidate only when element types match —
                     // see the ADR-3 precision boundary.
                     if p_elem != c_elem {
+                        continue;
+                    }
+                    // LS-R-16: a non-primitive stream element type is recorded
+                    // as `Type(N)` where N is a COMPONENT-LOCAL type index, so
+                    // matching it across components is unsound — two DIFFERENT
+                    // element types that collide on the same local index N
+                    // would string-match and manufacture a false pair that
+                    // drives the bridge emitter to wire incompatible streams
+                    // (H-3.1 type confusion), and the same real type at
+                    // different indices would be missed. Until element types
+                    // are canonicalised to a structural cross-component key
+                    // (tracked follow-up), conservatively decline to pair on
+                    // local-index descriptors — the streams stay host-routed,
+                    // which is safe. Primitives serialise as a stable
+                    // `Primitive(..)` descriptor and remain pairable.
+                    if !p_elem.is_cross_component_pairable() {
                         continue;
                     }
                     let candidate = StreamPair {
@@ -960,6 +994,38 @@ mod tests {
         assert_eq!(p.consumer.role, StreamRole::Consumer);
         assert_eq!(p.element, typed("U8"));
         assert_eq!(p.mode, StreamMemoryMode::CrossMemory);
+    }
+
+    /// LS-R-16: two DIFFERENT non-primitive stream element types that
+    /// collide on the same component-LOCAL type index (`Type(0)` in each
+    /// component, but unrelated types) must NOT be paired — pairing on a
+    /// local-index descriptor would manufacture a false pair that drives the
+    /// bridge emitter to wire incompatible streams. They stay host-routed.
+    #[test]
+    fn local_index_element_descriptors_do_not_pair() {
+        // Producer's element is its local Type(0); consumer's element is a
+        // DIFFERENT type that happens to also sit at its local Type(0).
+        let roles = vec![
+            vec![(typed("Type(0)"), StreamRole::Producer)],
+            vec![(typed("Type(0)"), StreamRole::Consumer)],
+        ];
+        let pairs = pair_streams(&roles, &[(0, 1)], StreamMemoryMode::CrossMemory);
+        assert!(
+            pairs.is_empty(),
+            "local-index `Type(N)` descriptors are not a valid cross-component \
+             key and must not be paired (over-match would wire incompatible \
+             streams); got {pairs:?}"
+        );
+        // Sanity: primitive descriptors on the same shape DO still pair.
+        let prim_roles = vec![
+            vec![(typed("Primitive(U8)"), StreamRole::Producer)],
+            vec![(typed("Primitive(U8)"), StreamRole::Consumer)],
+        ];
+        assert_eq!(
+            pair_streams(&prim_roles, &[(0, 1)], StreamMemoryMode::CrossMemory).len(),
+            1,
+            "primitive stream element types remain pairable"
+        );
     }
 
     /// ADR-3 gating fixture: a producer and a consumer of the same

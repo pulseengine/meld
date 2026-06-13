@@ -1711,6 +1711,72 @@ loss-scenarios:
       post-fix match arms of both walkers descend into and skip the
       identical variant sets.
 
+  - id: LS-R-16
+    title: Cross-component stream pairing matches non-primitive element types by local type index
+    uca: UCA-R-5
+    hazards: [H-1, H-3.1]
+    type: inadequate-control-algorithm
+    scenario: >
+      The cross-component stream-pair detector (`p3_stream.rs::pair_streams`)
+      pairs a producer's `stream<T>` write endpoint with a consumer's read
+      endpoint when their element-type DESCRIPTORS are equal. For a
+      PRIMITIVE element the descriptor is the globally-stable `Primitive(..)`.
+      But for any NON-primitive element (record/list/tuple/variant/resource/
+      aliased type) the parser records `stream<Type(N)>` where N is a
+      COMPONENT-LOCAL type index — and `pair_streams` compared those strings
+      literally across two different components, exactly the "match on a raw
+      local index, not a cross-component key" pattern the module's own header
+      warns against (component A's `Type(5)` ≠ component B's `Type(5)`). Two
+      failure modes: (A) UNDER-MATCH — the same real type T at different
+      local indices in producer vs consumer fails to pair (benign: the
+      bridge is simply not emitted, streams stay host-routed); (B)
+      OVER-MATCH — two DIFFERENT element types that collide on the same
+      local index N (e.g. each component's `Type(0)`) string-match and
+      manufacture a false pair, which then drives `p3_bridge::emit_stream_bridge`
+      to rewire the producer's writes directly into the consumer's reads,
+      bypassing the host with TWO DIFFERENT on-wire element layouts →
+      type confusion / semantic drift / potential OOB on variable-width T
+      [H-1 fused output differs from composed input / H-3.1 misrouted data
+      with wrong layout]. `validate_stream_pair_graph` cannot catch (B)
+      because it compares the same local-index descriptor strings. Finding
+      (B) confirmed at API level; end-to-end execution divergence
+      plausible-but-unproven (requires two distinct types colliding on the
+      same local index across the two fused components). Surfaced by a
+      Mythos discovery pass on p3_stream.rs.
+    causal-factors:
+      - >-
+        Non-primitive stream element types are keyed by a component-local
+        `Type(N)` index, not a cross-component-stable structural descriptor
+      - >-
+        pair_streams (and validate_stream_pair_graph) compare these
+        local-index strings literally across components
+      - >-
+        existing tests exercise only primitive descriptors (U8/S32), never
+        the `Type(N)` form the parser actually emits for aggregate elements
+    process-model-flaw: >
+      The pairing model assumed the element-type descriptor is a stable
+      cross-component identity; for aggregate/handle element types it is a
+      component-local index — the same false-key class as #245 (cabi_realloc)
+      and #256 (resource_graph definer).
+    status: approved
+    priority: high
+    fix: >
+      Conservative first increment (this change): `pair_streams` declines to
+      pair when the element descriptor is a local-index `Type(N)` form
+      (`StreamElement::is_cross_component_pairable` = false for `Typed`
+      strings containing `Type(`). This ELIMINATES the over-match (B) safety
+      hazard — incompatible aggregate streams stay host-routed rather than
+      driving the emitter — with NO regression to correct primitive-stream
+      pairing (primitives serialise as the stable `Primitive(..)`). The
+      benign under-match (A) for aggregate streams remains (they stay
+      host-routed, their current behaviour). Pinned by
+      p3_stream::tests::local_index_element_descriptors_do_not_pair (two
+      colliding `Type(0)` descriptors → 0 pairs; primitive control → 1
+      pair). The COMPLETE fix — canonicalising `Type(N)` to a structural
+      cross-component descriptor so aggregate-element streams pair correctly
+      (and handling resource-element identity, which overlaps the
+      resource_graph attribution work) — is tracked as follow-up.
+
   # ==========================================================================
   # Merger scenarios
   # ==========================================================================
