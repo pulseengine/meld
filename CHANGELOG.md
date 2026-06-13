@@ -4,6 +4,49 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.31.0] - 2026-06-13
+
+### Changed (traceability audit — closes the campaign V)
+
+- **Full rivet-V audit, v0.22→v0.30** (#96 campaign tail; PR follows).
+  A clean-room read-only audit walked every SR-1…SR-40 and every
+  approved loss scenario against executed oracles, then this PR
+  applied the corrections:
+  - **Restored SR-37** (auto-memory soundness) — silently dropped by a
+    prior bulk YAML edit (PR #226); now present and `verified`.
+  - **Authored SR-27…SR-30** — had traceability + passing attestation
+    tests but no requirement artifacts; now defined and `verified`.
+  - **16 status upgrades to `verified`** where named oracles
+    demonstrably pass (SR-12/13/15, SR-19–26, SR-31, SR-32, SR-33,
+    SR-39, SR-40), each anchored to executed tests/harnesses.
+  - **SR-34 disposition**: the never-produced Kani cycle harness is
+    accepted on its test oracle (recorded in-artifact, not silent).
+  - **Stale-reference fixes**: SR-35 impl path (dwarf_remap.rs →
+    dwarf.rs), SR-6 proof path, SR-40 proof count (286 → 350),
+    traceability notes for SR-17/25/31, resource-handle draft id
+    collisions renumbered to SR-RH-1…8, proofs/STATUS.md metrics
+    (28 files / 14,487 lines / 350 Qed / 0 admitted + Kani layer).
+  - **LS gate closure**: lib-scope pins added for LS-R-13 and LS-M-6 —
+    `run_ls_verification.py` now reports 45 approved / 45 passed /
+    **0 missing** (was 2 discovery gaps).
+  - **No honest downgrades required**: no SR status was found to
+    overstate reality — the 2026-06-10 SR-33 emitter-gap class of
+    defect does not recur anywhere.
+- **Issues closed**: #218 (formal soundness inc 1, shipped v0.30.0),
+  #139 (smithy reliability — admin-bypass policy lifted and enforced).
+
+### Pre-release Mythos note
+
+No Tier-5 files changed (safety YAML, proofs/STATUS.md, and lib.rs
+test-module additions only).
+
+### Falsification statement
+
+Claim: for every `verified` requirement in scope, the named
+verification oracle exists and passes today. Refute by running the
+named test/harness or `python3 tools/run_ls_verification.py` (exit 0,
+0 missing) and finding a discrepancy.
+
 ## [0.30.0] - 2026-06-11
 
 ### Added
