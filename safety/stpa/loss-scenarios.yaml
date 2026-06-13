@@ -975,11 +975,18 @@ loss-scenarios:
       wasmtime that the output is 'A' + U+FFFD (UTF-8 EF BF BD, byte
       sum 684) — proving lossy replacement, not a trap or OOB read.
       Closes the "no regression test for UTF-16 inputs ending on a
-      high surrogate" causal-factor above. (The mid-string lone-
-      surrogate case — high surrogate followed by a non-low unit —
-      still relies on the end-of-input guard; a non-low second unit
-      takes the pair arm. Recorded as a residual: only the
-      end-of-input lone surrogate has a defined U+FFFD path.)
+      high surrogate" causal-factor above. The MID-string variant —
+      a high surrogate followed by a non-low-surrogate unit — was
+      ALSO fixed (the unvalidated-second-unit causal factor that the
+      v0.11 end-of-input-only mitigation left open): the pair arm now
+      validates 0xDC00 <= cu2 < 0xE000 and, on failure, emits U+FFFD
+      for the lone high surrogate and consumes only that unit
+      (reprocessing the second unit normally). Before the fix
+      [0xD800, 0x0041] produced a garbage code point from
+      `0x0041 - 0xDC00` (u32 underflow) and emitted wrong UTF-8
+      (run() == 500); after, it is U+FFFD + 'A' (sum 684). Runtime
+      oracle: test_sr17_utf16_to_utf8_midstring_lone_surrogate_replacement.
+      All causal factors of LS-P-16 are now mitigated and runtime-pinned.
 
   - id: LS-P-18
     title: LS-P-12 bypassed when a record mixes a covered pointer with a hidden conditional one

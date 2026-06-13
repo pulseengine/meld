@@ -3015,8 +3015,10 @@ impl FactStyleGenerator {
             (StringEncoding::Utf8, StringEncoding::Utf8)
         );
 
-        // Scratch locals: src_idx, dst_idx, out_ptr, byte (+ code_point for UTF-8/16)
-        let scratch_locals: u32 = if needs_transcoding_locals { 5 } else { 0 };
+        // Scratch locals: src_idx, dst_idx, out_ptr, cu, code_point, and cu2
+        // (the second surrogate unit, used by the UTF-16→UTF-8 low-surrogate
+        // validation — LS-P-16 mid-string mitigation).
+        let scratch_locals: u32 = if needs_transcoding_locals { 6 } else { 0 };
         let post_return_base = param_count as u32 + scratch_locals;
 
         let mut local_decls: Vec<(u32, wasm_encoder::ValType)> = Vec::new();
@@ -3543,6 +3545,7 @@ impl FactStyleGenerator {
         let out_ptr_local = param_count as u32 + 2;
         let cu_local = param_count as u32 + 3;
         let cp_local = param_count as u32 + 4;
+        let cu2_local = param_count as u32 + 5;
 
         // Source reads (UTF-16) use caller_memory, destination writes (UTF-8) use callee_memory
         let src_mem16 = wasm_encoder::MemArg {
@@ -3651,17 +3654,15 @@ impl FactStyleGenerator {
             }
             func.instruction(&Instruction::Else);
             {
-                // Surrogate pair: read low surrogate
+                // High surrogate with at least one more code unit available.
+                // LS-P-16 (mid-string mitigation): validate that the next
+                // unit is actually a low surrogate before treating this as a
+                // pair. An unvalidated second unit (e.g. a high surrogate
+                // followed by an ASCII char) underflows `cu2 - 0xDC00` and
+                // yields a garbage code point that the 4-byte encoder writes
+                // into callee memory (H-4.4 incorrect transcoding). The
+                // Canonical ABI mandates lossy U+FFFD replacement instead.
                 // cu2 = mem16[ptr + (src_idx + 1) * 2]
-                // code_point = 0x10000 + ((cu - 0xD800) << 10) + (cu2 - 0xDC00)
-                func.instruction(&Instruction::I32Const(0x10000));
-                func.instruction(&Instruction::LocalGet(cu_local));
-                func.instruction(&Instruction::I32Const(0xD800_u32 as i32));
-                func.instruction(&Instruction::I32Sub);
-                func.instruction(&Instruction::I32Const(10));
-                func.instruction(&Instruction::I32Shl);
-                func.instruction(&Instruction::I32Add);
-                // Load low surrogate
                 func.instruction(&Instruction::LocalGet(0));
                 func.instruction(&Instruction::LocalGet(src_idx_local));
                 func.instruction(&Instruction::I32Const(1));
@@ -3670,15 +3671,51 @@ impl FactStyleGenerator {
                 func.instruction(&Instruction::I32Shl);
                 func.instruction(&Instruction::I32Add);
                 func.instruction(&Instruction::I32Load16U(src_mem16));
+                func.instruction(&Instruction::LocalSet(cu2_local));
+
+                // is_low_surrogate = (cu2 >= 0xDC00) && (cu2 < 0xE000)
+                func.instruction(&Instruction::LocalGet(cu2_local));
                 func.instruction(&Instruction::I32Const(0xDC00_u32 as i32));
-                func.instruction(&Instruction::I32Sub);
-                func.instruction(&Instruction::I32Add);
-                func.instruction(&Instruction::LocalSet(cp_local));
-                // src_idx += 2
-                func.instruction(&Instruction::LocalGet(src_idx_local));
-                func.instruction(&Instruction::I32Const(2));
-                func.instruction(&Instruction::I32Add);
-                func.instruction(&Instruction::LocalSet(src_idx_local));
+                func.instruction(&Instruction::I32GeU);
+                func.instruction(&Instruction::LocalGet(cu2_local));
+                func.instruction(&Instruction::I32Const(0xE000_u32 as i32));
+                func.instruction(&Instruction::I32LtU);
+                func.instruction(&Instruction::I32And);
+                func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+                {
+                    // Valid surrogate pair:
+                    // cp = 0x10000 + ((cu - 0xD800) << 10) + (cu2 - 0xDC00)
+                    func.instruction(&Instruction::I32Const(0x10000));
+                    func.instruction(&Instruction::LocalGet(cu_local));
+                    func.instruction(&Instruction::I32Const(0xD800_u32 as i32));
+                    func.instruction(&Instruction::I32Sub);
+                    func.instruction(&Instruction::I32Const(10));
+                    func.instruction(&Instruction::I32Shl);
+                    func.instruction(&Instruction::I32Add);
+                    func.instruction(&Instruction::LocalGet(cu2_local));
+                    func.instruction(&Instruction::I32Const(0xDC00_u32 as i32));
+                    func.instruction(&Instruction::I32Sub);
+                    func.instruction(&Instruction::I32Add);
+                    func.instruction(&Instruction::LocalSet(cp_local));
+                    // src_idx += 2 (consume both units)
+                    func.instruction(&Instruction::LocalGet(src_idx_local));
+                    func.instruction(&Instruction::I32Const(2));
+                    func.instruction(&Instruction::I32Add);
+                    func.instruction(&Instruction::LocalSet(src_idx_local));
+                }
+                func.instruction(&Instruction::Else);
+                {
+                    // Mid-string lone high surrogate → U+FFFD, consuming only
+                    // the high surrogate so the next unit is reprocessed
+                    // normally on the following iteration.
+                    func.instruction(&Instruction::I32Const(0xFFFD));
+                    func.instruction(&Instruction::LocalSet(cp_local));
+                    func.instruction(&Instruction::LocalGet(src_idx_local));
+                    func.instruction(&Instruction::I32Const(1));
+                    func.instruction(&Instruction::I32Add);
+                    func.instruction(&Instruction::LocalSet(src_idx_local));
+                }
+                func.instruction(&Instruction::End); // end low-surrogate validation
             }
             func.instruction(&Instruction::End); // end LS-P-16 lone-surrogate check
         }
