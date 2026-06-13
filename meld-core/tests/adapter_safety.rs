@@ -2673,3 +2673,138 @@ fn test_sr17_utf16_to_utf8_malformed_surrogate_matrix() {
         );
     }
 }
+
+/// Comprehensive malformed-UTF-8 matrix for UTF-8 → UTF-16 transcoding
+/// (#251): the forward-direction analogue of the #249 reverse matrix above.
+/// Every ill-formed UTF-8 sequence — invalid continuation, invalid lead
+/// (lone continuation / overlong 2-byte lead / out-of-range lead), overlong
+/// encoding, UTF-8-encoded surrogate, and out-of-range 4-byte code point —
+/// must transcode to U+FFFD (one UTF-16 code unit, 0xFFFD = 65533) per the
+/// Canonical ABI, never to a wrong scalar. Valid inputs must be unchanged.
+///
+/// The callee sums received UTF-16 code units. Constants: U+FFFD = 65533,
+/// 'A' = 0x41 = 65. Expected sums are hand-derived under the codebase's
+/// established LS-P-19 "emit U+FFFD, consume ONLY the lead byte" convention:
+/// on malformed detection src_idx advances by 1, so any trailing
+/// continuation byte (0x80–0xBF) is reprocessed and — being a lone
+/// continuation acting as a lead — itself becomes another U+FFFD. This makes
+/// several cases emit MORE than one U+FFFD; the per-case derivations spell
+/// out the exact count.
+#[test]
+fn test_sr17_utf8_to_utf16_malformed_matrix() {
+    // (input UTF-8 bytes, expected callee code-unit-sum, label)
+    //
+    // Hand-derivations for the malformed cases (FFFD = 65533):
+    //   [0xC2,0x41]            2-byte lead, 0x41 not a continuation
+    //                          → FFFD (consume lead 0xC2), then 0x41 = 'A' = 65
+    //                          → 65533 + 65 = 65598
+    //   [0x80,0x41]            0x80 is a lone continuation < 0xC2 → invalid lead
+    //                          → FFFD (consume 1), then 0x41 = 65
+    //                          → 65533 + 65 = 65598
+    //   [0xC0,0x80]            0xC0 < 0xC2 → invalid (overlong) lead → FFFD
+    //                          (consume 1); reprocess 0x80, a lone continuation
+    //                          < 0xC2 → invalid lead → FFFD (consume 1)
+    //                          → 65533 + 65533 = 131066
+    //   [0xED,0xA0,0x80]       0xED is a 3-byte lead; conts 0xA0,0x80 are valid
+    //                          continuation bytes, decoding to cp = 0xD800 (a
+    //                          UTF-8-encoded surrogate) → rejected → FFFD,
+    //                          consume ONLY the lead. src_idx now 1: reprocess
+    //                          0xA0 (lone cont) → FFFD, consume 1. src_idx 2:
+    //                          reprocess 0x80 (lone cont) → FFFD, consume 1.
+    //                          THREE U+FFFD → 65533 * 3 = 196599
+    //   [0xF5,0x80,0x80,0x80]  0xF5 >= 0xF5 → out-of-range lead → FFFD,
+    //                          consume 1; the three trailing 0x80 are each lone
+    //                          continuations → FFFD each. FOUR U+FFFD
+    //                          → 65533 * 4 = 262132
+    //   [0xF4,0x90,0x80,0x80]  0xF4 is an in-range 4-byte lead; conts valid,
+    //                          cp = 0x110000 > U+10FFFF (out of range) →
+    //                          rejected → FFFD, consume ONLY the lead. The
+    //                          three trailing bytes 0x90,0x80,0x80 are then
+    //                          each lone continuations → FFFD each. FOUR U+FFFD
+    //                          → 65533 * 4 = 262132
+    //
+    // Valid controls (must be byte-for-byte unchanged from the fast paths):
+    //   [0x41]                 'A' = 65
+    //   [0xC3,0xA9]            é = U+00E9 = 233
+    //   [0xE2,0x82,0xAC]       € = U+20AC = 8364
+    //   [0xF0,0x9F,0x98,0x80]  😀 = U+1F600 → surrogate pair 0xD83D + 0xDE00
+    //                          = 55357 + 56832 = 112189
+    let cases: &[(&[u8], i32, &str)] = &[
+        // Malformed.
+        (&[0xC2, 0x41], 65598, "2-byte bad continuation → FFFD + A"),
+        (&[0x80, 0x41], 65598, "lone continuation as lead → FFFD + A"),
+        (
+            &[0xC0, 0x80],
+            131066,
+            "overlong 2-byte lead 0xC0 + lone cont → FFFD + FFFD",
+        ),
+        (
+            &[0xED, 0xA0, 0x80],
+            196599,
+            "UTF-8-encoded surrogate U+D800 → FFFD x3 (lead + 2 reprocessed conts)",
+        ),
+        (
+            &[0xF5, 0x80, 0x80, 0x80],
+            262132,
+            "out-of-range lead 0xF5 → FFFD x4",
+        ),
+        (
+            &[0xF4, 0x90, 0x80, 0x80],
+            262132,
+            "4-byte > U+10FFFF → FFFD x4 (lead + 3 reprocessed conts)",
+        ),
+        // Valid controls.
+        (&[0x41], 65, "valid ASCII 'A'"),
+        (&[0xC3, 0xA9], 233, "valid 2-byte é U+00E9"),
+        (&[0xE2, 0x82, 0xAC], 8364, "valid 3-byte € U+20AC"),
+        (
+            &[0xF0, 0x9F, 0x98, 0x80],
+            112189,
+            "valid 4-byte 😀 U+1F600 → surrogate pair",
+        ),
+    ];
+
+    for (bytes, expected, label) in cases {
+        let callee = build_callee_utf16_string_component();
+        let caller = build_caller_string_component_data(bytes);
+        let config = FuserConfig {
+            memory_strategy: MemoryStrategy::MultiMemory,
+            attestation: false,
+            component_provenance: false,
+            address_rebasing: false,
+            preserve_names: false,
+            custom_sections: meld_core::CustomSectionHandling::Drop,
+            dwarf_handling: meld_core::DwarfHandling::Strip,
+            output_format: meld_core::OutputFormat::CoreModule,
+            opaque_resources: Vec::new(),
+        };
+        let mut fuser = Fuser::new(config);
+        fuser
+            .add_component_named(&callee, Some("callee-utf16"))
+            .expect("callee parse");
+        fuser
+            .add_component_named(&caller, Some("caller-utf8"))
+            .expect("caller parse");
+        let (fused, _) = fuser.fuse_with_stats().expect("fusion");
+
+        let mut validator = wasmparser::Validator::new();
+        validator
+            .validate_all(&fused)
+            .unwrap_or_else(|e| panic!("#251 [{label}]: output must validate: {e}"));
+
+        let mut ec = Config::new();
+        ec.wasm_multi_memory(true);
+        let engine = Engine::new(&ec).unwrap();
+        let module = RuntimeModule::new(&engine, &fused).unwrap();
+        let mut store = Store::new(&engine, ());
+        let instance = Instance::new(&mut store, &module, &[]).unwrap();
+        let run = instance
+            .get_typed_func::<(), i32>(&mut store, "run")
+            .unwrap();
+        let result = run.call(&mut store, ()).unwrap();
+        assert_eq!(
+            result, *expected,
+            "#251 [{label}]: input {bytes:#04x?} expected code-unit-sum {expected}, got {result}"
+        );
+    }
+}

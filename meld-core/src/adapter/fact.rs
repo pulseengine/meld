@@ -3015,9 +3015,14 @@ impl FactStyleGenerator {
             (StringEncoding::Utf8, StringEncoding::Utf8)
         );
 
-        // Scratch locals: src_idx, dst_idx, out_ptr, cu, code_point, and cu2
-        // (the second surrogate unit, used by the UTF-16→UTF-8 low-surrogate
-        // validation — LS-P-16 mid-string mitigation).
+        // Scratch locals: src_idx, dst_idx, out_ptr, cu/byte, code_point, and
+        // a 6th unit. In the UTF-16→UTF-8 direction the 6th unit is `cu2`
+        // (the second surrogate unit, used by the low-surrogate validation —
+        // LS-P-16 mid-string mitigation). In the UTF-8→UTF-16 direction the
+        // 6th unit is `cont` (a continuation byte being validated — #251
+        // malformed-UTF-8 hardening: invalid continuation / lead / overlong /
+        // surrogate / out-of-range detection). Only one direction's transcoder
+        // runs per generated function, so the two uses never alias.
         let scratch_locals: u32 = if needs_transcoding_locals { 6 } else { 0 };
         let post_return_base = param_count as u32 + scratch_locals;
 
@@ -3130,12 +3135,14 @@ impl FactStyleGenerator {
             }
         };
 
-        // Scratch locals: src_idx, dst_idx (code units), out_ptr, byte, code_point
+        // Scratch locals: src_idx, dst_idx (code units), out_ptr, byte,
+        // code_point, and cont (a continuation byte being validated — #251).
         let src_idx_local = param_count as u32;
         let dst_idx_local = param_count as u32 + 1;
         let out_ptr_local = param_count as u32 + 2;
         let byte_local = param_count as u32 + 3;
         let cp_local = param_count as u32 + 4;
+        let cont_local = param_count as u32 + 5;
 
         // Source reads use caller_memory, destination writes use callee_memory
         let src_mem8 = wasm_encoder::MemArg {
@@ -3205,6 +3212,49 @@ impl FactStyleGenerator {
         func.instruction(&Instruction::LocalSet(byte_local));
 
         // --- Decode UTF-8 sequence into code_point, advance src_idx ---
+        //
+        // #251 malformed-UTF-8 hardening. The decode arms below validate the
+        // *content* of every multi-byte sequence, not just (LS-P-19)
+        // truncation. The Canonical ABI mandates lossy U+FFFD replacement for
+        // any ill-formed UTF-8 (H-4.4 incorrect transcoding); on detection we
+        // follow the established LS-P-19 convention of emitting U+FFFD (one
+        // UTF-16 code unit) and consuming ONLY the lead byte (src_idx += 1),
+        // so the offending continuation/trailing byte is reprocessed on the
+        // next iteration. This always makes progress (>= 1 byte consumed) and
+        // is consistent with the existing truncation handling. It can emit
+        // more U+FFFDs than the strict Unicode "maximal subpart" rule for
+        // some multi-continuation cases, but never decodes to a wrong scalar.
+        //
+        // Helper closures keep the repeated WASM emission DRY:
+
+        // Emit: cp = U+FFFD; src_idx += 1 (replacement, consume lead only).
+        let emit_fffd_consume_lead = |func: &mut Function| {
+            func.instruction(&Instruction::I32Const(0xFFFD));
+            func.instruction(&Instruction::LocalSet(cp_local));
+            func.instruction(&Instruction::LocalGet(src_idx_local));
+            func.instruction(&Instruction::I32Const(1));
+            func.instruction(&Instruction::I32Add);
+            func.instruction(&Instruction::LocalSet(src_idx_local));
+        };
+
+        // Push mem8[ptr + src_idx + off] onto the stack (a continuation byte).
+        let push_byte_at = |func: &mut Function, off: i32| {
+            func.instruction(&Instruction::LocalGet(0));
+            func.instruction(&Instruction::LocalGet(src_idx_local));
+            func.instruction(&Instruction::I32Add);
+            func.instruction(&Instruction::I32Const(off));
+            func.instruction(&Instruction::I32Add);
+            func.instruction(&Instruction::I32Load8U(src_mem8));
+        };
+
+        // Push: (cont_local & 0xC0) != 0x80  (true => NOT a continuation byte).
+        let push_not_continuation = |func: &mut Function| {
+            func.instruction(&Instruction::LocalGet(cont_local));
+            func.instruction(&Instruction::I32Const(0xC0));
+            func.instruction(&Instruction::I32And);
+            func.instruction(&Instruction::I32Const(0x80));
+            func.instruction(&Instruction::I32Ne);
+        };
 
         // if byte < 0x80: 1-byte ASCII
         func.instruction(&Instruction::LocalGet(byte_local));
@@ -3223,211 +3273,292 @@ impl FactStyleGenerator {
         }
         func.instruction(&Instruction::Else);
         {
-            // if byte < 0xE0: 2-byte sequence
+            // if byte < 0xC2: invalid lead — a lone continuation byte
+            // (0x80–0xBF) masquerading as a lead, or an overlong 2-byte lead
+            // (0xC0, 0xC1). #251 case 2. Reject before the 2-byte arm so these
+            // never enter the decoder. → U+FFFD, consume lead only.
             func.instruction(&Instruction::LocalGet(byte_local));
-            func.instruction(&Instruction::I32Const(0xE0));
+            func.instruction(&Instruction::I32Const(0xC2));
             func.instruction(&Instruction::I32LtU);
             func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
             {
-                // LS-P-19: emit U+FFFD when the 2-byte sequence's
-                // continuation byte would be read past the end of input
-                // (truncated multi-byte lead). Pre-v0.11 trapped via
-                // `unreachable`; the Canonical-ABI-correct behaviour is
-                // lossy replacement with U+FFFD (a single UTF-16 code
-                // unit), consuming only the lead byte. The continuations
-                // would have started a valid sequence in another world;
-                // by not consuming bytes past the lead we leave that
-                // possibility open for the next iteration.
-                func.instruction(&Instruction::LocalGet(src_idx_local));
-                func.instruction(&Instruction::I32Const(1));
-                func.instruction(&Instruction::I32Add);
-                func.instruction(&Instruction::LocalGet(1));
-                func.instruction(&Instruction::I32GeU);
-                func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
-                {
-                    // Truncated 2-byte lead → U+FFFD.
-                    func.instruction(&Instruction::I32Const(0xFFFD));
-                    func.instruction(&Instruction::LocalSet(cp_local));
-                    func.instruction(&Instruction::LocalGet(src_idx_local));
-                    func.instruction(&Instruction::I32Const(1));
-                    func.instruction(&Instruction::I32Add);
-                    func.instruction(&Instruction::LocalSet(src_idx_local));
-                }
-                func.instruction(&Instruction::Else);
-                {
-                    // cp = (byte & 0x1F) << 6 | (b1 & 0x3F)
-                    func.instruction(&Instruction::LocalGet(byte_local));
-                    func.instruction(&Instruction::I32Const(0x1F));
-                    func.instruction(&Instruction::I32And);
-                    func.instruction(&Instruction::I32Const(6));
-                    func.instruction(&Instruction::I32Shl);
-                    func.instruction(&Instruction::LocalGet(0));
-                    func.instruction(&Instruction::LocalGet(src_idx_local));
-                    func.instruction(&Instruction::I32Add);
-                    func.instruction(&Instruction::I32Const(1));
-                    func.instruction(&Instruction::I32Add);
-                    func.instruction(&Instruction::I32Load8U(src_mem8));
-                    func.instruction(&Instruction::I32Const(0x3F));
-                    func.instruction(&Instruction::I32And);
-                    func.instruction(&Instruction::I32Or);
-                    func.instruction(&Instruction::LocalSet(cp_local));
-                    // src_idx += 2
-                    func.instruction(&Instruction::LocalGet(src_idx_local));
-                    func.instruction(&Instruction::I32Const(2));
-                    func.instruction(&Instruction::I32Add);
-                    func.instruction(&Instruction::LocalSet(src_idx_local));
-                }
-                func.instruction(&Instruction::End); // end LS-P-19 (2-byte) check
+                emit_fffd_consume_lead(func);
             }
             func.instruction(&Instruction::Else);
             {
-                // if byte < 0xF0: 3-byte sequence
+                // if byte < 0xE0: 2-byte sequence (lead 0xC2–0xDF, well-formed).
                 func.instruction(&Instruction::LocalGet(byte_local));
-                func.instruction(&Instruction::I32Const(0xF0));
+                func.instruction(&Instruction::I32Const(0xE0));
                 func.instruction(&Instruction::I32LtU);
                 func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
                 {
-                    // LS-P-19: emit U+FFFD when the 3-byte sequence's
-                    // continuation bytes would extend past the end of
-                    // input. Pre-v0.11 trapped; now substitutes the
-                    // truncated lead with U+FFFD and consumes only the
-                    // lead byte.
+                    // LS-P-19: emit U+FFFD when the 2-byte sequence's
+                    // continuation byte would be read past the end of input
+                    // (truncated multi-byte lead). Pre-v0.11 trapped via
+                    // `unreachable`; the Canonical-ABI-correct behaviour is
+                    // lossy replacement with U+FFFD (a single UTF-16 code
+                    // unit), consuming only the lead byte. The continuations
+                    // would have started a valid sequence in another world;
+                    // by not consuming bytes past the lead we leave that
+                    // possibility open for the next iteration.
                     func.instruction(&Instruction::LocalGet(src_idx_local));
-                    func.instruction(&Instruction::I32Const(2));
+                    func.instruction(&Instruction::I32Const(1));
                     func.instruction(&Instruction::I32Add);
                     func.instruction(&Instruction::LocalGet(1));
                     func.instruction(&Instruction::I32GeU);
                     func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
                     {
-                        // Truncated 3-byte lead → U+FFFD.
-                        func.instruction(&Instruction::I32Const(0xFFFD));
-                        func.instruction(&Instruction::LocalSet(cp_local));
-                        func.instruction(&Instruction::LocalGet(src_idx_local));
-                        func.instruction(&Instruction::I32Const(1));
-                        func.instruction(&Instruction::I32Add);
-                        func.instruction(&Instruction::LocalSet(src_idx_local));
+                        // Truncated 2-byte lead → U+FFFD.
+                        emit_fffd_consume_lead(func);
                     }
                     func.instruction(&Instruction::Else);
                     {
-                        // cp = (byte & 0x0F) << 12 | (b1 & 0x3F) << 6 | (b2 & 0x3F)
-                        func.instruction(&Instruction::LocalGet(byte_local));
-                        func.instruction(&Instruction::I32Const(0x0F));
-                        func.instruction(&Instruction::I32And);
-                        func.instruction(&Instruction::I32Const(12));
-                        func.instruction(&Instruction::I32Shl);
-                        // b1
-                        func.instruction(&Instruction::LocalGet(0));
-                        func.instruction(&Instruction::LocalGet(src_idx_local));
-                        func.instruction(&Instruction::I32Add);
-                        func.instruction(&Instruction::I32Const(1));
-                        func.instruction(&Instruction::I32Add);
-                        func.instruction(&Instruction::I32Load8U(src_mem8));
-                        func.instruction(&Instruction::I32Const(0x3F));
-                        func.instruction(&Instruction::I32And);
-                        func.instruction(&Instruction::I32Const(6));
-                        func.instruction(&Instruction::I32Shl);
-                        func.instruction(&Instruction::I32Or);
-                        // b2
-                        func.instruction(&Instruction::LocalGet(0));
-                        func.instruction(&Instruction::LocalGet(src_idx_local));
-                        func.instruction(&Instruction::I32Add);
-                        func.instruction(&Instruction::I32Const(2));
-                        func.instruction(&Instruction::I32Add);
-                        func.instruction(&Instruction::I32Load8U(src_mem8));
-                        func.instruction(&Instruction::I32Const(0x3F));
-                        func.instruction(&Instruction::I32And);
-                        func.instruction(&Instruction::I32Or);
-                        func.instruction(&Instruction::LocalSet(cp_local));
-                        // src_idx += 3
-                        func.instruction(&Instruction::LocalGet(src_idx_local));
-                        func.instruction(&Instruction::I32Const(3));
-                        func.instruction(&Instruction::I32Add);
-                        func.instruction(&Instruction::LocalSet(src_idx_local));
+                        // #251 case 1: validate the continuation byte.
+                        push_byte_at(func, 1);
+                        func.instruction(&Instruction::LocalSet(cont_local));
+                        push_not_continuation(func);
+                        func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+                        {
+                            // b1 is not a continuation byte → U+FFFD, consume lead.
+                            emit_fffd_consume_lead(func);
+                        }
+                        func.instruction(&Instruction::Else);
+                        {
+                            // cp = (byte & 0x1F) << 6 | (b1 & 0x3F).
+                            // Lead >= 0xC2 guarantees cp >= 0x80, so no overlong
+                            // check is needed (the 0xC0/0xC1 leads were rejected
+                            // above).
+                            func.instruction(&Instruction::LocalGet(byte_local));
+                            func.instruction(&Instruction::I32Const(0x1F));
+                            func.instruction(&Instruction::I32And);
+                            func.instruction(&Instruction::I32Const(6));
+                            func.instruction(&Instruction::I32Shl);
+                            func.instruction(&Instruction::LocalGet(cont_local));
+                            func.instruction(&Instruction::I32Const(0x3F));
+                            func.instruction(&Instruction::I32And);
+                            func.instruction(&Instruction::I32Or);
+                            func.instruction(&Instruction::LocalSet(cp_local));
+                            // src_idx += 2
+                            func.instruction(&Instruction::LocalGet(src_idx_local));
+                            func.instruction(&Instruction::I32Const(2));
+                            func.instruction(&Instruction::I32Add);
+                            func.instruction(&Instruction::LocalSet(src_idx_local));
+                        }
+                        func.instruction(&Instruction::End); // end 2-byte continuation check
                     }
-                    func.instruction(&Instruction::End); // end LS-P-19 (3-byte) check
+                    func.instruction(&Instruction::End); // end LS-P-19 (2-byte) check
                 }
                 func.instruction(&Instruction::Else);
                 {
-                    // 4-byte sequence (byte >= 0xF0)
-                    // LS-P-19: trap when the 4-byte sequence's continuation
-                    // bytes would extend past the end of the input — without
-                    // this guard a truncated 4-byte lead at the buffer tail
-                    // reads up to 3 bytes of attacker-adjacent caller memory
-                    // and folds them into the encoded code point.
-                    // LS-P-19: emit U+FFFD when the 4-byte sequence's
-                    // continuation bytes would extend past the end of
-                    // input. Pre-v0.11 trapped; now substitutes the
-                    // truncated lead with U+FFFD and consumes only the
-                    // lead byte.
-                    func.instruction(&Instruction::LocalGet(src_idx_local));
-                    func.instruction(&Instruction::I32Const(3));
-                    func.instruction(&Instruction::I32Add);
-                    func.instruction(&Instruction::LocalGet(1));
-                    func.instruction(&Instruction::I32GeU);
+                    // if byte < 0xF0: 3-byte sequence (lead 0xE0–0xEF).
+                    func.instruction(&Instruction::LocalGet(byte_local));
+                    func.instruction(&Instruction::I32Const(0xF0));
+                    func.instruction(&Instruction::I32LtU);
                     func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
                     {
-                        // Truncated 4-byte lead → U+FFFD.
-                        func.instruction(&Instruction::I32Const(0xFFFD));
-                        func.instruction(&Instruction::LocalSet(cp_local));
+                        // LS-P-19: emit U+FFFD when the 3-byte sequence's
+                        // continuation bytes would extend past the end of
+                        // input. Pre-v0.11 trapped; now substitutes the
+                        // truncated lead with U+FFFD and consumes only the
+                        // lead byte.
                         func.instruction(&Instruction::LocalGet(src_idx_local));
-                        func.instruction(&Instruction::I32Const(1));
+                        func.instruction(&Instruction::I32Const(2));
                         func.instruction(&Instruction::I32Add);
-                        func.instruction(&Instruction::LocalSet(src_idx_local));
+                        func.instruction(&Instruction::LocalGet(1));
+                        func.instruction(&Instruction::I32GeU);
+                        func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+                        {
+                            // Truncated 3-byte lead → U+FFFD.
+                            emit_fffd_consume_lead(func);
+                        }
+                        func.instruction(&Instruction::Else);
+                        {
+                            // #251 case 1: validate BOTH continuation bytes.
+                            // not_cont(b1) | not_cont(b2) → reject.
+                            push_byte_at(func, 1);
+                            func.instruction(&Instruction::LocalSet(cont_local));
+                            push_not_continuation(func);
+                            push_byte_at(func, 2);
+                            func.instruction(&Instruction::LocalSet(cont_local));
+                            push_not_continuation(func);
+                            func.instruction(&Instruction::I32Or);
+                            func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+                            {
+                                // A continuation byte is not 10xxxxxx → U+FFFD.
+                                emit_fffd_consume_lead(func);
+                            }
+                            func.instruction(&Instruction::Else);
+                            {
+                                // cp = (byte & 0x0F) << 12 | (b1 & 0x3F) << 6 | (b2 & 0x3F)
+                                func.instruction(&Instruction::LocalGet(byte_local));
+                                func.instruction(&Instruction::I32Const(0x0F));
+                                func.instruction(&Instruction::I32And);
+                                func.instruction(&Instruction::I32Const(12));
+                                func.instruction(&Instruction::I32Shl);
+                                // b1
+                                push_byte_at(func, 1);
+                                func.instruction(&Instruction::I32Const(0x3F));
+                                func.instruction(&Instruction::I32And);
+                                func.instruction(&Instruction::I32Const(6));
+                                func.instruction(&Instruction::I32Shl);
+                                func.instruction(&Instruction::I32Or);
+                                // b2
+                                push_byte_at(func, 2);
+                                func.instruction(&Instruction::I32Const(0x3F));
+                                func.instruction(&Instruction::I32And);
+                                func.instruction(&Instruction::I32Or);
+                                func.instruction(&Instruction::LocalSet(cp_local));
+                                // #251 cases 3 & 4: reject overlong
+                                // (cp < 0x800) and UTF-8-encoded surrogates
+                                // (0xD800 <= cp < 0xE000). overlong | surrogate.
+                                func.instruction(&Instruction::LocalGet(cp_local));
+                                func.instruction(&Instruction::I32Const(0x800));
+                                func.instruction(&Instruction::I32LtU);
+                                func.instruction(&Instruction::LocalGet(cp_local));
+                                func.instruction(&Instruction::I32Const(0xD800));
+                                func.instruction(&Instruction::I32GeU);
+                                func.instruction(&Instruction::LocalGet(cp_local));
+                                func.instruction(&Instruction::I32Const(0xE000));
+                                func.instruction(&Instruction::I32LtU);
+                                func.instruction(&Instruction::I32And);
+                                func.instruction(&Instruction::I32Or);
+                                func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+                                {
+                                    // Overlong or surrogate → U+FFFD, consume lead.
+                                    emit_fffd_consume_lead(func);
+                                }
+                                func.instruction(&Instruction::Else);
+                                {
+                                    // Well-formed 3-byte. src_idx += 3.
+                                    func.instruction(&Instruction::LocalGet(src_idx_local));
+                                    func.instruction(&Instruction::I32Const(3));
+                                    func.instruction(&Instruction::I32Add);
+                                    func.instruction(&Instruction::LocalSet(src_idx_local));
+                                }
+                                func.instruction(&Instruction::End); // end 3-byte overlong/surrogate check
+                            }
+                            func.instruction(&Instruction::End); // end 3-byte continuation check
+                        }
+                        func.instruction(&Instruction::End); // end LS-P-19 (3-byte) check
                     }
                     func.instruction(&Instruction::Else);
                     {
-                        // cp = (byte & 0x07) << 18 | (b1 & 0x3F) << 12 | (b2 & 0x3F) << 6 | (b3 & 0x3F)
+                        // 4-byte sequence (byte >= 0xF0).
+                        // #251 case 2: leads 0xF5–0xFF can only produce
+                        // out-of-range code points; reject them up front so
+                        // they never enter the 4-byte decoder.
                         func.instruction(&Instruction::LocalGet(byte_local));
-                        func.instruction(&Instruction::I32Const(0x07));
-                        func.instruction(&Instruction::I32And);
-                        func.instruction(&Instruction::I32Const(18));
-                        func.instruction(&Instruction::I32Shl);
-                        // b1
-                        func.instruction(&Instruction::LocalGet(0));
-                        func.instruction(&Instruction::LocalGet(src_idx_local));
-                        func.instruction(&Instruction::I32Add);
-                        func.instruction(&Instruction::I32Const(1));
-                        func.instruction(&Instruction::I32Add);
-                        func.instruction(&Instruction::I32Load8U(src_mem8));
-                        func.instruction(&Instruction::I32Const(0x3F));
-                        func.instruction(&Instruction::I32And);
-                        func.instruction(&Instruction::I32Const(12));
-                        func.instruction(&Instruction::I32Shl);
-                        func.instruction(&Instruction::I32Or);
-                        // b2
-                        func.instruction(&Instruction::LocalGet(0));
-                        func.instruction(&Instruction::LocalGet(src_idx_local));
-                        func.instruction(&Instruction::I32Add);
-                        func.instruction(&Instruction::I32Const(2));
-                        func.instruction(&Instruction::I32Add);
-                        func.instruction(&Instruction::I32Load8U(src_mem8));
-                        func.instruction(&Instruction::I32Const(0x3F));
-                        func.instruction(&Instruction::I32And);
-                        func.instruction(&Instruction::I32Const(6));
-                        func.instruction(&Instruction::I32Shl);
-                        func.instruction(&Instruction::I32Or);
-                        // b3
-                        func.instruction(&Instruction::LocalGet(0));
-                        func.instruction(&Instruction::LocalGet(src_idx_local));
-                        func.instruction(&Instruction::I32Add);
-                        func.instruction(&Instruction::I32Const(3));
-                        func.instruction(&Instruction::I32Add);
-                        func.instruction(&Instruction::I32Load8U(src_mem8));
-                        func.instruction(&Instruction::I32Const(0x3F));
-                        func.instruction(&Instruction::I32And);
-                        func.instruction(&Instruction::I32Or);
-                        func.instruction(&Instruction::LocalSet(cp_local));
-                        // src_idx += 4
-                        func.instruction(&Instruction::LocalGet(src_idx_local));
-                        func.instruction(&Instruction::I32Const(4));
-                        func.instruction(&Instruction::I32Add);
-                        func.instruction(&Instruction::LocalSet(src_idx_local));
+                        func.instruction(&Instruction::I32Const(0xF5));
+                        func.instruction(&Instruction::I32GeU);
+                        func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+                        {
+                            emit_fffd_consume_lead(func);
+                        }
+                        func.instruction(&Instruction::Else);
+                        {
+                            // LS-P-19: emit U+FFFD when the 4-byte sequence's
+                            // continuation bytes would extend past the end of
+                            // input — without this guard a truncated 4-byte
+                            // lead at the buffer tail reads up to 3 bytes of
+                            // attacker-adjacent caller memory and folds them
+                            // into the encoded code point. Pre-v0.11 trapped;
+                            // now substitutes the truncated lead with U+FFFD
+                            // and consumes only the lead byte.
+                            func.instruction(&Instruction::LocalGet(src_idx_local));
+                            func.instruction(&Instruction::I32Const(3));
+                            func.instruction(&Instruction::I32Add);
+                            func.instruction(&Instruction::LocalGet(1));
+                            func.instruction(&Instruction::I32GeU);
+                            func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+                            {
+                                // Truncated 4-byte lead → U+FFFD.
+                                emit_fffd_consume_lead(func);
+                            }
+                            func.instruction(&Instruction::Else);
+                            {
+                                // #251 case 1: validate all THREE continuation bytes.
+                                push_byte_at(func, 1);
+                                func.instruction(&Instruction::LocalSet(cont_local));
+                                push_not_continuation(func);
+                                push_byte_at(func, 2);
+                                func.instruction(&Instruction::LocalSet(cont_local));
+                                push_not_continuation(func);
+                                func.instruction(&Instruction::I32Or);
+                                push_byte_at(func, 3);
+                                func.instruction(&Instruction::LocalSet(cont_local));
+                                push_not_continuation(func);
+                                func.instruction(&Instruction::I32Or);
+                                func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+                                {
+                                    // A continuation byte is not 10xxxxxx → U+FFFD.
+                                    emit_fffd_consume_lead(func);
+                                }
+                                func.instruction(&Instruction::Else);
+                                {
+                                    // cp = (byte & 0x07) << 18 | (b1 & 0x3F) << 12 | (b2 & 0x3F) << 6 | (b3 & 0x3F)
+                                    func.instruction(&Instruction::LocalGet(byte_local));
+                                    func.instruction(&Instruction::I32Const(0x07));
+                                    func.instruction(&Instruction::I32And);
+                                    func.instruction(&Instruction::I32Const(18));
+                                    func.instruction(&Instruction::I32Shl);
+                                    // b1
+                                    push_byte_at(func, 1);
+                                    func.instruction(&Instruction::I32Const(0x3F));
+                                    func.instruction(&Instruction::I32And);
+                                    func.instruction(&Instruction::I32Const(12));
+                                    func.instruction(&Instruction::I32Shl);
+                                    func.instruction(&Instruction::I32Or);
+                                    // b2
+                                    push_byte_at(func, 2);
+                                    func.instruction(&Instruction::I32Const(0x3F));
+                                    func.instruction(&Instruction::I32And);
+                                    func.instruction(&Instruction::I32Const(6));
+                                    func.instruction(&Instruction::I32Shl);
+                                    func.instruction(&Instruction::I32Or);
+                                    // b3
+                                    push_byte_at(func, 3);
+                                    func.instruction(&Instruction::I32Const(0x3F));
+                                    func.instruction(&Instruction::I32And);
+                                    func.instruction(&Instruction::I32Or);
+                                    func.instruction(&Instruction::LocalSet(cp_local));
+                                    // #251 cases 3 & 5: reject overlong
+                                    // (cp < 0x10000) and out-of-range
+                                    // (cp > 0x10FFFF). overlong | oor.
+                                    func.instruction(&Instruction::LocalGet(cp_local));
+                                    func.instruction(&Instruction::I32Const(0x10000));
+                                    func.instruction(&Instruction::I32LtU);
+                                    func.instruction(&Instruction::LocalGet(cp_local));
+                                    func.instruction(&Instruction::I32Const(0x10FFFF));
+                                    func.instruction(&Instruction::I32GtU);
+                                    func.instruction(&Instruction::I32Or);
+                                    func.instruction(&Instruction::If(
+                                        wasm_encoder::BlockType::Empty,
+                                    ));
+                                    {
+                                        // Overlong or out-of-range → U+FFFD, consume lead.
+                                        emit_fffd_consume_lead(func);
+                                    }
+                                    func.instruction(&Instruction::Else);
+                                    {
+                                        // Well-formed 4-byte. src_idx += 4.
+                                        func.instruction(&Instruction::LocalGet(src_idx_local));
+                                        func.instruction(&Instruction::I32Const(4));
+                                        func.instruction(&Instruction::I32Add);
+                                        func.instruction(&Instruction::LocalSet(src_idx_local));
+                                    }
+                                    func.instruction(&Instruction::End); // end 4-byte overlong/oor check
+                                }
+                                func.instruction(&Instruction::End); // end 4-byte continuation check
+                            }
+                            func.instruction(&Instruction::End); // end LS-P-19 (4-byte) check
+                        }
+                        func.instruction(&Instruction::End); // end 4-byte invalid-lead check
                     }
-                    func.instruction(&Instruction::End); // end LS-P-19 (4-byte) check
+                    func.instruction(&Instruction::End); // end 3-byte vs 4-byte
                 }
-                func.instruction(&Instruction::End); // end 3-byte vs 4-byte
+                func.instruction(&Instruction::End); // end 2-byte vs 3+byte
             }
-            func.instruction(&Instruction::End); // end 2-byte vs 3+byte
+            func.instruction(&Instruction::End); // end invalid-lead vs valid-multibyte
         }
         func.instruction(&Instruction::End); // end 1-byte vs 2+byte
 
