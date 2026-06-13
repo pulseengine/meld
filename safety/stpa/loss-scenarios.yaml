@@ -965,6 +965,21 @@ loss-scenarios:
       OOB read.
     status: approved
     priority: high
+    follow-up-closed: >
+      The structural-follow-up upgrade (trap → Canonical-ABI lossy
+      U+FFFD replacement) shipped in v0.11; as of 2026-06-13 it also
+      has an executing RUNTIME oracle:
+      adapter_safety::test_sr17_utf16_to_utf8_lone_high_surrogate_replacement
+      fuses a UTF-16-lowering caller passing [0x0041, 0xD800] (a lone
+      trailing high surrogate) into a UTF-8 callee and asserts under
+      wasmtime that the output is 'A' + U+FFFD (UTF-8 EF BF BD, byte
+      sum 684) — proving lossy replacement, not a trap or OOB read.
+      Closes the "no regression test for UTF-16 inputs ending on a
+      high surrogate" causal-factor above. (The mid-string lone-
+      surrogate case — high surrogate followed by a non-low unit —
+      still relies on the end-of-input guard; a non-low second unit
+      takes the pair arm. Recorded as a residual: only the
+      end-of-input lone surrogate has a defined U+FFFD path.)
 
   - id: LS-P-18
     title: LS-P-12 bypassed when a record mixes a covered pointer with a hidden conditional one
