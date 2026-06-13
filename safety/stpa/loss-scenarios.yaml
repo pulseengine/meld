@@ -1647,6 +1647,70 @@ loss-scenarios:
       ABI does not provide. (ii) is therefore closed as not-applicable
       rather than implemented; documented in `p3_stream.rs`.
 
+  - id: LS-R-15
+    title: FixedSizeList param/result desynchronises copy-layout from pointer-position arrays
+    uca: UCA-R-4
+    hazards: [H-4, H-4.1]
+    type: inadequate-control-algorithm
+    scenario: >
+      The cross-memory adapter copies each pointer-pair (string/list) leaf
+      of a function parameter/result by zipping two parallel arrays BY
+      INDEX: the flat pointer positions (`pointer_pair_param_positions` →
+      `collect_pointer_positions`, parser.rs) and the per-leaf copy layouts
+      (`collect_param_copy_layouts` → `collect_type_copy_layouts`,
+      resolver.rs). The position walker descended into `FixedSizeList`
+      (`list<T, N>`), but `collect_type_copy_layouts` omitted it via its
+      catch-all `_ => {}`. So for any param/result that is or contains a
+      `FixedSizeList` carrying pointer leaves, the layout array was SHORTER
+      than the position array and the two desynchronised: the adapter's
+      `param_layouts.get(i).map(..).unwrap_or(1)` fell back to
+      `byte_multiplier = 1` for the unmatched leaves (fact.rs). Result for
+      e.g. `list<list<u64>, 2>`: the callee `cabi_realloc` is undersized
+      8× and the `memory.copy` transfers 1/8 of each inner list's bytes —
+      the callee then reads `len` u64 elements from a buffer holding
+      `len/8` of real data [UCA-R-4 / H-4.1 wrong copy byte count, H-4
+      truncated cross-memory payload]. With a non-FixedSizeList pointer
+      after a FixedSizeList, the misalignment also shifts a wide list's
+      layout onto the wrong copy site. Reachable for any cross-memory
+      fusion whose interface fn param/result is or contains a
+      `FixedSizeList` with String/List leaves (meld enables the
+      fixed-length-list proposal; existing fixtures only assert the fused
+      module validates, not runtime copy correctness, so it was untested).
+      Surfaced by a Mythos discovery pass on resolver.rs.
+    causal-factors:
+      - >-
+        Two parallel walkers (position vs copy-layout) over the same type
+        tree diverged: the layout walker's catch-all skipped FixedSizeList
+        while the position walker descended into it
+      - >-
+        The adapter zips the arrays by index with an `unwrap_or(1)`
+        byte-multiplier fallback that silently absorbs a length mismatch
+        instead of erroring
+      - >-
+        No runtime test exercised a FixedSizeList-bearing param/result
+        across a memory boundary (fixtures only checked validation)
+    process-model-flaw: >
+      The copy-layout collector's model of "composite types to descend
+      into" omitted FixedSizeList, while the position collector's model
+      included it — a parallel-array invariant (equal length, matching
+      order) maintained by two independently-edited functions that drifted.
+    status: approved
+    priority: high
+    fix: >
+      `collect_type_copy_layouts` gains the `FixedSizeList(elem, len)` arm
+      (recurse `len`× into `elem`), mirroring `collect_pointer_positions`
+      exactly so the two arrays stay equal-length and identically ordered.
+      One collector feeds param/result/params-area layouts, so all three
+      pairings are fixed. Pinned by
+      resolver::tests::test_lsr12_fixed_size_list_copy_layout_alignment
+      (positions.len()==layouts.len()==2, each Bulk{byte_multiplier:8} for
+      `list<list<u64>, 2>`). Mythos-verified: an 8-shape matrix
+      (nested fixed-lists, fixed-list-in-record/tuple, scalar fixed-list,
+      order-sensitive interleaving) holds count AND order AND
+      byte_multiplier; disabling the arm reproduces the desync; the
+      post-fix match arms of both walkers descend into and skip the
+      identical variant sets.
+
   # ==========================================================================
   # Merger scenarios
   # ==========================================================================

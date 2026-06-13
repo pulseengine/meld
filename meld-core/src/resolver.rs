@@ -720,6 +720,20 @@ fn collect_type_copy_layouts(
                 collect_type_copy_layouts(component, elem_ty, out);
             }
         }
+        ComponentValType::FixedSizeList(elem, len) => {
+            // Each element is flattened inline, exactly as the parallel
+            // position walker `collect_pointer_positions` descends
+            // (parser.rs). Omitting this arm desynchronised this layout
+            // array from the pointer-position array: the adapter zips them
+            // by index and falls back to `byte_multiplier = 1` for the
+            // unmatched String/List leaves, undersizing the callee
+            // allocation and truncating the cross-memory copy (LS-R-15 /
+            // H-4.1). Loop `len` times over the element type so one layout
+            // is emitted per flattened pointer-pair leaf.
+            for _ in 0..*len {
+                collect_type_copy_layouts(component, elem, out);
+            }
+        }
         ComponentValType::Type(idx) => {
             if let Some(ct) = component.get_type_definition(*idx)
                 && let ComponentTypeKind::Defined(inner) = &ct.kind
@@ -727,7 +741,7 @@ fn collect_type_copy_layouts(
                 collect_type_copy_layouts(component, inner, out);
             }
         }
-        _ => {} // scalars don't have pointer pairs
+        _ => {} // scalars / options / results / variants — no param-level pointer pairs
     }
 }
 
@@ -5457,6 +5471,46 @@ mod tests {
     #[test]
     fn ls_r_10_intra_adapter_preserves_from_import_module() {
         test_issue112_item5_intra_adapter_preserves_from_import_module();
+    }
+
+    /// LS-R-15 regression: `collect_type_copy_layouts` must descend into
+    /// `FixedSizeList` so its output stays index-aligned with
+    /// `pointer_pair_param_positions` (which does). Pre-fix, a
+    /// `list<list<u64>, 2>` param produced 2 pointer positions but 0 copy
+    /// layouts, so the adapter zipped them misaligned and fell back to
+    /// byte_multiplier=1 (undersized alloc + truncated cross-memory copy).
+    #[test]
+    fn test_lsr12_fixed_size_list_copy_layout_alignment() {
+        use crate::parser::{ComponentValType as V, PrimitiveValType as P};
+        let comp = empty_parsed_component();
+        // list<list<u64>, 2>
+        let inner_list = V::List(Box::new(V::Primitive(P::U64)));
+        let param_ty = V::FixedSizeList(Box::new(inner_list), 2);
+        let params = vec![("p".to_string(), param_ty)];
+
+        let positions = comp.pointer_pair_param_positions(&params);
+        let layouts = collect_param_copy_layouts(&comp, &params);
+
+        assert_eq!(
+            positions.len(),
+            layouts.len(),
+            "pointer positions ({}) and copy layouts ({}) must stay aligned \
+             for FixedSizeList params",
+            positions.len(),
+            layouts.len()
+        );
+        assert_eq!(
+            layouts.len(),
+            2,
+            "list<list<u64>, 2> has two pointer-pair leaves"
+        );
+        for layout in &layouts {
+            assert!(
+                matches!(layout, CopyLayout::Bulk { byte_multiplier: 8 }),
+                "each list<u64> leaf must copy 8 bytes/element, not the \
+                 byte_multiplier=1 fallback; got {layout:?}"
+            );
+        }
     }
 }
 
