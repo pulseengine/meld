@@ -3221,6 +3221,68 @@ loss-scenarios:
       single-module identity case; the multi-module cases fail on
       pre-fix code (non-vacuity confirmed).
 
+  - id: LS-M-9
+    title: P3-async lowering does not relocate ref.func in expression-form element segments
+    uca: UCA-M-1
+    hazards: [H-1, H-3]
+    type: inadequate-control-algorithm
+    scenario: >
+      `p3_async.rs::shift_function_indices` (the P3-async lowering pass)
+      prepends `k` `pulseengine:async` function imports and shifts every
+      defined-function reference up by `k` so existing references still
+      resolve. The `ReindexedElementItems::Functions(_)` form was bumped,
+      but the `Expressions(_)` form (a `funcref`/typed-ref element segment
+      whose items are const-expressions like `(ref.func $b)`) was a
+      comment-only NO-OP — neither bumped NOR errored, despite the comment
+      claiming such components would be "flagged". So a `ref.func` index
+      inside an expression-form element segment was left STALE after the
+      shift: the table slot then points at one of the prepended intrinsic
+      imports (e.g. `stream_new`, a `() -> i64` host func) instead of the
+      intended function. A `call_indirect` through that slot invokes the
+      wrong function with an incompatible signature → trap, or (if
+      signatures happen to align) a silent wrong call [UCA-M-1 wrong
+      reference target / H-1 behaves differently from composed input /
+      H-3 index confusion]. Violates SC-3 ("index remapping must account
+      for all reference sites: instructions, init expressions, element
+      segments, …"). End-to-end reproduced: a P3-async component
+      (`stream<u8>` → k=5) with `(elem (i32.const 0) funcref (ref.func $b))`
+      fused to an output where `$b`'s export was bumped 2→7 but the elem
+      ref stayed 2 (= stream_new); a k=0 control was correct, isolating
+      the bug to this shift. The third site of the missing-reference-site
+      relocation class (with LS-M-8 segment indices). Surfaced by a Mythos
+      discovery pass on p3_async.rs.
+    causal-factors:
+      - >-
+        The shift handled Functions-form element segments but the
+        Expressions-form arm silently skipped ref.func indices
+      - >-
+        ReindexedElementItems::Expressions held opaque encoded ConstExpr
+        bytes, so the index was not accessible to the shift at that point
+      - >-
+        No test asserted post-shift ref.func/call targets for an
+        expression-form element segment under P3 lowering (existing tests
+        pinned import emission, not relocation of this reference site)
+    process-model-flaw: >
+      The lowering's enumeration of "function-reference sites to shift"
+      omitted ref.func inside element-segment expressions — the same
+      class as LS-M-8 (segment-index operands) and SC-3's mandate.
+    status: approved
+    priority: high
+    fix: >
+      `ReindexedElementItems::Expressions` now carries the structured,
+      merger-reindexed `Vec<ParsedConstExpr>` instead of opaque
+      `Vec<ConstExpr>` (encoding deferred to `encode_element_segment` at
+      emit), so the function index stays accessible. The P3 shift arm
+      bumps `ParsedConstExpr::RefFunc(idx)` via the same `bump` closure as
+      the Functions arm; GlobalGet/RefNull/scalars are untouched (already
+      finalized by the merger; P3 prepends only function imports). Pinned
+      by tests/p3_async_lowering.rs: `p3_shift_relocates_expr_form_elem_ref_func`
+      (k=5: the elem ref.func equals $b's shifted export index, not an
+      intrinsic-import slot) + a k=0 control; the e2e test fails on pre-fix
+      code (non-vacuity confirmed). Mythos-verified: the deferred encode is
+      byte-identical to the prior eager path across all ParsedConstExpr
+      kinds × all segment modes, and only RefFunc is bumped.
+
   - id: LS-D-1
     title: remapped DWARF emits a wrong code address for a fused function
     uca: UCA-M-9
