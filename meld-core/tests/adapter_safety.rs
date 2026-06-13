@@ -2174,6 +2174,13 @@ fn test_sr17_utf8_to_utf16_supplementary_plane_transcoding() {
 /// memory, and `run` calls `process-string(0, code_units.len())` — the
 /// length is a UTF-16 code-unit count, per the canonical ABI.
 fn build_caller_utf16_lowering_component(code_units: &[u16]) -> Vec<u8> {
+    build_caller_lowering_component(code_units, CanonicalOption::UTF16)
+}
+
+/// Like `build_caller_utf16_lowering_component` but parameterized on the
+/// `canon lower` string encoding, so tests can drive other caller-side
+/// encodings (e.g. CompactUTF16 → Latin1) through the resolver.
+fn build_caller_lowering_component(code_units: &[u16], lower_encoding: CanonicalOption) -> Vec<u8> {
     let mut data_bytes = Vec::new();
     for cu in code_units {
         data_bytes.extend_from_slice(&cu.to_le_bytes());
@@ -2373,7 +2380,7 @@ fn build_caller_utf16_lowering_component(code_units: &[u16]) -> Vec<u8> {
         canon.lower(
             0,
             [
-                CanonicalOption::UTF16,
+                lower_encoding,
                 CanonicalOption::Memory(0),
                 CanonicalOption::Realloc(0),
             ],
@@ -2807,4 +2814,48 @@ fn test_sr17_utf8_to_utf16_malformed_matrix() {
             "#251 [{label}]: input {bytes:#04x?} expected code-unit-sum {expected}, got {result}"
         );
     }
+}
+
+/// #253 fail-loud guard: a cross-encoding pair with no transcoder
+/// implemented must FAIL fusion loudly rather than silently emit a
+/// verbatim byte copy that mis-transcodes well-formed input. A caller
+/// that lowers with CompactUTF16 (which meld maps to Latin1) into a
+/// UTF-16 callee produces the unimplemented (Latin1, Utf16) pair; fusion
+/// must return Err, not a silently-wrong module.
+#[test]
+fn test_253_unsupported_cross_encoding_transcode_fails_loud() {
+    let callee = build_callee_utf16_string_component(); // lifts UTF-16
+    let caller = build_caller_lowering_component(&[0x0041], CanonicalOption::CompactUTF16);
+
+    let config = FuserConfig {
+        memory_strategy: MemoryStrategy::MultiMemory,
+        attestation: false,
+        component_provenance: false,
+        address_rebasing: false,
+        preserve_names: false,
+        custom_sections: meld_core::CustomSectionHandling::Drop,
+        dwarf_handling: meld_core::DwarfHandling::Strip,
+        output_format: meld_core::OutputFormat::CoreModule,
+        opaque_resources: Vec::new(),
+    };
+
+    let mut fuser = Fuser::new(config);
+    fuser
+        .add_component_named(&callee, Some("callee-utf16"))
+        .expect("callee parse");
+    fuser
+        .add_component_named(&caller, Some("caller-compact"))
+        .expect("caller parse");
+
+    let result = fuser.fuse_with_stats();
+    assert!(
+        result.is_err(),
+        "#253: (Latin1/CompactUTF16 -> Utf16) has no transcoder; fusion must \
+         fail loudly rather than emit a silently-wrong verbatim copy. Got Ok."
+    );
+    let msg = format!("{:?}", result.err().unwrap());
+    assert!(
+        msg.contains("transcoding") || msg.contains("#253"),
+        "#253: error should name the unsupported transcoding; got: {msg}"
+    );
 }
