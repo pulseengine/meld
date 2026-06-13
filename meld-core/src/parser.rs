@@ -4,6 +4,7 @@
 //! the core modules, types, imports, and exports needed for fusion.
 
 use crate::attestation::compute_sha256;
+use crate::rewriter::convert_abstract_heap_type;
 use crate::{Error, Result};
 use wasm_encoder::ValType;
 use wasmparser::{
@@ -3772,17 +3773,31 @@ fn convert_val_type(ty: WasmValType) -> ValType {
     }
 }
 
-/// Convert wasmparser RefType to wasm-encoder ValType
+/// Faithfully convert a `wasmparser::RefType` to a `wasm_encoder::ValType`,
+/// preserving nullability, abstract heap types, and concrete type indices.
+///
+/// At parse time, concrete heap-type indices are module-level
+/// (`idx.as_module_index()`); they are remapped to their merged-module index
+/// later by the merger (`convert_table_type` / `MergedFuncType` build /
+/// `convert_global_type`). Mirrors `segments.rs::convert_ref_type`.
+///
+/// Replaces the previous lossy funcref/externref bucketing that flattened
+/// concrete typed references `(ref null $t)` and GC abstract heap types
+/// (struct/array/eq/any/i31/...) to `funcref`, silently weakening the type.
 fn convert_ref_type(rt: wasmparser::RefType) -> ValType {
-    if rt.is_func_ref() {
-        ValType::Ref(wasm_encoder::RefType::FUNCREF)
-    } else if rt.is_extern_ref() {
-        ValType::Ref(wasm_encoder::RefType::EXTERNREF)
-    } else {
-        // For other reference types, default to funcref
-        // This is a simplification - real implementation would handle all ref types
-        ValType::Ref(wasm_encoder::RefType::FUNCREF)
-    }
+    let heap_type = match rt.heap_type() {
+        wasmparser::HeapType::Abstract { shared, ty } => wasm_encoder::HeapType::Abstract {
+            shared,
+            ty: convert_abstract_heap_type(ty),
+        },
+        wasmparser::HeapType::Concrete(idx) | wasmparser::HeapType::Exact(idx) => {
+            wasm_encoder::HeapType::Concrete(idx.as_module_index().unwrap_or(0))
+        }
+    };
+    ValType::Ref(wasm_encoder::RefType {
+        nullable: rt.is_nullable(),
+        heap_type,
+    })
 }
 
 #[cfg(test)]
