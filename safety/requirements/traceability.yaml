@@ -195,6 +195,7 @@ verification-status:
       - adapter_safety::test_sr17_utf16_to_utf8_midstring_lone_surrogate_replacement
       - adapter_safety::test_sr17_utf16_to_utf8_malformed_surrogate_matrix
       - adapter_safety::test_sr17_utf8_to_utf16_malformed_matrix
+      - adapter_safety::test_sr17_latin1_to_utf16_transcoding
       - resolver::tests::test_sr17_all_encoding_pairs_transcoding_matrix
     proofs: []
     status: verified
