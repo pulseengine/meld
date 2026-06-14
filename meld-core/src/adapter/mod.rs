@@ -23,6 +23,11 @@ pub(crate) mod fact;
 
 pub use fact::FactStyleGenerator;
 
+/// Test-support: build the #272 inc-1 UTF-8 → UTF-16 transcode oracle module.
+/// `#[doc(hidden)]` — not a supported API; see the function's own docs.
+#[doc(hidden)]
+pub use fact::build_utf8_to_utf16_transcode_test_module;
+
 use crate::Result;
 use crate::merger::MergedModule;
 use crate::resolver::DependencyGraph;
