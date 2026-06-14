@@ -340,7 +340,7 @@ fn build_elem_probe_component(marker: i32, export_name: &str) -> Vec<u8> {
 }
 
 #[test]
-fn segidx_elem_two_modules_distinct_segments() {
+fn ls_m_8_segidx_elem_two_modules_distinct_segments() {
     // Module A's elem segment references its konst (returns 0x0A0A);
     // module B's references its konst (returns 0x0B0B). After fusion the
     // element sections concatenate; without elem-index remap, B's

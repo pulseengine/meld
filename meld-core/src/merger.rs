@@ -2224,6 +2224,10 @@ impl Merger {
         // Track base (module, field) names already emitted for function imports
         // so we can suffix duplicates in multi-memory mode.
         let mut emitted_base_func: HashSet<(String, String)> = HashSet::new();
+        // Same for tables/globals: type-mismatched same-named imports need a
+        // unique (module, field) in multi-memory mode.
+        let mut emitted_base_table: HashSet<(String, String)> = HashSet::new();
+        let mut emitted_base_global: HashSet<(String, String)> = HashSet::new();
 
         for unresolved in &graph.unresolved_imports {
             // Skip imports resolved by adapter sites (must match the
@@ -2388,7 +2392,16 @@ impl Merger {
                     }
                 }
                 ImportKind::Table(t) => {
-                    if !emitted_table.insert(dedup_key.clone()) {
+                    // Type-mismatched entries must emit a separate import even
+                    // when the dedup key was already seen (mirrors the function
+                    // arm). Same-typed duplicates still collapse to one slot.
+                    let is_type_mismatch = dedup_info.type_mismatch_entries.contains(&(
+                        unresolved.component_idx,
+                        unresolved.module_idx,
+                        unresolved.module_name.clone(),
+                        unresolved.field_name.clone(),
+                    ));
+                    if !is_type_mismatch && !emitted_table.insert(dedup_key.clone()) {
                         continue;
                     }
 
@@ -2413,7 +2426,17 @@ impl Merger {
                                 .unwrap_or(&unresolved.module_name)
                                 .clone()
                         });
-                    let name = dedup_key.1.clone();
+                    // In multi-memory mode, suffix the field with $comp_idx when
+                    // a different component already emitted the same base name,
+                    // keeping (module, field) pairs unique (mirrors func arm).
+                    let base_key = (dedup_key.0.clone(), dedup_key.1.clone());
+                    let needs_suffix = self.memory_strategy == MemoryStrategy::MultiMemory
+                        && !emitted_base_table.insert(base_key);
+                    let name = if needs_suffix {
+                        format!("{}${}", dedup_key.1, unresolved.component_idx)
+                    } else {
+                        dedup_key.1.clone()
+                    };
 
                     merged.imports.push(MergedImport {
                         module,
@@ -2448,7 +2471,16 @@ impl Merger {
                     });
                 }
                 ImportKind::Global(g) => {
-                    if !emitted_global.insert(dedup_key.clone()) {
+                    // Type-mismatched entries must emit a separate import even
+                    // when the dedup key was already seen (mirrors the function
+                    // arm). Same-typed duplicates still collapse to one slot.
+                    let is_type_mismatch = dedup_info.type_mismatch_entries.contains(&(
+                        unresolved.component_idx,
+                        unresolved.module_idx,
+                        unresolved.module_name.clone(),
+                        unresolved.field_name.clone(),
+                    ));
+                    if !is_type_mismatch && !emitted_global.insert(dedup_key.clone()) {
                         continue;
                     }
 
@@ -2473,7 +2505,17 @@ impl Merger {
                                 .unwrap_or(&unresolved.module_name)
                                 .clone()
                         });
-                    let name = dedup_key.1.clone();
+                    // In multi-memory mode, suffix the field with $comp_idx when
+                    // a different component already emitted the same base name,
+                    // keeping (module, field) pairs unique (mirrors func arm).
+                    let base_key = (dedup_key.0.clone(), dedup_key.1.clone());
+                    let needs_suffix = self.memory_strategy == MemoryStrategy::MultiMemory
+                        && !emitted_base_global.insert(base_key);
+                    let name = if needs_suffix {
+                        format!("{}${}", dedup_key.1, unresolved.component_idx)
+                    } else {
+                        dedup_key.1.clone()
+                    };
 
                     merged.imports.push(MergedImport {
                         module,
@@ -3246,8 +3288,18 @@ fn compute_unresolved_import_assignments(
     // In multi-memory mode the key includes the component index so each
     // component gets its own import slot for per-component canon lower.
     let mut seen_func: HashMap<DedupKey, (u32, Option<FuncType>)> = HashMap::new();
-    let mut seen_table: HashMap<DedupKey, u32> = HashMap::new();
-    let mut seen_global: HashMap<DedupKey, u32> = HashMap::new();
+    // Table/global dedup maps also carry the entity TYPE alongside the first
+    // assigned position, mirroring the function arm. Two same-named imports
+    // with structurally different types must NOT be merged into one slot — the
+    // second importer's code would then operate on the wrong-typed entity,
+    // producing an invalid fused module. Type identity:
+    //   TableType  = (element_type, initial, maximum)
+    //   GlobalType = (content_type, mutable)
+    // (init_expr_bytes is irrelevant: imported globals carry no initializer.)
+    type TableSig = (ValType, u64, Option<u64>);
+    type GlobalSig = (ValType, bool);
+    let mut seen_table: HashMap<DedupKey, (u32, TableSig)> = HashMap::new();
+    let mut seen_global: HashMap<DedupKey, (u32, GlobalSig)> = HashMap::new();
 
     // Track highest version for each dedup key
     let mut best_module_version: HashMap<DedupKey, String> = HashMap::new();
@@ -3367,12 +3419,43 @@ fn compute_unresolved_import_assignments(
                     position,
                 );
             }
-            ImportKind::Table(_) => {
+            ImportKind::Table(table_type) => {
+                let table_sig: TableSig = (
+                    table_type.element_type,
+                    table_type.initial,
+                    table_type.maximum,
+                );
                 let position = match seen_table.entry(dedup_key) {
-                    std::collections::hash_map::Entry::Occupied(e) => *e.get(),
+                    std::collections::hash_map::Entry::Occupied(e) => {
+                        let (pos, ref first_sig) = *e.get();
+                        // Type compatibility: only dedup if element type AND
+                        // limits match the first occurrence. Otherwise this is
+                        // a distinct table despite the matching (module, field)
+                        // names — allocate a fresh slot (mirrors function arm).
+                        if first_sig == &table_sig {
+                            pos
+                        } else {
+                            log::warn!(
+                                "Import dedup: table type mismatch for {:?} — \
+                                 first={:?}, current={:?}; skipping dedup",
+                                e.key(),
+                                first_sig,
+                                table_sig,
+                            );
+                            type_mismatch_entries.insert((
+                                unresolved.component_idx,
+                                unresolved.module_idx,
+                                unresolved.module_name.clone(),
+                                unresolved.field_name.clone(),
+                            ));
+                            let pos = counts.table;
+                            counts.table += 1;
+                            pos
+                        }
+                    }
                     std::collections::hash_map::Entry::Vacant(e) => {
                         let pos = counts.table;
-                        e.insert(pos);
+                        e.insert((pos, table_sig));
                         counts.table += 1;
                         pos
                     }
@@ -3390,12 +3473,40 @@ fn compute_unresolved_import_assignments(
             ImportKind::Memory(_) => {
                 counts.memory += 1;
             }
-            ImportKind::Global(_) => {
+            ImportKind::Global(global_type) => {
+                let global_sig: GlobalSig = (global_type.content_type, global_type.mutable);
                 let position = match seen_global.entry(dedup_key) {
-                    std::collections::hash_map::Entry::Occupied(e) => *e.get(),
+                    std::collections::hash_map::Entry::Occupied(e) => {
+                        let (pos, ref first_sig) = *e.get();
+                        // Type compatibility: only dedup if content type AND
+                        // mutability match the first occurrence. Otherwise this
+                        // is a distinct global despite the matching (module,
+                        // field) names — allocate a fresh slot (mirrors
+                        // function arm).
+                        if first_sig == &global_sig {
+                            pos
+                        } else {
+                            log::warn!(
+                                "Import dedup: global type mismatch for {:?} — \
+                                 first={:?}, current={:?}; skipping dedup",
+                                e.key(),
+                                first_sig,
+                                global_sig,
+                            );
+                            type_mismatch_entries.insert((
+                                unresolved.component_idx,
+                                unresolved.module_idx,
+                                unresolved.module_name.clone(),
+                                unresolved.field_name.clone(),
+                            ));
+                            let pos = counts.global;
+                            counts.global += 1;
+                            pos
+                        }
+                    }
                     std::collections::hash_map::Entry::Vacant(e) => {
                         let pos = counts.global;
-                        e.insert(pos);
+                        e.insert((pos, global_sig));
                         counts.global += 1;
                         pos
                     }
@@ -4406,6 +4517,237 @@ mod tests {
         assert_eq!(
             pos_comp0, pos_comp1,
             "deduplicated imports must share the same position"
+        );
+    }
+
+    /// Two components import the same-named global `env.g` at DIFFERENT types
+    /// (comp0: i32 immutable, comp1: i64 mutable). The structural type check
+    /// must refuse to dedup them: TWO distinct global import slots, and the
+    /// two components' assignments (which feed `global_index_map`) must point
+    /// at DIFFERENT positions. Pre-fix this collapsed to a single slot.
+    #[test]
+    fn ls_m_10_test_global_import_type_mismatch_not_deduped() {
+        use crate::resolver::{DependencyGraph, UnresolvedImport};
+
+        let graph = DependencyGraph {
+            instantiation_order: vec![0, 1],
+            resolved_imports: HashMap::new(),
+            adapter_sites: Vec::new(),
+            module_resolutions: Vec::new(),
+            resource_graph: None,
+            stream_pair_graph: None,
+            reexporter_components: Vec::new(),
+            reexporter_resources: Vec::new(),
+            unresolved_imports: vec![
+                UnresolvedImport {
+                    component_idx: 0,
+                    module_idx: 0,
+                    module_name: "env".to_string(),
+                    field_name: "g".to_string(),
+                    kind: ImportKind::Global(GlobalType {
+                        content_type: ValType::I32,
+                        mutable: false,
+                        init_expr_bytes: Vec::new(),
+                    }),
+                    display_module: None,
+                    display_field: None,
+                },
+                UnresolvedImport {
+                    component_idx: 1,
+                    module_idx: 0,
+                    module_name: "env".to_string(),
+                    field_name: "g".to_string(),
+                    kind: ImportKind::Global(GlobalType {
+                        content_type: ValType::I64,
+                        mutable: true,
+                        init_expr_bytes: Vec::new(),
+                    }),
+                    display_module: None,
+                    display_field: None,
+                },
+            ],
+        };
+
+        let (counts, assignments, dedup_info) =
+            compute_unresolved_import_assignments(&graph, None, &[], MemoryStrategy::SharedMemory);
+
+        assert_eq!(
+            counts.global, 2,
+            "globals with mismatched (type, mutability) must NOT dedup"
+        );
+        let pos0 = assignments.global[&(0, 0, "env".to_string(), "g".to_string())];
+        let pos1 = assignments.global[&(1, 0, "env".to_string(), "g".to_string())];
+        assert_ne!(
+            pos0, pos1,
+            "mismatched-type globals must map to different import slots"
+        );
+        // The second occurrence must be recorded as a type mismatch so the
+        // emit side knows to emit a separate import.
+        assert!(
+            dedup_info
+                .type_mismatch_entries
+                .contains(&(1, 0, "env".to_string(), "g".to_string())),
+            "mismatched global must be recorded in type_mismatch_entries"
+        );
+    }
+
+    /// Two components import the same-named table `env.t` at DIFFERENT types
+    /// (comp0: funcref[1..], comp1: externref[5..]). Must emit TWO distinct
+    /// table import slots with distinct assignment positions.
+    #[test]
+    fn test_table_import_type_mismatch_not_deduped() {
+        use crate::resolver::{DependencyGraph, UnresolvedImport};
+
+        let graph = DependencyGraph {
+            instantiation_order: vec![0, 1],
+            resolved_imports: HashMap::new(),
+            adapter_sites: Vec::new(),
+            module_resolutions: Vec::new(),
+            resource_graph: None,
+            stream_pair_graph: None,
+            reexporter_components: Vec::new(),
+            reexporter_resources: Vec::new(),
+            unresolved_imports: vec![
+                UnresolvedImport {
+                    component_idx: 0,
+                    module_idx: 0,
+                    module_name: "env".to_string(),
+                    field_name: "t".to_string(),
+                    kind: ImportKind::Table(TableType {
+                        element_type: ValType::Ref(RefType::FUNCREF),
+                        initial: 1,
+                        maximum: None,
+                    }),
+                    display_module: None,
+                    display_field: None,
+                },
+                UnresolvedImport {
+                    component_idx: 1,
+                    module_idx: 0,
+                    module_name: "env".to_string(),
+                    field_name: "t".to_string(),
+                    kind: ImportKind::Table(TableType {
+                        element_type: ValType::Ref(RefType::EXTERNREF),
+                        initial: 5,
+                        maximum: None,
+                    }),
+                    display_module: None,
+                    display_field: None,
+                },
+            ],
+        };
+
+        let (counts, assignments, dedup_info) =
+            compute_unresolved_import_assignments(&graph, None, &[], MemoryStrategy::SharedMemory);
+
+        assert_eq!(
+            counts.table, 2,
+            "tables with mismatched (element_type, limits) must NOT dedup"
+        );
+        let pos0 = assignments.table[&(0, 0, "env".to_string(), "t".to_string())];
+        let pos1 = assignments.table[&(1, 0, "env".to_string(), "t".to_string())];
+        assert_ne!(
+            pos0, pos1,
+            "mismatched-type tables must map to different import slots"
+        );
+        assert!(
+            dedup_info
+                .type_mismatch_entries
+                .contains(&(1, 0, "env".to_string(), "t".to_string())),
+            "mismatched table must be recorded in type_mismatch_entries"
+        );
+    }
+
+    /// Regression: two components importing the SAME-typed `env.g`
+    /// (i32 immutable) must still deduplicate to ONE slot (current behaviour).
+    #[test]
+    fn test_global_import_same_type_still_deduped() {
+        use crate::resolver::{DependencyGraph, UnresolvedImport};
+
+        let mk = |comp: usize| UnresolvedImport {
+            component_idx: comp,
+            module_idx: 0,
+            module_name: "env".to_string(),
+            field_name: "g".to_string(),
+            kind: ImportKind::Global(GlobalType {
+                content_type: ValType::I32,
+                mutable: false,
+                init_expr_bytes: Vec::new(),
+            }),
+            display_module: None,
+            display_field: None,
+        };
+
+        let graph = DependencyGraph {
+            instantiation_order: vec![0, 1],
+            resolved_imports: HashMap::new(),
+            adapter_sites: Vec::new(),
+            module_resolutions: Vec::new(),
+            resource_graph: None,
+            stream_pair_graph: None,
+            reexporter_components: Vec::new(),
+            reexporter_resources: Vec::new(),
+            unresolved_imports: vec![mk(0), mk(1)],
+        };
+
+        let (counts, assignments, dedup_info) =
+            compute_unresolved_import_assignments(&graph, None, &[], MemoryStrategy::SharedMemory);
+
+        assert_eq!(
+            counts.global, 1,
+            "same-typed globals must dedup to one slot"
+        );
+        let pos0 = assignments.global[&(0, 0, "env".to_string(), "g".to_string())];
+        let pos1 = assignments.global[&(1, 0, "env".to_string(), "g".to_string())];
+        assert_eq!(pos0, pos1, "same-typed globals must share the slot");
+        assert!(
+            dedup_info.type_mismatch_entries.is_empty(),
+            "no mismatch must be recorded for identical types"
+        );
+    }
+
+    /// Regression: two components importing the SAME-typed `env.t`
+    /// (funcref[1..]) must still deduplicate to ONE slot.
+    #[test]
+    fn test_table_import_same_type_still_deduped() {
+        use crate::resolver::{DependencyGraph, UnresolvedImport};
+
+        let mk = |comp: usize| UnresolvedImport {
+            component_idx: comp,
+            module_idx: 0,
+            module_name: "env".to_string(),
+            field_name: "t".to_string(),
+            kind: ImportKind::Table(TableType {
+                element_type: ValType::Ref(RefType::FUNCREF),
+                initial: 1,
+                maximum: Some(10),
+            }),
+            display_module: None,
+            display_field: None,
+        };
+
+        let graph = DependencyGraph {
+            instantiation_order: vec![0, 1],
+            resolved_imports: HashMap::new(),
+            adapter_sites: Vec::new(),
+            module_resolutions: Vec::new(),
+            resource_graph: None,
+            stream_pair_graph: None,
+            reexporter_components: Vec::new(),
+            reexporter_resources: Vec::new(),
+            unresolved_imports: vec![mk(0), mk(1)],
+        };
+
+        let (counts, assignments, dedup_info) =
+            compute_unresolved_import_assignments(&graph, None, &[], MemoryStrategy::SharedMemory);
+
+        assert_eq!(counts.table, 1, "same-typed tables must dedup to one slot");
+        let pos0 = assignments.table[&(0, 0, "env".to_string(), "t".to_string())];
+        let pos1 = assignments.table[&(1, 0, "env".to_string(), "t".to_string())];
+        assert_eq!(pos0, pos1, "same-typed tables must share the slot");
+        assert!(
+            dedup_info.type_mismatch_entries.is_empty(),
+            "no mismatch must be recorded for identical types"
         );
     }
 

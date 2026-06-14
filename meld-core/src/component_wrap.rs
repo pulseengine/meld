@@ -938,14 +938,41 @@ fn assemble_component(
     // -----------------------------------------------------------------------
     let instance_map = build_instance_func_map(source);
 
+    // `fused_info.func_imports` is a FUNC-ONLY ordinal list, but
+    // `merged.imports` is a MIXED-KIND vector (Function/Global/Table/Memory
+    // interleaved in declaration order). Precompute the positions of the
+    // Function-kind entries in `merged.imports` so a func ordinal maps to the
+    // correct slot. Without this, a non-func import preceding a func import
+    // shifts every subsequent func's metadata (component_idx) to the wrong
+    // entry, mis-routing resource ops (H-8/H-2 class). This is the inverse of
+    // the position→func-ordinal mapping in `lib.rs` (`merged_func_idx`).
+    let func_import_positions: Vec<usize> = merged
+        .imports
+        .iter()
+        .enumerate()
+        .filter(|(_, i)| matches!(i.entity_type, EntityType::Function(_)))
+        .map(|(p, _)| p)
+        .collect();
+    // The count of Function entries in `merged.imports` must equal the
+    // func-import count; otherwise the ordinal→position mapping is unsound.
+    debug_assert_eq!(
+        func_import_positions.len(),
+        fused_info.func_imports.len(),
+        "func-import count mismatch: {} Function entries in merged.imports vs \
+         {} fused func_imports",
+        func_import_positions.len(),
+        fused_info.func_imports.len()
+    );
+
     let mut import_resolutions: Vec<ImportResolution> = Vec::new();
     for (import_idx, (module_name, field_name, _type_idx)) in
         fused_info.func_imports.iter().enumerate()
     {
-        // Look up the source component_idx from the merged import metadata
-        let comp_idx = merged
-            .imports
+        // Look up the source component_idx from the merged import metadata.
+        // Map the func ordinal to its position in the mixed-kind import vector.
+        let comp_idx = func_import_positions
             .get(import_idx)
+            .and_then(|&p| merged.imports.get(p))
             .and_then(|imp| imp.component_idx);
 
         // Category A: [export]-prefixed modules provide canon resource operations
@@ -3946,5 +3973,103 @@ mod tests {
             source_string_encoding_option(parser::CanonStringEncoding::CompactUtf16),
             CanonicalOption::CompactUTF16
         ));
+    }
+
+    /// Build a `MergedImport` of the given entity kind, carrying a source
+    /// component index, for the func-import position mapping tests below.
+    fn mk_import(kind: wasm_encoder::EntityType, comp: usize) -> crate::merger::MergedImport {
+        crate::merger::MergedImport {
+            module: "m".to_string(),
+            name: "n".to_string(),
+            entity_type: kind,
+            component_idx: Some(comp),
+        }
+    }
+
+    /// Compute the same func-ordinal → import-position mapping that
+    /// `assemble_component` precomputes, so the routing logic is testable
+    /// without driving the private assembly path.
+    fn func_import_positions(imports: &[crate::merger::MergedImport]) -> Vec<usize> {
+        imports
+            .iter()
+            .enumerate()
+            .filter(|(_, i)| matches!(i.entity_type, wasm_encoder::EntityType::Function(_)))
+            .map(|(p, _)| p)
+            .collect()
+    }
+
+    /// Regression for the func-import / component-idx desync (H-8/H-2 class).
+    ///
+    /// `merged.imports` is a MIXED-KIND vector while `fused_info.func_imports`
+    /// is FUNC-ONLY. A non-func import preceding a func import shifts every
+    /// later func's `component_idx` lookup. With `merged.imports =
+    /// [Global(comp 0), Func(comp 1)]`, the lone func import is ordinal 0; its
+    /// true `component_idx` is 1 (it lives at position 1 in the mixed vector).
+    #[test]
+    fn ls_w_2_func_import_comp_idx_skips_non_func_imports() {
+        use wasm_encoder::{EntityType, GlobalType, ValType};
+        let imports = vec![
+            mk_import(
+                EntityType::Global(GlobalType {
+                    val_type: ValType::I32,
+                    mutable: false,
+                    shared: false,
+                }),
+                0,
+            ),
+            mk_import(EntityType::Function(0), 1),
+        ];
+
+        let positions = func_import_positions(&imports);
+        // The single func import maps to position 1, not 0.
+        assert_eq!(positions, vec![1]);
+
+        // Corrected lookup: func ordinal 0 → position 1 → comp_idx 1.
+        let func_ordinal = 0usize;
+        let comp_idx = positions
+            .get(func_ordinal)
+            .and_then(|&p| imports.get(p))
+            .and_then(|imp| imp.component_idx);
+        assert_eq!(
+            comp_idx,
+            Some(1),
+            "func import must route to its own component, not the preceding global's"
+        );
+
+        // Non-vacuity: the OLD buggy logic (`merged.imports.get(import_idx)`)
+        // would read position 0 (the Global) and yield comp_idx 0 — the wrong
+        // component. Demonstrate the two disagree precisely where the bug bit.
+        let old_buggy = imports.get(func_ordinal).and_then(|imp| imp.component_idx);
+        assert_eq!(old_buggy, Some(0), "sanity: old logic indexes the Global");
+        assert_ne!(
+            old_buggy, comp_idx,
+            "fix must change behavior on the mixed-kind case"
+        );
+    }
+
+    /// The common all-func-imports case must be the identity mapping, so the
+    /// fix introduces NO behavior change for the overwhelmingly common shape
+    /// (every import is a function — positions == [0, 1, 2, ...]).
+    #[test]
+    fn func_import_positions_identity_for_all_func_imports() {
+        use wasm_encoder::EntityType;
+        let imports: Vec<_> = (0..4)
+            .map(|i| mk_import(EntityType::Function(0), i))
+            .collect();
+
+        let positions = func_import_positions(&imports);
+        assert_eq!(positions, vec![0, 1, 2, 3], "must be identity");
+
+        // Every func ordinal resolves to its own component, and the corrected
+        // lookup is bit-for-bit identical to the old `get(import_idx)` path.
+        for ordinal in 0..imports.len() {
+            let new = positions
+                .get(ordinal)
+                .and_then(|&p| imports.get(p))
+                .and_then(|imp| imp.component_idx);
+            let old = imports.get(ordinal).and_then(|imp| imp.component_idx);
+            assert_eq!(new, old, "identity case: no behavior change at {ordinal}");
+            assert_eq!(new, Some(ordinal));
+        }
     }
 }

@@ -1173,6 +1173,77 @@ loss-scenarios:
       lone-continuation lead, overlong, UTF-8 surrogate, out-of-range,
       and valid 1/2/3/4-byte controls incl. boundary code points).
 
+  - id: LS-P-21
+    title: latin1+utf16 length tag mis-read/mis-written → wrong-encoding string data
+    uca: UCA-P-3
+    hazards: [H-4, H-4.4]
+    type: inadequate-process-model
+    scenario: >
+      meld models the Component Model `latin1+utf16` string encoding
+      (`compact-utf16`) as `StringEncoding::Latin1`. In that encoding the
+      string's length operand is TAGGED: `UTF16_TAG = 1 << 31`
+      (0x8000_0000). When the tag bit is SET the payload is UTF-16 and the
+      code-unit count is `len & !UTF16_TAG` (byte length = count × 2); when
+      CLEAR the payload is Latin-1 (1 byte/char, byte length = len). Before
+      #253's final increment, meld treated the operand as an untagged
+      pure-Latin-1 byte count on BOTH the producer and consumer sides:
+      (1) the Latin-1-as-SOURCE transcoders (`emit_latin1_to_utf8_transcode`,
+      `emit_latin1_to_utf16_transcode`) never masked the tag nor branched on
+      it, so a tag-SET (UTF-16-represented) string was mis-read — its huge
+      tagged length either tripped the LS-A-7 overflow guard or, with the
+      high bit retained, drove the loop to read 1-byte Latin-1 units out of
+      what is really a 2-byte UTF-16 buffer, scrambling the data; and
+      (2) the Latin-1-as-DESTINATION pairs (`Utf8→Latin1`, `Utf16→Latin1`)
+      were unimplemented (held safely on the #253 fail-loud arm), so a
+      well-formed source that needed the UTF-16 fallback could not be
+      represented at all. The hazard is silent wrong-encoding string data at
+      a cross-component boundary [UCA-P-3 incorrect string transcoding /
+      H-4.4], distinct from the malformed-input families (LS-P-16/19/20)
+      because it mis-handles WELL-FORMED input solely due to the tag
+      convention. Reachable for any cross-memory fusion where a CompactUTF16
+      (latin1+utf16) component is on either side of a string parameter and
+      the string is UTF-16-represented (any code point > 0xFF) — e.g. a
+      JS/.NET host string ("日本", an emoji) flowing to/from a UTF-8 or
+      UTF-16 peer. Surfaced and closed while completing #253.
+    causal-factors:
+      - >-
+        The Latin-1-source transcoders read the length operand (local 1)
+        verbatim, with no `len & !UTF16_TAG` mask and no branch on the
+        `len & UTF16_TAG` tag bit
+      - >-
+        `alignment_for_encoding(Latin1)` returned 1, but a latin1+utf16
+        buffer may hold UTF-16 code units and the canonical ABI requires
+        2-byte alignment
+      - >-
+        The Latin-1-destination encoders did not exist, so the canonical
+        choose-latin1-else-utf16 representation + tag could not be produced
+    process-model-flaw: >
+      The model was "Latin1 means pure Latin-1, one untagged byte per char",
+      but meld's `Latin1` IS the canonical-ABI `latin1+utf16` encoding whose
+      length is tag-discriminated per string. Producer and consumer must
+      agree on `UTF16_TAG`: the reader masks + branches on it, the writer
+      sets it iff it fell back to UTF-16.
+    status: approved
+    priority: high
+    fix: >
+      #253 final increment makes both sides tag-faithful and they agree on
+      `UTF16_TAG = 1 << 31` (fact.rs). READ side: the Latin1-source
+      transcoders mask `count = len & !UTF16_TAG` and branch on the tag — a
+      tag-SET source is transcoded as UTF-16 (latin1→utf8 becomes
+      utf16→utf8; latin1→utf16 becomes a verbatim code-unit copy), a
+      tag-CLEAR source keeps the original 1-byte Latin-1 path unchanged.
+      WRITE side: `emit_utf8_to_latin1_transcode` / `emit_utf16_to_latin1_transcode`
+      are a two-phase encoder — scan the source; if every code point ≤ 0xFF
+      write Latin-1 (length = n, tag clear); else write UTF-16 with
+      surrogate pairs (length = code_units | UTF16_TAG). `alignment_for_encoding(Latin1)`
+      is corrected to 2. Pinned by the runtime-differential test
+      `ls_p_21_latin1_utf16_tag_honored_roundtrip` plus the full #253 matrix
+      (`test_253_read_*` and `test_253_write_*`): a tag-aware decoding callee
+      sums 16-bit units when the tag is set and 8-bit bytes when clear, so a
+      mis-read or mis-set tag drives the wrong element width and fails the
+      asserted per-representation sums for both a latin1-fits string ("café")
+      and a utf16-requiring string ("日本" / "A😀").
+
   - id: LS-P-17
     title: Caller-encoding match filters on Func only, miscalibrates mixed-encoding callers
     uca: UCA-R-3
@@ -3020,6 +3091,72 @@ loss-scenarios:
       Multi-memory WASI import lowering (PR #20). Per-import Memory(N)
       and Realloc(N) via import_memory_indices/import_realloc_indices.
 
+  - id: LS-W-2
+    title: Wrapper reads func-import source component from the wrong mixed-kind import slot
+    uca: UCA-W-2
+    hazards: [H-2, H-8]
+    type: inadequate-control-algorithm
+    scenario: >
+      `assemble_component` (component_wrap.rs) iterates the func-only
+      `fused_info.func_imports` with an enumeration index `import_idx` and
+      read each func import's source-component identity via
+      `merged.imports.get(import_idx)`. But `merged.imports` is a
+      MIXED-KIND vector (Function/Global/Table/Memory imports interleaved
+      in declaration order), so `import_idx` (a func ORDINAL) does not
+      index the matching entry when any non-func import precedes a func
+      import. The func import's `comp_idx` was then taken from the wrong
+      slot (e.g. with `merged.imports = [Global(comp 0), Func(comp 1)]`
+      the lone func read `comp_idx = Some(0)` instead of `1`). That wrong
+      component identity feeds (i) `find_task_return_for_import` (P3
+      task-return result-type search — has an all-components fallback,
+      partially self-healing) and (ii) `ImportResolution::LocalResource
+      { component_idx }` → `ht_export_suffix(cidx, ..)`, so a resource
+      handle op (drop/new/rep) is routed using the WRONG component's
+      handle-table suffix: the direct lookup misses and the op falls back
+      / mis-routes [UCA-W-2 / H-8 wrong-table handle deref / H-2]. Same
+      "guard present in one site, missing in its sibling" shape as the
+      rest of this sweep — the sibling `lib.rs:1119` handles the same
+      mixed-kind vector correctly by counting Function entries. The index
+      desync is confirmed end-to-end (real Merger::merge output; the line
+      executes for every func import); an OBSERVABLE miscompile requires
+      an UNRESOLVED non-func import (external global/table, or the
+      shared-memory Memory import) ordered before an unresolved
+      resource-op/task-return func import — reachable but not in the
+      standard wit-bindgen fixtures (whose non-func core imports resolve
+      internally and don't survive into merged.imports). Surfaced by a
+      Mythos discovery pass on component_wrap.rs.
+    causal-factors:
+      - >-
+        A func-only ordinal was used to index the mixed-kind
+        `merged.imports` vector (the sibling lib.rs:1119 filters to
+        Function entries; this site did not)
+      - >-
+        No test placed an unresolved non-func import before a func import
+        in merged.imports (standard fixtures resolve non-func imports
+        internally, hiding the desync)
+    process-model-flaw: >
+      The wrapper's model assumed `fused_info.func_imports` and
+      `merged.imports` share an index space; they do not — merged.imports
+      is mixed-kind. The func index → import-vector slot must be mapped by
+      Function-entry position, the same correction lib.rs:1119 already
+      applies in the inverse direction.
+    status: approved
+    priority: high
+    fix: >
+      Precompute `func_import_positions` (the positions of Function-kind
+      entries in `merged.imports`) and read `merged.imports[
+      func_import_positions[import_idx]]`, mirroring lib.rs:1119. The
+      output import section is emitted from `merged.imports` IN ORDER
+      (lib.rs:1538) and re-parsed in order into `fused_info.func_imports`,
+      so the i-th Function entry corresponds 1:1 to func_imports[i] —
+      verified by reading the emit/parse paths; `debug_assert_eq!` guards
+      the count equality (equal by construction). The all-func-imports
+      common case is the identity mapping (no behaviour change). Pinned by
+      func_import_comp_idx_skips_non_func_imports (mixed-kind
+      [Global(c0), Func(c1)] → comp_idx Some(1), with the old `.get(0)`
+      path asserted to yield the wrong Some(0) — non-vacuity) and
+      func_import_positions_identity_for_all_func_imports.
+
   - id: LS-M-5
     title: Multiply-instantiated module produces corrupt merged output
     uca: UCA-M-9
@@ -3348,6 +3485,74 @@ loss-scenarios:
       code (non-vacuity confirmed). Mythos-verified: the deferred encode is
       byte-identical to the prior eager path across all ParsedConstExpr
       kinds × all segment modes, and only RefFunc is bumped.
+
+  - id: LS-M-10
+    title: Global/table import dedup collapses type-incompatible imports into one slot
+    uca: UCA-M-9
+    hazards: [H-1, H-10]
+    type: inadequate-control-algorithm
+    scenario: >
+      The merger's unresolved-import dedup (`compute_unresolved_import_assignments`
+      + `add_unresolved_imports`) checks structural type compatibility for
+      FUNCTION imports — two same-named function imports with different
+      signatures are recorded in `type_mismatch_entries` and given separate
+      slots — but the TABLE and GLOBAL arms did NOT: they keyed solely on
+      `(normalized_module, field, comp_dim)` and unconditionally reused the
+      first slot. So when two fused components import the same-named global
+      or table at DIFFERENT types (e.g. comp0 `env.g : i32 immutable`,
+      comp1 `env.g : i64 mutable`; or comp0 `env.t : funcref[1..]`, comp1
+      `env.t : externref[5..]`), they collapsed into ONE merged import
+      emitted with the FIRST importer's type. The other component's
+      `global_index_map`/`table_index_map` then pointed at the wrong-typed
+      import, so its code performed type-incompatible operations (a
+      `global.set` on an i32-immutable global; a `call_indirect`/`table.get`
+      on a funcref table that is really externref) → an invalid fused core
+      module / type-system confusion [UCA-M-9 / H-1 / H-10]. Same
+      "guard present on one arm, missing on its siblings" asymmetry as the
+      rest of this sweep, and the same false-key class as #245. UCA-M-9 /
+      SC-12 described this hazard but were scoped to "function imports."
+      Confirmed at the merger API level via `Merger::merge`; end-to-end
+      from a real two-subcomponent fusion is reachable but contrived
+      (requires two core modules importing the same host global/table name
+      at mismatched types, e.g. differing toolchain `env.__stack_pointer`
+      / `GOT.*` / indirect-function-table imports). Surfaced by a Mythos
+      discovery pass on merger.rs.
+    causal-factors:
+      - >-
+        The table/global dedup arms keyed on name only, with no structural
+        type-compatibility check (unlike the function arm's first_type guard)
+      - >-
+        SC-12 / UCA-M-9's type-equality requirement was implemented only for
+        function imports, leaving globals and tables an unguarded index space
+      - >-
+        no test imported the same-named global/table at mismatched types
+        across two fused components
+    process-model-flaw: >
+      The dedup model treated a shared (module, field) name as sufficient
+      identity for globals/tables, but the canonical identity is
+      name + structural type (GlobalType content+mutability; TableType
+      element+limits) — the same model flaw the function path already fixed.
+    status: approved
+    priority: high
+    fix: >
+      `seen_table`/`seen_global` now store the entity type signature
+      (TableSig = element_type + initial + maximum; GlobalSig = content_type
+      + mutability) alongside the position; on an Occupied key whose sig
+      DIFFERS, a fresh slot is allocated and the entry recorded in
+      `type_mismatch_entries`, and `add_unresolved_imports` emits a separate
+      import (with the MultiMemory `$comp` suffix) — mirroring the function
+      path exactly. Same-typed duplicates still dedup to one slot. Pinned by
+      merger unit tests (global/table type-mismatch → 2 slots, distinct
+      index-map positions; same-type → 1 slot regression). Mythos-verified:
+      the compute/emit position-invariant holds across multi-component
+      cases (incl. A,B,A → comp2 dedups to comp0); each component's
+      index-map resolves to a slot of its own type; and shared-mode
+      duplicate import names with differing types are legal core wasm
+      (encoded + validated), so the fix never emits an invalid module.
+      Known minor limitation (matches the pre-existing function arm): a
+      third importer matching the SECOND distinct type gets a redundant
+      slot (`seen` holds only the first sig) — a dedup-completeness gap,
+      not a correctness issue (compute and emit stay in lockstep).
 
   - id: LS-D-1
     title: remapped DWARF emits a wrong code address for a fused function

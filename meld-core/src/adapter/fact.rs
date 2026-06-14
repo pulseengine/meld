@@ -50,16 +50,35 @@ fn canon_to_string_encoding(enc: CanonStringEncoding) -> StringEncoding {
     match enc {
         CanonStringEncoding::Utf8 => StringEncoding::Utf8,
         CanonStringEncoding::Utf16 => StringEncoding::Utf16,
-        // CompactUTF16 is latin1+utf16 — treat as Latin1 for adapter purposes
+        // CompactUTF16 is latin1+utf16 — modelled as `Latin1`, which in meld
+        // means the canonical-ABI `latin1+utf16` encoding (the length operand
+        // is tag-bit encoded; see [`UTF16_TAG`]). It is NOT a pure-Latin-1
+        // encoding: a tag-set string carries UTF-16 payload.
         CanonStringEncoding::CompactUtf16 => StringEncoding::Latin1,
     }
 }
 
+/// The canonical-ABI `latin1+utf16` length-operand tag bit (`1 << 31`).
+///
+/// A `latin1+utf16` string's length operand is *tagged*:
+/// - tag **clear** → the payload is Latin-1 (1 byte per char); the byte length
+///   equals the operand.
+/// - tag **set** → the payload is UTF-16; the *code-unit count* is
+///   `operand & !UTF16_TAG`, and the byte length is that count × 2.
+///
+/// meld models `latin1+utf16` as [`StringEncoding::Latin1`]; the transcoders
+/// that have `Latin1` as a source must branch on this bit, and those that
+/// produce `Latin1` set it when they fall back to UTF-16.
+pub(crate) const UTF16_TAG: i32 = 1 << 31;
+
 /// Return the required alignment for a cabi_realloc call for the given string encoding
 fn alignment_for_encoding(encoding: StringEncoding) -> i32 {
     match encoding {
-        StringEncoding::Utf8 | StringEncoding::Latin1 => 1,
-        StringEncoding::Utf16 => 2,
+        StringEncoding::Utf8 => 1,
+        // latin1+utf16: the destination buffer may hold UTF-16 code units, so
+        // the canonical ABI requires 2-byte alignment for the string pointer
+        // (the realloc backing the tag-set fallback writes i16s).
+        StringEncoding::Latin1 | StringEncoding::Utf16 => 2,
     }
 }
 
@@ -101,6 +120,570 @@ pub(crate) fn emit_overflow_guard(body: &mut Function, len_local: u32, k: u32) {
     body.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
     body.instruction(&Instruction::Unreachable);
     body.instruction(&Instruction::End);
+}
+
+/// Push the byte length of a copied string/list buffer onto the stack.
+///
+/// For a `latin1+utf16` string (the `Latin1` encoding, `byte_mult == 1`) the
+/// `(ptr, len)` length operand is **tagged** (see [`UTF16_TAG`]): tag set ⇒ the
+/// payload is UTF-16, so the byte length is `(len & !UTF16_TAG) * 2`; tag clear
+/// ⇒ Latin-1, byte length `len`. A same-encoding cross-memory copy
+/// ([`generate_memory_copy_adapter`]) must use this tag-aware byte count for
+/// both the `cabi_realloc` size and the `memory.copy` length — copying the raw
+/// tagged operand would copy `count | 0x8000_0000` bytes (~2 GiB OOB read).
+/// The length operand FORWARDED to the callee stays tagged; only the internal
+/// byte count is masked here.
+///
+/// For every other buffer (`byte_mult != 1`, or a non-Latin1 encoding) the
+/// length is an untagged element count, byte length `len * byte_mult`. A plain
+/// `list<u8>` (also `byte_mult == 1`) is unaffected: a legitimate byte count is
+/// `< 2^31` (the [`emit_overflow_guard`] bound), so the tag bit is clear and
+/// the tag-aware path returns `len` unchanged.
+fn emit_copy_byte_count(
+    func: &mut Function,
+    len_local: u32,
+    byte_mult: u32,
+    is_compact_utf16: bool,
+) {
+    if is_compact_utf16 {
+        // bytes = (len & UTF16_TAG) ? (len & !UTF16_TAG) * 2 : len
+        func.instruction(&Instruction::LocalGet(len_local));
+        func.instruction(&Instruction::I32Const(UTF16_TAG));
+        func.instruction(&Instruction::I32And);
+        func.instruction(&Instruction::If(wasm_encoder::BlockType::Result(
+            wasm_encoder::ValType::I32,
+        )));
+        func.instruction(&Instruction::LocalGet(len_local));
+        func.instruction(&Instruction::I32Const(!UTF16_TAG));
+        func.instruction(&Instruction::I32And);
+        func.instruction(&Instruction::I32Const(2));
+        func.instruction(&Instruction::I32Mul);
+        func.instruction(&Instruction::Else);
+        func.instruction(&Instruction::LocalGet(len_local));
+        func.instruction(&Instruction::End);
+    } else {
+        func.instruction(&Instruction::LocalGet(len_local));
+        if byte_mult > 1 {
+            func.instruction(&Instruction::I32Const(byte_mult as i32));
+            func.instruction(&Instruction::I32Mul);
+        }
+    }
+}
+
+/// Emit the hardened UTF-8 → code-point decoder for one code point.
+///
+/// Reads the lead byte at `mem8[ptr_local + src_idx_local]`, decodes a full
+/// UTF-8 sequence into `cp_local`, and advances `src_idx_local` past the bytes
+/// consumed. `len_local` bounds the buffer. Malformed input (truncation,
+/// invalid continuation, overlong, surrogate, out-of-range, lone continuation)
+/// is replaced with U+FFFD, consuming only the lead byte (the #251/#249/LS-P-19
+/// Canonical-ABI lossy-replacement convention). `byte_local` and `cont_local`
+/// are scratch. `ptr_local` is the local holding the source base pointer
+/// (param 0 for the standard caller-string layout).
+///
+/// Extracted from `emit_utf8_to_utf16_transcode` (#253) so the UTF-8 → Latin-1
+/// scan/write phases share the exact same validated decoder rather than a
+/// re-derived copy that could drift.
+#[allow(clippy::too_many_arguments)]
+fn emit_utf8_decode_codepoint(
+    func: &mut Function,
+    src_mem8: wasm_encoder::MemArg,
+    ptr_local: u32,
+    src_idx_local: u32,
+    len_local: u32,
+    byte_local: u32,
+    cp_local: u32,
+    cont_local: u32,
+) {
+    // Read lead byte from source memory.
+    func.instruction(&Instruction::LocalGet(ptr_local));
+    func.instruction(&Instruction::LocalGet(src_idx_local));
+    func.instruction(&Instruction::I32Add);
+    func.instruction(&Instruction::I32Load8U(src_mem8));
+    func.instruction(&Instruction::LocalSet(byte_local));
+
+    // Emit: cp = U+FFFD; src_idx += 1 (replacement, consume lead only).
+    let emit_fffd_consume_lead = |func: &mut Function| {
+        func.instruction(&Instruction::I32Const(0xFFFD));
+        func.instruction(&Instruction::LocalSet(cp_local));
+        func.instruction(&Instruction::LocalGet(src_idx_local));
+        func.instruction(&Instruction::I32Const(1));
+        func.instruction(&Instruction::I32Add);
+        func.instruction(&Instruction::LocalSet(src_idx_local));
+    };
+    // Push mem8[ptr + src_idx + off] onto the stack (a continuation byte).
+    let push_byte_at = |func: &mut Function, off: i32| {
+        func.instruction(&Instruction::LocalGet(ptr_local));
+        func.instruction(&Instruction::LocalGet(src_idx_local));
+        func.instruction(&Instruction::I32Add);
+        func.instruction(&Instruction::I32Const(off));
+        func.instruction(&Instruction::I32Add);
+        func.instruction(&Instruction::I32Load8U(src_mem8));
+    };
+    // Push: (cont_local & 0xC0) != 0x80  (true => NOT a continuation byte).
+    let push_not_continuation = |func: &mut Function| {
+        func.instruction(&Instruction::LocalGet(cont_local));
+        func.instruction(&Instruction::I32Const(0xC0));
+        func.instruction(&Instruction::I32And);
+        func.instruction(&Instruction::I32Const(0x80));
+        func.instruction(&Instruction::I32Ne);
+    };
+
+    // if byte < 0x80: 1-byte ASCII
+    func.instruction(&Instruction::LocalGet(byte_local));
+    func.instruction(&Instruction::I32Const(0x80));
+    func.instruction(&Instruction::I32LtU);
+    func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+    {
+        func.instruction(&Instruction::LocalGet(byte_local));
+        func.instruction(&Instruction::LocalSet(cp_local));
+        func.instruction(&Instruction::LocalGet(src_idx_local));
+        func.instruction(&Instruction::I32Const(1));
+        func.instruction(&Instruction::I32Add);
+        func.instruction(&Instruction::LocalSet(src_idx_local));
+    }
+    func.instruction(&Instruction::Else);
+    {
+        // if byte < 0xC2: invalid lead → U+FFFD, consume lead only.
+        func.instruction(&Instruction::LocalGet(byte_local));
+        func.instruction(&Instruction::I32Const(0xC2));
+        func.instruction(&Instruction::I32LtU);
+        func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+        {
+            emit_fffd_consume_lead(func);
+        }
+        func.instruction(&Instruction::Else);
+        {
+            // if byte < 0xE0: 2-byte sequence (lead 0xC2–0xDF).
+            func.instruction(&Instruction::LocalGet(byte_local));
+            func.instruction(&Instruction::I32Const(0xE0));
+            func.instruction(&Instruction::I32LtU);
+            func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+            {
+                // Truncation guard.
+                func.instruction(&Instruction::LocalGet(src_idx_local));
+                func.instruction(&Instruction::I32Const(1));
+                func.instruction(&Instruction::I32Add);
+                func.instruction(&Instruction::LocalGet(len_local));
+                func.instruction(&Instruction::I32GeU);
+                func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+                {
+                    emit_fffd_consume_lead(func);
+                }
+                func.instruction(&Instruction::Else);
+                {
+                    push_byte_at(func, 1);
+                    func.instruction(&Instruction::LocalSet(cont_local));
+                    push_not_continuation(func);
+                    func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+                    {
+                        emit_fffd_consume_lead(func);
+                    }
+                    func.instruction(&Instruction::Else);
+                    {
+                        // cp = (byte & 0x1F) << 6 | (b1 & 0x3F)
+                        func.instruction(&Instruction::LocalGet(byte_local));
+                        func.instruction(&Instruction::I32Const(0x1F));
+                        func.instruction(&Instruction::I32And);
+                        func.instruction(&Instruction::I32Const(6));
+                        func.instruction(&Instruction::I32Shl);
+                        func.instruction(&Instruction::LocalGet(cont_local));
+                        func.instruction(&Instruction::I32Const(0x3F));
+                        func.instruction(&Instruction::I32And);
+                        func.instruction(&Instruction::I32Or);
+                        func.instruction(&Instruction::LocalSet(cp_local));
+                        func.instruction(&Instruction::LocalGet(src_idx_local));
+                        func.instruction(&Instruction::I32Const(2));
+                        func.instruction(&Instruction::I32Add);
+                        func.instruction(&Instruction::LocalSet(src_idx_local));
+                    }
+                    func.instruction(&Instruction::End);
+                }
+                func.instruction(&Instruction::End);
+            }
+            func.instruction(&Instruction::Else);
+            {
+                // if byte < 0xF0: 3-byte sequence (lead 0xE0–0xEF).
+                func.instruction(&Instruction::LocalGet(byte_local));
+                func.instruction(&Instruction::I32Const(0xF0));
+                func.instruction(&Instruction::I32LtU);
+                func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+                {
+                    func.instruction(&Instruction::LocalGet(src_idx_local));
+                    func.instruction(&Instruction::I32Const(2));
+                    func.instruction(&Instruction::I32Add);
+                    func.instruction(&Instruction::LocalGet(len_local));
+                    func.instruction(&Instruction::I32GeU);
+                    func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+                    {
+                        emit_fffd_consume_lead(func);
+                    }
+                    func.instruction(&Instruction::Else);
+                    {
+                        push_byte_at(func, 1);
+                        func.instruction(&Instruction::LocalSet(cont_local));
+                        push_not_continuation(func);
+                        push_byte_at(func, 2);
+                        func.instruction(&Instruction::LocalSet(cont_local));
+                        push_not_continuation(func);
+                        func.instruction(&Instruction::I32Or);
+                        func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+                        {
+                            emit_fffd_consume_lead(func);
+                        }
+                        func.instruction(&Instruction::Else);
+                        {
+                            func.instruction(&Instruction::LocalGet(byte_local));
+                            func.instruction(&Instruction::I32Const(0x0F));
+                            func.instruction(&Instruction::I32And);
+                            func.instruction(&Instruction::I32Const(12));
+                            func.instruction(&Instruction::I32Shl);
+                            push_byte_at(func, 1);
+                            func.instruction(&Instruction::I32Const(0x3F));
+                            func.instruction(&Instruction::I32And);
+                            func.instruction(&Instruction::I32Const(6));
+                            func.instruction(&Instruction::I32Shl);
+                            func.instruction(&Instruction::I32Or);
+                            push_byte_at(func, 2);
+                            func.instruction(&Instruction::I32Const(0x3F));
+                            func.instruction(&Instruction::I32And);
+                            func.instruction(&Instruction::I32Or);
+                            func.instruction(&Instruction::LocalSet(cp_local));
+                            // reject overlong (< 0x800) and surrogate.
+                            func.instruction(&Instruction::LocalGet(cp_local));
+                            func.instruction(&Instruction::I32Const(0x800));
+                            func.instruction(&Instruction::I32LtU);
+                            func.instruction(&Instruction::LocalGet(cp_local));
+                            func.instruction(&Instruction::I32Const(0xD800));
+                            func.instruction(&Instruction::I32GeU);
+                            func.instruction(&Instruction::LocalGet(cp_local));
+                            func.instruction(&Instruction::I32Const(0xE000));
+                            func.instruction(&Instruction::I32LtU);
+                            func.instruction(&Instruction::I32And);
+                            func.instruction(&Instruction::I32Or);
+                            func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+                            {
+                                emit_fffd_consume_lead(func);
+                            }
+                            func.instruction(&Instruction::Else);
+                            {
+                                func.instruction(&Instruction::LocalGet(src_idx_local));
+                                func.instruction(&Instruction::I32Const(3));
+                                func.instruction(&Instruction::I32Add);
+                                func.instruction(&Instruction::LocalSet(src_idx_local));
+                            }
+                            func.instruction(&Instruction::End);
+                        }
+                        func.instruction(&Instruction::End);
+                    }
+                    func.instruction(&Instruction::End);
+                }
+                func.instruction(&Instruction::Else);
+                {
+                    // 4-byte sequence (byte >= 0xF0).
+                    func.instruction(&Instruction::LocalGet(byte_local));
+                    func.instruction(&Instruction::I32Const(0xF5));
+                    func.instruction(&Instruction::I32GeU);
+                    func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+                    {
+                        emit_fffd_consume_lead(func);
+                    }
+                    func.instruction(&Instruction::Else);
+                    {
+                        func.instruction(&Instruction::LocalGet(src_idx_local));
+                        func.instruction(&Instruction::I32Const(3));
+                        func.instruction(&Instruction::I32Add);
+                        func.instruction(&Instruction::LocalGet(len_local));
+                        func.instruction(&Instruction::I32GeU);
+                        func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+                        {
+                            emit_fffd_consume_lead(func);
+                        }
+                        func.instruction(&Instruction::Else);
+                        {
+                            push_byte_at(func, 1);
+                            func.instruction(&Instruction::LocalSet(cont_local));
+                            push_not_continuation(func);
+                            push_byte_at(func, 2);
+                            func.instruction(&Instruction::LocalSet(cont_local));
+                            push_not_continuation(func);
+                            func.instruction(&Instruction::I32Or);
+                            push_byte_at(func, 3);
+                            func.instruction(&Instruction::LocalSet(cont_local));
+                            push_not_continuation(func);
+                            func.instruction(&Instruction::I32Or);
+                            func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+                            {
+                                emit_fffd_consume_lead(func);
+                            }
+                            func.instruction(&Instruction::Else);
+                            {
+                                func.instruction(&Instruction::LocalGet(byte_local));
+                                func.instruction(&Instruction::I32Const(0x07));
+                                func.instruction(&Instruction::I32And);
+                                func.instruction(&Instruction::I32Const(18));
+                                func.instruction(&Instruction::I32Shl);
+                                push_byte_at(func, 1);
+                                func.instruction(&Instruction::I32Const(0x3F));
+                                func.instruction(&Instruction::I32And);
+                                func.instruction(&Instruction::I32Const(12));
+                                func.instruction(&Instruction::I32Shl);
+                                func.instruction(&Instruction::I32Or);
+                                push_byte_at(func, 2);
+                                func.instruction(&Instruction::I32Const(0x3F));
+                                func.instruction(&Instruction::I32And);
+                                func.instruction(&Instruction::I32Const(6));
+                                func.instruction(&Instruction::I32Shl);
+                                func.instruction(&Instruction::I32Or);
+                                push_byte_at(func, 3);
+                                func.instruction(&Instruction::I32Const(0x3F));
+                                func.instruction(&Instruction::I32And);
+                                func.instruction(&Instruction::I32Or);
+                                func.instruction(&Instruction::LocalSet(cp_local));
+                                // reject overlong (< 0x10000) and oor (> 0x10FFFF).
+                                func.instruction(&Instruction::LocalGet(cp_local));
+                                func.instruction(&Instruction::I32Const(0x10000));
+                                func.instruction(&Instruction::I32LtU);
+                                func.instruction(&Instruction::LocalGet(cp_local));
+                                func.instruction(&Instruction::I32Const(0x10FFFF));
+                                func.instruction(&Instruction::I32GtU);
+                                func.instruction(&Instruction::I32Or);
+                                func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+                                {
+                                    emit_fffd_consume_lead(func);
+                                }
+                                func.instruction(&Instruction::Else);
+                                {
+                                    func.instruction(&Instruction::LocalGet(src_idx_local));
+                                    func.instruction(&Instruction::I32Const(4));
+                                    func.instruction(&Instruction::I32Add);
+                                    func.instruction(&Instruction::LocalSet(src_idx_local));
+                                }
+                                func.instruction(&Instruction::End);
+                            }
+                            func.instruction(&Instruction::End);
+                        }
+                        func.instruction(&Instruction::End);
+                    }
+                    func.instruction(&Instruction::End);
+                }
+                func.instruction(&Instruction::End); // end 3-byte vs 4-byte
+            }
+            func.instruction(&Instruction::End); // end 2-byte vs 3+byte
+        }
+        func.instruction(&Instruction::End); // end invalid-lead vs valid-multibyte
+    }
+    func.instruction(&Instruction::End); // end 1-byte vs 2+byte
+}
+
+/// Emit the UTF-16 → code-point decoder for one code point.
+///
+/// Reads the code unit at `mem16[ptr_local + src_idx_local*2]`, decodes a full
+/// scalar value into `cp_local`, and advances `src_idx_local` (by 1 for a BMP
+/// scalar / replaced lone surrogate, by 2 for a valid surrogate pair).
+/// `len_local` bounds the buffer (code-unit count). Lone surrogates (high at
+/// EOF, high not followed by low, or lone low) are replaced with U+FFFD per the
+/// Canonical ABI, mirroring `emit_utf16_to_utf8_transcode`. `cu2_local` is
+/// scratch. Extracted for #253 so the UTF-16 → Latin-1 scan/write phases share
+/// one validated decoder.
+#[allow(clippy::too_many_arguments)]
+fn emit_utf16_decode_codepoint(
+    func: &mut Function,
+    src_mem16: wasm_encoder::MemArg,
+    ptr_local: u32,
+    src_idx_local: u32,
+    len_local: u32,
+    cu_local: u32,
+    cp_local: u32,
+    cu2_local: u32,
+) {
+    // cu = mem16[ptr + src_idx*2]
+    func.instruction(&Instruction::LocalGet(ptr_local));
+    func.instruction(&Instruction::LocalGet(src_idx_local));
+    func.instruction(&Instruction::I32Const(1));
+    func.instruction(&Instruction::I32Shl);
+    func.instruction(&Instruction::I32Add);
+    func.instruction(&Instruction::I32Load16U(src_mem16));
+    func.instruction(&Instruction::LocalSet(cu_local));
+
+    // if cu is a high surrogate (0xD800..0xDC00)
+    func.instruction(&Instruction::LocalGet(cu_local));
+    func.instruction(&Instruction::I32Const(0xD800_u32 as i32));
+    func.instruction(&Instruction::I32GeU);
+    func.instruction(&Instruction::LocalGet(cu_local));
+    func.instruction(&Instruction::I32Const(0xDC00_u32 as i32));
+    func.instruction(&Instruction::I32LtU);
+    func.instruction(&Instruction::I32And);
+    func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+    {
+        // High surrogate. If it's the last unit → U+FFFD, consume 1.
+        func.instruction(&Instruction::LocalGet(src_idx_local));
+        func.instruction(&Instruction::I32Const(1));
+        func.instruction(&Instruction::I32Add);
+        func.instruction(&Instruction::LocalGet(len_local));
+        func.instruction(&Instruction::I32GeU);
+        func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+        {
+            func.instruction(&Instruction::I32Const(0xFFFD));
+            func.instruction(&Instruction::LocalSet(cp_local));
+            func.instruction(&Instruction::LocalGet(src_idx_local));
+            func.instruction(&Instruction::I32Const(1));
+            func.instruction(&Instruction::I32Add);
+            func.instruction(&Instruction::LocalSet(src_idx_local));
+        }
+        func.instruction(&Instruction::Else);
+        {
+            // cu2 = mem16[ptr + (src_idx+1)*2]
+            func.instruction(&Instruction::LocalGet(ptr_local));
+            func.instruction(&Instruction::LocalGet(src_idx_local));
+            func.instruction(&Instruction::I32Const(1));
+            func.instruction(&Instruction::I32Add);
+            func.instruction(&Instruction::I32Const(1));
+            func.instruction(&Instruction::I32Shl);
+            func.instruction(&Instruction::I32Add);
+            func.instruction(&Instruction::I32Load16U(src_mem16));
+            func.instruction(&Instruction::LocalSet(cu2_local));
+            // is cu2 a low surrogate?
+            func.instruction(&Instruction::LocalGet(cu2_local));
+            func.instruction(&Instruction::I32Const(0xDC00_u32 as i32));
+            func.instruction(&Instruction::I32GeU);
+            func.instruction(&Instruction::LocalGet(cu2_local));
+            func.instruction(&Instruction::I32Const(0xE000_u32 as i32));
+            func.instruction(&Instruction::I32LtU);
+            func.instruction(&Instruction::I32And);
+            func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+            {
+                // cp = 0x10000 + ((cu-0xD800)<<10) + (cu2-0xDC00); consume 2.
+                func.instruction(&Instruction::I32Const(0x10000));
+                func.instruction(&Instruction::LocalGet(cu_local));
+                func.instruction(&Instruction::I32Const(0xD800_u32 as i32));
+                func.instruction(&Instruction::I32Sub);
+                func.instruction(&Instruction::I32Const(10));
+                func.instruction(&Instruction::I32Shl);
+                func.instruction(&Instruction::I32Add);
+                func.instruction(&Instruction::LocalGet(cu2_local));
+                func.instruction(&Instruction::I32Const(0xDC00_u32 as i32));
+                func.instruction(&Instruction::I32Sub);
+                func.instruction(&Instruction::I32Add);
+                func.instruction(&Instruction::LocalSet(cp_local));
+                func.instruction(&Instruction::LocalGet(src_idx_local));
+                func.instruction(&Instruction::I32Const(2));
+                func.instruction(&Instruction::I32Add);
+                func.instruction(&Instruction::LocalSet(src_idx_local));
+            }
+            func.instruction(&Instruction::Else);
+            {
+                // Mid-string lone high surrogate → U+FFFD, consume 1.
+                func.instruction(&Instruction::I32Const(0xFFFD));
+                func.instruction(&Instruction::LocalSet(cp_local));
+                func.instruction(&Instruction::LocalGet(src_idx_local));
+                func.instruction(&Instruction::I32Const(1));
+                func.instruction(&Instruction::I32Add);
+                func.instruction(&Instruction::LocalSet(src_idx_local));
+            }
+            func.instruction(&Instruction::End);
+        }
+        func.instruction(&Instruction::End);
+    }
+    func.instruction(&Instruction::Else);
+    {
+        // Not a high surrogate. Lone low surrogate → U+FFFD, else cp = cu.
+        func.instruction(&Instruction::LocalGet(cu_local));
+        func.instruction(&Instruction::I32Const(0xDC00_u32 as i32));
+        func.instruction(&Instruction::I32GeU);
+        func.instruction(&Instruction::LocalGet(cu_local));
+        func.instruction(&Instruction::I32Const(0xE000_u32 as i32));
+        func.instruction(&Instruction::I32LtU);
+        func.instruction(&Instruction::I32And);
+        func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+        {
+            func.instruction(&Instruction::I32Const(0xFFFD));
+            func.instruction(&Instruction::LocalSet(cp_local));
+        }
+        func.instruction(&Instruction::Else);
+        {
+            func.instruction(&Instruction::LocalGet(cu_local));
+            func.instruction(&Instruction::LocalSet(cp_local));
+        }
+        func.instruction(&Instruction::End);
+        func.instruction(&Instruction::LocalGet(src_idx_local));
+        func.instruction(&Instruction::I32Const(1));
+        func.instruction(&Instruction::I32Add);
+        func.instruction(&Instruction::LocalSet(src_idx_local));
+    }
+    func.instruction(&Instruction::End);
+}
+
+/// Emit the code-point → UTF-16 encoder for one code point.
+///
+/// Writes `cp_local` to `mem16[out_ptr_local + dst_idx_local*2]` as one BMP
+/// code unit, or as a surrogate pair for cp >= 0x10000, advancing
+/// `dst_idx_local` by 1 or 2 code units. Mirrors the encoder in
+/// `emit_utf8_to_utf16_transcode`. Extracted for #253.
+fn emit_utf16_encode_codepoint(
+    func: &mut Function,
+    dst_mem16: wasm_encoder::MemArg,
+    out_ptr_local: u32,
+    dst_idx_local: u32,
+    cp_local: u32,
+) {
+    func.instruction(&Instruction::LocalGet(cp_local));
+    func.instruction(&Instruction::I32Const(0x10000));
+    func.instruction(&Instruction::I32LtU);
+    func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+    {
+        // BMP: one code unit.
+        func.instruction(&Instruction::LocalGet(out_ptr_local));
+        func.instruction(&Instruction::LocalGet(dst_idx_local));
+        func.instruction(&Instruction::I32Const(1));
+        func.instruction(&Instruction::I32Shl);
+        func.instruction(&Instruction::I32Add);
+        func.instruction(&Instruction::LocalGet(cp_local));
+        func.instruction(&Instruction::I32Store16(dst_mem16));
+        func.instruction(&Instruction::LocalGet(dst_idx_local));
+        func.instruction(&Instruction::I32Const(1));
+        func.instruction(&Instruction::I32Add);
+        func.instruction(&Instruction::LocalSet(dst_idx_local));
+    }
+    func.instruction(&Instruction::Else);
+    {
+        // Supplementary: surrogate pair.
+        // high = 0xD800 + ((cp - 0x10000) >> 10)
+        func.instruction(&Instruction::LocalGet(out_ptr_local));
+        func.instruction(&Instruction::LocalGet(dst_idx_local));
+        func.instruction(&Instruction::I32Const(1));
+        func.instruction(&Instruction::I32Shl);
+        func.instruction(&Instruction::I32Add);
+        func.instruction(&Instruction::I32Const(0xD800));
+        func.instruction(&Instruction::LocalGet(cp_local));
+        func.instruction(&Instruction::I32Const(0x10000));
+        func.instruction(&Instruction::I32Sub);
+        func.instruction(&Instruction::I32Const(10));
+        func.instruction(&Instruction::I32ShrU);
+        func.instruction(&Instruction::I32Add);
+        func.instruction(&Instruction::I32Store16(dst_mem16));
+        // low = 0xDC00 + ((cp - 0x10000) & 0x3FF)
+        func.instruction(&Instruction::LocalGet(out_ptr_local));
+        func.instruction(&Instruction::LocalGet(dst_idx_local));
+        func.instruction(&Instruction::I32Const(1));
+        func.instruction(&Instruction::I32Shl);
+        func.instruction(&Instruction::I32Add);
+        func.instruction(&Instruction::I32Const(2));
+        func.instruction(&Instruction::I32Add);
+        func.instruction(&Instruction::I32Const(0xDC00));
+        func.instruction(&Instruction::LocalGet(cp_local));
+        func.instruction(&Instruction::I32Const(0x10000));
+        func.instruction(&Instruction::I32Sub);
+        func.instruction(&Instruction::I32Const(0x3FF));
+        func.instruction(&Instruction::I32And);
+        func.instruction(&Instruction::I32Add);
+        func.instruction(&Instruction::I32Store16(dst_mem16));
+        func.instruction(&Instruction::LocalGet(dst_idx_local));
+        func.instruction(&Instruction::I32Const(2));
+        func.instruction(&Instruction::I32Add);
+        func.instruction(&Instruction::LocalSet(dst_idx_local));
+    }
+    func.instruction(&Instruction::End);
 }
 
 /// Emit a chain of `(disc == value)` checks for a [`ConditionalPointerPair`]'s
@@ -323,6 +906,12 @@ fn emit_patch_nested_indirections(
     realloc_func: u32,
     caller_memory: u32,
     callee_memory: u32,
+    // True when the *callee* string encoding (this is a result-side,
+    // callee → caller copy) is `latin1+utf16` (CompactUtf16). A byte-granular
+    // inner buffer (`sub_elem_size == 1`) is then a tag-encoded string whose
+    // byte count must be masked/doubled. The inner (ptr, len) header keeps its
+    // original (tagged) length — this function rewrites only the pointer.
+    callee_compact_utf16: bool,
 ) {
     let indirections = collect_indirections(elem_ty, 0);
     if indirections.is_empty() {
@@ -410,8 +999,13 @@ fn emit_patch_nested_indirections(
         // side bulk-copy of the outer (ptr, len) keeps the original large
         // `len` — silent truncation and semantic drift between the fused
         // and composed executions.
+        let inner_compact_utf16 = callee_compact_utf16 && *sub_elem_size == 1;
         emit_overflow_guard(body, l_buf_len, *sub_elem_size);
-        if *sub_elem_size != 1 {
+        if inner_compact_utf16 {
+            // #253: byte count is tag-aware — (len & TAG) ? (len & !TAG)*2 : len.
+            emit_copy_byte_count(body, l_buf_len, 1, true);
+            body.instruction(&Instruction::LocalSet(l_buf_len));
+        } else if *sub_elem_size != 1 {
             body.instruction(&Instruction::LocalGet(l_buf_len));
             body.instruction(&Instruction::I32Const(*sub_elem_size as i32));
             body.instruction(&Instruction::I32Mul);
@@ -430,10 +1024,16 @@ fn emit_patch_nested_indirections(
         body.instruction(&Instruction::I32GtU);
         body.instruction(&Instruction::BrIf(0));
 
-        // new_ptr = realloc(0, 0, 1, buf_len) in caller memory
+        // new_ptr = realloc(0, 0, align, buf_len) in caller memory.
+        // align 2 for a compact-utf16 inner string (the buffer may hold a
+        // UTF-16 payload), else 1 — matching the other tag-aware copy sites.
         body.instruction(&Instruction::I32Const(0));
         body.instruction(&Instruction::I32Const(0));
-        body.instruction(&Instruction::I32Const(1));
+        body.instruction(&Instruction::I32Const(if inner_compact_utf16 {
+            2
+        } else {
+            1
+        }));
         body.instruction(&Instruction::LocalGet(l_buf_len));
         emit_checked_realloc(body, realloc_func, l_new_ptr);
 
@@ -1572,26 +2172,31 @@ impl FactStyleGenerator {
                     })
                     .unwrap_or(1);
 
-                // Allocate: dest = cabi_realloc(0, 0, 1, len * byte_mult)
+                // A param-side buffer carries a latin1+utf16 (CompactUTF16,
+                // modelled as Latin1) string when the *caller* encoding is
+                // Latin1 and the data is byte-granular (byte_mult == 1). Its
+                // length operand is tag-encoded (UTF16_TAG): the byte count
+                // must be masked/doubled (`emit_copy_byte_count`) for the
+                // realloc size and the memory.copy length, while the length
+                // FORWARDED to the callee stays tagged. A plain list<u8>
+                // (also byte_mult == 1) is unaffected: its count is < 2^31,
+                // so the tag bit is clear and the tag-aware path returns `len`.
+                let is_compact_utf16 =
+                    options.caller_string_encoding == StringEncoding::Latin1 && byte_mult == 1;
+                let realloc_align = if is_compact_utf16 { 2 } else { 1 };
+
+                // Allocate: dest = cabi_realloc(0, 0, align, <byte count>)
                 emit_overflow_guard(&mut func, len_pos, byte_mult);
                 func.instruction(&Instruction::I32Const(0));
                 func.instruction(&Instruction::I32Const(0));
-                func.instruction(&Instruction::I32Const(1));
-                func.instruction(&Instruction::LocalGet(len_pos));
-                if byte_mult > 1 {
-                    func.instruction(&Instruction::I32Const(byte_mult as i32));
-                    func.instruction(&Instruction::I32Mul);
-                }
+                func.instruction(&Instruction::I32Const(realloc_align));
+                emit_copy_byte_count(&mut func, len_pos, byte_mult, is_compact_utf16);
                 emit_checked_realloc(&mut func, callee_realloc, dest_local);
 
-                // Copy: memory.copy callee_mem caller_mem (dest, src, len * byte_mult)
+                // Copy: memory.copy callee_mem caller_mem (dest, src, <byte count>)
                 func.instruction(&Instruction::LocalGet(dest_local));
                 func.instruction(&Instruction::LocalGet(ptr_pos));
-                func.instruction(&Instruction::LocalGet(len_pos));
-                if byte_mult > 1 {
-                    func.instruction(&Instruction::I32Const(byte_mult as i32));
-                    func.instruction(&Instruction::I32Mul);
-                }
+                emit_copy_byte_count(&mut func, len_pos, byte_mult, is_compact_utf16);
                 func.instruction(&Instruction::MemoryCopy {
                     src_mem: options.caller_memory,
                     dst_mem: options.callee_memory,
@@ -1617,6 +2222,8 @@ impl FactStyleGenerator {
                         options.callee_memory,
                         callee_realloc,
                         fixup_base,
+                        // Param-side: governed by the caller's string encoding.
+                        options.caller_string_encoding == StringEncoding::Latin1,
                     );
                 }
             } // end for each pointer pair
@@ -1726,6 +2333,11 @@ impl FactStyleGenerator {
                     crate::resolver::CopyLayout::Bulk { byte_multiplier } => *byte_multiplier,
                     crate::resolver::CopyLayout::Elements { element_size, .. } => *element_size,
                 };
+                // Param-side (caller → callee) tagged latin1+utf16 string: see
+                // the unconditional param-copy loop above.
+                let is_compact_utf16 =
+                    options.caller_string_encoding == StringEncoding::Latin1 && byte_mult == 1;
+                let realloc_align = if is_compact_utf16 { 2 } else { 1 };
 
                 // if (all guards in chain hold) { copy and replace ptr }
                 // — outer-guard ANDing matters for nested option/result/variant
@@ -1734,27 +2346,19 @@ impl FactStyleGenerator {
                 emit_conditional_guard_chain_flat(&mut func, cond, 0);
                 func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
 
-                // Allocate: new_ptr = cabi_realloc(0, 0, 1, len * byte_mult)
+                // Allocate: new_ptr = cabi_realloc(0, 0, align, <byte count>)
                 emit_overflow_guard(&mut func, len_local, byte_mult);
                 func.instruction(&Instruction::I32Const(0));
                 func.instruction(&Instruction::I32Const(0));
-                func.instruction(&Instruction::I32Const(1));
-                func.instruction(&Instruction::LocalGet(len_local));
-                if byte_mult > 1 {
-                    func.instruction(&Instruction::I32Const(byte_mult as i32));
-                    func.instruction(&Instruction::I32Mul);
-                }
+                func.instruction(&Instruction::I32Const(realloc_align));
+                emit_copy_byte_count(&mut func, len_local, byte_mult, is_compact_utf16);
                 // Save as dest_ptr (reuse a scratch local)
                 emit_checked_realloc(&mut func, callee_realloc, dest_ptr_local);
 
-                // Copy: memory.copy callee caller (dest, src, len * byte_mult)
+                // Copy: memory.copy callee caller (dest, src, <byte count>)
                 func.instruction(&Instruction::LocalGet(dest_ptr_local));
                 func.instruction(&Instruction::LocalGet(ptr_local));
-                func.instruction(&Instruction::LocalGet(len_local));
-                if byte_mult > 1 {
-                    func.instruction(&Instruction::I32Const(byte_mult as i32));
-                    func.instruction(&Instruction::I32Mul);
-                }
+                emit_copy_byte_count(&mut func, len_local, byte_mult, is_compact_utf16);
                 func.instruction(&Instruction::MemoryCopy {
                     src_mem: options.caller_memory,
                     dst_mem: options.callee_memory,
@@ -1796,19 +2400,29 @@ impl FactStyleGenerator {
             func.instruction(&Instruction::LocalSet(callee_ret_len_local));
             func.instruction(&Instruction::LocalSet(callee_ret_ptr_local));
 
+            // The returned (ptr, len) pair was produced BY THE CALLEE in the
+            // callee's string encoding, so its tag-encoding is governed by
+            // `callee_string_encoding`. byte_mult is 1 here (bulk string /
+            // list<u8> return). A latin1+utf16 return has its length tagged
+            // with UTF16_TAG; copying the raw operand would copy
+            // `count | 0x8000_0000` bytes (~2 GiB OOB). The length pushed back
+            // to the caller stays tagged; only the byte count is masked.
+            let result_is_compact_utf16 = options.callee_string_encoding == StringEncoding::Latin1;
+            let result_realloc_align = if result_is_compact_utf16 { 2 } else { 1 };
+
             // Allocate in caller's memory:
-            //   caller_new_ptr = cabi_realloc(0, 0, 1, callee_ret_len)
+            //   caller_new_ptr = cabi_realloc(0, 0, align, <byte count>)
             func.instruction(&Instruction::I32Const(0)); // original_ptr
             func.instruction(&Instruction::I32Const(0)); // original_size
-            func.instruction(&Instruction::I32Const(1)); // alignment
-            func.instruction(&Instruction::LocalGet(callee_ret_len_local));
+            func.instruction(&Instruction::I32Const(result_realloc_align)); // alignment
+            emit_copy_byte_count(&mut func, callee_ret_len_local, 1, result_is_compact_utf16);
             emit_checked_realloc(&mut func, caller_realloc, caller_new_ptr_local);
 
             // Copy data from callee's memory to caller's memory:
-            //   memory.copy $caller_mem $callee_mem (caller_new_ptr, callee_ret_ptr, len)
+            //   memory.copy $caller_mem $callee_mem (caller_new_ptr, callee_ret_ptr, <byte count>)
             func.instruction(&Instruction::LocalGet(caller_new_ptr_local)); // dst
             func.instruction(&Instruction::LocalGet(callee_ret_ptr_local)); // src
-            func.instruction(&Instruction::LocalGet(callee_ret_len_local)); // size
+            emit_copy_byte_count(&mut func, callee_ret_len_local, 1, result_is_compact_utf16);
             func.instruction(&Instruction::MemoryCopy {
                 src_mem: options.callee_memory,
                 dst_mem: options.caller_memory,
@@ -1877,6 +2491,12 @@ impl FactStyleGenerator {
                         crate::resolver::CopyLayout::Bulk { byte_multiplier } => *byte_multiplier,
                         crate::resolver::CopyLayout::Elements { element_size, .. } => *element_size,
                     };
+                    // Result-side (callee → caller) string: tag-encoding is
+                    // governed by `callee_string_encoding` (the callee produced
+                    // it). See the unconditional result-copy above.
+                    let is_compact_utf16 =
+                        options.callee_string_encoding == StringEncoding::Latin1 && byte_mult == 1;
+                    let realloc_align = if is_compact_utf16 { 2 } else { 1 };
 
                     // if (all guards in chain hold) { allocate in caller,
                     // copy, replace ptr } — outer-guard ANDing per LS-P-10.
@@ -1887,22 +2507,14 @@ impl FactStyleGenerator {
                     emit_overflow_guard(&mut func, len_local, byte_mult);
                     func.instruction(&Instruction::I32Const(0));
                     func.instruction(&Instruction::I32Const(0));
-                    func.instruction(&Instruction::I32Const(1));
-                    func.instruction(&Instruction::LocalGet(len_local));
-                    if byte_mult > 1 {
-                        func.instruction(&Instruction::I32Const(byte_mult as i32));
-                        func.instruction(&Instruction::I32Mul);
-                    }
+                    func.instruction(&Instruction::I32Const(realloc_align));
+                    emit_copy_byte_count(&mut func, len_local, byte_mult, is_compact_utf16);
                     emit_checked_realloc(&mut func, caller_realloc, dest_ptr_local);
 
                     // Copy from callee memory to caller memory
                     func.instruction(&Instruction::LocalGet(dest_ptr_local));
                     func.instruction(&Instruction::LocalGet(ptr_local));
-                    func.instruction(&Instruction::LocalGet(len_local));
-                    if byte_mult > 1 {
-                        func.instruction(&Instruction::I32Const(byte_mult as i32));
-                        func.instruction(&Instruction::I32Mul);
-                    }
+                    emit_copy_byte_count(&mut func, len_local, byte_mult, is_compact_utf16);
                     func.instruction(&Instruction::MemoryCopy {
                         src_mem: options.callee_memory,
                         dst_mem: options.caller_memory,
@@ -2055,19 +2667,23 @@ impl FactStyleGenerator {
             }));
             func.instruction(&Instruction::LocalSet(pair_len_local));
 
-            // Allocate: new_ptr = cabi_realloc(0, 0, 1, len * byte_mult)
+            // The params buffer was lowered by the caller, so a latin1+utf16
+            // string inside it has its length tagged per the *caller* encoding.
+            // byte_mult == 1 selects the byte-granular (string / list<u8>)
+            // case; a plain list<u8> stays unaffected (count < 2^31 ⇒ tag clear).
+            let is_compact_utf16 =
+                options.caller_string_encoding == StringEncoding::Latin1 && byte_mult == 1;
+            let realloc_align = if is_compact_utf16 { 2 } else { 1 };
+
+            // Allocate: new_ptr = cabi_realloc(0, 0, align, <byte count>)
             emit_overflow_guard(&mut func, pair_len_local, byte_mult);
             func.instruction(&Instruction::I32Const(0));
             func.instruction(&Instruction::I32Const(0));
-            func.instruction(&Instruction::I32Const(1));
-            func.instruction(&Instruction::LocalGet(pair_len_local));
-            if byte_mult > 1 {
-                func.instruction(&Instruction::I32Const(byte_mult as i32));
-                func.instruction(&Instruction::I32Mul);
-            }
+            func.instruction(&Instruction::I32Const(realloc_align));
+            emit_copy_byte_count(&mut func, pair_len_local, byte_mult, is_compact_utf16);
             emit_checked_realloc(&mut func, callee_realloc, dest_local);
 
-            // Copy data: memory.copy callee caller (new_ptr, old_ptr, len * byte_mult)
+            // Copy data: memory.copy callee caller (new_ptr, old_ptr, <byte count>)
             func.instruction(&Instruction::LocalGet(dest_local)); // dst (in callee mem)
             // Load old_ptr from callee's buffer (this was copied from caller's buffer,
             // so it points into caller's memory)
@@ -2077,17 +2693,8 @@ impl FactStyleGenerator {
                 align: 2,
                 memory_index: options.callee_memory,
             })); // src (in caller mem)
-            // Load len from callee's buffer
-            func.instruction(&Instruction::LocalGet(callee_ptr_local));
-            func.instruction(&Instruction::I32Load(wasm_encoder::MemArg {
-                offset: (byte_offset + 4) as u64,
-                align: 2,
-                memory_index: options.callee_memory,
-            }));
-            if byte_mult > 1 {
-                func.instruction(&Instruction::I32Const(byte_mult as i32));
-                func.instruction(&Instruction::I32Mul);
-            }
+            // Byte count from the stashed (still-tagged) length operand.
+            emit_copy_byte_count(&mut func, pair_len_local, byte_mult, is_compact_utf16);
             func.instruction(&Instruction::MemoryCopy {
                 src_mem: options.caller_memory,
                 dst_mem: options.callee_memory,
@@ -2330,26 +2937,26 @@ impl FactStyleGenerator {
                     })
                     .unwrap_or(1);
 
-                // Allocate: dest = cabi_realloc(0, 0, 1, len * byte_mult)
+                // Param-side (caller → callee) tagged latin1+utf16 string —
+                // governed by the caller encoding; byte_mult == 1 selects the
+                // byte-granular string / list<u8> case. See the memory-copy
+                // adapter's param-copy loop for the full reasoning.
+                let is_compact_utf16 =
+                    options.caller_string_encoding == StringEncoding::Latin1 && byte_mult == 1;
+                let realloc_align = if is_compact_utf16 { 2 } else { 1 };
+
+                // Allocate: dest = cabi_realloc(0, 0, align, <byte count>)
                 emit_overflow_guard(&mut func, len_pos, byte_mult);
                 func.instruction(&Instruction::I32Const(0));
                 func.instruction(&Instruction::I32Const(0));
-                func.instruction(&Instruction::I32Const(1));
-                func.instruction(&Instruction::LocalGet(len_pos));
-                if byte_mult > 1 {
-                    func.instruction(&Instruction::I32Const(byte_mult as i32));
-                    func.instruction(&Instruction::I32Mul);
-                }
+                func.instruction(&Instruction::I32Const(realloc_align));
+                emit_copy_byte_count(&mut func, len_pos, byte_mult, is_compact_utf16);
                 emit_checked_realloc(&mut func, callee_realloc, dest_local);
 
-                // Copy: memory.copy callee_mem caller_mem (dest, src, len * byte_mult)
+                // Copy: memory.copy callee_mem caller_mem (dest, src, <byte count>)
                 func.instruction(&Instruction::LocalGet(dest_local));
                 func.instruction(&Instruction::LocalGet(ptr_pos));
-                func.instruction(&Instruction::LocalGet(len_pos));
-                if byte_mult > 1 {
-                    func.instruction(&Instruction::I32Const(byte_mult as i32));
-                    func.instruction(&Instruction::I32Mul);
-                }
+                emit_copy_byte_count(&mut func, len_pos, byte_mult, is_compact_utf16);
                 func.instruction(&Instruction::MemoryCopy {
                     src_mem: options.caller_memory,
                     dst_mem: options.callee_memory,
@@ -2374,6 +2981,8 @@ impl FactStyleGenerator {
                         options.callee_memory,
                         callee_realloc,
                         fixup_locals_base,
+                        // Param-side: governed by the caller's string encoding.
+                        options.caller_string_encoding == StringEncoding::Latin1,
                     );
                 }
 
@@ -2457,6 +3066,10 @@ impl FactStyleGenerator {
                     crate::resolver::CopyLayout::Bulk { byte_multiplier } => *byte_multiplier,
                     crate::resolver::CopyLayout::Elements { element_size, .. } => *element_size,
                 };
+                // Param-side (caller → callee) tagged latin1+utf16 string.
+                let is_compact_utf16 =
+                    options.caller_string_encoding == StringEncoding::Latin1 && byte_mult == 1;
+                let realloc_align = if is_compact_utf16 { 2 } else { 1 };
 
                 // Outer-guard AND-chain (LS-P-10) before firing the copy.
                 emit_conditional_guard_chain_flat(&mut func, cond, 0);
@@ -2466,22 +3079,14 @@ impl FactStyleGenerator {
                 emit_overflow_guard(&mut func, len_local, byte_mult);
                 func.instruction(&Instruction::I32Const(0));
                 func.instruction(&Instruction::I32Const(0));
-                func.instruction(&Instruction::I32Const(1));
-                func.instruction(&Instruction::LocalGet(len_local));
-                if byte_mult > 1 {
-                    func.instruction(&Instruction::I32Const(byte_mult as i32));
-                    func.instruction(&Instruction::I32Mul);
-                }
+                func.instruction(&Instruction::I32Const(realloc_align));
+                emit_copy_byte_count(&mut func, len_local, byte_mult, is_compact_utf16);
                 emit_checked_realloc(&mut func, callee_realloc, cond_dest_ptr_local);
 
                 // Copy from caller to callee memory
                 func.instruction(&Instruction::LocalGet(cond_dest_ptr_local));
                 func.instruction(&Instruction::LocalGet(ptr_local));
-                func.instruction(&Instruction::LocalGet(len_local));
-                if byte_mult > 1 {
-                    func.instruction(&Instruction::I32Const(byte_mult as i32));
-                    func.instruction(&Instruction::I32Mul);
-                }
+                emit_copy_byte_count(&mut func, len_local, byte_mult, is_compact_utf16);
                 func.instruction(&Instruction::MemoryCopy {
                     src_mem: options.caller_memory,
                     dst_mem: options.callee_memory,
@@ -2563,26 +3168,27 @@ impl FactStyleGenerator {
                     }));
                     func.instruction(&Instruction::LocalSet(data_len_local));
 
-                    // Allocate in caller's memory: data_len * byte_mult bytes
+                    // Result-side (callee → caller): a returned latin1+utf16
+                    // string has its length tagged per the *callee* encoding.
+                    // byte_mult == 1 selects the byte-granular string / list<u8>
+                    // case; the length stored back into the caller's return area
+                    // stays tagged (only the byte count is masked here).
+                    let is_compact_utf16 =
+                        options.callee_string_encoding == StringEncoding::Latin1 && byte_mult == 1;
+                    let realloc_align = if is_compact_utf16 { 2 } else { 1 };
+
+                    // Allocate in caller's memory: <byte count> bytes
                     emit_overflow_guard(&mut func, data_len_local, byte_mult);
                     func.instruction(&Instruction::I32Const(0));
                     func.instruction(&Instruction::I32Const(0));
-                    func.instruction(&Instruction::I32Const(1));
-                    func.instruction(&Instruction::LocalGet(data_len_local));
-                    if byte_mult > 1 {
-                        func.instruction(&Instruction::I32Const(byte_mult as i32));
-                        func.instruction(&Instruction::I32Mul);
-                    }
+                    func.instruction(&Instruction::I32Const(realloc_align));
+                    emit_copy_byte_count(&mut func, data_len_local, byte_mult, is_compact_utf16);
                     emit_checked_realloc(&mut func, caller_realloc, caller_new_ptr_local);
 
                     // Copy data bytes from callee → caller
                     func.instruction(&Instruction::LocalGet(caller_new_ptr_local));
                     func.instruction(&Instruction::LocalGet(data_ptr_local));
-                    func.instruction(&Instruction::LocalGet(data_len_local));
-                    if byte_mult > 1 {
-                        func.instruction(&Instruction::I32Const(byte_mult as i32));
-                        func.instruction(&Instruction::I32Mul);
-                    }
+                    emit_copy_byte_count(&mut func, data_len_local, byte_mult, is_compact_utf16);
                     func.instruction(&Instruction::MemoryCopy {
                         src_mem: options.callee_memory,
                         dst_mem: options.caller_memory,
@@ -2607,6 +3213,8 @@ impl FactStyleGenerator {
                             options.caller_memory,
                             caller_realloc,
                             fixup_locals_base,
+                            // Result-side: governed by the callee's string encoding.
+                            options.callee_string_encoding == StringEncoding::Latin1,
                         );
                     }
 
@@ -2735,26 +3343,25 @@ impl FactStyleGenerator {
                 }));
                 func.instruction(&Instruction::LocalSet(data_len_local));
 
+                // Result-side (callee → caller) conditional string: tagged per
+                // the *callee* encoding. byte_mult == 1 ⇒ byte-granular string /
+                // list<u8>; the length written back to the retptr stays tagged.
+                let is_compact_utf16 =
+                    options.callee_string_encoding == StringEncoding::Latin1 && byte_mult == 1;
+                let realloc_align = if is_compact_utf16 { 2 } else { 1 };
+
                 // Allocate in caller memory
                 emit_overflow_guard(&mut func, data_len_local, byte_mult);
                 func.instruction(&Instruction::I32Const(0));
                 func.instruction(&Instruction::I32Const(0));
-                func.instruction(&Instruction::I32Const(1));
-                func.instruction(&Instruction::LocalGet(data_len_local));
-                if byte_mult > 1 {
-                    func.instruction(&Instruction::I32Const(byte_mult as i32));
-                    func.instruction(&Instruction::I32Mul);
-                }
+                func.instruction(&Instruction::I32Const(realloc_align));
+                emit_copy_byte_count(&mut func, data_len_local, byte_mult, is_compact_utf16);
                 emit_checked_realloc(&mut func, caller_realloc, caller_new_ptr_local);
 
                 // Copy data from callee → caller
                 func.instruction(&Instruction::LocalGet(caller_new_ptr_local));
                 func.instruction(&Instruction::LocalGet(data_ptr_local));
-                func.instruction(&Instruction::LocalGet(data_len_local));
-                if byte_mult > 1 {
-                    func.instruction(&Instruction::I32Const(byte_mult as i32));
-                    func.instruction(&Instruction::I32Mul);
-                }
+                emit_copy_byte_count(&mut func, data_len_local, byte_mult, is_compact_utf16);
                 func.instruction(&Instruction::MemoryCopy {
                     src_mem: options.callee_memory,
                     dst_mem: options.caller_memory,
@@ -2886,6 +3493,18 @@ impl FactStyleGenerator {
         dst_mem: u32,
         realloc_func: u32,
         locals_base: u32,
+        // True when the governing canonical-ABI string encoding (caller's for
+        // param-side copies, callee's for result-side copies) is `latin1+utf16`
+        // (modelled as `StringEncoding::Latin1`). When set, a byte-granular
+        // inner buffer (`byte_mult == 1`) is treated as a tag-encoded string:
+        // its byte count is masked/doubled via `emit_copy_byte_count`. The
+        // pointer-pair length stored back into the destination element is the
+        // ORIGINAL (still-tagged) operand, so the callee/caller decoder still
+        // sees the tag. `CopyLayout` cannot distinguish a nested `string` from
+        // a nested `list<u8>`, but the latter is unaffected: a legitimate
+        // list<u8> count is < 2^31, so its tag bit is clear and the tag-aware
+        // path returns `len` unchanged (see `emit_copy_byte_count`).
+        is_compact_utf16: bool,
     ) {
         if inner_pointers.is_empty() {
             return;
@@ -2996,27 +3615,28 @@ impl FactStyleGenerator {
             }));
             func.instruction(&Instruction::LocalSet(inner_len));
 
-            // Allocate inner data in dst memory: new_ptr = realloc(0, 0, 1, inner_len * byte_mult)
+            // A byte-granular inner buffer in a latin1+utf16 component is a
+            // tag-encoded string; mask/double its byte count. Non-byte-granular
+            // inner buffers and list<u8> are handled by the plain path.
+            let inner_is_compact_utf16 = is_compact_utf16 && byte_mult == 1;
+
+            // Allocate inner data in dst memory: new_ptr = realloc(0, 0, align, <byte count>)
             emit_overflow_guard(func, inner_len, byte_mult);
             func.instruction(&Instruction::I32Const(0));
             func.instruction(&Instruction::I32Const(0));
-            func.instruction(&Instruction::I32Const(1));
-            func.instruction(&Instruction::LocalGet(inner_len));
-            if byte_mult > 1 {
-                func.instruction(&Instruction::I32Const(byte_mult as i32));
-                func.instruction(&Instruction::I32Mul);
-            }
+            func.instruction(&Instruction::I32Const(if inner_is_compact_utf16 {
+                2
+            } else {
+                1
+            }));
+            emit_copy_byte_count(func, inner_len, byte_mult, inner_is_compact_utf16);
             emit_checked_realloc(func, realloc_func, new_ptr);
 
             // Copy data from src memory to dst memory
-            // memory.copy dst_mem src_mem (new_ptr, inner_ptr, inner_len * byte_mult)
+            // memory.copy dst_mem src_mem (new_ptr, inner_ptr, <byte count>)
             func.instruction(&Instruction::LocalGet(new_ptr));
             func.instruction(&Instruction::LocalGet(inner_ptr));
-            func.instruction(&Instruction::LocalGet(inner_len));
-            if byte_mult > 1 {
-                func.instruction(&Instruction::I32Const(byte_mult as i32));
-                func.instruction(&Instruction::I32Mul);
-            }
+            emit_copy_byte_count(func, inner_len, byte_mult, inner_is_compact_utf16);
             func.instruction(&Instruction::MemoryCopy { src_mem, dst_mem });
 
             // Recursively fix up inner-inner pointers if the inner layout
@@ -3040,6 +3660,7 @@ impl FactStyleGenerator {
                     dst_mem,
                     realloc_func,
                     locals_base + 4, // next level gets next 4 scratch locals
+                    is_compact_utf16,
                 );
             }
 
@@ -3132,6 +3753,24 @@ impl FactStyleGenerator {
         // Phase 0: Convert borrow resource handles
         emit_resource_borrow_phase0(&mut func, &options.resource_rep_calls);
 
+        // The #253 latin1+utf16 transcoders dispatch on the length tag with an
+        // `If`/`Else` whose two legs each call the target and leave the
+        // function's result on the stack. The block must therefore carry the
+        // function's result type so the value isn't trapped inside the block.
+        // Flat string-call results are 0 or 1 value (multi-value returns go
+        // through a retptr param); we only need Empty / single-result here.
+        let transcode_block_ty = match result_types.as_slice() {
+            [] => wasm_encoder::BlockType::Empty,
+            [ty] => wasm_encoder::BlockType::Result(*ty),
+            _ => {
+                return Err(crate::Error::AdapterGeneration(format!(
+                    "string transcoding with {} flat results is unsupported \
+                     (expected 0 or 1; multi-value returns use a retptr) — see #253",
+                    result_types.len()
+                )));
+            }
+        };
+
         // Generate transcoding logic based on encoding pair
 
         match (
@@ -3158,14 +3797,54 @@ impl FactStyleGenerator {
             }
 
             (StringEncoding::Latin1, StringEncoding::Utf8) => {
-                // Latin-1 to UTF-8 is straightforward (single byte to potentially multi-byte)
-                self.emit_latin1_to_utf8_transcode(&mut func, param_count, target_func, options);
+                // latin1+utf16 → UTF-8. Branches on the source length tag
+                // (#253): tag-clear takes the 1-byte Latin-1 path; tag-set
+                // re-reads the source as UTF-16 and transcodes to UTF-8.
+                self.emit_latin1_to_utf8_transcode(
+                    &mut func,
+                    param_count,
+                    target_func,
+                    options,
+                    transcode_block_ty,
+                );
             }
 
             (StringEncoding::Latin1, StringEncoding::Utf16) => {
-                // #253 inc 2: Latin-1 to UTF-16 is total and unambiguous — each
-                // byte 0x00–0xFF zero-extends to one code unit U+0000–U+00FF.
-                self.emit_latin1_to_utf16_transcode(&mut func, param_count, target_func, options);
+                // #253: latin1+utf16 → UTF-16. Branches on the source length
+                // tag: tag-clear zero-extends each Latin-1 byte; tag-set does a
+                // verbatim UTF-16 code-unit copy.
+                self.emit_latin1_to_utf16_transcode(
+                    &mut func,
+                    param_count,
+                    target_func,
+                    options,
+                    transcode_block_ty,
+                );
+            }
+
+            (StringEncoding::Utf8, StringEncoding::Latin1) => {
+                // #253: UTF-8 → latin1+utf16. Two-phase encoder: if every code
+                // point ≤ 0xFF, write Latin-1 (tag clear); else write UTF-16
+                // (tag set).
+                self.emit_utf8_to_latin1_transcode(
+                    &mut func,
+                    param_count,
+                    target_func,
+                    options,
+                    transcode_block_ty,
+                );
+            }
+
+            (StringEncoding::Utf16, StringEncoding::Latin1) => {
+                // #253: UTF-16 → latin1+utf16. Two-phase encoder mirroring the
+                // UTF-8 case but scanning UTF-16 code units / surrogate pairs.
+                self.emit_utf16_to_latin1_transcode(
+                    &mut func,
+                    param_count,
+                    target_func,
+                    options,
+                    transcode_block_ty,
+                );
             }
 
             (caller_enc, callee_enc) if caller_enc == callee_enc => {
@@ -4189,14 +4868,67 @@ impl FactStyleGenerator {
         func.instruction(&Instruction::Call(target_func));
     }
 
-    /// Emit Latin-1 to UTF-8 transcoding
+    /// Emit `latin1+utf16` → UTF-8 transcoding.
+    ///
+    /// meld models the canonical-ABI `latin1+utf16` encoding as
+    /// [`StringEncoding::Latin1`]. The length operand (local 1) is **tagged**
+    /// (see [`UTF16_TAG`]):
+    /// - tag **clear** → the source is Latin-1 (1 byte/char); decode each byte
+    ///   0x00–0xFF as code point U+0000–U+00FF and re-encode as UTF-8. This is
+    ///   the path the pre-#253 implementation always took.
+    /// - tag **set** → the source is UTF-16 (`count = len & !UTF16_TAG` code
+    ///   units); the correct behaviour is a full UTF-16 → UTF-8 transcode
+    ///   (surrogate pairs, lossy U+FFFD for malformed units — the exact
+    ///   semantics of [`Self::emit_utf16_to_utf8_transcode`]).
+    ///
+    /// We dispatch at runtime on the tag. The two arms share the destination
+    /// target call: each inner emitter reads the (now-masked) code count from
+    /// local 1 and emits its own `Call(target_func)`, so the `If`/`Else` is two
+    /// complete, self-contained sub-programs.
+    fn emit_latin1_to_utf8_transcode(
+        &self,
+        func: &mut Function,
+        param_count: usize,
+        target_func: u32,
+        options: &AdapterOptions,
+        block_ty: wasm_encoder::BlockType,
+    ) {
+        // Decode the tag, then rewrite local 1 to the *masked* count so the
+        // inner emitters (which read local 1) see the untagged code/byte count.
+        // tag_set := (len & UTF16_TAG) != 0 ; len := len & !UTF16_TAG
+        let tag_local = param_count as u32; // reuse first scratch local
+        func.instruction(&Instruction::LocalGet(1));
+        func.instruction(&Instruction::I32Const(UTF16_TAG));
+        func.instruction(&Instruction::I32And);
+        func.instruction(&Instruction::LocalSet(tag_local));
+        func.instruction(&Instruction::LocalGet(1));
+        func.instruction(&Instruction::I32Const(!UTF16_TAG));
+        func.instruction(&Instruction::I32And);
+        func.instruction(&Instruction::LocalSet(1));
+
+        func.instruction(&Instruction::LocalGet(tag_local));
+        func.instruction(&Instruction::If(block_ty));
+        {
+            // Tag set: the latin1+utf16 source is UTF-16 — transcode as such.
+            self.emit_utf16_to_utf8_transcode(func, param_count, target_func, options);
+        }
+        func.instruction(&Instruction::Else);
+        {
+            // Tag clear: pure Latin-1 source — the original 1-byte path.
+            self.emit_latin1_pure_to_utf8_transcode(func, param_count, target_func, options);
+        }
+        func.instruction(&Instruction::End);
+    }
+
+    /// The tag-clear (pure Latin-1) leg of `latin1+utf16` → UTF-8.
     ///
     /// Latin-1 (ISO 8859-1) maps 1:1 to Unicode code points 0x00-0xFF.
     /// UTF-8 encoding: 0x00-0x7F → 1 byte, 0x80-0xFF → 2 bytes.
     /// Max output size = 2 * input length.
     ///
-    /// Assumes params start with (ptr: i32, len: i32), followed by other params.
-    fn emit_latin1_to_utf8_transcode(
+    /// Assumes params start with (ptr: i32, len: i32) where `len` is the
+    /// (already tag-masked) Latin-1 byte count.
+    fn emit_latin1_pure_to_utf8_transcode(
         &self,
         func: &mut Function,
         param_count: usize,
@@ -4363,7 +5095,166 @@ impl FactStyleGenerator {
         func.instruction(&Instruction::Call(target_func));
     }
 
-    /// Emit Latin-1 to UTF-16 transcoding (#253 increment 2).
+    /// Emit `latin1+utf16` → UTF-16 transcoding (#253).
+    ///
+    /// The source length operand (local 1) is **tagged** (see [`UTF16_TAG`]):
+    /// - tag **clear** → the source is Latin-1; zero-extend each byte
+    ///   0x00–0xFF to one UTF-16 code unit U+0000–U+00FF (the #253 increment-2
+    ///   path, total and unambiguous).
+    /// - tag **set** → the source is *already* UTF-16 (`count = len &
+    ///   !UTF16_TAG` code units); the destination is UTF-16, so this is a
+    ///   verbatim code-unit copy (2 bytes per unit, preserving surrogate pairs
+    ///   byte-for-byte).
+    ///
+    /// We dispatch at runtime on the tag, masking local 1 to the code count
+    /// first so the inner emitters see the untagged count.
+    fn emit_latin1_to_utf16_transcode(
+        &self,
+        func: &mut Function,
+        param_count: usize,
+        target_func: u32,
+        options: &AdapterOptions,
+        block_ty: wasm_encoder::BlockType,
+    ) {
+        let tag_local = param_count as u32; // reuse first scratch local
+        func.instruction(&Instruction::LocalGet(1));
+        func.instruction(&Instruction::I32Const(UTF16_TAG));
+        func.instruction(&Instruction::I32And);
+        func.instruction(&Instruction::LocalSet(tag_local));
+        func.instruction(&Instruction::LocalGet(1));
+        func.instruction(&Instruction::I32Const(!UTF16_TAG));
+        func.instruction(&Instruction::I32And);
+        func.instruction(&Instruction::LocalSet(1));
+
+        func.instruction(&Instruction::LocalGet(tag_local));
+        func.instruction(&Instruction::If(block_ty));
+        {
+            // Tag set: source is UTF-16 already → verbatim code-unit copy.
+            self.emit_utf16_verbatim_copy(func, param_count, target_func, options);
+        }
+        func.instruction(&Instruction::Else);
+        {
+            // Tag clear: pure Latin-1 → zero-extend each byte.
+            self.emit_latin1_pure_to_utf16_transcode(func, param_count, target_func, options);
+        }
+        func.instruction(&Instruction::End);
+    }
+
+    /// Verbatim UTF-16 → UTF-16 code-unit copy across memories.
+    ///
+    /// Used by the `latin1+utf16` → UTF-16 transcoder when the source's tag
+    /// bit is set (the source is already UTF-16). Copies `count` (local 1)
+    /// code units = `2 * count` bytes from caller to callee memory, preserving
+    /// surrogate pairs byte-for-byte. Calls target with (out_ptr, count,
+    /// ...rest).
+    fn emit_utf16_verbatim_copy(
+        &self,
+        func: &mut Function,
+        param_count: usize,
+        target_func: u32,
+        options: &AdapterOptions,
+    ) {
+        let callee_realloc = match options.callee_realloc {
+            Some(idx) => idx,
+            None => {
+                log::warn!("UTF-16 verbatim copy: no callee realloc, falling back to direct call");
+                for i in 0..param_count {
+                    func.instruction(&Instruction::LocalGet(i as u32));
+                }
+                func.instruction(&Instruction::Call(target_func));
+                return;
+            }
+        };
+
+        // Scratch (after params): +1 = idx (code unit), +2 = out_ptr, +3 = cu.
+        // (+0 holds the tag flag, set by the caller; do not reuse it.)
+        let idx_local = param_count as u32 + 1;
+        let out_ptr_local = param_count as u32 + 2;
+        let cu_local = param_count as u32 + 3;
+
+        let src_mem16 = wasm_encoder::MemArg {
+            offset: 0,
+            align: 1,
+            memory_index: options.caller_memory,
+        };
+        let dst_mem16 = wasm_encoder::MemArg {
+            offset: 0,
+            align: 1,
+            memory_index: options.callee_memory,
+        };
+
+        // Allocate 2 * count bytes (LS-A-7: wrap guard + OOM guard).
+        let callee_align = alignment_for_encoding(options.callee_string_encoding);
+        func.instruction(&Instruction::LocalGet(1)); // count
+        func.instruction(&Instruction::I32Const((u32::MAX / 2) as i32));
+        func.instruction(&Instruction::I32GtU);
+        func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+        func.instruction(&Instruction::Unreachable);
+        func.instruction(&Instruction::End);
+
+        func.instruction(&Instruction::I32Const(0));
+        func.instruction(&Instruction::I32Const(0));
+        func.instruction(&Instruction::I32Const(callee_align));
+        func.instruction(&Instruction::LocalGet(1));
+        func.instruction(&Instruction::I32Const(2));
+        func.instruction(&Instruction::I32Mul);
+        func.instruction(&Instruction::Call(callee_realloc));
+        func.instruction(&Instruction::LocalSet(out_ptr_local));
+
+        func.instruction(&Instruction::LocalGet(out_ptr_local));
+        func.instruction(&Instruction::I32Eqz);
+        func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+        func.instruction(&Instruction::Unreachable);
+        func.instruction(&Instruction::End);
+
+        func.instruction(&Instruction::I32Const(0));
+        func.instruction(&Instruction::LocalSet(idx_local));
+
+        func.instruction(&Instruction::Block(wasm_encoder::BlockType::Empty));
+        func.instruction(&Instruction::Loop(wasm_encoder::BlockType::Empty));
+
+        func.instruction(&Instruction::LocalGet(idx_local));
+        func.instruction(&Instruction::LocalGet(1));
+        func.instruction(&Instruction::I32GeU);
+        func.instruction(&Instruction::BrIf(1));
+
+        // cu = mem16[src_ptr + idx*2]
+        func.instruction(&Instruction::LocalGet(0));
+        func.instruction(&Instruction::LocalGet(idx_local));
+        func.instruction(&Instruction::I32Const(1));
+        func.instruction(&Instruction::I32Shl);
+        func.instruction(&Instruction::I32Add);
+        func.instruction(&Instruction::I32Load16U(src_mem16));
+        func.instruction(&Instruction::LocalSet(cu_local));
+
+        // mem16[out_ptr + idx*2] = cu
+        func.instruction(&Instruction::LocalGet(out_ptr_local));
+        func.instruction(&Instruction::LocalGet(idx_local));
+        func.instruction(&Instruction::I32Const(1));
+        func.instruction(&Instruction::I32Shl);
+        func.instruction(&Instruction::I32Add);
+        func.instruction(&Instruction::LocalGet(cu_local));
+        func.instruction(&Instruction::I32Store16(dst_mem16));
+
+        func.instruction(&Instruction::LocalGet(idx_local));
+        func.instruction(&Instruction::I32Const(1));
+        func.instruction(&Instruction::I32Add);
+        func.instruction(&Instruction::LocalSet(idx_local));
+
+        func.instruction(&Instruction::Br(0));
+        func.instruction(&Instruction::End); // loop
+        func.instruction(&Instruction::End); // block
+
+        // Call target with (out_ptr, count, ...rest).
+        func.instruction(&Instruction::LocalGet(out_ptr_local));
+        func.instruction(&Instruction::LocalGet(1));
+        for i in 2..param_count {
+            func.instruction(&Instruction::LocalGet(i as u32));
+        }
+        func.instruction(&Instruction::Call(target_func));
+    }
+
+    /// The tag-clear (pure Latin-1) leg of `latin1+utf16` → UTF-16.
     ///
     /// This direction is **total and unambiguous**: every Latin-1 byte
     /// 0x00–0xFF maps to exactly one UTF-16 code unit U+0000–U+00FF by
@@ -4373,10 +5264,10 @@ impl FactStyleGenerator {
     /// (1:1), and the output buffer is exactly `2 * byte_len` bytes.
     ///
     /// Assumes params start with (ptr: i32, byte_len: i32) where byte_len is
-    /// the Latin-1 byte count (== char count). Calls target with
+    /// the (tag-masked) Latin-1 byte count (== char count). Calls target with
     /// (out_ptr: i32, code_unit_count: i32, ...rest); code_unit_count ==
     /// byte_len.
-    fn emit_latin1_to_utf16_transcode(
+    fn emit_latin1_pure_to_utf16_transcode(
         &self,
         func: &mut Function,
         param_count: usize,
@@ -4499,6 +5390,438 @@ impl FactStyleGenerator {
             func.instruction(&Instruction::LocalGet(i as u32));
         }
         func.instruction(&Instruction::Call(target_func));
+    }
+
+    /// Emit UTF-8 → `latin1+utf16` transcoding (#253).
+    ///
+    /// `latin1+utf16` (meld's [`StringEncoding::Latin1`]) is the Component
+    /// Model's compact representation: each string is EITHER pure Latin-1 (1
+    /// byte/char, length operand tag-clear) OR UTF-16 (2 bytes/code-unit,
+    /// length operand tagged with [`UTF16_TAG`]). This is therefore an
+    /// *encoder*, not a lossy down-conversion — it represents every input.
+    ///
+    /// Two-phase:
+    /// - **Phase A (scan):** decode the UTF-8 source; set `needs_utf16` if any
+    ///   decoded code point exceeds 0xFF (malformed input decodes to U+FFFD,
+    ///   which is > 0xFF, so it forces the UTF-16 representation).
+    /// - **Phase B (write):**
+    ///   - tag clear: decode again, write each code point as one Latin-1 byte;
+    ///     length = char count (no tag).
+    ///   - tag set: decode again, write UTF-16 (surrogate pairs for > 0xFFFF);
+    ///     length = `code_units | UTF16_TAG`.
+    ///
+    /// Output buffer is `2 * byte_len` bytes (the UTF-16 worst case, which also
+    /// bounds the Latin-1 case since char count ≤ byte_len). Mirrors the
+    /// LS-A-7 realloc/OOM/overflow guards.
+    fn emit_utf8_to_latin1_transcode(
+        &self,
+        func: &mut Function,
+        param_count: usize,
+        target_func: u32,
+        options: &AdapterOptions,
+        block_ty: wasm_encoder::BlockType,
+    ) {
+        let callee_realloc = match options.callee_realloc {
+            Some(idx) => idx,
+            None => {
+                log::warn!(
+                    "UTF-8→latin1+utf16 transcode: no callee realloc, falling back to direct call"
+                );
+                for i in 0..param_count {
+                    func.instruction(&Instruction::LocalGet(i as u32));
+                }
+                func.instruction(&Instruction::Call(target_func));
+                return;
+            }
+        };
+
+        // Locals: +0 src_idx, +1 flag/dst_idx, +2 out_ptr, +3 byte, +4 cp,
+        // +5 cont. `flag` (needs_utf16) lives in +1 only during the scan; the
+        // write phases re-use +1 as dst_idx.
+        let src_idx_local = param_count as u32;
+        let flag_local = param_count as u32 + 1;
+        let dst_idx_local = param_count as u32 + 1;
+        let out_ptr_local = param_count as u32 + 2;
+        let byte_local = param_count as u32 + 3;
+        let cp_local = param_count as u32 + 4;
+        let cont_local = param_count as u32 + 5;
+
+        let src_mem8 = wasm_encoder::MemArg {
+            offset: 0,
+            align: 0,
+            memory_index: options.caller_memory,
+        };
+        let dst_mem8 = wasm_encoder::MemArg {
+            offset: 0,
+            align: 0,
+            memory_index: options.callee_memory,
+        };
+        let dst_mem16 = wasm_encoder::MemArg {
+            offset: 0,
+            align: 1,
+            memory_index: options.callee_memory,
+        };
+
+        // Allocate 2 * byte_len bytes (UTF-16 worst case; bounds Latin-1 too).
+        let callee_align = alignment_for_encoding(options.callee_string_encoding);
+        func.instruction(&Instruction::LocalGet(1)); // byte_len
+        func.instruction(&Instruction::I32Const((u32::MAX / 2) as i32));
+        func.instruction(&Instruction::I32GtU);
+        func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+        func.instruction(&Instruction::Unreachable);
+        func.instruction(&Instruction::End);
+
+        func.instruction(&Instruction::I32Const(0));
+        func.instruction(&Instruction::I32Const(0));
+        func.instruction(&Instruction::I32Const(callee_align));
+        func.instruction(&Instruction::LocalGet(1));
+        func.instruction(&Instruction::I32Const(2));
+        func.instruction(&Instruction::I32Mul);
+        func.instruction(&Instruction::Call(callee_realloc));
+        func.instruction(&Instruction::LocalSet(out_ptr_local));
+
+        func.instruction(&Instruction::LocalGet(out_ptr_local));
+        func.instruction(&Instruction::I32Eqz);
+        func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+        func.instruction(&Instruction::Unreachable);
+        func.instruction(&Instruction::End);
+
+        // --- Phase A: scan to decide latin1-vs-utf16. ---
+        func.instruction(&Instruction::I32Const(0));
+        func.instruction(&Instruction::LocalSet(flag_local)); // needs_utf16 = 0
+        func.instruction(&Instruction::I32Const(0));
+        func.instruction(&Instruction::LocalSet(src_idx_local));
+
+        func.instruction(&Instruction::Block(wasm_encoder::BlockType::Empty));
+        func.instruction(&Instruction::Loop(wasm_encoder::BlockType::Empty));
+        func.instruction(&Instruction::LocalGet(src_idx_local));
+        func.instruction(&Instruction::LocalGet(1));
+        func.instruction(&Instruction::I32GeU);
+        func.instruction(&Instruction::BrIf(1));
+
+        emit_utf8_decode_codepoint(
+            func,
+            src_mem8,
+            0,
+            src_idx_local,
+            1,
+            byte_local,
+            cp_local,
+            cont_local,
+        );
+        // if cp > 0xFF: needs_utf16 = 1
+        func.instruction(&Instruction::LocalGet(cp_local));
+        func.instruction(&Instruction::I32Const(0xFF));
+        func.instruction(&Instruction::I32GtU);
+        func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+        func.instruction(&Instruction::I32Const(1));
+        func.instruction(&Instruction::LocalSet(flag_local));
+        func.instruction(&Instruction::End);
+
+        func.instruction(&Instruction::Br(0));
+        func.instruction(&Instruction::End); // loop
+        func.instruction(&Instruction::End); // block
+
+        // --- Phase B: write, branching on the flag. ---
+        func.instruction(&Instruction::LocalGet(flag_local));
+        func.instruction(&Instruction::If(block_ty));
+        {
+            // UTF-16 representation (tag set).
+            func.instruction(&Instruction::I32Const(0));
+            func.instruction(&Instruction::LocalSet(src_idx_local));
+            func.instruction(&Instruction::I32Const(0));
+            func.instruction(&Instruction::LocalSet(dst_idx_local));
+
+            func.instruction(&Instruction::Block(wasm_encoder::BlockType::Empty));
+            func.instruction(&Instruction::Loop(wasm_encoder::BlockType::Empty));
+            func.instruction(&Instruction::LocalGet(src_idx_local));
+            func.instruction(&Instruction::LocalGet(1));
+            func.instruction(&Instruction::I32GeU);
+            func.instruction(&Instruction::BrIf(1));
+
+            emit_utf8_decode_codepoint(
+                func,
+                src_mem8,
+                0,
+                src_idx_local,
+                1,
+                byte_local,
+                cp_local,
+                cont_local,
+            );
+            emit_utf16_encode_codepoint(func, dst_mem16, out_ptr_local, dst_idx_local, cp_local);
+
+            func.instruction(&Instruction::Br(0));
+            func.instruction(&Instruction::End); // loop
+            func.instruction(&Instruction::End); // block
+
+            // Call target with (out_ptr, code_units | UTF16_TAG, ...rest).
+            func.instruction(&Instruction::LocalGet(out_ptr_local));
+            func.instruction(&Instruction::LocalGet(dst_idx_local));
+            func.instruction(&Instruction::I32Const(UTF16_TAG));
+            func.instruction(&Instruction::I32Or);
+            for i in 2..param_count {
+                func.instruction(&Instruction::LocalGet(i as u32));
+            }
+            func.instruction(&Instruction::Call(target_func));
+        }
+        func.instruction(&Instruction::Else);
+        {
+            // Latin-1 representation (tag clear). cp <= 0xFF for all chars.
+            func.instruction(&Instruction::I32Const(0));
+            func.instruction(&Instruction::LocalSet(src_idx_local));
+            func.instruction(&Instruction::I32Const(0));
+            func.instruction(&Instruction::LocalSet(dst_idx_local));
+
+            func.instruction(&Instruction::Block(wasm_encoder::BlockType::Empty));
+            func.instruction(&Instruction::Loop(wasm_encoder::BlockType::Empty));
+            func.instruction(&Instruction::LocalGet(src_idx_local));
+            func.instruction(&Instruction::LocalGet(1));
+            func.instruction(&Instruction::I32GeU);
+            func.instruction(&Instruction::BrIf(1));
+
+            emit_utf8_decode_codepoint(
+                func,
+                src_mem8,
+                0,
+                src_idx_local,
+                1,
+                byte_local,
+                cp_local,
+                cont_local,
+            );
+            // out[dst_idx] = cp (one Latin-1 byte)
+            func.instruction(&Instruction::LocalGet(out_ptr_local));
+            func.instruction(&Instruction::LocalGet(dst_idx_local));
+            func.instruction(&Instruction::I32Add);
+            func.instruction(&Instruction::LocalGet(cp_local));
+            func.instruction(&Instruction::I32Store8(dst_mem8));
+            func.instruction(&Instruction::LocalGet(dst_idx_local));
+            func.instruction(&Instruction::I32Const(1));
+            func.instruction(&Instruction::I32Add);
+            func.instruction(&Instruction::LocalSet(dst_idx_local));
+
+            func.instruction(&Instruction::Br(0));
+            func.instruction(&Instruction::End); // loop
+            func.instruction(&Instruction::End); // block
+
+            // Call target with (out_ptr, char_count, ...rest) — tag clear.
+            func.instruction(&Instruction::LocalGet(out_ptr_local));
+            func.instruction(&Instruction::LocalGet(dst_idx_local));
+            for i in 2..param_count {
+                func.instruction(&Instruction::LocalGet(i as u32));
+            }
+            func.instruction(&Instruction::Call(target_func));
+        }
+        func.instruction(&Instruction::End); // end flag branch
+    }
+
+    /// Emit UTF-16 → `latin1+utf16` transcoding (#253).
+    ///
+    /// The mirror of [`Self::emit_utf8_to_latin1_transcode`] for a UTF-16
+    /// source. The source length operand (local 1) is a code-unit count.
+    /// Two-phase: scan the UTF-16 code units (decoding surrogate pairs and
+    /// replacing lone surrogates with U+FFFD per the Canonical ABI) to decide
+    /// latin1-vs-utf16; then write the chosen representation. The output buffer
+    /// is `2 * code_units` bytes (the UTF-16-verbatim worst case).
+    fn emit_utf16_to_latin1_transcode(
+        &self,
+        func: &mut Function,
+        param_count: usize,
+        target_func: u32,
+        options: &AdapterOptions,
+        block_ty: wasm_encoder::BlockType,
+    ) {
+        let callee_realloc = match options.callee_realloc {
+            Some(idx) => idx,
+            None => {
+                log::warn!(
+                    "UTF-16→latin1+utf16 transcode: no callee realloc, falling back to direct call"
+                );
+                for i in 0..param_count {
+                    func.instruction(&Instruction::LocalGet(i as u32));
+                }
+                func.instruction(&Instruction::Call(target_func));
+                return;
+            }
+        };
+
+        // Locals: +0 src_idx (code units), +1 flag/dst_idx, +2 out_ptr,
+        // +3 cu, +4 cp, +5 cu2.
+        let src_idx_local = param_count as u32;
+        let flag_local = param_count as u32 + 1;
+        let dst_idx_local = param_count as u32 + 1;
+        let out_ptr_local = param_count as u32 + 2;
+        let cu_local = param_count as u32 + 3;
+        let cp_local = param_count as u32 + 4;
+        let cu2_local = param_count as u32 + 5;
+
+        let src_mem16 = wasm_encoder::MemArg {
+            offset: 0,
+            align: 1,
+            memory_index: options.caller_memory,
+        };
+        let dst_mem8 = wasm_encoder::MemArg {
+            offset: 0,
+            align: 0,
+            memory_index: options.callee_memory,
+        };
+        let dst_mem16 = wasm_encoder::MemArg {
+            offset: 0,
+            align: 1,
+            memory_index: options.callee_memory,
+        };
+
+        // Allocate 2 * code_units bytes.
+        let callee_align = alignment_for_encoding(options.callee_string_encoding);
+        func.instruction(&Instruction::LocalGet(1));
+        func.instruction(&Instruction::I32Const((u32::MAX / 2) as i32));
+        func.instruction(&Instruction::I32GtU);
+        func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+        func.instruction(&Instruction::Unreachable);
+        func.instruction(&Instruction::End);
+
+        func.instruction(&Instruction::I32Const(0));
+        func.instruction(&Instruction::I32Const(0));
+        func.instruction(&Instruction::I32Const(callee_align));
+        func.instruction(&Instruction::LocalGet(1));
+        func.instruction(&Instruction::I32Const(2));
+        func.instruction(&Instruction::I32Mul);
+        func.instruction(&Instruction::Call(callee_realloc));
+        func.instruction(&Instruction::LocalSet(out_ptr_local));
+
+        func.instruction(&Instruction::LocalGet(out_ptr_local));
+        func.instruction(&Instruction::I32Eqz);
+        func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+        func.instruction(&Instruction::Unreachable);
+        func.instruction(&Instruction::End);
+
+        // --- Phase A: scan to decide latin1-vs-utf16. ---
+        func.instruction(&Instruction::I32Const(0));
+        func.instruction(&Instruction::LocalSet(flag_local));
+        func.instruction(&Instruction::I32Const(0));
+        func.instruction(&Instruction::LocalSet(src_idx_local));
+
+        func.instruction(&Instruction::Block(wasm_encoder::BlockType::Empty));
+        func.instruction(&Instruction::Loop(wasm_encoder::BlockType::Empty));
+        func.instruction(&Instruction::LocalGet(src_idx_local));
+        func.instruction(&Instruction::LocalGet(1));
+        func.instruction(&Instruction::I32GeU);
+        func.instruction(&Instruction::BrIf(1));
+
+        emit_utf16_decode_codepoint(
+            func,
+            src_mem16,
+            0,
+            src_idx_local,
+            1,
+            cu_local,
+            cp_local,
+            cu2_local,
+        );
+        func.instruction(&Instruction::LocalGet(cp_local));
+        func.instruction(&Instruction::I32Const(0xFF));
+        func.instruction(&Instruction::I32GtU);
+        func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+        func.instruction(&Instruction::I32Const(1));
+        func.instruction(&Instruction::LocalSet(flag_local));
+        func.instruction(&Instruction::End);
+
+        func.instruction(&Instruction::Br(0));
+        func.instruction(&Instruction::End); // loop
+        func.instruction(&Instruction::End); // block
+
+        // --- Phase B: write, branching on the flag. ---
+        func.instruction(&Instruction::LocalGet(flag_local));
+        func.instruction(&Instruction::If(block_ty));
+        {
+            // UTF-16 representation (tag set). Re-decode and re-encode rather
+            // than verbatim-copy so lone surrogates are normalised to U+FFFD
+            // consistently with phase A's decision.
+            func.instruction(&Instruction::I32Const(0));
+            func.instruction(&Instruction::LocalSet(src_idx_local));
+            func.instruction(&Instruction::I32Const(0));
+            func.instruction(&Instruction::LocalSet(dst_idx_local));
+
+            func.instruction(&Instruction::Block(wasm_encoder::BlockType::Empty));
+            func.instruction(&Instruction::Loop(wasm_encoder::BlockType::Empty));
+            func.instruction(&Instruction::LocalGet(src_idx_local));
+            func.instruction(&Instruction::LocalGet(1));
+            func.instruction(&Instruction::I32GeU);
+            func.instruction(&Instruction::BrIf(1));
+
+            emit_utf16_decode_codepoint(
+                func,
+                src_mem16,
+                0,
+                src_idx_local,
+                1,
+                cu_local,
+                cp_local,
+                cu2_local,
+            );
+            emit_utf16_encode_codepoint(func, dst_mem16, out_ptr_local, dst_idx_local, cp_local);
+
+            func.instruction(&Instruction::Br(0));
+            func.instruction(&Instruction::End); // loop
+            func.instruction(&Instruction::End); // block
+
+            func.instruction(&Instruction::LocalGet(out_ptr_local));
+            func.instruction(&Instruction::LocalGet(dst_idx_local));
+            func.instruction(&Instruction::I32Const(UTF16_TAG));
+            func.instruction(&Instruction::I32Or);
+            for i in 2..param_count {
+                func.instruction(&Instruction::LocalGet(i as u32));
+            }
+            func.instruction(&Instruction::Call(target_func));
+        }
+        func.instruction(&Instruction::Else);
+        {
+            // Latin-1 representation (tag clear). cp <= 0xFF for all code points.
+            func.instruction(&Instruction::I32Const(0));
+            func.instruction(&Instruction::LocalSet(src_idx_local));
+            func.instruction(&Instruction::I32Const(0));
+            func.instruction(&Instruction::LocalSet(dst_idx_local));
+
+            func.instruction(&Instruction::Block(wasm_encoder::BlockType::Empty));
+            func.instruction(&Instruction::Loop(wasm_encoder::BlockType::Empty));
+            func.instruction(&Instruction::LocalGet(src_idx_local));
+            func.instruction(&Instruction::LocalGet(1));
+            func.instruction(&Instruction::I32GeU);
+            func.instruction(&Instruction::BrIf(1));
+
+            emit_utf16_decode_codepoint(
+                func,
+                src_mem16,
+                0,
+                src_idx_local,
+                1,
+                cu_local,
+                cp_local,
+                cu2_local,
+            );
+            func.instruction(&Instruction::LocalGet(out_ptr_local));
+            func.instruction(&Instruction::LocalGet(dst_idx_local));
+            func.instruction(&Instruction::I32Add);
+            func.instruction(&Instruction::LocalGet(cp_local));
+            func.instruction(&Instruction::I32Store8(dst_mem8));
+            func.instruction(&Instruction::LocalGet(dst_idx_local));
+            func.instruction(&Instruction::I32Const(1));
+            func.instruction(&Instruction::I32Add);
+            func.instruction(&Instruction::LocalSet(dst_idx_local));
+
+            func.instruction(&Instruction::Br(0));
+            func.instruction(&Instruction::End); // loop
+            func.instruction(&Instruction::End); // block
+
+            func.instruction(&Instruction::LocalGet(out_ptr_local));
+            func.instruction(&Instruction::LocalGet(dst_idx_local));
+            for i in 2..param_count {
+                func.instruction(&Instruction::LocalGet(i as u32));
+            }
+            func.instruction(&Instruction::Call(target_func));
+        }
+        func.instruction(&Instruction::End); // end flag branch
     }
 
     /// Resolve the target function index in the merged module
@@ -4886,6 +6209,11 @@ impl FactStyleGenerator {
                         caller_memory,
                         callee_memory,
                         l_p2 + 1,
+                        // Result-side: governed by the callee's string encoding.
+                        matches!(
+                            site.requirements.callee_encoding,
+                            Some(crate::parser::CanonStringEncoding::CompactUtf16)
+                        ),
                     );
                 } else {
                     // Non-pointer results: write globals directly to retptr
@@ -5015,26 +6343,31 @@ impl FactStyleGenerator {
                 })
                 .unwrap_or(1);
 
-            // Allocate: cabi_realloc(0, 0, 1, len * byte_mult)
+            // Param-side (caller → callee) async copy. This path has no
+            // `AdapterOptions`, but the governing caller string encoding is
+            // carried by `site.requirements.caller_encoding`; CompactUtf16 is
+            // the `latin1+utf16` encoding (mapped to `StringEncoding::Latin1`
+            // by `canon_to_string_encoding`). A byte-granular buffer
+            // (byte_mult == 1) in such a component is a tag-encoded string,
+            // so mask/double its byte count; the forwarded length stays tagged.
+            let is_compact_utf16 = matches!(
+                site.requirements.caller_encoding,
+                Some(crate::parser::CanonStringEncoding::CompactUtf16)
+            ) && byte_mult == 1;
+            let realloc_align = if is_compact_utf16 { 2 } else { 1 };
+
+            // Allocate: cabi_realloc(0, 0, align, <byte count>)
             emit_overflow_guard(body, len_local, byte_mult);
             body.instruction(&Instruction::I32Const(0));
             body.instruction(&Instruction::I32Const(0));
-            body.instruction(&Instruction::I32Const(1));
-            body.instruction(&Instruction::LocalGet(len_local));
-            if byte_mult > 1 {
-                body.instruction(&Instruction::I32Const(byte_mult as i32));
-                body.instruction(&Instruction::I32Mul);
-            }
+            body.instruction(&Instruction::I32Const(realloc_align));
+            emit_copy_byte_count(body, len_local, byte_mult, is_compact_utf16);
             emit_checked_realloc(body, realloc, l_new_ptr);
 
-            // Copy: memory.copy new_ptr <- old_ptr, len * byte_mult
+            // Copy: memory.copy new_ptr <- old_ptr, <byte count>
             body.instruction(&Instruction::LocalGet(l_new_ptr));
             body.instruction(&Instruction::LocalGet(ptr_local));
-            body.instruction(&Instruction::LocalGet(len_local));
-            if byte_mult > 1 {
-                body.instruction(&Instruction::I32Const(byte_mult as i32));
-                body.instruction(&Instruction::I32Mul);
-            }
+            emit_copy_byte_count(body, len_local, byte_mult, is_compact_utf16);
             body.instruction(&Instruction::MemoryCopy {
                 dst_mem: callee_memory,
                 src_mem: caller_memory,
@@ -5082,6 +6415,12 @@ impl FactStyleGenerator {
         caller_memory: u32,
         callee_memory: u32,
         scratch_base: u32,
+        // True when the *callee* string encoding is `latin1+utf16`
+        // (CompactUtf16). A byte-granular result buffer (`elem_size == 1`,
+        // i.e. a top-level `string`) then carries a tag-encoded length whose
+        // byte count must be masked/doubled. The len written back to the
+        // retptr stays tagged. #253.
+        callee_compact_utf16: bool,
     ) {
         let (ptr_global, _) = info.result_globals[0];
         let (len_global, _) = info.result_globals[1];
@@ -5112,19 +6451,20 @@ impl FactStyleGenerator {
         body.instruction(&Instruction::GlobalGet(len_global));
         body.instruction(&Instruction::LocalSet(l_src_len));
 
-        // byte_count = len * elem_size, with LS-A-7 overflow guard
+        // A top-level byte-granular result (elem_size == 1) in a latin1+utf16
+        // callee is a tag-encoded string; its byte count must be masked/doubled.
+        let top_compact_utf16 = callee_compact_utf16 && elem_size == 1;
+        // byte_count = <tag-aware byte count> | len * elem_size, with LS-A-7 guard
         emit_overflow_guard(body, l_src_len, elem_size);
-        body.instruction(&Instruction::LocalGet(l_src_len));
-        if elem_size != 1 {
-            body.instruction(&Instruction::I32Const(elem_size as i32));
-            body.instruction(&Instruction::I32Mul);
-        }
+        emit_copy_byte_count(body, l_src_len, elem_size, top_compact_utf16);
         body.instruction(&Instruction::LocalSet(l_byte_count));
 
-        // Allocate in caller memory: cabi_realloc(0, 0, align, byte_count)
+        // Allocate in caller memory: cabi_realloc(0, 0, align, byte_count).
+        // A utf16 payload needs 2-byte alignment.
+        let realloc_align = if top_compact_utf16 { 2 } else { elem_align };
         body.instruction(&Instruction::I32Const(0)); // old_ptr
         body.instruction(&Instruction::I32Const(0)); // old_size
-        body.instruction(&Instruction::I32Const(elem_align as i32));
+        body.instruction(&Instruction::I32Const(realloc_align as i32));
         body.instruction(&Instruction::LocalGet(l_byte_count));
         emit_checked_realloc(body, caller_realloc_func, l_dst_ptr);
 
@@ -5151,6 +6491,7 @@ impl FactStyleGenerator {
                 caller_realloc_func,
                 caller_memory,
                 callee_memory,
+                callee_compact_utf16,
             );
         }
 
@@ -5438,6 +6779,11 @@ impl FactStyleGenerator {
                         caller_memory,
                         callee_memory,
                         l_scratch + 1,
+                        // Result-side: governed by the callee's string encoding.
+                        matches!(
+                            site.requirements.callee_encoding,
+                            Some(crate::parser::CanonStringEncoding::CompactUtf16)
+                        ),
                     );
                 } else {
                     // Non-pointer results: write globals directly to retptr
@@ -5705,6 +7051,7 @@ mod tests {
             /* elem_size = */ 8, // record { ptr:i32, len:i32 } = 8 bytes
             /* l_first_scratch = */ 3, /* realloc_func = */ 99,
             /* caller_memory = */ 0, /* callee_memory = */ 1,
+            /* callee_compact_utf16 = */ false,
         );
 
         // wasm_encoder::Function has no public bytes() accessor on stable;
@@ -5834,10 +7181,15 @@ mod tests {
 
     #[test]
     fn test_sr17_alignment_for_latin1() {
+        // #253: `Latin1` is meld's model of the canonical-ABI `latin1+utf16`
+        // encoding. Its string buffer may hold UTF-16 code units (the tag-set
+        // representation), so the canonical ABI requires 2-byte alignment for
+        // the string pointer — NOT 1. (A pure-Latin-1-only encoding would be 1,
+        // but meld has no such encoding; Latin1 IS latin1+utf16.)
         assert_eq!(
             alignment_for_encoding(StringEncoding::Latin1),
-            1,
-            "SR-17: Latin-1 alignment should be 1 (byte-aligned)"
+            2,
+            "#253: latin1+utf16 alignment should be 2 (buffer may hold UTF-16)"
         );
     }
 
@@ -5995,7 +7347,17 @@ mod tests {
         } else if options.caller_string_encoding == StringEncoding::Latin1
             && options.callee_string_encoding == StringEncoding::Utf8
         {
-            gen_.emit_latin1_to_utf8_transcode(&mut f, 2, 0, &options);
+            // The test only inspects the emitted byte patterns (it never
+            // validates or runs the body), so the tag-dispatch block type is
+            // immaterial here; Empty keeps the raw body well-formed for the
+            // structural pattern checks.
+            gen_.emit_latin1_to_utf8_transcode(
+                &mut f,
+                2,
+                0,
+                &options,
+                wasm_encoder::BlockType::Empty,
+            );
         } else {
             panic!("unsupported encoding pair for test");
         }
