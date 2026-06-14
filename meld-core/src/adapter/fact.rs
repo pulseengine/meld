@@ -7800,6 +7800,17 @@ impl FactStyleGenerator {
         // count does not exceed 6. Top addressable index stays offset 26 < 27 —
         // the inc-4a budget already fits, no further growth. Proven by
         // `inc4b_callback_adapter_dest_latin1_locals_within_budget`.
+        //
+        // #272 inc 4c (latin1 RESULT-side transcode): the result-writeback REUSES
+        // the SAME `transcode_base = l_p2 + 16` block for the FOUR latin1 result
+        // directions (callee→caller), each using the same ≤ 6 scratch
+        // (`l_p2 + 16 ..= l_p2 + 21`, offsets 21..=26) the inc-4a/4b PARAM loops
+        // occupy. Param transcode (step 0.5) and result transcode (step 3) are
+        // never simultaneously live, and offsets 21..=26 do not overlap the
+        // result-writeback/nested region `l_p2 + 1 ..= l_p2 + 10` (offsets
+        // 6..=15) live during step 3 — so NO growth; top index stays offset 26
+        // < 27. Proven by
+        // `inc4c_callback_adapter_latin1_result_locals_within_budget`.
         let mut body = Function::new([(27, wasm_encoder::ValType::I32)]);
 
         // Step 0.5: copy string/list params from caller to callee memory.
@@ -8668,6 +8679,53 @@ impl FactStyleGenerator {
                 Some(crate::parser::CanonStringEncoding::Utf8)
             );
 
+        // #272 inc 4c: the FOUR latin1 (CompactUtf16) RESULT directions —
+        // mirroring the inc-4a/4b latin1 PARAM directions but `callee → caller`
+        // (a result is produced by the callee, read by the caller). SOURCE =
+        // callee memory, DEST = caller memory, realloc in CALLER memory via
+        // `caller_realloc_func`. Each calls the matching already-runtime-verified
+        // loop fn (inc 4a/4b); the loop fn does its OWN realloc internally (the
+        // writeback does NOT pre-size), rewrites `l_src_ptr` → out_ptr and
+        // `l_src_len` → the (possibly tagged) OUTPUT length, and `out_ptr_local =
+        // l_dst_ptr` keeps the `(l_dst_ptr, l_src_len)` retptr write below
+        // correct.
+        //   * callee CompactUtf16 → caller Utf16 ⇒ emit_latin1_to_utf16 (2*count)
+        //   * callee CompactUtf16 → caller Utf8  ⇒ emit_latin1_to_utf8  (3*count)
+        //   * callee Utf8  → caller CompactUtf16 ⇒ emit_utf8_to_latin1  (2*len)
+        //   * callee Utf16 → caller CompactUtf16 ⇒ emit_utf16_to_latin1 (2*len)
+        let callee_is_latin1 = matches!(
+            callee_encoding,
+            Some(crate::parser::CanonStringEncoding::CompactUtf16)
+        );
+        let caller_is_latin1 = matches!(
+            caller_encoding,
+            Some(crate::parser::CanonStringEncoding::CompactUtf16)
+        );
+        let result_transcode_latin1_to_utf16 = top_level_byte_string
+            && callee_is_latin1
+            && matches!(
+                caller_encoding,
+                Some(crate::parser::CanonStringEncoding::Utf16)
+            );
+        let result_transcode_latin1_to_utf8 = top_level_byte_string
+            && callee_is_latin1
+            && matches!(
+                caller_encoding,
+                Some(crate::parser::CanonStringEncoding::Utf8)
+            );
+        let result_transcode_utf8_to_latin1 = top_level_byte_string
+            && caller_is_latin1
+            && matches!(
+                callee_encoding,
+                Some(crate::parser::CanonStringEncoding::Utf8)
+            );
+        let result_transcode_utf16_to_latin1 = top_level_byte_string
+            && caller_is_latin1
+            && matches!(
+                callee_encoding,
+                Some(crate::parser::CanonStringEncoding::Utf16)
+            );
+
         if result_transcode_utf8_to_utf16 {
             // SOURCE = callee memory (UTF-8 bytes), DEST = caller memory
             // (UTF-16 code units). Realloc worst case 2*len bytes (each UTF-8
@@ -8732,6 +8790,155 @@ impl FactStyleGenerator {
                 transcode_base + 2, // cp
                 transcode_base + 3, // cu
                 transcode_base + 4, // cu2
+            );
+        } else if result_transcode_latin1_to_utf16 {
+            // callee CompactUtf16 → caller Utf16. SOURCE = callee memory (a
+            // tag-encoded latin1+utf16 buffer; tag-clear → Latin-1 bytes,
+            // tag-set → verbatim UTF-16 code units), DEST = caller memory
+            // (UTF-16). `l_src_len` holds the TAGGED source length; the loop
+            // masks it and rewrites `l_src_len` to the UNTAGGED output code-unit
+            // count. The loop reallocs internally (2*count, align 2). 4 scratch.
+            let src_mem8 = wasm_encoder::MemArg {
+                offset: 0,
+                align: 0,
+                memory_index: callee_memory,
+            };
+            let src_mem16 = wasm_encoder::MemArg {
+                offset: 0,
+                align: 1,
+                memory_index: callee_memory,
+            };
+            let dst_mem16 = wasm_encoder::MemArg {
+                offset: 0,
+                align: 1,
+                memory_index: caller_memory,
+            };
+            emit_latin1_to_utf16_transcode_param(
+                body,
+                caller_realloc_func,
+                src_mem8,
+                src_mem16,
+                dst_mem16,
+                l_src_ptr,
+                l_src_len,
+                l_dst_ptr,
+                transcode_base,     // tag
+                transcode_base + 1, // idx
+                transcode_base + 2, // count
+                transcode_base + 3, // unit
+            );
+        } else if result_transcode_latin1_to_utf8 {
+            // callee CompactUtf16 → caller Utf8. SOURCE = callee memory
+            // (tag-encoded), DEST = caller memory (UTF-8). The loop reallocs
+            // internally (3*count, align 1) and rewrites `l_src_len` to the
+            // output UTF-8 byte count. 6 scratch.
+            let src_mem8 = wasm_encoder::MemArg {
+                offset: 0,
+                align: 0,
+                memory_index: callee_memory,
+            };
+            let src_mem16 = wasm_encoder::MemArg {
+                offset: 0,
+                align: 1,
+                memory_index: callee_memory,
+            };
+            let dst_mem8 = wasm_encoder::MemArg {
+                offset: 0,
+                align: 0,
+                memory_index: caller_memory,
+            };
+            emit_latin1_to_utf8_transcode_param(
+                body,
+                caller_realloc_func,
+                1, // realloc align (utf-8 caller, byte-granular)
+                src_mem8,
+                src_mem16,
+                dst_mem8,
+                l_src_ptr,
+                l_src_len,
+                l_dst_ptr,
+                transcode_base,     // tag
+                transcode_base + 1, // src_idx
+                transcode_base + 2, // dst_idx / out byte count
+                transcode_base + 3, // cp
+                transcode_base + 4, // cu
+                transcode_base + 5, // cu2
+            );
+        } else if result_transcode_utf8_to_latin1 {
+            // callee Utf8 → caller CompactUtf16. SOURCE = callee memory (UTF-8),
+            // DEST = caller memory (latin1+utf16, two-phase tag-PRODUCING). The
+            // loop reallocs internally (2*len, align 2) and rewrites `l_src_len`
+            // to the TAGGED output length (Latin-1 byte count, tag clear; or
+            // UTF-16 code-unit count | UTF16_TAG, tag set) — the retptr len stays
+            // tagged, exactly as a latin1+utf16 caller reads it. 6 scratch.
+            let src_mem8 = wasm_encoder::MemArg {
+                offset: 0,
+                align: 0,
+                memory_index: callee_memory,
+            };
+            let dst_mem8 = wasm_encoder::MemArg {
+                offset: 0,
+                align: 0,
+                memory_index: caller_memory,
+            };
+            let dst_mem16 = wasm_encoder::MemArg {
+                offset: 0,
+                align: 1,
+                memory_index: caller_memory,
+            };
+            emit_utf8_to_latin1_transcode_param(
+                body,
+                caller_realloc_func,
+                2, // realloc align (latin1+utf16 caller, utf16-worst-case)
+                src_mem8,
+                dst_mem8,
+                dst_mem16,
+                l_src_ptr,
+                l_src_len,
+                l_dst_ptr,
+                transcode_base,     // flag (needs_utf16)
+                transcode_base + 1, // src_idx
+                transcode_base + 2, // dst_idx
+                transcode_base + 3, // byte
+                transcode_base + 4, // cp
+                transcode_base + 5, // cont
+            );
+        } else if result_transcode_utf16_to_latin1 {
+            // callee Utf16 → caller CompactUtf16. SOURCE = callee memory
+            // (UTF-16), DEST = caller memory (latin1+utf16, two-phase
+            // tag-PRODUCING). The loop reallocs internally (2*len, align 2) and
+            // rewrites `l_src_len` to the TAGGED output length. 6 scratch.
+            let src_mem16 = wasm_encoder::MemArg {
+                offset: 0,
+                align: 1,
+                memory_index: callee_memory,
+            };
+            let dst_mem8 = wasm_encoder::MemArg {
+                offset: 0,
+                align: 0,
+                memory_index: caller_memory,
+            };
+            let dst_mem16 = wasm_encoder::MemArg {
+                offset: 0,
+                align: 1,
+                memory_index: caller_memory,
+            };
+            emit_utf16_to_latin1_transcode_param(
+                body,
+                caller_realloc_func,
+                2, // realloc align (latin1+utf16 caller, utf16-worst-case)
+                src_mem16,
+                dst_mem8,
+                dst_mem16,
+                l_src_ptr,
+                l_src_len,
+                l_dst_ptr,
+                transcode_base,     // flag (needs_utf16)
+                transcode_base + 1, // src_idx
+                transcode_base + 2, // dst_idx
+                transcode_base + 3, // cu
+                transcode_base + 4, // cp
+                transcode_base + 5, // cu2
             );
         } else {
             // A top-level byte-granular result (elem_size == 1) in a latin1+utf16
@@ -8988,6 +9195,16 @@ impl FactStyleGenerator {
         // stays `l_scratch + 17` < 18, so the budget already fits with NO
         // growth. Proven by
         // `inc4b_stackful_adapter_dest_latin1_locals_within_budget`.
+        //
+        // #272 inc 4c (latin1 RESULT-side transcode): the result-writeback REUSES
+        // the SAME `transcode_base = l_scratch + 12` block for the FOUR latin1
+        // result directions (callee→caller), each using ≤ 6 scratch
+        // (`l_scratch + 12 ..= l_scratch + 17`, offsets 12..=17). Param (step
+        // 0.5) and result (step 3) transcodes are never simultaneously live, and
+        // offsets 12..=17 do not overlap the writeback/nested region `l_scratch +
+        // 1 ..= l_scratch + 10` (offsets 1..=10) live during step 3 — so NO
+        // growth; top index stays `l_scratch + 17` < 18. Proven by
+        // `inc4c_stackful_adapter_latin1_result_locals_within_budget`.
         let mut body = Function::new([(18, wasm_encoder::ValType::I32)]);
 
         // Step 0.5: cross-memory param copy (shared with callback path)
@@ -9183,10 +9400,13 @@ impl FactStyleGenerator {
     ///     encodings match, or there is no byte-granular `(ptr, len)` buffer at
     ///     all (a `list<u32>`/record-only call is encoding-independent); OR
     ///   * EVERY byte-granular PARAM is **top-level** AND its caller→callee
-    ///     direction is utf8↔utf16 (`emit_param_copy_step` transcodes it — #272
-    ///     inc 1/2), AND EVERY byte-granular RESULT is **top-level** AND its
-    ///     callee→caller direction is utf8↔utf16
-    ///     (`emit_ptr_pair_result_writeback` transcodes it — #272 inc 3).
+    ///     direction is one of the 6 implemented combos — utf8↔utf16 (#272 inc
+    ///     1/2), latin1↔utf8/utf16 (#272 inc 4a/4b) — (`emit_param_copy_step`
+    ///     transcodes it), AND EVERY byte-granular RESULT is **top-level** AND
+    ///     its callee→caller direction is one of the SAME 6 implemented combos —
+    ///     utf8↔utf16 (#272 inc 3), latin1↔utf8/utf16 (#272 inc 4c) —
+    ///     (`emit_ptr_pair_result_writeback` transcodes it). All 6 param AND all
+    ///     6 result directions are now implemented.
     ///
     /// DIRECTION SUBTLETY: a param crosses caller→callee, but a RESULT is
     /// produced by the callee and read by the caller, so its transcode
@@ -9195,12 +9415,13 @@ impl FactStyleGenerator {
     /// `result_transcode_*` triggers in `emit_ptr_pair_result_writeback`.
     ///
     /// EVERY other cross-encoding combo — a NESTED (`list<string>`) param OR
-    /// result, any latin1/CompactUtf16 direction — still FAILS LOUD, because
-    /// the emitters would otherwise raw-copy the bytes and silently
-    /// mis-transcode (the H-4.4 defect). This is safety-critical: the guard's
-    /// allow-predicate and the UNION of the emitter transcode-triggers (the
-    /// param triggers plus the result triggers) must be IDENTICAL — any
-    /// allow-but-not-transcode is silent corruption.
+    /// result (its inner string is still raw-copied by
+    /// `emit_patch_nested_indirections`) — still FAILS LOUD, because the
+    /// emitters would otherwise raw-copy the bytes and silently mis-transcode
+    /// (the H-4.4 defect). This is safety-critical: the guard's allow-predicate
+    /// and the UNION of the emitter transcode-triggers (the param triggers plus
+    /// the result triggers) must be IDENTICAL — any allow-but-not-transcode is
+    /// silent corruption.
     fn guard_async_cross_encoding_strings(site: &AdapterSite) -> Result<()> {
         if !site.crosses_memory {
             return Ok(());
@@ -9309,7 +9530,8 @@ impl FactStyleGenerator {
         // (`emit_{utf8,utf16}_to_latin1_transcode_param`) transcode exactly
         // these (scan → pick representation → tagged-length output), completing
         // all 6 PARAM directions. RESULT-side latin1 (a CompactUtf16 callee
-        // PRODUCING a result) and nested latin1 strings stay fail-loud.
+        // PRODUCING a result) is completed in #272 inc 4c below; only NESTED
+        // latin1 strings stay fail-loud.
         let direction_is_utf8_to_latin1 = matches!(
             site.requirements.caller_encoding,
             Some(crate::parser::CanonStringEncoding::Utf8)
@@ -9351,7 +9573,45 @@ impl FactStyleGenerator {
             site.requirements.caller_encoding,
             Some(crate::parser::CanonStringEncoding::Utf8)
         );
-        let result_dir_is_implemented = result_dir_is_utf8_to_utf16 || result_dir_is_utf16_to_utf8;
+        // #272 inc 4c: the FOUR latin1 (CompactUtf16) RESULT directions are now
+        // transcoded by `emit_ptr_pair_result_writeback` (mirroring the inc-4a/4b
+        // latin1 PARAM directions, but `callee → caller`). This MUST stay
+        // identical to the `result_transcode_latin1_*` / `result_transcode_*_to_latin1`
+        // triggers in `emit_ptr_pair_result_writeback`.
+        let result_callee_is_latin1 = matches!(
+            site.requirements.callee_encoding,
+            Some(crate::parser::CanonStringEncoding::CompactUtf16)
+        );
+        let result_caller_is_latin1 = matches!(
+            site.requirements.caller_encoding,
+            Some(crate::parser::CanonStringEncoding::CompactUtf16)
+        );
+        let result_dir_is_latin1_to_utf16 = result_callee_is_latin1
+            && matches!(
+                site.requirements.caller_encoding,
+                Some(crate::parser::CanonStringEncoding::Utf16)
+            );
+        let result_dir_is_latin1_to_utf8 = result_callee_is_latin1
+            && matches!(
+                site.requirements.caller_encoding,
+                Some(crate::parser::CanonStringEncoding::Utf8)
+            );
+        let result_dir_is_utf8_to_latin1 = result_caller_is_latin1
+            && matches!(
+                site.requirements.callee_encoding,
+                Some(crate::parser::CanonStringEncoding::Utf8)
+            );
+        let result_dir_is_utf16_to_latin1 = result_caller_is_latin1
+            && matches!(
+                site.requirements.callee_encoding,
+                Some(crate::parser::CanonStringEncoding::Utf16)
+            );
+        let result_dir_is_implemented = result_dir_is_utf8_to_utf16
+            || result_dir_is_utf16_to_utf8
+            || result_dir_is_latin1_to_utf16
+            || result_dir_is_latin1_to_utf8
+            || result_dir_is_utf8_to_latin1
+            || result_dir_is_utf16_to_latin1;
         // Every byte-granular RESULT must be a TOP-LEVEL byte-granular string
         // (directly `Bulk{1}` or a bare offset) AND the callee→caller direction
         // must be implemented — `emit_ptr_pair_result_writeback` only transcodes
@@ -9416,12 +9676,12 @@ impl FactStyleGenerator {
         Err(crate::Error::AdapterGeneration(format!(
             "async cross-encoding string transcoding is not yet supported \
              (caller {caller_enc:?} != callee {callee_enc:?}); only a \
-             top-level UTF-8 ↔ UTF-16 string param (#272 inc 1/2), a \
-             top-level UTF-8 ↔ UTF-16 string result (#272 inc 3), or a \
-             top-level latin1+utf16 ↔ UTF-16/UTF-8 string param (all 6 param \
-             directions, #272 inc 4a/4b) is implemented — a verbatim copy of \
-             any other case (nested list<string>, any latin1 result) would \
-             silently mis-transcode — see #272"
+             top-level string param (all 6 directions — UTF-8 ↔ UTF-16 #272 inc \
+             1/2, latin1+utf16 ↔ UTF-16/UTF-8 #272 inc 4a/4b) or a top-level \
+             string result (all 6 directions — UTF-8 ↔ UTF-16 #272 inc 3, \
+             latin1+utf16 ↔ UTF-16/UTF-8 #272 inc 4c) is implemented — a \
+             verbatim copy of any other case (a NESTED list<string> param or \
+             result) would silently mis-transcode — see #272"
         )))
     }
 
@@ -10309,12 +10569,13 @@ mod tests {
         );
     }
 
-    /// #272 inc 4a (scope guard, still fail-loud): a latin1-SOURCE RESULT string
-    /// is NOT in scope for inc 4a (result-side latin1 is a separate later
-    /// sub-increment). A latin1+utf16 callee PRODUCING a result read by a UTF-8
-    /// caller (result dir callee→caller = latin1→utf8) must STILL fail loud.
+    /// #272 inc 4c: a latin1-SOURCE (CompactUtf16) callee PRODUCING a top-level
+    /// RESULT string read by a UTF-8 caller (result dir callee→caller =
+    /// latin1→utf8) is now the IMPLEMENTED async transcode case — the result
+    /// writeback calls `emit_latin1_to_utf8_transcode_param`. Previously this
+    /// failed loud (inc 4a out of scope); inc 4c legitimately flips it to allow.
     #[test]
-    fn inc4a_async_latin1_result_still_fails_loud() {
+    fn inc4c_async_latin1_to_utf8_top_level_string_result_allowed() {
         use crate::parser::CanonStringEncoding;
         let mut site = async_lift_site("[async-lift]greet");
         site.crosses_memory = true;
@@ -10322,13 +10583,13 @@ mod tests {
         site.requirements.result_copy_layouts =
             vec![crate::resolver::CopyLayout::Bulk { byte_multiplier: 1 }];
         // caller=Utf8, callee=CompactUtf16 ⇒ result dir (callee→caller) =
-        // latin1→utf8, which the result writeback does NOT transcode.
+        // latin1→utf8, now transcoded by the result writeback.
         site.requirements.caller_encoding = Some(CanonStringEncoding::Utf8);
         site.requirements.callee_encoding = Some(CanonStringEncoding::CompactUtf16);
         assert!(
-            FactStyleGenerator::guard_async_cross_encoding_strings(&site).is_err(),
-            "#272 inc 4a: a latin1-source async string RESULT must still fail \
-             loud — result-side latin1 is out of scope for inc 4a"
+            FactStyleGenerator::guard_async_cross_encoding_strings(&site).is_ok(),
+            "#272 inc 4c: a top-level latin1 → UTF-8 (callee→caller) async string \
+             result must be allowed through (transcoded), not fail loud"
         );
     }
 
@@ -10391,28 +10652,37 @@ mod tests {
         );
     }
 
-    /// LS-F-27 (still fail-loud): an UNIMPLEMENTED case — a latin1+utf16
-    /// (CompactUtf16) callee PRODUCING a top-level RESULT string read by a UTF-8
-    /// caller (result dir callee→caller = latin1→utf8) — must still fail loud
-    /// (result-side latin1 is a later sub-increment; the result writeback does
-    /// NOT transcode it). #272 inc 4b implemented all 6 PARAM directions but no
-    /// latin1 RESULT, so this remains the canonical fail-loud case carrying the
-    /// diagnostic. Asserts both the error variant and the diagnostic text — the
-    /// message must still explain the gap and cite #272.
+    /// LS-F-27 (still fail-loud): an UNIMPLEMENTED case — a NESTED latin1
+    /// (CompactUtf16) `list<string>` RESULT (top-level `Elements{element_size:
+    /// 8}` with a byte-granular inner string). #272 inc 4c implemented all 6
+    /// TOP-LEVEL result directions, but a NESTED result's inner string is still
+    /// raw-copied by `emit_patch_nested_indirections`, so this remains the
+    /// canonical fail-loud case carrying the diagnostic. (Top-level latin1
+    /// results now ALLOW — see `inc4c_async_*_result_allowed`.) Asserts both the
+    /// error variant and the diagnostic text — the message must still explain the
+    /// gap and cite #272.
     #[test]
     fn ls_f_27_async_cross_encoding_unimplemented_direction_fails_loud() {
         use crate::parser::CanonStringEncoding;
+        use crate::resolver::{CopyLayout, InnerPointer};
+        let nested_list_of_string = CopyLayout::Elements {
+            element_size: 8,
+            inner_pointers: vec![InnerPointer::unconditional(
+                0,
+                CopyLayout::Bulk { byte_multiplier: 1 },
+            )],
+            inner_resources: vec![],
+        };
         let mut site = async_lift_site("[async-lift]greet");
         site.crosses_memory = true;
         site.requirements.result_pointer_pair_offsets = vec![0];
-        site.requirements.result_copy_layouts =
-            vec![crate::resolver::CopyLayout::Bulk { byte_multiplier: 1 }];
-        // caller=Utf8, callee=CompactUtf16 ⇒ result dir (callee→caller) =
-        // latin1→utf8, which the result writeback does NOT transcode.
+        site.requirements.result_copy_layouts = vec![nested_list_of_string];
+        // caller=Utf8, callee=CompactUtf16 ⇒ a latin1 result direction, and the
+        // result is NESTED, so the inner string is raw-copied → fail loud.
         site.requirements.caller_encoding = Some(CanonStringEncoding::Utf8);
         site.requirements.callee_encoding = Some(CanonStringEncoding::CompactUtf16);
         let err = FactStyleGenerator::guard_async_cross_encoding_strings(&site)
-            .expect_err("a latin1+utf16 RESULT string must still fail loud");
+            .expect_err("a NESTED latin1 list<string> RESULT must still fail loud");
         match err {
             crate::Error::AdapterGeneration(msg) => {
                 assert!(
@@ -10426,12 +10696,13 @@ mod tests {
         }
     }
 
-    /// #272 inc 4b (scope guard, still fail-loud): the MIRROR latin1 RESULT
-    /// direction — a UTF-16 caller reading a latin1+utf16 callee's RESULT
-    /// (result dir callee→caller = latin1→utf16) — is also a later sub-increment
-    /// and must still fail loud. Only PARAM-side latin1 is implemented.
+    /// #272 inc 4c: the MIRROR latin1 RESULT direction — a UTF-16 caller reading
+    /// a latin1+utf16 callee's RESULT (result dir callee→caller = latin1→utf16)
+    /// — is now implemented; the result writeback calls
+    /// `emit_latin1_to_utf16_transcode_param`. Previously fail-loud (inc 4b out
+    /// of scope); inc 4c legitimately flips it to allow.
     #[test]
-    fn inc4b_async_latin1_result_mirror_still_fails_loud() {
+    fn inc4c_async_latin1_to_utf16_top_level_string_result_allowed() {
         use crate::parser::CanonStringEncoding;
         let mut site = async_lift_site("[async-lift]greet");
         site.crosses_memory = true;
@@ -10441,9 +10712,9 @@ mod tests {
         site.requirements.caller_encoding = Some(CanonStringEncoding::Utf16);
         site.requirements.callee_encoding = Some(CanonStringEncoding::CompactUtf16);
         assert!(
-            FactStyleGenerator::guard_async_cross_encoding_strings(&site).is_err(),
-            "#272 inc 4b: a latin1+utf16 async string RESULT (callee→caller = \
-             latin1→utf16) must still fail loud — result-side latin1 is out of scope"
+            FactStyleGenerator::guard_async_cross_encoding_strings(&site).is_ok(),
+            "#272 inc 4c: a top-level latin1 → UTF-16 (callee→caller) async string \
+             result must be allowed through (transcoded), not fail loud"
         );
     }
 
@@ -10490,25 +10761,43 @@ mod tests {
         );
     }
 
-    /// LS-F-27 (still fail-loud, #272 inc 3): a top-level RESULT string in a
-    /// latin1/CompactUtf16 direction is NOT implemented and must still fail
-    /// loud — the result-direction check is on the raw canon enum (UTF-8/UTF-16
-    /// strictly), so a CompactUtf16 endpoint never satisfies it. Here caller=
-    /// CompactUtf16, callee=Utf8 ⇒ result dir (callee→caller) = Utf8→CompactUtf16,
-    /// unimplemented.
+    /// #272 inc 4c: the two DEST-latin1 RESULT directions — a CompactUtf16
+    /// caller reading a UTF-8 (or UTF-16) callee's RESULT (result dir
+    /// callee→caller = utf8→latin1, utf16→latin1) — are now implemented; the
+    /// result writeback calls the two-phase tag-PRODUCING `emit_utf8_to_latin1`
+    /// / `emit_utf16_to_latin1` loops. Previously these failed loud (inc 3);
+    /// inc 4c legitimately flips both to allow. Together with the two
+    /// latin1-SOURCE result tests above, all FOUR latin1 result directions (and
+    /// thus all 6 result directions) are now allowed.
     #[test]
-    fn ls_f_27_async_cross_encoding_compact_utf16_string_result_fails_loud() {
+    fn inc4c_async_dest_latin1_top_level_string_result_allowed() {
         use crate::parser::CanonStringEncoding;
-        let mut site = async_lift_site("[async-lift]greet");
-        site.crosses_memory = true;
-        site.requirements.result_pointer_pair_offsets = vec![0];
-        site.requirements.result_copy_layouts =
+        // callee=Utf8, caller=CompactUtf16 ⇒ result dir = utf8→latin1.
+        let mut utf8_to_latin1 = async_lift_site("[async-lift]greet");
+        utf8_to_latin1.crosses_memory = true;
+        utf8_to_latin1.requirements.result_pointer_pair_offsets = vec![0];
+        utf8_to_latin1.requirements.result_copy_layouts =
             vec![crate::resolver::CopyLayout::Bulk { byte_multiplier: 1 }];
-        site.requirements.caller_encoding = Some(CanonStringEncoding::CompactUtf16);
-        site.requirements.callee_encoding = Some(CanonStringEncoding::Utf8);
+        utf8_to_latin1.requirements.caller_encoding = Some(CanonStringEncoding::CompactUtf16);
+        utf8_to_latin1.requirements.callee_encoding = Some(CanonStringEncoding::Utf8);
         assert!(
-            FactStyleGenerator::guard_async_cross_encoding_strings(&site).is_err(),
-            "LS-F-27: a latin1+utf16 async string result must still fail loud"
+            FactStyleGenerator::guard_async_cross_encoding_strings(&utf8_to_latin1).is_ok(),
+            "#272 inc 4c: a top-level UTF-8 → latin1 (callee→caller) async string \
+             result must be allowed through (transcoded), not fail loud"
+        );
+
+        // callee=Utf16, caller=CompactUtf16 ⇒ result dir = utf16→latin1.
+        let mut utf16_to_latin1 = async_lift_site("[async-lift]greet");
+        utf16_to_latin1.crosses_memory = true;
+        utf16_to_latin1.requirements.result_pointer_pair_offsets = vec![0];
+        utf16_to_latin1.requirements.result_copy_layouts =
+            vec![crate::resolver::CopyLayout::Bulk { byte_multiplier: 1 }];
+        utf16_to_latin1.requirements.caller_encoding = Some(CanonStringEncoding::CompactUtf16);
+        utf16_to_latin1.requirements.callee_encoding = Some(CanonStringEncoding::Utf16);
+        assert!(
+            FactStyleGenerator::guard_async_cross_encoding_strings(&utf16_to_latin1).is_ok(),
+            "#272 inc 4c: a top-level UTF-16 → latin1 (callee→caller) async string \
+             result must be allowed through (transcoded), not fail loud"
         );
     }
 
@@ -11107,6 +11396,99 @@ mod tests {
             .expect("stackful emitter must succeed for the inc-3 result-string site");
         let cpc = site_caller_param_count(&site, &merged);
         assert_locals_within_budget(adapter.body, cpc, "#272 inc-3 stackful result");
+    }
+
+    /// #272 inc-4c (integration, callback): the CALLBACK async adapter's
+    /// top-level latin1 STRING RESULT transcode path must not reference a local
+    /// past its declared budget (27). The latin1 result loops reuse the
+    /// param-transcode block `transcode_base = l_p2 + 16` with ≤ 6 scratch
+    /// (`l_p2 + 16 ..= l_p2 + 21`, offsets 21..=26 — top index offset 26 < 27),
+    /// the SAME six the inc-4a/4b PARAM loops occupy, never colliding with the
+    /// result-writeback live locals (`l_p2 + 1 ..= l_p2 + 10`). Covers BOTH the
+    /// source-latin1 result case (callee=CompactUtf16, caller=Utf16 ⇒ result dir
+    /// latin1→utf16, the 4-scratch loop) AND the dest-latin1 result case
+    /// (callee=Utf8, caller=CompactUtf16 ⇒ result dir utf8→latin1, the 6-scratch
+    /// two-phase loop — the worst case for the budget). Generates the REAL
+    /// adapters — the budget-bug class inc-1 shipped.
+    #[test]
+    fn inc4c_callback_adapter_latin1_result_locals_within_budget() {
+        use crate::parser::CanonStringEncoding;
+        let gen_ = FactStyleGenerator::new(AdapterConfig::default());
+
+        // Source-latin1 result: callee=CompactUtf16 → caller=Utf16 (4 scratch).
+        let (merged_src, site_src) = xenc_string_result_merged_and_site(
+            CanonStringEncoding::Utf16,
+            CanonStringEncoding::CompactUtf16,
+        );
+        let adapter_src = gen_
+            .generate_async_callback_adapter(&site_src, &merged_src)
+            .expect("callback emitter must succeed for the inc-4c latin1-source result site");
+        let cpc_src = site_caller_param_count(&site_src, &merged_src);
+        assert_locals_within_budget(
+            adapter_src.body,
+            cpc_src,
+            "#272 inc-4c callback latin1-source result",
+        );
+
+        // Dest-latin1 result: callee=Utf8 → caller=CompactUtf16 (6 scratch, the
+        // two-phase tag-producing loop — the budget worst case).
+        let (merged_dst, site_dst) = xenc_string_result_merged_and_site(
+            CanonStringEncoding::CompactUtf16,
+            CanonStringEncoding::Utf8,
+        );
+        let adapter_dst = gen_
+            .generate_async_callback_adapter(&site_dst, &merged_dst)
+            .expect("callback emitter must succeed for the inc-4c dest-latin1 result site");
+        let cpc_dst = site_caller_param_count(&site_dst, &merged_dst);
+        assert_locals_within_budget(
+            adapter_dst.body,
+            cpc_dst,
+            "#272 inc-4c callback dest-latin1 result",
+        );
+    }
+
+    /// #272 inc-4c (integration, stackful): the STACKFUL async adapter's
+    /// top-level latin1 STRING RESULT transcode path must likewise stay within
+    /// its declared budget (18). The latin1 result loops reuse `transcode_base =
+    /// l_scratch + 12` with ≤ 6 scratch (offsets 12..=17 — top index < 18),
+    /// never colliding with the writeback region `l_scratch + 1 ..= l_scratch +
+    /// 10`. Covers both the source-latin1 and dest-latin1 result cases.
+    #[test]
+    fn inc4c_stackful_adapter_latin1_result_locals_within_budget() {
+        use crate::parser::CanonStringEncoding;
+        let gen_ = FactStyleGenerator::new(AdapterConfig::default());
+
+        // Source-latin1 result: callee=CompactUtf16 → caller=Utf16 (4 scratch).
+        let (mut merged_src, site_src) = xenc_string_result_merged_and_site(
+            CanonStringEncoding::Utf16,
+            CanonStringEncoding::CompactUtf16,
+        );
+        merged_src.exports[0].name = site_src.export_name.clone();
+        let adapter_src = gen_
+            .generate_async_stackful_adapter(&site_src, &merged_src)
+            .expect("stackful emitter must succeed for the inc-4c latin1-source result site");
+        let cpc_src = site_caller_param_count(&site_src, &merged_src);
+        assert_locals_within_budget(
+            adapter_src.body,
+            cpc_src,
+            "#272 inc-4c stackful latin1-source result",
+        );
+
+        // Dest-latin1 result: callee=Utf8 → caller=CompactUtf16 (6 scratch).
+        let (mut merged_dst, site_dst) = xenc_string_result_merged_and_site(
+            CanonStringEncoding::CompactUtf16,
+            CanonStringEncoding::Utf8,
+        );
+        merged_dst.exports[0].name = site_dst.export_name.clone();
+        let adapter_dst = gen_
+            .generate_async_stackful_adapter(&site_dst, &merged_dst)
+            .expect("stackful emitter must succeed for the inc-4c dest-latin1 result site");
+        let cpc_dst = site_caller_param_count(&site_dst, &merged_dst);
+        assert_locals_within_budget(
+            adapter_dst.body,
+            cpc_dst,
+            "#272 inc-4c stackful dest-latin1 result",
+        );
     }
 
     /// Regression test for the alignment-padding bug surfaced by the
