@@ -211,10 +211,17 @@ verification-status:
       a runtime assertion
       (test_sr17_utf16_to_utf8_lone_high_surrogate_replacement: a lone
       trailing high surrogate → U+FFFD, byte sum 684). SR-17 verified.
-      Residual: the MID-string lone surrogate (high surrogate followed
-      by a non-low unit) relies on the end-of-input guard — only the
-      end-of-input lone surrogate has a defined U+FFFD path (recorded
-      in LS-P-16).
+      The MID-string lone surrogate (high surrogate followed by a
+      non-low unit) is also handled: emit_utf16_to_utf8_transcode
+      (fact.rs:3901-3964) validates the second unit is a low surrogate
+      in [0xDC00, 0xE000) before treating it as a pair, and otherwise
+      emits U+FFFD consuming only the high surrogate — pinned by
+      test_sr17_utf16_to_utf8_midstring_lone_surrogate_replacement.
+      The lone LOW surrogate reaching the non-high arm is likewise
+      replaced with U+FFFD (#249, fact.rs:3968+). No residual gap;
+      all four UTF-16 malformity cases (lone-high-at-end,
+      mid-string-high+non-low, valid pair, lone-low) have explicit
+      arms and runtime oracles.
 
   SR-18:
     implementation-files: [meld-core/src/adapter/fact.rs]
@@ -625,7 +632,26 @@ gaps:
       encodings. No UTF-16, CompactUTF16, or surrogate pair tests exist.
       Cross-toolchain hazard XH-4 (string encoding disagreement) is
       unmitigated for non-UTF-8 paths.
-    priority: high
-    action: >
-      Add transcoding tests with UTF-16 canonical option. Consider
-      building a custom fixture with mixed string encodings.
+      (As identified in weighted-gap-analysis.md GAP-P2-3, dated
+      2026-03-14 — historical state.)
+    priority: closed
+    status: resolved
+    resolution: >-
+      Closed 2026-06-14. SR-17 now carries the full transcoding test
+      suite and is status: verified. Coverage runs both directions
+      across all encoding pairs, including non-BMP (supplementary
+      plane) characters and surrogate handling:
+      tests/adapter_safety.rs fuses and executes under wasmtime —
+      test_sr17_utf8_to_utf16_supplementary_plane_transcoding (#244),
+      test_sr17_utf16_to_utf8_supplementary_plane_transcoding (#245/#246),
+      test_sr17_utf16_to_utf8_lone_high_surrogate_replacement (LS-P-16),
+      test_sr17_utf16_to_utf8_midstring_lone_surrogate_replacement,
+      and the malformed-surrogate matrices both directions;
+      resolver::tests::test_sr17_all_encoding_pairs_transcoding_matrix
+      pins the requirement-derivation matrix; parser covers the
+      UTF-16 / CompactUTF16 canonical options. 8 integration + 35 unit
+      SR-17 tests, all green (verified 2026-06-14, exit 0). XH-4 for
+      non-UTF-8 paths is thereby mitigated.
+    references:
+      - "safety/stpa/weighted-gap-analysis.md GAP-P2-3 (historical, 2026-03-14)"
+      - "safety/requirements/traceability.yaml SR-17 (status: verified)"
