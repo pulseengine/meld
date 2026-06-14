@@ -6852,6 +6852,92 @@ impl FactStyleGenerator {
     }
 }
 
+impl FactStyleGenerator {
+    /// #272 / LS-F-27 fail-loud guard for cross-encoding async strings.
+    ///
+    /// Trips only when ALL of the following hold for an async-lift site:
+    ///   * `site.crosses_memory` (a same-memory async call shares one memory
+    ///     and one encoding, so there is nothing to transcode), AND
+    ///   * the caller and callee canonical string encodings differ (computed
+    ///     the same way `analyze_call_site` does, via `canon_to_string_encoding`
+    ///     so that e.g. UTF-8 vs `latin1+utf16`/CompactUtf16 are compared on
+    ///     their `StringEncoding` mapping, not the raw canon enum), AND
+    ///   * there is at least one byte-granular `(ptr, len)` param or result —
+    ///     i.e. a plausible STRING. A byte-granular buffer (`Bulk{1}` /
+    ///     `Elements{element_size:1}`) is what a lowered string looks like;
+    ///     a `list<u32>` (element size 4) etc. is encoding-independent and
+    ///     must NOT trip the guard.
+    ///
+    /// When any condition is false the call proceeds normally, so:
+    ///   * same-encoding async string calls keep working,
+    ///   * cross-encoding async calls with NO string params/results keep
+    ///     working,
+    ///   * non-cross-memory async calls keep working.
+    fn guard_async_cross_encoding_strings(site: &AdapterSite) -> Result<()> {
+        if !site.crosses_memory {
+            return Ok(());
+        }
+        let caller_enc = site
+            .requirements
+            .caller_encoding
+            .map(canon_to_string_encoding);
+        let callee_enc = site
+            .requirements
+            .callee_encoding
+            .map(canon_to_string_encoding);
+        // Only meaningful when both sides have a known, differing encoding.
+        let (caller_enc, callee_enc) = match (caller_enc, callee_enc) {
+            (Some(a), Some(b)) if a != b => (a, b),
+            _ => return Ok(()),
+        };
+
+        // Is there a byte-granular (ptr, len) param or result — a plausible
+        // string whose bytes the async emitter would raw-copy?
+        let is_byte_granular = |cl: &crate::resolver::CopyLayout| -> bool {
+            match cl {
+                crate::resolver::CopyLayout::Bulk { byte_multiplier } => *byte_multiplier == 1,
+                crate::resolver::CopyLayout::Elements { element_size, .. } => *element_size == 1,
+            }
+        };
+        // A ptr-pair position with no recorded layout defaults to byte-granular
+        // in the emitters (`byte_mult` falls back to 1), so treat a bare
+        // position (no parallel layout) as a string too.
+        let param_has_string = site
+            .requirements
+            .pointer_pair_positions
+            .iter()
+            .enumerate()
+            .any(|(i, _)| {
+                site.requirements
+                    .param_copy_layouts
+                    .get(i)
+                    .map(is_byte_granular)
+                    .unwrap_or(true)
+            });
+        let result_has_string = site
+            .requirements
+            .result_pointer_pair_offsets
+            .iter()
+            .enumerate()
+            .any(|(i, _)| {
+                site.requirements
+                    .result_copy_layouts
+                    .get(i)
+                    .map(is_byte_granular)
+                    .unwrap_or(true)
+            });
+
+        if param_has_string || result_has_string {
+            return Err(crate::Error::AdapterGeneration(format!(
+                "async cross-encoding string transcoding is not yet supported \
+                 (caller {caller_enc:?} != callee {callee_enc:?}); a verbatim \
+                 copy would silently mis-transcode — see #272"
+            )));
+        }
+        Ok(())
+    }
+}
+
 impl AdapterGenerator for FactStyleGenerator {
     fn generate(
         &self,
@@ -6863,6 +6949,18 @@ impl AdapterGenerator for FactStyleGenerator {
 
         for (idx, site) in graph.adapter_sites.iter().enumerate() {
             if site.is_async_lift {
+                // #272 / H-4.4 LS-F-27: the async emitters (`emit_param_copy_step`
+                // / `emit_ptr_pair_result_writeback`) copy string/(ptr,len)
+                // buffers via `memory.copy` with no transcoding. The sync
+                // dispatch routes cross-encoding string calls to
+                // `generate_transcoding_adapter`; the async branch never did.
+                // A cross-memory async-lift call passing/returning a string in
+                // one encoding while the other side expects a different
+                // encoding would therefore raw-copy the bytes and silently
+                // mis-transcode (the H-4.4 defect #253/#271 closed for sync).
+                // Full async transcoding is the tracked #272 capability; until
+                // then we FAIL LOUD rather than emit a silently-corrupting copy.
+                Self::guard_async_cross_encoding_strings(site)?;
                 let adapter = if self.has_callback_export(site, merged) {
                     self.generate_async_callback_adapter(site, merged)?
                 } else {
@@ -7485,6 +7583,156 @@ mod tests {
         }
     }
 
+    /// Build a cross-memory async-lift site carrying a single byte-granular
+    /// `(ptr, len)` string param, parameterised by caller/callee canon
+    /// encodings. Used by the #272 / LS-F-27 guard matrix.
+    fn async_xenc_string_param_site(
+        caller: crate::parser::CanonStringEncoding,
+        callee: crate::parser::CanonStringEncoding,
+    ) -> crate::resolver::AdapterSite {
+        let mut site = async_lift_site("[async-lift]greet");
+        site.crosses_memory = true;
+        site.requirements.pointer_pair_positions = vec![0];
+        site.requirements.param_copy_layouts =
+            vec![crate::resolver::CopyLayout::Bulk { byte_multiplier: 1 }];
+        site.requirements.caller_encoding = Some(caller);
+        site.requirements.callee_encoding = Some(callee);
+        site
+    }
+
+    /// LS-F-27 gate: a cross-encoding async string PARAM that crosses memory
+    /// must fail loud (the async emitter would otherwise raw-copy the bytes
+    /// and silently mis-transcode — #272 / H-4.4). Asserts both the error
+    /// variant and the diagnostic text.
+    #[test]
+    fn ls_f_27_async_cross_encoding_string_param_fails_loud() {
+        use crate::parser::CanonStringEncoding;
+        let site =
+            async_xenc_string_param_site(CanonStringEncoding::Utf8, CanonStringEncoding::Utf16);
+        let err = FactStyleGenerator::guard_async_cross_encoding_strings(&site)
+            .expect_err("cross-encoding async string param must fail loud");
+        match err {
+            crate::Error::AdapterGeneration(msg) => {
+                assert!(
+                    msg.contains("async cross-encoding string transcoding is not yet supported")
+                        && msg.contains("#272"),
+                    "LS-F-27 guard message must explain the cross-encoding gap and \
+                     cite #272; got: {msg}"
+                );
+            }
+            other => panic!("LS-F-27: expected AdapterGeneration error, got {other:?}"),
+        }
+    }
+
+    /// LS-F-27 gate (result side): a cross-encoding async string RESULT that
+    /// crosses memory must also fail loud — `emit_ptr_pair_result_writeback`
+    /// raw-copies the returned buffer with no transcode.
+    #[test]
+    fn ls_f_27_async_cross_encoding_string_result_fails_loud() {
+        use crate::parser::CanonStringEncoding;
+        let mut site = async_lift_site("[async-lift]greet");
+        site.crosses_memory = true;
+        site.requirements.result_pointer_pair_offsets = vec![0];
+        site.requirements.result_copy_layouts =
+            vec![crate::resolver::CopyLayout::Bulk { byte_multiplier: 1 }];
+        site.requirements.caller_encoding = Some(CanonStringEncoding::Utf16);
+        site.requirements.callee_encoding = Some(CanonStringEncoding::Utf8);
+        assert!(
+            FactStyleGenerator::guard_async_cross_encoding_strings(&site).is_err(),
+            "LS-F-27: cross-encoding async string result must fail loud"
+        );
+    }
+
+    /// LS-F-27 must NOT over-trip: a SAME-encoding async string call keeps
+    /// working (no transcode needed, raw copy is correct).
+    #[test]
+    fn ls_f_27_same_encoding_async_string_ok() {
+        use crate::parser::CanonStringEncoding;
+        let site =
+            async_xenc_string_param_site(CanonStringEncoding::Utf8, CanonStringEncoding::Utf8);
+        assert!(
+            FactStyleGenerator::guard_async_cross_encoding_strings(&site).is_ok(),
+            "LS-F-27: same-encoding async string must not trip the guard"
+        );
+    }
+
+    /// LS-F-27 must NOT over-trip: a CROSS-encoding async call with NO string
+    /// param/result (e.g. a `list<u32>`, element size 4 — encoding-independent)
+    /// keeps working. Differing encodings alone must not block the call.
+    #[test]
+    fn ls_f_27_cross_encoding_async_no_string_ok() {
+        use crate::parser::CanonStringEncoding;
+        // A non-byte-element list param: element_size 4 → not a string.
+        let mut site = async_lift_site("[async-lift]sum");
+        site.crosses_memory = true;
+        site.requirements.pointer_pair_positions = vec![0];
+        site.requirements.param_copy_layouts = vec![crate::resolver::CopyLayout::Elements {
+            element_size: 4,
+            inner_pointers: Vec::new(),
+            inner_resources: Vec::new(),
+        }];
+        site.requirements.caller_encoding = Some(CanonStringEncoding::Utf8);
+        site.requirements.callee_encoding = Some(CanonStringEncoding::Utf16);
+        assert!(
+            FactStyleGenerator::guard_async_cross_encoding_strings(&site).is_ok(),
+            "LS-F-27: cross-encoding async with no string must not trip the guard"
+        );
+
+        // And a cross-encoding async call with NO ptr-pairs at all.
+        let mut bare = async_lift_site("[async-lift]noop");
+        bare.crosses_memory = true;
+        bare.requirements.caller_encoding = Some(CanonStringEncoding::Utf8);
+        bare.requirements.callee_encoding = Some(CanonStringEncoding::Utf16);
+        assert!(
+            FactStyleGenerator::guard_async_cross_encoding_strings(&bare).is_ok(),
+            "LS-F-27: cross-encoding async with no ptr-pairs must not trip"
+        );
+    }
+
+    /// LS-F-27 must NOT over-trip: a cross-encoding async string that does
+    /// NOT cross memory (shared-memory mode) keeps working — there is only
+    /// one memory and one encoding in play.
+    #[test]
+    fn ls_f_27_cross_encoding_async_same_memory_ok() {
+        use crate::parser::CanonStringEncoding;
+        let mut site =
+            async_xenc_string_param_site(CanonStringEncoding::Utf8, CanonStringEncoding::Utf16);
+        site.crosses_memory = false;
+        assert!(
+            FactStyleGenerator::guard_async_cross_encoding_strings(&site).is_ok(),
+            "LS-F-27: non-cross-memory async string must not trip the guard"
+        );
+    }
+
+    /// LS-F-27 wiring: the guard is reached through the real `generate`
+    /// dispatch (not just the helper), so a graph with a cross-encoding
+    /// async string site makes `generate` return Err before emitting a
+    /// silently-corrupting adapter.
+    #[test]
+    fn ls_f_27_generate_dispatch_rejects_cross_encoding_async_string() {
+        use crate::parser::CanonStringEncoding;
+        let gen_ = FactStyleGenerator::new(AdapterConfig::default());
+        let merged = empty_merged();
+        let site =
+            async_xenc_string_param_site(CanonStringEncoding::Utf8, CanonStringEncoding::Utf16);
+        let graph = crate::resolver::DependencyGraph {
+            instantiation_order: vec![0, 1],
+            resolved_imports: std::collections::HashMap::new(),
+            unresolved_imports: Vec::new(),
+            adapter_sites: vec![site],
+            resource_graph: None,
+            stream_pair_graph: None,
+            module_resolutions: Vec::new(),
+            reexporter_components: Vec::new(),
+            reexporter_resources: Vec::new(),
+        };
+        let res = <FactStyleGenerator as AdapterGenerator>::generate(&gen_, &merged, &graph);
+        assert!(
+            res.is_err(),
+            "LS-F-27: generate() must reject a cross-encoding async string site"
+        );
+    }
+
     #[test]
     fn sr32_has_callback_export_detects_companion() {
         let gen_ = FactStyleGenerator::new(AdapterConfig::default());
@@ -7646,6 +7894,79 @@ mod tests {
             shift += 7;
         }
         (result, consumed)
+    }
+
+    /// #272 STEP-1 differential: confirm whether a CROSS-ENCODING async
+    /// string PARAM is silently raw-copied (no transcode) by the async
+    /// emitter, transcoded, or rejected. Builds a cross-memory async-lift
+    /// site whose caller lowers a string param in UTF-8 while the callee
+    /// lifts it in UTF-16 (`pointer_pair_positions=[0]`), then inspects
+    /// the emitted body.
+    ///
+    /// Verdict recorded by the assertions below: the body emits
+    /// `memory.copy` (0xFC 0x0A) and contains NO UTF-8↔UTF-16 transcode
+    /// loop, i.e. the cross-encoding string crosses memory as raw bytes
+    /// reinterpreted under the wrong encoding — verdict (a), CONFIRMED
+    /// silent corruption. The post-fix guard test below
+    /// (`ls_f_27_async_cross_encoding_string_param_fails_loud`) asserts
+    /// this same shape is now rejected with an `AdapterGeneration` error.
+    #[test]
+    #[ignore = "STEP-1 evidence: pre-fix this asserted raw-copy; post-fix the \
+                emitter fails loud (see ls_f_27_* gate). Kept ignored as the \
+                documented confirmation record."]
+    fn issue_272_step1_async_cross_encoding_param_was_raw_copied() {
+        let gen_ = FactStyleGenerator::new(AdapterConfig::default());
+        let mut merged = empty_merged();
+
+        // Caller type: (ptr: i32, len: i32) -> () — a lowered string param.
+        merged.types.push(crate::merger::MergedFuncType {
+            params: vec![wasm_encoder::ValType::I32, wasm_encoder::ValType::I32],
+            results: vec![],
+        });
+        // Lift type: (ptr, len) -> ()
+        merged.types.push(crate::merger::MergedFuncType {
+            params: vec![wasm_encoder::ValType::I32, wasm_encoder::ValType::I32],
+            results: vec![],
+        });
+        merged.functions.push(crate::merger::MergedFunction {
+            type_idx: 1,
+            body: wasm_encoder::Function::new([]),
+            origin: (1, 0, 0),
+            synthetic_kind: None,
+        });
+        merged.function_index_map.insert((1, 0, 0), 0);
+        // callee realloc at idx 1
+        merged.functions.push(crate::merger::MergedFunction {
+            type_idx: 1,
+            body: wasm_encoder::Function::new([]),
+            origin: (1, 0, 0),
+            synthetic_kind: None,
+        });
+        merged.realloc_map.insert((1, 0), 1);
+        merged.memory_index_map.insert((0, 0, 0), 0);
+        merged.memory_index_map.insert((1, 0, 0), 1);
+
+        let mut site = async_lift_site("[async-lift]greet");
+        site.from_component = 0;
+        site.to_component = 1;
+        site.import_func_type_idx = Some(0);
+        site.crosses_memory = true;
+        // String param at flat position 0; caller UTF-8, callee UTF-16.
+        site.requirements.pointer_pair_positions = vec![0];
+        site.requirements.param_copy_layouts =
+            vec![crate::resolver::CopyLayout::Bulk { byte_multiplier: 1 }];
+        site.requirements.caller_encoding = Some(crate::parser::CanonStringEncoding::Utf8);
+        site.requirements.callee_encoding = Some(crate::parser::CanonStringEncoding::Utf16);
+
+        let adapter = gen_
+            .generate_async_stackful_adapter(&site, &merged)
+            .expect("pre-fix: async emitter raw-copies cross-encoding string");
+        let body = adapter.body.into_raw_body();
+        let has_memcopy = body.windows(2).any(|w| w == [0xFC, 0x0A]);
+        assert!(
+            has_memcopy,
+            "STEP-1: cross-encoding async string param raw-copied via memory.copy"
+        );
     }
 
     /// Regression test for the cross-memory ptr-pair stackful return

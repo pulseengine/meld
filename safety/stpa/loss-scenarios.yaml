@@ -1244,6 +1244,78 @@ loss-scenarios:
       asserted per-representation sums for both a latin1-fits string ("café")
       and a utf16-requiring string ("日本" / "A😀").
 
+  - id: LS-F-27
+    title: Async-lift adapter raw-copies cross-encoding string → silent mis-transcode
+    uca: UCA-A-8
+    hazards: [H-4, H-4.4]
+    type: inadequate-control-algorithm
+    scenario: >
+      The adapter generator's async dispatch (`FactStyleGenerator::generate`,
+      fact.rs) routes EVERY `site.is_async_lift` call to
+      `generate_async_callback_adapter` / `generate_async_stackful_adapter`
+      and `continue`s — unconditionally, never computing `needs_transcoding()`.
+      The SYNC dispatch sends cross-encoding calls
+      (`caller_string_encoding != callee_string_encoding`) to
+      `generate_transcoding_adapter`; the async branch bypasses that gate. The
+      shared async copy helpers `emit_param_copy_step` (param side) and
+      `emit_ptr_pair_result_writeback` (result side) move a string's bytes
+      across memories via `memory.copy` (byte-count tag-aware after #253) but
+      perform NO encoding conversion. A cross-memory async-lift call whose
+      caller lowers a string in one encoding (e.g. UTF-8) while the callee
+      lifts it in a different encoding (e.g. UTF-16) therefore copies the raw
+      bytes verbatim, which the receiving side reinterprets under the wrong
+      encoding — the H-4.4 silent wrong-encoding string data that #253 / #271
+      closed for the sync path, here re-opened on the async path. Confirmed
+      reachable by a runtime-differential: the resolver populates
+      `is_async_lift`, both `caller_encoding`/`callee_encoding`, and
+      `pointer_pair_positions` on the same site, and the async stackful emitter
+      emits `memory.copy` (0xFC 0x0A) with no transcode loop for such a site
+      (`issue_272_step1_async_cross_encoding_param_was_raw_copied`, kept as the
+      ignored confirmation record).
+    causal-factors:
+      - >-
+        The async branch in `generate` runs before — and instead of — the
+        `crosses_memory && needs_transcoding()` gate the sync `generate_adapter`
+        applies, so a cross-encoding async-lift site is never routed to a
+        transcoding emitter
+      - >-
+        `emit_param_copy_step` / `emit_ptr_pair_result_writeback` copy
+        string/(ptr,len) buffers with `memory.copy` and no encoding conversion,
+        correct only when both sides share an encoding
+    control-algorithm-flaw: >
+      The async adapter emission path assumes both components share a string
+      encoding (true for same-encoding fusions) and has no branch for the
+      cross-encoding case — neither a transcoding emitter nor a loud rejection.
+      Full async transcoding is a larger tracked capability (#272); until it
+      lands the only safe behaviour is to fail loud rather than emit a
+      silently-corrupting raw copy.
+    status: approved
+    priority: high
+    fix: >
+      `FactStyleGenerator::guard_async_cross_encoding_strings` (fact.rs) is
+      invoked at the top of the async branch in `generate`, before either
+      async emitter runs. It returns
+      `Err(Error::AdapterGeneration("async cross-encoding string transcoding
+      is not yet supported (caller … != callee …); a verbatim copy would
+      silently mis-transcode — see #272"))` iff the site crosses memory AND the
+      caller/callee canonical encodings differ (compared via
+      `canon_to_string_encoding`, as `analyze_call_site` does) AND there is at
+      least one byte-granular `(ptr, len)` param or result (a plausible string:
+      `CopyLayout::Bulk{1}` / `Elements{element_size:1}`, or a bare ptr-pair
+      with no layout, which the emitters treat as byte-granular). It does NOT
+      trip for same-encoding async strings, cross-encoding async calls with no
+      string (e.g. `list<u32>`, element size 4) or no ptr-pairs at all, or
+      non-cross-memory (shared-memory) async strings. Pinned by the LS-F-27
+      gate tests: `ls_f_27_async_cross_encoding_string_param_fails_loud`,
+      `ls_f_27_async_cross_encoding_string_result_fails_loud`,
+      `ls_f_27_same_encoding_async_string_ok`,
+      `ls_f_27_cross_encoding_async_no_string_ok`,
+      `ls_f_27_cross_encoding_async_same_memory_ok`, and
+      `ls_f_27_generate_dispatch_rejects_cross_encoding_async_string` (drives
+      the real `generate` dispatch). Full async cross-encoding TRANSCODING
+      (versus this fail-loud guard) remains the tracked #272 capability
+      follow-up.
+
   - id: LS-P-17
     title: Caller-encoding match filters on Func only, miscalibrates mixed-encoding callers
     uca: UCA-R-3
