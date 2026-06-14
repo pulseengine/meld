@@ -3123,21 +3123,445 @@ fn test_sr17_latin1_to_utf16_transcoding() {
     }
 }
 
-/// #253 fail-loud guard (still-unsupported direction): the down-conversion
-/// directions remain genuinely ambiguous and stay on the unchanged catch-all
-/// `Err` arm. Increment 2 only added (Latin1 → Utf16); (Utf16 → Latin1) is
-/// NOT implemented (code points > 0xFF are unrepresentable in Latin-1), so it
-/// must still FAIL fusion loudly rather than silently emit a wrong adapter.
-///
-/// Fixture: a UTF-16-lowering caller fused into a CompactUTF16-lifting callee
-/// (meld maps CompactUTF16 → Latin1), producing the (Utf16, Latin1) pair.
-/// Fusion must return Err. (The complementary (Utf8 → Latin1) pair shares the
-/// same unchanged catch-all and is not separately fixtured here.)
-#[test]
-fn test_253_utf16_to_latin1_transcode_fails_loud() {
-    let callee = build_callee_codeunit_summing_component(CanonicalOption::CompactUTF16); // → Latin1
-    let caller = build_caller_utf16_lowering_component(&[0x0041]);
+// ===========================================================================
+// #253 (final increment): spec-faithful latin1+utf16 (CompactUTF16) transcoding
+//
+// meld models the canonical-ABI `latin1+utf16` encoding as
+// `StringEncoding::Latin1`. The length operand is TAGGED with
+// UTF16_TAG = 1<<31: tag-clear means the payload is Latin-1 (1 byte/char,
+// byte length == operand); tag-set means the payload is UTF-16 (code-unit
+// count == operand & !UTF16_TAG, byte length == that × 2).
+//
+// The fixtures below exercise both the READ side (Latin1 as the *source*: a
+// tag-clear / tag-set caller into a UTF-8 or UTF-16 callee) and the WRITE side
+// (Latin1 as the *destination*: a UTF-8 / UTF-16 caller into a tag-decoding
+// CompactUTF16 callee that picks the representation + sets the tag).
+// ===========================================================================
 
+const UTF16_TAG: u32 = 1 << 31;
+
+/// A tag-aware decoding callee that lifts with `CompactUTF16` (meld maps it to
+/// `StringEncoding::Latin1`). Its core `process-string(ptr, tagged_len) -> sum`
+/// branches on the canonical-ABI tag:
+///
+/// - tag SET → payload is UTF-16; count = len & !UTF16_TAG; sum 16-bit code
+///   units (`mem16[ptr + i*2]`).
+/// - tag CLEAR → payload is Latin-1; sum 8-bit bytes (`mem8[ptr + i]`).
+///
+/// The differential oracle is the per-representation sum: a wrong tag would
+/// drive the callee to read the wrong element width and produce a wrong sum,
+/// and wrong bytes would also mis-sum — so the sum pins both the tag decision
+/// AND the written bytes. This is the WRITE-side oracle for #253
+/// (`emit_utf8_to_latin1_transcode` / `emit_utf16_to_latin1_transcode`).
+fn build_callee_compact_decoding_component() -> Vec<u8> {
+    let core_module = {
+        let mut types = TypeSection::new();
+        types.ty().function(
+            [
+                wasm_encoder::ValType::I32,
+                wasm_encoder::ValType::I32,
+                wasm_encoder::ValType::I32,
+                wasm_encoder::ValType::I32,
+            ],
+            [wasm_encoder::ValType::I32],
+        );
+        types.ty().function(
+            [wasm_encoder::ValType::I32, wasm_encoder::ValType::I32],
+            [wasm_encoder::ValType::I32],
+        );
+
+        let mut functions = FunctionSection::new();
+        functions.function(0); // cabi_realloc
+        functions.function(1); // process-string
+
+        let mut memory = MemorySection::new();
+        memory.memory(MemoryType {
+            minimum: 1,
+            maximum: None,
+            memory64: false,
+            shared: false,
+            page_size_log2: None,
+        });
+
+        let mut globals = GlobalSection::new();
+        globals.global(
+            GlobalType {
+                val_type: wasm_encoder::ValType::I32,
+                mutable: true,
+                shared: false,
+            },
+            &ConstExpr::i32_const(1024),
+        );
+
+        let mut exports = ExportSection::new();
+        exports.export("cabi_realloc", ExportKind::Func, 0);
+        exports.export("test:api/api#process-string", ExportKind::Func, 1);
+        exports.export("memory", ExportKind::Memory, 0);
+
+        let mut code = CodeSection::new();
+        {
+            let mut f = Function::new([]);
+            emit_cabi_realloc(&mut f, 0);
+            code.function(&f);
+        }
+        // func 1: process-string(ptr, tagged_len) -> sum.
+        // locals: 0=ptr, 1=tagged_len, 2=sum, 3=index, 4=count, 5=tag_set
+        {
+            let mut f = Function::new(vec![(4, wasm_encoder::ValType::I32)]);
+            // tag_set = (tagged_len & UTF16_TAG) != 0
+            f.instruction(&Instruction::LocalGet(1));
+            f.instruction(&Instruction::I32Const(UTF16_TAG as i32));
+            f.instruction(&Instruction::I32And);
+            f.instruction(&Instruction::LocalSet(5));
+            // count = tagged_len & !UTF16_TAG
+            f.instruction(&Instruction::LocalGet(1));
+            f.instruction(&Instruction::I32Const(!UTF16_TAG as i32));
+            f.instruction(&Instruction::I32And);
+            f.instruction(&Instruction::LocalSet(4));
+
+            f.instruction(&Instruction::Block(wasm_encoder::BlockType::Empty));
+            f.instruction(&Instruction::Loop(wasm_encoder::BlockType::Empty));
+            // if index >= count, break
+            f.instruction(&Instruction::LocalGet(3));
+            f.instruction(&Instruction::LocalGet(4));
+            f.instruction(&Instruction::I32GeU);
+            f.instruction(&Instruction::BrIf(1));
+
+            // if tag_set: sum += mem16[ptr + index*2]; else sum += mem8[ptr + index]
+            f.instruction(&Instruction::LocalGet(5));
+            f.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+            {
+                f.instruction(&Instruction::LocalGet(0));
+                f.instruction(&Instruction::LocalGet(3));
+                f.instruction(&Instruction::I32Const(1));
+                f.instruction(&Instruction::I32Shl);
+                f.instruction(&Instruction::I32Add);
+                f.instruction(&Instruction::I32Load16U(wasm_encoder::MemArg {
+                    offset: 0,
+                    align: 1,
+                    memory_index: 0,
+                }));
+                f.instruction(&Instruction::LocalGet(2));
+                f.instruction(&Instruction::I32Add);
+                f.instruction(&Instruction::LocalSet(2));
+            }
+            f.instruction(&Instruction::Else);
+            {
+                f.instruction(&Instruction::LocalGet(0));
+                f.instruction(&Instruction::LocalGet(3));
+                f.instruction(&Instruction::I32Add);
+                f.instruction(&Instruction::I32Load8U(wasm_encoder::MemArg {
+                    offset: 0,
+                    align: 0,
+                    memory_index: 0,
+                }));
+                f.instruction(&Instruction::LocalGet(2));
+                f.instruction(&Instruction::I32Add);
+                f.instruction(&Instruction::LocalSet(2));
+            }
+            f.instruction(&Instruction::End);
+
+            // index += 1
+            f.instruction(&Instruction::LocalGet(3));
+            f.instruction(&Instruction::I32Const(1));
+            f.instruction(&Instruction::I32Add);
+            f.instruction(&Instruction::LocalSet(3));
+
+            f.instruction(&Instruction::Br(0));
+            f.instruction(&Instruction::End); // loop
+            f.instruction(&Instruction::End); // block
+
+            f.instruction(&Instruction::LocalGet(2));
+            f.instruction(&Instruction::End);
+            code.function(&f);
+        }
+
+        let mut module = Module::new();
+        module
+            .section(&types)
+            .section(&functions)
+            .section(&memory)
+            .section(&globals)
+            .section(&exports)
+            .section(&code);
+        module
+    };
+
+    let mut component = Component::new();
+    component.section(&ModuleSection(&core_module));
+    {
+        let mut types = ComponentTypeSection::new();
+        types
+            .function()
+            .params([(
+                "s",
+                wasm_encoder::ComponentValType::Primitive(wasm_encoder::PrimitiveValType::String),
+            )])
+            .result(Some(wasm_encoder::ComponentValType::Primitive(
+                wasm_encoder::PrimitiveValType::U32,
+            )));
+        component.section(&types);
+    }
+    {
+        let mut inst = InstanceSection::new();
+        let no_args: Vec<(&str, ModuleArg)> = vec![];
+        inst.instantiate(0, no_args);
+        component.section(&inst);
+    }
+    for name in ["cabi_realloc", "test:api/api#process-string"] {
+        let mut aliases = ComponentAliasSection::new();
+        aliases.alias(Alias::CoreInstanceExport {
+            instance: 0,
+            kind: ExportKind::Func,
+            name,
+        });
+        component.section(&aliases);
+    }
+    {
+        let mut aliases = ComponentAliasSection::new();
+        aliases.alias(Alias::CoreInstanceExport {
+            instance: 0,
+            kind: ExportKind::Memory,
+            name: "memory",
+        });
+        component.section(&aliases);
+    }
+    {
+        let mut canon = CanonicalFunctionSection::new();
+        canon.lift(
+            1,
+            0,
+            [
+                CanonicalOption::CompactUTF16, // meld → Latin1 (latin1+utf16)
+                CanonicalOption::Memory(0),
+                CanonicalOption::Realloc(0),
+            ],
+        );
+        component.section(&canon);
+    }
+    {
+        let mut exp = ComponentExportSection::new();
+        exp.export("test:api/api", ComponentExportKind::Func, 0, None);
+        component.section(&exp);
+    }
+    component.finish()
+}
+
+/// A CompactUTF16-lowering caller (meld → Latin1) whose stored payload is
+/// UTF-16 and whose length operand has the **tag SET** (`code_units |
+/// UTF16_TAG`). This drives the READ-side tag-set path: a latin1+utf16 source
+/// string that is actually UTF-16. Mirrors `build_caller_latin1_lowering_component`
+/// (which is the tag-CLEAR / pure-Latin-1 variant) but stores 2 bytes/code-unit
+/// and tags the length.
+fn build_caller_latin1_tagged_lowering_component(code_units: &[u16]) -> Vec<u8> {
+    let mut data_bytes = Vec::new();
+    for cu in code_units {
+        data_bytes.extend_from_slice(&cu.to_le_bytes());
+    }
+    let tagged_len = (code_units.len() as u32 | UTF16_TAG) as i32;
+
+    let core_module = {
+        let mut types = TypeSection::new();
+        types.ty().function(
+            [wasm_encoder::ValType::I32, wasm_encoder::ValType::I32],
+            [wasm_encoder::ValType::I32],
+        );
+        types.ty().function([], [wasm_encoder::ValType::I32]);
+        types.ty().function(
+            [
+                wasm_encoder::ValType::I32,
+                wasm_encoder::ValType::I32,
+                wasm_encoder::ValType::I32,
+                wasm_encoder::ValType::I32,
+            ],
+            [wasm_encoder::ValType::I32],
+        );
+
+        let mut imports = ImportSection::new();
+        imports.import(
+            "test:api/api",
+            "process-string",
+            wasm_encoder::EntityType::Function(0),
+        );
+
+        let mut functions = FunctionSection::new();
+        functions.function(1); // run
+        functions.function(2); // cabi_realloc
+
+        let mut memory = MemorySection::new();
+        memory.memory(MemoryType {
+            minimum: 1,
+            maximum: None,
+            memory64: false,
+            shared: false,
+            page_size_log2: None,
+        });
+
+        let mut globals = GlobalSection::new();
+        globals.global(
+            GlobalType {
+                val_type: wasm_encoder::ValType::I32,
+                mutable: true,
+                shared: false,
+            },
+            &ConstExpr::i32_const(1024),
+        );
+
+        let mut exports = ExportSection::new();
+        exports.export("run", ExportKind::Func, 1);
+        exports.export("cabi_realloc", ExportKind::Func, 2);
+        exports.export("memory", ExportKind::Memory, 0);
+
+        let mut code = CodeSection::new();
+        {
+            let mut f = Function::new([]);
+            f.instruction(&Instruction::I32Const(0)); // ptr
+            f.instruction(&Instruction::I32Const(tagged_len)); // tagged code-unit count
+            f.instruction(&Instruction::Call(0));
+            f.instruction(&Instruction::End);
+            code.function(&f);
+        }
+        {
+            let mut f = Function::new([]);
+            emit_cabi_realloc(&mut f, 0);
+            code.function(&f);
+        }
+
+        let mut data = DataSection::new();
+        data.segment(DataSegment {
+            mode: DataSegmentMode::Active {
+                memory_index: 0,
+                offset: &ConstExpr::i32_const(0),
+            },
+            data: data_bytes,
+        });
+
+        let mut module = Module::new();
+        module
+            .section(&types)
+            .section(&imports)
+            .section(&functions)
+            .section(&memory)
+            .section(&globals)
+            .section(&exports)
+            .section(&code)
+            .section(&data);
+        module
+    };
+
+    let mem_provider = {
+        let mut types = TypeSection::new();
+        types.ty().function(
+            [
+                wasm_encoder::ValType::I32,
+                wasm_encoder::ValType::I32,
+                wasm_encoder::ValType::I32,
+                wasm_encoder::ValType::I32,
+            ],
+            [wasm_encoder::ValType::I32],
+        );
+        let mut functions = FunctionSection::new();
+        functions.function(0);
+        let mut memory = MemorySection::new();
+        memory.memory(MemoryType {
+            minimum: 1,
+            maximum: None,
+            memory64: false,
+            shared: false,
+            page_size_log2: None,
+        });
+        let mut globals = GlobalSection::new();
+        globals.global(
+            GlobalType {
+                val_type: wasm_encoder::ValType::I32,
+                mutable: true,
+                shared: false,
+            },
+            &ConstExpr::i32_const(1024),
+        );
+        let mut exports = ExportSection::new();
+        exports.export("mp_realloc", ExportKind::Func, 0);
+        exports.export("mp_memory", ExportKind::Memory, 0);
+        let mut code = CodeSection::new();
+        {
+            let mut f = Function::new([]);
+            emit_cabi_realloc(&mut f, 0);
+            code.function(&f);
+        }
+        let mut module = Module::new();
+        module
+            .section(&types)
+            .section(&functions)
+            .section(&memory)
+            .section(&globals)
+            .section(&exports)
+            .section(&code);
+        module
+    };
+
+    let mut component = Component::new();
+    {
+        let mut types = ComponentTypeSection::new();
+        types
+            .function()
+            .params([(
+                "s",
+                wasm_encoder::ComponentValType::Primitive(wasm_encoder::PrimitiveValType::String),
+            )])
+            .result(Some(wasm_encoder::ComponentValType::Primitive(
+                wasm_encoder::PrimitiveValType::U32,
+            )));
+        component.section(&types);
+    }
+    {
+        let mut imports = ComponentImportSection::new();
+        imports.import("test:api/api", ComponentTypeRef::Func(0));
+        component.section(&imports);
+    }
+    component.section(&ModuleSection(&mem_provider));
+    {
+        let mut inst = InstanceSection::new();
+        let no_args: Vec<(&str, ModuleArg)> = vec![];
+        inst.instantiate(0, no_args);
+        component.section(&inst);
+    }
+    {
+        let mut aliases = ComponentAliasSection::new();
+        aliases.alias(Alias::CoreInstanceExport {
+            instance: 0,
+            kind: ExportKind::Func,
+            name: "mp_realloc",
+        });
+        component.section(&aliases);
+    }
+    {
+        let mut aliases = ComponentAliasSection::new();
+        aliases.alias(Alias::CoreInstanceExport {
+            instance: 0,
+            kind: ExportKind::Memory,
+            name: "mp_memory",
+        });
+        component.section(&aliases);
+    }
+    {
+        let mut canon = CanonicalFunctionSection::new();
+        canon.lower(
+            0,
+            [
+                CanonicalOption::CompactUTF16, // meld → Latin1
+                CanonicalOption::Memory(0),
+                CanonicalOption::Realloc(0),
+            ],
+        );
+        component.section(&canon);
+    }
+    component.section(&ModuleSection(&core_module));
+    component.finish()
+}
+
+/// Fuse a (caller, callee) pair in MultiMemory mode, validate, run `run`, and
+/// return its i32 result. Shared by the #253 runtime-differential tests.
+fn fuse_run_i32(caller: &[u8], callee: &[u8], label: &str) -> i32 {
     let config = FuserConfig {
         memory_strategy: MemoryStrategy::MultiMemory,
         attestation: false,
@@ -3149,24 +3573,175 @@ fn test_253_utf16_to_latin1_transcode_fails_loud() {
         output_format: meld_core::OutputFormat::CoreModule,
         opaque_resources: Vec::new(),
     };
-
     let mut fuser = Fuser::new(config);
     fuser
-        .add_component_named(&callee, Some("callee-latin1"))
+        .add_component_named(callee, Some("callee"))
         .expect("callee parse");
     fuser
-        .add_component_named(&caller, Some("caller-utf16"))
+        .add_component_named(caller, Some("caller"))
         .expect("caller parse");
+    let (fused, _) = fuser
+        .fuse_with_stats()
+        .unwrap_or_else(|e| panic!("#253 [{label}]: fusion must succeed: {e:?}"));
 
-    let result = fuser.fuse_with_stats();
-    assert!(
-        result.is_err(),
-        "#253: (Utf16 -> Latin1) is a lossy down-conversion with no transcoder; \
-         fusion must fail loudly rather than emit a silently-wrong copy. Got Ok."
+    let mut validator = wasmparser::Validator::new();
+    validator
+        .validate_all(&fused)
+        .unwrap_or_else(|e| panic!("#253 [{label}]: output must validate: {e}"));
+
+    let mut ec = Config::new();
+    ec.wasm_multi_memory(true);
+    let engine = Engine::new(&ec).unwrap();
+    let module = RuntimeModule::new(&engine, &fused).unwrap();
+    let mut store = Store::new(&engine, ());
+    let instance = Instance::new(&mut store, &module, &[]).unwrap();
+    let run = instance
+        .get_typed_func::<(), i32>(&mut store, "run")
+        .unwrap();
+    run.call(&mut store, ()).unwrap()
+}
+
+/// #253 READ side, tag CLEAR (pure Latin-1 source). A CompactUTF16-lowering
+/// caller storing 1 byte/char with an untagged length, fused into a UTF-16
+/// callee: latin1+utf16 → UTF-16. "café" = bytes [0x63,0x61,0x66,0xE9] →
+/// code units [0x0063,0x0061,0x0066,0x00E9], sum 99+97+102+233 = 531. Preserves
+/// the pre-#253 tag-clear behaviour (this is the path the old SR-17 test took).
+#[test]
+fn test_253_read_latin1_tagclear_to_utf16() {
+    let callee = build_callee_utf16_string_component(); // UTF-16 lift, sums code units
+    let caller = build_caller_latin1_lowering_component(&[0x63, 0x61, 0x66, 0xE9]);
+    let result = fuse_run_i32(&caller, &callee, "read latin1 tag-clear → utf16");
+    assert_eq!(result, 531, "café code-unit sum");
+}
+
+/// #253 READ side, tag CLEAR → UTF-8. latin1+utf16 (pure Latin-1) → UTF-8.
+/// "café" Latin-1 bytes [0x63,0x61,0x66,0xE9]; 0xE9 ('é') becomes the 2-byte
+/// UTF-8 sequence 0xC3 0xA9, the ASCII bytes pass through. The UTF-8 callee
+/// sums received bytes: 0x63+0x61+0x66 + 0xC3+0xA9 = 99+97+102+195+169 = 662.
+#[test]
+fn test_253_read_latin1_tagclear_to_utf8() {
+    let callee = build_callee_string_component(); // UTF-8 lift, sums bytes
+    let caller = build_caller_latin1_lowering_component(&[0x63, 0x61, 0x66, 0xE9]);
+    let result = fuse_run_i32(&caller, &callee, "read latin1 tag-clear → utf8");
+    assert_eq!(result, 662, "café UTF-8 byte sum");
+}
+
+/// #253 READ side, tag SET (UTF-16 payload) → UTF-16. The latin1+utf16 source
+/// is actually UTF-16 ("日本" = [0x65E5, 0x672C], tag set). latin1+utf16 →
+/// UTF-16 with the tag set is a verbatim code-unit copy. The UTF-16 callee sums
+/// code units: 0x65E5 + 0x672C = 26085 + 26412 = 52497.
+#[test]
+fn test_253_read_latin1_tagset_to_utf16() {
+    let callee = build_callee_utf16_string_component();
+    let caller = build_caller_latin1_tagged_lowering_component(&[0x65E5, 0x672C]);
+    let result = fuse_run_i32(&caller, &callee, "read latin1 tag-set → utf16");
+    assert_eq!(result, 52497, "日本 code-unit sum (verbatim utf16 copy)");
+}
+
+/// #253 READ side, tag SET (UTF-16 payload) → UTF-8, including a supplementary
+/// code point. Source "A😀" = UTF-16 [0x0041, 0xD83D, 0xDE00] (tag set). When
+/// the tag is set the latin1+utf16 → UTF-8 transcoder treats the source as
+/// UTF-16, so it must decode the surrogate pair to U+1F600 and emit 4-byte
+/// UTF-8. Expected UTF-8 bytes: 0x41, 0xF0,0x9F,0x98,0x80 → byte sum
+/// 65 + 240+159+152+128 = 744.
+#[test]
+fn test_253_read_latin1_tagset_to_utf8_supplementary() {
+    let callee = build_callee_string_component(); // UTF-8, sums bytes
+    let caller = build_caller_latin1_tagged_lowering_component(&[0x0041, 0xD83D, 0xDE00]);
+    let result = fuse_run_i32(&caller, &callee, "read latin1 tag-set → utf8 (supp)");
+    assert_eq!(result, 744, "A😀 UTF-8 byte sum via surrogate decode");
+}
+
+/// #253 WRITE side, UTF-8 → latin1+utf16, latin1-FITS (tag CLEAR). All code
+/// points ≤ 0xFF, so the encoder must pick the Latin-1 representation (1
+/// byte/char, tag clear). Source "café" UTF-8 = [0x63,0x61,0x66,0xC3,0xA9]
+/// (5 bytes); decodes to code points [0x63,0x61,0x66,0xE9], all ≤ 0xFF →
+/// Latin-1 bytes [0x63,0x61,0x66,0xE9]. The tag-decoding callee reads bytes
+/// (tag clear) and sums: 99+97+102+233 = 531.
+#[test]
+fn test_253_write_utf8_to_latin1_fits() {
+    let callee = build_callee_compact_decoding_component();
+    let caller = build_caller_string_component_data("café".as_bytes()); // UTF-8 source
+    let result = fuse_run_i32(&caller, &callee, "write utf8 → latin1 (fits)");
+    assert_eq!(result, 531, "café Latin-1 byte sum, tag clear");
+}
+
+/// #253 WRITE side, UTF-8 → latin1+utf16, UTF-16-REQUIRING (tag SET). "日本"
+/// contains code points > 0xFF, so the encoder must fall back to UTF-16 (tag
+/// set). Source UTF-8 = E6 97 A5 E6 9C AC → code points [0x65E5, 0x672C] →
+/// UTF-16 units [0x65E5, 0x672C]. The tag-decoding callee reads 16-bit units
+/// (tag set) and sums 0x65E5 + 0x672C = 52497.
+#[test]
+fn test_253_write_utf8_to_latin1_needs_utf16() {
+    let callee = build_callee_compact_decoding_component();
+    let caller = build_caller_string_component_data("日本".as_bytes());
+    let result = fuse_run_i32(&caller, &callee, "write utf8 → latin1 (needs utf16)");
+    assert_eq!(result, 52497, "日本 UTF-16 code-unit sum, tag set");
+}
+
+/// #253 WRITE side, UTF-16 → latin1+utf16, latin1-FITS (tag CLEAR). UTF-16
+/// source "café" = [0x0063,0x0061,0x0066,0x00E9], all ≤ 0xFF → Latin-1 bytes,
+/// tag clear. Callee sums bytes: 99+97+102+233 = 531.
+#[test]
+fn test_253_write_utf16_to_latin1_fits() {
+    let callee = build_callee_compact_decoding_component();
+    let caller = build_caller_utf16_lowering_component(&[0x0063, 0x0061, 0x0066, 0x00E9]);
+    let result = fuse_run_i32(&caller, &callee, "write utf16 → latin1 (fits)");
+    assert_eq!(result, 531, "café Latin-1 byte sum, tag clear");
+}
+
+/// #253 WRITE side, UTF-16 → latin1+utf16, UTF-16-REQUIRING with a
+/// supplementary code point (tag SET). Source "A😀" = UTF-16
+/// [0x0041, 0xD83D, 0xDE00]; the encoder decodes the surrogate pair to
+/// U+1F600 (> 0xFF → UTF-16 representation) and re-encodes it as the SAME
+/// surrogate pair, so the stored UTF-16 units are [0x0041, 0xD83D, 0xDE00]
+/// (3 code units, tag set). Callee sums 16-bit units:
+/// 0x0041 + 0xD83D + 0xDE00 = 65 + 55357 + 56832 = 112254.
+#[test]
+fn test_253_write_utf16_to_latin1_needs_utf16_supplementary() {
+    let callee = build_callee_compact_decoding_component();
+    let caller = build_caller_utf16_lowering_component(&[0x0041, 0xD83D, 0xDE00]);
+    let result = fuse_run_i32(&caller, &callee, "write utf16 → latin1 (supp)");
+    assert_eq!(result, 112254, "A😀 UTF-16 code-unit sum, tag set");
+}
+
+/// LS-P-21 regression gate: the latin1+utf16 tag must be honoured end-to-end,
+/// so a tag-SET (UTF-16-represented) latin1+utf16 string is NOT mis-read as
+/// pure Latin-1 (and a latin1-fits string is NOT mis-tagged as UTF-16). This
+/// is the differential guard for the "tag mis-read → wrong-encoding data"
+/// hazard (H-4.4). It pins BOTH directions of the tag:
+///
+/// - a tag-SET read ("日本" as UTF-16 → UTF-16 verbatim copy) must recover the
+///   UTF-16 code units (52497), NOT the byte-wise misread a pure-Latin-1
+///   interpretation would produce;
+/// - a latin1-fits write ("café" UTF-8 → latin1+utf16) must emit Latin-1 with
+///   the tag CLEAR (sum 531 via the callee's 8-bit path), NOT UTF-16.
+///
+/// A regression that ignored the tag (the pre-#253 untagged treatment) would
+/// drive the callee to the wrong element width and fail these equalities.
+#[test]
+fn ls_p_21_latin1_utf16_tag_honored_roundtrip() {
+    // Tag-SET source read correctly (would be byte-misread if the tag were
+    // ignored on the read side).
+    let read = fuse_run_i32(
+        &build_caller_latin1_tagged_lowering_component(&[0x65E5, 0x672C]),
+        &build_callee_utf16_string_component(),
+        "LS-P-21 tag-set read",
     );
-    let msg = format!("{:?}", result.err().unwrap());
-    assert!(
-        msg.contains("transcoding") || msg.contains("#253"),
-        "#253: error should name the unsupported transcoding; got: {msg}"
+    assert_eq!(
+        read, 52497,
+        "LS-P-21: tag-set latin1+utf16 must be read as UTF-16"
+    );
+
+    // latin1-fits write tagged CLEAR (callee's 8-bit path must apply; a
+    // wrongly-set tag would make the callee sum 16-bit units instead).
+    let write = fuse_run_i32(
+        &build_caller_string_component_data("café".as_bytes()),
+        &build_callee_compact_decoding_component(),
+        "LS-P-21 latin1-fits write",
+    );
+    assert_eq!(
+        write, 531,
+        "LS-P-21: latin1-fits UTF-8 must encode as tag-clear Latin-1"
     );
 }
