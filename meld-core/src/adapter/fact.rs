@@ -686,6 +686,192 @@ fn emit_utf16_encode_codepoint(
     func.instruction(&Instruction::End);
 }
 
+/// Emit the code-point → UTF-8 encoder for one code point.
+///
+/// Writes `cp_local` to `mem8[out_ptr_local + dst_idx_local]` as 1–4 UTF-8
+/// bytes (cp<0x80 → 1; <0x800 → 2; <0x10000 → 3; else → 4), advancing
+/// `dst_idx_local` by the number of bytes written. Extracted verbatim from the
+/// sync [`FactStyleGenerator::emit_utf16_to_utf8_transcode`] encode tail (#272
+/// inc 2) so the sync transcoder and the async param transcoder
+/// ([`emit_utf16_to_utf8_transcode_param`]) share ONE validated encoder and
+/// cannot drift. Uses no scratch beyond `cp_local` / `dst_idx_local`.
+fn emit_utf8_encode_codepoint(
+    func: &mut Function,
+    dst_mem8: wasm_encoder::MemArg,
+    out_ptr_local: u32,
+    dst_idx_local: u32,
+    cp_local: u32,
+) {
+    // if code_point < 0x80: 1-byte
+    func.instruction(&Instruction::LocalGet(cp_local));
+    func.instruction(&Instruction::I32Const(0x80));
+    func.instruction(&Instruction::I32LtU);
+    func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+    {
+        // out[dst_idx] = code_point
+        func.instruction(&Instruction::LocalGet(out_ptr_local));
+        func.instruction(&Instruction::LocalGet(dst_idx_local));
+        func.instruction(&Instruction::I32Add);
+        func.instruction(&Instruction::LocalGet(cp_local));
+        func.instruction(&Instruction::I32Store8(dst_mem8));
+        // dst_idx += 1
+        func.instruction(&Instruction::LocalGet(dst_idx_local));
+        func.instruction(&Instruction::I32Const(1));
+        func.instruction(&Instruction::I32Add);
+        func.instruction(&Instruction::LocalSet(dst_idx_local));
+    }
+    func.instruction(&Instruction::Else);
+    {
+        // if code_point < 0x800: 2-byte
+        func.instruction(&Instruction::LocalGet(cp_local));
+        func.instruction(&Instruction::I32Const(0x800));
+        func.instruction(&Instruction::I32LtU);
+        func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+        {
+            // out[dst_idx] = 0xC0 | (cp >> 6)
+            func.instruction(&Instruction::LocalGet(out_ptr_local));
+            func.instruction(&Instruction::LocalGet(dst_idx_local));
+            func.instruction(&Instruction::I32Add);
+            func.instruction(&Instruction::I32Const(0xC0));
+            func.instruction(&Instruction::LocalGet(cp_local));
+            func.instruction(&Instruction::I32Const(6));
+            func.instruction(&Instruction::I32ShrU);
+            func.instruction(&Instruction::I32Or);
+            func.instruction(&Instruction::I32Store8(dst_mem8));
+            // out[dst_idx+1] = 0x80 | (cp & 0x3F)
+            func.instruction(&Instruction::LocalGet(out_ptr_local));
+            func.instruction(&Instruction::LocalGet(dst_idx_local));
+            func.instruction(&Instruction::I32Add);
+            func.instruction(&Instruction::I32Const(1));
+            func.instruction(&Instruction::I32Add);
+            func.instruction(&Instruction::I32Const(0x80));
+            func.instruction(&Instruction::LocalGet(cp_local));
+            func.instruction(&Instruction::I32Const(0x3F));
+            func.instruction(&Instruction::I32And);
+            func.instruction(&Instruction::I32Or);
+            func.instruction(&Instruction::I32Store8(dst_mem8));
+            // dst_idx += 2
+            func.instruction(&Instruction::LocalGet(dst_idx_local));
+            func.instruction(&Instruction::I32Const(2));
+            func.instruction(&Instruction::I32Add);
+            func.instruction(&Instruction::LocalSet(dst_idx_local));
+        }
+        func.instruction(&Instruction::Else);
+        {
+            // if code_point < 0x10000: 3-byte
+            func.instruction(&Instruction::LocalGet(cp_local));
+            func.instruction(&Instruction::I32Const(0x10000));
+            func.instruction(&Instruction::I32LtU);
+            func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+            {
+                // out[dst_idx] = 0xE0 | (cp >> 12)
+                func.instruction(&Instruction::LocalGet(out_ptr_local));
+                func.instruction(&Instruction::LocalGet(dst_idx_local));
+                func.instruction(&Instruction::I32Add);
+                func.instruction(&Instruction::I32Const(0xE0_u32 as i32));
+                func.instruction(&Instruction::LocalGet(cp_local));
+                func.instruction(&Instruction::I32Const(12));
+                func.instruction(&Instruction::I32ShrU);
+                func.instruction(&Instruction::I32Or);
+                func.instruction(&Instruction::I32Store8(dst_mem8));
+                // out[dst_idx+1] = 0x80 | ((cp >> 6) & 0x3F)
+                func.instruction(&Instruction::LocalGet(out_ptr_local));
+                func.instruction(&Instruction::LocalGet(dst_idx_local));
+                func.instruction(&Instruction::I32Add);
+                func.instruction(&Instruction::I32Const(1));
+                func.instruction(&Instruction::I32Add);
+                func.instruction(&Instruction::I32Const(0x80));
+                func.instruction(&Instruction::LocalGet(cp_local));
+                func.instruction(&Instruction::I32Const(6));
+                func.instruction(&Instruction::I32ShrU);
+                func.instruction(&Instruction::I32Const(0x3F));
+                func.instruction(&Instruction::I32And);
+                func.instruction(&Instruction::I32Or);
+                func.instruction(&Instruction::I32Store8(dst_mem8));
+                // out[dst_idx+2] = 0x80 | (cp & 0x3F)
+                func.instruction(&Instruction::LocalGet(out_ptr_local));
+                func.instruction(&Instruction::LocalGet(dst_idx_local));
+                func.instruction(&Instruction::I32Add);
+                func.instruction(&Instruction::I32Const(2));
+                func.instruction(&Instruction::I32Add);
+                func.instruction(&Instruction::I32Const(0x80));
+                func.instruction(&Instruction::LocalGet(cp_local));
+                func.instruction(&Instruction::I32Const(0x3F));
+                func.instruction(&Instruction::I32And);
+                func.instruction(&Instruction::I32Or);
+                func.instruction(&Instruction::I32Store8(dst_mem8));
+                // dst_idx += 3
+                func.instruction(&Instruction::LocalGet(dst_idx_local));
+                func.instruction(&Instruction::I32Const(3));
+                func.instruction(&Instruction::I32Add);
+                func.instruction(&Instruction::LocalSet(dst_idx_local));
+            }
+            func.instruction(&Instruction::Else);
+            {
+                // 4-byte: code_point >= 0x10000
+                // out[dst_idx] = 0xF0 | (cp >> 18)
+                func.instruction(&Instruction::LocalGet(out_ptr_local));
+                func.instruction(&Instruction::LocalGet(dst_idx_local));
+                func.instruction(&Instruction::I32Add);
+                func.instruction(&Instruction::I32Const(0xF0_u32 as i32));
+                func.instruction(&Instruction::LocalGet(cp_local));
+                func.instruction(&Instruction::I32Const(18));
+                func.instruction(&Instruction::I32ShrU);
+                func.instruction(&Instruction::I32Or);
+                func.instruction(&Instruction::I32Store8(dst_mem8));
+                // out[dst_idx+1] = 0x80 | ((cp >> 12) & 0x3F)
+                func.instruction(&Instruction::LocalGet(out_ptr_local));
+                func.instruction(&Instruction::LocalGet(dst_idx_local));
+                func.instruction(&Instruction::I32Add);
+                func.instruction(&Instruction::I32Const(1));
+                func.instruction(&Instruction::I32Add);
+                func.instruction(&Instruction::I32Const(0x80));
+                func.instruction(&Instruction::LocalGet(cp_local));
+                func.instruction(&Instruction::I32Const(12));
+                func.instruction(&Instruction::I32ShrU);
+                func.instruction(&Instruction::I32Const(0x3F));
+                func.instruction(&Instruction::I32And);
+                func.instruction(&Instruction::I32Or);
+                func.instruction(&Instruction::I32Store8(dst_mem8));
+                // out[dst_idx+2] = 0x80 | ((cp >> 6) & 0x3F)
+                func.instruction(&Instruction::LocalGet(out_ptr_local));
+                func.instruction(&Instruction::LocalGet(dst_idx_local));
+                func.instruction(&Instruction::I32Add);
+                func.instruction(&Instruction::I32Const(2));
+                func.instruction(&Instruction::I32Add);
+                func.instruction(&Instruction::I32Const(0x80));
+                func.instruction(&Instruction::LocalGet(cp_local));
+                func.instruction(&Instruction::I32Const(6));
+                func.instruction(&Instruction::I32ShrU);
+                func.instruction(&Instruction::I32Const(0x3F));
+                func.instruction(&Instruction::I32And);
+                func.instruction(&Instruction::I32Or);
+                func.instruction(&Instruction::I32Store8(dst_mem8));
+                // out[dst_idx+3] = 0x80 | (cp & 0x3F)
+                func.instruction(&Instruction::LocalGet(out_ptr_local));
+                func.instruction(&Instruction::LocalGet(dst_idx_local));
+                func.instruction(&Instruction::I32Add);
+                func.instruction(&Instruction::I32Const(3));
+                func.instruction(&Instruction::I32Add);
+                func.instruction(&Instruction::I32Const(0x80));
+                func.instruction(&Instruction::LocalGet(cp_local));
+                func.instruction(&Instruction::I32Const(0x3F));
+                func.instruction(&Instruction::I32And);
+                func.instruction(&Instruction::I32Or);
+                func.instruction(&Instruction::I32Store8(dst_mem8));
+                // dst_idx += 4
+                func.instruction(&Instruction::LocalGet(dst_idx_local));
+                func.instruction(&Instruction::I32Const(4));
+                func.instruction(&Instruction::I32Add);
+                func.instruction(&Instruction::LocalSet(dst_idx_local));
+            }
+            func.instruction(&Instruction::End); // end 3-byte vs 4-byte
+        }
+        func.instruction(&Instruction::End); // end 2-byte vs 3+byte
+    }
+    func.instruction(&Instruction::End); // end 1-byte vs 2+byte
+}
+
 /// Emit a UTF-8 → UTF-16 transcode of a single top-level `(ptr, len)` string
 /// param on the async-lift cross-memory copy path (#272 inc 1).
 ///
@@ -773,6 +959,108 @@ fn emit_utf8_to_utf16_transcode_param(
 
     // Rewrite the forwarded (ptr, len): ptr → callee output buffer, len →
     // output UTF-16 code-unit count.
+    body.instruction(&Instruction::LocalGet(out_ptr_local));
+    body.instruction(&Instruction::LocalSet(ptr_local));
+    body.instruction(&Instruction::LocalGet(dst_idx_local));
+    body.instruction(&Instruction::LocalSet(len_local));
+}
+
+/// Emit a UTF-16 → UTF-8 transcode of a single top-level `(ptr, len)` string
+/// param on the async-lift cross-memory copy path (#272 inc 2).
+///
+/// The exact mirror of [`emit_utf8_to_utf16_transcode_param`] in the REVERSE
+/// direction. Fully parameterised by local indices / MemArgs (no hidden
+/// local-0/1 assumptions) and emits NO `Call` — composed from the shared,
+/// validated [`emit_utf16_decode_codepoint`] (source side) +
+/// [`emit_utf8_encode_codepoint`] (destination side, the same encoder the sync
+/// [`FactStyleGenerator::emit_utf16_to_utf8_transcode`] now uses) so it cannot
+/// drift from the sync decoder/encoder.
+///
+/// Contract:
+/// * `ptr_local` / `len_local` hold the CALLER-memory source pointer and the
+///   source length, which for a UTF-16 source is a **code-unit count** (NOT a
+///   byte count). On return, `ptr_local` is rewritten to the freshly
+///   reallocated CALLEE-memory output pointer and `len_local` is rewritten to
+///   the output UTF-8 **byte count** — the operand a UTF-8 lifting callee
+///   reads. Failing to rewrite `len_local` would silently mis-size the callee's
+///   view of the string.
+/// * `out_ptr_local` receives the realloc result (the callee output buffer).
+/// * `src_idx_local`, `dst_idx_local`, `cp_local`, `cu_local`, `cu2_local`
+///   are dedicated scratch i32 locals the caller must reserve; they must not
+///   alias `ptr_local`/`len_local` or each other. (Same count — 5 — as the
+///   inc-1 forward transcoder, so the async-adapter scratch budgets are
+///   unchanged.)
+///
+/// Sizing (mirrors the sync emitter's LS-A-7 guards): the worst case is 3 UTF-8
+/// bytes per UTF-16 code unit — a BMP non-ASCII unit (U+0800..U+FFFF) encodes
+/// to 3 bytes, while a supplementary scalar uses a surrogate PAIR (2 units) for
+/// 4 bytes = 2 bytes/unit < 3 — so the output is at most `3 * len` bytes.
+/// `3 * len` is computed with an i32-overflow guard before the multiply (trap
+/// if `len > u32::MAX/3`), and the realloc return is null-checked, both via the
+/// shared helpers — the same `(*3, guard)` sizing the sync emitter uses.
+#[allow(clippy::too_many_arguments)]
+fn emit_utf16_to_utf8_transcode_param(
+    body: &mut Function,
+    realloc_func: u32,
+    realloc_align: i32,
+    src_mem16: wasm_encoder::MemArg,
+    dst_mem8: wasm_encoder::MemArg,
+    ptr_local: u32,
+    len_local: u32,
+    out_ptr_local: u32,
+    src_idx_local: u32,
+    dst_idx_local: u32,
+    cp_local: u32,
+    cu_local: u32,
+    cu2_local: u32,
+) {
+    // Allocate output buffer = 3 * len bytes (each UTF-16 code unit → ≤ 3 UTF-8
+    // bytes; a surrogate pair is 2 units → 4 bytes = 2 bytes/unit). LS-A-7 leg
+    // (a): guard the *3 against i32 wrap; leg (b): emit_checked_realloc traps on
+    // a null return.
+    emit_overflow_guard(body, len_local, 3);
+    body.instruction(&Instruction::I32Const(0)); // old_ptr
+    body.instruction(&Instruction::I32Const(0)); // old_size
+    body.instruction(&Instruction::I32Const(realloc_align)); // align
+    body.instruction(&Instruction::LocalGet(len_local));
+    body.instruction(&Instruction::I32Const(3));
+    body.instruction(&Instruction::I32Mul); // new_size = 3 * len
+    emit_checked_realloc(body, realloc_func, out_ptr_local);
+
+    // src_idx = 0 (code units); dst_idx = 0 (the running output BYTE count).
+    body.instruction(&Instruction::I32Const(0));
+    body.instruction(&Instruction::LocalSet(src_idx_local));
+    body.instruction(&Instruction::I32Const(0));
+    body.instruction(&Instruction::LocalSet(dst_idx_local));
+
+    // Transcode loop.
+    body.instruction(&Instruction::Block(wasm_encoder::BlockType::Empty));
+    body.instruction(&Instruction::Loop(wasm_encoder::BlockType::Empty));
+    // if src_idx >= len: break.
+    body.instruction(&Instruction::LocalGet(src_idx_local));
+    body.instruction(&Instruction::LocalGet(len_local));
+    body.instruction(&Instruction::I32GeU);
+    body.instruction(&Instruction::BrIf(1));
+    // cp = decode_utf16(src); src_idx advances by 1 or 2 code units (lossy
+    // U+FFFD for lone surrogates).
+    emit_utf16_decode_codepoint(
+        body,
+        src_mem16,
+        ptr_local,
+        src_idx_local,
+        len_local,
+        cu_local,
+        cp_local,
+        cu2_local,
+    );
+    // encode_utf8(cp) → dst; dst_idx advances by 1..4 bytes.
+    emit_utf8_encode_codepoint(body, dst_mem8, out_ptr_local, dst_idx_local, cp_local);
+    body.instruction(&Instruction::Br(0));
+    body.instruction(&Instruction::End); // loop
+    body.instruction(&Instruction::End); // block
+
+    // Rewrite the forwarded (ptr, len): ptr → callee output buffer, len →
+    // output UTF-8 byte count.
     body.instruction(&Instruction::LocalGet(out_ptr_local));
     body.instruction(&Instruction::LocalSet(ptr_local));
     body.instruction(&Instruction::LocalGet(dst_idx_local));
@@ -934,6 +1222,178 @@ pub fn build_utf8_to_utf16_transcode_test_module() -> Vec<u8> {
         f.instruction(&Instruction::I32Shl);
         f.instruction(&Instruction::I32Add);
         f.instruction(&Instruction::I32Load16U(dst_mem16));
+        f.instruction(&Instruction::LocalGet(8));
+        f.instruction(&Instruction::I32Add);
+        f.instruction(&Instruction::LocalSet(8));
+        // i += 1
+        f.instruction(&Instruction::LocalGet(9));
+        f.instruction(&Instruction::I32Const(1));
+        f.instruction(&Instruction::I32Add);
+        f.instruction(&Instruction::LocalSet(9));
+        f.instruction(&Instruction::Br(0));
+        f.instruction(&Instruction::End); // loop
+        f.instruction(&Instruction::End); // block
+        f.instruction(&Instruction::LocalGet(8));
+        f.instruction(&Instruction::End);
+        code.function(&f);
+    }
+
+    let mut module = Module::new();
+    module
+        .section(&types)
+        .section(&functions)
+        .section(&memory)
+        .section(&globals)
+        .section(&exports)
+        .section(&code);
+    module.finish()
+}
+
+/// Build a self-contained two-memory wasm module that exercises the EXACT
+/// async-path UTF-16 → UTF-8 param transcode emitter
+/// ([`emit_utf16_to_utf8_transcode_param`]) under a real engine, for the
+/// #272 inc-2 runtime-differential oracle. The mirror of
+/// [`build_utf8_to_utf16_transcode_test_module`] in the reverse direction.
+///
+/// Module shape (exercises the real emitter, MemArgs distinct per memory):
+/// * memory 0 (caller): the UTF-16 source code units (little-endian), written
+///   by the host before the call.
+/// * memory 1 (callee): the bump-allocated UTF-8 output.
+/// * func 0 `cabi_realloc(old,oldsz,align,newsz) -> i32`: a 1-byte-aligned bump
+///   allocator over a mutable global cursor in memory 1.
+/// * func 1 `transcode_and_sum(src_ptr, src_units) -> i32` (exported): copies
+///   the args into the `(ptr, len)` locals, runs the transcode (which reallocs
+///   in memory 1 and rewrites the locals to `(out_ptr, byte_count)`), then sums
+///   `mem1.u8[out_ptr + i]` for `i in 0..byte_count`. A raw byte-copy (the
+///   pre-inc-2 behaviour) cannot produce the correct UTF-8 byte sum, so the
+///   oracle proves transcoding rather than copying.
+///
+/// Exposed `#[doc(hidden)] pub` purely so the `async_cross_encoding` runtime
+/// test can instantiate it; it is not part of the supported API.
+#[doc(hidden)]
+pub fn build_utf16_to_utf8_transcode_test_module() -> Vec<u8> {
+    use wasm_encoder::{
+        CodeSection, ConstExpr, ExportKind, ExportSection, FunctionSection, GlobalSection,
+        GlobalType, MemArg, MemorySection, MemoryType, Module, TypeSection, ValType,
+    };
+
+    let mut types = TypeSection::new();
+    // type 0: cabi_realloc (i32,i32,i32,i32) -> i32
+    types.ty().function(
+        [ValType::I32, ValType::I32, ValType::I32, ValType::I32],
+        [ValType::I32],
+    );
+    // type 1: transcode_and_sum (i32 src_ptr, i32 src_units) -> i32
+    types
+        .ty()
+        .function([ValType::I32, ValType::I32], [ValType::I32]);
+
+    let mut functions = FunctionSection::new();
+    functions.function(0); // func 0: cabi_realloc
+    functions.function(1); // func 1: transcode_and_sum
+
+    // memory 0 = caller (UTF-16 src), memory 1 = callee (UTF-8 out).
+    let mut memory = MemorySection::new();
+    for _ in 0..2 {
+        memory.memory(MemoryType {
+            minimum: 1,
+            maximum: None,
+            memory64: false,
+            shared: false,
+            page_size_log2: None,
+        });
+    }
+
+    // global 0: bump cursor for the memory-1 allocator (start at 16).
+    let mut globals = GlobalSection::new();
+    globals.global(
+        GlobalType {
+            val_type: ValType::I32,
+            mutable: true,
+            shared: false,
+        },
+        &ConstExpr::i32_const(16),
+    );
+
+    let mut exports = ExportSection::new();
+    exports.export("transcode_and_sum", ExportKind::Func, 1);
+    exports.export("caller_memory", ExportKind::Memory, 0);
+    exports.export("callee_memory", ExportKind::Memory, 1);
+
+    let mut code = CodeSection::new();
+
+    // func 0: cabi_realloc — bump allocator over global 0, aligned to `align`.
+    // params: 0=old_ptr, 1=old_size, 2=align, 3=new_size. local 4 = result.
+    {
+        let mut f = Function::new([(1, ValType::I32)]);
+        // ptr = (cursor + align - 1) & ~(align - 1)
+        f.instruction(&Instruction::GlobalGet(0));
+        f.instruction(&Instruction::LocalGet(2));
+        f.instruction(&Instruction::I32Add);
+        f.instruction(&Instruction::I32Const(1));
+        f.instruction(&Instruction::I32Sub);
+        f.instruction(&Instruction::LocalGet(2));
+        f.instruction(&Instruction::I32Const(1));
+        f.instruction(&Instruction::I32Sub);
+        f.instruction(&Instruction::I32Const(-1));
+        f.instruction(&Instruction::I32Xor);
+        f.instruction(&Instruction::I32And);
+        f.instruction(&Instruction::LocalSet(4));
+        // cursor = ptr + new_size
+        f.instruction(&Instruction::LocalGet(4));
+        f.instruction(&Instruction::LocalGet(3));
+        f.instruction(&Instruction::I32Add);
+        f.instruction(&Instruction::GlobalSet(0));
+        f.instruction(&Instruction::LocalGet(4));
+        f.instruction(&Instruction::End);
+        code.function(&f);
+    }
+
+    // func 1: transcode_and_sum(src_ptr, src_units) -> i32
+    // Locals: 0=ptr (in/out), 1=len (in/out), then the transcode scratch:
+    //   2=out_ptr, 3=src_idx, 4=dst_idx/out_bytes, 5=cp, 6=cu, 7=cu2,
+    // plus 8=sum, 9=i for the summing loop.
+    {
+        let src_mem16 = MemArg {
+            offset: 0,
+            align: 1,
+            memory_index: 0,
+        };
+        let dst_mem8 = MemArg {
+            offset: 0,
+            align: 0,
+            memory_index: 1,
+        };
+        let mut f = Function::new([(8, ValType::I32)]);
+        emit_utf16_to_utf8_transcode_param(
+            &mut f, 0, // realloc func
+            1, // realloc align (utf-8: 1)
+            src_mem16, dst_mem8, 0, // ptr_local (src_ptr param, rewritten to out_ptr)
+            1, // len_local (src code-unit count, rewritten to byte count)
+            2, // out_ptr_local
+            3, // src_idx
+            4, // dst_idx / out byte count
+            5, // cp
+            6, // cu
+            7, // cu2
+        );
+        // sum = 0; i = 0
+        f.instruction(&Instruction::I32Const(0));
+        f.instruction(&Instruction::LocalSet(8));
+        f.instruction(&Instruction::I32Const(0));
+        f.instruction(&Instruction::LocalSet(9));
+        f.instruction(&Instruction::Block(wasm_encoder::BlockType::Empty));
+        f.instruction(&Instruction::Loop(wasm_encoder::BlockType::Empty));
+        // if i >= len (now the byte count): break
+        f.instruction(&Instruction::LocalGet(9));
+        f.instruction(&Instruction::LocalGet(1));
+        f.instruction(&Instruction::I32GeU);
+        f.instruction(&Instruction::BrIf(1));
+        // sum += mem1.u8[ptr + i]
+        f.instruction(&Instruction::LocalGet(0));
+        f.instruction(&Instruction::LocalGet(9));
+        f.instruction(&Instruction::I32Add);
+        f.instruction(&Instruction::I32Load8U(dst_mem8));
         f.instruction(&Instruction::LocalGet(8));
         f.instruction(&Instruction::I32Add);
         f.instruction(&Instruction::LocalSet(8));
@@ -4958,175 +5418,9 @@ impl FactStyleGenerator {
         func.instruction(&Instruction::End); // end surrogate detection
 
         // --- Encode code_point as UTF-8 ---
-
-        // if code_point < 0x80: 1-byte
-        func.instruction(&Instruction::LocalGet(cp_local));
-        func.instruction(&Instruction::I32Const(0x80));
-        func.instruction(&Instruction::I32LtU);
-        func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
-        {
-            // out[dst_idx] = code_point
-            func.instruction(&Instruction::LocalGet(out_ptr_local));
-            func.instruction(&Instruction::LocalGet(dst_idx_local));
-            func.instruction(&Instruction::I32Add);
-            func.instruction(&Instruction::LocalGet(cp_local));
-            func.instruction(&Instruction::I32Store8(dst_mem8));
-            // dst_idx += 1
-            func.instruction(&Instruction::LocalGet(dst_idx_local));
-            func.instruction(&Instruction::I32Const(1));
-            func.instruction(&Instruction::I32Add);
-            func.instruction(&Instruction::LocalSet(dst_idx_local));
-        }
-        func.instruction(&Instruction::Else);
-        {
-            // if code_point < 0x800: 2-byte
-            func.instruction(&Instruction::LocalGet(cp_local));
-            func.instruction(&Instruction::I32Const(0x800));
-            func.instruction(&Instruction::I32LtU);
-            func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
-            {
-                // out[dst_idx] = 0xC0 | (cp >> 6)
-                func.instruction(&Instruction::LocalGet(out_ptr_local));
-                func.instruction(&Instruction::LocalGet(dst_idx_local));
-                func.instruction(&Instruction::I32Add);
-                func.instruction(&Instruction::I32Const(0xC0));
-                func.instruction(&Instruction::LocalGet(cp_local));
-                func.instruction(&Instruction::I32Const(6));
-                func.instruction(&Instruction::I32ShrU);
-                func.instruction(&Instruction::I32Or);
-                func.instruction(&Instruction::I32Store8(dst_mem8));
-                // out[dst_idx+1] = 0x80 | (cp & 0x3F)
-                func.instruction(&Instruction::LocalGet(out_ptr_local));
-                func.instruction(&Instruction::LocalGet(dst_idx_local));
-                func.instruction(&Instruction::I32Add);
-                func.instruction(&Instruction::I32Const(1));
-                func.instruction(&Instruction::I32Add);
-                func.instruction(&Instruction::I32Const(0x80));
-                func.instruction(&Instruction::LocalGet(cp_local));
-                func.instruction(&Instruction::I32Const(0x3F));
-                func.instruction(&Instruction::I32And);
-                func.instruction(&Instruction::I32Or);
-                func.instruction(&Instruction::I32Store8(dst_mem8));
-                // dst_idx += 2
-                func.instruction(&Instruction::LocalGet(dst_idx_local));
-                func.instruction(&Instruction::I32Const(2));
-                func.instruction(&Instruction::I32Add);
-                func.instruction(&Instruction::LocalSet(dst_idx_local));
-            }
-            func.instruction(&Instruction::Else);
-            {
-                // if code_point < 0x10000: 3-byte
-                func.instruction(&Instruction::LocalGet(cp_local));
-                func.instruction(&Instruction::I32Const(0x10000));
-                func.instruction(&Instruction::I32LtU);
-                func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
-                {
-                    // out[dst_idx] = 0xE0 | (cp >> 12)
-                    func.instruction(&Instruction::LocalGet(out_ptr_local));
-                    func.instruction(&Instruction::LocalGet(dst_idx_local));
-                    func.instruction(&Instruction::I32Add);
-                    func.instruction(&Instruction::I32Const(0xE0_u32 as i32));
-                    func.instruction(&Instruction::LocalGet(cp_local));
-                    func.instruction(&Instruction::I32Const(12));
-                    func.instruction(&Instruction::I32ShrU);
-                    func.instruction(&Instruction::I32Or);
-                    func.instruction(&Instruction::I32Store8(dst_mem8));
-                    // out[dst_idx+1] = 0x80 | ((cp >> 6) & 0x3F)
-                    func.instruction(&Instruction::LocalGet(out_ptr_local));
-                    func.instruction(&Instruction::LocalGet(dst_idx_local));
-                    func.instruction(&Instruction::I32Add);
-                    func.instruction(&Instruction::I32Const(1));
-                    func.instruction(&Instruction::I32Add);
-                    func.instruction(&Instruction::I32Const(0x80));
-                    func.instruction(&Instruction::LocalGet(cp_local));
-                    func.instruction(&Instruction::I32Const(6));
-                    func.instruction(&Instruction::I32ShrU);
-                    func.instruction(&Instruction::I32Const(0x3F));
-                    func.instruction(&Instruction::I32And);
-                    func.instruction(&Instruction::I32Or);
-                    func.instruction(&Instruction::I32Store8(dst_mem8));
-                    // out[dst_idx+2] = 0x80 | (cp & 0x3F)
-                    func.instruction(&Instruction::LocalGet(out_ptr_local));
-                    func.instruction(&Instruction::LocalGet(dst_idx_local));
-                    func.instruction(&Instruction::I32Add);
-                    func.instruction(&Instruction::I32Const(2));
-                    func.instruction(&Instruction::I32Add);
-                    func.instruction(&Instruction::I32Const(0x80));
-                    func.instruction(&Instruction::LocalGet(cp_local));
-                    func.instruction(&Instruction::I32Const(0x3F));
-                    func.instruction(&Instruction::I32And);
-                    func.instruction(&Instruction::I32Or);
-                    func.instruction(&Instruction::I32Store8(dst_mem8));
-                    // dst_idx += 3
-                    func.instruction(&Instruction::LocalGet(dst_idx_local));
-                    func.instruction(&Instruction::I32Const(3));
-                    func.instruction(&Instruction::I32Add);
-                    func.instruction(&Instruction::LocalSet(dst_idx_local));
-                }
-                func.instruction(&Instruction::Else);
-                {
-                    // 4-byte: code_point >= 0x10000
-                    // out[dst_idx] = 0xF0 | (cp >> 18)
-                    func.instruction(&Instruction::LocalGet(out_ptr_local));
-                    func.instruction(&Instruction::LocalGet(dst_idx_local));
-                    func.instruction(&Instruction::I32Add);
-                    func.instruction(&Instruction::I32Const(0xF0_u32 as i32));
-                    func.instruction(&Instruction::LocalGet(cp_local));
-                    func.instruction(&Instruction::I32Const(18));
-                    func.instruction(&Instruction::I32ShrU);
-                    func.instruction(&Instruction::I32Or);
-                    func.instruction(&Instruction::I32Store8(dst_mem8));
-                    // out[dst_idx+1] = 0x80 | ((cp >> 12) & 0x3F)
-                    func.instruction(&Instruction::LocalGet(out_ptr_local));
-                    func.instruction(&Instruction::LocalGet(dst_idx_local));
-                    func.instruction(&Instruction::I32Add);
-                    func.instruction(&Instruction::I32Const(1));
-                    func.instruction(&Instruction::I32Add);
-                    func.instruction(&Instruction::I32Const(0x80));
-                    func.instruction(&Instruction::LocalGet(cp_local));
-                    func.instruction(&Instruction::I32Const(12));
-                    func.instruction(&Instruction::I32ShrU);
-                    func.instruction(&Instruction::I32Const(0x3F));
-                    func.instruction(&Instruction::I32And);
-                    func.instruction(&Instruction::I32Or);
-                    func.instruction(&Instruction::I32Store8(dst_mem8));
-                    // out[dst_idx+2] = 0x80 | ((cp >> 6) & 0x3F)
-                    func.instruction(&Instruction::LocalGet(out_ptr_local));
-                    func.instruction(&Instruction::LocalGet(dst_idx_local));
-                    func.instruction(&Instruction::I32Add);
-                    func.instruction(&Instruction::I32Const(2));
-                    func.instruction(&Instruction::I32Add);
-                    func.instruction(&Instruction::I32Const(0x80));
-                    func.instruction(&Instruction::LocalGet(cp_local));
-                    func.instruction(&Instruction::I32Const(6));
-                    func.instruction(&Instruction::I32ShrU);
-                    func.instruction(&Instruction::I32Const(0x3F));
-                    func.instruction(&Instruction::I32And);
-                    func.instruction(&Instruction::I32Or);
-                    func.instruction(&Instruction::I32Store8(dst_mem8));
-                    // out[dst_idx+3] = 0x80 | (cp & 0x3F)
-                    func.instruction(&Instruction::LocalGet(out_ptr_local));
-                    func.instruction(&Instruction::LocalGet(dst_idx_local));
-                    func.instruction(&Instruction::I32Add);
-                    func.instruction(&Instruction::I32Const(3));
-                    func.instruction(&Instruction::I32Add);
-                    func.instruction(&Instruction::I32Const(0x80));
-                    func.instruction(&Instruction::LocalGet(cp_local));
-                    func.instruction(&Instruction::I32Const(0x3F));
-                    func.instruction(&Instruction::I32And);
-                    func.instruction(&Instruction::I32Or);
-                    func.instruction(&Instruction::I32Store8(dst_mem8));
-                    // dst_idx += 4
-                    func.instruction(&Instruction::LocalGet(dst_idx_local));
-                    func.instruction(&Instruction::I32Const(4));
-                    func.instruction(&Instruction::I32Add);
-                    func.instruction(&Instruction::LocalSet(dst_idx_local));
-                }
-                func.instruction(&Instruction::End); // end 3-byte vs 4-byte
-            }
-            func.instruction(&Instruction::End); // end 2-byte vs 3+byte
-        }
-        func.instruction(&Instruction::End); // end 1-byte vs 2+byte
+        // Shared with the async param transcoder via the extracted free fn
+        // (#272 inc 2) so both paths use one validated 1–4-byte encoder.
+        emit_utf8_encode_codepoint(func, dst_mem8, out_ptr_local, dst_idx_local, cp_local);
 
         // Continue loop
         func.instruction(&Instruction::Br(0));
@@ -6698,6 +6992,53 @@ impl FactStyleGenerator {
                 continue;
             }
 
+            // #272 inc 2: the REVERSE direction — a TOP-LEVEL byte-granular
+            // (byte_mult == 1) string param crossing memory from a UTF-16
+            // caller to a UTF-8 callee is TRANSCODED (UTF-16 code units decoded
+            // to code points and re-encoded as UTF-8 bytes) rather than
+            // raw-copied (which would leave the callee reading UTF-16 code
+            // units as UTF-8 bytes — the H-4.4 defect). The guard is narrowed
+            // in lockstep so ONLY this combo (in addition to inc 1's) reaches
+            // this branch.
+            let transcode_utf16_to_utf8 = byte_mult == 1
+                && matches!(
+                    site.requirements.caller_encoding,
+                    Some(crate::parser::CanonStringEncoding::Utf16)
+                )
+                && matches!(
+                    site.requirements.callee_encoding,
+                    Some(crate::parser::CanonStringEncoding::Utf8)
+                );
+
+            if transcode_utf16_to_utf8 {
+                let src_mem16 = wasm_encoder::MemArg {
+                    offset: 0,
+                    align: 1,
+                    memory_index: caller_memory,
+                };
+                let dst_mem8 = wasm_encoder::MemArg {
+                    offset: 0,
+                    align: 0,
+                    memory_index: callee_memory,
+                };
+                emit_utf16_to_utf8_transcode_param(
+                    body,
+                    realloc,
+                    1, // realloc align (utf-8 callee, byte-granular)
+                    src_mem16,
+                    dst_mem8,
+                    ptr_local,
+                    len_local,
+                    l_new_ptr,
+                    transcode_base,     // src_idx (code units)
+                    transcode_base + 1, // dst_idx / out byte count
+                    transcode_base + 2, // cp
+                    transcode_base + 3, // cu
+                    transcode_base + 4, // cu2
+                );
+                continue;
+            }
+
             // Allocate: cabi_realloc(0, 0, align, <byte count>)
             emit_overflow_guard(body, len_local, byte_mult);
             body.instruction(&Instruction::I32Const(0));
@@ -7278,11 +7619,15 @@ impl FactStyleGenerator {
             return Ok(());
         }
 
-        // #272 inc 1: the ONLY implemented async transcode is a TOP-LEVEL
-        // UTF-8 → UTF-16 string PARAM. Allow it through; reject everything
-        // else. The direction is compared on the raw canon enums (UTF-8 →
-        // UTF-16 strictly, not the StringEncoding mapping that collapses
-        // latin1+utf16 onto Latin1).
+        // The implemented async transcodes are a TOP-LEVEL string PARAM in
+        // EITHER UTF-8 → UTF-16 (#272 inc 1) or UTF-16 → UTF-8 (#272 inc 2).
+        // Allow those through; reject everything else. The direction is
+        // compared on the raw canon enums (UTF-8 / UTF-16 strictly, not the
+        // StringEncoding mapping that collapses latin1+utf16 onto Latin1), so a
+        // CompactUtf16 endpoint never satisfies either predicate. This MUST
+        // stay identical to the `transcode_*` triggers in `emit_param_copy_step`
+        // — any divergence between the guard's allow-set and the emitter's
+        // transcode-set is silent corruption.
         let direction_is_utf8_to_utf16 = matches!(
             site.requirements.caller_encoding,
             Some(crate::parser::CanonStringEncoding::Utf8)
@@ -7290,6 +7635,14 @@ impl FactStyleGenerator {
             site.requirements.callee_encoding,
             Some(crate::parser::CanonStringEncoding::Utf16)
         );
+        let direction_is_utf16_to_utf8 = matches!(
+            site.requirements.caller_encoding,
+            Some(crate::parser::CanonStringEncoding::Utf16)
+        ) && matches!(
+            site.requirements.callee_encoding,
+            Some(crate::parser::CanonStringEncoding::Utf8)
+        );
+        let direction_is_implemented = direction_is_utf8_to_utf16 || direction_is_utf16_to_utf8;
         // No byte-granular RESULT (the result writeback raw-copies).
         let no_byte_granular_result = !result_has_string;
         // Every param that bears a byte-granular buffer must be TOP-LEVEL
@@ -7316,7 +7669,7 @@ impl FactStyleGenerator {
                 Some(_) => true,
             });
 
-        if direction_is_utf8_to_utf16
+        if direction_is_implemented
             && param_has_string
             && no_byte_granular_result
             && all_param_strings_top_level
@@ -7327,9 +7680,9 @@ impl FactStyleGenerator {
         Err(crate::Error::AdapterGeneration(format!(
             "async cross-encoding string transcoding is not yet supported \
              (caller {caller_enc:?} != callee {callee_enc:?}); only a \
-             top-level UTF-8 → UTF-16 string param is implemented (#272 \
-             inc 1) — a verbatim copy of any other case would silently \
-             mis-transcode — see #272"
+             top-level UTF-8 → UTF-16 (#272 inc 1) or UTF-16 → UTF-8 (#272 \
+             inc 2) string param is implemented — a verbatim copy of any \
+             other case would silently mis-transcode — see #272"
         )))
     }
 
@@ -8132,17 +8485,40 @@ mod tests {
         );
     }
 
-    /// LS-F-27 (still fail-loud): the REVERSE direction — a UTF-16 → UTF-8
-    /// top-level async string PARAM — is NOT implemented by inc 1 and must
-    /// still fail loud (the emitter would raw-copy UTF-16 bytes as UTF-8). The
-    /// guard must not be over-narrowed to allow any non-UTF-8→UTF-16 direction.
+    /// #272 inc 2: the REVERSE direction — a top-level UTF-16 → UTF-8 string
+    /// PARAM crossing memory is now the IMPLEMENTED async transcode case, so
+    /// the guard must ALLOW it through (the emitter transcodes rather than
+    /// raw-copies). Previously this case failed loud (LS-F-27); inc 2
+    /// legitimately flips it to success. The runtime differential proof that
+    /// the transcode is correct (not a raw copy) lives in the
+    /// `async_cross_encoding` runtime test target.
     #[test]
-    fn ls_f_27_async_cross_encoding_utf16_to_utf8_string_param_fails_loud() {
+    fn inc2_async_utf16_to_utf8_top_level_string_param_allowed() {
         use crate::parser::CanonStringEncoding;
         let site =
             async_xenc_string_param_site(CanonStringEncoding::Utf16, CanonStringEncoding::Utf8);
+        assert!(
+            FactStyleGenerator::guard_async_cross_encoding_strings(&site).is_ok(),
+            "#272 inc 2: a top-level UTF-16 → UTF-8 async string param must be \
+             allowed through (transcoded), not fail loud"
+        );
+    }
+
+    /// LS-F-27 (still fail-loud): an UNIMPLEMENTED direction — a UTF-8 →
+    /// latin1+utf16 (CompactUtf16) top-level async string PARAM — must still
+    /// fail loud (the emitter would raw-copy UTF-8 bytes the CompactUtf16
+    /// callee reads with a different shape). Neither inc-1 nor inc-2 allows it.
+    /// Asserts both the error variant and the diagnostic text — the message
+    /// must still explain the gap and cite #272.
+    #[test]
+    fn ls_f_27_async_cross_encoding_unimplemented_direction_fails_loud() {
+        use crate::parser::CanonStringEncoding;
+        let site = async_xenc_string_param_site(
+            CanonStringEncoding::Utf8,
+            CanonStringEncoding::CompactUtf16,
+        );
         let err = FactStyleGenerator::guard_async_cross_encoding_strings(&site)
-            .expect_err("UTF-16 → UTF-8 async string param must still fail loud");
+            .expect_err("UTF-8 → latin1+utf16 async string param must still fail loud");
         match err {
             crate::Error::AdapterGeneration(msg) => {
                 assert!(
@@ -8255,18 +8631,22 @@ mod tests {
 
     /// LS-F-27 wiring: the guard is reached through the real `generate`
     /// dispatch (not just the helper), so a graph with a STILL-unimplemented
-    /// cross-encoding async string site (here UTF-16 → UTF-8, which inc 1 does
-    /// NOT transcode) makes `generate` return Err before emitting a
-    /// silently-corrupting adapter. (The now-implemented UTF-8 → UTF-16 param
-    /// case is covered by `inc1_async_utf8_to_utf16_top_level_string_param_allowed`
-    /// and the runtime differential test.)
+    /// cross-encoding async string site (here UTF-8 → latin1+utf16, which
+    /// neither inc 1 nor inc 2 transcodes) makes `generate` return Err before
+    /// emitting a silently-corrupting adapter. (The now-implemented UTF-8 →
+    /// UTF-16 and UTF-16 → UTF-8 param cases are covered by
+    /// `inc1_async_utf8_to_utf16_top_level_string_param_allowed` /
+    /// `inc2_async_utf16_to_utf8_top_level_string_param_allowed` and the runtime
+    /// differential tests.)
     #[test]
     fn ls_f_27_generate_dispatch_rejects_cross_encoding_async_string() {
         use crate::parser::CanonStringEncoding;
         let gen_ = FactStyleGenerator::new(AdapterConfig::default());
         let merged = empty_merged();
-        let site =
-            async_xenc_string_param_site(CanonStringEncoding::Utf16, CanonStringEncoding::Utf8);
+        let site = async_xenc_string_param_site(
+            CanonStringEncoding::Utf8,
+            CanonStringEncoding::CompactUtf16,
+        );
         let graph = crate::resolver::DependencyGraph {
             instantiation_order: vec![0, 1],
             resolved_imports: std::collections::HashMap::new(),
@@ -8877,6 +9257,162 @@ mod tests {
              {total_locals} are addressable ({caller_param_count} params + \
              {declared} declared) — transcode locals overflow the budget",
         );
+    }
+
+    /// Build a merged module + async-lift site for a SINGLE top-level
+    /// `(ptr, len)` string param crossing memory, with the given caller/callee
+    /// canon string encodings, for the inc-2 local-bounds integration tests.
+    /// The caller type (merged type 1) has two i32 params, so
+    /// `caller_param_count == 2`.
+    fn xenc_string_param_merged_and_site(
+        caller_enc: crate::parser::CanonStringEncoding,
+        callee_enc: crate::parser::CanonStringEncoding,
+    ) -> (crate::merger::MergedModule, crate::resolver::AdapterSite) {
+        use wasm_encoder::{EntityType, ExportKind, Function, ValType};
+        let mut merged = empty_merged();
+        // type 0: () -> i32 (lift, callback-mode packed return).
+        merged.types.push(crate::merger::MergedFuncType {
+            params: Vec::new(),
+            results: vec![ValType::I32],
+        });
+        // type 1: (i32, i32) -> () — caller type, one (ptr,len) string param.
+        merged.types.push(crate::merger::MergedFuncType {
+            params: vec![ValType::I32, ValType::I32],
+            results: Vec::new(),
+        });
+        // type 2: (i32,i32,i32,i32) -> i32 — cabi_realloc.
+        merged.types.push(crate::merger::MergedFuncType {
+            params: vec![ValType::I32; 4],
+            results: vec![ValType::I32],
+        });
+        // lift func @ merged 0, realloc func @ merged 1.
+        merged.functions.push(crate::merger::MergedFunction {
+            type_idx: 0,
+            body: Function::new([]),
+            origin: (1, 0, 0),
+            synthetic_kind: None,
+        });
+        merged.function_index_map.insert((1, 0, 0), 0);
+        merged.functions.push(crate::merger::MergedFunction {
+            type_idx: 2,
+            body: Function::new([]),
+            origin: (1, 0, 1),
+            synthetic_kind: None,
+        });
+        merged.realloc_map.insert((1, 0), 1);
+        // caller memory = component 0, callee memory = component 1.
+        merged.memory_index_map.insert((0, 0, 0), 0);
+        merged.memory_index_map.insert((1, 0, 0), 1);
+        let export_name = "[async-lift]greet";
+        merged.exports.push(crate::merger::MergedExport {
+            name: format!("[callback]{export_name}"),
+            kind: ExportKind::Func,
+            index: 0,
+        });
+        merged.imports.push(crate::merger::MergedImport {
+            module: "$root".into(),
+            name: "[waitable-set-poll]".into(),
+            entity_type: EntityType::Function(0),
+            component_idx: None,
+        });
+
+        let mut site = async_lift_site(export_name);
+        site.from_component = 0;
+        site.to_component = 1;
+        site.import_func_type_idx = Some(1); // caller type (i32,i32) → 2 params
+        site.crosses_memory = true;
+        site.requirements.pointer_pair_positions = vec![0];
+        site.requirements.param_copy_layouts =
+            vec![crate::resolver::CopyLayout::Bulk { byte_multiplier: 1 }];
+        site.requirements.caller_encoding = Some(caller_enc);
+        site.requirements.callee_encoding = Some(callee_enc);
+        (merged, site)
+    }
+
+    /// Assert that every local referenced in `adapter_body` is addressable
+    /// given `caller_param_count` params plus the declared local count.
+    fn assert_locals_within_budget(
+        adapter_body: wasm_encoder::Function,
+        caller_param_count: u32,
+        label: &str,
+    ) {
+        let raw = adapter_body.into_raw_body();
+        let fb = wasmparser::FunctionBody::new(wasmparser::BinaryReader::new(&raw, 0));
+        let mut declared = 0u32;
+        for lp in fb.get_locals_reader().expect("locals reader") {
+            let (count, _ty) = lp.expect("local pair");
+            declared += count;
+        }
+        let total_locals = caller_param_count + declared;
+        let mut max_idx = 0u32;
+        let mut found = false;
+        for op in fb.get_operators_reader().expect("ops reader") {
+            match op.expect("operator") {
+                wasmparser::Operator::LocalGet { local_index }
+                | wasmparser::Operator::LocalSet { local_index }
+                | wasmparser::Operator::LocalTee { local_index } => {
+                    found = true;
+                    max_idx = max_idx.max(local_index);
+                }
+                _ => {}
+            }
+        }
+        assert!(found, "{label}: adapter body should reference locals");
+        assert!(
+            max_idx < total_locals,
+            "{label}: adapter references local {max_idx} but only {total_locals} \
+             are addressable ({caller_param_count} params + {declared} declared) \
+             — transcode locals overflow the budget",
+        );
+    }
+
+    /// #272 inc-2 (integration, callback): the CALLBACK async adapter's
+    /// UTF-16→UTF-8 string-param transcode path must not reference a local past
+    /// its declared budget. The inc-2 transcode loop uses the SAME number of
+    /// scratch locals (5: src_idx, dst_idx, cp, cu, cu2) as inc-1, so the
+    /// callback budget of 26 (top addressable `caller_params + 25`; transcode
+    /// top `caller_params + 25`) already suffices — but the runtime oracle (a
+    /// synthetic module with a large local block) can't prove that for the REAL
+    /// adapter, so this generates it and asserts every referenced local is
+    /// addressable. This is the integration check that caught the inc-1
+    /// "unknown local 24" bug.
+    #[test]
+    fn inc2_callback_adapter_utf16_to_utf8_locals_within_budget() {
+        use crate::parser::CanonStringEncoding;
+        let gen_ = FactStyleGenerator::new(AdapterConfig::default());
+        let (merged, site) = xenc_string_param_merged_and_site(
+            CanonStringEncoding::Utf16,
+            CanonStringEncoding::Utf8,
+        );
+        let adapter = gen_
+            .generate_async_callback_adapter(&site, &merged)
+            .expect("callback emitter must succeed for the inc-2 utf16→utf8 string-param site");
+        assert_locals_within_budget(adapter.body, 2, "#272 inc-2 callback");
+    }
+
+    /// #272 inc-2 (integration, stackful): the STACKFUL async adapter's
+    /// UTF-16→UTF-8 string-param transcode path must likewise stay within its
+    /// declared budget (18; `transcode_base = l_scratch + 12`, top
+    /// `caller_params + 16` ≤ `caller_params + 17`). Inc 1 added only the
+    /// callback bounds test; this adds the stackful variant so BOTH async
+    /// emitters are integration-checked for the implemented transcode site.
+    #[test]
+    fn inc2_stackful_adapter_utf16_to_utf8_locals_within_budget() {
+        use crate::parser::CanonStringEncoding;
+        let gen_ = FactStyleGenerator::new(AdapterConfig::default());
+        let (mut merged, mut site) = xenc_string_param_merged_and_site(
+            CanonStringEncoding::Utf16,
+            CanonStringEncoding::Utf8,
+        );
+        // The stackful path dispatches on a non-`[callback]` export; rename the
+        // export so `generate_async_stackful_adapter` is the one under test.
+        merged.exports[0].name = site.export_name.clone();
+        site.requirements.caller_encoding = Some(CanonStringEncoding::Utf16);
+        site.requirements.callee_encoding = Some(CanonStringEncoding::Utf8);
+        let adapter = gen_
+            .generate_async_stackful_adapter(&site, &merged)
+            .expect("stackful emitter must succeed for the inc-2 utf16→utf8 string-param site");
+        assert_locals_within_budget(adapter.body, 2, "#272 inc-2 stackful");
     }
 
     #[test]
