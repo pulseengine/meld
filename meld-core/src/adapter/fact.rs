@@ -1024,10 +1024,16 @@ fn emit_patch_nested_indirections(
         body.instruction(&Instruction::I32GtU);
         body.instruction(&Instruction::BrIf(0));
 
-        // new_ptr = realloc(0, 0, 1, buf_len) in caller memory
+        // new_ptr = realloc(0, 0, align, buf_len) in caller memory.
+        // align 2 for a compact-utf16 inner string (the buffer may hold a
+        // UTF-16 payload), else 1 — matching the other tag-aware copy sites.
         body.instruction(&Instruction::I32Const(0));
         body.instruction(&Instruction::I32Const(0));
-        body.instruction(&Instruction::I32Const(1));
+        body.instruction(&Instruction::I32Const(if inner_compact_utf16 {
+            2
+        } else {
+            1
+        }));
         body.instruction(&Instruction::LocalGet(l_buf_len));
         emit_checked_realloc(body, realloc_func, l_new_ptr);
 
