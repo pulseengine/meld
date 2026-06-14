@@ -196,6 +196,15 @@ verification-status:
       - adapter_safety::test_sr17_utf16_to_utf8_malformed_surrogate_matrix
       - adapter_safety::test_sr17_utf8_to_utf16_malformed_matrix
       - adapter_safety::test_sr17_latin1_to_utf16_transcoding
+      - adapter_safety::test_253_read_latin1_tagclear_to_utf16
+      - adapter_safety::test_253_read_latin1_tagclear_to_utf8
+      - adapter_safety::test_253_read_latin1_tagset_to_utf16
+      - adapter_safety::test_253_read_latin1_tagset_to_utf8_supplementary
+      - adapter_safety::test_253_write_utf8_to_latin1_fits
+      - adapter_safety::test_253_write_utf8_to_latin1_needs_utf16
+      - adapter_safety::test_253_write_utf16_to_latin1_fits
+      - adapter_safety::test_253_write_utf16_to_latin1_needs_utf16_supplementary
+      - adapter_safety::ls_p_21_latin1_utf16_tag_honored_roundtrip
       - resolver::tests::test_sr17_all_encoding_pairs_transcoding_matrix
     proofs: []
     status: verified
@@ -222,6 +231,26 @@ verification-status:
       all four UTF-16 malformity cases (lone-high-at-end,
       mid-string-high+non-low, valid pair, lone-low) have explicit
       arms and runtime oracles.
+      Extended 2026-06-14 (#253 final increment): SR-17 now covers the
+      canonical-ABI `latin1+utf16` (CompactUTF16) TAGGED length form
+      (UTF16_TAG = 1<<31), which meld models as StringEncoding::Latin1.
+      READ side — the Latin1-source transcoders mask
+      `count = len & !UTF16_TAG` and branch on the tag: tag-clear keeps
+      the pure-Latin-1 1-byte path; tag-set transcodes the source as
+      UTF-16 (latin1→utf8 ⇒ utf16→utf8, latin1→utf16 ⇒ verbatim
+      code-unit copy). WRITE side — emit_utf8_to_latin1_transcode /
+      emit_utf16_to_latin1_transcode are a two-phase encoder: scan, then
+      write Latin-1 (length = n, tag clear) if every code point ≤ 0xFF,
+      else UTF-16 with surrogate pairs (length = code_units | UTF16_TAG).
+      alignment_for_encoding(Latin1) corrected from 1 to 2 (the buffer
+      may hold UTF-16). Runtime-differential oracles cover every
+      newly-enabled direction for BOTH a latin1-fits string ("café") and
+      a utf16-requiring string ("日本" / "A😀"), via a tag-aware decoding
+      callee that reads 16-bit units when the tag is set and 8-bit bytes
+      when clear (test_253_read_* / test_253_write_*). The tag-mis-read /
+      mis-write hazard is recorded as approved loss scenario LS-P-21
+      (H-4.4) with the ls_p_21_latin1_utf16_tag_honored_roundtrip gate
+      test.
 
   SR-18:
     implementation-files: [meld-core/src/adapter/fact.rs]
