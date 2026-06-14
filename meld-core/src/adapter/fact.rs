@@ -122,6 +122,54 @@ pub(crate) fn emit_overflow_guard(body: &mut Function, len_local: u32, k: u32) {
     body.instruction(&Instruction::End);
 }
 
+/// Push the byte length of a copied string/list buffer onto the stack.
+///
+/// For a `latin1+utf16` string (the `Latin1` encoding, `byte_mult == 1`) the
+/// `(ptr, len)` length operand is **tagged** (see [`UTF16_TAG`]): tag set ⇒ the
+/// payload is UTF-16, so the byte length is `(len & !UTF16_TAG) * 2`; tag clear
+/// ⇒ Latin-1, byte length `len`. A same-encoding cross-memory copy
+/// ([`generate_memory_copy_adapter`]) must use this tag-aware byte count for
+/// both the `cabi_realloc` size and the `memory.copy` length — copying the raw
+/// tagged operand would copy `count | 0x8000_0000` bytes (~2 GiB OOB read).
+/// The length operand FORWARDED to the callee stays tagged; only the internal
+/// byte count is masked here.
+///
+/// For every other buffer (`byte_mult != 1`, or a non-Latin1 encoding) the
+/// length is an untagged element count, byte length `len * byte_mult`. A plain
+/// `list<u8>` (also `byte_mult == 1`) is unaffected: a legitimate byte count is
+/// `< 2^31` (the [`emit_overflow_guard`] bound), so the tag bit is clear and
+/// the tag-aware path returns `len` unchanged.
+fn emit_copy_byte_count(
+    func: &mut Function,
+    len_local: u32,
+    byte_mult: u32,
+    is_compact_utf16: bool,
+) {
+    if is_compact_utf16 {
+        // bytes = (len & UTF16_TAG) ? (len & !UTF16_TAG) * 2 : len
+        func.instruction(&Instruction::LocalGet(len_local));
+        func.instruction(&Instruction::I32Const(UTF16_TAG));
+        func.instruction(&Instruction::I32And);
+        func.instruction(&Instruction::If(wasm_encoder::BlockType::Result(
+            wasm_encoder::ValType::I32,
+        )));
+        func.instruction(&Instruction::LocalGet(len_local));
+        func.instruction(&Instruction::I32Const(!UTF16_TAG));
+        func.instruction(&Instruction::I32And);
+        func.instruction(&Instruction::I32Const(2));
+        func.instruction(&Instruction::I32Mul);
+        func.instruction(&Instruction::Else);
+        func.instruction(&Instruction::LocalGet(len_local));
+        func.instruction(&Instruction::End);
+    } else {
+        func.instruction(&Instruction::LocalGet(len_local));
+        if byte_mult > 1 {
+            func.instruction(&Instruction::I32Const(byte_mult as i32));
+            func.instruction(&Instruction::I32Mul);
+        }
+    }
+}
+
 /// Emit the hardened UTF-8 → code-point decoder for one code point.
 ///
 /// Reads the lead byte at `mem8[ptr_local + src_idx_local]`, decodes a full
@@ -858,6 +906,12 @@ fn emit_patch_nested_indirections(
     realloc_func: u32,
     caller_memory: u32,
     callee_memory: u32,
+    // True when the *callee* string encoding (this is a result-side,
+    // callee → caller copy) is `latin1+utf16` (CompactUtf16). A byte-granular
+    // inner buffer (`sub_elem_size == 1`) is then a tag-encoded string whose
+    // byte count must be masked/doubled. The inner (ptr, len) header keeps its
+    // original (tagged) length — this function rewrites only the pointer.
+    callee_compact_utf16: bool,
 ) {
     let indirections = collect_indirections(elem_ty, 0);
     if indirections.is_empty() {
@@ -945,8 +999,13 @@ fn emit_patch_nested_indirections(
         // side bulk-copy of the outer (ptr, len) keeps the original large
         // `len` — silent truncation and semantic drift between the fused
         // and composed executions.
+        let inner_compact_utf16 = callee_compact_utf16 && *sub_elem_size == 1;
         emit_overflow_guard(body, l_buf_len, *sub_elem_size);
-        if *sub_elem_size != 1 {
+        if inner_compact_utf16 {
+            // #253: byte count is tag-aware — (len & TAG) ? (len & !TAG)*2 : len.
+            emit_copy_byte_count(body, l_buf_len, 1, true);
+            body.instruction(&Instruction::LocalSet(l_buf_len));
+        } else if *sub_elem_size != 1 {
             body.instruction(&Instruction::LocalGet(l_buf_len));
             body.instruction(&Instruction::I32Const(*sub_elem_size as i32));
             body.instruction(&Instruction::I32Mul);
@@ -2107,26 +2166,31 @@ impl FactStyleGenerator {
                     })
                     .unwrap_or(1);
 
-                // Allocate: dest = cabi_realloc(0, 0, 1, len * byte_mult)
+                // A param-side buffer carries a latin1+utf16 (CompactUTF16,
+                // modelled as Latin1) string when the *caller* encoding is
+                // Latin1 and the data is byte-granular (byte_mult == 1). Its
+                // length operand is tag-encoded (UTF16_TAG): the byte count
+                // must be masked/doubled (`emit_copy_byte_count`) for the
+                // realloc size and the memory.copy length, while the length
+                // FORWARDED to the callee stays tagged. A plain list<u8>
+                // (also byte_mult == 1) is unaffected: its count is < 2^31,
+                // so the tag bit is clear and the tag-aware path returns `len`.
+                let is_compact_utf16 =
+                    options.caller_string_encoding == StringEncoding::Latin1 && byte_mult == 1;
+                let realloc_align = if is_compact_utf16 { 2 } else { 1 };
+
+                // Allocate: dest = cabi_realloc(0, 0, align, <byte count>)
                 emit_overflow_guard(&mut func, len_pos, byte_mult);
                 func.instruction(&Instruction::I32Const(0));
                 func.instruction(&Instruction::I32Const(0));
-                func.instruction(&Instruction::I32Const(1));
-                func.instruction(&Instruction::LocalGet(len_pos));
-                if byte_mult > 1 {
-                    func.instruction(&Instruction::I32Const(byte_mult as i32));
-                    func.instruction(&Instruction::I32Mul);
-                }
+                func.instruction(&Instruction::I32Const(realloc_align));
+                emit_copy_byte_count(&mut func, len_pos, byte_mult, is_compact_utf16);
                 emit_checked_realloc(&mut func, callee_realloc, dest_local);
 
-                // Copy: memory.copy callee_mem caller_mem (dest, src, len * byte_mult)
+                // Copy: memory.copy callee_mem caller_mem (dest, src, <byte count>)
                 func.instruction(&Instruction::LocalGet(dest_local));
                 func.instruction(&Instruction::LocalGet(ptr_pos));
-                func.instruction(&Instruction::LocalGet(len_pos));
-                if byte_mult > 1 {
-                    func.instruction(&Instruction::I32Const(byte_mult as i32));
-                    func.instruction(&Instruction::I32Mul);
-                }
+                emit_copy_byte_count(&mut func, len_pos, byte_mult, is_compact_utf16);
                 func.instruction(&Instruction::MemoryCopy {
                     src_mem: options.caller_memory,
                     dst_mem: options.callee_memory,
@@ -2152,6 +2216,8 @@ impl FactStyleGenerator {
                         options.callee_memory,
                         callee_realloc,
                         fixup_base,
+                        // Param-side: governed by the caller's string encoding.
+                        options.caller_string_encoding == StringEncoding::Latin1,
                     );
                 }
             } // end for each pointer pair
@@ -2261,6 +2327,11 @@ impl FactStyleGenerator {
                     crate::resolver::CopyLayout::Bulk { byte_multiplier } => *byte_multiplier,
                     crate::resolver::CopyLayout::Elements { element_size, .. } => *element_size,
                 };
+                // Param-side (caller → callee) tagged latin1+utf16 string: see
+                // the unconditional param-copy loop above.
+                let is_compact_utf16 =
+                    options.caller_string_encoding == StringEncoding::Latin1 && byte_mult == 1;
+                let realloc_align = if is_compact_utf16 { 2 } else { 1 };
 
                 // if (all guards in chain hold) { copy and replace ptr }
                 // — outer-guard ANDing matters for nested option/result/variant
@@ -2269,27 +2340,19 @@ impl FactStyleGenerator {
                 emit_conditional_guard_chain_flat(&mut func, cond, 0);
                 func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
 
-                // Allocate: new_ptr = cabi_realloc(0, 0, 1, len * byte_mult)
+                // Allocate: new_ptr = cabi_realloc(0, 0, align, <byte count>)
                 emit_overflow_guard(&mut func, len_local, byte_mult);
                 func.instruction(&Instruction::I32Const(0));
                 func.instruction(&Instruction::I32Const(0));
-                func.instruction(&Instruction::I32Const(1));
-                func.instruction(&Instruction::LocalGet(len_local));
-                if byte_mult > 1 {
-                    func.instruction(&Instruction::I32Const(byte_mult as i32));
-                    func.instruction(&Instruction::I32Mul);
-                }
+                func.instruction(&Instruction::I32Const(realloc_align));
+                emit_copy_byte_count(&mut func, len_local, byte_mult, is_compact_utf16);
                 // Save as dest_ptr (reuse a scratch local)
                 emit_checked_realloc(&mut func, callee_realloc, dest_ptr_local);
 
-                // Copy: memory.copy callee caller (dest, src, len * byte_mult)
+                // Copy: memory.copy callee caller (dest, src, <byte count>)
                 func.instruction(&Instruction::LocalGet(dest_ptr_local));
                 func.instruction(&Instruction::LocalGet(ptr_local));
-                func.instruction(&Instruction::LocalGet(len_local));
-                if byte_mult > 1 {
-                    func.instruction(&Instruction::I32Const(byte_mult as i32));
-                    func.instruction(&Instruction::I32Mul);
-                }
+                emit_copy_byte_count(&mut func, len_local, byte_mult, is_compact_utf16);
                 func.instruction(&Instruction::MemoryCopy {
                     src_mem: options.caller_memory,
                     dst_mem: options.callee_memory,
@@ -2331,19 +2394,29 @@ impl FactStyleGenerator {
             func.instruction(&Instruction::LocalSet(callee_ret_len_local));
             func.instruction(&Instruction::LocalSet(callee_ret_ptr_local));
 
+            // The returned (ptr, len) pair was produced BY THE CALLEE in the
+            // callee's string encoding, so its tag-encoding is governed by
+            // `callee_string_encoding`. byte_mult is 1 here (bulk string /
+            // list<u8> return). A latin1+utf16 return has its length tagged
+            // with UTF16_TAG; copying the raw operand would copy
+            // `count | 0x8000_0000` bytes (~2 GiB OOB). The length pushed back
+            // to the caller stays tagged; only the byte count is masked.
+            let result_is_compact_utf16 = options.callee_string_encoding == StringEncoding::Latin1;
+            let result_realloc_align = if result_is_compact_utf16 { 2 } else { 1 };
+
             // Allocate in caller's memory:
-            //   caller_new_ptr = cabi_realloc(0, 0, 1, callee_ret_len)
+            //   caller_new_ptr = cabi_realloc(0, 0, align, <byte count>)
             func.instruction(&Instruction::I32Const(0)); // original_ptr
             func.instruction(&Instruction::I32Const(0)); // original_size
-            func.instruction(&Instruction::I32Const(1)); // alignment
-            func.instruction(&Instruction::LocalGet(callee_ret_len_local));
+            func.instruction(&Instruction::I32Const(result_realloc_align)); // alignment
+            emit_copy_byte_count(&mut func, callee_ret_len_local, 1, result_is_compact_utf16);
             emit_checked_realloc(&mut func, caller_realloc, caller_new_ptr_local);
 
             // Copy data from callee's memory to caller's memory:
-            //   memory.copy $caller_mem $callee_mem (caller_new_ptr, callee_ret_ptr, len)
+            //   memory.copy $caller_mem $callee_mem (caller_new_ptr, callee_ret_ptr, <byte count>)
             func.instruction(&Instruction::LocalGet(caller_new_ptr_local)); // dst
             func.instruction(&Instruction::LocalGet(callee_ret_ptr_local)); // src
-            func.instruction(&Instruction::LocalGet(callee_ret_len_local)); // size
+            emit_copy_byte_count(&mut func, callee_ret_len_local, 1, result_is_compact_utf16);
             func.instruction(&Instruction::MemoryCopy {
                 src_mem: options.callee_memory,
                 dst_mem: options.caller_memory,
@@ -2412,6 +2485,12 @@ impl FactStyleGenerator {
                         crate::resolver::CopyLayout::Bulk { byte_multiplier } => *byte_multiplier,
                         crate::resolver::CopyLayout::Elements { element_size, .. } => *element_size,
                     };
+                    // Result-side (callee → caller) string: tag-encoding is
+                    // governed by `callee_string_encoding` (the callee produced
+                    // it). See the unconditional result-copy above.
+                    let is_compact_utf16 =
+                        options.callee_string_encoding == StringEncoding::Latin1 && byte_mult == 1;
+                    let realloc_align = if is_compact_utf16 { 2 } else { 1 };
 
                     // if (all guards in chain hold) { allocate in caller,
                     // copy, replace ptr } — outer-guard ANDing per LS-P-10.
@@ -2422,22 +2501,14 @@ impl FactStyleGenerator {
                     emit_overflow_guard(&mut func, len_local, byte_mult);
                     func.instruction(&Instruction::I32Const(0));
                     func.instruction(&Instruction::I32Const(0));
-                    func.instruction(&Instruction::I32Const(1));
-                    func.instruction(&Instruction::LocalGet(len_local));
-                    if byte_mult > 1 {
-                        func.instruction(&Instruction::I32Const(byte_mult as i32));
-                        func.instruction(&Instruction::I32Mul);
-                    }
+                    func.instruction(&Instruction::I32Const(realloc_align));
+                    emit_copy_byte_count(&mut func, len_local, byte_mult, is_compact_utf16);
                     emit_checked_realloc(&mut func, caller_realloc, dest_ptr_local);
 
                     // Copy from callee memory to caller memory
                     func.instruction(&Instruction::LocalGet(dest_ptr_local));
                     func.instruction(&Instruction::LocalGet(ptr_local));
-                    func.instruction(&Instruction::LocalGet(len_local));
-                    if byte_mult > 1 {
-                        func.instruction(&Instruction::I32Const(byte_mult as i32));
-                        func.instruction(&Instruction::I32Mul);
-                    }
+                    emit_copy_byte_count(&mut func, len_local, byte_mult, is_compact_utf16);
                     func.instruction(&Instruction::MemoryCopy {
                         src_mem: options.callee_memory,
                         dst_mem: options.caller_memory,
@@ -2590,19 +2661,23 @@ impl FactStyleGenerator {
             }));
             func.instruction(&Instruction::LocalSet(pair_len_local));
 
-            // Allocate: new_ptr = cabi_realloc(0, 0, 1, len * byte_mult)
+            // The params buffer was lowered by the caller, so a latin1+utf16
+            // string inside it has its length tagged per the *caller* encoding.
+            // byte_mult == 1 selects the byte-granular (string / list<u8>)
+            // case; a plain list<u8> stays unaffected (count < 2^31 ⇒ tag clear).
+            let is_compact_utf16 =
+                options.caller_string_encoding == StringEncoding::Latin1 && byte_mult == 1;
+            let realloc_align = if is_compact_utf16 { 2 } else { 1 };
+
+            // Allocate: new_ptr = cabi_realloc(0, 0, align, <byte count>)
             emit_overflow_guard(&mut func, pair_len_local, byte_mult);
             func.instruction(&Instruction::I32Const(0));
             func.instruction(&Instruction::I32Const(0));
-            func.instruction(&Instruction::I32Const(1));
-            func.instruction(&Instruction::LocalGet(pair_len_local));
-            if byte_mult > 1 {
-                func.instruction(&Instruction::I32Const(byte_mult as i32));
-                func.instruction(&Instruction::I32Mul);
-            }
+            func.instruction(&Instruction::I32Const(realloc_align));
+            emit_copy_byte_count(&mut func, pair_len_local, byte_mult, is_compact_utf16);
             emit_checked_realloc(&mut func, callee_realloc, dest_local);
 
-            // Copy data: memory.copy callee caller (new_ptr, old_ptr, len * byte_mult)
+            // Copy data: memory.copy callee caller (new_ptr, old_ptr, <byte count>)
             func.instruction(&Instruction::LocalGet(dest_local)); // dst (in callee mem)
             // Load old_ptr from callee's buffer (this was copied from caller's buffer,
             // so it points into caller's memory)
@@ -2612,17 +2687,8 @@ impl FactStyleGenerator {
                 align: 2,
                 memory_index: options.callee_memory,
             })); // src (in caller mem)
-            // Load len from callee's buffer
-            func.instruction(&Instruction::LocalGet(callee_ptr_local));
-            func.instruction(&Instruction::I32Load(wasm_encoder::MemArg {
-                offset: (byte_offset + 4) as u64,
-                align: 2,
-                memory_index: options.callee_memory,
-            }));
-            if byte_mult > 1 {
-                func.instruction(&Instruction::I32Const(byte_mult as i32));
-                func.instruction(&Instruction::I32Mul);
-            }
+            // Byte count from the stashed (still-tagged) length operand.
+            emit_copy_byte_count(&mut func, pair_len_local, byte_mult, is_compact_utf16);
             func.instruction(&Instruction::MemoryCopy {
                 src_mem: options.caller_memory,
                 dst_mem: options.callee_memory,
@@ -2865,26 +2931,26 @@ impl FactStyleGenerator {
                     })
                     .unwrap_or(1);
 
-                // Allocate: dest = cabi_realloc(0, 0, 1, len * byte_mult)
+                // Param-side (caller → callee) tagged latin1+utf16 string —
+                // governed by the caller encoding; byte_mult == 1 selects the
+                // byte-granular string / list<u8> case. See the memory-copy
+                // adapter's param-copy loop for the full reasoning.
+                let is_compact_utf16 =
+                    options.caller_string_encoding == StringEncoding::Latin1 && byte_mult == 1;
+                let realloc_align = if is_compact_utf16 { 2 } else { 1 };
+
+                // Allocate: dest = cabi_realloc(0, 0, align, <byte count>)
                 emit_overflow_guard(&mut func, len_pos, byte_mult);
                 func.instruction(&Instruction::I32Const(0));
                 func.instruction(&Instruction::I32Const(0));
-                func.instruction(&Instruction::I32Const(1));
-                func.instruction(&Instruction::LocalGet(len_pos));
-                if byte_mult > 1 {
-                    func.instruction(&Instruction::I32Const(byte_mult as i32));
-                    func.instruction(&Instruction::I32Mul);
-                }
+                func.instruction(&Instruction::I32Const(realloc_align));
+                emit_copy_byte_count(&mut func, len_pos, byte_mult, is_compact_utf16);
                 emit_checked_realloc(&mut func, callee_realloc, dest_local);
 
-                // Copy: memory.copy callee_mem caller_mem (dest, src, len * byte_mult)
+                // Copy: memory.copy callee_mem caller_mem (dest, src, <byte count>)
                 func.instruction(&Instruction::LocalGet(dest_local));
                 func.instruction(&Instruction::LocalGet(ptr_pos));
-                func.instruction(&Instruction::LocalGet(len_pos));
-                if byte_mult > 1 {
-                    func.instruction(&Instruction::I32Const(byte_mult as i32));
-                    func.instruction(&Instruction::I32Mul);
-                }
+                emit_copy_byte_count(&mut func, len_pos, byte_mult, is_compact_utf16);
                 func.instruction(&Instruction::MemoryCopy {
                     src_mem: options.caller_memory,
                     dst_mem: options.callee_memory,
@@ -2909,6 +2975,8 @@ impl FactStyleGenerator {
                         options.callee_memory,
                         callee_realloc,
                         fixup_locals_base,
+                        // Param-side: governed by the caller's string encoding.
+                        options.caller_string_encoding == StringEncoding::Latin1,
                     );
                 }
 
@@ -2992,6 +3060,10 @@ impl FactStyleGenerator {
                     crate::resolver::CopyLayout::Bulk { byte_multiplier } => *byte_multiplier,
                     crate::resolver::CopyLayout::Elements { element_size, .. } => *element_size,
                 };
+                // Param-side (caller → callee) tagged latin1+utf16 string.
+                let is_compact_utf16 =
+                    options.caller_string_encoding == StringEncoding::Latin1 && byte_mult == 1;
+                let realloc_align = if is_compact_utf16 { 2 } else { 1 };
 
                 // Outer-guard AND-chain (LS-P-10) before firing the copy.
                 emit_conditional_guard_chain_flat(&mut func, cond, 0);
@@ -3001,22 +3073,14 @@ impl FactStyleGenerator {
                 emit_overflow_guard(&mut func, len_local, byte_mult);
                 func.instruction(&Instruction::I32Const(0));
                 func.instruction(&Instruction::I32Const(0));
-                func.instruction(&Instruction::I32Const(1));
-                func.instruction(&Instruction::LocalGet(len_local));
-                if byte_mult > 1 {
-                    func.instruction(&Instruction::I32Const(byte_mult as i32));
-                    func.instruction(&Instruction::I32Mul);
-                }
+                func.instruction(&Instruction::I32Const(realloc_align));
+                emit_copy_byte_count(&mut func, len_local, byte_mult, is_compact_utf16);
                 emit_checked_realloc(&mut func, callee_realloc, cond_dest_ptr_local);
 
                 // Copy from caller to callee memory
                 func.instruction(&Instruction::LocalGet(cond_dest_ptr_local));
                 func.instruction(&Instruction::LocalGet(ptr_local));
-                func.instruction(&Instruction::LocalGet(len_local));
-                if byte_mult > 1 {
-                    func.instruction(&Instruction::I32Const(byte_mult as i32));
-                    func.instruction(&Instruction::I32Mul);
-                }
+                emit_copy_byte_count(&mut func, len_local, byte_mult, is_compact_utf16);
                 func.instruction(&Instruction::MemoryCopy {
                     src_mem: options.caller_memory,
                     dst_mem: options.callee_memory,
@@ -3098,26 +3162,27 @@ impl FactStyleGenerator {
                     }));
                     func.instruction(&Instruction::LocalSet(data_len_local));
 
-                    // Allocate in caller's memory: data_len * byte_mult bytes
+                    // Result-side (callee → caller): a returned latin1+utf16
+                    // string has its length tagged per the *callee* encoding.
+                    // byte_mult == 1 selects the byte-granular string / list<u8>
+                    // case; the length stored back into the caller's return area
+                    // stays tagged (only the byte count is masked here).
+                    let is_compact_utf16 =
+                        options.callee_string_encoding == StringEncoding::Latin1 && byte_mult == 1;
+                    let realloc_align = if is_compact_utf16 { 2 } else { 1 };
+
+                    // Allocate in caller's memory: <byte count> bytes
                     emit_overflow_guard(&mut func, data_len_local, byte_mult);
                     func.instruction(&Instruction::I32Const(0));
                     func.instruction(&Instruction::I32Const(0));
-                    func.instruction(&Instruction::I32Const(1));
-                    func.instruction(&Instruction::LocalGet(data_len_local));
-                    if byte_mult > 1 {
-                        func.instruction(&Instruction::I32Const(byte_mult as i32));
-                        func.instruction(&Instruction::I32Mul);
-                    }
+                    func.instruction(&Instruction::I32Const(realloc_align));
+                    emit_copy_byte_count(&mut func, data_len_local, byte_mult, is_compact_utf16);
                     emit_checked_realloc(&mut func, caller_realloc, caller_new_ptr_local);
 
                     // Copy data bytes from callee → caller
                     func.instruction(&Instruction::LocalGet(caller_new_ptr_local));
                     func.instruction(&Instruction::LocalGet(data_ptr_local));
-                    func.instruction(&Instruction::LocalGet(data_len_local));
-                    if byte_mult > 1 {
-                        func.instruction(&Instruction::I32Const(byte_mult as i32));
-                        func.instruction(&Instruction::I32Mul);
-                    }
+                    emit_copy_byte_count(&mut func, data_len_local, byte_mult, is_compact_utf16);
                     func.instruction(&Instruction::MemoryCopy {
                         src_mem: options.callee_memory,
                         dst_mem: options.caller_memory,
@@ -3142,6 +3207,8 @@ impl FactStyleGenerator {
                             options.caller_memory,
                             caller_realloc,
                             fixup_locals_base,
+                            // Result-side: governed by the callee's string encoding.
+                            options.callee_string_encoding == StringEncoding::Latin1,
                         );
                     }
 
@@ -3270,26 +3337,25 @@ impl FactStyleGenerator {
                 }));
                 func.instruction(&Instruction::LocalSet(data_len_local));
 
+                // Result-side (callee → caller) conditional string: tagged per
+                // the *callee* encoding. byte_mult == 1 ⇒ byte-granular string /
+                // list<u8>; the length written back to the retptr stays tagged.
+                let is_compact_utf16 =
+                    options.callee_string_encoding == StringEncoding::Latin1 && byte_mult == 1;
+                let realloc_align = if is_compact_utf16 { 2 } else { 1 };
+
                 // Allocate in caller memory
                 emit_overflow_guard(&mut func, data_len_local, byte_mult);
                 func.instruction(&Instruction::I32Const(0));
                 func.instruction(&Instruction::I32Const(0));
-                func.instruction(&Instruction::I32Const(1));
-                func.instruction(&Instruction::LocalGet(data_len_local));
-                if byte_mult > 1 {
-                    func.instruction(&Instruction::I32Const(byte_mult as i32));
-                    func.instruction(&Instruction::I32Mul);
-                }
+                func.instruction(&Instruction::I32Const(realloc_align));
+                emit_copy_byte_count(&mut func, data_len_local, byte_mult, is_compact_utf16);
                 emit_checked_realloc(&mut func, caller_realloc, caller_new_ptr_local);
 
                 // Copy data from callee → caller
                 func.instruction(&Instruction::LocalGet(caller_new_ptr_local));
                 func.instruction(&Instruction::LocalGet(data_ptr_local));
-                func.instruction(&Instruction::LocalGet(data_len_local));
-                if byte_mult > 1 {
-                    func.instruction(&Instruction::I32Const(byte_mult as i32));
-                    func.instruction(&Instruction::I32Mul);
-                }
+                emit_copy_byte_count(&mut func, data_len_local, byte_mult, is_compact_utf16);
                 func.instruction(&Instruction::MemoryCopy {
                     src_mem: options.callee_memory,
                     dst_mem: options.caller_memory,
@@ -3421,6 +3487,18 @@ impl FactStyleGenerator {
         dst_mem: u32,
         realloc_func: u32,
         locals_base: u32,
+        // True when the governing canonical-ABI string encoding (caller's for
+        // param-side copies, callee's for result-side copies) is `latin1+utf16`
+        // (modelled as `StringEncoding::Latin1`). When set, a byte-granular
+        // inner buffer (`byte_mult == 1`) is treated as a tag-encoded string:
+        // its byte count is masked/doubled via `emit_copy_byte_count`. The
+        // pointer-pair length stored back into the destination element is the
+        // ORIGINAL (still-tagged) operand, so the callee/caller decoder still
+        // sees the tag. `CopyLayout` cannot distinguish a nested `string` from
+        // a nested `list<u8>`, but the latter is unaffected: a legitimate
+        // list<u8> count is < 2^31, so its tag bit is clear and the tag-aware
+        // path returns `len` unchanged (see `emit_copy_byte_count`).
+        is_compact_utf16: bool,
     ) {
         if inner_pointers.is_empty() {
             return;
@@ -3531,27 +3609,28 @@ impl FactStyleGenerator {
             }));
             func.instruction(&Instruction::LocalSet(inner_len));
 
-            // Allocate inner data in dst memory: new_ptr = realloc(0, 0, 1, inner_len * byte_mult)
+            // A byte-granular inner buffer in a latin1+utf16 component is a
+            // tag-encoded string; mask/double its byte count. Non-byte-granular
+            // inner buffers and list<u8> are handled by the plain path.
+            let inner_is_compact_utf16 = is_compact_utf16 && byte_mult == 1;
+
+            // Allocate inner data in dst memory: new_ptr = realloc(0, 0, align, <byte count>)
             emit_overflow_guard(func, inner_len, byte_mult);
             func.instruction(&Instruction::I32Const(0));
             func.instruction(&Instruction::I32Const(0));
-            func.instruction(&Instruction::I32Const(1));
-            func.instruction(&Instruction::LocalGet(inner_len));
-            if byte_mult > 1 {
-                func.instruction(&Instruction::I32Const(byte_mult as i32));
-                func.instruction(&Instruction::I32Mul);
-            }
+            func.instruction(&Instruction::I32Const(if inner_is_compact_utf16 {
+                2
+            } else {
+                1
+            }));
+            emit_copy_byte_count(func, inner_len, byte_mult, inner_is_compact_utf16);
             emit_checked_realloc(func, realloc_func, new_ptr);
 
             // Copy data from src memory to dst memory
-            // memory.copy dst_mem src_mem (new_ptr, inner_ptr, inner_len * byte_mult)
+            // memory.copy dst_mem src_mem (new_ptr, inner_ptr, <byte count>)
             func.instruction(&Instruction::LocalGet(new_ptr));
             func.instruction(&Instruction::LocalGet(inner_ptr));
-            func.instruction(&Instruction::LocalGet(inner_len));
-            if byte_mult > 1 {
-                func.instruction(&Instruction::I32Const(byte_mult as i32));
-                func.instruction(&Instruction::I32Mul);
-            }
+            emit_copy_byte_count(func, inner_len, byte_mult, inner_is_compact_utf16);
             func.instruction(&Instruction::MemoryCopy { src_mem, dst_mem });
 
             // Recursively fix up inner-inner pointers if the inner layout
@@ -3575,6 +3654,7 @@ impl FactStyleGenerator {
                     dst_mem,
                     realloc_func,
                     locals_base + 4, // next level gets next 4 scratch locals
+                    is_compact_utf16,
                 );
             }
 
@@ -6123,6 +6203,11 @@ impl FactStyleGenerator {
                         caller_memory,
                         callee_memory,
                         l_p2 + 1,
+                        // Result-side: governed by the callee's string encoding.
+                        matches!(
+                            site.requirements.callee_encoding,
+                            Some(crate::parser::CanonStringEncoding::CompactUtf16)
+                        ),
                     );
                 } else {
                     // Non-pointer results: write globals directly to retptr
@@ -6252,26 +6337,31 @@ impl FactStyleGenerator {
                 })
                 .unwrap_or(1);
 
-            // Allocate: cabi_realloc(0, 0, 1, len * byte_mult)
+            // Param-side (caller → callee) async copy. This path has no
+            // `AdapterOptions`, but the governing caller string encoding is
+            // carried by `site.requirements.caller_encoding`; CompactUtf16 is
+            // the `latin1+utf16` encoding (mapped to `StringEncoding::Latin1`
+            // by `canon_to_string_encoding`). A byte-granular buffer
+            // (byte_mult == 1) in such a component is a tag-encoded string,
+            // so mask/double its byte count; the forwarded length stays tagged.
+            let is_compact_utf16 = matches!(
+                site.requirements.caller_encoding,
+                Some(crate::parser::CanonStringEncoding::CompactUtf16)
+            ) && byte_mult == 1;
+            let realloc_align = if is_compact_utf16 { 2 } else { 1 };
+
+            // Allocate: cabi_realloc(0, 0, align, <byte count>)
             emit_overflow_guard(body, len_local, byte_mult);
             body.instruction(&Instruction::I32Const(0));
             body.instruction(&Instruction::I32Const(0));
-            body.instruction(&Instruction::I32Const(1));
-            body.instruction(&Instruction::LocalGet(len_local));
-            if byte_mult > 1 {
-                body.instruction(&Instruction::I32Const(byte_mult as i32));
-                body.instruction(&Instruction::I32Mul);
-            }
+            body.instruction(&Instruction::I32Const(realloc_align));
+            emit_copy_byte_count(body, len_local, byte_mult, is_compact_utf16);
             emit_checked_realloc(body, realloc, l_new_ptr);
 
-            // Copy: memory.copy new_ptr <- old_ptr, len * byte_mult
+            // Copy: memory.copy new_ptr <- old_ptr, <byte count>
             body.instruction(&Instruction::LocalGet(l_new_ptr));
             body.instruction(&Instruction::LocalGet(ptr_local));
-            body.instruction(&Instruction::LocalGet(len_local));
-            if byte_mult > 1 {
-                body.instruction(&Instruction::I32Const(byte_mult as i32));
-                body.instruction(&Instruction::I32Mul);
-            }
+            emit_copy_byte_count(body, len_local, byte_mult, is_compact_utf16);
             body.instruction(&Instruction::MemoryCopy {
                 dst_mem: callee_memory,
                 src_mem: caller_memory,
@@ -6319,6 +6409,12 @@ impl FactStyleGenerator {
         caller_memory: u32,
         callee_memory: u32,
         scratch_base: u32,
+        // True when the *callee* string encoding is `latin1+utf16`
+        // (CompactUtf16). A byte-granular result buffer (`elem_size == 1`,
+        // i.e. a top-level `string`) then carries a tag-encoded length whose
+        // byte count must be masked/doubled. The len written back to the
+        // retptr stays tagged. #253.
+        callee_compact_utf16: bool,
     ) {
         let (ptr_global, _) = info.result_globals[0];
         let (len_global, _) = info.result_globals[1];
@@ -6349,19 +6445,20 @@ impl FactStyleGenerator {
         body.instruction(&Instruction::GlobalGet(len_global));
         body.instruction(&Instruction::LocalSet(l_src_len));
 
-        // byte_count = len * elem_size, with LS-A-7 overflow guard
+        // A top-level byte-granular result (elem_size == 1) in a latin1+utf16
+        // callee is a tag-encoded string; its byte count must be masked/doubled.
+        let top_compact_utf16 = callee_compact_utf16 && elem_size == 1;
+        // byte_count = <tag-aware byte count> | len * elem_size, with LS-A-7 guard
         emit_overflow_guard(body, l_src_len, elem_size);
-        body.instruction(&Instruction::LocalGet(l_src_len));
-        if elem_size != 1 {
-            body.instruction(&Instruction::I32Const(elem_size as i32));
-            body.instruction(&Instruction::I32Mul);
-        }
+        emit_copy_byte_count(body, l_src_len, elem_size, top_compact_utf16);
         body.instruction(&Instruction::LocalSet(l_byte_count));
 
-        // Allocate in caller memory: cabi_realloc(0, 0, align, byte_count)
+        // Allocate in caller memory: cabi_realloc(0, 0, align, byte_count).
+        // A utf16 payload needs 2-byte alignment.
+        let realloc_align = if top_compact_utf16 { 2 } else { elem_align };
         body.instruction(&Instruction::I32Const(0)); // old_ptr
         body.instruction(&Instruction::I32Const(0)); // old_size
-        body.instruction(&Instruction::I32Const(elem_align as i32));
+        body.instruction(&Instruction::I32Const(realloc_align as i32));
         body.instruction(&Instruction::LocalGet(l_byte_count));
         emit_checked_realloc(body, caller_realloc_func, l_dst_ptr);
 
@@ -6388,6 +6485,7 @@ impl FactStyleGenerator {
                 caller_realloc_func,
                 caller_memory,
                 callee_memory,
+                callee_compact_utf16,
             );
         }
 
@@ -6675,6 +6773,11 @@ impl FactStyleGenerator {
                         caller_memory,
                         callee_memory,
                         l_scratch + 1,
+                        // Result-side: governed by the callee's string encoding.
+                        matches!(
+                            site.requirements.callee_encoding,
+                            Some(crate::parser::CanonStringEncoding::CompactUtf16)
+                        ),
                     );
                 } else {
                     // Non-pointer results: write globals directly to retptr
@@ -6942,6 +7045,7 @@ mod tests {
             /* elem_size = */ 8, // record { ptr:i32, len:i32 } = 8 bytes
             /* l_first_scratch = */ 3, /* realloc_func = */ 99,
             /* caller_memory = */ 0, /* callee_memory = */ 1,
+            /* callee_compact_utf16 = */ false,
         );
 
         // wasm_encoder::Function has no public bytes() accessor on stable;

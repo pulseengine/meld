@@ -3745,3 +3745,48 @@ fn ls_p_21_latin1_utf16_tag_honored_roundtrip() {
         "LS-P-21: latin1-fits UTF-8 must encode as tag-clear Latin-1"
     );
 }
+
+/// LS-P-21 (#253 memory-safety follow-up): a SAME-ENCODING CompactUTF16 →
+/// CompactUTF16 fusion takes the bulk memory-copy adapter path (no transcoding,
+/// since caller and callee encodings match). The caller lowers a tag-SET
+/// (UTF-16-represented) latin1+utf16 string "日本" = [0x65E5, 0x672C] with the
+/// length operand `2 | UTF16_TAG`. Before the fix the copy machinery treated
+/// the length as untagged and issued a `memory.copy` / `cabi_realloc` of
+/// `(2 | 0x8000_0000)` bytes (~2 GiB) — a confirmed wasmtime OOB trap. After
+/// the fix `emit_copy_byte_count` masks the tag and copies `(2)*2 = 4` bytes,
+/// the tag-aware callee reads 2 UTF-16 units and sums them: 0x65E5 + 0x672C =
+/// 52497. The forwarded length stays tagged so the callee decodes correctly.
+#[test]
+fn ls_p_21_same_encoding_compact_tagset_param_copy_roundtrips() {
+    let result = fuse_run_i32(
+        &build_caller_latin1_tagged_lowering_component(&[0x65E5, 0x672C]),
+        &build_callee_compact_decoding_component(),
+        "same-encoding CompactUTF16 tag-set param copy",
+    );
+    assert_eq!(
+        result, 52497,
+        "tag-set latin1+utf16 same-encoding copy must mask the tag (copy 4 bytes), \
+         not OOB-copy 0x8000_0002 bytes; callee sums the 2 UTF-16 units 0x65E5+0x672C"
+    );
+}
+
+/// LS-P-21 (#253) tag-CLEAR control for the same-encoding memory-copy path.
+/// A pure-Latin-1 (tag-clear) latin1+utf16 string "café" Latin-1 bytes
+/// [0x63,0x61,0x66,0xE9], length operand `4` (tag clear), CompactUTF16 →
+/// CompactUTF16. The tag-aware byte count returns `len` unchanged (tag bit
+/// clear), so 4 bytes are copied and the callee's 8-bit path sums them:
+/// 0x63+0x61+0x66+0xE9 = 99+97+102+233 = 531. Proves the tag-aware fix does
+/// not regress the tag-clear path.
+#[test]
+fn ls_p_21_same_encoding_compact_tagclear_param_copy_roundtrips() {
+    let result = fuse_run_i32(
+        &build_caller_latin1_lowering_component(&[0x63, 0x61, 0x66, 0xE9]),
+        &build_callee_compact_decoding_component(),
+        "same-encoding CompactUTF16 tag-clear param copy",
+    );
+    assert_eq!(
+        result, 531,
+        "tag-clear latin1+utf16 same-encoding copy must copy len bytes verbatim; \
+         callee 8-bit path sums café Latin-1 bytes 0x63+0x61+0x66+0xE9"
+    );
+}
