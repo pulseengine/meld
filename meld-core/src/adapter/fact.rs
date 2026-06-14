@@ -6544,6 +6544,15 @@ impl FactStyleGenerator {
         // undeclared → the generated callback adapter failed wasm validation
         // ("unknown local 24") for exactly the inc-1 UTF-8→UTF-16 string-param
         // case (the stackful variant was sized correctly). #272 inc 1 fix.
+        //
+        // #272 inc 3 (RESULT-side transcode): the result-writeback transcode
+        // REUSES the same `transcode_base = l_p2 + 16` block (offsets 21..=25,
+        // already declared). The param transcode (step 0.5) and the result
+        // transcode (step 3) are never simultaneously live, and that block does
+        // not overlap the result-writeback/nested-patch region `l_p2 + 1 ..=
+        // l_p2 + 10` (offsets 6..=15) live during step 3 — so no growth is
+        // needed; top addressable index stays offset 25 < 26 (proven by
+        // `inc3_callback_adapter_result_string_locals_within_budget`).
         let mut body = Function::new([(26, wasm_encoder::ValType::I32)]);
 
         // Step 0.5: copy string/list params from caller to callee memory.
@@ -6789,6 +6798,17 @@ impl FactStyleGenerator {
                         caller_memory,
                         callee_memory,
                         l_p2 + 1,
+                        // #272 inc 3: the result transcode's 5 scratch locals.
+                        // SAME index passed to `emit_param_copy_step` above
+                        // (`l_p2 + 16`) — the param transcode (step 0.5) and the
+                        // result transcode (step 3) are never simultaneously
+                        // live, and `l_p2 + 16 ..= l_p2 + 20` (block offsets
+                        // 21..=25, declared by the budget of 26) does not
+                        // overlap the writeback/nested region `l_p2 + 1 ..=
+                        // l_p2 + 10` that IS live here.
+                        l_p2 + 16,
+                        site.requirements.caller_encoding,
+                        site.requirements.callee_encoding,
                         // Result-side: governed by the callee's string encoding.
                         matches!(
                             site.requirements.callee_encoding,
@@ -7088,6 +7108,31 @@ impl FactStyleGenerator {
     /// i32 locals starting at `scratch_base`, plus the 6 locals
     /// `emit_patch_nested_indirections` consumes starting at
     /// `scratch_base + 4`.
+    ///
+    /// `transcode_base` is the first of 5 DEDICATED i32 scratch locals
+    /// (`transcode_base ..= transcode_base + 4`) the #272 inc-3 RESULT
+    /// transcode path uses (src_idx, dst_idx/out_count, cp, + two decode/encode
+    /// scratch). They must not alias the param locals, `scratch_base ..
+    /// scratch_base + 9` (the writeback + nested-patch region that IS live
+    /// during this call), or the retptr local. Both async emitters pass the
+    /// SAME local index they pass to `emit_param_copy_step` as its
+    /// `transcode_base`: the param-side transcode runs in step 0.5 (before the
+    /// lift call) and the result-side transcode runs in step 3 (after it), so
+    /// those locals are never simultaneously live and may be shared. The
+    /// same-encoding raw-copy + compact-utf16 path never touches them.
+    ///
+    /// `caller_encoding` / `callee_encoding` are the raw canon string
+    /// encodings. A RESULT string is PRODUCED by the callee (in
+    /// `callee_encoding`) and READ by the caller (in `caller_encoding`), so the
+    /// result transcode direction is `callee_enc → caller_enc` — the REVERSE of
+    /// the param side. When the result is a TOP-LEVEL byte-granular string and
+    /// that direction is UTF-8 → UTF-16 or UTF-16 → UTF-8 (#272 inc 3), the raw
+    /// `memory.copy` is replaced by the matching transcode loop (SOURCE =
+    /// callee memory, DEST = caller memory) and the OUTPUT code-unit/byte count
+    /// — not the source length — is written to the retptr. Everything else
+    /// keeps the raw-copy + compact-utf16 tag path; the guard
+    /// `guard_async_cross_encoding_strings` fails loud on any direction this
+    /// branch does not transcode.
     #[allow(clippy::too_many_arguments)]
     fn emit_ptr_pair_result_writeback(
         &self,
@@ -7098,6 +7143,9 @@ impl FactStyleGenerator {
         caller_memory: u32,
         callee_memory: u32,
         scratch_base: u32,
+        transcode_base: u32,
+        caller_encoding: Option<crate::parser::CanonStringEncoding>,
+        callee_encoding: Option<crate::parser::CanonStringEncoding>,
         // True when the *callee* string encoding is `latin1+utf16`
         // (CompactUtf16). A byte-granular result buffer (`elem_size == 1`,
         // i.e. a top-level `string`) then carries a tag-encoded length whose
@@ -7134,48 +7182,152 @@ impl FactStyleGenerator {
         body.instruction(&Instruction::GlobalGet(len_global));
         body.instruction(&Instruction::LocalSet(l_src_len));
 
-        // A top-level byte-granular result (elem_size == 1) in a latin1+utf16
-        // callee is a tag-encoded string; its byte count must be masked/doubled.
-        let top_compact_utf16 = callee_compact_utf16 && elem_size == 1;
-        // byte_count = <tag-aware byte count> | len * elem_size, with LS-A-7 guard
-        emit_overflow_guard(body, l_src_len, elem_size);
-        emit_copy_byte_count(body, l_src_len, elem_size, top_compact_utf16);
-        body.instruction(&Instruction::LocalSet(l_byte_count));
+        // #272 inc 3: a TOP-LEVEL byte-granular RESULT string crossing memory
+        // is TRANSCODED, for the utf8↔utf16 directions, instead of raw-copied.
+        //
+        // DIRECTION SUBTLETY: a result string is PRODUCED BY THE CALLEE (in
+        // `callee_encoding`) and READ BY THE CALLER (in `caller_encoding`), so
+        // the result transcode direction is `callee_enc → caller_enc` — the
+        // REVERSE of the param side (caller_enc → callee_enc). SOURCE = callee
+        // memory (where the callee wrote the result), DEST = caller memory
+        // (where the caller reads it).
+        //   * callee Utf8  → caller Utf16  ⇒ emit_utf8_to_utf16_transcode_param
+        //   * callee Utf16 → caller Utf8   ⇒ emit_utf16_to_utf8_transcode_param
+        // A nested result (`list<string>`, so `list_elem_ty.is_some()`), a
+        // latin1/CompactUtf16 direction, or a non-byte-granular result keeps
+        // the raw-copy + compact-utf16 tag path below; the guard fails loud on
+        // any cross-encoding result this branch does not transcode. The
+        // top-level string is exactly `elem_size == 1 && list_elem_ty.is_none()`
+        // (a top-level `string` result, or the `None`/unknown fallback).
+        let top_level_byte_string = elem_size == 1 && list_elem_ty.is_none();
+        let result_transcode_utf8_to_utf16 = top_level_byte_string
+            && matches!(
+                callee_encoding,
+                Some(crate::parser::CanonStringEncoding::Utf8)
+            )
+            && matches!(
+                caller_encoding,
+                Some(crate::parser::CanonStringEncoding::Utf16)
+            );
+        let result_transcode_utf16_to_utf8 = top_level_byte_string
+            && matches!(
+                callee_encoding,
+                Some(crate::parser::CanonStringEncoding::Utf16)
+            )
+            && matches!(
+                caller_encoding,
+                Some(crate::parser::CanonStringEncoding::Utf8)
+            );
 
-        // Allocate in caller memory: cabi_realloc(0, 0, align, byte_count).
-        // A utf16 payload needs 2-byte alignment.
-        let realloc_align = if top_compact_utf16 { 2 } else { elem_align };
-        body.instruction(&Instruction::I32Const(0)); // old_ptr
-        body.instruction(&Instruction::I32Const(0)); // old_size
-        body.instruction(&Instruction::I32Const(realloc_align as i32));
-        body.instruction(&Instruction::LocalGet(l_byte_count));
-        emit_checked_realloc(body, caller_realloc_func, l_dst_ptr);
-
-        // Copy from callee memory to caller memory
-        body.instruction(&Instruction::LocalGet(l_dst_ptr));
-        body.instruction(&Instruction::LocalGet(l_src_ptr));
-        body.instruction(&Instruction::LocalGet(l_byte_count));
-        body.instruction(&Instruction::MemoryCopy {
-            dst_mem: caller_memory,
-            src_mem: callee_memory,
-        });
-
-        // Walk nested indirections (string fields, nested lists) if the
-        // list element type carries them.
-        if let Some(elem_ty) = &list_elem_ty {
-            emit_patch_nested_indirections(
+        if result_transcode_utf8_to_utf16 {
+            // SOURCE = callee memory (UTF-8 bytes), DEST = caller memory
+            // (UTF-16 code units). Realloc worst case 2*len bytes (each UTF-8
+            // byte → ≤ 1 UTF-16 code unit) — handled by the loop fn (align 2,
+            // overflow guard). The loop rewrites `l_src_ptr` → out_ptr (caller
+            // mem) and `l_src_len` → output UTF-16 code-unit count; passing
+            // `out_ptr_local = l_dst_ptr` makes `l_dst_ptr` hold that out_ptr
+            // too, so the existing `(l_dst_ptr, l_src_len)` retptr write below
+            // forwards the transcoded pointer + OUTPUT length.
+            let src_mem8 = wasm_encoder::MemArg {
+                offset: 0,
+                align: 0,
+                memory_index: callee_memory,
+            };
+            let dst_mem16 = wasm_encoder::MemArg {
+                offset: 0,
+                align: 1,
+                memory_index: caller_memory,
+            };
+            emit_utf8_to_utf16_transcode_param(
                 body,
-                elem_ty,
-                l_dst_ptr,
+                caller_realloc_func,
+                src_mem8,
+                dst_mem16,
                 l_src_ptr,
                 l_src_len,
-                elem_size,
-                scratch_base + 4,
-                caller_realloc_func,
-                caller_memory,
-                callee_memory,
-                callee_compact_utf16,
+                l_dst_ptr,
+                transcode_base,     // src_idx
+                transcode_base + 1, // dst_idx / out code-unit count
+                transcode_base + 2, // cp
+                transcode_base + 3, // byte
+                transcode_base + 4, // cont
             );
+        } else if result_transcode_utf16_to_utf8 {
+            // SOURCE = callee memory (UTF-16 code units), DEST = caller memory
+            // (UTF-8 bytes). Realloc worst case 3*len bytes (≤ 3 UTF-8 bytes
+            // per UTF-16 code unit) — handled by the loop fn (align 1, overflow
+            // guard). The loop rewrites `l_src_ptr` → out_ptr and `l_src_len` →
+            // output UTF-8 byte count; `out_ptr_local = l_dst_ptr` keeps the
+            // retptr write below correct.
+            let src_mem16 = wasm_encoder::MemArg {
+                offset: 0,
+                align: 1,
+                memory_index: callee_memory,
+            };
+            let dst_mem8 = wasm_encoder::MemArg {
+                offset: 0,
+                align: 0,
+                memory_index: caller_memory,
+            };
+            emit_utf16_to_utf8_transcode_param(
+                body,
+                caller_realloc_func,
+                1, // realloc align (utf-8 caller, byte-granular)
+                src_mem16,
+                dst_mem8,
+                l_src_ptr,
+                l_src_len,
+                l_dst_ptr,
+                transcode_base,     // src_idx (code units)
+                transcode_base + 1, // dst_idx / out byte count
+                transcode_base + 2, // cp
+                transcode_base + 3, // cu
+                transcode_base + 4, // cu2
+            );
+        } else {
+            // A top-level byte-granular result (elem_size == 1) in a latin1+utf16
+            // callee is a tag-encoded string; its byte count must be masked/doubled.
+            let top_compact_utf16 = callee_compact_utf16 && elem_size == 1;
+            // byte_count = <tag-aware byte count> | len * elem_size, with LS-A-7 guard
+            emit_overflow_guard(body, l_src_len, elem_size);
+            emit_copy_byte_count(body, l_src_len, elem_size, top_compact_utf16);
+            body.instruction(&Instruction::LocalSet(l_byte_count));
+
+            // Allocate in caller memory: cabi_realloc(0, 0, align, byte_count).
+            // A utf16 payload needs 2-byte alignment.
+            let realloc_align = if top_compact_utf16 { 2 } else { elem_align };
+            body.instruction(&Instruction::I32Const(0)); // old_ptr
+            body.instruction(&Instruction::I32Const(0)); // old_size
+            body.instruction(&Instruction::I32Const(realloc_align as i32));
+            body.instruction(&Instruction::LocalGet(l_byte_count));
+            emit_checked_realloc(body, caller_realloc_func, l_dst_ptr);
+
+            // Copy from callee memory to caller memory
+            body.instruction(&Instruction::LocalGet(l_dst_ptr));
+            body.instruction(&Instruction::LocalGet(l_src_ptr));
+            body.instruction(&Instruction::LocalGet(l_byte_count));
+            body.instruction(&Instruction::MemoryCopy {
+                dst_mem: caller_memory,
+                src_mem: callee_memory,
+            });
+
+            // Walk nested indirections (string fields, nested lists) if the
+            // list element type carries them.
+            if let Some(elem_ty) = &list_elem_ty {
+                emit_patch_nested_indirections(
+                    body,
+                    elem_ty,
+                    l_dst_ptr,
+                    l_src_ptr,
+                    l_src_len,
+                    elem_size,
+                    scratch_base + 4,
+                    caller_realloc_func,
+                    caller_memory,
+                    callee_memory,
+                    callee_compact_utf16,
+                );
+            }
         }
 
         // Write (new_ptr, len) to retptr at offsets 0 and 4 (both i32,
@@ -7362,6 +7514,14 @@ impl FactStyleGenerator {
         // (#272 inc 1) for the UTF-8→UTF-16 param transcode loop (src_idx,
         // out_count, cp, byte, cont — at `l_scratch + 12 ..`, past the
         // writeback / nested-patch region) = 18.
+        //
+        // #272 inc 3 (RESULT-side transcode): REUSES the same
+        // `l_scratch + 12 ..= l_scratch + 16` transcode block (already
+        // declared). Param (step 0.5) and result (step 3) transcodes never
+        // run simultaneously, and that block does not overlap the
+        // writeback/nested region `l_scratch + 1 ..= l_scratch + 10` live in
+        // step 3 — so no growth; top index stays `l_scratch + 16` < 18 (proven
+        // by `inc3_stackful_adapter_result_string_locals_within_budget`).
         let mut body = Function::new([(18, wasm_encoder::ValType::I32)]);
 
         // Step 0.5: cross-memory param copy (shared with callback path)
@@ -7466,6 +7626,16 @@ impl FactStyleGenerator {
                         caller_memory,
                         callee_memory,
                         l_scratch + 1,
+                        // #272 inc 3: the result transcode's 5 scratch locals.
+                        // SAME index passed to `emit_param_copy_step` above
+                        // (`l_scratch + 12`) — param (step 0.5) and result
+                        // (step 3) transcodes are never simultaneously live, and
+                        // `l_scratch + 12 ..= l_scratch + 16` (declared by the
+                        // budget of 18) does not overlap the writeback/nested
+                        // region `l_scratch + 1 ..= l_scratch + 10` live here.
+                        l_scratch + 12,
+                        site.requirements.caller_encoding,
+                        site.requirements.callee_encoding,
                         // Result-side: governed by the callee's string encoding.
                         matches!(
                             site.requirements.callee_encoding,
@@ -7546,21 +7716,25 @@ impl FactStyleGenerator {
     ///   * there is nothing to transcode — the call doesn't cross memory, the
     ///     encodings match, or there is no byte-granular `(ptr, len)` buffer at
     ///     all (a `list<u32>`/record-only call is encoding-independent); OR
-    ///   * the call is **exactly** the #272 inc-1 implemented combo:
-    ///     `crosses_memory` AND caller canon-encoding `Utf8` AND callee
-    ///     canon-encoding `Utf16` AND ≥1 **top-level** byte-granular PARAM AND
-    ///     **no** byte-granular RESULT AND **no nested** byte-granular param
-    ///     (every param that bears a byte-granular buffer is itself directly
-    ///     `Bulk{1}` / a bare position, NOT an `Elements` whose inner pointer
-    ///     is byte-granular). `emit_param_copy_step` transcodes exactly that
-    ///     case; everything else it would still raw-copy.
+    ///   * EVERY byte-granular PARAM is **top-level** AND its caller→callee
+    ///     direction is utf8↔utf16 (`emit_param_copy_step` transcodes it — #272
+    ///     inc 1/2), AND EVERY byte-granular RESULT is **top-level** AND its
+    ///     callee→caller direction is utf8↔utf16
+    ///     (`emit_ptr_pair_result_writeback` transcodes it — #272 inc 3).
     ///
-    /// EVERY other cross-encoding combo — a byte-granular result string, a
-    /// nested (`list<string>`) param, any non-UTF-8→UTF-16 direction
-    /// (UTF-16→UTF-8, UTF-8→latin1+utf16, …) — still FAILS LOUD, because the
-    /// emitters would otherwise raw-copy the bytes and silently mis-transcode
-    /// (the H-4.4 defect). This is safety-critical: an over-narrow allow-through
-    /// would let an unimplemented combo through and corrupt the string.
+    /// DIRECTION SUBTLETY: a param crosses caller→callee, but a RESULT is
+    /// produced by the callee and read by the caller, so its transcode
+    /// direction is callee→caller — the REVERSE. The result-allow predicate
+    /// therefore checks `callee_enc → caller_enc`, matching the
+    /// `result_transcode_*` triggers in `emit_ptr_pair_result_writeback`.
+    ///
+    /// EVERY other cross-encoding combo — a NESTED (`list<string>`) param OR
+    /// result, any latin1/CompactUtf16 direction — still FAILS LOUD, because
+    /// the emitters would otherwise raw-copy the bytes and silently
+    /// mis-transcode (the H-4.4 defect). This is safety-critical: the guard's
+    /// allow-predicate and the UNION of the emitter transcode-triggers (the
+    /// param triggers plus the result triggers) must be IDENTICAL — any
+    /// allow-but-not-transcode is silent corruption.
     fn guard_async_cross_encoding_strings(site: &AdapterSite) -> Result<()> {
         if !site.crosses_memory {
             return Ok(());
@@ -7643,8 +7817,56 @@ impl FactStyleGenerator {
             Some(crate::parser::CanonStringEncoding::Utf8)
         );
         let direction_is_implemented = direction_is_utf8_to_utf16 || direction_is_utf16_to_utf8;
-        // No byte-granular RESULT (the result writeback raw-copies).
-        let no_byte_granular_result = !result_has_string;
+        // #272 inc 3: a top-level byte-granular RESULT string is now transcoded
+        // by `emit_ptr_pair_result_writeback`, for the utf8↔utf16 directions.
+        // The RESULT transcode direction is `callee_enc → caller_enc` (the
+        // callee PRODUCES the result, the caller READS it) — the REVERSE of the
+        // param side. So the result is implemented iff `callee → caller` is
+        // UTF-8 → UTF-16 or UTF-16 → UTF-8. This MUST stay identical to the
+        // `result_transcode_*` triggers in `emit_ptr_pair_result_writeback`.
+        let result_dir_is_utf8_to_utf16 = matches!(
+            site.requirements.callee_encoding,
+            Some(crate::parser::CanonStringEncoding::Utf8)
+        ) && matches!(
+            site.requirements.caller_encoding,
+            Some(crate::parser::CanonStringEncoding::Utf16)
+        );
+        let result_dir_is_utf16_to_utf8 = matches!(
+            site.requirements.callee_encoding,
+            Some(crate::parser::CanonStringEncoding::Utf16)
+        ) && matches!(
+            site.requirements.caller_encoding,
+            Some(crate::parser::CanonStringEncoding::Utf8)
+        );
+        let result_dir_is_implemented = result_dir_is_utf8_to_utf16 || result_dir_is_utf16_to_utf8;
+        // Every byte-granular RESULT must be a TOP-LEVEL byte-granular string
+        // (directly `Bulk{1}` or a bare offset) AND the callee→caller direction
+        // must be implemented — `emit_ptr_pair_result_writeback` only transcodes
+        // a top-level string; a nested (`list<string>`) result's inner string is
+        // still raw-copied by `emit_patch_nested_indirections`, so it stays
+        // fail-loud, as does any latin1/CompactUtf16 result direction. When
+        // there is NO byte-granular result this is trivially satisfied.
+        let result_ok = !result_has_string
+            || (result_dir_is_implemented
+                && site
+                    .requirements
+                    .result_pointer_pair_offsets
+                    .iter()
+                    .enumerate()
+                    .all(
+                        |(i, _)| match site.requirements.result_copy_layouts.get(i) {
+                            // Bare offset (no recorded layout) → emitter treats it as
+                            // a top-level byte-granular string.
+                            None => true,
+                            // Bears a byte-granular buffer ⇒ must be a TOP-LEVEL one;
+                            // a nested string stays raw-copied / fail-loud.
+                            Some(cl) if Self::layout_bears_byte_granular_buffer(cl) => {
+                                Self::layout_is_top_level_byte_granular(cl)
+                            }
+                            // Not a string (e.g. list<u32>): encoding-independent.
+                            Some(_) => true,
+                        },
+                    ));
         // Every param that bears a byte-granular buffer must be TOP-LEVEL
         // byte-granular (directly `Bulk{1}` or a bare position) — a nested
         // (`list<string>`) param's inner string is still raw-copied by
@@ -7669,20 +7891,23 @@ impl FactStyleGenerator {
                 Some(_) => true,
             });
 
-        if direction_is_implemented
-            && param_has_string
-            && no_byte_granular_result
-            && all_param_strings_top_level
-        {
+        // Params allowed iff there is no byte-granular param OR every one is
+        // top-level AND the caller→callee direction is implemented (utf8↔utf16).
+        let param_ok =
+            !param_has_string || (direction_is_implemented && all_param_strings_top_level);
+
+        if param_ok && result_ok {
             return Ok(());
         }
 
         Err(crate::Error::AdapterGeneration(format!(
             "async cross-encoding string transcoding is not yet supported \
              (caller {caller_enc:?} != callee {callee_enc:?}); only a \
-             top-level UTF-8 → UTF-16 (#272 inc 1) or UTF-16 → UTF-8 (#272 \
-             inc 2) string param is implemented — a verbatim copy of any \
-             other case would silently mis-transcode — see #272"
+             top-level UTF-8 ↔ UTF-16 string param (#272 inc 1/2) or a \
+             top-level UTF-8 ↔ UTF-16 string result (#272 inc 3) is \
+             implemented — a verbatim copy of any other case (nested \
+             list<string>, latin1/CompactUtf16) would silently mis-transcode \
+             — see #272"
         )))
     }
 
@@ -8549,22 +8774,68 @@ mod tests {
         );
     }
 
-    /// LS-F-27 gate (result side): a cross-encoding async string RESULT that
-    /// crosses memory must also fail loud — `emit_ptr_pair_result_writeback`
-    /// raw-copies the returned buffer with no transcode.
+    /// #272 inc 3: a top-level byte-granular RESULT string crossing memory in a
+    /// utf8↔utf16 direction is now the IMPLEMENTED async transcode case, so the
+    /// guard must ALLOW it through (the result writeback transcodes rather than
+    /// raw-copies). Previously this case failed loud (LS-F-27); inc 3
+    /// legitimately flips it to success.
+    ///
+    /// DIRECTION SUBTLETY: caller=Utf16, callee=Utf8 means the RESULT (produced
+    /// by the callee, read by the caller) transcodes callee→caller = Utf8→Utf16
+    /// — an implemented direction. The runtime differential proof for the
+    /// transcode loop itself lives in the `async_cross_encoding` target.
     #[test]
-    fn ls_f_27_async_cross_encoding_string_result_fails_loud() {
+    fn inc3_async_utf8_to_utf16_top_level_string_result_allowed() {
         use crate::parser::CanonStringEncoding;
         let mut site = async_lift_site("[async-lift]greet");
         site.crosses_memory = true;
         site.requirements.result_pointer_pair_offsets = vec![0];
         site.requirements.result_copy_layouts =
             vec![crate::resolver::CopyLayout::Bulk { byte_multiplier: 1 }];
+        // caller=Utf16, callee=Utf8 ⇒ result dir (callee→caller) = Utf8→Utf16.
         site.requirements.caller_encoding = Some(CanonStringEncoding::Utf16);
         site.requirements.callee_encoding = Some(CanonStringEncoding::Utf8);
         assert!(
+            FactStyleGenerator::guard_async_cross_encoding_strings(&site).is_ok(),
+            "#272 inc 3: a top-level UTF-8 → UTF-16 (callee→caller) async string \
+             result must be allowed through (transcoded), not fail loud"
+        );
+
+        // The mirror result direction (callee=Utf16, caller=Utf8 ⇒ result dir
+        // Utf16→Utf8) is also implemented and must be allowed.
+        let mut mirror = async_lift_site("[async-lift]greet");
+        mirror.crosses_memory = true;
+        mirror.requirements.result_pointer_pair_offsets = vec![0];
+        mirror.requirements.result_copy_layouts =
+            vec![crate::resolver::CopyLayout::Bulk { byte_multiplier: 1 }];
+        mirror.requirements.caller_encoding = Some(CanonStringEncoding::Utf8);
+        mirror.requirements.callee_encoding = Some(CanonStringEncoding::Utf16);
+        assert!(
+            FactStyleGenerator::guard_async_cross_encoding_strings(&mirror).is_ok(),
+            "#272 inc 3: a top-level UTF-16 → UTF-8 (callee→caller) async string \
+             result must be allowed through (transcoded), not fail loud"
+        );
+    }
+
+    /// LS-F-27 (still fail-loud, #272 inc 3): a top-level RESULT string in a
+    /// latin1/CompactUtf16 direction is NOT implemented and must still fail
+    /// loud — the result-direction check is on the raw canon enum (UTF-8/UTF-16
+    /// strictly), so a CompactUtf16 endpoint never satisfies it. Here caller=
+    /// CompactUtf16, callee=Utf8 ⇒ result dir (callee→caller) = Utf8→CompactUtf16,
+    /// unimplemented.
+    #[test]
+    fn ls_f_27_async_cross_encoding_compact_utf16_string_result_fails_loud() {
+        use crate::parser::CanonStringEncoding;
+        let mut site = async_lift_site("[async-lift]greet");
+        site.crosses_memory = true;
+        site.requirements.result_pointer_pair_offsets = vec![0];
+        site.requirements.result_copy_layouts =
+            vec![crate::resolver::CopyLayout::Bulk { byte_multiplier: 1 }];
+        site.requirements.caller_encoding = Some(CanonStringEncoding::CompactUtf16);
+        site.requirements.callee_encoding = Some(CanonStringEncoding::Utf8);
+        assert!(
             FactStyleGenerator::guard_async_cross_encoding_strings(&site).is_err(),
-            "LS-F-27: cross-encoding async string result must fail loud"
+            "LS-F-27: a latin1+utf16 async string result must still fail loud"
         );
     }
 
@@ -9021,6 +9292,146 @@ mod tests {
             Some(&0x0B),
             "body must end with `end` (0x0B); body={body:?}",
         );
+    }
+
+    /// Build a merged module + async-lift site for a SINGLE top-level
+    /// `(ptr, len)` STRING RESULT crossing memory (caller has a retptr param,
+    /// the lift returns void and writes the result via task.return globals),
+    /// with the given caller/callee canon string encodings — for the #272 inc-3
+    /// result-side local-bounds integration tests. The caller type (merged type
+    /// 0) has one i32 retptr param, so `caller_param_count == 1`. A
+    /// `[callback]` companion export is registered so the CALLBACK emitter
+    /// dispatches; the stackful test renames it.
+    fn xenc_string_result_merged_and_site(
+        caller_enc: crate::parser::CanonStringEncoding,
+        callee_enc: crate::parser::CanonStringEncoding,
+    ) -> (crate::merger::MergedModule, crate::resolver::AdapterSite) {
+        use wasm_encoder::{EntityType, ExportKind, Function, ValType};
+        let mut merged = empty_merged();
+        // type 0: (retptr: i32) -> () — caller type; one retptr param, void.
+        merged.types.push(crate::merger::MergedFuncType {
+            params: vec![ValType::I32],
+            results: Vec::new(),
+        });
+        // type 1: () -> i32 — lift (callback-mode packed return).
+        merged.types.push(crate::merger::MergedFuncType {
+            params: Vec::new(),
+            results: vec![ValType::I32],
+        });
+        // type 2: (i32,i32,i32,i32) -> i32 — cabi_realloc.
+        merged.types.push(crate::merger::MergedFuncType {
+            params: vec![ValType::I32; 4],
+            results: vec![ValType::I32],
+        });
+        // lift func @ merged 0 (callee component 1).
+        merged.functions.push(crate::merger::MergedFunction {
+            type_idx: 1,
+            body: Function::new([]),
+            origin: (1, 0, 0),
+            synthetic_kind: None,
+        });
+        merged.function_index_map.insert((1, 0, 0), 0);
+        // caller's cabi_realloc @ merged 1 (caller component 0) — the result
+        // writeback reallocs in CALLER memory.
+        merged.functions.push(crate::merger::MergedFunction {
+            type_idx: 2,
+            body: Function::new([]),
+            origin: (0, 0, 0),
+            synthetic_kind: None,
+        });
+        merged.realloc_map.insert((0, 0), 1);
+        // caller memory = component 0, callee memory = component 1.
+        merged.memory_index_map.insert((0, 0, 0), 0);
+        merged.memory_index_map.insert((1, 0, 0), 1);
+
+        // Result globals: a (ptr, len) i32 pair with a String result_type so
+        // elem_size == 1 (a top-level string result).
+        let lookup_name = "[async-lift]greet".to_string();
+        let globals = vec![
+            (20u32, wasm_encoder::ValType::I32),
+            (21u32, wasm_encoder::ValType::I32),
+        ];
+        merged
+            .async_result_globals
+            .insert((1, lookup_name.clone()), globals.clone());
+        merged.task_return_shims.insert(
+            0,
+            crate::merger::TaskReturnShimInfo {
+                shim_func: 0,
+                result_globals: globals.clone(),
+                component_idx: 1,
+                import_name: "[task-return]0".into(),
+                original_func_name: lookup_name.clone(),
+                result_type: Some(crate::parser::ComponentValType::String),
+            },
+        );
+
+        let export_name = "[async-lift]greet";
+        merged.exports.push(crate::merger::MergedExport {
+            name: format!("[callback]{export_name}"),
+            kind: ExportKind::Func,
+            index: 0,
+        });
+        merged.imports.push(crate::merger::MergedImport {
+            module: "$root".into(),
+            name: "[waitable-set-poll]".into(),
+            entity_type: EntityType::Function(0),
+            component_idx: None,
+        });
+
+        let mut site = async_lift_site(export_name);
+        site.from_component = 0;
+        site.to_component = 1;
+        site.import_func_type_idx = Some(0); // caller type (retptr) → 1 param
+        site.crosses_memory = true;
+        site.requirements.result_pointer_pair_offsets = vec![0];
+        site.requirements.result_copy_layouts =
+            vec![crate::resolver::CopyLayout::Bulk { byte_multiplier: 1 }];
+        site.requirements.caller_encoding = Some(caller_enc);
+        site.requirements.callee_encoding = Some(callee_enc);
+        (merged, site)
+    }
+
+    /// #272 inc-3 (integration, callback): the CALLBACK async adapter's
+    /// top-level STRING RESULT transcode path must not reference a local past
+    /// its declared budget. caller=Utf16, callee=Utf8 ⇒ the RESULT transcode
+    /// direction (callee→caller) is Utf8→Utf16, an implemented direction. The
+    /// result transcode reuses the param-transcode local block (`l_p2 + 16 ..=
+    /// l_p2 + 20`, declared by the budget of 26); this proves it for the REAL
+    /// adapter — the budget-bug class inc-1 shipped.
+    #[test]
+    fn inc3_callback_adapter_result_string_locals_within_budget() {
+        use crate::parser::CanonStringEncoding;
+        let gen_ = FactStyleGenerator::new(AdapterConfig::default());
+        let (merged, site) = xenc_string_result_merged_and_site(
+            CanonStringEncoding::Utf16,
+            CanonStringEncoding::Utf8,
+        );
+        let adapter = gen_
+            .generate_async_callback_adapter(&site, &merged)
+            .expect("callback emitter must succeed for the inc-3 result-string site");
+        assert_locals_within_budget(adapter.body, 1, "#272 inc-3 callback result");
+    }
+
+    /// #272 inc-3 (integration, stackful): the STACKFUL async adapter's
+    /// top-level STRING RESULT transcode path must likewise stay within its
+    /// declared budget (18); the result transcode reuses the param-transcode
+    /// block `l_scratch + 12 ..= l_scratch + 16`.
+    #[test]
+    fn inc3_stackful_adapter_result_string_locals_within_budget() {
+        use crate::parser::CanonStringEncoding;
+        let gen_ = FactStyleGenerator::new(AdapterConfig::default());
+        let (mut merged, site) = xenc_string_result_merged_and_site(
+            CanonStringEncoding::Utf16,
+            CanonStringEncoding::Utf8,
+        );
+        // The stackful path dispatches on a non-`[callback]` export; rename the
+        // companion so `generate_async_stackful_adapter` is under test.
+        merged.exports[0].name = site.export_name.clone();
+        let adapter = gen_
+            .generate_async_stackful_adapter(&site, &merged)
+            .expect("stackful emitter must succeed for the inc-3 result-string site");
+        assert_locals_within_budget(adapter.body, 1, "#272 inc-3 stackful result");
     }
 
     /// Regression test for the alignment-padding bug surfaced by the
