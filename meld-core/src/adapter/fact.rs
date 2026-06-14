@@ -6891,17 +6891,15 @@ impl FactStyleGenerator {
             _ => return Ok(()),
         };
 
-        // Is there a byte-granular (ptr, len) param or result — a plausible
-        // string whose bytes the async emitter would raw-copy?
-        let is_byte_granular = |cl: &crate::resolver::CopyLayout| -> bool {
-            match cl {
-                crate::resolver::CopyLayout::Bulk { byte_multiplier } => *byte_multiplier == 1,
-                crate::resolver::CopyLayout::Elements { element_size, .. } => *element_size == 1,
-            }
-        };
-        // A ptr-pair position with no recorded layout defaults to byte-granular
-        // in the emitters (`byte_mult` falls back to 1), so treat a bare
-        // position (no parallel layout) as a string too.
+        // Is there a byte-granular (ptr, len) param or result whose bytes the
+        // async emitter would raw-copy — at ANY nesting depth? A nested string
+        // (e.g. `list<string>`) has a non-byte-granular TOP-LEVEL layout
+        // (`Elements{element_size: 8}`) but a byte-granular inner pointer that
+        // `emit_patch_nested_indirections` raw-copies; the detection recurses
+        // into `inner_pointers` to match the emitter's depth (LS-F-27
+        // under-trip fix). A ptr-pair position with no recorded layout defaults
+        // to byte-granular in the emitters (`byte_mult` falls back to 1), so
+        // treat a bare position (no parallel layout) as a string too.
         let param_has_string = site
             .requirements
             .pointer_pair_positions
@@ -6911,7 +6909,7 @@ impl FactStyleGenerator {
                 site.requirements
                     .param_copy_layouts
                     .get(i)
-                    .map(is_byte_granular)
+                    .map(Self::layout_bears_byte_granular_buffer)
                     .unwrap_or(true)
             });
         let result_has_string = site
@@ -6923,7 +6921,7 @@ impl FactStyleGenerator {
                 site.requirements
                     .result_copy_layouts
                     .get(i)
-                    .map(is_byte_granular)
+                    .map(Self::layout_bears_byte_granular_buffer)
                     .unwrap_or(true)
             });
 
@@ -6935,6 +6933,31 @@ impl FactStyleGenerator {
             )));
         }
         Ok(())
+    }
+
+    /// Recursively: does this copy layout carry a byte-granular `(ptr, len)`
+    /// buffer at ANY nesting depth — the conservative proxy for "a string the
+    /// async emitter would raw-copy without transcoding"? `Bulk{1}` /
+    /// `Elements{element_size: 1}` are byte-granular; an `Elements` is also a
+    /// carrier if any of its `inner_pointers` is (e.g. `list<string>`, whose
+    /// top-level `Elements{element_size: 8}` holds a `Bulk{1}` inner string).
+    /// This must match the depth of `emit_patch_nested_indirections`, which
+    /// copies inner buffers — otherwise a nested cross-encoding string
+    /// under-trips the guard and silently mis-transcodes (LS-F-27).
+    fn layout_bears_byte_granular_buffer(cl: &crate::resolver::CopyLayout) -> bool {
+        match cl {
+            crate::resolver::CopyLayout::Bulk { byte_multiplier } => *byte_multiplier == 1,
+            crate::resolver::CopyLayout::Elements {
+                element_size,
+                inner_pointers,
+                ..
+            } => {
+                *element_size == 1
+                    || inner_pointers
+                        .iter()
+                        .any(|ip| Self::layout_bears_byte_granular_buffer(&ip.copy_layout))
+            }
+        }
     }
 }
 
@@ -7598,6 +7621,84 @@ mod tests {
         site.requirements.caller_encoding = Some(caller);
         site.requirements.callee_encoding = Some(callee);
         site
+    }
+
+    /// Build a cross-memory async-lift site whose param or result is a
+    /// `list<string>`: top-level `Elements{element_size: 8}` (NOT byte-granular)
+    /// with a byte-granular `Bulk{1}` inner string. Exercises the LS-F-27
+    /// under-trip fix — the guard must recurse into `inner_pointers`.
+    fn async_xenc_nested_list_string_site(on_result: bool) -> crate::resolver::AdapterSite {
+        use crate::parser::CanonStringEncoding;
+        use crate::resolver::{CopyLayout, InnerPointer};
+        let list_of_string = CopyLayout::Elements {
+            element_size: 8,
+            inner_pointers: vec![InnerPointer::unconditional(
+                0,
+                CopyLayout::Bulk { byte_multiplier: 1 },
+            )],
+            inner_resources: vec![],
+        };
+        let mut site = async_lift_site("[async-lift]greet");
+        site.crosses_memory = true;
+        if on_result {
+            site.requirements.result_pointer_pair_offsets = vec![0];
+            site.requirements.result_copy_layouts = vec![list_of_string];
+        } else {
+            site.requirements.pointer_pair_positions = vec![0];
+            site.requirements.param_copy_layouts = vec![list_of_string];
+        }
+        site.requirements.caller_encoding = Some(CanonStringEncoding::Utf8);
+        site.requirements.callee_encoding = Some(CanonStringEncoding::Utf16);
+        site
+    }
+
+    /// LS-F-27 (under-trip fix): a cross-encoding async `list<string>` PARAM —
+    /// non-byte-granular top-level layout, byte-granular inner string the
+    /// emitter raw-copies — must fail loud. Pre-fix the guard inspected only
+    /// the top-level layout and silently let this through (#272 under-trip,
+    /// confirmed by an adversarial Mythos pass).
+    #[test]
+    fn ls_f_27_async_cross_encoding_nested_list_string_param_fails_loud() {
+        let site = async_xenc_nested_list_string_site(false);
+        FactStyleGenerator::guard_async_cross_encoding_strings(&site)
+            .expect_err("cross-encoding async list<string> param must fail loud (nested string)");
+    }
+
+    /// LS-F-27 (under-trip fix), result side.
+    #[test]
+    fn ls_f_27_async_cross_encoding_nested_list_string_result_fails_loud() {
+        let site = async_xenc_nested_list_string_site(true);
+        FactStyleGenerator::guard_async_cross_encoding_strings(&site)
+            .expect_err("cross-encoding async list<string> result must fail loud (nested string)");
+    }
+
+    /// LS-F-27 negative (the recursion must not OVER-trip): a cross-encoding
+    /// async `list<list<u32>>` — nested but with NO byte-granular buffer at any
+    /// depth (inner `Elements{element_size: 4}`) — must still pass.
+    #[test]
+    fn ls_f_27_async_cross_encoding_nested_no_string_ok() {
+        use crate::parser::CanonStringEncoding;
+        use crate::resolver::{CopyLayout, InnerPointer};
+        let list_of_list_u32 = CopyLayout::Elements {
+            element_size: 8,
+            inner_pointers: vec![InnerPointer::unconditional(
+                0,
+                CopyLayout::Elements {
+                    element_size: 4,
+                    inner_pointers: vec![],
+                    inner_resources: vec![],
+                },
+            )],
+            inner_resources: vec![],
+        };
+        let mut site = async_lift_site("[async-lift]f");
+        site.crosses_memory = true;
+        site.requirements.pointer_pair_positions = vec![0];
+        site.requirements.param_copy_layouts = vec![list_of_list_u32];
+        site.requirements.caller_encoding = Some(CanonStringEncoding::Utf8);
+        site.requirements.callee_encoding = Some(CanonStringEncoding::Utf16);
+        FactStyleGenerator::guard_async_cross_encoding_strings(&site)
+            .expect("nested list<list<u32>> with no string must NOT trip the guard");
     }
 
     /// LS-F-27 gate: a cross-encoding async string PARAM that crosses memory
