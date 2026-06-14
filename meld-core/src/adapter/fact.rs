@@ -686,6 +686,281 @@ fn emit_utf16_encode_codepoint(
     func.instruction(&Instruction::End);
 }
 
+/// Emit a UTF-8 → UTF-16 transcode of a single top-level `(ptr, len)` string
+/// param on the async-lift cross-memory copy path (#272 inc 1).
+///
+/// Unlike the sync [`FactStyleGenerator::emit_utf8_to_utf16_transcode`], this
+/// helper is FULLY parameterised by local indices and MemArgs (no hidden
+/// local-0/1 / param-shape assumptions) and emits NO `Call` — it is composed
+/// from the shared, validated [`emit_utf8_decode_codepoint`] +
+/// [`emit_utf16_encode_codepoint`] codepoint helpers so it cannot drift from
+/// the sync decoder/encoder.
+///
+/// Contract:
+/// * `ptr_local` / `len_local` hold the CALLER-memory source pointer and the
+///   source byte length. On return, `ptr_local` is rewritten to the freshly
+///   reallocated CALLEE-memory output pointer and `len_local` is rewritten to
+///   the output UTF-16 **code-unit count** (NOT a byte count) — the operand a
+///   UTF-16 lifting callee reads. Failing to rewrite `len_local` would
+///   silently mis-size the callee's view of the string.
+/// * `out_ptr_local` receives the realloc result (the callee output buffer).
+/// * `src_idx_local`, `dst_idx_local`, `cp_local`, `byte_local`,
+///   `cont_local` are dedicated scratch i32 locals the caller must reserve;
+///   they must not alias `ptr_local`/`len_local` or each other.
+///
+/// Sizing (mirrors the sync emitter's LS-A-7 guards): each UTF-8 byte yields
+/// at most one UTF-16 code unit, so the worst case is `len` code units =
+/// `2 * len` bytes. `2 * len` is computed with an i32-overflow guard before
+/// the multiply (trap if `len > u32::MAX/2`), and the realloc return is
+/// null-checked, both via the shared helpers.
+#[allow(clippy::too_many_arguments)]
+fn emit_utf8_to_utf16_transcode_param(
+    body: &mut Function,
+    realloc_func: u32,
+    src_mem8: wasm_encoder::MemArg,
+    dst_mem16: wasm_encoder::MemArg,
+    ptr_local: u32,
+    len_local: u32,
+    out_ptr_local: u32,
+    src_idx_local: u32,
+    dst_idx_local: u32,
+    cp_local: u32,
+    byte_local: u32,
+    cont_local: u32,
+) {
+    // Allocate output buffer = 2 * len bytes (each UTF-8 byte → ≤ 1 UTF-16
+    // code unit = 2 bytes). LS-A-7 leg (a): guard the *2 against i32 wrap;
+    // leg (b): emit_checked_realloc traps on a null return.
+    emit_overflow_guard(body, len_local, 2);
+    body.instruction(&Instruction::I32Const(0)); // old_ptr
+    body.instruction(&Instruction::I32Const(0)); // old_size
+    body.instruction(&Instruction::I32Const(2)); // align (utf16)
+    body.instruction(&Instruction::LocalGet(len_local));
+    body.instruction(&Instruction::I32Const(2));
+    body.instruction(&Instruction::I32Mul); // new_size = 2 * len
+    emit_checked_realloc(body, realloc_func, out_ptr_local);
+
+    // src_idx = 0; dst_idx = 0 (dst_idx is the running output code-unit count).
+    body.instruction(&Instruction::I32Const(0));
+    body.instruction(&Instruction::LocalSet(src_idx_local));
+    body.instruction(&Instruction::I32Const(0));
+    body.instruction(&Instruction::LocalSet(dst_idx_local));
+
+    // Transcode loop.
+    body.instruction(&Instruction::Block(wasm_encoder::BlockType::Empty));
+    body.instruction(&Instruction::Loop(wasm_encoder::BlockType::Empty));
+    // if src_idx >= len: break.
+    body.instruction(&Instruction::LocalGet(src_idx_local));
+    body.instruction(&Instruction::LocalGet(len_local));
+    body.instruction(&Instruction::I32GeU);
+    body.instruction(&Instruction::BrIf(1));
+    // cp = decode_utf8(src); src_idx advances.
+    emit_utf8_decode_codepoint(
+        body,
+        src_mem8,
+        ptr_local,
+        src_idx_local,
+        len_local,
+        byte_local,
+        cp_local,
+        cont_local,
+    );
+    // encode_utf16(cp) → dst; dst_idx advances by 1 or 2 code units.
+    emit_utf16_encode_codepoint(body, dst_mem16, out_ptr_local, dst_idx_local, cp_local);
+    body.instruction(&Instruction::Br(0));
+    body.instruction(&Instruction::End); // loop
+    body.instruction(&Instruction::End); // block
+
+    // Rewrite the forwarded (ptr, len): ptr → callee output buffer, len →
+    // output UTF-16 code-unit count.
+    body.instruction(&Instruction::LocalGet(out_ptr_local));
+    body.instruction(&Instruction::LocalSet(ptr_local));
+    body.instruction(&Instruction::LocalGet(dst_idx_local));
+    body.instruction(&Instruction::LocalSet(len_local));
+}
+
+/// Build a self-contained two-memory wasm module that exercises the EXACT
+/// async-path UTF-8 → UTF-16 param transcode emitter
+/// ([`emit_utf8_to_utf16_transcode_param`]) under a real engine, for the
+/// #272 inc-1 runtime-differential oracle.
+///
+/// The async fuse+run harness cannot express a string-param async-lift callee
+/// runnable under bare wasmtime (async-lift execution is deferred to a real
+/// async runtime / kiln; the wat crate does not even parse `canon lift async`
+/// — see `p3_async_lowering.rs`). This builder instead drives the production
+/// transcode emitter directly: it places the caller's UTF-8 bytes in memory 0
+/// ("caller memory"), transcodes them into a freshly bump-allocated buffer in
+/// memory 1 ("callee memory"), and sums the resulting UTF-16 code units the
+/// way a UTF-16-lifting callee would read them. A raw byte-copy (the pre-inc-1
+/// behaviour) cannot produce the correct code-unit sum, so the oracle proves
+/// transcoding rather than copying.
+///
+/// Module shape (exercises the real emitter, MemArgs distinct per memory):
+/// * memory 0 (caller): the UTF-8 source bytes, written by the host before the
+///   call.
+/// * memory 1 (callee): the bump-allocated UTF-16 output.
+/// * func 0 `cabi_realloc(old,oldsz,align,newsz) -> i32`: a 2-byte-aligned bump
+///   allocator over a mutable global cursor in memory 1.
+/// * func 1 `transcode_and_sum(src_ptr, src_len) -> i32` (exported): copies the
+///   args into the `(ptr, len)` locals, runs the transcode (which reallocs in
+///   memory 1 and rewrites the locals to `(out_ptr, code_unit_count)`), then
+///   sums `mem1.u16[out_ptr + 2*i]` for `i in 0..code_unit_count`.
+///
+/// Exposed `#[doc(hidden)] pub` purely so the `async_cross_encoding` runtime
+/// test (a separate integration crate, where `wasmtime` is available) can
+/// instantiate it; it is not part of the supported API.
+#[doc(hidden)]
+pub fn build_utf8_to_utf16_transcode_test_module() -> Vec<u8> {
+    use wasm_encoder::{
+        CodeSection, ConstExpr, ExportKind, ExportSection, FunctionSection, GlobalSection,
+        GlobalType, MemArg, MemorySection, MemoryType, Module, TypeSection, ValType,
+    };
+
+    let mut types = TypeSection::new();
+    // type 0: cabi_realloc (i32,i32,i32,i32) -> i32
+    types.ty().function(
+        [ValType::I32, ValType::I32, ValType::I32, ValType::I32],
+        [ValType::I32],
+    );
+    // type 1: transcode_and_sum (i32 src_ptr, i32 src_len) -> i32
+    types
+        .ty()
+        .function([ValType::I32, ValType::I32], [ValType::I32]);
+
+    let mut functions = FunctionSection::new();
+    functions.function(0); // func 0: cabi_realloc
+    functions.function(1); // func 1: transcode_and_sum
+
+    // memory 0 = caller (UTF-8 src), memory 1 = callee (UTF-16 out).
+    let mut memory = MemorySection::new();
+    for _ in 0..2 {
+        memory.memory(MemoryType {
+            minimum: 1,
+            maximum: None,
+            memory64: false,
+            shared: false,
+            page_size_log2: None,
+        });
+    }
+
+    // global 0: bump cursor for the memory-1 allocator (start at 16).
+    let mut globals = GlobalSection::new();
+    globals.global(
+        GlobalType {
+            val_type: ValType::I32,
+            mutable: true,
+            shared: false,
+        },
+        &ConstExpr::i32_const(16),
+    );
+
+    let mut exports = ExportSection::new();
+    exports.export("transcode_and_sum", ExportKind::Func, 1);
+    exports.export("caller_memory", ExportKind::Memory, 0);
+    exports.export("callee_memory", ExportKind::Memory, 1);
+
+    let mut code = CodeSection::new();
+
+    // func 0: cabi_realloc — bump allocator over global 0, aligned to `align`.
+    // params: 0=old_ptr, 1=old_size, 2=align, 3=new_size. local 4 = result.
+    {
+        let mut f = Function::new([(1, ValType::I32)]);
+        // ptr = (cursor + align - 1) & ~(align - 1)
+        f.instruction(&Instruction::GlobalGet(0));
+        f.instruction(&Instruction::LocalGet(2));
+        f.instruction(&Instruction::I32Add);
+        f.instruction(&Instruction::I32Const(1));
+        f.instruction(&Instruction::I32Sub);
+        f.instruction(&Instruction::LocalGet(2));
+        f.instruction(&Instruction::I32Const(1));
+        f.instruction(&Instruction::I32Sub);
+        f.instruction(&Instruction::I32Const(-1));
+        f.instruction(&Instruction::I32Xor);
+        f.instruction(&Instruction::I32And);
+        f.instruction(&Instruction::LocalSet(4));
+        // cursor = ptr + new_size
+        f.instruction(&Instruction::LocalGet(4));
+        f.instruction(&Instruction::LocalGet(3));
+        f.instruction(&Instruction::I32Add);
+        f.instruction(&Instruction::GlobalSet(0));
+        f.instruction(&Instruction::LocalGet(4));
+        f.instruction(&Instruction::End);
+        code.function(&f);
+    }
+
+    // func 1: transcode_and_sum(src_ptr, src_len) -> i32
+    // Locals: 0=ptr (in/out), 1=len (in/out), then the transcode scratch:
+    //   2=out_ptr, 3=src_idx, 4=dst_idx/out_count, 5=cp, 6=byte, 7=cont,
+    // plus 8=sum, 9=i for the summing loop.
+    {
+        let src_mem8 = MemArg {
+            offset: 0,
+            align: 0,
+            memory_index: 0,
+        };
+        let dst_mem16 = MemArg {
+            offset: 0,
+            align: 1,
+            memory_index: 1,
+        };
+        let mut f = Function::new([(8, ValType::I32)]);
+        emit_utf8_to_utf16_transcode_param(
+            &mut f, 0, // realloc func
+            src_mem8, dst_mem16, 0, // ptr_local (src_ptr param, rewritten to out_ptr)
+            1, // len_local (src_len param, rewritten to code-unit count)
+            2, // out_ptr_local
+            3, // src_idx
+            4, // dst_idx / out code-unit count
+            5, // cp
+            6, // byte
+            7, // cont
+        );
+        // sum = 0; i = 0
+        f.instruction(&Instruction::I32Const(0));
+        f.instruction(&Instruction::LocalSet(8));
+        f.instruction(&Instruction::I32Const(0));
+        f.instruction(&Instruction::LocalSet(9));
+        f.instruction(&Instruction::Block(wasm_encoder::BlockType::Empty));
+        f.instruction(&Instruction::Loop(wasm_encoder::BlockType::Empty));
+        // if i >= len (now the code-unit count): break
+        f.instruction(&Instruction::LocalGet(9));
+        f.instruction(&Instruction::LocalGet(1));
+        f.instruction(&Instruction::I32GeU);
+        f.instruction(&Instruction::BrIf(1));
+        // sum += mem1.u16[ptr + i*2]
+        f.instruction(&Instruction::LocalGet(0));
+        f.instruction(&Instruction::LocalGet(9));
+        f.instruction(&Instruction::I32Const(1));
+        f.instruction(&Instruction::I32Shl);
+        f.instruction(&Instruction::I32Add);
+        f.instruction(&Instruction::I32Load16U(dst_mem16));
+        f.instruction(&Instruction::LocalGet(8));
+        f.instruction(&Instruction::I32Add);
+        f.instruction(&Instruction::LocalSet(8));
+        // i += 1
+        f.instruction(&Instruction::LocalGet(9));
+        f.instruction(&Instruction::I32Const(1));
+        f.instruction(&Instruction::I32Add);
+        f.instruction(&Instruction::LocalSet(9));
+        f.instruction(&Instruction::Br(0));
+        f.instruction(&Instruction::End); // loop
+        f.instruction(&Instruction::End); // block
+        f.instruction(&Instruction::LocalGet(8));
+        f.instruction(&Instruction::End);
+        code.function(&f);
+    }
+
+    let mut module = Module::new();
+    module
+        .section(&types)
+        .section(&functions)
+        .section(&memory)
+        .section(&globals)
+        .section(&exports)
+        .section(&code);
+    module.finish()
+}
+
 /// Emit a chain of `(disc == value)` checks for a [`ConditionalPointerPair`]'s
 /// guards on the **flat-local** path — every guard in `cond.outer_guards`
 /// followed by the pair's innermost discriminant. All checks are ANDed; the
@@ -5965,7 +6240,10 @@ impl FactStyleGenerator {
 
         // 6 locals for callback loop + 4 for string copy (src_ptr, src_len, dst_ptr, new_ptr)
         // + 6 for nested indirection patching (i, rec_dst, old_ptr, buf_len, new_ptr, rec_src)
-        let mut body = Function::new([(16, wasm_encoder::ValType::I32)]);
+        // + 6 (#272 inc 1) for the UTF-8→UTF-16 param transcode loop
+        // (src_idx, out_count, cp, byte, cont — at `l_p2 + 16 ..`, past the
+        // result-writeback / nested-patch region so they cannot collide).
+        let mut body = Function::new([(22, wasm_encoder::ValType::I32)]);
 
         // Step 0.5: copy string/list params from caller to callee memory.
         // Shared with the stackful emitter (SR-32, #140); see
@@ -5978,6 +6256,7 @@ impl FactStyleGenerator {
             caller_param_count,
             callee_param_count,
             l_p2 + 4,
+            l_p2 + 16,
         );
 
         // Step 1: Call [async-lift] entry with callee's params
@@ -6282,6 +6561,13 @@ impl FactStyleGenerator {
     /// realloc result. Callers must reserve at least one i32 local at that
     /// index. Both emitters allocate their local layout so the scratch sits
     /// just past the caller's params and per-emitter loop locals.
+    ///
+    /// `transcode_base` is the first of 5 DEDICATED i32 scratch locals
+    /// (`transcode_base ..= transcode_base + 4`: src_idx, dst_idx/out_count,
+    /// cp, byte, cont) the UTF-8 → UTF-16 transcode path (#272 inc 1) uses;
+    /// they must not alias the param locals, `scratch_local`, or the
+    /// result-writeback / nested-patch scratch. Same-encoding copies never
+    /// touch them.
     #[allow(clippy::too_many_arguments)]
     fn emit_param_copy_step(
         &self,
@@ -6292,6 +6578,7 @@ impl FactStyleGenerator {
         caller_param_count: usize,
         callee_param_count: usize,
         scratch_local: u32,
+        transcode_base: u32,
     ) {
         // `pointer_pair_positions` from the resolver are flat indices into
         // the component-type param list, computed by
@@ -6355,6 +6642,54 @@ impl FactStyleGenerator {
                 Some(crate::parser::CanonStringEncoding::CompactUtf16)
             ) && byte_mult == 1;
             let realloc_align = if is_compact_utf16 { 2 } else { 1 };
+
+            // #272 inc 1: a TOP-LEVEL byte-granular (byte_mult == 1) string
+            // param crossing memory from a UTF-8 caller to a UTF-16 callee is
+            // TRANSCODED — UTF-8 bytes decoded to code points and re-encoded as
+            // UTF-16 code units — rather than raw-copied (which would leave the
+            // callee reading UTF-8 bytes as UTF-16 code units: the H-4.4 defect
+            // the LS-F-27 guard otherwise fails loud on). Every other case
+            // (same-encoding, other directions, nested strings, result strings)
+            // is either handled by the raw-copy path below or rejected by
+            // `guard_async_cross_encoding_strings`. The guard is narrowed in
+            // lockstep so ONLY this combo reaches this branch.
+            let transcode_utf8_to_utf16 = byte_mult == 1
+                && matches!(
+                    site.requirements.caller_encoding,
+                    Some(crate::parser::CanonStringEncoding::Utf8)
+                )
+                && matches!(
+                    site.requirements.callee_encoding,
+                    Some(crate::parser::CanonStringEncoding::Utf16)
+                );
+
+            if transcode_utf8_to_utf16 {
+                let src_mem8 = wasm_encoder::MemArg {
+                    offset: 0,
+                    align: 0,
+                    memory_index: caller_memory,
+                };
+                let dst_mem16 = wasm_encoder::MemArg {
+                    offset: 0,
+                    align: 1,
+                    memory_index: callee_memory,
+                };
+                emit_utf8_to_utf16_transcode_param(
+                    body,
+                    realloc,
+                    src_mem8,
+                    dst_mem16,
+                    ptr_local,
+                    len_local,
+                    l_new_ptr,
+                    transcode_base,     // src_idx
+                    transcode_base + 1, // dst_idx / out code-unit count
+                    transcode_base + 2, // cp
+                    transcode_base + 3, // byte
+                    transcode_base + 4, // cont
+                );
+                continue;
+            }
 
             // Allocate: cabi_realloc(0, 0, align, <byte count>)
             emit_overflow_guard(body, len_local, byte_mult);
@@ -6675,8 +7010,11 @@ impl FactStyleGenerator {
         let l_scratch = caller_param_count as u32;
 
         // 11 locals total: 1 for step 0.5 + 4 for ptr-pair writeback +
-        // 6 for nested-indirection patching. Plus 1 headroom = 12.
-        let mut body = Function::new([(12, wasm_encoder::ValType::I32)]);
+        // 6 for nested-indirection patching. Plus 1 headroom = 12. + 6
+        // (#272 inc 1) for the UTF-8→UTF-16 param transcode loop (src_idx,
+        // out_count, cp, byte, cont — at `l_scratch + 12 ..`, past the
+        // writeback / nested-patch region) = 18.
+        let mut body = Function::new([(18, wasm_encoder::ValType::I32)]);
 
         // Step 0.5: cross-memory param copy (shared with callback path)
         self.emit_param_copy_step(
@@ -6687,6 +7025,7 @@ impl FactStyleGenerator {
             caller_param_count,
             callee_param_count,
             l_scratch,
+            l_scratch + 12,
         );
 
         // Step 1: call [async-lift] entry. In stackful mode the runtime
@@ -6853,26 +7192,27 @@ impl FactStyleGenerator {
 }
 
 impl FactStyleGenerator {
-    /// #272 / LS-F-27 fail-loud guard for cross-encoding async strings.
+    /// #272 / LS-F-27 cross-encoding async-string guard.
     ///
-    /// Trips only when ALL of the following hold for an async-lift site:
-    ///   * `site.crosses_memory` (a same-memory async call shares one memory
-    ///     and one encoding, so there is nothing to transcode), AND
-    ///   * the caller and callee canonical string encodings differ (computed
-    ///     the same way `analyze_call_site` does, via `canon_to_string_encoding`
-    ///     so that e.g. UTF-8 vs `latin1+utf16`/CompactUtf16 are compared on
-    ///     their `StringEncoding` mapping, not the raw canon enum), AND
-    ///   * there is at least one byte-granular `(ptr, len)` param or result —
-    ///     i.e. a plausible STRING. A byte-granular buffer (`Bulk{1}` /
-    ///     `Elements{element_size:1}`) is what a lowered string looks like;
-    ///     a `list<u32>` (element size 4) etc. is encoding-independent and
-    ///     must NOT trip the guard.
+    /// Returns `Ok` (allow-through) for an async-lift site ONLY when both:
+    ///   * there is nothing to transcode — the call doesn't cross memory, the
+    ///     encodings match, or there is no byte-granular `(ptr, len)` buffer at
+    ///     all (a `list<u32>`/record-only call is encoding-independent); OR
+    ///   * the call is **exactly** the #272 inc-1 implemented combo:
+    ///     `crosses_memory` AND caller canon-encoding `Utf8` AND callee
+    ///     canon-encoding `Utf16` AND ≥1 **top-level** byte-granular PARAM AND
+    ///     **no** byte-granular RESULT AND **no nested** byte-granular param
+    ///     (every param that bears a byte-granular buffer is itself directly
+    ///     `Bulk{1}` / a bare position, NOT an `Elements` whose inner pointer
+    ///     is byte-granular). `emit_param_copy_step` transcodes exactly that
+    ///     case; everything else it would still raw-copy.
     ///
-    /// When any condition is false the call proceeds normally, so:
-    ///   * same-encoding async string calls keep working,
-    ///   * cross-encoding async calls with NO string params/results keep
-    ///     working,
-    ///   * non-cross-memory async calls keep working.
+    /// EVERY other cross-encoding combo — a byte-granular result string, a
+    /// nested (`list<string>`) param, any non-UTF-8→UTF-16 direction
+    /// (UTF-16→UTF-8, UTF-8→latin1+utf16, …) — still FAILS LOUD, because the
+    /// emitters would otherwise raw-copy the bytes and silently mis-transcode
+    /// (the H-4.4 defect). This is safety-critical: an over-narrow allow-through
+    /// would let an unimplemented combo through and corrupt the string.
     fn guard_async_cross_encoding_strings(site: &AdapterSite) -> Result<()> {
         if !site.crosses_memory {
             return Ok(());
@@ -6925,14 +7265,80 @@ impl FactStyleGenerator {
                     .unwrap_or(true)
             });
 
-        if param_has_string || result_has_string {
-            return Err(crate::Error::AdapterGeneration(format!(
-                "async cross-encoding string transcoding is not yet supported \
-                 (caller {caller_enc:?} != callee {callee_enc:?}); a verbatim \
-                 copy would silently mis-transcode — see #272"
-            )));
+        if !param_has_string && !result_has_string {
+            // Encoding-independent (no string-like buffer): nothing to
+            // transcode, nothing to raw-copy-corrupt.
+            return Ok(());
         }
-        Ok(())
+
+        // #272 inc 1: the ONLY implemented async transcode is a TOP-LEVEL
+        // UTF-8 → UTF-16 string PARAM. Allow it through; reject everything
+        // else. The direction is compared on the raw canon enums (UTF-8 →
+        // UTF-16 strictly, not the StringEncoding mapping that collapses
+        // latin1+utf16 onto Latin1).
+        let direction_is_utf8_to_utf16 = matches!(
+            site.requirements.caller_encoding,
+            Some(crate::parser::CanonStringEncoding::Utf8)
+        ) && matches!(
+            site.requirements.callee_encoding,
+            Some(crate::parser::CanonStringEncoding::Utf16)
+        );
+        // No byte-granular RESULT (the result writeback raw-copies).
+        let no_byte_granular_result = !result_has_string;
+        // Every param that bears a byte-granular buffer must be TOP-LEVEL
+        // byte-granular (directly `Bulk{1}` or a bare position) — a nested
+        // (`list<string>`) param's inner string is still raw-copied by
+        // `emit_patch_nested_indirections`, so it stays fail-loud.
+        let all_param_strings_top_level = site
+            .requirements
+            .pointer_pair_positions
+            .iter()
+            .enumerate()
+            .all(|(i, _)| match site.requirements.param_copy_layouts.get(i) {
+                // Bare position (no recorded layout) → emitter treats it as a
+                // top-level byte-granular string (byte_mult falls back to 1).
+                None => true,
+                // Bears a byte-granular buffer ⇒ must be a TOP-LEVEL one (a
+                // direct `Bulk{1}`); a nested string (`list<string>`) is still
+                // raw-copied so it stays fail-loud.
+                Some(cl) if Self::layout_bears_byte_granular_buffer(cl) => {
+                    Self::layout_is_top_level_byte_granular(cl)
+                }
+                // Not a string at all (e.g. list<u32>): copied verbatim and
+                // encoding-independent — does not block the allow-through.
+                Some(_) => true,
+            });
+
+        if direction_is_utf8_to_utf16
+            && param_has_string
+            && no_byte_granular_result
+            && all_param_strings_top_level
+        {
+            return Ok(());
+        }
+
+        Err(crate::Error::AdapterGeneration(format!(
+            "async cross-encoding string transcoding is not yet supported \
+             (caller {caller_enc:?} != callee {callee_enc:?}); only a \
+             top-level UTF-8 → UTF-16 string param is implemented (#272 \
+             inc 1) — a verbatim copy of any other case would silently \
+             mis-transcode — see #272"
+        )))
+    }
+
+    /// Is this copy layout a TOP-LEVEL byte-granular `(ptr, len)` buffer — i.e.
+    /// a direct `Bulk{1}` — as opposed to a NESTED byte-granular buffer reached
+    /// through an `Elements`' `inner_pointers` (e.g. the inner string of a
+    /// `list<string>`)? The #272 inc-1 transcode only rewrites the top-level
+    /// param `(ptr, len)`; a nested inner string is still raw-copied by
+    /// `emit_patch_nested_indirections`, so the guard must keep failing loud on
+    /// it. An `Elements{element_size: 1}` is itself a top-level byte buffer
+    /// (a `list<u8>` lowering shape) but is encoding-independent; it never
+    /// reaches this check because `transcode_utf8_to_utf16` only fires for the
+    /// `Bulk` byte_mult==1 string shape. Treated conservatively as NOT
+    /// top-level-string so it cannot widen the allow-through.
+    fn layout_is_top_level_byte_granular(cl: &crate::resolver::CopyLayout) -> bool {
+        matches!(cl, crate::resolver::CopyLayout::Bulk { byte_multiplier: 1 })
     }
 
     /// Recursively: does this copy layout carry a byte-granular `(ptr, len)`
@@ -7701,17 +8107,35 @@ mod tests {
             .expect("nested list<list<u32>> with no string must NOT trip the guard");
     }
 
-    /// LS-F-27 gate: a cross-encoding async string PARAM that crosses memory
-    /// must fail loud (the async emitter would otherwise raw-copy the bytes
-    /// and silently mis-transcode — #272 / H-4.4). Asserts both the error
-    /// variant and the diagnostic text.
+    /// #272 inc 1: a top-level UTF-8 → UTF-16 string PARAM crossing memory is
+    /// now the IMPLEMENTED async transcode case, so the guard must ALLOW it
+    /// through (the emitter transcodes rather than raw-copies). Previously this
+    /// case failed loud (LS-F-27); inc 1 legitimately flips it to success. The
+    /// runtime differential proof that the transcode is correct (not a raw
+    /// copy) lives in the `async_cross_encoding` runtime test target.
     #[test]
-    fn ls_f_27_async_cross_encoding_string_param_fails_loud() {
+    fn inc1_async_utf8_to_utf16_top_level_string_param_allowed() {
         use crate::parser::CanonStringEncoding;
         let site =
             async_xenc_string_param_site(CanonStringEncoding::Utf8, CanonStringEncoding::Utf16);
+        assert!(
+            FactStyleGenerator::guard_async_cross_encoding_strings(&site).is_ok(),
+            "#272 inc 1: a top-level UTF-8 → UTF-16 async string param must be \
+             allowed through (transcoded), not fail loud"
+        );
+    }
+
+    /// LS-F-27 (still fail-loud): the REVERSE direction — a UTF-16 → UTF-8
+    /// top-level async string PARAM — is NOT implemented by inc 1 and must
+    /// still fail loud (the emitter would raw-copy UTF-16 bytes as UTF-8). The
+    /// guard must not be over-narrowed to allow any non-UTF-8→UTF-16 direction.
+    #[test]
+    fn ls_f_27_async_cross_encoding_utf16_to_utf8_string_param_fails_loud() {
+        use crate::parser::CanonStringEncoding;
+        let site =
+            async_xenc_string_param_site(CanonStringEncoding::Utf16, CanonStringEncoding::Utf8);
         let err = FactStyleGenerator::guard_async_cross_encoding_strings(&site)
-            .expect_err("cross-encoding async string param must fail loud");
+            .expect_err("UTF-16 → UTF-8 async string param must still fail loud");
         match err {
             crate::Error::AdapterGeneration(msg) => {
                 assert!(
@@ -7723,6 +8147,23 @@ mod tests {
             }
             other => panic!("LS-F-27: expected AdapterGeneration error, got {other:?}"),
         }
+    }
+
+    /// LS-F-27 (still fail-loud): a UTF-8 → latin1+utf16 (CompactUtf16)
+    /// top-level async string PARAM is also unimplemented and must fail loud —
+    /// the direction check is on the raw canon enum (UTF-16 strictly), so the
+    /// CompactUtf16 callee does not satisfy it.
+    #[test]
+    fn ls_f_27_async_cross_encoding_utf8_to_compact_utf16_string_param_fails_loud() {
+        use crate::parser::CanonStringEncoding;
+        let site = async_xenc_string_param_site(
+            CanonStringEncoding::Utf8,
+            CanonStringEncoding::CompactUtf16,
+        );
+        assert!(
+            FactStyleGenerator::guard_async_cross_encoding_strings(&site).is_err(),
+            "LS-F-27: UTF-8 → latin1+utf16 async string param must still fail loud"
+        );
     }
 
     /// LS-F-27 gate (result side): a cross-encoding async string RESULT that
@@ -7806,16 +8247,19 @@ mod tests {
     }
 
     /// LS-F-27 wiring: the guard is reached through the real `generate`
-    /// dispatch (not just the helper), so a graph with a cross-encoding
-    /// async string site makes `generate` return Err before emitting a
-    /// silently-corrupting adapter.
+    /// dispatch (not just the helper), so a graph with a STILL-unimplemented
+    /// cross-encoding async string site (here UTF-16 → UTF-8, which inc 1 does
+    /// NOT transcode) makes `generate` return Err before emitting a
+    /// silently-corrupting adapter. (The now-implemented UTF-8 → UTF-16 param
+    /// case is covered by `inc1_async_utf8_to_utf16_top_level_string_param_allowed`
+    /// and the runtime differential test.)
     #[test]
     fn ls_f_27_generate_dispatch_rejects_cross_encoding_async_string() {
         use crate::parser::CanonStringEncoding;
         let gen_ = FactStyleGenerator::new(AdapterConfig::default());
         let merged = empty_merged();
         let site =
-            async_xenc_string_param_site(CanonStringEncoding::Utf8, CanonStringEncoding::Utf16);
+            async_xenc_string_param_site(CanonStringEncoding::Utf16, CanonStringEncoding::Utf8);
         let graph = crate::resolver::DependencyGraph {
             instantiation_order: vec![0, 1],
             resolved_imports: std::collections::HashMap::new(),
