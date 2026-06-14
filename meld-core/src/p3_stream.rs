@@ -33,9 +33,20 @@
 
 use crate::parser::{
     CanonicalEntry, ComponentFuncDef, ComponentTypeKind, ComponentValType, ParsedComponent,
+    PrimitiveValType,
 };
 use std::collections::HashMap;
 use wasmparser::ComponentExternalKind;
+
+/// Depth bound for [`canonical_structural_key`] recursion.
+///
+/// Component-local type references (`Type(N)`) can in principle form
+/// cycles or pathologically deep nests in adversarial input. The
+/// structural canonicaliser returns `None` (→ non-pairable, host-routed)
+/// once this bound is exceeded, so a cyclic or unbounded type can never
+/// drive the canonicaliser into non-termination. 64 levels is far past
+/// any genuine aggregate nesting a real component declares.
+const CANON_MAX_DEPTH: usize = 64;
 
 /// The element type carried by a `stream<T>`, parsed from the
 /// component-type descriptor the parser records.
@@ -75,12 +86,17 @@ impl StreamElement {
     /// A bare `Type(N)` descriptor is a component-LOCAL type index —
     /// component A's `Type(5)` and component B's `Type(5)` are unrelated —
     /// so it is not a valid cross-component key (LS-R-16). Primitive
-    /// descriptors (`Primitive(..)` / scalar names) and the untyped stream
-    /// are globally stable and pairable; a local-index descriptor is not
+    /// descriptors (scalar names such as `u8`) and the untyped stream are
+    /// globally stable and pairable; a local-index descriptor is not
     /// (pairing on it risks an over-match that drives the bridge emitter to
-    /// wire incompatible streams). Canonicalising `Type(N)` to a structural
-    /// descriptor — which would make aggregate-element streams pairable — is
-    /// tracked follow-up; until then such streams stay host-routed.
+    /// wire incompatible streams).
+    ///
+    /// As of #264, an aggregate element that DID resolve structurally is
+    /// recorded as its structural key (e.g. `record{f0:u8,f1:list<s32>}`),
+    /// which contains no `"Type("` and so is pairable — and pairs only with
+    /// an identical key. An element that could NOT be canonicalised (a
+    /// resource handle, a depth-bound or cycle hit, or an unresolvable
+    /// index) keeps its raw `Type(N)` descriptor and stays host-routed.
     fn is_cross_component_pairable(&self) -> bool {
         match self {
             StreamElement::Untyped => true,
@@ -179,10 +195,176 @@ pub fn component_stream_roles(comp: &ParsedComponent) -> Vec<(StreamElement, Str
 
 /// Resolve a component-local type index to its stream element type, or
 /// `None` if the index does not name a `stream<T>` type.
+///
+/// The element is canonicalised in the component's context (see
+/// [`canonicalize_stream_element`]) so that an aggregate element recorded
+/// as the component-LOCAL `Type(N)` descriptor becomes a cross-component
+/// structural key, pairable iff structurally identical on the other side.
 fn stream_element_of_type(comp: &ParsedComponent, ty: u32) -> Option<StreamElement> {
     match &comp.types.get(ty as usize)?.kind {
-        ComponentTypeKind::P3Async(desc) => StreamElement::from_descriptor(desc),
+        ComponentTypeKind::P3Async(desc) => Some(canonicalize_stream_element(
+            comp,
+            StreamElement::from_descriptor(desc)?,
+        )),
         _ => None,
+    }
+}
+
+/// Canonicalise a parsed [`StreamElement`] in `comp`'s type context.
+///
+/// The parser records a non-primitive stream element as the Debug form of
+/// a `wasmparser::ComponentValType`, which for an aggregate is the
+/// component-LOCAL `Type(N)` index — e.g. `stream<record{..}>` parses to
+/// `Typed("Type(3)")`. That local index is not a valid cross-component
+/// key (LS-R-16): index 3 in component A and index 3 in component B are
+/// unrelated.
+///
+/// This resolves `Type(N)` through `comp`'s type table to a
+/// **cross-component-stable structural descriptor** via
+/// [`canonical_structural_key`]. On success the element becomes
+/// `Typed(structural_key)` — no longer containing `"Type("`, so it is
+/// pairable, and pairs ONLY with an identical structural key. On failure
+/// (resource handle at any depth, depth bound exceeded, or unresolvable
+/// index) the original `Type(N)` descriptor is kept, which stays
+/// non-pairable / host-routed — exactly the conservative LS-R-16
+/// behaviour. Primitive and untyped elements pass through unchanged.
+fn canonicalize_stream_element(comp: &ParsedComponent, element: StreamElement) -> StreamElement {
+    let StreamElement::Typed(desc) = &element else {
+        return element;
+    };
+    let Some(idx) = parse_type_index(desc) else {
+        // Not a bare local-index descriptor (primitive scalar names, or
+        // an already-structural nested form) — leave unchanged.
+        return element;
+    };
+    match canonical_structural_key(comp, &ComponentValType::Type(idx), 0) {
+        Some(key) => StreamElement::Typed(key),
+        None => element,
+    }
+}
+
+/// Render a component value type to a cross-component-stable structural
+/// descriptor string, resolving component-local `Type(N)` references
+/// through `comp`'s type table.
+///
+/// The key is **injective enough that structurally-different types
+/// produce different strings**: field names AND order, element types,
+/// arities, tuple/record/variant/flags membership, and discriminant case
+/// names all contribute. This injectivity is the load-bearing safety
+/// property — a key collision would re-introduce the exact over-match
+/// LS-R-16 prevents, manufacturing a false pair that wires incompatible
+/// streams.
+///
+/// Returns `None` (caller keeps the type non-pairable) when:
+/// - the type contains a resource handle (`own<R>` / `borrow<R>`) at any
+///   nesting depth. Cross-component resource identity overlaps the
+///   unresolved #256 definer-attribution problem, so resource-element
+///   streams stay host-routed (conservative, per the issue);
+/// - `depth` exceeds [`CANON_MAX_DEPTH`] (cycle / unbounded-nest guard);
+/// - a `Type(N)` reference does not resolve to a defined type.
+///
+/// Example: a `record { count: u8, data: list<s32> }` element renders to
+/// `record{count:u8,data:list<s32>}`. A `tuple<u8, u8>` renders to
+/// `tuple<u8,u8>`; an `option<u32>` to `option<u32>`.
+fn canonical_structural_key(
+    comp: &ParsedComponent,
+    ty: &ComponentValType,
+    depth: usize,
+) -> Option<String> {
+    if depth > CANON_MAX_DEPTH {
+        return None;
+    }
+    let child = depth + 1;
+    match ty {
+        ComponentValType::Primitive(p) => Some(primitive_name(*p).to_string()),
+        ComponentValType::String => Some("string".to_string()),
+        ComponentValType::List(inner) => Some(format!(
+            "list<{}>",
+            canonical_structural_key(comp, inner, child)?
+        )),
+        ComponentValType::FixedSizeList(inner, len) => Some(format!(
+            "fixed-list<{},{len}>",
+            canonical_structural_key(comp, inner, child)?
+        )),
+        ComponentValType::Record(fields) => {
+            let mut parts = Vec::with_capacity(fields.len());
+            for (name, vt) in fields {
+                parts.push(format!(
+                    "{name}:{}",
+                    canonical_structural_key(comp, vt, child)?
+                ));
+            }
+            Some(format!("record{{{}}}", parts.join(",")))
+        }
+        ComponentValType::Tuple(items) => {
+            let mut parts = Vec::with_capacity(items.len());
+            for vt in items {
+                parts.push(canonical_structural_key(comp, vt, child)?);
+            }
+            Some(format!("tuple<{}>", parts.join(",")))
+        }
+        ComponentValType::Option(inner) => Some(format!(
+            "option<{}>",
+            canonical_structural_key(comp, inner, child)?
+        )),
+        ComponentValType::Result { ok, err } => {
+            let ok_s = match ok {
+                Some(vt) => canonical_structural_key(comp, vt, child)?,
+                None => "_".to_string(),
+            };
+            let err_s = match err {
+                Some(vt) => canonical_structural_key(comp, vt, child)?,
+                None => "_".to_string(),
+            };
+            Some(format!("result<{ok_s},{err_s}>"))
+        }
+        ComponentValType::Variant(cases) => {
+            let mut parts = Vec::with_capacity(cases.len());
+            for (name, opt) in cases {
+                match opt {
+                    Some(vt) => parts.push(format!(
+                        "{name}({})",
+                        canonical_structural_key(comp, vt, child)?
+                    )),
+                    None => parts.push(name.clone()),
+                }
+            }
+            Some(format!("variant{{{}}}", parts.join(",")))
+        }
+        ComponentValType::Flags(names) => Some(format!("flags{{{}}}", names.join(","))),
+        // Conservative on resources (#256): a handle element has no sound
+        // cross-component identity yet → None keeps it host-routed.
+        ComponentValType::Own(_) | ComponentValType::Borrow(_) => None,
+        ComponentValType::Type(idx) => {
+            let ct = comp.get_type_definition(*idx)?;
+            match &ct.kind {
+                ComponentTypeKind::Defined(inner) => canonical_structural_key(comp, inner, child),
+                // A `Type(N)` that resolves to anything other than a
+                // defined value type (resource declaration, function,
+                // instance, nested async) has no structural value key —
+                // stay conservative.
+                _ => None,
+            }
+        }
+    }
+}
+
+/// Stable scalar name for a primitive value type — the canonical-ABI
+/// spelling, independent of any component-local representation.
+fn primitive_name(p: PrimitiveValType) -> &'static str {
+    match p {
+        PrimitiveValType::Bool => "bool",
+        PrimitiveValType::S8 => "s8",
+        PrimitiveValType::U8 => "u8",
+        PrimitiveValType::S16 => "s16",
+        PrimitiveValType::U16 => "u16",
+        PrimitiveValType::S32 => "s32",
+        PrimitiveValType::U32 => "u32",
+        PrimitiveValType::S64 => "s64",
+        PrimitiveValType::U64 => "u64",
+        PrimitiveValType::F32 => "f32",
+        PrimitiveValType::F64 => "f64",
+        PrimitiveValType::Char => "char",
     }
 }
 
@@ -250,19 +432,22 @@ pub fn pair_streams(
                     if p_elem != c_elem {
                         continue;
                     }
-                    // LS-R-16: a non-primitive stream element type is recorded
-                    // as `Type(N)` where N is a COMPONENT-LOCAL type index, so
-                    // matching it across components is unsound — two DIFFERENT
-                    // element types that collide on the same local index N
-                    // would string-match and manufacture a false pair that
-                    // drives the bridge emitter to wire incompatible streams
+                    // LS-R-16 / #264: a non-primitive stream element type
+                    // is recorded as `Type(N)` where N is a COMPONENT-LOCAL
+                    // type index, so matching the raw index across
+                    // components is unsound — two DIFFERENT element types
+                    // that collide on the same local index N would
+                    // string-match and manufacture a false pair that drives
+                    // the bridge emitter to wire incompatible streams
                     // (H-3.1 type confusion), and the same real type at
-                    // different indices would be missed. Until element types
-                    // are canonicalised to a structural cross-component key
-                    // (tracked follow-up), conservatively decline to pair on
-                    // local-index descriptors — the streams stay host-routed,
-                    // which is safe. Primitives serialise as a stable
-                    // `Primitive(..)` descriptor and remain pairable.
+                    // different indices would be missed. The element types
+                    // here have already been run through
+                    // `canonicalize_stream_element`: a resolvable aggregate
+                    // now carries its structural key (pairable, pairs only
+                    // with an identical structure), while a resource handle
+                    // or an unresolvable / too-deep type keeps its raw
+                    // `Type(N)` and is declined here — host-routed, which is
+                    // safe. Primitives carry a stable scalar name.
                     if !p_elem.is_cross_component_pairable() {
                         continue;
                     }
@@ -412,7 +597,7 @@ pub fn stream_elements_in_typeref(
                 match &ty.kind {
                     ComponentTypeKind::P3Async(desc) => {
                         if let Some(elem) = StreamElement::from_descriptor(desc) {
-                            out.push(elem);
+                            out.push(canonicalize_stream_element(comp, elem));
                         }
                     }
                     ComponentTypeKind::Function { params, results } => {
@@ -480,7 +665,7 @@ pub fn stream_elements_in_valtype(
                 && let ComponentTypeKind::P3Async(desc) = &ty.kind
                 && let Some(elem) = StreamElement::from_descriptor(desc)
             {
-                out.push(elem);
+                out.push(canonicalize_stream_element(comp, elem));
             }
         }
         ComponentValType::List(inner)
@@ -996,15 +1181,30 @@ mod tests {
         assert_eq!(p.mode, StreamMemoryMode::CrossMemory);
     }
 
-    /// LS-R-16: two DIFFERENT non-primitive stream element types that
-    /// collide on the same component-LOCAL type index (`Type(0)` in each
-    /// component, but unrelated types) must NOT be paired — pairing on a
-    /// local-index descriptor would manufacture a false pair that drives the
-    /// bridge emitter to wire incompatible streams. They stay host-routed.
+    /// LS-R-16 gate (over-match prevention): a raw, un-canonicalised
+    /// component-LOCAL `Type(N)` descriptor must NEVER pair.
+    ///
+    /// After #264 the pairing layer keys on STRUCTURAL descriptors, but a
+    /// raw `Type(N)` is exactly what `canonicalize_stream_element` returns
+    /// when it declines to resolve a type — a resource handle, a
+    /// depth-bound / cycle hit, or an unresolvable index. So `Type(N)` is
+    /// the canonical "conservative fallback" element, and this test pins
+    /// the invariant that such a fallback element is non-pairable: two
+    /// DIFFERENT real types that both happened to fall back at the same
+    /// local index `Type(0)` would string-match and manufacture a false
+    /// pair that drives the bridge emitter to wire incompatible streams.
+    /// `pair_streams` must decline it; the streams stay host-routed.
+    ///
+    /// The positive direction (a genuine aggregate that DOES canonicalise,
+    /// at different local indices, pairing exactly once) and the structural
+    /// over-match guard (two different aggregates at the SAME local index,
+    /// no pair) are pinned separately by the `#264` tests below, which
+    /// exercise the canonicaliser end-to-end through `component_stream_roles`.
     #[test]
     fn ls_r_16_local_index_element_descriptors_do_not_pair() {
         // Producer's element is its local Type(0); consumer's element is a
         // DIFFERENT type that happens to also sit at its local Type(0).
+        // (Stand-in for any element the canonicaliser declined to resolve.)
         let roles = vec![
             vec![(typed("Type(0)"), StreamRole::Producer)],
             vec![(typed("Type(0)"), StreamRole::Consumer)],
@@ -1016,10 +1216,10 @@ mod tests {
              key and must not be paired (over-match would wire incompatible \
              streams); got {pairs:?}"
         );
-        // Sanity: primitive descriptors on the same shape DO still pair.
+        // Sanity: stable scalar descriptors on the same shape DO still pair.
         let prim_roles = vec![
-            vec![(typed("Primitive(U8)"), StreamRole::Producer)],
-            vec![(typed("Primitive(U8)"), StreamRole::Consumer)],
+            vec![(typed("u8"), StreamRole::Producer)],
+            vec![(typed("u8"), StreamRole::Consumer)],
         ];
         assert_eq!(
             pair_streams(&prim_roles, &[(0, 1)], StreamMemoryMode::CrossMemory).len(),
@@ -1786,6 +1986,314 @@ mod tests {
         assert!(
             resource_lifetime_issues(&[comp]).is_empty(),
             "primitive-element stream must not flag (iv)"
+        );
+    }
+
+    // ─── #264: structural canonicalisation of aggregate stream elements ──
+
+    fn prim(p: PrimitiveValType) -> ComponentValType {
+        ComponentValType::Primitive(p)
+    }
+
+    /// Direct unit tests of the structural canonicaliser. Pins the key
+    /// format and — crucially — its injectivity: structurally different
+    /// types must produce different keys (the LS-R-16 safety property).
+    #[test]
+    fn canonical_key_format_and_injectivity() {
+        // record { count: u8, data: list<s32> } at types[0].
+        let rec = comp_with_defined_types(vec![defined(ComponentValType::Record(vec![
+            ("count".into(), prim(PrimitiveValType::U8)),
+            (
+                "data".into(),
+                ComponentValType::List(Box::new(prim(PrimitiveValType::S32))),
+            ),
+        ]))]);
+        assert_eq!(
+            canonical_structural_key(&rec, &ComponentValType::Type(0), 0).as_deref(),
+            Some("record{count:u8,data:list<s32>}")
+        );
+
+        // tuple<u8, u8> vs record{f0:u8,f1:u8} — different structures, keys differ.
+        let tup = comp_with_defined_types(vec![defined(ComponentValType::Tuple(vec![
+            prim(PrimitiveValType::U8),
+            prim(PrimitiveValType::U8),
+        ]))]);
+        assert_eq!(
+            canonical_structural_key(&tup, &ComponentValType::Type(0), 0).as_deref(),
+            Some("tuple<u8,u8>")
+        );
+
+        // Field-name sensitivity: record{a:u8} ≠ record{b:u8}.
+        let rec_a = comp_with_defined_types(vec![defined(ComponentValType::Record(vec![(
+            "a".into(),
+            prim(PrimitiveValType::U8),
+        )]))]);
+        let rec_b = comp_with_defined_types(vec![defined(ComponentValType::Record(vec![(
+            "b".into(),
+            prim(PrimitiveValType::U8),
+        )]))]);
+        assert_ne!(
+            canonical_structural_key(&rec_a, &ComponentValType::Type(0), 0),
+            canonical_structural_key(&rec_b, &ComponentValType::Type(0), 0),
+            "field-name difference must yield different structural keys"
+        );
+
+        // option / result / variant / flags / fixed-list spellings.
+        let opt = comp_with_defined_types(vec![defined(ComponentValType::Option(Box::new(prim(
+            PrimitiveValType::U32,
+        ))))]);
+        assert_eq!(
+            canonical_structural_key(&opt, &ComponentValType::Type(0), 0).as_deref(),
+            Some("option<u32>")
+        );
+        let res = comp_with_defined_types(vec![defined(ComponentValType::Result {
+            ok: Some(Box::new(prim(PrimitiveValType::U8))),
+            err: None,
+        })]);
+        assert_eq!(
+            canonical_structural_key(&res, &ComponentValType::Type(0), 0).as_deref(),
+            Some("result<u8,_>")
+        );
+        let var = comp_with_defined_types(vec![defined(ComponentValType::Variant(vec![
+            ("none".into(), None),
+            ("some".into(), Some(prim(PrimitiveValType::U8))),
+        ]))]);
+        assert_eq!(
+            canonical_structural_key(&var, &ComponentValType::Type(0), 0).as_deref(),
+            Some("variant{none,some(u8)}")
+        );
+        let fl = comp_with_defined_types(vec![defined(ComponentValType::Flags(vec![
+            "a".into(),
+            "b".into(),
+        ]))]);
+        assert_eq!(
+            canonical_structural_key(&fl, &ComponentValType::Type(0), 0).as_deref(),
+            Some("flags{a,b}")
+        );
+        let fll = comp_with_defined_types(vec![defined(ComponentValType::FixedSizeList(
+            Box::new(prim(PrimitiveValType::U8)),
+            4,
+        ))]);
+        assert_eq!(
+            canonical_structural_key(&fll, &ComponentValType::Type(0), 0).as_deref(),
+            Some("fixed-list<u8,4>")
+        );
+    }
+
+    /// Conservative: a resource handle anywhere in the element type → None,
+    /// so the stream stays non-pairable / host-routed (#256 deferred).
+    #[test]
+    fn canonical_key_resource_returns_none() {
+        let own = comp_with_defined_types(vec![defined(ComponentValType::Own(7))]);
+        assert_eq!(
+            canonical_structural_key(&own, &ComponentValType::Type(0), 0),
+            None,
+            "own<R> element must not canonicalise"
+        );
+        // Nested handle: record { h: own<R> } — still None.
+        let nested = comp_with_defined_types(vec![defined(ComponentValType::Record(vec![(
+            "h".into(),
+            ComponentValType::Own(7),
+        )]))]);
+        assert_eq!(
+            canonical_structural_key(&nested, &ComponentValType::Type(0), 0),
+            None,
+            "a handle nested inside a record must still force None"
+        );
+    }
+
+    /// Cycle / unbounded-nest guard: a `Type(N)` that refers to itself
+    /// must terminate and return None rather than recurse forever.
+    #[test]
+    fn canonical_key_self_cycle_returns_none() {
+        // types[0] = list<Type(0)> — a self-referential alias cycle.
+        let cyclic = comp_with_defined_types(vec![defined(ComponentValType::List(Box::new(
+            ComponentValType::Type(0),
+        )))]);
+        assert_eq!(
+            canonical_structural_key(&cyclic, &ComponentValType::Type(0), 0),
+            None,
+            "a self-referential type must hit the depth bound and return None"
+        );
+    }
+
+    /// Helper: a component whose types are `[stream<Type(1)>, defined(elem)]`
+    /// with a `StreamWrite`/`StreamRead` role on the stream type at index 0.
+    /// The stream's element sits at LOCAL index 1.
+    fn stream_role_component(elem: ComponentValType, role: CanonicalEntry) -> ParsedComponent {
+        let mut c = comp_with_defined_types(vec![stream_type("Type(1)"), defined(elem)]);
+        c.canonical_functions = vec![role];
+        c
+    }
+
+    /// Same, but the element type is placed at a DIFFERENT local index so
+    /// the two components cannot share a raw `Type(N)` string — only a
+    /// structural key can match them. types = [pad, stream<Type(2)>, elem];
+    /// stream type is at index 1.
+    fn stream_role_component_shifted(
+        elem: ComponentValType,
+        role: CanonicalEntry,
+    ) -> ParsedComponent {
+        let mut c = comp_with_defined_types(vec![
+            defined(prim(PrimitiveValType::Bool)), // padding at index 0
+            stream_type("Type(2)"),
+            defined(elem),
+        ]);
+        // The role references the stream type, which is now at index 1.
+        let role = match role {
+            CanonicalEntry::StreamWrite { options, .. } => {
+                CanonicalEntry::StreamWrite { ty: 1, options }
+            }
+            CanonicalEntry::StreamRead { options, .. } => {
+                CanonicalEntry::StreamRead { ty: 1, options }
+            }
+            other => other,
+        };
+        c.canonical_functions = vec![role];
+        c
+    }
+
+    fn record_count_data() -> ComponentValType {
+        ComponentValType::Record(vec![
+            ("count".into(), prim(PrimitiveValType::U8)),
+            (
+                "data".into(),
+                ComponentValType::List(Box::new(prim(PrimitiveValType::S32))),
+            ),
+        ])
+    }
+
+    /// POSITIVE (#264 / LS-R-16 Finding-A, now enabled): a producer and a
+    /// consumer share a genuine aggregate element type T, but at DIFFERENT
+    /// local type indices. Structural canonicalisation makes their keys
+    /// equal, so exactly ONE pair is detected. Non-vacuity: the producer's
+    /// element lives at local index 1 and the consumer's at index 2, so a
+    /// raw-`Type(N)`-string comparison (the pre-#264 behaviour) would NOT
+    /// have matched them — only structural equality does.
+    #[test]
+    fn structural_aggregate_pairs_across_different_local_indices() {
+        let producer = stream_role_component(
+            record_count_data(),
+            CanonicalEntry::StreamWrite {
+                ty: 0,
+                options: options(),
+            },
+        );
+        let consumer = stream_role_component_shifted(
+            record_count_data(),
+            CanonicalEntry::StreamRead {
+                ty: 0,
+                options: options(),
+            },
+        );
+
+        // Precondition: the two endpoints' raw local indices differ
+        // (producer at Type(1), consumer at Type(2)) — proves the match is
+        // structural, not a coincidental shared index.
+        let p_roles = component_stream_roles(&producer);
+        let c_roles = component_stream_roles(&consumer);
+        assert_eq!(
+            p_roles,
+            vec![(
+                typed("record{count:u8,data:list<s32>}"),
+                StreamRole::Producer
+            )],
+            "producer element should canonicalise to the structural key"
+        );
+        assert_eq!(
+            c_roles,
+            vec![(
+                typed("record{count:u8,data:list<s32>}"),
+                StreamRole::Consumer
+            )],
+            "consumer element should canonicalise to the same structural key"
+        );
+
+        let roles = vec![p_roles, c_roles];
+        let pairs = pair_streams(&roles, &[(0, 1)], StreamMemoryMode::CrossMemory);
+        assert_eq!(
+            pairs.len(),
+            1,
+            "structurally identical aggregate elements must pair exactly once; got {pairs:?}"
+        );
+        assert_eq!(pairs[0].element, typed("record{count:u8,data:list<s32>}"));
+    }
+
+    /// NEGATIVE / over-match still prevented (the critical regression
+    /// guard): two DIFFERENT aggregate types that sit at the SAME local
+    /// index in their respective components must NOT pair. A key collision
+    /// here would re-introduce the exact LS-R-16 over-match. Producer's
+    /// element is `record{count:u8,data:list<s32>}`, consumer's is
+    /// `tuple<u8,u8>` — both at local index 1.
+    #[test]
+    fn structurally_different_aggregates_at_same_index_do_not_pair() {
+        let producer = stream_role_component(
+            record_count_data(),
+            CanonicalEntry::StreamWrite {
+                ty: 0,
+                options: options(),
+            },
+        );
+        let consumer = stream_role_component(
+            ComponentValType::Tuple(vec![prim(PrimitiveValType::U8), prim(PrimitiveValType::U8)]),
+            CanonicalEntry::StreamRead {
+                ty: 0,
+                options: options(),
+            },
+        );
+
+        let p_roles = component_stream_roles(&producer);
+        let c_roles = component_stream_roles(&consumer);
+        // Both came from local Type(1) but their structural keys differ.
+        assert_eq!(
+            p_roles,
+            vec![(
+                typed("record{count:u8,data:list<s32>}"),
+                StreamRole::Producer
+            )]
+        );
+        assert_eq!(c_roles, vec![(typed("tuple<u8,u8>"), StreamRole::Consumer)]);
+
+        let roles = vec![p_roles, c_roles];
+        let pairs = pair_streams(&roles, &[(0, 1)], StreamMemoryMode::CrossMemory);
+        assert!(
+            pairs.is_empty(),
+            "different aggregate types at the same local index must NOT pair \
+             (over-match prevention); got {pairs:?}"
+        );
+    }
+
+    /// RESOURCE conservative: a `stream<own<R>>` element keeps its raw
+    /// `Type(N)` descriptor (canonicalisation declines resources) and so
+    /// stays non-pairable / host-routed — exactly today's behaviour, the
+    /// #256 boundary.
+    #[test]
+    fn resource_element_stream_stays_host_routed() {
+        let producer = stream_role_component(
+            ComponentValType::Own(42),
+            CanonicalEntry::StreamWrite {
+                ty: 0,
+                options: options(),
+            },
+        );
+        let consumer = stream_role_component(
+            ComponentValType::Own(42),
+            CanonicalEntry::StreamRead {
+                ty: 0,
+                options: options(),
+            },
+        );
+        let p_roles = component_stream_roles(&producer);
+        let c_roles = component_stream_roles(&consumer);
+        // Element kept its raw local-index descriptor (not canonicalised).
+        assert_eq!(p_roles, vec![(typed("Type(1)"), StreamRole::Producer)]);
+        assert_eq!(c_roles, vec![(typed("Type(1)"), StreamRole::Consumer)]);
+
+        let roles = vec![p_roles, c_roles];
+        let pairs = pair_streams(&roles, &[(0, 1)], StreamMemoryMode::CrossMemory);
+        assert!(
+            pairs.is_empty(),
+            "resource-handle stream elements must stay host-routed (#256); got {pairs:?}"
         );
     }
 }
