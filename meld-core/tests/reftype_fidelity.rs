@@ -171,7 +171,7 @@ fn case1_typed_ref_table_element_preserved() {
 // or collapsed element type causes a validation failure here.
 // ---------------------------------------------------------------------------
 #[test]
-fn case2_typed_ref_table_used_by_call_indirect() {
+fn ls_a_22_case2_typed_ref_table_used_by_call_indirect() {
     let wat = r#"
 (component
   (core module $m

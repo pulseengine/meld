@@ -736,7 +736,7 @@ fn elem_expr_ref_func_indices(fused: &[u8]) -> Vec<u32> {
 }
 
 #[test]
-fn p3_shift_relocates_expr_form_elem_ref_func() {
+fn ls_m_9_p3_shift_relocates_expr_form_elem_ref_func() {
     let wat_src = build_stream_u8_component_with_expr_elem_wat();
     let bytes = match wat::parse_str(wat_src) {
         Ok(b) => b,

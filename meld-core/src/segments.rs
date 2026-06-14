@@ -1005,7 +1005,7 @@ mod tests {
     /// so the re-emitted module was rejected ("type mismatch: expected
     /// externref, found (ref $type)").
     #[test]
-    fn test_typed_ref_element_segment_roundtrips_and_validates() {
+    fn ls_a_21_test_typed_ref_element_segment_roundtrips_and_validates() {
         let src = r#"(module (type (func)) (func) (elem (ref null 0) (ref.func 0)))"#;
         let module_bytes = wat::parse_str(src).expect("wat compiles");
 

@@ -4006,7 +4006,7 @@ mod tests {
     /// [Global(comp 0), Func(comp 1)]`, the lone func import is ordinal 0; its
     /// true `component_idx` is 1 (it lives at position 1 in the mixed vector).
     #[test]
-    fn func_import_comp_idx_skips_non_func_imports() {
+    fn ls_w_2_func_import_comp_idx_skips_non_func_imports() {
         use wasm_encoder::{EntityType, GlobalType, ValType};
         let imports = vec![
             mk_import(

@@ -2928,7 +2928,7 @@ fn test_sr17_utf16_to_utf8_malformed_surrogate_matrix() {
 /// several cases emit MORE than one U+FFFD; the per-case derivations spell
 /// out the exact count.
 #[test]
-fn test_sr17_utf8_to_utf16_malformed_matrix() {
+fn ls_p_20_test_sr17_utf8_to_utf16_malformed_matrix() {
     // (input UTF-8 bytes, expected callee code-unit-sum, label)
     //
     // Hand-derivations for the malformed cases (FFFD = 65533):
