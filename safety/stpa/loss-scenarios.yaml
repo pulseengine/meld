@@ -3020,6 +3020,72 @@ loss-scenarios:
       Multi-memory WASI import lowering (PR #20). Per-import Memory(N)
       and Realloc(N) via import_memory_indices/import_realloc_indices.
 
+  - id: LS-W-2
+    title: Wrapper reads func-import source component from the wrong mixed-kind import slot
+    uca: UCA-W-2
+    hazards: [H-2, H-8]
+    type: inadequate-control-algorithm
+    scenario: >
+      `assemble_component` (component_wrap.rs) iterates the func-only
+      `fused_info.func_imports` with an enumeration index `import_idx` and
+      read each func import's source-component identity via
+      `merged.imports.get(import_idx)`. But `merged.imports` is a
+      MIXED-KIND vector (Function/Global/Table/Memory imports interleaved
+      in declaration order), so `import_idx` (a func ORDINAL) does not
+      index the matching entry when any non-func import precedes a func
+      import. The func import's `comp_idx` was then taken from the wrong
+      slot (e.g. with `merged.imports = [Global(comp 0), Func(comp 1)]`
+      the lone func read `comp_idx = Some(0)` instead of `1`). That wrong
+      component identity feeds (i) `find_task_return_for_import` (P3
+      task-return result-type search — has an all-components fallback,
+      partially self-healing) and (ii) `ImportResolution::LocalResource
+      { component_idx }` → `ht_export_suffix(cidx, ..)`, so a resource
+      handle op (drop/new/rep) is routed using the WRONG component's
+      handle-table suffix: the direct lookup misses and the op falls back
+      / mis-routes [UCA-W-2 / H-8 wrong-table handle deref / H-2]. Same
+      "guard present in one site, missing in its sibling" shape as the
+      rest of this sweep — the sibling `lib.rs:1119` handles the same
+      mixed-kind vector correctly by counting Function entries. The index
+      desync is confirmed end-to-end (real Merger::merge output; the line
+      executes for every func import); an OBSERVABLE miscompile requires
+      an UNRESOLVED non-func import (external global/table, or the
+      shared-memory Memory import) ordered before an unresolved
+      resource-op/task-return func import — reachable but not in the
+      standard wit-bindgen fixtures (whose non-func core imports resolve
+      internally and don't survive into merged.imports). Surfaced by a
+      Mythos discovery pass on component_wrap.rs.
+    causal-factors:
+      - >-
+        A func-only ordinal was used to index the mixed-kind
+        `merged.imports` vector (the sibling lib.rs:1119 filters to
+        Function entries; this site did not)
+      - >-
+        No test placed an unresolved non-func import before a func import
+        in merged.imports (standard fixtures resolve non-func imports
+        internally, hiding the desync)
+    process-model-flaw: >
+      The wrapper's model assumed `fused_info.func_imports` and
+      `merged.imports` share an index space; they do not — merged.imports
+      is mixed-kind. The func index → import-vector slot must be mapped by
+      Function-entry position, the same correction lib.rs:1119 already
+      applies in the inverse direction.
+    status: approved
+    priority: high
+    fix: >
+      Precompute `func_import_positions` (the positions of Function-kind
+      entries in `merged.imports`) and read `merged.imports[
+      func_import_positions[import_idx]]`, mirroring lib.rs:1119. The
+      output import section is emitted from `merged.imports` IN ORDER
+      (lib.rs:1538) and re-parsed in order into `fused_info.func_imports`,
+      so the i-th Function entry corresponds 1:1 to func_imports[i] —
+      verified by reading the emit/parse paths; `debug_assert_eq!` guards
+      the count equality (equal by construction). The all-func-imports
+      common case is the identity mapping (no behaviour change). Pinned by
+      func_import_comp_idx_skips_non_func_imports (mixed-kind
+      [Global(c0), Func(c1)] → comp_idx Some(1), with the old `.get(0)`
+      path asserted to yield the wrong Some(0) — non-vacuity) and
+      func_import_positions_identity_for_all_func_imports.
+
   - id: LS-M-5
     title: Multiply-instantiated module produces corrupt merged output
     uca: UCA-M-9
