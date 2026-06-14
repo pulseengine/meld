@@ -35,9 +35,16 @@
 //! `guard_async_cross_encoding_strings` (a private fn) directly.
 
 use meld_core::adapter::{
+    build_latin1_to_utf8_transcode_test_module, build_latin1_to_utf16_transcode_test_module,
     build_utf8_to_utf16_transcode_test_module, build_utf16_to_utf8_transcode_test_module,
 };
 use wasmtime::{Config, Engine, Instance, Module as RuntimeModule, Store};
+
+/// The canonical-ABI `latin1+utf16` length-operand tag bit, mirrored from
+/// `meld_core::adapter::fact::UTF16_TAG` (a crate-private const). A tag-SET
+/// length means the source bytes are UTF-16 (code-unit count = `len & !TAG`);
+/// tag-CLEAR means pure Latin-1 (byte count = `len`).
+const UTF16_TAG: i32 = 1 << 31;
 
 /// Build the oracle module, write `src_bytes` into caller memory 0 at offset
 /// 0, call `transcode_and_sum(0, src_bytes.len())`, and return the summed
@@ -250,5 +257,168 @@ fn inc2_async_utf16_to_utf8_param_empty_string() {
         transcode_utf16_to_utf8_and_sum(&[]),
         0,
         "#272 inc2: empty UTF-16 source must transcode to 0 bytes (sum 0)"
+    );
+}
+
+// ----------------------------------------------------------------------------
+// #272 inc 4a — latin1-SOURCE param transcode: `latin1+utf16` (CompactUTF16)
+// CALLER → UTF-16 or UTF-8 callee. The CALLER length operand is tag-encoded
+// (UTF16_TAG): tag-CLEAR → pure Latin-1 source (1 byte/char), tag-SET → UTF-16
+// source (code-unit count = len & !TAG). Each oracle writes the raw caller
+// bytes into memory 0 and passes the TAGGED length; the production tag-dispatch
+// emitter (`emit_latin1_to_{utf16,utf8}_transcode_param`) picks the arm, runs
+// the transcode into a `cabi_realloc`'d buffer in memory 1, and the module sums
+// the output the way the callee would read it. A raw copy of the tagged operand
+// + tag-set bytes cannot produce the correct sum, so a pass proves transcoding.
+// ----------------------------------------------------------------------------
+
+/// Write `src_bytes` (raw CALLER bytes — Latin-1 bytes when `tag_set` is false,
+/// UTF-16 LE bytes when true) into caller memory 0, call
+/// `transcode_and_sum(0, tagged_len)`, and return the summed UTF-16 code units
+/// the latin1+utf16 → UTF-16 transcode produced in callee memory 1. `count` is
+/// the untagged code/byte count (Latin-1 byte count, or UTF-16 code-unit count).
+fn latin1_to_utf16_transcode_and_sum(src_bytes: &[u8], count: i32, tag_set: bool) -> i32 {
+    let wasm = build_latin1_to_utf16_transcode_test_module();
+    let mut validator = wasmparser::Validator::new();
+    validator
+        .validate_all(&wasm)
+        .expect("#272 inc4a latin1→utf16 oracle module should validate");
+
+    let mut config = Config::new();
+    config.wasm_multi_memory(true);
+    let engine = Engine::new(&config).unwrap();
+    let module = RuntimeModule::new(&engine, &wasm).unwrap();
+    let mut store = Store::new(&engine, ());
+    let instance = Instance::new(&mut store, &module, &[]).unwrap();
+
+    let caller_mem = instance
+        .get_memory(&mut store, "caller_memory")
+        .expect("oracle module exports caller_memory");
+    caller_mem
+        .write(&mut store, 0, src_bytes)
+        .expect("write src bytes into caller memory");
+
+    let f = instance
+        .get_typed_func::<(i32, i32), i32>(&mut store, "transcode_and_sum")
+        .expect("oracle module exports transcode_and_sum");
+    let tagged_len = if tag_set { count | UTF16_TAG } else { count };
+    f.call(&mut store, (0, tagged_len))
+        .expect("transcode_and_sum runs")
+}
+
+/// Same as above for the latin1+utf16 → UTF-8 direction; returns the summed
+/// UTF-8 output bytes.
+fn latin1_to_utf8_transcode_and_sum(src_bytes: &[u8], count: i32, tag_set: bool) -> i32 {
+    let wasm = build_latin1_to_utf8_transcode_test_module();
+    let mut validator = wasmparser::Validator::new();
+    validator
+        .validate_all(&wasm)
+        .expect("#272 inc4a latin1→utf8 oracle module should validate");
+
+    let mut config = Config::new();
+    config.wasm_multi_memory(true);
+    let engine = Engine::new(&config).unwrap();
+    let module = RuntimeModule::new(&engine, &wasm).unwrap();
+    let mut store = Store::new(&engine, ());
+    let instance = Instance::new(&mut store, &module, &[]).unwrap();
+
+    let caller_mem = instance
+        .get_memory(&mut store, "caller_memory")
+        .expect("oracle module exports caller_memory");
+    caller_mem
+        .write(&mut store, 0, src_bytes)
+        .expect("write src bytes into caller memory");
+
+    let f = instance
+        .get_typed_func::<(i32, i32), i32>(&mut store, "transcode_and_sum")
+        .expect("oracle module exports transcode_and_sum");
+    let tagged_len = if tag_set { count | UTF16_TAG } else { count };
+    f.call(&mut store, (0, tagged_len))
+        .expect("transcode_and_sum runs")
+}
+
+/// Encode a `&str` as UTF-16 LE bytes (the tag-set CALLER payload shape).
+fn utf16_le_bytes(s: &str) -> Vec<u8> {
+    let mut v = Vec::new();
+    for u in s.encode_utf16() {
+        v.extend_from_slice(&u.to_le_bytes());
+    }
+    v
+}
+
+// --- latin1+utf16 → UTF-16 ---------------------------------------------------
+
+/// #272 inc 4a (latin1→utf16, tag CLEAR): a pure Latin-1 "café" =
+/// [0x63,0x61,0x66,0xE9] (tag clear, count 4) → UTF-16 code units
+/// [0x0063,0x0061,0x0066,0x00E9] by zero-extension, summing to
+/// 99+97+102+233 = 531. A raw copy would leave 4 bytes the callee reads as
+/// 16-bit units, a different sum.
+#[test]
+fn inc4a_async_latin1_to_utf16_tag_clear_cafe() {
+    assert_eq!(
+        latin1_to_utf16_transcode_and_sum(&[0x63, 0x61, 0x66, 0xE9], 4, false),
+        531,
+        "#272 inc4a: tag-clear Latin-1 \"café\" → UTF-16 must sum to 531"
+    );
+}
+
+/// #272 inc 4a (latin1→utf16, tag SET): a UTF-16 source "日本" = units
+/// [0x65E5,0x672C] (tag set, count 2) is copied VERBATIM as 2 code units,
+/// summing to 0x65E5 + 0x672C = 52497.
+#[test]
+fn inc4a_async_latin1_to_utf16_tag_set_nihon() {
+    assert_eq!(
+        latin1_to_utf16_transcode_and_sum(&utf16_le_bytes("日本"), 2, true),
+        52497,
+        "#272 inc4a: tag-set UTF-16 \"日本\" → UTF-16 verbatim copy must sum to 52497"
+    );
+}
+
+/// #272 inc 4a (latin1→utf16, empty): zero-length source (tag clear) → 0 code
+/// units, sum 0 — the realloc/loop must handle count==0 without trapping.
+#[test]
+fn inc4a_async_latin1_to_utf16_empty() {
+    assert_eq!(
+        latin1_to_utf16_transcode_and_sum(&[], 0, false),
+        0,
+        "#272 inc4a: empty latin1+utf16 source → 0 UTF-16 code units (sum 0)"
+    );
+}
+
+// --- latin1+utf16 → UTF-8 ----------------------------------------------------
+
+/// #272 inc 4a (latin1→utf8, tag CLEAR): pure Latin-1 "café" =
+/// [0x63,0x61,0x66,0xE9] (count 4) → UTF-8 [0x63,0x61,0x66,0xC3,0xA9] (0xE9 is
+/// the 2-byte branch), summing to 99+97+102+195+169 = 662.
+#[test]
+fn inc4a_async_latin1_to_utf8_tag_clear_cafe() {
+    assert_eq!(
+        latin1_to_utf8_transcode_and_sum(&[0x63, 0x61, 0x66, 0xE9], 4, false),
+        662,
+        "#272 inc4a: tag-clear Latin-1 \"café\" → UTF-8 must sum to 662"
+    );
+}
+
+/// #272 inc 4a (latin1→utf8, tag SET): UTF-16 source "日本" = units
+/// [0x65E5,0x672C] (count 2) → UTF-8 [0xE6,0x97,0xA5, 0xE6,0x9C,0xAC] (each a
+/// BMP 3-byte sequence via the shared UTF-16 decoder + UTF-8 encoder), summing
+/// to 230+151+165 + 230+156+172 = 1104.
+#[test]
+fn inc4a_async_latin1_to_utf8_tag_set_nihon() {
+    assert_eq!(
+        latin1_to_utf8_transcode_and_sum(&utf16_le_bytes("日本"), 2, true),
+        1104,
+        "#272 inc4a: tag-set UTF-16 \"日本\" → UTF-8 must sum to 1104"
+    );
+}
+
+/// #272 inc 4a (latin1→utf8, empty): zero-length source (tag clear) → 0 bytes,
+/// sum 0.
+#[test]
+fn inc4a_async_latin1_to_utf8_empty() {
+    assert_eq!(
+        latin1_to_utf8_transcode_and_sum(&[], 0, false),
+        0,
+        "#272 inc4a: empty latin1+utf16 source → 0 UTF-8 bytes (sum 0)"
     );
 }
