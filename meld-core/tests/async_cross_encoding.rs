@@ -36,7 +36,8 @@
 
 use meld_core::adapter::{
     build_latin1_to_utf8_transcode_test_module, build_latin1_to_utf16_transcode_test_module,
-    build_utf8_to_utf16_transcode_test_module, build_utf16_to_utf8_transcode_test_module,
+    build_utf8_to_latin1_transcode_test_module, build_utf8_to_utf16_transcode_test_module,
+    build_utf16_to_latin1_transcode_test_module, build_utf16_to_utf8_transcode_test_module,
 };
 use wasmtime::{Config, Engine, Instance, Module as RuntimeModule, Store};
 
@@ -421,4 +422,191 @@ fn inc4a_async_latin1_to_utf8_empty() {
         0,
         "#272 inc4a: empty latin1+utf16 source → 0 UTF-8 bytes (sum 0)"
     );
+}
+
+// ----------------------------------------------------------------------------
+// #272 inc 4b — DEST-latin1 / tag-PRODUCING param transcode: UTF-8 or UTF-16
+// CALLER → `latin1+utf16` (CompactUTF16) callee. These are the two-phase
+// encoders: phase 1 scans the source code points (any cp > 0xFF ⇒ UTF-16),
+// phase 2 writes either Latin-1 (1 byte/char, tag CLEAR) or UTF-16 (code units,
+// possibly surrogate pairs, length | UTF16_TAG). The oracle returns the TAGGED
+// output length and exposes the output pointer (global `out_ptr`) so the test
+// asserts BOTH the tag bit and the exact output bytes a `latin1+utf16` lifting
+// callee would read. A raw copy could not produce the correct tagged length +
+// representation, so a pass proves two-phase transcoding.
+// ----------------------------------------------------------------------------
+
+/// Run a DEST-latin1 oracle: write `src_bytes` into caller memory 0, call
+/// `transcode(0, src_count)`, and return `(tagged_len, output_bytes)` — the
+/// raw bytes of the produced `latin1+utf16` buffer in callee memory 1, sized by
+/// the untagged output length (Latin-1: `len` bytes; UTF-16: `2 * (len & !TAG)`
+/// bytes). `utf16_source` selects which oracle module to build.
+fn dest_latin1_transcode(src_bytes: &[u8], src_count: i32, utf16_source: bool) -> (i32, Vec<u8>) {
+    let wasm = if utf16_source {
+        build_utf16_to_latin1_transcode_test_module()
+    } else {
+        build_utf8_to_latin1_transcode_test_module()
+    };
+    let mut validator = wasmparser::Validator::new();
+    validator
+        .validate_all(&wasm)
+        .expect("#272 inc4b dest-latin1 oracle module should validate");
+
+    let mut config = Config::new();
+    config.wasm_multi_memory(true);
+    let engine = Engine::new(&config).unwrap();
+    let module = RuntimeModule::new(&engine, &wasm).unwrap();
+    let mut store = Store::new(&engine, ());
+    let instance = Instance::new(&mut store, &module, &[]).unwrap();
+
+    let caller_mem = instance
+        .get_memory(&mut store, "caller_memory")
+        .expect("oracle module exports caller_memory");
+    caller_mem
+        .write(&mut store, 0, src_bytes)
+        .expect("write src bytes into caller memory");
+
+    let f = instance
+        .get_typed_func::<(i32, i32), i32>(&mut store, "transcode")
+        .expect("oracle module exports transcode");
+    let tagged_len = f.call(&mut store, (0, src_count)).expect("transcode runs");
+
+    let out_ptr = instance
+        .get_global(&mut store, "out_ptr")
+        .expect("oracle module exports out_ptr")
+        .get(&mut store)
+        .i32()
+        .expect("out_ptr is i32") as usize;
+    let count = (tagged_len & !UTF16_TAG) as usize;
+    let byte_len = if tagged_len & UTF16_TAG != 0 {
+        count * 2 // UTF-16 code units
+    } else {
+        count // Latin-1 bytes
+    };
+    let callee_mem = instance
+        .get_memory(&mut store, "callee_memory")
+        .expect("oracle module exports callee_memory");
+    let mut out = vec![0u8; byte_len];
+    callee_mem
+        .read(&store, out_ptr, &mut out)
+        .expect("read output bytes from callee memory");
+    (tagged_len, out)
+}
+
+/// Encode a `&str` as UTF-16 LE bytes (the UTF-16-source CALLER payload shape).
+fn inc4b_utf16_le_bytes(s: &str) -> Vec<u8> {
+    let mut v = Vec::new();
+    for u in s.encode_utf16() {
+        v.extend_from_slice(&u.to_le_bytes());
+    }
+    v
+}
+
+// --- UTF-8 → latin1+utf16 ----------------------------------------------------
+
+/// #272 inc 4b (utf8→latin1, latin1-FITS): UTF-8 "café" = [0x63,0x61,0x66,
+/// 0xC3,0xA9] (5 bytes, all cp ≤ 0xFF) → Latin-1 output [0x63,0x61,0x66,0xE9],
+/// tag CLEAR, length 4.
+#[test]
+fn inc4b_async_utf8_to_latin1_fits_cafe() {
+    let (tagged, out) = dest_latin1_transcode(&[0x63, 0x61, 0x66, 0xC3, 0xA9], 5, false);
+    assert_eq!(tagged & UTF16_TAG, 0, "café must pick Latin-1 (tag CLEAR)");
+    assert_eq!(tagged, 4, "café Latin-1 output length must be 4");
+    assert_eq!(out, vec![0x63, 0x61, 0x66, 0xE9], "café Latin-1 bytes");
+}
+
+/// #272 inc 4b (utf8→latin1, NON-latin1): UTF-8 "日本" (cp 0x65E5,0x672C > 0xFF)
+/// → UTF-16 output units [0x65E5,0x672C], tag SET, length 2.
+#[test]
+fn inc4b_async_utf8_to_latin1_nihon_utf16() {
+    let src = "日本".as_bytes();
+    let (tagged, out) = dest_latin1_transcode(src, src.len() as i32, false);
+    assert_ne!(tagged & UTF16_TAG, 0, "日本 must pick UTF-16 (tag SET)");
+    assert_eq!(tagged & !UTF16_TAG, 2, "日本 UTF-16 output is 2 code units");
+    assert_eq!(
+        out,
+        vec![0xE5, 0x65, 0x2C, 0x67],
+        "日本 UTF-16 LE bytes [0x65E5, 0x672C]"
+    );
+}
+
+/// #272 inc 4b (utf8→latin1, supplementary): UTF-8 "😀" (U+1F600, supplementary)
+/// forces UTF-16 with a surrogate PAIR [0xD83D,0xDE00], tag SET, length 2.
+#[test]
+fn inc4b_async_utf8_to_latin1_emoji_surrogate_pair() {
+    let src = "😀".as_bytes(); // 4 UTF-8 bytes
+    let (tagged, out) = dest_latin1_transcode(src, src.len() as i32, false);
+    assert_ne!(tagged & UTF16_TAG, 0, "😀 must pick UTF-16 (tag SET)");
+    assert_eq!(
+        tagged & !UTF16_TAG,
+        2,
+        "😀 UTF-16 output is a 2-unit surrogate pair"
+    );
+    assert_eq!(
+        out,
+        vec![0x3D, 0xD8, 0x00, 0xDE],
+        "😀 surrogate pair LE bytes [0xD83D, 0xDE00]"
+    );
+}
+
+/// #272 inc 4b (utf8→latin1, empty): zero-length source → Latin-1, tag CLEAR,
+/// length 0 — the scan/realloc/write must handle count==0 without trapping.
+#[test]
+fn inc4b_async_utf8_to_latin1_empty() {
+    let (tagged, out) = dest_latin1_transcode(&[], 0, false);
+    assert_eq!(tagged, 0, "empty UTF-8 source → tag-clear length 0");
+    assert!(out.is_empty(), "empty output buffer");
+}
+
+// --- UTF-16 → latin1+utf16 ---------------------------------------------------
+
+/// #272 inc 4b (utf16→latin1, latin1-FITS): UTF-16 "café" (units all ≤ 0xFF) →
+/// Latin-1 output [0x63,0x61,0x66,0xE9], tag CLEAR, length 4.
+#[test]
+fn inc4b_async_utf16_to_latin1_fits_cafe() {
+    let src = inc4b_utf16_le_bytes("café");
+    let (tagged, out) = dest_latin1_transcode(&src, 4, true);
+    assert_eq!(tagged & UTF16_TAG, 0, "café must pick Latin-1 (tag CLEAR)");
+    assert_eq!(tagged, 4, "café Latin-1 output length must be 4");
+    assert_eq!(out, vec![0x63, 0x61, 0x66, 0xE9], "café Latin-1 bytes");
+}
+
+/// #272 inc 4b (utf16→latin1, NON-latin1): UTF-16 "日本" → UTF-16 output
+/// [0x65E5,0x672C], tag SET, length 2 (re-encoded verbatim through the decoder).
+#[test]
+fn inc4b_async_utf16_to_latin1_nihon_utf16() {
+    let src = inc4b_utf16_le_bytes("日本");
+    let (tagged, out) = dest_latin1_transcode(&src, 2, true);
+    assert_ne!(tagged & UTF16_TAG, 0, "日本 must pick UTF-16 (tag SET)");
+    assert_eq!(tagged & !UTF16_TAG, 2, "日本 UTF-16 output is 2 code units");
+    assert_eq!(
+        out,
+        vec![0xE5, 0x65, 0x2C, 0x67],
+        "日本 UTF-16 LE bytes [0x65E5, 0x672C]"
+    );
+}
+
+/// #272 inc 4b (utf16→latin1, supplementary): UTF-16 "😀" (a surrogate pair on
+/// input, 2 code units) → UTF-16 surrogate pair output [0xD83D,0xDE00], tag SET,
+/// length 2 (decoded to U+1F600 then re-encoded).
+#[test]
+fn inc4b_async_utf16_to_latin1_emoji_surrogate_pair() {
+    let src = inc4b_utf16_le_bytes("😀"); // 2 code units (surrogate pair)
+    let (tagged, out) = dest_latin1_transcode(&src, 2, true);
+    assert_ne!(tagged & UTF16_TAG, 0, "😀 must pick UTF-16 (tag SET)");
+    assert_eq!(tagged & !UTF16_TAG, 2, "😀 UTF-16 output is a 2-unit pair");
+    assert_eq!(
+        out,
+        vec![0x3D, 0xD8, 0x00, 0xDE],
+        "😀 surrogate pair LE bytes [0xD83D, 0xDE00]"
+    );
+}
+
+/// #272 inc 4b (utf16→latin1, empty): zero-length UTF-16 source → Latin-1, tag
+/// CLEAR, length 0.
+#[test]
+fn inc4b_async_utf16_to_latin1_empty() {
+    let (tagged, out) = dest_latin1_transcode(&[], 0, true);
+    assert_eq!(tagged, 0, "empty UTF-16 source → tag-clear length 0");
+    assert!(out.is_empty(), "empty output buffer");
 }
