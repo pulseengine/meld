@@ -6240,10 +6240,17 @@ impl FactStyleGenerator {
 
         // 6 locals for callback loop + 4 for string copy (src_ptr, src_len, dst_ptr, new_ptr)
         // + 6 for nested indirection patching (i, rec_dst, old_ptr, buf_len, new_ptr, rec_src)
-        // + 6 (#272 inc 1) for the UTF-8→UTF-16 param transcode loop
-        // (src_idx, out_count, cp, byte, cont — at `l_p2 + 16 ..`, past the
-        // result-writeback / nested-patch region so they cannot collide).
-        let mut body = Function::new([(22, wasm_encoder::ValType::I32)]);
+        // + (#272 inc 1) the UTF-8→UTF-16 param transcode loop, which uses
+        // `transcode_base ..= transcode_base+4` (src_idx, out_count, cp, byte,
+        // cont) where `transcode_base = l_p2 + 16` — past the result-writeback
+        // / nested-patch region so it cannot collide. That top index is
+        // `l_p2 + 20 = caller_param_count + 25`, i.e. offset 25 into the local
+        // block, so the block must declare 26 i32 locals (offsets 0..=25). The
+        // budget was previously 22, leaving the four transcode tail locals
+        // undeclared → the generated callback adapter failed wasm validation
+        // ("unknown local 24") for exactly the inc-1 UTF-8→UTF-16 string-param
+        // case (the stackful variant was sized correctly). #272 inc 1 fix.
+        let mut body = Function::new([(26, wasm_encoder::ValType::I32)]);
 
         // Step 0.5: copy string/list params from caller to callee memory.
         // Shared with the stackful emitter (SR-32, #140); see
@@ -8764,6 +8771,114 @@ mod tests {
     /// (locals layout, surrounding control flow) — what we care about
     /// is that `i32.const 2 / i32.eq / i32.const 3 / i32.eq / i32.or`
     /// appears in that order somewhere in the loop body.
+    /// Regression for #272 inc-1 (integration, not just loop logic): the
+    /// callback async adapter's UTF-8→UTF-16 string-param transcode path must
+    /// not reference a local past its declared budget. As shipped, the budget
+    /// was 22 (top addressable local `caller_params + 21`) but the transcode
+    /// loop reaches `caller_params + 25`, so the generated callback adapter
+    /// failed wasm validation ("unknown local 24") for exactly the inc-1 case.
+    /// An adversarial Mythos pass found this: the runtime oracle drives the
+    /// transcode *emitter* via a synthetic module with a large-enough local
+    /// block, so it never exercised the real callback adapter's budget. This
+    /// generates the REAL callback adapter for the inc-1 site and asserts every
+    /// referenced local is addressable (params + declared locals).
+    #[test]
+    fn inc1_callback_adapter_transcode_locals_within_budget() {
+        use wasm_encoder::{EntityType, ExportKind, Function, ValType};
+        let gen_ = FactStyleGenerator::new(AdapterConfig::default());
+        let mut merged = empty_merged();
+        // type 0: () -> i32 (lift, callback-mode packed return).
+        merged.types.push(crate::merger::MergedFuncType {
+            params: Vec::new(),
+            results: vec![ValType::I32],
+        });
+        // type 1: (i32, i32) -> () — caller type, one (ptr,len) string param.
+        merged.types.push(crate::merger::MergedFuncType {
+            params: vec![ValType::I32, ValType::I32],
+            results: Vec::new(),
+        });
+        // type 2: (i32,i32,i32,i32) -> i32 — cabi_realloc.
+        merged.types.push(crate::merger::MergedFuncType {
+            params: vec![ValType::I32; 4],
+            results: vec![ValType::I32],
+        });
+        // lift func @ merged 0, realloc func @ merged 1.
+        merged.functions.push(crate::merger::MergedFunction {
+            type_idx: 0,
+            body: Function::new([]),
+            origin: (1, 0, 0),
+            synthetic_kind: None,
+        });
+        merged.function_index_map.insert((1, 0, 0), 0);
+        merged.functions.push(crate::merger::MergedFunction {
+            type_idx: 2,
+            body: Function::new([]),
+            origin: (1, 0, 1),
+            synthetic_kind: None,
+        });
+        merged.realloc_map.insert((1, 0), 1);
+        // caller memory = component 0, callee memory = component 1.
+        merged.memory_index_map.insert((0, 0, 0), 0);
+        merged.memory_index_map.insert((1, 0, 0), 1);
+        let export_name = "[async-lift]greet";
+        merged.exports.push(crate::merger::MergedExport {
+            name: format!("[callback]{export_name}"),
+            kind: ExportKind::Func,
+            index: 0,
+        });
+        merged.imports.push(crate::merger::MergedImport {
+            module: "$root".into(),
+            name: "[waitable-set-poll]".into(),
+            entity_type: EntityType::Function(0),
+            component_idx: None,
+        });
+
+        let mut site = async_lift_site(export_name);
+        site.from_component = 0;
+        site.to_component = 1;
+        site.import_func_type_idx = Some(1); // caller type (i32,i32) → 2 params
+        site.crosses_memory = true;
+        site.requirements.pointer_pair_positions = vec![0];
+        site.requirements.param_copy_layouts =
+            vec![crate::resolver::CopyLayout::Bulk { byte_multiplier: 1 }];
+        site.requirements.caller_encoding = Some(crate::parser::CanonStringEncoding::Utf8);
+        site.requirements.callee_encoding = Some(crate::parser::CanonStringEncoding::Utf16);
+
+        let adapter = gen_
+            .generate_async_callback_adapter(&site, &merged)
+            .expect("callback emitter must succeed for the inc-1 utf8→utf16 string-param site");
+
+        let caller_param_count = 2u32; // type 1 has two i32 params
+        let raw = adapter.body.into_raw_body();
+        let fb = wasmparser::FunctionBody::new(wasmparser::BinaryReader::new(&raw, 0));
+        let mut declared = 0u32;
+        for lp in fb.get_locals_reader().expect("locals reader") {
+            let (count, _ty) = lp.expect("local pair");
+            declared += count;
+        }
+        let total_locals = caller_param_count + declared;
+        let mut max_idx = 0u32;
+        let mut found = false;
+        for op in fb.get_operators_reader().expect("ops reader") {
+            match op.expect("operator") {
+                wasmparser::Operator::LocalGet { local_index }
+                | wasmparser::Operator::LocalSet { local_index }
+                | wasmparser::Operator::LocalTee { local_index } => {
+                    found = true;
+                    max_idx = max_idx.max(local_index);
+                }
+                _ => {}
+            }
+        }
+        assert!(found, "adapter body should reference locals");
+        assert!(
+            max_idx < total_locals,
+            "#272 inc-1: callback adapter references local {max_idx} but only \
+             {total_locals} are addressable ({caller_param_count} params + \
+             {declared} declared) — transcode locals overflow the budget",
+        );
+    }
+
     #[test]
     fn ls_a_9_callback_adapter_dispatches_both_wait_and_poll() {
         let gen_ = FactStyleGenerator::new(AdapterConfig::default());
