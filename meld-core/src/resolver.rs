@@ -5506,7 +5506,7 @@ mod tests {
     /// layouts, so the adapter zipped them misaligned and fell back to
     /// byte_multiplier=1 (undersized alloc + truncated cross-memory copy).
     #[test]
-    fn test_lsr12_fixed_size_list_copy_layout_alignment() {
+    fn ls_r_15_test_lsr12_fixed_size_list_copy_layout_alignment() {
         use crate::parser::{ComponentValType as V, PrimitiveValType as P};
         let comp = empty_parsed_component();
         // list<list<u64>, 2>

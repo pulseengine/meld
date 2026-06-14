@@ -5473,7 +5473,7 @@ mod tests {
     /// `list<option<borrow<R>>>` → Elements with exactly one inner resource,
     /// guarded by the option's Some discriminant (value=1).
     #[test]
-    fn uca_a16_list_of_option_borrow_emits_guarded_inner_resource() {
+    fn ls_a_23_uca_a16_list_of_option_borrow_emits_guarded_inner_resource() {
         use crate::resolver::CopyLayout;
         let pc = empty_parsed_component();
         let ty = ComponentValType::List(Box::new(ComponentValType::Option(Box::new(

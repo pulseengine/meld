@@ -4526,7 +4526,7 @@ mod tests {
     /// two components' assignments (which feed `global_index_map`) must point
     /// at DIFFERENT positions. Pre-fix this collapsed to a single slot.
     #[test]
-    fn test_global_import_type_mismatch_not_deduped() {
+    fn ls_m_10_test_global_import_type_mismatch_not_deduped() {
         use crate::resolver::{DependencyGraph, UnresolvedImport};
 
         let graph = DependencyGraph {

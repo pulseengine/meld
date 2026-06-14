@@ -1002,7 +1002,7 @@ mod tests {
     /// local-index descriptor would manufacture a false pair that drives the
     /// bridge emitter to wire incompatible streams. They stay host-routed.
     #[test]
-    fn local_index_element_descriptors_do_not_pair() {
+    fn ls_r_16_local_index_element_descriptors_do_not_pair() {
         // Producer's element is its local Type(0); consumer's element is a
         // DIFFERENT type that happens to also sit at its local Type(0).
         let roles = vec![
