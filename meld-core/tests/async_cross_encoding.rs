@@ -36,9 +36,11 @@
 
 use meld_core::adapter::{
     build_latin1_to_utf8_transcode_test_module, build_latin1_to_utf16_transcode_test_module,
-    build_utf8_to_latin1_transcode_test_module, build_utf8_to_utf16_transcode_test_module,
-    build_utf16_to_latin1_transcode_test_module, build_utf16_to_utf8_transcode_test_module,
+    build_nested_list_string_result_test_module, build_utf8_to_latin1_transcode_test_module,
+    build_utf8_to_utf16_transcode_test_module, build_utf16_to_latin1_transcode_test_module,
+    build_utf16_to_utf8_transcode_test_module,
 };
+use meld_core::parser::CanonStringEncoding;
 use wasmtime::{Config, Engine, Instance, Module as RuntimeModule, Store};
 
 /// The canonical-ABI `latin1+utf16` length-operand tag bit, mirrored from
@@ -745,4 +747,231 @@ fn inc5a_async_nested_list_u8_result_not_transcoded() {
          NOT transcoded — proves the string-ness blocker is resolved and \
          arbitrary binary is not corrupted"
     );
+}
+
+// ----------------------------------------------------------------------------
+// #272 inc 5b — NESTED `list<string>` RESULT transcode, the FIVE remaining
+// result directions (everything except inc-5a's callee=Utf8 → caller=Utf16).
+// Drives the production `emit_patch_nested_indirections` via the parametrized
+// `build_nested_list_string_result_test_module(caller_enc, callee_enc)` module,
+// which patches but does NOT sum in wasm; the host reads back the PATCHED
+// caller-memory inner `(ptr, len)` headers + transcoded buffers and asserts
+// directly (so dest-latin1 TAGGED lengths are observable in Rust).
+// ----------------------------------------------------------------------------
+
+const N_INNER_A_OFF: i32 = 100; // callee-memory offset of inner buffer 0
+const N_INNER_B_OFF: i32 = 160; // callee-memory offset of inner buffer 1
+const N_OUTER_OFF: i32 = 240; // outer list offset (BOTH memories)
+
+/// A patched inner record as the host reads it back from CALLER memory after
+/// `patch`: `(inner_ptr, inner_len_raw, bytes)` — `inner_len_raw` is the
+/// possibly-UTF16_TAG-tagged length the emitter wrote; `bytes` is the
+/// transcoded output buffer read at `inner_ptr` for the UNTAGGED unit/byte
+/// count (read as raw bytes; the caller asserts shape per direction).
+struct PatchedInner {
+    len_raw: i32,
+    bytes: Vec<u8>,
+}
+
+/// Instantiate the inc-5b module for `(caller_enc, callee_enc)`, write the two
+/// inner source buffers into CALLEE memory 1 with the given (possibly tagged)
+/// source lengths, lay out the 2-record outer list in BOTH memories, run
+/// `patch`, and return the two PATCHED inner records read back from CALLER
+/// memory. `read_unit_bytes` is how many bytes per output unit to read for the
+/// UNTAGGED length (1 for UTF-8/Latin-1 output, 2 for UTF-16 output) — for
+/// dest-latin1 the caller decides per-record from the tag.
+/// `out_unit_width`: how many output bytes per UNTAGGED unit. `Some(2)` for a
+/// UTF-16 caller, `Some(1)` for a UTF-8 caller; `None` for a CompactUtf16
+/// (dest-latin1) caller, where the width is derived per-record from the output
+/// tag (tag-set → 2-byte UTF-16, tag-clear → 1-byte Latin-1).
+fn nested_patch_readback(
+    caller_enc: CanonStringEncoding,
+    callee_enc: CanonStringEncoding,
+    out_unit_width: Option<usize>,
+    inner_a: (&[u8], i32),
+    inner_b: (&[u8], i32),
+) -> Vec<PatchedInner> {
+    let wasm = build_nested_list_string_result_test_module(caller_enc, callee_enc);
+
+    let mut validator = wasmparser::Validator::new();
+    validator
+        .validate_all(&wasm)
+        .expect("#272 inc5b oracle module should validate");
+
+    let mut config = Config::new();
+    config.wasm_multi_memory(true);
+    let engine = Engine::new(&config).unwrap();
+    let module = RuntimeModule::new(&engine, &wasm).unwrap();
+    let mut store = Store::new(&engine, ());
+    let instance = Instance::new(&mut store, &module, &[]).unwrap();
+
+    let caller_mem = instance
+        .get_memory(&mut store, "caller_memory")
+        .expect("oracle module exports caller_memory");
+    let callee_mem = instance
+        .get_memory(&mut store, "callee_memory")
+        .expect("oracle module exports callee_memory");
+
+    // Inner SOURCE buffers live only in callee memory 1.
+    callee_mem
+        .write(&mut store, N_INNER_A_OFF as usize, inner_a.0)
+        .expect("write inner buffer 0");
+    callee_mem
+        .write(&mut store, N_INNER_B_OFF as usize, inner_b.0)
+        .expect("write inner buffer 1");
+
+    // Outer list: (ptr, len) per record, the SAME bytes in both memories
+    // (caller = the stale post-outer-bulk-copy duplicate the emitter overwrites).
+    let mut outer = Vec::new();
+    outer.extend_from_slice(&N_INNER_A_OFF.to_le_bytes());
+    outer.extend_from_slice(&inner_a.1.to_le_bytes());
+    outer.extend_from_slice(&N_INNER_B_OFF.to_le_bytes());
+    outer.extend_from_slice(&inner_b.1.to_le_bytes());
+    callee_mem
+        .write(&mut store, N_OUTER_OFF as usize, &outer)
+        .expect("write outer records (callee)");
+    caller_mem
+        .write(&mut store, N_OUTER_OFF as usize, &outer)
+        .expect("write outer records (caller stale)");
+
+    let f = instance
+        .get_typed_func::<(i32, i32, i32), ()>(&mut store, "patch")
+        .expect("oracle module exports patch");
+    f.call(&mut store, (N_OUTER_OFF, N_OUTER_OFF, 2))
+        .expect("patch runs");
+
+    // Read back the two PATCHED caller-side records.
+    let mut out = Vec::new();
+    for i in 0..2i32 {
+        let rec = (N_OUTER_OFF + i * 8) as usize;
+        let mut hdr = [0u8; 8];
+        caller_mem
+            .read(&mut store, rec, &mut hdr)
+            .expect("read hdr");
+        let ptr = i32::from_le_bytes(hdr[0..4].try_into().unwrap());
+        let len_raw = i32::from_le_bytes(hdr[4..8].try_into().unwrap());
+        // Untagged unit count; output unit width depends on whether the tag is
+        // set (UTF-16, 2 bytes) or clear (1 byte) — for non-dest-latin1 the tag
+        // is never set so this collapses to the natural width.
+        let units = (len_raw & !UTF16_TAG) as usize;
+        // Output unit width: fixed for utf8/utf16 callers; tag-derived for the
+        // dest-latin1 (CompactUtf16) caller.
+        let unit_w = out_unit_width.unwrap_or(if (len_raw & UTF16_TAG) != 0 { 2 } else { 1 });
+        let mut bytes = vec![0u8; units * unit_w];
+        caller_mem
+            .read(&mut store, ptr as usize, &mut bytes)
+            .expect("read inner buffer");
+        out.push(PatchedInner { len_raw, bytes });
+    }
+    out
+}
+
+/// #272 inc 5b (callee=Utf16 → caller=Utf8): a nested `list<string>` result with
+/// a latin1-fitting "Hi" (UTF-16 [H,i]) and a non-latin1 "é" (UTF-16 [0x00E9])
+/// must transcode the inner UTF-16 to UTF-8. "Hi" → [0x48,0x69] (len 2); "é" →
+/// the 2-byte UTF-8 sequence [0xC3,0xA9] (len 2 — the direction's multi-byte
+/// representation matters: a raw copy would leave 2 UTF-16 code units = 4 bytes).
+#[test]
+fn inc5b_nested_list_string_utf16_to_utf8() {
+    // "Hi" UTF-16 LE, len 2 code units; "é" = U+00E9 UTF-16 LE, len 1.
+    let recs = nested_patch_readback(
+        CanonStringEncoding::Utf8,
+        CanonStringEncoding::Utf16,
+        Some(1), // UTF-8 caller output: 1 byte/unit
+        (&[0x48, 0x00, 0x69, 0x00], 2),
+        (&[0xE9, 0x00], 1),
+    );
+    assert_eq!(recs[0].len_raw, 2, "\"Hi\" → UTF-8 byte len 2");
+    assert_eq!(recs[0].bytes, vec![0x48, 0x69]);
+    assert_eq!(recs[1].len_raw, 2, "\"é\" → 2-byte UTF-8 len 2");
+    assert_eq!(recs[1].bytes, vec![0xC3, 0xA9]);
+}
+
+/// #272 inc 5b (callee=CompactUtf16 → caller=Utf16): a nested `list<string>`
+/// result. Record 0 is a tag-CLEAR Latin-1 "Hi" (bytes [0x48,0x69], len 2);
+/// record 1 DRIVES A TAG-SET inner (source already UTF-16): "中" = U+4E2D,
+/// stored verbatim as UTF-16 [0x2D,0x4E], len = 1 | UTF16_TAG. Both transcode to
+/// UTF-16 output: "Hi" → [H,0,i,0] len 2; "中" → [0x2D,0x4E] len 1.
+#[test]
+fn inc5b_nested_list_string_latin1_to_utf16() {
+    let recs = nested_patch_readback(
+        CanonStringEncoding::Utf16,
+        CanonStringEncoding::CompactUtf16,
+        Some(2),                        // UTF-16 caller output: 2 bytes/unit
+        (&[0x48, 0x69], 2),             // tag-clear Latin-1 "Hi"
+        (&[0x2D, 0x4E], 1 | UTF16_TAG), // tag-SET UTF-16 "中"
+    );
+    assert_eq!(recs[0].len_raw, 2, "latin1 \"Hi\" → UTF-16 code-unit len 2");
+    assert_eq!(recs[0].bytes, vec![0x48, 0x00, 0x69, 0x00]);
+    assert_eq!(
+        recs[1].len_raw, 1,
+        "tag-set \"中\" → UTF-16 code-unit len 1"
+    );
+    assert_eq!(recs[1].bytes, vec![0x2D, 0x4E]);
+}
+
+/// #272 inc 5b (callee=CompactUtf16 → caller=Utf8): record 0 tag-CLEAR Latin-1
+/// "Hi" → UTF-8 "Hi" (len 2); record 1 DRIVES A TAG-SET inner "中" (UTF-16
+/// [0x2D,0x4E], len 1|TAG) → 3-byte UTF-8 [0xE4,0xB8,0xAD] (len 3).
+#[test]
+fn inc5b_nested_list_string_latin1_to_utf8() {
+    let recs = nested_patch_readback(
+        CanonStringEncoding::Utf8,
+        CanonStringEncoding::CompactUtf16,
+        Some(1), // UTF-8 caller output: 1 byte/unit
+        (&[0x48, 0x69], 2),
+        (&[0x2D, 0x4E], 1 | UTF16_TAG),
+    );
+    assert_eq!(recs[0].len_raw, 2, "latin1 \"Hi\" → UTF-8 len 2");
+    assert_eq!(recs[0].bytes, vec![0x48, 0x69]);
+    assert_eq!(recs[1].len_raw, 3, "tag-set \"中\" → 3-byte UTF-8 len 3");
+    assert_eq!(recs[1].bytes, vec![0xE4, 0xB8, 0xAD]);
+}
+
+/// #272 inc 5b (callee=Utf8 → caller=CompactUtf16, DEST-LATIN1): record 0 a
+/// latin1-FITTING "é" (UTF-8 [0xC3,0xA9]) collapses to a single Latin-1 byte
+/// [0xE9] with a tag-CLEAR len 1; record 1 a NON-LATIN1 "中" (UTF-8
+/// [0xE4,0xB8,0xAD]) must use the UTF-16 representation [0x2D,0x4E] with the
+/// TAGGED len (1 | UTF16_TAG). Asserting the tagged len on the non-latin1 record
+/// proves the dest-latin1 tag-producing path runs inside the nested loop.
+#[test]
+fn inc5b_nested_list_string_utf8_to_latin1() {
+    let recs = nested_patch_readback(
+        CanonStringEncoding::CompactUtf16,
+        CanonStringEncoding::Utf8,
+        None,                     // dest-latin1: output width tag-derived per record
+        (&[0xC3, 0xA9], 2),       // "é" UTF-8, fits Latin-1
+        (&[0xE4, 0xB8, 0xAD], 3), // "中" UTF-8, needs UTF-16
+    );
+    assert_eq!(recs[0].len_raw, 1, "latin1-fitting \"é\" → tag-CLEAR len 1");
+    assert_eq!(recs[0].bytes, vec![0xE9]);
+    assert_eq!(
+        recs[1].len_raw,
+        1 | UTF16_TAG,
+        "non-latin1 \"中\" → TAGGED len (1 | UTF16_TAG)"
+    );
+    assert_eq!(recs[1].bytes, vec![0x2D, 0x4E]);
+}
+
+/// #272 inc 5b (callee=Utf16 → caller=CompactUtf16, DEST-LATIN1): record 0 a
+/// latin1-FITTING "é" (UTF-16 [0xE9,0x00]) → Latin-1 byte [0xE9], tag-CLEAR len
+/// 1; record 1 a NON-LATIN1 "中" (UTF-16 [0x2D,0x4E]) → UTF-16 [0x2D,0x4E] with
+/// TAGGED len (1 | UTF16_TAG).
+#[test]
+fn inc5b_nested_list_string_utf16_to_latin1() {
+    let recs = nested_patch_readback(
+        CanonStringEncoding::CompactUtf16,
+        CanonStringEncoding::Utf16,
+        None,               // dest-latin1: output width tag-derived per record
+        (&[0xE9, 0x00], 1), // "é" UTF-16, fits Latin-1
+        (&[0x2D, 0x4E], 1), // "中" UTF-16, needs UTF-16 rep
+    );
+    assert_eq!(recs[0].len_raw, 1, "latin1-fitting \"é\" → tag-CLEAR len 1");
+    assert_eq!(recs[0].bytes, vec![0xE9]);
+    assert_eq!(
+        recs[1].len_raw,
+        1 | UTF16_TAG,
+        "non-latin1 \"中\" → TAGGED len (1 | UTF16_TAG)"
+    );
+    assert_eq!(recs[1].bytes, vec![0x2D, 0x4E]);
 }

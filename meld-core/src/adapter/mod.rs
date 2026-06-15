@@ -67,6 +67,12 @@ pub use fact::build_nested_list_string_utf8_to_utf16_result_test_module;
 #[doc(hidden)]
 pub use fact::build_nested_list_u8_result_not_transcoded_test_module;
 
+/// Test-support: build the #272 inc-5b NESTED `list<string>` RESULT transcode
+/// oracle module for an ARBITRARY result direction (`callee_enc → caller_enc`).
+/// `#[doc(hidden)]` — not a supported API; see the function's own docs.
+#[doc(hidden)]
+pub use fact::build_nested_list_string_result_test_module;
+
 use crate::Result;
 use crate::merger::MergedModule;
 use crate::resolver::DependencyGraph;
