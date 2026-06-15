@@ -610,3 +610,139 @@ fn inc4b_async_utf16_to_latin1_empty() {
     assert_eq!(tagged, 0, "empty UTF-16 source → tag-clear length 0");
     assert!(out.is_empty(), "empty output buffer");
 }
+
+// ----------------------------------------------------------------------------
+// #272 inc 5a — NESTED `list<string>` RESULT transcode (UTF-8 → UTF-16), the
+// first real nested cross-encoding delivery, plus the negative `list<u8>` case
+// proving the string-ness blocker is resolved (a nested `list<u8>` is RAW-COPIED
+// verbatim, never transcoded, so its arbitrary binary bytes are not corrupted).
+//
+// Both drive the EXACT production `emit_patch_nested_indirections` emitter via
+// the two-memory modules built by
+// `build_nested_list_string_utf8_to_utf16_result_test_module` /
+// `build_nested_list_u8_result_not_transcoded_test_module`. This is the RESULT
+// direction (callee PRODUCES, caller READS): the host writes the inner buffers +
+// the outer `(ptr, len)` records into CALLEE memory 1, and a verbatim copy of
+// the outer records into CALLER memory 0 (the post-outer-bulk-copy state). The
+// emitter transcodes (or raw-copies) each inner buffer into caller memory 0,
+// rewrites the caller-side inner `(ptr, len)` header, and the module then sums
+// the inner units by re-reading the PATCHED headers.
+// ----------------------------------------------------------------------------
+
+const INNER_A_OFF: i32 = 100; // callee-memory offset of inner buffer 0
+const INNER_B_OFF: i32 = 140; // callee-memory offset of inner buffer 1
+const OUTER_OFF: i32 = 200; // outer list offset (BOTH memories)
+
+/// Instantiate `wasm`, write the two inner byte buffers into CALLEE memory 1 at
+/// `INNER_A_OFF`/`INNER_B_OFF`, lay out a 2-record outer list `(ptr, len)` at
+/// `OUTER_OFF` in BOTH memories (callee = source, caller = the stale post-bulk-
+/// copy duplicate), run `patch_and_sum(OUTER_OFF, OUTER_OFF, 2)`, and return its
+/// sum.
+fn nested_patch_and_sum(wasm: &[u8], inner_a: &[u8], inner_b: &[u8]) -> i32 {
+    let mut validator = wasmparser::Validator::new();
+    validator
+        .validate_all(wasm)
+        .expect("#272 inc5a oracle module should validate");
+
+    let mut config = Config::new();
+    config.wasm_multi_memory(true);
+    let engine = Engine::new(&config).unwrap();
+    let module = RuntimeModule::new(&engine, wasm).unwrap();
+    let mut store = Store::new(&engine, ());
+    let instance = Instance::new(&mut store, &module, &[]).unwrap();
+
+    let caller_mem = instance
+        .get_memory(&mut store, "caller_memory")
+        .expect("oracle module exports caller_memory");
+    let callee_mem = instance
+        .get_memory(&mut store, "callee_memory")
+        .expect("oracle module exports callee_memory");
+
+    // Inner buffers live ONLY in callee memory 1 (the source).
+    callee_mem
+        .write(&mut store, INNER_A_OFF as usize, inner_a)
+        .expect("write inner buffer 0 into callee memory");
+    callee_mem
+        .write(&mut store, INNER_B_OFF as usize, inner_b)
+        .expect("write inner buffer 1 into callee memory");
+
+    // Outer list: rec0 = (INNER_A_OFF, len_a), rec1 = (INNER_B_OFF, len_b),
+    // 8 bytes each. The same bytes go into BOTH memories — caller memory 0 is
+    // the verbatim outer bulk-copy the production writeback already performed.
+    let mut outer = Vec::new();
+    outer.extend_from_slice(&INNER_A_OFF.to_le_bytes());
+    outer.extend_from_slice(&(inner_a.len() as i32).to_le_bytes());
+    outer.extend_from_slice(&INNER_B_OFF.to_le_bytes());
+    outer.extend_from_slice(&(inner_b.len() as i32).to_le_bytes());
+    callee_mem
+        .write(&mut store, OUTER_OFF as usize, &outer)
+        .expect("write outer records into callee memory");
+    caller_mem
+        .write(&mut store, OUTER_OFF as usize, &outer)
+        .expect("write outer records into caller memory (stale duplicate)");
+
+    let f = instance
+        .get_typed_func::<(i32, i32, i32), i32>(&mut store, "patch_and_sum")
+        .expect("oracle module exports patch_and_sum");
+    f.call(&mut store, (OUTER_OFF, OUTER_OFF, 2))
+        .expect("patch_and_sum runs")
+}
+
+/// #272 inc 5a (positive): a 2-element `list<string>` result `["Hi", "yo"]`
+/// (UTF-8 bytes) transcoded UTF-8 → UTF-16 sums the inner UTF-16 CODE UNITS to
+/// 'H'+'i'+'y'+'o' = 0x48+0x69+0x79+0x6F = 409. The module sums by re-reading
+/// the PATCHED caller-side `(ptr, len)` headers, so a correct sum proves BOTH
+/// the inner transcode AND the NEW header-len rewrite (the rewritten len must be
+/// the UTF-16 code-unit count = 2 per string, not the UTF-8 byte count — they
+/// happen to coincide for ASCII, but the patched PTR must point into caller
+/// memory, which a raw copy would not produce correctly for the summing loop).
+#[test]
+fn inc5a_async_nested_list_string_utf8_to_utf16_transcodes() {
+    let wasm = meld_core::adapter::build_nested_list_string_utf8_to_utf16_result_test_module();
+    // "Hi" = [0x48, 0x69], "yo" = [0x79, 0x6F].
+    let sum = nested_patch_and_sum(&wasm, b"Hi", b"yo");
+    assert_eq!(
+        sum, 409,
+        "#272 inc5a: nested list<string> [\"Hi\",\"yo\"] UTF-8 → UTF-16 must sum \
+         the transcoded inner code units to 409 (proves real nested transcode + \
+         header-len rewrite, not raw copy)"
+    );
+}
+
+/// #272 inc 5a (positive, non-ASCII): a `list<string>` result `["é", "Hi"]`
+/// where "é" is UTF-8 `0xC3 0xA9` (2 bytes) → ONE UTF-16 code unit 0x00E9. The
+/// inner len header MUST be rewritten from the 2-byte UTF-8 length to the 1-unit
+/// UTF-16 length, else the summing loop would read a phantom second unit. Sum =
+/// 0x00E9 (é) + 0x48 ('H') + 0x69 ('i') = 233 + 72 + 105 = 410.
+#[test]
+fn inc5a_async_nested_list_string_non_ascii_rewrites_len() {
+    let wasm = meld_core::adapter::build_nested_list_string_utf8_to_utf16_result_test_module();
+    let sum = nested_patch_and_sum(&wasm, &[0xC3, 0xA9], b"Hi");
+    assert_eq!(
+        sum, 410,
+        "#272 inc5a: nested list<string> [\"é\",\"Hi\"] must transcode 'é' to one \
+         UTF-16 unit 0x00E9 and REWRITE its inner len to 1 (sum 410); a stale \
+         2-byte len would over-read"
+    );
+}
+
+/// #272 inc 5a (NEGATIVE — the blocker resolution): a 2-element `list<list<u8>>`
+/// result must be RAW-COPIED, never transcoded. A nested `list<u8>`
+/// (`is_string == false` from `collect_indirections`) is arbitrary binary;
+/// transcoding it as UTF-8 would corrupt it. Inner buffers `[0xC3, 0xA9]` and
+/// `[0x01, 0x80]`: a raw copy preserves all 4 bytes (lengths stay 2 each), so
+/// the byte-sum is 0xC3+0xA9+0x01+0x80 = 195+169+1+128 = 493. A (WRONG)
+/// UTF-8→UTF-16 transcode would collapse `0xC3 0xA9` to one unit 0x00E9 and
+/// replace the lone `0x80` with U+FFFD, changing both the bytes AND the lengths
+/// — a different sum. The correct 493 proves the `list<u8>` is NOT transcoded.
+#[test]
+fn inc5a_async_nested_list_u8_result_not_transcoded() {
+    let wasm = meld_core::adapter::build_nested_list_u8_result_not_transcoded_test_module();
+    let sum = nested_patch_and_sum(&wasm, &[0xC3, 0xA9], &[0x01, 0x80]);
+    assert_eq!(
+        sum, 493,
+        "#272 inc5a: nested list<u8> must be RAW-COPIED verbatim (byte-sum 493), \
+         NOT transcoded — proves the string-ness blocker is resolved and \
+         arbitrary binary is not corrupted"
+    );
+}

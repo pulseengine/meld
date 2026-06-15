@@ -331,6 +331,18 @@ pub struct AdapterRequirements {
     pub param_copy_layouts: Vec<CopyLayout>,
     /// Copy layouts for result pointer pairs (parallel to `result_pointer_pair_offsets`).
     pub result_copy_layouts: Vec<CopyLayout>,
+    /// WIT result types of the callee export (one per result; usually one).
+    ///
+    /// #272 inc 5a: the lowered `CopyLayout` descriptor cannot distinguish a
+    /// nested `string` from a nested `list<u8>` — both lower to `Bulk{1}`. The
+    /// async cross-encoding guard recovers string-ness by running
+    /// `collect_indirections` over these WIT types, the SAME string-ness signal
+    /// `emit_patch_nested_indirections` consults before transcoding an inner
+    /// buffer. Keeping the guard's allow-set and the emitter's transcode-set on
+    /// one signal closes the allow-but-raw-copy corruption gap. Empty when the
+    /// resolver could not recover the WIT result types (the guard then treats
+    /// the result conservatively as not-allowed-for-nested-transcode).
+    pub result_wit_types: Vec<crate::parser::ComponentValType>,
     /// Conditional pointer pairs inside option/result/variant params.
     /// Each entry: (discriminant_flat_idx, discriminant_value, ptr_flat_idx, copy_layout).
     /// The adapter must check the discriminant and only copy when it matches.
@@ -2884,6 +2896,11 @@ impl Resolver {
                                             );
                                             requirements.result_copy_layouts =
                                                 collect_result_copy_layouts(to_component, results);
+                                            // #272 inc 5a: stash the WIT result types so the
+                                            // async cross-encoding guard can recover nested
+                                            // string-ness via `collect_indirections`.
+                                            requirements.result_wit_types =
+                                                results.iter().map(|(_, ty)| ty.clone()).collect();
                                             resolve_inner_resource_imports(
                                                 &mut requirements.result_copy_layouts,
                                                 to_component,
@@ -3193,6 +3210,9 @@ impl Resolver {
                                         collect_param_copy_layouts(to_component, comp_params);
                                     requirements.result_copy_layouts =
                                         collect_result_copy_layouts(to_component, results);
+                                    // #272 inc 5a: stash WIT result types (see above).
+                                    requirements.result_wit_types =
+                                        results.iter().map(|(_, ty)| ty.clone()).collect();
                                     requirements.conditional_pointer_pairs = to_component
                                         .conditional_pointer_pair_positions(comp_params);
                                     requirements.conditional_result_pointer_pairs = to_component
