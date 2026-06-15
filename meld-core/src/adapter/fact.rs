@@ -11090,6 +11090,19 @@ impl FactStyleGenerator {
         // `list<string>` shape). Records / deeper / other-direction nested params
         // stay fail-loud. Reads the SAME `collect_indirections` string-ness
         // signal the emitter consults (via `param_wit_types`).
+        //
+        // #272 inc 5c-a (index-alignment fix): `param_wit_types` is now
+        // PER-POINTER-PAIR (one leaf WIT type per pointer pair, parallel to
+        // `param_copy_layouts`), so this whole-collection `.iter().all/any()`
+        // predicate and the emitter's `param_wit_types.get(pair_idx)` index the
+        // SAME space. A mixed `(u32, list<string>)` param list now yields
+        // `[list<string>]` (the u32 bears no pointer pair and is absent), so the
+        // guard's allow decision matches what the emitter actually transcodes —
+        // the previous per-top-level-param population let the guard allow a site
+        // the emitter then silently skipped. Each entry is a String or
+        // List/FixedSizeList leaf (never a scalar); a bare top-level `String`
+        // leaf hits the `_ => Vec::new()` arm and is handled by the top-level
+        // path, not this nested predicate.
         let param_inner_all_strings = !site.requirements.param_wit_types.is_empty()
             && site.requirements.param_wit_types.iter().all(|ty| {
                 let inner_indirections = match ty {
@@ -11097,8 +11110,9 @@ impl FactStyleGenerator {
                     | crate::parser::ComponentValType::FixedSizeList(elem, _) => {
                         collect_indirections(elem, 0)
                     }
-                    // A non-list param has no inner-element indirections to walk
-                    // for the nested case; the top-level path handles it.
+                    // A non-list pointer-pair leaf (a top-level `String`) has no
+                    // inner-element indirections to walk for the nested case; the
+                    // top-level path handles it.
                     _ => Vec::new(),
                 };
                 inner_indirections.iter().all(|(_, _, is_string)| *is_string)
@@ -13655,6 +13669,152 @@ mod tests {
         site.requirements.caller_encoding = Some(caller_enc);
         site.requirements.callee_encoding = Some(callee_enc);
         (merged, site)
+    }
+
+    /// #272 inc-5c-a (index-alignment fix): a MIXED `(u32, list<string>)` async
+    /// PARAM site — a SCALAR before the pointer-bearing `list<string>`. This is
+    /// the shape the index-alignment bug needs: the `list<string>` is the 2nd
+    /// top-level param but the 1st (and only) POINTER PAIR. The resolver now
+    /// populates `param_wit_types` PER-POINTER-PAIR (`[list<string>]`, len 1),
+    /// so the emitter's `param_wit_types.get(pair_idx=0)` correctly returns the
+    /// `list<string>` and the nested walk fires. The old per-top-level-param
+    /// population returned `[u32, list<string>]`, so `.get(0)` returned `u32`,
+    /// the List match failed, and the nested transcode/deep-copy was silently
+    /// skipped (re-opening #281 + an H-4.4 wrong-encoding miss) while the guard
+    /// (whole-collection `.iter().all/any()`) still ALLOWED the site.
+    fn xenc_mixed_scalar_list_string_param_merged_and_site(
+        caller_enc: crate::parser::CanonStringEncoding,
+        callee_enc: crate::parser::CanonStringEncoding,
+    ) -> (crate::merger::MergedModule, crate::resolver::AdapterSite) {
+        // Start from the single-`list<string>`-param site and graft a leading
+        // scalar so the pointer pair sits at flat index 1, not 0.
+        let (mut merged, mut site) = xenc_list_string_param_merged_and_site(caller_enc, callee_enc);
+        // Caller type now (i32 [u32], i32 [ptr], i32 [len]) → 3 params; replace
+        // type 1 in place (it is the caller type the site references).
+        merged.types[1].params = vec![
+            wasm_encoder::ValType::I32, // u32 scalar
+            wasm_encoder::ValType::I32, // list ptr
+            wasm_encoder::ValType::I32, // list len
+        ];
+        // The `list<string>` pointer pair is now at flat index 1 (after the
+        // u32 at 0). `param_copy_layouts` stays length-1 (the scalar bears no
+        // pointer pair) — exactly as `collect_param_copy_layouts` would build it.
+        site.requirements.pointer_pair_positions = vec![1];
+        // `param_wit_types` stays the PER-POINTER-PAIR value `[list<string>]`
+        // (len 1), NOT `[u32, list<string>]` — this is precisely what the fixed
+        // `collect_param_wit_types` yields for `(u32, list<string>)`.
+        // (Left unchanged from the single-param helper.)
+        (merged, site)
+    }
+
+    /// Count `memory.copy` ops in a generated adapter body.
+    fn count_memcopies(adapter: crate::adapter::AdapterFunction) -> usize {
+        let raw = adapter.body.into_raw_body();
+        let fb = wasmparser::FunctionBody::new(wasmparser::BinaryReader::new(&raw, 0));
+        let mut n = 0usize;
+        for op in fb.get_operators_reader().expect("ops reader") {
+            if let wasmparser::Operator::MemoryCopy { .. } = op.expect("operator") {
+                n += 1;
+            }
+        }
+        n
+    }
+
+    /// Count total operators in a generated adapter body (a coarse proxy for
+    /// "the nested walk was emitted" — skipping it makes the body strictly
+    /// shorter).
+    fn count_ops(adapter: crate::adapter::AdapterFunction) -> usize {
+        let raw = adapter.body.into_raw_body();
+        let fb = wasmparser::FunctionBody::new(wasmparser::BinaryReader::new(&raw, 0));
+        fb.get_operators_reader()
+            .expect("ops reader")
+            .into_iter()
+            .map(|op| {
+                op.expect("operator");
+            })
+            .count()
+    }
+
+    /// #272 inc-5c-a (index-alignment regression): a MIXED `(u32, list<string>)`
+    /// async PARAM site in the transcoding direction (caller=Utf8 →
+    /// callee=Utf16) must run the SAME nested-param walk as the single
+    /// `list<string>` param — even though the list is the 2nd top-level param /
+    /// 1st pointer pair. PRE-fix (`param_wit_types` per-top-level-param → `[u32,
+    /// list<string>]`) the emitter's `.get(pair_idx=0)` returned `u32`, the List
+    /// match failed, and the nested walk was SILENTLY SKIPPED — making the mixed
+    /// adapter SHORTER than the single-param one (re-opening #281 + an H-4.4
+    /// wrong-encoding miss) while the guard still ALLOWED the site. POST-fix
+    /// (per-pointer-pair → `[list<string>]`) the two adapters emit the IDENTICAL
+    /// nested transcode (the leading scalar adds no param-copy work), so their
+    /// op counts match.
+    ///
+    /// NB: in the utf8→utf16 direction the INNER string is transcoded by a
+    /// per-byte loop, NOT a `memory.copy`, so a raw memory.copy count is 1 for
+    /// both shapes here; the op-count equivalence is what proves the nested walk
+    /// fired (the same-encoding sibling test pins the 2-`memory.copy` deep-copy).
+    #[test]
+    fn inc5c_a_mixed_param_nested_list_string_after_scalar_transcodes() {
+        use crate::parser::CanonStringEncoding;
+        let gen_ = FactStyleGenerator::new(AdapterConfig::default());
+        let (mixed_merged, mixed_site) = xenc_mixed_scalar_list_string_param_merged_and_site(
+            CanonStringEncoding::Utf8,  // caller PROVIDES Utf8
+            CanonStringEncoding::Utf16, // callee READS Utf16
+        );
+        // Guard-vs-emitter consistency: the guard must ALLOW this mixed shape
+        // (no allow-but-skip) before we assert the emitter transcodes it.
+        FactStyleGenerator::guard_async_cross_encoding_strings(&mixed_site).expect(
+            "#272 inc-5c-a: a (u32, list<string>) param in caller=Utf8 → callee=Utf16 \
+             must be ALLOWED — the emitter transcodes the inner strings",
+        );
+        let mixed_ops = count_ops(
+            gen_.generate_async_callback_adapter(&mixed_site, &mixed_merged)
+                .expect("callback emitter must succeed for the mixed param site"),
+        );
+
+        // Reference: the single `list<string>` param (pointer pair at index 0)
+        // in the SAME direction — its nested walk is the known-good baseline.
+        let (single_merged, single_site) = xenc_list_string_param_merged_and_site(
+            CanonStringEncoding::Utf8,
+            CanonStringEncoding::Utf16,
+        );
+        let single_ops = count_ops(
+            gen_.generate_async_callback_adapter(&single_site, &single_merged)
+                .expect("callback emitter must succeed for the single param site"),
+        );
+
+        assert_eq!(
+            mixed_ops, single_ops,
+            "#272 inc-5c-a (index-alignment): the (u32, list<string>) PARAM adapter must \
+             emit the SAME nested-param transcode walk as the single list<string> param \
+             (the leading scalar adds no param-copy work) — a SHORTER body means the \
+             nested walk was silently skipped (param_wit_types index misalignment, \
+             re-opening #281 + H-4.4)"
+        );
+    }
+
+    /// #272 inc-5c-a (#281 same-encoding deep-copy, mixed shape): a MIXED
+    /// `(u32, list<string>)` async PARAM in a SAME-encoding (Utf8→Utf8) site
+    /// must STILL deep-copy each inner string (2 memory.copy) — the #281 fix
+    /// fires regardless of the leading scalar. Pins that the index alignment
+    /// holds in the no-transcode path too.
+    #[test]
+    fn inc5c_a_mixed_param_nested_list_string_same_encoding_deep_copies() {
+        use crate::parser::CanonStringEncoding;
+        let gen_ = FactStyleGenerator::new(AdapterConfig::default());
+        let (merged, site) = xenc_mixed_scalar_list_string_param_merged_and_site(
+            CanonStringEncoding::Utf8,
+            CanonStringEncoding::Utf8,
+        );
+        let adapter = gen_
+            .generate_async_callback_adapter(&site, &merged)
+            .expect("callback emitter must succeed for the same-encoding mixed param site");
+        let memcopies = count_memcopies(adapter);
+        assert_eq!(
+            memcopies, 2,
+            "#272 inc-5c-a: a same-encoding (u32, list<string>) PARAM must deep-copy \
+             the OUTER element array AND each INNER string buffer (2 memory.copy) — \
+             closing the #281 shallow-copy gap even with a leading scalar"
+        );
     }
 
     /// #272 inc-5c-a (the #281 same-encoding deep-copy fix): a `list<string>`
