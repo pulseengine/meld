@@ -975,3 +975,133 @@ fn inc5b_nested_list_string_utf16_to_latin1() {
     );
     assert_eq!(recs[1].bytes, vec![0x2D, 0x4E]);
 }
+
+// ----------------------------------------------------------------------------
+// #272 inc 5c-a — NESTED `list<string>` PARAM nested-copy (UTF-8 → UTF-16), the
+// FIRST real nested-PARAM transcoding, plus the negative `list<u8>` case proving
+// the #281 same-encoding/deep-copy gap is CLOSED (a nested `list<u8>` PARAM is
+// DEEP-COPIED VERBATIM into callee memory + re-pointed, never transcoded).
+//
+// Both drive the EXACT production `emit_param_nested_indirections` emitter via
+// the two-memory modules built by
+// `build_nested_list_string_utf8_to_utf16_param_test_module` /
+// `build_nested_list_u8_param_deep_copied_test_module`. This is the PARAM
+// direction (caller PROVIDES, callee READS): the host writes the inner SOURCE
+// buffers into CALLER memory 0, and the SHALLOW outer `(ptr, len)` records (inner
+// ptr still pointing into CALLER memory) into CALLEE memory 1 — the post-outer-
+// bulk-copy state. The emitter transcodes (or deep-copies) each inner buffer into
+// callee memory 1, rewrites the callee-side inner header, and the module then
+// sums the inner units by re-reading the PATCHED CALLEE-memory headers.
+// ----------------------------------------------------------------------------
+
+const P_INNER_A_OFF: i32 = 100; // CALLER-memory offset of inner source buffer 0
+const P_INNER_B_OFF: i32 = 140; // CALLER-memory offset of inner source buffer 1
+const P_OUTER_OFF: i32 = 200; // shallow outer record array offset (CALLEE memory)
+
+/// Instantiate `wasm`, write the two inner SOURCE buffers into CALLER memory 0,
+/// lay out the SHALLOW 2-record outer list `(inner_caller_ptr, len)` at
+/// `P_OUTER_OFF` in CALLEE memory 1 (the inner ptr still points into CALLER
+/// memory — the post-bulk-copy state), run `patch_and_sum(P_OUTER_OFF, 2)`, and
+/// return its sum.
+fn nested_param_patch_and_sum(wasm: &[u8], inner_a: &[u8], inner_b: &[u8]) -> i32 {
+    let mut validator = wasmparser::Validator::new();
+    validator
+        .validate_all(wasm)
+        .expect("#272 inc5c-a oracle module should validate");
+
+    let mut config = Config::new();
+    config.wasm_multi_memory(true);
+    let engine = Engine::new(&config).unwrap();
+    let module = RuntimeModule::new(&engine, wasm).unwrap();
+    let mut store = Store::new(&engine, ());
+    let instance = Instance::new(&mut store, &module, &[]).unwrap();
+
+    let caller_mem = instance
+        .get_memory(&mut store, "caller_memory")
+        .expect("oracle module exports caller_memory");
+    let callee_mem = instance
+        .get_memory(&mut store, "callee_memory")
+        .expect("oracle module exports callee_memory");
+
+    // Inner SOURCE buffers live ONLY in CALLER memory 0 (the param source).
+    caller_mem
+        .write(&mut store, P_INNER_A_OFF as usize, inner_a)
+        .expect("write inner buffer 0 into caller memory");
+    caller_mem
+        .write(&mut store, P_INNER_B_OFF as usize, inner_b)
+        .expect("write inner buffer 1 into caller memory");
+
+    // SHALLOW outer record array in CALLEE memory 1: rec0 = (P_INNER_A_OFF,
+    // len_a), rec1 = (P_INNER_B_OFF, len_b). The inner ptr points into CALLER
+    // memory — exactly what the outer bulk `memory.copy` leaves (gap #281).
+    let mut outer = Vec::new();
+    outer.extend_from_slice(&P_INNER_A_OFF.to_le_bytes());
+    outer.extend_from_slice(&(inner_a.len() as i32).to_le_bytes());
+    outer.extend_from_slice(&P_INNER_B_OFF.to_le_bytes());
+    outer.extend_from_slice(&(inner_b.len() as i32).to_le_bytes());
+    callee_mem
+        .write(&mut store, P_OUTER_OFF as usize, &outer)
+        .expect("write shallow outer records into callee memory");
+
+    let f = instance
+        .get_typed_func::<(i32, i32), i32>(&mut store, "patch_and_sum")
+        .expect("oracle module exports patch_and_sum");
+    f.call(&mut store, (P_OUTER_OFF, 2))
+        .expect("patch_and_sum runs")
+}
+
+/// #272 inc 5c-a (positive): a 2-element `list<string>` PARAM `["Hi", "yo"]`
+/// (UTF-8) transcoded UTF-8 → UTF-16 sums the inner UTF-16 CODE UNITS to
+/// 'H'+'i'+'y'+'o' = 0x48+0x69+0x79+0x6F = 409, read back from the PATCHED
+/// CALLEE-memory headers. A correct sum proves the inner strings are TRANSCODED,
+/// their headers re-pointed INTO CALLEE memory, and the len set to the UTF-16
+/// code-unit count.
+#[test]
+fn inc5c_a_async_nested_list_string_param_utf8_to_utf16_transcodes() {
+    let wasm = meld_core::adapter::build_nested_list_string_utf8_to_utf16_param_test_module();
+    let sum = nested_param_patch_and_sum(&wasm, b"Hi", b"yo");
+    assert_eq!(
+        sum, 409,
+        "#272 inc5c-a: nested list<string> [\"Hi\",\"yo\"] PARAM UTF-8 → UTF-16 must \
+         sum the transcoded inner code units to 409 (proves real nested PARAM \
+         transcode + re-point into callee memory, not a shallow copy)"
+    );
+}
+
+/// #272 inc 5c-a (positive, non-ASCII): a `list<string>` PARAM `["é", "Hi"]`
+/// where "é" is UTF-8 `0xC3 0xA9` (2 bytes) → ONE UTF-16 code unit 0x00E9. The
+/// inner len header MUST be rewritten from the 2-byte UTF-8 length to the 1-unit
+/// UTF-16 length, else the summing loop would read a phantom second unit. Sum =
+/// 0x00E9 + 0x48 + 0x69 = 233 + 72 + 105 = 410.
+#[test]
+fn inc5c_a_async_nested_list_string_param_non_ascii_rewrites_len() {
+    let wasm = meld_core::adapter::build_nested_list_string_utf8_to_utf16_param_test_module();
+    let sum = nested_param_patch_and_sum(&wasm, &[0xC3, 0xA9], b"Hi");
+    assert_eq!(
+        sum, 410,
+        "#272 inc5c-a: nested list<string> [\"é\",\"Hi\"] PARAM must transcode 'é' to \
+         one UTF-16 unit 0x00E9 and REWRITE its inner len to 1 (sum 410)"
+    );
+}
+
+/// #272 inc 5c-a (NEGATIVE — the #281 close): a 2-element `list<list<u8>>` PARAM
+/// must be DEEP-COPIED VERBATIM into callee memory and re-pointed, NEVER
+/// transcoded. A nested `list<u8>` (`is_string == false`) is arbitrary binary.
+/// Inner buffers `[0xC3, 0xA9]` and `[0x01, 0x80]`: a verbatim deep-copy
+/// preserves all 4 bytes (lengths stay 2 each), so the byte-sum is
+/// 0xC3+0xA9+0x01+0x80 = 195+169+1+128 = 493. A (wrong) UTF-8→UTF-16 transcode
+/// would collapse `0xC3 0xA9` to one unit 0x00E9 and replace the lone `0x80`
+/// with U+FFFD — a different sum. The correct 493 (re-read from the PATCHED
+/// CALLEE-memory header) proves the inner buffer is deep-copied + re-pointed
+/// (NOT left dangling into caller memory — #281 closed — and NOT transcoded).
+#[test]
+fn inc5c_a_async_nested_list_u8_param_deep_copied_verbatim() {
+    let wasm = meld_core::adapter::build_nested_list_u8_param_deep_copied_test_module();
+    let sum = nested_param_patch_and_sum(&wasm, &[0xC3, 0xA9], &[0x01, 0x80]);
+    assert_eq!(
+        sum, 493,
+        "#272 inc5c-a: nested list<u8> PARAM must be DEEP-COPIED verbatim into \
+         callee memory + re-pointed (byte-sum 493), NOT transcoded — proves #281 \
+         closed and arbitrary binary is not corrupted"
+    );
+}

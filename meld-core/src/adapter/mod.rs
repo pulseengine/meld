@@ -73,6 +73,18 @@ pub use fact::build_nested_list_u8_result_not_transcoded_test_module;
 #[doc(hidden)]
 pub use fact::build_nested_list_string_result_test_module;
 
+/// Test-support: build the #272 inc-5c-a NESTED `list<string>` PARAM transcode
+/// (UTF-8 → UTF-16) oracle module. `#[doc(hidden)]` — not a supported API; see
+/// the function's own docs.
+#[doc(hidden)]
+pub use fact::build_nested_list_string_utf8_to_utf16_param_test_module;
+
+/// Test-support: build the #272 inc-5c-a NESTED `list<u8>` PARAM deep-copied
+/// (NOT transcoded — closes #281) oracle module. `#[doc(hidden)]` — not a
+/// supported API; see the function's own docs.
+#[doc(hidden)]
+pub use fact::build_nested_list_u8_param_deep_copied_test_module;
+
 use crate::Result;
 use crate::merger::MergedModule;
 use crate::resolver::DependencyGraph;
