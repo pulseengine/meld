@@ -562,6 +562,47 @@ verification-status:
       do not converge in CBMC against the current ParsedComponent
       shape; that contract stays pinned by the exhaustive unit tests.
 
+  SR-41:
+    implementation-files: [meld-core/src/adapter/fact.rs]
+    tests:
+      # Param side — all 6 directions (runtime-differential under wasmtime)
+      - async_cross_encoding::inc1_async_utf8_to_utf16_param_transcodes_hello
+      - async_cross_encoding::inc1_async_utf8_to_utf16_param_transcodes_supplementary_plane
+      - async_cross_encoding::inc2_async_utf16_to_utf8_param_transcodes_supplementary_plane
+      - async_cross_encoding::inc4a_async_latin1_to_utf16_tag_set_nihon
+      - async_cross_encoding::inc4a_async_latin1_to_utf8_tag_set_nihon
+      - async_cross_encoding::inc4b_async_utf8_to_latin1_emoji_surrogate_pair
+      - async_cross_encoding::inc4b_async_utf16_to_latin1_nihon_utf16
+      # Result side + nested (one level) + the list<u8>-not-transcoded guarantee
+      - adapter::fact::tests::inc3_async_utf8_to_utf16_top_level_string_result_allowed
+      - async_cross_encoding::inc5a_async_nested_list_string_utf8_to_utf16_transcodes
+      - async_cross_encoding::inc5a_async_nested_list_u8_result_not_transcoded
+      - async_cross_encoding::inc5b_nested_list_string_utf16_to_latin1
+      - async_cross_encoding::inc5c_a_async_nested_list_string_param_utf8_to_utf16_transcodes
+      - async_cross_encoding::inc5c_b_same_encoding_utf16_nested_param_deep_copies_full_codeunits
+      # Integration: the REAL callback+stackful adapter local-bounds (the async-lift
+      # integration compensating control; full e2e is kiln-gated)
+      - adapter::fact::tests::inc1_callback_adapter_transcode_locals_within_budget
+      - adapter::fact::tests::inc5c_b_callback_adapter_nested_param_dest_latin1_locals_within_budget
+      # The fail-loud guard (LS-F-27) for the not-yet-supported deeper-nesting edge
+      - adapter::fact::tests::inc5c_b_async_deeper_list_nesting_param_fails_loud_all_directions
+    proofs: []
+    status: verified
+    note: >-
+      The #272 campaign (PRs #273–#285, 2026-06-15). Async-lift adapters
+      transcode cross-encoding strings for all 6 directions × {param, result}
+      × {flat, one-level-nested}, both callback and stackful; nested list<u8>
+      deep-copied verbatim; #281 closed (async nested-param pointers were
+      dangling into caller memory). Each increment passed an adversarial
+      Mythos delta-pass that caught 4 real silent-corruption bugs before
+      merge. Verification posture: the transcode loops are runtime-verified
+      under wasmtime via synthetic two-memory modules; the async-lift
+      trampoline integration is verified by the *_within_budget real-adapter
+      tests (full async-lift e2e is kiln-gated, out of scope per the repo's
+      existing async-lift fuse-only posture). Remaining gap: deeper list
+      nesting (list<list<string>>) — fail-loud-safe, tracked as #286 (a
+      recursive-copy restructure, not a bounded increment).
+
 # wit-bindgen fixture coverage (14 fixtures × 3 levels = 42 integration tests)
 wit-bindgen-fixtures:
   passing-all-3-levels:

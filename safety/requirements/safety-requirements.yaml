@@ -1211,3 +1211,56 @@ artifacts:
         (proofs/STATUS.md); these harnesses target
         the parser-layer gap STATUS.md marks as placeholder.
       milestone: v0.30.0
+
+  - id: SR-41
+    type: requirement
+    title: Async cross-encoding string transcoding
+    description: >
+      Async-lift FACT adapters shall transcode string params and results
+      that cross a string-encoding boundary, rather than raw-copying them
+      under the wrong encoding. Coverage: all six ordered encoding-pair
+      directions over utf8 / utf16 / latin1+utf16 (CompactUTF16, the
+      UTF16_TAG = 1<<31 tagged-length form), at the top level and one level
+      of list / record / tuple nesting, in both the callback and stackful
+      async variants. A nested `list<u8>` shall be deep-copied verbatim,
+      never transcoded (string-vs-byte-list disambiguation via the WIT type).
+      Any not-yet-supported shape — deeper-than-one-level list nesting
+      (`list<list<string>>`, #286) — shall fail loud (the LS-F-27 guard),
+      never silently mis-transcode. Extends SR-17 (sync transcoding) to the
+      async-lift adapter path.
+    status: verified
+    tags: [roadmap, async, transcoding]
+    links:
+      - type: derives-from
+        target: SR-17
+      - type: tracked-by
+        target: "#272"
+      - type: mitigates
+        target: LS-F-27
+    fields:
+      implementation:
+        - meld-core/src/adapter/fact.rs
+      verification-method: test
+      verification-description: >
+        Runtime-differential oracles in tests/async_cross_encoding.rs
+        (inc1..inc5c-b) drive the production transcode emitters
+        (emit_<dir>_transcode_param, wired into emit_param_copy_step /
+        emit_ptr_pair_result_writeback / emit_param_nested_indirections /
+        emit_patch_nested_indirections) under wasmtime via synthetic
+        two-memory modules, asserting correct transcoded bytes + (for the
+        latin1+utf16 directions) the tagged length, for both latin1-fitting
+        and utf16-requiring strings, including the nested cases and the
+        nested-list<u8>-not-transcoded guarantee. The async-lift trampoline
+        INTEGRATION (the real callback/stackful adapter) is verified by the
+        inc*_{callback,stackful}_*_within_budget tests, which generate the
+        REAL adapter and assert local-index addressability — the
+        compensating control for the full async-lift e2e, which is gated on
+        the kiln runtime (out of scope for this repo's tests, per the
+        existing async-lift fuse-only/structural posture). Each increment
+        passed an adversarial Mythos delta-pass; the passes caught four real
+        silent-corruption bugs before merge (callback budget overflow; the
+        nested list<u8> corruption blocker; the param_wit_types
+        per-pointer-pair index misalignment; the same-encoding UTF-16 nested
+        deep-copy under-copy). #281 (async nested-param pointers dangling
+        into caller memory) was closed in the same work.
+      milestone: post-v0.31.0

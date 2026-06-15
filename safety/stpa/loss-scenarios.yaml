@@ -1286,9 +1286,14 @@ loss-scenarios:
       The async adapter emission path assumes both components share a string
       encoding (true for same-encoding fusions) and has no branch for the
       cross-encoding case — neither a transcoding emitter nor a loud rejection.
-      Full async transcoding is a larger tracked capability (#272); until it
-      lands the only safe behaviour is to fail loud rather than emit a
-      silently-corrupting raw copy.
+      RESOLVED (#272 campaign, SR-41): async cross-encoding transcoding is now
+      implemented for all 6 directions × {param, result} × {flat, one-level
+      list/record/tuple nesting}. This guard remains as the RESIDUAL fallback:
+      it now fails loud ONLY for shapes still unsupported — currently deeper
+      list nesting (`list<list<string>>`, #286, a recursive-copy restructure) —
+      so any not-yet-transcodable cross-encoding string still fails loud rather
+      than silently raw-copying. The original blanket fail-loud (the safe
+      interim before #272) has been narrowed to exactly the unimplemented set.
     status: approved
     priority: high
     fix: >
@@ -1312,9 +1317,12 @@ loss-scenarios:
       `ls_f_27_cross_encoding_async_no_string_ok`,
       `ls_f_27_cross_encoding_async_same_memory_ok`, and
       `ls_f_27_generate_dispatch_rejects_cross_encoding_async_string` (drives
-      the real `generate` dispatch). Full async cross-encoding TRANSCODING
-      (versus this fail-loud guard) remains the tracked #272 capability
-      follow-up.
+      the real `generate` dispatch). Full async cross-encoding TRANSCODING is
+      now IMPLEMENTED (#272 / SR-41) — the guard's allow-set was narrowed in
+      lockstep across inc 1–5c-b so it permits every transcodable shape and
+      fails loud only on the residual deeper-nesting edge (#286). The guard's
+      allow-set ≡ the emitter's transcode-set at every increment (verified by
+      the inc*/ls_f_27 gate tests), so there is no allow-but-raw-copy gap.
 
   - id: LS-P-17
     title: Caller-encoding match filters on Func only, miscalibrates mixed-encoding callers
