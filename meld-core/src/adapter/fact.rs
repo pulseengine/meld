@@ -4251,6 +4251,23 @@ fn emit_param_nested_indirections(
         || inner_transcode_utf8_to_latin1
         || inner_transcode_utf16_to_latin1;
 
+    // #272 inc 5c-b (completeness gap, #281): when an inner STRING is NOT
+    // transcoded (a SAME-ENCODING direction, where caller_enc == callee_enc) it
+    // falls through to the verbatim deep-copy below. The stored inner `len` is a
+    // CODE-UNIT (or, for CompactUtf16, a tagged) count — NOT a byte count — so
+    // the deep-copy's byte count MUST account for the encoding width, exactly as
+    // the RESULT-side `emit_patch_nested_indirections` does via
+    // `emit_copy_byte_count(.., callee_compact_utf16)`. Without this a
+    // same-encoding UTF-16 inner string copies `len*1` bytes (half the buffer,
+    // bleeding adjacent data) and a CompactUtf16 inner string's tagged `len`
+    // inflates the bounds guard so the re-point is skipped (dangling pointer).
+    // For the deep-copy path caller_enc == callee_enc; derive the width from
+    // either side. A nested `list<u8>`/`list<uN>` (`is_string == false`) keeps
+    // `sub_elem_size` and is unaffected.
+    let same_encoding_inner_utf16 =
+        matches!(caller_encoding, Some(Enc::Utf16)) && matches!(callee_encoding, Some(Enc::Utf16));
+    let same_encoding_inner_compact_utf16 = caller_is_latin1 && callee_is_latin1;
+
     // Locals for the per-element walk (all live across the loop body):
     //   l_i       = element index counter
     //   l_rec     = callee-side pointer to the current record (read + write)
@@ -4492,9 +4509,35 @@ fn emit_param_nested_indirections(
         // lives in callee memory, no longer dangling into caller memory. Keep
         // the original len.
         //
-        // LS-P-14: trap if `len * sub_elem_size` would wrap mod 2^32.
-        emit_overflow_guard(body, l_buf_len, *sub_elem_size);
-        if *sub_elem_size != 1 {
+        // #272 inc 5c-b (#281 completeness): the inner `len` header is NOT
+        // necessarily a byte count. For a SAME-ENCODING inner STRING it is a
+        // CODE-UNIT count (UTF-16 → *2 bytes) or a tagged count (CompactUtf16 →
+        // tag-aware mask/double). Mirror the RESULT-side
+        // `emit_patch_nested_indirections` deep-copy byte-count + align exactly:
+        //   * CompactUtf16 same-encoding string → `emit_copy_byte_count(.., true)`
+        //     (also un-inflates the bounds guard the raw tagged len would trip),
+        //     realloc align 2.
+        //   * Utf16 same-encoding string → `len * 2`, realloc align 2.
+        //   * Utf8 same-encoding string → `len * 1` (unchanged).
+        //   * a nested `list<u8>`/`list<uN>` (`is_string == false`) →
+        //     `len * sub_elem_size` (unchanged verbatim deep-copy).
+        let inner_compact_utf16 = *is_string && same_encoding_inner_compact_utf16;
+        let inner_utf16 = *is_string && same_encoding_inner_utf16;
+        // LS-P-14: trap if the byte count would wrap mod 2^32. For a UTF-16
+        // string the multiplier is 2; for the tag-aware CompactUtf16 path the
+        // mask/double cannot exceed the original `len` so the *1 guard suffices.
+        let overflow_mult = if inner_utf16 { 2 } else { *sub_elem_size };
+        emit_overflow_guard(body, l_buf_len, overflow_mult);
+        if inner_compact_utf16 {
+            // bytes = (len & TAG) ? (len & !TAG)*2 : len.
+            emit_copy_byte_count(body, l_buf_len, 1, true);
+            body.instruction(&Instruction::LocalSet(l_buf_len));
+        } else if inner_utf16 {
+            body.instruction(&Instruction::LocalGet(l_buf_len));
+            body.instruction(&Instruction::I32Const(2));
+            body.instruction(&Instruction::I32Mul);
+            body.instruction(&Instruction::LocalSet(l_buf_len));
+        } else if *sub_elem_size != 1 {
             body.instruction(&Instruction::LocalGet(l_buf_len));
             body.instruction(&Instruction::I32Const(*sub_elem_size as i32));
             body.instruction(&Instruction::I32Mul);
@@ -4513,10 +4556,18 @@ fn emit_param_nested_indirections(
         body.instruction(&Instruction::I32GtU);
         body.instruction(&Instruction::BrIf(0));
 
-        // new_ptr = realloc(0, 0, 1, buf_len) in CALLEE memory.
+        // new_ptr = realloc(0, 0, align, buf_len) in CALLEE memory. align 2 for a
+        // UTF-16 / CompactUtf16 inner string (the buffer may hold a UTF-16
+        // payload), else 1 — matching the result-side deep-copy align choice.
         body.instruction(&Instruction::I32Const(0));
         body.instruction(&Instruction::I32Const(0));
-        body.instruction(&Instruction::I32Const(1));
+        body.instruction(&Instruction::I32Const(
+            if inner_compact_utf16 || inner_utf16 {
+                2
+            } else {
+                1
+            },
+        ));
         body.instruction(&Instruction::LocalGet(l_buf_len));
         emit_checked_realloc(body, realloc_func, l_new_ptr);
 

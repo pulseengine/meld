@@ -1341,3 +1341,209 @@ fn inc5c_b_async_nested_list_u8_param_deep_copied_not_transcoded() {
          493), NEVER transcoded — the is_string==false gate holds in every direction"
     );
 }
+
+// ----------------------------------------------------------------------------
+// #272 inc 5c-b — SAME-ENCODING nested `list<string>` PARAM deep-copy (the #281
+// completeness gap). A same-encoding direction (caller_enc == callee_enc) is
+// NOT transcoded; it falls through to the verbatim deep-copy. The inner `len`
+// header is a CODE-UNIT count (UTF-16) or a tagged count (CompactUtf16), NOT a
+// byte count, so the deep-copy byte count MUST account for the encoding width —
+// mirroring the result-side `emit_patch_nested_indirections`. Pre-fix these
+// fail: a UTF-16 same-encoding inner copies `len*1` bytes (half the buffer,
+// bleeding adjacent data) and a CompactUtf16 tag-set inner inflates the bounds
+// guard so the re-point is skipped (dangling pointer).
+// ----------------------------------------------------------------------------
+
+/// Like `nested_param_patch_readback` but for the SAME-ENCODING deep-copy path:
+/// the inner header `len` is PRESERVED verbatim (the deep-copy keeps the
+/// original len), so the host supplies the read-back width and the explicit
+/// caller-side source ptr. Returns each patched `(ptr, len_raw, bytes)` so a
+/// test can assert BOTH the re-point happened (ptr moved out of caller memory)
+/// and the full code units landed in callee memory.
+fn nested_param_deepcopy_readback(
+    caller_enc: CanonStringEncoding,
+    callee_enc: CanonStringEncoding,
+    unit_width: usize,
+    inner_a: (&[u8], i32),
+    inner_b: (&[u8], i32),
+) -> Vec<(i32, i32, Vec<u8>)> {
+    let wasm =
+        meld_core::adapter::build_nested_list_string_param_test_module(caller_enc, callee_enc);
+
+    let mut validator = wasmparser::Validator::new();
+    validator
+        .validate_all(&wasm)
+        .expect("#272 inc5c-b same-encoding oracle module should validate");
+
+    let mut config = Config::new();
+    config.wasm_multi_memory(true);
+    let engine = Engine::new(&config).unwrap();
+    let module = RuntimeModule::new(&engine, &wasm).unwrap();
+    let mut store = Store::new(&engine, ());
+    let instance = Instance::new(&mut store, &module, &[]).unwrap();
+
+    let caller_mem = instance
+        .get_memory(&mut store, "caller_memory")
+        .expect("oracle module exports caller_memory");
+    let callee_mem = instance
+        .get_memory(&mut store, "callee_memory")
+        .expect("oracle module exports callee_memory");
+
+    // Inner SOURCE buffers live ONLY in CALLER memory 0 (the param source).
+    caller_mem
+        .write(&mut store, P_INNER_A_OFF as usize, inner_a.0)
+        .expect("write inner buffer 0 into caller memory");
+    caller_mem
+        .write(&mut store, P_INNER_B_OFF as usize, inner_b.0)
+        .expect("write inner buffer 1 into caller memory");
+
+    // SHALLOW outer record array in CALLEE memory 1 (post-bulk-copy state, #281):
+    // inner ptr → CALLER memory, with the (possibly tagged) SOURCE length.
+    let mut outer = Vec::new();
+    outer.extend_from_slice(&P_INNER_A_OFF.to_le_bytes());
+    outer.extend_from_slice(&inner_a.1.to_le_bytes());
+    outer.extend_from_slice(&P_INNER_B_OFF.to_le_bytes());
+    outer.extend_from_slice(&inner_b.1.to_le_bytes());
+    callee_mem
+        .write(&mut store, P_OUTER_OFF as usize, &outer)
+        .expect("write shallow outer records into callee memory");
+
+    let f = instance
+        .get_typed_func::<(i32, i32), ()>(&mut store, "patch")
+        .expect("oracle module exports patch");
+    f.call(&mut store, (P_OUTER_OFF, 2)).expect("patch runs");
+
+    let mut out = Vec::new();
+    for i in 0..2i32 {
+        let rec = (P_OUTER_OFF + i * 8) as usize;
+        let mut hdr = [0u8; 8];
+        callee_mem
+            .read(&mut store, rec, &mut hdr)
+            .expect("read hdr");
+        let ptr = i32::from_le_bytes(hdr[0..4].try_into().unwrap());
+        let len_raw = i32::from_le_bytes(hdr[4..8].try_into().unwrap());
+        let units = (len_raw & !UTF16_TAG) as usize;
+        let mut bytes = vec![0u8; units * unit_width];
+        callee_mem
+            .read(&mut store, ptr as usize, &mut bytes)
+            .expect("read inner buffer");
+        out.push((ptr, len_raw, bytes));
+    }
+    out
+}
+
+/// #272 inc 5c-b (SAME-ENCODING Utf16 → Utf16, #281 completeness): a nested
+/// `list<string>` PARAM over `["é","Hi"]` in UTF-16. "é" = U+00E9 → 1 code unit
+/// [0xE9,0x00]; "Hi" = 2 code units [0x48,0x00,0x69,0x00]. Same-encoding ⇒ NOT
+/// transcoded ⇒ verbatim deep-copy. Each re-pointed callee buffer MUST hold the
+/// FULL code units (é = [0xE9,0x00], i.e. `len*2` bytes). Pre-fix the deep-copy
+/// copies `len*1` bytes — é lands as [0xE9, 0x48] (the trailing 0x00 dropped, the
+/// 0x48 bled in from the adjacent "Hi" buffer) — so this FAILS; post-fix the
+/// UTF-16 width (`len*2`, align 2) copies the whole buffer and it PASSES.
+#[test]
+fn inc5c_b_same_encoding_utf16_nested_param_deep_copies_full_codeunits() {
+    let recs = nested_param_deepcopy_readback(
+        CanonStringEncoding::Utf16,
+        CanonStringEncoding::Utf16,
+        2,                              // UTF-16: 2 bytes per code unit
+        (&[0xE9, 0x00], 1),             // "é" — 1 code unit
+        (&[0x48, 0x00, 0x69, 0x00], 2), // "Hi" — 2 code units
+    );
+    // re-pointed out of CALLER memory into the CALLEE realloc arena (>= 1024).
+    assert!(
+        recs[0].0 >= 1024 && recs[1].0 >= 1024,
+        "same-encoding UTF-16 inner buffers must be re-pointed into callee memory"
+    );
+    assert_eq!(recs[0].1, 1, "\"é\" inner len preserved (1 code unit)");
+    assert_eq!(
+        recs[0].2,
+        vec![0xE9, 0x00],
+        "#272 inc5c-b: same-encoding UTF-16 deep-copy must hold the FULL code \
+         units (é = [0xE9,0x00], not [0xE9,0x48]) — len*2, not len*1"
+    );
+    assert_eq!(recs[1].1, 2, "\"Hi\" inner len preserved (2 code units)");
+    assert_eq!(recs[1].2, vec![0x48, 0x00, 0x69, 0x00]);
+}
+
+/// #272 inc 5c-b (SAME-ENCODING CompactUtf16, tag-SET inner, #281 completeness):
+/// a nested `list<string>` PARAM where record 1 is a TAG-SET inner — "中" =
+/// U+4E2D stored as UTF-16 [0x2D,0x4E], len = 1 | UTF16_TAG. Same-encoding ⇒ NOT
+/// transcoded ⇒ verbatim deep-copy. Pre-fix the raw tagged `len` (a huge value)
+/// inflates the in-bounds guard so the re-point is SKIPPED — the callee record
+/// keeps the stale CALLER ptr (dangling). Post-fix the tag-aware byte count
+/// (`(len & !TAG)*2 = 2` bytes, align 2) un-inflates the guard, the buffer is
+/// re-pointed into callee memory, and the 2 UTF-16 bytes land correctly.
+#[test]
+fn inc5c_b_same_encoding_compact_utf16_nested_param_tagset_deep_copies() {
+    let recs = nested_param_deepcopy_readback(
+        CanonStringEncoding::CompactUtf16,
+        CanonStringEncoding::CompactUtf16,
+        2,                              // tag-set record reads 2 bytes per (UTF-16) code unit
+        (&[0x2D, 0x4E], 1 | UTF16_TAG), // tag-SET UTF-16 "中"
+        (&[0x2D, 0x4E], 1 | UTF16_TAG),
+    );
+    // The re-point MUST happen — the buffer moves into the callee realloc arena
+    // (>= 1024), NOT left at the stale caller ptr P_INNER_*_OFF (100 / 140).
+    assert!(
+        recs[0].0 >= 1024,
+        "#272 inc5c-b: tag-set CompactUtf16 inner must be re-pointed (not skipped \
+         by the inflated tagged-len guard) — ptr {} should be in the callee arena",
+        recs[0].0
+    );
+    assert!(recs[1].0 >= 1024, "second tag-set inner must also re-point");
+    assert_eq!(
+        recs[0].1,
+        1 | UTF16_TAG,
+        "tagged inner len preserved verbatim"
+    );
+    assert_eq!(
+        recs[0].2,
+        vec![0x2D, 0x4E],
+        "#272 inc5c-b: tag-set CompactUtf16 deep-copy must hold the full UTF-16 \
+         code unit [0x2D,0x4E]"
+    );
+    assert_eq!(recs[1].2, vec![0x2D, 0x4E]);
+}
+
+/// #272 inc 5c-b (SAME-ENCODING Utf8 → Utf8, UNCHANGED correct behavior): a
+/// nested `list<string>` PARAM over `["é","Hi"]` in UTF-8. "é" = [0xC3,0xA9]
+/// (2 bytes, len 2); "Hi" = [0x48,0x69] (2 bytes, len 2). Same-encoding UTF-8 ⇒
+/// deep-copy with byte count `len*1` — the path the fix MUST leave untouched.
+#[test]
+fn inc5c_b_same_encoding_utf8_nested_param_deep_copies_verbatim() {
+    let recs = nested_param_deepcopy_readback(
+        CanonStringEncoding::Utf8,
+        CanonStringEncoding::Utf8,
+        1, // UTF-8: 1 byte per unit (len is a byte count)
+        (&[0xC3, 0xA9], 2),
+        (&[0x48, 0x69], 2),
+    );
+    assert!(
+        recs[0].0 >= 1024 && recs[1].0 >= 1024,
+        "same-encoding UTF-8 inner buffers must be re-pointed into callee memory"
+    );
+    assert_eq!(recs[0].1, 2, "\"é\" UTF-8 byte len preserved (2)");
+    assert_eq!(
+        recs[0].2,
+        vec![0xC3, 0xA9],
+        "#272 inc5c-b: same-encoding UTF-8 deep-copy is byte-for-byte (len*1) — \
+         UNCHANGED by the fix"
+    );
+    assert_eq!(recs[1].1, 2);
+    assert_eq!(recs[1].2, vec![0x48, 0x69]);
+}
+
+/// #272 inc 5c-b (nested `list<u8>` param, UNCHANGED verbatim deep-copy): the
+/// `is_string == false` path keeps `len * sub_elem_size` and must be untouched
+/// by the string-width fix. Inner buffers `[0xC3,0xA9]` (sum 365) and
+/// `[0x01,0x80]` (sum 129) → byte-sum 493, copied verbatim.
+#[test]
+fn inc5c_b_nested_list_u8_param_deep_copy_unchanged() {
+    let wasm = meld_core::adapter::build_nested_list_u8_param_deep_copied_test_module();
+    let sum = nested_param_patch_and_sum(&wasm, &[0xC3, 0xA9], &[0x01, 0x80]);
+    assert_eq!(
+        sum, 493,
+        "#272 inc5c-b: nested list<u8> param deep-copy (len*sub_elem_size) is \
+         UNCHANGED by the same-encoding string-width fix"
+    );
+}
