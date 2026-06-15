@@ -425,10 +425,20 @@ artifacts:
         [0x0041, 0xD83D, 0xDE00], proving the supplementary-plane
         surrogate-pair branch of emit_utf8_to_utf16_transcode encodes
         the high/low surrogates correctly and advances the destination
-        cursor by one then two units. Carried gap: the UTF-16 → UTF-8
-        reverse direction and lone-surrogate U+FFFD substitution are
-        covered structurally (LS-P-16) but not yet by a non-BMP runtime
-        round-trip.
+        cursor by one then two units. The UTF-16 → UTF-8 reverse
+        direction is covered by a non-BMP runtime round-trip
+        (test_sr17_utf16_to_utf8_supplementary_plane_transcoding —
+        U+1F600 surrogate pair D83D DE00 → UTF-8 F0 9F 98 80) and the
+        Canonical-ABI lossy lone-surrogate U+FFFD substitution by
+        test_sr17_utf16_to_utf8_lone_high_surrogate_replacement and
+        test_sr17_utf16_to_utf8_midstring_lone_surrogate_replacement
+        (lone high surrogate, terminal and mid-string, → U+FFFD
+        EF BF BD), with malformed-input coverage in
+        test_sr17_utf16_to_utf8_malformed_surrogate_matrix. The async
+        cross-encoding path reuses the same shared decode/encode helpers
+        and is independently exercised over the supplementary plane and
+        a lone surrogate by inc2_async_utf16_to_utf8_param_* in
+        tests/async_cross_encoding.rs (#272, post-v0.31.0-audit).
 
   - id: SR-18
     type: requirement
