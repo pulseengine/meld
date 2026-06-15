@@ -3091,6 +3091,309 @@ fn build_nested_list_result_test_module(
     module.finish()
 }
 
+/// Build a self-contained two-memory wasm module that exercises the EXACT
+/// async-path NESTED-PARAM inner copy emitter ([`emit_param_nested_indirections`])
+/// for a `list<string>` PARAM crossing memory in the caller=Utf8 → callee=Utf16
+/// direction, for the #272 inc-5c-a runtime-differential oracle.
+///
+/// This is the PARAM direction (caller PROVIDES, callee READS): SRC = caller
+/// memory 0 (where the caller wrote the UTF-8 inner strings), DST = callee
+/// memory 1 (where the callee reads UTF-16, and where the deep-copy/transcode
+/// arena lives). The host pre-writes the post-outer-bulk-copy state:
+/// * caller memory 0: the inner UTF-8 (or `list<u8>`) source buffers.
+/// * callee memory 1: the SHALLOW outer copy of the 8-byte `(inner_ptr,
+///   inner_len)` records — `inner_ptr` STILL points into CALLER memory 0 (the
+///   bulk copy was shallow; gap #281).
+///
+/// The exported `patch_and_sum(outer_callee, count) -> i32` runs the production
+/// [`emit_param_nested_indirections`] (caller=Utf8 → callee=Utf16), which for
+/// EACH record transcodes (string) or deep-copies (`list<u8>`) the inner buffer
+/// into a freshly `cabi_realloc`'d CALLEE-memory buffer, rewrites the
+/// callee-side inner `(ptr, len)` header, then SUMS the inner units of every
+/// inner buffer by re-reading the PATCHED `(ptr, len)` headers from CALLEE
+/// memory. For the string case a passing UTF-16 sum proves real transcode +
+/// header-len rewrite + re-point into callee memory; for the `list<u8>` case a
+/// matching byte-sum proves verbatim deep-copy + re-point (the #281 close), NOT
+/// a transcode.
+///
+/// `#[doc(hidden)] pub` purely so the `async_cross_encoding` runtime test can
+/// instantiate it; not a supported API.
+#[doc(hidden)]
+pub fn build_nested_list_string_utf8_to_utf16_param_test_module() -> Vec<u8> {
+    use crate::parser::ComponentValType;
+    // Element type of the outer `list<string>` is `string` (is_string == true) —
+    // transcoded UTF-8 → UTF-16; the summing reads u16 code units.
+    build_nested_list_param_test_module(ComponentValType::String, true)
+}
+
+/// Build the #272 inc-5c-a PARAM negative oracle: the SAME nested-param emitter,
+/// but for a `list<list<u8>>` PARAM in the caller=Utf8 → callee=Utf16 direction.
+/// A nested `list<u8>` (`is_string == false`) is arbitrary binary; it MUST be
+/// DEEP-COPIED VERBATIM into callee memory and re-pointed (closing #281), NEVER
+/// transcoded. The module sums the inner BYTES via the PATCHED header; a
+/// verbatim copy preserves both the bytes and the length.
+///
+/// `#[doc(hidden)] pub` purely so the `async_cross_encoding` runtime test can
+/// instantiate it; not a supported API.
+#[doc(hidden)]
+pub fn build_nested_list_u8_param_deep_copied_test_module() -> Vec<u8> {
+    use crate::parser::{ComponentValType, PrimitiveValType};
+    // Element type of the outer `list<list<u8>>` is `list<u8>` (is_string ==
+    // false) — deep-copied verbatim, NOT transcoded; the summing reads u8 bytes.
+    build_nested_list_param_test_module(
+        ComponentValType::List(Box::new(ComponentValType::Primitive(PrimitiveValType::U8))),
+        false,
+    )
+}
+
+/// Shared builder for the two inc-5c-a nested-PARAM oracle modules — the
+/// param-direction mirror of [`build_nested_list_result_test_module`].
+///
+/// `elem_ty` is the OUTER list's element type (`string` or `list<u8>`).
+/// `sum_as_u16` selects the summing read width: u16 code units (transcoded
+/// string case) vs u8 bytes (deep-copied `list<u8>` case). Both run the SAME
+/// production [`emit_param_nested_indirections`]; the string-ness gate inside it
+/// decides transcode-vs-deep-copy from `elem_ty`.
+fn build_nested_list_param_test_module(
+    elem_ty: crate::parser::ComponentValType,
+    sum_as_u16: bool,
+) -> Vec<u8> {
+    use wasm_encoder::{
+        BlockType, CodeSection, ConstExpr, ExportKind, ExportSection, FunctionSection,
+        GlobalSection, GlobalType, MemArg, MemorySection, MemoryType, Module, TypeSection, ValType,
+    };
+
+    let mut types = TypeSection::new();
+    // type 0: cabi_realloc (i32,i32,i32,i32) -> i32
+    types.ty().function(
+        [ValType::I32, ValType::I32, ValType::I32, ValType::I32],
+        [ValType::I32],
+    );
+    // type 1: patch_and_sum (i32 outer_callee, i32 count) -> i32
+    types
+        .ty()
+        .function([ValType::I32, ValType::I32], [ValType::I32]);
+
+    let mut functions = FunctionSection::new();
+    functions.function(0); // func 0: cabi_realloc (allocates in CALLEE memory 1)
+    functions.function(1); // func 1: patch_and_sum
+
+    // memory 0 = caller (UTF-8 inner strings SRC), memory 1 = callee (UTF-16 /
+    // deep-copy DST + realloc arena).
+    let mut memory = MemorySection::new();
+    for _ in 0..2 {
+        memory.memory(MemoryType {
+            minimum: 1,
+            maximum: None,
+            memory64: false,
+            shared: false,
+            page_size_log2: None,
+        });
+    }
+
+    // global 0: bump cursor for the CALLEE-memory-1 allocator (start high, above
+    // the host-written outer records, so realloc never overwrites them).
+    let mut globals = GlobalSection::new();
+    globals.global(
+        GlobalType {
+            val_type: ValType::I32,
+            mutable: true,
+            shared: false,
+        },
+        &ConstExpr::i32_const(1024),
+    );
+
+    let mut exports = ExportSection::new();
+    exports.export("patch_and_sum", ExportKind::Func, 1);
+    exports.export("caller_memory", ExportKind::Memory, 0);
+    exports.export("callee_memory", ExportKind::Memory, 1);
+
+    let mut code = CodeSection::new();
+
+    // func 0: cabi_realloc — bump allocator over global 0 in CALLEE memory 1.
+    // (The allocator only bumps a cursor; it writes nothing, so it is
+    // memory-agnostic — the actual writes go to memory 1 via the production
+    // emitter's MemArgs.)
+    {
+        let mut f = Function::new([(1, ValType::I32)]);
+        f.instruction(&Instruction::GlobalGet(0));
+        f.instruction(&Instruction::LocalGet(2));
+        f.instruction(&Instruction::I32Add);
+        f.instruction(&Instruction::I32Const(1));
+        f.instruction(&Instruction::I32Sub);
+        f.instruction(&Instruction::LocalGet(2));
+        f.instruction(&Instruction::I32Const(1));
+        f.instruction(&Instruction::I32Sub);
+        f.instruction(&Instruction::I32Const(-1));
+        f.instruction(&Instruction::I32Xor);
+        f.instruction(&Instruction::I32And);
+        f.instruction(&Instruction::LocalSet(4));
+        f.instruction(&Instruction::LocalGet(4));
+        f.instruction(&Instruction::LocalGet(3));
+        f.instruction(&Instruction::I32Add);
+        f.instruction(&Instruction::GlobalSet(0));
+        f.instruction(&Instruction::LocalGet(4));
+        f.instruction(&Instruction::End);
+        code.function(&f);
+    }
+
+    // func 1: patch_and_sum(outer_callee, count) -> i32
+    //
+    // Params: 0=outer_callee (the SHALLOW-copied outer record array, CALLEE
+    //         mem 1), 1=count (element count).
+    // Locals beyond params (declared block below):
+    //   2..=6  : the 5-local scratch `emit_param_nested_indirections` consumes
+    //            (l_first_scratch = 2 ⇒ nested walk 2..=6).
+    //   7..=11 : transcode_base = 7 ⇒ 7..=11 (5 scratch) — DISJOINT from the
+    //            nested-walk region exactly as the async adapters guarantee.
+    //   12 = sum, 13 = i, 14 = rec (callee record ptr), 15 = inner_ptr,
+    //   16 = inner_len, 17 = j.
+    {
+        // Inner (ptr, len) headers are read back from CALLEE memory 1 (the
+        // re-pointed records the emitter wrote).
+        let rec_mem = MemArg {
+            offset: 0,
+            align: 2,
+            memory_index: 1,
+        };
+        let rec_len_mem = MemArg {
+            offset: 4,
+            align: 2,
+            memory_index: 1,
+        };
+        // The summed inner buffer lives in callee memory 1 (transcoded UTF-16,
+        // or the deep-copied `list<u8>` bytes).
+        let inner_u16 = MemArg {
+            offset: 0,
+            align: 1,
+            memory_index: 1,
+        };
+        let inner_u8 = MemArg {
+            offset: 0,
+            align: 0,
+            memory_index: 1,
+        };
+
+        let l_first_scratch = 2u32;
+        let l_transcode_base = 7u32;
+        let l_sum = 12u32;
+        let l_i = 13u32;
+        let l_rec = 14u32;
+        let l_inner_ptr = 15u32;
+        let l_inner_len = 16u32;
+        let l_j = 17u32;
+
+        let mut f = Function::new([(16, ValType::I32)]);
+
+        // Run the production nested-param patcher: l_array_ptr = param 0 (callee
+        // outer list), l_len = param 1 (count), elem_size = 8 (one (ptr,len)
+        // record), caller_memory = 0, callee_memory = 1, UTF-8 → UTF-16.
+        emit_param_nested_indirections(
+            &mut f,
+            &elem_ty,
+            0, // l_array_ptr (callee outer list)
+            1, // l_len (count)
+            8, // elem_size (one (ptr, len) record)
+            l_first_scratch,
+            0, // realloc_func (allocates in callee memory 1)
+            0, // caller_memory
+            1, // callee_memory
+            Some(crate::parser::CanonStringEncoding::Utf8), // caller_encoding
+            Some(crate::parser::CanonStringEncoding::Utf16), // callee_encoding
+            l_transcode_base,
+        );
+
+        // sum = 0; i = 0
+        f.instruction(&Instruction::I32Const(0));
+        f.instruction(&Instruction::LocalSet(l_sum));
+        f.instruction(&Instruction::I32Const(0));
+        f.instruction(&Instruction::LocalSet(l_i));
+
+        // outer loop over records (in callee memory 1)
+        f.instruction(&Instruction::Block(BlockType::Empty));
+        f.instruction(&Instruction::Loop(BlockType::Empty));
+        f.instruction(&Instruction::LocalGet(l_i));
+        f.instruction(&Instruction::LocalGet(1));
+        f.instruction(&Instruction::I32GeU);
+        f.instruction(&Instruction::BrIf(1));
+
+        // rec = outer_callee + i * 8
+        f.instruction(&Instruction::LocalGet(0));
+        f.instruction(&Instruction::LocalGet(l_i));
+        f.instruction(&Instruction::I32Const(8));
+        f.instruction(&Instruction::I32Mul);
+        f.instruction(&Instruction::I32Add);
+        f.instruction(&Instruction::LocalSet(l_rec));
+
+        // inner_ptr = callee_mem1.load(rec + 0); inner_len = callee_mem1.load(rec + 4)
+        f.instruction(&Instruction::LocalGet(l_rec));
+        f.instruction(&Instruction::I32Load(rec_mem));
+        f.instruction(&Instruction::LocalSet(l_inner_ptr));
+        f.instruction(&Instruction::LocalGet(l_rec));
+        f.instruction(&Instruction::I32Load(rec_len_mem));
+        f.instruction(&Instruction::LocalSet(l_inner_len));
+
+        // inner loop: j in 0..inner_len, sum the inner units (u16 or u8)
+        f.instruction(&Instruction::I32Const(0));
+        f.instruction(&Instruction::LocalSet(l_j));
+        f.instruction(&Instruction::Block(BlockType::Empty));
+        f.instruction(&Instruction::Loop(BlockType::Empty));
+        f.instruction(&Instruction::LocalGet(l_j));
+        f.instruction(&Instruction::LocalGet(l_inner_len));
+        f.instruction(&Instruction::I32GeU);
+        f.instruction(&Instruction::BrIf(1));
+
+        // addr = inner_ptr + j*(2 if u16 else 1)
+        f.instruction(&Instruction::LocalGet(l_inner_ptr));
+        f.instruction(&Instruction::LocalGet(l_j));
+        if sum_as_u16 {
+            f.instruction(&Instruction::I32Const(1));
+            f.instruction(&Instruction::I32Shl);
+        }
+        f.instruction(&Instruction::I32Add);
+        if sum_as_u16 {
+            f.instruction(&Instruction::I32Load16U(inner_u16));
+        } else {
+            f.instruction(&Instruction::I32Load8U(inner_u8));
+        }
+        f.instruction(&Instruction::LocalGet(l_sum));
+        f.instruction(&Instruction::I32Add);
+        f.instruction(&Instruction::LocalSet(l_sum));
+
+        // j += 1
+        f.instruction(&Instruction::LocalGet(l_j));
+        f.instruction(&Instruction::I32Const(1));
+        f.instruction(&Instruction::I32Add);
+        f.instruction(&Instruction::LocalSet(l_j));
+        f.instruction(&Instruction::Br(0));
+        f.instruction(&Instruction::End); // inner loop
+        f.instruction(&Instruction::End); // inner block
+
+        // i += 1
+        f.instruction(&Instruction::LocalGet(l_i));
+        f.instruction(&Instruction::I32Const(1));
+        f.instruction(&Instruction::I32Add);
+        f.instruction(&Instruction::LocalSet(l_i));
+        f.instruction(&Instruction::Br(0));
+        f.instruction(&Instruction::End); // outer loop
+        f.instruction(&Instruction::End); // outer block
+
+        f.instruction(&Instruction::LocalGet(l_sum));
+        f.instruction(&Instruction::End);
+        code.function(&f);
+    }
+
+    let mut module = Module::new();
+    module
+        .section(&types)
+        .section(&functions)
+        .section(&memory)
+        .section(&globals)
+        .section(&exports)
+        .section(&code);
+    module.finish()
+}
+
 /// Emit a chain of `(disc == value)` checks for a [`ConditionalPointerPair`]'s
 /// guards on the **flat-local** path — every guard in `cond.outer_guards`
 /// followed by the pair's innermost discriminant. All checks are ANDed; the
@@ -3697,6 +4000,238 @@ fn emit_patch_nested_indirections(
         body.instruction(&Instruction::LocalGet(l_rec_dst));
         body.instruction(&Instruction::LocalGet(l_new_ptr));
         body.instruction(&Instruction::I32Store(dst_mem_arg_ptr));
+
+        body.instruction(&Instruction::End);
+    }
+
+    // i++
+    body.instruction(&Instruction::LocalGet(l_i));
+    body.instruction(&Instruction::I32Const(1));
+    body.instruction(&Instruction::I32Add);
+    body.instruction(&Instruction::LocalSet(l_i));
+    body.instruction(&Instruction::Br(0));
+
+    body.instruction(&Instruction::End); // end loop
+    body.instruction(&Instruction::End); // end block
+}
+
+/// #272 inc 5c-a: the PARAM-side mirror of [`emit_patch_nested_indirections`].
+///
+/// After the OUTER bulk `memory.copy` of a pointer-bearing aggregate PARAM
+/// (e.g. `list<string>`) into callee memory at `l_array_ptr`, the inner string
+/// `(ptr, len)` headers in that copied array still point into CALLER memory (the
+/// bulk copy is SHALLOW — gap #281). This walks each element's inner
+/// indirections and, for each:
+///
+/// * `is_string` AND caller=Utf8 → callee=Utf16: REALLOC in callee memory +
+///   TRANSCODE the inner buffer UTF-8 → UTF-16 (SRC = CALLER mem where the inner
+///   ptr points, DST = CALLEE mem) via [`emit_utf8_to_utf16_transcode_param`],
+///   then store the new callee ptr + transcoded code-unit count into the inner
+///   header (in callee memory).
+/// * otherwise (a `list<u8>` `is_string == false`, OR a same-encoding string):
+///   DEEP-COPY the inner buffer VERBATIM (realloc callee + `memory.copy`
+///   caller → callee) and store the new callee ptr, keeping the original len.
+///   This CLOSES #281 for this shape — the inner buffer now lives in callee
+///   memory, re-pointed, instead of dangling into caller memory.
+///
+/// CRITICAL — DIRECTION: params are caller → callee, so SRC = CALLER memory,
+/// DST = CALLEE memory — the OPPOSITE of the result side. The record array is in
+/// CALLEE memory (the copied array), so BOTH the inner-header read and write are
+/// in callee memory (one record pointer, not two).
+///
+/// Scope (inc 5c-a): only the `is_string` + Utf8→Utf16 transcode and the
+/// verbatim deep-copy (list<u8> / same-encoding) directions are wired. Other
+/// transcode directions for a nested PARAM are out of scope and the guard keeps
+/// them fail-loud, so they never reach here. A nested `list<u8>` and a
+/// same-encoding string are always deep-copied (never transcoded) so arbitrary
+/// binary is never corrupted.
+///
+/// Locals: `l_first_scratch ..= l_first_scratch + 4` (5: i, rec, old_ptr,
+/// buf_len, new_ptr) for the per-element walk, plus the disjoint
+/// `l_transcode_base ..= l_transcode_base + 4` block (5) for the inner transcode
+/// loop. The two regions are SIMULTANEOUSLY LIVE (the transcode runs INSIDE the
+/// per-element loop), so the caller MUST keep them disjoint.
+#[allow(clippy::too_many_arguments)]
+fn emit_param_nested_indirections(
+    body: &mut Function,
+    elem_ty: &crate::parser::ComponentValType,
+    l_array_ptr: u32,
+    l_len: u32,
+    elem_size: u32,
+    l_first_scratch: u32,
+    realloc_func: u32,
+    caller_memory: u32,
+    callee_memory: u32,
+    caller_encoding: Option<crate::parser::CanonStringEncoding>,
+    callee_encoding: Option<crate::parser::CanonStringEncoding>,
+    l_transcode_base: u32,
+) {
+    let indirections = collect_indirections(elem_ty, 0);
+    if indirections.is_empty() {
+        return;
+    }
+
+    use crate::parser::CanonStringEncoding as Enc;
+    // inc 5c-a wires ONLY the Utf8→Utf16 inner transcode for the param
+    // direction (caller → callee). Every other inner case (list<u8>, or a
+    // same-encoding string) is DEEP-COPIED verbatim below.
+    let inner_transcode_utf8_to_utf16 =
+        matches!(caller_encoding, Some(Enc::Utf8)) && matches!(callee_encoding, Some(Enc::Utf16));
+
+    // Locals for the per-element walk (all live across the loop body):
+    //   l_i       = element index counter
+    //   l_rec     = callee-side pointer to the current record (read + write)
+    //   l_old_ptr = inner ptr read from the copied record (points into CALLER)
+    //   l_buf_len = inner byte length read from the copied record
+    //   l_new_ptr = freshly allocated CALLEE buffer
+    let l_i = l_first_scratch;
+    let l_rec = l_first_scratch + 1;
+    let l_old_ptr = l_first_scratch + 2;
+    let l_buf_len = l_first_scratch + 3;
+    let l_new_ptr = l_first_scratch + 4;
+
+    // i = 0
+    body.instruction(&Instruction::I32Const(0));
+    body.instruction(&Instruction::LocalSet(l_i));
+
+    body.instruction(&Instruction::Block(wasm_encoder::BlockType::Empty));
+    body.instruction(&Instruction::Loop(wasm_encoder::BlockType::Empty));
+
+    // if i >= len break
+    body.instruction(&Instruction::LocalGet(l_i));
+    body.instruction(&Instruction::LocalGet(l_len));
+    body.instruction(&Instruction::I32GeU);
+    body.instruction(&Instruction::BrIf(1));
+
+    // rec = l_array_ptr + i * elem_size (in CALLEE memory — the copied array)
+    body.instruction(&Instruction::LocalGet(l_array_ptr));
+    body.instruction(&Instruction::LocalGet(l_i));
+    if elem_size != 1 {
+        body.instruction(&Instruction::I32Const(elem_size as i32));
+        body.instruction(&Instruction::I32Mul);
+    }
+    body.instruction(&Instruction::I32Add);
+    body.instruction(&Instruction::LocalSet(l_rec));
+
+    for (offset, sub_elem_size, is_string) in &indirections {
+        // Both the inner-header read and write are in CALLEE memory (the
+        // record array was bulk-copied there); the inner BUFFER itself is read
+        // from CALLER memory (the shallow ptr) and written to CALLEE memory.
+        let rec_mem_arg_ptr = wasm_encoder::MemArg {
+            offset: *offset as u64,
+            align: 2,
+            memory_index: callee_memory,
+        };
+        let rec_mem_arg_len = wasm_encoder::MemArg {
+            offset: (*offset + 4) as u64,
+            align: 2,
+            memory_index: callee_memory,
+        };
+
+        // Read the (ptr, len) the SHALLOW outer copy left in the callee record;
+        // the ptr still points into CALLER memory.
+        body.instruction(&Instruction::LocalGet(l_rec));
+        body.instruction(&Instruction::I32Load(rec_mem_arg_ptr));
+        body.instruction(&Instruction::LocalSet(l_old_ptr));
+        body.instruction(&Instruction::LocalGet(l_rec));
+        body.instruction(&Instruction::I32Load(rec_mem_arg_len));
+        body.instruction(&Instruction::LocalSet(l_buf_len));
+
+        let transcode_inner = *is_string && inner_transcode_utf8_to_utf16;
+
+        if transcode_inner {
+            // PARAM direction (caller PROVIDES, callee READS): SRC = CALLER
+            // memory (where the caller wrote the inner string), DST = CALLEE
+            // memory. `l_old_ptr`/`l_buf_len` are the in/out (ptr, len) the loop
+            // rewrites: `l_old_ptr` → callee out-ptr, `l_buf_len` → the output
+            // UTF-16 code-unit count. `l_new_ptr` is the out-ptr sink; the loop
+            // scratch is `l_transcode_base ..= l_transcode_base + 4` (5).
+            let src_mem8 = wasm_encoder::MemArg {
+                offset: 0,
+                align: 0,
+                memory_index: caller_memory,
+            };
+            let dst_mem16 = wasm_encoder::MemArg {
+                offset: 0,
+                align: 1,
+                memory_index: callee_memory,
+            };
+            emit_utf8_to_utf16_transcode_param(
+                body,
+                realloc_func,
+                src_mem8,
+                dst_mem16,
+                l_old_ptr,
+                l_buf_len,
+                l_new_ptr,
+                l_transcode_base,
+                l_transcode_base + 1,
+                l_transcode_base + 2,
+                l_transcode_base + 3,
+                l_transcode_base + 4,
+            );
+
+            // Store the transcoded out-ptr AND the NEW code-unit count into the
+            // callee-memory inner (ptr, len) header. The len store overwrites the
+            // STALE caller byte length the outer bulk copy left.
+            body.instruction(&Instruction::LocalGet(l_rec));
+            body.instruction(&Instruction::LocalGet(l_old_ptr));
+            body.instruction(&Instruction::I32Store(rec_mem_arg_ptr));
+            body.instruction(&Instruction::LocalGet(l_rec));
+            body.instruction(&Instruction::LocalGet(l_buf_len));
+            body.instruction(&Instruction::I32Store(rec_mem_arg_len));
+
+            continue;
+        }
+
+        // DEEP-COPY verbatim (a `list<u8>` is_string == false, OR a
+        // same-encoding string): realloc a CALLEE buffer + memory.copy
+        // caller → callee, re-point. This CLOSES #281 — the inner buffer now
+        // lives in callee memory, no longer dangling into caller memory. Keep
+        // the original len.
+        //
+        // LS-P-14: trap if `len * sub_elem_size` would wrap mod 2^32.
+        emit_overflow_guard(body, l_buf_len, *sub_elem_size);
+        if *sub_elem_size != 1 {
+            body.instruction(&Instruction::LocalGet(l_buf_len));
+            body.instruction(&Instruction::I32Const(*sub_elem_size as i32));
+            body.instruction(&Instruction::I32Mul);
+            body.instruction(&Instruction::LocalSet(l_buf_len));
+        }
+
+        // Skip patch if (old_ptr, buf_len) doesn't fit in CALLER mem (the source
+        // here) — guards garbage values triggering an unrecoverable trap.
+        body.instruction(&Instruction::Block(wasm_encoder::BlockType::Empty));
+        body.instruction(&Instruction::LocalGet(l_old_ptr));
+        body.instruction(&Instruction::LocalGet(l_buf_len));
+        body.instruction(&Instruction::I32Add);
+        body.instruction(&Instruction::MemorySize(caller_memory));
+        body.instruction(&Instruction::I32Const(16));
+        body.instruction(&Instruction::I32Shl);
+        body.instruction(&Instruction::I32GtU);
+        body.instruction(&Instruction::BrIf(0));
+
+        // new_ptr = realloc(0, 0, 1, buf_len) in CALLEE memory.
+        body.instruction(&Instruction::I32Const(0));
+        body.instruction(&Instruction::I32Const(0));
+        body.instruction(&Instruction::I32Const(1));
+        body.instruction(&Instruction::LocalGet(l_buf_len));
+        emit_checked_realloc(body, realloc_func, l_new_ptr);
+
+        // memory.copy new_ptr <- old_ptr (caller → callee)
+        body.instruction(&Instruction::LocalGet(l_new_ptr));
+        body.instruction(&Instruction::LocalGet(l_old_ptr));
+        body.instruction(&Instruction::LocalGet(l_buf_len));
+        body.instruction(&Instruction::MemoryCopy {
+            dst_mem: callee_memory,
+            src_mem: caller_memory,
+        });
+
+        // callee_mem.store(rec + offset, new_ptr). Len header left as the
+        // bulk-copied original (verbatim deep-copy preserves the length).
+        body.instruction(&Instruction::LocalGet(l_rec));
+        body.instruction(&Instruction::LocalGet(l_new_ptr));
+        body.instruction(&Instruction::I32Store(rec_mem_arg_ptr));
 
         body.instruction(&Instruction::End);
     }
@@ -8528,6 +9063,20 @@ impl FactStyleGenerator {
         // the REAL adapter (a dest-latin1, i.e. 6-scratch, nested result) by
         // `inc5b_callback_adapter_nested_result_dest_latin1_locals_within_budget`
         // (and the utf8→utf16 5-scratch case by the inc-5a test).
+        //
+        // #272 inc 5c-a (NESTED `list<string>` PARAM nested-copy — SIMULTANEOUS
+        // LIVENESS, param side): the new `emit_param_nested_indirections` walk
+        // runs in STEP 0.5 (the param copy, BEFORE the call), so its locals do
+        // NOT collide with the result-side writeback/transcode region (step 3),
+        // which is not yet live. Its per-element walk uses `scratch_local + 1 ..=
+        // scratch_local + 5` = `l_p2 + 5 ..= l_p2 + 9` (offsets 10..=14) and the
+        // inner utf8→utf16 transcode uses `transcode_base ..= transcode_base + 4`
+        // = `l_p2 + 16 ..= l_p2 + 20` (offsets 21..=25) — the SAME 5-scratch block
+        // the inc-5a result transcode reserves. The two are SIMULTANEOUSLY LIVE
+        // (transcode runs INSIDE the per-element loop) and DISJOINT (offsets
+        // 10..=14 vs 21..=25, gap at 15..=20). Top index = offset 25 < 27 — the
+        // existing budget fits with NO growth. Proven under the REAL adapter by
+        // `inc5c_a_callback_adapter_nested_param_locals_within_budget`.
         let mut body = Function::new([(27, wasm_encoder::ValType::I32)]);
 
         // Step 0.5: copy string/list params from caller to callee memory.
@@ -9256,6 +9805,56 @@ impl FactStyleGenerator {
             // Replace the ptr param with the new callee-memory ptr
             body.instruction(&Instruction::LocalGet(l_new_ptr));
             body.instruction(&Instruction::LocalSet(ptr_local));
+
+            // #272 inc 5c-a: the OUTER bulk copy above is SHALLOW — for a
+            // pointer-bearing aggregate PARAM (an `Elements` layout, e.g.
+            // `list<string>`) the inner string `(ptr, len)` headers it copied
+            // into callee memory at `l_new_ptr` still point into CALLER memory
+            // (gap #281). Walk each element's inner indirections and, per the
+            // recovered WIT type (`collect_indirections` is_string signal),
+            // either TRANSCODE (string + Utf8→Utf16) or DEEP-COPY VERBATIM
+            // (list<u8> / same-encoding string) the inner buffer into callee
+            // memory + re-point its header. This is the param mirror of the
+            // result-side `emit_patch_nested_indirections`; direction is
+            // caller → callee (src = caller, dst = callee). The guard
+            // (`guard_async_cross_encoding_strings`) only lets a `list<string>`
+            // PARAM in the Utf8→Utf16 (or same-encoding) shape reach here; other
+            // directions / records / deeper nesting still fail loud, so the
+            // emitter's nested-param set ≡ the guard's nested-param allow-set.
+            //
+            // Locals: `scratch_local + 1 ..= scratch_local + 5` (the per-element
+            // walk, DISJOINT from `l_new_ptr = scratch_local`) and the
+            // `transcode_base` block (5 for utf8→utf16). Step 0.5 (param copy)
+            // runs BEFORE the call, so these never collide with the result-side
+            // writeback/transcode region (step 3), which is not yet live.
+            // For a `list<T>` param the element type `T` is descended (matching
+            // how the layout's `Elements` came from the list); a non-list /
+            // non-`Elements` shape carries no nested-param walk.
+            let is_elements = matches!(
+                param_layouts.get(pair_idx),
+                Some(crate::resolver::CopyLayout::Elements { .. })
+            );
+            if is_elements
+                && let Some(
+                    crate::parser::ComponentValType::List(elem)
+                    | crate::parser::ComponentValType::FixedSizeList(elem, _),
+                ) = site.requirements.param_wit_types.get(pair_idx)
+            {
+                emit_param_nested_indirections(
+                    body,
+                    elem.as_ref(),
+                    l_new_ptr, // array ptr (copied list, callee memory)
+                    len_local, // element count
+                    byte_mult, // elem_size (Elements.element_size)
+                    scratch_local + 1,
+                    realloc,
+                    caller_memory,
+                    callee_memory,
+                    site.requirements.caller_encoding,
+                    site.requirements.callee_encoding,
+                    transcode_base,
+                );
+            }
         }
     }
 
@@ -9947,6 +10546,18 @@ impl FactStyleGenerator {
         // result) by
         // `inc5b_stackful_adapter_nested_result_dest_latin1_locals_within_budget`
         // (and the utf8→utf16 5-scratch case by the inc-5a test).
+        //
+        // #272 inc 5c-a (NESTED `list<string>` PARAM nested-copy — SIMULTANEOUS
+        // LIVENESS, param side): the new `emit_param_nested_indirections` walk
+        // runs in STEP 0.5 (BEFORE the call), disjoint in TIME from the result
+        // writeback (step 3). Its per-element walk uses `scratch_local + 1 ..=
+        // scratch_local + 5` = `l_scratch + 1 ..= l_scratch + 5` (offsets 1..=5)
+        // and the inner utf8→utf16 transcode uses `transcode_base ..=
+        // transcode_base + 4` = `l_scratch + 12 ..= l_scratch + 16` (offsets
+        // 12..=16). The two are SIMULTANEOUSLY LIVE and DISJOINT (offsets 1..=5
+        // vs 12..=16, gap at 6..=11). Top index = offset 16 < 18 — the existing
+        // budget fits with NO growth. Proven under the REAL adapter by
+        // `inc5c_a_stackful_adapter_nested_param_locals_within_budget`.
         let mut body = Function::new([(18, wasm_encoder::ValType::I32)]);
 
         // Step 0.5: cross-memory param copy (shared with callback path)
@@ -10466,10 +11077,69 @@ impl FactStyleGenerator {
                 Some(_) => true,
             });
 
-        // Params allowed iff there is no byte-granular param OR every one is
-        // top-level AND the caller→callee direction is implemented (utf8↔utf16).
-        let param_ok =
-            !param_has_string || (direction_is_implemented && all_param_strings_top_level);
+        // #272 inc 5c-a: a NESTED `list<string>` PARAM (one level of nesting) is
+        // now ALLOWED — but ONLY in the caller=Utf8 → callee=Utf16 direction (the
+        // single direction `emit_param_nested_indirections` transcodes; the
+        // same-encoding case never reaches here, it returns Ok early above) AND
+        // ONLY when every nested byte-granular indirection is a `string` (not a
+        // `list<u8>`). `emit_param_nested_indirections` transcodes exactly those
+        // inner strings; a nested `list<u8>` (is_string == false) in this
+        // direction would be DEEP-COPIED verbatim (correct — never transcoded),
+        // but the allow-set must equal the transcode-set, so we allow the nested
+        // case ONLY when ALL nested indirections are strings (a pure
+        // `list<string>` shape). Records / deeper / other-direction nested params
+        // stay fail-loud. Reads the SAME `collect_indirections` string-ness
+        // signal the emitter consults (via `param_wit_types`).
+        //
+        // #272 inc 5c-a (index-alignment fix): `param_wit_types` is now
+        // PER-POINTER-PAIR (one leaf WIT type per pointer pair, parallel to
+        // `param_copy_layouts`), so this whole-collection `.iter().all/any()`
+        // predicate and the emitter's `param_wit_types.get(pair_idx)` index the
+        // SAME space. A mixed `(u32, list<string>)` param list now yields
+        // `[list<string>]` (the u32 bears no pointer pair and is absent), so the
+        // guard's allow decision matches what the emitter actually transcodes —
+        // the previous per-top-level-param population let the guard allow a site
+        // the emitter then silently skipped. Each entry is a String or
+        // List/FixedSizeList leaf (never a scalar); a bare top-level `String`
+        // leaf hits the `_ => Vec::new()` arm and is handled by the top-level
+        // path, not this nested predicate.
+        let param_inner_all_strings = !site.requirements.param_wit_types.is_empty()
+            && site.requirements.param_wit_types.iter().all(|ty| {
+                let inner_indirections = match ty {
+                    crate::parser::ComponentValType::List(elem)
+                    | crate::parser::ComponentValType::FixedSizeList(elem, _) => {
+                        collect_indirections(elem, 0)
+                    }
+                    // A non-list pointer-pair leaf (a top-level `String`) has no
+                    // inner-element indirections to walk for the nested case; the
+                    // top-level path handles it.
+                    _ => Vec::new(),
+                };
+                inner_indirections.iter().all(|(_, _, is_string)| *is_string)
+            })
+            // At least one param must actually carry a nested string for this
+            // predicate to widen the allow-set (a pure `list<u32>` has no inner
+            // indirections — `all` is vacuously true — but is encoding-independent
+            // and must not be mistaken for a nested string).
+            && site.requirements.param_wit_types.iter().any(|ty| match ty {
+                crate::parser::ComponentValType::List(elem)
+                | crate::parser::ComponentValType::FixedSizeList(elem, _) => {
+                    let inner = collect_indirections(elem, 0);
+                    !inner.is_empty() && inner.iter().all(|(_, _, is_string)| *is_string)
+                }
+                _ => false,
+            });
+        // Only the caller=Utf8 → callee=Utf16 PARAM direction is wired for a
+        // nested string (inc 5c-a — bounded to ONE direction, like inc 5a). The
+        // allow-set ≡ `emit_param_nested_indirections`' transcode trigger.
+        let param_nested_string_ok = direction_is_utf8_to_utf16 && param_inner_all_strings;
+
+        // Params allowed iff there is no byte-granular param OR (every one is
+        // top-level OR the nested list<string> case is the implemented one) AND
+        // the caller→callee direction is implemented (utf8↔utf16 etc.).
+        let param_ok = !param_has_string
+            || (direction_is_implemented && all_param_strings_top_level)
+            || param_nested_string_ok;
 
         if param_ok && result_ok {
             return Ok(());
@@ -12911,6 +13581,413 @@ mod tests {
             "#272 inc-1: callback adapter references local {max_idx} but only \
              {total_locals} are addressable ({caller_param_count} params + \
              {declared} declared) — transcode locals overflow the budget",
+        );
+    }
+
+    /// Build a merged module + async-lift site for a `list<string>` PARAM
+    /// crossing memory (caller type has one (ptr,len) pair for the outer list),
+    /// with the given caller/callee canon string encodings — for the #272
+    /// inc-5c-a PARAM-side nested-copy + local-bounds integration tests. Mirrors
+    /// `xenc_string_param_merged_and_site` but the param is `list<string>`
+    /// (`param_wit_type = List(String)`, `Elements{8, [Bulk{1}]}` layout) so the
+    /// PARAM nested-indirection walk (and, in the Utf8→Utf16 direction, the inner
+    /// transcode that runs INSIDE the nested per-element loop) is exercised on
+    /// the REAL adapter — the param-side mirror of the inc-5a result builder.
+    fn xenc_list_string_param_merged_and_site(
+        caller_enc: crate::parser::CanonStringEncoding,
+        callee_enc: crate::parser::CanonStringEncoding,
+    ) -> (crate::merger::MergedModule, crate::resolver::AdapterSite) {
+        use wasm_encoder::{EntityType, ExportKind, Function, ValType};
+        let mut merged = empty_merged();
+        // type 0: () -> i32 (lift, callback-mode packed return).
+        merged.types.push(crate::merger::MergedFuncType {
+            params: Vec::new(),
+            results: vec![ValType::I32],
+        });
+        // type 1: (i32, i32) -> () — caller type, one (ptr,len) for the outer
+        // `list<string>` param.
+        merged.types.push(crate::merger::MergedFuncType {
+            params: vec![ValType::I32, ValType::I32],
+            results: Vec::new(),
+        });
+        // type 2: (i32,i32,i32,i32) -> i32 — cabi_realloc.
+        merged.types.push(crate::merger::MergedFuncType {
+            params: vec![ValType::I32; 4],
+            results: vec![ValType::I32],
+        });
+        // lift func @ merged 0, callee realloc @ merged 1.
+        merged.functions.push(crate::merger::MergedFunction {
+            type_idx: 0,
+            body: Function::new([]),
+            origin: (1, 0, 0),
+            synthetic_kind: None,
+        });
+        merged.function_index_map.insert((1, 0, 0), 0);
+        merged.functions.push(crate::merger::MergedFunction {
+            type_idx: 2,
+            body: Function::new([]),
+            origin: (1, 0, 1),
+            synthetic_kind: None,
+        });
+        merged.realloc_map.insert((1, 0), 1);
+        // caller memory = component 0, callee memory = component 1.
+        merged.memory_index_map.insert((0, 0, 0), 0);
+        merged.memory_index_map.insert((1, 0, 0), 1);
+        let export_name = "[async-lift]greet";
+        merged.exports.push(crate::merger::MergedExport {
+            name: format!("[callback]{export_name}"),
+            kind: ExportKind::Func,
+            index: 0,
+        });
+        merged.imports.push(crate::merger::MergedImport {
+            module: "$root".into(),
+            name: "[waitable-set-poll]".into(),
+            entity_type: EntityType::Function(0),
+            component_idx: None,
+        });
+
+        let list_string = crate::parser::ComponentValType::List(Box::new(
+            crate::parser::ComponentValType::String,
+        ));
+
+        let mut site = async_lift_site(export_name);
+        site.from_component = 0;
+        site.to_component = 1;
+        site.import_func_type_idx = Some(1); // caller type (i32,i32) → 2 params
+        site.crosses_memory = true;
+        site.requirements.pointer_pair_positions = vec![0];
+        // `list<string>` lowers to `Elements{element_size: 8, inner: [Bulk{1}]}`.
+        site.requirements.param_copy_layouts = vec![crate::resolver::CopyLayout::Elements {
+            element_size: 8,
+            inner_pointers: vec![crate::resolver::InnerPointer::unconditional(
+                0,
+                crate::resolver::CopyLayout::Bulk { byte_multiplier: 1 },
+            )],
+            inner_resources: Vec::new(),
+        }];
+        site.requirements.param_wit_types = vec![list_string];
+        site.requirements.caller_encoding = Some(caller_enc);
+        site.requirements.callee_encoding = Some(callee_enc);
+        (merged, site)
+    }
+
+    /// #272 inc-5c-a (index-alignment fix): a MIXED `(u32, list<string>)` async
+    /// PARAM site — a SCALAR before the pointer-bearing `list<string>`. This is
+    /// the shape the index-alignment bug needs: the `list<string>` is the 2nd
+    /// top-level param but the 1st (and only) POINTER PAIR. The resolver now
+    /// populates `param_wit_types` PER-POINTER-PAIR (`[list<string>]`, len 1),
+    /// so the emitter's `param_wit_types.get(pair_idx=0)` correctly returns the
+    /// `list<string>` and the nested walk fires. The old per-top-level-param
+    /// population returned `[u32, list<string>]`, so `.get(0)` returned `u32`,
+    /// the List match failed, and the nested transcode/deep-copy was silently
+    /// skipped (re-opening #281 + an H-4.4 wrong-encoding miss) while the guard
+    /// (whole-collection `.iter().all/any()`) still ALLOWED the site.
+    fn xenc_mixed_scalar_list_string_param_merged_and_site(
+        caller_enc: crate::parser::CanonStringEncoding,
+        callee_enc: crate::parser::CanonStringEncoding,
+    ) -> (crate::merger::MergedModule, crate::resolver::AdapterSite) {
+        // Start from the single-`list<string>`-param site and graft a leading
+        // scalar so the pointer pair sits at flat index 1, not 0.
+        let (mut merged, mut site) = xenc_list_string_param_merged_and_site(caller_enc, callee_enc);
+        // Caller type now (i32 [u32], i32 [ptr], i32 [len]) → 3 params; replace
+        // type 1 in place (it is the caller type the site references).
+        merged.types[1].params = vec![
+            wasm_encoder::ValType::I32, // u32 scalar
+            wasm_encoder::ValType::I32, // list ptr
+            wasm_encoder::ValType::I32, // list len
+        ];
+        // The `list<string>` pointer pair is now at flat index 1 (after the
+        // u32 at 0). `param_copy_layouts` stays length-1 (the scalar bears no
+        // pointer pair) — exactly as `collect_param_copy_layouts` would build it.
+        site.requirements.pointer_pair_positions = vec![1];
+        // `param_wit_types` stays the PER-POINTER-PAIR value `[list<string>]`
+        // (len 1), NOT `[u32, list<string>]` — this is precisely what the fixed
+        // `collect_param_wit_types` yields for `(u32, list<string>)`.
+        // (Left unchanged from the single-param helper.)
+        (merged, site)
+    }
+
+    /// Count `memory.copy` ops in a generated adapter body.
+    fn count_memcopies(adapter: crate::adapter::AdapterFunction) -> usize {
+        let raw = adapter.body.into_raw_body();
+        let fb = wasmparser::FunctionBody::new(wasmparser::BinaryReader::new(&raw, 0));
+        let mut n = 0usize;
+        for op in fb.get_operators_reader().expect("ops reader") {
+            if let wasmparser::Operator::MemoryCopy { .. } = op.expect("operator") {
+                n += 1;
+            }
+        }
+        n
+    }
+
+    /// Count total operators in a generated adapter body (a coarse proxy for
+    /// "the nested walk was emitted" — skipping it makes the body strictly
+    /// shorter).
+    fn count_ops(adapter: crate::adapter::AdapterFunction) -> usize {
+        let raw = adapter.body.into_raw_body();
+        let fb = wasmparser::FunctionBody::new(wasmparser::BinaryReader::new(&raw, 0));
+        fb.get_operators_reader()
+            .expect("ops reader")
+            .into_iter()
+            .map(|op| {
+                op.expect("operator");
+            })
+            .count()
+    }
+
+    /// #272 inc-5c-a (index-alignment regression): a MIXED `(u32, list<string>)`
+    /// async PARAM site in the transcoding direction (caller=Utf8 →
+    /// callee=Utf16) must run the SAME nested-param walk as the single
+    /// `list<string>` param — even though the list is the 2nd top-level param /
+    /// 1st pointer pair. PRE-fix (`param_wit_types` per-top-level-param → `[u32,
+    /// list<string>]`) the emitter's `.get(pair_idx=0)` returned `u32`, the List
+    /// match failed, and the nested walk was SILENTLY SKIPPED — making the mixed
+    /// adapter SHORTER than the single-param one (re-opening #281 + an H-4.4
+    /// wrong-encoding miss) while the guard still ALLOWED the site. POST-fix
+    /// (per-pointer-pair → `[list<string>]`) the two adapters emit the IDENTICAL
+    /// nested transcode (the leading scalar adds no param-copy work), so their
+    /// op counts match.
+    ///
+    /// NB: in the utf8→utf16 direction the INNER string is transcoded by a
+    /// per-byte loop, NOT a `memory.copy`, so a raw memory.copy count is 1 for
+    /// both shapes here; the op-count equivalence is what proves the nested walk
+    /// fired (the same-encoding sibling test pins the 2-`memory.copy` deep-copy).
+    #[test]
+    fn inc5c_a_mixed_param_nested_list_string_after_scalar_transcodes() {
+        use crate::parser::CanonStringEncoding;
+        let gen_ = FactStyleGenerator::new(AdapterConfig::default());
+        let (mixed_merged, mixed_site) = xenc_mixed_scalar_list_string_param_merged_and_site(
+            CanonStringEncoding::Utf8,  // caller PROVIDES Utf8
+            CanonStringEncoding::Utf16, // callee READS Utf16
+        );
+        // Guard-vs-emitter consistency: the guard must ALLOW this mixed shape
+        // (no allow-but-skip) before we assert the emitter transcodes it.
+        FactStyleGenerator::guard_async_cross_encoding_strings(&mixed_site).expect(
+            "#272 inc-5c-a: a (u32, list<string>) param in caller=Utf8 → callee=Utf16 \
+             must be ALLOWED — the emitter transcodes the inner strings",
+        );
+        let mixed_ops = count_ops(
+            gen_.generate_async_callback_adapter(&mixed_site, &mixed_merged)
+                .expect("callback emitter must succeed for the mixed param site"),
+        );
+
+        // Reference: the single `list<string>` param (pointer pair at index 0)
+        // in the SAME direction — its nested walk is the known-good baseline.
+        let (single_merged, single_site) = xenc_list_string_param_merged_and_site(
+            CanonStringEncoding::Utf8,
+            CanonStringEncoding::Utf16,
+        );
+        let single_ops = count_ops(
+            gen_.generate_async_callback_adapter(&single_site, &single_merged)
+                .expect("callback emitter must succeed for the single param site"),
+        );
+
+        assert_eq!(
+            mixed_ops, single_ops,
+            "#272 inc-5c-a (index-alignment): the (u32, list<string>) PARAM adapter must \
+             emit the SAME nested-param transcode walk as the single list<string> param \
+             (the leading scalar adds no param-copy work) — a SHORTER body means the \
+             nested walk was silently skipped (param_wit_types index misalignment, \
+             re-opening #281 + H-4.4)"
+        );
+    }
+
+    /// #272 inc-5c-a (#281 same-encoding deep-copy, mixed shape): a MIXED
+    /// `(u32, list<string>)` async PARAM in a SAME-encoding (Utf8→Utf8) site
+    /// must STILL deep-copy each inner string (2 memory.copy) — the #281 fix
+    /// fires regardless of the leading scalar. Pins that the index alignment
+    /// holds in the no-transcode path too.
+    #[test]
+    fn inc5c_a_mixed_param_nested_list_string_same_encoding_deep_copies() {
+        use crate::parser::CanonStringEncoding;
+        let gen_ = FactStyleGenerator::new(AdapterConfig::default());
+        let (merged, site) = xenc_mixed_scalar_list_string_param_merged_and_site(
+            CanonStringEncoding::Utf8,
+            CanonStringEncoding::Utf8,
+        );
+        let adapter = gen_
+            .generate_async_callback_adapter(&site, &merged)
+            .expect("callback emitter must succeed for the same-encoding mixed param site");
+        let memcopies = count_memcopies(adapter);
+        assert_eq!(
+            memcopies, 2,
+            "#272 inc-5c-a: a same-encoding (u32, list<string>) PARAM must deep-copy \
+             the OUTER element array AND each INNER string buffer (2 memory.copy) — \
+             closing the #281 shallow-copy gap even with a leading scalar"
+        );
+    }
+
+    /// #272 inc-5c-a (the #281 same-encoding deep-copy fix): a `list<string>`
+    /// PARAM in a SAME-encoding (Utf8→Utf8) cross-MEMORY async-lift site emits
+    /// the OUTER bulk `memory.copy` AND, per the new nested-param walk, one INNER
+    /// deep-copy per element — 2 total. PRE-inc-5c-a this was 1 (the shallow
+    /// outer copy only), leaving the inner string buffers dangling into CALLER
+    /// memory (gap #281). The count going from 1 → 2 pins the fix.
+    #[test]
+    fn inc5c_a_step0_list_string_param_premise() {
+        use crate::parser::CanonStringEncoding;
+        let gen_ = FactStyleGenerator::new(AdapterConfig::default());
+        // Same encoding so the cross-encoding guard passes (early Ok); the
+        // premise is purely about the deep-copy SHAPE, independent of transcode.
+        let (merged, site) = xenc_list_string_param_merged_and_site(
+            CanonStringEncoding::Utf8,
+            CanonStringEncoding::Utf8,
+        );
+        let adapter = gen_
+            .generate_async_callback_adapter(&site, &merged)
+            .expect("callback emitter must succeed for the list<string> param site");
+        let raw = adapter.body.into_raw_body();
+        let fb = wasmparser::FunctionBody::new(wasmparser::BinaryReader::new(&raw, 0));
+        let mut memcopies = 0usize;
+        for op in fb.get_operators_reader().expect("ops reader") {
+            if let wasmparser::Operator::MemoryCopy { .. } = op.expect("operator") {
+                memcopies += 1;
+            }
+        }
+        // Post inc-5c-a same-encoding deep-copy: 1 OUTER bulk copy + 1 INNER
+        // deep-copy per the nested walk = 2. Pre-fix this was 1 (the shallow
+        // outer copy only — gap #281, premise confirmed during development).
+        assert_eq!(
+            memcopies, 2,
+            "#272 inc 5c-a: a same-encoding list<string> PARAM must deep-copy the \
+             OUTER element array AND each INNER string buffer (2 memory.copy) — \
+             closing the #281 shallow-copy gap"
+        );
+    }
+
+    /// #272 inc-5c-a (integration, callback): the CALLBACK async adapter's NESTED
+    /// `list<string>` PARAM nested-copy path (caller=Utf8 → callee=Utf16) must not
+    /// reference a local past its declared budget (27) under SIMULTANEOUS liveness
+    /// — the inner transcode runs INSIDE `emit_param_nested_indirections`' per-
+    /// element loop, so the nested-walk locals (`scratch_local + 1 ..= scratch_local
+    /// + 5` = `l_p2 + 5 ..= l_p2 + 9`, offsets 10..=14) AND the transcode-loop
+    /// locals (`transcode_base ..= transcode_base + 4` = `l_p2 + 16 ..= l_p2 + 20`,
+    /// offsets 21..=25) are live at once. They are DISJOINT (gap at 15..=20) and
+    /// the top index (offset 25) < 27. Step 0.5 (param copy) runs BEFORE the call,
+    /// so this region does not collide with the result-side writeback/transcode
+    /// region (step 3). Generates the REAL adapter for a `list<string>` param site.
+    #[test]
+    fn inc5c_a_callback_adapter_nested_param_locals_within_budget() {
+        use crate::parser::CanonStringEncoding;
+        let gen_ = FactStyleGenerator::new(AdapterConfig::default());
+        // caller=Utf8 → callee=Utf16 ⇒ the PARAM direction transcodes the inner
+        // strings (the implemented inc-5c-a direction).
+        let (merged, site) = xenc_list_string_param_merged_and_site(
+            CanonStringEncoding::Utf8,
+            CanonStringEncoding::Utf16,
+        );
+        let adapter = gen_
+            .generate_async_callback_adapter(&site, &merged)
+            .expect("callback emitter must succeed for the inc-5c-a list<string> param site");
+        let cpc = site_caller_param_count(&site, &merged);
+        assert_locals_within_budget(adapter.body, cpc, "#272 inc-5c-a callback nested param");
+    }
+
+    /// #272 inc-5c-a (integration, stackful): the STACKFUL async adapter's NESTED
+    /// `list<string>` PARAM nested-copy path must likewise stay within its declared
+    /// budget (18) under simultaneous liveness — nested walk `l_scratch + 1 ..=
+    /// l_scratch + 5` (offsets 1..=5) vs transcode `l_scratch + 12 ..= l_scratch +
+    /// 16` (offsets 12..=16), DISJOINT (gap at 6..=11), top index (offset 16) < 18.
+    #[test]
+    fn inc5c_a_stackful_adapter_nested_param_locals_within_budget() {
+        use crate::parser::CanonStringEncoding;
+        let gen_ = FactStyleGenerator::new(AdapterConfig::default());
+        let (mut merged, site) = xenc_list_string_param_merged_and_site(
+            CanonStringEncoding::Utf8,
+            CanonStringEncoding::Utf16,
+        );
+        // The stackful path dispatches on a non-`[callback]` export; rename the
+        // companion so `generate_async_stackful_adapter` is under test.
+        merged.exports[0].name = site.export_name.clone();
+        let adapter = gen_
+            .generate_async_stackful_adapter(&site, &merged)
+            .expect("stackful emitter must succeed for the inc-5c-a list<string> param site");
+        let cpc = site_caller_param_count(&site, &merged);
+        assert_locals_within_budget(adapter.body, cpc, "#272 inc-5c-a stackful nested param");
+    }
+
+    /// #272 inc-5c-a guard: a NESTED `list<string>` PARAM in the caller=Utf8 →
+    /// callee=Utf16 direction is now ALLOWED (the emitter transcodes its inner
+    /// strings). The guard must NOT fail loud.
+    #[test]
+    fn inc5c_a_async_nested_list_string_param_utf8_to_utf16_allowed() {
+        use crate::parser::CanonStringEncoding;
+        let (_merged, site) = xenc_list_string_param_merged_and_site(
+            CanonStringEncoding::Utf8,  // caller PROVIDES Utf8
+            CanonStringEncoding::Utf16, // callee READS Utf16
+        );
+        FactStyleGenerator::guard_async_cross_encoding_strings(&site).expect(
+            "#272 inc-5c-a: a nested list<string> param in caller=Utf8 → callee=Utf16 \
+             must be ALLOWED (the emitter transcodes the inner strings)",
+        );
+    }
+
+    /// #272 inc-5c-a guard (negative): a NESTED `list<list<u8>>` PARAM in the
+    /// caller=Utf8 → callee=Utf16 direction must STILL fail loud — the allow-set
+    /// equals the transcode-set, and a nested `list<u8>` (is_string == false) is
+    /// never transcoded (it is deep-copied verbatim, but the guard refuses to
+    /// widen the allow-set for it, matching the result-side rule).
+    #[test]
+    fn inc5c_a_async_nested_list_u8_param_still_fails_loud() {
+        use crate::parser::CanonStringEncoding;
+        use crate::parser::{ComponentValType, PrimitiveValType};
+        let (mut _merged, mut site) = xenc_list_string_param_merged_and_site(
+            CanonStringEncoding::Utf8,
+            CanonStringEncoding::Utf16,
+        );
+        // Replace the param WIT type with `list<list<u8>>` (inner is_string ==
+        // false). The lowered layout stays an `Elements` aggregate; only the WIT
+        // type's string-ness flips.
+        site.requirements.param_wit_types = vec![ComponentValType::List(Box::new(
+            ComponentValType::List(Box::new(ComponentValType::Primitive(PrimitiveValType::U8))),
+        ))];
+        FactStyleGenerator::guard_async_cross_encoding_strings(&site).expect_err(
+            "#272 inc-5c-a: a nested list<list<u8>> param must STILL fail loud \
+             (is_string == false — never transcoded, allow-set ≡ transcode-set)",
+        );
+    }
+
+    /// #272 inc-5c-a guard (negative): a NESTED `list<string>` PARAM in a
+    /// non-implemented direction (caller=Utf16 → callee=Utf8) must STILL fail
+    /// loud — only caller=Utf8 → callee=Utf16 is wired for the param side.
+    #[test]
+    fn inc5c_a_async_nested_list_string_param_utf16_to_utf8_still_fails_loud() {
+        use crate::parser::CanonStringEncoding;
+        let (_merged, site) = xenc_list_string_param_merged_and_site(
+            CanonStringEncoding::Utf16,
+            CanonStringEncoding::Utf8,
+        );
+        FactStyleGenerator::guard_async_cross_encoding_strings(&site).expect_err(
+            "#272 inc-5c-a: a nested list<string> param in caller=Utf16 → callee=Utf8 \
+             must STILL fail loud (only Utf8→Utf16 is wired for the param side)",
+        );
+    }
+
+    /// #272 inc-5c-a guard (negative): a NESTED `list<record { data: list<u8> }>`
+    /// PARAM (a record element with a non-string inner buffer) must STILL fail
+    /// loud — `collect_indirections` reports the record's inner `list<u8>` as
+    /// `is_string == false`, so the allow-set (≡ transcode-set) refuses it. This
+    /// pins that records / deeper structure are out of the inc-5c-a slice unless
+    /// EVERY inner indirection is a string.
+    #[test]
+    fn inc5c_a_async_nested_record_param_still_fails_loud() {
+        use crate::parser::CanonStringEncoding;
+        use crate::parser::ComponentValType;
+        let (_merged, mut site) = xenc_list_string_param_merged_and_site(
+            CanonStringEncoding::Utf8,
+            CanonStringEncoding::Utf16,
+        );
+        site.requirements.param_wit_types = vec![ComponentValType::List(Box::new(
+            ComponentValType::Record(vec![(
+                "data".to_string(),
+                ComponentValType::List(Box::new(ComponentValType::Primitive(
+                    crate::parser::PrimitiveValType::U8,
+                ))),
+            )]),
+        ))];
+        FactStyleGenerator::guard_async_cross_encoding_strings(&site).expect_err(
+            "#272 inc-5c-a: a nested list<record{list<u8>}> param must STILL fail \
+             loud (inner is_string == false)",
         );
     }
 
