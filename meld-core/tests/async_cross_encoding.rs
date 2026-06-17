@@ -36,6 +36,7 @@
 
 use meld_core::adapter::{
     build_latin1_to_utf8_transcode_test_module, build_latin1_to_utf16_transcode_test_module,
+    build_nested_list_list_string_param_test_module,
     build_nested_list_list_string_result_test_module, build_nested_list_string_result_test_module,
     build_utf8_to_latin1_transcode_test_module, build_utf8_to_utf16_transcode_test_module,
     build_utf16_to_latin1_transcode_test_module, build_utf16_to_utf8_transcode_test_module,
@@ -1118,6 +1119,129 @@ fn d5d_depth2_nested_list_list_string_utf8_to_utf16_transcodes() {
                 &got, want_bytes,
                 "outer[{oi}].inner[{ii}] must be transcoded UTF-8 → UTF-16 (a raw copy \
                  would leave the UTF-8 bytes / dangling callee ptr)"
+            );
+        }
+    }
+}
+
+// ----------------------------------------------------------------------------
+// #286 5d — DEPTH-2 nested `list<list<string>>` PARAM transcode (UTF-8 → UTF-16).
+// The param-direction mirror of d5d_depth2 (RESULT): exercises the codegen-time
+// recursion in `emit_param_nested_indirections`. PARAM direction (caller
+// PROVIDES, callee READS): the full two-level value lives in CALLER memory; the
+// SHALLOW outer array (inner ptrs → caller) is in CALLEE memory. After `patch`,
+// the host follows the doubly relocated pointers ENTIRELY within CALLEE memory
+// and asserts each deepest string was deep-copied + transcoded UTF-8 → UTF-16.
+// ----------------------------------------------------------------------------
+
+// CALLER-memory offsets: 3 UTF-8 inner strings + 2 inner lists. CALLEE: outer.
+const PD2_HI_OFF: i32 = 100; // "Hi" UTF-8
+const PD2_E_OFF: i32 = 110; // "é"  UTF-8 [0xC3,0xA9]
+const PD2_OK_OFF: i32 = 120; // "ok" UTF-8
+const PD2_INNER_A_OFF: i32 = 200; // inner list A: [(Hi,2),(é,2)] (in CALLER)
+const PD2_INNER_B_OFF: i32 = 240; // inner list B: [(ok,2)]       (in CALLER)
+const PD2_OUTER_OFF: i32 = 300; // shallow outer list (in CALLEE)
+
+#[test]
+fn d5d_depth2_nested_list_list_string_param_utf8_to_utf16_transcodes() {
+    let wasm = build_nested_list_list_string_param_test_module(
+        CanonStringEncoding::Utf8,  // caller PROVIDES Utf8
+        CanonStringEncoding::Utf16, // callee READS Utf16
+    );
+    let mut validator = wasmparser::Validator::new();
+    validator
+        .validate_all(&wasm)
+        .expect("#286 5d depth-2 PARAM oracle module should validate");
+
+    let mut config = Config::new();
+    config.wasm_multi_memory(true);
+    let engine = Engine::new(&config).unwrap();
+    let module = RuntimeModule::new(&engine, &wasm).unwrap();
+    let mut store = Store::new(&engine, ());
+    let instance = Instance::new(&mut store, &module, &[]).unwrap();
+
+    let caller_mem = instance.get_memory(&mut store, "caller_memory").unwrap();
+    let callee_mem = instance.get_memory(&mut store, "callee_memory").unwrap();
+
+    // Full nested value in CALLER memory: inner UTF-8 strings + inner lists.
+    caller_mem
+        .write(&mut store, PD2_HI_OFF as usize, &[0x48, 0x69])
+        .unwrap();
+    caller_mem
+        .write(&mut store, PD2_E_OFF as usize, &[0xC3, 0xA9])
+        .unwrap();
+    caller_mem
+        .write(&mut store, PD2_OK_OFF as usize, &[0x6F, 0x6B])
+        .unwrap();
+
+    let mut inner_a = Vec::new();
+    inner_a.extend_from_slice(&PD2_HI_OFF.to_le_bytes());
+    inner_a.extend_from_slice(&2i32.to_le_bytes());
+    inner_a.extend_from_slice(&PD2_E_OFF.to_le_bytes());
+    inner_a.extend_from_slice(&2i32.to_le_bytes());
+    caller_mem
+        .write(&mut store, PD2_INNER_A_OFF as usize, &inner_a)
+        .unwrap();
+
+    let mut inner_b = Vec::new();
+    inner_b.extend_from_slice(&PD2_OK_OFF.to_le_bytes());
+    inner_b.extend_from_slice(&2i32.to_le_bytes());
+    caller_mem
+        .write(&mut store, PD2_INNER_B_OFF as usize, &inner_b)
+        .unwrap();
+
+    // SHALLOW outer list in CALLEE memory (inner_list_ptr → CALLER, count) — the
+    // post-outer-bulk-copy state.
+    let mut outer = Vec::new();
+    outer.extend_from_slice(&PD2_INNER_A_OFF.to_le_bytes());
+    outer.extend_from_slice(&2i32.to_le_bytes());
+    outer.extend_from_slice(&PD2_INNER_B_OFF.to_le_bytes());
+    outer.extend_from_slice(&1i32.to_le_bytes());
+    callee_mem
+        .write(&mut store, PD2_OUTER_OFF as usize, &outer)
+        .unwrap();
+
+    instance
+        .get_typed_func::<(i32, i32), ()>(&mut store, "patch")
+        .unwrap()
+        .call(&mut store, (PD2_OUTER_OFF, 2))
+        .expect("depth-2 param patch runs");
+
+    // Follow the doubly relocated pointers ENTIRELY within CALLEE memory.
+    let expected: [&[(&[u8], i32)]; 2] = [
+        &[(&[0x48, 0x00, 0x69, 0x00], 2), (&[0xE9, 0x00], 1)],
+        &[(&[0x6F, 0x00, 0x6B, 0x00], 2)],
+    ];
+    for (oi, inner_expected) in expected.iter().enumerate() {
+        let (inner_ptr, inner_len) =
+            read_hdr(&callee_mem, &mut store, PD2_OUTER_OFF as usize + oi * 8);
+        assert_eq!(
+            inner_len as usize,
+            inner_expected.len(),
+            "outer[{oi}] inner-list element count preserved"
+        );
+        assert!(
+            inner_ptr >= 2048,
+            "outer[{oi}] inner-list ptr {inner_ptr} must be relocated into CALLEE memory"
+        );
+        for (ii, (want_bytes, want_units)) in inner_expected.iter().enumerate() {
+            let (str_ptr, str_len) = read_hdr(&callee_mem, &mut store, inner_ptr as usize + ii * 8);
+            assert_eq!(
+                str_len, *want_units,
+                "outer[{oi}].inner[{ii}] transcoded UTF-16 code-unit count"
+            );
+            assert!(
+                str_ptr >= 2048,
+                "outer[{oi}].inner[{ii}] string ptr {str_ptr} must be relocated into CALLEE memory"
+            );
+            let mut got = vec![0u8; want_bytes.len()];
+            callee_mem
+                .read(&mut store, str_ptr as usize, &mut got)
+                .unwrap();
+            assert_eq!(
+                &got, want_bytes,
+                "outer[{oi}].inner[{ii}] must be deep-copied + transcoded UTF-8 → UTF-16 \
+                 (a verbatim deep-copy would leave UTF-8 bytes / dangling caller ptr)"
             );
         }
     }

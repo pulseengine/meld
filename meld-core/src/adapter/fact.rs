@@ -3413,6 +3413,125 @@ pub fn build_nested_list_string_param_test_module(
     module.finish()
 }
 
+/// #286 5d — DEPTH-2 nested-PARAM oracle module: drives the production
+/// `emit_param_nested_indirections` over `elem_ty = list<string>` (so the outer
+/// param is `list<list<string>>`), exercising the codegen-time PARAM recursion.
+///
+/// Identical to [`build_nested_list_string_param_test_module`] except
+/// `elem_ty = List(String)` and the depth-2 local layout: `l_first_scratch = 2`
+/// (depth-0 block 2..=6), depth-1 recursion block 7..=11 (the param walk uses 5
+/// locals/depth), `l_transcode_base = 12` (shared scratch 12..=17, past both
+/// loop blocks) — 16 i32 locals (indices 2..=17). Exported `patch(outer_callee,
+/// count)`; the host lays out the two-level `list<list<string>>` (inner data in
+/// CALLER memory, shallow outer array in CALLEE memory) and reads back the doubly
+/// relocated + transcoded result from CALLEE memory.
+pub fn build_nested_list_list_string_param_test_module(
+    caller_enc: crate::parser::CanonStringEncoding,
+    callee_enc: crate::parser::CanonStringEncoding,
+) -> Vec<u8> {
+    use crate::parser::ComponentValType;
+    use wasm_encoder::{
+        CodeSection, ConstExpr, ExportKind, ExportSection, FunctionSection, GlobalSection,
+        GlobalType, MemorySection, MemoryType, Module, TypeSection, ValType,
+    };
+
+    let mut types = TypeSection::new();
+    types.ty().function(
+        [ValType::I32, ValType::I32, ValType::I32, ValType::I32],
+        [ValType::I32],
+    );
+    types.ty().function([ValType::I32, ValType::I32], []);
+
+    let mut functions = FunctionSection::new();
+    functions.function(0);
+    functions.function(1);
+
+    let mut memory = MemorySection::new();
+    for _ in 0..2 {
+        memory.memory(MemoryType {
+            minimum: 1,
+            maximum: None,
+            memory64: false,
+            shared: false,
+            page_size_log2: None,
+        });
+    }
+
+    let mut globals = GlobalSection::new();
+    globals.global(
+        GlobalType {
+            val_type: ValType::I32,
+            mutable: true,
+            shared: false,
+        },
+        &ConstExpr::i32_const(2048),
+    );
+
+    let mut exports = ExportSection::new();
+    exports.export("patch", ExportKind::Func, 1);
+    exports.export("caller_memory", ExportKind::Memory, 0);
+    exports.export("callee_memory", ExportKind::Memory, 1);
+
+    let mut code = CodeSection::new();
+
+    // func 0: cabi_realloc — bump allocator over global 0 (writes land in CALLEE
+    // memory 1 via the production emitter's MemArgs).
+    {
+        let mut f = Function::new([(1, ValType::I32)]);
+        f.instruction(&Instruction::GlobalGet(0));
+        f.instruction(&Instruction::LocalGet(2));
+        f.instruction(&Instruction::I32Add);
+        f.instruction(&Instruction::I32Const(1));
+        f.instruction(&Instruction::I32Sub);
+        f.instruction(&Instruction::LocalGet(2));
+        f.instruction(&Instruction::I32Const(1));
+        f.instruction(&Instruction::I32Sub);
+        f.instruction(&Instruction::I32Const(-1));
+        f.instruction(&Instruction::I32Xor);
+        f.instruction(&Instruction::I32And);
+        f.instruction(&Instruction::LocalSet(4));
+        f.instruction(&Instruction::LocalGet(4));
+        f.instruction(&Instruction::LocalGet(3));
+        f.instruction(&Instruction::I32Add);
+        f.instruction(&Instruction::GlobalSet(0));
+        f.instruction(&Instruction::LocalGet(4));
+        f.instruction(&Instruction::End);
+        code.function(&f);
+    }
+
+    // func 1: patch(outer_callee, count) -> () for list<list<string>>.
+    {
+        let elem_ty = ComponentValType::List(Box::new(ComponentValType::String));
+        let mut f = Function::new([(16, ValType::I32)]);
+        emit_param_nested_indirections(
+            &mut f,
+            &elem_ty,
+            0, // l_array_ptr (callee outer list)
+            1, // l_len (outer count)
+            8, // elem_size (outer element = inner list (ptr, len))
+            2, // l_first_scratch (depth-0 block 2..=6; depth-1 recursion 7..=11)
+            0, // realloc_func (allocates in callee memory 1)
+            0, // caller_memory
+            1, // callee_memory
+            Some(caller_enc),
+            Some(callee_enc),
+            12, // l_transcode_base (shared scratch 12..=17, past both loop blocks)
+        );
+        f.instruction(&Instruction::End);
+        code.function(&f);
+    }
+
+    let mut module = Module::new();
+    module
+        .section(&types)
+        .section(&functions)
+        .section(&memory)
+        .section(&globals)
+        .section(&exports)
+        .section(&code);
+    module.finish()
+}
+
 /// Shared builder for the two inc-5c-a nested-PARAM oracle modules — the
 /// param-direction mirror of [`build_nested_list_result_test_module`].
 ///
