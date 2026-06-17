@@ -4745,6 +4745,107 @@ fn emit_param_nested_indirections(
             continue;
         }
 
+        // #286 5d: a nested pointer-bearing LIST PARAM (e.g. `list<list<string>>`)
+        // — the inner element ITSELF carries indirections (its own strings), so a
+        // verbatim deep-copy would leave those inner `(ptr, len)` pairs dangling
+        // into CALLER memory and un-transcoded. Instead we deep-copy the inner
+        // array into CALLEE memory, store the relocated header, and RECURSE one
+        // nesting level down to patch each inner element IN-PLACE (transcode each
+        // string caller→callee). The param-side mirror of the result-side
+        // recursion in `emit_patch_nested_indirections`.
+        //
+        // Codegen-time recursion: each depth `d` gets a disjoint 5-local block at
+        // `l_first_scratch + 5*d`; the transcode scratch (`l_transcode_base..`) is
+        // SHARED — only the single deepest string leaf transcodes at any instant.
+        // The caller sizes `l_transcode_base >= l_first_scratch + 5*max_depth`.
+        //
+        // Allow-set ≡ transcode-set: recurse ONLY when the inner subtree is all
+        // strings AND the direction is transcodable; a nested `list<u8>` or
+        // non-transcode direction falls through to the verbatim deep-copy below.
+        if let IndirectionKind::List { elem } = &ind.kind {
+            let sub = collect_indirections(elem, 0);
+            if inner_transcode_dir && !sub.is_empty() && sub.iter().all(|s| s.is_string()) {
+                let (_, inner_align) = cabi_size_align(elem);
+                // `l_old_ptr` = inner array base (CALLER), `l_buf_len` = inner
+                // ELEMENT count (a nested list len is the element count, never
+                // tag-encoded). Guard `count * sub_elem_size` against 2^32 wrap.
+                emit_overflow_guard(body, l_buf_len, *sub_elem_size);
+
+                // Skip the inner patch if (old_ptr, count*sub_elem_size) doesn't
+                // fit CALLER memory (the source) — fail-safe (matches deep-copy).
+                body.instruction(&Instruction::Block(wasm_encoder::BlockType::Empty));
+                body.instruction(&Instruction::LocalGet(l_old_ptr));
+                body.instruction(&Instruction::LocalGet(l_buf_len));
+                if *sub_elem_size != 1 {
+                    body.instruction(&Instruction::I32Const(*sub_elem_size as i32));
+                    body.instruction(&Instruction::I32Mul);
+                }
+                body.instruction(&Instruction::I32Add);
+                body.instruction(&Instruction::MemorySize(caller_memory));
+                body.instruction(&Instruction::I32Const(16));
+                body.instruction(&Instruction::I32Shl);
+                body.instruction(&Instruction::I32GtU);
+                body.instruction(&Instruction::BrIf(0));
+
+                // new_ptr = realloc(0, 0, inner_align, count*sub_elem_size) in
+                // CALLEE memory; bulk-copy the inner array caller→callee.
+                body.instruction(&Instruction::I32Const(0));
+                body.instruction(&Instruction::I32Const(0));
+                body.instruction(&Instruction::I32Const(inner_align as i32));
+                body.instruction(&Instruction::LocalGet(l_buf_len));
+                if *sub_elem_size != 1 {
+                    body.instruction(&Instruction::I32Const(*sub_elem_size as i32));
+                    body.instruction(&Instruction::I32Mul);
+                }
+                emit_checked_realloc(body, realloc_func, l_new_ptr);
+
+                body.instruction(&Instruction::LocalGet(l_new_ptr));
+                body.instruction(&Instruction::LocalGet(l_old_ptr));
+                body.instruction(&Instruction::LocalGet(l_buf_len));
+                if *sub_elem_size != 1 {
+                    body.instruction(&Instruction::I32Const(*sub_elem_size as i32));
+                    body.instruction(&Instruction::I32Mul);
+                }
+                body.instruction(&Instruction::MemoryCopy {
+                    dst_mem: callee_memory,
+                    src_mem: caller_memory,
+                });
+
+                // Store the relocated (callee) inner-array pointer + (unchanged)
+                // element count into the callee-memory header.
+                body.instruction(&Instruction::LocalGet(l_rec));
+                body.instruction(&Instruction::LocalGet(l_new_ptr));
+                body.instruction(&Instruction::I32Store(rec_mem_arg_ptr));
+                body.instruction(&Instruction::LocalGet(l_rec));
+                body.instruction(&Instruction::LocalGet(l_buf_len));
+                body.instruction(&Instruction::I32Store(rec_mem_arg_len));
+
+                // RECURSE one level down: patch the inner array IN-PLACE (its
+                // headers still point into CALLER memory after the bulk copy;
+                // the recursion reads them, transcodes caller→callee, and writes
+                // back callee pointers). Disjoint loop block at `l_first_scratch +
+                // 5`; `l_transcode_base` shared. `l_old_ptr`/`l_new_ptr`/`l_buf_len`
+                // (this depth) are read-only during the call (its block is +5).
+                emit_param_nested_indirections(
+                    body,
+                    elem,
+                    l_new_ptr,
+                    l_buf_len,
+                    *sub_elem_size,
+                    l_first_scratch + 5,
+                    realloc_func,
+                    caller_memory,
+                    callee_memory,
+                    caller_encoding,
+                    callee_encoding,
+                    l_transcode_base,
+                );
+
+                body.instruction(&Instruction::End); // end bounds block
+                continue;
+            }
+        }
+
         // DEEP-COPY verbatim (a `list<u8>` is_string == false, OR a
         // same-encoding string): realloc a CALLEE buffer + memory.copy
         // caller → callee, re-point. This CLOSES #281 — the inner buffer now
