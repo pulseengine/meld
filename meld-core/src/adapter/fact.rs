@@ -4087,6 +4087,112 @@ fn emit_patch_nested_indirections(
             continue;
         }
 
+        // #286 5d: a nested pointer-bearing LIST (e.g. `list<list<string>>`) —
+        // the inner element ITSELF carries indirections (its own strings), so
+        // raw-copying the inner array verbatim would leave those inner `(ptr,
+        // len)` pairs dangling into callee memory and un-transcoded. Instead we
+        // copy the inner array into caller memory, store the relocated header,
+        // and RECURSE one nesting level down to patch each inner element.
+        //
+        // Recursion is at CODEGEN time (statically-nested wasm loops, depth
+        // known from the WIT type): each depth `d` gets a disjoint 6-local loop
+        // block at `l_first_scratch + 6*d`, while the transcode scratch
+        // (`l_transcode_base..`) is SHARED — only the single deepest string leaf
+        // transcodes at any instant (a level either recurses OR transcodes,
+        // never both), so `l_new_ptr` at each depth is its own local and never
+        // collides with the leaf sink. The caller sizes `l_transcode_base` past
+        // the deepest loop block (≥ `l_first_scratch + 6*max_depth`).
+        //
+        // Allow-set ≡ transcode-set: recurse ONLY when the inner subtree is
+        // ALL strings (`list<list<string>>`, not `list<list<u8>>`) AND the
+        // direction is one the leaf transcodes; otherwise fall through to the
+        // verbatim raw-copy (a nested `list<u8>` stays binary, fail-safe).
+        if let IndirectionKind::List { elem } = &ind.kind {
+            let sub = collect_indirections(elem, 0);
+            if inner_transcode_dir && !sub.is_empty() && sub.iter().all(|s| s.is_string()) {
+                let (_, inner_align) = cabi_size_align(elem);
+                // `l_old_ptr` = inner array base (callee), `l_buf_len` = inner
+                // ELEMENT count (a nested list len is the element count, never
+                // tag-encoded). Guard `count * sub_elem_size` against 2^32 wrap.
+                emit_overflow_guard(body, l_buf_len, *sub_elem_size);
+
+                // Skip the whole inner patch if (old_ptr, count*sub_elem_size)
+                // doesn't fit callee memory — fail-safe (matches the raw-copy).
+                body.instruction(&Instruction::Block(wasm_encoder::BlockType::Empty));
+                body.instruction(&Instruction::LocalGet(l_old_ptr));
+                body.instruction(&Instruction::LocalGet(l_buf_len));
+                if *sub_elem_size != 1 {
+                    body.instruction(&Instruction::I32Const(*sub_elem_size as i32));
+                    body.instruction(&Instruction::I32Mul);
+                }
+                body.instruction(&Instruction::I32Add);
+                body.instruction(&Instruction::MemorySize(callee_memory));
+                body.instruction(&Instruction::I32Const(16));
+                body.instruction(&Instruction::I32Shl);
+                body.instruction(&Instruction::I32GtU);
+                body.instruction(&Instruction::BrIf(0));
+
+                // new_ptr = realloc(0, 0, inner_align, count*sub_elem_size) in
+                // caller memory; bulk-copy the inner array callee→caller.
+                body.instruction(&Instruction::I32Const(0));
+                body.instruction(&Instruction::I32Const(0));
+                body.instruction(&Instruction::I32Const(inner_align as i32));
+                body.instruction(&Instruction::LocalGet(l_buf_len));
+                if *sub_elem_size != 1 {
+                    body.instruction(&Instruction::I32Const(*sub_elem_size as i32));
+                    body.instruction(&Instruction::I32Mul);
+                }
+                emit_checked_realloc(body, realloc_func, l_new_ptr);
+
+                body.instruction(&Instruction::LocalGet(l_new_ptr));
+                body.instruction(&Instruction::LocalGet(l_old_ptr));
+                body.instruction(&Instruction::LocalGet(l_buf_len));
+                if *sub_elem_size != 1 {
+                    body.instruction(&Instruction::I32Const(*sub_elem_size as i32));
+                    body.instruction(&Instruction::I32Mul);
+                }
+                body.instruction(&Instruction::MemoryCopy {
+                    dst_mem: caller_memory,
+                    src_mem: callee_memory,
+                });
+
+                // Store the relocated inner-array pointer + (unchanged) element
+                // count into the caller-memory header.
+                body.instruction(&Instruction::LocalGet(l_rec_dst));
+                body.instruction(&Instruction::LocalGet(l_new_ptr));
+                body.instruction(&Instruction::I32Store(dst_mem_arg_ptr));
+                body.instruction(&Instruction::LocalGet(l_rec_dst));
+                body.instruction(&Instruction::LocalGet(l_buf_len));
+                body.instruction(&Instruction::I32Store(dst_mem_arg_len));
+
+                // RECURSE one level down: patch the inner array's elements,
+                // reading source headers from the callee original (`l_old_ptr`)
+                // and writing patched headers into the caller copy
+                // (`l_new_ptr`). Disjoint loop block at `l_first_scratch + 6`;
+                // `l_transcode_base` shared. `l_old_ptr`/`l_new_ptr`/`l_buf_len`
+                // (this depth) are read-only during the call (its block is +6).
+                emit_patch_nested_indirections(
+                    body,
+                    elem,
+                    l_new_ptr,
+                    l_old_ptr,
+                    l_buf_len,
+                    *sub_elem_size,
+                    l_first_scratch + 6,
+                    realloc_func,
+                    caller_memory,
+                    callee_memory,
+                    callee_compact_utf16,
+                    caller_encoding,
+                    callee_encoding,
+                    l_transcode_base,
+                );
+
+                body.instruction(&Instruction::End); // end bounds block
+                continue;
+            }
+        }
+
         // LS-P-14: trap if `len * sub_elem_size` would wrap mod 2^32. Without
         // this guard a callee-supplied `len` near `u32::MAX / sub_elem_size`
         // wraps `buf_len` to a small value; the bounds check below uses
