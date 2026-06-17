@@ -3873,7 +3873,13 @@ fn emit_patch_nested_indirections(
     body.instruction(&Instruction::I32Add);
     body.instruction(&Instruction::LocalSet(l_rec_src));
 
-    for (offset, sub_elem_size, is_string) in &indirections {
+    for ind in &indirections {
+        // #286 5d-pre: field-access over the type-carrying descriptor. `offset`
+        // / `sub_elem_size` stay references so the `*offset`/`*sub_elem_size`
+        // body reads are unchanged; `is_string` is the former leaf flag.
+        let offset = &ind.offset;
+        let sub_elem_size = &ind.sub_elem_size;
+        let is_string = ind.is_string();
         let dst_mem_arg_ptr = wasm_encoder::MemArg {
             offset: *offset as u64,
             align: 2,
@@ -3910,7 +3916,7 @@ fn emit_patch_nested_indirections(
         // `sub_elem_size == 1` but is arbitrary binary — explicitly does NOT
         // take this branch; it keeps the raw-copy below so its bytes are never
         // mis-transcoded.
-        let transcode_inner = *is_string && inner_transcode_dir;
+        let transcode_inner = is_string && inner_transcode_dir;
 
         if transcode_inner {
             // RESULT direction (callee PRODUCES, caller READS): SRC = callee
@@ -4303,7 +4309,12 @@ fn emit_param_nested_indirections(
     body.instruction(&Instruction::I32Add);
     body.instruction(&Instruction::LocalSet(l_rec));
 
-    for (offset, sub_elem_size, is_string) in &indirections {
+    for ind in &indirections {
+        // #286 5d-pre: field-access over the type-carrying descriptor (see the
+        // result-side mirror). `offset`/`sub_elem_size` stay references.
+        let offset = &ind.offset;
+        let sub_elem_size = &ind.sub_elem_size;
+        let is_string = ind.is_string();
         // Both the inner-header read and write are in CALLEE memory (the
         // record array was bulk-copied there); the inner BUFFER itself is read
         // from CALLER memory (the shallow ptr) and written to CALLEE memory.
@@ -4333,7 +4344,7 @@ fn emit_param_nested_indirections(
         // lowers to `sub_elem_size == 1` but is arbitrary binary — explicitly
         // does NOT take this branch; it keeps the verbatim deep-copy below so
         // its bytes are never mis-transcoded.
-        let transcode_inner = *is_string && inner_transcode_dir;
+        let transcode_inner = is_string && inner_transcode_dir;
 
         if transcode_inner {
             // PARAM direction (caller PROVIDES, callee READS): SRC = CALLER
@@ -4521,8 +4532,8 @@ fn emit_param_nested_indirections(
         //   * Utf8 same-encoding string → `len * 1` (unchanged).
         //   * a nested `list<u8>`/`list<uN>` (`is_string == false`) →
         //     `len * sub_elem_size` (unchanged verbatim deep-copy).
-        let inner_compact_utf16 = *is_string && same_encoding_inner_compact_utf16;
-        let inner_utf16 = *is_string && same_encoding_inner_utf16;
+        let inner_compact_utf16 = is_string && same_encoding_inner_compact_utf16;
+        let inner_utf16 = is_string && same_encoding_inner_utf16;
         // LS-P-14: trap if the byte count would wrap mod 2^32. For a UTF-16
         // string the multiplier is 2; for the tag-aware CompactUtf16 path the
         // mask/double cannot exceed the original `len` so the *1 guard suffices.
@@ -4600,33 +4611,84 @@ fn emit_param_nested_indirections(
     body.instruction(&Instruction::End); // end block
 }
 
-/// For a given element type, find every field offset that holds a (ptr, len)
-/// pair that needs cross-memory copying (currently strings and nested lists).
-/// Returns `(byte_offset_within_element, sub_element_size_in_bytes, is_string)`.
+/// What the pointed-to buffer of an [`Indirection`] is. This is the #272 inc-5a
+/// string-ness signal in type-carrying form (#286 5d-pre): a nested `string`
+/// and a nested `list<u8>` BOTH lower to `Bulk{1}` (byte-granular,
+/// indistinguishable in the lowered `CopyLayout`), so the emitter MUST consult
+/// this before transcoding an inner buffer — transcoding an arbitrary-binary
+/// `list<u8>` as if it were UTF-8 would silently corrupt it. Only
+/// [`IndirectionKind::String`] buffers may be transcoded; a
+/// [`IndirectionKind::List`] is raw-copied verbatim.
+#[derive(Debug, Clone)]
+pub(crate) enum IndirectionKind {
+    /// A `string`: byte-granular and transcode-eligible.
+    String,
+    /// A nested `list<elem>`: pointer-bearing, NOT transcodable as bytes. The
+    /// `elem` type is carried so a future depth-N recursion (#286 5d) can
+    /// descend into it; in 5d-pre the leaf is still raw-copied verbatim exactly
+    /// as the old `is_string == false` leaf was — behaviour is unchanged.
+    ///
+    /// `elem` is the 5d recursion seam: no production code path reads it yet
+    /// (5d-pre is a behaviour-preserving descriptor redesign), but the 5d-pre
+    /// unit test pins it for `list<list<string>>` vs `list<list<u8>>`. The
+    /// `allow` is removed when 5d wires in the recursive copy.
+    #[allow(dead_code)]
+    List {
+        elem: Box<crate::parser::ComponentValType>,
+    },
+}
+
+/// One (ptr, len) indirection within an element that needs cross-memory copying
+/// (currently strings and nested lists). `offset` is the byte offset of the
+/// (ptr, len) pair within the element; `sub_elem_size` is the size in bytes of
+/// one sub-element of the pointed-to buffer (1 for `string`/`list<u8>`, the
+/// element stride for other lists).
 ///
-/// `is_string` is the #272 inc-5a string-ness signal: `true` for a nested
-/// `ComponentValType::String`, `false` for a nested `List` (e.g. `list<u8>`).
-/// This is RECOVERABLE here, where the WIT type is still in hand, but NOT in
-/// the lowered `CopyLayout` descriptor — a nested `string` and a nested
-/// `list<u8>` BOTH lower to `Bulk{1}` (byte-granular, indistinguishable). The
-/// emitter MUST consult this flag before transcoding an inner buffer:
-/// transcoding an arbitrary-binary `list<u8>` as if it were UTF-8 would
-/// silently corrupt it. Only `is_string == true` inner buffers may be
-/// transcoded; everything else keeps the raw-copy.
+/// Replaces the former `(offset, sub_elem_size, is_string)` tuple (#286 5d-pre):
+/// the `kind` now CARRIES the element WIT type for a nested list, where the flat
+/// tuple discarded it — the prerequisite for depth-N recursion (5d). The WIT
+/// type is RECOVERABLE here, where it is still in hand, but NOT in the lowered
+/// `CopyLayout` descriptor.
+#[derive(Debug, Clone)]
+pub(crate) struct Indirection {
+    pub offset: u32,
+    pub sub_elem_size: u32,
+    pub kind: IndirectionKind,
+}
+
+impl Indirection {
+    /// `true` iff this indirection points at a transcode-eligible `string`
+    /// (the former `is_string` flag). A nested `list<_>` returns `false` and is
+    /// raw-copied verbatim in every direction.
+    pub(crate) fn is_string(&self) -> bool {
+        matches!(self.kind, IndirectionKind::String)
+    }
+}
+
+/// For a given element type, find every field offset that holds a (ptr, len)
+/// pair that needs cross-memory copying. See [`Indirection`].
 pub(crate) fn collect_indirections(
     ty: &crate::parser::ComponentValType,
     base_offset: u32,
-) -> Vec<(u32, u32, bool)> {
+) -> Vec<Indirection> {
     use crate::parser::ComponentValType as CVT;
     fn align_up(n: u32, a: u32) -> u32 {
         (n + a - 1) & !(a - 1)
     }
     let mut out = Vec::new();
     match ty {
-        CVT::String => out.push((base_offset, 1, true)),
+        CVT::String => out.push(Indirection {
+            offset: base_offset,
+            sub_elem_size: 1,
+            kind: IndirectionKind::String,
+        }),
         CVT::List(elem) => {
             let (es, _) = cabi_size_align(elem);
-            out.push((base_offset, es, false));
+            out.push(Indirection {
+                offset: base_offset,
+                sub_elem_size: es,
+                kind: IndirectionKind::List { elem: elem.clone() },
+            });
         }
         CVT::Record(fields) => {
             let mut off = 0u32;
@@ -11396,7 +11458,7 @@ impl FactStyleGenerator {
                 // Every inner indirection of THIS result must be a string for the
                 // nested transcode to be safe; a `list<u8>` inner (is_string ==
                 // false) makes the whole result NOT nested-string-allowed.
-                inner_indirections.iter().all(|(_, _, is_string)| *is_string)
+                inner_indirections.iter().all(|ind| ind.is_string())
             })
             // At least one result must actually carry a nested string for this
             // predicate to widen the allow-set (a pure `list<u32>` has no inner
@@ -11406,7 +11468,7 @@ impl FactStyleGenerator {
                 crate::parser::ComponentValType::List(elem)
                 | crate::parser::ComponentValType::FixedSizeList(elem, _) => {
                     let inner = collect_indirections(elem, 0);
-                    !inner.is_empty() && inner.iter().all(|(_, _, is_string)| *is_string)
+                    !inner.is_empty() && inner.iter().all(|ind| ind.is_string())
                 }
                 _ => false,
             });
@@ -11483,7 +11545,7 @@ impl FactStyleGenerator {
                     // top-level path handles it.
                     _ => Vec::new(),
                 };
-                inner_indirections.iter().all(|(_, _, is_string)| *is_string)
+                inner_indirections.iter().all(|ind| ind.is_string())
             })
             // At least one param must actually carry a nested string for this
             // predicate to widen the allow-set (a pure `list<u32>` has no inner
@@ -11493,7 +11555,7 @@ impl FactStyleGenerator {
                 crate::parser::ComponentValType::List(elem)
                 | crate::parser::ComponentValType::FixedSizeList(elem, _) => {
                     let inner = collect_indirections(elem, 0);
-                    !inner.is_empty() && inner.iter().all(|(_, _, is_string)| *is_string)
+                    !inner.is_empty() && inner.iter().all(|ind| ind.is_string())
                 }
                 _ => false,
             });
@@ -11640,6 +11702,91 @@ mod tests {
         assert_eq!(options.caller_string_encoding, StringEncoding::Utf8);
         assert_eq!(options.callee_string_encoding, StringEncoding::Utf8);
         assert!(!options.needs_transcoding());
+    }
+
+    /// #286 5d-pre — the type-carrying [`Indirection`] descriptor must
+    /// distinguish a nested `list<string>` from a nested `list<u8>` by the
+    /// element WIT type it CARRIES, where the former flat
+    /// `(offset, sub_elem_size, is_string)` tuple discarded it. This is the
+    /// prerequisite for depth-N recursion (5d): the emitter can only recurse
+    /// into an inner pointer-bearing list if the descriptor told it the list's
+    /// element type.
+    ///
+    /// CRITICAL 5d-pre invariant (NO behaviour change): both `list<list<string>>`
+    /// and `list<list<u8>>` still collect to a single `List { .. }` leaf with
+    /// `is_string() == false`, so the guard's `.all(is_string)` allow-predicate
+    /// still REJECTS them and they stay fail-loud — exactly as before. 5d-pre
+    /// only adds the carried `elem`; it does not widen the allow-set.
+    #[test]
+    fn collect_indirections_carries_nested_list_element_type_5d_pre() {
+        use crate::parser::{ComponentValType as CVT, PrimitiveValType as P};
+
+        // Depth-1, transcodable: outer `list<string>` ⇒ element `string`.
+        let string_leaves = collect_indirections(&CVT::String, 0);
+        assert_eq!(string_leaves.len(), 1, "string ⇒ one leaf");
+        assert!(
+            string_leaves[0].is_string(),
+            "a `string` leaf is transcode-eligible"
+        );
+        assert_eq!(string_leaves[0].sub_elem_size, 1, "string is byte-granular");
+
+        // Depth-1, NOT a buffer indirection: outer `list<u8>` ⇒ element `u8`
+        // (a primitive) ⇒ no inner indirection at all (top-level bulk copy
+        // handles it). Unchanged from the tuple form.
+        let u8_elem = collect_indirections(&CVT::Primitive(P::U8), 0);
+        assert!(
+            u8_elem.is_empty(),
+            "a primitive `u8` element has no (ptr,len) indirection"
+        );
+
+        // Depth-2: outer `list<list<string>>` ⇒ element `list<string>`.
+        let nested_string = collect_indirections(&CVT::List(Box::new(CVT::String)), 0);
+        assert_eq!(nested_string.len(), 1, "list<string> ⇒ one List leaf");
+        assert!(
+            !nested_string[0].is_string(),
+            "5d-pre invariant: a nested list leaf is NOT a string ⇒ guard still \
+             rejects list<list<string>> ⇒ fail-loud preserved"
+        );
+        assert_eq!(
+            nested_string[0].sub_elem_size, 8,
+            "a `string` sub-element is an 8-byte (ptr,len) pair"
+        );
+        // The carried element type — the 5d seam — must be `string`.
+        match &nested_string[0].kind {
+            IndirectionKind::List { elem } => assert!(
+                matches!(**elem, CVT::String),
+                "list<string> leaf must carry elem = String for 5d recursion"
+            ),
+            IndirectionKind::String => panic!("list<string> leaf must be a List, not a String"),
+        }
+
+        // Depth-2: outer `list<list<u8>>` ⇒ element `list<u8>`.
+        let nested_u8 = collect_indirections(
+            &CVT::List(Box::new(CVT::List(Box::new(CVT::Primitive(P::U8))))),
+            0,
+        );
+        // NB: called on the *element* `list<u8>` ⇒ one List leaf (the inner
+        // `list<u8>`); `collect_indirections` does not pre-expand nested lists.
+        let nested_u8_elem = collect_indirections(&CVT::List(Box::new(CVT::Primitive(P::U8))), 0);
+        assert_eq!(nested_u8_elem.len(), 1, "list<u8> ⇒ one List leaf");
+        assert!(
+            !nested_u8_elem[0].is_string(),
+            "5d-pre invariant: list<u8> leaf is NOT a string ⇒ guard rejects \
+             list<list<u8>> ⇒ stays fail-loud AND is never transcoded"
+        );
+        // The carried element type distinguishes it from the list<string> leaf:
+        // THIS is what the flat tuple could not express.
+        match &nested_u8_elem[0].kind {
+            IndirectionKind::List { elem } => assert!(
+                matches!(**elem, CVT::Primitive(P::U8)),
+                "list<u8> leaf must carry elem = u8 — distinct from the \
+                 list<string> leaf's elem = String"
+            ),
+            IndirectionKind::String => panic!("list<u8> leaf must be a List, not a String"),
+        }
+        // Sanity: the depth-2 outer call yields the same single List leaf
+        // (one level; no pre-expansion).
+        assert_eq!(nested_u8.len(), 1);
     }
 
     /// LS-P-19 — `emit_utf8_to_utf16_transcode` must replace truncated
