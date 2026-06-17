@@ -3413,6 +3413,125 @@ pub fn build_nested_list_string_param_test_module(
     module.finish()
 }
 
+/// #286 5d — DEPTH-2 nested-PARAM oracle module: drives the production
+/// `emit_param_nested_indirections` over `elem_ty = list<string>` (so the outer
+/// param is `list<list<string>>`), exercising the codegen-time PARAM recursion.
+///
+/// Identical to [`build_nested_list_string_param_test_module`] except
+/// `elem_ty = List(String)` and the depth-2 local layout: `l_first_scratch = 2`
+/// (depth-0 block 2..=6), depth-1 recursion block 7..=11 (the param walk uses 5
+/// locals/depth), `l_transcode_base = 12` (shared scratch 12..=17, past both
+/// loop blocks) — 16 i32 locals (indices 2..=17). Exported `patch(outer_callee,
+/// count)`; the host lays out the two-level `list<list<string>>` (inner data in
+/// CALLER memory, shallow outer array in CALLEE memory) and reads back the doubly
+/// relocated + transcoded result from CALLEE memory.
+pub fn build_nested_list_list_string_param_test_module(
+    caller_enc: crate::parser::CanonStringEncoding,
+    callee_enc: crate::parser::CanonStringEncoding,
+) -> Vec<u8> {
+    use crate::parser::ComponentValType;
+    use wasm_encoder::{
+        CodeSection, ConstExpr, ExportKind, ExportSection, FunctionSection, GlobalSection,
+        GlobalType, MemorySection, MemoryType, Module, TypeSection, ValType,
+    };
+
+    let mut types = TypeSection::new();
+    types.ty().function(
+        [ValType::I32, ValType::I32, ValType::I32, ValType::I32],
+        [ValType::I32],
+    );
+    types.ty().function([ValType::I32, ValType::I32], []);
+
+    let mut functions = FunctionSection::new();
+    functions.function(0);
+    functions.function(1);
+
+    let mut memory = MemorySection::new();
+    for _ in 0..2 {
+        memory.memory(MemoryType {
+            minimum: 1,
+            maximum: None,
+            memory64: false,
+            shared: false,
+            page_size_log2: None,
+        });
+    }
+
+    let mut globals = GlobalSection::new();
+    globals.global(
+        GlobalType {
+            val_type: ValType::I32,
+            mutable: true,
+            shared: false,
+        },
+        &ConstExpr::i32_const(2048),
+    );
+
+    let mut exports = ExportSection::new();
+    exports.export("patch", ExportKind::Func, 1);
+    exports.export("caller_memory", ExportKind::Memory, 0);
+    exports.export("callee_memory", ExportKind::Memory, 1);
+
+    let mut code = CodeSection::new();
+
+    // func 0: cabi_realloc — bump allocator over global 0 (writes land in CALLEE
+    // memory 1 via the production emitter's MemArgs).
+    {
+        let mut f = Function::new([(1, ValType::I32)]);
+        f.instruction(&Instruction::GlobalGet(0));
+        f.instruction(&Instruction::LocalGet(2));
+        f.instruction(&Instruction::I32Add);
+        f.instruction(&Instruction::I32Const(1));
+        f.instruction(&Instruction::I32Sub);
+        f.instruction(&Instruction::LocalGet(2));
+        f.instruction(&Instruction::I32Const(1));
+        f.instruction(&Instruction::I32Sub);
+        f.instruction(&Instruction::I32Const(-1));
+        f.instruction(&Instruction::I32Xor);
+        f.instruction(&Instruction::I32And);
+        f.instruction(&Instruction::LocalSet(4));
+        f.instruction(&Instruction::LocalGet(4));
+        f.instruction(&Instruction::LocalGet(3));
+        f.instruction(&Instruction::I32Add);
+        f.instruction(&Instruction::GlobalSet(0));
+        f.instruction(&Instruction::LocalGet(4));
+        f.instruction(&Instruction::End);
+        code.function(&f);
+    }
+
+    // func 1: patch(outer_callee, count) -> () for list<list<string>>.
+    {
+        let elem_ty = ComponentValType::List(Box::new(ComponentValType::String));
+        let mut f = Function::new([(16, ValType::I32)]);
+        emit_param_nested_indirections(
+            &mut f,
+            &elem_ty,
+            0, // l_array_ptr (callee outer list)
+            1, // l_len (outer count)
+            8, // elem_size (outer element = inner list (ptr, len))
+            2, // l_first_scratch (depth-0 block 2..=6; depth-1 recursion 7..=11)
+            0, // realloc_func (allocates in callee memory 1)
+            0, // caller_memory
+            1, // callee_memory
+            Some(caller_enc),
+            Some(callee_enc),
+            12, // l_transcode_base (shared scratch 12..=17, past both loop blocks)
+        );
+        f.instruction(&Instruction::End);
+        code.function(&f);
+    }
+
+    let mut module = Module::new();
+    module
+        .section(&types)
+        .section(&functions)
+        .section(&memory)
+        .section(&globals)
+        .section(&exports)
+        .section(&code);
+    module.finish()
+}
+
 /// Shared builder for the two inc-5c-a nested-PARAM oracle modules — the
 /// param-direction mirror of [`build_nested_list_result_test_module`].
 ///
@@ -4745,6 +4864,107 @@ fn emit_param_nested_indirections(
             continue;
         }
 
+        // #286 5d: a nested pointer-bearing LIST PARAM (e.g. `list<list<string>>`)
+        // — the inner element ITSELF carries indirections (its own strings), so a
+        // verbatim deep-copy would leave those inner `(ptr, len)` pairs dangling
+        // into CALLER memory and un-transcoded. Instead we deep-copy the inner
+        // array into CALLEE memory, store the relocated header, and RECURSE one
+        // nesting level down to patch each inner element IN-PLACE (transcode each
+        // string caller→callee). The param-side mirror of the result-side
+        // recursion in `emit_patch_nested_indirections`.
+        //
+        // Codegen-time recursion: each depth `d` gets a disjoint 5-local block at
+        // `l_first_scratch + 5*d`; the transcode scratch (`l_transcode_base..`) is
+        // SHARED — only the single deepest string leaf transcodes at any instant.
+        // The caller sizes `l_transcode_base >= l_first_scratch + 5*max_depth`.
+        //
+        // Allow-set ≡ transcode-set: recurse ONLY when the inner subtree is all
+        // strings AND the direction is transcodable; a nested `list<u8>` or
+        // non-transcode direction falls through to the verbatim deep-copy below.
+        if let IndirectionKind::List { elem } = &ind.kind {
+            let sub = collect_indirections(elem, 0);
+            if inner_transcode_dir && !sub.is_empty() && sub.iter().all(|s| s.is_string()) {
+                let (_, inner_align) = cabi_size_align(elem);
+                // `l_old_ptr` = inner array base (CALLER), `l_buf_len` = inner
+                // ELEMENT count (a nested list len is the element count, never
+                // tag-encoded). Guard `count * sub_elem_size` against 2^32 wrap.
+                emit_overflow_guard(body, l_buf_len, *sub_elem_size);
+
+                // Skip the inner patch if (old_ptr, count*sub_elem_size) doesn't
+                // fit CALLER memory (the source) — fail-safe (matches deep-copy).
+                body.instruction(&Instruction::Block(wasm_encoder::BlockType::Empty));
+                body.instruction(&Instruction::LocalGet(l_old_ptr));
+                body.instruction(&Instruction::LocalGet(l_buf_len));
+                if *sub_elem_size != 1 {
+                    body.instruction(&Instruction::I32Const(*sub_elem_size as i32));
+                    body.instruction(&Instruction::I32Mul);
+                }
+                body.instruction(&Instruction::I32Add);
+                body.instruction(&Instruction::MemorySize(caller_memory));
+                body.instruction(&Instruction::I32Const(16));
+                body.instruction(&Instruction::I32Shl);
+                body.instruction(&Instruction::I32GtU);
+                body.instruction(&Instruction::BrIf(0));
+
+                // new_ptr = realloc(0, 0, inner_align, count*sub_elem_size) in
+                // CALLEE memory; bulk-copy the inner array caller→callee.
+                body.instruction(&Instruction::I32Const(0));
+                body.instruction(&Instruction::I32Const(0));
+                body.instruction(&Instruction::I32Const(inner_align as i32));
+                body.instruction(&Instruction::LocalGet(l_buf_len));
+                if *sub_elem_size != 1 {
+                    body.instruction(&Instruction::I32Const(*sub_elem_size as i32));
+                    body.instruction(&Instruction::I32Mul);
+                }
+                emit_checked_realloc(body, realloc_func, l_new_ptr);
+
+                body.instruction(&Instruction::LocalGet(l_new_ptr));
+                body.instruction(&Instruction::LocalGet(l_old_ptr));
+                body.instruction(&Instruction::LocalGet(l_buf_len));
+                if *sub_elem_size != 1 {
+                    body.instruction(&Instruction::I32Const(*sub_elem_size as i32));
+                    body.instruction(&Instruction::I32Mul);
+                }
+                body.instruction(&Instruction::MemoryCopy {
+                    dst_mem: callee_memory,
+                    src_mem: caller_memory,
+                });
+
+                // Store the relocated (callee) inner-array pointer + (unchanged)
+                // element count into the callee-memory header.
+                body.instruction(&Instruction::LocalGet(l_rec));
+                body.instruction(&Instruction::LocalGet(l_new_ptr));
+                body.instruction(&Instruction::I32Store(rec_mem_arg_ptr));
+                body.instruction(&Instruction::LocalGet(l_rec));
+                body.instruction(&Instruction::LocalGet(l_buf_len));
+                body.instruction(&Instruction::I32Store(rec_mem_arg_len));
+
+                // RECURSE one level down: patch the inner array IN-PLACE (its
+                // headers still point into CALLER memory after the bulk copy;
+                // the recursion reads them, transcodes caller→callee, and writes
+                // back callee pointers). Disjoint loop block at `l_first_scratch +
+                // 5`; `l_transcode_base` shared. `l_old_ptr`/`l_new_ptr`/`l_buf_len`
+                // (this depth) are read-only during the call (its block is +5).
+                emit_param_nested_indirections(
+                    body,
+                    elem,
+                    l_new_ptr,
+                    l_buf_len,
+                    *sub_elem_size,
+                    l_first_scratch + 5,
+                    realloc_func,
+                    caller_memory,
+                    callee_memory,
+                    caller_encoding,
+                    callee_encoding,
+                    l_transcode_base,
+                );
+
+                body.instruction(&Instruction::End); // end bounds block
+                continue;
+            }
+        }
+
         // DEEP-COPY verbatim (a `list<u8>` is_string == false, OR a
         // same-encoding string): realloc a CALLEE buffer + memory.copy
         // caller → callee, re-point. This CLOSES #281 — the inner buffer now
@@ -4896,17 +5116,20 @@ impl Indirection {
     }
 }
 
-/// #286 5d: the per-indirection RESULT recurse/transcode decision, shared by the
-/// emitter and the result guard so the guard's allow-set is EXACTLY what
-/// `emit_patch_nested_indirections` transcodes or recurses into (allow-set ≡
-/// transcode-set). A leaf is depth-bounded transcodable iff it is a `string`
-/// (transcoded directly) OR a nested `list<elem>` whose immediate inner
-/// indirections are all strings (the depth-2 `list<list<string>>` case the
-/// emitter recurses one level for). Returns `false` for a nested `list<u8>`
-/// (raw-copied binary) and for deeper-than-2 nesting (whose inner subtree is a
-/// `list`, not all strings) — both remain fail-loud, matching the emitter's
-/// recursion guard and the async-adapter local budget (sized for depth-2).
-pub(crate) fn indirection_result_transcodable_depth2(ind: &Indirection) -> bool {
+/// #286 5d: the per-indirection recurse/transcode decision, shared by BOTH the
+/// result and param emitters/guards so each guard's allow-set is EXACTLY what
+/// the emitter transcodes or recurses into (allow-set ≡ transcode-set). The
+/// decision is DIRECTION-AGNOSTIC — it inspects only the type structure, which
+/// is identical for `emit_patch_nested_indirections` (result) and
+/// `emit_param_nested_indirections` (param). A leaf is depth-bounded transcodable
+/// iff it is a `string` (transcoded directly) OR a nested `list<elem>` whose
+/// immediate inner indirections are all strings (the depth-2 `list<list<string>>`
+/// case the emitter recurses one level for). Returns `false` for a nested
+/// `list<u8>` (raw-copied binary) and for deeper-than-2 nesting (whose inner
+/// subtree is a `list`, not all strings) — both remain fail-loud, matching the
+/// emitter's recursion guard and the async-adapter local budget (sized for
+/// depth-2 on both sides).
+pub(crate) fn indirection_transcodable_depth2(ind: &Indirection) -> bool {
     match &ind.kind {
         IndirectionKind::String => true,
         IndirectionKind::List { elem } => {
@@ -11735,7 +11958,7 @@ impl FactStyleGenerator {
                 // makes the whole result NOT nested-string-allowed (fail-loud).
                 inner_indirections
                     .iter()
-                    .all(indirection_result_transcodable_depth2)
+                    .all(indirection_transcodable_depth2)
             })
             // At least one result must actually carry a nested string for this
             // predicate to widen the allow-set (a pure `list<u32>` has no inner
@@ -11746,7 +11969,7 @@ impl FactStyleGenerator {
                 | crate::parser::ComponentValType::FixedSizeList(elem, _) => {
                     let inner = collect_indirections(elem, 0);
                     !inner.is_empty()
-                        && inner.iter().all(indirection_result_transcodable_depth2)
+                        && inner.iter().all(indirection_transcodable_depth2)
                 }
                 _ => false,
             });
@@ -11823,7 +12046,13 @@ impl FactStyleGenerator {
                     // top-level path handles it.
                     _ => Vec::new(),
                 };
-                inner_indirections.iter().all(|ind| ind.is_string())
+                // #286 5d: a leaf is transcodable iff `string` OR `list<string>`
+                // (depth-2 — `emit_param_nested_indirections` recurses one level);
+                // a nested `list<u8>` or deeper-than-2 nesting stays fail-loud.
+                // Same direction-agnostic decision as the result guard.
+                inner_indirections
+                    .iter()
+                    .all(indirection_transcodable_depth2)
             })
             // At least one param must actually carry a nested string for this
             // predicate to widen the allow-set (a pure `list<u32>` has no inner
@@ -11833,7 +12062,7 @@ impl FactStyleGenerator {
                 crate::parser::ComponentValType::List(elem)
                 | crate::parser::ComponentValType::FixedSizeList(elem, _) => {
                     let inner = collect_indirections(elem, 0);
-                    !inner.is_empty() && inner.iter().all(|ind| ind.is_string())
+                    !inner.is_empty() && inner.iter().all(indirection_transcodable_depth2)
                 }
                 _ => false,
             });
@@ -14528,6 +14757,37 @@ mod tests {
         caller_enc: crate::parser::CanonStringEncoding,
         callee_enc: crate::parser::CanonStringEncoding,
     ) -> (crate::merger::MergedModule, crate::resolver::AdapterSite) {
+        // Depth-1: outer param = `list<string>` (outer element = `string`).
+        xenc_nested_param_merged_and_site(
+            caller_enc,
+            callee_enc,
+            crate::parser::ComponentValType::String,
+        )
+    }
+
+    /// #286 5d: depth-2 fixture — outer param = `list<list<string>>` (outer
+    /// element = `list<string>`), so `emit_param_nested_indirections` recurses.
+    fn xenc_list_list_string_param_merged_and_site(
+        caller_enc: crate::parser::CanonStringEncoding,
+        callee_enc: crate::parser::CanonStringEncoding,
+    ) -> (crate::merger::MergedModule, crate::resolver::AdapterSite) {
+        xenc_nested_param_merged_and_site(
+            caller_enc,
+            callee_enc,
+            crate::parser::ComponentValType::List(Box::new(
+                crate::parser::ComponentValType::String,
+            )),
+        )
+    }
+
+    /// Shared fixture: build a merged module + async-lift site whose PARAM is
+    /// `list<OUTER_ELEM>`. `outer_elem = string` → `list<string>` (depth-1);
+    /// `outer_elem = list<string>` → `list<list<string>>` (depth-2).
+    fn xenc_nested_param_merged_and_site(
+        caller_enc: crate::parser::CanonStringEncoding,
+        callee_enc: crate::parser::CanonStringEncoding,
+        outer_elem: crate::parser::ComponentValType,
+    ) -> (crate::merger::MergedModule, crate::resolver::AdapterSite) {
         use wasm_encoder::{EntityType, ExportKind, Function, ValType};
         let mut merged = empty_merged();
         // type 0: () -> i32 (lift, callback-mode packed return).
@@ -14577,9 +14837,10 @@ mod tests {
             component_idx: None,
         });
 
-        let list_string = crate::parser::ComponentValType::List(Box::new(
-            crate::parser::ComponentValType::String,
-        ));
+        // Outer param type `list<outer_elem>`: `list<string>` (depth-1) or
+        // `list<list<string>>` (depth-2). `emit_param_nested_indirections`
+        // recurses when the element bears nested pointer indirections.
+        let list_string = crate::parser::ComponentValType::List(Box::new(outer_elem));
 
         let mut site = async_lift_site(export_name);
         site.from_component = 0;
@@ -14878,6 +15139,103 @@ mod tests {
         assert_locals_within_budget(adapter.body, cpc, "#272 inc-5c-a stackful nested param");
     }
 
+    /// #286 5d (integration, callback): the CALLBACK async adapter's DEPTH-2
+    /// `list<list<string>>` PARAM recursion must stay within budget (28) under
+    /// simultaneous liveness — depth-0 nested walk (offsets 10..=14), depth-1
+    /// recursion block (`l_first_scratch + 5 = l_p2 + 10 ..= l_p2 + 14`, offsets
+    /// 15..=19), shared leaf transcode (`transcode_base = l_p2 + 16 ..= l_p2 + 21`,
+    /// offsets 21..=26) — all DISJOINT, top index offset 26 < 28. The param
+    /// transcode_base already sat past the depth-1 block (no relayout needed; the
+    /// result-side growth to 28 provides the headroom). Generates the REAL
+    /// adapter — the budget-bug class the synthetic loop oracle cannot reach.
+    #[test]
+    fn d5d_callback_adapter_depth2_nested_param_within_budget() {
+        use crate::parser::CanonStringEncoding;
+        let gen_ = FactStyleGenerator::new(AdapterConfig::default());
+        let (merged, site) = xenc_list_list_string_param_merged_and_site(
+            CanonStringEncoding::Utf8,
+            CanonStringEncoding::Utf16,
+        );
+        let adapter = gen_
+            .generate_async_callback_adapter(&site, &merged)
+            .expect("callback emitter must succeed for the #286 5d list<list<string>> param");
+        let cpc = site_caller_param_count(&site, &merged);
+        assert_locals_within_budget(adapter.body, cpc, "#286 5d callback depth-2 nested param");
+    }
+
+    /// #286 5d (integration, stackful): the STACKFUL adapter's DEPTH-2
+    /// `list<list<string>>` PARAM recursion must stay within budget (23). Layout:
+    /// depth-0 walk at offsets 1..=5, depth-1 recursion block at offsets 6..=10
+    /// (`l_scratch + 6 ..= l_scratch + 10`), shared transcode at offsets 12..=17
+    /// (`l_scratch + 12 ..= l_scratch + 17`) — all DISJOINT, top index offset
+    /// less than 23. Generates the REAL adapter.
+    #[test]
+    fn d5d_stackful_adapter_depth2_nested_param_within_budget() {
+        use crate::parser::CanonStringEncoding;
+        let gen_ = FactStyleGenerator::new(AdapterConfig::default());
+        let (mut merged, site) = xenc_list_list_string_param_merged_and_site(
+            CanonStringEncoding::Utf8,
+            CanonStringEncoding::Utf16,
+        );
+        merged.exports[0].name = site.export_name.clone();
+        let adapter = gen_
+            .generate_async_stackful_adapter(&site, &merged)
+            .expect("stackful emitter must succeed for the #286 5d list<list<string>> param");
+        let cpc = site_caller_param_count(&site, &merged);
+        assert_locals_within_budget(adapter.body, cpc, "#286 5d stackful depth-2 nested param");
+    }
+
+    /// #286 5d guard (POSITIVE, param): a DEPTH-2 `list<list<string>>` PARAM in the
+    /// caller=Utf8 → callee=Utf16 direction is now ALLOWED — the param emitter
+    /// recurses one level and transcodes the deepest strings.
+    #[test]
+    fn d5d_async_nested_list_list_string_param_allowed() {
+        use crate::parser::CanonStringEncoding;
+        let (_merged, site) = xenc_list_list_string_param_merged_and_site(
+            CanonStringEncoding::Utf8,
+            CanonStringEncoding::Utf16,
+        );
+        FactStyleGenerator::guard_async_cross_encoding_strings(&site)
+            .expect("#286 5d: a depth-2 list<list<string>> param (Utf8 → Utf16) must be ALLOWED");
+    }
+
+    /// #286 5d guard (NEGATIVE, param — allow-set ≡ transcode-set): a DEPTH-2
+    /// `list<list<u8>>` PARAM must STAY FAIL-LOUD (deepest leaf is binary
+    /// `list<u8>`, deep-copied not transcoded).
+    #[test]
+    fn d5d_async_nested_list_list_u8_param_fail_loud() {
+        use crate::parser::{CanonStringEncoding, ComponentValType, PrimitiveValType};
+        let (_merged, site) = xenc_nested_param_merged_and_site(
+            CanonStringEncoding::Utf8,
+            CanonStringEncoding::Utf16,
+            ComponentValType::List(Box::new(ComponentValType::Primitive(PrimitiveValType::U8))),
+        );
+        assert!(
+            FactStyleGenerator::guard_async_cross_encoding_strings(&site).is_err(),
+            "#286 5d: a depth-2 list<list<u8>> param must stay FAIL-LOUD"
+        );
+    }
+
+    /// #286 5d guard (NEGATIVE, param — depth bound): a DEPTH-3
+    /// `list<list<list<string>>>` PARAM must STAY FAIL-LOUD (emitter recurses one
+    /// level; budget sized for depth-2).
+    #[test]
+    fn d5d_async_nested_depth3_param_fail_loud() {
+        use crate::parser::{CanonStringEncoding, ComponentValType};
+        let depth2 = ComponentValType::List(Box::new(ComponentValType::List(Box::new(
+            ComponentValType::String,
+        ))));
+        let (_merged, site) = xenc_nested_param_merged_and_site(
+            CanonStringEncoding::Utf8,
+            CanonStringEncoding::Utf16,
+            depth2,
+        );
+        assert!(
+            FactStyleGenerator::guard_async_cross_encoding_strings(&site).is_err(),
+            "#286 5d: a depth-3 list<list<list<string>>> param must stay FAIL-LOUD"
+        );
+    }
+
     /// #272 inc-5c-a guard: a NESTED `list<string>` PARAM in the caller=Utf8 →
     /// callee=Utf16 direction is now ALLOWED (the emitter transcodes its inner
     /// strings). The guard must NOT fail loud.
@@ -15069,14 +15427,16 @@ mod tests {
         }
     }
 
-    /// #272 inc-5c-b guard (negative): DEEPER list nesting
-    /// (`list<list<string>>`) must STILL fail loud in every direction — the inner
-    /// element is a `list<string>`, which `collect_indirections` reports as
-    /// is_string == false (it does not recurse list elements), so the nested walk
-    /// would only deep-copy the inner list verbatim, NOT transcode the
-    /// deeper strings. The allow-set (≡ transcode-set) refuses it.
+    /// #286 5d (was #272 inc-5c-b negative): DEPTH-2 list nesting
+    /// (`list<list<string>>`) PARAM is now ALLOWED in every implemented direction
+    /// — `emit_param_nested_indirections` recurses one level and transcodes the
+    /// deeper strings (the allow-set ≡ transcode-set widened to depth-2). Before
+    /// #286 5d this asserted fail-loud; that invariant is intentionally inverted.
+    /// (Depth-3 and nested `list<u8>` still fail loud — see
+    /// `d5d_async_nested_depth3_param_fail_loud` /
+    /// `d5d_async_nested_list_list_u8_param_fail_loud`.)
     #[test]
-    fn inc5c_b_async_deeper_list_nesting_param_fails_loud_all_directions() {
+    fn d5d_async_deeper_list_nesting_param_allowed_all_directions() {
         use crate::parser::CanonStringEncoding as Enc;
         use crate::parser::ComponentValType;
         let dirs = [
@@ -15093,7 +15453,9 @@ mod tests {
             site.requirements.param_wit_types = vec![ComponentValType::List(Box::new(
                 ComponentValType::List(Box::new(ComponentValType::String)),
             ))];
-            FactStyleGenerator::guard_async_cross_encoding_strings(&site).unwrap_err();
+            FactStyleGenerator::guard_async_cross_encoding_strings(&site).unwrap_or_else(|e| {
+                panic!("#286 5d: depth-2 list<list<string>> param must be ALLOWED for {caller:?}→{callee:?}: {e}")
+            });
         }
     }
 

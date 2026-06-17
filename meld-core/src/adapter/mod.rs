@@ -97,6 +97,12 @@ pub use fact::build_nested_list_u8_param_deep_copied_test_module;
 #[doc(hidden)]
 pub use fact::build_nested_list_string_param_test_module;
 
+/// Test-support: build the #286 5d DEPTH-2 NESTED `list<list<string>>` PARAM
+/// transcode oracle module (exercises the codegen-time param recursion).
+/// `#[doc(hidden)]` — not a supported API; see the function's own docs.
+#[doc(hidden)]
+pub use fact::build_nested_list_list_string_param_test_module;
+
 use crate::Result;
 use crate::merger::MergedModule;
 use crate::resolver::DependencyGraph;
