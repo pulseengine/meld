@@ -4896,6 +4896,26 @@ impl Indirection {
     }
 }
 
+/// #286 5d: the per-indirection RESULT recurse/transcode decision, shared by the
+/// emitter and the result guard so the guard's allow-set is EXACTLY what
+/// `emit_patch_nested_indirections` transcodes or recurses into (allow-set ≡
+/// transcode-set). A leaf is depth-bounded transcodable iff it is a `string`
+/// (transcoded directly) OR a nested `list<elem>` whose immediate inner
+/// indirections are all strings (the depth-2 `list<list<string>>` case the
+/// emitter recurses one level for). Returns `false` for a nested `list<u8>`
+/// (raw-copied binary) and for deeper-than-2 nesting (whose inner subtree is a
+/// `list`, not all strings) — both remain fail-loud, matching the emitter's
+/// recursion guard and the async-adapter local budget (sized for depth-2).
+pub(crate) fn indirection_result_transcodable_depth2(ind: &Indirection) -> bool {
+    match &ind.kind {
+        IndirectionKind::String => true,
+        IndirectionKind::List { elem } => {
+            let sub = collect_indirections(elem, 0);
+            !sub.is_empty() && sub.iter().all(|s| s.is_string())
+        }
+    }
+}
+
 /// For a given element type, find every field offset that holds a (ptr, len)
 /// pair that needs cross-memory copying. See [`Indirection`].
 pub(crate) fn collect_indirections(
@@ -9730,7 +9750,17 @@ impl FactStyleGenerator {
         // under the REAL adapter (6-scratch, dest-latin1 nested param) by
         // `inc5c_b_callback_adapter_nested_param_dest_latin1_locals_within_budget`
         // (and the utf8→utf16 5-scratch case by the inc-5c-a test).
-        let mut body = Function::new([(27, wasm_encoder::ValType::I32)]);
+        //
+        // #286 5d (DEPTH-2 nested `list<list<string>>` RESULT): the result
+        // writeback now recurses one level, adding a SECOND nested-loop block at
+        // `l_first_scratch + 6 = l_p2 + 11 ..= l_p2 + 16` (offsets 16..=21) LIVE
+        // simultaneously with the depth-0 block (offsets 10..=15) and the leaf
+        // transcode. The result `transcode_base` therefore shifts past the
+        // depth-1 block to `l_p2 + 17` (6-scratch → offsets 22..=27); top index
+        // offset 27 ⇒ budget grows 27 → 28. Only the deepest leaf transcodes at
+        // once, so a single shared transcode block suffices. Proven under the
+        // REAL adapter by `d5d_callback_adapter_depth2_nested_result_within_budget`.
+        let mut body = Function::new([(28, wasm_encoder::ValType::I32)]);
 
         // Step 0.5: copy string/list params from caller to callee memory.
         // Shared with the stackful emitter (SR-32, #140); see
@@ -9979,11 +10009,12 @@ impl FactStyleGenerator {
                         // SAME index passed to `emit_param_copy_step` above
                         // (`l_p2 + 16`) — the param transcode (step 0.5) and the
                         // result transcode (step 3) are never simultaneously
-                        // live, and `l_p2 + 16 ..= l_p2 + 20` (block offsets
-                        // 21..=25, declared by the budget of 26) does not
-                        // overlap the writeback/nested region `l_p2 + 1 ..=
-                        // l_p2 + 10` that IS live here.
-                        l_p2 + 16,
+                        // live. #286 5d: shifted to `l_p2 + 17` so the shared
+                        // leaf-transcode block (offsets 22..=27) sits past the
+                        // depth-1 recursion block `l_p2 + 11 ..= l_p2 + 16`
+                        // (offsets 16..=21); both are disjoint from the depth-0
+                        // nested region `l_p2 + 1 ..= l_p2 + 10` live here.
+                        l_p2 + 17,
                         site.requirements.caller_encoding,
                         site.requirements.callee_encoding,
                         // Result-side: governed by the callee's string encoding.
@@ -11219,7 +11250,16 @@ impl FactStyleGenerator {
         // nested param) by
         // `inc5c_b_stackful_adapter_nested_param_dest_latin1_locals_within_budget`
         // (and the utf8→utf16 5-scratch case by the inc-5c-a test).
-        let mut body = Function::new([(18, wasm_encoder::ValType::I32)]);
+        //
+        // #286 5d (DEPTH-2 nested `list<list<string>>` RESULT): the result
+        // writeback recurses one level, adding a SECOND nested-loop block at
+        // `l_first_scratch + 6 = l_scratch + 11 ..= l_scratch + 16` (offsets
+        // 11..=16) LIVE with the depth-0 block (offsets 5..=10) and the leaf
+        // transcode. The result `transcode_base` shifts past it to `l_scratch +
+        // 17` (6-scratch → offsets 17..=22); top index offset 22 ⇒ budget grows
+        // 18 → 23. Proven under the REAL adapter by
+        // `d5d_stackful_adapter_depth2_nested_result_within_budget`.
+        let mut body = Function::new([(23, wasm_encoder::ValType::I32)]);
 
         // Step 0.5: cross-memory param copy (shared with callback path)
         self.emit_param_copy_step(
@@ -11326,11 +11366,13 @@ impl FactStyleGenerator {
                         // #272 inc 3: the result transcode's 5 scratch locals.
                         // SAME index passed to `emit_param_copy_step` above
                         // (`l_scratch + 12`) — param (step 0.5) and result
-                        // (step 3) transcodes are never simultaneously live, and
-                        // `l_scratch + 12 ..= l_scratch + 16` (declared by the
-                        // budget of 18) does not overlap the writeback/nested
-                        // region `l_scratch + 1 ..= l_scratch + 10` live here.
-                        l_scratch + 12,
+                        // (step 3) transcodes are never simultaneously live.
+                        // #286 5d: shifted to `l_scratch + 17` so the shared
+                        // leaf-transcode block (offsets 17..=22) sits past the
+                        // depth-1 recursion block `l_scratch + 11 ..= l_scratch +
+                        // 16` (offsets 11..=16); both disjoint from the depth-0
+                        // nested region `l_scratch + 1 ..= l_scratch + 10`.
+                        l_scratch + 17,
                         site.requirements.caller_encoding,
                         site.requirements.callee_encoding,
                         // Result-side: governed by the callee's string encoding.
@@ -11686,10 +11728,14 @@ impl FactStyleGenerator {
                     // for the nested case; the top-level path handles it.
                     _ => Vec::new(),
                 };
-                // Every inner indirection of THIS result must be a string for the
-                // nested transcode to be safe; a `list<u8>` inner (is_string ==
-                // false) makes the whole result NOT nested-string-allowed.
-                inner_indirections.iter().all(|ind| ind.is_string())
+                // Every inner indirection of THIS result must be transcodable for
+                // the nested transcode to be safe. #286 5d: a leaf is transcodable
+                // iff it is a `string` OR a `list<string>` (depth-2 — the emitter
+                // recurses one level); a nested `list<u8>` or deeper-than-2 nesting
+                // makes the whole result NOT nested-string-allowed (fail-loud).
+                inner_indirections
+                    .iter()
+                    .all(indirection_result_transcodable_depth2)
             })
             // At least one result must actually carry a nested string for this
             // predicate to widen the allow-set (a pure `list<u32>` has no inner
@@ -11699,7 +11745,8 @@ impl FactStyleGenerator {
                 crate::parser::ComponentValType::List(elem)
                 | crate::parser::ComponentValType::FixedSizeList(elem, _) => {
                     let inner = collect_indirections(elem, 0);
-                    !inner.is_empty() && inner.iter().all(|ind| ind.is_string())
+                    !inner.is_empty()
+                        && inner.iter().all(indirection_result_transcodable_depth2)
                 }
                 _ => false,
             });
@@ -13736,6 +13783,37 @@ mod tests {
         caller_enc: crate::parser::CanonStringEncoding,
         callee_enc: crate::parser::CanonStringEncoding,
     ) -> (crate::merger::MergedModule, crate::resolver::AdapterSite) {
+        // Depth-1: outer result = `list<string>` (outer element = `string`).
+        xenc_nested_result_merged_and_site(
+            caller_enc,
+            callee_enc,
+            crate::parser::ComponentValType::String,
+        )
+    }
+
+    /// #286 5d: depth-2 fixture — outer result = `list<list<string>>` (outer
+    /// element = `list<string>`), so the writeback recurses one level.
+    fn xenc_list_list_string_result_merged_and_site(
+        caller_enc: crate::parser::CanonStringEncoding,
+        callee_enc: crate::parser::CanonStringEncoding,
+    ) -> (crate::merger::MergedModule, crate::resolver::AdapterSite) {
+        xenc_nested_result_merged_and_site(
+            caller_enc,
+            callee_enc,
+            crate::parser::ComponentValType::List(Box::new(
+                crate::parser::ComponentValType::String,
+            )),
+        )
+    }
+
+    /// Shared fixture: build a merged module + async-lift site whose result is
+    /// `list<OUTER_ELEM>`. `outer_elem = string` → `list<string>` (depth-1);
+    /// `outer_elem = list<string>` → `list<list<string>>` (depth-2).
+    fn xenc_nested_result_merged_and_site(
+        caller_enc: crate::parser::CanonStringEncoding,
+        callee_enc: crate::parser::CanonStringEncoding,
+        outer_elem: crate::parser::ComponentValType,
+    ) -> (crate::merger::MergedModule, crate::resolver::AdapterSite) {
         use wasm_encoder::{EntityType, ExportKind, Function, ValType};
         let mut merged = empty_merged();
         // type 0: (retptr: i32) -> () — caller type; one retptr param, void.
@@ -13773,11 +13851,11 @@ mod tests {
         merged.memory_index_map.insert((0, 0, 0), 0);
         merged.memory_index_map.insert((1, 0, 0), 1);
 
-        // The nested-result element type: `string` (so the outer result is
-        // `list<string>`).
-        let list_string = crate::parser::ComponentValType::List(Box::new(
-            crate::parser::ComponentValType::String,
-        ));
+        // The outer result type is `list<outer_elem>`: `list<string>` (depth-1,
+        // outer_elem = string) or `list<list<string>>` (depth-2, outer_elem =
+        // list<string>). The writeback recurses when the element bears nested
+        // pointer indirections.
+        let list_string = crate::parser::ComponentValType::List(Box::new(outer_elem));
 
         // Result globals: a (ptr, len) i32 pair with a `list<string>`
         // result_type so the writeback walks nested indirections.
@@ -13882,6 +13960,106 @@ mod tests {
             .expect("stackful emitter must succeed for the inc-5a list<string> result site");
         let cpc = site_caller_param_count(&site, &merged);
         assert_locals_within_budget(adapter.body, cpc, "#272 inc-5a stackful nested result");
+    }
+
+    /// #286 5d (integration, callback): the CALLBACK async adapter's DEPTH-2
+    /// `list<list<string>>` RESULT recursion must stay within the grown budget
+    /// (28) under simultaneous liveness — depth-0 loop (offsets 10..=15), depth-1
+    /// recursion loop (offsets 16..=21), and the shared leaf transcode
+    /// (`l_p2 + 17 ..= l_p2 + 22`, offsets 22..=27) all live at once, DISJOINT,
+    /// top index offset 27 < 28. Generates the REAL adapter — the budget-bug
+    /// class (unknown-local overflow AND valid-but-wrong local-reuse collision)
+    /// the synthetic loop oracle cannot reach.
+    #[test]
+    fn d5d_callback_adapter_depth2_nested_result_within_budget() {
+        use crate::parser::CanonStringEncoding;
+        let gen_ = FactStyleGenerator::new(AdapterConfig::default());
+        let (merged, site) = xenc_list_list_string_result_merged_and_site(
+            CanonStringEncoding::Utf16,
+            CanonStringEncoding::Utf8,
+        );
+        let adapter = gen_
+            .generate_async_callback_adapter(&site, &merged)
+            .expect("callback emitter must succeed for the #286 5d list<list<string>> result");
+        let cpc = site_caller_param_count(&site, &merged);
+        assert_locals_within_budget(adapter.body, cpc, "#286 5d callback depth-2 nested result");
+    }
+
+    /// #286 5d (integration, stackful): the STACKFUL adapter's DEPTH-2
+    /// `list<list<string>>` RESULT recursion must stay within the grown budget
+    /// (23) — depth-0 loop (offsets 5..=10), depth-1 recursion loop (offsets
+    /// 11..=16), shared leaf transcode (`l_scratch + 17 ..= l_scratch + 22`,
+    /// offsets 17..=22), DISJOINT, top index offset 22 < 23. Generates the REAL
+    /// adapter.
+    #[test]
+    fn d5d_stackful_adapter_depth2_nested_result_within_budget() {
+        use crate::parser::CanonStringEncoding;
+        let gen_ = FactStyleGenerator::new(AdapterConfig::default());
+        let (mut merged, site) = xenc_list_list_string_result_merged_and_site(
+            CanonStringEncoding::Utf16,
+            CanonStringEncoding::Utf8,
+        );
+        merged.exports[0].name = site.export_name.clone();
+        let adapter = gen_
+            .generate_async_stackful_adapter(&site, &merged)
+            .expect("stackful emitter must succeed for the #286 5d list<list<string>> result");
+        let cpc = site_caller_param_count(&site, &merged);
+        assert_locals_within_budget(adapter.body, cpc, "#286 5d stackful depth-2 nested result");
+    }
+
+    /// #286 5d guard (POSITIVE): a DEPTH-2 `list<list<string>>` RESULT in the
+    /// callee=Utf8 → caller=Utf16 direction is now ALLOWED — the emitter recurses
+    /// one level and transcodes the deepest strings.
+    #[test]
+    fn d5d_async_nested_list_list_string_result_allowed() {
+        use crate::parser::CanonStringEncoding;
+        let (_merged, site) = xenc_list_list_string_result_merged_and_site(
+            CanonStringEncoding::Utf16,
+            CanonStringEncoding::Utf8,
+        );
+        FactStyleGenerator::guard_async_cross_encoding_strings(&site)
+            .expect("#286 5d: a depth-2 list<list<string>> result (Utf8 → Utf16) must be ALLOWED");
+    }
+
+    /// #286 5d guard (NEGATIVE — allow-set ≡ transcode-set): a DEPTH-2
+    /// `list<list<u8>>` RESULT must STAY FAIL-LOUD — the deepest leaf is a
+    /// `list<u8>` (binary, raw-copied, never transcoded), so the recursion guard
+    /// rejects it and the adapter must not be generated for cross-encoding.
+    #[test]
+    fn d5d_async_nested_list_list_u8_result_fail_loud() {
+        use crate::parser::{CanonStringEncoding, ComponentValType, PrimitiveValType};
+        let (_merged, site) = xenc_nested_result_merged_and_site(
+            CanonStringEncoding::Utf16,
+            CanonStringEncoding::Utf8,
+            ComponentValType::List(Box::new(ComponentValType::Primitive(PrimitiveValType::U8))),
+        );
+        assert!(
+            FactStyleGenerator::guard_async_cross_encoding_strings(&site).is_err(),
+            "#286 5d: a depth-2 list<list<u8>> result must stay FAIL-LOUD (deepest leaf \
+             is binary list<u8>, never transcoded)"
+        );
+    }
+
+    /// #286 5d guard (NEGATIVE — depth bound): a DEPTH-3
+    /// `list<list<list<string>>>` RESULT must STAY FAIL-LOUD — the emitter
+    /// recurses exactly one level and the async-adapter budget is sized for
+    /// depth-2; the guard must not widen past what the emitter+budget support.
+    #[test]
+    fn d5d_async_nested_depth3_result_fail_loud() {
+        use crate::parser::{CanonStringEncoding, ComponentValType};
+        let depth2 = ComponentValType::List(Box::new(ComponentValType::List(Box::new(
+            ComponentValType::String,
+        ))));
+        let (_merged, site) = xenc_nested_result_merged_and_site(
+            CanonStringEncoding::Utf16,
+            CanonStringEncoding::Utf8,
+            depth2, // outer_elem = list<list<string>> ⇒ result = list<list<list<string>>>
+        );
+        assert!(
+            FactStyleGenerator::guard_async_cross_encoding_strings(&site).is_err(),
+            "#286 5d: a depth-3 list<list<list<string>>> result must stay FAIL-LOUD \
+             (emitter recurses one level; budget sized for depth-2)"
+        );
     }
 
     /// #272 inc-5a guard: a NESTED `list<string>` RESULT in the callee=Utf8 →
