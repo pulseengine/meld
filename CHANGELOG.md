@@ -4,6 +4,85 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.33.0] - 2026-06-17
+
+Depth-2 nested-string transcoding release: closes the last gap of the #272
+async cross-encoding campaign by implementing `list<list<string>>`
+cross-encoding transcoding (#286), corrects an understated traceability claim
+(#289), and fixes the recurring fuzz-CI runner-drift flake (#168). 5 PRs since
+v0.32.0; each Tier-5 change adversarially Mythos-gated (REFUTED), no admin merge.
+
+### Added
+
+- **#286 — depth-2 `list<list<string>>` async cross-encoding transcoding**
+  (#290 5d-pre, #291 RESULT, #292 PARAM). The async-lift nested-indirection
+  patchers now recurse one level at codegen time: a `list<list<string>>` param
+  or result is deep-copied/relocated and its *deepest* strings transcoded
+  across the encoding boundary, in all 6 directions × {callback, stackful},
+  instead of failing loud. Implemented as a type-carrying `Indirection`
+  descriptor (5d-pre, behaviour-preserving) + per-depth disjoint local blocks
+  with a shared transcode-scratch (only the deepest leaf transcodes, so the
+  feared `l_new_ptr` collision is avoided structurally). Each increment was
+  verified by a runtime-differential oracle (following the doubly relocated
+  pointers) + a REAL-adapter `wasmparser::Validator` budget test, and an
+  adversarial Mythos delta-pass (REFUTED across directions, aliasing, and
+  empty-inner-list edges). This **closes #286** and completes the #272 campaign
+  (all 6 directions × {flat, one-level, depth-2} × {params, results}).
+
+### Fixed
+
+- **#168 — fuzz-CI runner cargo-config drift.** The Fuzz-smoke jobs failed
+  intermittently per-runner with `ToolNotFound: x86_64-linux-musl-g++`. Root
+  cause: cargo-fuzz *derives* its target from a drifted runner's
+  `[build] target = musl` cargo config and passes it as an explicit `--target`,
+  which beats the `CARGO_BUILD_TARGET` env override (cargo precedence). Fixed by
+  pinning `cargo fuzz run --target x86_64-unknown-linux-gnu` (highest-precedence
+  slot), forcing the host gnu target on every runner. The infra root-cause
+  (re-image the rust-cpu runners) remains tracked on #168 (smithy's domain).
+
+### Changed (traceability)
+
+- **SR-41** description + verification updated: coverage now explicitly includes
+  two-level list nesting (`list<list<string>>`, #286); the residual fail-loud
+  boundary moved to deeper-than-two-level nesting. Cites the new `d5d_*` depth-2
+  runtime + real-adapter budget oracles.
+- **LS-F-27** de-staled: the async fail-loud guard's residual set narrowed from
+  `list<list<string>>` (now transcoded) to `list<list<list<string>>>` (depth-3+).
+- **SR-17** (#289): corrected an *understated* gap — the UTF-16→UTF-8 reverse
+  direction and lone-surrogate U+FFFD substitution were already covered by
+  passing runtime oracles (closed during #272), but the SR text still listed
+  them as a carried gap. Now cites the closing oracles. (Understated, not
+  overstated — the safe direction, but still a traceability defect.)
+
+### Falsification
+
+This release's central claim — depth-2 `list<list<string>>` cross-encoding
+transcodes correctly and only depth-2 is allowed — would be falsified by: a
+fused depth-2 nested-string param/result whose deepest string reads back under
+the wrong encoding or via a pointer still aimed into the source memory; a
+generated callback/stackful adapter referencing an out-of-budget or wrong local
+(rejected by `wasmparser::Validator`); or a `list<list<u8>>` / depth-3 site that
+is *allowed* (transcoded/raw-copied) rather than failing loud. The `d5d_*`
+oracles + guard boundary tests exercise each; all pass, none falsify.
+
+### Known gaps (disclosed)
+
+- **Depth-3+ list nesting** (`list<list<list<string>>>`) fails loud (LS-F-27),
+  not transcoded — bounded by the emitter's one-level recursion + the
+  async-adapter local budget. Extends to depth-N straightforwardly if needed.
+- **Async-lift e2e** remains fuse-only/structural in this repo's tests; the full
+  trampoline run is kiln-gated (out of scope here). The REAL-adapter budget
+  validator tests are the compensating control.
+- **Kani proofs not in CI** (runners lack the toolchain); run locally. The #286
+  equivalence proofs are additionally intractable under CBMC (allocation-heavy
+  recursive `cabi_size_align`) — the differential runtime oracle is the
+  load-bearing check there.
+- **#168 fuzz fix** is a meld-side mitigation verified by contract + ongoing CI
+  observation (the drifted runner is not locally reproducible); the infra
+  re-imaging root-cause stays open.
+- 16 baseline SRs remain `implemented` (not yet `verified`) — unchanged from
+  v0.32.0; not regressed by this release.
+
 ## [0.32.0] - 2026-06-15
 
 String-transcoding correctness release: completes spec-faithful
