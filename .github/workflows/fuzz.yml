@@ -113,8 +113,21 @@ jobs:
           key: ${{ runner.os }}-fuzz-v2-${{ matrix.target }}-${{ hashFiles('fuzz/Cargo.toml', 'meld-core/Cargo.toml') }}
           restore-keys: ${{ runner.os }}-fuzz-v2-${{ matrix.target }}-
 
+      # Layer 3 defense against #168 (the layer that actually holds): an
+      # EXPLICIT `--target` on `cargo fuzz run`. Layer 2 (`CARGO_BUILD_TARGET`
+      # env) is insufficient because cargo-fuzz DERIVES its own target from the
+      # runner's cargo config (`[build] target = "x86_64-unknown-linux-musl"` on
+      # drifted runners) and passes it as an explicit `--target`, which takes
+      # strict precedence over the env var. The result: `libfuzzer-sys`'s
+      # build.rs sees `TARGET=...musl`, the `cc` crate looks for
+      # `x86_64-linux-musl-g++` (not installed) and fails with "ToolNotFound" —
+      # observed intermittently on PRs #290/#292 despite Layers 1+2. Passing
+      # `--target` here occupies the SAME (highest) precedence slot cargo-fuzz
+      # uses, forcing the host gnu target on every runner: no musl std, no
+      # cross-compiler, sanitizer stays compatible. Harmless on clean runners
+      # (gnu IS the native host triple). See pulseengine/meld#168.
       - name: Run target for 60 s
-        run: cargo +nightly fuzz run --release "$FUZZ_TARGET" -- -max_total_time=60
+        run: cargo +nightly fuzz run --release --target x86_64-unknown-linux-gnu "$FUZZ_TARGET" -- -max_total_time=60
 
       - name: Upload crash artifacts on failure
         if: failure()
