@@ -36,9 +36,9 @@
 
 use meld_core::adapter::{
     build_latin1_to_utf8_transcode_test_module, build_latin1_to_utf16_transcode_test_module,
-    build_nested_list_string_result_test_module, build_utf8_to_latin1_transcode_test_module,
-    build_utf8_to_utf16_transcode_test_module, build_utf16_to_latin1_transcode_test_module,
-    build_utf16_to_utf8_transcode_test_module,
+    build_nested_list_list_string_result_test_module, build_nested_list_string_result_test_module,
+    build_utf8_to_latin1_transcode_test_module, build_utf8_to_utf16_transcode_test_module,
+    build_utf16_to_latin1_transcode_test_module, build_utf16_to_utf8_transcode_test_module,
 };
 use meld_core::parser::CanonStringEncoding;
 use wasmtime::{Config, Engine, Instance, Module as RuntimeModule, Store};
@@ -974,6 +974,153 @@ fn inc5b_nested_list_string_utf16_to_latin1() {
         "non-latin1 \"中\" → TAGGED len (1 | UTF16_TAG)"
     );
     assert_eq!(recs[1].bytes, vec![0x2D, 0x4E]);
+}
+
+// ----------------------------------------------------------------------------
+// #286 5d — DEPTH-2 nested `list<list<string>>` RESULT transcode (UTF-8 →
+// UTF-16). Exercises the codegen-time recursion in `emit_patch_nested_indirections`:
+// the OUTER leaf is a `list<string>` (pointer-bearing, NOT a string) so the
+// emitter must copy each inner list into caller memory and RECURSE to transcode
+// the deepest strings — not raw-copy the inner array (which would leave the
+// inner string pointers dangling into callee memory + un-transcoded).
+//
+// RESULT direction (callee PRODUCES, caller READS): callee memory 1 holds the
+// real two-level value; caller memory 0 gets the stale outer-array duplicate
+// (the post-outer-bulk-copy state). After `patch`, the host follows the doubly
+// relocated pointers ENTIRELY within caller memory and asserts each deepest
+// string was transcoded UTF-8 → UTF-16.
+// ----------------------------------------------------------------------------
+
+// callee-memory offsets: 3 UTF-8 inner strings, 2 inner lists, 1 outer list.
+const D2_HI_OFF: i32 = 100; // "Hi"  UTF-8 [0x48,0x69]
+const D2_E_OFF: i32 = 110; // "é"   UTF-8 [0xC3,0xA9] (U+00E9)
+const D2_OK_OFF: i32 = 120; // "ok"  UTF-8 [0x6F,0x6B]
+const D2_INNER_A_OFF: i32 = 200; // inner list A: [(Hi,2),(é,2)]
+const D2_INNER_B_OFF: i32 = 240; // inner list B: [(ok,2)]
+const D2_OUTER_OFF: i32 = 300; // outer list: [(A,2),(B,1)]
+
+/// Read an 8-byte `(ptr, len)` header from `mem` at `off`.
+fn read_hdr(mem: &wasmtime::Memory, store: &mut Store<()>, off: usize) -> (i32, i32) {
+    let mut hdr = [0u8; 8];
+    mem.read(store, off, &mut hdr).expect("read header");
+    (
+        i32::from_le_bytes(hdr[0..4].try_into().unwrap()),
+        i32::from_le_bytes(hdr[4..8].try_into().unwrap()),
+    )
+}
+
+#[test]
+fn d5d_depth2_nested_list_list_string_utf8_to_utf16_transcodes() {
+    let wasm = build_nested_list_list_string_result_test_module(
+        CanonStringEncoding::Utf16,
+        CanonStringEncoding::Utf8,
+    );
+    let mut validator = wasmparser::Validator::new();
+    validator
+        .validate_all(&wasm)
+        .expect("#286 5d depth-2 oracle module should validate");
+
+    let mut config = Config::new();
+    config.wasm_multi_memory(true);
+    let engine = Engine::new(&config).unwrap();
+    let module = RuntimeModule::new(&engine, &wasm).unwrap();
+    let mut store = Store::new(&engine, ());
+    let instance = Instance::new(&mut store, &module, &[]).unwrap();
+
+    let caller_mem = instance.get_memory(&mut store, "caller_memory").unwrap();
+    let callee_mem = instance.get_memory(&mut store, "callee_memory").unwrap();
+
+    // Inner UTF-8 source strings (callee memory only).
+    callee_mem
+        .write(&mut store, D2_HI_OFF as usize, &[0x48, 0x69])
+        .unwrap();
+    callee_mem
+        .write(&mut store, D2_E_OFF as usize, &[0xC3, 0xA9])
+        .unwrap();
+    callee_mem
+        .write(&mut store, D2_OK_OFF as usize, &[0x6F, 0x6B])
+        .unwrap();
+
+    // Inner lists of (str_ptr, str_len) — callee memory only.
+    let mut inner_a = Vec::new();
+    inner_a.extend_from_slice(&D2_HI_OFF.to_le_bytes());
+    inner_a.extend_from_slice(&2i32.to_le_bytes());
+    inner_a.extend_from_slice(&D2_E_OFF.to_le_bytes());
+    inner_a.extend_from_slice(&2i32.to_le_bytes());
+    callee_mem
+        .write(&mut store, D2_INNER_A_OFF as usize, &inner_a)
+        .unwrap();
+
+    let mut inner_b = Vec::new();
+    inner_b.extend_from_slice(&D2_OK_OFF.to_le_bytes());
+    inner_b.extend_from_slice(&2i32.to_le_bytes());
+    callee_mem
+        .write(&mut store, D2_INNER_B_OFF as usize, &inner_b)
+        .unwrap();
+
+    // Outer list of (inner_list_ptr, inner_count) — written to BOTH memories
+    // (caller = the stale post-outer-bulk-copy duplicate the emitter overwrites).
+    let mut outer = Vec::new();
+    outer.extend_from_slice(&D2_INNER_A_OFF.to_le_bytes());
+    outer.extend_from_slice(&2i32.to_le_bytes());
+    outer.extend_from_slice(&D2_INNER_B_OFF.to_le_bytes());
+    outer.extend_from_slice(&1i32.to_le_bytes());
+    callee_mem
+        .write(&mut store, D2_OUTER_OFF as usize, &outer)
+        .unwrap();
+    caller_mem
+        .write(&mut store, D2_OUTER_OFF as usize, &outer)
+        .unwrap();
+
+    instance
+        .get_typed_func::<(i32, i32, i32), ()>(&mut store, "patch")
+        .unwrap()
+        .call(&mut store, (D2_OUTER_OFF, D2_OUTER_OFF, 2))
+        .expect("depth-2 patch runs");
+
+    // Follow the doubly relocated pointers ENTIRELY within caller memory.
+    // Expected inner strings transcoded to UTF-16LE:
+    //   "Hi" → [0x48,0x00,0x69,0x00] (2 units), "é" → [0xE9,0x00] (1 unit),
+    //   "ok" → [0x6F,0x00,0x6B,0x00] (2 units).
+    let expected: [&[(&[u8], i32)]; 2] = [
+        &[(&[0x48, 0x00, 0x69, 0x00], 2), (&[0xE9, 0x00], 1)],
+        &[(&[0x6F, 0x00, 0x6B, 0x00], 2)],
+    ];
+    for (oi, inner_expected) in expected.iter().enumerate() {
+        let (inner_ptr, inner_len) =
+            read_hdr(&caller_mem, &mut store, D2_OUTER_OFF as usize + oi * 8);
+        assert_eq!(
+            inner_len as usize,
+            inner_expected.len(),
+            "outer[{oi}] inner-list element count preserved"
+        );
+        // The relocated inner-list pointer must be in the caller arena (>=2048),
+        // NOT the original callee offset — proving the inner array was copied.
+        assert!(
+            inner_ptr >= 2048,
+            "outer[{oi}] inner-list ptr {inner_ptr} must be relocated into caller memory"
+        );
+        for (ii, (want_bytes, want_units)) in inner_expected.iter().enumerate() {
+            let (str_ptr, str_len) = read_hdr(&caller_mem, &mut store, inner_ptr as usize + ii * 8);
+            assert_eq!(
+                str_len, *want_units,
+                "outer[{oi}].inner[{ii}] transcoded UTF-16 code-unit count"
+            );
+            assert!(
+                str_ptr >= 2048,
+                "outer[{oi}].inner[{ii}] string ptr {str_ptr} must be relocated into caller memory"
+            );
+            let mut got = vec![0u8; want_bytes.len()];
+            caller_mem
+                .read(&mut store, str_ptr as usize, &mut got)
+                .unwrap();
+            assert_eq!(
+                &got, want_bytes,
+                "outer[{oi}].inner[{ii}] must be transcoded UTF-8 → UTF-16 (a raw copy \
+                 would leave the UTF-8 bytes / dangling callee ptr)"
+            );
+        }
+    }
 }
 
 // ----------------------------------------------------------------------------
