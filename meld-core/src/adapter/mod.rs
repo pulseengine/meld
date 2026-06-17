@@ -73,6 +73,12 @@ pub use fact::build_nested_list_u8_result_not_transcoded_test_module;
 #[doc(hidden)]
 pub use fact::build_nested_list_string_result_test_module;
 
+/// Test-support: build the #286 5d DEPTH-2 NESTED `list<list<string>>` RESULT
+/// transcode oracle module (exercises the codegen-time recursion).
+/// `#[doc(hidden)]` — not a supported API; see the function's own docs.
+#[doc(hidden)]
+pub use fact::build_nested_list_list_string_result_test_module;
+
 /// Test-support: build the #272 inc-5c-a NESTED `list<string>` PARAM transcode
 /// (UTF-8 → UTF-16) oracle module. `#[doc(hidden)]` — not a supported API; see
 /// the function's own docs.
