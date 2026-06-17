@@ -1230,14 +1230,17 @@ artifacts:
       that cross a string-encoding boundary, rather than raw-copying them
       under the wrong encoding. Coverage: all six ordered encoding-pair
       directions over utf8 / utf16 / latin1+utf16 (CompactUTF16, the
-      UTF16_TAG = 1<<31 tagged-length form), at the top level and one level
-      of list / record / tuple nesting, in both the callback and stackful
-      async variants. A nested `list<u8>` shall be deep-copied verbatim,
-      never transcoded (string-vs-byte-list disambiguation via the WIT type).
-      Any not-yet-supported shape — deeper-than-one-level list nesting
-      (`list<list<string>>`, #286) — shall fail loud (the LS-F-27 guard),
-      never silently mis-transcode. Extends SR-17 (sync transcoding) to the
-      async-lift adapter path.
+      UTF16_TAG = 1<<31 tagged-length form), at the top level, one level of
+      list / record / tuple nesting, AND two levels of list nesting
+      (`list<list<string>>`, #286 — both params and results, via codegen-time
+      recursion in emit_{patch,param}_nested_indirections), in both the
+      callback and stackful async variants. A nested `list<u8>` shall be
+      deep-copied verbatim, never transcoded (string-vs-byte-list
+      disambiguation via the WIT type). Any deeper-than-two-level list nesting
+      (`list<list<list<string>>>`) shall fail loud (the LS-F-27 guard), never
+      silently mis-transcode — the allow-set is bounded to the depth the
+      emitter recurses (one level) and the async-adapter local budget supports.
+      Extends SR-17 (sync transcoding) to the async-lift adapter path.
     status: verified
     tags: [roadmap, async, transcoding]
     links:
@@ -1260,17 +1263,28 @@ artifacts:
         two-memory modules, asserting correct transcoded bytes + (for the
         latin1+utf16 directions) the tagged length, for both latin1-fitting
         and utf16-requiring strings, including the nested cases and the
-        nested-list<u8>-not-transcoded guarantee. The async-lift trampoline
-        INTEGRATION (the real callback/stackful adapter) is verified by the
-        inc*_{callback,stackful}_*_within_budget tests, which generate the
-        REAL adapter and assert local-index addressability — the
-        compensating control for the full async-lift e2e, which is gated on
+        nested-list<u8>-not-transcoded guarantee. The DEPTH-2
+        `list<list<string>>` recursion (#286) is verified by the runtime
+        oracles d5d_depth2_nested_list_list_string_{,param_}utf8_to_utf16_transcodes
+        (RESULT + PARAM, following the doubly relocated pointers and asserting
+        the deepest strings transcoded) and the allow-set boundary tests
+        d5d_async_nested_list_list_{string_result,string_param}_allowed plus
+        the negatives d5d_async_nested_list_list_u8_{result,param}_fail_loud and
+        d5d_async_nested_depth3_{result,param}_fail_loud (depth-3 stays loud).
+        The async-lift trampoline INTEGRATION (the real callback/stackful
+        adapter) is verified by the inc*_{callback,stackful}_*_within_budget AND
+        d5d_{callback,stackful}_adapter_depth2_nested_{result,param}_within_budget
+        tests, which generate the REAL adapter and assert local-index
+        addressability (catching budget overflow AND local-reuse collision) —
+        the compensating control for the full async-lift e2e, which is gated on
         the kiln runtime (out of scope for this repo's tests, per the
         existing async-lift fuse-only/structural posture). Each increment
-        passed an adversarial Mythos delta-pass; the passes caught four real
+        passed an adversarial Mythos delta-pass; the #272 passes caught four real
         silent-corruption bugs before merge (callback budget overflow; the
         nested list<u8> corruption blocker; the param_wit_types
         per-pointer-pair index misalignment; the same-encoding UTF-16 nested
-        deep-copy under-copy). #281 (async nested-param pointers dangling
-        into caller memory) was closed in the same work.
+        deep-copy under-copy), and the #286 depth-2 passes confirmed the
+        recursion REFUTED across directions + aliasing/empty-inner edges. #281
+        (async nested-param pointers dangling into caller memory) was closed in
+        the same work.
       milestone: post-v0.31.0
