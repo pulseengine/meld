@@ -331,6 +331,31 @@ pub struct AdapterRequirements {
     pub param_copy_layouts: Vec<CopyLayout>,
     /// Copy layouts for result pointer pairs (parallel to `result_pointer_pair_offsets`).
     pub result_copy_layouts: Vec<CopyLayout>,
+    /// WIT result types of the callee export (one per result; usually one).
+    ///
+    /// #272 inc 5a: the lowered `CopyLayout` descriptor cannot distinguish a
+    /// nested `string` from a nested `list<u8>` — both lower to `Bulk{1}`. The
+    /// async cross-encoding guard recovers string-ness by running
+    /// `collect_indirections` over these WIT types, the SAME string-ness signal
+    /// `emit_patch_nested_indirections` consults before transcoding an inner
+    /// buffer. Keeping the guard's allow-set and the emitter's transcode-set on
+    /// one signal closes the allow-but-raw-copy corruption gap. Empty when the
+    /// resolver could not recover the WIT result types (the guard then treats
+    /// the result conservatively as not-allowed-for-nested-transcode).
+    pub result_wit_types: Vec<crate::parser::ComponentValType>,
+    /// WIT param types of the callee export (one per param, parallel order).
+    ///
+    /// #272 inc 5c-a: the param-side mirror of `result_wit_types`. The lowered
+    /// `CopyLayout` descriptor cannot distinguish a nested `string` from a
+    /// nested `list<u8>` (both lower to `Bulk{1}`); the async cross-encoding
+    /// guard AND `emit_param_copy_step`'s nested-param walk recover string-ness
+    /// by running `collect_indirections` over these WIT types. Keeping the
+    /// guard's nested-param allow-set and the emitter's nested-param
+    /// transcode/deep-copy set on one signal closes the allow-but-mis-transcode
+    /// gap (the param-side analogue of the inc-5a result fix). Empty when the
+    /// resolver could not recover the WIT param types (the guard then treats a
+    /// nested param conservatively as not-allowed-for-nested-transcode).
+    pub param_wit_types: Vec<crate::parser::ComponentValType>,
     /// Conditional pointer pairs inside option/result/variant params.
     /// Each entry: (discriminant_flat_idx, discriminant_value, ptr_flat_idx, copy_layout).
     /// The adapter must check the discriminant and only copy when it matches.
@@ -769,6 +794,77 @@ fn collect_type_copy_layouts(
         }
         _ => {} // scalars / options / results / variants — no param-level pointer pairs
     }
+}
+
+/// Collect the WIT type of each pointer-bearing leaf, in lockstep with
+/// [`collect_type_copy_layouts`] / [`collect_param_copy_layouts`].
+///
+/// #272 inc 5c-a: `param_wit_types` MUST be parallel to `param_copy_layouts`
+/// (and `pointer_pair_positions`) — ONE entry per POINTER PAIR — so the async
+/// cross-encoding guard (`param_inner_all_strings`) and the emitter
+/// (`emit_param_copy_step`, which indexes `param_wit_types.get(pair_idx)` by the
+/// per-pointer-pair index) read the SAME index space. Populating it per
+/// top-level param instead silently desynchronised the two spaces for a mixed
+/// param list like `(u32, list<string>)`: the guard (whole-collection
+/// `.iter().all/any()`) still ALLOWED the site, but the emitter's
+/// `param_wit_types.get(pair_idx=0)` returned the `u32`'s type, the `List` match
+/// failed, and the nested-param transcode/deep-copy was SILENTLY SKIPPED
+/// (re-opening #281 + an H-4.4 wrong-encoding miss).
+///
+/// This walker descends EXACTLY as `collect_type_copy_layouts` does (each
+/// String/List leaf is a pointer pair; records/tuples/fixed-lists flatten
+/// inline, so a record with two string fields yields TWO entries — one per
+/// pointer pair — and a `FixedSizeList<_, N>` yields `N` per element). Each
+/// pushed type is the RESOLVED leaf type (named `Type` aliases are unwrapped)
+/// so the emitter's `List(elem)` match and the guard's `collect_indirections`
+/// see the concrete list/string, never an opaque alias.
+fn collect_param_pointer_wit_types(
+    component: &ParsedComponent,
+    ty: &crate::parser::ComponentValType,
+    out: &mut Vec<crate::parser::ComponentValType>,
+) {
+    use crate::parser::{ComponentTypeKind, ComponentValType};
+    match ty {
+        ComponentValType::String | ComponentValType::List(_) => {
+            out.push(ty.clone());
+        }
+        ComponentValType::Record(fields) => {
+            for (_, field_ty) in fields {
+                collect_param_pointer_wit_types(component, field_ty, out);
+            }
+        }
+        ComponentValType::Tuple(elems) => {
+            for elem_ty in elems {
+                collect_param_pointer_wit_types(component, elem_ty, out);
+            }
+        }
+        ComponentValType::FixedSizeList(elem, len) => {
+            for _ in 0..*len {
+                collect_param_pointer_wit_types(component, elem, out);
+            }
+        }
+        ComponentValType::Type(idx) => {
+            if let Some(ct) = component.get_type_definition(*idx)
+                && let ComponentTypeKind::Defined(inner) = &ct.kind
+            {
+                collect_param_pointer_wit_types(component, inner, out);
+            }
+        }
+        _ => {} // scalars / options / results / variants — no param-level pointer pairs
+    }
+}
+
+/// Collect per-pointer-pair WIT types across a whole param list, in the same
+/// order/length as [`collect_param_copy_layouts`].
+fn collect_param_wit_types(
+    component: &ParsedComponent,
+    params: &[(String, crate::parser::ComponentValType)],
+) -> Vec<crate::parser::ComponentValType> {
+    let mut out = Vec::new();
+    for (_, ty) in params {
+        collect_param_pointer_wit_types(component, ty, &mut out);
+    }
+    out
 }
 
 /// Maps core function entity indices from canonical lowered functions to their
@@ -2884,6 +2980,34 @@ impl Resolver {
                                             );
                                             requirements.result_copy_layouts =
                                                 collect_result_copy_layouts(to_component, results);
+                                            // #272 inc 5a: stash the WIT result types so the
+                                            // async cross-encoding guard can recover nested
+                                            // string-ness via `collect_indirections`.
+                                            requirements.result_wit_types =
+                                                results.iter().map(|(_, ty)| ty.clone()).collect();
+                                            // #272 inc 5c-a: stash the WIT param types so the
+                                            // async cross-encoding guard + `emit_param_copy_step`
+                                            // nested-param walk recover string-ness via
+                                            // `collect_indirections` (param-side mirror).
+                                            // PER-POINTER-PAIR, in lockstep with
+                                            // `param_copy_layouts` / `pointer_pair_positions`, so
+                                            // the guard and the emitter's
+                                            // `param_wit_types.get(pair_idx)` index the SAME space
+                                            // (see `collect_param_wit_types`).
+                                            requirements.param_wit_types =
+                                                collect_param_wit_types(to_component, comp_params);
+                                            debug_assert_eq!(
+                                                requirements.param_wit_types.len(),
+                                                requirements.param_copy_layouts.len(),
+                                                "param_wit_types must be parallel to \
+                                                 param_copy_layouts (one per pointer pair)"
+                                            );
+                                            debug_assert_eq!(
+                                                requirements.param_wit_types.len(),
+                                                requirements.pointer_pair_positions.len(),
+                                                "param_wit_types must be parallel to \
+                                                 pointer_pair_positions (one per pointer pair)"
+                                            );
                                             resolve_inner_resource_imports(
                                                 &mut requirements.result_copy_layouts,
                                                 to_component,
@@ -3193,6 +3317,26 @@ impl Resolver {
                                         collect_param_copy_layouts(to_component, comp_params);
                                     requirements.result_copy_layouts =
                                         collect_result_copy_layouts(to_component, results);
+                                    // #272 inc 5a: stash WIT result types (see above).
+                                    requirements.result_wit_types =
+                                        results.iter().map(|(_, ty)| ty.clone()).collect();
+                                    // #272 inc 5c-a: stash WIT param types (param-side
+                                    // mirror), PER-POINTER-PAIR in lockstep with
+                                    // `param_copy_layouts` / `pointer_pair_positions` so the
+                                    // guard and `emit_param_copy_step`'s
+                                    // `param_wit_types.get(pair_idx)` share an index space.
+                                    requirements.param_wit_types =
+                                        collect_param_wit_types(to_component, comp_params);
+                                    debug_assert_eq!(
+                                        requirements.param_wit_types.len(),
+                                        requirements.param_copy_layouts.len(),
+                                        "param_wit_types must be parallel to param_copy_layouts"
+                                    );
+                                    debug_assert_eq!(
+                                        requirements.param_wit_types.len(),
+                                        requirements.pointer_pair_positions.len(),
+                                        "param_wit_types must be parallel to pointer_pair_positions"
+                                    );
                                     requirements.conditional_pointer_pairs = to_component
                                         .conditional_pointer_pair_positions(comp_params);
                                     requirements.conditional_result_pointer_pairs = to_component
@@ -4659,6 +4803,90 @@ mod tests {
             layouts.len(),
             2,
             "SR-17: two string params should produce two copy layouts (scalar params excluded)"
+        );
+    }
+
+    // #272 inc 5c-a (index-alignment fix): `collect_param_wit_types` must be
+    // PARALLEL to `collect_param_copy_layouts` — one entry PER POINTER PAIR, NOT
+    // one per top-level param. A mixed `(u32, list<string>)` param list has a
+    // single pointer pair (the `list<string>` at flat index 1), so
+    // `param_wit_types` must be `[list<string>]` (len 1) — NOT `[u32,
+    // list<string>]` (len 2). The old per-param population desynchronised the
+    // emitter's `param_wit_types.get(pair_idx=0)` (it returned `u32`, the List
+    // match failed, the nested walk was silently skipped — re-opening #281 + an
+    // H-4.4 wrong-encoding miss).
+    #[test]
+    fn test_inc5c_a_param_wit_types_per_pointer_pair_mixed_scalar_list() {
+        let pc = empty_parsed_component();
+        let list_string = ComponentValType::List(Box::new(ComponentValType::String));
+        let params = vec![
+            (
+                "n".to_string(),
+                ComponentValType::Primitive(PrimitiveValType::U32),
+            ),
+            ("items".to_string(), list_string.clone()),
+        ];
+        let wit_types = collect_param_wit_types(&pc, &params);
+        let layouts = collect_param_copy_layouts(&pc, &params);
+        assert_eq!(
+            wit_types.len(),
+            1,
+            "#272 inc 5c-a: (u32, list<string>) has ONE pointer pair — \
+             param_wit_types must hold ONE entry (the list<string>), not one \
+             per top-level param"
+        );
+        assert_eq!(
+            wit_types.len(),
+            layouts.len(),
+            "#272 inc 5c-a: param_wit_types must be parallel to param_copy_layouts"
+        );
+        assert_eq!(
+            wit_types.len(),
+            pc.pointer_pair_param_positions(&params).len(),
+            "#272 inc 5c-a: param_wit_types must be parallel to pointer_pair_positions"
+        );
+        assert!(
+            matches!(&wit_types[0], ComponentValType::List(elem) if matches!(**elem, ComponentValType::String)),
+            "#272 inc 5c-a: the single pointer-pair entry must be the list<string> \
+             leaf, so the emitter's List(elem) match fires — got {:?}",
+            wit_types[0]
+        );
+    }
+
+    // A record flattening TWO string fields produces TWO pointer pairs, so
+    // `param_wit_types` must hold TWO `String` leaves — mirroring how
+    // `collect_param_copy_layouts` emits a layout per flattened pointer pair.
+    #[test]
+    fn test_inc5c_a_param_wit_types_record_two_strings_two_pairs() {
+        let pc = empty_parsed_component();
+        let rec = ComponentValType::Record(vec![
+            ("a".to_string(), ComponentValType::String),
+            (
+                "n".to_string(),
+                ComponentValType::Primitive(PrimitiveValType::U32),
+            ),
+            ("b".to_string(), ComponentValType::String),
+        ]);
+        let params = vec![("r".to_string(), rec)];
+        let wit_types = collect_param_wit_types(&pc, &params);
+        let layouts = collect_param_copy_layouts(&pc, &params);
+        assert_eq!(
+            wit_types.len(),
+            2,
+            "#272 inc 5c-a: a record with two string fields flattens to TWO \
+             pointer pairs — param_wit_types must hold TWO String leaves"
+        );
+        assert_eq!(
+            wit_types.len(),
+            layouts.len(),
+            "#272 inc 5c-a: param_wit_types must stay parallel to param_copy_layouts \
+             even across multi-pointer-pair-per-param flattening"
+        );
+        assert!(
+            wit_types
+                .iter()
+                .all(|t| matches!(t, ComponentValType::String)),
+            "#272 inc 5c-a: both pointer-pair leaves of the record are strings"
         );
     }
 

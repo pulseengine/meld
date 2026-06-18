@@ -2322,7 +2322,7 @@ fn propagate_outer_wiring(
 ///   memory.copy stable_records <- ptr, byte_count   ; intra-callee
 ///   for i in 0..len:
 ///     rec = stable_records + i*elem_size
-///     for each (offset, sub_size) in indirections:
+///     for each indirection (offset, sub_elem_size) in indirections:
 ///       old_str = mem.load(rec + offset)
 ///       str_len = mem.load(rec + offset + 4) * sub_size
 ///       stable_str = realloc(0, 0, 1, str_len)
@@ -2335,7 +2335,7 @@ fn generate_stabilizing_shim(
     result_globals: &[(u32, wasm_encoder::ValType)],
     elem_size: u32,
     elem_align: u32,
-    indirections: &[(u32, u32)],
+    indirections: &[crate::adapter::fact::Indirection],
     realloc_func: u32,
     callee_memory: u32,
 ) -> wasm_encoder::Function {
@@ -2401,7 +2401,15 @@ fn generate_stabilizing_shim(
     body.instruction(&Instruction::I32Add);
     body.instruction(&Instruction::LocalSet(l_rec));
 
-    for (offset, sub_size) in indirections {
+    // The string-ness `kind` is unused here: callee-side stabilization is a
+    // verbatim intra-memory deep-copy that PRESERVES bytes for both nested
+    // strings and nested `list<u8>` — no transcoding happens at stabilization
+    // time, so the string-ness signal does not change this raw copy. #286
+    // 5d-pre: field-access over the type-carrying descriptor; `offset`/`sub_size`
+    // stay references so the `*offset`/`*sub_size` body reads are unchanged.
+    for ind in indirections {
+        let offset = &ind.offset;
+        let sub_size = &ind.sub_elem_size;
         let mem_arg_ptr = wasm_encoder::MemArg {
             offset: *offset as u64,
             align: 2,

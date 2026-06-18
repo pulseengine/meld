@@ -4,6 +4,173 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.33.0] - 2026-06-17
+
+Depth-2 nested-string transcoding release: closes the last gap of the #272
+async cross-encoding campaign by implementing `list<list<string>>`
+cross-encoding transcoding (#286), corrects an understated traceability claim
+(#289), and fixes the recurring fuzz-CI runner-drift flake (#168). 5 PRs since
+v0.32.0; each Tier-5 change adversarially Mythos-gated (REFUTED), no admin merge.
+
+### Added
+
+- **#286 — depth-2 `list<list<string>>` async cross-encoding transcoding**
+  (#290 5d-pre, #291 RESULT, #292 PARAM). The async-lift nested-indirection
+  patchers now recurse one level at codegen time: a `list<list<string>>` param
+  or result is deep-copied/relocated and its *deepest* strings transcoded
+  across the encoding boundary, in all 6 directions × {callback, stackful},
+  instead of failing loud. Implemented as a type-carrying `Indirection`
+  descriptor (5d-pre, behaviour-preserving) + per-depth disjoint local blocks
+  with a shared transcode-scratch (only the deepest leaf transcodes, so the
+  feared `l_new_ptr` collision is avoided structurally). Each increment was
+  verified by a runtime-differential oracle (following the doubly relocated
+  pointers) + a REAL-adapter `wasmparser::Validator` budget test, and an
+  adversarial Mythos delta-pass (REFUTED across directions, aliasing, and
+  empty-inner-list edges). This **closes #286** and completes the #272 campaign
+  (all 6 directions × {flat, one-level, depth-2} × {params, results}).
+
+### Fixed
+
+- **#168 — fuzz-CI runner cargo-config drift.** The Fuzz-smoke jobs failed
+  intermittently per-runner with `ToolNotFound: x86_64-linux-musl-g++`. Root
+  cause: cargo-fuzz *derives* its target from a drifted runner's
+  `[build] target = musl` cargo config and passes it as an explicit `--target`,
+  which beats the `CARGO_BUILD_TARGET` env override (cargo precedence). Fixed by
+  pinning `cargo fuzz run --target x86_64-unknown-linux-gnu` (highest-precedence
+  slot), forcing the host gnu target on every runner. The infra root-cause
+  (re-image the rust-cpu runners) remains tracked on #168 (smithy's domain).
+
+### Changed (traceability)
+
+- **SR-41** description + verification updated: coverage now explicitly includes
+  two-level list nesting (`list<list<string>>`, #286); the residual fail-loud
+  boundary moved to deeper-than-two-level nesting. Cites the new `d5d_*` depth-2
+  runtime + real-adapter budget oracles.
+- **LS-F-27** de-staled: the async fail-loud guard's residual set narrowed from
+  `list<list<string>>` (now transcoded) to `list<list<list<string>>>` (depth-3+).
+- **SR-17** (#289): corrected an *understated* gap — the UTF-16→UTF-8 reverse
+  direction and lone-surrogate U+FFFD substitution were already covered by
+  passing runtime oracles (closed during #272), but the SR text still listed
+  them as a carried gap. Now cites the closing oracles. (Understated, not
+  overstated — the safe direction, but still a traceability defect.)
+
+### Falsification
+
+This release's central claim — depth-2 `list<list<string>>` cross-encoding
+transcodes correctly and only depth-2 is allowed — would be falsified by: a
+fused depth-2 nested-string param/result whose deepest string reads back under
+the wrong encoding or via a pointer still aimed into the source memory; a
+generated callback/stackful adapter referencing an out-of-budget or wrong local
+(rejected by `wasmparser::Validator`); or a `list<list<u8>>` / depth-3 site that
+is *allowed* (transcoded/raw-copied) rather than failing loud. The `d5d_*`
+oracles + guard boundary tests exercise each; all pass, none falsify.
+
+### Known gaps (disclosed)
+
+- **Depth-3+ list nesting** (`list<list<list<string>>>`) fails loud (LS-F-27),
+  not transcoded — bounded by the emitter's one-level recursion + the
+  async-adapter local budget. Extends to depth-N straightforwardly if needed.
+- **Async-lift e2e** remains fuse-only/structural in this repo's tests; the full
+  trampoline run is kiln-gated (out of scope here). The REAL-adapter budget
+  validator tests are the compensating control.
+- **Kani proofs not in CI** (runners lack the toolchain); run locally. The #286
+  equivalence proofs are additionally intractable under CBMC (allocation-heavy
+  recursive `cabi_size_align`) — the differential runtime oracle is the
+  load-bearing check there.
+- **#168 fuzz fix** is a meld-side mitigation verified by contract + ongoing CI
+  observation (the drifted runner is not locally reproducible); the infra
+  re-imaging root-cause stays open.
+- 16 baseline SRs remain `implemented` (not yet `verified`) — unchanged from
+  v0.32.0; not regressed by this release.
+
+## [0.32.0] - 2026-06-15
+
+String-transcoding correctness release: completes spec-faithful
+`latin1+utf16` (#253), implements **async cross-encoding string
+transcoding** end-to-end (#272), closes a Tier-5 missing-guard bug class
+(the sweep), and closes a confirmed dangling-pointer bug (#281). 33 commits
+since v0.31.0, each Tier-5 change adversarially Mythos-gated.
+
+### Added
+
+- **SR-41 — Async cross-encoding string transcoding** (#272). Async-lift FACT
+  adapters now transcode string params **and** results that cross a
+  string-encoding boundary, instead of raw-copying them under the wrong
+  encoding. Coverage: all 6 ordered directions over utf8 / utf16 /
+  latin1+utf16 (CompactUTF16, the `UTF16_TAG = 1<<31` tagged-length form),
+  at the top level **and** one level of list/record/tuple nesting, in both
+  the callback and stackful async variants. A nested `list<u8>` is
+  deep-copied verbatim and never transcoded (string-vs-byte-list
+  disambiguation via the WIT type). Shipped as 12 oracle-gated increments
+  (inc 1–5c-b); the adversarial Mythos passes caught four real
+  silent-corruption bugs before merge (a callback local-budget overflow, the
+  nested `list<u8>` corruption blocker, a `param_wit_types` per-pointer-pair
+  index misalignment, and a same-encoding UTF-16 nested deep-copy under-copy).
+
+### Fixed
+
+- **Spec-faithful `latin1+utf16` (CompactUTF16) transcoding** (#253).
+  meld's `StringEncoding::Latin1` is the canonical-ABI `latin1+utf16`
+  encoding; the read side now honors the `UTF16_TAG` length bit, the write
+  side encodes into the tagged latin1-or-utf16 form, and the cross-memory
+  copy machinery sizes buffers tag-aware (was silently corrupting / OOB).
+  `alignment_for_encoding(Latin1)` corrected 1→2.
+- **#281 — async nested-string param pointers no longer dangle.** The async
+  param path had no nested-indirection copy at all, so a `list<string>`
+  param's inner string pointers were bulk-copied verbatim and left pointing
+  into caller memory; they are now deep-copied/transcoded into callee memory.
+- **Tier-5 missing-guard sweep** — a recurring "a correctness guard / index
+  relocation present in one arm but missing from its siblings" bug class,
+  fixed across the fusion pipeline: element/data segment index relocation
+  (LS-M-8), `ref.func` in expression-form element segments (LS-M-9),
+  global/table import type-compatibility dedup (LS-M-10), `FixedSizeList`
+  copy-layout descent (LS-R-15), cross-component stream pairing on a stable
+  structural key (LS-R-16, #264), reference-type fidelity through fusion
+  (LS-A-21/22), nested resource detection (LS-A-23), and func-import
+  mixed-kind import-slot mapping (LS-W-2).
+- Malformed-UTF-8 / lone-surrogate → U+FFFD hardening in the sync
+  transcoders (#248/#249/#251, LS-P-16).
+
+### Changed (traceability)
+
+- SR-17 extended to cover the `latin1+utf16` tagged form; **LS-P-21** added
+  (tag mis-read/mis-write). **LS-F-27** de-staled: the async fail-loud guard
+  is now the *residual* fallback (its allow-set narrowed in lockstep to the
+  emitter's transcode-set) for the only unimplemented shape — deeper list
+  nesting (#286). GAP-8 closed. The Tier-5 sweep's loss scenarios are all
+  LS-N-gate-covered (gate 57/0/0).
+
+### Falsification statement
+
+The central claim of this release — *an async-lift adapter joining two
+components with a different string-encoding boundary transcodes string
+payloads to the destination encoding's exact bytes (and the correct
+`UTF16_TAG` length for latin1+utf16), while a `list<u8>` is deep-copied
+verbatim* — is falsified by the `tests/async_cross_encoding.rs` suite (44
+byte-exact differential oracles under wasmtime): a raw-copy instead of a
+transcode would render `"café"` (utf8→utf16) as bytes `63 61 66 C3 A9`
+rather than code units `0x0063 0x0061 0x0066 0x00E9`, mispair a
+supplementary `😀`, drop/corrupt the `1<<31` length tag, or corrupt a
+`list<u8>` — any of which flips one of the 44 oracles to failing. All 44
+pass.
+
+### Known gaps (disclosed)
+
+- **Deeper list nesting** (`list<list<string>>`, #286) is **not** transcoded
+  — it fails loud (the LS-F-27 guard), never silently mis-transcodes. A
+  recursive-copy restructure, tracked low-priority.
+- **Async-lift e2e is kiln-gated.** SR-41's transcode loops are
+  runtime-verified under wasmtime via synthetic two-memory modules; the real
+  callback/stackful adapter integration is verified by the `*_within_budget`
+  local-index tests (the compensating control), since full async-lift e2e
+  runs on the kiln runtime (out of scope for this repo's tests).
+- **Kani not in CI** — the SR-40 layout proofs verify locally
+  (`VERIFICATION SUCCESSFUL`) but smithy runners lack the toolchain
+  (follow-up); some CBMC aggregate-padding harnesses stay pinned by
+  exhaustive unit tests. 16 core SRs (SR-1..11, SR-14, SR-16, SR-18, SR-36)
+  remain `implemented`, unchanged from the v0.31.0 baseline (none in this
+  release's new scope).
+
 ## [0.31.0] - 2026-06-13
 
 ### Changed (traceability audit — closes the campaign V)

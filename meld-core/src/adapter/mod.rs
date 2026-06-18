@@ -23,6 +23,86 @@ pub(crate) mod fact;
 
 pub use fact::FactStyleGenerator;
 
+/// Test-support: build the #272 inc-1 UTF-8 → UTF-16 transcode oracle module.
+/// `#[doc(hidden)]` — not a supported API; see the function's own docs.
+#[doc(hidden)]
+pub use fact::build_utf8_to_utf16_transcode_test_module;
+
+/// Test-support: build the #272 inc-2 UTF-16 → UTF-8 transcode oracle module.
+/// `#[doc(hidden)]` — not a supported API; see the function's own docs.
+#[doc(hidden)]
+pub use fact::build_utf16_to_utf8_transcode_test_module;
+
+/// Test-support: build the #272 inc-4a latin1+utf16 → UTF-16 transcode oracle
+/// module. `#[doc(hidden)]` — not a supported API; see the function's own docs.
+#[doc(hidden)]
+pub use fact::build_latin1_to_utf16_transcode_test_module;
+
+/// Test-support: build the #272 inc-4a latin1+utf16 → UTF-8 transcode oracle
+/// module. `#[doc(hidden)]` — not a supported API; see the function's own docs.
+#[doc(hidden)]
+pub use fact::build_latin1_to_utf8_transcode_test_module;
+
+/// Test-support: build the #272 inc-4b UTF-8 → latin1+utf16 (DEST-latin1,
+/// tag-PRODUCING) transcode oracle module. `#[doc(hidden)]` — not a supported
+/// API; see the function's own docs.
+#[doc(hidden)]
+pub use fact::build_utf8_to_latin1_transcode_test_module;
+
+/// Test-support: build the #272 inc-4b UTF-16 → latin1+utf16 (DEST-latin1,
+/// tag-PRODUCING) transcode oracle module. `#[doc(hidden)]` — not a supported
+/// API; see the function's own docs.
+#[doc(hidden)]
+pub use fact::build_utf16_to_latin1_transcode_test_module;
+
+/// Test-support: build the #272 inc-5a NESTED `list<string>` RESULT transcode
+/// (UTF-8 → UTF-16) oracle module. `#[doc(hidden)]` — not a supported API; see
+/// the function's own docs.
+#[doc(hidden)]
+pub use fact::build_nested_list_string_utf8_to_utf16_result_test_module;
+
+/// Test-support: build the #272 inc-5a NESTED `list<u8>` RESULT NOT-transcoded
+/// (raw-copied) oracle module. `#[doc(hidden)]` — not a supported API; see the
+/// function's own docs.
+#[doc(hidden)]
+pub use fact::build_nested_list_u8_result_not_transcoded_test_module;
+
+/// Test-support: build the #272 inc-5b NESTED `list<string>` RESULT transcode
+/// oracle module for an ARBITRARY result direction (`callee_enc → caller_enc`).
+/// `#[doc(hidden)]` — not a supported API; see the function's own docs.
+#[doc(hidden)]
+pub use fact::build_nested_list_string_result_test_module;
+
+/// Test-support: build the #286 5d DEPTH-2 NESTED `list<list<string>>` RESULT
+/// transcode oracle module (exercises the codegen-time recursion).
+/// `#[doc(hidden)]` — not a supported API; see the function's own docs.
+#[doc(hidden)]
+pub use fact::build_nested_list_list_string_result_test_module;
+
+/// Test-support: build the #272 inc-5c-a NESTED `list<string>` PARAM transcode
+/// (UTF-8 → UTF-16) oracle module. `#[doc(hidden)]` — not a supported API; see
+/// the function's own docs.
+#[doc(hidden)]
+pub use fact::build_nested_list_string_utf8_to_utf16_param_test_module;
+
+/// Test-support: build the #272 inc-5c-a NESTED `list<u8>` PARAM deep-copied
+/// (NOT transcoded — closes #281) oracle module. `#[doc(hidden)]` — not a
+/// supported API; see the function's own docs.
+#[doc(hidden)]
+pub use fact::build_nested_list_u8_param_deep_copied_test_module;
+
+/// Test-support: build the #272 inc-5c-b NESTED `list<string>` PARAM transcode
+/// oracle module for an ARBITRARY param direction (`caller_enc → callee_enc`).
+/// `#[doc(hidden)]` — not a supported API; see the function's own docs.
+#[doc(hidden)]
+pub use fact::build_nested_list_string_param_test_module;
+
+/// Test-support: build the #286 5d DEPTH-2 NESTED `list<list<string>>` PARAM
+/// transcode oracle module (exercises the codegen-time param recursion).
+/// `#[doc(hidden)]` — not a supported API; see the function's own docs.
+#[doc(hidden)]
+pub use fact::build_nested_list_list_string_param_test_module;
+
 use crate::Result;
 use crate::merger::MergedModule;
 use crate::resolver::DependencyGraph;
