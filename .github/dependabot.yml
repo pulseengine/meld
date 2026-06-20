@@ -1,0 +1,33 @@
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    labels: &ref_0
+      - dependencies
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    labels: *ref_0
+  - package-ecosystem: cargo
+    directory: /meld-cli
+    schedule:
+      interval: weekly
+    labels: *ref_0
+  - package-ecosystem: cargo
+    directory: /meld-core
+    schedule:
+      interval: weekly
+    labels: *ref_0
+  - package-ecosystem: cargo
+    directory: /tools/spec-sync
+    schedule:
+      interval: weekly
+    labels: *ref_0
+  - package-ecosystem: cargo
+    directory: /verification/verus-pilot
+    schedule:
+      interval: weekly
+    labels: *ref_0
