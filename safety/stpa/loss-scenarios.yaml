@@ -2650,10 +2650,35 @@ loss-scenarios:
         specific iface being attributed (and its `[export]`-prefixed
         variants), so unrelated resource imports no longer disqualify
         the definer.
+
+      Defensive hardening (#295, 2026-06-20): the terminal-exporter pass
+      attributed a definer via `defines_cache.insert(...)` /
+      `definer_cache.insert(...)` BEFORE the rep-backed `defines_candidates`
+      were merged in with `.or_insert(...)`, so an export-name terminal
+      component (which may hold NO canonical `ResourceRep`) silently
+      OVERRODE a genuine rep-backed definer for the same `(iface, rn)`. A
+      bounded Mythos discovery sweep surfaced this; its reachability to an
+      observable misroute was REFUTED (the resolver consumes
+      `resource_definer` only as `.is_some()` and the routing override at
+      `resolver.rs:3116` is downgrade-only + heuristic-gated, so a wrong
+      `definer_cache`/`defines_cache` value cannot steer a route — see #295).
+      It is therefore robustness hardening, NOT a reachable loss path. The
+      fix makes rep-backed `Defines` AUTHORITATIVE: the terminal-exporter
+      pass now skips attribution for any `(iface, rn)` that already has a
+      rep-backed `defines_candidate`, so export-inference fills only the
+      genuine no-rep (flattened-canonical) case it exists for. Behaviour is
+      unchanged where the terminal exporter IS the rep holder (the cases
+      these tests + the live routing already exercise); only the
+      rep-vs-export conflict resolves toward the rep holder. Residual
+      (documented, low-priority): when NO rep-backed definer exists, two
+      colliding non-rep export terminals for one `(iface, rn)` still resolve
+      last-wins via `HashMap` iteration order — non-deterministic but
+      `.is_some()`-immune at every current consumer.
     causal-factors:
       - "Cleanup filter discarded the iface dimension of the (idx, iface, rn) tuple"
       - "`to_also_imports_resource` checked `resource_nodes.keys().any(...)` against ANY iface rather than the iface under attribution"
       - No upstream test exercised same-resource-name-across-different-interfaces or unrelated-resource-import cases
+      - "#295: export-inferred attribution (`.insert`) ran before, and thus overrode, the rep-backed candidate merge (`.or_insert`) — rep-backed truth was not authoritative"
     status: approved
     priority: high
 
