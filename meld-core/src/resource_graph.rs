@@ -283,9 +283,22 @@ impl ResourceGraph {
         // canonical) case it exists for. Reachability to a live misroute was
         // refuted (#295); this is robustness hardening, behaviour-unchanged
         // where the terminal exporter IS the rep holder.
+        //
+        // The interface is normalised by stripping any `[export]` prefix, so
+        // the membership check below is `[export]`-prefix-INSENSITIVE — matching
+        // the bare/`[export]` variant lookups in `defines_resource` /
+        // `resource_definer`. Without this, a rep holder registered under
+        // `svc:lib/api` would not match a terminal whose resource node is keyed
+        // `[export]svc:lib/api` (a distinct map key), defeating the guard in the
+        // `[export]`-alias case (mythos-auto finding on PR #296).
         let rep_backed_resources: std::collections::HashSet<(String, String)> = defines_candidates
             .keys()
-            .map(|(_idx, iface, rn)| (iface.clone(), rn.clone()))
+            .map(|(_idx, iface, rn)| {
+                (
+                    iface.strip_prefix("[export]").unwrap_or(iface).to_string(),
+                    rn.clone(),
+                )
+            })
             .collect();
 
         // Second pass: use ResolvesTo edges for definer detection.
@@ -322,8 +335,11 @@ impl ResourceGraph {
                     // that already has a rep-backed `Defines` candidate — the
                     // rep holder is the authoritative definer and is merged in
                     // below. Only attribute the export terminal for the genuine
-                    // no-rep case.
-                    if iface_matches && !rep_backed_resources.contains(&(iface.clone(), rn.clone()))
+                    // no-rep case. The interface is `[export]`-normalised to
+                    // match how `rep_backed_resources` is keyed (PR #296 finding).
+                    let norm_iface = iface.strip_prefix("[export]").unwrap_or(iface);
+                    if iface_matches
+                        && !rep_backed_resources.contains(&(norm_iface.to_string(), rn.clone()))
                     {
                         defines_cache.insert((*to_comp, iface.clone(), rn.clone()), true);
                         definer_cache.insert((iface.clone(), rn.clone()), Some(*to_comp));
@@ -646,6 +662,64 @@ mod tests {
             !rg.defines_resource(1, "svc:lib/api", "thing"),
             "#295: a no-rep export terminal must not override / shadow the rep \
              holder as definer"
+        );
+    }
+
+    /// LS-A-17 / #295 (`[export]`-prefix variant): the rep-backed authority
+    /// guard must be `[export]`-prefix-INSENSITIVE, matching the lookup
+    /// semantics of `defines_resource`/`resource_definer` (which try bare and
+    /// `[export]`-prefixed iface variants). Found by the mythos-auto discover
+    /// pass on PR #296: the rep holder registers the resource under
+    /// `svc:lib/api`, but the no-rep export terminal's resource node is keyed
+    /// `[export]svc:lib/api` (a distinct `HashMap` key). An exact-key guard
+    /// (`rep_backed_resources.contains(("[export]svc:lib/api", "thing"))`)
+    /// returns false, so the no-rep terminal is still attributed and
+    /// `defines_resource(1, "svc:lib/api", "thing")` wrongly returns true via
+    /// the `[export]`-alias lookup. The guard must normalise the `[export]`
+    /// prefix on both sides.
+    #[test]
+    fn ls_a_17_rep_backed_guard_is_export_prefix_insensitive() {
+        // Comp 0: rep holder, registers under the BARE interface `svc:lib/api`.
+        let mut c0 = empty_pc();
+        c0.canonical_functions
+            .push(CanonicalEntry::ResourceRep { resource: 0 });
+        let mut m0 = empty_cm();
+        m0.imports.push(imp("svc:lib/api", "[resource-rep]thing"));
+        c0.core_modules.push(m0);
+
+        // Comp 1: no-rep export terminal.
+        let c1 = empty_pc();
+
+        // Comp 2: pure consumer that drops `thing` under the `[export]`-prefixed
+        // interface — this creates the distinct `("[export]svc:lib/api", thing)`
+        // resource node — AND imports `svc:lib/api`, resolved to comp 1.
+        let mut c2 = empty_pc();
+        let mut m2 = empty_cm();
+        m2.imports
+            .push(imp("[export]svc:lib/api", "[resource-drop]thing"));
+        c2.core_modules.push(m2);
+
+        let mut resolved = HashMap::new();
+        resolved.insert(
+            (2usize, "svc:lib/api".to_string()),
+            (1usize, "svc:lib/api".to_string()),
+        );
+
+        let rg = ResourceGraph::build(&resolved, &[c0, c1, c2]);
+
+        // The no-rep export terminal (comp 1) must NOT be a definer even via the
+        // `[export]`-alias lookup — the bare-keyed rep-backed candidate (comp 0)
+        // is authoritative regardless of `[export]` prefixing.
+        assert!(
+            !rg.defines_resource(1, "svc:lib/api", "thing"),
+            "#295/[export]: a no-rep export terminal must not be attributed as \
+             definer when the rep holder registered under the bare interface \
+             and the terminal's node is [export]-prefixed (guard must normalise \
+             the [export] prefix)"
+        );
+        assert!(
+            rg.defines_resource(0, "svc:lib/api", "thing"),
+            "#295/[export]: the rep holder remains the definer"
         );
     }
 
