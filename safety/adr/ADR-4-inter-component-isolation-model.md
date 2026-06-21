@@ -114,13 +114,41 @@ The **corruption-critical drop wiring is paused** — it is no longer on
 the priority path. Resume only if a specific target needs the secondary
 shared mode.
 
-## Open knob (not settled by this ADR)
+## `Auto`-default policy (resolved — maintainer decision)
 
-The `Auto` strategy (#172) currently prefers `SharedMemory` + rebasing
-when provably sound, else `MultiMemory`. With model 1 now *secondary*,
-whether `Auto` should keep that bias or whether structural-isolation
-targets should explicitly select `--memory multi` is a separate policy
-decision, still open.
+The `Auto` strategy (#172) prefers `SharedMemory` + rebasing when
+provably sound (no `memory.grow`, ≥2 input memories), else `MultiMemory`,
+with a runtime downgrade shared→multi if shared fusion refuses.
+
+**Decision: `Auto` is NOT flipped, and `Auto` is NOT the safety path.**
+Rationale (maintainer): *functional safety wants the isolation model to
+be **explicit**, not automatic — "if we flip Auto things automatically
+might get wrong."* An implicit/automatic choice of a safety-relevant
+property (which isolation model protects components from each other) is
+itself the hazard.
+
+Therefore:
+1. **Safety-critical / structural-isolation builds MUST select the
+   memory strategy explicitly** (`--memory multi` for model 2). Do not
+   rely on `Auto` to land the committed isolation model — relying on an
+   automatic resolution for a safety property is disallowed.
+2. **`Auto` is left unchanged** (a convenience for general, non-safety
+   fusion). Flipping its default to prefer `MultiMemory` was rejected:
+   it would silently change a safety-relevant property for every build
+   and regress size/efficiency for the common non-MCU case — i.e. it
+   trades one automatic-wrong for another.
+3. **Auditability backstop**: the *resolved* strategy + `address_rebasing`
+   are already recorded in the signed attestation
+   (`attestation.rs`, set from `memory_strategy_label()` after
+   resolution), so even when `Auto` is used the chosen model is explicit
+   and verifiable *in the artifact* — not silent post-hoc.
+
+Recommended follow-up (not in this ADR): when `Auto` resolves a strategy
+for an **attested** build, emit a `warn`-level note recommending an
+explicit `--memory` selection, so the implicit choice is loud at build
+time for safety builds. Deferred as a behavior change pending its own
+review (the shared→multi downgrade path means the warning must report
+the *final* strategy, not the initial pick).
 
 ## Rivet artifacts
 
