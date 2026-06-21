@@ -5200,6 +5200,174 @@ mod tests {
         );
     }
 
+    /// #298 kill-criterion oracle (in-repo reproduction).
+    ///
+    /// Until now this failure was only reproducible *externally* — via gale's
+    /// `crates/gale-app-demo/dissolve.sh` on a real wit-bindgen component pair.
+    /// This pins it inside meld: fusing an all-scalar-boundary component pair in
+    /// the real MCU config (`SharedMemory` ⟹ `address_rebasing = true`, exactly
+    /// what `lib.rs` forces for shared memory) currently **hard-fails** because
+    /// the vestigial canonical-ABI allocator's `memory.grow` (here standing in
+    /// for `cabi_realloc → … → $sbrk → memory.grow`) reaches the address-rebase
+    /// rewriter, which rejects `memory.grow` (`rewriter.rs` `MemoryGrow` arm).
+    ///
+    /// The boundary between the two components is fully internalized and scalar,
+    /// so the allocator is provably dead — but the rewrite chokes on it *during
+    /// merge*, before any DCE/reachability pass could run. That ordering is the
+    /// crux of #298 (and why #298 ⟺ #299 are coupled).
+    ///
+    /// This asserts **today's** behavior (the hard-fail). When the #298
+    /// dead-allocator handling lands, this test goes red — at which point its
+    /// assertion must flip to the success criterion: merge succeeds, the fused
+    /// core exports **0** `cabi_realloc`, and contains **0** `memory.grow`.
+    #[test]
+    fn test_298_vestigial_grow_blocks_shared_rebase_fusion() {
+        use crate::parser::{FuncType, ModuleExport, ModuleImport, ParsedComponent};
+        use crate::resolver::{DependencyGraph, UnresolvedImport};
+
+        // A real core module whose exported `cabi_realloc` body contains a
+        // `memory.grow` — the canonical-ABI allocator meld must learn to drop.
+        let src = r#"(module
+            (type (func))
+            (type (func (param i32 i32 i32 i32) (result i32)))
+            (import "" "0" (func (type 0)))
+            (memory 1)
+            (func (type 1)
+                i32.const 1
+                memory.grow
+                drop
+                i32.const 0)
+            (export "cabi_realloc" (func 1)))"#;
+        let module_bytes = wat::parse_str(src).expect("wat compiles");
+
+        // Locate the code section payload range (the parser fills this in real
+        // runs; we mirror it so `extract_function_body` reads real bytes).
+        let mut code_range = None;
+        for payload in wasmparser::Parser::new(0).parse_all(&module_bytes) {
+            if let wasmparser::Payload::CodeSectionStart { range, .. } = payload.expect("payload") {
+                code_range = Some((range.start, range.end));
+            }
+        }
+        let code_range = code_range.expect("module has a code section");
+
+        let make_module = move || -> CoreModule {
+            CoreModule {
+                index: 0,
+                bytes: module_bytes.clone(),
+                types: vec![
+                    FuncType {
+                        params: vec![],
+                        results: vec![],
+                    },
+                    FuncType {
+                        params: vec![ValType::I32, ValType::I32, ValType::I32, ValType::I32],
+                        results: vec![ValType::I32],
+                    },
+                ],
+                imports: vec![ModuleImport {
+                    module: "".to_string(),
+                    name: "0".to_string(),
+                    kind: ImportKind::Function(0),
+                }],
+                exports: vec![ModuleExport {
+                    name: "cabi_realloc".to_string(),
+                    kind: ExportKind::Function,
+                    index: 1, // imported func 0, defined func = wasm idx 1
+                }],
+                functions: vec![1], // one defined func, type 1
+                memories: vec![MemoryType {
+                    memory64: false,
+                    shared: false,
+                    initial: 1,
+                    maximum: None,
+                }],
+                tables: Vec::new(),
+                globals: Vec::new(),
+                start: None,
+                data_count: None,
+                element_count: 0,
+                custom_sections: Vec::new(),
+                code_section_range: Some(code_range),
+                global_section_range: None,
+                element_section_range: None,
+                data_section_range: None,
+            }
+        };
+
+        let make_component = |module: CoreModule| -> ParsedComponent {
+            ParsedComponent {
+                name: None,
+                core_modules: vec![module],
+                imports: Vec::new(),
+                exports: Vec::new(),
+                types: Vec::new(),
+                instances: Vec::new(),
+                canonical_functions: Vec::new(),
+                sub_components: Vec::new(),
+                component_aliases: Vec::new(),
+                component_instances: Vec::new(),
+                core_entity_order: Vec::new(),
+                component_func_defs: Vec::new(),
+                component_instance_defs: Vec::new(),
+                component_type_defs: Vec::new(),
+                original_size: 0,
+                original_hash: String::new(),
+                depth_0_sections: Vec::new(),
+                p3_async_features: Vec::new(),
+            }
+        };
+
+        let components = vec![make_component(make_module()), make_component(make_module())];
+
+        let graph = DependencyGraph {
+            instantiation_order: vec![0, 1],
+            resolved_imports: HashMap::new(),
+            adapter_sites: Vec::new(),
+            module_resolutions: Vec::new(),
+            resource_graph: None,
+            stream_pair_graph: None,
+            reexporter_components: Vec::new(),
+            reexporter_resources: Vec::new(),
+            unresolved_imports: vec![
+                UnresolvedImport {
+                    component_idx: 0,
+                    module_idx: 0,
+                    module_name: "".to_string(),
+                    field_name: "0".to_string(),
+                    kind: ImportKind::Function(0),
+                    display_module: Some("wasi:io/error@0.2.6".to_string()),
+                    display_field: Some("drop".to_string()),
+                },
+                UnresolvedImport {
+                    component_idx: 1,
+                    module_idx: 0,
+                    module_name: "".to_string(),
+                    field_name: "0".to_string(),
+                    kind: ImportKind::Function(0),
+                    display_module: Some("wasi:io/error@0.2.6".to_string()),
+                    display_field: Some("drop".to_string()),
+                },
+            ],
+        };
+
+        // Real MCU config: shared memory forces address rebasing.
+        let merger = Merger::new(MemoryStrategy::SharedMemory, true);
+        let result = merger.merge(&components, &graph);
+
+        // TODO(#298): when the dead-allocator handling lands, flip this to:
+        //   let merged = result.expect("fusion of a scalar boundary succeeds");
+        //   assert!(!merged.exports.iter().any(|e| e.name.starts_with("cabi_realloc")));
+        //   // and assert 0 memory.grow in the encoded core.
+        let err = result.expect_err(
+            "today: shared+rebase fusion must reject the vestigial allocator's memory.grow",
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("memory.grow"),
+            "expected the memory.grow rebase rejection (the #298 coupling), got: {msg}"
+        );
+    }
+
     // -- SR-31: Multiply-instantiated module detection -------------------------
 
     /// Helper to build a minimal ParsedComponent with given instances.
