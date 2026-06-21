@@ -199,3 +199,50 @@ fn test_address_rebasing_end_to_end() {
     let b_fill_region = read_shared(&memory, base + 8, 4);
     assert_eq!(b_fill_region, vec![0xBB, 0xBB, 0xBB, 0xBB]);
 }
+
+/// #298 real-artifact blocker — grounds the synthetic kill-criterion oracle
+/// (`merger::tests::test_298_vestigial_grow_blocks_shared_rebase_fusion`) on a
+/// **real** wit-bindgen component.
+///
+/// Stock wit-bindgen output links a growing allocator behind `cabi_realloc`
+/// (`cabi_realloc → … → $sbrk → memory.grow`). Every fixture in the corpus
+/// carries it: `strings-simple.wasm` exports `cabi_realloc` and contains
+/// `memory.grow`. So fusing it in the single-address-space MCU config
+/// (`SharedMemory` ⟹ `address_rebasing`) must currently hard-fail when the
+/// rebase rewriter reaches that `memory.grow` — exactly the blocker the fork's
+/// `cabi-realloc-extern` (arena-backed, no-grow) build removes, after which
+/// `test_298_fork_arena_realloc_fuses_under_shared_rebase_today` shows meld
+/// fuses the result.
+///
+/// This is the real-bytes proof that the embedded no-grow story is needed and
+/// that meld's blocker fires on actual wit-bindgen output, not just hand-built
+/// WAT. When #298's dead-allocator handling lands, this stays red until updated
+/// to assert the (now grow-free) success.
+#[test]
+fn test_298_real_wit_bindgen_component_blocks_shared_rebase() {
+    let path = format!(
+        "{}/../tests/wit_bindgen/fixtures/strings-simple.wasm",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let component = std::fs::read(&path).expect("strings-simple fixture present");
+
+    let config = FuserConfig {
+        memory_strategy: MemoryStrategy::SharedMemory,
+        address_rebasing: true,
+        ..Default::default()
+    };
+    let mut fuser = Fuser::new(config);
+    fuser
+        .add_component_named(&component, Some("strings-simple"))
+        .unwrap();
+
+    let err = fuser.fuse().expect_err(
+        "today: a real wit-bindgen component (cabi_realloc-backed memory.grow) \
+         must not fuse under shared+rebase",
+    );
+    let msg = err.to_string();
+    assert!(
+        msg.contains("memory.grow"),
+        "expected the memory.grow rebase rejection on a real wit-bindgen artifact, got: {msg}"
+    );
+}
