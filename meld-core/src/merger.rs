@@ -5377,26 +5377,39 @@ mod tests {
     /// carries **no** `memory.grow` already fuses under `--memory shared`
     /// (⟹ `address_rebasing`) **today**, with no #298 fix — because the
     /// rewriter only rejects `memory.grow`, nothing else about the allocator.
-    /// This is the same harness as the kill-criterion oracle, with the
-    /// `memory.grow` removed from the body; it must SUCCEED.
+    ///
+    /// This faithfully mirrors the **real** fork output shape (verified against
+    /// `pulseengine/wit-bindgen@4753871d`, the `cabi-realloc-extern` feature):
+    /// `cabi_realloc` stays **exported** (so the same build still links on a
+    /// composing host like wasmtime) but its body **forwards to an imported**
+    /// `__cabi_arena_realloc(old_ptr, old_len, align, new_len) -> ptr` — the
+    /// embedder-provided bounded arena that traps on exhaustion instead of
+    /// calling `memory.grow`. The arena import is left **unresolved** (gale, the
+    /// embedder, links it post-fuse over one policy for the whole image).
+    ///
+    /// This must SUCCEED and the fused core must (a) still export `cabi_realloc`
+    /// and (b) retain the `__cabi_arena_realloc` import (the embedder seam).
     ///
     /// So the two fixes are complementary: the fork's no-grow `cabi_realloc`
     /// unblocks the MCU path directly (belt), and #298's meld-side drop handles
     /// the mixed/un-elided case (suspenders).
     #[test]
-    fn test_298_no_grow_realloc_fuses_under_shared_rebase_today() {
+    fn test_298_fork_arena_realloc_fuses_under_shared_rebase_today() {
         use crate::parser::{FuncType, ModuleExport, ModuleImport, ParsedComponent};
         use crate::resolver::{DependencyGraph, UnresolvedImport};
 
-        // Identical to the kill-criterion oracle, but the cabi_realloc body has
-        // NO memory.grow (an arena-backed realloc just returns a pointer).
+        // The real fork shape: cabi_realloc forwards to the imported arena
+        // function; NO memory.grow anywhere.
         let src = r#"(module
-            (type (func))
             (type (func (param i32 i32 i32 i32) (result i32)))
-            (import "" "0" (func (type 0)))
+            (import "pulseengine:embedder/arena" "__cabi_arena_realloc" (func (type 0)))
             (memory 1)
-            (func (type 1)
-                i32.const 0)
+            (func (type 0)
+                local.get 0
+                local.get 1
+                local.get 2
+                local.get 3
+                call 0)
             (export "cabi_realloc" (func 1)))"#;
         let module_bytes = wat::parse_str(src).expect("wat compiles");
 
@@ -5412,27 +5425,21 @@ mod tests {
             CoreModule {
                 index: 0,
                 bytes: module_bytes.clone(),
-                types: vec![
-                    FuncType {
-                        params: vec![],
-                        results: vec![],
-                    },
-                    FuncType {
-                        params: vec![ValType::I32, ValType::I32, ValType::I32, ValType::I32],
-                        results: vec![ValType::I32],
-                    },
-                ],
+                types: vec![FuncType {
+                    params: vec![ValType::I32, ValType::I32, ValType::I32, ValType::I32],
+                    results: vec![ValType::I32],
+                }],
                 imports: vec![ModuleImport {
-                    module: "".to_string(),
-                    name: "0".to_string(),
+                    module: "pulseengine:embedder/arena".to_string(),
+                    name: "__cabi_arena_realloc".to_string(),
                     kind: ImportKind::Function(0),
                 }],
                 exports: vec![ModuleExport {
                     name: "cabi_realloc".to_string(),
                     kind: ExportKind::Function,
-                    index: 1,
+                    index: 1, // imported arena func 0, defined cabi_realloc = wasm idx 1
                 }],
-                functions: vec![1],
+                functions: vec![0],
                 memories: vec![MemoryType {
                     memory64: false,
                     shared: false,
@@ -5486,41 +5493,69 @@ mod tests {
             stream_pair_graph: None,
             reexporter_components: Vec::new(),
             reexporter_resources: Vec::new(),
+            // The arena function is the embedder seam: gale provides it
+            // post-fuse, so it stays unresolved through fusion.
             unresolved_imports: vec![
                 UnresolvedImport {
                     component_idx: 0,
                     module_idx: 0,
-                    module_name: "".to_string(),
-                    field_name: "0".to_string(),
+                    module_name: "pulseengine:embedder/arena".to_string(),
+                    field_name: "__cabi_arena_realloc".to_string(),
                     kind: ImportKind::Function(0),
-                    display_module: Some("wasi:io/error@0.2.6".to_string()),
-                    display_field: Some("drop".to_string()),
+                    display_module: Some("pulseengine:embedder/arena".to_string()),
+                    display_field: Some("__cabi_arena_realloc".to_string()),
                 },
                 UnresolvedImport {
                     component_idx: 1,
                     module_idx: 0,
-                    module_name: "".to_string(),
-                    field_name: "0".to_string(),
+                    module_name: "pulseengine:embedder/arena".to_string(),
+                    field_name: "__cabi_arena_realloc".to_string(),
                     kind: ImportKind::Function(0),
-                    display_module: Some("wasi:io/error@0.2.6".to_string()),
-                    display_field: Some("drop".to_string()),
+                    display_module: Some("pulseengine:embedder/arena".to_string()),
+                    display_field: Some("__cabi_arena_realloc".to_string()),
                 },
             ],
         };
 
         let merger = Merger::new(MemoryStrategy::SharedMemory, true);
-        let merged = merger
-            .merge(&components, &graph)
-            .expect("a grow-free realloc must fuse under shared+rebase TODAY (no #298 needed)");
+        let merged = merger.merge(&components, &graph).expect(
+            "a fork arena-backed (grow-free) realloc must fuse under shared+rebase TODAY \
+             (no #298 needed)",
+        );
 
         // Success under address-rebasing IS the grow-free proof: the rewriter
         // rejects any reachable `memory.grow` (see the kill-criterion oracle),
-        // so a completed merge means no body grew memory. The fused core retains
-        // both realloc bodies (the suspenders #298 will later drop are belt here).
+        // so a completed merge means no body grew memory. Both cabi_realloc
+        // bodies survive (the suspenders #298 will later drop are belt here).
         assert_eq!(
             merged.functions.len(),
             2,
-            "both grow-free realloc bodies survive the rebase fuse"
+            "both arena-backed cabi_realloc bodies survive the rebase fuse"
+        );
+
+        // The fused core must still export cabi_realloc (kept present for a
+        // composing host) ...
+        assert!(
+            merged.exports.iter().any(|e| e.name == "cabi_realloc"),
+            "fused core keeps cabi_realloc exported (wasmtime-composability), \
+             got exports: {:?}",
+            merged.exports.iter().map(|e| &e.name).collect::<Vec<_>>()
+        );
+
+        // ... and must retain the __cabi_arena_realloc import — the embedder
+        // seam gale links post-fuse. Without it the fused core could not
+        // allocate, so meld must not drop or mis-wire it.
+        assert!(
+            merged
+                .imports
+                .iter()
+                .any(|i| i.name == "__cabi_arena_realloc"),
+            "fused core must retain the embedder arena import, got imports: {:?}",
+            merged
+                .imports
+                .iter()
+                .map(|i| format!("{}/{}", i.module, i.name))
+                .collect::<Vec<_>>()
         );
     }
 
