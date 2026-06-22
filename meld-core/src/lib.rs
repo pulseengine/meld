@@ -261,6 +261,12 @@ pub struct FusionStats {
     /// Number of adapter functions generated
     pub adapter_functions: usize,
 
+    /// Number of identity-trampoline adapters inlined away (#304): the caller's
+    /// import was wired directly to the target instead of through the thunk, so
+    /// no forwarding indirection survives. The thunk itself is left unreferenced
+    /// for loom to DCE. Subset of `adapter_functions`.
+    pub adapters_inlined: usize,
+
     /// Number of imports resolved internally
     pub imports_resolved: usize,
 
@@ -667,7 +673,7 @@ impl Fuser {
         // re-rewrite the affected function bodies so that call sites go through
         // the adapter trampolines instead of calling the target directly.
         if !adapters.is_empty() {
-            self.wire_adapter_indices(&mut merged, &adapters, &graph)?;
+            stats.adapters_inlined = self.wire_adapter_indices(&mut merged, &adapters, &graph)?;
         }
 
         // Step 4: Encode output module.
@@ -787,7 +793,10 @@ impl Fuser {
         merged: &mut merger::MergedModule,
         adapters: &[adapter::AdapterFunction],
         graph: &resolver::DependencyGraph,
-    ) -> Result<()> {
+    ) -> Result<usize> {
+        // #304: count of identity trampolines inlined away (caller wired
+        // straight to the target instead of through the thunk).
+        let mut inlined_count = 0usize;
         use std::collections::{HashMap, HashSet};
         use wasm_encoder::{Function, Instruction, ValType};
 
@@ -860,8 +869,16 @@ impl Fuser {
         for (adapter_offset, (adapter, site)) in
             adapters.iter().zip(graph.adapter_sites.iter()).enumerate()
         {
+            // #304: a pure identity trampoline is bypassed — wire the caller's
+            // import straight to the target. (A widening wrapper, if any, takes
+            // precedence; the two are mutually exclusive since an identity
+            // forward has no result widening, but order defensively.) The
+            // bypassed thunk is left unreferenced for loom to DCE.
             let target_idx = if let Some(&wrapper_idx) = adapter_to_wrapper.get(&adapter_offset) {
                 wrapper_idx
+            } else if let Some(inline_target) = adapter.inline_target {
+                inlined_count += 1;
+                inline_target
             } else {
                 adapter_base + adapter_offset as u32
             };
@@ -1000,12 +1017,13 @@ impl Fuser {
         }
 
         log::info!(
-            "Wired {} adapter(s) into {} source module(s)",
+            "Wired {} adapter(s) into {} source module(s); {} identity trampoline(s) inlined",
             adapters.len(),
-            affected_modules.len()
+            affected_modules.len(),
+            inlined_count
         );
 
-        Ok(())
+        Ok(inlined_count)
     }
 
     /// Generate task.return shim functions for internal fused async calls.

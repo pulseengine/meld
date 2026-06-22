@@ -149,6 +149,50 @@ fn test_cross_module_call() {
     assert_eq!(result, 7, "run() should return add(3, 4) = 7");
 }
 
+/// #304: fusing a real wac-composed two-component fixture (consumer → provider)
+/// internalizes the cross-component `compute` call, which is a same-memory
+/// scalar boundary → a pure identity Direct adapter. With `inline_adapters` on
+/// (the default), meld wires the caller's import **straight to the target**
+/// rather than through the forwarding thunk — no indirection interposed; the
+/// dead thunk is left for loom to DCE. Asserts the inline fired and the fused
+/// module still validates. (Behavioural equivalence is covered by
+/// `golden_e2e`'s Tier-B test on the same fixture.)
+#[test]
+fn test_304_identity_direct_adapter_is_inlined() {
+    let path = format!(
+        "{}/../tests/wit_bindgen/fixtures/compose/composed.wasm",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let Ok(composed) = std::fs::read(&path) else {
+        eprintln!("compose fixture absent ({path}); skipping");
+        return;
+    };
+
+    let mut fuser = Fuser::new(FuserConfig {
+        attestation: false,
+        component_provenance: false,
+        ..Default::default()
+    });
+    fuser
+        .add_component_named(&composed, Some("composed"))
+        .unwrap();
+
+    let (fused, stats) = fuser.fuse_with_stats().unwrap();
+
+    assert!(
+        stats.adapters_inlined >= 1,
+        "expected >=1 identity Direct adapter inlined when fusing the composed \
+         consumer→provider fixture, got {} (of {} adapters)",
+        stats.adapters_inlined,
+        stats.adapter_functions
+    );
+
+    // The fused output must still be valid wasm after the rewiring.
+    wasmparser::Validator::new_with_features(wasmparser::WasmFeatures::all())
+        .validate_all(&fused)
+        .expect("fused module must validate after identity-adapter inlining");
+}
+
 #[test]
 fn test_cross_module_call_with_different_args() {
     // Same structure but verify the actual function, not just a constant

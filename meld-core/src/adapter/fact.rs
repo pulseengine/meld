@@ -5306,6 +5306,28 @@ impl FactStyleGenerator {
             (t, b, AdapterClass::Direct)
         };
 
+        let target_function = self.resolve_target_function(site, merged)?;
+
+        // #304: a Direct adapter is a *pure identity trampoline* — body is
+        // exactly `local.get*; call target; end` — only when it carries no
+        // resource conversions AND no post-return. (The Direct `else` branch in
+        // `generate_direct_adapter` still emits `call post_return` when
+        // `has_post_return && result_count == 0`, so post-return must be
+        // excluded entirely, not just the result>0 case — wiring the caller
+        // straight to the target would otherwise skip the post-return cleanup.)
+        // When inlining is enabled and that holds, record the target so
+        // `wire_adapter_indices` bypasses this thunk. Fail-safe: any doubt → None.
+        let inline_target = if self.config.inline_adapters
+            && matches!(class, AdapterClass::Direct)
+            && options.resource_rep_calls.is_empty()
+            && options.resource_new_calls.is_empty()
+            && options.callee_post_return.is_none()
+        {
+            Some(target_function)
+        } else {
+            None
+        };
+
         Ok(AdapterFunction {
             name,
             type_idx,
@@ -5314,8 +5336,9 @@ impl FactStyleGenerator {
             source_module: site.from_module,
             target_component: site.to_component,
             target_module: site.to_module,
-            target_function: self.resolve_target_function(site, merged)?,
+            target_function,
             class,
+            inline_target,
         })
     }
 
@@ -10299,6 +10322,9 @@ impl FactStyleGenerator {
             target_module: site.to_module,
             target_function: target_func,
             class: AdapterClass::Async,
+            // Async-lift adapters transform (await/result delivery) — never a
+            // pure identity trampoline, so never inlined (#304).
+            inline_target: None,
         })
     }
 
@@ -11667,6 +11693,8 @@ impl FactStyleGenerator {
             target_module: site.to_module,
             target_function: target_func,
             class: AdapterClass::Async,
+            // Async-lift adapter — transforms, never a pure trampoline (#304).
+            inline_target: None,
         })
     }
 }

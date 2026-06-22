@@ -175,6 +175,17 @@ pub struct AdapterFunction {
 
     /// Emitter class, for synthetic DWARF attribution (#144 inc 4).
     pub class: AdapterClass,
+
+    /// #304: when this adapter is a *pure identity trampoline* (a `Direct`
+    /// adapter whose body only re-pushes params and `call`s the target — no
+    /// transcoding, no resource conversion, no post-return), and adapter
+    /// inlining is enabled, this holds the target function's merged index.
+    /// `wire_adapter_indices` then wires the caller's import **directly** to the
+    /// target instead of to this thunk, so no forwarding indirection is
+    /// interposed at runtime; the now-unreferenced adapter is left for loom to
+    /// DCE. `None` means "keep the thunk" (the conservative default — set only
+    /// when the no-op forwarding is provable). See `inline_adapters`.
+    pub inline_target: Option<u32>,
 }
 
 /// Trait for adapter generators
