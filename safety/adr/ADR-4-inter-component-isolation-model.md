@@ -143,12 +143,20 @@ Therefore:
    resolution), so even when `Auto` is used the chosen model is explicit
    and verifiable *in the artifact* — not silent post-hoc.
 
-Recommended follow-up (not in this ADR): when `Auto` resolves a strategy
-for an **attested** build, emit a `warn`-level note recommending an
-explicit `--memory` selection, so the implicit choice is loud at build
-time for safety builds. Deferred as a behavior change pending its own
-review (the shared→multi downgrade path means the warning must report
-the *final* strategy, not the initial pick).
+**Implemented**: when `Auto` resolves a strategy for an **attested**
+build, `Fuser::fuse` emits a `warn`-level note recommending an explicit
+`--memory` selection, so the implicit choice is loud at build time for
+safety builds. The warning reports the *final* strategy (after any
+shared→multi downgrade), not the initial pick, and fires only when
+attestation is enabled (the release/safety-build signal) to avoid noise
+on casual fusion. Log-only — no change to fusion behavior; the existing
+`auto_memory` tests confirm resolution is unchanged.
+
+Not done (a stricter option, if wanted later): *erroring* instead of
+warning when `Auto` is used on an attested build, behind an opt-in
+`require_explicit_memory_strategy` config — hard-enforcing "explicit, not
+auto." Deferred because erroring is a breaking change for existing
+`Auto`+attestation users and should be opt-in.
 
 ## Rivet artifacts
 

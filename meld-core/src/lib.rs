@@ -403,8 +403,8 @@ impl Fuser {
         self.config.address_rebasing = requested_rebasing;
         if self.config.memory_strategy == MemoryStrategy::Auto {
             self.resolve_auto_memory_strategy();
-            if self.config.memory_strategy == MemoryStrategy::SharedMemory {
-                return match self.fuse_with_stats_resolved() {
+            let result = if self.config.memory_strategy == MemoryStrategy::SharedMemory {
+                match self.fuse_with_stats_resolved() {
                     Err(Error::MemoryStrategyUnsupported(msg)) => {
                         // Auto must never fail on input multi-memory accepts:
                         // a shared-plan refusal downgrades to multi-memory
@@ -418,8 +418,26 @@ impl Fuser {
                         self.fuse_with_stats_resolved()
                     }
                     other => other,
-                };
+                }
+            } else {
+                self.fuse_with_stats_resolved()
+            };
+            // #300 / ADR-4: `Auto` resolved a safety-relevant property (which
+            // inter-component isolation model protects components) automatically.
+            // Functional-safety builds must choose the strategy EXPLICITLY — so
+            // on an attested build (the release/safety build) surface the
+            // automatic choice loudly rather than letting it pass silently.
+            // `memory_strategy_label()` here is the FINAL strategy, after any
+            // shared->multi downgrade above.
+            if self.config.attestation {
+                log::warn!(
+                    "memory strategy: `Auto` resolved to '{}' for an attested build; \
+                     functional-safety builds should select `--memory` explicitly \
+                     (ADR-4: explicit, not auto)",
+                    self.memory_strategy_label()
+                );
             }
+            return result;
         }
         self.fuse_with_stats_resolved()
     }
