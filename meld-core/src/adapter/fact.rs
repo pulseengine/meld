@@ -5317,6 +5317,9 @@ impl FactStyleGenerator {
         // straight to the target would otherwise skip the post-return cleanup.)
         // When inlining is enabled and that holds, record the target so
         // `wire_adapter_indices` bypasses this thunk. Fail-safe: any doubt → None.
+        // This guard MUST stay a superset of `generate_direct_adapter`'s
+        // complex-branch trigger — see the "#304 INVARIANT" note on its simple-
+        // trampoline `else` branch; the two are coupled and must move together.
         let inline_target = if self.config.inline_adapters
             && matches!(class, AdapterClass::Direct)
             && options.resource_rep_calls.is_empty()
@@ -5954,7 +5957,17 @@ impl FactStyleGenerator {
             func.instruction(&Instruction::End);
             Ok((type_idx, func))
         } else {
-            // Simple trampoline (no post-return or no results)
+            // Simple trampoline (no post-return or no results).
+            //
+            // #304 INVARIANT: when `callee_post_return.is_none()` (and no
+            // resource ops — guaranteed here by the enclosing `if`), this body
+            // is a *pure identity forward* — exactly `local.get 0..N; call
+            // target; end`. `generate_adapter`'s inline guard relies on that to
+            // wire the caller straight to the target and drop this thunk. If you
+            // add ANY instruction below for the post-return-free case (a trap, a
+            // result fixup, anything), you MUST extend that guard
+            // (`callee_post_return.is_none()` etc.) or the inlined path will
+            // silently diverge from the thunk. Keep the two in lockstep.
             let mut func = Function::new([]);
 
             for i in 0..param_count {
