@@ -261,6 +261,12 @@ pub struct FusionStats {
     /// Number of adapter functions generated
     pub adapter_functions: usize,
 
+    /// Number of identity-trampoline adapters inlined away (#304): the caller's
+    /// import was wired directly to the target instead of through the thunk, so
+    /// no forwarding indirection survives. The thunk itself is left unreferenced
+    /// for loom to DCE. Subset of `adapter_functions`.
+    pub adapters_inlined: usize,
+
     /// Number of imports resolved internally
     pub imports_resolved: usize,
 
@@ -403,8 +409,8 @@ impl Fuser {
         self.config.address_rebasing = requested_rebasing;
         if self.config.memory_strategy == MemoryStrategy::Auto {
             self.resolve_auto_memory_strategy();
-            if self.config.memory_strategy == MemoryStrategy::SharedMemory {
-                return match self.fuse_with_stats_resolved() {
+            let result = if self.config.memory_strategy == MemoryStrategy::SharedMemory {
+                match self.fuse_with_stats_resolved() {
                     Err(Error::MemoryStrategyUnsupported(msg)) => {
                         // Auto must never fail on input multi-memory accepts:
                         // a shared-plan refusal downgrades to multi-memory
@@ -418,8 +424,26 @@ impl Fuser {
                         self.fuse_with_stats_resolved()
                     }
                     other => other,
-                };
+                }
+            } else {
+                self.fuse_with_stats_resolved()
+            };
+            // #300 / ADR-4: `Auto` resolved a safety-relevant property (which
+            // inter-component isolation model protects components) automatically.
+            // Functional-safety builds must choose the strategy EXPLICITLY — so
+            // on an attested build (the release/safety build) surface the
+            // automatic choice loudly rather than letting it pass silently.
+            // `memory_strategy_label()` here is the FINAL strategy, after any
+            // shared->multi downgrade above.
+            if self.config.attestation {
+                log::warn!(
+                    "memory strategy: `Auto` resolved to '{}' for an attested build; \
+                     functional-safety builds should select `--memory` explicitly \
+                     (ADR-4: explicit, not auto)",
+                    self.memory_strategy_label()
+                );
             }
+            return result;
         }
         self.fuse_with_stats_resolved()
     }
@@ -473,6 +497,58 @@ impl Fuser {
         }
     }
 
+    /// #298 — whether the fused core's `cabi_realloc` is provably vestigial and
+    /// therefore safe to drop (so loom can DCE the allocator + `memory.grow`,
+    /// unblocking the single-address-space `--memory shared` MCU path).
+    ///
+    /// **Fail-safe and currently INERT.** This computes the verdict only; it is
+    /// not yet wired to change merge/encode behavior — that's the
+    /// corruption-critical step gated *behind* this verdict (the tolerant
+    /// rewriter + dead-function stubbing, see #298 / #299). The default on any
+    /// uncertainty is `false` (keep `cabi_realloc`): under-drop is a missed
+    /// optimization, over-drop is silent marshalling corruption.
+    ///
+    /// `cabi_realloc` is the component's *own* allocator, used by `canon lift`
+    /// when the host calls in with pointer-carrying args/results. So the
+    /// relevant surface is each component's **lifts** (exports): if every lift
+    /// is scalar (no string/list params or results) nothing needs the
+    /// allocator. (`canon lower`/imports use the *callee's* realloc, not this
+    /// one.) Two sound conservatisms: it also counts lifts that fusion will
+    /// internalize (over-keep), and it bails to `false` on any unresolvable
+    /// type, non-core output, or adapter presence.
+    fn cabi_realloc_drop_provably_safe(&self, graph: &resolver::DependencyGraph) -> bool {
+        // (1) Core-module output only: a P2 wrap aliases cabi_realloc for
+        //     `canon lower`, so dropping it there corrupts marshalling.
+        if self.config.output_format != OutputFormat::CoreModule {
+            return false;
+        }
+        // (2) No cross-component adapters: an adapter may marshal pointers and
+        //     consume the allocator. Over-keep; refine to per-site later.
+        if !graph.adapter_sites.is_empty() {
+            return false;
+        }
+        // (3) Every lift's component-level type must be provably scalar.
+        for comp in &self.components {
+            for entry in &comp.canonical_functions {
+                let parser::CanonicalEntry::Lift { type_index, .. } = entry else {
+                    continue;
+                };
+                let Some(td) = comp.get_type_definition(*type_index) else {
+                    return false; // unresolvable type => fail-safe keep
+                };
+                let parser::ComponentTypeKind::Function { params, results } = &td.kind else {
+                    return false; // non-function lift type => keep
+                };
+                if params.iter().any(|(_, t)| comp.type_contains_pointers(t))
+                    || results.iter().any(|(_, t)| comp.type_contains_pointers(t))
+                {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
     /// The fusion pipeline proper. `self.config.memory_strategy` is a
     /// concrete strategy here — `Auto` has been resolved by the caller.
     fn fuse_with_stats_resolved(&self) -> Result<(Vec<u8>, FusionStats)> {
@@ -516,6 +592,17 @@ impl Fuser {
         let resolver = Resolver::with_strategy(self.config.memory_strategy);
         let graph = resolver.resolve_with_hints(&self.components, &self.wiring_hints)?;
         stats.imports_resolved = graph.resolved_imports.len();
+
+        // #298 (INERT): compute the vestigial-cabi_realloc verdict for
+        // visibility. Not yet wired to drop anything — the actual drop is the
+        // corruption-critical step gated behind this and is implemented
+        // separately (tolerant rewriter + dead-function stubbing).
+        if self.cabi_realloc_drop_provably_safe(&graph) {
+            log::debug!(
+                "#298: cabi_realloc is provably vestigial for this fuse \
+                 (scalar lift surface, core output, no adapters) — drop not yet wired"
+            );
+        }
 
         // Step 2: Merge modules
         log::info!("Merging {} core modules", stats.modules_merged);
@@ -586,7 +673,7 @@ impl Fuser {
         // re-rewrite the affected function bodies so that call sites go through
         // the adapter trampolines instead of calling the target directly.
         if !adapters.is_empty() {
-            self.wire_adapter_indices(&mut merged, &adapters, &graph)?;
+            stats.adapters_inlined = self.wire_adapter_indices(&mut merged, &adapters, &graph)?;
         }
 
         // Step 4: Encode output module.
@@ -706,7 +793,10 @@ impl Fuser {
         merged: &mut merger::MergedModule,
         adapters: &[adapter::AdapterFunction],
         graph: &resolver::DependencyGraph,
-    ) -> Result<()> {
+    ) -> Result<usize> {
+        // #304: count of identity trampolines inlined away (caller wired
+        // straight to the target instead of through the thunk).
+        let mut inlined_count = 0usize;
         use std::collections::{HashMap, HashSet};
         use wasm_encoder::{Function, Instruction, ValType};
 
@@ -779,8 +869,16 @@ impl Fuser {
         for (adapter_offset, (adapter, site)) in
             adapters.iter().zip(graph.adapter_sites.iter()).enumerate()
         {
+            // #304: a pure identity trampoline is bypassed — wire the caller's
+            // import straight to the target. (A widening wrapper, if any, takes
+            // precedence; the two are mutually exclusive since an identity
+            // forward has no result widening, but order defensively.) The
+            // bypassed thunk is left unreferenced for loom to DCE.
             let target_idx = if let Some(&wrapper_idx) = adapter_to_wrapper.get(&adapter_offset) {
                 wrapper_idx
+            } else if let Some(inline_target) = adapter.inline_target {
+                inlined_count += 1;
+                inline_target
             } else {
                 adapter_base + adapter_offset as u32
             };
@@ -919,12 +1017,13 @@ impl Fuser {
         }
 
         log::info!(
-            "Wired {} adapter(s) into {} source module(s)",
+            "Wired {} adapter(s) into {} source module(s); {} identity trampoline(s) inlined",
             adapters.len(),
-            affected_modules.len()
+            affected_modules.len(),
+            inlined_count
         );
 
-        Ok(())
+        Ok(inlined_count)
     }
 
     /// Generate task.return shim functions for internal fused async calls.
@@ -2487,6 +2586,135 @@ fn generate_stabilizing_shim(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- #298 inert vestigial-cabi_realloc verdict oracles ----------------
+    //
+    // These pin `cabi_realloc_drop_provably_safe` (the fail-safe verdict the
+    // future drop is gated behind). The verdict is INERT today — it only
+    // decides keep-vs-drop; nothing acts on it yet. Each oracle exercises one
+    // gate so the corruption-critical default (keep) cannot silently regress.
+
+    fn empty_graph_298() -> crate::resolver::DependencyGraph {
+        crate::resolver::DependencyGraph {
+            instantiation_order: Vec::new(),
+            resolved_imports: std::collections::HashMap::new(),
+            adapter_sites: Vec::new(),
+            module_resolutions: Vec::new(),
+            resource_graph: None,
+            stream_pair_graph: None,
+            reexporter_components: Vec::new(),
+            reexporter_resources: Vec::new(),
+            unresolved_imports: Vec::new(),
+        }
+    }
+
+    /// A component exporting exactly one lifted function with the given params
+    /// (no results). Empty params ⟹ scalar surface; a `String` param ⟹ pointer.
+    fn component_with_one_lift_298(
+        params: Vec<(String, crate::parser::ComponentValType)>,
+    ) -> crate::parser::ParsedComponent {
+        crate::parser::ParsedComponent {
+            name: None,
+            core_modules: Vec::new(),
+            imports: Vec::new(),
+            exports: Vec::new(),
+            types: vec![crate::parser::ComponentType {
+                kind: crate::parser::ComponentTypeKind::Function {
+                    params,
+                    results: Vec::new(),
+                },
+            }],
+            instances: Vec::new(),
+            canonical_functions: vec![crate::parser::CanonicalEntry::Lift {
+                core_func_index: 0,
+                type_index: 0,
+                options: crate::parser::CanonicalOptions::default(),
+            }],
+            sub_components: Vec::new(),
+            component_aliases: Vec::new(),
+            component_instances: Vec::new(),
+            core_entity_order: Vec::new(),
+            component_func_defs: Vec::new(),
+            component_instance_defs: Vec::new(),
+            component_type_defs: vec![crate::parser::ComponentTypeDef::Defined],
+            original_size: 0,
+            original_hash: String::new(),
+            depth_0_sections: Vec::new(),
+            p3_async_features: Vec::new(),
+        }
+    }
+
+    fn fuser_with_components_298(
+        components: Vec<crate::parser::ParsedComponent>,
+        output_format: OutputFormat,
+    ) -> Fuser {
+        let mut fuser = Fuser::new(FuserConfig {
+            output_format,
+            ..Default::default()
+        });
+        fuser.components = components;
+        fuser
+    }
+
+    /// Scalar lift surface + core output + no adapters ⟹ droppable (true).
+    #[test]
+    fn test_298_verdict_scalar_lift_surface_is_droppable() {
+        let fuser = fuser_with_components_298(
+            vec![component_with_one_lift_298(Vec::new())],
+            OutputFormat::CoreModule,
+        );
+        assert!(fuser.cabi_realloc_drop_provably_safe(&empty_graph_298()));
+    }
+
+    /// A pointer-carrying (string) lift param ⟹ cabi_realloc needed ⟹ keep.
+    #[test]
+    fn test_298_verdict_pointer_lift_surface_keeps_realloc() {
+        let fuser = fuser_with_components_298(
+            vec![component_with_one_lift_298(vec![(
+                "s".to_string(),
+                crate::parser::ComponentValType::String,
+            )])],
+            OutputFormat::CoreModule,
+        );
+        assert!(!fuser.cabi_realloc_drop_provably_safe(&empty_graph_298()));
+    }
+
+    /// Even a scalar surface must keep realloc when the output is a P2 wrap:
+    /// the wrap aliases cabi_realloc for `canon lower` (over-drop = corruption).
+    #[test]
+    fn test_298_verdict_component_output_keeps_realloc() {
+        let fuser = fuser_with_components_298(
+            vec![component_with_one_lift_298(Vec::new())],
+            OutputFormat::Component,
+        );
+        assert!(!fuser.cabi_realloc_drop_provably_safe(&empty_graph_298()));
+    }
+
+    /// Any cross-component adapter site ⟹ keep (an adapter may marshal pointers
+    /// and consume the allocator).
+    #[test]
+    fn test_298_verdict_adapter_sites_keep_realloc() {
+        let fuser = fuser_with_components_298(
+            vec![component_with_one_lift_298(Vec::new())],
+            OutputFormat::CoreModule,
+        );
+        let mut graph = empty_graph_298();
+        graph.adapter_sites.push(crate::resolver::AdapterSite {
+            from_component: 0,
+            from_module: 0,
+            import_name: "f".to_string(),
+            import_module: "m".to_string(),
+            import_func_type_idx: None,
+            to_component: 0,
+            to_module: 0,
+            export_name: "f".to_string(),
+            export_func_idx: 0,
+            crosses_memory: false,
+            is_async_lift: false,
+            requirements: crate::resolver::AdapterRequirements::default(),
+        });
+        assert!(!fuser.cabi_realloc_drop_provably_safe(&graph));
+    }
 
     /// #172: the library default is `Auto` — shared+rebase when provably
     /// safe, multi-memory otherwise. Pin it so a change is deliberate.

@@ -1288,3 +1288,100 @@ artifacts:
         (async nested-param pointers dangling into caller memory) was closed in
         the same work.
       milestone: post-v0.31.0
+
+  - id: SR-42
+    type: requirement
+    title: Identity-trampoline adapter inlining
+    description: >
+      When a cross-component call edge resolves to a pure identity-trampoline
+      adapter (a `Direct` adapter whose body is exactly
+      `local.get*; call target; end` — no transcoding, no resource conversion,
+      no post-return), meld shall wire the caller's import directly to the
+      target function instead of interposing the forwarding thunk, when
+      `inline_adapters` is enabled (the default). The bypassed thunk is left
+      unreferenced for loom to DCE; no re-indexing is performed (all adapter
+      index maps are preserved). The inline condition is fail-safe: any
+      resource ops or any `callee_post_return` keeps the thunk (#304).
+    status: implemented
+    tags: [optimization, adapter, v0.34.0]
+    links:
+      - type: tracked-by
+        target: "#304"
+      - type: derives-from
+        target: SR-12
+    fields:
+      implementation:
+        - meld-core/src/adapter/fact.rs
+        - meld-core/src/adapter/mod.rs
+        - meld-core/src/lib.rs
+      verification-method: test
+      verification-description: >
+        cross_component_call::test_304_identity_direct_adapter_is_inlined fuses
+        the wac-composed consumer->provider fixture, asserts >=1 identity
+        adapter inlined (FusionStats.adapters_inlined) + the fused module
+        validates. Behaviour preserved across cross_component_call,
+        adapter_safety, runtime_intra_adapter, runtime_from_exports,
+        wit_bindgen_runtime (73), and golden_e2e Tier-B behavioural
+        equivalence on the same fixture. A clean-room adversarial review
+        (5 angles) returned SOUND; the guard<->trampoline-body coupling is
+        pinned by reciprocal invariant comments.
+      milestone: v0.34.0
+
+  - id: SR-43
+    type: requirement
+    title: Opaque-rep resource drop-teardown soundness
+    description: >
+      A fused 3-component re-exporter chain whose intermediate exports an
+      opaque-rep resource shall construct AND drop without trapping. Opaque-rep
+      removes the `& 7` alignment trap of the standard resource_floats fixture,
+      unmasking a separate drop-teardown memory fault. meld shall forward the
+      inner-handle drop and discriminate per-resource handle tables so the
+      construct+drop runtime path completes cleanly (#305).
+    status: proposed
+    tags: [bug, resource, opaque-rep, v0.35.0]
+    links:
+      - type: tracked-by
+        target: "#305"
+      - type: derives-from
+        target: SR-25
+    fields:
+      implementation:
+        - meld-core/src/merger.rs
+      verification-method: test
+      verification-description: >
+        PLANNED. Cherry-pick the fuse oracle
+        (wit_bindgen_runtime::test_fuse_wit_bindgen_resource_floats_opaque) from
+        feat/explore-I-opaque-rep, then upgrade it from fuse_only to a runtime
+        construct+drop test once the inner-handle drop forwarding +
+        per-resource handle-table discrimination land. Not yet implemented.
+      milestone: v0.35.0
+
+  - id: SR-44
+    type: requirement
+    title: Enforced requirement->verification->test traceability
+    description: >
+      The V-model right side shall be a machine-enforced rivet trace, not inert
+      YAML. Today `rivet validate` reports 0% requirement-coverage and there is
+      no test/verification artifact type, so every SR's "verified" status is
+      self-asserted in `traceability.yaml` rather than gated by a `verifies`
+      link to a test artifact (#303). meld shall: add a verification artifact
+      type + `verifies` links generated from the existing verification-status
+      test names; repair the 34 broken links (issue-refs mis-encoded as trace
+      links; host-controller and dangling-UCA references); and reconcile the
+      requirement-coverage rule with this project's STPA+requirements topology.
+    status: proposed
+    tags: [process, traceability, verification, v0.36.0]
+    links:
+      - type: tracked-by
+        target: "#303"
+    fields:
+      implementation:
+        - safety/requirements/traceability.yaml
+        - safety/stpa/ucas.yaml
+      verification-method: review
+      verification-description: >
+        PLANNED. Done when `rivet validate` is error-free and `rivet coverage`
+        reports requirement-coverage > 0% with every SR linked by `verifies` to
+        a test artifact. Partly gated on maintainer STPA judgment (host-
+        controller scope; intended UCAs for the dangling refs — #303 Class B/C).
+      milestone: v0.36.0

@@ -1,0 +1,177 @@
+---
+id: ADR-4
+type: design-question
+title: Inter-component memory-isolation model for the dissolved library-OS
+status: resolved
+gating-fixtures:
+  - multi_memory::test_multi_memory_separate_memories
+  - multi_memory::test_multi_memory_preserves_isolation
+  - multi_memory::test_multi_memory_preserves_isolation_three_components
+  - multi_memory::test_multi_memory_result_copy_adapter
+design-paths:
+  - model-1 — Single shared memory + embedder MPU-carve (rejected as the committed path; retained as a secondary mode)
+  - model-2 — Multi-memory; one preserved wasm memory per component = one MPU/PMP region (chosen)
+---
+
+# ADR-4 — Inter-component memory-isolation model for the dissolved library-OS
+
+## Context
+
+The cross-repo dissolved-library-OS work (gale#86, gale#404, synth#404,
+synth#369, meld#298, meld#299) must choose how fused components are
+isolated from one another on the MCU target (Cortex-M / PMP-class). The
+fusion-structure half of that choice is meld's, and gale#86's isolation
+design forks on it, so meld#300 raised it for an explicit decision.
+
+Two models were on the table (meld#300):
+
+1. **Single shared memory + MPU-carve.** `meld fuse --memory shared`
+   produces one linear memory; the embedder / TCB carves MPU
+   sub-regions per component by hand. Isolation is *configured*: a
+   miscomputed address lands in a neighbour's sub-range and only a
+   correct MPU programming catches it. This is what meld#298 / meld#299
+   were actively enabling (drop the vestigial canonical-ABI allocator so
+   `--memory shared` becomes viable; the lean ~544 B-class core).
+
+2. **Multi-memory → one native region per wasm memory.** meld preserves
+   each component's memory as a distinct linear memory; synth places each
+   at a distinct native base so the MPU/PMP region boundary *is* the
+   semantic boundary. Isolation is *structural*: a component cannot even
+   form a pointer into a neighbour's memory — the wasm memory index is
+   the capability.
+
+synth (synth#404) lowers whichever structure meld emits and will not be
+the blocker for model 2; it scoped the lowering work as: carry `memidx`
+through the IR instead of dropping it, place each wasm memory at a
+distinct native base, lower cross-memory ops explicitly (synth#369), and
+expose per-memory base/size so the embedder programs one MPU/PMP region
+per memory. synth is single-memory today, so model 1 is what is
+lowerable *now*; model 2 is forward-looking on the synth side.
+
+The MPU/PMP region cap (~8 on ARMv7-M, PMP similar) bounds the component
+count N under *either* model, so it is not a differentiator.
+
+## Decision
+
+**model-2 — multi-memory structural isolation is the committed
+dissolved-MCU path.** Isolation coincides with the semantic boundary by
+construction; this is the stronger story for the ASIL-D context gale
+targets (defence-by-construction, not defence-by-correct-MPU-config).
+Recorded in meld#300 (the maintainer's call resolves this design
+question).
+
+meld is **already on this side of the fork** and is not the blocker.
+`MemoryStrategy::MultiMemory` preserves each component's memory as a
+distinct region and emits the explicit cross-memory data movement that
+fusion across distinct memories requires — verified today by the gating
+fixtures:
+
+- `test_multi_memory_separate_memories` — a two-module component fuses to
+  **two** memories, one per original core module.
+- `test_multi_memory_preserves_isolation` — two separate components fuse
+  to **two distinct** memories, both exports callable.
+- `test_multi_memory_preserves_isolation_three_components` — the
+  invariant **scales** to the realistic dissolved-OS shape (≥3
+  components, e.g. relay + kernel + app): three distinct memories survive
+  with no collapse/merge of address spaces.
+- `test_multi_memory_result_copy_adapter` — cross-memory `(ptr, len)`
+  result data is copied callee→caller correctly.
+
+So the meld half of model 2 — emit N distinct memories + correct
+cross-memory ops, no rebasing/merging, per-memory sizes carried in the
+fused memory section — exists and is tested. The committed path's
+remaining work is **synth-side** (synth#369 cross-memory op lowering,
+synth#404 carry `memidx` + distinct native bases + per-memory base/size
+for MPU). meld keeps `MultiMemory` output stable as the lowering target
+and adjusts only if synth hits a structure it cannot consume.
+
+### Why not model-1 (kept as a secondary mode)
+
+model 1 is lean and lowerable on synth *today*, but its isolation is
+only as good as the embedder's MPU-carve — a miscomputed address is
+caught by hardware config rather than being unrepresentable. For the
+committed safety-critical path, structural isolation wins. model 1 is
+**retained as a secondary, optional mode** for targets that accept
+embedder-MPU-carve isolation in exchange for the smallest core.
+
+### Status of the secondary `--memory shared` path
+
+meld#298 / meld#299 are **reclassified secondary** (commented on both).
+The work already landed on branch `fix/298-dead-allocator-dce` is sound
+and stays for that secondary mode:
+
+- in-repo kill-criterion + real-artifact blocker oracles
+  (`merger::tests::test_298_vestigial_grow_blocks_shared_rebase_fusion`,
+  `rebasing_end_to_end::test_298_real_wit_bindgen_component_blocks_shared_rebase`);
+- proven compatibility with the fork's arena-backed no-grow
+  `cabi_realloc`
+  (`merger::tests::test_298_fork_arena_realloc_fuses_under_shared_rebase_today`);
+- the inert fail-safe vestigial-allocator verdict
+  (`Fuser::cabi_realloc_drop_provably_safe`, 4 gate oracles) and the
+  inert tolerant-rewriter flag (`IndexMaps::defer_grow_under_rebase`).
+
+The **corruption-critical drop wiring is paused** — it is no longer on
+the priority path. Resume only if a specific target needs the secondary
+shared mode.
+
+## `Auto`-default policy (resolved — maintainer decision)
+
+The `Auto` strategy (#172) prefers `SharedMemory` + rebasing when
+provably sound (no `memory.grow`, ≥2 input memories), else `MultiMemory`,
+with a runtime downgrade shared→multi if shared fusion refuses.
+
+**Decision: `Auto` is NOT flipped, and `Auto` is NOT the safety path.**
+Rationale (maintainer): *functional safety wants the isolation model to
+be **explicit**, not automatic — "if we flip Auto things automatically
+might get wrong."* An implicit/automatic choice of a safety-relevant
+property (which isolation model protects components from each other) is
+itself the hazard.
+
+Therefore:
+1. **Safety-critical / structural-isolation builds MUST select the
+   memory strategy explicitly** (`--memory multi` for model 2). Do not
+   rely on `Auto` to land the committed isolation model — relying on an
+   automatic resolution for a safety property is disallowed.
+2. **`Auto` is left unchanged** (a convenience for general, non-safety
+   fusion). Flipping its default to prefer `MultiMemory` was rejected:
+   it would silently change a safety-relevant property for every build
+   and regress size/efficiency for the common non-MCU case — i.e. it
+   trades one automatic-wrong for another.
+3. **Auditability backstop**: the *resolved* strategy + `address_rebasing`
+   are already recorded in the signed attestation
+   (`attestation.rs`, set from `memory_strategy_label()` after
+   resolution), so even when `Auto` is used the chosen model is explicit
+   and verifiable *in the artifact* — not silent post-hoc.
+
+**Implemented**: when `Auto` resolves a strategy for an **attested**
+build, `Fuser::fuse` emits a `warn`-level note recommending an explicit
+`--memory` selection, so the implicit choice is loud at build time for
+safety builds. The warning reports the *final* strategy (after any
+shared→multi downgrade), not the initial pick, and fires only when
+attestation is enabled (the release/safety-build signal) to avoid noise
+on casual fusion. Log-only — no change to fusion behavior; the existing
+`auto_memory` tests confirm resolution is unchanged.
+
+Not done (a stricter option, if wanted later): *erroring* instead of
+warning when `Auto` is used on an attested build, behind an opt-in
+`require_explicit_memory_strategy` config — hard-enforcing "explicit, not
+auto." Deferred because erroring is a breaking change for existing
+`Auto`+attestation users and should be opt-in.
+
+## Rivet artifacts
+
+The committed model-2 path relies on the existing multi-memory
+correctness requirements rather than a new one: SR-9/SR-10 (memory and
+data/element index reindexing), SR-12 (multi-memory adapter generation
+for pointer-bearing types), SR-14 (correct source/destination memory
+indices in adapters), SR-16 (inner-pointer rewrite into the destination
+memory), SR-21/SR-23 (correct per-memory `canon lower` indices and
+import slots in multi-memory mode). These collectively pin "distinct
+memories preserved + cross-memory ops correct," which is exactly the
+structural-isolation guarantee.
+
+## References
+
+- meld#300 (the decision), meld#298, meld#299 (now secondary).
+- gale#86, gale#404 (isolation design that forked on this).
+- synth#404, synth#369 (the lowering work this commits synth to).

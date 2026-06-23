@@ -80,6 +80,14 @@ pub struct IndexMaps {
     pub memory_base_offset: u64,
     /// Whether address rebasing is enabled
     pub address_rebasing: bool,
+    /// #298: when set (only ever under the upstream vestigial-allocator
+    /// verdict + a proof that this function is dead), a `memory.grow` reached
+    /// during address rebasing is replaced with `unreachable` instead of
+    /// hard-failing. Sound ONLY for provably-dead code (it is never executed);
+    /// loom then DCEs the dead allocator. Defaults `false` — the conservative
+    /// hard-fail (current behavior) is preserved everywhere this is not
+    /// explicitly enabled by the gated wiring.
+    pub defer_grow_under_rebase: bool,
     /// Whether the memory uses 64-bit addressing
     pub memory64: bool,
     /// Initial memory size in pages for the module (used for rebased memory.size)
@@ -394,6 +402,14 @@ fn rewrite_operator(op: Operator<'_>, maps: &IndexMaps) -> Result<Vec<Instructio
         }
         MemoryGrow { mem, .. } => {
             if maps.address_rebasing {
+                if maps.defer_grow_under_rebase {
+                    // #298: the upstream verdict proved this allocator vestigial
+                    // and this function dead, so the grow is never executed.
+                    // Emitting `unreachable` lets the rebase pass complete (loom
+                    // DCEs the dead function) instead of hard-failing. Sound
+                    // ONLY because the function is provably unreachable.
+                    return Ok(vec![Instruction::Unreachable]);
+                }
                 return Err(Error::UnsupportedFeature(
                     "memory.grow not supported with address rebasing".to_string(),
                 ));
@@ -928,6 +944,30 @@ mod tests {
         let mut maps = IndexMaps::new();
         maps.address_rebasing = true;
 
+        assert!(rewrite_operator(Operator::MemoryGrow { mem: 0 }, &maps).is_err());
+    }
+
+    /// #298 part (b): with the (default-off) tolerant flag set, a `memory.grow`
+    /// reached during address rebasing is replaced with `unreachable` instead
+    /// of hard-failing — the deferred-dead-allocator path. Inert until the
+    /// gated wiring enables the flag; this pins the mechanism.
+    #[test]
+    fn test_rewrite_memory_grow_rebased_deferred_emits_unreachable() {
+        let mut maps = IndexMaps::new();
+        maps.address_rebasing = true;
+        maps.defer_grow_under_rebase = true;
+
+        let instrs = rewrite_operator(Operator::MemoryGrow { mem: 0 }, &maps).unwrap();
+        assert!(matches!(instrs.as_slice(), [Instruction::Unreachable]));
+    }
+
+    /// The flag is opt-in: rebasing WITHOUT it still hard-fails (the
+    /// conservative default must never silently relax).
+    #[test]
+    fn test_rewrite_memory_grow_rebased_default_still_fails() {
+        let mut maps = IndexMaps::new();
+        maps.address_rebasing = true;
+        assert!(!maps.defer_grow_under_rebase, "flag must default off");
         assert!(rewrite_operator(Operator::MemoryGrow { mem: 0 }, &maps).is_err());
     }
 

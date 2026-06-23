@@ -5306,6 +5306,31 @@ impl FactStyleGenerator {
             (t, b, AdapterClass::Direct)
         };
 
+        let target_function = self.resolve_target_function(site, merged)?;
+
+        // #304: a Direct adapter is a *pure identity trampoline* — body is
+        // exactly `local.get*; call target; end` — only when it carries no
+        // resource conversions AND no post-return. (The Direct `else` branch in
+        // `generate_direct_adapter` still emits `call post_return` when
+        // `has_post_return && result_count == 0`, so post-return must be
+        // excluded entirely, not just the result>0 case — wiring the caller
+        // straight to the target would otherwise skip the post-return cleanup.)
+        // When inlining is enabled and that holds, record the target so
+        // `wire_adapter_indices` bypasses this thunk. Fail-safe: any doubt → None.
+        // This guard MUST stay a superset of `generate_direct_adapter`'s
+        // complex-branch trigger — see the "#304 INVARIANT" note on its simple-
+        // trampoline `else` branch; the two are coupled and must move together.
+        let inline_target = if self.config.inline_adapters
+            && matches!(class, AdapterClass::Direct)
+            && options.resource_rep_calls.is_empty()
+            && options.resource_new_calls.is_empty()
+            && options.callee_post_return.is_none()
+        {
+            Some(target_function)
+        } else {
+            None
+        };
+
         Ok(AdapterFunction {
             name,
             type_idx,
@@ -5314,8 +5339,9 @@ impl FactStyleGenerator {
             source_module: site.from_module,
             target_component: site.to_component,
             target_module: site.to_module,
-            target_function: self.resolve_target_function(site, merged)?,
+            target_function,
             class,
+            inline_target,
         })
     }
 
@@ -5931,7 +5957,17 @@ impl FactStyleGenerator {
             func.instruction(&Instruction::End);
             Ok((type_idx, func))
         } else {
-            // Simple trampoline (no post-return or no results)
+            // Simple trampoline (no post-return or no results).
+            //
+            // #304 INVARIANT: when `callee_post_return.is_none()` (and no
+            // resource ops — guaranteed here by the enclosing `if`), this body
+            // is a *pure identity forward* — exactly `local.get 0..N; call
+            // target; end`. `generate_adapter`'s inline guard relies on that to
+            // wire the caller straight to the target and drop this thunk. If you
+            // add ANY instruction below for the post-return-free case (a trap, a
+            // result fixup, anything), you MUST extend that guard
+            // (`callee_post_return.is_none()` etc.) or the inlined path will
+            // silently diverge from the thunk. Keep the two in lockstep.
             let mut func = Function::new([]);
 
             for i in 0..param_count {
@@ -10299,6 +10335,9 @@ impl FactStyleGenerator {
             target_module: site.to_module,
             target_function: target_func,
             class: AdapterClass::Async,
+            // Async-lift adapters transform (await/result delivery) — never a
+            // pure identity trampoline, so never inlined (#304).
+            inline_target: None,
         })
     }
 
@@ -11667,6 +11706,8 @@ impl FactStyleGenerator {
             target_module: site.to_module,
             target_function: target_func,
             class: AdapterClass::Async,
+            // Async-lift adapter — transforms, never a pure trampoline (#304).
+            inline_target: None,
         })
     }
 }

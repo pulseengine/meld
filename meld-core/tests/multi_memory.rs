@@ -314,6 +314,76 @@ fn test_multi_memory_preserves_isolation() {
     );
 }
 
+/// #300: meld is the committed *structural-isolation* emitter for the
+/// dissolved library-OS (model 2 — one preserved wasm memory per component, so
+/// the MPU/PMP region boundary coincides with the semantic boundary). The
+/// existing tests cover N=2; this pins that the property **scales** to the
+/// realistic dissolved-OS shape (≥3 components, e.g. relay + kernel + app):
+/// fusing three single-memory components under `MultiMemory` must preserve
+/// **three distinct memories** (no collapse/merge) and keep every export
+/// callable, and the output must validate as multi-memory wasm. This is the
+/// stable structure synth#369/#404 lower (carry memidx → distinct native bases
+/// → one MPU region per memory).
+#[test]
+fn test_multi_memory_preserves_isolation_three_components() {
+    let component_a = build_single_module_component("get_a", "memory_a");
+    let component_b = build_single_module_component("get_b", "memory_b");
+    let component_c = build_single_module_component("get_c", "memory_c");
+
+    let config = FuserConfig {
+        memory_strategy: MemoryStrategy::MultiMemory,
+        attestation: false,
+        component_provenance: false,
+        address_rebasing: false,
+        preserve_names: false,
+        custom_sections: meld_core::CustomSectionHandling::Merge,
+        dwarf_handling: meld_core::DwarfHandling::Strip,
+        output_format: meld_core::OutputFormat::CoreModule,
+        opaque_resources: Vec::new(),
+    };
+
+    let mut fuser = Fuser::new(config);
+    fuser
+        .add_component_named(&component_a, Some("component-a"))
+        .unwrap();
+    fuser
+        .add_component_named(&component_b, Some("component-b"))
+        .unwrap();
+    fuser
+        .add_component_named(&component_c, Some("component-c"))
+        .unwrap();
+
+    let fused = fuser.fuse().unwrap();
+
+    let mut engine_config = Config::new();
+    engine_config.wasm_multi_memory(true);
+    let engine = Engine::new(&engine_config).unwrap();
+    // RuntimeModule::new validates the fused bytes as multi-memory wasm.
+    let module = RuntimeModule::new(&engine, &fused).unwrap();
+    let mut store = Store::new(&engine, ());
+    let instance = Instance::new(&mut store, &module, &[]).unwrap();
+
+    // One distinct memory per component must survive — the structural
+    // isolation invariant. A collapse to fewer would silently merge two
+    // components' address spaces (the failure model 2 exists to prevent).
+    let mem_count = count_memory_exports(&instance, &mut store);
+    assert_eq!(
+        mem_count, 3,
+        "fused module must export 3 distinct memories (one per component)"
+    );
+
+    for name in ["get_a", "get_b", "get_c"] {
+        let f = instance
+            .get_typed_func::<(), i32>(&mut store, name)
+            .unwrap();
+        assert_eq!(
+            f.call(&mut store, ()).unwrap(),
+            0,
+            "{name}() should return 0 (zero-initialized, isolated memory)"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Test 3: Result copy adapter (callee → caller memory)
 // ---------------------------------------------------------------------------
