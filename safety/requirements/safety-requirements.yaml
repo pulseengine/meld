@@ -1302,7 +1302,7 @@ artifacts:
       unreferenced for loom to DCE; no re-indexing is performed (all adapter
       index maps are preserved). The inline condition is fail-safe: any
       resource ops or any `callee_post_return` keeps the thunk (#304).
-    status: implemented
+    status: verified
     tags: [optimization, adapter, v0.34.0]
     links:
       - type: tracked-by

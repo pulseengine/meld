@@ -4,6 +4,41 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.34.0] - 2026-06-23
+
+Adapter-inlining + isolation-model release. Honors the previously-dead
+`inline_adapters` flag and commits meld to multi-memory structural isolation as
+the dissolved-MCU path. The #304 Tier-5 change was clean-room adversarially
+verified (SOUND) and passed the PR-time Mythos delta-pass gate (4/4 files NO
+FINDINGS). Release plan landed in rivet (SR-42/43/44).
+
+**Falsification:** if meld inlined a *non-identity* adapter (one that transcodes,
+converts resources, or runs post-return), the cross-component runtime suites
+would mis-execute or trap. They pass — including `golden_e2e` Tier-B behavioural
+equivalence on the real wac-composed consumer→provider fixture, where ≥1 identity
+adapter is inlined.
+
+### Added
+
+- **#304 — identity-trampoline adapter inlining (SR-42).** When a cross-component
+  call edge resolves to a pure identity `Direct` adapter (`local.get*; call
+  target; end` — no transcoding, resource conversion, or post-return), the
+  caller's import is wired directly to the target instead of through the
+  forwarding thunk; the dead thunk is left for loom to DCE. No re-index (all
+  adapter index maps preserved). Fail-safe guard: `Direct && no resource ops &&
+  callee_post_return.is_none()`. New `FusionStats.adapters_inlined`.
+- **Release plan (rivet):** SR-42 [v0.34.0], SR-43 [v0.35.0, opaque-rep drop fix
+  #305], SR-44 [v0.36.0, enforced requirement→test traceability #303].
+
+### Changed
+
+- **#300 — multi-memory structural isolation committed as the dissolved-MCU
+  model (ADR-4).** `Auto` is unchanged but now emits a warning when it resolves a
+  memory strategy on an attested build ("explicit, not auto" for functional
+  safety). Multi-memory isolation verified to scale to N=3 components.
+  `#298`/`#299` (shared-memory de-export) reclassified secondary; their
+  oracle/verdict foundation rides along (inert, sound).
+
 ## [0.33.0] - 2026-06-17
 
 Depth-2 nested-string transcoding release: closes the last gap of the #272
