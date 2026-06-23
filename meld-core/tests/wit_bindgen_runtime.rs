@@ -675,6 +675,14 @@ runtime_test!(
     "resource_aggregates"
 );
 runtime_test!(test_runtime_wit_bindgen_resource_floats, "resource_floats");
+// #305: opaque-rep re-exporter resource chain (built from wit-bindgen fork
+// feat/opaque-rep-attribute, with the user-supplied dtor). Fixture is gitignored
+// (~11 MB build artifact, regenerate per tests/wit_bindgen/README.md); the test
+// skips when absent. Runtime variant exercises construct+drop — the #305 trap.
+runtime_test!(
+    test_runtime_wit_bindgen_resource_floats_opaque,
+    "resource_floats_opaque"
+);
 runtime_test!(
     test_runtime_wit_bindgen_resource_borrow_in_record,
     "resource_borrow_in_record"

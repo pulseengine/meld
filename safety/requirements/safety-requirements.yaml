@@ -1334,10 +1334,14 @@ artifacts:
       A fused 3-component re-exporter chain whose intermediate exports an
       opaque-rep resource shall construct AND drop without trapping. Opaque-rep
       removes the `& 7` alignment trap of the standard resource_floats fixture,
-      unmasking a separate drop-teardown memory fault. meld shall forward the
-      inner-handle drop and discriminate per-resource handle tables so the
-      construct+drop runtime path completes cleanly (#305).
-    status: proposed
+      unmasking a separate drop-teardown memory fault. The fused chain shall
+      run construct+drop cleanly (#305). RESOLUTION: the trap was the
+      wit-bindgen-side opaque-rep destructor (missing inner-handle forwarding),
+      fixed by the fork's user-supplied dtor (feat/opaque-rep-attribute
+      51eca6b6). With that fixture, meld fuses the chain AND construct+drop runs
+      cleanly with no meld code change — the suspected meld handle-table
+      discrimination was not required.
+    status: verified
     tags: [bug, resource, opaque-rep, v0.35.0]
     links:
       - type: tracked-by
@@ -1349,11 +1353,12 @@ artifacts:
         - meld-core/src/merger.rs
       verification-method: test
       verification-description: >
-        PLANNED. Cherry-pick the fuse oracle
-        (wit_bindgen_runtime::test_fuse_wit_bindgen_resource_floats_opaque) from
-        feat/explore-I-opaque-rep, then upgrade it from fuse_only to a runtime
-        construct+drop test once the inner-handle drop forwarding +
-        per-resource handle-table discrimination land. Not yet implemented.
+        wit_bindgen_runtime::test_runtime_wit_bindgen_resource_floats_opaque
+        fuses the fork-built resource_floats_opaque composed component
+        (--output component) and runs construct+drop on wasmtime — passes
+        cleanly (163 KB fused, 695 funcs, 4 adapters). Fixture is gitignored
+        (~11 MB; regenerate per tests/wit_bindgen/README.md), so the test skips
+        in CI when absent and is the load-bearing local regression oracle.
       milestone: v0.35.0
 
   - id: SR-44
