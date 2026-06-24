@@ -10,6 +10,7 @@ project:
     - stpa
     - aspice
     - dev
+    - meld-local
 
 sources:
   - path: safety/stpa

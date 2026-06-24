@@ -20,7 +20,7 @@ artifacts:
   # ==========================================================================
 
   - id: SR-1
-    type: requirement
+    type: sw-req
     title: Complete core module extraction
     description: >
       The parser shall extract all core modules from a component,
@@ -29,8 +29,10 @@ artifacts:
     tags: [stpa-derived]
     links:
       - type: derives-from
+        target: SYS-1
+      - type: addresses-constraint
         target: CC-P-1
-      - type: derives-from
+      - type: mitigates
         target: LS-P-1
     fields:
       implementation: meld-core/src/parser.rs
@@ -41,7 +43,7 @@ artifacts:
         Parser completeness proof (proofs/parser/).
 
   - id: SR-2
-    type: requirement
+    type: sw-req
     title: Complete import/export extraction
     description: >
       The parser shall extract every import and export entry declared
@@ -50,6 +52,8 @@ artifacts:
     tags: [stpa-derived]
     links:
       - type: derives-from
+        target: SYS-1
+      - type: addresses-constraint
         target: CC-P-2
     fields:
       implementation: meld-core/src/parser.rs
@@ -59,7 +63,7 @@ artifacts:
         match wasmparser's independent count
 
   - id: SR-3
-    type: requirement
+    type: sw-req
     title: Correct Canonical ABI element size computation
     description: >
       canonical_abi_element_size shall return the correctly aligned
@@ -69,10 +73,12 @@ artifacts:
     tags: [stpa-derived]
     links:
       - type: derives-from
+        target: SYS-1
+      - type: addresses-constraint
         target: CC-P-3
-      - type: derives-from
+      - type: addresses-constraint
         target: CC-P-5
-      - type: derives-from
+      - type: mitigates
         target: LS-P-2
     fields:
       implementation: meld-core/src/parser.rs
@@ -85,7 +91,7 @@ artifacts:
         spec definition (proofs/parser/ or proofs/adapter/).
 
   - id: SR-4
-    type: requirement
+    type: sw-req
     title: Reject malformed components
     description: >
       The parser shall reject components that do not pass wasmparser
@@ -95,8 +101,10 @@ artifacts:
     tags: [stpa-derived]
     links:
       - type: derives-from
+        target: SYS-1
+      - type: addresses-constraint
         target: CC-P-6
-      - type: derives-from
+      - type: mitigates
         target: LS-P-3
     fields:
       implementation: meld-core/src/parser.rs
@@ -110,7 +118,7 @@ artifacts:
   # ==========================================================================
 
   - id: SR-5
-    type: requirement
+    type: sw-req
     title: Complete and correct import resolution
     description: >
       The resolver shall match every import to exactly one export with
@@ -120,10 +128,12 @@ artifacts:
     tags: [stpa-derived]
     links:
       - type: derives-from
+        target: SYS-2
+      - type: addresses-constraint
         target: CC-R-1
-      - type: derives-from
+      - type: addresses-constraint
         target: CC-R-3
-      - type: derives-from
+      - type: mitigates
         target: LS-R-1
     fields:
       implementation: meld-core/src/resolver.rs
@@ -134,7 +144,7 @@ artifacts:
         Resolver correctness proof (proofs/resolver/).
 
   - id: SR-6
-    type: requirement
+    type: sw-req
     title: Correct CopyLayout classification
     description: >
       The resolver shall classify each cross-component call parameter
@@ -145,12 +155,14 @@ artifacts:
     tags: [stpa-derived]
     links:
       - type: derives-from
+        target: SYS-1
+      - type: addresses-constraint
         target: CC-R-2
-      - type: derives-from
+      - type: addresses-constraint
         target: CC-R-4
-      - type: derives-from
+      - type: addresses-constraint
         target: CC-R-5
-      - type: derives-from
+      - type: mitigates
         target: LS-R-2
     fields:
       implementation: meld-core/src/resolver.rs
@@ -162,7 +174,7 @@ artifacts:
         (proofs/transformations/adapter/copy_layout_proofs.v).
 
   - id: SR-7
-    type: requirement
+    type: sw-req
     title: Valid topological instantiation order
     description: >
       The resolver shall produce a topological order where every
@@ -173,12 +185,14 @@ artifacts:
     tags: [stpa-derived]
     links:
       - type: derives-from
+        target: SYS-2
+      - type: addresses-constraint
         target: CC-R-6
-      - type: derives-from
+      - type: addresses-constraint
         target: CC-R-7
-      - type: derives-from
+      - type: mitigates
         target: LS-R-3
-      - type: derives-from
+      - type: mitigates
         target: LS-R-4
     fields:
       implementation: meld-core/src/resolver.rs
@@ -193,7 +207,7 @@ artifacts:
   # ==========================================================================
 
   - id: SR-8
-    type: requirement
+    type: sw-req
     title: Correct function base offset calculation
     description: >
       The merger shall compute each component's function base offset
@@ -203,8 +217,10 @@ artifacts:
     tags: [stpa-derived]
     links:
       - type: derives-from
+        target: SYS-2
+      - type: addresses-constraint
         target: CC-M-3
-      - type: derives-from
+      - type: mitigates
         target: LS-M-1
     fields:
       implementation: meld-core/src/merger.rs
@@ -215,7 +231,7 @@ artifacts:
         Merge layout correctness proof (proofs/transformations/merge/).
 
   - id: SR-9
-    type: requirement
+    type: sw-req
     title: Complete instruction index rewriting
     description: >
       The rewriter shall remap indices in all instruction types that
@@ -225,14 +241,16 @@ artifacts:
     tags: [stpa-derived]
     links:
       - type: derives-from
+        target: SYS-2
+      - type: addresses-constraint
         target: CC-M-2
-      - type: derives-from
+      - type: addresses-constraint
         target: CC-M-4
-      - type: derives-from
+      - type: addresses-constraint
         target: CC-M-8
-      - type: derives-from
+      - type: mitigates
         target: LS-M-2
-      - type: derives-from
+      - type: mitigates
         target: LS-M-3
     fields:
       implementation: meld-core/src/rewriter.rs
@@ -243,7 +261,7 @@ artifacts:
         Rewriter completeness proof (proofs/rewriter/).
 
   - id: SR-10
-    type: requirement
+    type: sw-req
     title: Correct segment reindexing
     description: >
       The merger shall reindex data segment memory indices, element
@@ -253,8 +271,10 @@ artifacts:
     tags: [stpa-derived]
     links:
       - type: derives-from
+        target: SYS-2
+      - type: addresses-constraint
         target: CC-M-5
-      - type: derives-from
+      - type: addresses-constraint
         target: CC-M-6
     fields:
       implementation: meld-core/src/segments.rs
@@ -265,7 +285,7 @@ artifacts:
         Segment reindexing proof (proofs/segments/).
 
   - id: SR-11
-    type: requirement
+    type: sw-req
     title: Component processing order matches resolver order
     description: >
       The merger shall process components in the same order as the
@@ -274,6 +294,8 @@ artifacts:
     tags: [stpa-derived]
     links:
       - type: derives-from
+        target: SYS-2
+      - type: addresses-constraint
         target: CC-M-7
     fields:
       implementation: meld-core/src/merger.rs
@@ -286,7 +308,7 @@ artifacts:
   # ==========================================================================
 
   - id: SR-12
-    type: requirement
+    type: sw-req
     title: Adapter generation for all pointer-passing cross-component calls
     description: >
       The adapter generator shall produce an adapter function for every
@@ -297,6 +319,8 @@ artifacts:
     tags: [stpa-derived]
     links:
       - type: derives-from
+        target: SYS-3
+      - type: addresses-constraint
         target: CC-A-1
     fields:
       implementation: meld-core/src/adapter/fact.rs
@@ -306,7 +330,7 @@ artifacts:
         multi-memory mode produces adapter functions
 
   - id: SR-13
-    type: requirement
+    type: sw-req
     title: Correct cabi_realloc targeting
     description: >
       The adapter shall call cabi_realloc using the post-merge function
@@ -315,10 +339,12 @@ artifacts:
     tags: [stpa-derived]
     links:
       - type: derives-from
+        target: SYS-3
+      - type: addresses-constraint
         target: CC-A-2
-      - type: derives-from
+      - type: addresses-constraint
         target: CC-A-6
-      - type: derives-from
+      - type: mitigates
         target: LS-A-1
     fields:
       implementation: meld-core/src/adapter/fact.rs
@@ -328,7 +354,7 @@ artifacts:
         with list argument, verify callee receives correct data
 
   - id: SR-14
-    type: requirement
+    type: sw-req
     title: Correct memory index usage in adapters
     description: >
       The adapter shall use the correct source and destination memory
@@ -339,12 +365,14 @@ artifacts:
     tags: [stpa-derived]
     links:
       - type: derives-from
+        target: SYS-3
+      - type: addresses-constraint
         target: CC-A-4
-      - type: derives-from
+      - type: addresses-constraint
         target: CC-A-9
-      - type: derives-from
+      - type: mitigates
         target: LS-A-2
-      - type: derives-from
+      - type: mitigates
         target: LS-A-4
     fields:
       implementation: meld-core/src/adapter/fact.rs
@@ -355,7 +383,7 @@ artifacts:
         Adapter memory index proof (proofs/adapter/).
 
   - id: SR-15
-    type: requirement
+    type: sw-req
     title: Correct list copy length
     description: >
       The adapter shall compute list copy byte length as element_count
@@ -364,6 +392,8 @@ artifacts:
     tags: [stpa-derived]
     links:
       - type: derives-from
+        target: SYS-3
+      - type: addresses-constraint
         target: CC-A-5
     fields:
       implementation: meld-core/src/adapter/fact.rs
@@ -374,7 +404,7 @@ artifacts:
         Copy length proof (proofs/adapter/).
 
   - id: SR-16
-    type: requirement
+    type: sw-req
     title: Recursive inner pointer fixup
     description: >
       For list types whose elements contain pointer fields, the adapter
@@ -386,12 +416,14 @@ artifacts:
     tags: [stpa-derived]
     links:
       - type: derives-from
+        target: SYS-3
+      - type: addresses-constraint
         target: CC-A-3
-      - type: derives-from
+      - type: addresses-constraint
         target: CC-A-7
-      - type: derives-from
+      - type: addresses-constraint
         target: CC-A-11
-      - type: derives-from
+      - type: mitigates
         target: LS-A-3
     fields:
       implementation: meld-core/src/adapter/fact.rs
@@ -402,7 +434,7 @@ artifacts:
         Fixup loop termination and correctness proof (proofs/adapter/).
 
   - id: SR-17
-    type: requirement
+    type: sw-req
     title: Correct string transcoding
     description: >
       String transcoding adapters shall produce valid output encoding
@@ -412,6 +444,8 @@ artifacts:
     tags: [stpa-derived]
     links:
       - type: derives-from
+        target: SYS-3
+      - type: addresses-constraint
         target: CC-A-8
     fields:
       implementation: meld-core/src/adapter/fact.rs
@@ -441,7 +475,7 @@ artifacts:
         tests/async_cross_encoding.rs (#272, post-v0.31.0-audit).
 
   - id: SR-18
-    type: requirement
+    type: sw-req
     title: Adapter instruction ordering
     description: >
       The adapter shall emit instructions in the correct order:
@@ -451,6 +485,8 @@ artifacts:
     tags: [stpa-derived]
     links:
       - type: derives-from
+        target: SYS-3
+      - type: addresses-constraint
         target: CC-A-10
     fields:
       implementation: meld-core/src/adapter/fact.rs
@@ -464,7 +500,7 @@ artifacts:
   # ==========================================================================
 
   - id: SR-19
-    type: requirement
+    type: sw-req
     title: Deterministic output
     description: >
       Given identical input component bytes and identical FuserConfig,
@@ -473,8 +509,10 @@ artifacts:
     tags: [stpa-derived]
     links:
       - type: derives-from
+        target: SYS-9
+      - type: addresses-constraint
         target: SC-7
-      - type: derives-from
+      - type: mitigates
         target: LS-CP-2
     fields:
       implementation: meld-core/src/lib.rs
@@ -483,7 +521,7 @@ artifacts:
         Run fusion twice with same inputs; assert byte-equal outputs
 
   - id: SR-20
-    type: requirement
+    type: sw-req
     title: Fail-fast on unresolvable state
     description: >
       If any stage encounters an unresolvable error (unresolved import,
@@ -494,8 +532,10 @@ artifacts:
     tags: [stpa-derived]
     links:
       - type: derives-from
+        target: SYS-9
+      - type: addresses-constraint
         target: SC-8
-      - type: derives-from
+      - type: addresses-constraint
         target: SC-9
     fields:
       implementation: meld-core/src/error.rs
@@ -509,7 +549,7 @@ artifacts:
   # ==========================================================================
 
   - id: SR-21
-    type: requirement
+    type: sw-req
     title: Valid P2 component wrapping
     description: >
       When OutputFormat::Component is selected, the wrapper shall produce
@@ -521,12 +561,14 @@ artifacts:
     tags: [stpa-derived]
     links:
       - type: derives-from
+        target: SYS-4
+      - type: addresses-constraint
         target: CC-W-1
-      - type: derives-from
+      - type: addresses-constraint
         target: CC-W-2
-      - type: derives-from
+      - type: addresses-constraint
         target: CC-W-3
-      - type: derives-from
+      - type: mitigates
         target: LS-W-1
     fields:
       implementation: meld-core/src/component_wrap.rs
@@ -536,7 +578,7 @@ artifacts:
         validate with wasm-tools, run through wasmtime
 
   - id: SR-22
-    type: requirement
+    type: sw-req
     title: Conditional pointer copy for option/result/variant types
     description: >
       The adapter shall check the discriminant value of option, result,
@@ -548,8 +590,10 @@ artifacts:
     tags: [stpa-derived]
     links:
       - type: derives-from
+        target: SYS-3
+      - type: addresses-constraint
         target: CC-A-12
-      - type: derives-from
+      - type: mitigates
         target: LS-A-5
     fields:
       implementation: meld-core/src/adapter/fact.rs
@@ -559,7 +603,7 @@ artifacts:
         both Some and None values; verify correct behavior for each
 
   - id: SR-23
-    type: requirement
+    type: sw-req
     title: Import deduplication type safety
     description: >
       The merger shall not deduplicate function imports that have the same
@@ -570,10 +614,12 @@ artifacts:
     tags: [stpa-derived]
     links:
       - type: derives-from
+        target: SYS-3
+      - type: addresses-constraint
         target: CC-M-9
-      - type: derives-from
+      - type: addresses-constraint
         target: CC-M-10
-      - type: derives-from
+      - type: mitigates
         target: LS-M-4
     fields:
       implementation: meld-core/src/merger.rs
@@ -583,7 +629,7 @@ artifacts:
         import slots in multi-memory mode
 
   - id: SR-24
-    type: requirement
+    type: sw-req
     title: Correct retptr layout for variant return types
     description: >
       The adapter shall copy retptr return values using the correct
@@ -595,10 +641,12 @@ artifacts:
     tags: [stpa-derived]
     links:
       - type: derives-from
+        target: SYS-3
+      - type: addresses-constraint
         target: CC-A-13
-      - type: derives-from
+      - type: addresses-constraint
         target: CC-R-9
-      - type: derives-from
+      - type: mitigates
         target: LS-A-6
     fields:
       implementation:
@@ -611,7 +659,7 @@ artifacts:
         f64/i64 payloads via retptr; verify correct values
 
   - id: SR-25
-    type: requirement
+    type: sw-req
     title: Resource handle pass-through
     description: >
       The adapter shall pass resource handles through cross-component calls
@@ -621,6 +669,8 @@ artifacts:
     tags: [stpa-derived]
     links:
       - type: derives-from
+        target: SYS-3
+      - type: addresses-constraint
         target: CC-A-1
     fields:
       implementation: meld-core/src/adapter/fact.rs
@@ -630,7 +680,7 @@ artifacts:
         are valid after cross-component calls
 
   - id: SR-26
-    type: requirement
+    type: sw-req
     title: Complete component type index tracking
     description: >
       The parser shall track all entries in the component type index space
@@ -642,8 +692,10 @@ artifacts:
     tags: [stpa-derived]
     links:
       - type: derives-from
+        target: SYS-2
+      - type: addresses-constraint
         target: CC-P-9
-      - type: derives-from
+      - type: addresses-constraint
         target: CC-P-10
     fields:
       implementation: meld-core/src/parser.rs
@@ -662,7 +714,7 @@ artifacts:
   # ==========================================================================
 
   - id: SR-27
-    type: requirement
+    type: sw-req
     title: Attestation input hash integrity
     description: >
       For every input component added to a fusion, the attestation shall
@@ -675,6 +727,8 @@ artifacts:
     tags: [stpa-derived, attestation, supply-chain]
     links:
       - type: derives-from
+        target: SYS-10
+      - type: addresses-constraint
         target: SC-6
       - type: mitigates
         target: H-6
@@ -688,7 +742,7 @@ artifacts:
         size equals the actual byte length.
 
   - id: SR-28
-    type: requirement
+    type: sw-req
     title: Attestation configuration completeness
     description: >
       The attestation metadata shall record every FuserConfig field
@@ -703,6 +757,8 @@ artifacts:
     tags: [stpa-derived, attestation, supply-chain]
     links:
       - type: derives-from
+        target: SYS-10
+      - type: addresses-constraint
         target: SC-6
       - type: mitigates
         target: H-6
@@ -718,7 +774,7 @@ artifacts:
         asserting metadata.memory_strategy survives to JSON.
 
   - id: SR-29
-    type: requirement
+    type: sw-req
     title: Attestation serialization round-trip
     description: >
       The attestation shall serialize to JSON and deserialize back with
@@ -732,6 +788,8 @@ artifacts:
     tags: [stpa-derived, attestation, supply-chain]
     links:
       - type: derives-from
+        target: SYS-10
+      - type: addresses-constraint
         target: SC-6
       - type: mitigates
         target: H-6
@@ -746,7 +804,7 @@ artifacts:
         signature, output is valid non-empty JSON).
 
   - id: SR-30
-    type: requirement
+    type: sw-req
     title: Attestation output hash integrity
     description: >
       The attestation shall record a SHA-256 hash and byte size of the
@@ -758,6 +816,8 @@ artifacts:
     tags: [stpa-derived, attestation, supply-chain]
     links:
       - type: derives-from
+        target: SYS-10
+      - type: addresses-constraint
         target: SC-6
       - type: mitigates
         target: H-6
@@ -775,7 +835,7 @@ artifacts:
   # ==========================================================================
 
   - id: SR-31
-    type: requirement
+    type: sw-req
     title: Multiply-instantiated module detection
     description: >
       The merger shall detect when the same core module is instantiated
@@ -788,10 +848,12 @@ artifacts:
     tags: [stpa-derived]
     links:
       - type: derives-from
+        target: SYS-2
+      - type: addresses-constraint
         target: SC-8
-      - type: derives-from
+      - type: addresses-constraint
         target: SC-9
-      - type: derives-from
+      - type: mitigates
         target: LS-M-5
     fields:
       implementation: meld-core/src/merger.rs
@@ -814,7 +876,7 @@ artifacts:
   # ==========================================================================
 
   - id: SR-32
-    type: requirement
+    type: sw-req
     title: Stackful P3 lifting mode emission
     description: >
       In addition to the callback trampoline (shipped #128), meld shall
@@ -833,9 +895,14 @@ artifacts:
     tags: [roadmap, p3-async, v0.8.0]
     links:
       - type: derives-from
-        target: "#94"
-      - type: tracked-by
-        target: "#140"
+        target: SYS-5
+    cited-source:
+      - uri: "https://github.com/pulseengine/meld/issues/94"
+        kind: github
+        last-checked: 2026-06-24
+      - uri: "https://github.com/pulseengine/meld/issues/140"
+        kind: github
+        last-checked: 2026-06-24
     fields:
       implementation:
         - meld-core/src/p3_async.rs        # ABI foundation (Phase 1)
@@ -852,7 +919,7 @@ artifacts:
       milestone: v0.8.0
 
   - id: SR-33
-    type: requirement
+    type: sw-req
     title: Cross-component `stream<T>` fusion at merge time
     description: >
       When two fused components share a `stream<T>` endpoint, meld shall
@@ -872,9 +939,14 @@ artifacts:
     tags: [roadmap, p3-async, v0.29.0]
     links:
       - type: derives-from
-        target: "#94"
-      - type: tracked-by
-        target: "#141"
+        target: SYS-5
+    cited-source:
+      - uri: "https://github.com/pulseengine/meld/issues/94"
+        kind: github
+        last-checked: 2026-06-24
+      - uri: "https://github.com/pulseengine/meld/issues/141"
+        kind: github
+        last-checked: 2026-06-24
     fields:
       implementation:
         - meld-core/src/p3_bridge.rs
@@ -911,7 +983,7 @@ artifacts:
       milestone: v0.29.0
 
   - id: SR-34
-    type: requirement
+    type: sw-req
     title: Static `stream<T>` validation
     description: >
       Build-time validation passes for cross-component streams:
@@ -930,11 +1002,16 @@ artifacts:
     tags: [roadmap, p3-async, v0.12.0, v0.21.0]
     links:
       - type: derives-from
-        target: "#94"
-      - type: tracked-by
-        target: "#142"
+        target: SYS-5
       - type: depends-on
         target: SR-33
+    cited-source:
+      - uri: "https://github.com/pulseengine/meld/issues/94"
+        kind: github
+        last-checked: 2026-06-24
+      - uri: "https://github.com/pulseengine/meld/issues/142"
+        kind: github
+        last-checked: 2026-06-24
     fields:
       implementation:
         - meld-core/src/p3_stream.rs
@@ -951,7 +1028,7 @@ artifacts:
       milestone: v0.21.0
 
   - id: SR-35
-    type: requirement
+    type: sw-req
     title: DWARF address remap into merged code section
     description: >
       A new `DwarfHandling::Remap` policy on `FuserConfig` shall rewrite
@@ -965,11 +1042,16 @@ artifacts:
     tags: [roadmap, dwarf, witness-mc-dc, v0.10.0]
     links:
       - type: derives-from
-        target: "#130"
-      - type: tracked-by
-        target: "#143"
+        target: SYS-7
       - type: supersedes-default-of
         target: LS-CP-4
+    cited-source:
+      - uri: "https://github.com/pulseengine/meld/issues/130"
+        kind: github
+        last-checked: 2026-06-24
+      - uri: "https://github.com/pulseengine/meld/issues/143"
+        kind: github
+        last-checked: 2026-06-24
     fields:
       implementation: meld-core/src/dwarf.rs
       verification-method: test+cross-repo
@@ -980,7 +1062,7 @@ artifacts:
       milestone: v0.10.0
 
   - id: SR-36
-    type: requirement
+    type: sw-req
     title: Synthesised DWARF DIEs for meld-generated adapter functions
     description: >
       For every adapter function meld emits (cross-component lift/lower,
@@ -1020,11 +1102,16 @@ artifacts:
     tags: [roadmap, dwarf, witness-mc-dc, v0.23.0, v0.24.0]
     links:
       - type: derives-from
-        target: "#130"
-      - type: tracked-by
-        target: "#144"
+        target: SYS-7
       - type: depends-on
         target: SR-35
+    cited-source:
+      - uri: "https://github.com/pulseengine/meld/issues/130"
+        kind: github
+        last-checked: 2026-06-24
+      - uri: "https://github.com/pulseengine/meld/issues/144"
+        kind: github
+        last-checked: 2026-06-24
     fields:
       implementation:
         - meld-core/src/dwarf.rs
@@ -1052,7 +1139,7 @@ artifacts:
   # verbatim from c50d9d5 in the v0.31.0 traceability audit, with status
   # upgraded implemented → verified on the recorded evidence.
   - id: SR-37
-    type: requirement
+    type: sw-req
     title: Automatic memory-strategy resolution (sound-by-construction default)
     description: >
       `MemoryStrategy::Auto` — the default for both `FuserConfig` and the
@@ -1072,10 +1159,14 @@ artifacts:
     status: verified
     tags: [usability, memory-strategy, v0.22.0]
     links:
-      - type: tracked-by
-        target: "#172"
+      - type: derives-from
+        target: SYS-6
       - type: mitigates
         target: LS-M-7
+    cited-source:
+      - uri: "https://github.com/pulseengine/meld/issues/172"
+        kind: github
+        last-checked: 2026-06-24
     fields:
       implementation:
         - meld-core/src/memory_probe.rs
@@ -1100,7 +1191,7 @@ artifacts:
       milestone: v0.22.0
 
   - id: SR-38
-    type: requirement
+    type: sw-req
     title: Multi-source DWARF merge (bounded relocator)
     description: >
       When more than one input core module carries `.debug_*` sections,
@@ -1118,13 +1209,18 @@ artifacts:
     tags: [roadmap, dwarf, witness-mc-dc, v0.26.0]
     links:
       - type: derives-from
-        target: "#130"
-      - type: tracked-by
-        target: "#208"
+        target: SYS-7
       - type: depends-on
         target: SR-35
       - type: mitigates
         target: LS-D-3
+    cited-source:
+      - uri: "https://github.com/pulseengine/meld/issues/130"
+        kind: github
+        last-checked: 2026-06-24
+      - uri: "https://github.com/pulseengine/meld/issues/208"
+        kind: github
+        last-checked: 2026-06-24
     fields:
       implementation:
         - meld-core/src/dwarf.rs
@@ -1142,7 +1238,7 @@ artifacts:
       milestone: v0.26.0
 
   - id: SR-39
-    type: requirement
+    type: sw-req
     title: Separate-input cross-component linking (import internalisation)
     description: >
       `meld fuse a.wasm b.wasm --component` shall resolve one input's
@@ -1156,11 +1252,16 @@ artifacts:
     tags: [roadmap, composition, v0.28.0]
     links:
       - type: derives-from
-        target: "#94"
-      - type: tracked-by
-        target: "#212"
+        target: SYS-8
       - type: mitigates
         target: LS-CP-6
+    cited-source:
+      - uri: "https://github.com/pulseengine/meld/issues/94"
+        kind: github
+        last-checked: 2026-06-24
+      - uri: "https://github.com/pulseengine/meld/issues/212"
+        kind: github
+        last-checked: 2026-06-24
     fields:
       implementation:
         - meld-core/src/component_wrap.rs
@@ -1175,7 +1276,7 @@ artifacts:
       milestone: v0.28.0
 
   - id: SR-40
-    type: requirement
+    type: sw-req
     title: Machine-checked Canonical-ABI layout invariants (Kani)
     description: >
       The canonical-ABI layout functions shall carry machine-checked
@@ -1192,9 +1293,11 @@ artifacts:
     tags: [roadmap, proofs, v0.30.0]
     links:
       - type: derives-from
-        target: "#218"
-      - type: tracked-by
-        target: "#218"
+        target: SYS-3
+    cited-source:
+      - uri: "https://github.com/pulseengine/meld/issues/218"
+        kind: github
+        last-checked: 2026-06-24
     fields:
       implementation:
         - meld-core/src/abi_proofs.rs
@@ -1223,7 +1326,7 @@ artifacts:
       milestone: v0.30.0
 
   - id: SR-41
-    type: requirement
+    type: sw-req
     title: Async cross-encoding string transcoding
     description: >
       Async-lift FACT adapters shall transcode string params and results
@@ -1245,11 +1348,15 @@ artifacts:
     tags: [roadmap, async, transcoding]
     links:
       - type: derives-from
+        target: SYS-3
+      - type: depends-on
         target: SR-17
-      - type: tracked-by
-        target: "#272"
       - type: mitigates
         target: LS-F-27
+    cited-source:
+      - uri: "https://github.com/pulseengine/meld/issues/272"
+        kind: github
+        last-checked: 2026-06-24
     fields:
       implementation:
         - meld-core/src/adapter/fact.rs
@@ -1290,7 +1397,7 @@ artifacts:
       milestone: post-v0.31.0
 
   - id: SR-42
-    type: requirement
+    type: sw-req
     title: Identity-trampoline adapter inlining
     description: >
       When a cross-component call edge resolves to a pure identity-trampoline
@@ -1305,10 +1412,14 @@ artifacts:
     status: verified
     tags: [optimization, adapter, v0.34.0]
     links:
-      - type: tracked-by
-        target: "#304"
       - type: derives-from
+        target: SYS-3
+      - type: depends-on
         target: SR-12
+    cited-source:
+      - uri: "https://github.com/pulseengine/meld/issues/304"
+        kind: github
+        last-checked: 2026-06-24
     fields:
       implementation:
         - meld-core/src/adapter/fact.rs
@@ -1328,7 +1439,7 @@ artifacts:
       milestone: v0.34.0
 
   - id: SR-43
-    type: requirement
+    type: sw-req
     title: Opaque-rep resource drop-teardown soundness
     description: >
       A fused 3-component re-exporter chain whose intermediate exports an
@@ -1344,10 +1455,14 @@ artifacts:
     status: verified
     tags: [bug, resource, opaque-rep, v0.35.0]
     links:
-      - type: tracked-by
-        target: "#305"
       - type: derives-from
+        target: SYS-5
+      - type: depends-on
         target: SR-25
+    cited-source:
+      - uri: "https://github.com/pulseengine/meld/issues/305"
+        kind: github
+        last-checked: 2026-06-24
     fields:
       implementation:
         - meld-core/src/merger.rs
@@ -1362,7 +1477,7 @@ artifacts:
       milestone: v0.35.0
 
   - id: SR-44
-    type: requirement
+    type: sw-req
     title: Enforced requirement->verification->test traceability
     description: >
       The V-model right side shall be a machine-enforced rivet trace, not inert
@@ -1377,8 +1492,12 @@ artifacts:
     status: proposed
     tags: [process, traceability, verification, v0.36.0]
     links:
-      - type: tracked-by
-        target: "#303"
+      - type: derives-from
+        target: SYS-11
+    cited-source:
+      - uri: "https://github.com/pulseengine/meld/issues/303"
+        kind: github
+        last-checked: 2026-06-24
     fields:
       implementation:
         - safety/requirements/traceability.yaml

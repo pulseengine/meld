@@ -1,0 +1,26 @@
+# Project-local schema extensions for meld.
+#
+# Additive (merged on top of common/stpa/aspice/dev). Declares the link types
+# meld uses to keep its STPA safety trace on the ASPICE sw-reqs (ADR-5,
+# option A): a software requirement that addresses an STPA safety constraint,
+# and the one supersedes-default-of relation. Both are unrestricted global
+# link types (like `mitigates`) so a sw-req may carry them alongside its
+# ASPICE `derived-from`.
+
+schema:
+  name: meld-local
+  version: "0.1.0"
+  description: Project-local link-type extensions for meld (STPA×ASPICE trace).
+
+link-types:
+  - name: addresses-constraint
+    inverse: constraint-addressed-by
+    description: >
+      Source requirement addresses (is the realization of) an STPA controller
+      or system safety constraint.
+  - name: supersedes-default-of
+    inverse: default-superseded-by
+    description: >
+      Source requirement supersedes the default behaviour modelled by the
+      target (e.g. a new sound-by-construction default over a prior loss
+      scenario's default).
