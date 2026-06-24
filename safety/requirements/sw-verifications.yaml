@@ -1,0 +1,546 @@
+# Software verification measures — ASPICE SWE.6 (sw-verification)
+#
+# Generated for the v0.36 ASPICE tier migration (ADR-5, Phase 3). One typed
+# sw-verification per sw-req, carrying its `verifies` backlink and the
+# concrete tests/proofs from traceability.yaml's verification-status block.
+# This closes the right side of the V (clears swe1-has-verification).
+#
+# Format: rivet generic-yaml.
+
+artifacts:
+
+  - id: SWV-1
+    type: sw-verification
+    title: "Verification of SR-1: Complete core module extraction"
+    description: >
+      Verifies SR-1 via: tests `nested_component::test_parse_composed_component_structure`; proofs `proofs/parser/`.
+    status: implemented
+    fields:
+      method: automated-test
+    links:
+      - type: verifies
+        target: SR-1
+
+  - id: SWV-2
+    type: sw-verification
+    title: "Verification of SR-2: Complete import/export extraction"
+    description: >
+      Verifies SR-2 via: tests `release_components::test_no_duplicate_imports`; proofs `proofs/parser/`.
+    status: implemented
+    fields:
+      method: automated-test
+    links:
+      - type: verifies
+        target: SR-2
+
+  - id: SWV-3
+    type: sw-verification
+    title: "Verification of SR-3: Correct Canonical ABI element size computation"
+    description: >
+      Verifies SR-3 via: tests `parser::tests::test_canonical_abi_element_size_primitive_types`, `parser::tests::test_canonical_abi_element_size_string`, `parser::tests::test_canonical_abi_element_size_record_with_padding`, `parser::tests::test_canonical_abi_element_size_record_homogeneous`, `parser::tests::test_canonical_abi_align_values`.
+    status: implemented
+    fields:
+      method: automated-test
+    links:
+      - type: verifies
+        target: SR-3
+
+  - id: SWV-4
+    type: sw-verification
+    title: "Verification of SR-4: Reject malformed components"
+    description: >
+      Verifies SR-4 via: tests `parser::tests::test_parser_rejects_core_module`, `parser::tests::test_parser_rejects_invalid_wasm`, `tests::test_fuser_rejects_core_module_input`, `tests::test_fuser_rejects_invalid_wasm`.
+    status: implemented
+    fields:
+      method: automated-test
+    links:
+      - type: verifies
+        target: SR-4
+
+  - id: SWV-5
+    type: sw-verification
+    title: "Verification of SR-5: Complete and correct import resolution"
+    description: >
+      Verifies SR-5 via: tests `resolver::tests::test_resolver_strict_mode`, `resolver::tests::test_resolver_unresolved_import_error`; proofs `proofs/resolver/`.
+    status: implemented
+    fields:
+      method: automated-test
+    links:
+      - type: verifies
+        target: SR-5
+
+  - id: SWV-6
+    type: sw-verification
+    title: "Verification of SR-6: Correct CopyLayout classification"
+    description: >
+      Verifies SR-6 via: tests `resolver::tests::test_copy_layout_flat_list`, `resolver::tests::test_copy_layout_string_list`, `resolver::tests::test_copy_layout_record_with_string`, `resolver::tests::test_copy_layout_nested_list`, `resolver::tests::test_copy_layout_flat_record`.
+    status: implemented
+    fields:
+      method: automated-test
+    links:
+      - type: verifies
+        target: SR-6
+
+  - id: SWV-7
+    type: sw-verification
+    title: "Verification of SR-7: Valid topological instantiation order"
+    description: >
+      Verifies SR-7 via: tests `resolver::tests::test_topological_sort_linear`, `resolver::tests::test_topological_sort_no_deps`, `resolver::tests::test_topological_sort_circular_fallback`, `resolver::tests::test_topological_sort_diamond`, `resolver::tests::test_resolver_preserves_order_stability`; proofs `proofs/resolver/`.
+    status: implemented
+    fields:
+      method: automated-test
+    links:
+      - type: verifies
+        target: SR-7
+
+  - id: SWV-8
+    type: sw-verification
+    title: "Verification of SR-8: Correct function base offset calculation"
+    description: >
+      Verifies SR-8 via: proofs `proofs/transformations/merge/`.
+    status: implemented
+    fields:
+      method: formal-verification
+    links:
+      - type: verifies
+        target: SR-8
+
+  - id: SWV-9
+    type: sw-verification
+    title: "Verification of SR-9: Complete instruction index rewriting"
+    description: >
+      Verifies SR-9 via: tests `rewriter::tests::test_rewrite_memory_copy_rebased`, `rewriter::tests::test_rewrite_memory_fill_rebased`, `rewriter::tests::test_rewrite_memory_init_rebased`, `rewriter::tests::test_rewrite_memory_size_rebased_const`, `rewriter::tests::test_rewrite_call_remaps_function_index`, `rewriter::tests::test_rewrite_call_indirect_remaps_type_and_table`, `rewriter::tests::test_rewrite_global_get_set_remaps`, `rewriter::tests::test_rewrite_table_ops_remap`, `rewriter::tests::test_rewrite_table_copy_remaps_both`, `rewriter::tests::test_rewrite_memory_copy_remaps_both_memories`, `rewriter::tests::test_rewrite_memory_load_store_remaps_memory`, `rewriter::tests::test_rewrite_ref_func_remaps`; proofs `proofs/rewriter/`.
+    status: implemented
+    fields:
+      method: automated-test
+    links:
+      - type: verifies
+        target: SR-9
+
+  - id: SWV-10
+    type: sw-verification
+    title: "Verification of SR-10: Correct segment reindexing"
+    description: >
+      Verifies SR-10 via: tests `segments::tests::test_reindex_data_segment_rebases_offset`, `segments::tests::test_reindex_const_expr_global_get`, `segments::tests::test_reindex_const_expr_ref_func`, `segments::tests::test_reindex_element_segment_active_remaps_table`, `segments::tests::test_reindex_element_segment_remaps_function_refs`, `segments::tests::test_reindex_data_segment_remaps_memory_index`, `segments::tests::test_reindex_data_segment_global_get_remaps_global`, `segments::tests::test_reindex_element_segment_expression_remaps_ref_null_type`; proofs `proofs/segments/`.
+    status: implemented
+    fields:
+      method: automated-test
+    links:
+      - type: verifies
+        target: SR-10
+
+  - id: SWV-11
+    type: sw-verification
+    title: "Verification of SR-11: Component processing order matches resolver order"
+    description: >
+      Verifies SR-11 via: tests `resolver::tests::test_topological_sort_linear`, `resolver::tests::test_topological_sort_diamond`, `resolver::tests::test_resolver_preserves_order_stability`.
+    status: implemented
+    fields:
+      method: automated-test
+    links:
+      - type: verifies
+        target: SR-11
+
+  - id: SWV-12
+    type: sw-verification
+    title: "Verification of SR-12: Adapter generation for all pointer-passing cross-component calls"
+    description: >
+      Verifies SR-12 via: tests `adapter_safety::test_sr12_adapter_generation_for_string_param`.
+    status: implemented
+    fields:
+      method: automated-test
+    links:
+      - type: verifies
+        target: SR-12
+
+  - id: SWV-13
+    type: sw-verification
+    title: "Verification of SR-13: Correct cabi_realloc targeting"
+    description: >
+      Verifies SR-13 via: tests `adapter_safety::test_sr13_cabi_realloc_targets_correct_memory`.
+    status: implemented
+    fields:
+      method: automated-test
+    links:
+      - type: verifies
+        target: SR-13
+
+  - id: SWV-14
+    type: sw-verification
+    title: "Verification of SR-14: Correct memory index usage in adapters"
+    description: >
+      Verifies SR-14 via: proofs `proofs/adapter/`.
+    status: implemented
+    fields:
+      method: formal-verification
+    links:
+      - type: verifies
+        target: SR-14
+
+  - id: SWV-15
+    type: sw-verification
+    title: "Verification of SR-15: Correct list copy length"
+    description: >
+      Verifies SR-15 via: tests `adapter_safety::test_sr15_list_copy_length`.
+    status: implemented
+    fields:
+      method: automated-test
+    links:
+      - type: verifies
+        target: SR-15
+
+  - id: SWV-16
+    type: sw-verification
+    title: "Verification of SR-16: Recursive inner pointer fixup"
+    description: >
+      Verifies SR-16 via: tests `adapter_safety::test_sr16_inner_pointer_fixup_list_string`.
+    status: implemented
+    fields:
+      method: automated-test
+    links:
+      - type: verifies
+        target: SR-16
+
+  - id: SWV-17
+    type: sw-verification
+    title: "Verification of SR-17: Correct string transcoding"
+    description: >
+      Verifies SR-17 via: tests `adapter_safety::test_sr17_utf8_to_utf16_string_transcoding`, `adapter_safety::test_sr17_utf8_to_utf16_supplementary_plane_transcoding`, `adapter_safety::test_sr17_utf16_to_utf8_supplementary_plane_transcoding`, `adapter_safety::test_sr17_utf16_to_utf8_lone_high_surrogate_replacement`, `adapter_safety::test_sr17_utf16_to_utf8_midstring_lone_surrogate_replacement`, `adapter_safety::test_sr17_utf16_to_utf8_malformed_surrogate_matrix`, `adapter_safety::test_sr17_utf8_to_utf16_malformed_matrix`, `adapter_safety::test_sr17_latin1_to_utf16_transcoding`, `adapter_safety::test_253_read_latin1_tagclear_to_utf16`, `adapter_safety::test_253_read_latin1_tagclear_to_utf8`, `adapter_safety::test_253_read_latin1_tagset_to_utf16`, `adapter_safety::test_253_read_latin1_tagset_to_utf8_supplementary`, `adapter_safety::test_253_write_utf8_to_latin1_fits`, `adapter_safety::test_253_write_utf8_to_latin1_needs_utf16`, `adapter_safety::test_253_write_utf16_to_latin1_fits`, `adapter_safety::test_253_write_utf16_to_latin1_needs_utf16_supplementary`, `adapter_safety::ls_p_21_latin1_utf16_tag_honored_roundtrip`, `resolver::tests::test_sr17_all_encoding_pairs_transcoding_matrix`.
+    status: verified
+    fields:
+      method: automated-test
+    links:
+      - type: verifies
+        target: SR-17
+
+  - id: SWV-19
+    type: sw-verification
+    title: "Verification of SR-19: Deterministic output"
+    description: >
+      Verifies SR-19 via: tests `tests::test_deterministic_output`, `resolver::tests::test_resolver_preserves_order_stability`.
+    status: implemented
+    fields:
+      method: automated-test
+    links:
+      - type: verifies
+        target: SR-19
+
+  - id: SWV-20
+    type: sw-verification
+    title: "Verification of SR-20: Fail-fast on unresolvable state"
+    description: >
+      Verifies SR-20 via: tests `tests::test_fuser_empty_components_error`, `tests::test_fuser_rejects_core_module_input`, `tests::test_fuser_address_rebasing_requires_shared_memory`, `tests::test_fuser_rejects_invalid_wasm`.
+    status: implemented
+    fields:
+      method: automated-test
+    links:
+      - type: verifies
+        target: SR-20
+
+  - id: SWV-21
+    type: sw-verification
+    title: "Verification of SR-21: Valid P2 component wrapping"
+    description: >
+      Verifies SR-21 via: tests `component_wrap::tests::test_build_stubs_module_multi_memory_exports`, `component_wrap::tests::test_build_stubs_module_single_memory_no_suffix`, `component_wrap::tests::test_build_stubs_module_multi_memory_limits_preserved`, `component_wrap::tests::test_resolve_import_to_instance_strips_suffix`, `component_wrap::tests::test_resolve_import_to_instance_non_numeric_suffix_not_stripped`, `component_wrap::tests::test_resolve_import_to_instance_unknown_module`, `wit_bindgen_runtime::test_fuse_component_wit_bindgen_flavorful`, `wit_bindgen_runtime::test_runtime_wit_bindgen_flavorful`.
+    status: implemented
+    fields:
+      method: automated-test
+    links:
+      - type: verifies
+        target: SR-21
+
+  - id: SWV-22
+    type: sw-verification
+    title: "Verification of SR-22: Conditional pointer copy for option/result/variant types"
+    description: >
+      Verifies SR-22 via: tests `wit_bindgen_runtime::test_runtime_wit_bindgen_options`, `wit_bindgen_runtime::test_runtime_wit_bindgen_variants`, `wit_bindgen_runtime::test_runtime_wit_bindgen_flavorful`.
+    status: implemented
+    fields:
+      method: automated-test
+    links:
+      - type: verifies
+        target: SR-22
+
+  - id: SWV-23
+    type: sw-verification
+    title: "Verification of SR-23: Import deduplication type safety"
+    description: >
+      Verifies SR-23 via: tests `merger::tests::test_multi_memory_dedup_separates_components`, `merger::tests::test_shared_memory_dedup_merges_components`, `merger::tests::test_import_memory_and_realloc_indices_populated`, `merger::tests::test_cabi_realloc_suffixed_exports_generated`, `merger::tests::test_shared_memory_no_suffixed_realloc_exports`.
+    status: implemented
+    fields:
+      method: automated-test
+    links:
+      - type: verifies
+        target: SR-23
+
+  - id: SWV-24
+    type: sw-verification
+    title: "Verification of SR-24: Correct retptr layout for variant return types"
+    description: >
+      Verifies SR-24 via: tests `wit_bindgen_runtime::test_runtime_wit_bindgen_flavorful`, `wit_bindgen_runtime::test_runtime_wit_bindgen_variants`.
+    status: implemented
+    fields:
+      method: automated-test
+    links:
+      - type: verifies
+        target: SR-24
+
+  - id: SWV-25
+    type: sw-verification
+    title: "Verification of SR-25: Resource handle pass-through"
+    description: >
+      Verifies SR-25 via: tests `wit_bindgen_runtime::test_fuse_wit_bindgen_resources`, `wit_bindgen_runtime::test_fuse_component_wit_bindgen_resources`, `wit_bindgen_runtime::test_runtime_wit_bindgen_resources`.
+    status: verified
+    fields:
+      method: automated-test
+    links:
+      - type: verifies
+        target: SR-25
+
+  - id: SWV-26
+    type: sw-verification
+    title: "Verification of SR-26: Complete component type index tracking"
+    description: >
+      Verifies SR-26 via: tests `wit_bindgen_runtime::test_runtime_wit_bindgen_flavorful`.
+    status: implemented
+    fields:
+      method: automated-test
+    links:
+      - type: verifies
+        target: SR-26
+
+  - id: SWV-27
+    type: sw-verification
+    title: "Verification of SR-27: Attestation input hash integrity"
+    description: >
+      Verifies SR-27 via: tests `attestation::tests::test_sr27_input_hash_integrity`.
+    status: implemented
+    fields:
+      method: automated-test
+    links:
+      - type: verifies
+        target: SR-27
+
+  - id: SWV-28
+    type: sw-verification
+    title: "Verification of SR-28: Attestation configuration completeness"
+    description: >
+      Verifies SR-28 via: tests `attestation::tests::test_sr28_config_completeness`.
+    status: implemented
+    fields:
+      method: automated-test
+    links:
+      - type: verifies
+        target: SR-28
+
+  - id: SWV-29
+    type: sw-verification
+    title: "Verification of SR-29: Attestation serialization round-trip"
+    description: >
+      Verifies SR-29 via: tests `attestation::tests::test_sr29_attestation_round_trip`, `attestation::tests::test_to_bytes_returns_result`.
+    status: implemented
+    fields:
+      method: automated-test
+    links:
+      - type: verifies
+        target: SR-29
+
+  - id: SWV-30
+    type: sw-verification
+    title: "Verification of SR-30: Attestation output hash integrity"
+    description: >
+      Verifies SR-30 via: tests `attestation::tests::test_sr30_output_hash_integrity`.
+    status: implemented
+    fields:
+      method: automated-test
+    links:
+      - type: verifies
+        target: SR-30
+
+  - id: SWV-31
+    type: sw-verification
+    title: "Verification of SR-31: Multiply-instantiated module detection"
+    description: >
+      Verifies SR-31 via: tests `merger::tests::ls_m_5_multiply_instantiated_module_rejected`.
+    status: verified
+    fields:
+      method: automated-test
+    links:
+      - type: verifies
+        target: SR-31
+
+  - id: SWV-32
+    type: sw-verification
+    title: "Verification of SR-32: Stackful P3 lifting mode emission"
+    description: >
+      Verifies SR-32 via: tests `p3_async::tests::stackful_intrinsic_signatures_pinned`, `p3_async::tests::stackful_lift_is_async_without_callback`, `adapter::fact::tests::sr32_has_callback_export_detects_companion`, `adapter::fact::tests::sr32_stackful_emitter_handles_no_shim_with_default_results`, `adapter::fact::tests::sr32_stackful_emitter_shape_pins_call_drop_globalget`.
+    status: implemented
+    fields:
+      method: automated-test
+    links:
+      - type: verifies
+        target: SR-32
+
+  - id: SWV-33
+    type: sw-verification
+    title: "Verification of SR-33: Cross-component `stream<T>` fusion at merge time"
+    description: >
+      Verifies SR-33 via: tests `p3_bridge_runtime::ls_st_1_round_trip_local_stream_never_crosses_host`, `p3_bridge_runtime::cross_memory_chain_preserves_data_across_distinct_memories`, `p3_bridge_runtime::backpressure_partial_write_then_drain_then_resume`, `p3_bridge_runtime::ls_st_1_eof_only_after_writer_drop_and_drain`, `p3_bridge_runtime::slot_exhaustion_falls_back_to_host_stream`.
+    status: verified
+    fields:
+      method: automated-test
+    links:
+      - type: verifies
+        target: SR-33
+
+  - id: SWV-34
+    type: sw-verification
+    title: "Verification of SR-34: Static `stream<T>` validation"
+    description: >
+      Verifies SR-34 via: tests `meld-core/src/p3_stream.rs::tests::ls_r_11_stream_typed_import_with_mismatched_roles_raises`, `meld-core/src/p3_stream.rs::tests::ls_r_11_per_edge_lift_export_mismatch_raises`, `meld-core/src/p3_stream.rs::tests::ls_r_11_sync_only_connection_with_unrelated_streams_does_not_raise`.
+    status: implemented
+    fields:
+      method: automated-test
+    links:
+      - type: verifies
+        target: SR-34
+
+  - id: SWV-35
+    type: sw-verification
+    title: "Verification of SR-35: DWARF address remap into merged code section"
+    description: >
+      Verifies SR-35 via: tests `meld-core/src/dwarf.rs::tests::ls_d_1_remap_translates_low_pc`, `meld-core/tests/dwarf_remap_witness.rs`, `meld-core/tests/dwarf_strip.rs`, `meld-core/tests/dwarf_passthrough.rs`.
+    status: verified
+    fields:
+      method: automated-test
+    links:
+      - type: verifies
+        target: SR-35
+
+  - id: SWV-36
+    type: sw-verification
+    title: "Verification of SR-36: Synthesised DWARF DIEs for meld-generated adapter functions"
+    description: >
+      Verifies SR-36 via: tests `dwarf::tests::adapter_spans_identifies_component_synthetic`, `dwarf::tests::adapter_spans_recognises_fully_synthetic_sentinel`, `dwarf::tests::adapter_spans_empty_when_all_source`, `dwarf::tests::adapter_spans_disjoint_from_source_ranges`, `dwarf::tests::build_adapter_dwarf_attributes_ranges_to_meld_adapter`, `dwarf::tests::ls_d_2_rewrite_emits_source_and_adapter_units_in_one_write`, `adapter_dwarf_e2e::ls_d_2_generated_start_wrapper_is_attributed_to_meld_adapter`.
+    status: implemented
+    fields:
+      method: automated-test
+    links:
+      - type: verifies
+        target: SR-36
+
+  - id: SWV-37
+    type: sw-verification
+    title: "Verification of SR-37: Automatic memory-strategy resolution (sound-by-construction default)"
+    description: >
+      Verifies SR-37 via: tests `meld-core/tests/auto_memory.rs::auto_selects_shared_for_growfree_inputs`, `meld-core/tests/auto_memory.rs::ls_m_7_auto_keeps_multi_when_input_grows`, `meld-core/tests/auto_memory.rs::ls_m_7_auto_reprobes_after_add_component`, `meld-core/tests/auto_memory.rs::auto_keeps_multi_for_single_memory_input`, `meld-core/tests/auto_memory.rs::explicit_multi_is_not_overridden`, `meld-core/src/memory_probe.rs::tests::ls_m_7_malformed_input_counts_as_grow`.
+    status: verified
+    fields:
+      method: automated-test
+    links:
+      - type: verifies
+        target: SR-37
+
+  - id: SWV-38
+    type: sw-verification
+    title: "Verification of SR-38: Multi-source DWARF merge (bounded relocator)"
+    description: >
+      Verifies SR-38 via: tests `dwarf::tests::ls_d_3_multi_source_merge_round_trips_both_units`, `dwarf_passthrough (multi-source policy test on lists.wasm)`.
+    status: verified
+    fields:
+      method: automated-test
+    links:
+      - type: verifies
+        target: SR-38
+
+  - id: SWV-39
+    type: sw-verification
+    title: "Verification of SR-39: Separate-input cross-component linking (import internalisation)"
+    description: >
+      Verifies SR-39 via: tests `golden_e2e::ls_cp_6_separate_inputs_internalise_link`, `wit_bindgen_runtime (full suite guards WASI imports staying declared)`.
+    status: verified
+    fields:
+      method: automated-test
+    links:
+      - type: verifies
+        target: SR-39
+
+  - id: SWV-40
+    type: sw-verification
+    title: "Verification of SR-40: Machine-checked Canonical-ABI layout invariants (Kani)"
+    description: >
+      Verifies SR-40 via: proofs `abi_proofs::flags_layout_matches_spec (Kani)`, `abi_proofs::total_flat_params_saturating_monotone (Kani)`, `abi_proofs::ring_cursor_invariant_inductive (Kani)`.
+    status: verified
+    fields:
+      method: formal-verification
+    links:
+      - type: verifies
+        target: SR-40
+
+  - id: SWV-41
+    type: sw-verification
+    title: "Verification of SR-41: Async cross-encoding string transcoding"
+    description: >
+      Verifies SR-41 via: tests `async_cross_encoding::inc1_async_utf8_to_utf16_param_transcodes_hello`, `async_cross_encoding::inc1_async_utf8_to_utf16_param_transcodes_supplementary_plane`, `async_cross_encoding::inc2_async_utf16_to_utf8_param_transcodes_supplementary_plane`, `async_cross_encoding::inc4a_async_latin1_to_utf16_tag_set_nihon`, `async_cross_encoding::inc4a_async_latin1_to_utf8_tag_set_nihon`, `async_cross_encoding::inc4b_async_utf8_to_latin1_emoji_surrogate_pair`, `async_cross_encoding::inc4b_async_utf16_to_latin1_nihon_utf16`, `adapter::fact::tests::inc3_async_utf8_to_utf16_top_level_string_result_allowed`, `async_cross_encoding::inc5a_async_nested_list_string_utf8_to_utf16_transcodes`, `async_cross_encoding::inc5a_async_nested_list_u8_result_not_transcoded`, `async_cross_encoding::inc5b_nested_list_string_utf16_to_latin1`, `async_cross_encoding::inc5c_a_async_nested_list_string_param_utf8_to_utf16_transcodes`, `async_cross_encoding::inc5c_b_same_encoding_utf16_nested_param_deep_copies_full_codeunits`, `adapter::fact::tests::inc1_callback_adapter_transcode_locals_within_budget`, `adapter::fact::tests::inc5c_b_callback_adapter_nested_param_dest_latin1_locals_within_budget`, `adapter::fact::tests::inc5c_b_async_deeper_list_nesting_param_fails_loud_all_directions`.
+    status: verified
+    fields:
+      method: automated-test
+    links:
+      - type: verifies
+        target: SR-41
+  - id: SWV-18
+    type: sw-verification
+    title: "Verification of SR-18: Adapter instruction ordering"
+    description: >
+      Verifies SR-18 via runtime/e2e tests that exercise the full adapter
+      instruction path (`meld-core/tests/wit_bindgen_runtime.rs` suite) plus
+      code inspection of the emission order in `meld-core/src/adapter/fact.rs`.
+    status: implemented
+    fields:
+      method: automated-test
+    links:
+      - type: verifies
+        target: SR-18
+
+  - id: SWV-42
+    type: sw-verification
+    title: "Verification of SR-42: Identity-trampoline adapter inlining"
+    description: >
+      Verifies SR-42 via test
+      `meld-core/tests/cross_component_call.rs::test_304_identity_direct_adapter_is_inlined`
+      (fuses a composed component, asserts adapters_inlined >= 1 and validates).
+    status: verified
+    fields:
+      method: automated-test
+    links:
+      - type: verifies
+        target: SR-42
+
+  - id: SWV-43
+    type: sw-verification
+    title: "Verification of SR-43: Opaque-rep resource drop-teardown soundness"
+    description: >
+      Verifies SR-43 via runtime oracle
+      `meld-core/tests/wit_bindgen_runtime.rs::test_runtime_wit_bindgen_resource_floats_opaque`
+      (construct+drop runs cleanly on the fused opaque-rep chain; skips if the
+      gitignored fixture is absent).
+    status: verified
+    fields:
+      method: automated-test
+    links:
+      - type: verifies
+        target: SR-43
+
+  - id: SWV-44
+    type: sw-verification
+    title: "Verification of SR-44: Enforced requirement->verification traceability"
+    description: >
+      Verifies SR-44 by static analysis: `rivet validate` mechanically enforces
+      that every sw-req carries a typed sw-verification backlink (the ASPICE SWE
+      tier, ADR-5). The passing gate is itself the verification measure.
+    status: implemented
+    fields:
+      method: static-analysis
+    links:
+      - type: verifies
+        target: SR-44
