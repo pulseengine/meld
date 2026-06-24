@@ -1,0 +1,186 @@
+# System & Stakeholder requirements — ASPICE SYS.1 / SYS.2 tier
+#
+# The upstream tier for meld's software requirements (safety-requirements.yaml,
+# being migrated requirement → sw-req per ADR-5). Each system-req derives from a
+# stakeholder need; each sw-req (SWE.1) derives from exactly one system-req.
+#
+# Format: rivet generic-yaml (types from the aspice schema).
+
+artifacts:
+
+  # ── Stakeholder requirements (SYS.1) ──────────────────────────────────────
+  - id: STK-1
+    type: stakeholder-req
+    title: Fused output is functionally equivalent to the composed input
+    description: >
+      A meld-fused core module shall behave observably identically to the
+      original composed P2/P3 component graph it was produced from, for every
+      supported input.
+    status: approved
+    fields:
+      priority: critical
+      source: PulseEngine toolchain charter (static component fusion, RFC-46)
+
+  - id: STK-2
+    type: stakeholder-req
+    title: Fused output is fit for functional-safety deployment
+    description: >
+      A meld-fused module shall be suitable for use in functional-safety
+      contexts: its construction shall be traceable and attestable, its output
+      deterministic, and unsafe states shall fail by construction rather than
+      silently.
+    status: approved
+    fields:
+      priority: critical
+      source: PulseEngine functional-safety positioning (ASIL/SIL targets)
+
+  # ── System requirements (SYS.2) ───────────────────────────────────────────
+  - id: SYS-1
+    type: system-req
+    title: Faithful component ingestion
+    description: >
+      meld shall parse composed components completely and correctly — every
+      core module, import/export, ABI element size, and copy-layout class — and
+      reject malformed input rather than mis-parse it.
+    status: approved
+    fields:
+      req-type: functional
+    links:
+      - type: derives-from
+        target: STK-1
+
+  - id: SYS-2
+    type: system-req
+    title: Sound index-space merging
+    description: >
+      meld shall merge component index spaces (functions, memories, tables,
+      types, segments, instantiation order) without collision or mis-offset,
+      including detection of multiply-instantiated modules.
+    status: approved
+    fields:
+      req-type: functional
+    links:
+      - type: derives-from
+        target: STK-1
+
+  - id: SYS-3
+    type: system-req
+    title: Correct Canonical-ABI cross-component adapters
+    description: >
+      meld shall emit Canonical-ABI adapters that correctly transfer values
+      across the internalised component boundary — pointer/list/string copies,
+      transcoding, retptr layouts, realloc/memory targeting, resource handles,
+      with machine-checked layout invariants.
+    status: approved
+    fields:
+      req-type: functional
+    links:
+      - type: derives-from
+        target: STK-1
+
+  - id: SYS-4
+    type: system-req
+    title: Valid component wrapping and output
+    description: >
+      meld shall wrap the fused core module into a valid output artifact whose
+      structure matches downstream-tool expectations.
+    status: approved
+    fields:
+      req-type: functional
+    links:
+      - type: derives-from
+        target: STK-1
+
+  - id: SYS-5
+    type: system-req
+    title: Async / P3 fusion support
+    description: >
+      meld shall fuse P3 async constructs — stackful lifting, cross-component
+      stream<T> bridging, opaque-rep resource drop — preserving their runtime
+      semantics.
+    status: approved
+    fields:
+      req-type: functional
+    links:
+      - type: derives-from
+        target: STK-1
+
+  - id: SYS-6
+    type: system-req
+    title: Memory-strategy and isolation soundness
+    description: >
+      meld shall select a memory strategy that is sound by construction for the
+      input, preserving inter-component isolation (multi-memory structural
+      isolation as the committed model, per ADR-4).
+    status: approved
+    fields:
+      req-type: safety
+    links:
+      - type: derives-from
+        target: STK-2
+
+  - id: SYS-7
+    type: system-req
+    title: DWARF debug-info preservation
+    description: >
+      meld shall preserve and correctly relocate DWARF debug information across
+      the merge, including multi-source merge and synthesised DIEs for
+      meld-generated adapter functions.
+    status: approved
+    fields:
+      req-type: functional
+    links:
+      - type: derives-from
+        target: STK-1
+
+  - id: SYS-8
+    type: system-req
+    title: Cross-input linking (import internalisation)
+    description: >
+      meld shall link separately-supplied inputs by internalising cross-input
+      imports into intra-module calls.
+    status: approved
+    fields:
+      req-type: functional
+    links:
+      - type: derives-from
+        target: STK-1
+
+  - id: SYS-9
+    type: system-req
+    title: Deterministic, fail-fast operation
+    description: >
+      meld shall produce byte-deterministic output for identical input and
+      shall fail fast on unresolvable state rather than emit a degraded module.
+    status: approved
+    fields:
+      req-type: constraint
+    links:
+      - type: derives-from
+        target: STK-2
+
+  - id: SYS-10
+    type: system-req
+    title: Attestation integrity
+    description: >
+      meld shall record a complete, round-trippable attestation binding the
+      input hash, configuration, and output hash of each fusion.
+    status: approved
+    fields:
+      req-type: safety
+    links:
+      - type: derives-from
+        target: STK-2
+
+  - id: SYS-11
+    type: system-req
+    title: Traceability and verification governance
+    description: >
+      meld's requirements shall trace to typed verification measures, enforced
+      mechanically (the ASPICE SWE tier, this migration).
+    status: approved
+    fields:
+      req-type: constraint
+    links:
+      - type: derives-from
+        target: STK-2
