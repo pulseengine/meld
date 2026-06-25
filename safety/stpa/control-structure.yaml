@@ -223,6 +223,31 @@ controllers:
       - cabi_realloc indices in canon lower match importing component's allocator
       - All import names resolve to valid component instances
 
+  # --- Host / runtime controllers outside meld's direct authorship ---
+  # meld's fusion design must contain the UCAs these issue (RFC-46 resource
+  # & async hazards, RH-*). They live in the control structure as the
+  # issuers referenced by safety/stpa/rfc46-hazards.yaml UCA `issued-by`.
+  - id: "CM Runtime (embedded)"
+    name: Embedded Component-Model Runtime
+    type: automated
+    description: >
+      The embedded CM runtime that allocates and drops resource handles and
+      schedules async tasks in the fused module's execution environment.
+      Issues the RFC-46 resource-lifetime and task-scheduling control actions.
+  - id: "Fiber Manager (host intrinsic)"
+    name: Fiber Manager (host intrinsic)
+    type: automated
+    description: >
+      Host intrinsic that creates, suspends, and resumes the fibers backing
+      stackful async guest execution. Issues fiber lifecycle control actions.
+  - id: "host-wit-bindgen"
+    name: Host wit-bindgen (maps to syn/kiln)
+    type: automated
+    description: >
+      Host-side binding generator (syn/kiln in PulseEngine) that emits the
+      memory/encoding glue at the host/guest boundary. Issues the binding
+      control actions whose UCAs meld's multi-memory lowering must survive.
+
 controlled-processes:
   - id: PROC-COMPONENT
     name: Component Binary Data

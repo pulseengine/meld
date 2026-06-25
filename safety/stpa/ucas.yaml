@@ -429,6 +429,36 @@ adapter-ucas:
         Copied list elements retain pointers into source memory. Callee
         dereferences them and reads garbage or traps.
 
+    - id: UCA-F-2
+      description: >
+        Adapter resource-graph construction drops or ignores resource handling
+        for a component — the definer-purge and terminal-exporter passes skip
+        an (iface, resource-name) pair, and [resource-drop] imports are dropped
+        for non-pure-consumer components — so the needed adapter logic is not
+        emitted.
+      context: >
+        Resource-graph build during FACT adapter generation for a component
+        that defines or re-exports resources across the fused boundary.
+      hazards: [H-3, H-1]
+      rationale: >
+        Omitting resource-drop wiring or an (iface, rn) handler diverges the
+        fused module from the composed module's resource semantics and can
+        leak or mis-route handles.
+
+    - id: UCA-F-3
+      description: >
+        Adapter async-callback trampoline does not dispatch the host poll for a
+        guest POLL return code — it treats POLL (3) as falling through to the
+        non-WAIT else arm and returns (EVENT_NONE, 0, 0), dropping a ready event.
+      context: >
+        Guest legitimately returns callback::POLL on a P3 async export call path
+        while the host has the polled event ready.
+      hazards: [H-3]
+      rationale: >
+        The guest never observes the event it polls for, so the fused module
+        diverges from the composed module on P3 async export paths (semantic-
+        preservation violation).
+
   providing:
     - id: UCA-A-4
       description: >
@@ -565,6 +595,20 @@ wrapper-ucas:
       rationale: >
         Non-imported memories are not accessible to the stubs module.
         Canon lower cannot reference the correct memory for each component.
+
+    - id: UCA-CP-1
+      description: >
+        Wrapper does not export, or mis-types, the composition's export when
+        assembling the fused multi-component output (a re-exported interface or
+        function from a sub-component is dropped or given the wrong type).
+      context: >
+        Multi-component fusion where the composition re-exports an interface or
+        function originating in one of the fused sub-components.
+      hazards: [H-1, H-3]
+      rationale: >
+        A dropped or mis-typed composition export makes the fused module's
+        public surface diverge from the composed module — callers see a missing
+        or wrongly-typed export, breaking semantic preservation.
 
   providing:
     - id: UCA-W-2

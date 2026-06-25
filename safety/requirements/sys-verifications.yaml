@@ -1,0 +1,162 @@
+# System verification measures — ASPICE SYS.5 (sys-verification)
+#
+# Closes the system tier of the V (ADR-5): each system-req (SYS-1..11) is
+# verified by meld's system-level test evidence — primarily the behavioural-
+# equivalence golden harness (tests/.../golden_e2e.rs, #213) plus the per-
+# domain end-to-end / runtime suites. Clears sys2-has-verification.
+#
+# Format: rivet generic-yaml (sys-verification type from the aspice schema).
+
+artifacts:
+
+  - id: SYSV-1
+    type: sys-verification
+    title: "System verification of SYS-1: Faithful component ingestion"
+    description: >
+      Behavioural-equivalence golden harness (meld-core/tests/golden_e2e.rs,
+      #213 Tier A+B) plus nested_component.rs and release_components.rs confirm
+      the fused module ingests and reproduces the composed input faithfully.
+    status: implemented
+    fields:
+      method: automated-test
+    links:
+      - type: verifies
+        target: SYS-1
+
+  - id: SYSV-2
+    type: sys-verification
+    title: "System verification of SYS-2: Sound index-space merging"
+    description: >
+      proptest_fusion.rs (property-based merge invariants) and
+      rebasing_end_to_end.rs exercise index-space merging across components;
+      golden_e2e.rs confirms runtime equivalence of the merged result.
+    status: implemented
+    fields:
+      method: automated-test
+    links:
+      - type: verifies
+        target: SYS-2
+
+  - id: SYSV-3
+    type: sys-verification
+    title: "System verification of SYS-3: Canonical-ABI cross-component adapters"
+    description: >
+      cross_component_call.rs, runtime_intra_adapter.rs and adapter_safety.rs
+      exercise the emitted adapters end-to-end; golden_e2e.rs confirms
+      observable equivalence across the adapted boundary.
+    status: implemented
+    fields:
+      method: automated-test
+    links:
+      - type: verifies
+        target: SYS-3
+
+  - id: SYSV-4
+    type: sys-verification
+    title: "System verification of SYS-4: Valid component wrapping and output"
+    description: >
+      file_ops_validate.rs and runtime_from_exports.rs validate the wrapped
+      output artifact's structure and that its exports run.
+    status: implemented
+    fields:
+      method: automated-test
+    links:
+      - type: verifies
+        target: SYS-4
+
+  - id: SYSV-5
+    type: sys-verification
+    title: "System verification of SYS-5: Async / P3 fusion support"
+    description: >
+      p3_async_abi.rs, p3_async_lowering.rs, p3_bridge_runtime.rs and
+      async_cross_encoding.rs exercise stackful lifting, stream<T> bridging and
+      cross-encoding end-to-end.
+    status: implemented
+    fields:
+      method: automated-test
+    links:
+      - type: verifies
+        target: SYS-5
+
+  - id: SYSV-6
+    type: sys-verification
+    title: "System verification of SYS-6: Memory-strategy and isolation soundness"
+    description: >
+      multi_memory.rs (N distinct memories preserved, cross-memory data
+      movement) and auto_memory.rs (sound-by-construction strategy selection)
+      verify inter-component isolation.
+    status: implemented
+    fields:
+      method: automated-test
+    links:
+      - type: verifies
+        target: SYS-6
+
+  - id: SYSV-7
+    type: sys-verification
+    title: "System verification of SYS-7: DWARF debug-info preservation"
+    description: >
+      dwarf_passthrough.rs, dwarf_remap_witness.rs, dwarf_strip.rs and
+      adapter_dwarf_e2e.rs verify DWARF is preserved/relocated correctly,
+      including synthesised adapter DIEs.
+    status: implemented
+    fields:
+      method: automated-test
+    links:
+      - type: verifies
+        target: SYS-7
+
+  - id: SYSV-8
+    type: sys-verification
+    title: "System verification of SYS-8: Cross-input linking"
+    description: >
+      runtime_from_exports.rs and the separate-input linking e2e path verify
+      cross-input imports are internalised into intra-module calls and the
+      linked module runs.
+    status: implemented
+    fields:
+      method: automated-test
+    links:
+      - type: verifies
+        target: SYS-8
+
+  - id: SYSV-9
+    type: sys-verification
+    title: "System verification of SYS-9: Deterministic, fail-fast operation"
+    description: >
+      proptest_fusion.rs covers byte-determinism over generated inputs;
+      file_ops_validate.rs and the reject/fail-fast tests confirm unresolvable
+      state aborts rather than emitting a degraded module.
+    status: implemented
+    fields:
+      method: automated-test
+    links:
+      - type: verifies
+        target: SYS-9
+
+  - id: SYSV-10
+    type: sys-verification
+    title: "System verification of SYS-10: Attestation integrity"
+    description: >
+      component_provenance.rs verifies the attestation records a complete,
+      round-trippable binding of input hash, configuration and output hash.
+    status: implemented
+    fields:
+      method: automated-test
+    links:
+      - type: verifies
+        target: SYS-10
+
+  - id: SYSV-11
+    type: sys-verification
+    title: "System verification of SYS-11: Traceability and verification governance"
+    description: >
+      `rivet validate` mechanically enforces the ASPICE SWE/SYS trace (this
+      migration, ADR-5) — every requirement carries a typed verification
+      backlink; the passing gate is the verification measure.
+    status: implemented
+    fields:
+      method: static-analysis
+    links:
+      - type: verifies
+        target: SYS-11

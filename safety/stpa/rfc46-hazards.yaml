@@ -145,7 +145,7 @@ ucas:
       leaving a dangling reference that subsequent operations dereference.
     context: "Resource creation during component-to-component call"
     hazards: [RH-1]
-    type: not-providing
+    uca-type: not-providing
 
   - id: UCA-RT-2
     controller: "CM Runtime (embedded)"
@@ -154,7 +154,7 @@ ucas:
       active stream or future, causing use-after-free on next I/O.
     context: "Resource cleanup during async task completion"
     hazards: [RH-1, RH-6]
-    type: too-early
+    uca-type: too-early-too-late
 
   - id: UCA-RT-3
     controller: "CM Runtime (embedded)"
@@ -163,7 +163,7 @@ ucas:
       from multiple tasks without synchronization.
     context: "Multi-task stream I/O with shared buffer"
     hazards: [RH-6]
-    type: providing-causes-hazard
+    uca-type: providing
 
   - id: UCA-RT-4
     controller: "CM Runtime (embedded)"
@@ -172,7 +172,7 @@ ucas:
       apparent hang or timeout in the starved component's callers.
     context: "Task scheduling with multiple async components"
     hazards: [RH-6]
-    type: too-late
+    uca-type: too-early-too-late
 
   # --- Fiber Manager (host) ---
   - id: UCA-FM-1
@@ -182,7 +182,7 @@ ucas:
       that will execute on it, causing stack overflow during execution.
     context: "Fiber creation for async component call"
     hazards: [RH-2]
-    type: providing-causes-hazard
+    uca-type: providing
 
   - id: UCA-FM-2
     controller: "Fiber Manager (host intrinsic)"
@@ -191,7 +191,7 @@ ucas:
       memory or corrupting execution state.
     context: "Fiber resume after task completion"
     hazards: [RH-2]
-    type: providing-causes-hazard
+    uca-type: providing
 
   - id: UCA-FM-3
     controller: "Fiber Manager (host intrinsic)"
@@ -200,7 +200,7 @@ ucas:
       completion, causing a permanent resource leak and logical deadlock.
     context: "Fiber suspension waiting for stream data"
     hazards: [RH-6]
-    type: not-providing
+    uca-type: not-providing
 
   - id: UCA-FM-4
     controller: "Fiber Manager (host intrinsic)"
@@ -209,7 +209,7 @@ ucas:
       one component to observe another component's internal state.
     context: "Fiber-local state access during context switch"
     hazards: [RH-2]
-    type: providing-causes-hazard
+    uca-type: providing
 
   # --- host-wit-bindgen (maps to syn/kiln in PulseEngine) ---
   - id: UCA-HB-1
@@ -219,7 +219,7 @@ ucas:
       module, reading from or writing to the wrong component's memory.
     context: "Host calling guest export that takes pointer arguments"
     hazards: [RH-3]
-    type: providing-causes-hazard
+    uca-type: providing
     pulseengine-owner: syn/kiln
 
   - id: UCA-HB-2
@@ -229,7 +229,7 @@ ucas:
       host/guest boundary, passing invalid UTF-8 into guest memory.
     context: "Host passing string argument to guest function"
     hazards: [RH-3]
-    type: not-providing
+    uca-type: not-providing
     pulseengine-owner: syn/kiln
 
   - id: UCA-HB-3
@@ -239,7 +239,7 @@ ucas:
       offset, misinterpreting function signatures.
     context: "Host bindings initialization / module inspection"
     hazards: [RH-3]
-    type: providing-causes-hazard
+    uca-type: providing
     pulseengine-owner: syn/kiln
 
   - id: UCA-HB-4
@@ -250,7 +250,7 @@ ucas:
       memory 0 regardless of which component owns the data.
     context: "Host reading return values from guest export"
     hazards: [RH-3]
-    type: providing-causes-hazard
+    uca-type: providing
     pulseengine-owner: syn/kiln
 
 # ---------------------------------------------------------------------------
