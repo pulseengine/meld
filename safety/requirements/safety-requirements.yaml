@@ -1453,7 +1453,7 @@ artifacts:
       cleanly with no meld code change — the suspected meld handle-table
       discrimination was not required.
     status: verified
-    tags: [bug, resource, opaque-rep, v0.35.0]
+    tags: [bug, resource, opaque-rep, v0.36.0]
     links:
       - type: derives-from
         target: SYS-5

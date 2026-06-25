@@ -4,6 +4,48 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.36.0] - 2026-06-25
+
+Traceability-enforcement release (catches up the planned v0.35.0 — its SR-43
+opaque-rep work ships here). No library code change: this release closes the
+ASPICE V-model so requirement→verification is a typed, mechanically-enforced
+trace rather than a rendered matrix. `rivet validate` goes from 77 errors to
+**PASS (0 errors)** on the #570-fixed rivet (shipped in rivet v0.19.0).
+
+**Falsification:** if any requirement lacked a typed verification backlink, or
+any STPA/derives-from link pointed at a wrong-typed or missing target, `rivet
+validate` would FAIL. It passes — every one of the 44 sw-reqs and 11
+system-reqs carries a `verifies` backlink, 0 requirement-verification gaps.
+
+### Added
+
+- **Full ASPICE SWE/SYS tier migration (SR-44, #311).** New upstream tier —
+  2 stakeholder-reqs + 11 system-reqs (`safety/requirements/system-requirements.yaml`).
+  All 44 safety requirements flipped `requirement`→`sw-req`, each `derived-from`
+  its system-req. STPA trace preserved on the sw-reqs (ADR-5 option A):
+  `LS-*`→`mitigates`, `CC-*/SC-*`→`addresses-constraint` (declared in the new
+  `schemas/meld-local.yaml`), GitHub-issue refs→`cited-source`.
+- **Typed verification layer.** 44 `sw-verification` (SWE.6) +
+  11 `sys-verification` (SYS.5) artifacts, each `verifies` its requirement,
+  grounded in the existing tests/proofs (and the `golden_e2e` behavioural-
+  equivalence harness for the system tier).
+- **ADR-5** records the migration plan; **SR-43 opaque-rep drop oracle (#309)**
+  and the **verification matrix (#308)** / **multi-memory lowering contract
+  (#310, #300)** ship in this release.
+- **3 STPA UCAs authored** (`UCA-F-2`/`UCA-F-3`/`UCA-CP-1`) that loss scenarios
+  referenced but were never defined.
+
+### Changed
+
+- `compliance.yml` rivet pin bumped v0.15.0→v0.19.0 (carries the #570 parser
+  fix + aspice@0.2.0) so the release compliance report consumes the new schema.
+
+### Dependencies
+
+- Requires rivet ≥ v0.19.0 to validate the artifact graph (the #570 YAML-parser
+  fix; before it, `rivet validate` silently dropped trace edges and reported a
+  false PASS).
+
 ## [0.34.0] - 2026-06-23
 
 Adapter-inlining + isolation-model release. Honors the previously-dead
