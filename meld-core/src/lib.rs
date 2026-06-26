@@ -734,10 +734,8 @@ impl Fuser {
 
         if self.config.component_provenance {
             let provenance = provenance::build(&merged, &self.components, &output_without_extras);
-            let payload = provenance.to_bytes().map_err(|e| {
-                Error::EncodingError(format!("component-provenance serialization failed: {e}"))
-            })?;
-            extra_sections.push((provenance::SECTION_NAME, payload));
+            // SCPV v3 binary payload (#313 / scry#63) — infallible encode.
+            extra_sections.push((provenance::SECTION_NAME, provenance.to_bytes()));
         }
 
         let output = if extra_sections.is_empty() {
