@@ -4036,3 +4036,66 @@ loss-scenarios:
       open+empty; EOF 0 only after drop_writable AND drain; sticky).
       slot_exhaustion_falls_back_to_host_stream pins the untagged
       fallback direction (host ops are reached exactly once each).
+
+  - id: LS-R-17
+    title: Embedder-provided import mis-bound or rejected during fusion
+    uca: UCA-R-3
+    hazards: [H-1, H-3.1]
+    type: inadequate-control-algorithm
+    scenario: >
+      The BYO-OS lean-MCU dissolve pipeline (gale#89) routes `cabi_realloc`
+      to an embedder-provided seam in the well-known `pulseengine:embedder`
+      WIT package namespace (e.g. `pulseengine:embedder/arena`'s
+      `__cabi_arena_realloc`), satisfied downstream at native link / synth
+      dissolve — NOT by any component in the fusion set. If the resolver
+      treats this seam as an ordinary import it can go wrong two ways. (a)
+      Mis-bind: a component that coincidentally exports a name colliding with
+      the seam is matched as its provider [UCA-R-3], wiring the fused core to
+      the wrong allocator — a trap on signature mismatch [H-1] or, if the
+      signatures align, a silently wrong allocation path [H-3.1]. (b) False
+      rejection / drop: a stricter resolver mode rejects the seam as an
+      unresolved import (or a future "aggressive resolve" pass drops it),
+      so the fused core can no longer allocate. Both stem from the seam
+      surviving only INCIDENTALLY (`allow_unresolved: true`) rather than
+      being recognized as intentional embedder passthrough.
+    causal-factors:
+      - >-
+        Embedder seams were preserved only incidentally (the fusion
+        resolver's `allow_unresolved: true`), with no positive recognition,
+        so a future strict/aggressive resolver could silently drop or reject
+        them
+      - >-
+        A bare magic-name contract (`cabi-arena-realloc`) would be
+        collision-prone (any component exporting that name captures the
+        seam) and invisible to review
+    process-model-flaw: >
+      The resolver's model was "every import is either bound to a provider in
+      the fusion set or is a (tolerated) generic unresolved import". Embedder
+      seams are a third, distinct category — provider-is-the-embedder,
+      resolved post-fuse — that must be recognized explicitly so it is never
+      bound to a fusion-set provider and never counts as a resolution failure.
+    status: approved
+    priority: medium
+    fix: >
+      resolver.rs adds the well-known `EMBEDDER_PASSTHROUGH_NAMESPACE`
+      (`pulseengine:embedder`) and `is_embedder_passthrough(import_name)`,
+      which matches by *package namespace* (version-tolerant, no prefix
+      false-positive) rather than the bare field name. The component-level
+      resolution path (`resolve_component_imports_with_hints`) recognizes
+      such imports as intentional passthrough: they are never bound to a
+      coincidental provider and are exempt from the strict-mode
+      `UnresolvedImport` error. Pinned by
+      `ls_r_17_embedder_passthrough_survives_strict_resolution` (strict
+      resolver does NOT reject a `pulseengine:embedder/arena` import, but a
+      non-embedder unexported import alongside it STILL errors — the
+      exemption is namespace-scoped, not over-broad),
+      `test_is_embedder_passthrough_recognizes_namespace_only` (namespace
+      match incl. version suffixes; rejects `pulseengine:embedderx/foo`,
+      `pulseengine:embed/foo`, `wasi:io/streams`), and the merger fixture
+      `test_298_fork_arena_realloc_fuses_under_shared_rebase_today`, which
+      now also asserts the retained `__cabi_arena_realloc` import's module is
+      recognized by `is_embedder_passthrough`. Core-module passthrough
+      already held (`allow_unresolved: true`); this makes it explicit and
+      robust to a future strict resolver. The `--output component` (P2 wrap)
+      exposure of embedder imports remains a tracked follow-up (needs a
+      `wasm-tools component new --import-passthrough` fixture).

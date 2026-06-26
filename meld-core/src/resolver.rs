@@ -1587,6 +1587,40 @@ fn resolve_resource_positions(
     resolved
 }
 
+/// The well-known WIT package namespace for embedder-provided seams.
+///
+/// Imports in this namespace (e.g. `pulseengine:embedder/arena`'s
+/// `__cabi_arena_realloc`) are satisfied by the *embedder* downstream — at
+/// native link / synth dissolve — NOT by another component in the fusion set.
+/// meld must recognize them as intentional passthrough: never bind them to a
+/// provider, never treat them as a resolution failure, and preserve them into
+/// the fused artifact (meld#301, gale#89).
+///
+/// Recognition is by **namespace**, not by the bare field name
+/// `cabi-arena-realloc`: a magic-name match would be collision-prone and
+/// invisible to review, whereas a namespaced interface is an explicit,
+/// greppable contract (the "explicit, not auto" stance that settled #300).
+pub const EMBEDDER_PASSTHROUGH_NAMESPACE: &str = "pulseengine:embedder";
+
+/// Returns `true` if `import_name` names an import in the
+/// [`EMBEDDER_PASSTHROUGH_NAMESPACE`] — an embedder-provided seam that is
+/// intentionally left unresolved through fusion (see the constant's docs).
+///
+/// Matches the *package* portion of a WIT interface/instance import name,
+/// tolerating a version suffix on either the package or the interface:
+/// `pulseengine:embedder/arena`, `pulseengine:embedder/arena@0.1.0`, and
+/// `pulseengine:embedder@0.1.0/arena` all match; the prefix look-alikes
+/// `pulseengine:embedderx/foo` and `pulseengine:embed/foo`, and unrelated
+/// namespaces like `wasi:io/streams`, do not.
+pub fn is_embedder_passthrough(import_name: &str) -> bool {
+    // Take the package portion (before the first '/'), then strip any
+    // package-level version suffix (`@x.y.z`). Exact-match the namespace so a
+    // longer prefix (`...embedderx`) can never false-positive.
+    let package = import_name.split('/').next().unwrap_or(import_name);
+    let package = package.split('@').next().unwrap_or(package);
+    package == EMBEDDER_PASSTHROUGH_NAMESPACE
+}
+
 /// Dependency resolver
 pub struct Resolver {
     /// Whether to allow unresolved imports
@@ -2104,29 +2138,31 @@ impl Resolver {
     ) -> Result<()> {
         for (comp_idx, component) in components.iter().enumerate() {
             for import in &component.imports {
-                // Look for a matching export
-                if let Some(exports) = export_index.get(&import.name) {
-                    // Check directed wiring hints first (from composition DAG)
-                    let hinted = wiring_hints.get(&(comp_idx, import.name.clone()));
-                    let resolved = if let Some(&target) = hinted {
-                        exports.iter().find(|(idx, _)| *idx == target)
-                    } else {
-                        None
-                    };
-                    // Fallback: first export from a different component
-                    let resolved =
-                        resolved.or_else(|| exports.iter().find(|(idx, _)| *idx != comp_idx));
-                    if let Some((export_comp_idx, _export)) = resolved {
-                        graph.resolved_imports.insert(
-                            (comp_idx, import.name.clone()),
-                            (*export_comp_idx, import.name.clone()),
-                        );
-                    } else if !self.allow_unresolved {
-                        return Err(Error::UnresolvedImport {
-                            module: "component".to_string(),
-                            name: import.name.clone(),
-                        });
-                    }
+                // Look for a matching export: directed wiring hint first (from
+                // the composition DAG), then the first export from a *different*
+                // component.
+                let resolved = export_index.get(&import.name).and_then(|exports| {
+                    let hinted = wiring_hints
+                        .get(&(comp_idx, import.name.clone()))
+                        .and_then(|&target| exports.iter().find(|(idx, _)| *idx == target));
+                    hinted.or_else(|| exports.iter().find(|(idx, _)| *idx != comp_idx))
+                });
+
+                if let Some((export_comp_idx, _export)) = resolved {
+                    graph.resolved_imports.insert(
+                        (comp_idx, import.name.clone()),
+                        (*export_comp_idx, import.name.clone()),
+                    );
+                } else if is_embedder_passthrough(&import.name) {
+                    // Embedder-provided seam (e.g. `pulseengine:embedder/arena`):
+                    // satisfied downstream at native link / synth dissolve, never
+                    // by a component in the fusion set. Recognize it explicitly so
+                    // it is preserved as intentional passthrough and is NOT a
+                    // resolution failure — even under strict resolution (#301).
+                    log::debug!(
+                        "embedder passthrough import preserved (not bound to a provider): {}",
+                        import.name
+                    );
                 } else if !self.allow_unresolved {
                     return Err(Error::UnresolvedImport {
                         module: "component".to_string(),
@@ -4269,6 +4305,70 @@ mod tests {
                 );
             }
             other => panic!("expected Error::UnresolvedImport, got: {:?}", other),
+        }
+    }
+
+    /// #301: `is_embedder_passthrough` recognizes the embedder namespace by
+    /// *package*, version-tolerantly, with no prefix false-positives.
+    #[test]
+    fn test_is_embedder_passthrough_recognizes_namespace_only() {
+        // Recognized: the embedder namespace, with/without version suffixes on
+        // either the package or the interface.
+        assert!(is_embedder_passthrough("pulseengine:embedder/arena"));
+        assert!(is_embedder_passthrough("pulseengine:embedder/arena@0.1.0"));
+        assert!(is_embedder_passthrough("pulseengine:embedder@0.1.0/arena"));
+        assert!(is_embedder_passthrough("pulseengine:embedder/alloc"));
+
+        // Not recognized: unrelated namespaces, prefix look-alikes (the exact
+        // namespace match must not be fooled by a longer/shorter package), and
+        // bare names.
+        assert!(!is_embedder_passthrough("wasi:io/streams@0.2.6"));
+        assert!(!is_embedder_passthrough("pulseengine:embedderx/foo"));
+        assert!(!is_embedder_passthrough("pulseengine:embed/foo"));
+        assert!(!is_embedder_passthrough("nonexistent-iface"));
+        assert!(!is_embedder_passthrough("env"));
+    }
+
+    /// LS-R-17 / #301 / SC-9: an embedder-provided import (the
+    /// `pulseengine:embedder` namespace) is INTENTIONAL passthrough —
+    /// satisfied downstream at native link / synth dissolve — so it must
+    /// survive resolution as a recognized seam, NOT be bound to a coincidental
+    /// provider nor reported as an unresolved-import failure, even under strict
+    /// mode. Contrast `test_resolver_unresolved_import_error`: an ordinary
+    /// unexported import DOES still error under strict mode, so the recognition
+    /// is scoped to the embedder namespace and is not over-broad.
+    #[test]
+    fn ls_r_17_embedder_passthrough_survives_strict_resolution() {
+        // An embedder-namespace import with no provider must NOT error, even
+        // though strict mode rejects ordinary unresolved imports.
+        let components = vec![
+            make_component(&["pulseengine:embedder/arena"], &[]),
+            make_component(&[], &["some-other-iface"]),
+        ];
+        let result = Resolver::strict().resolve(&components);
+        assert!(
+            result.is_ok(),
+            "strict resolver must NOT reject an embedder-namespace passthrough import, got: {:?}",
+            result.err()
+        );
+
+        // Guard: a NON-embedder unexported import alongside the embedder one
+        // still errors under strict mode — the exemption is namespace-scoped.
+        let components = vec![
+            make_component(&["pulseengine:embedder/arena", "nonexistent-iface"], &[]),
+            make_component(&[], &["some-other-iface"]),
+        ];
+        let err = Resolver::strict()
+            .resolve(&components)
+            .expect_err("a non-embedder unexported import must still error under strict mode");
+        match err {
+            Error::UnresolvedImport { name, .. } => assert_eq!(
+                name, "nonexistent-iface",
+                "the non-embedder import must be the one reported"
+            ),
+            other => {
+                panic!("expected UnresolvedImport for the non-embedder import, got: {other:?}")
+            }
         }
     }
 
