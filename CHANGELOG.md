@@ -4,6 +4,67 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.37.0] - 2026-06-26
+
+Downstream-boundary release: meld now (a) emits machine-checkable **fusion
+premises** for scry's abstract interpreter and (b) **explicitly recognizes**
+embedder-provided passthrough imports for the gale#89 single-address-space MCU
+lowering. Both are inc-1 producer-side increments; the heavy analysis (scry's
+value-range work) and the component-wrap exposure stay downstream / tracked.
+
+**Falsification:** if meld's `component-provenance` section diverged from the
+SCPV v3 wire format scry consumes, scry's decoder would reject it — instead
+scry v2.0.0 decodes it byte-for-byte (scry#63), and the previously-dead
+meld↔scry boundary is live end-to-end. If `closed_world` were ever over-asserted
+(claimed for a core that still imports), scry's soundness assumption would break;
+it is the provably-sound zero-imports tautology, hardened through three
+adversarial Mythos findings. If an embedder seam in the `pulseengine:embedder`
+namespace were bound to a coincidental provider or rejected under strict
+resolution, `ls_r_17_*` would fail — it passes.
+
+### Added
+
+- **SCPV v3 fusion premises for scry (#313 inc 1, #314).** The
+  `component-provenance` custom section now carries `bounded_memory`
+  (`!uses(memory.grow)`) and `closed_world` (zero imports) premises in a
+  no_std/no-alloc-decodable binary format (43-byte header, little-endian).
+  scry's fixpoint tightens with these fusion-unique facts; meld does **not**
+  compute value ranges / constant args / dead params — those remain scry's
+  abstract interpretation (SR-45). scry v2.0.0 ships the matching consumer.
+- **Explicit embedder-passthrough recognition (#301 inc 1, #315).**
+  `EMBEDDER_PASSTHROUGH_NAMESPACE` (`pulseengine:embedder`) +
+  `is_embedder_passthrough()` — package-namespace match, version-tolerant, no
+  prefix false-positives. The resolver recognizes these embedder-provided seams
+  (e.g. `pulseengine:embedder/arena`'s `__cabi_arena_realloc`) as intentional
+  passthrough: never bound to a fusion-set provider, exempt from the strict-mode
+  unresolved-import error, preserved into the fused core for the embedder to bind
+  at native link / synth dissolve (gale#89). LS-R-17.
+
+### Changed
+
+- `provenance::to_bytes()` is now infallible (`Vec<u8>`) — the SCPV v3 binary
+  encoder cannot fail, so the fusion path no longer threads a serialization
+  `Result`.
+
+### Fixed
+
+- **SCPV decoder DoS (Mythos #314).** `from_bytes` bounds the entry-count
+  allocation by remaining input length, so a hostile `count = u32::MAX` can no
+  longer force a multi-GiB `Vec::with_capacity`.
+
+### Safety
+
+- **LS-R-17** (approved): embedder-provided import mis-bound or rejected during
+  fusion (UCA-R-3, H-1/H-3.1) — mitigated by explicit namespace recognition,
+  pinned by `ls_r_17_embedder_passthrough_survives_strict_resolution`.
+- `closed_world` reduced to the provably-sound zero-imports tautology after
+  three adversarial Mythos findings (two soundness over-assertions + the DoS).
+- **Carried gap:** `fuse --output component` (P2 wrap) still *rejects* embedder
+  passthrough imports at `component_wrap.rs:1084`; #301 inc 2 (an
+  `EmbedderPassthrough` arm) is tracked and needs a `wasm-tools#2`
+  `--import-passthrough` fixture to gate end-to-end. The core-module path
+  (the gale#89 lowering target) preserves them correctly.
+
 ## [0.36.0] - 2026-06-25
 
 Traceability-enforcement release (catches up the planned v0.35.0 — its SR-43
