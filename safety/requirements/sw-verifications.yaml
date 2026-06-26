@@ -544,3 +544,18 @@ artifacts:
     links:
       - type: verifies
         target: SR-44
+  - id: SWV-45
+    type: sw-verification
+    title: "Verification of SR-45: Fusion-premise emission"
+    description: >
+      Verifies SR-45 via the SCPV v3 codec round-trip
+      (meld-core::provenance::tests::scpv_v3_round_trip_preserves_payload +
+      scpv_v3_header_layout_pinned + closed_world_host_namespace_classification)
+      and the end-to-end golden assertion on a real fusion
+      (meld-core/tests/component_provenance.rs::v3_fusion_premises_present_on_real_fusion).
+    status: implemented
+    fields:
+      method: automated-test
+    links:
+      - type: verifies
+        target: SR-45
