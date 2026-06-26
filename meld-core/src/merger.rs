@@ -5557,6 +5557,26 @@ mod tests {
                 .map(|i| format!("{}/{}", i.module, i.name))
                 .collect::<Vec<_>>()
         );
+
+        // #301: the retained import's module is in the recognized
+        // `pulseengine:embedder` namespace, so meld preserves it as INTENTIONAL
+        // embedder passthrough — not merely incidental survival of an unresolved
+        // import. This ties the real fork fixture's module name to the explicit
+        // recognition predicate the strict-resolution carve-out relies on.
+        assert!(
+            merged
+                .imports
+                .iter()
+                .any(|i| i.name == "__cabi_arena_realloc"
+                    && crate::resolver::is_embedder_passthrough(&i.module)),
+            "retained arena import must be recognized as embedder passthrough by namespace, \
+             got imports: {:?}",
+            merged
+                .imports
+                .iter()
+                .map(|i| format!("{}/{}", i.module, i.name))
+                .collect::<Vec<_>>()
+        );
     }
 
     // -- SR-31: Multiply-instantiated module detection -------------------------
