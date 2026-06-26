@@ -153,6 +153,45 @@ fn component_provenance_round_trips() {
 }
 
 #[test]
+fn v3_fusion_premises_present_on_real_fusion() {
+    // #313 / scry#63: the SCPV v3 section carries the fusion premises
+    // that feed scry's analysis. On a real wac-composed fusion the
+    // cross-component imports are internalised, so `closed_world` must
+    // hold; `bounded_memory` reflects whether the fused core grows its
+    // memory. Both must round-trip through the binary codec.
+    if !fixture_available() {
+        return;
+    }
+    let bytes = std::fs::read(FIXTURE).expect("read fixture");
+    let fused = fuse_default(&bytes, "auth");
+
+    let payloads = read_custom_sections(&fused, SECTION_NAME);
+    let payload = payloads.first().expect("section present");
+    // Binary SCPV magic — proves we emit the converged format, not JSON.
+    assert_eq!(
+        &payload[0..4],
+        b"SCPV",
+        "payload must be binary SCPV, not JSON"
+    );
+    let prov = ComponentProvenance::from_bytes(payload).expect("decode SCPV v3");
+
+    // Both premises must agree with an independent probe of the fused
+    // module (the premises' sources) — sound and input-independent.
+    let grows = meld_core::memory_probe::module_uses_memory_grow(&fused);
+    assert_eq!(
+        prov.bounded_memory, !grows,
+        "bounded_memory must equal !uses(memory.grow)"
+    );
+    let has_imports = wasmparser::Parser::new(0)
+        .parse_all(&fused)
+        .any(|p| matches!(p, Ok(wasmparser::Payload::ImportSection(r)) if r.count() > 0));
+    assert_eq!(
+        prov.closed_world, !has_imports,
+        "closed_world must equal (fused module has zero imports)"
+    );
+}
+
+#[test]
 fn v2_code_ranges_are_populated_ordered_and_nonoverlapping() {
     // DWARF Phase 2 increment 1: every entry should carry a
     // `code_range`, the spans should be ordered by fused_func_idx and

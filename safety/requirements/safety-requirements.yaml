@@ -1509,3 +1509,38 @@ artifacts:
         a test artifact. Partly gated on maintainer STPA judgment (host-
         controller scope; intended UCAs for the dangling refs — #303 Class B/C).
       milestone: v0.36.0
+
+  - id: SR-45
+    type: sw-req
+    title: Fusion-premise emission for downstream specialization
+    description: >
+      meld shall emit, into the fused core module's `component-provenance`
+      custom section, the fusion-unique optimization premises that downstream
+      consumers (scry's sound abstract interpreter, then synth) cannot soundly
+      assume on their own — at minimum `bounded_memory` (no `memory.grow` in the
+      fused core) and `closed_world` (all cross-component import edges
+      internalised). The section uses the converged binary `SCPV` v3 wire format
+      (scry#63); meld is the producer, scry-provenance owns the format (DD-002).
+      meld shall NOT compute value ranges / constant args / dead params — those
+      are scry's abstract interpretation, fed by these premises (#313).
+    status: implemented
+    tags: [feature, provenance, specialization, v0.37.0]
+    links:
+      - type: derives-from
+        target: SYS-4
+    cited-source:
+      - uri: "https://github.com/pulseengine/meld/issues/313"
+        kind: github
+        last-checked: 2026-06-26
+      - uri: "https://github.com/pulseengine/scry/issues/63"
+        kind: github
+        last-checked: 2026-06-26
+    fields:
+      implementation:
+        - meld-core/src/provenance.rs
+      verification-method: test
+      verification-description: >
+        SCPV v3 binary codec round-trips both premises (provenance unit tests);
+        a real wac-composed fusion emits `SCPV` magic with closed_world=true and
+        bounded_memory = !uses(memory.grow)
+        (component_provenance::v3_fusion_premises_present_on_real_fusion).

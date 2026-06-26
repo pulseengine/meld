@@ -47,16 +47,24 @@ pub const SECTION_NAME: &str = "component-provenance";
 /// - **v1**: `{ fused_func_idx, component_id, originating_func_idx }`
 ///   per entry (issue #192).
 /// - **v2** (DWARF Phase 2, issue #143): adds an optional
-///   [`Entry::code_range`] giving the function body's byte span in
-///   the fused module's code section. The field is the anchor for
-///   DWARF address remapping. v1 consumers that check `version`
-///   first will see `2` and can either upgrade or ignore the new
-///   field (serde deserialization tolerates its absence via
-///   `#[serde(default)]`, and its presence is additive — no v1 key
-///   changed shape).
+///   [`Entry::code_range`].
+/// - **v3** (#313 / scry#63): the canonical **binary `SCPV`** wire
+///   format (replacing the JSON encoding, which never decoded against
+///   scry's binary `scry-provenance` reader — the boundary was dead).
+///   Adds a fixed header carrying the **fusion premises**
+///   ([`ComponentProvenance::bounded_memory`],
+///   [`ComponentProvenance::closed_world`]) that tighten scry's
+///   abstract-interpretation fixpoint. The byte layout is the
+///   converged spec in scry#63; see [`ComponentProvenance::to_bytes`].
+///   meld is the producer; scry's `scry-provenance` is the consumer
+///   and owns the format (DD-002).
 ///
-/// Consumers MUST check `version` before relying on `code_range`.
-pub const VERSION: u32 = 2;
+/// Consumers MUST check the `SCPV` magic + `version` before decoding.
+pub const VERSION: u32 = 3;
+
+/// Magic prefixing the binary `SCPV` payload — lets a consumer reject a
+/// non-provenance / wrong-format section before decoding (scry#63).
+pub const MAGIC: &[u8; 4] = b"SCPV";
 
 /// Byte span of a function body in the fused module's code section.
 ///
@@ -109,24 +117,165 @@ pub struct Entry {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ComponentProvenance {
     pub version: u32,
+    /// **Fusion premise (#313):** the fused core uses no `memory.grow`,
+    /// so its linear memory is fixed-size. Lets scry assume a bounded
+    /// memory and drop grow-reachability widening. Sound, varies per
+    /// input (computed by [`crate::memory_probe::module_uses_memory_grow`]).
+    pub bounded_memory: bool,
+    /// **Fusion premise (#313):** the fused module has **zero imports**,
+    /// so no inter-component call can escape through an import — provably
+    /// closed. Lets scry tighten `reachable_from_exports`. Computed by
+    /// [`fused_is_closed_world`]; deliberately conservative (a module
+    /// with host imports reports `false`) because no import namespace is
+    /// spec-guaranteed host, and this premise must never be over-asserted
+    /// (scry treats it as a soundness assumption). See [`fused_is_closed_world`].
+    pub closed_world: bool,
     pub fused_module_sha256: String,
     pub entries: Vec<Entry>,
 }
 
 impl ComponentProvenance {
-    /// JSON-encode for emission as the section payload. Compact (no
-    /// pretty-printing) so the on-disk overhead is bounded by the
-    /// number of functions; expected to be ~120 bytes per entry for
-    /// typical component_id lengths.
-    pub fn to_bytes(&self) -> Result<Vec<u8>, serde_json::Error> {
-        serde_json::to_vec(self)
+    /// Encode the canonical **binary `SCPV` v3** section payload
+    /// (scry#63). Little-endian; entries are length-prefixed so a
+    /// `no_std`/no-alloc consumer can bound-check without allocating.
+    ///
+    /// ```text
+    /// "SCPV" | u8 ver=3 | u8 bounded_memory | u8 closed_world
+    ///        | sha256[32 raw] | u32 count
+    ///        | { fused_idx:u32, id_len:u32, id:[u8;len], orig_idx:u32,
+    ///            has_code_range:u8, [start:u32, end:u32] } * count
+    /// ```
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut b = Vec::with_capacity(43 + self.entries.len() * 24);
+        b.extend_from_slice(MAGIC);
+        b.push(VERSION as u8);
+        b.push(self.bounded_memory as u8);
+        b.push(self.closed_world as u8);
+        // sha256 hex string -> 32 raw bytes (zero-padded if malformed,
+        // which build() never produces).
+        let mut sha32 = [0u8; 32];
+        if let Ok(raw) = hex::decode(&self.fused_module_sha256) {
+            let n = raw.len().min(32);
+            sha32[..n].copy_from_slice(&raw[..n]);
+        }
+        b.extend_from_slice(&sha32);
+        b.extend_from_slice(&(self.entries.len() as u32).to_le_bytes());
+        for e in &self.entries {
+            b.extend_from_slice(&e.fused_func_idx.to_le_bytes());
+            let id = e.component_id.as_bytes();
+            b.extend_from_slice(&(id.len() as u32).to_le_bytes());
+            b.extend_from_slice(id);
+            b.extend_from_slice(&e.originating_func_idx.to_le_bytes());
+            match e.code_range {
+                Some(cr) => {
+                    b.push(1);
+                    b.extend_from_slice(&cr.start.to_le_bytes());
+                    b.extend_from_slice(&cr.end.to_le_bytes());
+                }
+                None => b.push(0),
+            }
+        }
+        b
     }
 
-    /// Inverse of [`to_bytes`]. Returns `Err` on malformed JSON; the
-    /// caller is responsible for the `version` check.
-    pub fn from_bytes(bytes: &[u8]) -> Result<Self, serde_json::Error> {
-        serde_json::from_slice(bytes)
+    /// Inverse of [`to_bytes`] — decode a binary `SCPV` v3 payload.
+    /// `Err` on bad magic, unsupported version, truncation, or invalid
+    /// UTF-8 in a `component_id`.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, String> {
+        let mut p = 0usize;
+        let take = |b: &[u8], p: &mut usize, n: usize| -> Result<Vec<u8>, String> {
+            if *p + n > b.len() {
+                return Err(format!("SCPV truncated: need {n} at {p}, have {}", b.len()));
+            }
+            let s = b[*p..*p + n].to_vec();
+            *p += n;
+            Ok(s)
+        };
+        let u32le = |b: &[u8], p: &mut usize| -> Result<u32, String> {
+            let s = take(b, p, 4)?;
+            Ok(u32::from_le_bytes([s[0], s[1], s[2], s[3]]))
+        };
+        if take(bytes, &mut p, 4)? != MAGIC {
+            return Err("SCPV bad magic".into());
+        }
+        let ver = take(bytes, &mut p, 1)?[0] as u32;
+        if ver != VERSION {
+            return Err(format!(
+                "SCPV unsupported version {ver} (expected {VERSION})"
+            ));
+        }
+        let bounded_memory = take(bytes, &mut p, 1)?[0] != 0;
+        let closed_world = take(bytes, &mut p, 1)?[0] != 0;
+        let fused_module_sha256 = hex::encode(take(bytes, &mut p, 32)?);
+        let count = u32le(bytes, &mut p)? as usize;
+        // Bound the pre-allocation by the bytes actually remaining: the
+        // count is an untrusted wire u32, so a crafted section with
+        // count = u32::MAX must NOT trigger a ~190 GiB `with_capacity`
+        // and abort the process (DoS on memory-constrained hosts).
+        // Smallest possible entry is 13 bytes (fused_idx 4 + id_len 4 +
+        // id 0 + orig_idx 4 + has_code_range 1); the loop's bounded
+        // `take` still errors on genuine truncation.
+        const MIN_ENTRY_BYTES: usize = 13;
+        let max_possible = bytes.len().saturating_sub(p) / MIN_ENTRY_BYTES;
+        let mut entries = Vec::with_capacity(count.min(max_possible));
+        for _ in 0..count {
+            let fused_func_idx = u32le(bytes, &mut p)?;
+            let id_len = u32le(bytes, &mut p)? as usize;
+            let component_id =
+                String::from_utf8(take(bytes, &mut p, id_len)?).map_err(|_| "SCPV bad utf8")?;
+            let originating_func_idx = u32le(bytes, &mut p)?;
+            let code_range = if take(bytes, &mut p, 1)?[0] != 0 {
+                Some(CodeRange {
+                    start: u32le(bytes, &mut p)?,
+                    end: u32le(bytes, &mut p)?,
+                })
+            } else {
+                None
+            };
+            entries.push(Entry {
+                fused_func_idx,
+                component_id,
+                originating_func_idx,
+                code_range,
+            });
+        }
+        Ok(ComponentProvenance {
+            version: ver,
+            bounded_memory,
+            closed_world,
+            fused_module_sha256,
+            entries,
+        })
     }
+}
+
+/// `closed_world` premise: **provably** true iff the fused module has
+/// **zero imports**.
+///
+/// This is a *tautology* — no imports ⇒ no import edge of any kind ⇒ no
+/// surviving inter-component import — so it can never be over-asserted,
+/// which is the one thing this premise must never do (scry treats it as
+/// a soundness assumption; a false-positive would silently disable its
+/// inter-component reachability widening).
+///
+/// We deliberately do NOT try to classify imports as "host" vs
+/// "cross-component" by namespace: no namespace string (`env`, `wasi…`,
+/// …) is *spec-guaranteed* to be host, so any allowlist is an
+/// over-assertion risk (Mythos #314 found three escalating cases). The
+/// result is conservative — a module with host (e.g. WASI) imports
+/// reports `false` even though it is closed in the inter-component
+/// sense. Tightening it requires meld's resolution-state (which imports
+/// were internalised vs deliberately kept external), tracked as a
+/// follow-up; the wire format already carries the field.
+pub fn fused_is_closed_world(module_bytes: &[u8]) -> bool {
+    for payload in wasmparser::Parser::new(0).parse_all(module_bytes) {
+        match payload {
+            Ok(wasmparser::Payload::ImportSection(reader)) if reader.count() > 0 => return false,
+            Ok(_) => {}
+            Err(_) => return false,
+        }
+    }
+    true
 }
 
 /// Compute the SHA-256 hex digest of the given bytes. Lower-case hex,
@@ -213,6 +362,11 @@ pub fn build(
 
     ComponentProvenance {
         version: VERSION,
+        // Fusion premises (#313): both sound, computed from the fused
+        // bytes meld just produced. `bounded_memory` varies per input;
+        // `closed_world` is conservative (false on any non-host import).
+        bounded_memory: !crate::memory_probe::module_uses_memory_grow(fused_bytes_without_extras),
+        closed_world: fused_is_closed_world(fused_bytes_without_extras),
         fused_module_sha256: sha256_hex(fused_bytes_without_extras),
         entries,
     }
@@ -222,10 +376,11 @@ pub fn build(
 mod tests {
     use super::*;
 
-    #[test]
-    fn round_trip_preserves_payload() {
-        let original = ComponentProvenance {
+    fn sample(bounded: bool, closed: bool) -> ComponentProvenance {
+        ComponentProvenance {
             version: VERSION,
+            bounded_memory: bounded,
+            closed_world: closed,
             fused_module_sha256: "deadbeef".repeat(8),
             entries: vec![
                 Entry {
@@ -238,87 +393,98 @@ mod tests {
                     fused_func_idx: 1,
                     component_id: "db".into(),
                     originating_func_idx: 7,
-                    code_range: Some(CodeRange {
-                        start: 42,
-                        end: 100,
-                    }),
+                    code_range: None,
                 },
             ],
-        };
-        let bytes = original.to_bytes().expect("serialize");
-        let decoded = ComponentProvenance::from_bytes(&bytes).expect("deserialize");
-        assert_eq!(original, decoded);
+        }
     }
 
     #[test]
-    fn v1_shaped_entry_deserializes_with_none_code_range() {
-        // A v1 producer emits entries without `code_range`. The v2
-        // Entry struct must still deserialize them (serde default),
-        // yielding `None`. This pins backward-compat so a v2 meld can
-        // read a v1 section and a v2 consumer tolerates v1 entries.
-        let v1_json = br#"{"version":1,"fused_module_sha256":"00","entries":[
-            {"fused_func_idx":0,"component_id":"auth","originating_func_idx":3}
-        ]}"#;
-        let decoded = ComponentProvenance::from_bytes(v1_json).expect("deserialize v1");
-        assert_eq!(decoded.entries.len(), 1);
-        assert_eq!(decoded.entries[0].code_range, None);
+    fn scpv_v3_round_trip_preserves_payload() {
+        for (b, c) in [(true, true), (true, false), (false, true), (false, false)] {
+            let original = sample(b, c);
+            let decoded = ComponentProvenance::from_bytes(&original.to_bytes()).expect("decode");
+            assert_eq!(original, decoded, "premises ({b},{c}) must round-trip");
+        }
     }
 
     #[test]
-    fn code_range_omitted_from_json_when_none() {
-        // v1-shaped round-trip: an entry with no code_range must not
-        // emit a `code_range` key (skip_serializing_if), so a v2 meld
-        // producing a None entry is byte-compatible with v1 readers.
-        let cp = ComponentProvenance {
-            version: VERSION,
-            fused_module_sha256: "0".repeat(64),
-            entries: vec![Entry {
-                fused_func_idx: 0,
-                component_id: "x".into(),
-                originating_func_idx: 0,
-                code_range: None,
-            }],
-        };
-        let json: serde_json::Value =
-            serde_json::from_slice(&cp.to_bytes().expect("serialize")).expect("parse json");
+    fn scpv_v3_header_layout_pinned() {
+        // Pin the converged scry#63 byte layout so meld can't drift from
+        // scry's decoder: magic, version, the two premise bytes.
+        let bytes = sample(true, false).to_bytes();
+        assert_eq!(&bytes[0..4], MAGIC, "magic 'SCPV'");
+        assert_eq!(bytes[4], 3, "version byte = 3");
+        assert_eq!(bytes[5], 1, "bounded_memory byte");
+        assert_eq!(bytes[6], 0, "closed_world byte");
+        // 32-byte sha then u32 LE count (2 entries).
+        assert_eq!(&bytes[39..43], &2u32.to_le_bytes(), "entry count");
+    }
+
+    #[test]
+    fn from_bytes_rejects_bad_magic_version_and_truncation() {
+        assert!(ComponentProvenance::from_bytes(b"").is_err());
         assert!(
-            json["entries"][0].get("code_range").is_none(),
-            "code_range must be omitted when None; got {}",
-            json["entries"][0]
+            ComponentProvenance::from_bytes(b"JSON{...}").is_err(),
+            "bad magic"
+        );
+        let mut wrong_ver = sample(true, true).to_bytes();
+        wrong_ver[4] = 2; // older/unknown version
+        assert!(
+            ComponentProvenance::from_bytes(&wrong_ver).is_err(),
+            "version"
+        );
+        let full = sample(true, true).to_bytes();
+        assert!(
+            ComponentProvenance::from_bytes(&full[..full.len() - 3]).is_err(),
+            "truncated entry"
         );
     }
 
     #[test]
-    fn from_bytes_rejects_malformed_json() {
-        assert!(ComponentProvenance::from_bytes(b"{not json}").is_err());
-        assert!(ComponentProvenance::from_bytes(b"").is_err());
+    fn closed_world_is_provably_no_imports() {
+        // closed_world must NEVER be over-asserted (scry soundness). The
+        // only definition we can prove sound without classifying import
+        // namespaces is "zero imports". Mythos #314 escalated through
+        // three over-broad host allowlists (wasi-prefix, then env); the
+        // tautology ends the cycle.
+        let no_imports = wat::parse_str(r#"(module (func nop))"#).unwrap();
+        assert!(fused_is_closed_world(&no_imports), "no imports → closed");
+        // ANY import — even a genuine WASI host import — conservatively
+        // yields false (sound: never claims closed when an edge exists).
+        for m in [
+            r#"(module (import "wasi_snapshot_preview1" "fd_write" (func (param i32 i32 i32 i32) (result i32))))"#,
+            r#"(module (import "wasi:io/streams" "blocking-flush" (func)))"#,
+            r#"(module (import "env" "memory" (memory 1)))"#,
+            r#"(module (import "auth-component" "login" (func)))"#,
+        ] {
+            let w = wat::parse_str(m).unwrap();
+            assert!(
+                !fused_is_closed_world(&w),
+                "any import ⇒ conservatively not closed: {m}"
+            );
+        }
     }
 
     #[test]
-    fn version_field_present_in_serialized_output() {
-        // scry's consumer-side version check needs `version` to be a
-        // top-level integer key so it can be inspected without
-        // deserializing the entire payload. This pins that contract.
-        let cp = ComponentProvenance {
-            version: VERSION,
-            fused_module_sha256: "0".repeat(64),
-            entries: vec![],
-        };
-        let json: serde_json::Value =
-            serde_json::from_slice(&cp.to_bytes().expect("serialize")).expect("parse json");
-        assert_eq!(json["version"], serde_json::json!(VERSION));
-    }
-
-    #[test]
-    fn empty_entries_serializes_to_empty_array() {
-        let cp = ComponentProvenance {
-            version: VERSION,
-            fused_module_sha256: "0".repeat(64),
-            entries: vec![],
-        };
-        let json: serde_json::Value =
-            serde_json::from_slice(&cp.to_bytes().expect("serialize")).expect("parse json");
-        assert_eq!(json["entries"], serde_json::json!([]));
+    fn from_bytes_huge_count_does_not_overallocate() {
+        // Mythos finding (#314): a crafted SCPV v3 section with
+        // count = u32::MAX must NOT pre-allocate ~190 GiB and abort the
+        // process — `from_bytes` bounds with_capacity by the bytes
+        // remaining, then errors cleanly on the truncated first entry.
+        let mut buf = Vec::new();
+        buf.extend_from_slice(MAGIC);
+        buf.push(VERSION as u8);
+        buf.push(0); // bounded_memory
+        buf.push(0); // closed_world
+        buf.extend_from_slice(&[0u8; 32]); // sha256
+        buf.extend_from_slice(&u32::MAX.to_le_bytes()); // count = 4.3e9
+        // No entry bytes follow.
+        let r = ComponentProvenance::from_bytes(&buf);
+        assert!(
+            r.is_err(),
+            "huge count with no entry bytes must Err (truncation), not OOM"
+        );
     }
 
     #[test]
