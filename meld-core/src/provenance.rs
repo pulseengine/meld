@@ -252,10 +252,17 @@ impl ComponentProvenance {
 /// `closed_world`. Anything else is treated conservatively as a
 /// surviving cross-component import (`closed_world = false`).
 fn is_host_import_namespace(module: &str) -> bool {
-    module.starts_with("wasi")
-        || module == "env"
-        || module.starts_with("pulseengine:")
-        || module.starts_with("__")
+    // PRECISE host namespaces only. `closed_world` must never be
+    // over-asserted: a surviving cross-component import misread as host
+    // would make the premise UNSOUND for scry's abstract interpretation.
+    // So we match exact known host module names + reserved interface
+    // prefixes, and classify anything else as non-host (⇒ closed_world
+    // stays conservatively false). NB a bare `starts_with("wasi")` was
+    // over-broad — it swallowed component namespaces like
+    // `wasi_auth_component` (Mythos #314).
+    matches!(module, "wasi_snapshot_preview1" | "wasi_unstable" | "env")
+        || module.starts_with("wasi:")            // WASI preview2 interfaces (reserved ns)
+        || module.starts_with("pulseengine:async") // meld/host async intrinsics (reserved ns)
 }
 
 /// `closed_world` premise: every import in `module_bytes` is in a host
@@ -459,6 +466,23 @@ mod tests {
         assert!(
             !fused_is_closed_world(&cross),
             "non-host import → not closed"
+        );
+        // Mythos #314: a component namespace that merely *starts with*
+        // "wasi" must NOT be misread as a host interface — that would
+        // over-assert closed_world (unsound). Precise matching only.
+        let wasi_prefixed_component =
+            wat::parse_str(r#"(module (import "wasi_auth_component" "login" (func)))"#).unwrap();
+        assert!(
+            !fused_is_closed_world(&wasi_prefixed_component),
+            "a 'wasi'-prefixed component namespace is NOT host → not closed"
+        );
+        // The genuine WASI preview2 colon form stays host.
+        let wasi_p2 =
+            wat::parse_str(r#"(module (import "wasi:io/streams" "blocking-flush" (func)))"#)
+                .unwrap();
+        assert!(
+            fused_is_closed_world(&wasi_p2),
+            "wasi: interface is host → closed"
         );
     }
 
