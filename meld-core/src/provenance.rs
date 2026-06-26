@@ -206,7 +206,16 @@ impl ComponentProvenance {
         let closed_world = take(bytes, &mut p, 1)?[0] != 0;
         let fused_module_sha256 = hex::encode(take(bytes, &mut p, 32)?);
         let count = u32le(bytes, &mut p)? as usize;
-        let mut entries = Vec::with_capacity(count);
+        // Bound the pre-allocation by the bytes actually remaining: the
+        // count is an untrusted wire u32, so a crafted section with
+        // count = u32::MAX must NOT trigger a ~190 GiB `with_capacity`
+        // and abort the process (DoS on memory-constrained hosts).
+        // Smallest possible entry is 13 bytes (fused_idx 4 + id_len 4 +
+        // id 0 + orig_idx 4 + has_code_range 1); the loop's bounded
+        // `take` still errors on genuine truncation.
+        const MIN_ENTRY_BYTES: usize = 13;
+        let max_possible = bytes.len().saturating_sub(p) / MIN_ENTRY_BYTES;
+        let mut entries = Vec::with_capacity(count.min(max_possible));
         for _ in 0..count {
             let fused_func_idx = u32le(bytes, &mut p)?;
             let id_len = u32le(bytes, &mut p)? as usize;
@@ -450,6 +459,27 @@ mod tests {
         assert!(
             !fused_is_closed_world(&cross),
             "non-host import → not closed"
+        );
+    }
+
+    #[test]
+    fn from_bytes_huge_count_does_not_overallocate() {
+        // Mythos finding (#314): a crafted SCPV v3 section with
+        // count = u32::MAX must NOT pre-allocate ~190 GiB and abort the
+        // process — `from_bytes` bounds with_capacity by the bytes
+        // remaining, then errors cleanly on the truncated first entry.
+        let mut buf = Vec::new();
+        buf.extend_from_slice(MAGIC);
+        buf.push(VERSION as u8);
+        buf.push(0); // bounded_memory
+        buf.push(0); // closed_world
+        buf.extend_from_slice(&[0u8; 32]); // sha256
+        buf.extend_from_slice(&u32::MAX.to_le_bytes()); // count = 4.3e9
+        // No entry bytes follow.
+        let r = ComponentProvenance::from_bytes(&buf);
+        assert!(
+            r.is_err(),
+            "huge count with no entry bytes must Err (truncation), not OOM"
         );
     }
 
