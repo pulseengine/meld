@@ -122,11 +122,13 @@ pub struct ComponentProvenance {
     /// memory and drop grow-reachability widening. Sound, varies per
     /// input (computed by [`crate::memory_probe::module_uses_memory_grow`]).
     pub bounded_memory: bool,
-    /// **Fusion premise (#313):** every cross-component import edge has
-    /// been internalised — the fused module has no residual import in a
-    /// non-host namespace. Lets scry tighten `reachable_from_exports`
-    /// and assume no inter-component call escapes through an import.
-    /// Conservative: an unrecognised import namespace yields `false`.
+    /// **Fusion premise (#313):** the fused module has **zero imports**,
+    /// so no inter-component call can escape through an import — provably
+    /// closed. Lets scry tighten `reachable_from_exports`. Computed by
+    /// [`fused_is_closed_world`]; deliberately conservative (a module
+    /// with host imports reports `false`) because no import namespace is
+    /// spec-guaranteed host, and this premise must never be over-asserted
+    /// (scry treats it as a soundness assumption). See [`fused_is_closed_world`].
     pub closed_world: bool,
     pub fused_module_sha256: String,
     pub entries: Vec<Entry>,
@@ -247,38 +249,30 @@ impl ComponentProvenance {
     }
 }
 
-/// Host import namespaces — residual imports in these are the external
-/// boundary, not unresolved inter-component edges, so they don't break
-/// `closed_world`. Anything else is treated conservatively as a
-/// surviving cross-component import (`closed_world = false`).
-fn is_host_import_namespace(module: &str) -> bool {
-    // PRECISE host namespaces only. `closed_world` must never be
-    // over-asserted: a surviving cross-component import misread as host
-    // would make the premise UNSOUND for scry's abstract interpretation.
-    // So we match exact known host module names + reserved interface
-    // prefixes, and classify anything else as non-host (⇒ closed_world
-    // stays conservatively false). NB a bare `starts_with("wasi")` was
-    // over-broad — it swallowed component namespaces like
-    // `wasi_auth_component` (Mythos #314).
-    matches!(module, "wasi_snapshot_preview1" | "wasi_unstable" | "env")
-        || module.starts_with("wasi:")            // WASI preview2 interfaces (reserved ns)
-        || module.starts_with("pulseengine:async") // meld/host async intrinsics (reserved ns)
-}
-
-/// `closed_world` premise: every import in `module_bytes` is in a host
-/// namespace (no surviving inter-component import edge). A module with
-/// no imports is trivially closed. Conservative on unrecognised
-/// namespaces (returns `false`) so the premise is never over-asserted.
+/// `closed_world` premise: **provably** true iff the fused module has
+/// **zero imports**.
+///
+/// This is a *tautology* — no imports ⇒ no import edge of any kind ⇒ no
+/// surviving inter-component import — so it can never be over-asserted,
+/// which is the one thing this premise must never do (scry treats it as
+/// a soundness assumption; a false-positive would silently disable its
+/// inter-component reachability widening).
+///
+/// We deliberately do NOT try to classify imports as "host" vs
+/// "cross-component" by namespace: no namespace string (`env`, `wasi…`,
+/// …) is *spec-guaranteed* to be host, so any allowlist is an
+/// over-assertion risk (Mythos #314 found three escalating cases). The
+/// result is conservative — a module with host (e.g. WASI) imports
+/// reports `false` even though it is closed in the inter-component
+/// sense. Tightening it requires meld's resolution-state (which imports
+/// were internalised vs deliberately kept external), tracked as a
+/// follow-up; the wire format already carries the field.
 pub fn fused_is_closed_world(module_bytes: &[u8]) -> bool {
     for payload in wasmparser::Parser::new(0).parse_all(module_bytes) {
-        if let Ok(wasmparser::Payload::ImportSection(reader)) = payload {
-            for imp in reader.into_imports() {
-                match imp {
-                    Ok(import) if !is_host_import_namespace(import.module) => return false,
-                    Ok(_) => {}
-                    Err(_) => return false,
-                }
-            }
+        match payload {
+            Ok(wasmparser::Payload::ImportSection(reader)) if reader.count() > 0 => return false,
+            Ok(_) => {}
+            Err(_) => return false,
         }
     }
     true
@@ -448,42 +442,28 @@ mod tests {
     }
 
     #[test]
-    fn closed_world_host_namespace_classification() {
-        // Host namespaces don't break closed_world; an unrecognised
-        // (e.g. component-instance) namespace does, conservatively.
-        let host = wat::parse_str(
-            r#"(module (import "wasi_snapshot_preview1" "fd_write"
-                (func (param i32 i32 i32 i32) (result i32))))"#,
-        )
-        .unwrap();
-        assert!(fused_is_closed_world(&host), "wasi import is host → closed");
+    fn closed_world_is_provably_no_imports() {
+        // closed_world must NEVER be over-asserted (scry soundness). The
+        // only definition we can prove sound without classifying import
+        // namespaces is "zero imports". Mythos #314 escalated through
+        // three over-broad host allowlists (wasi-prefix, then env); the
+        // tautology ends the cycle.
         let no_imports = wat::parse_str(r#"(module (func nop))"#).unwrap();
-        assert!(
-            fused_is_closed_world(&no_imports),
-            "no imports → trivially closed"
-        );
-        let cross = wat::parse_str(r#"(module (import "auth-component" "login" (func)))"#).unwrap();
-        assert!(
-            !fused_is_closed_world(&cross),
-            "non-host import → not closed"
-        );
-        // Mythos #314: a component namespace that merely *starts with*
-        // "wasi" must NOT be misread as a host interface — that would
-        // over-assert closed_world (unsound). Precise matching only.
-        let wasi_prefixed_component =
-            wat::parse_str(r#"(module (import "wasi_auth_component" "login" (func)))"#).unwrap();
-        assert!(
-            !fused_is_closed_world(&wasi_prefixed_component),
-            "a 'wasi'-prefixed component namespace is NOT host → not closed"
-        );
-        // The genuine WASI preview2 colon form stays host.
-        let wasi_p2 =
-            wat::parse_str(r#"(module (import "wasi:io/streams" "blocking-flush" (func)))"#)
-                .unwrap();
-        assert!(
-            fused_is_closed_world(&wasi_p2),
-            "wasi: interface is host → closed"
-        );
+        assert!(fused_is_closed_world(&no_imports), "no imports → closed");
+        // ANY import — even a genuine WASI host import — conservatively
+        // yields false (sound: never claims closed when an edge exists).
+        for m in [
+            r#"(module (import "wasi_snapshot_preview1" "fd_write" (func (param i32 i32 i32 i32) (result i32))))"#,
+            r#"(module (import "wasi:io/streams" "blocking-flush" (func)))"#,
+            r#"(module (import "env" "memory" (memory 1)))"#,
+            r#"(module (import "auth-component" "login" (func)))"#,
+        ] {
+            let w = wat::parse_str(m).unwrap();
+            assert!(
+                !fused_is_closed_world(&w),
+                "any import ⇒ conservatively not closed: {m}"
+            );
+        }
     }
 
     #[test]

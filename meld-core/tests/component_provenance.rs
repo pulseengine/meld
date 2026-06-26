@@ -175,16 +175,19 @@ fn v3_fusion_premises_present_on_real_fusion() {
     );
     let prov = ComponentProvenance::from_bytes(payload).expect("decode SCPV v3");
 
-    assert!(
-        prov.closed_world,
-        "a fully wac-composed fusion internalises all cross-component imports → closed_world"
-    );
-    // bounded_memory is input-dependent; assert it agrees with a direct
-    // memory.grow probe of the fused module (the premise's source).
+    // Both premises must agree with an independent probe of the fused
+    // module (the premises' sources) — sound and input-independent.
     let grows = meld_core::memory_probe::module_uses_memory_grow(&fused);
     assert_eq!(
         prov.bounded_memory, !grows,
         "bounded_memory must equal !uses(memory.grow)"
+    );
+    let has_imports = wasmparser::Parser::new(0)
+        .parse_all(&fused)
+        .any(|p| matches!(p, Ok(wasmparser::Payload::ImportSection(r)) if r.count() > 0));
+    assert_eq!(
+        prov.closed_world, !has_imports,
+        "closed_world must equal (fused module has zero imports)"
     );
 }
 
