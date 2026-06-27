@@ -412,3 +412,108 @@ fn tier_b_separate_inputs_internalise_link() {
 fn ls_cp_6_separate_inputs_internalise_link() {
     tier_b_separate_inputs_internalise_link();
 }
+
+// ---------------------------------------------------------------------------
+// Tier C (#297): execution on kiln — the safety-critical MCU-target runtime,
+// not just wasmtime. This is the "honest boundary" Tier A/B disclose.
+// ---------------------------------------------------------------------------
+
+/// Locate the `kilnd` binary: `MELD_KILND` override, else the conventional
+/// sibling-repo debug build. `None` (→ skip) when unavailable, mirroring the
+/// fixture-absent skips above.
+fn kilnd_path() -> Option<std::path::PathBuf> {
+    if let Ok(p) = std::env::var("MELD_KILND") {
+        let p = std::path::PathBuf::from(p);
+        if p.exists() {
+            return Some(p);
+        }
+    }
+    let conv =
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../kiln/target/debug/kilnd");
+    conv.exists().then_some(conv)
+}
+
+/// Run a `--component` wasm on `kilnd` and report whether kiln executed it
+/// successfully. `None` when kilnd is unavailable (→ skip). `tag` only
+/// disambiguates the temp file (no `Date`/rand in tests — the caller-supplied
+/// tag is unique per fixture+role). Uses `std::process::Command` fully
+/// qualified to avoid the `wasmtime_wasi::...::Command` import above.
+fn run_on_kiln(wasm: &[u8], tag: &str) -> Option<bool> {
+    let kilnd = kilnd_path()?;
+    let tmp = std::env::temp_dir().join(format!("meld_tierc_{tag}.wasm"));
+    std::fs::write(&tmp, wasm).ok()?;
+    let out = std::process::Command::new(&kilnd)
+        .arg(&tmp)
+        .arg("--component")
+        .arg("--wasi")
+        .output()
+        .ok()?;
+    let _ = std::fs::remove_file(&tmp);
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // kilnd prints an explicit success/failure line; exit code alone is
+    // unreliable across its run modes.
+    Some(combined.contains("executed successfully") && !combined.contains("Execution failed"))
+}
+
+/// Tier C (#297): a meld-fused component must EXECUTE on kiln — the
+/// safety-critical MCU-target runtime — not only under wasmtime (Tier A/B).
+///
+/// `#[ignore]`d: today kiln's component executor looks for a core-instance
+/// `_start` and cannot run meld's multi-core-module `--component` wrap (the
+/// stubs, fused, fixup and caller modules, with a deferred start); it fails
+/// with "No core instance exports _start". Filed as kiln#364. wasmtime runs
+/// the same artifact via `wasi:cli/run` (Tier A/B green), so meld's output is
+/// spec-valid. Un-ignore when kiln#364 lands; it then pins the meld-to-kiln
+/// behavioural seam green.
+#[test]
+#[ignore = "blocked on kiln#364: kilnd requires a core-instance _start; can't run meld's multi-core-module fused component"]
+fn tier_c_fused_executes_on_kiln() {
+    if kilnd_path().is_none() {
+        eprintln!("skipping Tier C: kilnd not found (set MELD_KILND or build ../../kiln)");
+        return;
+    }
+    let mut ran = 0usize;
+    for &name in &[
+        "release-0.2.0/hello_c_cli",
+        "release-0.2.0/hello_rust",
+        "release-0.2.0/hello_cpp_cli",
+    ] {
+        let Some(orig) = fixture_bytes(name) else {
+            continue;
+        };
+        let tag = name.replace('/', "_");
+        // Baseline: the unfused original must run on kiln, else a fused
+        // failure can't be attributed to fusion.
+        match run_on_kiln(&orig, &format!("{tag}_orig")) {
+            Some(true) => {}
+            Some(false) => {
+                eprintln!("[{name}] unfused original did not execute on kiln; skipping");
+                continue;
+            }
+            None => return, // kilnd vanished mid-run
+        }
+        let fused = fuse(
+            &orig,
+            name,
+            OutputFormat::Component,
+            MemoryStrategy::MultiMemory,
+        )
+        .expect("fusing a single command component must succeed");
+        let ok = run_on_kiln(&fused, &format!("{tag}_fused")).expect("kilnd available (checked)");
+        assert!(
+            ok,
+            "[{name}] meld-fused component must execute on kiln (kiln#364): \
+             the unfused original ran but the fused one did not"
+        );
+        ran += 1;
+    }
+    assert!(
+        ran > 0,
+        "Tier C exercised no command fixtures (corpus missing in {FIXTURES_DIR}?)"
+    );
+    eprintln!("Tier C: {ran} fused components executed on kiln ✓");
+}
