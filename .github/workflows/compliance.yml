@@ -43,10 +43,10 @@ jobs:
 
       - name: Generate compliance report
         id: report
-        uses: pulseengine/rivet/.github/actions/compliance@v0.19.0
+        uses: pulseengine/rivet/.github/actions/compliance@v0.22.0
         with:
           theme: dark
-          rivet-version: v0.19.0
+          rivet-version: v0.22.0
           include-data-formats: true
           report-label: ${{ steps.tag.outputs.tag }}
           archive: 'true'

@@ -777,6 +777,12 @@ GitHub REST API).
 2. **CI must pass completely**: Wait for ALL CI jobs to succeed before merging
 3. **Watch the full CI run**: Do not assume CI passes — verify it
 4. **Mythos delta pass**: Run per `### Pre-Release Mythos delta pass` above. Zero `confirmed` findings, OR every `confirmed` finding maps to an `approved LS-N` in `safety/stpa/loss-scenarios.yaml` with a shipped fix
+5. **Release-readiness query (rivet ≥ v0.22.0)**: readiness is a query, not an opinion. Scope this release's requirement artifacts with the first-class `release:` field (`rivet release move <ID> vX.Y.Z`), then gate on:
+   ```bash
+   rivet release status vX.Y.Z          # human burn-down; exits non-zero when not cuttable
+   rivet release status vX.Y.Z --format json   # CI-consumable: {"cuttable": bool, "not_verified": [...]}
+   ```
+   The release is **cuttable** only when every scoped artifact is `verified`/`accepted` (an artifact whose V is closed — verification passing at the right levels — moves `implemented`→`verified`). The `compliance.yml` rivet pin is also v0.22.0. (Historical per-release `vX.Y` *tags* on artifacts are "shipped-in" markers and stay; the `release:` field is the single forward scope `rivet release status` queries.)
 
 #### Release Steps
 
