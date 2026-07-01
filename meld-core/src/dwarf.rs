@@ -283,6 +283,15 @@ impl AddressRemap {
             .find(|s| out_low >= s.output_body_start && out_low < s.output_body_end)?;
         let orig_low = Self::reverse_in_span(span, out_low)?;
         let orig_end = orig_low.checked_add(stale_len)?;
+        // Never correct a range that would extend past its own function
+        // body: a valid DIE's `high_pc` end is `≤ input_end` (subprograms
+        // end exactly there; nested blocks/inlines stay interior). A larger
+        // `stale_len` (malformed/padded input) would otherwise `translate`
+        // into the NEXT function and emit a plausible-but-wrong length —
+        // exactly the LS-D-1 class. Bail to leave it unchanged instead.
+        if orig_end > span.input_end {
+            return None;
+        }
         let new_end = if orig_end == span.input_end {
             span.output_body_end
         } else {
@@ -1558,6 +1567,11 @@ mod tests {
         // A tombstoned low_pc (dropped/deduped code) has no output body →
         // left untouched (llvm-dwarfdump ignores tombstoned DIEs).
         assert_eq!(remap.corrected_high_pc(0xFFFF_FFFF, 20), None);
+        // A length that runs past the function body (malformed/padded input)
+        // must NOT be corrected into the next function — bail, leave stale
+        // (LS-D-1: never a plausible-but-wrong length). `grew` is input
+        // len 20; a stale 30 would reach into `shrank`.
+        assert_eq!(remap.corrected_high_pc(200, 30), None);
     }
 
     /// Oracle for inc 3b: build real input DWARF with gimli, remap a
