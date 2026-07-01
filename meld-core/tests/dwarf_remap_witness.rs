@@ -286,3 +286,73 @@ fn inc2_die_ranges_stay_within_enclosing_subprogram() {
     );
     eprintln!("inc2: {checked} DW_AT_ranges entries all contained in their subprogram");
 }
+
+/// #319 inc 3: no `DW_AT_location` location-list entry may have an
+/// out-of-module range in the remapped output. Location-list entries carry
+/// base-relative begin/end offsets identical to `.debug_ranges` (inc 2);
+/// before the fix gimli mis-routed those offsets through `convert_address`,
+/// producing garbage ranges (e.g. `[0x905993c0, …)`) that derailed the
+/// list decode (`llvm-dwarfdump`: "Invalid DW_AT_location" / "Invalid DWARF
+/// expressions"). This fuses the fixture and asserts every location-list
+/// entry's range lies within the fused module's byte length — a garbage
+/// remap (≈2.4 GiB begin) fails; a correct fused-code offset (< a few MiB)
+/// passes.
+#[test]
+fn inc3_location_list_ranges_stay_in_module() {
+    if !std::path::Path::new(RANGES_FIXTURE).is_file() {
+        eprintln!("skipping: fixture not found at {RANGES_FIXTURE}");
+        return;
+    }
+    let input = std::fs::read(RANGES_FIXTURE).expect("read fixture");
+    let fused = fuse_remap(&input);
+    // Generous upper bound: no real fused-code address exceeds the whole
+    // module size; the pre-fix garbage (~0x905993c0) blows past it.
+    let bound = fused.len() as u64;
+    let sections = debug_sections(&fused);
+    assert!(
+        sections.contains_key(".debug_info"),
+        "expected remapped DWARF"
+    );
+
+    let endian = gimli::LittleEndian;
+    let load = |id: gimli::SectionId| -> Result<gimli::EndianSlice<'_, gimli::LittleEndian>, gimli::Error> {
+        let data = sections.get(id.name()).map(|v| v.as_slice()).unwrap_or(&[]);
+        Ok(gimli::EndianSlice::new(data, endian))
+    };
+    let dwarf = gimli::Dwarf::load(load).expect("load output dwarf");
+
+    let mut checked = 0usize;
+    let mut units = dwarf.units();
+    while let Some(header) = units.next().expect("unit header") {
+        let unit = dwarf.unit(header).expect("parse unit");
+        let mut entries = unit.entries();
+        while let Some((_, entry)) = entries.next_dfs().expect("dfs walk") {
+            let Some(loc) = entry
+                .attr_value(gimli::constants::DW_AT_location)
+                .expect("location attr")
+            else {
+                continue;
+            };
+            // Only location LISTS (a bare exprloc → None).
+            let Some(mut locs) = dwarf.attr_locations(&unit, loc).expect("attr_locations") else {
+                continue;
+            };
+            while let Some(le) = locs.next().expect("loc entry") {
+                assert!(
+                    le.range.begin <= le.range.end && le.range.end <= bound,
+                    "inc3: DW_AT_location entry range [{:#x},{:#x}) is out of the \
+                     fused module (len {bound:#x}) — a base-relative location \
+                     offset was remapped as an absolute address (#319)",
+                    le.range.begin,
+                    le.range.end
+                );
+                checked += 1;
+            }
+        }
+    }
+    assert!(
+        checked > 0,
+        "expected at least one DW_AT_location list entry to check"
+    );
+    eprintln!("inc3: {checked} DW_AT_location list entries all within the fused module");
+}
