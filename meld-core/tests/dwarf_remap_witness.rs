@@ -190,3 +190,99 @@ fn remapped_subprogram_low_pcs_match_fused_body_starts() {
          fused body starts, {tombstoned} dead-code subprograms tombstoned"
     );
 }
+
+/// A multi-inner-module fixture whose `.debug_ranges` carry inlined
+/// subroutines (base-relative offset pairs) — the #319 inc-2 surface.
+const RANGES_FIXTURE: &str = "../tests/wit_bindgen/fixtures/records.wasm";
+
+/// #319 inc 2: no `DW_AT_ranges` DIE may escape its enclosing subprogram in
+/// the remapped output. `records.wasm` carries inlined subroutines whose
+/// `.debug_ranges` are base-relative offset pairs; before the fix gimli
+/// mis-routed those *offsets* through `convert_address` (treating a small
+/// offset as an absolute address), sending the ranges to unrelated output
+/// locations — `llvm-dwarfdump --verify`: "DIE address ranges are not
+/// contained in its parent's ranges". This re-parses the fused DWARF and
+/// asserts every resolved range sits inside the enclosing subprogram.
+#[test]
+fn inc2_die_ranges_stay_within_enclosing_subprogram() {
+    if !std::path::Path::new(RANGES_FIXTURE).is_file() {
+        eprintln!("skipping: fixture not found at {RANGES_FIXTURE}");
+        return;
+    }
+    let input = std::fs::read(RANGES_FIXTURE).expect("read fixture");
+    let fused = fuse_remap(&input);
+    let sections = debug_sections(&fused);
+    assert!(
+        sections.contains_key(".debug_info"),
+        "Remap must emit remapped .debug_info for the ranges fixture"
+    );
+
+    let endian = gimli::LittleEndian;
+    let load = |id: gimli::SectionId| -> Result<gimli::EndianSlice<'_, gimli::LittleEndian>, gimli::Error> {
+        let data = sections.get(id.name()).map(|v| v.as_slice()).unwrap_or(&[]);
+        Ok(gimli::EndianSlice::new(data, endian))
+    };
+    let dwarf = gimli::Dwarf::load(load).expect("load output dwarf");
+
+    let mut checked = 0usize;
+    let mut units = dwarf.units();
+    while let Some(header) = units.next().expect("unit header") {
+        let unit = dwarf.unit(header).expect("parse unit");
+        let mut entries = unit.entries();
+        let mut depth = 0isize;
+        // Stack of enclosing subprogram ranges: (die_depth, low, end).
+        let mut encl: Vec<(isize, u64, u64)> = Vec::new();
+        while let Some((delta, entry)) = entries.next_dfs().expect("dfs walk") {
+            depth += delta;
+            while matches!(encl.last(), Some(&(d, _, _)) if d >= depth) {
+                encl.pop();
+            }
+            if entry.tag() == gimli::constants::DW_TAG_subprogram
+                && let Some(gimli::AttributeValue::Addr(low)) = entry
+                    .attr_value(gimli::constants::DW_AT_low_pc)
+                    .expect("low_pc")
+                && low != TOMBSTONE
+                && let Some(hp) = entry
+                    .attr_value(gimli::constants::DW_AT_high_pc)
+                    .expect("high_pc")
+            {
+                let end = match hp {
+                    gimli::AttributeValue::Udata(len) => low + len,
+                    gimli::AttributeValue::Addr(a) => a,
+                    _ => low,
+                };
+                encl.push((depth, low, end));
+            }
+            // A DIE carrying a range LIST, checked against its enclosing
+            // subprogram (the class that escaped in #319).
+            if entry
+                .attr_value(gimli::constants::DW_AT_ranges)
+                .expect("ranges attr")
+                .is_some()
+                && let Some(&(_, plow, pend)) = encl.last()
+            {
+                let mut ranges = dwarf.die_ranges(&unit, entry).expect("die_ranges");
+                while let Some(r) = ranges.next().expect("range") {
+                    // Skip tombstone / dead-code sentinel entries.
+                    if r.begin >= 0xffff_fffe {
+                        continue;
+                    }
+                    assert!(
+                        r.begin >= plow && r.end <= pend,
+                        "inc2: DW_AT_ranges [{:#x},{:#x}) escapes enclosing \
+                         subprogram [{plow:#x},{pend:#x}) — base-relative range \
+                         offset was remapped as an absolute address (#319)",
+                        r.begin,
+                        r.end
+                    );
+                    checked += 1;
+                }
+            }
+        }
+    }
+    assert!(
+        checked > 0,
+        "expected at least one DW_AT_ranges DIE inside a subprogram to check"
+    );
+    eprintln!("inc2: {checked} DW_AT_ranges entries all contained in their subprogram");
+}

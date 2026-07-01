@@ -575,6 +575,9 @@ fn rewrite_debug_sections(
     // `llvm-dwarfdump --verify` flags as out-of-parent / overlapping. Fix
     // the lengths to the fused layout now that `low_pc` is remapped.
     correct_high_pc_lengths(&mut write_dwarf, remap);
+    // #319 inc 2: fix DW_AT_ranges lists (base-relative offsets that gimli
+    // mis-routes through convert_address) from the read side.
+    correct_die_ranges(&mut write_dwarf, &read_dwarf, remap);
     // #144 inc 3: the synthetic `<meld-adapter>` unit rides the SAME
     // write as the remapped original units, so every cross-section
     // offset is computed in one shared offset space (appending
@@ -639,6 +642,138 @@ fn correct_high_pc_lengths(write_dwarf: &mut gimli::write::Dwarf, remap: &Addres
                     .get_mut(unit_id)
                     .get_mut(id)
                     .set(DW_AT_high_pc, AttributeValue::Udata(new_len as u64));
+            }
+        }
+    }
+}
+
+/// Collect a write unit's DIE ids in first-child-first pre-order — the same
+/// order `gimli::read`'s `next_dfs` yields, so the two can be walked in
+/// lockstep. (Distinct from [`correct_high_pc_lengths`]'s order-agnostic
+/// stack walk, which doesn't need to align with the read side.)
+fn write_dies_preorder(
+    unit: &gimli::write::Unit,
+    id: gimli::write::UnitEntryId,
+    out: &mut Vec<gimli::write::UnitEntryId>,
+) {
+    out.push(id);
+    let children: Vec<_> = unit.get(id).children().copied().collect();
+    for c in children {
+        write_dies_preorder(unit, c, out);
+    }
+}
+
+/// Rewrite every `DW_AT_ranges` list to the fused layout (#319 inc 2).
+///
+/// DWARF v4 `.debug_ranges` entries are base-relative offset pairs. gimli
+/// parses them as `AddressOrOffsetPair` and routes the *offsets* through
+/// `convert_address` — which treats a small offset as an absolute code
+/// address and remaps it to an unrelated output location, so the resolved
+/// range escapes its parent (the `.debug_ranges` analogue of the inc-1
+/// `high_pc`-length bug). Fix it from the read side, where the base is still
+/// applied: resolve each DIE's absolute input ranges via `die_ranges`,
+/// `translate` both endpoints to the fused layout, and re-emit them as
+/// offsets relative to the output CU base. Drop sub-ranges (or the whole
+/// list) that can't be mapped — never emit a wrong or escaping range
+/// (LS-D-1).
+fn correct_die_ranges<R: gimli::read::Reader<Offset = usize>>(
+    write_dwarf: &mut gimli::write::Dwarf,
+    read_dwarf: &gimli::read::Dwarf<R>,
+    remap: &AddressRemap,
+) {
+    use gimli::constants::{DW_AT_low_pc, DW_AT_ranges};
+    use gimli::write::{Address, AttributeValue, Range, RangeList};
+
+    let mut headers = read_dwarf.units();
+    let mut unit_idx = 0usize;
+    while let Ok(Some(header)) = headers.next() {
+        if unit_idx >= write_dwarf.units.count() {
+            break;
+        }
+        let uid = write_dwarf.units.id(unit_idx);
+        unit_idx += 1;
+        let unit = match read_dwarf.unit(header) {
+            Ok(u) => u,
+            Err(_) => continue,
+        };
+
+        // Output CU base = the write root's already-remapped low_pc; v4
+        // range entries are emitted relative to it. No usable base → skip.
+        let out_cu_base = {
+            let root = write_dwarf.units.get(uid).root();
+            match write_dwarf.units.get(uid).get(root).get(DW_AT_low_pc) {
+                Some(AttributeValue::Address(Address::Constant(a))) => *a as u32,
+                _ => continue,
+            }
+        };
+
+        // Write DIE ids in the same pre-order the read cursor will walk.
+        let write_ids = {
+            let wunit = write_dwarf.units.get(uid);
+            let mut ids = Vec::new();
+            write_dies_preorder(wunit, wunit.root(), &mut ids);
+            ids
+        };
+
+        let mut entries = unit.entries();
+        let mut wi = 0usize;
+        while let Ok(Some((_, entry))) = entries.next_dfs() {
+            if wi >= write_ids.len() {
+                break;
+            }
+            let die_id = write_ids[wi];
+            wi += 1;
+
+            // Only DIEs that carry a range LIST (not low/high — those are the
+            // inc-1 path). `die_ranges` would otherwise synthesize a single
+            // range from low/high and we'd wrongly convert a subprogram.
+            if entry.attr_value(DW_AT_ranges).ok().flatten().is_none() {
+                continue;
+            }
+
+            let mut ranges = match read_dwarf.die_ranges(&unit, entry) {
+                Ok(r) => r,
+                Err(_) => continue,
+            };
+            let mut new_ranges = Vec::new();
+            while let Ok(Some(r)) = ranges.next() {
+                // `die_ranges` yields absolute input addresses (base applied).
+                let (Some(ob), Some(oe)) = (
+                    remap.translate(r.begin as u32),
+                    remap.translate(r.end as u32),
+                ) else {
+                    continue; // unmappable (dropped/tombstoned) sub-range → drop
+                };
+                // Require a strictly-positive extent: a degenerate `begin ==
+                // end` OffsetPair is rejected by gimli's range writer
+                // (`InvalidRange`), which would abort the whole DWARF write
+                // and strip. A zero-length range carries no information, so
+                // dropping it is lossless.
+                if ob >= out_cu_base && oe > ob {
+                    new_ranges.push(Range::OffsetPair {
+                        begin: (ob - out_cu_base) as u64,
+                        end: (oe - out_cu_base) as u64,
+                    });
+                }
+            }
+
+            if new_ranges.is_empty() {
+                write_dwarf
+                    .units
+                    .get_mut(uid)
+                    .get_mut(die_id)
+                    .delete(DW_AT_ranges);
+            } else {
+                let rid = write_dwarf
+                    .units
+                    .get_mut(uid)
+                    .ranges
+                    .add(RangeList(new_ranges));
+                write_dwarf
+                    .units
+                    .get_mut(uid)
+                    .get_mut(die_id)
+                    .set(DW_AT_ranges, AttributeValue::RangeListRef(rid));
             }
         }
     }
