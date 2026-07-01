@@ -1523,7 +1523,7 @@ artifacts:
       (scry#63); meld is the producer, scry-provenance owns the format (DD-002).
       meld shall NOT compute value ranges / constant args / dead params — those
       are scry's abstract interpretation, fed by these premises (#313).
-    status: implemented
+    status: verified
     tags: [feature, provenance, specialization, v0.37.0]
     links:
       - type: derives-from
@@ -1535,6 +1535,7 @@ artifacts:
       - uri: "https://github.com/pulseengine/scry/issues/63"
         kind: github
         last-checked: 2026-06-26
+    release: v0.37.0
     fields:
       implementation:
         - meld-core/src/provenance.rs
