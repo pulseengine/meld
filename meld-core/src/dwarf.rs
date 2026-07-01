@@ -744,7 +744,12 @@ fn correct_die_ranges<R: gimli::read::Reader<Offset = usize>>(
                 ) else {
                     continue; // unmappable (dropped/tombstoned) sub-range → drop
                 };
-                if ob >= out_cu_base && oe >= ob {
+                // Require a strictly-positive extent: a degenerate `begin ==
+                // end` OffsetPair is rejected by gimli's range writer
+                // (`InvalidRange`), which would abort the whole DWARF write
+                // and strip. A zero-length range carries no information, so
+                // dropping it is lossless.
+                if ob >= out_cu_base && oe > ob {
                     new_ranges.push(Range::OffsetPair {
                         begin: (ob - out_cu_base) as u64,
                         end: (oe - out_cu_base) as u64,
