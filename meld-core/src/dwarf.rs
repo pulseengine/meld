@@ -236,6 +236,69 @@ impl AddressRemap {
             .unwrap_or(0);
         self.input_code_extent.max(registered_max)
     }
+
+    /// Inverse of [`Self::translate`] within one span: map an **output**
+    /// code address at an instruction boundary back to its **input**
+    /// address. Used to correct `DW_AT_high_pc`-as-length (#319), whose
+    /// stale value is an input-relative length that gimli copies verbatim
+    /// (it is a constant, not an address, so it never reaches the forward
+    /// remap). Returns `None` when `out_addr` does not land on a recorded
+    /// instruction boundary.
+    fn reverse_in_span(span: &FunctionSpan, out_addr: u32) -> Option<u32> {
+        let out_rel = out_addr - span.output_body_start;
+        // Region 1: locals/prefix — preserved verbatim, linear inverse.
+        if out_rel < span.locals_prefix_len {
+            return Some(span.input_start + out_rel);
+        }
+        // Region 2: instruction stream — invert the offset map. DIE ranges
+        // always start on an instruction boundary, so require an exact
+        // `new` match; a miss means "not a boundary", return None.
+        let instr_new = out_rel - span.locals_prefix_len;
+        for e in &span.instr_offsets.entries {
+            if e.new == instr_new {
+                return Some(span.input_start + span.locals_prefix_len + e.old);
+            }
+        }
+        None
+    }
+
+    /// Correct a `DW_AT_high_pc` encoded as a **length** (#319).
+    ///
+    /// `out_low` is the DIE's already-remapped `low_pc`; `stale_len` is the
+    /// verbatim-copied **input** body length. The corrected output length
+    /// is `out_end − out_low`, where the input range `[orig_low, orig_end)`
+    /// is recovered by inverting the remap for `out_low` within its output
+    /// body. When the range ends exactly at the function body end, the
+    /// output end is the span's `output_body_end` directly — routing that
+    /// exclusive end through [`Self::translate`] would hit the aliased
+    /// boundary case (a function end coincident with a reordered
+    /// neighbour's start) and fail. Interior ends (lexical blocks / inlined
+    /// subroutines) translate unambiguously. Returns `None` when the
+    /// endpoints can't be resolved (dropped/tombstoned code, non-boundary),
+    /// so the caller leaves the attribute unchanged.
+    pub fn corrected_high_pc(&self, out_low: u32, stale_len: u32) -> Option<u32> {
+        let span = self
+            .by_input_start
+            .values()
+            .find(|s| out_low >= s.output_body_start && out_low < s.output_body_end)?;
+        let orig_low = Self::reverse_in_span(span, out_low)?;
+        let orig_end = orig_low.checked_add(stale_len)?;
+        // Never correct a range that would extend past its own function
+        // body: a valid DIE's `high_pc` end is `≤ input_end` (subprograms
+        // end exactly there; nested blocks/inlines stay interior). A larger
+        // `stale_len` (malformed/padded input) would otherwise `translate`
+        // into the NEXT function and emit a plausible-but-wrong length —
+        // exactly the LS-D-1 class. Bail to leave it unchanged instead.
+        if orig_end > span.input_end {
+            return None;
+        }
+        let new_end = if orig_end == span.input_end {
+            span.output_body_end
+        } else {
+            self.translate(orig_end)?
+        };
+        new_end.checked_sub(out_low)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -503,6 +566,15 @@ fn rewrite_debug_sections(
             return None;
         }
     };
+    // #319: gimli routes only *address*-form values through
+    // `convert_address`; `DW_AT_high_pc` encoded as a length
+    // (`DW_FORM_udata`, the common Rust/LLVM form) is a constant it copies
+    // verbatim. Fused bodies change length (LEB re-encoding), so every DIE
+    // would otherwise be `[remapped_low, remapped_low + STALE_input_len)`
+    // — overrunning its parent (grew) or the next function (shrank), which
+    // `llvm-dwarfdump --verify` flags as out-of-parent / overlapping. Fix
+    // the lengths to the fused layout now that `low_pc` is remapped.
+    correct_high_pc_lengths(&mut write_dwarf, remap);
     // #144 inc 3: the synthetic `<meld-adapter>` unit rides the SAME
     // write as the remapped original units, so every cross-section
     // offset is computed in one shared offset space (appending
@@ -522,6 +594,54 @@ fn rewrite_debug_sections(
         })
         .ok()?;
     Some(out)
+}
+
+/// Rewrite every `DW_AT_high_pc`-encoded-as-length to the fused output
+/// length (#319). gimli copies these verbatim because it treats a length
+/// as a constant, not an address; after fusion re-lays-out the code they
+/// are stale and produce out-of-parent / overlapping DIE ranges. For each
+/// DIE carrying `low_pc` (address) + `high_pc` (udata length), replace the
+/// length with [`AddressRemap::corrected_high_pc`]; leave it untouched when
+/// the endpoints can't be resolved (dropped/tombstoned code).
+fn correct_high_pc_lengths(write_dwarf: &mut gimli::write::Dwarf, remap: &AddressRemap) {
+    use gimli::constants::{DW_AT_high_pc, DW_AT_low_pc};
+    use gimli::write::{Address, AttributeValue};
+
+    for i in 0..write_dwarf.units.count() {
+        let unit_id = write_dwarf.units.id(i);
+        // Collect DIE ids first (immutable walk), then mutate per id.
+        let ids = {
+            let unit = write_dwarf.units.get(unit_id);
+            let mut ids = Vec::new();
+            let mut stack = vec![unit.root()];
+            while let Some(id) = stack.pop() {
+                ids.push(id);
+                stack.extend(unit.get(id).children().copied());
+            }
+            ids
+        };
+        for id in ids {
+            let (low, stale) = {
+                let die = write_dwarf.units.get(unit_id).get(id);
+                let low = match die.get(DW_AT_low_pc) {
+                    Some(AttributeValue::Address(Address::Constant(a))) => *a,
+                    _ => continue,
+                };
+                let stale = match die.get(DW_AT_high_pc) {
+                    Some(AttributeValue::Udata(u)) => *u,
+                    _ => continue,
+                };
+                (low, stale)
+            };
+            if let Some(new_len) = remap.corrected_high_pc(low as u32, stale as u32) {
+                write_dwarf
+                    .units
+                    .get_mut(unit_id)
+                    .get_mut(id)
+                    .set(DW_AT_high_pc, AttributeValue::Udata(new_len as u64));
+            }
+        }
+    }
 }
 
 /// Top-level entry point for [`crate::DwarfHandling::Remap`].
@@ -1393,6 +1513,65 @@ mod tests {
         assert_eq!(remap.translate(10), Some(50));
         // body_rel 2 (still in the 5-byte locals prefix) → 50 + 2.
         assert_eq!(remap.translate(12), Some(52));
+    }
+
+    /// #319: `corrected_high_pc` rewrites a `DW_AT_high_pc` *length* to the
+    /// fused output length. gimli copies these verbatim (a length is a
+    /// constant, not an address), so after fusion re-lays-out the code the
+    /// stale lengths produce out-of-parent / overlapping DIE ranges. A
+    /// function that grows and one that shrinks both get their length
+    /// remapped; an interior sub-range (lexical block) resolves through its
+    /// end instruction; a tombstoned `low_pc` (dropped code) is left alone.
+    #[test]
+    fn corrected_high_pc_rewrites_length_to_fused_layout() {
+        // `grew`: input body [10,30) (len 20) → output [200,240) (len 40),
+        // with an interior instruction at input offset 10 → output 20.
+        let grew = FunctionSpan {
+            input_start: 10,
+            input_end: 30,
+            output_body_start: 200,
+            output_body_end: 240,
+            locals_prefix_len: 0,
+            instr_offsets: InstrOffsetMap {
+                entries: vec![
+                    InstrOffset { old: 0, new: 0 },
+                    InstrOffset { old: 10, new: 20 },
+                ],
+            },
+        };
+        // `shrank`: input body [30,50) (len 20) → output [240,250) (len 10).
+        let shrank = FunctionSpan {
+            input_start: 30,
+            input_end: 50,
+            output_body_start: 240,
+            output_body_end: 250,
+            locals_prefix_len: 0,
+            instr_offsets: InstrOffsetMap {
+                entries: vec![InstrOffset { old: 0, new: 0 }],
+            },
+        };
+        let mut remap = AddressRemap::new();
+        remap.insert(grew);
+        remap.insert(shrank);
+
+        // Whole-function subprogram of `grew`: stale input length 20 → the
+        // output length 40 (end == input_end → span.output_body_end).
+        assert_eq!(remap.corrected_high_pc(200, 20), Some(40));
+        // Whole-function subprogram of `shrank`: 20 → 10.
+        assert_eq!(remap.corrected_high_pc(240, 20), Some(10));
+        // Interior lexical block [10,20) inside `grew`: end is interior
+        // (!= input_end) so it routes through `translate` → output [200,220)
+        // → length 20. Distinct from the subprogram at the same low_pc,
+        // proving the correction is length-sensitive.
+        assert_eq!(remap.corrected_high_pc(200, 10), Some(20));
+        // A tombstoned low_pc (dropped/deduped code) has no output body →
+        // left untouched (llvm-dwarfdump ignores tombstoned DIEs).
+        assert_eq!(remap.corrected_high_pc(0xFFFF_FFFF, 20), None);
+        // A length that runs past the function body (malformed/padded input)
+        // must NOT be corrected into the next function — bail, leave stale
+        // (LS-D-1: never a plausible-but-wrong length). `grew` is input
+        // len 20; a stale 30 would reach into `shrank`.
+        assert_eq!(remap.corrected_high_pc(200, 30), None);
     }
 
     /// Oracle for inc 3b: build real input DWARF with gimli, remap a
