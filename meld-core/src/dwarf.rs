@@ -578,6 +578,9 @@ fn rewrite_debug_sections(
     // #319 inc 2: fix DW_AT_ranges lists (base-relative offsets that gimli
     // mis-routes through convert_address) from the read side.
     correct_die_ranges(&mut write_dwarf, &read_dwarf, remap);
+    // #319 inc 3: fix DW_AT_location lists (same base-relative offset bug as
+    // ranges, plus sentinel-derailed decode) from the read side.
+    correct_die_locations(&mut write_dwarf, &read_dwarf, remap);
     // #144 inc 3: the synthetic `<meld-adapter>` unit rides the SAME
     // write as the remapped original units, so every cross-section
     // offset is computed in one shared offset space (appending
@@ -774,6 +777,127 @@ fn correct_die_ranges<R: gimli::read::Reader<Offset = usize>>(
                     .get_mut(uid)
                     .get_mut(die_id)
                     .set(DW_AT_ranges, AttributeValue::RangeListRef(rid));
+            }
+        }
+    }
+}
+
+/// Rewrite every `DW_AT_location` **location list** to the fused layout
+/// (#319 inc 3). Location-list entries carry the same base-relative
+/// begin/end offsets as `.debug_ranges` (inc 2), so gimli mis-routes them
+/// through `convert_address` — the entry ranges land at garbage output
+/// offsets and, combined with the `0xFFFFFFFF`/`0xFFFFFFFE` sentinels,
+/// derail the whole list (`llvm-dwarfdump`: "Invalid DW_AT_location" /
+/// "Invalid DWARF expressions"). Fix it exactly like [`correct_die_ranges`]:
+/// resolve each list from the read side (`attr_locations`, base applied),
+/// `translate` the entry endpoints, and re-emit as `OffsetPair` relative to
+/// the output CU base — carrying the location **expression bytes verbatim**
+/// (WASM location expressions — `DW_OP_WASM_location`, `DW_OP_stack_value` —
+/// hold no code addresses; a data `DW_OP_addr` is unchanged under fusion,
+/// matching `convert_address`'s data passthrough). Bare exprloc
+/// `DW_AT_location`s are not lists (`attr_locations` → `None`) and are left
+/// to gimli. Unmappable entries are dropped; an emptied list deletes the
+/// attribute (LS-D-1).
+fn correct_die_locations<R: gimli::read::Reader<Offset = usize>>(
+    write_dwarf: &mut gimli::write::Dwarf,
+    read_dwarf: &gimli::read::Dwarf<R>,
+    remap: &AddressRemap,
+) {
+    use gimli::constants::{DW_AT_location, DW_AT_low_pc};
+    use gimli::write::{Address, AttributeValue, Expression, Location, LocationList};
+
+    let mut headers = read_dwarf.units();
+    let mut unit_idx = 0usize;
+    while let Ok(Some(header)) = headers.next() {
+        if unit_idx >= write_dwarf.units.count() {
+            break;
+        }
+        let uid = write_dwarf.units.id(unit_idx);
+        unit_idx += 1;
+        let unit = match read_dwarf.unit(header) {
+            Ok(u) => u,
+            Err(_) => continue,
+        };
+
+        let out_cu_base = {
+            let root = write_dwarf.units.get(uid).root();
+            match write_dwarf.units.get(uid).get(root).get(DW_AT_low_pc) {
+                Some(AttributeValue::Address(Address::Constant(a))) => *a as u32,
+                _ => continue,
+            }
+        };
+
+        let write_ids = {
+            let wunit = write_dwarf.units.get(uid);
+            let mut ids = Vec::new();
+            write_dies_preorder(wunit, wunit.root(), &mut ids);
+            ids
+        };
+
+        let mut entries = unit.entries();
+        let mut wi = 0usize;
+        while let Ok(Some((_, entry))) = entries.next_dfs() {
+            if wi >= write_ids.len() {
+                break;
+            }
+            let die_id = write_ids[wi];
+            wi += 1;
+
+            let loc_attr = match entry.attr_value(DW_AT_location) {
+                Ok(Some(v)) => v,
+                _ => continue,
+            };
+            // `attr_locations` returns `None` for a bare exprloc (not a list).
+            let mut locs = match read_dwarf.attr_locations(&unit, loc_attr) {
+                Ok(Some(l)) => l,
+                _ => continue,
+            };
+
+            let mut new_locs = Vec::new();
+            let mut aborted = false;
+            while let Ok(Some(le)) = locs.next() {
+                let (Some(ob), Some(oe)) = (
+                    remap.translate(le.range.begin as u32),
+                    remap.translate(le.range.end as u32),
+                ) else {
+                    continue; // unmappable (dropped/tombstoned) entry → drop
+                };
+                if ob < out_cu_base || oe <= ob {
+                    continue;
+                }
+                let bytes = match le.data.0.to_slice() {
+                    Ok(b) => b.into_owned(),
+                    Err(_) => {
+                        aborted = true;
+                        break;
+                    }
+                };
+                new_locs.push(Location::OffsetPair {
+                    begin: (ob - out_cu_base) as u64,
+                    end: (oe - out_cu_base) as u64,
+                    data: Expression::raw(bytes),
+                });
+            }
+            if aborted {
+                continue; // couldn't read an expression — leave gimli's output
+            }
+            if new_locs.is_empty() {
+                write_dwarf
+                    .units
+                    .get_mut(uid)
+                    .get_mut(die_id)
+                    .delete(DW_AT_location);
+            } else {
+                let lid = write_dwarf
+                    .units
+                    .get_mut(uid)
+                    .locations
+                    .add(LocationList(new_locs));
+                write_dwarf
+                    .units
+                    .get_mut(uid)
+                    .get_mut(die_id)
+                    .set(DW_AT_location, AttributeValue::LocationListRef(lid));
             }
         }
     }
