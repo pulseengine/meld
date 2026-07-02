@@ -462,15 +462,20 @@ fn run_on_kiln(wasm: &[u8], tag: &str) -> Option<bool> {
 /// Tier C (#297): a meld-fused component must EXECUTE on kiln — the
 /// safety-critical MCU-target runtime — not only under wasmtime (Tier A/B).
 ///
-/// `#[ignore]`d: today kiln's component executor looks for a core-instance
-/// `_start` and cannot run meld's multi-core-module `--component` wrap (the
-/// stubs, fused, fixup and caller modules, with a deferred start); it fails
-/// with "No core instance exports _start". Filed as kiln#364. wasmtime runs
-/// the same artifact via `wasi:cli/run` (Tier A/B green), so meld's output is
-/// spec-valid. Un-ignore when kiln#364 lands; it then pins the meld-to-kiln
-/// behavioural seam green.
+/// `#[ignore]`d: kiln#364 (kilnd `wasi:cli/run` canonical entry, landed via
+/// kiln#374) removed the original `_start` gate — the unfused original command
+/// component now runs on kilnd. But a real meld-fused `--component` wrap (stubs,
+/// fused, fixup and caller core modules) fails one layer deeper:
+/// `[ComponentRuntime][E5DC2] wasi:cli/run export references an out-of-bounds
+/// component instance index`. The SAME fused artifact runs correctly on
+/// wasmtime 41 ("Hello wasm component world from C!", Tier A/B green), so meld's
+/// output is spec-valid and the defect is in kilnd's component-instance
+/// resolution for a multi-core-module component — tracked in kiln#375
+/// (multi-core instantiation; E5DC2 flagged as a possibly-distinct, earlier
+/// failure than its user-import linking). Un-ignore when kiln#375 lands; it
+/// then pins the meld-to-kiln behavioural seam green.
 #[test]
-#[ignore = "blocked on kiln#364: kilnd requires a core-instance _start; can't run meld's multi-core-module fused component"]
+#[ignore = "blocked on kiln#375: kilnd's wasi:cli/run export resolution reports an out-of-bounds component instance index (E5DC2) for meld's multi-core-module fused component; kiln#364 (the _start gate) is resolved"]
 fn tier_c_fused_executes_on_kiln() {
     if kilnd_path().is_none() {
         eprintln!("skipping Tier C: kilnd not found (set MELD_KILND or build ../../kiln)");
