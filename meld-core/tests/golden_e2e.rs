@@ -470,12 +470,15 @@ fn run_on_kiln(wasm: &[u8], tag: &str) -> Option<bool> {
 /// component instance index`. The SAME fused artifact runs correctly on
 /// wasmtime 41 ("Hello wasm component world from C!", Tier A/B green), so meld's
 /// output is spec-valid and the defect is in kilnd's component-instance
-/// resolution for a multi-core-module component — tracked in kiln#375
-/// (multi-core instantiation; E5DC2 flagged as a possibly-distinct, earlier
-/// failure than its user-import linking). Un-ignore when kiln#375 lands; it
-/// then pins the meld-to-kiln behavioural seam green.
+/// resolution for a multi-core-module component. Root-caused and tracked as
+/// kiln#382 (split from kiln#375): `resolve_command_entry` treats the run
+/// export's index as a defined-only index into `parsed.instances`, missing the
+/// `-K` instance-import offset (meld's fused component imports K=13 instances
+/// before the defined run instance, so it overruns). kiln#375 (cross-core user
+/// imports) is the *next* layer the seam hits once #382 lands. Un-ignore when
+/// kiln#382 lands (then #375 if it re-blocks); it pins the meld-to-kiln seam green.
 #[test]
-#[ignore = "blocked on kiln#375: kilnd's wasi:cli/run export resolution reports an out-of-bounds component instance index (E5DC2) for meld's multi-core-module fused component; kiln#364 (the _start gate) is resolved"]
+#[ignore = "blocked on kiln#382: kilnd's resolve_command_entry misses the -K instance-import offset, so the wasi:cli/run export resolves to an out-of-bounds component-instance index (E5DC2) for meld's multi-core fused component; then kiln#375 (cross-core user imports) is the next layer. kiln#364 (the _start gate) is resolved"]
 fn tier_c_fused_executes_on_kiln() {
     if kilnd_path().is_none() {
         eprintln!("skipping Tier C: kilnd not found (set MELD_KILND or build ../../kiln)");
