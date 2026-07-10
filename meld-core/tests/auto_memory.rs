@@ -185,7 +185,7 @@ fn validates_without_multimemory(wasm: &[u8]) -> bool {
 /// plausible-but-wrong one). Shared remains reachable only via explicit
 /// `--memory shared --address-rebase`, which warns loudly.
 #[test]
-fn auto_gates_shared_for_growfree_inputs_326() {
+fn ls_m_11_auto_gates_unsound_shared_rebase() {
     let component_a = build_component(build_module_a());
     let component_b = build_component(build_module_b(false));
 

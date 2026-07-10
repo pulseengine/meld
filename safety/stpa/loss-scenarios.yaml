@@ -3662,6 +3662,70 @@ loss-scenarios:
       slot (`seen` holds only the first sig) — a dedup-completeness gap,
       not a correctness issue (compute and emit stay in lockstep).
 
+  - id: LS-M-11
+    title: shared-memory address rebasing does not rebase dynamic addresses, corrupting computed-pointer access
+    uca: UCA-M-11
+    hazards: [H-2, H-3.2]
+    type: inadequate-control-algorithm
+    scenario: >
+      `--memory shared --address-rebase` (and, before the #326 gate, the
+      `MemoryStrategy::Auto` default for grow-free multi-memory inputs)
+      relocates each fused component's private memory into a shared
+      linear memory at a per-component base. But the rebasing is
+      INCOMPLETE: `rewriter.rs::convert_memarg` adds `memory_base_offset`
+      only to the STATIC memarg offset immediate, and `needs_rebase_locals`
+      injects runtime base-adjustment only for bulk-memory ops
+      (`MemoryCopy`/`MemoryFill`/`MemoryInit`). The DYNAMIC address operand
+      of ordinary `i32.load`/`i32.store` — a computed pointer pushed on the
+      stack (heap object, shadow-stack slot) — is never adjusted. Real
+      components address their heap/shadow-stack via computed pointers, so
+      two rebased components' private accesses land at the SAME physical
+      addresses: one component's store clobbers another's data, wrong
+      result, no trap, no error [H-2, H-3.2]. The output validates and
+      runs; corruption is silent. Distinct from LS-M-7 (shared unsound
+      under `memory.grow`) — this occurs with NO growth, purely from
+      unrebased computed addresses. Reproduced end-to-end: the wac-composed
+      consumer→provider fixture returns the provider's private sentinel to
+      the consumer under shared fusion, while `--memory multi` returns the
+      correct value.
+    causal-factors:
+      - >-
+        `convert_memarg` rebases only `MemArg.offset` (the static
+        immediate); the effective address is `dynamic_operand + offset`,
+        and the dynamic operand is left untouched
+      - >-
+        `needs_rebase_locals` is set true only when a function contains a
+        bulk-memory op, so plain loads/stores get no runtime base
+        adjustment at all
+      - >-
+        the auto-resolution and SR-37 both treated "no memory.grow" as
+        sufficient for sound shared fusion, but growth-freedom is
+        orthogonal to whether dynamic addresses are rebased
+    process-model-flaw: >
+      The rebasing model assumed that adding the component base to the
+      static memarg offset relocates every access. That holds only for
+      accesses whose address is a compile-time constant folded into the
+      memarg; for computed-pointer access (the norm) the runtime operand
+      dominates and is never relocated. Correct rebasing must inject
+      `dynamic_addr + memory_base` at runtime for every memory access in
+      a rebased component.
+    status: approved
+    priority: high
+    fix: >
+      Interim GATE (#326, PR #329, shipped v0.38.0): `resolve_auto_memory_
+      strategy` no longer selects shared+rebase — Auto always resolves to
+      multi-memory (sound). Explicit `--memory shared --address-rebase`
+      remains an opt-in but emits a loud unsoundness warning. SR-37 was
+      corrected (it had required the unsound shared preference). Pinned by
+      `ls_m_11_auto_gates_unsound_shared_rebase` (Auto → multi + separate
+      memories) and the `test_304` shared path made explicit. PENDING
+      full fix (rewriter.rs dynamic-address rebasing, Tier-5): inject
+      `addr + memory_base` for every load/store in a rebased component,
+      which re-enables sound single-address-space (MCU) lowering for
+      #298/#299/gale. Until that lands, `--memory shared` stays unsound
+      for computed-pointer access and Auto's output needs
+      `--enable-multimemory`.
+
   - id: LS-D-1
     title: remapped DWARF emits a wrong code address for a fused function
     uca: UCA-M-9
