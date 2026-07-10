@@ -168,9 +168,17 @@ fn test_304_identity_direct_adapter_is_inlined() {
         return;
     };
 
+    // Identity-adapter inlining (#304) is exercised on the shared-memory
+    // fusion path. Request it explicitly: since #326, `auto` no longer selects
+    // shared+rebase (it is unsound for computed-pointer memory access), so this
+    // feature test must opt into shared itself. The unsoundness #326 gates is
+    // about memory *access*, not adapter inlining, so exercising shared here to
+    // check the inlining + validity is fine.
     let mut fuser = Fuser::new(FuserConfig {
         attestation: false,
         component_provenance: false,
+        memory_strategy: MemoryStrategy::SharedMemory,
+        address_rebasing: true,
         ..Default::default()
     });
     fuser
