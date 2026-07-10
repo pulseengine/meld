@@ -76,6 +76,7 @@ fn fuse_remap() -> Vec<u8> {
         memory_strategy: MemoryStrategy::MultiMemory,
         dwarf_handling: DwarfHandling::Remap,
         attestation: false,
+        reproducible: false,
         ..Default::default()
     });
     fuser.add_component_named(&a, Some("a")).unwrap();

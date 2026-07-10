@@ -123,6 +123,7 @@ pub struct FusionAttestationBuilder {
     tool_version: String,
     tool_hash: Option<String>,
     memory_strategy: String,
+    reproducible: bool,
 }
 
 impl FusionAttestationBuilder {
@@ -134,7 +135,16 @@ impl FusionAttestationBuilder {
             tool_version: tool_version.into(),
             tool_hash: None,
             memory_strategy: "shared".to_string(),
+            reproducible: false,
         }
+    }
+
+    /// Emit a byte-reproducible attestation (#325): derive the id from the
+    /// output content and take the timestamp from `SOURCE_DATE_EPOCH`
+    /// (default epoch 0) instead of a random UUID + wall clock.
+    pub fn reproducible(mut self, reproducible: bool) -> Self {
+        self.reproducible = reproducible;
+        self
     }
 
     /// Set the tool hash for reproducibility
@@ -211,8 +221,16 @@ impl FusionAttestationBuilder {
     /// Build the attestation
     pub fn build(self, output_bytes: &[u8], stats: &FusionStats) -> FusionAttestation {
         let output_hash = compute_sha256(output_bytes);
-        let timestamp = chrono_timestamp();
-        let attestation_id = generate_uuid();
+        // #325: reproducible mode derives the id from the output content and
+        // the timestamp from SOURCE_DATE_EPOCH so the artifact is byte-stable.
+        let (timestamp, attestation_id) = if self.reproducible {
+            (
+                chrono_timestamp_from(source_date_epoch()),
+                generate_uuid_from(entropy_from_hex(&output_hash)),
+            )
+        } else {
+            (chrono_timestamp(), generate_uuid())
+        };
 
         let size_reduction = if stats.input_size > 0 {
             let diff = stats.input_size as i128 - stats.output_size as i128;
@@ -326,6 +344,35 @@ pub(crate) fn generate_uuid_from(entropy: u128) -> String {
             0, 0, bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15]
         ])
     )
+}
+
+/// Seconds-since-epoch for a reproducible attestation timestamp (#325).
+///
+/// Honors the ecosystem-standard `SOURCE_DATE_EPOCH` environment variable
+/// (a decimal seconds-since-Unix-epoch string); when it is unset or
+/// unparseable, falls back to `0` (`1970-01-01T00:00:00Z`) so a reproducible
+/// build is byte-stable regardless of the wall clock. Only consulted on the
+/// `--reproducible` path; normal builds keep the real `chrono_timestamp()`.
+pub(crate) fn source_date_epoch() -> u64 {
+    std::env::var("SOURCE_DATE_EPOCH")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .unwrap_or(0)
+}
+
+/// Derive deterministic UUID entropy from a content hash (#325).
+///
+/// Takes the fused output's SHA-256 hex string and folds its first 32 hex
+/// digits into a `u128`, so the attestation id is a stable function of the
+/// artifact content rather than the wall clock. Short/odd input degrades
+/// gracefully to whatever parses (never panics).
+pub(crate) fn entropy_from_hex(hash_hex: &str) -> u128 {
+    let head: String = hash_hex
+        .chars()
+        .filter(|c| c.is_ascii_hexdigit())
+        .take(32)
+        .collect();
+    u128::from_str_radix(&head, 16).unwrap_or(0)
 }
 
 /// Get current timestamp in ISO 8601 format using the system clock.
