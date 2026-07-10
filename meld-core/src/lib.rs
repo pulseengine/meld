@@ -84,6 +84,12 @@ pub struct FuserConfig {
     /// Whether to generate attestation data
     pub attestation: bool,
 
+    /// Whether to emit a byte-reproducible attestation (#325): derive the
+    /// attestation id from the output content and source the timestamp from
+    /// `SOURCE_DATE_EPOCH` (default epoch 0) instead of a random UUID + the
+    /// wall clock, so identical input yields an identical fused artifact.
+    pub reproducible: bool,
+
     /// Whether to emit the `component-provenance` custom section
     /// (issue #192). When enabled (the default), every defined
     /// function in the fused module gets a back-pointer entry
@@ -144,6 +150,7 @@ impl Default for FuserConfig {
         Self {
             memory_strategy: MemoryStrategy::Auto,
             attestation: true,
+            reproducible: false,
             component_provenance: true,
             address_rebasing: false,
             preserve_names: false,
@@ -1832,7 +1839,8 @@ impl Fuser {
         stats: &FusionStats,
     ) -> attestation::FusionAttestation {
         let mut builder = FusionAttestationBuilder::new("meld", env!("CARGO_PKG_VERSION"))
-            .memory_strategy(self.memory_strategy_label());
+            .memory_strategy(self.memory_strategy_label())
+            .reproducible(self.config.reproducible);
 
         for (index, component) in self.components.iter().enumerate() {
             let name = component
@@ -1863,8 +1871,20 @@ impl Fuser {
         };
 
         let output_hash = attestation::compute_sha256(output_bytes);
-        let timestamp = attestation::chrono_timestamp();
-        let attestation_id = attestation::generate_uuid();
+        // #325: in reproducible mode, derive the id from the output content and
+        // the timestamp from SOURCE_DATE_EPOCH so the fused artifact is
+        // byte-stable across runs; otherwise keep the wall-clock/random id.
+        let (timestamp, attestation_id) = if self.config.reproducible {
+            (
+                attestation::chrono_timestamp_from(attestation::source_date_epoch()),
+                attestation::generate_uuid_from(attestation::entropy_from_hex(&output_hash)),
+            )
+        } else {
+            (
+                attestation::chrono_timestamp(),
+                attestation::generate_uuid(),
+            )
+        };
 
         let mut inputs = Vec::new();
         for (index, component) in self.components.iter().enumerate() {
@@ -2820,6 +2840,85 @@ mod tests {
                 iteration
             );
         }
+    }
+
+    /// #325: with `reproducible: true`, the fused artifact is byte-identical
+    /// across runs *even with attestation enabled* — the attestation id is
+    /// derived from the output content and the timestamp from
+    /// `SOURCE_DATE_EPOCH` (default epoch 0), so the random-UUID + wall-clock
+    /// non-determinism is removed. The control (attestation on, reproducible
+    /// off) must differ, proving the flag is what fixes it.
+    #[test]
+    fn test_reproducible_attestation_is_byte_stable() {
+        use wasm_encoder::{
+            CodeSection, Component, ExportKind, ExportSection, Function, FunctionSection,
+            Instruction, MemorySection, MemoryType, Module as EncoderModule, ModuleSection,
+            TypeSection, ValType,
+        };
+        fn build_minimal_component() -> Vec<u8> {
+            let mut types = TypeSection::new();
+            types.ty().function([], [ValType::I32]);
+            let mut functions = FunctionSection::new();
+            functions.function(0);
+            let mut memory = MemorySection::new();
+            memory.memory(MemoryType {
+                minimum: 1,
+                maximum: None,
+                memory64: false,
+                shared: false,
+                page_size_log2: None,
+            });
+            let mut exports = ExportSection::new();
+            exports.export("run", ExportKind::Func, 0);
+            exports.export("memory", ExportKind::Memory, 0);
+            let mut code = CodeSection::new();
+            let mut func = Function::new([]);
+            func.instruction(&Instruction::I32Const(42));
+            func.instruction(&Instruction::End);
+            code.function(&func);
+            let mut module = EncoderModule::new();
+            module
+                .section(&types)
+                .section(&functions)
+                .section(&memory)
+                .section(&exports)
+                .section(&code);
+            let mut component = Component::new();
+            component.section(&ModuleSection(&module));
+            component.finish()
+        }
+        let component_bytes = build_minimal_component();
+
+        let fuse_once = |reproducible: bool| -> Vec<u8> {
+            let config = FuserConfig {
+                attestation: true,
+                reproducible,
+                ..FuserConfig::default()
+            };
+            let mut fuser = Fuser::new(config);
+            fuser
+                .add_component(&component_bytes)
+                .expect("add_component failed");
+            fuser.fuse().expect("fuse failed")
+        };
+
+        // Reproducible: identical bytes across independent runs.
+        let a = fuse_once(true);
+        let b = fuse_once(true);
+        assert_eq!(
+            a, b,
+            "#325: reproducible fusion must be byte-identical across runs"
+        );
+
+        // Control: without reproducible, the attestation's random UUID makes
+        // the output differ — otherwise the flag would be a no-op.
+        let c = fuse_once(false);
+        let d = fuse_once(false);
+        assert_ne!(
+            c, d,
+            "#325: non-reproducible fusion is expected to differ (random attestation id); \
+             if this ever holds, the reproducible flag is testing nothing"
+        );
     }
 
     /// SR-20 / SC-8: Fail-fast when a core module (not a component) is passed
