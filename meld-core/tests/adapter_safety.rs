@@ -431,6 +431,7 @@ fn test_sr12_adapter_generation_for_string_param() {
     let config = FuserConfig {
         memory_strategy: MemoryStrategy::MultiMemory,
         attestation: false,
+        reproducible: false,
         component_provenance: false,
         address_rebasing: false,
         preserve_names: false,
@@ -819,6 +820,7 @@ fn test_sr13_cabi_realloc_targets_correct_memory() {
     let config = FuserConfig {
         memory_strategy: MemoryStrategy::MultiMemory,
         attestation: false,
+        reproducible: false,
         component_provenance: false,
         address_rebasing: false,
         preserve_names: false,
@@ -1235,6 +1237,7 @@ fn test_sr15_list_copy_length() {
     let config = FuserConfig {
         memory_strategy: MemoryStrategy::MultiMemory,
         attestation: false,
+        reproducible: false,
         component_provenance: false,
         address_rebasing: false,
         preserve_names: false,
@@ -1731,6 +1734,7 @@ fn test_sr16_inner_pointer_fixup_list_string() {
     let config = FuserConfig {
         memory_strategy: MemoryStrategy::MultiMemory,
         attestation: false,
+        reproducible: false,
         component_provenance: false,
         address_rebasing: false,
         preserve_names: false,
@@ -2031,6 +2035,7 @@ fn test_sr17_utf8_to_utf16_string_transcoding() {
     let config = FuserConfig {
         memory_strategy: MemoryStrategy::MultiMemory,
         attestation: false,
+        reproducible: false,
         component_provenance: false,
         address_rebasing: false,
         preserve_names: false,
@@ -2120,6 +2125,7 @@ fn test_sr17_utf8_to_utf16_supplementary_plane_transcoding() {
     let config = FuserConfig {
         memory_strategy: MemoryStrategy::MultiMemory,
         attestation: false,
+        reproducible: false,
         component_provenance: false,
         address_rebasing: false,
         preserve_names: false,
@@ -2645,6 +2651,7 @@ fn test_sr17_utf16_to_utf8_supplementary_plane_transcoding() {
     let config = FuserConfig {
         memory_strategy: MemoryStrategy::MultiMemory,
         attestation: false,
+        reproducible: false,
         component_provenance: false,
         address_rebasing: false,
         preserve_names: false,
@@ -2719,6 +2726,7 @@ fn test_sr17_utf16_to_utf8_lone_high_surrogate_replacement() {
     let config = FuserConfig {
         memory_strategy: MemoryStrategy::MultiMemory,
         attestation: false,
+        reproducible: false,
         component_provenance: false,
         address_rebasing: false,
         preserve_names: false,
@@ -2783,6 +2791,7 @@ fn test_sr17_utf16_to_utf8_midstring_lone_surrogate_replacement() {
     let config = FuserConfig {
         memory_strategy: MemoryStrategy::MultiMemory,
         attestation: false,
+        reproducible: false,
         component_provenance: false,
         address_rebasing: false,
         preserve_names: false,
@@ -2872,6 +2881,7 @@ fn test_sr17_utf16_to_utf8_malformed_surrogate_matrix() {
         let config = FuserConfig {
             memory_strategy: MemoryStrategy::MultiMemory,
             attestation: false,
+            reproducible: false,
             component_provenance: false,
             address_rebasing: false,
             preserve_names: false,
@@ -3007,6 +3017,7 @@ fn ls_p_20_test_sr17_utf8_to_utf16_malformed_matrix() {
         let config = FuserConfig {
             memory_strategy: MemoryStrategy::MultiMemory,
             attestation: false,
+            reproducible: false,
             component_provenance: false,
             address_rebasing: false,
             preserve_names: false,
@@ -3082,6 +3093,7 @@ fn test_sr17_latin1_to_utf16_transcoding() {
         let config = FuserConfig {
             memory_strategy: MemoryStrategy::MultiMemory,
             attestation: false,
+            reproducible: false,
             component_provenance: false,
             address_rebasing: false,
             preserve_names: false,
@@ -3565,6 +3577,7 @@ fn fuse_run_i32(caller: &[u8], callee: &[u8], label: &str) -> i32 {
     let config = FuserConfig {
         memory_strategy: MemoryStrategy::MultiMemory,
         attestation: false,
+        reproducible: false,
         component_provenance: false,
         address_rebasing: false,
         preserve_names: false,

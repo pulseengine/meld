@@ -120,6 +120,7 @@ fn test_cross_module_call() {
     let config = FuserConfig {
         memory_strategy: MemoryStrategy::SharedMemory,
         attestation: false,
+        reproducible: false,
         component_provenance: false,
         ..Default::default()
     };
@@ -176,6 +177,7 @@ fn test_304_identity_direct_adapter_is_inlined() {
     // check the inlining + validity is fine.
     let mut fuser = Fuser::new(FuserConfig {
         attestation: false,
+        reproducible: false,
         component_provenance: false,
         memory_strategy: MemoryStrategy::SharedMemory,
         address_rebasing: true,
@@ -209,6 +211,7 @@ fn test_cross_module_call_with_different_args() {
     let config = FuserConfig {
         memory_strategy: MemoryStrategy::SharedMemory,
         attestation: false,
+        reproducible: false,
         component_provenance: false,
         ..Default::default()
     };
@@ -354,6 +357,7 @@ fn test_unresolved_import_index_offset() {
     let config = FuserConfig {
         memory_strategy: MemoryStrategy::MultiMemory,
         attestation: false,
+        reproducible: false,
         component_provenance: false,
         ..Default::default()
     };

@@ -46,6 +46,7 @@ fn fuser_config() -> FuserConfig {
     FuserConfig {
         memory_strategy: MemoryStrategy::MultiMemory,
         attestation: false,
+        reproducible: false,
         component_provenance: false,
         address_rebasing: false,
         preserve_names: false,

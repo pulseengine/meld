@@ -165,6 +165,7 @@ fn fuse_passthrough(input: &[u8]) -> Vec<u8> {
     let mut fuser = Fuser::new(FuserConfig {
         memory_strategy: MemoryStrategy::MultiMemory,
         attestation: false,
+        reproducible: false,
         component_provenance: false,
         address_rebasing: false,
         preserve_names: false,
@@ -188,6 +189,7 @@ fn fuse_remap(input: &[u8]) -> Vec<u8> {
     let mut fuser = Fuser::new(FuserConfig {
         memory_strategy: MemoryStrategy::MultiMemory,
         attestation: false,
+        reproducible: false,
         component_provenance: false,
         address_rebasing: false,
         preserve_names: false,
@@ -206,6 +208,7 @@ fn fuse_with_drop(input: &[u8]) -> Vec<u8> {
     let mut fuser = Fuser::new(FuserConfig {
         memory_strategy: MemoryStrategy::MultiMemory,
         attestation: false,
+        reproducible: false,
         component_provenance: false,
         address_rebasing: false,
         preserve_names: false,
