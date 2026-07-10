@@ -1,11 +1,13 @@
-//! `MemoryStrategy::Auto` resolution — integration oracle for #172.
+//! `MemoryStrategy::Auto` resolution — integration oracle for #172 / #326.
 //!
-//! The default memory strategy is `Auto`: shared memory + address rebasing
-//! when no input module contains `memory.grow` and there are at least two
-//! memories to merge, multi-memory otherwise. The point of the feature is
-//! that out-of-the-box `meld fuse` output flows through `wasm-opt → synth`
-//! with no extra flags, WITHOUT ever selecting the shared form where it is
-//! unsound (merger Bug #7: shared memory breaks under `memory.grow`).
+//! The default memory strategy is `Auto`. It resolves to **multi-memory**:
+//! shared memory + address rebasing was previously auto-selected for grow-free
+//! multi-memory inputs, but that path is UNSOUND (#326 — rebasing does not
+//! relocate the dynamic address operand of ordinary loads/stores, so
+//! computed-pointer access silently collides across components), so Auto no
+//! longer selects it. Shared+rebase remains reachable only via explicit
+//! `--memory shared --address-rebase`, which warns loudly. (Historically Auto
+//! also always avoided shared under `memory.grow` — merger Bug #7.)
 //!
 //! The oracle here mirrors the issue's repro: `wasm-opt` (and any
 //! standards-default validator) rejects multi-memory modules. So the fused
@@ -19,9 +21,6 @@ use wasm_encoder::{
     ExportKind, ExportSection, Function, FunctionSection, Instruction, MemorySection, MemoryType,
     Module, ModuleSection, TypeSection,
 };
-use wasmtime::{Engine, Instance, Module as RuntimeModule, Store};
-
-const WASM_PAGE_SIZE: usize = 65_536;
 
 fn build_component(module: Module) -> Vec<u8> {
     let mut component = Component::new();
@@ -178,52 +177,33 @@ fn validates_without_multimemory(wasm: &[u8]) -> bool {
         .is_ok()
 }
 
-/// Two grow-free components, one memory each → Auto must pick shared +
-/// rebasing: single-memory output, accepted by a no-flags validator, and
-/// behaviourally correct (B's data lands at its rebased base, A's intact).
+/// #326: address rebasing does not relocate the dynamic address operand of
+/// ordinary loads/stores, so shared-memory fusion silently corrupts any
+/// component that addresses memory via a computed pointer. Auto therefore no
+/// longer selects shared+rebase even for grow-free inputs — it falls back to
+/// multi-memory, the sound strategy (LS-D-1: correct output, never a
+/// plausible-but-wrong one). Shared remains reachable only via explicit
+/// `--memory shared --address-rebase`, which warns loudly.
 #[test]
-fn auto_selects_shared_for_growfree_inputs() {
+fn auto_gates_shared_for_growfree_inputs_326() {
     let component_a = build_component(build_module_a());
     let component_b = build_component(build_module_b(false));
 
     let (fused, stats) = fuse_default(&[component_a, component_b]);
 
-    assert_eq!(stats.memory_strategy, "shared");
+    assert_eq!(
+        stats.memory_strategy, "multi",
+        "auto must gate the unsound shared+rebase path (#326) and select multi"
+    );
     assert_eq!(
         output_memory_count(&fused),
-        1,
-        "auto-resolved shared fusion must produce a single memory"
+        2,
+        "multi-memory keeps each component's memory separate — no silent \
+         cross-component collision (the correctness #326 protects)"
     );
     assert!(
-        validates_without_multimemory(&fused),
-        "fused output must validate without --enable-multimemory (#172)"
-    );
-
-    // Behaviour: the single memory holds A's fill at 0 and B's data one
-    // page in (B's rebased base).
-    let engine = Engine::default();
-    let module = RuntimeModule::new(&engine, &fused).unwrap();
-    let mut store = Store::new(&engine, ());
-    let instance = Instance::new(&mut store, &module, &[]).unwrap();
-
-    instance
-        .get_typed_func::<(), ()>(&mut store, "a_fill")
-        .unwrap()
-        .call(&mut store, ())
-        .unwrap();
-    instance
-        .get_typed_func::<(), ()>(&mut store, "b_init")
-        .unwrap()
-        .call(&mut store, ())
-        .unwrap();
-
-    let memory = instance.get_memory(&mut store, "memory").unwrap();
-    let data = memory.data(&store);
-    assert_eq!(&data[0..4], &[0x11, 0x11, 0x11, 0x11], "A's region");
-    assert_eq!(
-        &data[WASM_PAGE_SIZE..WASM_PAGE_SIZE + 4],
-        &[1, 2, 3, 4],
-        "B's region must sit at its rebased base, not clobber A"
+        !validates_without_multimemory(&fused),
+        "sanity: the multi-memory form is the one a no-flags validator rejects"
     );
 }
 
@@ -265,11 +245,12 @@ fn auto_keeps_multi_for_single_memory_input() {
 }
 
 /// Mythos finding A (PR #220): Auto resolution must be re-derived from the
-/// CURRENT component set on every fuse. A fuse → `add_component` → fuse
-/// sequence must not reuse the first fuse's stale "shared" resolution when
-/// the newly added component grows memory — the second fuse must succeed
-/// and resolve to multi. (`ls_m_7_` prefix: LS-M-7 / UCA-M-11 regression,
-/// run by the LS-N verification gate.)
+/// CURRENT component set on every fuse. Post-#326 Auto always resolves to
+/// multi-memory (shared+rebase is gated off as unsound), so re-probing is
+/// verified by the memory layout re-deriving: a grow-free pair fuses to 2
+/// memories, and after adding a third component the next fuse re-derives to
+/// 3 — not a stale 2. (`ls_m_7_` prefix: LS-M-7 / UCA-M-11 regression, run by
+/// the LS-N verification gate.)
 #[test]
 fn ls_m_7_auto_reprobes_after_add_component() {
     let component_a = build_component(build_module_a());
@@ -280,21 +261,29 @@ fn ls_m_7_auto_reprobes_after_add_component() {
     fuser.add_component_named(&component_a, Some("a")).unwrap();
     fuser.add_component_named(&component_b, Some("b")).unwrap();
 
-    let (_, stats) = fuser.fuse_with_stats().unwrap();
-    assert_eq!(stats.memory_strategy, "shared", "grow-free pair → shared");
+    let (fused1, stats) = fuser.fuse_with_stats().unwrap();
+    assert_eq!(
+        stats.memory_strategy, "multi",
+        "grow-free pair → multi (#326 gates the unsound shared+rebase path)"
+    );
+    assert_eq!(
+        output_memory_count(&fused1),
+        2,
+        "grow-free pair fuses to 2 memories"
+    );
 
     fuser
         .add_component_named(&component_grow, Some("grower"))
         .unwrap();
     let (fused, stats) = fuser
         .fuse_with_stats()
-        .expect("second fuse must re-resolve, not reuse the stale shared plan");
+        .expect("second fuse must re-resolve against the current component set");
+    assert_eq!(stats.memory_strategy, "multi");
     assert_eq!(
-        stats.memory_strategy, "multi",
-        "a growing component added after a previous fuse must flip the \
-         resolution back to multi"
+        output_memory_count(&fused),
+        3,
+        "the added component must be re-probed: 3 memories, not a stale 2"
     );
-    assert_eq!(output_memory_count(&fused), 3);
 }
 
 /// Explicit strategies are untouched by Auto: `MultiMemory` still produces
