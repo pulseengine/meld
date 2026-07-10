@@ -175,6 +175,7 @@ fn fuse_config() -> FuserConfig {
         memory_strategy: MemoryStrategy::MultiMemory,
         output_format: OutputFormat::CoreModule,
         attestation: false,
+        reproducible: false,
         component_provenance: false,
         address_rebasing: false,
         preserve_names: false,

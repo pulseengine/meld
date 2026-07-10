@@ -51,6 +51,7 @@ fn fuse_remap(input: &[u8]) -> Vec<u8> {
     let mut fuser = Fuser::new(FuserConfig {
         memory_strategy: MemoryStrategy::MultiMemory,
         attestation: false,
+        reproducible: false,
         component_provenance: true,
         address_rebasing: false,
         preserve_names: false,

@@ -209,6 +209,7 @@ fn test_intra_component_three_module_fusion() {
     let config = FuserConfig {
         memory_strategy: MemoryStrategy::MultiMemory,
         attestation: false,
+        reproducible: false,
         component_provenance: false,
         address_rebasing: false,
         preserve_names: false,
@@ -263,6 +264,7 @@ fn test_intra_component_memory_count() {
     let config = FuserConfig {
         memory_strategy: MemoryStrategy::MultiMemory,
         attestation: false,
+        reproducible: false,
         component_provenance: false,
         address_rebasing: false,
         preserve_names: false,

@@ -206,6 +206,7 @@ fn test_multi_memory_separate_memories() {
     let config = FuserConfig {
         memory_strategy: MemoryStrategy::MultiMemory,
         attestation: false,
+        reproducible: false,
         component_provenance: false,
         address_rebasing: false,
         preserve_names: false,
@@ -259,6 +260,7 @@ fn test_multi_memory_preserves_isolation() {
     let config = FuserConfig {
         memory_strategy: MemoryStrategy::MultiMemory,
         attestation: false,
+        reproducible: false,
         component_provenance: false,
         address_rebasing: false,
         preserve_names: false,
@@ -333,6 +335,7 @@ fn test_multi_memory_preserves_isolation_three_components() {
     let config = FuserConfig {
         memory_strategy: MemoryStrategy::MultiMemory,
         attestation: false,
+        reproducible: false,
         component_provenance: false,
         address_rebasing: false,
         preserve_names: false,

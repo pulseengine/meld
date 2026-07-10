@@ -76,6 +76,13 @@ enum Commands {
         #[arg(long)]
         no_attestation: bool,
 
+        /// Emit a byte-reproducible artifact (#325): derive the attestation
+        /// id from the output content and take the timestamp from
+        /// `SOURCE_DATE_EPOCH` (default epoch 0) instead of a random UUID +
+        /// wall clock, so identical input yields an identical sha256.
+        #[arg(long)]
+        reproducible: bool,
+
         /// Disable the `component-provenance` custom section (#192).
         /// The section maps each fused-module function index back to
         /// its originating component + function index; downstream
@@ -163,6 +170,7 @@ fn main() -> Result<()> {
             address_rebase,
             stats,
             no_attestation,
+            reproducible,
             no_component_provenance,
             dwarf,
             preserve_names,
@@ -178,6 +186,7 @@ fn main() -> Result<()> {
                 address_rebase,
                 stats,
                 no_attestation,
+                reproducible,
                 no_component_provenance,
                 dwarf,
                 preserve_names,
@@ -235,6 +244,7 @@ fn fuse_command(
     address_rebase: bool,
     show_stats: bool,
     no_attestation: bool,
+    reproducible: bool,
     no_component_provenance: bool,
     dwarf: String,
     preserve_names: bool,
@@ -333,6 +343,7 @@ fn fuse_command(
     let config = FuserConfig {
         memory_strategy,
         attestation: !no_attestation,
+        reproducible,
         component_provenance: !no_component_provenance,
         address_rebasing: address_rebase,
         preserve_names,

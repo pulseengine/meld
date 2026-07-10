@@ -188,6 +188,7 @@ fn fuse_many(
     let config = FuserConfig {
         memory_strategy,
         attestation: false,
+        reproducible: false,
         component_provenance: false,
         address_rebasing,
         preserve_names: false,
