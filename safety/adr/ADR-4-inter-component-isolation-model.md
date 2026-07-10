@@ -116,9 +116,25 @@ shared mode.
 
 ## `Auto`-default policy (resolved — maintainer decision)
 
-The `Auto` strategy (#172) prefers `SharedMemory` + rebasing when
-provably sound (no `memory.grow`, ≥2 input memories), else `MultiMemory`,
-with a runtime downgrade shared→multi if shared fusion refuses.
+> **⚠ SUPERSEDED IN PART by #326 (v0.38.0).** The decision below rejected
+> flipping `Auto` to prefer `MultiMemory` on the premise that shared+rebasing
+> was a *sound* alternative isolation model with a size benefit. #326 proved
+> that premise false: address rebasing does not relocate the dynamic address
+> operand of ordinary loads/stores, so shared fusion silently corrupts any
+> component using computed pointers (LS-M-11). With no valid benefit to
+> preserve, `Auto` now resolves to `MultiMemory` (the sound strategy) and no
+> longer selects shared+rebase; shared+rebase is reachable only by explicit
+> `--memory shared --address-rebase`, which warns loudly (PR #329, SR-37 as
+> corrected). Item 2's "flipping was rejected" is thus reversed — not to change
+> an isolation *model*, but to stop defaulting to a *corrupting* transform. The
+> single-address-space (MCU) benefit shared fusion was meant to give (#298/#299)
+> returns only once correct dynamic-address rebasing lands in `rewriter.rs`
+> (tracked follow-up). The rest of this section (explicit-is-safety, the
+> attestation backstop) still holds.
+
+The `Auto` strategy (#172) originally preferred `SharedMemory` + rebasing when
+believed provably sound (no `memory.grow`, ≥2 input memories), else `MultiMemory`.
+Since #326 it always resolves to `MultiMemory`.
 
 **Decision: `Auto` is NOT flipped, and `Auto` is NOT the safety path.**
 Rationale (maintainer): *functional safety wants the isolation model to
@@ -149,8 +165,16 @@ build, `Fuser::fuse` emits a `warn`-level note recommending an explicit
 safety builds. The warning reports the *final* strategy (after any
 shared→multi downgrade), not the initial pick, and fires only when
 attestation is enabled (the release/safety-build signal) to avoid noise
-on casual fusion. Log-only — no change to fusion behavior; the existing
-`auto_memory` tests confirm resolution is unchanged.
+on casual fusion. (Since #326 this attested-build warning is in addition to
+the always-on warning that `Auto` gated shared+rebase to multi-memory.)
+
+**Updated by #326 (v0.38.0):** the earlier claim here — "log-only, no change
+to fusion behavior; the `auto_memory` tests confirm resolution is unchanged" —
+no longer holds. `Auto` resolution DID change: it now always yields
+`MultiMemory` (was shared+rebase for grow-free multi-memory inputs), because
+shared+rebase is unsound (LS-M-11). The `auto_memory` tests were updated to
+assert the new resolution (`ls_m_11_auto_gates_unsound_shared_rebase`,
+`auto_keeps_multi_*`, `ls_m_7_*`).
 
 Not done (a stricter option, if wanted later): *erroring* instead of
 warning when `Auto` is used on an attested build, behind an opt-in

@@ -4,6 +4,64 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.38.0] - 2026-07-10
+
+Correctness release: a **soundness fix** to the default memory strategy, a
+**reproducible-build** flag, and the completion of the DWARF-verify trilogy.
+
+**⚠ Default-behaviour change (#326):** `meld fuse --memory auto` (the default)
+**no longer selects shared memory + address rebasing** — it always resolves to
+multi-memory. The shared+rebase path was silently corrupting memory for any
+component that addresses memory via computed pointers (see below). This
+**supersedes ADR-4's prior "`Auto` is not flipped" decision** (that decision
+assumed shared+rebase was a sound alternative isolation model; #326 proved it
+corrupts). Consequence: default fused output now needs `wasm-opt
+--enable-multimemory` and loses single-address-space (MCU) lowering until the
+correct-rebasing follow-up lands; use explicit `--memory shared --address-rebase`
+(now warns loudly) if you knowingly want the old behaviour.
+
+**Falsification:** if `--memory auto` still selected shared+rebase for a
+grow-free multi-memory input, `ls_m_11_auto_gates_unsound_shared_rebase` would
+fail — it asserts multi-memory + two separate memories. If `--reproducible`
+fusion were not byte-stable, `test_reproducible_attestation_is_byte_stable`
+would fail (and its control asserts non-reproducible output *does* differ, so
+the flag can't silently no-op). If the DWARF remap emitted a wrong length,
+range, or location, `llvm-dwarfdump --verify` would report it — instead the
+records+variants fixtures go from 1049 errors to 0.
+
+### Added
+
+- **`--reproducible` flag for byte-stable output (#325).** `meld fuse
+  --reproducible` derives the attestation id from the output content and takes
+  the timestamp from `SOURCE_DATE_EPOCH` (default epoch 0) instead of a random
+  UUID + wall clock, so identical input yields an identical sha256 — a
+  prerequisite for reproducible-build / supply-chain attestation. (Root cause of
+  the nondeterminism was the attestation section, not fusion; the fused module
+  was already deterministic.)
+
+### Fixed
+
+- **Shared-memory fusion silently corrupted memory (#326, LS-M-11) — GATED.**
+  Address rebasing only relocated the static memarg offset (and bulk-memory
+  ops), never the dynamic address operand of ordinary loads/stores, so
+  computed-pointer access collided across components with no trap or error.
+  `Auto` now gates this unsound path (→ multi-memory); explicit shared+rebase
+  warns. SR-37 corrected (it had *required* the unsound preference); ADR-4
+  superseded; the correct runtime dynamic-address rebasing in `rewriter.rs` is a
+  tracked follow-up.
+- **DWARF-verify trilogy complete (#319, #320/#321/#322).** `--dwarf remap` now
+  rewrites `DW_AT_high_pc` lengths, `DW_AT_ranges` lists, and `DW_AT_location`
+  lists to the fused layout — `llvm-dwarfdump --verify` goes from 1049 errors to
+  0 on the records+variants fixtures.
+
+### Changed
+
+- **Tier-C meld→kiln execution seam (#297)** tracked to the current kiln-side
+  blocker (E0BBB on kiln#375; kiln#364 + kiln#382/E5DC2 resolved upstream);
+  meld's fused output is spec-valid throughout (runs on wasmtime 41). Test stays
+  `#[ignore]`d pending kiln.
+- Adopted rivet v0.22.0 release-handling as the pre-tag readiness gate (#318).
+
 ## [0.37.0] - 2026-06-26
 
 Downstream-boundary release: meld now (a) emits machine-checkable **fusion

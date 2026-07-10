@@ -433,7 +433,7 @@ artifacts:
     type: sw-verification
     title: "Verification of SR-37: Automatic memory-strategy resolution (sound-by-construction default)"
     description: >
-      Verifies SR-37 via: tests `meld-core/tests/auto_memory.rs::auto_selects_shared_for_growfree_inputs`, `meld-core/tests/auto_memory.rs::ls_m_7_auto_keeps_multi_when_input_grows`, `meld-core/tests/auto_memory.rs::ls_m_7_auto_reprobes_after_add_component`, `meld-core/tests/auto_memory.rs::auto_keeps_multi_for_single_memory_input`, `meld-core/tests/auto_memory.rs::explicit_multi_is_not_overridden`, `meld-core/src/memory_probe.rs::tests::ls_m_7_malformed_input_counts_as_grow`.
+      Verifies SR-37 (post-#326: Auto resolves to multi-memory; shared+rebase is gated as unsound, LS-M-11) via: tests `meld-core/tests/auto_memory.rs::ls_m_11_auto_gates_unsound_shared_rebase`, `meld-core/tests/auto_memory.rs::ls_m_7_auto_keeps_multi_when_input_grows`, `meld-core/tests/auto_memory.rs::ls_m_7_auto_reprobes_after_add_component`, `meld-core/tests/auto_memory.rs::auto_keeps_multi_for_single_memory_input`, `meld-core/tests/auto_memory.rs::explicit_multi_is_not_overridden`, `meld-core/src/memory_probe.rs::tests::ls_m_7_malformed_input_counts_as_grow`.
     status: verified
     fields:
       method: automated-test

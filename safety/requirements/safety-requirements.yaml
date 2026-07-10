@@ -1143,30 +1143,41 @@ artifacts:
     title: Automatic memory-strategy resolution (sound-by-construction default)
     description: >
       `MemoryStrategy::Auto` — the default for both `FuserConfig` and the
-      `meld fuse` CLI — shall resolve to shared memory + address rebasing
-      if and only if (a) no input core module contains a `memory.grow`
-      instruction (static probe, conservative on parse failure) and
-      (b) the inputs carry at least two linear memories. Otherwise it
-      shall resolve to multi-memory. If the shared-memory plan refuses
-      the input, fusion shall retry with multi-memory, so Auto accepts
-      every input multi-memory accepts. The resolved strategy shall be
-      reported in `FusionStats` and recorded in the attestation /
-      provenance metadata as the concrete strategy, never as "auto".
-      Rationale: out-of-the-box `meld fuse` output must flow through the
-      `wasm-opt → synth` chain with no extra flags (#172) without ever
-      selecting the shared form where `memory.grow` makes it unsound
-      (merger Bug #7, LS-M-7).
+      `meld fuse` CLI — shall resolve to **multi-memory**, the strategy
+      that is sound by construction for arbitrary inputs. Auto shall
+      NOT select shared memory + address rebasing: address rebasing does
+      not relocate the dynamic address operand of ordinary load/store
+      instructions (only the static memarg offset and bulk-memory ops),
+      so components that address memory via computed pointers — heap,
+      shadow stack, i.e. all real components — would silently collide
+      in a shared memory (#326, LS-M-11). Shared memory + rebasing shall
+      remain reachable only by explicit selection (`--memory shared
+      --address-rebase`), which shall emit a loud unsoundness warning.
+      The resolved strategy shall be reported in `FusionStats` and
+      recorded in the attestation / provenance metadata as the concrete
+      strategy, never as "auto".
+      History: the prior form of SR-37 (v0.22.0) required Auto to prefer
+      shared+rebasing for grow-free multi-memory inputs — that
+      requirement was UNSOUND (it specified a corrupting transform) and
+      is superseded here by the #326 gate. The single-address-space
+      (MCU) benefit that shared fusion was meant to provide (#172, #298,
+      #299) requires correct dynamic-address rebasing in `rewriter.rs`
+      first (tracked follow-up); until then Auto trades that benefit for
+      correctness and its output needs `--enable-multimemory`.
     status: verified
-    tags: [usability, memory-strategy, v0.22.0]
+    tags: [usability, memory-strategy, v0.22.0, v0.38.0]
     links:
       - type: derives-from
         target: SYS-6
       - type: mitigates
         target: LS-M-7
+      - type: mitigates
+        target: LS-M-11
     cited-source:
       - uri: "https://github.com/pulseengine/meld/issues/172"
         kind: github
         last-checked: 2026-06-24
+    release: v0.38.0
     fields:
       implementation:
         - meld-core/src/memory_probe.rs
