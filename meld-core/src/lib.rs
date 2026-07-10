@@ -452,16 +452,35 @@ impl Fuser {
             }
             return result;
         }
+        // #326: explicit `--memory shared --address-rebase` is an opt-in to an
+        // unsound transform — address rebasing does not rebase computed memory
+        // addresses, so it silently corrupts real components. `auto` no longer
+        // selects this path; when a caller requests it explicitly, warn loudly
+        // rather than corrupt silently (LS-D-1). The build still proceeds.
+        if self.config.memory_strategy == MemoryStrategy::SharedMemory
+            && self.config.address_rebasing
+        {
+            log::warn!(
+                "memory strategy: explicit shared-memory + address rebasing is UNSOUND \
+                 for components that access memory via computed pointers (#326) — the \
+                 dynamic address operand of ordinary loads/stores is not rebased, so \
+                 per-component memory can silently collide. Prefer `--memory multi` \
+                 unless every input addresses memory only via static offsets."
+            );
+        }
         self.fuse_with_stats_resolved()
     }
 
     /// Resolve `MemoryStrategy::Auto` against the added components.
     ///
-    /// Shared memory + address rebasing is selected only when it is
-    /// statically sound AND buys anything: no input module can grow its
-    /// memory (`memory_probe`, merger Bug #7) and the inputs carry at
-    /// least two memories (with fewer, multi-memory output is already
-    /// single-memory). Any user-supplied `address_rebasing` value is
+    /// Auto always selects **multi-memory** — it is the sound strategy. Shared
+    /// memory + address rebasing was previously auto-selected for grow-free,
+    /// multi-memory inputs, but that path is **unsound** (#326): rebasing does
+    /// not relocate the dynamic address operand of ordinary loads/stores, so
+    /// components addressing memory via computed pointers silently collide.
+    /// Until correct dynamic rebasing lands, Auto never picks shared+rebase;
+    /// it remains reachable only via explicit `--memory shared --address-rebase`
+    /// (which warns loudly). Any user-supplied `address_rebasing` value is
     /// overridden — Auto owns both knobs.
     fn resolve_auto_memory_strategy(&mut self) {
         let mut memory_count = 0usize;
@@ -495,12 +514,25 @@ impl Fuser {
             self.config.memory_strategy = MemoryStrategy::MultiMemory;
             self.config.address_rebasing = false;
         } else {
-            log::info!(
-                "memory strategy auto: {memory_count} memories, no memory.grow; \
-                 selecting shared memory with address rebasing"
+            // #326: address rebasing does NOT rebase the dynamic address
+            // operand of ordinary loads/stores (only the static memarg offset
+            // and bulk-memory ops) — so shared-memory fusion silently corrupts
+            // any component that addresses memory via a computed pointer (heap,
+            // shadow stack — i.e. all real components). Until correct dynamic
+            // rebasing lands, `auto` must NOT silently pick shared+rebase.
+            // Fall back to multi-memory, which is sound (LS-D-1: emit correct
+            // output, never a plausible-but-wrong one). Explicit
+            // `--memory shared --address-rebase` remains available as an
+            // opt-in, and warns loudly (see `warn_if_unsound_rebasing`).
+            log::warn!(
+                "memory strategy auto: {memory_count} memories, no memory.grow — \
+                 shared-memory fusion would apply here, but address rebasing is \
+                 unsound for computed memory addresses (#326); selecting \
+                 multi-memory instead. Use `--memory shared --address-rebase` to \
+                 override explicitly (unsound; corrupts computed-pointer access)."
             );
-            self.config.memory_strategy = MemoryStrategy::SharedMemory;
-            self.config.address_rebasing = true;
+            self.config.memory_strategy = MemoryStrategy::MultiMemory;
+            self.config.address_rebasing = false;
         }
     }
 
