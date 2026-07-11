@@ -1707,3 +1707,61 @@ artifacts:
         absolute address purely as a value (no load/store) still slips the
         hard-error gate; does not affect the supported `--emit-relocs` path.
 
+  - id: SR-49
+    type: sw-req
+    title: Fused shared-memory output is directly MCU-dissolvable
+    description: >
+      When `meld fuse --memory shared` flattens a wac-composed multi-provider
+      node for the single-address-space (MCU) dissolve path, the fused core
+      module shall not leave artifacts that block a downstream
+      `synth --native-pointer-abi --shadow-stack-size` lowering (#334). Two are
+      required:
+      (1) SHADOW-STACK COALESCING — the fused module shall carry a SINGLE
+      `__stack_pointer` global, not one per input component. A shared linear
+      memory has one shadow stack; leaving N mutable `i32` globals all
+      initialised to the same `sp_init` is UNSOUND (two components descending
+      from the shared-memory top clobber each other's frames on a
+      cross-component call) and defeats synth's shadow-stack rebasing (it cannot
+      uniquely identify the stack global, synth#707). meld shall keep one
+      survivor and redirect every `global.get`/`global.set` of the coalesced
+      duplicates to it, dropping the extras.
+      (2) DEAD-SHIM DCE — the vestigial wac lowered-import trampoline (a
+      `call_indirect` through an `$imports` table, exported as `"0"`, that
+      becomes unreachable and mis-typed once meld flattens the real
+      cross-component calls to direct calls) shall not survive in the fused
+      output: meld shall drop its keep-alive export (or not materialise it once
+      imports are internalised) so it is DCE-eligible. A surviving mis-typed
+      trampoline is loud-declined by synth's closed-world check (synth#642/#676),
+      skipping the function.
+      Result: the fused node dissolves cleanly (zero warnings) to a
+      budget-fitting relocatable object — gale's gust:os v0.4.0 buffer node fits
+      the STM32F100 8 KiB SRAM budget without the hand WAT surgery gale currently
+      applies.
+    status: proposed
+    tags: [memory-strategy, shared-memory, mcu, dissolve, dce, v0.41.0]
+    links:
+      - type: derives-from
+        target: SYS-2
+      - type: derives-from
+        target: SYS-8
+    cited-source:
+      - uri: "https://github.com/pulseengine/meld/issues/334"
+        kind: github
+        last-checked: 2026-07-11
+    release: v0.41.0
+    fields:
+      implementation:
+        - meld-core/src/merger.rs
+        - meld-core/src/rewriter.rs
+      verification-method: test
+      verification-description: >
+        PLANNED. (1) A fused two-provider shared-memory module exposes exactly
+        one mutable `i32` `__stack_pointer`-class global (init == sp_init), and
+        every use of a coalesced duplicate is redirected to the survivor
+        (global-index remap verified; a runtime check that two providers' frames
+        do not alias). (2) The fused output contains no exported `call_indirect`
+        trampoline over an import table — the dead shim's keep-alive export is
+        dropped so it DCEs. End-to-end oracle on the gale app-tl repro: the fused
+        module lowers under `synth ... --native-pointer-abi --shadow-stack-size`
+        with zero closed-world/shadow-stack warnings and fits the 8 KiB budget.
+
