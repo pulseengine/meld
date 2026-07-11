@@ -1366,6 +1366,7 @@ fn shift_function_indices(
             memory_initial_pages,
             data_segment_base,
             elem_segment_base,
+            None, // code_addr_relocs (#326): adapter/shim re-rewrite, no relocs
         );
 
         let import_func_count = module

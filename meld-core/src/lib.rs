@@ -1022,6 +1022,10 @@ impl Fuser {
                 memory_initial_pages,
                 data_segment_base,
                 elem_segment_base,
+                // #326: this adapter-redirect re-rewrite runs with
+                // `memory_base_offset == 0` (no rebasing), so no reloc
+                // consumption is needed here.
+                None,
             );
 
             let import_func_count = module
@@ -1541,6 +1545,7 @@ impl Fuser {
                 None,
                 data_segment_base,
                 elem_segment_base,
+                None, // code_addr_relocs (#326): base 0, no rebasing on this pass
             );
             let import_func_count = module
                 .imports
@@ -1783,6 +1788,14 @@ impl Fuser {
                 .iter()
                 .filter(|(name, _)| {
                     if !self.config.preserve_names && name == "name" {
+                        return false;
+                    }
+                    // #326: `linking` + `reloc.*` metadata describes each INPUT
+                    // module's own section layout; after fusion the section
+                    // indices/offsets they name are stale (and, where address
+                    // rebasing consumed them, already applied). Never emit them
+                    // on the fused module.
+                    if name == "linking" || name.starts_with("reloc.") {
                         return false;
                     }
                     // Only PassThrough emits raw per-input `.debug_*`

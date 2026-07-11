@@ -127,6 +127,11 @@ pub struct ParsedDataSegment {
     pub mode: DataSegmentMode_,
     /// Raw data bytes
     pub data: Vec<u8>,
+    /// Byte offset of this segment's payload (`data`) bytes within the data
+    /// section's *content* — the coordinate space `reloc.DATA` entry offsets
+    /// use (#326 Part C). Lets the fuser locate which absolute pointers inside
+    /// `data` a `reloc.DATA` site names, to rebase them for shared memory.
+    pub content_offset: u32,
 }
 
 /// Data segment mode
@@ -288,9 +293,15 @@ pub fn parse_data_segments(module: &CoreModule) -> Result<Vec<ParsedDataSegment>
             wasmparser::DataKind::Passive => DataSegmentMode_::Passive,
         };
 
+        // `data.range` covers this whole segment entry within the section
+        // content (base-0 reader); the payload bytes are its final `len` bytes,
+        // so their start is `range.end - len` — the data-section-content offset
+        // that `reloc.DATA` sites are relative to.
+        let content_offset = (data.range.end - data.data.len()) as u32;
         segments.push(ParsedDataSegment {
             mode,
             data: data.data.to_vec(),
+            content_offset,
         });
     }
 
@@ -745,6 +756,7 @@ mod tests {
                 offset_value: Some(ConstExprValue::I32(10)),
             },
             data: vec![1, 2, 3],
+            content_offset: 0,
         };
 
         let mut maps = IndexMaps::new();
@@ -774,6 +786,7 @@ mod tests {
                 offset_value: None,
             },
             data: vec![1],
+            content_offset: 0,
         };
 
         let mut maps = IndexMaps::new();
@@ -880,6 +893,7 @@ mod tests {
                 offset_value: Some(ConstExprValue::I32(0)),
             },
             data: vec![0xAA, 0xBB],
+            content_offset: 0,
         };
 
         let mut maps = IndexMaps::new();
@@ -909,6 +923,7 @@ mod tests {
                 offset_value: None,
             },
             data: vec![0xFF],
+            content_offset: 0,
         };
 
         let mut maps = IndexMaps::new();

@@ -1,8 +1,8 @@
 use meld_core::{Fuser, FuserConfig, MemoryStrategy};
 use wasm_encoder::{
-    CodeSection, Component, DataCountSection, DataSection, DataSegment, DataSegmentMode,
-    ExportKind, ExportSection, Function, FunctionSection, Instruction, MemorySection, MemoryType,
-    Module, ModuleSection, TypeSection,
+    CodeSection, Component, CustomSection, DataCountSection, DataSection, DataSegment,
+    DataSegmentMode, ExportKind, ExportSection, Function, FunctionSection, Instruction, MemArg,
+    MemorySection, MemoryType, Module, ModuleSection, TypeSection, ValType,
 };
 use wasmtime::{Config, Engine, Instance, Module as RuntimeModule, Store};
 
@@ -236,13 +236,331 @@ fn test_298_real_wit_bindgen_component_blocks_shared_rebase() {
         .add_component_named(&component, Some("strings-simple"))
         .unwrap();
 
-    let err = fuser.fuse().expect_err(
-        "today: a real wit-bindgen component (cabi_realloc-backed memory.grow) \
-         must not fuse under shared+rebase",
-    );
+    let err = fuser
+        .fuse()
+        .expect_err("a real wit-bindgen component must not fuse under shared+rebase");
     let msg = err.to_string();
+    // The invariant this pins is that a real wit-bindgen artifact is REJECTED
+    // under shared+rebase — the corruption meld must not silently emit. There
+    // are now two hard-fail gates and either satisfies the invariant:
+    //   * the #298 `memory.grow` rebase rejection (the vestigial allocator), or
+    //   * #326's path-F `MissingRelocMetadata`: this artifact's non-base module
+    //     carries no relocation metadata yet does direct memory access, so its
+    //     absolute addresses cannot be rebased safely. That gate is checked at
+    //     merge time, *before* the rewriter reaches the `memory.grow`, so on
+    //     this fixture #326 now fires first.
     assert!(
-        msg.contains("memory.grow"),
-        "expected the memory.grow rebase rejection on a real wit-bindgen artifact, got: {msg}"
+        msg.contains("memory.grow") || msg.contains("relocation metadata"),
+        "expected shared+rebase to reject the real wit-bindgen artifact \
+         (memory.grow or missing-reloc-metadata), got: {msg}"
+    );
+}
+
+// ─── #326: relocation-driven address rebasing ──────────────────────────────
+
+const RELOC_ADDR: i32 = 0x100;
+const RELOC_VAL: i32 = 0xAB;
+
+/// The base module (component-a): a 1-page shared memory exported as "memory".
+/// It occupies window `[0, 64KiB)`, so the reloc module below is placed at base
+/// 64KiB. No code ⟹ no direct memory access ⟹ no relocs required (base 0).
+fn build_reloc_base_module() -> Module {
+    let mut exports = ExportSection::new();
+    exports.export("memory", ExportKind::Memory, 0);
+
+    let mut module = Module::new();
+    module.section(&shared_memory_section()).section(&exports);
+    module
+}
+
+/// Add the sections of the reloc module: a 1-page shared memory and three
+/// functions. `b_store` writes `RELOC_VAL` through the **absolute** address
+/// `RELOC_ADDR`; `b_load` reads it back; `b_get_addr` simply RETURNS the
+/// absolute address literal. Every `i32.const RELOC_ADDR` is a site the
+/// synthetic `reloc.CODE` MEMORY_ADDR entry flags.
+///
+/// `b_get_addr` is the real discriminator: it uses the address as a *value*
+/// (as canonical-ABI code does when it takes `&BUF` to hand to `memcpy`), where
+/// there is no load/store `memarg` for the legacy access-point rebasing to
+/// "accidentally" compensate. Pre-fix it returns the un-rebased `RELOC_ADDR`
+/// (pointing into component-a's window); post-fix it returns `base+RELOC_ADDR`.
+/// The store/load `memarg` offsets are 0 (genuine, not addresses) so they must
+/// NOT be rebased — proving const-rebase and (conditional) memarg-rebase do not
+/// double-count.
+fn add_reloc_module_sections(module: &mut Module) {
+    let mut types = TypeSection::new();
+    types.ty().function([], []); // type 0: b_store: () -> ()
+    types.ty().function([], [ValType::I32]); // type 1: () -> i32
+
+    let mut functions = FunctionSection::new();
+    functions.function(0);
+    functions.function(1);
+    functions.function(1);
+
+    let mut exports = ExportSection::new();
+    exports.export("b_store", ExportKind::Func, 0);
+    exports.export("b_load", ExportKind::Func, 1);
+    exports.export("b_get_addr", ExportKind::Func, 2);
+
+    let zero_memarg = MemArg {
+        offset: 0,
+        align: 0,
+        memory_index: 0,
+    };
+
+    let mut code = CodeSection::new();
+    let mut store = Function::new([]);
+    store.instruction(&Instruction::I32Const(RELOC_ADDR)); // absolute address (reloc-flagged)
+    store.instruction(&Instruction::I32Const(RELOC_VAL));
+    store.instruction(&Instruction::I32Store8(zero_memarg));
+    store.instruction(&Instruction::End);
+    code.function(&store);
+
+    let mut load = Function::new([]);
+    load.instruction(&Instruction::I32Const(RELOC_ADDR)); // absolute address (reloc-flagged)
+    load.instruction(&Instruction::I32Load8U(zero_memarg));
+    load.instruction(&Instruction::End);
+    code.function(&load);
+
+    let mut get_addr = Function::new([]);
+    get_addr.instruction(&Instruction::I32Const(RELOC_ADDR)); // returned as a VALUE (reloc-flagged)
+    get_addr.instruction(&Instruction::End);
+    code.function(&get_addr);
+
+    module
+        .section(&types)
+        .section(&functions)
+        .section(&shared_memory_section())
+        .section(&exports)
+        .section(&code);
+}
+
+fn write_uleb(out: &mut Vec<u8>, mut v: u32) {
+    loop {
+        let mut byte = (v & 0x7f) as u8;
+        v >>= 7;
+        if v != 0 {
+            byte |= 0x80;
+        }
+        out.push(byte);
+        if v == 0 {
+            break;
+        }
+    }
+}
+
+/// Parse `module_bytes` and return the code-section-content byte offset of the
+/// immediate of every `i32.const flag_value` — the coordinate space a
+/// `reloc.CODE` MEMORY_ADDR entry uses (`opcode_pos - code_content_start + 1`,
+/// matching how meld's rewriter walks operators over the sliced code section).
+fn find_i32const_reloc_offsets(module_bytes: &[u8], flag_value: i32) -> Vec<u32> {
+    let mut code_start = None;
+    let mut offsets = Vec::new();
+    for payload in wasmparser::Parser::new(0).parse_all(module_bytes) {
+        match payload.expect("payload") {
+            wasmparser::Payload::CodeSectionStart { range, .. } => code_start = Some(range.start),
+            wasmparser::Payload::CodeSectionEntry(body) => {
+                let cs = code_start.expect("code section start seen first");
+                for item in body
+                    .get_operators_reader()
+                    .expect("operators")
+                    .into_iter_with_offsets()
+                {
+                    let (op, pos) = item.expect("operator");
+                    if let wasmparser::Operator::I32Const { value } = op
+                        && value == flag_value
+                    {
+                        offsets.push((pos - cs + 1) as u32);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    offsets
+}
+
+/// Build a `reloc.CODE` custom-section body flagging each offset as a
+/// `MemoryAddrSleb` site (`type=4, offset, index=0, addend=0`).
+fn build_reloc_code_body(offsets: &[u32]) -> Vec<u8> {
+    let mut body = Vec::new();
+    write_uleb(&mut body, 3); // target section index (cosmetic — consumer ignores it)
+    write_uleb(&mut body, offsets.len() as u32);
+    for &off in offsets {
+        body.push(4u8); // R_WASM_MEMORY_ADDR_SLEB
+        write_uleb(&mut body, off);
+        write_uleb(&mut body, 0); // symbol index
+        body.push(0u8); // addend = 0 (sleb)
+    }
+    body
+}
+
+/// The reloc module wrapped as a component. Built in two passes: a dry build to
+/// locate the address-literal offsets, then the real build with a `linking`
+/// (version 2) and `reloc.CODE` custom section appended. Custom sections sit
+/// after the code section, so appending them does not shift the offsets found
+/// in the dry pass.
+fn build_reloc_component() -> Vec<u8> {
+    let mut dry = Module::new();
+    add_reloc_module_sections(&mut dry);
+    let dry_bytes = dry.finish();
+    let offsets = find_i32const_reloc_offsets(&dry_bytes, RELOC_ADDR);
+    assert_eq!(offsets.len(), 3, "three i32.const address literals to flag");
+    let reloc_code = build_reloc_code_body(&offsets);
+
+    let mut module = Module::new();
+    add_reloc_module_sections(&mut module);
+    module.section(&CustomSection {
+        name: "linking".into(),
+        data: vec![0x02].into(), // version 2, no subsections
+    });
+    module.section(&CustomSection {
+        name: "reloc.CODE".into(),
+        data: reloc_code.into(),
+    });
+    build_component(module)
+}
+
+/// True if the core module `bytes` carries a top-level custom section `name`.
+fn has_custom_section(bytes: &[u8], name: &str) -> bool {
+    wasmparser::Parser::new(0)
+        .parse_all(bytes)
+        .any(|p| matches!(p, Ok(wasmparser::Payload::CustomSection(r)) if r.name() == name))
+}
+
+/// #326 behavioural oracle: fusing a relocatable module into shared memory at a
+/// non-zero base must rebase its absolute `i32.const` addresses.
+///
+/// The discriminator is `b_get_addr`, which returns the absolute address of the
+/// module's `BUF` as a *value* (what canonical-ABI code does when it takes
+/// `&BUF` to pass to `memcpy`). `b_store` first writes `0xAB` at that address.
+///
+/// * BEFORE the reloc-consumer fix the `i32.const RELOC_ADDR` is left
+///   un-rebased, so `b_get_addr` returns `RELOC_ADDR` (0x100) — an address in
+///   component-a's window. `read_shared` at that returned address reads `0`
+///   (component-a never wrote there): the two assertions below FAIL.
+///   (Note: `b_store`'s own byte still lands at `base+RELOC_ADDR` even pre-fix
+///   because the legacy *access-point* rebasing rebases the store's `memarg`
+///   offset — which is exactly why a store-and-read-back oracle would NOT
+///   distinguish, and why the discriminator uses the address as a value.)
+/// * AFTER the fix `b_get_addr` returns `base+RELOC_ADDR`, and `read_shared` at
+///   that address reads back the `0xAB` written by `b_store`.
+#[test]
+fn test_326_reloc_const_rebasing_end_to_end() {
+    let component_a = build_component(build_reloc_base_module());
+    let component_b = build_reloc_component();
+
+    let config = FuserConfig {
+        memory_strategy: MemoryStrategy::SharedMemory,
+        address_rebasing: true,
+        ..Default::default()
+    };
+    let mut fuser = Fuser::new(config);
+    fuser
+        .add_component_named(&component_a, Some("component-a"))
+        .unwrap();
+    fuser
+        .add_component_named(&component_b, Some("component-b"))
+        .unwrap();
+
+    let fused = fuser.fuse().unwrap();
+
+    // Part C: the consumed reloc/linking metadata must not survive fusion.
+    assert!(
+        !has_custom_section(&fused, "reloc.CODE"),
+        "reloc.CODE must be stripped from the fused output"
+    );
+    assert!(
+        !has_custom_section(&fused, "linking"),
+        "linking must be stripped from the fused output"
+    );
+
+    let mut engine_config = Config::new();
+    engine_config.wasm_threads(true);
+    engine_config.shared_memory(true);
+    engine_config.wasm_bulk_memory(true);
+
+    let engine = Engine::new(&engine_config).unwrap();
+    let module = RuntimeModule::new(&engine, &fused).unwrap();
+    let mut store = Store::new(&engine, ());
+    let instance = Instance::new(&mut store, &module, &[]).unwrap();
+
+    let b_store = instance
+        .get_typed_func::<(), ()>(&mut store, "b_store")
+        .unwrap();
+    let b_load = instance
+        .get_typed_func::<(), i32>(&mut store, "b_load")
+        .unwrap();
+    let b_get_addr = instance
+        .get_typed_func::<(), i32>(&mut store, "b_get_addr")
+        .unwrap();
+
+    b_store.call(&mut store, ()).unwrap();
+
+    let memory = instance
+        .get_shared_memory(&mut store, "memory")
+        .expect("shared memory export not found");
+    let base = WASM_PAGE_SIZE; // component-b is placed at page 1
+
+    // DISCRIMINATOR 1: the address literal, used as a value, must be rebased.
+    let addr = b_get_addr.call(&mut store, ()).unwrap();
+    assert_eq!(
+        addr,
+        (base + RELOC_ADDR as usize) as i32,
+        "b_get_addr must return the REBASED address base+0x100 (pre-fix: 0x100)"
+    );
+
+    // DISCRIMINATOR 2 (behavioural): the address the module computes for BUF
+    // must actually point at the byte `b_store` wrote. Pre-fix `addr` is 0x100
+    // (component-a's window, never written) so this reads 0.
+    let via_addr = read_shared(&memory, addr as usize, 1);
+    assert_eq!(
+        via_addr,
+        vec![RELOC_VAL as u8],
+        "the module's computed BUF address must point at the written byte"
+    );
+
+    // Sanity: the store landed at the rebased window and `b_load` reads it back.
+    // (These pass pre-fix too, via the legacy access-point memarg rebasing.)
+    assert_eq!(
+        read_shared(&memory, base + RELOC_ADDR as usize, 1),
+        vec![RELOC_VAL as u8]
+    );
+    assert_eq!(b_load.call(&mut store, ()).unwrap(), RELOC_VAL);
+}
+
+/// #326 Part A (path-F): a module doing direct memory access, placed at a
+/// non-zero shared-memory base but carrying NO relocation metadata, cannot have
+/// its absolute addresses rebased safely, so fusion must hard-fail with
+/// `MissingRelocMetadata` rather than silently emit a colliding module.
+#[test]
+fn test_326_shared_rebase_without_relocs_hard_errors() {
+    let component_a = build_component(build_reloc_base_module());
+
+    // Same direct-memory module as the oracle, but WITHOUT the reloc.CODE /
+    // linking custom sections.
+    let mut module = Module::new();
+    add_reloc_module_sections(&mut module);
+    let component_b = build_component(module);
+
+    let config = FuserConfig {
+        memory_strategy: MemoryStrategy::SharedMemory,
+        address_rebasing: true,
+        ..Default::default()
+    };
+    let mut fuser = Fuser::new(config);
+    fuser
+        .add_component_named(&component_a, Some("component-a"))
+        .unwrap();
+    fuser
+        .add_component_named(&component_b, Some("non-relocatable"))
+        .unwrap();
+
+    let err = fuser
+        .fuse()
+        .expect_err("shared+rebase of a non-relocatable direct-memory module must fail");
+    assert!(
+        matches!(err, meld_core::Error::MissingRelocMetadata { .. }),
+        "expected MissingRelocMetadata, got: {err:?}"
     );
 }

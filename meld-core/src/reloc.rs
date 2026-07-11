@@ -253,6 +253,96 @@ pub struct RelocInfo {
     pub sections: Vec<RelocSection>,
 }
 
+impl RelocInfo {
+    /// Code-section-content byte offsets of every `R_WASM_MEMORY_ADDR_*` site
+    /// recorded in `reloc.CODE`.
+    ///
+    /// Each offset points at the relocatable immediate inside a function body
+    /// — the LEB of an `i32.const`/`i64.const` address literal, or the LEB
+    /// `offset` field of a load/store `memarg`. These are exactly the sites
+    /// the fuser must rebase by the shared-memory base. The coordinate space
+    /// is the code section's *content* (the bytes a `CodeSectionReader`
+    /// consumes, starting at the function-count prefix), which is the same
+    /// space `OperatorsReader::into_iter_with_offsets()` reports when the code
+    /// section is parsed from its content start.
+    pub fn code_memory_addr_offsets(&self) -> std::collections::HashSet<u32> {
+        self.sections
+            .iter()
+            .filter(|s| s.target == RelocTarget::Code)
+            .flat_map(|s| s.entries.iter())
+            .filter(|e| e.ty.is_memory_addr())
+            .map(|e| e.offset)
+            .collect()
+    }
+
+    /// `reloc.DATA` `R_WASM_MEMORY_ADDR_I32` entries — the 4-byte little-endian
+    /// absolute pointers embedded in data-segment payloads that must be
+    /// rebased. Only the `I32` form embeds an inline pointer in a data section;
+    /// the LEB/SLEB memory-address forms only appear in code.
+    pub fn data_memory_addr_entries(&self) -> Vec<RelocEntry> {
+        self.sections
+            .iter()
+            .filter(|s| s.target == RelocTarget::Data)
+            .flat_map(|s| s.entries.iter())
+            .filter(|e| matches!(e.ty, RelocType::MemoryAddrI32))
+            .copied()
+            .collect()
+    }
+
+    /// Whether any `reloc.DATA` entry embeds a memory address that
+    /// [`data_memory_addr_entries`](Self::data_memory_addr_entries) does NOT
+    /// handle — i.e. a non-`I32` inline data pointer (the 8-byte
+    /// `R_WASM_MEMORY_ADDR_I64`/`_LEB64`/`_SLEB64` forms a `memory64` module
+    /// emits). Those pointers would be left un-rebased while the segment
+    /// placement *is* rebased, silently corrupting memory, so the caller must
+    /// reject rather than emit a plausible-but-wrong module (#326 Finding B,
+    /// LS-D-1). `MemoryAddrI32` is the only inline-data form we can rebase.
+    pub fn has_unhandled_data_addr_relocs(&self) -> bool {
+        self.sections
+            .iter()
+            .filter(|s| s.target == RelocTarget::Data)
+            .flat_map(|s| s.entries.iter())
+            .any(|e| e.ty.is_memory_addr() && !matches!(e.ty, RelocType::MemoryAddrI32))
+    }
+}
+
+/// Rebase the absolute little-endian `u32` pointers embedded in one data
+/// segment's payload by `base`.
+///
+/// `segment_content_start` is the byte offset of this segment's payload within
+/// the data-section content — the same coordinate space `reloc.DATA` entry
+/// offsets use. Each entry whose site falls inside
+/// `[segment_content_start, segment_content_start + payload.len())` has its
+/// 4-byte little-endian pointer read, `base` added (wrapping), and the result
+/// written back. Entries outside this segment are ignored (they belong to
+/// another segment). Passive/`.bss` segments with no inline pointers simply
+/// see no matching entries.
+pub fn rebase_data_segment_pointers(
+    payload: &mut [u8],
+    segment_content_start: u32,
+    entries: &[RelocEntry],
+    base: u32,
+) {
+    for entry in entries {
+        if !matches!(entry.ty, RelocType::MemoryAddrI32) {
+            continue;
+        }
+        let Some(rel) = entry.offset.checked_sub(segment_content_start) else {
+            continue;
+        };
+        let rel = rel as usize;
+        let Some(slot) = payload.get_mut(rel..rel + 4) else {
+            continue;
+        };
+        let mut buf = [0u8; 4];
+        buf.copy_from_slice(slot);
+        // The reloc addend is already folded into the stored value by the
+        // toolchain, so rebasing is a straight `+ base`.
+        let rebased = u32::from_le_bytes(buf).wrapping_add(base);
+        slot.copy_from_slice(&rebased.to_le_bytes());
+    }
+}
+
 /// Errors from relocation-metadata parsing.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum RelocError {
@@ -444,6 +534,49 @@ mod tests {
     use std::path::Path;
 
     const SPIKE_DIR: &str = "/tmp/spike326";
+
+    /// #326 Finding B: a `memory64` `reloc.DATA` entry embeds an 8-byte pointer
+    /// (`MemoryAddrI64`, wire code 16 → `RelocType::Other(16)`) that the
+    /// 4-byte-only rebasing cannot handle, so `has_unhandled_data_addr_relocs`
+    /// must flag it; an `I32` inline pointer must NOT be flagged.
+    #[test]
+    fn unhandled_data_addr_relocs_flags_non_i32_pointers() {
+        let i64_data = RelocInfo {
+            linking_version: Some(2),
+            linking_subsections: vec![],
+            sections: vec![RelocSection {
+                target: RelocTarget::Data,
+                target_section_index: 0,
+                entries: vec![RelocEntry {
+                    ty: RelocType::from_code(16), // R_WASM_MEMORY_ADDR_I64
+                    offset: 0,
+                    index: 0,
+                    addend: 0,
+                }],
+            }],
+        };
+        assert!(i64_data.has_unhandled_data_addr_relocs());
+        // The I64 form is a memory address but NOT a rebasable inline pointer,
+        // so it is excluded from the handled-entries list.
+        assert!(i64_data.data_memory_addr_entries().is_empty());
+
+        let i32_data = RelocInfo {
+            linking_version: Some(2),
+            linking_subsections: vec![],
+            sections: vec![RelocSection {
+                target: RelocTarget::Data,
+                target_section_index: 0,
+                entries: vec![RelocEntry {
+                    ty: RelocType::MemoryAddrI32,
+                    offset: 0,
+                    index: 0,
+                    addend: 0,
+                }],
+            }],
+        };
+        assert!(!i32_data.has_unhandled_data_addr_relocs());
+        assert_eq!(i32_data.data_memory_addr_entries().len(), 1);
+    }
 
     /// Ground-truth `reloc.CODE` entries, from `wasm-tools objdump`.
     fn expected_entries() -> Vec<RelocEntry> {
@@ -689,5 +822,80 @@ mod tests {
         assert!(info.sections.is_empty());
         assert_eq!(info.linking_version, None);
         assert!(!has_reloc_metadata(&[]));
+    }
+
+    /// The MEMORY_ADDR code sites the fuser must rebase are exactly the
+    /// `is_memory_addr()` entries' offsets — index-only relocations (function
+    /// index, etc.) are excluded.
+    #[test]
+    fn code_memory_addr_offsets_selects_only_memory_addr_sites() {
+        // MemoryAddrSleb@62, MemoryAddrLeb@132, plus a non-address
+        // FunctionIndexLeb@5 that must NOT appear.
+        let body: &[u8] = &[
+            0x03, // target section = CODE
+            0x03, // count = 3
+            0x04, 0x3e, 0x03, 0x20, // MemoryAddrSleb off=62 idx=3 add=32
+            0x00, 0x05, 0x01, // FunctionIndexLeb off=5 idx=1 (no addend)
+            0x03, 0x84, 0x01, 0x04, 0x00, // MemoryAddrLeb off=132 idx=4 add=0
+        ];
+        let customs = vec![("reloc.CODE".to_string(), body.to_vec())];
+        let info = parse_reloc_info(&customs).expect("parse");
+        let offsets = info.code_memory_addr_offsets();
+        assert_eq!(offsets.len(), 2);
+        assert!(offsets.contains(&62));
+        assert!(offsets.contains(&132));
+        assert!(!offsets.contains(&5), "index reloc must be excluded");
+    }
+
+    /// #326 Part C: a `reloc.DATA` `MEMORY_ADDR_I32` entry names a 4-byte LE
+    /// absolute pointer inside a data segment's payload; consuming it adds the
+    /// shared-memory base to that pointer. The spike's `.bss` symbols are
+    /// zero-init so no real `reloc.DATA` appears — this hand-built case pins
+    /// the mechanism directly.
+    #[test]
+    fn rebase_data_segment_pointer_adds_base() {
+        // reloc.DATA: target=DATA(=index 5 here, arbitrary), count=1,
+        // MemoryAddrI32(5) off=8 idx=0 add=0.
+        let body: &[u8] = &[
+            0x05, // target section index (DATA)
+            0x01, // count = 1
+            0x05, // MemoryAddrI32
+            0x08, // offset = 8 (data-section-content relative)
+            0x00, // symbol index = 0
+            0x00, // addend = 0
+        ];
+        let customs = vec![("reloc.DATA".to_string(), body.to_vec())];
+        let info = parse_reloc_info(&customs).expect("parse");
+        let entries = info.data_memory_addr_entries();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].offset, 8);
+
+        // A segment whose payload begins at content offset 6 and holds an
+        // absolute pointer 0x00000010 (=16) at bytes [2..6] — i.e. content
+        // offset 8, matching the reloc. Base = 0x10000 (one page).
+        let mut payload = vec![0xAA, 0xBB, 0x10, 0x00, 0x00, 0x00, 0xCC];
+        rebase_data_segment_pointers(&mut payload, 6, &entries, 0x1_0000);
+        // Pointer at [2..6] rebased from 16 → 16 + 65536.
+        let ptr = u32::from_le_bytes([payload[2], payload[3], payload[4], payload[5]]);
+        assert_eq!(ptr, 16 + 0x1_0000);
+        // Surrounding bytes are untouched.
+        assert_eq!(payload[0], 0xAA);
+        assert_eq!(payload[1], 0xBB);
+        assert_eq!(payload[6], 0xCC);
+    }
+
+    /// A `reloc.DATA` entry that points outside a given segment's payload must
+    /// not touch that segment (it belongs to a different segment).
+    #[test]
+    fn rebase_data_segment_pointer_ignores_out_of_range() {
+        let entries = vec![RelocEntry {
+            ty: RelocType::MemoryAddrI32,
+            offset: 100,
+            index: 0,
+            addend: 0,
+        }];
+        let mut payload = vec![1u8, 0, 0, 0];
+        rebase_data_segment_pointers(&mut payload, 0, &entries, 0x1_0000);
+        assert_eq!(payload, vec![1u8, 0, 0, 0], "out-of-range site untouched");
     }
 }

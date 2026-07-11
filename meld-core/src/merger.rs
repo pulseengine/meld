@@ -1248,6 +1248,7 @@ impl Merger {
                     None,  // memory_initial_pages
                     data_segment_base,
                     elem_segment_base,
+                    None, // code_addr_relocs (rebasing off in this re-rewrite pass)
                 );
                 let import_func_count = module
                     .imports
@@ -1884,6 +1885,52 @@ impl Merger {
         let memory_base_offset = shared_memory_plan
             .and_then(|plan| plan.bases.get(&(comp_idx, mod_idx)).copied())
             .unwrap_or(0);
+
+        // #326: relocation-driven address rebasing. A module placed at a
+        // non-zero shared-memory base has its absolute addresses shifted by
+        // that base; the `reloc.CODE` MEMORY_ADDR sites name exactly which
+        // `i32.const`/`memarg` immediates encode those addresses.
+        //
+        // Path-F (ADR-6): if such a module carries NO reloc metadata we cannot
+        // find its absolute addresses, so emitting it unchanged would collide
+        // it with a prior module and silently corrupt memory. Hard-fail —
+        // BUT only when the module actually performs *direct* (non-bulk)
+        // memory access. A module whose every memory touch is a bulk-memory op
+        // (`memory.copy/fill/init`) is safe without relocs: the rewriter
+        // rebases those ops' runtime address operands dynamically
+        // (`append_rebased_address`), so no baked-in absolute address can hide.
+        let mut data_addr_relocs: Vec<crate::reloc::RelocEntry> = Vec::new();
+        let code_addr_relocs = if self.address_rebasing {
+            let has_reloc = crate::reloc::has_reloc_metadata(&module.custom_sections);
+            if memory_base_offset != 0 && !has_reloc && module_has_direct_memory_access(module)? {
+                return Err(Error::MissingRelocMetadata {
+                    component: component_display_name(components, comp_idx),
+                    module: mod_idx.to_string(),
+                });
+            }
+            if has_reloc {
+                let info = crate::reloc::parse_reloc_info(&module.custom_sections)?;
+                // #326 Finding B: a memory64 module emits 8-byte inline data
+                // pointers (`R_WASM_MEMORY_ADDR_I64`) we cannot rebase; the
+                // segment placement would move while the pointers stay stale —
+                // silent corruption. Reject rather than emit a wrong module.
+                if info.has_unhandled_data_addr_relocs() {
+                    return Err(Error::UnsupportedFeature(format!(
+                        "component '{}' module {mod_idx}: shared-memory rebasing of \
+                         non-32-bit inline data pointers (memory64 reloc.DATA) is not \
+                         supported (#326)",
+                        component_display_name(components, comp_idx),
+                    )));
+                }
+                data_addr_relocs = info.data_memory_addr_entries();
+                Some(info.code_memory_addr_offsets())
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         let module_memory = if self.address_rebasing {
             module_memory_type(module)?
         } else {
@@ -1921,6 +1968,7 @@ impl Merger {
             memory_initial_pages,
             data_segment_base,
             elem_segment_base,
+            code_addr_relocs,
         );
 
         // Second pass: extract and rewrite function bodies
@@ -2203,9 +2251,26 @@ impl Merger {
             merged.elements.push(reindexed);
         }
 
-        // Parse and merge data segments with reindexing
+        // Parse and merge data segments with reindexing.
         let data_segments = crate::segments::parse_data_segments(module)?;
-        for segment in data_segments {
+        for mut segment in data_segments {
+            // #326 Part C: rebase absolute pointers baked into a data segment's
+            // payload. `reloc.DATA` MEMORY_ADDR_I32 sites name the 4-byte LE
+            // pointers; each segment's `content_offset` places its bytes in the
+            // same data-section-content coordinate space as those sites.
+            if memory_base_offset != 0 && !data_addr_relocs.is_empty() {
+                let base = u32::try_from(memory_base_offset).map_err(|_| {
+                    Error::MemoryStrategyUnsupported(
+                        "shared memory base offset exceeds 32-bit address space".to_string(),
+                    )
+                })?;
+                crate::reloc::rebase_data_segment_pointers(
+                    &mut segment.data,
+                    segment.content_offset,
+                    &data_addr_relocs,
+                    base,
+                );
+            }
             let reindexed = crate::segments::reindex_data_segment(&segment, &index_maps)?;
             merged.data_segments.push(reindexed);
         }
@@ -2930,6 +2995,86 @@ fn convert_global_type(
     }
 }
 
+/// Display name for a component (its declared name, else `component-<idx>`).
+/// Used in #326 diagnostics.
+fn component_display_name(components: &[ParsedComponent], comp_idx: usize) -> String {
+    components
+        .get(comp_idx)
+        .and_then(|c| c.name.clone())
+        .unwrap_or_else(|| format!("component-{comp_idx}"))
+}
+
+/// Whether `module` performs any *direct* (non-bulk) linear-memory access — an
+/// `i32.load`/`i32.store` family instruction whose effective address may embed
+/// a baked-in absolute address.
+///
+/// Bulk-memory ops (`memory.copy`/`fill`/`init`) are deliberately excluded: the
+/// rewriter rebases their runtime address operands dynamically
+/// ([`crate::rewriter`]'s `append_rebased_address`), so a module whose only
+/// memory touches are bulk ops is safe to place at a non-zero shared-memory
+/// base even without relocation metadata. This is what lets #326's path-F gate
+/// fire precisely — on modules that could hide an un-rebased absolute address —
+/// without rejecting the (safe) bulk-only case.
+///
+/// KNOWN LIMITATION (#326 Finding A, tracked follow-up): this catches an
+/// address embedded in a load/store, but NOT an `i32.const`/`i64.const` whose
+/// value is itself an absolute address used purely as a *value* (handed to an
+/// imported `memcpy`/`fd_write` or returned across the module boundary) with no
+/// direct access. Such a no-reloc module still slips the gate. A sound fix
+/// needs data-flow (a bare const is indistinguishable from an integer, and
+/// bulk-op-consumed consts ARE safe — rejecting all consts regresses the
+/// legitimate bulk-only case, `test_address_rebasing_end_to_end`). Note this
+/// residual gap does NOT affect the supported path: `--emit-relocs` inputs
+/// carry reloc metadata, so their address consts are rebased via `reloc.CODE`.
+fn module_has_direct_memory_access(module: &CoreModule) -> Result<bool> {
+    let Some((start, end)) = module.code_section_range else {
+        return Ok(false);
+    };
+    let code_bytes = &module.bytes[start..end];
+    let reader = wasmparser::CodeSectionReader::new(wasmparser::BinaryReader::new(code_bytes, 0))?;
+    for body in reader {
+        let body = body?;
+        for op in body.get_operators_reader()? {
+            if is_direct_memory_access(&op?) {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+/// True for the standard integer/float load & store operators (the ones that
+/// carry a `memarg`). See [`module_has_direct_memory_access`].
+fn is_direct_memory_access(op: &wasmparser::Operator<'_>) -> bool {
+    use wasmparser::Operator::*;
+    matches!(
+        op,
+        I32Load { .. }
+            | I64Load { .. }
+            | F32Load { .. }
+            | F64Load { .. }
+            | I32Load8S { .. }
+            | I32Load8U { .. }
+            | I32Load16S { .. }
+            | I32Load16U { .. }
+            | I64Load8S { .. }
+            | I64Load8U { .. }
+            | I64Load16S { .. }
+            | I64Load16U { .. }
+            | I64Load32S { .. }
+            | I64Load32U { .. }
+            | I32Store { .. }
+            | I64Store { .. }
+            | F32Store { .. }
+            | F64Store { .. }
+            | I32Store8 { .. }
+            | I32Store16 { .. }
+            | I64Store8 { .. }
+            | I64Store16 { .. }
+            | I64Store32 { .. }
+    )
+}
+
 /// Build IndexMaps for a module from the merger's index maps
 ///
 /// This creates a local view of index remappings for a specific module,
@@ -2947,12 +3092,14 @@ pub(crate) fn build_index_maps_for_module(
     memory_initial_pages: Option<u64>,
     data_segment_base: u32,
     elem_segment_base: u32,
+    code_addr_relocs: Option<std::collections::HashSet<u32>>,
 ) -> IndexMaps {
     let mut maps = IndexMaps::new();
     maps.address_rebasing = address_rebasing;
     maps.memory_base_offset = memory_base_offset;
     maps.memory64 = memory64;
     maps.memory_initial_pages = memory_initial_pages;
+    maps.code_addr_relocs = code_addr_relocs;
 
     // Build function map (including imported functions)
     let import_func_count = module
@@ -3817,6 +3964,7 @@ mod tests {
             None,
             0,
             0,
+            None,
         );
         assert_eq!(maps_a.remap_memory(0), 0);
 
@@ -3832,6 +3980,7 @@ mod tests {
             None,
             0,
             0,
+            None,
         );
         assert_eq!(maps_b.remap_memory(0), 1);
     }
