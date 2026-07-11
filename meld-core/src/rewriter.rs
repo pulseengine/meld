@@ -94,6 +94,23 @@ pub struct IndexMaps {
     pub memory_initial_pages: Option<u64>,
     /// Scratch locals used for address rebasing
     pub rebase_locals: Option<RebaseLocals>,
+    /// #326: code-section-content byte offsets of this module's
+    /// `R_WASM_MEMORY_ADDR_*` `reloc.CODE` sites (see
+    /// [`crate::reloc::RelocInfo::code_memory_addr_offsets`]).
+    ///
+    /// Present ⟺ the module carries relocation metadata AND address rebasing
+    /// is active. Its presence flips two behaviours during rewriting, so that
+    /// each absolute address is rebased **exactly once**:
+    ///
+    /// * an `i32.const`/`i64.const` address literal flagged by one of these
+    ///   sites has `memory_base_offset` added to its value, and
+    /// * `memarg` offset rebasing switches from the legacy *blanket* form (add
+    ///   the base to every load/store offset) to *reloc-driven* (add it only
+    ///   to the flagged `memarg`s), leaving genuine struct-field offsets alone.
+    ///
+    /// `None` preserves the zero-cost legacy path exactly: no const rebasing,
+    /// and blanket `memarg` rebasing (a no-op when `memory_base_offset == 0`).
+    pub code_addr_relocs: Option<std::collections::HashSet<u32>>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -260,32 +277,106 @@ fn rewrite_operators(
     let mut new_offset: u32 = 0;
     let mut base_old: Option<usize> = None;
 
-    for res in reader.into_iter_with_offsets() {
-        let (op, old_pos) = res?;
-        let instrs = rewrite_operator(op, maps)?;
-        if let Some(m) = map.as_mut() {
-            // First operator's absolute position defines the
-            // instruction-stream base; subsequent offsets are relative.
-            let base = *base_old.get_or_insert(old_pos);
-            m.entries.push(InstrOffset {
-                old: (old_pos - base) as u32,
-                new: new_offset,
-            });
-        }
-        for instr in &instrs {
-            if map.is_some() {
-                let mut buf = Vec::new();
-                instr.encode(&mut buf);
-                new_offset = new_offset.saturating_add(buf.len() as u32);
+    match maps.code_addr_relocs.as_ref() {
+        // #326: reloc-driven rebasing needs each operator's END offset to test
+        // whether a MEMORY_ADDR reloc site falls on its immediate, so
+        // materialize the operator stream with positions and look one ahead.
+        // A site at code-relative `r` belongs to the operator whose byte range
+        // `[old_pos, op_end)` contains it. Only the flagged operator is
+        // rebased.
+        Some(relocs) if !relocs.is_empty() => {
+            let ops: Vec<(Operator<'_>, usize)> = reader
+                .into_iter_with_offsets()
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            let ends: Vec<usize> = ops
+                .iter()
+                .skip(1)
+                .map(|(_, pos)| *pos)
+                .chain(std::iter::once(usize::MAX))
+                .collect();
+            for ((op, old_pos), op_end) in ops.into_iter().zip(ends) {
+                let addr_reloc = relocs
+                    .iter()
+                    .any(|&r| (r as usize) >= old_pos && (r as usize) < op_end);
+                emit_operator(
+                    op,
+                    old_pos,
+                    addr_reloc,
+                    maps,
+                    func,
+                    &mut map,
+                    &mut new_offset,
+                    &mut base_old,
+                )?;
             }
-            func.instruction(instr);
+        }
+        _ => {
+            for res in reader.into_iter_with_offsets() {
+                let (op, old_pos) = res?;
+                emit_operator(
+                    op,
+                    old_pos,
+                    false,
+                    maps,
+                    func,
+                    &mut map,
+                    &mut new_offset,
+                    &mut base_old,
+                )?;
+            }
         }
     }
     Ok(map)
 }
 
-/// Convert a wasmparser operator to wasm-encoder instruction with index remapping
-fn rewrite_operator(op: Operator<'_>, maps: &IndexMaps) -> Result<Vec<Instruction<'static>>> {
+/// Rewrite one operator and append it (and any expansion) to `func`, updating
+/// the optional [`InstrOffsetMap`]. `addr_reloc` is true when a MEMORY_ADDR
+/// `reloc.CODE` site lands on this operator's immediate (see
+/// [`IndexMaps::code_addr_relocs`]).
+#[allow(clippy::too_many_arguments)]
+fn emit_operator(
+    op: Operator<'_>,
+    old_pos: usize,
+    addr_reloc: bool,
+    maps: &IndexMaps,
+    func: &mut Function,
+    map: &mut Option<InstrOffsetMap>,
+    new_offset: &mut u32,
+    base_old: &mut Option<usize>,
+) -> Result<()> {
+    let instrs = rewrite_operator(op, maps, addr_reloc)?;
+    if let Some(m) = map.as_mut() {
+        // First operator's absolute position defines the
+        // instruction-stream base; subsequent offsets are relative.
+        let base = *base_old.get_or_insert(old_pos);
+        m.entries.push(InstrOffset {
+            old: (old_pos - base) as u32,
+            new: *new_offset,
+        });
+    }
+    for instr in &instrs {
+        if map.is_some() {
+            let mut buf = Vec::new();
+            instr.encode(&mut buf);
+            *new_offset = new_offset.saturating_add(buf.len() as u32);
+        }
+        func.instruction(instr);
+    }
+    Ok(())
+}
+
+/// Convert a wasmparser operator to wasm-encoder instruction with index remapping.
+///
+/// `addr_reloc` is true when a `R_WASM_MEMORY_ADDR_*` `reloc.CODE` site lands
+/// on this operator's relocatable immediate (#326). It only ever matters under
+/// address rebasing: it selects the `i32.const`/`i64.const` address literals
+/// and the load/store `memarg`s whose offset must be shifted by the
+/// shared-memory base. It is always `false` on the legacy (no-reloc) path.
+fn rewrite_operator(
+    op: Operator<'_>,
+    maps: &IndexMaps,
+    addr_reloc: bool,
+) -> Result<Vec<Instruction<'static>>> {
     use Operator::*;
 
     let instr = match op {
@@ -353,29 +444,29 @@ fn rewrite_operator(op: Operator<'_>, maps: &IndexMaps) -> Result<Vec<Instructio
         ElemDrop { elem_index } => Instruction::ElemDrop(maps.remap_elem(elem_index)),
 
         // Memory operations - need memory index remapping
-        I32Load { memarg } => Instruction::I32Load(convert_memarg(memarg, maps)?),
-        I64Load { memarg } => Instruction::I64Load(convert_memarg(memarg, maps)?),
-        F32Load { memarg } => Instruction::F32Load(convert_memarg(memarg, maps)?),
-        F64Load { memarg } => Instruction::F64Load(convert_memarg(memarg, maps)?),
-        I32Load8S { memarg } => Instruction::I32Load8S(convert_memarg(memarg, maps)?),
-        I32Load8U { memarg } => Instruction::I32Load8U(convert_memarg(memarg, maps)?),
-        I32Load16S { memarg } => Instruction::I32Load16S(convert_memarg(memarg, maps)?),
-        I32Load16U { memarg } => Instruction::I32Load16U(convert_memarg(memarg, maps)?),
-        I64Load8S { memarg } => Instruction::I64Load8S(convert_memarg(memarg, maps)?),
-        I64Load8U { memarg } => Instruction::I64Load8U(convert_memarg(memarg, maps)?),
-        I64Load16S { memarg } => Instruction::I64Load16S(convert_memarg(memarg, maps)?),
-        I64Load16U { memarg } => Instruction::I64Load16U(convert_memarg(memarg, maps)?),
-        I64Load32S { memarg } => Instruction::I64Load32S(convert_memarg(memarg, maps)?),
-        I64Load32U { memarg } => Instruction::I64Load32U(convert_memarg(memarg, maps)?),
-        I32Store { memarg } => Instruction::I32Store(convert_memarg(memarg, maps)?),
-        I64Store { memarg } => Instruction::I64Store(convert_memarg(memarg, maps)?),
-        F32Store { memarg } => Instruction::F32Store(convert_memarg(memarg, maps)?),
-        F64Store { memarg } => Instruction::F64Store(convert_memarg(memarg, maps)?),
-        I32Store8 { memarg } => Instruction::I32Store8(convert_memarg(memarg, maps)?),
-        I32Store16 { memarg } => Instruction::I32Store16(convert_memarg(memarg, maps)?),
-        I64Store8 { memarg } => Instruction::I64Store8(convert_memarg(memarg, maps)?),
-        I64Store16 { memarg } => Instruction::I64Store16(convert_memarg(memarg, maps)?),
-        I64Store32 { memarg } => Instruction::I64Store32(convert_memarg(memarg, maps)?),
+        I32Load { memarg } => Instruction::I32Load(convert_memarg(memarg, maps, addr_reloc)?),
+        I64Load { memarg } => Instruction::I64Load(convert_memarg(memarg, maps, addr_reloc)?),
+        F32Load { memarg } => Instruction::F32Load(convert_memarg(memarg, maps, addr_reloc)?),
+        F64Load { memarg } => Instruction::F64Load(convert_memarg(memarg, maps, addr_reloc)?),
+        I32Load8S { memarg } => Instruction::I32Load8S(convert_memarg(memarg, maps, addr_reloc)?),
+        I32Load8U { memarg } => Instruction::I32Load8U(convert_memarg(memarg, maps, addr_reloc)?),
+        I32Load16S { memarg } => Instruction::I32Load16S(convert_memarg(memarg, maps, addr_reloc)?),
+        I32Load16U { memarg } => Instruction::I32Load16U(convert_memarg(memarg, maps, addr_reloc)?),
+        I64Load8S { memarg } => Instruction::I64Load8S(convert_memarg(memarg, maps, addr_reloc)?),
+        I64Load8U { memarg } => Instruction::I64Load8U(convert_memarg(memarg, maps, addr_reloc)?),
+        I64Load16S { memarg } => Instruction::I64Load16S(convert_memarg(memarg, maps, addr_reloc)?),
+        I64Load16U { memarg } => Instruction::I64Load16U(convert_memarg(memarg, maps, addr_reloc)?),
+        I64Load32S { memarg } => Instruction::I64Load32S(convert_memarg(memarg, maps, addr_reloc)?),
+        I64Load32U { memarg } => Instruction::I64Load32U(convert_memarg(memarg, maps, addr_reloc)?),
+        I32Store { memarg } => Instruction::I32Store(convert_memarg(memarg, maps, addr_reloc)?),
+        I64Store { memarg } => Instruction::I64Store(convert_memarg(memarg, maps, addr_reloc)?),
+        F32Store { memarg } => Instruction::F32Store(convert_memarg(memarg, maps, addr_reloc)?),
+        F64Store { memarg } => Instruction::F64Store(convert_memarg(memarg, maps, addr_reloc)?),
+        I32Store8 { memarg } => Instruction::I32Store8(convert_memarg(memarg, maps, addr_reloc)?),
+        I32Store16 { memarg } => Instruction::I32Store16(convert_memarg(memarg, maps, addr_reloc)?),
+        I64Store8 { memarg } => Instruction::I64Store8(convert_memarg(memarg, maps, addr_reloc)?),
+        I64Store16 { memarg } => Instruction::I64Store16(convert_memarg(memarg, maps, addr_reloc)?),
+        I64Store32 { memarg } => Instruction::I64Store32(convert_memarg(memarg, maps, addr_reloc)?),
         MemorySize { mem, .. } => {
             if maps.address_rebasing {
                 let pages = maps.memory_initial_pages.ok_or_else(|| {
@@ -427,9 +518,25 @@ fn rewrite_operator(op: Operator<'_>, maps: &IndexMaps) -> Result<Vec<Instructio
             return rewrite_memory_fill(mem, maps);
         }
 
-        // Constants
-        I32Const { value } => Instruction::I32Const(value),
-        I64Const { value } => Instruction::I64Const(value),
+        // Constants. #326: an `i32.const`/`i64.const` flagged by a
+        // MEMORY_ADDR `reloc.CODE` site is an absolute linear-memory address
+        // baked into the code; add the shared-memory base to its value so it
+        // points into this module's rebased window. Bare integer constants
+        // (never flagged) are emitted verbatim.
+        I32Const { value } => {
+            if maps.address_rebasing && addr_reloc {
+                Instruction::I32Const(value.wrapping_add(maps.memory_base_offset as i32))
+            } else {
+                Instruction::I32Const(value)
+            }
+        }
+        I64Const { value } => {
+            if maps.address_rebasing && addr_reloc {
+                Instruction::I64Const(value.wrapping_add(maps.memory_base_offset as i64))
+            } else {
+                Instruction::I64Const(value)
+            }
+        }
         F32Const { value } => Instruction::F32Const(f32::from_bits(value.bits()).into()),
         F64Const { value } => Instruction::F64Const(f64::from_bits(value.bits()).into()),
 
@@ -681,7 +788,13 @@ fn append_rebased_address(
     local_index: u32,
 ) -> Result<()> {
     instrs.push(Instruction::LocalGet(local_index));
-    if maps.memory_base_offset != 0 {
+    // #326: this is the legacy *access-point* rebasing — it adds the base to a
+    // bulk-memory op's runtime address operand. Under reloc-driven (*source-
+    // point*) rebasing the operand is already rebased at its origin
+    // (`i32.const` / `reloc.DATA`), so applying it again here would
+    // double-count. Skip it whenever the module carries reloc metadata; keep it
+    // for the legacy no-reloc path.
+    if maps.memory_base_offset != 0 && maps.code_addr_relocs.is_none() {
         instrs.push(base_const_instruction(maps)?);
         instrs.push(base_add_instruction(maps));
     }
@@ -716,14 +829,28 @@ fn convert_block_type(bt: WpBlockType, maps: &IndexMaps) -> Result<BlockType> {
     })
 }
 
-/// Convert wasmparser MemArg to wasm-encoder MemArg
-fn convert_memarg(ma: WpMemArg, maps: &IndexMaps) -> Result<MemArg> {
-    let offset =
-        ma.offset
-            .checked_add(maps.memory_base_offset)
-            .ok_or(Error::UnsupportedFeature(
-                "memory offset overflow during rebasing".to_string(),
-            ))?;
+/// Convert wasmparser MemArg to wasm-encoder MemArg.
+///
+/// The static `offset` field of a load/store is rebased by
+/// `memory_base_offset` when it encodes an absolute address. #326 makes this
+/// precise: when the module carries reloc metadata
+/// ([`IndexMaps::code_addr_relocs`] is `Some`), the offset is rebased **only**
+/// when `addr_reloc` says a MEMORY_ADDR site lands on it — genuine struct-field
+/// offsets are left alone, and an accompanying rebased `i32.const` address is
+/// not double-counted. With no reloc metadata the legacy blanket behaviour is
+/// kept (rebase every offset — a no-op when `memory_base_offset == 0`).
+fn convert_memarg(ma: WpMemArg, maps: &IndexMaps, addr_reloc: bool) -> Result<MemArg> {
+    let rebase = match maps.code_addr_relocs {
+        Some(_) => addr_reloc,
+        None => true,
+    };
+    let base = if rebase { maps.memory_base_offset } else { 0 };
+    let offset = ma
+        .offset
+        .checked_add(base)
+        .ok_or(Error::UnsupportedFeature(
+            "memory offset overflow during rebasing".to_string(),
+        ))?;
     Ok(MemArg {
         offset,
         align: ma.align as u32,
@@ -858,6 +985,7 @@ mod tests {
                 dst_mem: 0,
             },
             &maps,
+            false,
         )
         .unwrap();
 
@@ -885,7 +1013,7 @@ mod tests {
             value: 3,
         });
 
-        let instrs = rewrite_operator(Operator::MemoryFill { mem: 0 }, &maps).unwrap();
+        let instrs = rewrite_operator(Operator::MemoryFill { mem: 0 }, &maps, false).unwrap();
 
         assert!(
             instrs
@@ -914,6 +1042,7 @@ mod tests {
                 mem: 0,
             },
             &maps,
+            false,
         )
         .unwrap();
 
@@ -935,7 +1064,7 @@ mod tests {
         maps.memory64 = false;
         maps.memory_initial_pages = Some(3);
 
-        let instrs = rewrite_operator(Operator::MemorySize { mem: 0 }, &maps).unwrap();
+        let instrs = rewrite_operator(Operator::MemorySize { mem: 0 }, &maps, false).unwrap();
         assert!(matches!(instrs.as_slice(), [Instruction::I32Const(3)]));
     }
 
@@ -944,7 +1073,7 @@ mod tests {
         let mut maps = IndexMaps::new();
         maps.address_rebasing = true;
 
-        assert!(rewrite_operator(Operator::MemoryGrow { mem: 0 }, &maps).is_err());
+        assert!(rewrite_operator(Operator::MemoryGrow { mem: 0 }, &maps, false).is_err());
     }
 
     /// #298 part (b): with the (default-off) tolerant flag set, a `memory.grow`
@@ -957,7 +1086,7 @@ mod tests {
         maps.address_rebasing = true;
         maps.defer_grow_under_rebase = true;
 
-        let instrs = rewrite_operator(Operator::MemoryGrow { mem: 0 }, &maps).unwrap();
+        let instrs = rewrite_operator(Operator::MemoryGrow { mem: 0 }, &maps, false).unwrap();
         assert!(matches!(instrs.as_slice(), [Instruction::Unreachable]));
     }
 
@@ -968,7 +1097,7 @@ mod tests {
         let mut maps = IndexMaps::new();
         maps.address_rebasing = true;
         assert!(!maps.defer_grow_under_rebase, "flag must default off");
-        assert!(rewrite_operator(Operator::MemoryGrow { mem: 0 }, &maps).is_err());
+        assert!(rewrite_operator(Operator::MemoryGrow { mem: 0 }, &maps, false).is_err());
     }
 
     #[test]
@@ -1080,7 +1209,7 @@ mod tests {
     #[test]
     fn test_rewrite_call_remaps_function_index() {
         let maps = make_test_maps();
-        let instrs = rewrite_operator(Operator::Call { function_index: 0 }, &maps).unwrap();
+        let instrs = rewrite_operator(Operator::Call { function_index: 0 }, &maps, false).unwrap();
         assert_eq!(instrs.len(), 1);
         assert!(
             matches!(instrs[0], Instruction::Call(5)),
@@ -1099,6 +1228,7 @@ mod tests {
                 table_index: 0,
             },
             &maps,
+            false,
         )
         .unwrap();
         assert_eq!(instrs.len(), 1);
@@ -1118,7 +1248,8 @@ mod tests {
     fn test_rewrite_global_get_set_remaps() {
         let maps = make_test_maps();
 
-        let get_instrs = rewrite_operator(Operator::GlobalGet { global_index: 0 }, &maps).unwrap();
+        let get_instrs =
+            rewrite_operator(Operator::GlobalGet { global_index: 0 }, &maps, false).unwrap();
         assert_eq!(get_instrs.len(), 1);
         assert!(
             matches!(get_instrs[0], Instruction::GlobalGet(7)),
@@ -1126,7 +1257,8 @@ mod tests {
             get_instrs[0]
         );
 
-        let set_instrs = rewrite_operator(Operator::GlobalSet { global_index: 0 }, &maps).unwrap();
+        let set_instrs =
+            rewrite_operator(Operator::GlobalSet { global_index: 0 }, &maps, false).unwrap();
         assert_eq!(set_instrs.len(), 1);
         assert!(
             matches!(set_instrs[0], Instruction::GlobalSet(7)),
@@ -1140,7 +1272,7 @@ mod tests {
         let maps = make_test_maps();
 
         // TableGet
-        let instrs = rewrite_operator(Operator::TableGet { table: 0 }, &maps).unwrap();
+        let instrs = rewrite_operator(Operator::TableGet { table: 0 }, &maps, false).unwrap();
         assert_eq!(instrs.len(), 1);
         assert!(
             matches!(instrs[0], Instruction::TableGet(3)),
@@ -1149,7 +1281,7 @@ mod tests {
         );
 
         // TableSet
-        let instrs = rewrite_operator(Operator::TableSet { table: 0 }, &maps).unwrap();
+        let instrs = rewrite_operator(Operator::TableSet { table: 0 }, &maps, false).unwrap();
         assert_eq!(instrs.len(), 1);
         assert!(
             matches!(instrs[0], Instruction::TableSet(3)),
@@ -1158,7 +1290,7 @@ mod tests {
         );
 
         // TableGrow
-        let instrs = rewrite_operator(Operator::TableGrow { table: 0 }, &maps).unwrap();
+        let instrs = rewrite_operator(Operator::TableGrow { table: 0 }, &maps, false).unwrap();
         assert_eq!(instrs.len(), 1);
         assert!(
             matches!(instrs[0], Instruction::TableGrow(3)),
@@ -1167,7 +1299,7 @@ mod tests {
         );
 
         // TableSize
-        let instrs = rewrite_operator(Operator::TableSize { table: 0 }, &maps).unwrap();
+        let instrs = rewrite_operator(Operator::TableSize { table: 0 }, &maps, false).unwrap();
         assert_eq!(instrs.len(), 1);
         assert!(
             matches!(instrs[0], Instruction::TableSize(3)),
@@ -1176,7 +1308,7 @@ mod tests {
         );
 
         // TableFill
-        let instrs = rewrite_operator(Operator::TableFill { table: 0 }, &maps).unwrap();
+        let instrs = rewrite_operator(Operator::TableFill { table: 0 }, &maps, false).unwrap();
         assert_eq!(instrs.len(), 1);
         assert!(
             matches!(instrs[0], Instruction::TableFill(3)),
@@ -1197,6 +1329,7 @@ mod tests {
                 src_table: 1,
             },
             &maps,
+            false,
         )
         .unwrap();
         assert_eq!(instrs.len(), 1);
@@ -1226,6 +1359,7 @@ mod tests {
                 src_mem: 1,
             },
             &maps,
+            false,
         )
         .unwrap();
 
@@ -1255,6 +1389,7 @@ mod tests {
                 },
             },
             &maps,
+            false,
         )
         .unwrap();
         assert_eq!(instrs.len(), 1);
@@ -1279,6 +1414,7 @@ mod tests {
                 },
             },
             &maps,
+            false,
         )
         .unwrap();
         assert_eq!(instrs.len(), 1);
@@ -1298,7 +1434,8 @@ mod tests {
     fn test_rewrite_ref_func_remaps() {
         let maps = make_test_maps();
 
-        let instrs = rewrite_operator(Operator::RefFunc { function_index: 0 }, &maps).unwrap();
+        let instrs =
+            rewrite_operator(Operator::RefFunc { function_index: 0 }, &maps, false).unwrap();
         assert_eq!(instrs.len(), 1);
         assert!(
             matches!(instrs[0], Instruction::RefFunc(5)),

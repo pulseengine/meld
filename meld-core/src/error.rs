@@ -56,6 +56,26 @@ pub enum Error {
     #[error("memory strategy not supported: {0}")]
     MemoryStrategyUnsupported(String),
 
+    /// A core module must be placed at a non-zero shared-memory base but
+    /// carries no relocation metadata, so meld cannot rebase its absolute
+    /// addresses into the shared window (issue #326, ADR-6 path-F). Emitting
+    /// it unchanged would collide it with a prior module's addresses and
+    /// silently corrupt memory, so fusion hard-fails instead.
+    #[error(
+        "component '{component}' module {module} is placed at a non-zero shared-memory base but \
+         carries no relocation metadata (linking/reloc.*); its absolute addresses cannot be \
+         rebased safely. Rebuild it with relocations retained on the FINAL link \
+         (`-C link-arg=--emit-relocs`) — an unresolved relocatable object \
+         (`wasm-ld -r`) is NOT sufficient, its stored values are addends, not final \
+         addresses — or fuse without shared memory"
+    )]
+    MissingRelocMetadata {
+        /// Display name of the component that owns the offending module.
+        component: String,
+        /// The offending module's index within its component.
+        module: String,
+    },
+
     /// Adapter generation error
     #[error("adapter generation failed: {0}")]
     AdapterGeneration(String),
