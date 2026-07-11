@@ -53,6 +53,7 @@ pub mod component_wrap;
 pub mod custom_merge;
 pub mod dwarf;
 mod error;
+pub mod mcu_dissolve;
 pub mod memory_probe;
 pub mod merger;
 pub mod p3_async;
@@ -714,6 +715,21 @@ impl Fuser {
         // the adapter trampolines instead of calling the target directly.
         if !adapters.is_empty() {
             stats.adapters_inlined = self.wire_adapter_indices(&mut merged, &adapters, &graph)?;
+        }
+
+        // Step 3.6: #334 MCU-dissolve fixups (SR-49, `--memory shared` only).
+        //
+        // Coalesce the N per-provider `__stack_pointer` globals into one
+        // shared shadow stack, and drop the vestigial lowered-import shim's
+        // keep-alive export so the downstream
+        // `synth --native-pointer-abi --shadow-stack-size` dissolve proceeds
+        // without gale's hand WAT surgery. Runs AFTER adapter wiring (so
+        // direct-call flattening is already reflected in the bodies) and
+        // BEFORE encoding (so all three encode passes, DWARF remap, and the
+        // attestation/provenance hashes see the coalesced module). The
+        // non-shared paths never reach here, keeping their output unchanged.
+        if self.config.memory_strategy == MemoryStrategy::SharedMemory {
+            mcu_dissolve::dissolve_fixups(&mut merged, &self.components)?;
         }
 
         // Step 4: Encode output module.
