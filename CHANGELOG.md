@@ -4,6 +4,50 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.39.0] - 2026-07-11
+
+Debug-info fidelity release: two independent correctness fixes to what the
+fused module reports about itself — the DWARF `.debug_line` table and the Wasm
+`name` section. Both close the "point at the right function/line or drop the
+entry, never point at the wrong one" invariant (SYS-7). No behaviour change to
+the executable core; only the debug/observability sections are corrected.
+
+This is the first slice of the v0.39.x line; the remaining MCU-lowering items
+(#326 dynamic-address rebasing, #299, #298, #334) are deferred to a following
+release.
+
+**Falsification:** if the `.debug_line` relocation regressed, every emitted row
+would no longer be guaranteed inside the fused code section —
+`dwarf_331_line_rows_within_code_section_multi_source` asserts on a real
+two-component fusion that every row address is `<=` the fused code-section end
+and the row set is non-empty; it would fail. If the `name` section were copied
+verbatim instead of index-remapped,
+`accumulate_remapped_function_names_remaps_and_drops_unmapped` would fail — it
+asserts a mapped entry is renumbered to its fused index and an unmapped entry is
+dropped.
+
+### Fixed
+
+- **DWARF `.debug_line` row addresses are now rebased through the offset map
+  (#331).** `DwarfHandling::Remap` previously relocated the DIE
+  `DW_AT_low_pc`/high-pc/range/location attributes (the #319 trilogy) but
+  carried each unit's line program over with *input-relative* row addresses, so
+  a debugger or `pulseengine/witness` MC/DC map resolved instructions to the
+  wrong source line (LS-D-1). `correct_line_programs` now rebuilds each unit's
+  line program, running every row address through the same
+  `AddressRemap::translate`, dropping any untranslatable row, and replicating
+  the file/directory table in gimli's add-order so `FileId`s stay aligned with
+  the DIE `decl_file` (including the DWARF v5 `file(0)`/`directory(0)` header
+  seeding). On the repro, the max `.debug_line` row moved from `0xF8` (past the
+  code) to `0xEC` (inside it) and `meld fuse --verify` is clean.
+- **`name` custom section is coalesced and index-remapped under
+  `--preserve-names` (#328).** Each input's `name` section was previously copied
+  verbatim, so `Name::Function` entries carried the input's local indices and
+  collided across inputs against the fused index space. The fuser now remaps
+  every function-name entry through `MergedModule::function_index_map`, drops
+  entries whose source index has no fused mapping, and emits a single coalesced
+  `name` section (deterministically ordered via a `BTreeMap`).
+
 ## [0.38.0] - 2026-07-10
 
 Correctness release: a **soundness fix** to the default memory strategy, a

@@ -1556,3 +1556,92 @@ artifacts:
         a real wac-composed fusion emits `SCPV` magic with closed_world=true and
         bounded_memory = !uses(memory.grow)
         (component_provenance::v3_fusion_premises_present_on_real_fusion).
+
+  - id: SR-46
+    type: sw-req
+    title: DWARF .debug_line row addresses rebased through the offset map
+    description: >
+      When `DwarfHandling::Remap` relocates an input core module's debug
+      information, it shall rewrite every `.debug_line` line-program row
+      address to its fused code-section address using the SAME per-function
+      offset map (`AddressRemap::translate`) that relocates the DIE
+      `DW_AT_low_pc`/high-pc and range attributes — not leave the source
+      row addresses unrelocated. A row whose address cannot be translated
+      shall be dropped, never emitted pointing at the wrong instruction:
+      every emitted row address shall fall within the fused code section.
+      Before this fix the line-program was carried over with input-relative
+      addresses (max observed row 0xF8 against a fused code section ending
+      at 0xEC on the #331 repro), so a debugger or `pulseengine/witness`
+      MC/DC mapping resolved instructions to the wrong source line — the
+      LS-D-1 hazard. History: the DIE-attribute passes (#319 trilogy,
+      v0.38.0) already relocated low_pc/high_pc/ranges/locations; the
+      line-program was the remaining unrelocated section (#331).
+    status: verified
+    tags: [dwarf, debug-info, correctness, v0.39.0]
+    links:
+      - type: derives-from
+        target: SYS-7
+      - type: mitigates
+        target: LS-D-1
+    cited-source:
+      - uri: "https://github.com/pulseengine/meld/issues/331"
+        kind: github
+        last-checked: 2026-07-11
+    release: v0.39.0
+    fields:
+      implementation:
+        - meld-core/src/dwarf.rs
+      verification-method: test
+      verification-description: >
+        `correct_line_programs` rebuilds each unit's line program, running
+        every source row address through `AddressRemap::translate` and
+        replicating the file/directory table in gimli's add-order so
+        `FileId`s coincide with the DIE `decl_file` (the v5 `file(0)`/
+        `directory(0)` header seeding is honoured — the latent off-by-one
+        Mythos caught and fixed in 02b70c5). Integration oracle
+        `dwarf_331_line_rows_within_code_section_multi_source`
+        (meld-core/tests/adapter_dwarf_e2e.rs): fuses two DWARF-bearing
+        components (hello_rust + hello_c_cli) and asserts every emitted
+        `.debug_line` row address is <= the fused code-section end and the
+        row set is non-empty. Manual evidence on the #331 repro: max
+        `.debug_line` row 0xF8 -> 0xEC (within code), `meld fuse --verify`
+        clean, both CUs preserved.
+
+  - id: SR-47
+    type: sw-req
+    title: Name section coalesced and index-remapped under --preserve-names
+    description: >
+      Under `--preserve-names`, the fused module shall carry a SINGLE
+      `name` custom section whose `Name::Function` entries are remapped
+      from each input's local function index to the fused function index
+      via `MergedModule::function_index_map`; an entry whose source index
+      has no fused mapping shall be DROPPED, never emitted against a
+      colliding or stale fused index. Before this fix each input's `name`
+      section was copied verbatim, so fused indices carried the wrong
+      names (or several inputs' name sections collided), mis-attributing
+      symbol names in any consumer that reads them (#328).
+    status: verified
+    tags: [names, debug-info, correctness, v0.39.0]
+    links:
+      - type: derives-from
+        target: SYS-7
+    cited-source:
+      - uri: "https://github.com/pulseengine/meld/issues/328"
+        kind: github
+        last-checked: 2026-07-11
+    release: v0.39.0
+    fields:
+      implementation:
+        - meld-core/src/merger.rs
+        - meld-core/src/lib.rs
+      verification-method: test
+      verification-description: >
+        `accumulate_remapped_function_names` parses each input `name`
+        section (`wasmparser::NameSectionReader`), remaps `Name::Function`
+        entries through `function_index_map`, drops the unmapped, and
+        accumulates into `MergedModule::fused_function_names` (a BTreeMap
+        for deterministic order); `encode_output` emits one coalesced
+        `name` section from it. Unit oracle
+        `accumulate_remapped_function_names_remaps_and_drops_unmapped`
+        (meld-core/src/merger.rs) asserts a mapped entry is remapped to
+        its fused index and an unmapped entry is dropped.
