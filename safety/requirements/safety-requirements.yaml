@@ -1645,3 +1645,56 @@ artifacts:
         `accumulate_remapped_function_names_remaps_and_drops_unmapped`
         (meld-core/src/merger.rs) asserts a mapped entry is remapped to
         its fused index and an unmapped entry is dropped.
+
+  - id: SR-48
+    type: sw-req
+    title: Sound shared-memory fusion via relocation-metadata consumption
+    description: >
+      When `meld fuse --memory shared` places a component's linear memory at a
+      non-zero base in the shared address space, it shall produce a semantically
+      correct output OR fail — never a plausible-but-wrong one (LS-M-11, LS-D-1).
+      Because a finished non-PIC module bakes absolute addresses with no way to
+      recover which constants are addresses, meld shall relocate a component's
+      addresses ONLY from its relocation metadata: it shall consume the input's
+      `linking` (v2) + `reloc.CODE`/`reloc.DATA` custom sections, translate each
+      relocation site through the rewriter's `offset_map`, add the module's
+      shared-memory `memory_base` to every `R_WASM_MEMORY_ADDR_SLEB`/`_LEB`/`_I32`
+      operand (code literals AND data-section pointers), and strip the consumed
+      relocations from the output. When a `--memory shared` input lacks this
+      metadata (non-relocatable / PIC-stripped), meld shall HARD-ERROR rather
+      than emit an un-rebased colliding module. PIC/dylink inputs are out of
+      scope: a Component-Model core may import only functions, so
+      `wasm-tools component new` rejects a core importing `memory`/`__memory_base`
+      globals (ADR-6, path-E rejected). This supersedes, for the shared path,
+      the pending "inject addr + memory_base at every load/store" idea in SR-37's
+      history — that is unsound (it cannot distinguish pointers from integers,
+      nor same-module from cross-module pointers).
+    status: proposed
+    tags: [memory-strategy, shared-memory, relocation, mcu, v0.40.0]
+    links:
+      - type: derives-from
+        target: SYS-6
+      - type: mitigates
+        target: LS-M-11
+    cited-source:
+      - uri: "https://github.com/pulseengine/meld/issues/326"
+        kind: github
+        last-checked: 2026-07-11
+    release: v0.40.0
+    fields:
+      implementation:
+        - meld-core/src/rewriter.rs
+        - meld-core/src/segments.rs
+        - meld-core/src/merger.rs
+      verification-method: test
+      verification-description: >
+        PLANNED (prototype on feat/326-reloc-consumer). Oracle fixtures from the
+        /tmp/spike326 spike reproduce both gale datapoints under a fused shared
+        memory: `reloc_326_static_addr_rebased_shared` (a `static mut` store at
+        an absolute `i32.const` persists across calls after rebasing — datapoint
+        B) and `reloc_326_data_pointer_rebased_shared` (a computed-pointer copy
+        preserves content — datapoint A). Negative control: a `--memory shared`
+        input WITHOUT `reloc.*` metadata hard-errors rather than emitting a
+        colliding module. Done when both oracles pass, the control errors, and
+        the fused output carries no stale `reloc.*` sections.
+
