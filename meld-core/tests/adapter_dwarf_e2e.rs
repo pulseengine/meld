@@ -225,3 +225,55 @@ fn fused_module_with_synthetic_dwarf_still_runs() {
     assert_eq!(get_a.call(&mut store, ()).unwrap(), 11, "a's start ran");
     assert_eq!(get_b.call(&mut store, ()).unwrap(), 22, "b's start ran");
 }
+
+/// #331: with multiple DWARF-bearing inputs, every `.debug_line` row address
+/// must fall within the fused code section. gimli's line-program conversion
+/// translated only the sequence start and re-applied each row's ORIGINAL
+/// `advance_pc` delta; fusion rewrites bodies non-linearly (call-index
+/// renumbering), so the deltas overshot the code end (verify-silent).
+/// `correct_line_programs` re-translates every row through the offset-aware
+/// `AddressRemap`, keeping the merged (multi-source) line info in-bounds.
+#[test]
+fn dwarf_331_line_rows_within_code_section_multi_source() {
+    // Two real DWARF-bearing release components → a multi-source remap.
+    let (Ok(rust), Ok(c)) = (
+        std::fs::read("../tests/wit_bindgen/fixtures/release-0.2.0/hello_rust.wasm"),
+        std::fs::read("../tests/wit_bindgen/fixtures/release-0.2.0/hello_c_cli.wasm"),
+    ) else {
+        eprintln!("skipping #331: release fixtures absent");
+        return;
+    };
+
+    let mut fuser = Fuser::new(FuserConfig {
+        memory_strategy: MemoryStrategy::MultiMemory,
+        dwarf_handling: DwarfHandling::Remap,
+        attestation: false,
+        reproducible: false,
+        ..Default::default()
+    });
+    fuser.add_component_named(&rust, Some("rust")).unwrap();
+    fuser.add_component_named(&c, Some("c")).unwrap();
+    let fused = fuser.fuse().expect("fuse two DWARF-bearing components");
+
+    // Tight upper bound: the greatest function-body end (code-section-relative),
+    // derived independently with wasmparser. A `.debug_line` row past this is
+    // the #331 out-of-section overshoot.
+    let code_end = function_body_ranges(&fused)
+        .iter()
+        .map(|(_, e)| *e)
+        .max()
+        .expect("fused output has a code section");
+
+    let rows = debug_line_rows(&fused);
+    assert!(
+        !rows.is_empty(),
+        "multi-source DWARF remap must still emit .debug_line rows (line info preserved)"
+    );
+    for (addr, file, line) in &rows {
+        assert!(
+            *addr <= code_end,
+            "#331: .debug_line row at {addr:#x} ({file}:{line}) exceeds the fused \
+             code-section end {code_end:#x} — out-of-section line row"
+        );
+    }
+}
