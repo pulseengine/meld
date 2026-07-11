@@ -930,7 +930,6 @@ fn correct_line_programs<R: gimli::read::Reader<Offset = usize>>(
     read_dwarf: &gimli::read::Dwarf<R>,
     remap: &AddressRemap,
 ) {
-    use gimli::constants::{DW_AT_comp_dir, DW_AT_name};
     use gimli::write::{Address, LineProgram, LineString};
 
     // Best-effort bytes for a line-program string attribute (name/dir).
@@ -961,23 +960,25 @@ fn correct_line_programs<R: gimli::read::Reader<Offset = usize>>(
         let encoding = lph.encoding();
         let line_encoding = lph.line_encoding();
 
-        // comp_dir / comp_name for the rebuilt program (from the CU root).
-        let (comp_dir, comp_name) = {
-            let mut cd = b".".to_vec();
-            let mut cn = b"<unknown>".to_vec();
-            if let Ok(mut tree) = unit.entries_tree(None)
-                && let Ok(root) = tree.root()
-            {
-                let e = root.entry();
-                if let Ok(Some(v)) = e.attr_value(DW_AT_comp_dir) {
-                    cd = to_bytes(&unit, &v);
-                }
-                if let Ok(Some(v)) = e.attr_value(DW_AT_name) {
-                    cn = to_bytes(&unit, &v);
-                }
-            }
-            (cd, cn)
-        };
+        // comp_dir / comp_name: source them from the line-program HEADER
+        // (`directory(0)` / `file(0).path_name()`) EXACTLY as gimli's own
+        // converter does (gimli::write::line). This is required for FileId
+        // alignment, not cosmetic: in DWARF v5 gimli pre-seeds `file(0)` as
+        // `FileId(0)`, so the `file_names[0]` we re-add below must dedup back
+        // to it (same name + directory) — otherwise the whole file table
+        // shifts by one and every DIE's `DW_AT_decl_file` (which we do NOT
+        // rewrite) resolves to the wrong file. Taking `comp_name` from the CU
+        // `DW_AT_name` (which can differ from `file(0)`) breaks that dedup on
+        // real `-gdwarf-5` output (#331 Mythos finding). v4 has no such seed,
+        // so this is harmless there.
+        let comp_dir = lph
+            .directory(0)
+            .map(|d| to_bytes(&unit, &d))
+            .unwrap_or_else(|| b".".to_vec());
+        let comp_name = lph
+            .file(0)
+            .map(|f| to_bytes(&unit, &f.path_name()))
+            .unwrap_or_else(|| b"<unknown>".to_vec());
 
         let mut new_lp = LineProgram::new(
             encoding,
@@ -1000,8 +1001,8 @@ fn correct_line_programs<R: gimli::read::Reader<Offset = usize>>(
 
         // Files: replicate in read order. v4 file index is 1-based; v5 0-based.
         let file_base: u64 = if encoding.version >= 5 { 0 } else { 1 };
-        let mut file_ids: std::collections::HashMap<u64, gimli::write::FileId> =
-            std::collections::HashMap::new();
+        let mut file_ids: std::collections::BTreeMap<u64, gimli::write::FileId> =
+            std::collections::BTreeMap::new();
         for (i, fe) in lph.file_names().iter().enumerate() {
             let read_idx = file_base + i as u64;
             let name = to_bytes(&unit, &fe.path_name());
