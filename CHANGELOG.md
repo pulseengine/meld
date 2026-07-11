@@ -4,6 +4,57 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.40.0] - 2026-07-11
+
+MCU-lowering release: `fuse --memory shared` is now **sound** for relocatable
+inputs. This is the address-rebasing keystone that the v0.38.0 soundness gate
+was holding the line for — single-address-space fusion no longer silently
+corrupts memory (#326).
+
+**What changed:** when meld places a component's linear memory at a non-zero
+base in a shared address space, it now consumes that module's relocation
+metadata (`linking` + `reloc.CODE`/`reloc.DATA`, as produced by `-C
+link-arg=--emit-relocs`) and rebases every `R_WASM_MEMORY_ADDR_*` site — code
+address literals and inline data pointers — by the module's base. A `--memory
+shared` input that lacks the metadata and performs direct memory access now
+hard-errors instead of emitting a colliding module. The input contract is
+**relocatable**, not PIC: a Component-Model core may import only functions, so
+`wasm-tools component new` rejects a PIC/dylink core (ADR-6).
+
+**Falsification:** if the rebasing regressed, `test_326_reloc_const_rebasing_end_to_end`
+(fuses two components and asserts, via wasmtime, that an absolute address
+literal resolves to `base + addr` at runtime) would fail. If the hard-error gate
+regressed, `test_326_shared_rebase_without_relocs_hard_errors` would fail. If the
+legacy bulk-only dynamic rebasing regressed, `test_address_rebasing_end_to_end`
+would fail.
+
+### Added
+
+- **Sound `fuse --memory shared` via relocation-metadata consumption (#326).**
+  New `reloc` module hand-parses `linking` v2 + `reloc.CODE`/`reloc.DATA` (the
+  wasmparser readers were dropped upstream). The rewriter rebases flagged
+  `i32.const`/`i64.const` address literals and inline data pointers through the
+  per-function offset map; consumed reloc sections are stripped from the output.
+  memarg-offset rebasing moved from blanket to reloc-driven, which also fixes a
+  latent over-rebasing of genuine struct-field offsets.
+
+### Fixed
+
+- **`fuse --memory shared` no longer silently corrupts memory (#326).** Absolute
+  addresses in a relocated component (heap/shadow-stack pointers, `static mut`
+  data, canonical-ABI buffer copies) are rebased into the shared window; the
+  runtime datapoints that motivated this (a `list<u8>` buffer reading wrong
+  bytes, a `static mut` store not persisting) are corrected for `--emit-relocs`
+  inputs.
+
+### Known limitations
+
+- A **no-reloc** module that references an absolute address purely as a *value*
+  (no load/store) still slips the hard-error gate (#339, Mythos Finding A — a
+  sound fix needs data-flow analysis). This does not affect the supported
+  `--emit-relocs` path. `memory64` shared inputs with 8-byte inline data
+  pointers are rejected rather than mis-rebased.
+
 ## [0.39.0] - 2026-07-11
 
 Debug-info fidelity release: two independent correctness fixes to what the

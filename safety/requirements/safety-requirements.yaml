@@ -1669,7 +1669,7 @@ artifacts:
       the pending "inject addr + memory_base at every load/store" idea in SR-37's
       history — that is unsound (it cannot distinguish pointers from integers,
       nor same-module from cross-module pointers).
-    status: proposed
+    status: verified
     tags: [memory-strategy, shared-memory, relocation, mcu, v0.40.0]
     links:
       - type: derives-from
@@ -1683,18 +1683,27 @@ artifacts:
     release: v0.40.0
     fields:
       implementation:
+        - meld-core/src/reloc.rs
         - meld-core/src/rewriter.rs
         - meld-core/src/segments.rs
         - meld-core/src/merger.rs
       verification-method: test
       verification-description: >
-        PLANNED (prototype on feat/326-reloc-consumer). Oracle fixtures from the
-        /tmp/spike326 spike reproduce both gale datapoints under a fused shared
-        memory: `reloc_326_static_addr_rebased_shared` (a `static mut` store at
-        an absolute `i32.const` persists across calls after rebasing — datapoint
-        B) and `reloc_326_data_pointer_rebased_shared` (a computed-pointer copy
-        preserves content — datapoint A). Negative control: a `--memory shared`
-        input WITHOUT `reloc.*` metadata hard-errors rather than emitting a
-        colliding module. Done when both oracles pass, the control errors, and
-        the fused output carries no stale `reloc.*` sections.
+        VERIFIED (#340, merged 2026-07-11). Runtime oracle
+        `test_326_reloc_const_rebasing_end_to_end`
+        (meld-core/tests/rebasing_end_to_end.rs): fuses two components into a
+        shared memory and, via wasmtime, asserts an absolute `i32.const` address
+        literal is rebased to `base + addr` (the datapoint-B `static mut` class).
+        Path-F negative control `test_326_shared_rebase_without_relocs_hard_errors`:
+        a `--memory shared` input with direct memory access and no `reloc.*`
+        hard-errors (`Error::MissingRelocMetadata`) instead of emitting a
+        colliding module. `reloc.rs` unit tests parse `linking`+`reloc.CODE`,
+        confirm the metadata survives `wasm-tools component new`, and
+        `unhandled_data_addr_relocs_flags_non_i32_pointers` gates out memory64
+        8-byte data pointers (Mythos Finding B). Existing
+        `test_address_rebasing_end_to_end` (bulk-only dynamic rebasing) stays
+        green. 457 lib + 4 integration tests pass; Mythos discover pass done.
+        KNOWN LIMITATION (#339, Mythos Finding A): a no-reloc module that leaks an
+        absolute address purely as a value (no load/store) still slips the
+        hard-error gate; does not affect the supported `--emit-relocs` path.
 
