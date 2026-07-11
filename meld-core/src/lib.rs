@@ -1812,6 +1812,23 @@ impl Fuser {
                     data: std::borrow::Cow::Borrowed(contents),
                 });
             }
+
+            // #328: emit ONE coalesced `name` section (function names) whose
+            // indices are already remapped into the fused space. This
+            // replaces the old verbatim per-module `name` copies (duplicate
+            // sections → llvm-dwarfdump rejects; stale indices → wrong
+            // labels). The merger no longer routes `name` into
+            // `custom_sections`, so this is the sole emitter under
+            // `preserve_names`.
+            if self.config.preserve_names && !merged.fused_function_names.is_empty() {
+                let mut fnames = wasm_encoder::NameMap::new();
+                for (idx, fname) in &merged.fused_function_names {
+                    fnames.append(*idx, fname);
+                }
+                let mut names = wasm_encoder::NameSection::new();
+                names.functions(&fnames);
+                module.section(&names);
+            }
         }
 
         // Remapped DWARF (DwarfHandling::Remap): a single `.debug_*` set

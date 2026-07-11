@@ -88,6 +88,15 @@ pub struct MergedModule {
     /// Custom sections
     pub custom_sections: Vec<(String, Vec<u8>)>,
 
+    /// #328: fused function names accumulated from every input module's
+    /// `name` section, with each function index already remapped into the
+    /// fused function-index space (`function_index_map`). Emitted as ONE
+    /// coalesced `name` section under `preserve_names` — replacing the old
+    /// verbatim per-module copies (duplicate sections + stale indices).
+    /// `BTreeMap` keeps the fused indices ascending (the order the
+    /// name-section function-name subsection expects).
+    pub fused_function_names: std::collections::BTreeMap<u32, String>,
+
     /// Index mapping for function references
     pub function_index_map: HashMap<(usize, usize, u32), u32>,
 
@@ -989,6 +998,7 @@ impl Merger {
             elements: Vec::new(),
             data_segments: Vec::new(),
             custom_sections: Vec::new(),
+            fused_function_names: std::collections::BTreeMap::new(),
             function_index_map: HashMap::new(),
             memory_index_map: HashMap::new(),
             table_index_map: HashMap::new(),
@@ -2165,6 +2175,24 @@ impl Merger {
 
         // Merge custom sections
         for (name, data) in &module.custom_sections {
+            // #328: the `name` section carries function indices in THIS
+            // module's index space. Copying it verbatim produces duplicate
+            // `name` sections (llvm-dwarfdump rejects the module) whose
+            // indices point at the wrong fused functions. Instead, remap its
+            // function-name entries into the fused index space and accumulate
+            // them; a single coalesced `name` section is emitted at encode
+            // time under `preserve_names`. Function merge above has already
+            // populated `function_index_map` for this module.
+            if name == "name" {
+                accumulate_remapped_function_names(
+                    data,
+                    comp_idx,
+                    mod_idx,
+                    &merged.function_index_map,
+                    &mut merged.fused_function_names,
+                );
+                continue;
+            }
             merged.custom_sections.push((name.clone(), data.clone()));
         }
 
@@ -3551,9 +3579,74 @@ fn compute_unresolved_import_assignments(
     (counts, assignments, dedup_info)
 }
 
+/// #328: parse a WASM `name` custom section and accumulate its
+/// function-name entries into `out`, remapping each function index from
+/// this module's index space `(comp_idx, mod_idx, orig_idx)` into the
+/// fused index space via `function_index_map`.
+///
+/// Entries with no mapping (a dead / internalized function) are dropped —
+/// the coalesced section must never carry a wrong index (LS-D-1: correct or
+/// nothing). Non-function subsections (module / local / label / type / …
+/// names) are ignored in this pass: their indices would also need
+/// remapping, and dropping them keeps the emitted section correct rather
+/// than plausibly-wrong. A malformed section is dropped whole.
+fn accumulate_remapped_function_names(
+    data: &[u8],
+    comp_idx: usize,
+    mod_idx: usize,
+    function_index_map: &HashMap<(usize, usize, u32), u32>,
+    out: &mut std::collections::BTreeMap<u32, String>,
+) {
+    let reader = wasmparser::NameSectionReader::new(wasmparser::BinaryReader::new(data, 0));
+    for subsection in reader {
+        let Ok(subsection) = subsection else {
+            return; // malformed — never guess
+        };
+        if let wasmparser::Name::Function(namemap) = subsection {
+            for naming in namemap {
+                let Ok(naming) = naming else { continue };
+                if let Some(&fused) = function_index_map.get(&(comp_idx, mod_idx, naming.index)) {
+                    out.insert(fused, naming.name.to_string());
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #328: the name-section remap accumulates function names under their
+    /// FUSED indices, and drops entries whose source index isn't in the
+    /// fused map (dead/internalized) — never emitting a wrong index.
+    #[test]
+    fn accumulate_remapped_function_names_remaps_and_drops_unmapped() {
+        // A `name` section body with a function-name subsection (id 1)
+        // naming source func 0 -> "foo" and source func 5 -> "bar".
+        // Layout: [subsec_id=1][size=0x0b][count=2][idx=0,len=3,"foo"][idx=5,len=3,"bar"]
+        let data: Vec<u8> = vec![
+            0x01, 0x0b, 0x02, 0x00, 0x03, b'f', b'o', b'o', 0x05, 0x03, b'b', b'a', b'r',
+        ];
+        // Fused index map for (comp 0, module 0): 0 -> 10; source 5 is
+        // intentionally unmapped (should be dropped).
+        let mut map: HashMap<(usize, usize, u32), u32> = HashMap::new();
+        map.insert((0, 0, 0), 10);
+
+        let mut out: std::collections::BTreeMap<u32, String> = std::collections::BTreeMap::new();
+        accumulate_remapped_function_names(&data, 0, 0, &map, &mut out);
+
+        assert_eq!(
+            out.get(&10).map(String::as_str),
+            Some("foo"),
+            "source 0 -> fused 10"
+        );
+        assert_eq!(
+            out.len(),
+            1,
+            "unmapped source func 5 (\"bar\") must be dropped, not emitted at a wrong index"
+        );
+    }
 
     #[test]
     fn test_convert_memory_type() {
@@ -3670,6 +3763,7 @@ mod tests {
             elements: Vec::new(),
             data_segments: Vec::new(),
             custom_sections: Vec::new(),
+            fused_function_names: std::collections::BTreeMap::new(),
             function_index_map: HashMap::new(),
             memory_index_map: HashMap::new(),
             table_index_map: HashMap::new(),
@@ -5724,6 +5818,7 @@ mod tests {
             elements: Vec::new(),
             data_segments: Vec::new(),
             custom_sections: Vec::new(),
+            fused_function_names: std::collections::BTreeMap::new(),
             function_index_map: std::collections::HashMap::new(),
             memory_index_map: std::collections::HashMap::new(),
             table_index_map: std::collections::HashMap::new(),

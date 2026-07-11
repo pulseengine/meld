@@ -12883,6 +12883,7 @@ mod tests {
             elements: Vec::new(),
             data_segments: Vec::new(),
             custom_sections: Vec::new(),
+            fused_function_names: std::collections::BTreeMap::new(),
             function_index_map: std::collections::HashMap::new(),
             memory_index_map: std::collections::HashMap::new(),
             table_index_map: std::collections::HashMap::new(),
