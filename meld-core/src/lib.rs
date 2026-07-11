@@ -60,6 +60,7 @@ pub mod p3_bridge;
 pub mod p3_stream;
 pub mod parser;
 pub mod provenance;
+pub mod reloc;
 pub mod resolver;
 pub mod resource_graph;
 pub mod rewriter;
