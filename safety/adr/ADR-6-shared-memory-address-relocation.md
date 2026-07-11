@@ -81,10 +81,17 @@ metadata, `--memory shared` stays a hard error (path-F) rather than silently
 corrupting — never a plausible-but-wrong output (LS-D-1 discipline).
 
 path-E is **rejected** (component pipeline cannot carry PIC). The producer cost
-of path-D is a build helper on the gale side (rustc hardcodes
-`--export=__heap_base/__data_end --gc-sections`, which fights `--relocatable`;
-producing a relocatable core needs `--emit=obj` + manual `wasm-ld -r`) — filed
-as gale#168.
+of path-D is a single build flag: **`cargo rustc … -- -C link-arg=--emit-relocs`**
+keeps `reloc.CODE`/`reloc.DATA` in the *final linked* module — a valid,
+self-contained core (table + memory defined, no dangling imports) that also
+carries `linking` v2 + `reloc.*`. This is strictly better than the `--emit=obj`
+→ `wasm-ld -r` route the spike used: a relocatable *object* is under-linked and
+`wasm-tools component new` rejects it (dangling `env::__indirect_function_table`),
+whereas `--emit-relocs` yields a linked module `component new` accepts, importing
+neither `__memory_base` nor `memory` as globals (so it stays inside the no-PIC
+contract). Verified gale-side across all six gust:os cores and through
+`wac plug` — the composite carries one `reloc.CODE` + `linking` per inner core,
+so every core's metadata reaches meld unstripped (gale#168, RESOLVED gale-side).
 
 Locus of fix: **hybrid** — meld consumes; the producer must emit relocatable
 cores. Oracle: the gating fixtures above, derived from the spike, reproducing
