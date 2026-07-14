@@ -524,6 +524,13 @@ fn find_exact_resource_import_idx(
 pub struct Merger {
     memory_strategy: MemoryStrategy,
     address_rebasing: bool,
+    /// #298: the upstream `cabi_realloc`-is-vestigial verdict
+    /// (`Fuser::cabi_realloc_drop_provably_safe`). When set, module bodies are
+    /// rewritten with `IndexMaps::defer_grow_under_rebase`, so a `memory.grow`
+    /// in the (now provably dead) vestigial allocator emits `unreachable`
+    /// under address rebasing instead of hard-failing. Defaults `false`
+    /// (current behavior preserved everywhere the gated wiring is absent).
+    defer_grow_under_rebase: bool,
     /// (interface, resource_name) tuples marked opaque-rep — skip handle
     /// table allocation for these resources because their reps are already
     /// valid integer handles (no Box dereferencing in user code).
@@ -556,6 +563,7 @@ impl Merger {
         Self {
             memory_strategy,
             address_rebasing,
+            defer_grow_under_rebase: false,
             opaque_resources: Vec::new(),
         }
     }
@@ -563,6 +571,16 @@ impl Merger {
     /// Mark resources as opaque-rep so handle table allocation skips them.
     pub fn with_opaque_resources(mut self, opaque: Vec<(String, String)>) -> Self {
         self.opaque_resources = opaque;
+        self
+    }
+
+    /// #298: thread the upstream vestigial-`cabi_realloc` verdict in. When
+    /// `true`, the vestigial allocator's `memory.grow` is deferred to
+    /// `unreachable` under address rebasing (see
+    /// [`IndexMaps::defer_grow_under_rebase`]) rather than hard-failing —
+    /// sound only because the caller has proved that allocator dead.
+    pub fn with_defer_grow_under_rebase(mut self, defer: bool) -> Self {
+        self.defer_grow_under_rebase = defer;
         self
     }
 
@@ -1956,7 +1974,7 @@ impl Merger {
             .segment_bases
             .insert((comp_idx, mod_idx), (data_segment_base, elem_segment_base));
 
-        let index_maps = build_index_maps_for_module(
+        let mut index_maps = build_index_maps_for_module(
             comp_idx,
             mod_idx,
             module,
@@ -1970,6 +1988,11 @@ impl Merger {
             elem_segment_base,
             code_addr_relocs,
         );
+        // #298: only under the upstream vestigial-allocator verdict does a
+        // `memory.grow` reached during rebasing become `unreachable` (the
+        // allocator is provably dead) instead of a hard error. Inert when
+        // `address_rebasing` is off (the rewriter checks it only under rebase).
+        index_maps.defer_grow_under_rebase = self.defer_grow_under_rebase;
 
         // Second pass: extract and rewrite function bodies
         for (old_idx, old_func_idx, new_type_idx, type_idx) in func_type_indices {
