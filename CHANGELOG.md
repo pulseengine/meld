@@ -4,6 +4,29 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.41.1] - 2026-07-15
+
+Reproducibility patch: `--reproducible` output no longer depends on the input
+file path.
+
+**Falsification:** if the input path leaked into the output again,
+`test_reproducible_attestation_is_byte_stable` fails — it now asserts that
+byte-identical input under two different paths fuses to the same sha, while the
+non-reproducible control still differs.
+
+### Fixed
+
+- **`--reproducible` was still path-dependent (#341).** #325 removed the
+  random-UUID/wall-clock nondeterminism, but the caller-supplied component name
+  (the CLI passes the input file *path*) still leaked into the output via the
+  attestation input descriptor and the provenance `component_id`, so
+  byte-identical components at different paths fused to different sha256s. Under
+  `--reproducible`, the input identifier is now the positional `component-{index}`
+  (path/filename-independent); the input's content stays pinned by its sha256.
+  Two CI checkouts / temp dirs fusing the same component now agree — restoring
+  the re-verifiable, sigil-signable attestation the jess/Pixhawk first-flash
+  image set needs.
+
 ## [0.41.0] - 2026-07-15
 
 MCU-dissolve completion + a const-expr correctness fix. v0.40.0 made

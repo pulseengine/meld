@@ -1868,3 +1868,52 @@ artifacts:
         const-first pure fold are unchanged. Two Mythos passes (the second caught
         the operand-swapped sibling + the imported-global index-map ordering bug).
 
+  - id: SR-52
+    type: sw-req
+    title: Reproducible output depends only on input content
+    description: >
+      With `--reproducible`, the fused artifact shall be byte-identical for
+      byte-identical INPUT CONTENT, independent of anything not derived from that
+      content: no random state, no wall-clock, and no caller-supplied path/name.
+      (#325) The attestation id shall be derived from the output content and the
+      timestamp from `SOURCE_DATE_EPOCH` (default epoch 0) rather than a random
+      UUID + wall clock. (#341) The caller-supplied component name — which the
+      CLI populates from the input FILE PATH — shall NOT leak into the output:
+      under `--reproducible` the input identifier in the attestation input
+      descriptor and the provenance `component_id` shall be the positional
+      `component-{index}`, with the input's content still pinned by its sha256
+      (`original_hash`). Rationale: two parties, CI checkouts, or temp dirs
+      fusing the same component must obtain the same sha for a re-verifiable,
+      sigil-signable attestation (jess/Pixhawk first-flash image set). Off the
+      `--reproducible` path the human-friendly name is retained.
+    status: verified
+    tags: [attestation, reproducibility, supply-chain, v0.41.1]
+    links:
+      - type: derives-from
+        target: SYS-10
+    cited-source:
+      - uri: "https://github.com/pulseengine/meld/issues/325"
+        kind: github
+        last-checked: 2026-07-15
+      - uri: "https://github.com/pulseengine/meld/issues/341"
+        kind: github
+        last-checked: 2026-07-15
+    release: v0.41.1
+    fields:
+      implementation:
+        - meld-core/src/attestation.rs
+        - meld-core/src/provenance.rs
+        - meld-core/src/lib.rs
+      verification-method: test
+      verification-description: >
+        VERIFIED (#341 merged 2026-07-15; #325 v0.38.0).
+        `test_reproducible_attestation_is_byte_stable` (meld-core/src/lib.rs,
+        default features): reproducible fusion is byte-identical across
+        independent runs (#325); byte-identical input under two DIFFERENT paths
+        (`/tmp/pa/falcon.wasm` vs `/tmp/pb/falcon.wasm`) fuses to the SAME output
+        under `--reproducible` (#341, was different pre-fix); the
+        non-reproducible control differs (random attestation id + retained name),
+        so the flag is not a no-op. Path leak closed at all three output sites
+        (default attestation descriptor, wsc `InputArtifact`, provenance
+        `component_id`).
+
