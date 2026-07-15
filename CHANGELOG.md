@@ -4,6 +4,47 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.41.0] - 2026-07-15
+
+MCU-dissolve completion + a const-expr correctness fix. v0.40.0 made
+`--memory shared` *correct* (addresses rebased, #326); this release makes the
+fused node *cleanly dissolvable* on a real MCU and fixes a silent miscompile of
+the position-independent const-expr shape that lowering relies on. Together with
+#326, gale's gust:os node fuses **and** dissolves with no hand WAT surgery.
+
+**Falsification:** if SP-coalescing regressed, `shared_stack_pointer_runtime_non_clobber`
+(two providers' frames alias) fails. If the `cabi_realloc` drop deferred a *live*
+grow, `live_internal_grow_keeps_realloc_and_hard_errors` fails. If the const-expr
+truncation returned, `test_338_multimodule_const_first_embedded_globalget_remaps`
+(reads the un-remapped base 5100 instead of 1100) fails.
+
+### Added
+
+- **`--memory shared` MCU-dissolve fixups (#334).** A post-merge pass coalesces
+  the N per-component `__stack_pointer` globals into one shared shadow stack
+  (leaving them separate is unsound — providers clobber each other's frames) and
+  drops the dead wac lowered-import shim trampoline's keep-alive export so synth
+  DCEs it. The fused node now lowers with zero closed-world/shadow-stack
+  warnings. SP detection uses only the authoritative `__stack_pointer` name (an
+  init-value heuristic was rejected — it could mis-coalesce unrelated globals).
+- **Vestigial `cabi_realloc` drop (#298).** When a component boundary is fully
+  internalised (core output, no adapters, all lifts scalar) AND the allocator is
+  provably dead, `meld fuse` drops the `cabi_realloc*` exports and defers the
+  dead `memory.grow` — unblocking the lean `--memory shared --address-rebase`
+  fuse (which otherwise hard-errors on `memory.grow`). A call-graph reachability
+  gate ensures a component that allocates internally keeps its allocator and the
+  clean compile error rather than trapping at runtime.
+
+### Fixed
+
+- **Silent miscompile of `global.get` extended-const exprs (#338).** `meld fuse`
+  truncated any wasm-2.0 extended-const expression containing a `global.get`
+  (both `base + N` and `N + base`) to just `global.get $base`, dropping the
+  arithmetic — corrupting global initializers and data/element-segment offsets
+  (the PIE `__memory_base + N` shape). The full expression is now preserved and
+  re-emitted with global indices remapped; a load-bearing ordering fix ensures
+  the imported-global remap is populated before init-exprs are converted.
+
 ## [0.40.0] - 2026-07-11
 
 MCU-lowering release: `fuse --memory shared` is now **sound** for relocatable
