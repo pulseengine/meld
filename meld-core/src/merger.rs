@@ -1582,29 +1582,19 @@ impl Merger {
                 .push(convert_table_type(table, comp_idx, mod_idx, merged));
         }
 
-        // Merge globals (defined globals only; imported globals handled below)
-        let global_offset = merged.globals.len() as u32;
-        for (old_idx, global) in module.globals.iter().enumerate() {
-            let new_idx = merged.import_counts.global + global_offset + old_idx as u32;
-            merged.global_index_map.insert(
-                (comp_idx, mod_idx, import_global_count + old_idx as u32),
-                new_idx,
-            );
-            let init_expr = convert_init_expr(
-                &global.init_expr_bytes,
-                comp_idx,
-                mod_idx,
-                merged,
-                &global.content_type,
-            );
-            let ty = convert_global_type(global, comp_idx, mod_idx, merged);
-            merged.globals.push(MergedGlobal { ty, init_expr });
-        }
-
         // Resolve imported global indices via intra-component module_resolutions.
         // This mirrors how function imports are resolved below: if module A
         // imports a global that module B exports, map A's imported global index
         // to B's defined global's merged index.
+        //
+        // This MUST run before converting THIS module's defined-global init
+        // exprs below: an extended-const initializer may reference an imported
+        // global (`i32.const N; global.get $__memory_base; i32.add`, #338), and
+        // `convert_init_expr` remaps that global through `global_index_map`. If
+        // the imported-global entries were populated only afterwards (the prior
+        // ordering), the remap silently missed and emitted the un-remapped local
+        // index — reading the wrong global whenever fusion shifted the import
+        // off index 0.
         {
             let mut import_global_idx = 0u32;
             for imp in &module.imports {
@@ -1656,6 +1646,27 @@ impl Merger {
 
                 import_global_idx += 1;
             }
+        }
+
+        // Merge globals (defined globals only; imported globals handled above).
+        // Runs AFTER imported-global resolution so init exprs can remap any
+        // `global.get` of an imported global (#338).
+        let global_offset = merged.globals.len() as u32;
+        for (old_idx, global) in module.globals.iter().enumerate() {
+            let new_idx = merged.import_counts.global + global_offset + old_idx as u32;
+            merged.global_index_map.insert(
+                (comp_idx, mod_idx, import_global_count + old_idx as u32),
+                new_idx,
+            );
+            let init_expr = convert_init_expr(
+                &global.init_expr_bytes,
+                comp_idx,
+                mod_idx,
+                merged,
+                &global.content_type,
+            );
+            let ty = convert_global_type(global, comp_idx, mod_idx, merged);
+            merged.globals.push(MergedGlobal { ty, init_expr });
         }
 
         // Resolve imported table indices via intra-component module_resolutions.
@@ -3302,14 +3313,40 @@ fn convert_init_expr(
         // only the first op and silently dropped the rest, producing a
         // wrong-valued global (LS-A-11).
         wasmparser::Operator::I32Const { value } => {
+            let remap = |idx: u32| {
+                merged
+                    .global_index_map
+                    .get(&(comp_idx, mod_idx, idx))
+                    .copied()
+                    .unwrap_or(idx)
+            };
             match crate::segments::fold_extended_const_i32(&mut ops, value) {
-                Ok(folded) => ConstExpr::i32_const(folded),
+                Ok(crate::segments::ExtConstFold::Value(folded)) => ConstExpr::i32_const(folded),
+                // Const-first with an embedded `global.get` (`N + __memory_base`):
+                // preserve and remap the full sequence instead of falling back to
+                // un-remapped raw bytes, which would emit the wrong global index in
+                // genuine multi-module fusion (#338).
+                Ok(crate::segments::ExtConstFold::Extended(seq)) => {
+                    let remapped: Vec<_> = seq.iter().map(|o| o.remap_global(remap)).collect();
+                    crate::segments::ext_const_to_expr(&remapped)
+                }
                 Err(_) => ConstExpr::raw(bytes.iter().copied()),
             }
         }
         wasmparser::Operator::I64Const { value } => {
+            let remap = |idx: u32| {
+                merged
+                    .global_index_map
+                    .get(&(comp_idx, mod_idx, idx))
+                    .copied()
+                    .unwrap_or(idx)
+            };
             match crate::segments::fold_extended_const_i64(&mut ops, value) {
-                Ok(folded) => ConstExpr::i64_const(folded),
+                Ok(crate::segments::ExtConstFold::Value(folded)) => ConstExpr::i64_const(folded),
+                Ok(crate::segments::ExtConstFold::Extended(seq)) => {
+                    let remapped: Vec<_> = seq.iter().map(|o| o.remap_global(remap)).collect();
+                    crate::segments::ext_const_to_expr(&remapped)
+                }
                 Err(_) => ConstExpr::raw(bytes.iter().copied()),
             }
         }
@@ -3323,12 +3360,26 @@ fn convert_init_expr(
             ConstExpr::v128_const(i128::from_le_bytes(*value.bytes()))
         }
         wasmparser::Operator::GlobalGet { global_index } => {
-            let remapped = merged
-                .global_index_map
-                .get(&(comp_idx, mod_idx, global_index))
-                .copied()
-                .unwrap_or(global_index);
-            ConstExpr::global_get(remapped)
+            let remap = |idx: u32| {
+                merged
+                    .global_index_map
+                    .get(&(comp_idx, mod_idx, idx))
+                    .copied()
+                    .unwrap_or(idx)
+            };
+            // A `global.get`-first initializer may continue with extended-const
+            // arithmetic (`__memory_base + N`). Its value is runtime-dependent,
+            // so preserve and re-emit the COMPLETE operator sequence (global
+            // indices remapped) rather than reading only the leading
+            // `global.get` and dropping the trailing arithmetic (#338).
+            match crate::segments::read_extended_const_global_get(&mut ops, global_index) {
+                Ok(Some(seq)) => {
+                    let remapped: Vec<_> = seq.iter().map(|o| o.remap_global(remap)).collect();
+                    crate::segments::ext_const_to_expr(&remapped)
+                }
+                Ok(None) => ConstExpr::global_get(remap(global_index)),
+                Err(_) => ConstExpr::raw(bytes.iter().copied()),
+            }
         }
         wasmparser::Operator::RefFunc { function_index } => {
             let remapped = merged
