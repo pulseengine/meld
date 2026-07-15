@@ -25,6 +25,131 @@ use wasm_encoder::{
 };
 use wasmparser::{DataSectionReader, ElementItems, ElementKind, ElementSectionReader, Operator};
 
+/// A single operator inside a preserved wasm-2.0 extended-const expression
+/// whose value is runtime-dependent because it begins with `global.get`
+/// (the position-independent `__memory_base + N` / `__table_base + N` shape,
+/// #338). Such an expression CANNOT be folded to a constant, so its operators
+/// are kept verbatim and re-emitted, with `GlobalGet` indices remapped.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ExtConstOp {
+    GlobalGet(u32),
+    I32Const(i32),
+    I64Const(i64),
+    I32Add,
+    I32Sub,
+    I32Mul,
+    I64Add,
+    I64Sub,
+    I64Mul,
+}
+
+impl ExtConstOp {
+    /// Remap any `GlobalGet` index in this operator using `f`.
+    pub(crate) fn remap_global(&self, f: impl Fn(u32) -> u32) -> ExtConstOp {
+        match self {
+            ExtConstOp::GlobalGet(idx) => ExtConstOp::GlobalGet(f(*idx)),
+            other => other.clone(),
+        }
+    }
+
+    /// Append this operator to a `wasm_encoder::ConstExpr` builder.
+    fn append_to(&self, ce: ConstExpr) -> ConstExpr {
+        match self {
+            ExtConstOp::GlobalGet(i) => ce.with_global_get(*i),
+            ExtConstOp::I32Const(v) => ce.with_i32_const(*v),
+            ExtConstOp::I64Const(v) => ce.with_i64_const(*v),
+            ExtConstOp::I32Add => ce.with_i32_add(),
+            ExtConstOp::I32Sub => ce.with_i32_sub(),
+            ExtConstOp::I32Mul => ce.with_i32_mul(),
+            ExtConstOp::I64Add => ce.with_i64_add(),
+            ExtConstOp::I64Sub => ce.with_i64_sub(),
+            ExtConstOp::I64Mul => ce.with_i64_mul(),
+        }
+    }
+}
+
+/// Build a `wasm_encoder::ConstExpr` from a full preserved extended-const
+/// operator sequence (leading `global.get` + trailing arithmetic). The
+/// `End` opcode is appended by `ConstExpr`'s own encoder.
+pub(crate) fn ext_const_to_expr(ops: &[ExtConstOp]) -> ConstExpr {
+    let mut ce = ConstExpr::empty();
+    for op in ops {
+        ce = op.append_to(ce);
+    }
+    ce
+}
+
+/// The outcome of reading a `const`-first extended-const expression: either a
+/// pure-constant fold (no `global.get` anywhere) that collapses to a single
+/// value, or a runtime-dependent sequence that embeds a `global.get` partway
+/// through (the operand-swapped `N + __memory_base` shape) and therefore must
+/// be preserved verbatim so its global index can be remapped later (#338).
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum ExtConstFold<T> {
+    /// No `global.get` — the expression folded to this constant.
+    Value(T),
+    /// An embedded `global.get` was found; the COMPLETE operator sequence
+    /// (in input order) is preserved for later index remapping. The value is
+    /// runtime-dependent and stays `None` at the parse layer.
+    Extended(Vec<ExtConstOp>),
+}
+
+/// Read wasm-2.0 extended-const operators until `End`, appending each to `seq`
+/// (which already holds the operators consumed so far, in INPUT ORDER). Used
+/// by both the `global.get`-first path and the const-first path once an
+/// embedded `global.get` has forced the preserve-and-remap route.
+///
+/// Rejects any operator outside the extended-const set with a clear error
+/// (mirrors `fold_extended_const_*`) so audit and CI surface the path instead
+/// of silently dropping operators (#338 / LS-A-11). Operand order is preserved
+/// verbatim — non-commutative `sub`/`mul` must not be reordered.
+fn read_remaining_ext_const(
+    ops: &mut wasmparser::OperatorsReader<'_>,
+    mut seq: Vec<ExtConstOp>,
+) -> Result<Vec<ExtConstOp>> {
+    loop {
+        let op = ops.read()?;
+        match op {
+            Operator::End => break,
+            Operator::GlobalGet { global_index } => seq.push(ExtConstOp::GlobalGet(global_index)),
+            Operator::I32Const { value } => seq.push(ExtConstOp::I32Const(value)),
+            Operator::I64Const { value } => seq.push(ExtConstOp::I64Const(value)),
+            Operator::I32Add => seq.push(ExtConstOp::I32Add),
+            Operator::I32Sub => seq.push(ExtConstOp::I32Sub),
+            Operator::I32Mul => seq.push(ExtConstOp::I32Mul),
+            Operator::I64Add => seq.push(ExtConstOp::I64Add),
+            Operator::I64Sub => seq.push(ExtConstOp::I64Sub),
+            Operator::I64Mul => seq.push(ExtConstOp::I64Mul),
+            other => {
+                return Err(Error::UnsupportedFeature(format!(
+                    "unsupported extended-const operator after global.get: {other:?}"
+                )));
+            }
+        }
+    }
+    Ok(seq)
+}
+
+/// Read the remainder of a wasm-2.0 extended-const expression that begins
+/// with `global.get`, after the leading `GlobalGet(first_index)` has already
+/// been consumed by the caller. Returns the FULL operator sequence (leading
+/// `global.get` + trailing arithmetic) up to but not including `End`.
+///
+/// If the only remaining operator is `End` (a bare `global.get`), returns
+/// `Ok(None)` so callers preserve the existing single-`GlobalGet` behaviour
+/// verbatim. Otherwise returns `Ok(Some(ops))` with the complete sequence.
+pub(crate) fn read_extended_const_global_get(
+    ops: &mut wasmparser::OperatorsReader<'_>,
+    first_index: u32,
+) -> Result<Option<Vec<ExtConstOp>>> {
+    let seq = read_remaining_ext_const(ops, vec![ExtConstOp::GlobalGet(first_index)])?;
+    if seq.len() == 1 {
+        Ok(None)
+    } else {
+        Ok(Some(seq))
+    }
+}
+
 /// A structured constant expression that preserves the operator and operands,
 /// allowing index remapping before final encoding to `wasm_encoder::ConstExpr`.
 #[derive(Debug, Clone)]
@@ -37,6 +162,14 @@ pub enum ParsedConstExpr {
     RefNull(wasm_encoder::HeapType),
     RefFunc(u32),
     GlobalGet(u32),
+    /// A wasm-2.0 extended-const expression that begins with `global.get`
+    /// and continues with arithmetic (the position-independent
+    /// `__memory_base + N` shape). Its value is runtime-dependent, so the
+    /// complete operator sequence is preserved and re-emitted rather than
+    /// folded to a constant (#338). The `Vec` always holds the leading
+    /// `GlobalGet` plus at least one trailing operator; a bare `global.get`
+    /// with no trailing arithmetic stays a plain [`ParsedConstExpr::GlobalGet`].
+    ExtendedGlobalGet(Vec<ExtConstOp>),
 }
 
 impl ParsedConstExpr {
@@ -51,6 +184,7 @@ impl ParsedConstExpr {
             ParsedConstExpr::RefNull(ht) => ConstExpr::ref_null(*ht),
             ParsedConstExpr::RefFunc(idx) => ConstExpr::ref_func(*idx),
             ParsedConstExpr::GlobalGet(idx) => ConstExpr::global_get(*idx),
+            ParsedConstExpr::ExtendedGlobalGet(ops) => ext_const_to_expr(ops),
         }
     }
 
@@ -59,6 +193,11 @@ impl ParsedConstExpr {
         match self {
             ParsedConstExpr::RefFunc(idx) => ParsedConstExpr::RefFunc(maps.remap_func(*idx)),
             ParsedConstExpr::GlobalGet(idx) => ParsedConstExpr::GlobalGet(maps.remap_global(*idx)),
+            ParsedConstExpr::ExtendedGlobalGet(ops) => ParsedConstExpr::ExtendedGlobalGet(
+                ops.iter()
+                    .map(|o| o.remap_global(|i| maps.remap_global(i)))
+                    .collect(),
+            ),
             ParsedConstExpr::RefNull(ht) => {
                 let remapped_ht = match ht {
                     wasm_encoder::HeapType::Concrete(idx) => {
@@ -459,23 +598,53 @@ fn parse_const_expr(expr: &wasmparser::ConstExpr<'_>) -> Result<ParsedConstExpr>
 /// `i32.mul` / further `i32.const` to a small evaluation stack with
 /// wrapping semantics per the wasm execution model.
 ///
-/// Returns the final stack value if exactly one value remains at `End`.
-/// Rejects unsupported operators (any non-extended-const op) with a
-/// clear error so audit and CI surface the path instead of silently
-/// dropping operators (LS-A-11).
+/// If an embedded `global.get` is encountered partway through (the
+/// operand-swapped `N + __memory_base` position-independent shape), the value
+/// is runtime-dependent and CANNOT be folded: this captures the COMPLETE
+/// operator sequence in input order (leading `i32.const` + ops already read +
+/// the `global.get` + the remainder) and returns [`ExtConstFold::Extended`],
+/// so the global index is remapped later instead of the un-remapped raw bytes
+/// being emitted (#338). Pure-constant input still returns
+/// [`ExtConstFold::Value`] — behaviourally identical to before.
+///
+/// Rejects unsupported operators (any non-extended-const op) with a clear
+/// error so audit and CI surface the path instead of silently dropping
+/// operators (LS-A-11).
 pub(crate) fn fold_extended_const_i32(
     ops: &mut wasmparser::OperatorsReader<'_>,
     initial: i32,
-) -> Result<i32> {
+) -> Result<ExtConstFold<i32>> {
     let mut stack: Vec<i32> = vec![initial];
+    // Operator sequence captured in INPUT ORDER, kept in lockstep with the
+    // fold so that if an embedded `global.get` appears we can hand back the
+    // exact operators verbatim (no fold, no reorder) for later remapping.
+    let mut seq: Vec<ExtConstOp> = vec![ExtConstOp::I32Const(initial)];
     loop {
         let op = ops.read()?;
         match op {
             Operator::End => break,
-            Operator::I32Const { value } => stack.push(value),
-            Operator::I32Add => fold_i32_binop(&mut stack, i32::wrapping_add)?,
-            Operator::I32Sub => fold_i32_binop(&mut stack, i32::wrapping_sub)?,
-            Operator::I32Mul => fold_i32_binop(&mut stack, i32::wrapping_mul)?,
+            Operator::I32Const { value } => {
+                stack.push(value);
+                seq.push(ExtConstOp::I32Const(value));
+            }
+            Operator::I32Add => {
+                fold_i32_binop(&mut stack, i32::wrapping_add)?;
+                seq.push(ExtConstOp::I32Add);
+            }
+            Operator::I32Sub => {
+                fold_i32_binop(&mut stack, i32::wrapping_sub)?;
+                seq.push(ExtConstOp::I32Sub);
+            }
+            Operator::I32Mul => {
+                fold_i32_binop(&mut stack, i32::wrapping_mul)?;
+                seq.push(ExtConstOp::I32Mul);
+            }
+            Operator::GlobalGet { global_index } => {
+                // Runtime-dependent: abandon folding, preserve the full
+                // sequence (already-read ops + this global.get + remainder).
+                seq.push(ExtConstOp::GlobalGet(global_index));
+                return read_remaining_ext_const(ops, seq).map(ExtConstFold::Extended);
+            }
             other => {
                 return Err(Error::UnsupportedFeature(format!(
                     "unsupported i32 extended-const operator: {other:?}"
@@ -490,7 +659,7 @@ pub(crate) fn fold_extended_const_i32(
             stack.len()
         )));
     }
-    Ok(stack[0])
+    Ok(ExtConstFold::Value(stack[0]))
 }
 
 fn fold_i32_binop(stack: &mut Vec<i32>, op: fn(i32, i32) -> i32) -> Result<()> {
@@ -504,20 +673,39 @@ fn fold_i32_binop(stack: &mut Vec<i32>, op: fn(i32, i32) -> i32) -> Result<()> {
     Ok(())
 }
 
-/// i64 counterpart to `fold_extended_const_i32`.
+/// i64 counterpart to `fold_extended_const_i32`. An embedded `global.get`
+/// likewise switches to the preserve-and-remap [`ExtConstFold::Extended`]
+/// path instead of folding (#338).
 pub(crate) fn fold_extended_const_i64(
     ops: &mut wasmparser::OperatorsReader<'_>,
     initial: i64,
-) -> Result<i64> {
+) -> Result<ExtConstFold<i64>> {
     let mut stack: Vec<i64> = vec![initial];
+    let mut seq: Vec<ExtConstOp> = vec![ExtConstOp::I64Const(initial)];
     loop {
         let op = ops.read()?;
         match op {
             Operator::End => break,
-            Operator::I64Const { value } => stack.push(value),
-            Operator::I64Add => fold_i64_binop(&mut stack, i64::wrapping_add)?,
-            Operator::I64Sub => fold_i64_binop(&mut stack, i64::wrapping_sub)?,
-            Operator::I64Mul => fold_i64_binop(&mut stack, i64::wrapping_mul)?,
+            Operator::I64Const { value } => {
+                stack.push(value);
+                seq.push(ExtConstOp::I64Const(value));
+            }
+            Operator::I64Add => {
+                fold_i64_binop(&mut stack, i64::wrapping_add)?;
+                seq.push(ExtConstOp::I64Add);
+            }
+            Operator::I64Sub => {
+                fold_i64_binop(&mut stack, i64::wrapping_sub)?;
+                seq.push(ExtConstOp::I64Sub);
+            }
+            Operator::I64Mul => {
+                fold_i64_binop(&mut stack, i64::wrapping_mul)?;
+                seq.push(ExtConstOp::I64Mul);
+            }
+            Operator::GlobalGet { global_index } => {
+                seq.push(ExtConstOp::GlobalGet(global_index));
+                return read_remaining_ext_const(ops, seq).map(ExtConstFold::Extended);
+            }
             other => {
                 return Err(Error::UnsupportedFeature(format!(
                     "unsupported i64 extended-const operator: {other:?}"
@@ -532,7 +720,7 @@ pub(crate) fn fold_extended_const_i64(
             stack.len()
         )));
     }
-    Ok(stack[0])
+    Ok(ExtConstFold::Value(stack[0]))
 }
 
 fn fold_i64_binop(stack: &mut Vec<i64>, op: fn(i64, i64) -> i64) -> Result<()> {
@@ -563,20 +751,23 @@ fn parse_const_expr_with_value(
     let op = ops.read()?;
 
     let (const_expr, value) = match op {
-        Operator::I32Const { value } => {
-            let folded = fold_extended_const_i32(&mut ops, value)?;
-            (
+        Operator::I32Const { value } => match fold_extended_const_i32(&mut ops, value)? {
+            ExtConstFold::Value(folded) => (
                 ParsedConstExpr::I32Const(folded),
                 Some(ConstExprValue::I32(folded)),
-            )
-        }
-        Operator::I64Const { value } => {
-            let folded = fold_extended_const_i64(&mut ops, value)?;
-            (
+            ),
+            // A const-first expr with an embedded `global.get` (`N + base`) is
+            // runtime-dependent: preserve the full sequence so the global index
+            // is remapped, and expose no constant value (#338).
+            ExtConstFold::Extended(seq) => (ParsedConstExpr::ExtendedGlobalGet(seq), None),
+        },
+        Operator::I64Const { value } => match fold_extended_const_i64(&mut ops, value)? {
+            ExtConstFold::Value(folded) => (
                 ParsedConstExpr::I64Const(folded),
                 Some(ConstExprValue::I64(folded)),
-            )
-        }
+            ),
+            ExtConstFold::Extended(seq) => (ParsedConstExpr::ExtendedGlobalGet(seq), None),
+        },
         Operator::F32Const { value } => (
             ParsedConstExpr::F32Const(f32::from_bits(value.bits())),
             None,
@@ -606,7 +797,19 @@ fn parse_const_expr_with_value(
             (ParsedConstExpr::RefNull(heap_type), None)
         }
         Operator::RefFunc { function_index } => (ParsedConstExpr::RefFunc(function_index), None),
-        Operator::GlobalGet { global_index } => (ParsedConstExpr::GlobalGet(global_index), None),
+        Operator::GlobalGet { global_index } => {
+            // A `global.get`-first expression may continue with extended-const
+            // arithmetic (the position-independent `__memory_base + N` shape).
+            // Its value is runtime-dependent, so it CANNOT be folded — the
+            // complete operator sequence is preserved and re-emitted with the
+            // global index remapped later during reindexing. Prior versions
+            // read only the leading `global.get` and silently dropped the
+            // trailing arithmetic, corrupting the offset/initializer (#338).
+            match read_extended_const_global_get(&mut ops, global_index)? {
+                Some(seq) => (ParsedConstExpr::ExtendedGlobalGet(seq), None),
+                None => (ParsedConstExpr::GlobalGet(global_index), None),
+            }
+        }
         _ => {
             return Err(Error::UnsupportedFeature(format!(
                 "unsupported const expr operator: {:?}",

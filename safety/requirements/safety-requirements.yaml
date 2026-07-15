@@ -1817,4 +1817,42 @@ artifacts:
         KEEP `cabi_realloc` and do not defer grow. A live-allocator fuse still
         rejects `memory.grow` under rebasing (no behaviour change off the
         provably-safe path).
+  - id: SR-51
+    type: sw-req
+    title: Extended-const exprs beginning with global.get are preserved, not truncated
+    description: >
+      meld shall preserve the FULL wasm-2.0 extended-const expression of a global
+      initializer or data/element-segment offset that begins with `global.get` —
+      e.g. `global.get $base; i32.const N; i32.add` (the position-independent
+      `__memory_base + N` / `__table_base + N` shape) — NOT truncate it to the
+      leading `global.get`, dropping the trailing arithmetic (#338). Because the
+      value is runtime-dependent, meld shall re-emit the complete extended-const
+      operator sequence (global indices remapped) rather than fold to a constant.
+      The const-FIRST case was already handled (#152/LS-A-11); this closes the
+      `global.get`-first case. A truncated offset is a silent miscompile: the
+      module still validates but places data / initialises globals at `base + 0`
+      instead of `base + N`.
+    status: proposed
+    tags: [const-expr, miscompile, pie, correctness, v0.41.0]
+    links:
+      - type: derives-from
+        target: SYS-1
+      - type: mitigates
+        target: LS-A-11
+    cited-source:
+      - uri: "https://github.com/pulseengine/meld/issues/338"
+        kind: github
+        last-checked: 2026-07-14
+    release: v0.41.0
+    fields:
+      implementation:
+        - meld-core/src/segments.rs
+        - meld-core/src/merger.rs
+      verification-method: test
+      verification-description: >
+        PLANNED. Executed-vs-wasmtime oracles reproducing #338: a global
+        initializer `g = base + 100` (base=1000) yields 1100 (not 1000) after
+        fuse; a data-segment active offset `base + N` places the segment at
+        base+N. Negative: the const-first case and a bare `global.get` (no
+        trailing arithmetic) are unchanged.
 
