@@ -590,6 +590,29 @@ impl Fuser {
         true
     }
 
+    /// #298 (FINDING 1) — is every input's allocator genuinely dead once the
+    /// vestigial `cabi_realloc*` exports are dropped?
+    ///
+    /// [`Self::cabi_realloc_drop_provably_safe`] proves the *interface boundary*
+    /// needs no realloc; it does NOT prove the allocator unreachable. A
+    /// scalar-interface component may still allocate internally (`Vec`/`String`/
+    /// `Box` → `dlmalloc`/`sbrk` → `memory.grow`) from a live export, and the
+    /// grow-defer is module-wide — so without this gate a live grow would be
+    /// rewritten to `unreachable` and trap at runtime instead of hard-failing
+    /// at fuse time. This ANDs an extra, strictly-stricter condition into the
+    /// drop/defer wiring: it returns `true` only when NO `memory.grow` is
+    /// reachable from any live root (all exports except the dropped
+    /// `cabi_realloc*`, plus `start` and every indirectly-referenced function)
+    /// in ANY core module of ANY input. Fail-safe: an unparseable module counts
+    /// as having a live grow (via [`memory_probe::module_has_reachable_memory_grow`]).
+    fn allocator_grow_is_dead(&self) -> bool {
+        self.components.iter().all(|comp| {
+            comp.core_modules
+                .iter()
+                .all(|module| !memory_probe::module_has_reachable_memory_grow(&module.bytes))
+        })
+    }
+
     /// The fusion pipeline proper. `self.config.memory_strategy` is a
     /// concrete strategy here — `Auto` has been resolved by the caller.
     fn fuse_with_stats_resolved(&self) -> Result<(Vec<u8>, FusionStats)> {
@@ -634,22 +657,52 @@ impl Fuser {
         let graph = resolver.resolve_with_hints(&self.components, &self.wiring_hints)?;
         stats.imports_resolved = graph.resolved_imports.len();
 
-        // #298 (INERT): compute the vestigial-cabi_realloc verdict for
-        // visibility. Not yet wired to drop anything — the actual drop is the
-        // corruption-critical step gated behind this and is implemented
-        // separately (tolerant rewriter + dead-function stubbing).
-        if self.cabi_realloc_drop_provably_safe(&graph) {
+        // #298: compute the vestigial-`cabi_realloc` verdict. When it holds
+        // AND we are on the address-rebasing (single-address-space MCU) path —
+        // the only path a surviving allocator `memory.grow` hard-blocks — the
+        // allocator is provably dead: drop its exports (below, so loom can DCE
+        // it) and defer its now-unreachable `memory.grow` to `unreachable`
+        // (via the merger flag) instead of hard-failing. On a false verdict, or
+        // any non-rebasing fuse, behavior is byte-identical to before.
+        // #298 FINDING 1: the interface-boundary verdict proves only that the
+        // boundary needs no realloc — NOT that the allocator is dead. A
+        // scalar-interface component can still allocate internally (`Vec` →
+        // `dlmalloc` → `memory.grow`) reachable from a live export. Deferring
+        // every `memory.grow` there would fuse-`Ok` then trap at runtime.
+        // `allocator_grow_is_dead` closes the gap: it fires the drop/defer only
+        // when NO `memory.grow` is reachable from any live root once the
+        // `cabi_realloc*` exports are dropped. `&&` short-circuits, so this
+        // call-graph scan runs only on the boundary-clean rebasing path.
+        let drop_vestigial_realloc = self.cabi_realloc_drop_provably_safe(&graph)
+            && self.config.address_rebasing
+            && self.allocator_grow_is_dead();
+        if drop_vestigial_realloc {
             log::debug!(
-                "#298: cabi_realloc is provably vestigial for this fuse \
-                 (scalar lift surface, core output, no adapters) — drop not yet wired"
+                "#298: cabi_realloc is provably vestigial for this rebasing fuse \
+                 (scalar lift surface, core output, no adapters) — dropping its \
+                 exports and deferring the dead allocator's memory.grow"
             );
         }
 
         // Step 2: Merge modules
         log::info!("Merging {} core modules", stats.modules_merged);
         let merger = Merger::new(self.config.memory_strategy, self.config.address_rebasing)
-            .with_opaque_resources(self.config.opaque_resources.clone());
+            .with_opaque_resources(self.config.opaque_resources.clone())
+            .with_defer_grow_under_rebase(drop_vestigial_realloc);
         let mut merged = merger.merge(&self.components, &graph)?;
+
+        // #298: drop the now-vestigial `cabi_realloc*` exports. Removing the
+        // export (not the function body — out of scope per #298) makes the
+        // allocator + its `dlmalloc`/`sbrk`/`memory.grow` DCE-eligible for
+        // loom downstream. The merger emits these under exactly two names:
+        // the bare `cabi_realloc`, and the suffixed `cabi_realloc$<N>` forms
+        // (per-memory-index in multi-memory mode); match both. Gated on the
+        // verdict AND the rebasing path, so every other fuse is unchanged.
+        if drop_vestigial_realloc {
+            merged
+                .exports
+                .retain(|e| !memory_probe::is_vestigial_realloc_export_name(&e.name));
+        }
         stats.total_functions = merged.functions.len();
         stats.total_exports = merged.exports.len();
 

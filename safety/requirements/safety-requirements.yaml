@@ -1765,3 +1765,56 @@ artifacts:
         module lowers under `synth ... --native-pointer-abi --shadow-stack-size`
         with zero closed-world/shadow-stack warnings and fits the 8 KiB budget.
 
+  - id: SR-50
+    type: sw-req
+    title: Drop the vestigial cabi_realloc once the component boundary is internalised
+    description: >
+      After `meld fuse` fully internalises a component boundary (no remaining
+      cross-component imports and no adapter sites), each input's canonical-ABI
+      `cabi_realloc` — the allocator wit-bindgen emits to marshal
+      pointer-carrying values ACROSS that boundary — is vestigial: fusion has
+      removed the marshalling it served. Because it is an *export*, downstream
+      DCE (loom/synth) cannot remove it, so the allocator and its
+      `memory.grow` survive, bloating the MCU output and BLOCKING
+      `--memory shared --address-rebase` (which hard-errors on `memory.grow`,
+      #299) purely because of dead allocator code (#298).
+      When — and ONLY when — `cabi_realloc` is PROVABLY vestigial
+      (`cabi_realloc_drop_provably_safe`: core-module output, no adapter sites,
+      every component lift's type provably scalar — no string/list params or
+      results — fail-safe `false` on any uncertainty), meld shall: (a) drop the
+      `cabi_realloc*` exports so the allocator becomes DCE-eligible, and (b)
+      defer the now-dead `memory.grow` under address rebasing (emit
+      `unreachable` via `IndexMaps::defer_grow_under_rebase` rather than
+      hard-failing), so the lean single-address-space fuse succeeds. Over-drop
+      is silent marshalling corruption, so the verdict's conservatism is
+      load-bearing and must not be weakened.
+    status: proposed
+    tags: [memory-strategy, shared-memory, mcu, dce, realloc, v0.41.0]
+    links:
+      - type: derives-from
+        target: SYS-8
+      - type: mitigates
+        target: LS-D-3
+    cited-source:
+      - uri: "https://github.com/pulseengine/meld/issues/298"
+        kind: github
+        last-checked: 2026-07-11
+    release: v0.41.0
+    fields:
+      implementation:
+        - meld-core/src/lib.rs
+        - meld-core/src/merger.rs
+        - meld-core/src/rewriter.rs
+      verification-method: test
+      verification-description: >
+        PLANNED. Positive: a fused fully-internalised core (scalar lifts, no
+        adapters) exports no `cabi_realloc*` and, under `--memory shared
+        --address-rebase`, fuses successfully (the vestigial `memory.grow` is
+        deferred, not a hard error) — verified by re-parsing the output exports
+        and asserting the fuse returns Ok. Negative controls (the verdict's
+        conservatism): a component with a NON-scalar lift (string/list param or
+        result), a P2 component-wrapped output, or a fuse with adapter sites all
+        KEEP `cabi_realloc` and do not defer grow. A live-allocator fuse still
+        rejects `memory.grow` under rebasing (no behaviour change off the
+        provably-safe path).
+
