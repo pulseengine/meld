@@ -1737,7 +1737,7 @@ artifacts:
       budget-fitting relocatable object — gale's gust:os v0.4.0 buffer node fits
       the STM32F100 8 KiB SRAM budget without the hand WAT surgery gale currently
       applies.
-    status: proposed
+    status: verified
     tags: [memory-strategy, shared-memory, mcu, dissolve, dce, v0.41.0]
     links:
       - type: derives-from
@@ -1755,15 +1755,19 @@ artifacts:
         - meld-core/src/rewriter.rs
       verification-method: test
       verification-description: >
-        PLANNED. (1) A fused two-provider shared-memory module exposes exactly
-        one mutable `i32` `__stack_pointer`-class global (init == sp_init), and
-        every use of a coalesced duplicate is redirected to the survivor
-        (global-index remap verified; a runtime check that two providers' frames
-        do not alias). (2) The fused output contains no exported `call_indirect`
-        trampoline over an import table — the dead shim's keep-alive export is
-        dropped so it DCEs. End-to-end oracle on the gale app-tl repro: the fused
-        module lowers under `synth ... --native-pointer-abi --shadow-stack-size`
-        with zero closed-world/shadow-stack warnings and fits the 8 KiB budget.
+        VERIFIED (#343, merged 2026-07-14). meld-core/tests/mcu_dissolve.rs:
+        (1) `stack_pointer_globals_coalesced` — a fused module ends with exactly
+        one mutable-i32 SP-class global and every `global.get`/`global.set` of a
+        coalesced duplicate is redirected to the survivor;
+        `shared_stack_pointer_runtime_non_clobber` (wasmtime) — pre-coalesce two
+        providers' frames alias, post-coalesce they do not.
+        (2) `dead_import_trampoline_export_dropped` — the dead numeric-name
+        `call_indirect`-over-import trampoline export is dropped while real/vtable
+        exports are kept. `conservative_no_coalesce_when_unsure` — single-SP,
+        differing-init, AND unnamed same-init globals are NOT coalesced (Mythos
+        review: coalescing uses only the authoritative `__stack_pointer` name).
+        End-to-end synth-dissolve on the gale app-tl node is gale-side downstream
+        validation (gale#168), pending gale's probe re-run.
 
   - id: SR-50
     type: sw-req
@@ -1788,7 +1792,7 @@ artifacts:
       hard-failing), so the lean single-address-space fuse succeeds. Over-drop
       is silent marshalling corruption, so the verdict's conservatism is
       load-bearing and must not be weakened.
-    status: proposed
+    status: verified
     tags: [memory-strategy, shared-memory, mcu, dce, realloc, v0.41.0]
     links:
       - type: derives-from
@@ -1807,16 +1811,19 @@ artifacts:
         - meld-core/src/rewriter.rs
       verification-method: test
       verification-description: >
-        PLANNED. Positive: a fused fully-internalised core (scalar lifts, no
-        adapters) exports no `cabi_realloc*` and, under `--memory shared
-        --address-rebase`, fuses successfully (the vestigial `memory.grow` is
-        deferred, not a hard error) — verified by re-parsing the output exports
-        and asserting the fuse returns Ok. Negative controls (the verdict's
-        conservatism): a component with a NON-scalar lift (string/list param or
-        result), a P2 component-wrapped output, or a fuse with adapter sites all
-        KEEP `cabi_realloc` and do not defer grow. A live-allocator fuse still
-        rejects `memory.grow` under rebasing (no behaviour change off the
-        provably-safe path).
+        VERIFIED (#345, merged 2026-07-14). meld-core/tests/drop_realloc.rs +
+        memory_probe unit tests. Positive `scalar_boundary_drops_realloc_and_defers_grow`:
+        a fused fully-internalised core exports no `cabi_realloc*` and fuses Ok
+        under `--memory shared --address-rebase` (the vestigial `memory.grow` is
+        deferred, not a hard error). Negative controls (verdict conservatism):
+        `string_lift`/`component_output`/`adapter_site`_keeps_realloc_and_hard_errors
+        all KEEP `cabi_realloc` and hard-error on grow. Mythos-added
+        `live_internal_grow_keeps_realloc_and_hard_errors`: a scalar-interface
+        component that allocates internally KEEPS realloc (the call-graph
+        reachability gate `module_has_reachable_memory_grow` — 11 unit tests —
+        prevents deferring a LIVE grow to a runtime trap).
+        `tight_match_preserves_realloc_lookalike_export` guards the digits-only
+        name match. `non_shared_fuse_preserves_realloc` guards the off-path.
   - id: SR-51
     type: sw-req
     title: Extended-const exprs beginning with global.get are preserved, not truncated
@@ -1832,7 +1839,7 @@ artifacts:
       `global.get`-first case. A truncated offset is a silent miscompile: the
       module still validates but places data / initialises globals at `base + 0`
       instead of `base + N`.
-    status: proposed
+    status: verified
     tags: [const-expr, miscompile, pie, correctness, v0.41.0]
     links:
       - type: derives-from
@@ -1850,9 +1857,14 @@ artifacts:
         - meld-core/src/merger.rs
       verification-method: test
       verification-description: >
-        PLANNED. Executed-vs-wasmtime oracles reproducing #338: a global
-        initializer `g = base + 100` (base=1000) yields 1100 (not 1000) after
-        fuse; a data-segment active offset `base + N` places the segment at
-        base+N. Negative: the const-first case and a bare `global.get` (no
-        trailing arithmetic) are unchanged.
+        VERIFIED (#346, merged 2026-07-15). meld-core/tests/const_expr_globalget.rs,
+        executed-vs-wasmtime: a global initializer `g = base + 100` (base=1000)
+        yields 1100 (not the pre-fix 1000); the operand-swapped
+        `test_338_multimodule_const_first_embedded_globalget_remaps` — a
+        multi-module fuse shifting `__memory_base` off import-index 0 — reads the
+        correct base (1100), not the pre-fix un-remapped `__stack_pointer` (5100);
+        data-segment offsets `base+N` and `N+base` land at base+N (pre-fix
+        truncated to base+0 / hard-errored). Negative: bare `global.get` and the
+        const-first pure fold are unchanged. Two Mythos passes (the second caught
+        the operand-swapped sibling + the imported-global index-map ordering bug).
 
