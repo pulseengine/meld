@@ -338,6 +338,7 @@ pub fn build(
     merged: &crate::merger::MergedModule,
     components: &[crate::parser::ParsedComponent],
     fused_bytes_without_extras: &[u8],
+    reproducible: bool,
 ) -> ComponentProvenance {
     let import_count = merged.import_counts.func;
     let ranges = code_section_function_ranges(fused_bytes_without_extras);
@@ -347,10 +348,17 @@ pub fn build(
         .enumerate()
         .map(|(defined_idx, mf)| {
             let (comp_idx, _mod_idx, func_idx) = mf.origin;
-            let component_id = components
-                .get(comp_idx)
-                .and_then(|c| c.name.clone())
-                .unwrap_or_else(|| format!("component-{comp_idx}"));
+            // #341: under `--reproducible` the component_id must not carry the
+            // caller-supplied path (else byte-identical inputs at different
+            // paths produce different provenance bytes → different sha).
+            let component_id = if reproducible {
+                format!("component-{comp_idx}")
+            } else {
+                components
+                    .get(comp_idx)
+                    .and_then(|c| c.name.clone())
+                    .unwrap_or_else(|| format!("component-{comp_idx}"))
+            };
             Entry {
                 fused_func_idx: import_count + defined_idx as u32,
                 component_id,

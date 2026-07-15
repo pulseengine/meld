@@ -842,7 +842,12 @@ impl Fuser {
         }
 
         if self.config.component_provenance {
-            let provenance = provenance::build(&merged, &self.components, &output_without_extras);
+            let provenance = provenance::build(
+                &merged,
+                &self.components,
+                &output_without_extras,
+                self.config.reproducible,
+            );
             // SCPV v3 binary payload (#313 / scry#63) — infallible encode.
             extra_sections.push((provenance::SECTION_NAME, provenance.to_bytes()));
         }
@@ -1975,10 +1980,19 @@ impl Fuser {
             .reproducible(self.config.reproducible);
 
         for (index, component) in self.components.iter().enumerate() {
-            let name = component
-                .name
-                .clone()
-                .unwrap_or_else(|| format!("component-{}", index));
+            // #341: under `--reproducible` the input name must not carry the
+            // caller-supplied path — otherwise byte-identical inputs at
+            // different paths (e.g. two CI checkouts / temp dirs) fuse to
+            // different sha256s. Use the positional identifier; the input's
+            // content stays pinned by `original_hash` below.
+            let name = if self.config.reproducible {
+                format!("component-{}", index)
+            } else {
+                component
+                    .name
+                    .clone()
+                    .unwrap_or_else(|| format!("component-{}", index))
+            };
             builder = builder.add_input_descriptor(
                 name,
                 component.core_modules.len(),
@@ -2020,10 +2034,16 @@ impl Fuser {
 
         let mut inputs = Vec::new();
         for (index, component) in self.components.iter().enumerate() {
-            let name = component
-                .name
-                .clone()
-                .unwrap_or_else(|| format!("component-{}", index));
+            // #341: see build_attestation — under `--reproducible` the input
+            // name must not carry the caller-supplied path.
+            let name = if self.config.reproducible {
+                format!("component-{}", index)
+            } else {
+                component
+                    .name
+                    .clone()
+                    .unwrap_or_else(|| format!("component-{}", index))
+            };
             inputs.push(InputArtifact {
                 artifact: ArtifactDescriptor {
                     name,
@@ -3058,6 +3078,38 @@ mod tests {
             c, d,
             "#325: non-reproducible fusion is expected to differ (random attestation id); \
              if this ever holds, the reproducible flag is testing nothing"
+        );
+
+        // #341: byte-identical input under DIFFERENT names/paths must fuse to
+        // the SAME output when reproducible (the input's path leaked into the
+        // attestation + provenance component_id). Two CI checkouts / temp dirs
+        // fusing the same component must agree.
+        let fuse_named = |name: &str, reproducible: bool| -> Vec<u8> {
+            let config = FuserConfig {
+                attestation: true,
+                reproducible,
+                ..FuserConfig::default()
+            };
+            let mut fuser = Fuser::new(config);
+            fuser
+                .add_component_named(&component_bytes, Some(name))
+                .expect("add_component_named failed");
+            fuser.fuse().expect("fuse failed")
+        };
+        let pa = fuse_named("/tmp/pa/falcon.wasm", true);
+        let pb = fuse_named("/tmp/pb/falcon.wasm", true);
+        assert_eq!(
+            pa, pb,
+            "#341: reproducible fusion must not depend on the input file path/name"
+        );
+        // Control: without reproducible the human-friendly name IS retained, so
+        // different names produce different attestation bytes (name is not
+        // silently dropped off the reproducible path).
+        let qa = fuse_named("/tmp/pa/falcon.wasm", false);
+        let qb = fuse_named("/tmp/pb/falcon.wasm", false);
+        assert_ne!(
+            qa, qb,
+            "#341 control: non-reproducible fusion retains the caller-supplied name"
         );
     }
 
