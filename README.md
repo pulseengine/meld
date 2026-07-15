@@ -12,7 +12,7 @@
 ![Rust](https://img.shields.io/badge/Rust-CE422B?style=flat-square&logo=rust&logoColor=white&labelColor=1a1b27)
 ![WebAssembly](https://img.shields.io/badge/WebAssembly-654FF0?style=flat-square&logo=webassembly&logoColor=white&labelColor=1a1b27)
 ![Component Model](https://img.shields.io/badge/Component_Model-654FF0?style=flat-square&logoColor=white&labelColor=1a1b27)
-![Formally Verified](https://img.shields.io/badge/Formally_Verified-00C853?style=flat-square&logoColor=white&labelColor=1a1b27)
+[![Formal Methods](https://img.shields.io/badge/Formal_Methods-Rocq_%2B_Kani_(partial)-2962FF?style=flat-square&logoColor=white&labelColor=1a1b27)](#formal-verification)
 ![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue?style=flat-square&labelColor=1a1b27)
 
 &nbsp;
@@ -35,7 +35,7 @@
 
 Meld fuses. Loom weaves. Synth transpiles. Kiln fires. Sigil seals.
 
-Meld statically fuses multiple WebAssembly components into a single core module, eliminating the need for runtime linking. Import resolution, index-space merging, and canonical ABI adapter generation happen at build time. Every transformation carries mechanized proofs covering parsing, resolution, merging, and adapter correctness.
+Meld statically fuses multiple WebAssembly components into a single core module, eliminating the need for runtime linking. Import resolution, index-space merging, and canonical ABI adapter generation happen at build time. The core transformations — resolution, index-space merging, and adapter generation — carry mechanized Rocq proofs, plus local Kani bounded-model-checking harnesses on the Canonical-ABI layout invariants; see [Formal Verification](#formal-verification) for the per-stage coverage (some stages are specified but not yet proved, and the Kani harnesses are run locally, not gated in CI).
 
 Unlike composition tools that produce linked-but-separate component graphs, Meld produces a single monolithic module suitable for whole-program optimization by Loom and native transpilation by Synth.
 
@@ -158,13 +158,15 @@ Step 2 proves the checksum file came from this repo's `release.yml`; step 3 ties
 
 ## Formal Verification
 
-Meld's core transformations are formally verified using Rocq. The proofs establish that fusion preserves program semantics — the fused module behaves identically to the original composed components.
+Meld's **core** transformations carry mechanized Rocq proofs — 350 closed proofs (`Qed`) across the resolver, merger, adapter, and specification layers (see [`proofs/STATUS.md`](proofs/STATUS.md) for the per-stage coverage matrix). This is real, substantial verification on the core; it is **not** yet a whole-pipeline proof: the parser, rewriter, segments, and attestation stages are specified but their proofs are placeholders, orchestration (`lib.rs`) is unproven, and the semantic-preservation result is a **forward** simulation (the fused module simulates the original graph step-by-step; the reverse direction and the backward half of trap-equivalence are not yet proved).
 
-Key verified properties:
-- **Merge correctness** — Index remapping preserves function/memory/table references
-- **Resolve correctness** — Topological sort produces valid instantiation order; cycle detection terminates
-- **Adapter correctness** — Generated trampolines preserve call semantics
-- **Forward simulation** — Fused module simulates the original component graph step-by-step
+Proven properties (Rocq):
+- **Merge correctness** — Index remapping preserves function/memory/table references (injectivity, completeness, boundedness); memory-layout disjointness.
+- **Resolve correctness** — Topological sort produces a valid instantiation order; cycle detection terminates.
+- **Adapter correctness** — Canonical-ABI lift/lower roundtrip and crossing-adapter semantics (one FACT parameter-match lemma remains `Admitted`).
+- **Forward simulation** — The fused module simulates the original component graph step-by-step (forward direction; fully proved).
+
+In addition, the Canonical-ABI layout invariants (size/alignment saturating arithmetic, the #141 stream ring model) carry **Kani** bounded-model-checking harnesses (`abi_proofs.rs`, `resolver.rs`, `merger.rs`) that were `VERIFICATION SUCCESSFUL` locally (SR-40); these are **not gated in CI** (the shared runners do not ship the Kani toolchain), and the ABI size/alignment and aggregate-padding contracts that did not converge in CBMC fall back to unit tests.
 
 Proofs are built via Bazel using [`rules_rocq_rust`](https://github.com/pulseengine/rules_rocq_rust):
 
