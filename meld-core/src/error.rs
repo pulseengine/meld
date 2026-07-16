@@ -76,6 +76,31 @@ pub enum Error {
         module: String,
     },
 
+    /// A `reloc.CODE` memory-address relocation site does not land on a
+    /// rebasable immediate in the emitted code (issue #351). This is the
+    /// signature of stale relocation offsets — e.g. a producer that relaxed
+    /// address immediates from 5-byte-padded to minimal LEB128 without
+    /// rewriting `reloc.*` offsets in lockstep (pulseengine/wasm-tools#3),
+    /// leaving each site drifted by the accumulated width reduction. meld
+    /// cannot safely rebase from misaligned relocs: applying them at the wrong
+    /// site (or silently skipping a drifted one) corrupts the shared address
+    /// space. Hard-fail rather than emit a plausible-but-wrong module.
+    #[error(
+        "component '{component}' module {module}: relocation site at code offset {offset} \
+         (reloc.CODE) does not land on a rebasable address immediate — the relocation \
+         metadata is stale relative to the emitted code (a producer relaxed LEB immediates \
+         without updating reloc offsets; see pulseengine/wasm-tools#3 and meld#351). \
+         Cannot rebase safely under `--memory shared --address-rebase`"
+    )]
+    MisalignedReloc {
+        /// Display name of the component that owns the offending module.
+        component: String,
+        /// The offending module's index within its component.
+        module: String,
+        /// The stale reloc.CODE code-content offset that failed to align.
+        offset: u32,
+    },
+
     /// Adapter generation error
     #[error("adapter generation failed: {0}")]
     AdapterGeneration(String),

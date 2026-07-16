@@ -4,6 +4,25 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Stale `reloc.CODE` offsets no longer silently miscompile shared-memory
+  fusion (#351, soundness backstop).** A producer that relaxes address
+  immediates from 5-byte-padded to minimal LEB128 without rewriting `reloc.*`
+  offsets in lockstep (clang 22.1.4 + wit-component 0.245.1; upstream
+  pulseengine/wasm-tools#3) leaves each reloc site drifted by +2 bytes per
+  preceding memory-address reloc. Under `--memory shared --address-rebase` a
+  drifted site could land past its operator and be silently skipped — e.g. a
+  `ptr = &data[0]` `i32.const` left un-rebased, aliasing another component's
+  memory (grounded runtime bug on v0.41.1: `ptr-b` returned `65536` instead of
+  the rebased `196608`). meld now verifies every `R_WASM_MEMORY_ADDR_*` site
+  lands on a rebasable immediate and hard-fails with `MisalignedReloc` rather
+  than emit a plausible-but-wrong module. **Falsification:**
+  `test_351_stale_reloc_offsets_hard_error` fuses the exact reproducing
+  components and asserts the hard error at code offset 42; the working-path
+  oracle (consistent relocs) still rebases correctly. Drift-tolerant *correct*
+  rebasing (so such inputs fuse rather than fail) is tracked as a follow-up.
+
 ## [0.41.1] - 2026-07-15
 
 Reproducibility patch: `--reproducible` output no longer depends on the input

@@ -1917,3 +1917,59 @@ artifacts:
         (default attestation descriptor, wsc `InputArtifact`, provenance
         `component_id`).
 
+  - id: SR-53
+    type: sw-req
+    title: Stale reloc.CODE offsets hard-fail rather than silently miscompile
+    description: >
+      Under `--memory shared --address-rebase`, when consuming an input's
+      `reloc.CODE` to rebase memory-address sites, meld shall verify that every
+      `R_WASM_MEMORY_ADDR_*` site lands on a rebasable operator immediate
+      (an `i32`/`i64` const or a load/store `memarg`) in the emitted code. If any
+      site does not, the relocation metadata is stale relative to the code — the
+      signature of a producer that relaxed address immediates from 5-byte-padded
+      to minimal LEB128 without rewriting the reloc offsets in lockstep (drift
+      accumulates +2 bytes per preceding memory-address reloc;
+      pulseengine/wasm-tools#3). When a site drifts PAST its operator entirely it
+      is silently skipped, corrupting the shared address space (the observed
+      meld#351 shape). meld shall hard-fail with `MisalignedReloc` rather than
+      emit a plausible-but-wrong module (#351). SCOPE: this backstop catches the
+      drift-past-operator case (site outside every rebasable immediate); it does
+      NOT catch drift INTO an adjacent rebasable operator (undecidable from the
+      code + reloc offsets alone — needs symbol-resolved value confirmation).
+      Drift-tolerant CORRECT rebasing that closes the adjacent case and lets such
+      inputs fuse is the tracked tier-2 follow-up.
+    status: verified
+    tags: [reloc, rebasing, shared-memory, miscompile, correctness, v0.41.2]
+    links:
+      - type: derives-from
+        target: SYS-1
+      - type: mitigates
+        target: LS-D-1
+    cited-source:
+      - uri: "https://github.com/pulseengine/meld/issues/351"
+        kind: github
+        last-checked: 2026-07-16
+      - uri: "https://github.com/pulseengine/wasm-tools/issues/3"
+        kind: github
+        last-checked: 2026-07-16
+    release: v0.41.2
+    fields:
+      implementation:
+        - meld-core/src/reloc.rs
+        - meld-core/src/merger.rs
+        - meld-core/src/error.rs
+      verification-method: test
+      verification-description: >
+        VERIFIED. meld-core/tests/rebasing_end_to_end.rs
+        `test_351_stale_reloc_offsets_hard_error`: the exact reproducing
+        components from the issue (clang 22.1.4 + wit-component 0.245.1; b.wasm
+        sha256 481c36…d3a3), whose trailing `ptr-b` SLEB site drifts +4 to code
+        offset 42 (past its `i32.const` operator range [37,41)), now fuse to a
+        hard `MisalignedReloc { offset: 42 }` instead of the pre-fix silent
+        miscompile (`ptr-b` returned 65536, aliasing component-a, verified vs
+        wasmtime on v0.41.1). Unit oracle `reloc::first_misaligned_code_reloc_detects_drift`:
+        a site on a rebasable immediate aligns; one drifted onto the `end`
+        operator or past the code section is caught. Negative: the working-path
+        oracle `test_326_reloc_const_rebasing_end_to_end` (consistent relocs) and
+        a real clang-22.1.8 consistent-reloc fixture still rebase correctly
+        (ptr_b = 196608), so the backstop does not over-reject valid modules.

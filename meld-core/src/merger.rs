@@ -1952,7 +1952,26 @@ impl Merger {
                     )));
                 }
                 data_addr_relocs = info.data_memory_addr_entries();
-                Some(info.code_memory_addr_offsets())
+                let code_offsets = info.code_memory_addr_offsets();
+                // #351 backstop: verify every reloc.CODE memory-address site
+                // still lands on a rebasable immediate. A producer that relaxed
+                // LEB immediates without rewriting reloc offsets
+                // (pulseengine/wasm-tools#3) leaves them drifted; a drifted site
+                // is applied to the wrong operator or silently skipped, so
+                // hard-fail rather than corrupt the shared address space.
+                if let Some((start, end)) = module.code_section_range {
+                    let code_content = &module.bytes[start..end];
+                    if let Some(offset) =
+                        crate::reloc::first_misaligned_code_reloc(code_content, &code_offsets)?
+                    {
+                        return Err(Error::MisalignedReloc {
+                            component: component_display_name(components, comp_idx),
+                            module: mod_idx.to_string(),
+                            offset,
+                        });
+                    }
+                }
+                Some(code_offsets)
             } else {
                 None
             }
