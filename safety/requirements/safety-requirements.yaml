@@ -1929,11 +1929,15 @@ artifacts:
       signature of a producer that relaxed address immediates from 5-byte-padded
       to minimal LEB128 without rewriting the reloc offsets in lockstep (drift
       accumulates +2 bytes per preceding memory-address reloc;
-      pulseengine/wasm-tools#3). A drifted site is applied to the wrong operator
-      or (once it drifts past its operator) silently skipped, corrupting the
-      shared address space. meld shall hard-fail with `MisalignedReloc` rather
-      than emit a plausible-but-wrong module (#351). This is the backstop tier of
-      the fix; drift-tolerant correct rebasing is tracked separately.
+      pulseengine/wasm-tools#3). When a site drifts PAST its operator entirely it
+      is silently skipped, corrupting the shared address space (the observed
+      meld#351 shape). meld shall hard-fail with `MisalignedReloc` rather than
+      emit a plausible-but-wrong module (#351). SCOPE: this backstop catches the
+      drift-past-operator case (site outside every rebasable immediate); it does
+      NOT catch drift INTO an adjacent rebasable operator (undecidable from the
+      code + reloc offsets alone — needs symbol-resolved value confirmation).
+      Drift-tolerant CORRECT rebasing that closes the adjacent case and lets such
+      inputs fuse is the tracked tier-2 follow-up.
     status: verified
     tags: [reloc, rebasing, shared-memory, miscompile, correctness, v0.41.2]
     links:

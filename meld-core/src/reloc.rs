@@ -545,16 +545,28 @@ fn parse_reloc_section(suffix: &str, body: &[u8]) -> Result<RelocSection> {
 /// lands on. If a producer relaxes address immediates (5-byte-padded → minimal
 /// LEB128) without rewriting `reloc.*` offsets in lockstep
 /// (pulseengine/wasm-tools#3), every site drifts by the accumulated width
-/// reduction. A drifted site either lands on the wrong operator or (as with the
-/// trailing `i32.const` in meld#351) past its operator entirely — the rebase is
-/// then applied to the wrong immediate or silently skipped, corrupting the
-/// shared address space. Detecting a site that no longer lands on a rebasable
-/// immediate lets the caller hard-fail instead of emitting a wrong module.
+/// reduction. When a site drifts *past* its operator entirely (as with the
+/// trailing `i32.const` in meld#351) the rebase is silently skipped, corrupting
+/// the shared address space. Detecting a site that no longer lands on a
+/// rebasable immediate lets the caller hard-fail instead of emitting a wrong
+/// module.
 ///
 /// A site is "rebasable-aligned" when it falls within the byte range
 /// `[op_start, op_end)` of a rebasable operator. This is exactly the window the
 /// rewriter's `old_pos <= r < op_end` test uses to set `addr_reloc`, so a site
 /// this function accepts is one the rewriter will actually rebase.
+///
+/// **Scope / known limitation (backstop, not a full guarantee).** This catches
+/// the *drift-past-operator* case — a site outside every rebasable range. It
+/// does NOT catch *drift-into-an-adjacent-rebasable-operator*: if drift shifts a
+/// site off its intended immediate but into a neighbouring `i32.const`/`memarg`
+/// range, this returns `None` and the rewriter rebases the wrong (but still
+/// rebasable) immediate. Distinguishing that from a legitimately-placed site is
+/// undecidable from `(code_content, code_addr_offsets)` alone — it needs the
+/// reloc's *intended* target (symbol-resolved address / value confirmation),
+/// which the drift-tolerant tier-2 fix adds. So this function is a soundness
+/// *backstop* that converts the observed #351 silent corruption into a loud
+/// error, not a complete alignment verifier.
 pub fn first_misaligned_code_reloc(
     code_content: &[u8],
     code_addr_offsets: &std::collections::HashSet<u32>,
@@ -1038,6 +1050,31 @@ mod tests {
         assert_eq!(
             first_misaligned_code_reloc(code, &HashSet::new()).unwrap(),
             None
+        );
+    }
+
+    /// Documents the KNOWN LIMITATION of this backstop (see the fn docs): it
+    /// catches drift *past* an operator, but NOT drift *into an adjacent
+    /// rebasable operator*. Three consecutive `i32.const`; a site intended for
+    /// the middle const's immediate (@6) that drifts +2 to @8 lands inside the
+    /// THIRD const's range `[7,9)`, so the backstop returns `None` (accepts) even
+    /// though the rewriter would then rebase the wrong const. This is undecidable
+    /// from `(code, offsets)` alone and is closed by the drift-tolerant tier-2
+    /// fix; the test pins the boundary so the backstop is not mistaken for a
+    /// complete alignment verifier.
+    #[test]
+    fn first_misaligned_code_reloc_adjacent_drift_is_a_known_gap() {
+        use std::collections::HashSet;
+        //  @0 count=1  @1 body_size=8  @2 locals=0
+        //  @3 i32.const opcode @4 imm  @5 opcode @6 imm  @7 opcode @8 imm  @9 end
+        let code: &[u8] = &[0x01, 0x08, 0x00, 0x41, 0x01, 0x41, 0x01, 0x41, 0x01, 0x0b];
+        // A site drifted from the middle const (@6) into the third const (@8)
+        // is NOT caught — the documented gap.
+        let adjacent_drift: HashSet<u32> = [8u32].into_iter().collect();
+        assert_eq!(
+            first_misaligned_code_reloc(code, &adjacent_drift).unwrap(),
+            None,
+            "adjacent-operator drift is a known backstop gap (tier-2 closes it)"
         );
     }
 }
