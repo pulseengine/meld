@@ -126,6 +126,72 @@ coupling.
 Near-term this does not block #352 (the backstop for the canonical `--emit-relocs`
 path) — that ships and serves the mix-and-match path today.
 
+## Strategic review (10-persona) — consensus, refinements, the open choice
+
+A 10-persona review (Standards Steward, Commercial Moat Strategist,
+Functional-Safety Engineer, Component-Model Core Architect, Embedded/MCU Lead,
+Toolchain Maintenance Realist, Formal-Methods Researcher, Max-Composability
+Advocate, DX Lead, Adversarial Competitor) stress-tested this direction against
+the crux question: *how much to give away / make generic-for-all vs. keep as
+PulseEngine's own.* The following is **decision-independent consensus** and now
+refines this ADR regardless of the identity choice below.
+
+### Consensus (unanimous or near) — adopted as requirements
+
+1. **path-H is endorsed by all ten.** No dissent on the per-boundary /
+   canonical-fallback architecture.
+2. **Give away the ABIs; keep the proofs.** The mechanisms (canonical FACT, the
+   symmetric calling convention, PIC `__memory_base` static-base folding) are
+   commodity conventions — of no durable value if privatized. The **moat is the
+   mechanized-verified core + the soundness/no-alloc proofs + the ASIL-D/DO-178C
+   attestation.** Sell the *verification of the fused artifact*, not the fusion.
+3. **Silent downgrade is the top safety risk → a hard requirement.** A boundary
+   quietly falling back from symmetric/no-alloc to canonical (heap +
+   `cabi_realloc` + transcoding) inside a sealed image would smuggle a dynamic
+   allocator into an ASIL-D TCB with no signal. **Per-boundary strategy MUST be
+   declared, attested, and observable; an unmet symmetric/PIC precondition MUST be
+   a hard, loud error — never a silent adapter insertion or rebase.** (Add a
+   `--explain` per-edge boundary report.)
+4. **Symmetric must not remain a single-vendor fork.** Drive cpetig/Aptiv's
+   symmetric ABI into a BA / wit-bindgen named, versioned convention (and the PIC
+   static-base convention into tool-conventions) **before** shipping a safety
+   product against it; a 15–30 yr safety case cannot cite a hand-tracked fork.
+   Until then the symmetric strategy is gated **experimental / non-portable**.
+5. **The 16.4k-line adapter subsystem is a cost centre, not a moat** —
+   co-maintain / track upstream; do not garrison it.
+6. **Concrete shape: one binary, two attested profiles.**
+   `open/ecosystem` (canonical fallback, full mix-and-match, meld as reference)
+   and `sealed-safety` (symmetric+PIC only, statically rejects any
+   adapter/`cabi_realloc` boundary, emits the attestation). Strategy is *inferred
+   per edge from both endpoints' capability metadata*, not a user-facing mode
+   matrix; keep the strategy seam **internal** (ship exactly the two lowerings),
+   not a public plugin ABI.
+7. **New key proof obligation:** a **heterogeneous-composition theorem** — any
+   assignment of {canonical, symmetric} × {multi-memory, shared-rebase, PIC}
+   across boundaries is semantically equivalent to pure-canonical composition.
+   "Canonical fallback is safe" is a *claim, not a theorem* until this + the
+   symmetric-preserves-semantics refinement are discharged; an unproven fallback
+   is a *bigger* TCB, not a safer one.
+
+### The one open decision (for the human — status stays `open`)
+
+Is meld's **identity** "THE generic RFC-46 reference fuser (safety as a profile
+on top)" or "the specialized verified safety-critical fuser (canonical as a
+compatibility bridge)"? The review's resolution: *be the reference at the
+kernel+canonical **layer**, specialized at the strategy+attestation **layer** —
+one unforked binary, two profiles.* The **load-bearing sub-choice that forces the
+rest**: **do we co-maintain / track the upstream (wasmtime/BA) canonical FACT
+reference, or hand-carry our own 16.4k-line adapter fork forever?** Choosing
+"track upstream" frees verified-engineering budget for the moat and dissolves the
+generic-vs-specialize tension. This sub-choice is the next thing to decide.
+
+### Risks to keep on the board
+
+Silent downgrade (see req. 3); **donating the moat while garrisoning the
+commodity** (spending verified-engineering on the canonical adapter treadmill
+while giving away the symmetric/PIC lane we pioneered); and combinatorial
+verification / fork-drift blow-up across the 2×3 strategy matrix.
+
 ## References
 
 - BA RFC #46 (bytecodealliance/rfcs#46); `safety/stpa/rfc46-comparative-analysis.md`.
