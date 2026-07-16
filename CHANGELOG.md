@@ -4,6 +4,16 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.41.2] - 2026-07-16
+
+Soundness patch: stale relocation metadata can no longer silently miscompile
+shared-memory fusion.
+
+**Falsification:** if a producer's drifted `reloc.CODE` site slipped through
+un-rebased again, `test_351_stale_reloc_offsets_hard_error` fails — it fuses the
+exact reproducing components and asserts the hard `MisalignedReloc` at code
+offset 42, while the consistent-reloc oracle still rebases correctly.
+
 ### Fixed
 
 - **Stale `reloc.CODE` offsets no longer silently miscompile shared-memory
