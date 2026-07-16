@@ -2,7 +2,7 @@
 id: ADR-7
 type: design-question
 title: ABI & linking-strategy architecture — canonical mix-and-match vs a symmetric/PIC fast lane
-status: open
+status: resolved
 gating-fixtures:
   # The invariant any chosen path MUST preserve: the standard canonical-ABI
   # fusion path stays green (mix-and-match is not sacrificed for the fast lane).
@@ -113,7 +113,59 @@ So the clean split is a **moderate, incremental refactor**, not a rewrite.
   the zero-copy / allocation-free / far-more-verifiable safety path and leaves
   RFC-46 Q1 unresolved.
 
-## Recommendation (for human decision — status: open)
+## Decision (accepted 2026-07-16)
+
+**path-H is adopted.** The two human-owned calls were made deliberately, against
+the review's default recommendation, in favour of maximal control + verifiability:
+
+1. **Identity — balanced / dual.** meld is BOTH the generic RFC-46 canonical
+   reference fuser (full mix-and-match) AND the sealed-safety product
+   (symmetric+PIC, verified, allocation-free, attested). Both are first-class;
+   neither is merely "a profile on the other."
+2. **Ownership — own the full fusion stack.** meld keeps and formally verifies
+   the entire lowering implementation — canonical FACT (~16.4k lines),
+   symmetric-direct, and static-base PIC — depending on NO external lowering.
+   Rationale that overrides the review's "track upstream": a formally-verified,
+   15–30 yr-lifecycle safety tool must own a **frozen, verifiable trusted base**;
+   you cannot verify wasmtime's evolving FACT, and self-contained output is
+   already a differentiator. Control + verifiability beat escaping the treadmill.
+
+**Distinction that reconciles "own the fork" with "don't fragment":** meld owns
+its **implementation**; the **ABIs/conventions stay open standards** — drive the
+symmetric ABI to a BA/wit-bindgen spec and the PIC static-base convention to
+tool-conventions. Owning a verified impl of an open standard is not privatizing
+the standard. Mix-and-match is preserved (path-H canonical fallback); a
+third-party canonical component still composes.
+
+**Standing requirements (from the 10-persona review, unchanged and now binding):**
+silent-downgrade = hard error; per-boundary strategy declared/attested/observable;
+two attested profiles (`open/ecosystem`, `sealed-safety`); and the
+**heterogeneous-composition theorem** (any {canonical,symmetric}×{multi,rebase,
+PIC} ≡ pure-canonical) — now *mandatory*, since meld owns and verifies the whole
+matrix.
+
+**Risks accepted with this decision (named, not hidden):**
+1. *Scope / budget* — dual identity + own-everything is the largest surface; the
+   review's "splits a small team's budget" and "garrison the commodity" both
+   apply. Mitigation: canonical is largely built already; sequence symmetric/PIC
+   as the additive safety lane; lean on the agent-driven development model.
+2. *Canonical-parity treadmill* — owning FACT means tracking the Component Model
+   spec. Mitigation: the RFC-46 conformance suite gates drift; being the
+   reference means helping set the pace, not only chasing it.
+3. *Proof surface* — owning the full 2×3 matrix multiplies the verification /
+   MC-DC obligation; the heterogeneous-composition theorem is the linchpin.
+
+**Next increments (path-H, additive — canonical stays green throughout):**
+1. Extract the address strategy out of the merger (multi / shared-rebase /
+   static-base-PIC) — "the split, increment 1"; behavior-preserving refactor.
+2. Formalize the per-boundary call-lowering seam (canonical-FACT default /
+   symmetric-direct opt-in), with the declared/attested/hard-fail contract.
+3. Fulfill RFC-46 Q1 (multiply-instantiated modules) — converges with the #353
+   shared-everything core-instance topology work.
+4. #353 Path-A PIC static-flatten prototype; symmetric-direct lowering behind the
+   seam; begin the heterogeneous-composition proof.
+
+## Recommendation (superseded by the Decision above; retained for rationale)
 
 **path-H.** It is the only path that (a) holds the RFC-46 mix-and-match invariant
 as a hard constraint (canonical universal fallback), (b) lets the symmetric/PIC
