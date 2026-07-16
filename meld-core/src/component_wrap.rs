@@ -2069,15 +2069,90 @@ fn assemble_component(
         let aliased_core_func = core_func_idx;
         core_func_idx += 1;
 
-        // Define the function type — use default run type (func() -> void)
-        let wrapper_func_type = define_bare_func_type(&mut component, &mut component_type_idx);
+        // #355: carry the SOURCE export's lift type through, instead of assuming
+        // a bare `func()`. The `func()` assumption only held for `run`-style
+        // exports; for any non-empty signature it produced an INVALID component
+        // (`wasm-tools validate`: "lowered parameter types [] do not match ...").
+        // Bare *world* exports (e.g. `world root { export get-b: func(i:s32)
+        // -> u32 }`) hit exactly this path. `comp_export.index` now resolves
+        // correctly because the parser records func export-aliases so the
+        // component-function index space is aligned (see ComponentFuncDef::ExportAlias).
+        let source_lift = source
+            .component_func_defs
+            .get(comp_export.index as usize)
+            .and_then(|def| match def {
+                parser::ComponentFuncDef::Lift(canon_idx) => {
+                    source.canonical_functions.get(*canon_idx)
+                }
+                _ => None,
+            })
+            .and_then(|ce| match ce {
+                parser::CanonicalEntry::Lift {
+                    type_index,
+                    options,
+                    ..
+                } => Some((*type_index, options.clone())),
+                _ => None,
+            });
 
-        // Canon lift (bare functions like `run` take no arguments and return nothing)
+        // A string/list-returning bare export needs memory + encoding +
+        // post-return, same as the interface path. Alias the cleanup right
+        // after the main func so the core-func index stays contiguous.
+        let post_return_name = format!("cabi_post_{}", func_name);
+        let has_post_return = fused_info
+            .exports
+            .iter()
+            .any(|(n, k, _)| *k == wasmparser::ExternalKind::Func && *n == post_return_name);
+        let post_return_core_idx = if has_post_return {
+            let mut a = ComponentAliasSection::new();
+            a.alias(Alias::CoreInstanceExport {
+                instance: fused_instance,
+                kind: ExportKind::Func,
+                name: &post_return_name,
+            });
+            component.section(&a);
+            let idx = core_func_idx;
+            core_func_idx += 1;
+            Some(idx)
+        } else {
+            None
+        };
+
+        // Carry the source type; only fall back to `func()` when the export
+        // truly has no discoverable lift type (keeps the historical last resort).
+        let wrapper_func_type = match &source_lift {
+            Some((type_index, _)) => define_source_type_in_wrapper(
+                &mut component,
+                source,
+                *type_index,
+                &mut component_type_idx,
+                &mut type_remap,
+            )?,
+            None => define_bare_func_type(&mut component, &mut component_type_idx),
+        };
+
+        // Lift options: memory + string encoding + post-return when cleanup is
+        // needed (scalar exports keep the empty option list).
+        let mut lift_options: Vec<CanonicalOption> = Vec::new();
+        if let Some(pr_idx) = post_return_core_idx {
+            lift_options.push(CanonicalOption::Memory(0));
+            let enc = source_lift
+                .as_ref()
+                .map(|(_, opts)| source_string_encoding_option(opts.string_encoding))
+                .unwrap_or(CanonicalOption::UTF8);
+            lift_options.push(enc);
+            lift_options.push(CanonicalOption::PostReturn(pr_idx));
+        }
+
         let mut canon = CanonicalFunctionSection::new();
-        canon.lift(aliased_core_func, wrapper_func_type, []);
+        canon.lift(aliased_core_func, wrapper_func_type, lift_options);
         component.section(&canon);
 
-        // Export as a bare function
+        // Export as a bare function. `component_func_idx` is the canon-lift's
+        // component-func index. Exporting a `Func` binds a NEW component-func
+        // index (an export alias), so the NEXT lift lands two indices later —
+        // advance by 2, not 1. (#355: `+= 1` made each export reference the
+        // previous export's alias instead of its own lift.)
         let mut exp = ComponentExportSection::new();
         exp.export(
             func_name,
@@ -2086,7 +2161,7 @@ fn assemble_component(
             None,
         );
         component.section(&exp);
-        component_func_idx += 1;
+        component_func_idx += 2;
     }
 
     Ok(component.finish())
@@ -2882,6 +2957,13 @@ fn define_source_type_in_wrapper(
                     // Component model now only supports a single anonymous result;
                     // emit the first result type.
                     func_enc.result(Some(enc_results[0].1));
+                } else {
+                    // No results (e.g. `set-b: func(i: s32, v: u32)` returning
+                    // void). `result()` MUST still be called to terminate the
+                    // func type — omitting it left the type unencoded, so the
+                    // decoder hit EOF (#355). Latent until a no-result export
+                    // was routed through this helper.
+                    func_enc.result(None);
                 }
             }
             component.section(&types);

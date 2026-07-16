@@ -1973,3 +1973,51 @@ artifacts:
         oracle `test_326_reloc_const_rebasing_end_to_end` (consistent relocs) and
         a real clang-22.1.8 consistent-reloc fixture still rebase correctly
         (ptr_b = 196608), so the backstop does not over-reject valid modules.
+
+  - id: SR-54
+    type: sw-req
+    title: --component lifts bare world exports with their real signatures
+    description: >
+      When emitting a P2 component (`--component` / `OutputFormat::Component`),
+      meld shall lift every export with the component-level function type of the
+      source export (params + results), NOT an empty `(func)`. The bare
+      world-export path previously hardcoded `func()` (a `run`-style assumption),
+      so any export with a non-empty signature produced an INVALID component —
+      `wasm-tools validate` rejects it ("lowered parameter types [] do not match
+      the core function"), and it cannot be instantiated. Silent: fusion printed
+      "Fusion complete!" with no warning (#355). Three latent defects underlay
+      it: (a) the parser did not record func export-aliases, so the
+      component-function index space was compacted and `component_func_defs[
+      export.index]` mis-resolved; (b) the wrapper's func-type emitter never
+      terminated a NO-RESULT func type (`func_enc.result(None)` was not called),
+      truncating the type; (c) the bare-export emitter advanced the component-func
+      index by 1 per export while each export also binds an export-alias index,
+      so every export referenced the previous export's alias. All three are
+      fixed; the standard `--component` interface path is unaffected.
+    status: verified
+    tags: [component-wrap, canonical-abi, correctness, validity, v0.41.3]
+    links:
+      - type: derives-from
+        target: SYS-1
+    cited-source:
+      - uri: "https://github.com/pulseengine/meld/issues/355"
+        kind: github
+        last-checked: 2026-07-16
+    release: v0.41.3
+    fields:
+      implementation:
+        - meld-core/src/parser.rs
+        - meld-core/src/component_wrap.rs
+        - meld-core/src/p3_stream.rs
+      verification-method: test
+      verification-description: >
+        VERIFIED. meld-core/tests/component_bare_export_355.rs on avrabe's exact
+        fixtures (tests/reloc351/{a,b}.wasm; bare world exports get-b/set-b/ptr-b):
+        `test_355_bare_world_exports_single_component` and `..._two_components`
+        assert (1) the fused --component output is a VALID component
+        (`wasmparser::Validator` with all features — catches the empty-type bug
+        and the un-terminated no-result func) and (2) each export lifts with its
+        real arity — get-b (1,1), set-b (2,0), ptr-b (0,1) — catching the
+        export-alias index-skip that shifted every export onto the previous
+        one's type. Full meld-core suite green (no regression from the parser
+        component_func_defs change).
