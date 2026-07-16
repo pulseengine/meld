@@ -2036,7 +2036,13 @@ fn assemble_component(
             None,
         );
         component.section(&exp);
-        component_instance_idx += 1;
+        // Exporting the instance binds a NEW component-instance index (an export
+        // alias), same as the bare-func path (#355) — so the next interface's
+        // synthetic instance lands two indices later. `+= 1` made the 2nd and
+        // later exported interfaces reference the previous interface's alias,
+        // silently exporting the wrong functions (surfaced by the #355 Mythos
+        // pass; UCA-CP-1). The output still `validate`s, so it was silent.
+        component_instance_idx += 2;
     }
 
     // Handle bare function exports (e.g., "run" without an interface wrapper).

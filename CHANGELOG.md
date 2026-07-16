@@ -19,6 +19,15 @@ All notable changes to this project will be documented in this file.
   **Falsification:** `component_bare_export_355.rs` fuses the exact fixtures and
   asserts a valid component + correct per-export arities (get-b (1,1), set-b
   (2,0), ptr-b (0,1)); the standard interface-export path is unaffected.
+- **A component exporting ≥2 interfaces bound the wrong instance to the 2nd+
+  export (found by the #355 Mythos pass).** The interface-export loop advanced
+  the component-instance index by 1 per exported interface, but exporting an
+  instance also binds an export-alias index — so the second and later interface
+  exports referenced the previous interface's alias and silently exported the
+  wrong functions (the output still validated). Now advances by 2.
+  **Falsification:** `component_multi_interface_instance_idx.rs` fuses a
+  two-interface component and asserts each exported interface resolves to its own
+  functions.
 
 ## [0.41.2] - 2026-07-16
 

@@ -2020,4 +2020,4 @@ artifacts:
         real arity — get-b (1,1), set-b (2,0), ptr-b (0,1) — catching the
         export-alias index-skip that shifted every export onto the previous
         one's type. Full meld-core suite green (no regression from the parser
-        component_func_defs change).
+        component_func_defs change). The #355 Mythos pass also surfaced the sibling instance-index desync (a component exporting >=2 interfaces bound the 2nd+ export to the wrong instance); fixed (component_instance_idx += 2) and pinned by component_multi_interface_instance_idx.rs.
