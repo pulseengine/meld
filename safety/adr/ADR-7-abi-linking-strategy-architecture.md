@@ -197,6 +197,9 @@ verification / fork-drift blow-up across the 2×3 strategy matrix.
 - BA RFC #46 (bytecodealliance/rfcs#46); `safety/stpa/rfc46-comparative-analysis.md`.
 - ADR-4 (isolation model), ADR-6 (shared-memory address relocation).
 - meld#353 (PIC / shared-everything spike), meld#351 / #352 (reloc-drift backstop).
-- Symmetric ABI: cpetig/wit-bindgen (`crates/core/src/symmetric.rs`,
-  `meshless_strings`/`meshless_resources`); design hackmd.io/@cpetig/rJp4l6vKC;
+- Symmetric ABI: cpetig/wit-bindgen (`crates/core/src/symmetric.rs`; live tests
+  = `crates/cpp/tests/symmetric.rs` `symmetric_integration()`, which runs the
+  **standard `tests/runtime*` suite** under `opts.symmetric = true` + `-shared` —
+  per @cpetig the `meshless_*` fixtures are outdated); producer contract =
+  wit-bindgen `symmetric = true` → `-shared`; design hackmd.io/@cpetig/rJp4l6vKC;
   WasmCon24 "Component Model in Software-Defined Vehicles" (Aptiv).
