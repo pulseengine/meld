@@ -564,3 +564,49 @@ fn test_326_shared_rebase_without_relocs_hard_errors() {
         "expected MissingRelocMetadata, got: {err:?}"
     );
 }
+
+/// #351 backstop: real-world components whose `reloc.CODE` offsets are STALE
+/// relative to the emitted (minimal-LEB) code — produced by clang 22.1.4 +
+/// wit-component 0.245.1, which relaxed the address immediates 5-byte→3-byte
+/// without rewriting the reloc offsets (drift +2 per preceding memory-address
+/// reloc; upstream pulseengine/wasm-tools#3).
+///
+/// The trailing `ptr-b` `i32.const` site (`SLEB@42`) drifts PAST its operator's
+/// byte range, so pre-backstop meld silently left it un-rebased and `ptr-b`
+/// returned `0x10000` (aliasing component-a's window) — grounded runtime bug on
+/// v0.41.1. meld must now hard-fail with `MisalignedReloc` rather than emit a
+/// plausible-but-wrong module. Fixtures are the exact bytes from the issue
+/// (`b.wasm` sha256 `481c36…d3a3`).
+#[test]
+fn test_351_stale_reloc_offsets_hard_error() {
+    let component_a =
+        std::fs::read("../tests/reloc351/a.wasm").expect("meld#351 fixture a.wasm missing");
+    let component_b =
+        std::fs::read("../tests/reloc351/b.wasm").expect("meld#351 fixture b.wasm missing");
+
+    let config = FuserConfig {
+        memory_strategy: MemoryStrategy::SharedMemory,
+        address_rebasing: true,
+        ..Default::default()
+    };
+    let mut fuser = Fuser::new(config);
+    fuser
+        .add_component_named(&component_a, Some("a.wasm"))
+        .unwrap();
+    fuser
+        .add_component_named(&component_b, Some("b.wasm"))
+        .unwrap();
+
+    let err = fuser
+        .fuse()
+        .expect_err("stale-reloc module must hard-fail, not silently miscompile");
+    match err {
+        meld_core::Error::MisalignedReloc { offset, .. } => {
+            assert_eq!(
+                offset, 42,
+                "the drifted ptr-b SLEB site is at code offset 42"
+            );
+        }
+        other => panic!("expected MisalignedReloc at offset 42, got: {other:?}"),
+    }
+}

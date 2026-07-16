@@ -366,6 +366,9 @@ pub enum RelocError {
         /// The version byte that was found.
         found: u32,
     },
+    /// Failed to parse the code section while validating reloc alignment (#351).
+    #[error("failed to parse code section during reloc-alignment check: {0}")]
+    CodeParse(String),
 }
 
 impl From<RelocError> for Error {
@@ -526,6 +529,112 @@ fn parse_reloc_section(suffix: &str, body: &[u8]) -> Result<RelocSection> {
         target_section_index,
         entries,
     })
+}
+
+/// Verify that every `reloc.CODE` memory-address site in `code_addr_offsets`
+/// lands on a *rebasable* operator's immediate in the emitted code section
+/// `code_content` (the bytes a `CodeSectionReader` consumes — the same
+/// coordinate space [`RelocInfo::code_memory_addr_offsets`] reports).
+///
+/// Returns `Some(offset)` for the first site that does NOT fall inside a
+/// rebasable operator (an `i32.const`/`i64.const` address literal or a
+/// load/store `memarg`), i.e. the first *misaligned* reloc. `None` means every
+/// site aligns.
+///
+/// **Why this matters (#351).** The reloc consumer rebases the operator a site
+/// lands on. If a producer relaxes address immediates (5-byte-padded → minimal
+/// LEB128) without rewriting `reloc.*` offsets in lockstep
+/// (pulseengine/wasm-tools#3), every site drifts by the accumulated width
+/// reduction. A drifted site either lands on the wrong operator or (as with the
+/// trailing `i32.const` in meld#351) past its operator entirely — the rebase is
+/// then applied to the wrong immediate or silently skipped, corrupting the
+/// shared address space. Detecting a site that no longer lands on a rebasable
+/// immediate lets the caller hard-fail instead of emitting a wrong module.
+///
+/// A site is "rebasable-aligned" when it falls within the byte range
+/// `[op_start, op_end)` of a rebasable operator. This is exactly the window the
+/// rewriter's `old_pos <= r < op_end` test uses to set `addr_reloc`, so a site
+/// this function accepts is one the rewriter will actually rebase.
+pub fn first_misaligned_code_reloc(
+    code_content: &[u8],
+    code_addr_offsets: &std::collections::HashSet<u32>,
+) -> Result<Option<u32>> {
+    if code_addr_offsets.is_empty() {
+        return Ok(None);
+    }
+    // Collect the byte ranges of every rebasable operator, in one pass.
+    let mut rebasable_ranges: Vec<(usize, usize)> = Vec::new();
+    let reader = wasmparser::CodeSectionReader::new(wasmparser::BinaryReader::new(code_content, 0))
+        .map_err(|e| RelocError::CodeParse(e.to_string()))?;
+    for body in reader {
+        let body = body.map_err(|e| RelocError::CodeParse(e.to_string()))?;
+        let ops = body
+            .get_operators_reader()
+            .map_err(|e| RelocError::CodeParse(e.to_string()))?;
+        let items: Vec<(wasmparser::Operator<'_>, usize)> = ops
+            .into_iter_with_offsets()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| RelocError::CodeParse(e.to_string()))?;
+        let ends = items
+            .iter()
+            .skip(1)
+            .map(|(_, pos)| *pos)
+            .chain(std::iter::once(code_content.len()));
+        for ((op, start), end) in items.iter().zip(ends) {
+            if operator_is_rebasable(op) {
+                rebasable_ranges.push((*start, end));
+            }
+        }
+    }
+    // A site aligns iff it falls inside some rebasable operator's range.
+    let mut misaligned: Vec<u32> = code_addr_offsets
+        .iter()
+        .copied()
+        .filter(|&r| {
+            let r = r as usize;
+            !rebasable_ranges
+                .iter()
+                .any(|&(start, end)| r >= start && r < end)
+        })
+        .collect();
+    misaligned.sort_unstable();
+    Ok(misaligned.first().copied())
+}
+
+/// Whether a memory-address relocation can be applied to this operator — an
+/// `i32`/`i64` constant (an absolute address literal) or a memory load/store
+/// (whose `memarg` offset can encode an absolute address). These are exactly
+/// the arms the rewriter rebases when `addr_reloc` is set.
+fn operator_is_rebasable(op: &wasmparser::Operator<'_>) -> bool {
+    use wasmparser::Operator::*;
+    matches!(
+        op,
+        I32Const { .. }
+            | I64Const { .. }
+            | I32Load { .. }
+            | I64Load { .. }
+            | F32Load { .. }
+            | F64Load { .. }
+            | I32Load8S { .. }
+            | I32Load8U { .. }
+            | I32Load16S { .. }
+            | I32Load16U { .. }
+            | I64Load8S { .. }
+            | I64Load8U { .. }
+            | I64Load16S { .. }
+            | I64Load16U { .. }
+            | I64Load32S { .. }
+            | I64Load32U { .. }
+            | I32Store { .. }
+            | I64Store { .. }
+            | F32Store { .. }
+            | F64Store { .. }
+            | I32Store8 { .. }
+            | I32Store16 { .. }
+            | I64Store8 { .. }
+            | I64Store16 { .. }
+            | I64Store32 { .. }
+    )
 }
 
 #[cfg(test)]
@@ -897,5 +1006,38 @@ mod tests {
         let mut payload = vec![1u8, 0, 0, 0];
         rebase_data_segment_pointers(&mut payload, 0, &entries, 0x1_0000);
         assert_eq!(payload, vec![1u8, 0, 0, 0], "out-of-range site untouched");
+    }
+
+    /// #351: a reloc site landing on a rebasable operator's immediate aligns;
+    /// one drifted onto a non-rebasable operator (or past the code) is caught.
+    #[test]
+    fn first_misaligned_code_reloc_detects_drift() {
+        use std::collections::HashSet;
+        // Code-section content: one function `(i32.const 65536) end`.
+        //  @0 count=1  @1 body_size=6  @2 locals=0
+        //  @3 i32.const opcode  @4..6 operand (0x80 0x80 0x04)  @7 end
+        let code: &[u8] = &[0x01, 0x06, 0x00, 0x41, 0x80, 0x80, 0x04, 0x0b];
+
+        // A site on the i32.const immediate (or its opcode range) aligns.
+        let aligned: HashSet<u32> = [4u32].into_iter().collect();
+        assert_eq!(first_misaligned_code_reloc(code, &aligned).unwrap(), None);
+
+        // Drifted onto the (non-rebasable) `end` operator → caught.
+        let onto_end: HashSet<u32> = [7u32].into_iter().collect();
+        assert_eq!(
+            first_misaligned_code_reloc(code, &onto_end).unwrap(),
+            Some(7)
+        );
+
+        // Drifted past the end of the code section entirely → caught (this is
+        // exactly the meld#351 shape: SLEB site one byte past its operator).
+        let past: HashSet<u32> = [8u32].into_iter().collect();
+        assert_eq!(first_misaligned_code_reloc(code, &past).unwrap(), Some(8));
+
+        // No sites → trivially aligned.
+        assert_eq!(
+            first_misaligned_code_reloc(code, &HashSet::new()).unwrap(),
+            None
+        );
     }
 }
