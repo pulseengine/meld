@@ -4,6 +4,31 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+- **`fuse --component` emitted an invalid component for non-empty export
+  signatures (#355).** Bare *world* exports (e.g. `world root { export get-b:
+  func(i: s32) -> u32 }`) were all lifted with an empty `(func)` component type,
+  so `wasm-tools validate` rejected the output ("lowered parameter types [] do
+  not match the core function") — silently, after printing "Fusion complete!".
+  Three latent defects underlay it: the parser did not record func export-aliases
+  (compacting the component-function index space so lookups mis-resolved); the
+  wrapper never terminated a no-result func type (truncating it); and the
+  bare-export emitter advanced the func index by 1 per export while each export
+  also binds an export-alias, shifting every export onto the previous one's type.
+  Now each export lifts with its real signature and the output validates.
+  **Falsification:** `component_bare_export_355.rs` fuses the exact fixtures and
+  asserts a valid component + correct per-export arities (get-b (1,1), set-b
+  (2,0), ptr-b (0,1)); the standard interface-export path is unaffected.
+- **A component exporting ≥2 interfaces bound the wrong instance to the 2nd+
+  export (found by the #355 Mythos pass).** The interface-export loop advanced
+  the component-instance index by 1 per exported interface, but exporting an
+  instance also binds an export-alias index — so the second and later interface
+  exports referenced the previous interface's alias and silently exported the
+  wrong functions (the output still validated). Now advances by 2.
+  **Falsification:** `component_multi_interface_instance_idx.rs` fuses a
+  two-interface component and asserts each exported interface resolves to its own
+  functions.
+
 ## [0.41.2] - 2026-07-16
 
 Soundness patch: stale relocation metadata can no longer silently miscompile

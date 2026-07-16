@@ -791,6 +791,30 @@ pub fn export_stream_elements(comp: &ParsedComponent, export_name: &str) -> Vec<
             // in LS-R-11's "limits" block.
             Vec::new()
         }
+        ComponentFuncDef::ExportAlias(target) => {
+            // A func export-alias (#355) just re-binds another func index; the
+            // aliased func carries the real signature. Follow it one hop (no
+            // cycles: an export aliases an already-defined func).
+            match comp.component_func_defs.get(*target as usize) {
+                Some(ComponentFuncDef::Lift(canon_idx)) => {
+                    match comp.canonical_functions.get(*canon_idx) {
+                        Some(CanonicalEntry::Lift { type_index, .. }) => {
+                            stream_elements_in_typeref(
+                                comp,
+                                &wasmparser::ComponentTypeRef::Func(*type_index),
+                            )
+                        }
+                        _ => Vec::new(),
+                    }
+                }
+                Some(ComponentFuncDef::Import(import_idx)) => comp
+                    .imports
+                    .get(*import_idx)
+                    .map(|imp| stream_elements_in_typeref(comp, &imp.ty))
+                    .unwrap_or_default(),
+                _ => Vec::new(),
+            }
+        }
     }
 }
 

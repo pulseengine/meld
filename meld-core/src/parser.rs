@@ -95,6 +95,14 @@ pub enum ComponentFuncDef {
     Lift(usize),
     /// An `InstanceExport { kind: Func }` alias. Index into `component_aliases`.
     InstanceExportAlias(usize),
+    /// A component-level `(export "name" (func N))` of a `Func` also binds a
+    /// NEW component-function index (an export alias of func `N`). wit-component
+    /// interleaves these with `canon lift`s, so failing to record them here
+    /// leaves `component_func_defs` compacted while `ComponentExport::index`
+    /// (and every other reference) uses the real, interleaved index space —
+    /// making `component_func_defs[export.index]` read the wrong slot (#355).
+    /// The `u32` is the exported func index this aliases.
+    ExportAlias(u32),
 }
 
 /// Records what created each component-level instance index.
@@ -899,6 +907,16 @@ impl ComponentParser {
                                 .component_type_defs
                                 .push(ComponentTypeDef::ExportAlias(export.index));
                         }
+                    }
+                    // A `Func` export also binds a new component-function index
+                    // (an export alias). Record it so `component_func_defs` stays
+                    // aligned with the real, interleaved func index space that
+                    // `export.index` uses (#355). Without this the index space is
+                    // silently compacted and lookups by func index mis-resolve.
+                    if export.kind == ComponentExternalKind::Func {
+                        component
+                            .component_func_defs
+                            .push(ComponentFuncDef::ExportAlias(export.index));
                     }
                     component.exports.push(ComponentExport {
                         name: export.name.0.to_string(),
