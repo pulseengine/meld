@@ -1915,69 +1915,25 @@ impl Merger {
             .and_then(|plan| plan.bases.get(&(comp_idx, mod_idx)).copied())
             .unwrap_or(0);
 
-        // #326: relocation-driven address rebasing. A module placed at a
-        // non-zero shared-memory base has its absolute addresses shifted by
-        // that base; the `reloc.CODE` MEMORY_ADDR sites name exactly which
-        // `i32.const`/`memarg` immediates encode those addresses.
-        //
-        // Path-F (ADR-6): if such a module carries NO reloc metadata we cannot
-        // find its absolute addresses, so emitting it unchanged would collide
-        // it with a prior module and silently corrupt memory. Hard-fail —
-        // BUT only when the module actually performs *direct* (non-bulk)
-        // memory access. A module whose every memory touch is a bulk-memory op
-        // (`memory.copy/fill/init`) is safe without relocs: the rewriter
-        // rebases those ops' runtime address operands dynamically
-        // (`append_rebased_address`), so no baked-in absolute address can hide.
-        let mut data_addr_relocs: Vec<crate::reloc::RelocEntry> = Vec::new();
-        let code_addr_relocs = if self.address_rebasing {
-            let has_reloc = crate::reloc::has_reloc_metadata(&module.custom_sections);
-            if memory_base_offset != 0 && !has_reloc && module_has_direct_memory_access(module)? {
-                return Err(Error::MissingRelocMetadata {
-                    component: component_display_name(components, comp_idx),
-                    module: mod_idx.to_string(),
-                });
-            }
-            if has_reloc {
-                let info = crate::reloc::parse_reloc_info(&module.custom_sections)?;
-                // #326 Finding B: a memory64 module emits 8-byte inline data
-                // pointers (`R_WASM_MEMORY_ADDR_I64`) we cannot rebase; the
-                // segment placement would move while the pointers stay stale —
-                // silent corruption. Reject rather than emit a wrong module.
-                if info.has_unhandled_data_addr_relocs() {
-                    return Err(Error::UnsupportedFeature(format!(
-                        "component '{}' module {mod_idx}: shared-memory rebasing of \
-                         non-32-bit inline data pointers (memory64 reloc.DATA) is not \
-                         supported (#326)",
-                        component_display_name(components, comp_idx),
-                    )));
-                }
-                data_addr_relocs = info.data_memory_addr_entries();
-                let code_offsets = info.code_memory_addr_offsets();
-                // #351 backstop: verify every reloc.CODE memory-address site
-                // still lands on a rebasable immediate. A producer that relaxed
-                // LEB immediates without rewriting reloc offsets
-                // (pulseengine/wasm-tools#3) leaves them drifted; a drifted site
-                // is applied to the wrong operator or silently skipped, so
-                // hard-fail rather than corrupt the shared address space.
-                if let Some((start, end)) = module.code_section_range {
-                    let code_content = &module.bytes[start..end];
-                    if let Some(offset) =
-                        crate::reloc::first_misaligned_code_reloc(code_content, &code_offsets)?
-                    {
-                        return Err(Error::MisalignedReloc {
-                            component: component_display_name(components, comp_idx),
-                            module: mod_idx.to_string(),
-                            offset,
-                        });
-                    }
-                }
-                Some(code_offsets)
-            } else {
-                None
-            }
-        } else {
-            None
-        };
+        // Address / memory strategy (ADR-7 path-H): resolve which relocation
+        // sites this module needs rebased for its shared-memory placement. The
+        // full decision + validation (path-F MissingRelocMetadata, memory64
+        // reject, the #351 MisalignedReloc backstop) lives in
+        // `address_strategy`; `has_direct_memory_access` is passed as a closure
+        // so it stays lazily evaluated (only a non-zero-base, no-reloc module
+        // pays the check — the original short-circuit).
+        let address_plan = crate::address_strategy::resolve_address_plan(
+            &module.custom_sections,
+            module.code_section_range,
+            &module.bytes,
+            memory_base_offset,
+            self.address_rebasing,
+            &component_display_name(components, comp_idx),
+            mod_idx,
+            || module_has_direct_memory_access(module),
+        )?;
+        let data_addr_relocs = address_plan.data_addr_relocs;
+        let code_addr_relocs = address_plan.code_addr_relocs;
 
         let module_memory = if self.address_rebasing {
             module_memory_type(module)?

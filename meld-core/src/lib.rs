@@ -48,6 +48,7 @@
 
 pub mod abi_proofs;
 pub mod adapter;
+pub mod address_strategy;
 pub mod attestation;
 pub mod component_wrap;
 pub mod custom_merge;
