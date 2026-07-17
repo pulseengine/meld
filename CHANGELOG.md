@@ -4,6 +4,15 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.41.3] - 2026-07-17
+
+Correctness patch for the `--component` output path.
+
+**Falsification:** if a bare world export lifted with the wrong (or empty)
+signature again, `component_bare_export_355.rs` fails (invalid component /
+wrong arity); if a component exporting ≥2 interfaces mis-bound an export,
+`component_multi_interface_instance_idx.rs` fails.
+
 ### Fixed
 - **`fuse --component` emitted an invalid component for non-empty export
   signatures (#355).** Bare *world* exports (e.g. `world root { export get-b:
