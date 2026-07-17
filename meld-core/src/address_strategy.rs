@@ -17,8 +17,17 @@
 //! existing shared-rebase resolution here **behavior-preservingly** — same
 //! validation (`MissingRelocMetadata`, memory64 reject, `MisalignedReloc`), same
 //! short-circuits — so the pluggable variants above can be added later without
-//! touching the merger's hot path. The canonical/multi path is unchanged (it
-//! resolves to an empty plan).
+//! touching the merger's hot path.
+//!
+//! **Scope — this is *only* the absolute-address rebasing decision.** An
+//! [`AddressPlan`] carries *which relocation sites to shift* for a non-zero
+//! shared-memory base, and nothing else. Under **multi-memory** each component
+//! keeps its own linear memory at its own base, so there are no sites to shift
+//! and the plan is **empty** — an empty plan means "no address rebasing needed
+//! here", **not** that fusion is disabled. It does **not** touch cross-component
+//! adapter (FACT) generation, transcoding, or any other part of the merge: those
+//! run identically regardless of what this resolves. Multi-memory + FACT remains
+//! the generic, first-class fusion path (ADR-7's canonical / `open` profile).
 
 use crate::{Error, Result};
 
