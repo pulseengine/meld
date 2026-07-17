@@ -30,7 +30,7 @@
 //! makes that coupling explicit and keeps the merger/adapter call site a lookup
 //! rather than a re-derivation.
 //!
-//! ## Extraction is behavior-preserving
+//! ## Extraction is behavior-preserving (plus one silent-corruption backstop)
 //!
 //! Increment 2 lifts the exact three-way dispatch (`site.crosses_memory` /
 //! `options.needs_transcoding()`) and the #304 inline guard out of
@@ -38,8 +38,15 @@
 //! strategies (symmetric ABI, static-base PIC — ADR-7 / #353) become new inputs
 //! to [`resolve_call_lowering_plan`] instead of new branches threaded through
 //! the generator's hot path.
+//!
+//! The one deliberate behavior change: a boundary that needs transcoding but
+//! does **not** cross memory now **hard-fails** instead of silently emitting a
+//! non-transcoding `Direct` shim (#361). The pre-extraction dispatch mapped that
+//! case to `Direct` and mis-transcoded silently; the async path already failed
+//! loud on the identical case (#272), so this closes the sync gap consistently.
 
 use super::AdapterClass;
+use crate::{Error, Result};
 
 /// The facts about one call boundary that determine how it is lowered. All are
 /// cheap booleans read from the resolved [`AdapterSite`](crate::resolver::AdapterSite)
@@ -76,14 +83,40 @@ pub struct CallLoweringPlan {
 
 /// Resolve how a single cross-component call boundary is lowered.
 ///
-/// Behaviour (unchanged from the pre-extraction `generate_adapter`):
+/// Class selection (unchanged from the pre-extraction `generate_adapter`):
 /// - cross-memory + encoding mismatch → `Transcode`
 /// - cross-memory, same encoding → `MemoryCopy`
 /// - same memory → `Direct`
 ///
 /// and `inline_eligible` iff inlining is on, the class is `Direct`, and the call
 /// carries no resource conversions and no post-return.
-pub fn resolve_call_lowering_plan(facts: BoundaryFacts) -> CallLoweringPlan {
+///
+/// # Errors
+///
+/// Hard-fails ([`Error::AdapterGeneration`](crate::Error::AdapterGeneration))
+/// when the boundary needs transcoding but does **not** cross memory
+/// (`needs_transcoding && !crosses_memory`). A same-memory boundary is lowered
+/// as a `Direct` shim that does not transcode, so emitting one for a
+/// mixed-encoding call would deliver string bytes verbatim in the wrong encoding
+/// — a silent miscompile. This is the sync twin of `guard_async_cross_encoding_strings`
+/// (the async path already fails loud here, #272). Supporting same-memory
+/// transcoding is tracked in #361; until then we refuse rather than corrupt.
+pub fn resolve_call_lowering_plan(facts: BoundaryFacts) -> Result<CallLoweringPlan> {
+    // #361: a boundary that needs transcoding but does not cross memory has no
+    // lowering that transcodes — `Direct` (the same-memory class) is a thin
+    // shim. Fail loud instead of silently mis-transcoding (mirrors the async
+    // guard, #272).
+    if facts.needs_transcoding && !facts.crosses_memory {
+        return Err(Error::AdapterGeneration(
+            "same-memory string transcoding is not supported: this call requires \
+             transcoding (caller and callee use different string encodings) but \
+             does not cross a memory boundary, so it would be lowered as a Direct \
+             shim that copies the bytes verbatim — silently mis-transcoding. The \
+             async path already fails loud here (#272); see #361 to support it"
+                .to_string(),
+        ));
+    }
+
     let class = if facts.crosses_memory && facts.needs_transcoding {
         AdapterClass::Transcode
     } else if facts.crosses_memory {
@@ -104,10 +137,10 @@ pub fn resolve_call_lowering_plan(facts: BoundaryFacts) -> CallLoweringPlan {
         && !facts.has_resource_new_calls
         && !facts.has_post_return;
 
-    CallLoweringPlan {
+    Ok(CallLoweringPlan {
         class,
         inline_eligible,
-    }
+    })
 }
 
 #[cfg(test)]
@@ -128,7 +161,7 @@ mod tests {
 
     #[test]
     fn same_memory_is_direct_and_inlinable() {
-        let plan = resolve_call_lowering_plan(direct());
+        let plan = resolve_call_lowering_plan(direct()).unwrap();
         assert_eq!(plan.class, AdapterClass::Direct);
         assert!(plan.inline_eligible);
     }
@@ -138,7 +171,8 @@ mod tests {
         let plan = resolve_call_lowering_plan(BoundaryFacts {
             crosses_memory: true,
             ..direct()
-        });
+        })
+        .unwrap();
         assert_eq!(plan.class, AdapterClass::MemoryCopy);
         assert!(!plan.inline_eligible, "only Direct is ever inlinable");
     }
@@ -149,21 +183,27 @@ mod tests {
             crosses_memory: true,
             needs_transcoding: true,
             ..direct()
-        });
+        })
+        .unwrap();
         assert_eq!(plan.class, AdapterClass::Transcode);
         assert!(!plan.inline_eligible);
     }
 
     #[test]
-    fn transcoding_without_crossing_memory_stays_direct() {
-        // needs_transcoding only matters when memory is crossed — a same-memory
-        // boundary is Direct regardless (mirrors the original dispatch order).
-        let plan = resolve_call_lowering_plan(BoundaryFacts {
+    fn same_memory_transcoding_hard_fails() {
+        // #361: a boundary that needs transcoding but does not cross memory has
+        // no lowering that transcodes (Direct is a thin shim). Emitting one
+        // would silently mis-transcode, so the seam refuses — the sync twin of
+        // the async cross-encoding guard (#272).
+        let err = resolve_call_lowering_plan(BoundaryFacts {
             needs_transcoding: true,
             ..direct()
-        });
-        assert_eq!(plan.class, AdapterClass::Direct);
-        assert!(plan.inline_eligible);
+        })
+        .unwrap_err();
+        assert!(
+            matches!(err, Error::AdapterGeneration(_)),
+            "expected AdapterGeneration hard-fail, got {err:?}"
+        );
     }
 
     #[test]
@@ -171,7 +211,8 @@ mod tests {
         let plan = resolve_call_lowering_plan(BoundaryFacts {
             inline_adapters: false,
             ..direct()
-        });
+        })
+        .unwrap();
         assert_eq!(plan.class, AdapterClass::Direct);
         assert!(!plan.inline_eligible);
     }
@@ -181,7 +222,8 @@ mod tests {
         let plan = resolve_call_lowering_plan(BoundaryFacts {
             has_resource_rep_calls: true,
             ..direct()
-        });
+        })
+        .unwrap();
         assert_eq!(plan.class, AdapterClass::Direct);
         assert!(!plan.inline_eligible);
     }
@@ -191,7 +233,8 @@ mod tests {
         let plan = resolve_call_lowering_plan(BoundaryFacts {
             has_resource_new_calls: true,
             ..direct()
-        });
+        })
+        .unwrap();
         assert!(!plan.inline_eligible);
     }
 
@@ -202,7 +245,8 @@ mod tests {
         let plan = resolve_call_lowering_plan(BoundaryFacts {
             has_post_return: true,
             ..direct()
-        });
+        })
+        .unwrap();
         assert!(!plan.inline_eligible);
     }
 }

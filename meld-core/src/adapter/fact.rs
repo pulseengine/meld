@@ -5307,7 +5307,7 @@ impl FactStyleGenerator {
                 has_resource_new_calls: !options.resource_new_calls.is_empty(),
                 has_post_return: options.callee_post_return.is_some(),
             },
-        );
+        )?;
         let class = plan.class;
 
         // Generate the adapter function body for the resolved class.
