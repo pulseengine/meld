@@ -19,6 +19,7 @@
 //! 3. Calls the target function in B
 //! 4. Writes results back to A's memory (lifting)
 
+pub(crate) mod call_lowering;
 pub(crate) mod fact;
 
 pub use fact::FactStyleGenerator;

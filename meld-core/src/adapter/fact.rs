@@ -5293,39 +5293,44 @@ impl FactStyleGenerator {
         let options =
             self.analyze_call_site(site, merged, resource_rep_imports, resource_new_imports);
 
-        // Generate the adapter function body
-        let (type_idx, body, class) = if site.crosses_memory && options.needs_transcoding() {
-            let (t, b) = self.generate_transcoding_adapter(site, merged, &options)?;
-            (t, b, AdapterClass::Transcode)
-        } else if site.crosses_memory {
-            let (t, b) =
-                self.generate_memory_copy_adapter(site, merged, &options, resource_rep_imports)?;
-            (t, b, AdapterClass::MemoryCopy)
-        } else {
-            let (t, b) = self.generate_direct_adapter(site, merged, &options)?;
-            (t, b, AdapterClass::Direct)
+        // Resolve how this boundary is lowered (ADR-7 path-H inc 2): the class
+        // and the #304 inline-eligibility are decided together in the
+        // call-lowering seam — see `adapter::call_lowering` for why the two
+        // couple. `Async` never reaches here (async sites are dispatched in
+        // `generate` before `generate_adapter`).
+        let plan = crate::adapter::call_lowering::resolve_call_lowering_plan(
+            crate::adapter::call_lowering::BoundaryFacts {
+                crosses_memory: site.crosses_memory,
+                needs_transcoding: options.needs_transcoding(),
+                inline_adapters: self.config.inline_adapters,
+                has_resource_rep_calls: !options.resource_rep_calls.is_empty(),
+                has_resource_new_calls: !options.resource_new_calls.is_empty(),
+                has_post_return: options.callee_post_return.is_some(),
+            },
+        )?;
+        let class = plan.class;
+
+        // Generate the adapter function body for the resolved class.
+        let (type_idx, body) = match class {
+            AdapterClass::Transcode => self.generate_transcoding_adapter(site, merged, &options)?,
+            AdapterClass::MemoryCopy => {
+                self.generate_memory_copy_adapter(site, merged, &options, resource_rep_imports)?
+            }
+            AdapterClass::Direct => self.generate_direct_adapter(site, merged, &options)?,
+            AdapterClass::Async => unreachable!(
+                "async sites are dispatched before generate_adapter (see the \
+                 is_async_lift branch in FactStyleGenerator::generate)"
+            ),
         };
 
         let target_function = self.resolve_target_function(site, merged)?;
 
-        // #304: a Direct adapter is a *pure identity trampoline* — body is
-        // exactly `local.get*; call target; end` — only when it carries no
-        // resource conversions AND no post-return. (The Direct `else` branch in
-        // `generate_direct_adapter` still emits `call post_return` when
-        // `has_post_return && result_count == 0`, so post-return must be
-        // excluded entirely, not just the result>0 case — wiring the caller
-        // straight to the target would otherwise skip the post-return cleanup.)
-        // When inlining is enabled and that holds, record the target so
-        // `wire_adapter_indices` bypasses this thunk. Fail-safe: any doubt → None.
-        // This guard MUST stay a superset of `generate_direct_adapter`'s
-        // complex-branch trigger — see the "#304 INVARIANT" note on its simple-
-        // trampoline `else` branch; the two are coupled and must move together.
-        let inline_target = if self.config.inline_adapters
-            && matches!(class, AdapterClass::Direct)
-            && options.resource_rep_calls.is_empty()
-            && options.resource_new_calls.is_empty()
-            && options.callee_post_return.is_none()
-        {
+        // #304: wire the caller straight to the target when the seam judged this
+        // a pure identity trampoline. `inline_eligible` carries the full guard
+        // (Direct + no resource conversions + no post-return); see
+        // `adapter::call_lowering`, whose guard MUST stay a superset of
+        // `generate_direct_adapter`'s complex-branch trigger ("#304 INVARIANT").
+        let inline_target = if plan.inline_eligible {
             Some(target_function)
         } else {
             None
