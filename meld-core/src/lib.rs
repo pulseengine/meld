@@ -51,6 +51,7 @@ pub mod adapter;
 pub mod address_strategy;
 pub mod attestation;
 pub mod component_wrap;
+pub mod core_instance_topology;
 pub mod custom_merge;
 pub mod dwarf;
 mod error;

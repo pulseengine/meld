@@ -2021,3 +2021,58 @@ artifacts:
         export-alias index-skip that shifted every export onto the previous
         one's type. Full meld-core suite green (no regression from the parser
         component_func_defs change). The #355 Mythos pass also surfaced the sibling instance-index desync (a component exporting >=2 interfaces bound the 2nd+ export to the wrong instance); fixed (component_instance_idx += 2) and pinned by component_multi_interface_instance_idx.rs.
+
+  # ==========================================================================
+  # RFC-46 Q1 — multiply-instantiated module SUPPORT (ADR-7 path-H inc 3)
+  # ==========================================================================
+
+  - id: SR-55
+    type: sw-req
+    title: Multiply-instantiated module support via core-instance duplication
+    description: >
+      Where SR-31 requires meld to fail-fast REJECT a component that
+      instantiates the same core module more than once, this requirement is the
+      RFC-46 Q1 "duplicate" resolution: meld shall SUPPORT such a component by
+      giving each instantiation its own distinct module identity, so that each
+      instance is allocated independent functions, memory, tables, and globals
+      (mutable state), and no two instances share state (STPA hazard H-1) or
+      silently overwrite one another's merge-map entries. The mechanism is a
+      pre-resolve normalization (`core_instance_topology::
+      expand_multiply_instantiated_modules`) that deep-clones a module per
+      extra instantiation and rewrites the instantiation to the clone — reusing
+      the merger's index-remapping machinery already proven correct for N
+      distinct modules. When active, this SUPERSEDES the SR-31 reject for the
+      supported cases; SR-31's fail-fast remains for any residual meld cannot
+      duplicate soundly.
+    status: draft
+    tags: [rfc46, adr7, merger, topology, in-progress]
+    links:
+      - type: derives-from
+        target: SYS-2
+      - type: refines
+        target: SR-31
+      - type: mitigates
+        target: LS-M-5
+    cited-source:
+      - uri: "https://github.com/pulseengine/meld/pull/360"
+        kind: github
+        last-checked: 2026-07-21
+    fields:
+      implementation:
+        - meld-core/src/core_instance_topology.rs
+      verification-method: test
+      verification-description: >
+        DRAFT — mechanism only. The normalization pass is implemented and
+        structurally unit-tested (core_instance_topology::tests: single/distinct
+        unchanged; double/triple/interleaved expansion to N distinct module
+        identities; FromExports ignored). NOT YET ACTIVE: wiring the pass into
+        the fuse pipeline and dropping the DuplicateModuleInstantiation reject is
+        gated on a differential EXECUTION oracle proving two instances of one
+        module keep independent mutable state end-to-end (a real
+        multiply-instantiated component fixture, fused and executed on wasmtime).
+        Until that oracle is green + a Tier-5 Mythos pass on the wiring, SR-31
+        (reject) remains the shipped, verified behavior.
+      references:
+        - "BA RFC #46 discussion: cfallin on multiply-instantiated modules"
+        - "safety/stpa/rfc46-comparative-analysis.md section 4 Q1"
+        - "safety/adr/ADR-7-abi-linking-strategy-architecture.md (path-H inc 3)"
