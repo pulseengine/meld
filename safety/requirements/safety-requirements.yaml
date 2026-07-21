@@ -2046,7 +2046,7 @@ artifacts:
       distinct modules. When active, this SUPERSEDES the SR-31 reject for the
       supported cases; SR-31's fail-fast remains for any residual meld cannot
       duplicate soundly.
-    status: implemented
+    status: verified
     tags: [rfc46, adr7, merger, topology]
     links:
       - type: derives-from
@@ -2065,23 +2065,28 @@ artifacts:
         - meld-core/src/lib.rs
       verification-method: test
       verification-description: >
-        IMPLEMENTED — mechanism + wiring + differential EXECUTION oracle, green
-        locally (CI + merge pending → not yet `verified`). The normalization pass
-        (core_instance_topology) is wired into `Fuser::fuse_with_stats` before
-        resolve/merge, so multiply-instantiated modules now fuse. Verified by:
+        VERIFIED. The `core_instance_topology` normalization is wired into
+        `Fuser::fuse_with_stats` before resolve/merge, so multiply-instantiated
+        modules fuse. Evidence:
         (1) structural unit tests (core_instance_topology::tests — single/distinct
         unchanged; double/triple/interleaved → N distinct module identities;
-        FromExports ignored); (2) the differential execution oracle
-        multiply_instantiated_runtime::two_instances_keep_independent_counter_state
-        — a component instantiating ONE core module (mutable counter) TWICE is
-        fused (MultiMemory, CoreModule), VALIDATED, and executed on wasmtime; the
-        two instances' counters advance independently (inc→1,2; inc$0→1; inc→3;
-        inc$0→2), so a shared-state (H-1) corruption would fail the load-bearing
-        `inc$0` first-call == 1 assertion. Full meld-core suite green (0 failures,
-        no regression — the pass is a no-op for single-instantiation components).
-        The SR-31 `DuplicateModuleInstantiation` reject is retained as an
-        unreachable backstop (its ls_m_5 unit test still passes). Remaining before
-        `verified`: CI green on PR #362 + a Tier-5 Mythos pass on the lib.rs wiring.
+        FromExports ignored);
+        (2) differential EXECUTION oracle, two mutable-state axes, both fused
+        (MultiMemory, CoreModule), VALIDATED, and executed on wasmtime:
+        `two_instances_keep_independent_counter_state` proves independent GLOBAL
+        state (inc→1,2; inc$0→1; inc→3; inc$0→2), and
+        `two_instances_keep_independent_memory_and_data_segments` proves
+        independent LINEAR MEMORY and DATA SEGMENTS — each instance's counter is
+        data-seeded to 5 in its own memory (bump→6,7; bump$0→6; bump→8; bump$0→7).
+        A shared-state (H-1) corruption fails the load-bearing first-call
+        assertions (inc$0==1, bump$0==6). Full meld-core suite green (0 failures,
+        no regression — the pass is a no-op for single-instantiation components);
+        SR-31 `DuplicateModuleInstantiation` reject retained as an unreachable
+        backstop (ls_m_5 still passes). NOTE — one axis is not separately
+        execution-tested: per-instance IMPORT wiring (distinct args per instance)
+        relies on the resolver's normal distinct-module handling; the fixtures are
+        import-free. Not a mutable-state hazard; a differing-args oracle would
+        extend coverage further.
       references:
         - "BA RFC #46 discussion: cfallin on multiply-instantiated modules"
         - "safety/stpa/rfc46-comparative-analysis.md section 4 Q1"
