@@ -109,3 +109,77 @@ fn two_instances_keep_independent_counter_state() {
     assert_eq!(inc1.call(&mut store, ()).unwrap(), 3, "inc1 #3");
     assert_eq!(inc2.call(&mut store, ()).unwrap(), 2, "inc2 #2");
 }
+
+/// A component whose core module keeps its counter in LINEAR MEMORY (seeded by a
+/// DATA segment), instantiated twice. Proves the other mutable-state axis:
+/// each instance gets its own memory AND its own copy of the data segment
+/// (segment duplication/reindexing was flagged as a duplication risk). A shared
+/// memory / mis-based segment would make `bump$0`'s first call observe the other
+/// instance's writes.
+fn multiply_instantiated_memory_component() -> Vec<u8> {
+    let wat = r#"
+    (component
+      (core module $m
+        (memory (export "mem") 1)
+        ;; seed the in-memory counter at address 0 to 5 via a data segment
+        (data (i32.const 0) "\05\00\00\00")
+        (func $bump (result i32)
+          (i32.store (i32.const 0) (i32.add (i32.load (i32.const 0)) (i32.const 1)))
+          (i32.load (i32.const 0)))
+        (export "bump" (func $bump)))
+      (core instance $i1 (instantiate $m))
+      (core instance $i2 (instantiate $m))
+      (alias core export $i1 "bump" (core func $f1))
+      (alias core export $i2 "bump" (core func $f2))
+      (func $lift1 (result u32) (canon lift (core func $f1)))
+      (func $lift2 (result u32) (canon lift (core func $f2)))
+      (export "bump1" (func $lift1))
+      (export "bump2" (func $lift2)))
+    "#;
+    wat::parse_str(wat).expect("memory multiply-instantiated component WAT must assemble")
+}
+
+#[test]
+fn two_instances_keep_independent_memory_and_data_segments() {
+    use wasmtime::{Config, Engine, Instance, Module as RuntimeModule, Store};
+
+    let component = multiply_instantiated_memory_component();
+    let mut fuser = Fuser::new(base_config());
+    fuser
+        .add_component_named(&component, Some("multiply-instantiated-mem"))
+        .unwrap();
+    let (fused, _stats) = fuser
+        .fuse_with_stats()
+        .expect("multiply-instantiated (memory) component must fuse");
+
+    let mut validator = wasmparser::Validator::new();
+    validator
+        .validate_all(&fused)
+        .expect("fused multiply-instantiated (memory) output should validate");
+
+    let mut engine_config = Config::new();
+    engine_config.wasm_multi_memory(true);
+    let engine = Engine::new(&engine_config).unwrap();
+    let module = RuntimeModule::new(&engine, &fused).unwrap();
+    let mut store = Store::new(&engine, ());
+    let instance = Instance::new(&mut store, &module, &[]).unwrap();
+
+    let bump1 = instance
+        .get_typed_func::<(), i32>(&mut store, "bump")
+        .expect("fused module should export bump (instance 1)");
+    let bump2 = instance
+        .get_typed_func::<(), i32>(&mut store, "bump$0")
+        .expect("fused module should export bump$0 (instance 2)");
+
+    // Data segment seeds each instance's counter to 5 independently.
+    assert_eq!(bump1.call(&mut store, ()).unwrap(), 6, "bump1 #1 (5+1)");
+    assert_eq!(bump1.call(&mut store, ()).unwrap(), 7, "bump1 #2");
+    assert_eq!(
+        bump2.call(&mut store, ()).unwrap(),
+        6,
+        "bump2's FIRST call must be 6 (its own data-seeded 5, +1) — independent \
+         memory + data segment; an 8 here means the instances share linear memory"
+    );
+    assert_eq!(bump1.call(&mut store, ()).unwrap(), 8, "bump1 #3");
+    assert_eq!(bump2.call(&mut store, ()).unwrap(), 7, "bump2 #2");
+}
