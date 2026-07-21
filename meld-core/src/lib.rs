@@ -409,6 +409,28 @@ impl Fuser {
         if self.components.is_empty() {
             return Err(Error::NoComponents);
         }
+
+        // RFC-46 Q1 (ADR-7 path-H inc 3): normalize multiply-instantiated core
+        // modules into distinct module identities *before* resolve/merge, so each
+        // instantiation is allocated independent functions/memory/tables/globals
+        // via the merger's per-module machinery (already proven correct for N
+        // distinct modules) — no shared mutable state (H-1), no (component,
+        // module)-keyed map overwrites. After this pass no module is instantiated
+        // more than once, so the `DuplicateModuleInstantiation` reject in the
+        // resolver/merger becomes an unreachable backstop. Idempotent, so a
+        // repeated fuse (after another `add_component`) is safe.
+        let mut duplicated_modules = 0usize;
+        for component in &mut self.components {
+            duplicated_modules +=
+                crate::core_instance_topology::expand_multiply_instantiated_modules(component);
+        }
+        if duplicated_modules > 0 {
+            log::info!(
+                "core-instance topology: duplicated {duplicated_modules} multiply-instantiated \
+                 core module(s) into distinct identities (RFC-46 Q1)"
+            );
+        }
+
         // Restore the originally-requested strategy before resolving, so a
         // repeated fuse (e.g. after another `add_component`) re-derives the
         // resolution from the CURRENT component set instead of reusing a

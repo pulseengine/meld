@@ -30,16 +30,19 @@
 //!
 //! A component that instantiates each module at most once is returned unchanged.
 //!
-//! ## Status — mechanism only (activation gated)
+//! ## Status — wired, execution-oracle-gated (SR-55)
 //!
-//! This pass is the *mechanism*. Wiring it into the fuse pipeline (and dropping
-//! the [`crate::Error::DuplicateModuleInstantiation`] reject) flips a **verified
-//! safety requirement** (SR-31) and must be gated on a differential
-//! *execution* oracle proving two instances of one module keep **independent
-//! mutable state** end-to-end — identical-content module duplication can stress
-//! export-name and segment handling that a structural test cannot see. Until that
-//! oracle lands, meld still rejects multiply-instantiated modules at fuse time;
-//! this module is exercised only by its own structural unit tests.
+//! This pass is wired into [`crate::Fuser::fuse_with_stats`] *before*
+//! resolve/merge, so multiply-instantiated modules now fuse. Because activating
+//! it supersedes the [`crate::Error::DuplicateModuleInstantiation`] reject (a
+//! safety-relevant behavior, SR-31), it is gated on a differential **execution**
+//! oracle — `tests/multiply_instantiated_runtime.rs`
+//! (`two_instances_keep_independent_counter_state`) fuses a component that
+//! instantiates one core module twice, executes it on wasmtime, and asserts the
+//! two instances keep **independent** mutable counter state (a shared-state H-1
+//! corruption would fail it). The SR-31 reject is retained as an unreachable
+//! backstop. See this module's own structural unit tests for the expansion
+//! invariants.
 
 use crate::parser::{InstanceKind, ParsedComponent};
 use std::collections::HashSet;
