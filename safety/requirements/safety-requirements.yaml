@@ -840,10 +840,12 @@ artifacts:
     description: >
       The merger shall detect when the same core module is instantiated
       more than once within a component and return a diagnostic error.
-      Silent production of corrupt output shall not occur. Future work
-      may support multi-module component output (per cfallin's "simple
-      component" proposal), but until then, fail-fast rejection is
-      required.
+      Silent production of corrupt output shall not occur. NOTE: SR-55
+      (ADR-7 path-H inc 3) now SUPPORTS multiply-instantiated modules via
+      core-instance duplication, superseding the reject for handleable
+      cases; this detect-and-reject is retained as an unreachable backstop
+      (its ls_m_5 unit test still passes) for any residual meld cannot
+      duplicate soundly.
     status: verified
     tags: [stpa-derived]
     links:
@@ -2021,3 +2023,66 @@ artifacts:
         export-alias index-skip that shifted every export onto the previous
         one's type. Full meld-core suite green (no regression from the parser
         component_func_defs change). The #355 Mythos pass also surfaced the sibling instance-index desync (a component exporting >=2 interfaces bound the 2nd+ export to the wrong instance); fixed (component_instance_idx += 2) and pinned by component_multi_interface_instance_idx.rs.
+
+  # ==========================================================================
+  # RFC-46 Q1 — multiply-instantiated module SUPPORT (ADR-7 path-H inc 3)
+  # ==========================================================================
+
+  - id: SR-55
+    type: sw-req
+    title: Multiply-instantiated module support via core-instance duplication
+    description: >
+      Where SR-31 requires meld to fail-fast REJECT a component that
+      instantiates the same core module more than once, this requirement is the
+      RFC-46 Q1 "duplicate" resolution: meld shall SUPPORT such a component by
+      giving each instantiation its own distinct module identity, so that each
+      instance is allocated independent functions, memory, tables, and globals
+      (mutable state), and no two instances share state (STPA hazard H-1) or
+      silently overwrite one another's merge-map entries. The mechanism is a
+      pre-resolve normalization (`core_instance_topology::
+      expand_multiply_instantiated_modules`) that deep-clones a module per
+      extra instantiation and rewrites the instantiation to the clone — reusing
+      the merger's index-remapping machinery already proven correct for N
+      distinct modules. When active, this SUPERSEDES the SR-31 reject for the
+      supported cases; SR-31's fail-fast remains for any residual meld cannot
+      duplicate soundly.
+    status: implemented
+    tags: [rfc46, adr7, merger, topology]
+    links:
+      - type: derives-from
+        target: SYS-2
+      - type: refines
+        target: SR-31
+      - type: mitigates
+        target: LS-M-5
+    cited-source:
+      - uri: "https://github.com/pulseengine/meld/pull/362"
+        kind: github
+        last-checked: 2026-07-21
+    fields:
+      implementation:
+        - meld-core/src/core_instance_topology.rs
+        - meld-core/src/lib.rs
+      verification-method: test
+      verification-description: >
+        IMPLEMENTED — mechanism + wiring + differential EXECUTION oracle, green
+        locally (CI + merge pending → not yet `verified`). The normalization pass
+        (core_instance_topology) is wired into `Fuser::fuse_with_stats` before
+        resolve/merge, so multiply-instantiated modules now fuse. Verified by:
+        (1) structural unit tests (core_instance_topology::tests — single/distinct
+        unchanged; double/triple/interleaved → N distinct module identities;
+        FromExports ignored); (2) the differential execution oracle
+        multiply_instantiated_runtime::two_instances_keep_independent_counter_state
+        — a component instantiating ONE core module (mutable counter) TWICE is
+        fused (MultiMemory, CoreModule), VALIDATED, and executed on wasmtime; the
+        two instances' counters advance independently (inc→1,2; inc$0→1; inc→3;
+        inc$0→2), so a shared-state (H-1) corruption would fail the load-bearing
+        `inc$0` first-call == 1 assertion. Full meld-core suite green (0 failures,
+        no regression — the pass is a no-op for single-instantiation components).
+        The SR-31 `DuplicateModuleInstantiation` reject is retained as an
+        unreachable backstop (its ls_m_5 unit test still passes). Remaining before
+        `verified`: CI green on PR #362 + a Tier-5 Mythos pass on the lib.rs wiring.
+      references:
+        - "BA RFC #46 discussion: cfallin on multiply-instantiated modules"
+        - "safety/stpa/rfc46-comparative-analysis.md section 4 Q1"
+        - "safety/adr/ADR-7-abi-linking-strategy-architecture.md (path-H inc 3)"
