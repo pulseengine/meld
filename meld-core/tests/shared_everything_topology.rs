@@ -65,10 +65,10 @@ fn shared_everything_fuses_to_valid_single_memory_core() {
                 for d in r.into_iter().flatten() {
                     if let wasmparser::DataKind::Active { offset_expr, .. } = d.kind {
                         let mut ops = offset_expr.get_operators_reader();
-                        if let Ok(wasmparser::Operator::I32Const { value }) = ops.read() {
-                            if value == 0x0010_0000 {
-                                has_base_folded_data = true;
-                            }
+                        if let Ok(wasmparser::Operator::I32Const { value }) = ops.read()
+                            && value == 0x0010_0000
+                        {
+                            has_base_folded_data = true;
                         }
                     }
                 }
@@ -115,15 +115,15 @@ fn pic_exec_component() -> Vec<u8> {
     wat::parse_str(wat).expect("PIC-pattern component WAT must assemble")
 }
 
-// KNOWN FAILING — reproduces the real inc-4 bug (#353). meld emits the fused
-// data segment offset as `(data (global.get $__memory_base) …)` verbatim instead
-// of folding the constant-valued `__memory_base` global to `i32.const`.
-// wasm-tools validates it (lenient) but wasmtime REJECTS it at instantiation:
-// "constant expression required: global.get of locally defined global". Root
-// cause: segments.rs deliberately keeps `global.get`-first data offsets verbatim
-// as "runtime-dependent" (the #338 note), but a CONSTANT global must be folded
-// in a data const-expr. Un-ignore once the fold lands.
-#[ignore = "reproduces inc-4 bug #353: data-offset global.get(__memory_base) not folded to i32.const"]
+// Static-PIC data-offset fold (#353). Before the fix, meld emitted the fused
+// data-segment offset as `(data (global.get $__memory_base) …)` verbatim — valid
+// under wasm-tools (lenient) but REJECTED by wasmtime ("constant expression
+// required: global.get of locally defined global"), because after fusion the
+// dylib's imported `__memory_base` becomes a DEFINED global and a data const-expr
+// may `global.get` only an imported one. The fix folds a `global.get` of a
+// defined constant-i32 global to `i32.const <value>` in offset emission
+// (`ParsedConstExpr::reindex`), so the base-relative data lands at — and is read
+// from — the concrete folded base. Imported globals stay verbatim (#338).
 #[test]
 fn pic_base_relative_data_reads_correctly_after_fold() {
     use wasmtime::{Config, Engine, Instance, Module as RuntimeModule, Store};

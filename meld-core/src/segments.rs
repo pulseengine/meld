@@ -172,6 +172,30 @@ pub enum ParsedConstExpr {
     ExtendedGlobalGet(Vec<ExtConstOp>),
 }
 
+/// If a global's init const-expr bytes (WITHOUT the trailing `End`) fold to a
+/// constant `i32` — a bare `i32.const N`, or the wasm-2.0 extended-const
+/// `i32.const N (± M)*` with no embedded `global.get` — return that value.
+/// Anything with a `global.get` (runtime-dependent) or a non-i32 type → `None`.
+///
+/// Used by the merger to record which merged **defined** globals are constant
+/// i32s, so a data/element offset that `global.get`s one (a post-fusion
+/// `__memory_base`) can be folded to `i32.const` (#353).
+pub(crate) fn const_i32_init_value(init_bytes: &[u8]) -> Option<i32> {
+    let mut full = init_bytes.to_vec();
+    full.push(0x0B); // append End so wasmparser sees a complete const-expr
+    let reader = wasmparser::BinaryReader::new(&full, 0);
+    let expr = wasmparser::ConstExpr::new(reader);
+    let mut ops = expr.get_operators_reader();
+    match ops.read().ok()? {
+        Operator::I32Const { value } => match fold_extended_const_i32(&mut ops, value).ok()? {
+            ExtConstFold::Value(v) => Some(v),
+            // Embeds a `global.get` (`base + N`) → not a pure constant here.
+            ExtConstFold::Extended(_) => None,
+        },
+        _ => None,
+    }
+}
+
 impl ParsedConstExpr {
     /// Convert this parsed const expression into a `wasm_encoder::ConstExpr`
     pub fn to_const_expr(&self) -> ConstExpr {
@@ -192,7 +216,19 @@ impl ParsedConstExpr {
     pub fn reindex(&self, maps: &IndexMaps) -> ParsedConstExpr {
         match self {
             ParsedConstExpr::RefFunc(idx) => ParsedConstExpr::RefFunc(maps.remap_func(*idx)),
-            ParsedConstExpr::GlobalGet(idx) => ParsedConstExpr::GlobalGet(maps.remap_global(*idx)),
+            ParsedConstExpr::GlobalGet(idx) => {
+                // #353 (static PIC): a data/element offset may `global.get` only
+                // an IMPORTED global. After fusion a `__memory_base`-style base
+                // (imported by a dylib, defined by `$main`) becomes DEFINED, so a
+                // `global.get` of it here would be rejected by wasmtime. Fold it
+                // to the concrete `i32.const` base. Imported globals are absent
+                // from the map and stay a verbatim `global.get` (#338).
+                let new = maps.remap_global(*idx);
+                match maps.defined_global_i32_consts.get(&new) {
+                    Some(&value) => ParsedConstExpr::I32Const(value),
+                    None => ParsedConstExpr::GlobalGet(new),
+                }
+            }
             ParsedConstExpr::ExtendedGlobalGet(ops) => ParsedConstExpr::ExtendedGlobalGet(
                 ops.iter()
                     .map(|o| o.remap_global(|i| maps.remap_global(i)))
