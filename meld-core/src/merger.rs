@@ -73,6 +73,12 @@ pub struct MergedModule {
     /// Merged globals
     pub globals: Vec<MergedGlobal>,
 
+    /// #353 (static PIC): merged (absolute) global index → constant i32 value,
+    /// for **defined** globals whose init folds to a constant i32 (e.g. a
+    /// `__memory_base` a `$main` module provides). Consumed by the data/element
+    /// offset fold in `ParsedConstExpr::reindex` via `IndexMaps`.
+    pub defined_global_i32_const: std::collections::HashMap<u32, i32>,
+
     /// Merged exports
     pub exports: Vec<MergedExport>,
 
@@ -1011,6 +1017,7 @@ impl Merger {
             tables: Vec::new(),
             memories: Vec::new(),
             globals: Vec::new(),
+            defined_global_i32_const: std::collections::HashMap::new(),
             exports: Vec::new(),
             start_function: None,
             elements: Vec::new(),
@@ -1665,6 +1672,20 @@ impl Merger {
                 merged,
                 &global.content_type,
             );
+            // #353: record this DEFINED global's constant i32 value (if any) so a
+            // data/element offset that `global.get`s it (a post-fusion
+            // `__memory_base`) can be folded to `i32.const` — a data const-expr
+            // cannot `global.get` a defined global. Restricted to IMMUTABLE
+            // globals: a `__memory_base` base is immutable, and folding an init
+            // value is only unambiguously the segment-init-time value for a
+            // constant, non-mutable global. (Active segments are initialised
+            // before any start function, so even a mutable const-init would read
+            // its init value — but immutable removes all doubt.)
+            if !global.mutable
+                && let Some(v) = crate::segments::const_i32_init_value(&global.init_expr_bytes)
+            {
+                merged.defined_global_i32_const.insert(new_idx, v);
+            }
             let ty = convert_global_type(global, comp_idx, mod_idx, merged);
             merged.globals.push(MergedGlobal { ty, init_expr });
         }
@@ -1974,6 +1995,12 @@ impl Merger {
             elem_segment_base,
             code_addr_relocs,
         );
+        // #353: hand the data/element offset reindex the set of DEFINED
+        // constant-i32 globals so a `global.get` of a post-fusion `__memory_base`
+        // in an offset is folded to `i32.const` (imported globals stay verbatim).
+        index_maps
+            .defined_global_i32_consts
+            .clone_from(&merged.defined_global_i32_const);
         // #298: only under the upstream vestigial-allocator verdict does a
         // `memory.grow` reached during rebasing become `unreachable` (the
         // allocator is provably dead) instead of a hard error. Inert when
@@ -3954,6 +3981,7 @@ mod tests {
             tables: Vec::new(),
             memories: Vec::new(),
             globals: Vec::new(),
+            defined_global_i32_const: std::collections::HashMap::new(),
             exports: Vec::new(),
             start_function: None,
             elements: Vec::new(),
@@ -6011,6 +6039,7 @@ mod tests {
             tables: Vec::new(),
             memories: Vec::new(),
             globals: Vec::new(),
+            defined_global_i32_const: std::collections::HashMap::new(),
             exports: Vec::new(),
             start_function: None,
             elements: Vec::new(),

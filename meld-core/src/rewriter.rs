@@ -111,6 +111,15 @@ pub struct IndexMaps {
     /// `None` preserves the zero-cost legacy path exactly: no const rebasing,
     /// and blanket `memarg` rebasing (a no-op when `memory_base_offset == 0`).
     pub code_addr_relocs: Option<std::collections::HashSet<u32>>,
+    /// #353 (static PIC): merged (post-remap) global index → constant i32 value,
+    /// for **defined** globals whose init folds to a constant i32 (e.g. a
+    /// `__memory_base` provided by a `$main` module). A data/element segment
+    /// offset may `global.get` only an *imported* global; after fusion such a
+    /// base global becomes *defined*, so `ParsedConstExpr::reindex` folds a
+    /// `global.get` of one of these to `i32.const <value>` (imported globals are
+    /// absent from this map and stay verbatim, preserving the #338 behaviour).
+    /// Empty by default → no folding, so every other caller is unaffected.
+    pub defined_global_i32_consts: std::collections::HashMap<u32, i32>,
 }
 
 #[derive(Debug, Clone, Copy)]

@@ -12883,6 +12883,7 @@ mod tests {
             tables: Vec::new(),
             memories: Vec::new(),
             globals: Vec::new(),
+            defined_global_i32_const: std::collections::HashMap::new(),
             exports: Vec::new(),
             start_function: None,
             elements: Vec::new(),
