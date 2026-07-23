@@ -4,6 +4,49 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.42.0] - 2026-07-23
+
+ADR-7 path-H — the ABI/linking-strategy architecture — landed in full, plus two
+new fusion capabilities and safety hardening.
+
+### Added
+- **Multiply-instantiated module support (RFC-46 Q1)** — a component that
+  instantiates the same core module more than once now fuses (under explicit
+  `--memory multi`) with each instance allocated independent
+  functions/memory/tables/globals, instead of being rejected. A pre-resolve
+  core-instance topology normalization turns N instantiations into N distinct
+  modules, reusing the merger's proven per-module index-remapping (SR-55).
+- **Static-PIC data/element offset folding** — meld consumes PIC /
+  shared-everything inputs and statically folds a `__memory_base`-relative
+  segment offset (`global.get $base` and the extended-const `base + N` shape)
+  to a concrete `i32.const` once the base becomes a defined constant after
+  fusion, so the output is valid for wasmtime, not just wasm-tools (#353).
+- **Same-memory string transcoding** — a mixed-encoding call under
+  `--memory shared` now transcodes correctly within the one shared memory,
+  instead of hard-failing (#361).
+
+### Changed
+- **ADR-7 path-H architecture** — the merger's per-boundary decisions are now
+  pluggable seams: the address strategy (`address_strategy`, inc 1) and the
+  call lowering + inline decision (`adapter::call_lowering`, inc 2), each
+  extracted behavior-preservingly and unit-tested as a truth table (#354).
+
+### Fixed
+- **Multiply-instantiated safety-claim gap (#364)** — support is gated to the
+  execution-verified `MultiMemory` case; `SharedMemory`/`Auto` reject (their
+  independence is unverified), so shipped behavior matches SR-31/SR-55.
+- **Silent same-memory cross-encoding miscompile (#360/#361)** — the sync twin
+  of the async cross-encoding guard: mixed-encoding same-memory calls no longer
+  deliver bytes in the wrong encoding.
+
+**Falsification:** if a multiply-instantiated module fused under `--memory multi`
+shared mutable state between instances, `multiply_instantiated_runtime` fails
+(the second instance's counter would observe the first's writes); if a static-PIC
+`base + N` data offset were left un-folded, `pic_extended_const_353` fails
+(wasmtime rejects the fused module); if a same-memory UTF-8→UTF-16 call skipped
+transcoding, `adapter_safety::test_361_same_memory_utf8_to_utf16_transcoding`
+returns the wrong sum.
+
 ## [0.41.3] - 2026-07-17
 
 Correctness patch for the `--component` output path.

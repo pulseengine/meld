@@ -2066,6 +2066,7 @@ artifacts:
       reject fires instead.
     status: verified
     tags: [rfc46, adr7, merger, topology]
+    release: v0.42.0
     links:
       - type: derives-from
         target: SYS-2
