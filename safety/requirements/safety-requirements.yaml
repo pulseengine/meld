@@ -858,14 +858,27 @@ artifacts:
       - type: mitigates
         target: LS-M-5
     fields:
-      implementation: meld-core/src/merger.rs
+      implementation:
+        - meld-core/src/merger.rs
+        - meld-core/src/lib.rs
       verification-method: test
       verification-description: >
-        Test with component that instantiates the same core module
-        twice; verify merger returns an error
+        Verified on the LIVE fuse path (#364): `multiply_instantiated_runtime::
+        shared_memory_and_auto_reject_multiply_instantiated` fuses a component
+        instantiating one core module twice under SharedMemory and Auto and
+        asserts a DuplicateModuleInstantiation rejection — exercising
+        `fuse_with_stats`, not the merger reject in isolation. The unit-level
+        `merger::tests::ls_m_5_multiply_instantiated_module_rejected` still checks
+        the reject function directly. SCOPE (#364): the reject is the live
+        behavior only for SharedMemory/Auto, where per-instance independence is
+        unverified; under explicit MultiMemory the modules are SUPPORTED (SR-55,
+        execution-verified) — lib.rs gates the core-instance normalization to
+        MultiMemory so this reject fires elsewhere rather than shipping an
+        unverified transform.
       references:
         - "BA RFC #46 discussion: cfallin on multiply-instantiated modules"
         - "safety/stpa/rfc46-comparative-analysis.md section 4 Q1"
+        - "https://github.com/pulseengine/meld/issues/364"
 
   # ==========================================================================
   # Roadmap requirements v0.8 → v0.11 (SR-32..SR-36)
@@ -2045,7 +2058,12 @@ artifacts:
       the merger's index-remapping machinery already proven correct for N
       distinct modules. When active, this SUPERSEDES the SR-31 reject for the
       supported cases; SR-31's fail-fast remains for any residual meld cannot
-      duplicate soundly.
+      duplicate soundly. SCOPE (#364): support is gated to explicit
+      **MultiMemory** — the only strategy under which the execution oracle proves
+      per-instance independence (each instance gets its OWN linear memory). Under
+      SharedMemory (shared linear memory → independence unverified) and Auto
+      (implicit strategy, ADR-4) the normalization is NOT applied and the SR-31
+      reject fires instead.
     status: verified
     tags: [rfc46, adr7, merger, topology]
     links:
