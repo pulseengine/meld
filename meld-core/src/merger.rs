@@ -1675,8 +1675,15 @@ impl Merger {
             // #353: record this DEFINED global's constant i32 value (if any) so a
             // data/element offset that `global.get`s it (a post-fusion
             // `__memory_base`) can be folded to `i32.const` — a data const-expr
-            // cannot `global.get` a defined global.
-            if let Some(v) = crate::segments::const_i32_init_value(&global.init_expr_bytes) {
+            // cannot `global.get` a defined global. Restricted to IMMUTABLE
+            // globals: a `__memory_base` base is immutable, and folding an init
+            // value is only unambiguously the segment-init-time value for a
+            // constant, non-mutable global. (Active segments are initialised
+            // before any start function, so even a mutable const-init would read
+            // its init value — but immutable removes all doubt.)
+            if !global.mutable
+                && let Some(v) = crate::segments::const_i32_init_value(&global.init_expr_bytes)
+            {
                 merged.defined_global_i32_const.insert(new_idx, v);
             }
             let ty = convert_global_type(global, comp_idx, mod_idx, merged);
