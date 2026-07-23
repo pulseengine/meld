@@ -79,6 +79,47 @@ pub(crate) fn ext_const_to_expr(ops: &[ExtConstOp]) -> ConstExpr {
     ce
 }
 
+/// Evaluate a `global.get`-first extended-const i32 sequence (`base ± N …`) as a
+/// concrete constant, substituting `base` for the leading `global.get`. Returns
+/// `None` if the sequence isn't a pure i32 expression over a *single* (leading)
+/// `global.get` — a non-leading `global.get`, an i64 op, or an unbalanced stack
+/// all decline the fold. Used by [`ParsedConstExpr::reindex`] to fold a data /
+/// element offset `global.get $__memory_base + N` once the base is a defined
+/// constant (#353).
+fn eval_ext_const_i32_with_base(ops: &[ExtConstOp], base: i32) -> Option<i32> {
+    let mut stack: Vec<i32> = Vec::new();
+    for (i, op) in ops.iter().enumerate() {
+        match op {
+            ExtConstOp::GlobalGet(_) if i == 0 => stack.push(base),
+            // Only the leading global.get is the folded base; any other one means
+            // the value depends on a second global we can't fold here.
+            ExtConstOp::GlobalGet(_) => return None,
+            ExtConstOp::I32Const(v) => stack.push(*v),
+            ExtConstOp::I32Add => {
+                let b = stack.pop()?;
+                let a = stack.pop()?;
+                stack.push(a.wrapping_add(b));
+            }
+            ExtConstOp::I32Sub => {
+                let b = stack.pop()?;
+                let a = stack.pop()?;
+                stack.push(a.wrapping_sub(b));
+            }
+            ExtConstOp::I32Mul => {
+                let b = stack.pop()?;
+                let a = stack.pop()?;
+                stack.push(a.wrapping_mul(b));
+            }
+            // i64 ops don't apply to a 32-bit memory offset.
+            ExtConstOp::I64Const(_)
+            | ExtConstOp::I64Add
+            | ExtConstOp::I64Sub
+            | ExtConstOp::I64Mul => return None,
+        }
+    }
+    (stack.len() == 1).then(|| stack[0])
+}
+
 /// The outcome of reading a `const`-first extended-const expression: either a
 /// pure-constant fold (no `global.get` anywhere) that collapses to a single
 /// value, or a runtime-dependent sequence that embeds a `global.get` partway
@@ -229,11 +270,30 @@ impl ParsedConstExpr {
                     None => ParsedConstExpr::GlobalGet(new),
                 }
             }
-            ParsedConstExpr::ExtendedGlobalGet(ops) => ParsedConstExpr::ExtendedGlobalGet(
-                ops.iter()
+            ParsedConstExpr::ExtendedGlobalGet(ops) => {
+                let remapped: Vec<ExtConstOp> = ops
+                    .iter()
                     .map(|o| o.remap_global(|i| maps.remap_global(i)))
-                    .collect(),
-            ),
+                    .collect();
+                // #353 (static PIC): `wasm-tools component link` emits base-relative
+                // data at the position-independent offset
+                // `(i32.add (global.get $__memory_base) (i32.const N))` for every
+                // N > 0 (only N == 0 is a bare `global.get`). After fusion the base
+                // becomes a DEFINED global, so this whole extended-const would be
+                // `global.get <defined>; i32.const N; i32.add` — rejected by
+                // wasmtime in a const-expr. If the leading global is a defined
+                // constant-i32, FOLD the entire `base ± N` expression to a single
+                // `i32.const`. (Imported bases are absent from the map → left
+                // verbatim, preserving #338's runtime-dependent extended-const.)
+                if let Some(ExtConstOp::GlobalGet(g)) = remapped.first()
+                    && let Some(&base) = maps.defined_global_i32_consts.get(g)
+                    && let Some(folded) = eval_ext_const_i32_with_base(&remapped, base)
+                {
+                    ParsedConstExpr::I32Const(folded)
+                } else {
+                    ParsedConstExpr::ExtendedGlobalGet(remapped)
+                }
+            }
             ParsedConstExpr::RefNull(ht) => {
                 let remapped_ht = match ht {
                     wasm_encoder::HeapType::Concrete(idx) => {
@@ -954,6 +1014,42 @@ pub fn encode_data_segment(segment: &ReindexedDataSegment) -> DataSegment<'_, Ve
 mod tests {
     use super::*;
     use wasm_encoder::Encode;
+
+    #[test]
+    fn eval_ext_const_i32_with_base_folds_and_declines() {
+        use ExtConstOp::*;
+        // base + N  (the PIC `__memory_base + offset` shape)
+        assert_eq!(
+            eval_ext_const_i32_with_base(&[GlobalGet(0), I32Const(16), I32Add], 0x10_0000),
+            Some(0x10_0010)
+        );
+        // base - N and base * N
+        assert_eq!(
+            eval_ext_const_i32_with_base(&[GlobalGet(0), I32Const(4), I32Sub], 100),
+            Some(96)
+        );
+        assert_eq!(
+            eval_ext_const_i32_with_base(&[GlobalGet(0), I32Const(2), I32Mul], 21),
+            Some(42)
+        );
+        // bare base folds to base
+        assert_eq!(eval_ext_const_i32_with_base(&[GlobalGet(0)], 7), Some(7));
+        // DECLINE: a non-leading global.get (value depends on a 2nd global)
+        assert_eq!(
+            eval_ext_const_i32_with_base(&[GlobalGet(0), GlobalGet(1), I32Add], 5),
+            None
+        );
+        // DECLINE: an i64 op is not an i32 memory offset
+        assert_eq!(
+            eval_ext_const_i32_with_base(&[GlobalGet(0), I64Const(1), I64Add], 5),
+            None
+        );
+        // DECLINE: unbalanced (missing operand)
+        assert_eq!(
+            eval_ext_const_i32_with_base(&[GlobalGet(0), I32Add], 5),
+            None
+        );
+    }
 
     #[test]
     fn test_element_segment_mode() {
