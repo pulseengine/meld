@@ -361,7 +361,16 @@ artifacts:
     type: sw-verification
     title: "Verification of SR-31: Multiply-instantiated module detection"
     description: >
-      Verifies SR-31 via: tests `merger::tests::ls_m_5_multiply_instantiated_module_rejected`.
+      Verifies SR-31 on the LIVE fuse path via
+      `multiply_instantiated_runtime::shared_memory_and_auto_reject_multiply_instantiated`
+      — a component instantiating one core module 2× is REJECTED
+      (DuplicateModuleInstantiation) under SharedMemory and Auto, exercising
+      `fuse_with_stats` (not the merger reject in isolation). Complemented by the
+      unit-level `merger::tests::ls_m_5_multiply_instantiated_module_rejected`.
+      NOTE (#364): under explicit MultiMemory the reject is intentionally NOT
+      the behavior — multiply-instantiated modules are SUPPORTED there (SR-55,
+      execution-verified independent state); the SR-31 reject scope is
+      SharedMemory/Auto (unverified independence), gated in lib.rs.
     status: verified
     fields:
       method: automated-test

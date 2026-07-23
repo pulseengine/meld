@@ -410,27 +410,6 @@ impl Fuser {
             return Err(Error::NoComponents);
         }
 
-        // RFC-46 Q1 (ADR-7 path-H inc 3): normalize multiply-instantiated core
-        // modules into distinct module identities *before* resolve/merge, so each
-        // instantiation is allocated independent functions/memory/tables/globals
-        // via the merger's per-module machinery (already proven correct for N
-        // distinct modules) — no shared mutable state (H-1), no (component,
-        // module)-keyed map overwrites. After this pass no module is instantiated
-        // more than once, so the `DuplicateModuleInstantiation` reject in the
-        // resolver/merger becomes an unreachable backstop. Idempotent, so a
-        // repeated fuse (after another `add_component`) is safe.
-        let mut duplicated_modules = 0usize;
-        for component in &mut self.components {
-            duplicated_modules +=
-                crate::core_instance_topology::expand_multiply_instantiated_modules(component);
-        }
-        if duplicated_modules > 0 {
-            log::info!(
-                "core-instance topology: duplicated {duplicated_modules} multiply-instantiated \
-                 core module(s) into distinct identities (RFC-46 Q1)"
-            );
-        }
-
         // Restore the originally-requested strategy before resolving, so a
         // repeated fuse (e.g. after another `add_component`) re-derives the
         // resolution from the CURRENT component set instead of reusing a
@@ -440,6 +419,38 @@ impl Fuser {
             .get_or_insert((self.config.memory_strategy, self.config.address_rebasing));
         self.config.memory_strategy = requested_strategy;
         self.config.address_rebasing = requested_rebasing;
+
+        // RFC-46 Q1 (ADR-7 path-H inc 3): normalize multiply-instantiated core
+        // modules into distinct module identities *before* resolve/merge, so each
+        // instantiation is allocated independent functions/memory/tables/globals
+        // via the merger's per-module machinery (already proven correct for N
+        // distinct modules) — no shared mutable state (H-1), no (component,
+        // module)-keyed map overwrites. After this pass no module is instantiated
+        // more than once, so the `DuplicateModuleInstantiation` reject becomes an
+        // unreachable backstop. Idempotent, so a repeated fuse is safe.
+        //
+        // #364: support is gated to **explicit `MultiMemory`** — the only case the
+        // differential execution oracle (`multiply_instantiated_runtime`) proves
+        // keeps per-instance state independent (each instance gets its OWN memory).
+        // Under `SharedMemory` the instances would share one linear memory and the
+        // independence is *unverified* (SR-55 note); under `Auto` the strategy is
+        // resolved implicitly, which functional-safety builds must not rely on
+        // (ADR-4). In both cases we skip normalization and let the
+        // `DuplicateModuleInstantiation` reject fire (SR-31) rather than ship an
+        // unverified transform.
+        let mut duplicated_modules = 0usize;
+        if requested_strategy == MemoryStrategy::MultiMemory {
+            for component in &mut self.components {
+                duplicated_modules +=
+                    crate::core_instance_topology::expand_multiply_instantiated_modules(component);
+            }
+            if duplicated_modules > 0 {
+                log::info!(
+                    "core-instance topology: duplicated {duplicated_modules} multiply-instantiated \
+                     core module(s) into distinct identities (RFC-46 Q1, MultiMemory)"
+                );
+            }
+        }
         if self.config.memory_strategy == MemoryStrategy::Auto {
             self.resolve_auto_memory_strategy();
             let result = if self.config.memory_strategy == MemoryStrategy::SharedMemory {

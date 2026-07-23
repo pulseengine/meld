@@ -183,3 +183,25 @@ fn two_instances_keep_independent_memory_and_data_segments() {
     assert_eq!(bump1.call(&mut store, ()).unwrap(), 8, "bump1 #3");
     assert_eq!(bump2.call(&mut store, ()).unwrap(), 7, "bump2 #2");
 }
+
+/// #364: multiply-instantiated support is gated to the execution-verified
+/// MultiMemory case. Under SharedMemory (independence unverified) and Auto
+/// (implicit — ADR-4), meld must REJECT rather than ship an unverified transform.
+#[test]
+fn shared_memory_and_auto_reject_multiply_instantiated() {
+    for ms in [MemoryStrategy::SharedMemory, MemoryStrategy::Auto] {
+        let component = multiply_instantiated_component();
+        let mut cfg = base_config();
+        cfg.memory_strategy = ms;
+        let mut fuser = Fuser::new(cfg);
+        fuser.add_component_named(&component, Some("dup")).unwrap();
+        let err = fuser.fuse_with_stats().err().unwrap_or_else(|| {
+            panic!("{ms:?}: multiply-instantiated must be rejected (unverified), but it fused")
+        });
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("more than once") || msg.contains("multiply-instantiated"),
+            "{ms:?}: expected DuplicateModuleInstantiation, got: {msg}"
+        );
+    }
+}
