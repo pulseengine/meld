@@ -2095,6 +2095,65 @@ fn test_sr17_utf8_to_utf16_string_transcoding() {
     );
 }
 
+/// #361: the SAME transcoding, but under `SharedMemory` — the caller and callee
+/// share one linear memory, so `crosses_memory` is false. #360 hard-failed this
+/// (the class dispatch only reached `Transcode` when memory was crossed); this
+/// proves same-memory transcoding now works: the transcode adapter is
+/// memory-index-parameterised (src reads `caller_memory`, dst writes
+/// `callee_memory` — both 0 here), so it transcodes UTF-8 → UTF-16 within the
+/// one shared memory. `run()` must still return 500.
+#[test]
+fn test_361_same_memory_utf8_to_utf16_transcoding() {
+    let callee = build_callee_utf16_string_component();
+    let caller = build_caller_string_component();
+
+    let config = FuserConfig {
+        memory_strategy: MemoryStrategy::SharedMemory,
+        attestation: false,
+        reproducible: false,
+        component_provenance: false,
+        address_rebasing: false,
+        preserve_names: false,
+        custom_sections: meld_core::CustomSectionHandling::Drop,
+        dwarf_handling: meld_core::DwarfHandling::Strip,
+        output_format: meld_core::OutputFormat::CoreModule,
+        opaque_resources: Vec::new(),
+    };
+
+    let mut fuser = Fuser::new(config);
+    fuser
+        .add_component_named(&callee, Some("callee-utf16"))
+        .expect("callee should parse");
+    fuser
+        .add_component_named(&caller, Some("caller-utf8"))
+        .expect("caller should parse");
+
+    let (fused, _stats) = fuser
+        .fuse_with_stats()
+        .expect("#361: same-memory cross-encoding fusion should now succeed");
+
+    let mut validator = wasmparser::Validator::new();
+    validator
+        .validate_all(&fused)
+        .expect("#361: fused output should validate");
+
+    let mut engine_config = Config::new();
+    engine_config.wasm_multi_memory(true);
+    let engine = Engine::new(&engine_config).unwrap();
+    let module = RuntimeModule::new(&engine, &fused).unwrap();
+    let mut store = Store::new(&engine, ());
+    let instance = Instance::new(&mut store, &module, &[]).unwrap();
+    let run = instance
+        .get_typed_func::<(), i32>(&mut store, "run")
+        .expect("#361: fused module should export 'run'");
+    let result = run.call(&mut store, ()).unwrap();
+    assert_eq!(
+        result, 500,
+        "#361: same-memory UTF-8→UTF-16 'Hello' must transcode to 500, not \
+         silently mis-copy"
+    );
+}
+
 /// SR-17 (surrogate-pair clause): a supplementary-plane code point
 /// (U+10000 and above) transcoded UTF-8 → UTF-16 must be encoded as a
 /// surrogate PAIR — two code units — not a single truncated unit. The
