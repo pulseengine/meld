@@ -893,6 +893,16 @@ impl Fuser {
             self.encode_output(&merged, &adapters, &extra_sections, &dwarf_sections)?
         };
 
+        // SR-56 / LS-M-12 (#370): reject overlapping active data segments in
+        // the emitted core module — regardless of memory strategy or flags.
+        // Overlap means two components' data occupy the same linear-memory
+        // range, so the later segment silently overwrites the earlier one at
+        // instantiation (later-wins corruption with a clean exit). This is a
+        // cheap, purely local check on the final bytes, so it catches the
+        // defect no matter which merge path produced it. A probe across the
+        // full suite confirmed no legitimate fixture trips it.
+        segments::check_no_overlapping_data_segments(&output)?;
+
         // Optionally wrap the fused core module as a P2 component
         let output = if self.config.output_format == OutputFormat::Component {
             log::info!("Wrapping fused module as P2 component");

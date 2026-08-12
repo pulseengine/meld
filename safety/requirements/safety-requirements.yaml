@@ -2110,3 +2110,115 @@ artifacts:
         - "BA RFC #46 discussion: cfallin on multiply-instantiated modules"
         - "safety/stpa/rfc46-comparative-analysis.md section 4 Q1"
         - "safety/adr/ADR-7-abi-linking-strategy-architecture.md (path-H inc 3)"
+
+  # ==========================================================================
+  # #370 — shared-memory data-segment overlap (v0.43.0)
+  # ==========================================================================
+
+  - id: SR-56
+    type: sw-req
+    title: Reject overlapping data segments in the fused output
+    description: >
+      The fuser shall detect active data-segment ranges that overlap within a
+      linear memory in the EMITTED module and hard-fail with a diagnostic —
+      regardless of memory strategy or flags. An overlap is never an intended
+      output: active segments are applied in declaration order at instantiation,
+      so a later segment silently overwrites an earlier one (LS-M-12). The check
+      is local to the emitted module and therefore catches the general case,
+      including any future path that forgets to rebase. In particular
+      `--memory shared` WITHOUT `--address-rebase` merges memories but shifts no
+      offsets, so every input's `.rodata`/`.data` at the standard `wasm-ld` base
+      collides; today that exits 0 with no diagnostic, while the sound
+      `--address-rebase` path correctly refuses on missing relocations — the
+      safe-looking flag reaches the worse end state. The hard-fail's own
+      diagnostic carries the remediation (it names both `--address-rebase` and
+      the compact `--pack-rebase`), so no separate advisory warning is emitted —
+      a warning that fired on configurations that did NOT overlap would be noise
+      that trains users to ignore meld's stderr.
+    status: proposed
+    tags: [merger, memory, shared, safety, silent-corruption]
+    release: v0.43.0
+    links:
+      - type: derives-from
+        target: SYS-2
+      - type: mitigates
+        target: LS-M-12
+      - type: refines
+        target: SR-37
+    cited-source:
+      - uri: "https://github.com/pulseengine/meld/issues/370"
+        kind: github
+        last-checked: 2026-08-12
+    fields:
+      implementation:
+        - meld-core/src/segments.rs
+        - meld-core/src/lib.rs
+      verification-method: test
+      verification-description: >
+        Verified by `meld-core/tests/shared_overlap_370.rs` (3 cases):
+        (negative) two components each placing a data segment at the wasm-ld
+        base 1048576 under `--memory shared` without `--address-rebase` now
+        hard-fail with `Error::OverlappingDataSegments` (pair_count 1, memory 0,
+        start 1048576); (positive-disjoint) well-separated offsets fuse clean;
+        (positive-adjacent) `[0,4)` and `[4,8)` touch but do not overlap and
+        fuse clean, pinning the strict `start < max_end` boundary. Detection
+        lives in `segments::find_overlapping_data_segments` /
+        `check_no_overlapping_data_segments` (running-max-end scan, so a long
+        segment spanning several shorter ones is caught) and is called on the
+        emitted core module in `lib.rs::fuse_with_stats_resolved` before the
+        optional component wrap. A warn-only probe across the full test suite
+        (42 integration binaries) confirmed no existing fixture legitimately
+        overlaps — the only trip was the #370 repro itself.
+      references:
+        - "https://github.com/pulseengine/meld/issues/370"
+        - "gale#266 check-data-overlap.py"
+        - "meld-core/tests/shared_overlap_370.rs"
+
+  - id: SR-57
+    type: sw-req
+    title: Compact used-extent address rebasing for single-address-space targets (opt-in)
+    description: >
+      The fuser shall support an OPT-IN rebasing mode (`--pack-rebase`) that
+      places each fused component at its ACTUAL used extent — the maximum active
+      data-segment end offset plus any reserved mutable region — byte/8-byte
+      aligned, rather than at its DECLARED linear-memory page count. The declared
+      extent is page-granular (a wasm page is 64 KiB; the minimum a component can
+      declare is one page), so the sound page-granular rebasing reserves >=64 KiB
+      per component and cannot fit a single-address-space MCU (the STM32F100RB
+      has 8 KiB SRAM), even though each component's real used extent is a few
+      hundred bytes. Compact rebasing packs three such components into a few KiB,
+      disjoint AND smaller than today's overlapping `--memory shared` output —
+      giving MCU targets a path that is both sound and shippable (#370). Because
+      compact placement is unsound for components that compute addresses beyond
+      their data segments (the LS-M-11 / #326 computed-pointer case), the mode is
+      OPT-IN and intended for static-offset-only components (thin scalar-in /
+      scalar-out drivers, which can prove it); it does not change the default.
+    status: proposed
+    tags: [merger, rewriter, memory, shared, mcu, rebase]
+    release: v0.43.0
+    links:
+      - type: derives-from
+        target: SYS-2
+      - type: refines
+        target: SR-37
+    cited-source:
+      - uri: "https://github.com/pulseengine/meld/issues/370"
+        kind: github
+        last-checked: 2026-08-12
+    fields:
+      implementation:
+        - meld-core/src/merger.rs
+        - meld-core/src/rewriter.rs
+      verification-method: test
+      verification-description: >
+        PROPOSED. Verified by a differential execution oracle: fuse two/three
+        components (each with data at the wasm-ld base) under `--pack-rebase`,
+        assert the emitted data segments are DISJOINT and packed to their used
+        extent (not 64 KiB apart), the total fits a small budget, and each
+        component reads back its OWN data on wasmtime (no clobber). The SR-56
+        overlap check must pass on the output. Pairs with the #326 computed-
+        pointer caveat: `--pack-rebase` is documented sound only for
+        static-offset-only addressing.
+      references:
+        - "https://github.com/pulseengine/meld/issues/370"
+        - "gale#266"
