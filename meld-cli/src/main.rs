@@ -68,6 +68,18 @@ enum Commands {
         #[arg(long)]
         address_rebase: bool,
 
+        /// Compact used-extent rebasing for single-address-space (MCU)
+        /// targets. Places each component at its actual used data extent
+        /// (16-byte aligned) instead of its declared page count, and sizes
+        /// the merged memory to the packed total — so three thin drivers fit
+        /// in a few KiB instead of one 64 KiB page each. Implies
+        /// --address-rebase and requires --memory shared. OPT-IN and sound
+        /// ONLY when a component references no address above its last data
+        /// segment (no separately-addressed .bss, no heap, no computed
+        /// pointers); such components must use --address-rebase instead.
+        #[arg(long)]
+        pack_rebase: bool,
+
         /// Show fusion statistics
         #[arg(long)]
         stats: bool,
@@ -178,12 +190,14 @@ fn main() -> Result<()> {
             component,
             emit_import_map,
             opaque_rep,
+            pack_rebase,
         }) => {
             fuse_command(
                 inputs,
                 output,
                 memory,
                 address_rebase,
+                pack_rebase,
                 stats,
                 no_attestation,
                 reproducible,
@@ -242,6 +256,7 @@ fn fuse_command(
     output: String,
     memory: String,
     address_rebase: bool,
+    pack_rebase: bool,
     show_stats: bool,
     no_attestation: bool,
     reproducible: bool,
@@ -297,7 +312,23 @@ fn fuse_command(
         }
     };
 
-    if address_rebase {
+    // --pack-rebase is a compact variant of --address-rebase; it requires the
+    // same single shared memory and implies address rebasing (SR-57).
+    if pack_rebase && memory_strategy != MemoryStrategy::SharedMemory {
+        return Err(anyhow!(
+            "--pack-rebase requires --memory shared (it is a compact, \
+             used-extent variant of --address-rebase); 'auto'/'multi' \
+             do not support it"
+        ));
+    }
+    let address_rebase = address_rebase || pack_rebase;
+
+    if pack_rebase {
+        println!(
+            "Compact used-extent rebasing (--pack-rebase): sound only for \
+             components that address nothing above their last data segment"
+        );
+    } else if address_rebase {
         println!("Address rebasing is experimental and may have limitations");
     }
 
@@ -346,6 +377,7 @@ fn fuse_command(
         reproducible,
         component_provenance: !no_component_provenance,
         address_rebasing: address_rebase,
+        pack_rebase,
         preserve_names,
         output_format,
         opaque_resources,

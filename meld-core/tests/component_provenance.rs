@@ -319,6 +319,7 @@ fn opt_out_via_config_drops_the_section() {
         reproducible: false,
         component_provenance: false,
         address_rebasing: false,
+        pack_rebase: false,
         preserve_names: false,
         custom_sections: CustomSectionHandling::Merge,
         output_format: OutputFormat::CoreModule,

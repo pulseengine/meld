@@ -541,6 +541,12 @@ pub struct Merger {
     /// table allocation for these resources because their reps are already
     /// valid integer handles (no Box dereferencing in user code).
     opaque_resources: Vec<(String, String)>,
+    /// SR-57 / #370: compact used-extent rebasing. When set (and rebasing is
+    /// active), each module is placed at its actual used data extent (16-byte
+    /// aligned) instead of its declared page count, and the combined memory is
+    /// sized to the packed total. See [`FuserConfig::pack_rebase`] for the
+    /// soundness envelope.
+    pack_rebase: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -571,6 +577,7 @@ impl Merger {
             address_rebasing,
             defer_grow_under_rebase: false,
             opaque_resources: Vec::new(),
+            pack_rebase: false,
         }
     }
 
@@ -590,6 +597,14 @@ impl Merger {
         self
     }
 
+    /// SR-57 / #370: enable compact used-extent rebasing (see the
+    /// [`pack_rebase`](Self::pack_rebase) field). No effect unless rebasing is
+    /// active, since the per-module base map is only built under rebasing.
+    pub fn with_pack_rebase(mut self, pack: bool) -> Self {
+        self.pack_rebase = pack;
+        self
+    }
+
     fn compute_shared_memory_plan(
         &self,
         components: &[ParsedComponent],
@@ -597,7 +612,11 @@ impl Merger {
         let mut memory_types = Vec::new();
         let mut import_names: Vec<(String, String)> = Vec::new();
         let mut has_defined = false;
-        let mut module_memories: Vec<((usize, usize), MemoryType)> = Vec::new();
+        // (key, module memory type, used-data extent). The extent is
+        // `Some(bytes)` only under `--pack-rebase` and only when every active
+        // data segment has a constant offset; `None` means "cannot pack — fall
+        // back to the declared page stride" (SR-57).
+        let mut module_memories: Vec<((usize, usize), MemoryType, Option<u64>)> = Vec::new();
 
         for (comp_idx, component) in components.iter().enumerate() {
             for (mod_idx, module) in component.core_modules.iter().enumerate() {
@@ -615,7 +634,12 @@ impl Merger {
 
                 if self.address_rebasing {
                     if let Some(module_memory) = module_memory_type(module)? {
-                        module_memories.push(((comp_idx, mod_idx), module_memory));
+                        let extent = if self.pack_rebase {
+                            module_used_data_extent(module)?
+                        } else {
+                            None
+                        };
+                        module_memories.push(((comp_idx, mod_idx), module_memory, extent));
                     }
                 }
             }
@@ -625,7 +649,7 @@ impl Merger {
             return Ok(None);
         }
 
-        let combined = if self.address_rebasing {
+        let mut combined = if self.address_rebasing {
             combine_memory_types_rebased(&memory_types)?
         } else {
             combine_memory_types_shared(&memory_types)?
@@ -647,25 +671,48 @@ impl Merger {
 
         let mut bases = HashMap::new();
         if self.address_rebasing {
-            let mut next_base_pages: u64 = 0;
-            for (key, module_memory) in module_memories {
-                let base_pages = next_base_pages;
-                let base_bytes = base_pages.checked_mul(WASM_PAGE_SIZE).ok_or_else(|| {
-                    Error::MemoryStrategyUnsupported(
-                        "shared memory base offset overflow".to_string(),
-                    )
-                })?;
+            // Byte-granular running base. Under the default page-granular
+            // strategy each module strides by its declared page count; under
+            // `--pack-rebase` it strides by its 16-byte-aligned used data
+            // extent (SR-57). 16-byte alignment keeps `v128` accesses aligned
+            // after the uniform `+base` shift.
+            const PACK_ALIGN: u64 = 16;
+            let overflow =
+                || Error::MemoryStrategyUnsupported("shared memory size overflow".to_string());
+            let mut next_base: u64 = 0;
+            for (key, module_memory, extent) in &module_memories {
+                let base_bytes = next_base;
                 if !combined.memory64 && base_bytes > u64::from(u32::MAX) {
                     return Err(Error::MemoryStrategyUnsupported(
                         "shared memory base offset exceeds 32-bit address space".to_string(),
                     ));
                 }
-                bases.insert(key, base_bytes);
-                next_base_pages = next_base_pages
-                    .checked_add(module_memory.initial)
-                    .ok_or_else(|| {
-                        Error::MemoryStrategyUnsupported("shared memory size overflow".to_string())
-                    })?;
+                bases.insert(*key, base_bytes);
+
+                // Stride: packed extent when available, else the declared page
+                // count (the fallback also covers a module whose data offsets
+                // are non-constant and therefore cannot be safely packed).
+                let stride = match (self.pack_rebase, extent) {
+                    (true, Some(bytes)) => (*bytes)
+                        .checked_next_multiple_of(PACK_ALIGN)
+                        .ok_or_else(overflow)?,
+                    _ => module_memory
+                        .initial
+                        .checked_mul(WASM_PAGE_SIZE)
+                        .ok_or_else(overflow)?,
+                };
+                next_base = next_base.checked_add(stride).ok_or_else(overflow)?;
+            }
+
+            // Compact the combined memory to the packed total. Without this the
+            // combined minimum stays the sum of declared pages, so the bases
+            // would be compact inside an uncompacted memory and `--pack-rebase`
+            // would deliver none of its size benefit (SR-57).
+            if self.pack_rebase {
+                combined.initial = next_base.div_ceil(WASM_PAGE_SIZE).max(1);
+                if let Some(max) = combined.maximum {
+                    combined.maximum = Some(max.max(combined.initial));
+                }
             }
         }
 
@@ -3062,6 +3109,28 @@ fn component_display_name(components: &[ParsedComponent], comp_idx: usize) -> St
 /// legitimate bulk-only case, `test_address_rebasing_end_to_end`). Note this
 /// residual gap does NOT affect the supported path: `--emit-relocs` inputs
 /// carry reloc metadata, so their address consts are rebased via `reloc.CODE`.
+/// SR-57 / #370: the module's used data extent — the maximum end offset
+/// (`offset + len`) across its ACTIVE data segments, for compact `--pack-rebase`
+/// placement. Returns `None` if any active segment has a non-constant
+/// (runtime/global) offset: such a module cannot be safely packed, so the
+/// caller strides by its declared page count instead. A module with no active
+/// data segments has extent `Some(0)` (nothing to reserve).
+fn module_used_data_extent(module: &CoreModule) -> Result<Option<u64>> {
+    let segments = crate::segments::parse_data_segments(module)?;
+    let mut max_end: u64 = 0;
+    for seg in &segments {
+        if let crate::segments::DataSegmentMode_::Active { offset_value, .. } = &seg.mode {
+            let start = match offset_value {
+                Some(crate::segments::ConstExprValue::I32(v)) => u64::from(*v as u32),
+                Some(crate::segments::ConstExprValue::I64(v)) => *v as u64,
+                None => return Ok(None),
+            };
+            max_end = max_end.max(start.saturating_add(seg.data.len() as u64));
+        }
+    }
+    Ok(Some(max_end))
+}
+
 fn module_has_direct_memory_access(module: &CoreModule) -> Result<bool> {
     let Some((start, end)) = module.code_section_range else {
         return Ok(false);

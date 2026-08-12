@@ -67,6 +67,7 @@ fn test_fuse_composed_p2_component() {
         reproducible: false,
         component_provenance: false,
         address_rebasing: false,
+        pack_rebase: false,
         preserve_names: false,
         custom_sections: meld_core::CustomSectionHandling::Drop,
         dwarf_handling: meld_core::DwarfHandling::Strip,

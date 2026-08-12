@@ -109,6 +109,18 @@ pub struct FuserConfig {
     /// Whether to rebase per-module memory addresses into a shared memory
     pub address_rebasing: bool,
 
+    /// Compact used-extent rebasing for single-address-space (MCU) targets
+    /// (SR-57 / #370). When set, each component is placed at its actual used
+    /// data extent (the max end across its active data segments, 16-byte
+    /// aligned) instead of its declared page count, and the combined memory is
+    /// sized to the packed total. Implies `address_rebasing` (same reloc
+    /// machinery, tighter stride). OPT-IN because it is sound only when a
+    /// component references no address above its last data segment — no
+    /// separately-addressed zero-init region, no heap, no computed pointers.
+    /// Part A's overlap check sees only data segments, so it does NOT backstop
+    /// a too-short stride for such a region: the envelope is load-bearing.
+    pub pack_rebase: bool,
+
     /// Whether to preserve debug names
     pub preserve_names: bool,
 
@@ -157,6 +169,7 @@ impl Default for FuserConfig {
             reproducible: false,
             component_provenance: true,
             address_rebasing: false,
+            pack_rebase: false,
             preserve_names: false,
             custom_sections: CustomSectionHandling::Merge,
             dwarf_handling: DwarfHandling::Remap,
@@ -721,8 +734,13 @@ impl Fuser {
 
         // Step 2: Merge modules
         log::info!("Merging {} core modules", stats.modules_merged);
-        let merger = Merger::new(self.config.memory_strategy, self.config.address_rebasing)
+        // `--pack-rebase` is a rebasing mode (same reloc machinery, tighter
+        // stride), so it implies address rebasing — the per-module base map is
+        // only populated under rebasing (SR-57).
+        let address_rebasing = self.config.address_rebasing || self.config.pack_rebase;
+        let merger = Merger::new(self.config.memory_strategy, address_rebasing)
             .with_opaque_resources(self.config.opaque_resources.clone())
+            .with_pack_rebase(self.config.pack_rebase)
             .with_defer_grow_under_rebase(drop_vestigial_realloc);
         let mut merged = merger.merge(&self.components, &graph)?;
 
