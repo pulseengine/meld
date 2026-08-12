@@ -2285,7 +2285,7 @@ artifacts:
       pointer corruption). The output validates, so this is a silent
       "validates-but-wrong" divergence (#371). The retptr-only and
       params-ptr-only paths are unchanged.
-    status: proposed
+    status: verified
     tags: [adapter, canonical-abi, cross-memory, correctness, silent-divergence]
     release: v0.44.0
     links:
