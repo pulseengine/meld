@@ -568,3 +568,55 @@ artifacts:
     links:
       - type: verifies
         target: SR-45
+  - id: SWV-46
+    type: sw-verification
+    title: "Verification of SR-56: Reject overlapping data segments in the fused output"
+    description: >
+      Verifies SR-56 via meld-core/tests/shared_overlap_370.rs (3 cases):
+      (negative) two components each placing a data segment at the wasm-ld base
+      1048576 under `--memory shared` without `--address-rebase` now hard-fail
+      with Error::OverlappingDataSegments (pair_count 1, memory 0, start
+      1048576); (positive-disjoint) well-separated offsets fuse clean;
+      (positive-adjacent) `[0,4)` and `[4,8)` touch but do not overlap and fuse
+      clean, pinning the strict `start < max_end` boundary. The detector
+      (segments::find_overlapping_data_segments / check_no_overlapping_data_segments,
+      running-max-end scan) runs on the EMITTED core module in
+      lib.rs::fuse_with_stats_resolved before the optional component wrap, so it
+      is strategy- and flag-agnostic. A warn-only probe across the full suite
+      (42 integration binaries) confirmed no existing fixture legitimately
+      overlaps; an adversarial Mythos delta-pass returned no validated finding.
+    status: implemented
+    fields:
+      method: automated-test
+    links:
+      - type: verifies
+        target: SR-56
+  - id: SWV-47
+    type: sw-verification
+    title: "Verification of SR-57: Compact used-extent address rebasing (--pack-rebase)"
+    description: >
+      Verifies SR-57 via the differential-execution oracle
+      meld-core/tests/pack_rebase_370.rs: three reloc-bearing components, each
+      seeding a distinct sentinel via an ACTIVE data segment at 0x100 and
+      reading it back through a reloc-flagged absolute address, fused under
+      `--pack-rebase`. Asserts (1) the combined memory minimum shrinks from 3
+      pages (page-granular `--address-rebase`) to 1 page (packed) — a hard
+      inequality, both numbers printed — the size claim; and (2) on wasmtime
+      each component reads back ITS OWN sentinel (0xA1/0xB2/0xC3), so a stride
+      one min_start too short surfaces as a wrong read, not a silent pass. The
+      layout is in merger.rs::compute_shared_memory_plan (16-byte-aligned
+      used-extent stride via module_used_data_extent + compacted combined
+      memory); the reloc machinery is unchanged. The default page-granular path
+      is behavior-preserved (rebasing_end_to_end.rs et al. green). Two more cases
+      pin the Mythos SR-57 findings that a data-segment extent scan misses:
+      pack_rebase_passive_init_does_not_clobber (passive-data + memory.init;
+      before the fix all three read 0xC3) and
+      pack_rebase_nodata_module_does_not_alias (a memory with no static data
+      segments → extent 0 → align16(0)=0 stride → base aliasing; before the fix
+      both read 0xB2). Both fall back to page-granular and stay isolated.
+    status: implemented
+    fields:
+      method: automated-test
+    links:
+      - type: verifies
+        target: SR-57

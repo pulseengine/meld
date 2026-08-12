@@ -139,6 +139,7 @@ fn test_address_rebasing_end_to_end() {
     let config = FuserConfig {
         memory_strategy: MemoryStrategy::SharedMemory,
         address_rebasing: true,
+        pack_rebase: false,
         ..Default::default()
     };
 
@@ -229,6 +230,7 @@ fn test_298_real_wit_bindgen_component_blocks_shared_rebase() {
     let config = FuserConfig {
         memory_strategy: MemoryStrategy::SharedMemory,
         address_rebasing: true,
+        pack_rebase: false,
         ..Default::default()
     };
     let mut fuser = Fuser::new(config);
@@ -453,6 +455,7 @@ fn test_326_reloc_const_rebasing_end_to_end() {
     let config = FuserConfig {
         memory_strategy: MemoryStrategy::SharedMemory,
         address_rebasing: true,
+        pack_rebase: false,
         ..Default::default()
     };
     let mut fuser = Fuser::new(config);
@@ -546,6 +549,7 @@ fn test_326_shared_rebase_without_relocs_hard_errors() {
     let config = FuserConfig {
         memory_strategy: MemoryStrategy::SharedMemory,
         address_rebasing: true,
+        pack_rebase: false,
         ..Default::default()
     };
     let mut fuser = Fuser::new(config);
@@ -587,6 +591,7 @@ fn test_351_stale_reloc_offsets_hard_error() {
     let config = FuserConfig {
         memory_strategy: MemoryStrategy::SharedMemory,
         address_rebasing: true,
+        pack_rebase: false,
         ..Default::default()
     };
     let mut fuser = Fuser::new(config);

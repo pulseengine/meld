@@ -575,6 +575,100 @@ pub fn count_data_segments(module: &CoreModule) -> u32 {
     }
 }
 
+/// One overlapping active-data-segment pair in the emitted module:
+/// `(memory_index, first_end, second_start, second_end)` — the second
+/// segment starts (`second_start`) before the running maximum end
+/// (`first_end`) of an earlier segment in the same memory.
+pub type DataSegmentOverlap = (u32, u64, u64, u64);
+
+/// Find active data segments that overlap within a single linear memory of
+/// an *emitted* core module (SR-56 / LS-M-12, #370).
+///
+/// Overlapping active segments mean two components' data occupy the same
+/// linear-memory range — at instantiation the later segment overwrites the
+/// earlier one (later-wins), silently corrupting a component's data. This is
+/// a cheap, purely local check on the final bytes, so it catches overlap no
+/// matter which merge path produced it (shared-memory fusion without
+/// rebasing is the reported trigger, but the check is strategy-agnostic).
+///
+/// Only segments with a statically-known constant offset (`i32.const` /
+/// `i64.const`, incl. folded extended-const) are considered; a segment whose
+/// offset is a `global.get` (runtime base) is skipped — we cannot prove it
+/// overlaps. Zero-length segments occupy nothing and are ignored.
+///
+/// Overlap detection uses a running maximum end per memory after sorting by
+/// `(memory, start)`, so a long segment that spans several shorter ones is
+/// caught (a plain adjacent-pair scan would miss the non-adjacent members).
+pub fn find_overlapping_data_segments(module_bytes: &[u8]) -> Result<Vec<DataSegmentOverlap>> {
+    // (memory_index, start, end) for every constant-offset active segment.
+    let mut ranges: Vec<(u32, u64, u64)> = Vec::new();
+    for payload in wasmparser::Parser::new(0).parse_all(module_bytes) {
+        if let wasmparser::Payload::DataSection(reader) = payload? {
+            for data in reader {
+                let data = data?;
+                if let wasmparser::DataKind::Active {
+                    memory_index,
+                    offset_expr,
+                } = data.kind
+                {
+                    let (_, value) = parse_const_expr_with_value(&offset_expr)?;
+                    let start = match value {
+                        // i32 offsets are unsigned linear-memory addresses.
+                        Some(ConstExprValue::I32(v)) => v as u32 as u64,
+                        Some(ConstExprValue::I64(v)) => v as u64,
+                        // Runtime/global offset: cannot prove overlap — skip.
+                        _ => continue,
+                    };
+                    let len = data.data.len() as u64;
+                    if len == 0 {
+                        continue;
+                    }
+                    ranges.push((memory_index, start, start.saturating_add(len)));
+                }
+            }
+        }
+    }
+
+    ranges.sort_by_key(|&(m, s, _)| (m, s));
+
+    let mut overlaps = Vec::new();
+    let mut cur_mem: Option<u32> = None;
+    let mut max_end = 0u64;
+    for &(m, s, e) in &ranges {
+        if Some(m) != cur_mem {
+            cur_mem = Some(m);
+            max_end = 0;
+        }
+        if s < max_end {
+            overlaps.push((m, max_end, s, e));
+        }
+        max_end = max_end.max(e);
+    }
+    Ok(overlaps)
+}
+
+/// Reject a fused core module whose active data segments overlap within a
+/// single linear memory (SR-56 / LS-M-12, #370). See
+/// [`find_overlapping_data_segments`] for the detection rationale.
+///
+/// Hard-fails regardless of memory strategy or flags: overlap in the emitted
+/// module is always a silent-corruption defect. The error names the compact
+/// (`--pack-rebase`) and page-granular (`--address-rebase`) remedies for the
+/// single-address-space case that triggers it.
+pub fn check_no_overlapping_data_segments(module_bytes: &[u8]) -> Result<()> {
+    let overlaps = find_overlapping_data_segments(module_bytes)?;
+    if let Some(&(memory_index, first_end, second_start, second_end)) = overlaps.first() {
+        return Err(Error::OverlappingDataSegments {
+            pair_count: overlaps.len(),
+            memory_index,
+            first_end,
+            second_start,
+            second_end,
+        });
+    }
+    Ok(())
+}
+
 /// Reindex an element segment with new index mappings
 /// Faithfully convert a `wasmparser::RefType` to a `wasm_encoder::RefType`,
 /// preserving nullability, abstract heap types, and concrete type indices.

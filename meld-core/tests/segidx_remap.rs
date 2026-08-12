@@ -49,6 +49,7 @@ fn fuser_config() -> FuserConfig {
         reproducible: false,
         component_provenance: false,
         address_rebasing: false,
+        pack_rebase: false,
         preserve_names: false,
         custom_sections: meld_core::CustomSectionHandling::Merge,
         dwarf_handling: meld_core::DwarfHandling::Strip,

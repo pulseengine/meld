@@ -3726,6 +3726,64 @@ loss-scenarios:
       for computed-pointer access and Auto's output needs
       `--enable-multimemory`.
 
+  - id: LS-M-12
+    title: shared-memory fusion without rebasing overlaps data segments, silently overwriting cross-component data
+    uca: UCA-M-11
+    hazards: [H-1, H-3.2]
+    type: inadequate-control-algorithm
+    scenario: >
+      `--memory shared` merges every input component into ONE linear memory,
+      but WITHOUT `--address-rebase` no per-component base is applied and no
+      data-segment offset is shifted. Every `wit-bindgen` + `cargo` component
+      places its `.rodata`/`.data` at the standard `wasm-ld` base `1048576`,
+      so the fused module carries multiple ACTIVE data segments at identical or
+      overlapping ranges in memory 0. Active segments are applied in declaration
+      order at instantiation, so a later segment overwrites an earlier one —
+      e.g. a component's mutable `RegionTable` (memory-protection state)
+      initialised over the top of another component's `.rodata`. The fuse exits
+      0, prints "Fusion complete!", and emits NO diagnostic; the module passes
+      `wasm-tools validate`. Corruption is silent [H-1 semantic divergence,
+      H-3.2 memory]. Distinct from LS-M-11 (the `--address-rebase` path's
+      unrebased *computed pointers*): here rebasing is not attempted at all, and
+      the collision is in the *static* data-segment placement. Reproduced in
+      `meld-core` (two components, both data at `1048576`, fused `--memory
+      shared` → 2 segments at identical `[1048576,1048580)`, 1 overlapping pair).
+      Reported #370 (avrabe) against gale's isolation core: 4 overlapping pairs
+      across three real components.
+    causal-factors:
+      - >-
+        `--memory shared` unifies the memories but the merge emits each
+        component's data segments verbatim; no offset shift is applied unless
+        `--address-rebase` is also set
+      - >-
+        the `--address-rebase` path REFUSES when relocation metadata is missing
+        (the sound failure), but the plain `--memory shared` path has no
+        equivalent guard, so the safe-looking flag reaches the worse end state
+      - >-
+        `reloc-sections=0` is the DEFAULT for a `wit-bindgen` + `cargo`
+        component, so missing relocations — and thus the un-rebased overlap — is
+        the common case, not a one-off build gap
+    process-model-flaw: >
+      The design assumed a caller who selects `--memory shared` also pairs it
+      with `--address-rebase` (as `--help` documents). But when they do not, the
+      output is a concretely-overlapping module rather than a refusal, and the
+      overlap is invisible: no validator rejects overlapping active data
+      segments, and the flag combination that IS sound is the one that errors.
+      A correct control algorithm must make an overlap in the *emitted* module a
+      hard error on its own — independent of which flags were passed — because
+      an overlap is never an intended output.
+    status: proposed
+    priority: high
+    fix: >
+      SR-56 (v0.43.0): detect overlapping active data-segment ranges in the
+      emitted module and hard-fail regardless of flags; additionally warn when
+      `--memory shared` is given for multi-memory input without
+      `--address-rebase`. SR-57 (v0.43.0): an opt-in compact used-extent
+      rebasing (`--pack-rebase`) gives single-address-space targets a SOUND
+      path that also fits an MCU — the sound configuration is otherwise
+      page-granular (>=64 KiB per component) and cannot fit an 8 KiB MCU, which
+      is why the overlapping build is the only one that currently fits (#370).
+
   - id: LS-D-1
     title: remapped DWARF emits a wrong code address for a fused function
     uca: UCA-M-9

@@ -2110,3 +2110,148 @@ artifacts:
         - "BA RFC #46 discussion: cfallin on multiply-instantiated modules"
         - "safety/stpa/rfc46-comparative-analysis.md section 4 Q1"
         - "safety/adr/ADR-7-abi-linking-strategy-architecture.md (path-H inc 3)"
+
+  # ==========================================================================
+  # #370 — shared-memory data-segment overlap (v0.43.0)
+  # ==========================================================================
+
+  - id: SR-56
+    type: sw-req
+    title: Reject overlapping data segments in the fused output
+    description: >
+      The fuser shall detect active data-segment ranges that overlap within a
+      linear memory in the EMITTED module and hard-fail with a diagnostic —
+      regardless of memory strategy or flags. An overlap is never an intended
+      output: active segments are applied in declaration order at instantiation,
+      so a later segment silently overwrites an earlier one (LS-M-12). The check
+      is local to the emitted module and therefore catches the general case,
+      including any future path that forgets to rebase. In particular
+      `--memory shared` WITHOUT `--address-rebase` merges memories but shifts no
+      offsets, so every input's `.rodata`/`.data` at the standard `wasm-ld` base
+      collides; today that exits 0 with no diagnostic, while the sound
+      `--address-rebase` path correctly refuses on missing relocations — the
+      safe-looking flag reaches the worse end state. The hard-fail's own
+      diagnostic carries the remediation (it names both `--address-rebase` and
+      the compact `--pack-rebase`), so no separate advisory warning is emitted —
+      a warning that fired on configurations that did NOT overlap would be noise
+      that trains users to ignore meld's stderr.
+    status: verified
+    tags: [merger, memory, shared, safety, silent-corruption]
+    release: v0.43.0
+    links:
+      - type: derives-from
+        target: SYS-2
+      - type: mitigates
+        target: LS-M-12
+      - type: refines
+        target: SR-37
+    cited-source:
+      - uri: "https://github.com/pulseengine/meld/issues/370"
+        kind: github
+        last-checked: 2026-08-12
+    fields:
+      implementation:
+        - meld-core/src/segments.rs
+        - meld-core/src/lib.rs
+      verification-method: test
+      verification-description: >
+        Verified by `meld-core/tests/shared_overlap_370.rs` (3 cases):
+        (negative) two components each placing a data segment at the wasm-ld
+        base 1048576 under `--memory shared` without `--address-rebase` now
+        hard-fail with `Error::OverlappingDataSegments` (pair_count 1, memory 0,
+        start 1048576); (positive-disjoint) well-separated offsets fuse clean;
+        (positive-adjacent) `[0,4)` and `[4,8)` touch but do not overlap and
+        fuse clean, pinning the strict `start < max_end` boundary. Detection
+        lives in `segments::find_overlapping_data_segments` /
+        `check_no_overlapping_data_segments` (running-max-end scan, so a long
+        segment spanning several shorter ones is caught) and is called on the
+        emitted core module in `lib.rs::fuse_with_stats_resolved` before the
+        optional component wrap. A warn-only probe across the full test suite
+        (42 integration binaries) confirmed no existing fixture legitimately
+        overlaps — the only trip was the #370 repro itself.
+      references:
+        - "https://github.com/pulseengine/meld/issues/370"
+        - "gale#266 check-data-overlap.py"
+        - "meld-core/tests/shared_overlap_370.rs"
+
+  - id: SR-57
+    type: sw-req
+    title: Compact used-extent address rebasing for single-address-space targets (opt-in)
+    description: >
+      The fuser shall support an OPT-IN rebasing mode (`--pack-rebase`) that
+      places each fused component at its ACTUAL used extent — the maximum active
+      data-segment end offset, 16-byte aligned (16-byte to keep `v128` accesses
+      aligned after the uniform `+base` shift) — rather than at its DECLARED
+      linear-memory page count, and sizes the merged memory to the packed total.
+      It implies `--address-rebase` (same reloc machinery, tighter stride) and
+      requires `--memory shared`. The declared extent is page-granular (a wasm
+      page is 64 KiB; the minimum a component can declare is one page), so the
+      sound page-granular rebasing reserves >=64 KiB per component and cannot fit
+      a single-address-space MCU (the STM32F100RB has 8 KiB SRAM), even though
+      each component's real used extent is a few hundred bytes. Compact rebasing
+      packs three such components into a few KiB, disjoint AND smaller than
+      today's overlapping `--memory shared` output — giving MCU targets a path
+      that is both sound and shippable (#370).
+
+      Soundness envelope (positive precondition): `--pack-rebase` reserves each
+      component only its static data extent, so it is sound ONLY when a component
+      references no address above its last data segment — no separately-addressed
+      zero-init (`.bss`) region, no heap, no computed pointers. Components that
+      cannot prove this must use `--address-rebase`. The envelope is
+      load-bearing, NOT belt-and-suspenders: SR-56's overlap check sees only data
+      segments, so it does NOT backstop a too-short stride for a zero-init region
+      that lives above the last segment. The mode is intended for static-offset-
+      only components (thin scalar-in / scalar-out drivers — gale's dissolved
+      isolation core, whose mutable RegionTable is INITIALIZED data inside a
+      segment); it does not change the default and does not affect the
+      LS-M-11 / #326 computed-pointer case, which stays out of the envelope.
+      A module whose used region is invisible to the data-segment extent scan —
+      a PASSIVE segment (placed at runtime via `memory.init`), or a memory with
+      NO static data segments (a `.bss`/heap or reloc-flagged access above
+      offset 0) — falls back to page-granular placement instead of being packed
+      (safe but not compacted), so it cannot be silently clobbered by, nor alias
+      at a shared base with, a neighbor (Mythos SR-57 findings; regression tests
+      `pack_rebase_passive_init_does_not_clobber` and
+      `pack_rebase_nodata_module_does_not_alias`). The zero-extent case matters
+      because `align16(0) = 0` would leave `next_base` unadvanced.
+    status: verified
+    tags: [merger, rewriter, memory, shared, mcu, rebase]
+    release: v0.43.0
+    links:
+      - type: derives-from
+        target: SYS-2
+      - type: refines
+        target: SR-37
+    cited-source:
+      - uri: "https://github.com/pulseengine/meld/issues/370"
+        kind: github
+        last-checked: 2026-08-12
+    fields:
+      implementation:
+        - meld-core/src/merger.rs
+        - meld-core/src/lib.rs
+        - meld-cli/src/main.rs
+      verification-method: test
+      verification-description: >
+        Verified by the differential execution oracle
+        `meld-core/tests/pack_rebase_370.rs`: fuse three reloc-bearing
+        components, each seeding a distinct sentinel via an ACTIVE data segment
+        at 0x100 and reading it back through a reloc-flagged absolute address,
+        under `--pack-rebase`. Asserts (1) the combined memory minimum shrinks
+        from 3 pages (page-granular `--address-rebase`) to 1 page (packed) — a
+        hard inequality, both numbers printed — the actual size claim; and (2)
+        on wasmtime each component reads back ITS OWN sentinel (0xA1/0xB2/0xC3),
+        so a stride one min_start too short surfaces as a wrong read, not a
+        silent pass (the data lives at 0x100, well above 0). SR-56's overlap
+        check passes on the output but is only necessary, not sufficient — hence
+        the size + own-data assertions. The layout lives in
+        `merger.rs::compute_shared_memory_plan` (16-byte-aligned used-extent
+        stride + compacted combined memory) with `module_used_data_extent`
+        falling back to the declared page stride for non-constant offsets; the
+        reloc rebasing machinery is UNCHANGED (pack reuses it), which is why
+        rewriter.rs is not in the implementation set. Envelope is documented in
+        `--help` and the FuserConfig doc.
+      references:
+        - "https://github.com/pulseengine/meld/issues/370"
+        - "gale#266"
+        - "meld-core/tests/pack_rebase_370.rs"

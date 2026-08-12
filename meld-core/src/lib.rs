@@ -109,6 +109,24 @@ pub struct FuserConfig {
     /// Whether to rebase per-module memory addresses into a shared memory
     pub address_rebasing: bool,
 
+    /// Compact used-extent rebasing for single-address-space (MCU) targets
+    /// (SR-57 / #370). When set, each component is placed at its actual used
+    /// data extent (the max end across its active data segments, 16-byte
+    /// aligned) instead of its declared page count, and the combined memory is
+    /// sized to the packed total. Implies `address_rebasing` (same reloc
+    /// machinery, tighter stride). OPT-IN because it is sound only when a
+    /// component references no address above its last data segment — no
+    /// separately-addressed zero-init region, no heap, no computed pointers.
+    /// Part A's overlap check sees only data segments, so it does NOT backstop
+    /// a too-short stride for such a region: the envelope is load-bearing.
+    /// Modules whose used region is invisible to a data-segment extent scan —
+    /// a PASSIVE segment (placed at runtime via `memory.init`), or a memory with
+    /// NO static data segments at all (a `.bss`/heap or reloc-flagged access
+    /// above offset 0) — fall back to page-granular placement rather than being
+    /// packed. Safe but not compacted; prevents a zero stride from aliasing
+    /// their memories at a shared base.
+    pub pack_rebase: bool,
+
     /// Whether to preserve debug names
     pub preserve_names: bool,
 
@@ -157,6 +175,7 @@ impl Default for FuserConfig {
             reproducible: false,
             component_provenance: true,
             address_rebasing: false,
+            pack_rebase: false,
             preserve_names: false,
             custom_sections: CustomSectionHandling::Merge,
             dwarf_handling: DwarfHandling::Remap,
@@ -721,8 +740,13 @@ impl Fuser {
 
         // Step 2: Merge modules
         log::info!("Merging {} core modules", stats.modules_merged);
-        let merger = Merger::new(self.config.memory_strategy, self.config.address_rebasing)
+        // `--pack-rebase` is a rebasing mode (same reloc machinery, tighter
+        // stride), so it implies address rebasing — the per-module base map is
+        // only populated under rebasing (SR-57).
+        let address_rebasing = self.config.address_rebasing || self.config.pack_rebase;
+        let merger = Merger::new(self.config.memory_strategy, address_rebasing)
             .with_opaque_resources(self.config.opaque_resources.clone())
+            .with_pack_rebase(self.config.pack_rebase)
             .with_defer_grow_under_rebase(drop_vestigial_realloc);
         let mut merged = merger.merge(&self.components, &graph)?;
 
@@ -892,6 +916,16 @@ impl Fuser {
         } else {
             self.encode_output(&merged, &adapters, &extra_sections, &dwarf_sections)?
         };
+
+        // SR-56 / LS-M-12 (#370): reject overlapping active data segments in
+        // the emitted core module — regardless of memory strategy or flags.
+        // Overlap means two components' data occupy the same linear-memory
+        // range, so the later segment silently overwrites the earlier one at
+        // instantiation (later-wins corruption with a clean exit). This is a
+        // cheap, purely local check on the final bytes, so it catches the
+        // defect no matter which merge path produced it. A probe across the
+        // full suite confirmed no legitimate fixture trips it.
+        segments::check_no_overlapping_data_segments(&output)?;
 
         // Optionally wrap the fused core module as a P2 component
         let output = if self.config.output_format == OutputFormat::Component {

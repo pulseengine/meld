@@ -54,6 +54,7 @@ fn fuse_remap(input: &[u8]) -> Vec<u8> {
         reproducible: false,
         component_provenance: true,
         address_rebasing: false,
+        pack_rebase: false,
         preserve_names: false,
         custom_sections: CustomSectionHandling::Merge,
         output_format: OutputFormat::CoreModule,

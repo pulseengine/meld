@@ -675,6 +675,7 @@ fn shared_rebase_config() -> FuserConfig {
     FuserConfig {
         memory_strategy: MemoryStrategy::SharedMemory,
         address_rebasing: true,
+        pack_rebase: false,
         attestation: false,
         reproducible: false,
         component_provenance: false,
@@ -779,6 +780,7 @@ fn adapter_site_keeps_realloc_and_hard_errors_on_grow() {
         let mut fuser = Fuser::new(FuserConfig {
             memory_strategy: MemoryStrategy::MultiMemory,
             address_rebasing: false,
+            pack_rebase: false,
             attestation: false,
             reproducible: false,
             component_provenance: false,
@@ -865,6 +867,7 @@ fn non_shared_fuse_preserves_realloc() {
     let config = FuserConfig {
         memory_strategy: MemoryStrategy::MultiMemory,
         address_rebasing: false,
+        pack_rebase: false,
         attestation: false,
         reproducible: false,
         component_provenance: false,

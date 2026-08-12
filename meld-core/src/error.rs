@@ -160,6 +160,23 @@ pub enum Error {
     #[error("stream validation failed:\n{0}")]
     StreamValidation(String),
 
+    /// The emitted fused core module has active data segments that overlap
+    /// within a single linear memory (#370, LS-M-12). Two components' data
+    /// occupy the same address range → the later segment silently overwrites
+    /// the earlier one at instantiation (later-wins), corrupting a
+    /// component's data with a clean exit. Caught by an emitted-module check
+    /// (SR-56) regardless of memory strategy or flags.
+    #[error(
+        "overlapping data segments in fused output ({pair_count} overlapping pair(s)): memory {memory_index} has a segment ending at {first_end} that overlaps another spanning [{second_start}, {second_end}) — this silently corrupts data. For a single shared address space, give each component a distinct region: use --address-rebase (page-granular) or the compact --pack-rebase"
+    )]
+    OverlappingDataSegments {
+        pair_count: usize,
+        memory_index: u32,
+        first_end: u64,
+        second_start: u64,
+        second_end: u64,
+    },
+
     /// I/O error
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
