@@ -119,10 +119,12 @@ pub struct FuserConfig {
     /// separately-addressed zero-init region, no heap, no computed pointers.
     /// Part A's overlap check sees only data segments, so it does NOT backstop
     /// a too-short stride for such a region: the envelope is load-bearing.
-    /// Modules carrying a PASSIVE data segment (placed at runtime via
-    /// `memory.init`, so its region is invisible to a data-segment extent scan)
-    /// fall back to page-granular placement rather than being packed — safe but
-    /// not compacted.
+    /// Modules whose used region is invisible to a data-segment extent scan —
+    /// a PASSIVE segment (placed at runtime via `memory.init`), or a memory with
+    /// NO static data segments at all (a `.bss`/heap or reloc-flagged access
+    /// above offset 0) — fall back to page-granular placement rather than being
+    /// packed. Safe but not compacted; prevents a zero stride from aliasing
+    /// their memories at a shared base.
     pub pack_rebase: bool,
 
     /// Whether to preserve debug names

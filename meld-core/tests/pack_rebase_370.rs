@@ -389,3 +389,127 @@ fn pack_rebase_passive_init_does_not_clobber() {
         );
     }
 }
+
+/// A component with a memory but NO data segments: `store_<tag>` writes
+/// `sentinel` at `DATA_ADDR` at runtime and `load_<tag>` reads it back, both
+/// through reloc-flagged absolute `i32.const DATA_ADDR`. Its used region
+/// (address `DATA_ADDR`) lives above its data extent (0) — the exact shape the
+/// #326 reloc harness uses, supported under `--address-rebase`.
+fn build_nodata_component(tag: &str, sentinel: i32, export_memory: bool) -> Vec<u8> {
+    let zero_memarg = MemArg {
+        offset: 0,
+        align: 0,
+        memory_index: 0,
+    };
+
+    let add_sections = |module: &mut Module| {
+        let mut types = TypeSection::new();
+        types.ty().function([], []); // type 0: store: () -> ()
+        types.ty().function([], [ValType::I32]); // type 1: load: () -> i32
+
+        let mut functions = FunctionSection::new();
+        functions.function(0);
+        functions.function(1);
+
+        let mut exports = ExportSection::new();
+        exports.export(&format!("store_{tag}"), ExportKind::Func, 0);
+        exports.export(&format!("load_{tag}"), ExportKind::Func, 1);
+        if export_memory {
+            exports.export("memory", ExportKind::Memory, 0);
+        }
+
+        let mut code = CodeSection::new();
+        let mut store = Function::new([]);
+        store.instruction(&Instruction::I32Const(DATA_ADDR)); // dst (reloc-flagged)
+        store.instruction(&Instruction::I32Const(sentinel));
+        store.instruction(&Instruction::I32Store8(zero_memarg));
+        store.instruction(&Instruction::End);
+        code.function(&store);
+
+        let mut load = Function::new([]);
+        load.instruction(&Instruction::I32Const(DATA_ADDR)); // addr (reloc-flagged)
+        load.instruction(&Instruction::I32Load8U(zero_memarg));
+        load.instruction(&Instruction::End);
+        code.function(&load);
+
+        // No data section — this module has a memory but no static data.
+        module
+            .section(&types)
+            .section(&functions)
+            .section(&shared_memory_section())
+            .section(&exports)
+            .section(&code);
+    };
+
+    let mut dry = Module::new();
+    add_sections(&mut dry);
+    let offsets = find_i32const_reloc_offsets(&dry.finish(), DATA_ADDR);
+    assert_eq!(offsets.len(), 2, "store dst + load addr are reloc sites");
+    let reloc_code = build_reloc_code_body(&offsets);
+
+    let mut module = Module::new();
+    add_sections(&mut module);
+    module.section(&CustomSection {
+        name: "linking".into(),
+        data: vec![0x02].into(),
+    });
+    module.section(&CustomSection {
+        name: "reloc.CODE".into(),
+        data: reloc_code.into(),
+    });
+
+    let mut component = Component::new();
+    component.section(&ModuleSection(&module));
+    component.finish()
+}
+
+/// Regression (CI auto-Mythos SR-57 finding): a module with a memory but NO
+/// data segments reported extent Some(0), so its pack stride was
+/// align16(0) = 0 and `next_base` never advanced — every such module packed to
+/// base 0, aliasing their memories (both write+read DATA_ADDR → the second
+/// store clobbers the first). The fix treats a zero-static-extent module as
+/// unpackable (its real usage is invisible to a data-segment scan) and falls
+/// back to page-granular, keeping the components isolated. Before the fix both
+/// loads returned 0xB2.
+#[test]
+fn pack_rebase_nodata_module_does_not_alias() {
+    let a = build_nodata_component("a", 0xA1, true);
+    let b = build_nodata_component("b", 0xB2, false);
+    let config = FuserConfig {
+        memory_strategy: MemoryStrategy::SharedMemory,
+        pack_rebase: true,
+        ..Default::default()
+    };
+    let mut fuser = Fuser::new(config);
+    fuser.add_component_named(&a, Some("comp-a")).unwrap();
+    fuser.add_component_named(&b, Some("comp-b")).unwrap();
+    let fused = fuser.fuse().expect("fusion");
+
+    let mut engine_config = Config::new();
+    engine_config.wasm_threads(true);
+    engine_config.shared_memory(true);
+    engine_config.wasm_bulk_memory(true);
+    let engine = Engine::new(&engine_config).unwrap();
+    let module = RuntimeModule::new(&engine, &fused).unwrap();
+    let mut store = Store::new(&engine, ());
+    let instance = Instance::new(&mut store, &module, &[]).unwrap();
+
+    for s in ["store_a", "store_b"] {
+        instance
+            .get_typed_func::<(), ()>(&mut store, s)
+            .unwrap_or_else(|e| panic!("export {s}: {e}"))
+            .call(&mut store, ())
+            .unwrap();
+    }
+    for (load, want) in [("load_a", 0xA1), ("load_b", 0xB2)] {
+        let got = instance
+            .get_typed_func::<(), i32>(&mut store, load)
+            .unwrap_or_else(|e| panic!("export {load}: {e}"))
+            .call(&mut store, ())
+            .unwrap();
+        assert_eq!(
+            got, want,
+            "{load} must read its own value {want:#x}, got {got:#x} — no-data modules aliased at base 0"
+        );
+    }
+}

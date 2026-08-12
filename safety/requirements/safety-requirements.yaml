@@ -2205,12 +2205,15 @@ artifacts:
       isolation core, whose mutable RegionTable is INITIALIZED data inside a
       segment); it does not change the default and does not affect the
       LS-M-11 / #326 computed-pointer case, which stays out of the envelope.
-      A module carrying a PASSIVE data segment (placed at runtime via
-      `memory.init`, whose destination is invisible to the data-segment extent
-      scan) falls back to page-granular placement instead of being packed —
-      safe but not compacted — so it cannot be silently clobbered by a neighbor
-      packed over its `memory.init` destination (Mythos SR-57 finding, regression
-      test `pack_rebase_passive_init_does_not_clobber`).
+      A module whose used region is invisible to the data-segment extent scan —
+      a PASSIVE segment (placed at runtime via `memory.init`), or a memory with
+      NO static data segments (a `.bss`/heap or reloc-flagged access above
+      offset 0) — falls back to page-granular placement instead of being packed
+      (safe but not compacted), so it cannot be silently clobbered by, nor alias
+      at a shared base with, a neighbor (Mythos SR-57 findings; regression tests
+      `pack_rebase_passive_init_does_not_clobber` and
+      `pack_rebase_nodata_module_does_not_alias`). The zero-extent case matters
+      because `align16(0) = 0` would leave `next_base` unadvanced.
     status: verified
     tags: [merger, rewriter, memory, shared, mcu, rebase]
     release: v0.43.0

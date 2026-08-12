@@ -3112,19 +3112,22 @@ fn component_display_name(components: &[ParsedComponent], comp_idx: usize) -> St
 /// SR-57 / #370: the module's used data extent — the maximum end offset
 /// (`offset + len`) across its ACTIVE data segments, for compact `--pack-rebase`
 /// placement. Returns `None` (module cannot be safely packed → caller strides
-/// by the declared page count) when either:
-///   - an active segment has a non-constant (runtime/global) offset, or
-///   - the module carries any PASSIVE segment.
+/// by the declared page count) when any of:
+///   - an active segment has a non-constant (runtime/global) offset,
+///   - the module carries any PASSIVE segment, or
+///   - the computed extent is 0 (no static data to pack against).
 ///
-/// A passive segment is placed at runtime by `memory.init`, whose destination
-/// is not visible in the segment table — its used region is invisible to a
-/// data-segment-extent scan. Packing such a module by active extent alone would
-/// place a neighbor over the `memory.init` destination and silently clobber it
-/// (SR-56's overlap check is also active-only, so it offers no backstop). Since
-/// passive-data + `memory.init` is a supported placement under `--address-rebase`,
-/// treat it conservatively rather than corrupt it (Mythos SR-57 finding).
-///
-/// A module with no active or passive data segments has extent `Some(0)`.
+/// This is only called for modules that HAVE a memory (see the caller), so a
+/// zero extent means "has a memory but no static initialized data" — its real
+/// usage (a `.bss`/heap region, or reloc-flagged static access above offset 0
+/// as in the #326 harness) is invisible to a data-segment scan. Packing it by
+/// extent 0 would produce a stride of `align16(0) = 0`, so `next_base` would
+/// not advance and every such module would alias at the same base (CI Mythos
+/// SR-57 finding). A passive segment has the same invisibility: it is placed at
+/// runtime by `memory.init`, whose destination is not in the segment table.
+/// SR-56's overlap check is active-only, so it does not backstop either case.
+/// All are supported placements under `--address-rebase`, so fall back to
+/// page-granular rather than silently corrupt.
 fn module_used_data_extent(module: &CoreModule) -> Result<Option<u64>> {
     let segments = crate::segments::parse_data_segments(module)?;
     let mut max_end: u64 = 0;
@@ -3140,6 +3143,9 @@ fn module_used_data_extent(module: &CoreModule) -> Result<Option<u64>> {
             }
             crate::segments::DataSegmentMode_::Passive => return Ok(None),
         }
+    }
+    if max_end == 0 {
+        return Ok(None);
     }
     Ok(Some(max_end))
 }

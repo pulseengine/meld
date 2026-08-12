@@ -22,8 +22,9 @@ rebasing mode makes thin components fit an MCU's SRAM.
   requires `--memory shared`. OPT-IN and sound only for components that address
   nothing above their last data segment (no separately-addressed `.bss`, no
   heap, no computed pointers) — the thin scalar-in / scalar-out driver case.
-  Modules carrying passive data segments (runtime `memory.init`) fall back to
-  page-granular placement — safe but not compacted.
+  Modules whose used region is invisible to a data-segment scan — passive
+  segments (runtime `memory.init`) or a memory with no static data at all —
+  fall back to page-granular placement (safe but not compacted).
 
 ### Fixed
 - **Overlapping data segments in the fused output are now rejected (SR-56)** —

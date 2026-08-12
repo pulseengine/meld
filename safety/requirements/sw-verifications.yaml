@@ -607,11 +607,13 @@ artifacts:
       layout is in merger.rs::compute_shared_memory_plan (16-byte-aligned
       used-extent stride via module_used_data_extent + compacted combined
       memory); the reloc machinery is unchanged. The default page-granular path
-      is behavior-preserved (rebasing_end_to_end.rs et al. green). A second case
-      (pack_rebase_passive_init_does_not_clobber) pins the Mythos SR-57 finding:
-      passive-data + memory.init modules — invisible to the active-segment
-      extent scan — fall back to page-granular placement and stay isolated
-      (before the fix all three read 0xC3; after, 0xA1/0xB2/0xC3).
+      is behavior-preserved (rebasing_end_to_end.rs et al. green). Two more cases
+      pin the Mythos SR-57 findings that a data-segment extent scan misses:
+      pack_rebase_passive_init_does_not_clobber (passive-data + memory.init;
+      before the fix all three read 0xC3) and
+      pack_rebase_nodata_module_does_not_alias (a memory with no static data
+      segments → extent 0 → align16(0)=0 stride → base aliasing; before the fix
+      both read 0xB2). Both fall back to page-granular and stay isolated.
     status: implemented
     fields:
       method: automated-test
