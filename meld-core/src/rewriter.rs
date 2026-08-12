@@ -511,7 +511,15 @@ fn rewrite_operator(
                     return Ok(vec![Instruction::Unreachable]);
                 }
                 return Err(Error::UnsupportedFeature(
-                    "memory.grow not supported with address rebasing".to_string(),
+                    "memory.grow not supported with address rebasing: each module \
+                     is placed at a fixed base in one shared linear memory, so a \
+                     module cannot grow memory out from under its neighbours. \
+                     Remedies: build grow-free by backing allocation with the \
+                     embedder arena (pulseengine/wit-bindgen#4) so the vestigial \
+                     `cabi_realloc`/`sbrk` grow is eliminated, or fuse with \
+                     `--memory multi` so each component keeps its own growable \
+                     memory (#299)."
+                        .to_string(),
                 ));
             }
             Instruction::MemoryGrow(maps.remap_memory(mem))

@@ -3364,6 +3364,38 @@ fn create_global_init(val_type: &ValType) -> ConstExpr {
     }
 }
 
+/// #339: fold a **defined-base** extended-const global initializer to a concrete
+/// `i32.const`.
+///
+/// After fusion an imported `__memory_base`-style base becomes a DEFINED global.
+/// A global INITIALIZER const-expr may only `global.get` an *imported* global, so
+/// re-emitting a `global.get` of the now-defined base is rejected by wasmtime
+/// ("constant expression required: global.get of locally defined global"). When
+/// the (already index-remapped) sequence begins with a `global.get` of a global
+/// whose init folds to a constant i32 (recorded in `defined_global_i32_const`),
+/// evaluate `base ± N` and emit a single `i32.const`. This mirrors the #353
+/// data/element-offset fold in `segments::ParsedConstExpr::reindex`, and it is
+/// exactly the address rebase #339 asks for: the initializer holds `base + N`,
+/// the module's own placed address, not a stale un-rebased value.
+///
+/// Returns `None` (leave the sequence verbatim) unless the LEADING op is a
+/// `global.get` of a defined constant — an imported base (absent from the map)
+/// stays a runtime-dependent `global.get` (#338), preserving the multi-memory
+/// contract where the base is bound at instantiation.
+fn fold_defined_base_init(
+    seq: &[crate::segments::ExtConstOp],
+    merged: &MergedModule,
+) -> Option<ConstExpr> {
+    if let Some(crate::segments::ExtConstOp::GlobalGet(g)) = seq.first()
+        && let Some(&base) = merged.defined_global_i32_const.get(g)
+        && let Some(folded) = crate::segments::eval_ext_const_i32_with_base(seq, base)
+    {
+        Some(ConstExpr::i32_const(folded))
+    } else {
+        None
+    }
+}
+
 /// Convert stored init expression bytes into a `wasm_encoder::ConstExpr`,
 /// remapping any global or function indices through the merged module maps.
 ///
@@ -3418,7 +3450,25 @@ fn convert_init_expr(
                 // genuine multi-module fusion (#338).
                 Ok(crate::segments::ExtConstFold::Extended(seq)) => {
                     let remapped: Vec<_> = seq.iter().map(|o| o.remap_global(remap)).collect();
-                    crate::segments::ext_const_to_expr(&remapped)
+                    // #339: as in the `global.get`-first arm, fold a leading
+                    // defined-base `base ± N` to a constant. A const-first
+                    // embedded `global.get` (`N + base`) does NOT lead with the
+                    // base, so `fold_defined_base_init` declines and it stays
+                    // verbatim — CORRECT for an IMPORTED base (the #338
+                    // multi-memory `N + __memory_base` contract, where the base
+                    // is a live import). RESIDUAL (pre-existing, #339): if that
+                    // embedded `global.get` is a now-DEFINED constant base
+                    // (operand-swapped PIC form), emitting it verbatim yields
+                    // `i32.const N; global.get <defined>; i32.add`, which
+                    // wasm-tools accepts but wasmtime REJECTS ("constant
+                    // expression required: global.get of locally defined
+                    // global"). The leading-only fold does not cover it; not
+                    // observed from wasm-ld (which emits base-first), so tracked
+                    // as a residual rather than fixed here (would require
+                    // generalising the fold to a non-leading single defined
+                    // base). Fails loud at instantiation, never silent.
+                    fold_defined_base_init(&remapped, merged)
+                        .unwrap_or_else(|| crate::segments::ext_const_to_expr(&remapped))
                 }
                 Err(_) => ConstExpr::raw(bytes.iter().copied()),
             }
@@ -3465,9 +3515,24 @@ fn convert_init_expr(
             match crate::segments::read_extended_const_global_get(&mut ops, global_index) {
                 Ok(Some(seq)) => {
                     let remapped: Vec<_> = seq.iter().map(|o| o.remap_global(remap)).collect();
-                    crate::segments::ext_const_to_expr(&remapped)
+                    // #339: fold `base ± N` to `i32.const` when the base is a
+                    // now-DEFINED constant (a fused `__memory_base`); rebases the
+                    // global's address and avoids an invalid `global.get` of a
+                    // defined global in a const-expr. Imported bases fold to None
+                    // → preserved verbatim (#338).
+                    fold_defined_base_init(&remapped, merged)
+                        .unwrap_or_else(|| crate::segments::ext_const_to_expr(&remapped))
                 }
-                Ok(None) => ConstExpr::global_get(remap(global_index)),
+                Ok(None) => {
+                    // Bare `global.get`: if it names a now-DEFINED constant base,
+                    // fold to that constant (a const-expr cannot `global.get` a
+                    // defined global). Imported globals stay verbatim (#338).
+                    let new_idx = remap(global_index);
+                    match merged.defined_global_i32_const.get(&new_idx) {
+                        Some(&value) => ConstExpr::i32_const(value),
+                        None => ConstExpr::global_get(new_idx),
+                    }
+                }
                 Err(_) => ConstExpr::raw(bytes.iter().copied()),
             }
         }

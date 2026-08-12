@@ -2316,7 +2316,7 @@ artifacts:
 
   - id: SR-59
     type: sw-req
-    title: Loud no-reloc acceptance + rebased global-initializer addresses
+    title: Loud no-reloc acceptance + static-PIC global-initializer fold
     description: >
       Two residual gaps in the shared-memory rebase path left by SR-48's path-F
       carve-out (#339, #326 Finding A). (1) LOUD-NOT-SILENT: when
@@ -2326,15 +2326,32 @@ artifacts:
       the remedy (`--emit-relocs`); it shall never SILENTLY accept one. This is a
       policy/observability guarantee, NOT a detector — a sound-and-precise
       "is this const an address" test is undecidable without relocation metadata
-      (see SR-48). (2) GLOBAL-INIT REBASE: a global initializer that bakes an
-      absolute address (`(global (mut i32) (i32.const <abs>))`, or an extended-
-      const `base + N`) is currently emitted un-rebased by
-      `merger.rs::convert_init_expr` — a demonstrated end-to-end corruption (the
-      global reads the neighbor component's data under shared memory). meld shall
-      rebase a global initializer's absolute address by the module's
-      `memory_base` when it is reloc-covered, and hard-fail-or-warn otherwise;
-      `__stack_pointer`-class globals stay exempt (coalesced separately).
-    status: proposed
+      (see SR-48). (2) STATIC-PIC GLOBAL-INIT FOLD: real PIC toolchains emit a
+      global initialized to `__memory_base + N` (a leading `global.get` of the
+      base + extended-const), NOT a bare absolute const — and global initializers
+      are NEVER reloc-covered (clang/wasm-ld emit no `reloc.GLOBAL`; a data-address
+      global lowers to a `reloc.DATA` DATA symbol instead). `merger.rs::convert_init_expr`
+      previously applied the #353 `__memory_base`-fold ONLY to data/element
+      offsets, so after fusion such a global became `global.get <defined-base>;
+      i32.const N; i32.add`, which wasmtime REJECTS ("constant expression
+      required: global.get of locally defined global") — and where accepted held
+      an un-rebased address. meld shall fold a global initializer whose leading op
+      is a now-DEFINED constant base (`base + N`) to a concrete `i32.const
+      (base + N)` — the module's own placed address — mirroring the #353
+      leading-only offset fold; `__stack_pointer`-class globals stay exempt.
+      RESIDUAL (documented; #339 stays OPEN, NOT claimed fixed): a BARE no-reloc
+      absolute-const global (`(global (i32.const <abs>))`, avrabe's synthetic
+      repro) is byte-identical to an integer and carries no metadata naming the
+      site, so it is neither folded nor rebased — the same undecidability as the
+      value-address carve-out (part 1 / SR-48). Part 2's warn does not cover it
+      either (those modules carry relocs, so path-F never reaches the warn).
+      A second residual (pre-existing, Mythos-surfaced): the OPERAND-SWAPPED PIC
+      form `i32.add(i32.const N, global.get <defined-base>)` is not folded (the
+      fold is leading-base-only) → emitted verbatim → wasm-tools-valid but
+      wasmtime-invalid ("constant expression required"). Not observed from wasm-ld
+      (which emits base-first, which IS folded); fails loud at instantiation, not
+      silent; tracked, not fixed here.
+    status: verified
     tags: [memory-strategy, shared-memory, relocation, loud-not-silent, silent-corruption]
     release: v0.44.0
     links:
@@ -2352,18 +2369,24 @@ artifacts:
       implementation:
         - meld-core/src/merger.rs
         - meld-core/src/address_strategy.rs
+        - meld-core/src/segments.rs
       verification-method: test
       verification-description: >
-        PROPOSED. Global-init rebase verified by a wasmtime differential oracle:
-        fuse two reloc-bearing components under `--memory shared --address-rebase`
-        where one reads a pointer from a global initializer; assert the global
-        reads the component's OWN data (base + N), not the neighbor's (the #326
-        Finding A repro is a ready-made oracle — pre-fix the global returns the
-        raw un-rebased address). The loud-acceptance behavior is verified by a
-        log-assertion test on a no-reloc value-address module (the acceptance
-        warning fires; the output still validates — non-regression for #298/#304).
-        Explicitly NOT verified: that the gate detects address-as-value in
-        general (undecidable; documented in SR-48).
+        Part 2 (global-init fold) verified by
+        `meld-core/tests/pic_extended_const_353.rs::pic_extended_const_global_init_valid_and_rebased_339`:
+        a component whose global is initialized `__memory_base + 8` is fused and
+        run on wasmtime — RED before the fix (wasmtime rejects the unfolded
+        `global.get <defined>` init), GREEN after (accepts, and `get_g()` returns
+        the rebased `base + 8 = 65544`). Part 1 (loud acceptance) verified by
+        `meld-core/tests/value_address_warn_339.rs`: a no-reloc value-address
+        module fused under shared+rebase fires the acceptance warning and still
+        validates (non-regression for #298/#304); RED verified via negative
+        control. Explicitly NOT verified / NOT fixed: (a) the gate detecting
+        address-as-value in general, and (b) the bare no-reloc absolute-const
+        global (#339 residual) — both undecidable without relocs (see SR-48).
+        Implementation reuses `segments::eval_ext_const_i32_with_base` (visibility
+        widened to pub(crate)). The #299 memory.grow diagnostic (remedies named)
+        rides in the same change under SR-50.
       references:
         - "https://github.com/pulseengine/meld/issues/339"
         - "https://github.com/pulseengine/meld/issues/326"

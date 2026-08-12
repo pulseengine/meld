@@ -647,3 +647,30 @@ artifacts:
     links:
       - type: verifies
         target: SR-58
+  - id: SWV-49
+    type: sw-verification
+    title: "Verification of SR-59: Loud no-reloc acceptance + static-PIC global-init fold"
+    description: >
+      Verifies SR-59 via two wasmtime-backed oracles (both confirmed red→green
+      by stash). Global-init fold:
+      meld-core/tests/pic_extended_const_353.rs::pic_extended_const_global_init_valid_and_rebased_339
+      — a global initialized `__memory_base + 8` fused under shared+rebase; RED
+      before (wasmtime rejects the unfolded `global.get <defined>` init), GREEN
+      after (accepts; get_g() == base+8 == 65544). merger.rs::fold_defined_base_init
+      folds a leading defined-const-base extended-const to a concrete i32.const,
+      extending the #353 offset fold to global initializers (reusing
+      segments::eval_ext_const_i32_with_base). Loud acceptance:
+      meld-core/tests/value_address_warn_339.rs — a no-reloc value-address module
+      fires the address_strategy path-F accept warning and still validates
+      (non-regression for #298/#304). Mythos delta-pass: NO DELTA-INTRODUCED
+      FINDING (immutable-only + i32-only base map rules out mutable-drift/type
+      misfire; value-preserving). Documented residuals NOT claimed fixed: the
+      bare no-reloc absolute-const global and the operand-swapped defined-base
+      form (both undecidable / pre-existing; the latter fails loud at wasmtime
+      instantiation). #299 memory.grow diagnostic rides under SR-50.
+    status: implemented
+    fields:
+      method: automated-test
+    links:
+      - type: verifies
+        target: SR-59

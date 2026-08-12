@@ -86,7 +86,7 @@ pub(crate) fn ext_const_to_expr(ops: &[ExtConstOp]) -> ConstExpr {
 /// all decline the fold. Used by [`ParsedConstExpr::reindex`] to fold a data /
 /// element offset `global.get $__memory_base + N` once the base is a defined
 /// constant (#353).
-fn eval_ext_const_i32_with_base(ops: &[ExtConstOp], base: i32) -> Option<i32> {
+pub(crate) fn eval_ext_const_i32_with_base(ops: &[ExtConstOp], base: i32) -> Option<i32> {
     let mut stack: Vec<i32> = Vec::new();
     for (i, op) in ops.iter().enumerate() {
         match op {
