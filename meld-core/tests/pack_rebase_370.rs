@@ -17,9 +17,9 @@
 
 use meld_core::{Fuser, FuserConfig, MemoryStrategy};
 use wasm_encoder::{
-    CodeSection, Component, CustomSection, DataSection, DataSegment, DataSegmentMode, ExportKind,
-    ExportSection, Function, FunctionSection, Instruction, MemArg, MemorySection, MemoryType,
-    Module, ModuleSection, TypeSection, ValType,
+    CodeSection, Component, CustomSection, DataCountSection, DataSection, DataSegment,
+    DataSegmentMode, ExportKind, ExportSection, Function, FunctionSection, Instruction, MemArg,
+    MemorySection, MemoryType, Module, ModuleSection, TypeSection, ValType,
 };
 use wasmtime::{Config, Engine, Instance, Module as RuntimeModule, Store};
 
@@ -250,6 +250,142 @@ fn pack_rebase_is_compact_and_reads_own_data() {
         assert_eq!(
             got, want,
             "{name} must read its own sentinel {want:#x}, got {got:#x} — packed stride placed it over a neighbor"
+        );
+    }
+}
+
+/// A component whose sentinel lives in a PASSIVE data segment, written into
+/// memory at `DATA_ADDR` at runtime by `init_<tag>` (`memory.init`) and read
+/// back by `read_<tag>`. Both `i32.const DATA_ADDR` sites are reloc-flagged.
+fn build_passive_component(tag: &str, sentinel: u8, export_memory: bool) -> Vec<u8> {
+    let zero_memarg = MemArg {
+        offset: 0,
+        align: 0,
+        memory_index: 0,
+    };
+
+    let add_sections = |module: &mut Module| {
+        let mut types = TypeSection::new();
+        types.ty().function([], []); // type 0: init: () -> ()
+        types.ty().function([], [ValType::I32]); // type 1: read: () -> i32
+
+        let mut functions = FunctionSection::new();
+        functions.function(0);
+        functions.function(1);
+
+        let mut exports = ExportSection::new();
+        exports.export(&format!("init_{tag}"), ExportKind::Func, 0);
+        exports.export(&format!("read_{tag}"), ExportKind::Func, 1);
+        if export_memory {
+            exports.export("memory", ExportKind::Memory, 0);
+        }
+
+        let mut code = CodeSection::new();
+        let mut init = Function::new([]);
+        init.instruction(&Instruction::I32Const(DATA_ADDR)); // dst (reloc-flagged)
+        init.instruction(&Instruction::I32Const(0)); // src offset in passive data
+        init.instruction(&Instruction::I32Const(1)); // n bytes
+        init.instruction(&Instruction::MemoryInit {
+            mem: 0,
+            data_index: 0,
+        });
+        init.instruction(&Instruction::DataDrop(0));
+        init.instruction(&Instruction::End);
+        code.function(&init);
+
+        let mut read = Function::new([]);
+        read.instruction(&Instruction::I32Const(DATA_ADDR)); // addr (reloc-flagged)
+        read.instruction(&Instruction::I32Load8U(zero_memarg));
+        read.instruction(&Instruction::End);
+        code.function(&read);
+
+        let mut data = DataSection::new();
+        data.segment(DataSegment {
+            mode: DataSegmentMode::Passive,
+            data: [sentinel],
+        });
+
+        module
+            .section(&types)
+            .section(&functions)
+            .section(&shared_memory_section())
+            .section(&exports)
+            .section(&DataCountSection { count: 1 })
+            .section(&code)
+            .section(&data);
+    };
+
+    let mut dry = Module::new();
+    add_sections(&mut dry);
+    let offsets = find_i32const_reloc_offsets(&dry.finish(), DATA_ADDR);
+    assert_eq!(offsets.len(), 2, "init dst + read addr are reloc sites");
+    let reloc_code = build_reloc_code_body(&offsets);
+
+    let mut module = Module::new();
+    add_sections(&mut module);
+    module.section(&CustomSection {
+        name: "linking".into(),
+        data: vec![0x02].into(),
+    });
+    module.section(&CustomSection {
+        name: "reloc.CODE".into(),
+        data: reloc_code.into(),
+    });
+
+    let mut component = Component::new();
+    component.section(&ModuleSection(&module));
+    component.finish()
+}
+
+/// Regression (Mythos SR-57 finding): passive data + `memory.init` is a
+/// supported placement under `--address-rebase`, but its used region is
+/// invisible to an active-data-segment extent scan. Packing such modules by
+/// their active extent (0) placed them all at base 0, so each `memory.init`
+/// clobbered the last and all three read 0xC3. The fix treats a passive-
+/// carrying module as unpackable and falls back to the page-granular stride,
+/// keeping the components isolated. This test read a=b=c=0xC3 before the fix.
+#[test]
+fn pack_rebase_passive_init_does_not_clobber() {
+    let a = build_passive_component("a", 0xA1, true);
+    let b = build_passive_component("b", 0xB2, false);
+    let c = build_passive_component("c", 0xC3, false);
+    let config = FuserConfig {
+        memory_strategy: MemoryStrategy::SharedMemory,
+        pack_rebase: true,
+        ..Default::default()
+    };
+    let mut fuser = Fuser::new(config);
+    fuser.add_component_named(&a, Some("comp-a")).unwrap();
+    fuser.add_component_named(&b, Some("comp-b")).unwrap();
+    fuser.add_component_named(&c, Some("comp-c")).unwrap();
+    let fused = fuser.fuse().expect("fusion");
+
+    let mut engine_config = Config::new();
+    engine_config.wasm_threads(true);
+    engine_config.shared_memory(true);
+    engine_config.wasm_bulk_memory(true);
+    let engine = Engine::new(&engine_config).unwrap();
+    let module = RuntimeModule::new(&engine, &fused).unwrap();
+    let mut store = Store::new(&engine, ());
+    let instance = Instance::new(&mut store, &module, &[]).unwrap();
+
+    // Run every init (last-write-wins if they share a destination), then read.
+    for init in ["init_a", "init_b", "init_c"] {
+        instance
+            .get_typed_func::<(), ()>(&mut store, init)
+            .unwrap_or_else(|e| panic!("export {init}: {e}"))
+            .call(&mut store, ())
+            .unwrap();
+    }
+    for (read, want) in [("read_a", 0xA1), ("read_b", 0xB2), ("read_c", 0xC3)] {
+        let got = instance
+            .get_typed_func::<(), i32>(&mut store, read)
+            .unwrap_or_else(|e| panic!("export {read}: {e}"))
+            .call(&mut store, ())
+            .unwrap();
+        assert_eq!(
+            got, want,
+            "{read} must read its own sentinel {want:#x}, got {got:#x} — passive-init clobber (packed to base 0)"
         );
     }
 }

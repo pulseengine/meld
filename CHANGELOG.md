@@ -4,6 +4,46 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.43.0] - 2026-08-12
+
+Single-address-space (MCU) memory hardening for `--memory shared` (#370):
+overlapping data segments become a loud error, and a new opt-in compact
+rebasing mode makes thin components fit an MCU's SRAM.
+
+### Added
+- **`--pack-rebase` — compact used-extent rebasing (SR-57)** — an opt-in
+  rebasing mode that places each fused component at its 16-byte-aligned used
+  data extent (the max active data-segment end) instead of its declared page
+  count, and sizes the merged memory to the packed total. Page-granular
+  `--address-rebase` reserves ≥64 KiB per component, so three thin drivers need
+  ≥3 wasm pages even though each uses a few hundred bytes — 16× too big for an
+  8 KiB MCU. `--pack-rebase` packs them into one page, disjoint and smaller than
+  today's overlapping `--memory shared` output. Implies `--address-rebase` and
+  requires `--memory shared`. OPT-IN and sound only for components that address
+  nothing above their last data segment (no separately-addressed `.bss`, no
+  heap, no computed pointers) — the thin scalar-in / scalar-out driver case.
+  Modules carrying passive data segments (runtime `memory.init`) fall back to
+  page-granular placement — safe but not compacted.
+
+### Fixed
+- **Overlapping data segments in the fused output are now rejected (SR-56)** —
+  `--memory shared` without `--address-rebase` merged memories but shifted no
+  offsets, so every input's `.rodata`/`.data` at the wasm-ld base 1048576
+  collided in one memory; active segments apply in declaration order, so the
+  later silently overwrote the earlier — a clean exit 0 with corrupted data
+  (#370). meld now detects overlapping active data-segment ranges in the
+  EMITTED core module and hard-fails regardless of flags, naming
+  `--address-rebase` / `--pack-rebase` as the remedy. The check is local to the
+  output, so it catches any merge path that forgets to rebase.
+
+### Safety / traceability
+- LS-M-12 (loss scenario), SR-56 + SR-57 (verified), SWV-46 + SWV-47.
+  Falsification: fuse two components with data at the same base under
+  `--memory shared` — before, exit 0 with overlapping segments; now a hard
+  `OverlappingDataSegments` error. Fuse three reloc-bearing thin components
+  under `--pack-rebase` — the merged memory is 1 page (was 3) and each reads
+  back its own data on wasmtime.
+
 ## [0.42.0] - 2026-07-23
 
 ADR-7 path-H — the ABI/linking-strategy architecture — landed in full, plus two

@@ -3111,21 +3111,34 @@ fn component_display_name(components: &[ParsedComponent], comp_idx: usize) -> St
 /// carry reloc metadata, so their address consts are rebased via `reloc.CODE`.
 /// SR-57 / #370: the module's used data extent — the maximum end offset
 /// (`offset + len`) across its ACTIVE data segments, for compact `--pack-rebase`
-/// placement. Returns `None` if any active segment has a non-constant
-/// (runtime/global) offset: such a module cannot be safely packed, so the
-/// caller strides by its declared page count instead. A module with no active
-/// data segments has extent `Some(0)` (nothing to reserve).
+/// placement. Returns `None` (module cannot be safely packed → caller strides
+/// by the declared page count) when either:
+///   - an active segment has a non-constant (runtime/global) offset, or
+///   - the module carries any PASSIVE segment.
+///
+/// A passive segment is placed at runtime by `memory.init`, whose destination
+/// is not visible in the segment table — its used region is invisible to a
+/// data-segment-extent scan. Packing such a module by active extent alone would
+/// place a neighbor over the `memory.init` destination and silently clobber it
+/// (SR-56's overlap check is also active-only, so it offers no backstop). Since
+/// passive-data + `memory.init` is a supported placement under `--address-rebase`,
+/// treat it conservatively rather than corrupt it (Mythos SR-57 finding).
+///
+/// A module with no active or passive data segments has extent `Some(0)`.
 fn module_used_data_extent(module: &CoreModule) -> Result<Option<u64>> {
     let segments = crate::segments::parse_data_segments(module)?;
     let mut max_end: u64 = 0;
     for seg in &segments {
-        if let crate::segments::DataSegmentMode_::Active { offset_value, .. } = &seg.mode {
-            let start = match offset_value {
-                Some(crate::segments::ConstExprValue::I32(v)) => u64::from(*v as u32),
-                Some(crate::segments::ConstExprValue::I64(v)) => *v as u64,
-                None => return Ok(None),
-            };
-            max_end = max_end.max(start.saturating_add(seg.data.len() as u64));
+        match &seg.mode {
+            crate::segments::DataSegmentMode_::Active { offset_value, .. } => {
+                let start = match offset_value {
+                    Some(crate::segments::ConstExprValue::I32(v)) => u64::from(*v as u32),
+                    Some(crate::segments::ConstExprValue::I64(v)) => *v as u64,
+                    None => return Ok(None),
+                };
+                max_end = max_end.max(start.saturating_add(seg.data.len() as u64));
+            }
+            crate::segments::DataSegmentMode_::Passive => return Ok(None),
         }
     }
     Ok(Some(max_end))
