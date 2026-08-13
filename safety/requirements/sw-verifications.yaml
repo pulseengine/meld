@@ -756,8 +756,10 @@ artifacts:
       edges of the seam decision) with zero unresolved MC/DC gap rows, plus a
       branch-count>=1 and report-format guard; negative controls (simulated 1 gap,
       1/2 coverage) trip red. Documented limitation: single-condition seam →
-      MC/DC == branch coverage; rich multi-condition MC/DC needs a rustc-built
-      fixture (follow-up).
+      MC/DC == branch coverage; the rich multi-condition leg is delivered via the
+      rustc-built tests/gate/leap_mcdc fixture — witness recovers a real
+      2-condition FullMcdc decision on the fused output (negative control:
+      --dwarf strip -> 0/0 decisions -> gate red).
     status: implemented
     fields:
       method: automated-test

@@ -5,19 +5,29 @@ name: Witness MC/DC Gate
 # fuses the import-free component-seam fixture (tests/gate/composed.wasm) with
 # `meld fuse --preserve-names` and runs instrument -> run -> report.
 #
-# The fixture's decision is a single `result > 40` guard, so MC/DC == branch
-# coverage here: witness recovers 0 multi-condition decisions (the mcdc report
-# is 0/0 decisions, 0 gap by construction). Rich multi-condition MC/DC needs a
-# rustc-built fixture — hand-written short-circuit && is not fully coverable
-# under witness's condition model — and is the SR-62 follow-up.
+# Two gate steps run against the SAME two binaries:
 #
-# This is therefore a PIPELINE + BRANCH-COVERAGE no-regression gate with real
-# teeth (see tests/gate/run-witness.sh): meld must emit a valid import-free core
-# module, witness must still find the seam's branches, both branch edges must be
-# reached (100% coverage — red if a branch edge becomes unreachable, if the
-# decision outcome stops flipping, or if the export is renamed/dropped so run
-# invokes nothing; this is a reachability check, not value-correctness), and the
-# MC/DC report must be well-formed with 0 gap rows.
+#   (A) run-witness.sh — the WAT seam (tests/gate/composed.wasm). Its decision
+#       is a single `result > 40` guard, so MC/DC == branch coverage here:
+#       witness recovers 0 multi-condition decisions (0/0 decisions, 0 gap by
+#       construction). A PIPELINE + BRANCH-COVERAGE no-regression gate with real
+#       teeth: meld must emit a valid import-free core module, witness must
+#       still find the seam's branches, both branch edges must be reached (100%
+#       coverage — red if an edge becomes unreachable, if the outcome stops
+#       flipping, or if the export is renamed/dropped so run invokes nothing;
+#       reachability, not value-correctness), and the MC/DC report must be
+#       well-formed with 0 gap rows.
+#
+#   (B) run-witness-mcdc.sh — the RICH MULTI-CONDITION gate (SR-62). Uses a
+#       rustc-built fixture (tests/gate/leap_mcdc/, shipped as the checked-in
+#       Component tests/gate/leap_component.wasm) whose leap-year predicate
+#       lowers to a short-circuit br_if chain WITH DWARF. After `meld fuse`,
+#       witness reconstructs one decision with TWO independent conditions and
+#       proves each under masking / unique-cause MC/DC. This step gates on the
+#       decision surviving fusion: >= 1 decision, all proved, >= 2 conditions
+#       proved, 0 gap, 0 dead, and DWARF source attribution (`lib.rs:`) intact —
+#       it goes RED if fusion drops DWARF or collapses the chain (verified by a
+#       `--dwarf strip` negative control, which reconstructs 0/0 decisions).
 #
 # A core module cannot stub component imports (`--stub-imports` is component-
 # backend only), which is why the witness fixture is import-free while the scry
@@ -67,8 +77,13 @@ jobs:
         run: cargo build --release -p witness-mcdc --bin witness --manifest-path witness/Cargo.toml
       - name: Build meld
         run: cargo build --release --bin meld --manifest-path meld/Cargo.toml
-      - name: Witness MC/DC gate on a fused meld seam
+      - name: Witness MC/DC gate on a fused meld seam (WAT seam, branch coverage)
         env:
           MELD: ${{ github.workspace }}/meld/target/release/meld
           WITNESS: ${{ github.workspace }}/witness/target/release/witness
         run: meld/tests/gate/run-witness.sh
+      - name: Witness rich multi-condition MC/DC gate (rustc leap-year seam)
+        env:
+          MELD: ${{ github.workspace }}/meld/target/release/meld
+          WITNESS: ${{ github.workspace }}/witness/target/release/witness
+        run: meld/tests/gate/run-witness-mcdc.sh

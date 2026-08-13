@@ -10,8 +10,9 @@
 # `--stub-imports` is component-backend only). The single `if` gives the witness
 # gate a real branch to cover in both directions (invoke check with x>40 and
 # x<40 -> 2/2 branch coverage); it is one condition, so MC/DC == branch coverage
-# here (0 recoverable multi-condition decisions — rich MC/DC needs a rustc-built
-# fixture, tracked as the SR-62 follow-up).
+# here (0 recoverable multi-condition decisions). RICH multi-condition MC/DC
+# uses a separate rustc-built fixture — tests/gate/leap_mcdc/ + run-witness-mcdc.sh
+# (the SR-62 follow-up, now delivered).
 #
 # Re-run after changing any .wat/.wit. Requires: wasm-tools, wac.
 set -euo pipefail

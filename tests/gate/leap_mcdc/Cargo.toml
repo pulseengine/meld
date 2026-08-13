@@ -1,0 +1,28 @@
+[package]
+name = "leap-mcdc"
+version = "0.0.0"
+edition = "2024"
+publish = false
+description = "Rustc-built multi-condition MC/DC gate fixture for meld's witness gate (SR-62). Compiles to a wasm core module whose leap-year predicate lowers to a short-circuit br_if chain with DWARF; wrapped into a component and fused by meld, then instrumented by witness to recover a real 2-condition decision. Not part of meld's public API."
+license = "Apache-2.0 OR MIT"
+
+# Standalone workspace root: this empty [workspace] table keeps the
+# fixture OUT of meld's Cargo workspace (whose members are meld-core /
+# meld-cli). It is built only by build.sh for the wasm32 target, never as
+# part of a host build of meld.
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+
+[profile.release]
+# Keep DWARF: witness reads source-line + condition structure from it to
+# reconstruct the decision. Do not strip.
+debug = true
+strip = false
+# Deterministic-ish, source-close lowering so the br_if chain survives.
+codegen-units = 1
+lto = false
+opt-level = 1
+# wasm32-unknown-unknown has no unwinder.
+panic = "abort"

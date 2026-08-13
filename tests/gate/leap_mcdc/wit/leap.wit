@@ -1,0 +1,9 @@
+package gate:leap@0.1.0;
+
+interface rule {
+    is-leap: func(year: s32) -> s32;
+}
+
+world leap {
+    export rule;
+}
