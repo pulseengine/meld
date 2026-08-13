@@ -4,6 +4,32 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.47.0] - 2026-08-13
+
+### Fixed
+- **`--pack-rebase` no longer silently under-reserves `.bss` / static arenas
+  (SR-65, #370)** — it packed by the active-data-segment extent only, so a
+  component whose accessed memory (a zero-init `.bss` region or relay's bounded
+  static arena) extends above its last data segment was under-reserved, and
+  SR-56's overlap check is active-data-only so the cross-component collision
+  wasn't caught — silent corruption (confirmed on the real falcon components: a
+  65440-byte arena tail invisible to the data scan). Compaction below the
+  declared page count now **requires an authoritative `__heap_base` marker**
+  (defined immutable `i32` global, read from the export table or name section);
+  absent it, meld **falls back to page-granular and warns** (`-Wl,--export=__heap_base`),
+  never silently under-reserving. `declared` (initial pages) caps the extent only
+  for a **defined** memory; for an **imported** memory it is a floor. A local
+  Mythos delta-pass caught + closed an imported-memory under-reserve regression
+  in the first cut. Compaction of published artifacts is gated on suppliers
+  retaining `__heap_base` alongside `--emit-relocs`.
+
+### Added
+- **`meld docs` — embedded, queryable documentation (SR-64)** — topics compiled
+  into the binary (offline). `meld docs` lists topics, `meld docs <topic>` shows
+  one, `--grep <q>` searches, `--format json` for machine queries, and
+  `meld docs check --coverage --strict` asserts every subcommand has a topic (a
+  CI gate). Models `rivet docs` / varve's REQ-DOCS-001.
+
 ## [0.46.0] - 2026-08-13
 
 Traceability close-out and verification depth. **No production behavior change** —
