@@ -761,3 +761,172 @@ artifacts:
     links:
       - type: verifies
         target: SR-62
+
+  - id: SWV-54
+    type: sw-verification
+    title: "Verification of SR-1: Complete core module extraction"
+    description: >
+      Verifies SR-1 (Complete core module extraction) via 1 passing automated test(s):
+      nested_component::test_parse_composed_component_structure. Mappings carried from safety/requirements/traceability.yaml
+      (each confirmed present and green in the v0.46.0 traceability close-out);
+      status closed implemented -> verified.
+    status: implemented
+    fields:
+      method: automated-test
+    links:
+      - type: verifies
+        target: SR-1
+  - id: SWV-55
+    type: sw-verification
+    title: "Verification of SR-2: Complete import/export extraction"
+    description: >
+      Verifies SR-2 (Complete import/export extraction) via 1 passing automated test(s):
+      release_components::test_no_duplicate_imports. Mappings carried from safety/requirements/traceability.yaml
+      (each confirmed present and green in the v0.46.0 traceability close-out);
+      status closed implemented -> verified.
+    status: implemented
+    fields:
+      method: automated-test
+    links:
+      - type: verifies
+        target: SR-2
+  - id: SWV-56
+    type: sw-verification
+    title: "Verification of SR-3: Correct Canonical ABI element size computation"
+    description: >
+      Verifies SR-3 (Correct Canonical ABI element size computation) via 5 passing automated test(s):
+      parser::tests::test_canonical_abi_element_size_primitive_types, parser::tests::test_canonical_abi_element_size_string, parser::tests::test_canonical_abi_element_size_record_with_padding (+2 more). Mappings carried from safety/requirements/traceability.yaml
+      (each confirmed present and green in the v0.46.0 traceability close-out);
+      status closed implemented -> verified.
+    status: implemented
+    fields:
+      method: automated-test
+    links:
+      - type: verifies
+        target: SR-3
+  - id: SWV-57
+    type: sw-verification
+    title: "Verification of SR-4: Reject malformed components"
+    description: >
+      Verifies SR-4 (Reject malformed components) via 4 passing automated test(s):
+      parser::tests::test_parser_rejects_core_module, parser::tests::test_parser_rejects_invalid_wasm, tests::test_fuser_rejects_core_module_input (+1 more). Mappings carried from safety/requirements/traceability.yaml
+      (each confirmed present and green in the v0.46.0 traceability close-out);
+      status closed implemented -> verified.
+    status: implemented
+    fields:
+      method: automated-test
+    links:
+      - type: verifies
+        target: SR-4
+  - id: SWV-58
+    type: sw-verification
+    title: "Verification of SR-5: Complete and correct import resolution"
+    description: >
+      Verifies SR-5 (Complete and correct import resolution) via 2 passing automated test(s):
+      resolver::tests::test_resolver_strict_mode, resolver::tests::test_resolver_unresolved_import_error. Mappings carried from safety/requirements/traceability.yaml
+      (each confirmed present and green in the v0.46.0 traceability close-out);
+      status closed implemented -> verified.
+    status: implemented
+    fields:
+      method: automated-test
+    links:
+      - type: verifies
+        target: SR-5
+  - id: SWV-59
+    type: sw-verification
+    title: "Verification of SR-6: Correct CopyLayout classification"
+    description: >
+      Verifies SR-6 (Correct CopyLayout classification) via 5 passing automated test(s):
+      resolver::tests::test_copy_layout_flat_list, resolver::tests::test_copy_layout_string_list, resolver::tests::test_copy_layout_record_with_string (+2 more). Mappings carried from safety/requirements/traceability.yaml
+      (each confirmed present and green in the v0.46.0 traceability close-out);
+      status closed implemented -> verified.
+    status: implemented
+    fields:
+      method: automated-test
+    links:
+      - type: verifies
+        target: SR-6
+  - id: SWV-60
+    type: sw-verification
+    title: "Verification of SR-7: Valid topological instantiation order"
+    description: >
+      Verifies SR-7 (Valid topological instantiation order) via 5 passing automated test(s):
+      resolver::tests::test_topological_sort_linear, resolver::tests::test_topological_sort_no_deps, resolver::tests::test_topological_sort_circular_fallback (+2 more). Mappings carried from safety/requirements/traceability.yaml
+      (each confirmed present and green in the v0.46.0 traceability close-out);
+      status closed implemented -> verified.
+    status: implemented
+    fields:
+      method: automated-test
+    links:
+      - type: verifies
+        target: SR-7
+  - id: SWV-61
+    type: sw-verification
+    title: "Verification of SR-9: Complete instruction index rewriting"
+    description: >
+      Verifies SR-9 (Complete instruction index rewriting) via 12 passing automated test(s):
+      rewriter::tests::test_rewrite_memory_copy_rebased, rewriter::tests::test_rewrite_memory_fill_rebased, rewriter::tests::test_rewrite_memory_init_rebased (+9 more). Mappings carried from safety/requirements/traceability.yaml
+      (each confirmed present and green in the v0.46.0 traceability close-out);
+      status closed implemented -> verified.
+    status: implemented
+    fields:
+      method: automated-test
+    links:
+      - type: verifies
+        target: SR-9
+  - id: SWV-62
+    type: sw-verification
+    title: "Verification of SR-10: Correct segment reindexing"
+    description: >
+      Verifies SR-10 (Correct segment reindexing) via 8 passing automated test(s):
+      segments::tests::test_reindex_data_segment_rebases_offset, segments::tests::test_reindex_const_expr_global_get, segments::tests::test_reindex_const_expr_ref_func (+5 more). Mappings carried from safety/requirements/traceability.yaml
+      (each confirmed present and green in the v0.46.0 traceability close-out);
+      status closed implemented -> verified.
+    status: implemented
+    fields:
+      method: automated-test
+    links:
+      - type: verifies
+        target: SR-10
+  - id: SWV-63
+    type: sw-verification
+    title: "Verification of SR-11: Component processing order matches resolver order"
+    description: >
+      Verifies SR-11 (Component processing order matches resolver order) via 3 passing automated test(s):
+      resolver::tests::test_topological_sort_linear, resolver::tests::test_topological_sort_diamond, resolver::tests::test_resolver_preserves_order_stability. Mappings carried from safety/requirements/traceability.yaml
+      (each confirmed present and green in the v0.46.0 traceability close-out);
+      status closed implemented -> verified.
+    status: implemented
+    fields:
+      method: automated-test
+    links:
+      - type: verifies
+        target: SR-11
+  - id: SWV-64
+    type: sw-verification
+    title: "Verification of SR-16: Recursive inner pointer fixup"
+    description: >
+      Verifies SR-16 (Recursive inner pointer fixup) via 1 passing automated test(s):
+      adapter_safety::test_sr16_inner_pointer_fixup_list_string. Mappings carried from safety/requirements/traceability.yaml
+      (each confirmed present and green in the v0.46.0 traceability close-out);
+      status closed implemented -> verified.
+    status: implemented
+    fields:
+      method: automated-test
+    links:
+      - type: verifies
+        target: SR-16
+  - id: SWV-65
+    type: sw-verification
+    title: "Verification of SR-36: Synthesised DWARF DIEs for meld-generated adapter functions"
+    description: >
+      Verifies SR-36 (Synthesised DWARF DIEs for meld-generated adapter functions) via 7 passing automated test(s):
+      dwarf::tests::adapter_spans_identifies_component_synthetic, dwarf::tests::adapter_spans_recognises_fully_synthetic_sentinel, dwarf::tests::adapter_spans_empty_when_all_source (+4 more). Mappings carried from safety/requirements/traceability.yaml
+      (each confirmed present and green in the v0.46.0 traceability close-out);
+      status closed implemented -> verified.
+    status: implemented
+    fields:
+      method: automated-test
+    links:
+      - type: verifies
+        target: SR-36

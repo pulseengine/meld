@@ -25,7 +25,7 @@ artifacts:
     description: >
       The parser shall extract all core modules from a component,
       including those nested within component instances at any depth.
-    status: implemented
+    status: verified
     tags: [stpa-derived]
     links:
       - type: derives-from
@@ -48,7 +48,7 @@ artifacts:
     description: >
       The parser shall extract every import and export entry declared
       by a component, preserving names, types, and kind.
-    status: implemented
+    status: verified
     tags: [stpa-derived]
     links:
       - type: derives-from
@@ -69,7 +69,7 @@ artifacts:
       canonical_abi_element_size shall return the correctly aligned
       element size for all Canonical ABI types, including records with
       heterogeneous field alignments.
-    status: implemented
+    status: verified
     tags: [stpa-derived]
     links:
       - type: derives-from
@@ -97,7 +97,7 @@ artifacts:
       The parser shall reject components that do not pass wasmparser
       validation with feature flags locked to the Component Model
       baseline spec.
-    status: implemented
+    status: verified
     tags: [stpa-derived]
     links:
       - type: derives-from
@@ -124,7 +124,7 @@ artifacts:
       The resolver shall match every import to exactly one export with
       a matching interface name and compatible type. Ambiguous matches
       (multiple exports with the same name) shall produce an error.
-    status: implemented
+    status: verified
     tags: [stpa-derived]
     links:
       - type: derives-from
@@ -151,7 +151,7 @@ artifacts:
       type into the correct CopyLayout. Types with inner pointer fields
       (strings, lists, records containing pointers) shall be classified
       as Elements with inner_pointers, not as Bulk.
-    status: implemented
+    status: verified
     tags: [stpa-derived]
     links:
       - type: derives-from
@@ -181,7 +181,7 @@ artifacts:
       component appears after all components it imports from. Dependency
       cycles shall be detected and reported as an error (or handled by
       cycle-tolerant sort with documented semantics).
-    status: implemented
+    status: verified
     tags: [stpa-derived]
     links:
       - type: derives-from
@@ -237,7 +237,7 @@ artifacts:
       The rewriter shall remap indices in all instruction types that
       reference functions, memories, tables, globals, or types. This
       includes multi-index instructions (memory.copy, memory.init).
-    status: implemented
+    status: verified
     tags: [stpa-derived]
     links:
       - type: derives-from
@@ -267,7 +267,7 @@ artifacts:
       The merger shall reindex data segment memory indices, element
       segment table indices, and global indices in init expressions
       using the correct per-kind base offset.
-    status: implemented
+    status: verified
     tags: [stpa-derived]
     links:
       - type: derives-from
@@ -290,7 +290,7 @@ artifacts:
     description: >
       The merger shall process components in the same order as the
       resolver's topological sort output.
-    status: implemented
+    status: verified
     tags: [stpa-derived]
     links:
       - type: derives-from
@@ -412,7 +412,7 @@ artifacts:
       each inner pointer to reference the destination memory. The loop
       stride shall equal canonical_abi_element_size. The loop shall
       process exactly element_count iterations.
-    status: implemented
+    status: verified
     tags: [stpa-derived]
     links:
       - type: derives-from
@@ -1113,7 +1113,7 @@ artifacts:
       meld emits ONE fused trampoline per call site with lowering,
       allocation (a call to the callee's own cabi_realloc) and lifting
       inline, so the honest class unit is the trampoline kind.
-    status: implemented
+    status: verified
     tags: [roadmap, dwarf, witness-mc-dc, v0.23.0, v0.24.0]
     links:
       - type: derives-from
