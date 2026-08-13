@@ -1086,3 +1086,17 @@ artifacts:
     links:
       - type: verifies
         target: SR-55
+
+  - id: SWV-76
+    type: sw-verification
+    title: "Verification of SR-65: Pack-rebase true-static-extent (__heap_base) or loud refusal"
+    description: >
+      Verifies SR-65 via meld-core/tests/pack_rebase_370.rs (4 RED→GREEN
+      differential oracles): the .bss-arena shape (with-marker compacts 3→1 page,
+      without-marker falls back page-granular, neither clobbers) and the dylink
+      imported-memory shape where data exceeds the declared floor (marker not
+      clamped to floor; no-marker reserves >= max_end) — each reads its own
+      sentinel on wasmtime. A local Mythos delta-pass (the CI auto-Mythos cannot
+      run on the 6.6k-line merger.rs, #376) runtime-proved and then closed an
+      imported-memory under-reserve regression in the first cut. Never silently
+      under-reserves; supplier must export __heap_base for compaction.

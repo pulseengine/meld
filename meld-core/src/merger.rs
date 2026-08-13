@@ -635,7 +635,7 @@ impl Merger {
                 if self.address_rebasing {
                     if let Some(module_memory) = module_memory_type(module)? {
                         let extent = if self.pack_rebase {
-                            module_used_data_extent(module)?
+                            module_used_data_extent(module, &module_memory, comp_idx, mod_idx)?
                         } else {
                             None
                         };
@@ -3109,26 +3109,86 @@ fn component_display_name(components: &[ParsedComponent], comp_idx: usize) -> St
 /// legitimate bulk-only case, `test_address_rebasing_end_to_end`). Note this
 /// residual gap does NOT affect the supported path: `--emit-relocs` inputs
 /// carry reloc metadata, so their address consts are rebased via `reloc.CODE`.
-/// SR-57 / #370: the module's used data extent — the maximum end offset
-/// (`offset + len`) across its ACTIVE data segments, for compact `--pack-rebase`
-/// placement. Returns `None` (module cannot be safely packed → caller strides
-/// by the declared page count) when any of:
-///   - an active segment has a non-constant (runtime/global) offset,
-///   - the module carries any PASSIVE segment, or
-///   - the computed extent is 0 (no static data to pack against).
+/// SR-57 / #370: the module's used STATIC extent — the highest linear-memory
+/// address it uses — for compact `--pack-rebase` placement. Returns `Some(top)`
+/// when a sound compact extent is known; otherwise `None`, and the caller
+/// strides by the declared page count (page-granular). The page-granular stride
+/// is a safe reservation ONLY for a DEFINED memory (nothing can be accessed
+/// beyond `initial` pages without `memory.grow`, which the rebase path forbids);
+/// for an IMPORTED memory `initial` is only a floor, so the imported case is
+/// handled explicitly below and NEVER strides below the visible extent.
 ///
-/// This is only called for modules that HAVE a memory (see the caller), so a
-/// zero extent means "has a memory but no static initialized data" — its real
-/// usage (a `.bss`/heap region, or reloc-flagged static access above offset 0
-/// as in the #326 harness) is invisible to a data-segment scan. Packing it by
-/// extent 0 would produce a stride of `align16(0) = 0`, so `next_base` would
-/// not advance and every such module would alias at the same base (CI Mythos
-/// SR-57 finding). A passive segment has the same invisibility: it is placed at
-/// runtime by `memory.init`, whose destination is not in the segment table.
-/// SR-56's overlap check is active-only, so it does not backstop either case.
-/// All are supported placements under `--address-rebase`, so fall back to
-/// page-granular rather than silently corrupt.
-fn module_used_data_extent(module: &CoreModule) -> Result<Option<u64>> {
+/// ## Why a data-segment scan alone is not enough (#370)
+///
+/// The v0.43.0 implementation returned the maximum end (`offset + len`) across
+/// ACTIVE data segments, `D`. That is UNSOUND whenever a module uses memory
+/// above `D`: a zero-init `.bss`/arena region (relay#327 replaces a growing
+/// allocator with a bounded static arena that lives in `.bss`, NOT a data
+/// segment), a heap reached through a runtime bump pointer, a shadow stack, or
+/// a computed/MMIO address. None of those appear in the segment table, so
+/// packing by `D` UNDER-reserves the tail `[D, declared)` and the next packed
+/// component overlaps it. SR-56's overlap check is ACTIVE-data-only, so it does
+/// NOT catch a `.bss` collision — the result is silent corruption. Measured on
+/// the real target (falcon-v1.133.0): 17 declared pages, active-data extent
+/// `D ≈ 1048672`, declared `P = 1114112` — a 65440-byte tail invisible to `D`.
+///
+/// ## The sound rule
+///
+/// Reclaiming the tail `[D, declared)` is sound only when the module publishes
+/// an authoritative "top of used static memory" marker — an immutable-const
+/// `__heap_base` global (exported, or named in the `name` section). Everything
+/// above `__heap_base` is unused under the `--pack-rebase` contract (grow
+/// killed; any arena lives below it in `.bss`). With the marker we reserve
+/// `max(__heap_base, D)`, clamped down to `declared` only for a DEFINED memory
+/// (for an imported memory `declared` is a floor, so clamping would
+/// under-reserve). WITHOUT the marker we do NOT guess — fall back to the
+/// page-granular declared stride (`None`) and warn, EXCEPT when the visible data
+/// already exceeds `declared` (only possible for an imported memory), where
+/// page-granular would under-reserve, so we reserve `D` and warn. The
+/// `__heap_base` symbol is NOT present in default toolchain output (verified:
+/// absent from all six falcon exports, from the `--emit-relocs` linking symbol
+/// table, and from the `name` section — only `__stack_pointer` is named), so
+/// enabling compaction is a supplier precondition: build with
+/// `-Wl,--export=__heap_base`.
+///
+/// The invariant every branch preserves: the reservation is always `>= D`, and
+/// `declared` may only LOWER it for a DEFINED memory.
+///
+/// Returns `None` (page-granular) BEFORE the marker lookup — a `__heap_base`
+/// marker does NOT rescue these, their used region is invisible no matter what
+/// the marker says — when:
+///   - an active segment has a non-constant (runtime/global) offset, or
+///   - the module carries any PASSIVE segment (its `memory.init` destination is
+///     not in the segment table).
+///
+/// A module with a memory but no static data (`D == 0`) and no marker also
+/// declines (page-granular avoids the `align16(0) = 0` alias, CI Mythos SR-57
+/// finding) — but here a marker DOES rescue it (its `.bss` top is authoritative).
+fn module_used_data_extent(
+    module: &CoreModule,
+    memory: &MemoryType,
+    comp_idx: usize,
+    mod_idx: usize,
+) -> Result<Option<u64>> {
+    // `declared` = `initial` pages in bytes. Its meaning depends on whether the
+    // memory is DEFINED here or IMPORTED (LS-M-?? / coordinator delta-pass):
+    //   * DEFINED memory: `initial` is a true CAP — a valid module cannot
+    //     address (or place active data) beyond it without `memory.grow`, which
+    //     the rebase path forbids. `declared` may lower the extent.
+    //   * IMPORTED memory: `initial` is only the declared MINIMUM the module
+    //     needs; a dylink/PIC dylib legally imports `(memory 1 8)` and addresses
+    //     far above page 1. `declared` is a FLOOR, NOT a cap, and must NEVER
+    //     lower the extent.
+    // The hard invariant enforced below in EVERY branch: the returned extent
+    // (or the page-granular `None` stride) is always `>= max_end`, and
+    // `declared` may only lower the extent for a DEFINED memory.
+    let defined_memory = !module.memories.is_empty();
+    let Some(declared) = memory.initial.checked_mul(WASM_PAGE_SIZE) else {
+        return Ok(None);
+    };
+
+    // Active-data-segment extent `max_end` (constant offsets only). A passive or
+    // non-constant-offset segment makes the used region invisible → decline.
     let segments = crate::segments::parse_data_segments(module)?;
     let mut max_end: u64 = 0;
     for seg in &segments {
@@ -3144,10 +3204,132 @@ fn module_used_data_extent(module: &CoreModule) -> Result<Option<u64>> {
             crate::segments::DataSegmentMode_::Passive => return Ok(None),
         }
     }
-    if max_end == 0 {
-        return Ok(None);
+
+    // Compaction below `declared` is sound only with an authoritative marker.
+    match module_heap_base_marker(module) {
+        Some(heap_base) => {
+            // Marker present: the authoritative top of used static memory.
+            // Never below the visible data (`max_end`) — the hard invariant.
+            let mut extent = heap_base.max(max_end);
+            // Clamp DOWN to `declared` only for a DEFINED memory, where it is a
+            // real cap (a stale/oversized marker must not stride past the
+            // module's own memory). For an IMPORTED memory `declared` is a floor,
+            // so clamping would under-reserve — do NOT clamp (regression the
+            // delta-pass caught: `.min(declared)` shrank a legit extent).
+            if defined_memory {
+                extent = extent.min(declared);
+            }
+            if extent == 0 {
+                // Degenerate (no data, marker at 0): nothing to reserve; let the
+                // caller stride page-granular rather than alias at base 0.
+                return Ok(None);
+            }
+            Ok(Some(extent))
+        }
+        None if max_end == 0 => {
+            // Memory but no static data and no marker: real usage (a `.bss`/heap
+            // region, or reloc-flagged above-zero access as in the #326 harness)
+            // is invisible to a segment scan. Page-granular keeps the reservation
+            // >= anything within `declared` and avoids the `align16(0) = 0` alias.
+            Ok(None)
+        }
+        None if max_end > declared => {
+            // No marker AND the visible data already exceeds `declared` — only
+            // possible for an IMPORTED memory (a defined memory's active data
+            // cannot exceed its own `initial`). The page-granular `declared`
+            // stride would UNDER-reserve the visible data (the regression), so we
+            // reserve at least `max_end`. Loud: an invisible arena ABOVE max_end
+            // still can't be seen without a marker.
+            log::warn!(
+                "--pack-rebase: component {comp_idx} module {mod_idx} imports a memory whose \
+                 declared minimum is {declared} bytes but has static data up to {max_end} and no \
+                 immutable-const `__heap_base` marker; reserving {max_end} bytes (the visible \
+                 extent) — any arena above it is invisible. Build the input with \
+                 `-Wl,--export=__heap_base` to reserve the true static top."
+            );
+            Ok(Some(max_end))
+        }
+        None => {
+            // `max_end <= declared`: the page-granular `declared` stride is a
+            // sound reservation (>= max_end). Warn only when we are declining a
+            // requested compaction (there is slack we cannot prove unused).
+            if max_end < declared {
+                // LOUD, never silent under-reserve (#370): the module declares
+                // more memory than its visible static data and gives no
+                // __heap_base marker, so its tail may hold a `.bss`/arena we
+                // cannot see. Pack conservatively (page-granular) rather than
+                // risk a collision SR-56 cannot catch.
+                log::warn!(
+                    "--pack-rebase: component {comp_idx} module {mod_idx} declares {declared} \
+                     bytes of memory but only {max_end} are visible as static data, and it \
+                     publishes no immutable-const `__heap_base` marker; packing to the declared \
+                     page stride (no compaction) to avoid under-reserving a possible .bss/arena. \
+                     Build the input with `-Wl,--export=__heap_base` to enable compaction."
+                );
+            }
+            Ok(None)
+        }
     }
-    Ok(Some(max_end))
+}
+
+/// Discover a module's `__heap_base` marker — the immutable-const linear-memory
+/// address that is the top of its used static data (data + `.bss`). Returns the
+/// address when a defined, immutable `i32` global named `__heap_base` (via the
+/// export table or the `name` section) initialises to a single `i32.const`.
+///
+/// This is the ONLY signal that lets `--pack-rebase` compact below the declared
+/// page count soundly (see [`module_used_data_extent`]). `__data_end` is
+/// deliberately NOT accepted: in the default wasm-ld layout the shadow stack can
+/// sit ABOVE `__data_end` (measured: `__data_end = 5136`, `__heap_base = 70672`,
+/// a 64 KiB stack between), so packing to `__data_end` would under-reserve the
+/// stack. `__heap_base` is the true top of static usage.
+fn module_heap_base_marker(module: &CoreModule) -> Option<u64> {
+    const MARKER: &str = "__heap_base";
+    let import_globals = module
+        .imports
+        .iter()
+        .filter(|i| matches!(i.kind, ImportKind::Global(_)))
+        .count() as u32;
+
+    // Prefer the export table (what a supplier controls via --export=__heap_base
+    // and what survives `wasm-tools component new`); fall back to the name
+    // section's global-name subsection.
+    let global_index = module
+        .exports
+        .iter()
+        .find(|e| matches!(e.kind, ExportKind::Global) && e.name == MARKER)
+        .map(|e| e.index)
+        .or_else(|| module_named_global_index(module, MARKER))?;
+
+    // Only a DEFINED global carries a readable initialiser (imported globals do
+    // not). Must be an immutable `i32` initialised to a single `i32.const`.
+    if global_index < import_globals {
+        return None;
+    }
+    let defined = (global_index - import_globals) as usize;
+    let g = module.globals.get(defined)?;
+    if g.mutable || g.content_type != ValType::I32 {
+        return None;
+    }
+    crate::segments::const_i32_init_value(&g.init_expr_bytes).map(|v| u64::from(v as u32))
+}
+
+/// Absolute index of the global named `name` in the module's `name` section
+/// global-name subsection, if present.
+fn module_named_global_index(module: &CoreModule, name: &str) -> Option<u32> {
+    let (_, data) = module.custom_sections.iter().find(|(n, _)| n == "name")?;
+    let reader = wasmparser::NameSectionReader::new(wasmparser::BinaryReader::new(data, 0));
+    for subsection in reader {
+        if let Ok(wasmparser::Name::Global(namemap)) = subsection {
+            for naming in namemap {
+                let Ok(naming) = naming else { continue };
+                if naming.name == name {
+                    return Some(naming.index);
+                }
+            }
+        }
+    }
+    None
 }
 
 fn module_has_direct_memory_access(module: &CoreModule) -> Result<bool> {
