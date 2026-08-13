@@ -2583,3 +2583,114 @@ artifacts:
         - "https://github.com/pulseengine/meld/issues/301"
         - "https://github.com/pulseengine/meld/issues/298"
         - "https://github.com/pulseengine/meld/issues/299"
+
+  - id: SR-64
+    type: sw-req
+    title: Embedded, queryable CLI documentation with a coverage invariant
+    description: >
+      The meld CLI shall carry its own documentation compiled INTO the binary
+      (offline, air-gapped by construction) and expose it queryably:
+      `meld docs` lists topics, `meld docs <topic>` shows one, `--grep <q>`
+      searches titles and bodies, and `--format json` emits the list (or a
+      single topic, with its body) for machine consumption — modelled on
+      `rivet docs` and mirroring varve's REQ-DOCS-001. Coverage is a mechanical
+      invariant: every top-level CLI subcommand shall have a documented topic
+      whose slug equals the clap subcommand name, checked by
+      `meld docs check --coverage` (`--strict` exits non-zero — the CI gate)
+      and by a unit test that enumerates the subcommands via
+      `clap::CommandFactory`, so an undocumented subcommand cannot ship. Concept
+      topics (fusion, memory-strategies, address-rebasing, pack-rebase,
+      adapters, attestation, provenance) document meld's domain alongside the
+      per-subcommand topics.
+    status: verified
+    tags: [cli, documentation, coverage-gate, air-gapped, aspice]
+    release: v0.47.0
+    links:
+      - type: derives-from
+        target: SYS-11
+    cited-source:
+      - uri: "https://github.com/pulseengine/varve"
+        kind: github
+        last-checked: 2026-08-13
+    fields:
+      implementation:
+        - meld-cli/src/docs.rs
+        - meld-cli/src/main.rs
+        - meld-cli/docs/
+      verification-method: automated-test
+      verification-description: >
+        PROPOSED. The `meld-cli` unit test
+        `docs::tests::every_cli_subcommand_has_a_documented_topic` builds the
+        clap command via `clap::CommandFactory`, calls `docs::coverage_gaps`,
+        and asserts it is empty — every subcommand (excluding clap's built-in
+        `help`) has a topic. Companion tests cover findable/greppable topics,
+        the JSON list and single-topic forms, the empty-object unknown-topic
+        path, and a "no topic body shorter than ~40 chars" floor. The same
+        `coverage_gaps` invariant is exposed at runtime as
+        `meld docs check --coverage --strict` for use as a CI gate.
+      references:
+        - "https://github.com/pulseengine/varve"
+
+  - id: SR-65
+    type: sw-req
+    title: Pack-rebase reserves the true static extent (__heap_base) or refuses to compact
+    description: >
+      `--pack-rebase` shall reserve each component's TRUE static extent —
+      including a zero-init `.bss` / bounded-static-arena region above the last
+      data segment — not merely its active-data-segment extent. It reads
+      `__heap_base` (a defined, immutable `i32`-const global — wasm-ld's top of
+      static data+bss) from the export table or the name section, and packs to
+      `clamp(__heap_base, max_end .. cap)`. The extent shall NEVER be below the
+      visible data extent (`max_end`). `declared` (initial pages) is a valid cap
+      ONLY for a DEFINED memory (a valid module cannot address beyond its own
+      initial); for an IMPORTED memory `initial` is a declared MINIMUM (floor)
+      and must never lower the extent (a dylink dylib imports `(memory 1)` and
+      addresses far above page 1). When the true extent CANNOT be determined —
+      no `__heap_base` marker and a footprint that page-granular placement cannot
+      bound — meld shall fall back to page-granular placement (reserving at least
+      `max_end`) with a `log::warn!` naming the remedy, and shall NEVER silently
+      under-reserve: SR-56's overlap check is active-data-segment-only and cannot
+      catch a `.bss`/arena collision, so a silent under-reservation is silent
+      cross-component corruption (#370, the falcon/relay bounded-static-arena
+      shape). This corrects a first-cut regression (imported memory whose data
+      exceeds its declared floor) that a Mythos delta-pass runtime-proved.
+      SUPPLIER PRECONDITION: to get compaction, publish `__heap_base` retained
+      through `wasm-tools component new` (e.g. `-Wl,--export=__heap_base`)
+      alongside `--emit-relocs` — the marker is discarded by default (verified
+      absent on all published falcon 1.133.0 artifacts).
+    status: verified
+    tags: [merger, memory, shared, mcu, pack-rebase, silent-corruption, bss]
+    release: v0.47.0
+    links:
+      - type: derives-from
+        target: SYS-6
+      - type: mitigates
+        target: LS-M-12
+      - type: refines
+        target: SR-57
+    cited-source:
+      - uri: "https://github.com/pulseengine/meld/issues/370"
+        kind: github
+        last-checked: 2026-08-13
+    fields:
+      implementation:
+        - meld-core/src/merger.rs
+      verification-method: test
+      verification-description: >
+        Verified by meld-core/tests/pack_rebase_370.rs (4 differential-execution
+        oracles, each RED before the fix / GREEN after, proven by revert):
+        pack_rebase_bss_arena_with_marker_compacts_no_clobber and
+        pack_rebase_bss_arena_without_marker_falls_back_no_clobber (the .bss-tail
+        shape: compacts to 1 page with an exported __heap_base, falls back to 3
+        pages page-granular without, neither clobbers); and
+        pack_rebase_imported_memory_above_floor_no_marker_no_clobber +
+        pack_rebase_imported_memory_marker_not_clamped_to_floor_no_clobber (the
+        dylink imported-memory shape where data exceeds the declared floor — each
+        reads its own sentinel, closing the Mythos-found under-reserve). The
+        marker is read via merger.rs::module_heap_base_marker (defined immutable
+        i32-const global, export table or name section; mutable/non-i32/imported
+        rejected). Full suite green; the existing pack oracles (data-only,
+        passive, no-data) unregressed.
+      references:
+        - "https://github.com/pulseengine/meld/issues/370"
+        - "meld-core/tests/pack_rebase_370.rs"
