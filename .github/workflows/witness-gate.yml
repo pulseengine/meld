@@ -1,0 +1,74 @@
+name: Witness MC/DC Gate
+
+# MC/DC + branch-coverage over a FUSED meld output (meld#302 Track C2, SR-62).
+# Builds `witness` from a pinned source ref (no release CLI binary ships), then
+# fuses the import-free component-seam fixture (tests/gate/composed.wasm) with
+# `meld fuse --preserve-names` and runs instrument -> run -> report.
+#
+# The fixture's decision is a single `result > 40` guard, so MC/DC == branch
+# coverage here: witness recovers 0 multi-condition decisions (the mcdc report
+# is 0/0 decisions, 0 gap by construction). Rich multi-condition MC/DC needs a
+# rustc-built fixture — hand-written short-circuit && is not fully coverable
+# under witness's condition model — and is the SR-62 follow-up.
+#
+# This is therefore a PIPELINE + BRANCH-COVERAGE no-regression gate with real
+# teeth (see tests/gate/run-witness.sh): meld must emit a valid import-free core
+# module, witness must still find the seam's branches, both branch edges must be
+# reached (100% coverage — red if a branch edge becomes unreachable, if the
+# decision outcome stops flipping, or if the export is renamed/dropped so run
+# invokes nothing; this is a reachability check, not value-correctness), and the
+# MC/DC report must be well-formed with 0 gap rows.
+#
+# A core module cannot stub component imports (`--stub-imports` is component-
+# backend only), which is why the witness fixture is import-free while the scry
+# fixture is the real (import-bearing) module — scry does not execute.
+#
+# All inputs are files/metadata; no untrusted free-form PR text is read in
+# `run:` blocks.
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: witness-gate-${{ github.head_ref || github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'workflow_dispatch' }}
+
+permissions:
+  contents: read
+
+env:
+  # Pinned to the witness release tested against locally (v0.41; 2/2 branch
+  # coverage, 0 gap). Bump via PR.
+  WITNESS_REF: v0.41.0
+
+jobs:
+  witness:
+    name: Witness MC/DC (fused meld seam)
+    runs-on: [self-hosted, linux, x64, rust-cpu]
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: meld
+      - uses: actions/checkout@v4
+        with:
+          repository: pulseengine/witness
+          path: witness
+          ref: ${{ env.WITNESS_REF }}
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: witness
+          key: witness-build
+      - name: Build witness
+        run: cargo build --release -p witness-mcdc --bin witness --manifest-path witness/Cargo.toml
+      - name: Build meld
+        run: cargo build --release --bin meld --manifest-path meld/Cargo.toml
+      - name: Witness MC/DC gate on a fused meld seam
+        env:
+          MELD: ${{ github.workspace }}/meld/target/release/meld
+          WITNESS: ${{ github.workspace }}/witness/target/release/witness
+        run: meld/tests/gate/run-witness.sh

@@ -1,0 +1,3 @@
+package gate:seam@0.1.0;
+interface runner { check: func(x: u32) -> u32; }
+world consumer { import gate:math/lib@0.1.0; export runner; }
