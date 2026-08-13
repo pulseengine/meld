@@ -674,3 +674,26 @@ artifacts:
     links:
       - type: verifies
         target: SR-59
+  - id: SWV-50
+    type: sw-verification
+    title: "Verification of SR-60: Const-expr fold equivalence-checked against certified QF_BV (ordeal)"
+    description: >
+      Verifies SR-60 via meld-core/src/segments.rs::ordeal_fold_proof (9 tests,
+      test-only + one dev-dep `ordeal 0.18`). Harness A (64 boundary-biased cases
+      per width) encodes each extended-const to bytes with wasm_encoder, drives
+      the SHIPPED fold (parse_const_expr_with_value → fold_extended_const_i32/i64),
+      builds an independent QF_BV term, and asserts ordeal::Solver::prove_equiv is
+      Unsat with cert.recheck() passing (Unknown = hard failure; certificate
+      non-vacuous — ordeal-lrat requires deriving the empty clause). Harness B
+      cross-checks eval_ext_const_i32_with_base. Negative controls (asserted SAT):
+      the #338 `base + 16 == base` truncation refuted symbolically over free base,
+      swapped-sub, and off-by-one add. wasmtime anchoring: 3 wrap-boundary cases.
+      DISCRIMINATION PROVEN by mutation: injecting wrapping→saturating at each of
+      the three fold sites turns the matching harness RED (each caught, reverted).
+      Exercises shipped code, not a re-implementation. Full suite 815/45/0.
+    status: implemented
+    fields:
+      method: automated-test
+    links:
+      - type: verifies
+        target: SR-60

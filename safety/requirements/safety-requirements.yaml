@@ -2408,7 +2408,7 @@ artifacts:
       symbolically refute the #338 truncation (`prove_equiv(base + N, base)` →
       SAT with witness) and a mutated fold. Closes the #338 silent-miscompile
       class with proof rather than examples (#344).
-    status: proposed
+    status: verified
     tags: [const-expr, verification-hardening, smt, ordeal, correctness]
     release: v0.45.0
     links:

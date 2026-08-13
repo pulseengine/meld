@@ -51,6 +51,11 @@ wasmtime = "41.0.1"
 wasmtime-wasi = "41.0.4"
 bitflags.workspace = true  # Required for wit-bindgen component bindings
 criterion.workspace = true
+# SR-60 / #344: certificate-checked QF_BV SMT reference oracle for the
+# extended-const FOLD (proves the #338 miscompile class closed by proof,
+# not just examples). Default features only — pure Rust, wasm-clean, no
+# external solver (z3/cadical stay behind non-default features).
+ordeal = { version = "0.18", default-features = false }
 
 [features]
 default = []

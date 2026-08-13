@@ -1404,6 +1404,7 @@ dependencies = [
  "gimli 0.31.1",
  "hex",
  "log",
+ "ordeal",
  "petgraph 0.8.3",
  "proptest",
  "serde",
@@ -1483,6 +1484,21 @@ name = "oorandom"
 version = "11.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d6790f58c7ff633d8771f42965289203411a5e5c68388703c06e14f24770b41e"
+
+[[package]]
+name = "ordeal"
+version = "0.18.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3d56ca8355f266f889a33ac6f413fc016d647fb2cec38e94ed80f03d9dc56c4b"
+dependencies = [
+ "ordeal-lrat",
+]
+
+[[package]]
+name = "ordeal-lrat"
+version = "0.18.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "514834f970104c492975d07788f7afcc9cd16f27b4aa9c6122a03d52bbab3328"
 
 [[package]]
 name = "percent-encoding"

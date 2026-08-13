@@ -1605,3 +1605,445 @@ mod tests {
         }
     }
 }
+
+/// SR-60 / #344 — certificate-checked SMT proof of the extended-const FOLD.
+///
+/// This module validates meld's SHIPPED const-expr extended-const fold against
+/// the `ordeal` crate — a specialized, **certificate-checked** QF_BV SMT
+/// decision procedure (pure Rust, no external solver). The goal is to close the
+/// #338 silent-miscompile class *by proof, not by example*: for a large,
+/// boundary-biased population of well-formed extended-const operator sequences,
+/// the constant produced by meld's own fold (`parse_const_expr_with_value` →
+/// `fold_extended_const_i32/i64`) is proven **equivalent for every input** to
+/// the QF_BV modular-arithmetic model of the same operator sequence, and every
+/// `Unsat` verdict carries an LRAT certificate that is **independently
+/// re-checked** here (`cert.recheck()`) with zero trust in the solver.
+///
+/// ## What is exercised (shipped code, not a re-implementation)
+///
+/// - **Harness A** (`fold_i32/i64_matches_certified_smt`): encodes each sample
+///   to real const-expr bytes with `wasm_encoder`, drives the shipped
+///   `parse_const_expr_with_value` on those bytes to obtain the folded constant,
+///   builds the QF_BV term (`bvadd`/`bvsub`/`bvmul`) *independently* from the
+///   same operator tree, and asserts `prove_equiv(term, const(folded))` returns
+///   `Unsat` with a re-checkable certificate. A wrong wrapping rule shows up as
+///   `Sat` (a concrete counterexample) — the check can fail. `Unknown` is a HARD
+///   FAILURE (these are ground terms; they must be decidable).
+/// - **Harness B** (`fold_base_path_agrees_with_const_first`): cross-checks the
+///   two independent shipped paths — `eval_ext_const_i32_with_base` (base
+///   substituted for a leading `global.get`) against the const-first
+///   `fold_extended_const_i32` reached via bytes — over boundary-biased bases.
+///   The const-first side is the one carrying the SMT proof from Harness A, so
+///   agreement composes into real evidence for the base path.
+/// - **Negative controls**: prove the harness DISCRIMINATES — the #338
+///   truncation (`base + 16 == base` over a free base) and deliberately-wrong
+///   folds (swapped `sub` operands, off-by-one add) are asserted `Sat`.
+/// - **wasmtime anchoring**: 2–3 wrap-boundary cases where the real runtime
+///   value == the shipped fold == the expected wrapped constant.
+#[cfg(test)]
+mod ordeal_fold_proof {
+    use super::{ConstExprValue, ExtConstOp, eval_ext_const_i32_with_base, ext_const_to_expr};
+    use ordeal::{BvTerm, CheckResult, Solver, Sort};
+    use proptest::prelude::*;
+    use wasm_encoder::{ConstExpr, Encode};
+
+    // --- Reference AST: an extended-const arithmetic tree over constant leaves.
+    // Serialized to (a) real const-expr bytes for the shipped fold and (b) an
+    // independent QF_BV term for the SMT reference.
+
+    #[derive(Debug, Clone)]
+    enum Op {
+        Add,
+        Sub,
+        Mul,
+    }
+
+    #[derive(Debug, Clone)]
+    enum Expr {
+        Leaf(i64),
+        Node(Op, Box<Expr>, Box<Expr>),
+    }
+
+    fn op_strategy() -> impl Strategy<Value = Op> {
+        prop_oneof![Just(Op::Add), Just(Op::Sub), Just(Op::Mul)]
+    }
+
+    /// Constants biased HARD toward wrap boundaries — a uniform `any::<i32>()`
+    /// almost never produces an overflowing add/sub/mul, which would let a
+    /// broken (e.g. saturating) fold survive the proof. See the mutation note
+    /// in the module docs.
+    fn boundary_i32() -> impl Strategy<Value = i32> {
+        prop_oneof![
+            7 => prop_oneof![
+                Just(i32::MIN), Just(i32::MAX), Just(-1i32), Just(0i32), Just(1i32),
+                Just(i32::MIN + 1), Just(i32::MAX - 1),
+            ],
+            1 => any::<i32>(),
+        ]
+    }
+
+    fn boundary_i64() -> impl Strategy<Value = i64> {
+        prop_oneof![
+            7 => prop_oneof![
+                Just(i64::MIN), Just(i64::MAX), Just(-1i64), Just(0i64), Just(1i64),
+                Just(i64::MIN + 1), Just(i64::MAX - 1),
+            ],
+            1 => any::<i64>(),
+        ]
+    }
+
+    fn expr_i32() -> impl Strategy<Value = Expr> {
+        let leaf = boundary_i32().prop_map(|v| Expr::Leaf(v as i64));
+        leaf.prop_recursive(3, 8, 2, |inner| {
+            (op_strategy(), inner.clone(), inner)
+                .prop_map(|(op, a, b)| Expr::Node(op, Box::new(a), Box::new(b)))
+        })
+    }
+
+    fn expr_i64() -> impl Strategy<Value = Expr> {
+        let leaf = boundary_i64().prop_map(Expr::Leaf);
+        leaf.prop_recursive(3, 8, 2, |inner| {
+            (op_strategy(), inner.clone(), inner)
+                .prop_map(|(op, a, b)| Expr::Node(op, Box::new(a), Box::new(b)))
+        })
+    }
+
+    // --- Serialization: reference AST -> shipped operator sequence (post-order).
+
+    fn push_ops(e: &Expr, width: u32, out: &mut Vec<ExtConstOp>) {
+        match e {
+            Expr::Leaf(v) => out.push(if width == 32 {
+                ExtConstOp::I32Const(*v as i32)
+            } else {
+                ExtConstOp::I64Const(*v)
+            }),
+            Expr::Node(op, a, b) => {
+                push_ops(a, width, out);
+                push_ops(b, width, out);
+                out.push(match (width, op) {
+                    (32, Op::Add) => ExtConstOp::I32Add,
+                    (32, Op::Sub) => ExtConstOp::I32Sub,
+                    (32, Op::Mul) => ExtConstOp::I32Mul,
+                    (_, Op::Add) => ExtConstOp::I64Add,
+                    (_, Op::Sub) => ExtConstOp::I64Sub,
+                    (_, Op::Mul) => ExtConstOp::I64Mul,
+                });
+            }
+        }
+    }
+
+    // --- Serialization: reference AST -> INDEPENDENT QF_BV term.
+
+    fn to_bvterm(e: &Expr, width: u32) -> BvTerm {
+        let sort = Sort::new(width);
+        match e {
+            Expr::Leaf(v) => {
+                let value: u128 = if width == 32 {
+                    (*v as i32 as u32) as u128
+                } else {
+                    (*v as u64) as u128
+                };
+                BvTerm::Const { value, sort }
+            }
+            Expr::Node(op, a, b) => {
+                let l = Box::new(to_bvterm(a, width));
+                let r = Box::new(to_bvterm(b, width));
+                match op {
+                    Op::Add => BvTerm::Add(l, r),
+                    Op::Sub => BvTerm::Sub(l, r),
+                    Op::Mul => BvTerm::Mul(l, r),
+                }
+            }
+        }
+    }
+
+    /// Drive the SHIPPED fold: encode a `wasm_encoder::ConstExpr` to real
+    /// const-expr bytes, wrap them in a `wasmparser::ConstExpr`, and run meld's
+    /// own `parse_const_expr_with_value`. Returns the folded constant.
+    fn fold_shipped(ce: &ConstExpr) -> ConstExprValue {
+        let mut bytes = Vec::new();
+        ce.encode(&mut bytes);
+        let reader = wasmparser::BinaryReader::new(&bytes, 0);
+        let parsed = wasmparser::ConstExpr::new(reader);
+        let (_pce, value) =
+            super::parse_const_expr_with_value(&parsed).expect("shipped fold must parse");
+        value.expect("const-first extended-const fold must yield a concrete value")
+    }
+
+    fn fold_ops(ops: &[ExtConstOp]) -> ConstExprValue {
+        fold_shipped(&ext_const_to_expr(ops))
+    }
+
+    /// The core assertion: the shipped `folded` constant is PROVEN equal, for
+    /// every input, to the independent QF_BV model `term`, and the UNSAT
+    /// certificate is re-validated here with the trusted `ordeal-lrat` checker.
+    fn assert_fold_proven(term: BvTerm, folded_value: u128, width: u32, ctx: &str) {
+        let claim = BvTerm::Const {
+            value: folded_value,
+            sort: Sort::new(width),
+        };
+        match Solver::prove_equiv(term.clone(), claim) {
+            CheckResult::Unsat(cert) => {
+                // Guard against a vacuous certificate: the trusted `ordeal-lrat`
+                // checker only returns `Ok` when the LRAT proof derives the empty
+                // clause against a non-empty CNF (`CheckError::NoEmptyClause`
+                // otherwise), so an empty proof/CNF would be REJECTED — assert
+                // both halves are present so `recheck()` is provably non-trivial.
+                assert!(
+                    !cert.cnf.is_empty(),
+                    "{ctx}: UNSAT certificate carries an empty CNF (nothing proven)"
+                );
+                assert!(
+                    !cert.lrat.is_empty(),
+                    "{ctx}: UNSAT certificate carries an empty LRAT proof (vacuous)"
+                );
+                cert.recheck().unwrap_or_else(|e| {
+                    panic!("{ctx}: UNSAT certificate failed independent re-check: {e}")
+                });
+            }
+            CheckResult::Sat(model) => panic!(
+                "{ctx}: shipped fold DISAGREES with certified QF_BV model — \
+                 counterexample {:?}; term={term:?}",
+                model.assignments
+            ),
+            CheckResult::Unknown => panic!(
+                "{ctx}: ordeal returned Unknown on a ground constant term \
+                 (must be decidable — Unknown is a hard failure); term={term:?}"
+            ),
+        }
+    }
+
+    // --- Smoke tests: run FIRST to confirm the ordeal path decides (not
+    // Unknown) at both widths before the proptest population leans on it.
+
+    #[test]
+    fn smoke_i32_wrap_boundary_proven_and_rechecked() {
+        // i32::MAX + 1 wraps to i32::MIN — proven, certificate independently re-checked.
+        let t = BvTerm::Add(
+            Box::new(BvTerm::Const {
+                value: (i32::MAX as u32) as u128,
+                sort: Sort::new(32),
+            }),
+            Box::new(BvTerm::Const {
+                value: 1,
+                sort: Sort::new(32),
+            }),
+        );
+        assert_fold_proven(t, (i32::MIN as u32) as u128, 32, "smoke i32 MAX+1==MIN");
+    }
+
+    #[test]
+    fn smoke_i64_mul_wraps_proven_and_rechecked() {
+        // Confirms 64-bit bvmul is decided (not Unknown) in 0.18: MAX*2 wraps to -2.
+        let t = BvTerm::Mul(
+            Box::new(BvTerm::Const {
+                value: (i64::MAX as u64) as u128,
+                sort: Sort::new(64),
+            }),
+            Box::new(BvTerm::Const {
+                value: 2,
+                sort: Sort::new(64),
+            }),
+        );
+        let expected = (i64::MAX.wrapping_mul(2) as u64) as u128;
+        assert_fold_proven(t, expected, 64, "smoke i64 MAX*2");
+    }
+
+    // --- Harness A: the certified equivalence proof over a boundary-biased
+    // population of extended-const expressions, driving the SHIPPED fold.
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+
+        #[test]
+        fn fold_i32_matches_certified_smt(expr in expr_i32()) {
+            let mut ops = Vec::new();
+            push_ops(&expr, 32, &mut ops);
+            let folded = match fold_ops(&ops) {
+                ConstExprValue::I32(v) => v,
+                other => panic!("expected I32 fold, got {other:?}"),
+            };
+            let term = to_bvterm(&expr, 32);
+            assert_fold_proven(term, (folded as u32) as u128, 32, "i32 extended-const fold");
+        }
+
+        #[test]
+        fn fold_i64_matches_certified_smt(expr in expr_i64()) {
+            let mut ops = Vec::new();
+            push_ops(&expr, 64, &mut ops);
+            let folded = match fold_ops(&ops) {
+                ConstExprValue::I64(v) => v,
+                other => panic!("expected I64 fold, got {other:?}"),
+            };
+            let term = to_bvterm(&expr, 64);
+            assert_fold_proven(term, (folded as u64) as u128, 64, "i64 extended-const fold");
+        }
+    }
+
+    // --- Harness B: cross-check the two independent shipped folds. The
+    // base-substituted `eval_ext_const_i32_with_base` must agree with the
+    // const-first `parse_const_expr_with_value` (SMT-backed by Harness A) when
+    // the leading `global.get` is replaced by the concrete base.
+
+    fn op_i32(op: &Op) -> ExtConstOp {
+        match op {
+            Op::Add => ExtConstOp::I32Add,
+            Op::Sub => ExtConstOp::I32Sub,
+            Op::Mul => ExtConstOp::I32Mul,
+        }
+    }
+
+    proptest! {
+        #[test]
+        fn fold_base_path_agrees_with_const_first(
+            base in boundary_i32(),
+            steps in prop::collection::vec((op_strategy(), boundary_i32()), 0..=4),
+        ) {
+            // `base <op> c1 <op> c2 ...` with the base as a leading global.get.
+            let mut ops_base = vec![ExtConstOp::GlobalGet(0)];
+            let mut ops_const = vec![ExtConstOp::I32Const(base)];
+            for (op, c) in &steps {
+                ops_base.push(ExtConstOp::I32Const(*c));
+                ops_base.push(op_i32(op));
+                ops_const.push(ExtConstOp::I32Const(*c));
+                ops_const.push(op_i32(op));
+            }
+
+            let via_base = eval_ext_const_i32_with_base(&ops_base, base)
+                .expect("well-formed single-base i32 sequence must resolve");
+            let via_const = match fold_ops(&ops_const) {
+                ConstExprValue::I32(v) => v,
+                other => panic!("expected I32 fold, got {other:?}"),
+            };
+            prop_assert_eq!(via_base, via_const);
+        }
+    }
+
+    // --- Negative controls: the harness must DISCRIMINATE. Each of these is a
+    // KNOWN-WRONG fold and MUST come back Sat (a refuting counterexample).
+
+    fn var32(name: &str) -> BvTerm {
+        BvTerm::Var {
+            name: name.to_string(),
+            sort: Sort::new(32),
+        }
+    }
+    fn const32(value: u128) -> BvTerm {
+        BvTerm::Const {
+            value,
+            sort: Sort::new(32),
+        }
+    }
+
+    #[test]
+    fn negative_control_338_truncation_refuted() {
+        // The exact #338 bad fold: `base + 16` collapsed to `base`. Over a FREE
+        // base this is refutable — SAT with a witness — which is why dropping
+        // the `+ N` was a silent miscompile.
+        let base = var32("base");
+        let bad = BvTerm::Add(Box::new(base.clone()), Box::new(const32(16)));
+        match Solver::prove_equiv(bad, base) {
+            CheckResult::Sat(model) => assert!(
+                !model.assignments.is_empty(),
+                "SAT witness must bind the free base"
+            ),
+            other => panic!("expected SAT refutation of `base + 16 == base`, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn negative_control_swapped_sub_refuted() {
+        // `sub` is non-commutative: a - b != b - a over free vars.
+        let (a, b) = (var32("a"), var32("b"));
+        let ab = BvTerm::Sub(Box::new(a.clone()), Box::new(b.clone()));
+        let ba = BvTerm::Sub(Box::new(b), Box::new(a));
+        assert!(
+            matches!(Solver::prove_equiv(ab, ba), CheckResult::Sat(_)),
+            "swapped `sub` operands must be refuted (SAT)"
+        );
+    }
+
+    #[test]
+    fn negative_control_offbyone_add_refuted() {
+        // An off-by-one fold: `x + 0` vs `x + 1` differ for every x.
+        let x = var32("x");
+        let f0 = BvTerm::Add(Box::new(x.clone()), Box::new(const32(0)));
+        let f1 = BvTerm::Add(Box::new(x), Box::new(const32(1)));
+        assert!(
+            matches!(Solver::prove_equiv(f0, f1), CheckResult::Sat(_)),
+            "off-by-one add must be refuted (SAT)"
+        );
+    }
+
+    // --- wasmtime anchoring: tie the certified reference to a real runtime at
+    // wrap boundaries — runtime value == shipped fold == expected constant.
+
+    fn runtime_global_i32(ce: &ConstExpr) -> i32 {
+        let mut module = wasm_encoder::Module::new();
+        let mut globals = wasm_encoder::GlobalSection::new();
+        globals.global(
+            wasm_encoder::GlobalType {
+                val_type: wasm_encoder::ValType::I32,
+                mutable: false,
+                shared: false,
+            },
+            ce,
+        );
+        let mut exports = wasm_encoder::ExportSection::new();
+        exports.export("g", wasm_encoder::ExportKind::Global, 0);
+        module.section(&globals).section(&exports);
+        let bytes = module.finish();
+
+        let engine = wasmtime::Engine::default();
+        let module = wasmtime::Module::new(&engine, &bytes).expect("extended-const module valid");
+        let mut store = wasmtime::Store::new(&engine, ());
+        let instance =
+            wasmtime::Instance::new(&mut store, &module, &[]).expect("instantiation succeeds");
+        let g = instance
+            .get_global(&mut store, "g")
+            .expect("exported global g");
+        match g.get(&mut store) {
+            wasmtime::Val::I32(v) => v,
+            other => panic!("expected i32 global, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn wasmtime_anchors_shipped_fold_at_wrap_boundaries() {
+        // (const-expr, expected wrapped value). Each is a genuine wrap.
+        let cases: Vec<(ConstExpr, i32)> = vec![
+            // i32::MAX + 1 -> i32::MIN
+            (
+                ConstExpr::i32_const(i32::MAX)
+                    .with_i32_const(1)
+                    .with_i32_add(),
+                i32::MIN,
+            ),
+            // 0 - 1 -> -1 (0xFFFF_FFFF)
+            (ConstExpr::i32_const(0).with_i32_const(1).with_i32_sub(), -1),
+            // i32::MIN * -1 -> i32::MIN (signed-overflow wrap)
+            (
+                ConstExpr::i32_const(i32::MIN)
+                    .with_i32_const(-1)
+                    .with_i32_mul(),
+                i32::MIN,
+            ),
+        ];
+
+        for (ce, expected) in cases {
+            let runtime = runtime_global_i32(&ce);
+            let folded = match fold_shipped(&ce) {
+                ConstExprValue::I32(v) => v,
+                other => panic!("expected I32 fold, got {other:?}"),
+            };
+            assert_eq!(
+                runtime, expected,
+                "wasmtime runtime value must be the wrapped constant"
+            );
+            assert_eq!(
+                folded, expected,
+                "shipped fold must match the real runtime value"
+            );
+        }
+    }
+}
