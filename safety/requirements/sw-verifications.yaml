@@ -724,3 +724,40 @@ artifacts:
     links:
       - type: verifies
         target: SR-63
+  - id: SWV-52
+    type: sw-verification
+    title: "Verification of SR-61: Fused output passes scry abstract interpretation"
+    description: >
+      Verifies SR-61 via .github/workflows/scry-gate.yml, which ran GREEN in CI on
+      PR #374 (the gate's first CI run — a gate never run in CI is not verified).
+      The job builds scry-viz (pinned SCRY_REF v3.2.4), fuses
+      tests/wit_bindgen/fixtures/strings-simple.wasm, and runs `scry-viz check`
+      (586 functions / 7070 program points / 464 call edges well-formed, exit 0),
+      with a non-vacuity guard (function count > 0, captured from stderr) and a
+      negative control (truncated wasm → exit 3 → red). Catches structural
+      corruption the wasm validator does not.
+    status: implemented
+    fields:
+      method: automated-test
+    links:
+      - type: verifies
+        target: SR-61
+  - id: SWV-53
+    type: sw-verification
+    title: "Verification of SR-62: Fused output is witness-instrumentable, zero MC/DC gap"
+    description: >
+      Verifies SR-62 via .github/workflows/witness-gate.yml, which ran GREEN in CI
+      on PR #374 (first CI run). The job builds witness (pinned WITNESS_REF
+      v0.41.0), fuses an import-free seam fixture (tests/gate/, `--preserve-names`),
+      instruments, runs `--invoke-all`, and gates on 100% branch coverage (2/2
+      edges of the seam decision) with zero unresolved MC/DC gap rows, plus a
+      branch-count>=1 and report-format guard; negative controls (simulated 1 gap,
+      1/2 coverage) trip red. Documented limitation: single-condition seam →
+      MC/DC == branch coverage; rich multi-condition MC/DC needs a rustc-built
+      fixture (follow-up).
+    status: implemented
+    fields:
+      method: automated-test
+    links:
+      - type: verifies
+        target: SR-62

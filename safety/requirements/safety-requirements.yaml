@@ -2450,7 +2450,7 @@ artifacts:
       fused core modules (#302 Track C). This is a wasm-level verification gate on
       the actual product (meld fuses wasm in/out but currently runs no wasm-level
       verification).
-    status: proposed
+    status: verified
     tags: [ci-gate, wasm-verification, scry, abstract-interpretation, do-333]
     release: v0.45.0
     links:
@@ -2485,7 +2485,7 @@ artifacts:
       since hand-written WAT yields zero recoverable decisions, and the fused
       real wit-bindgen output retains wasi imports the core runner cannot stub —
       witness#180).
-    status: proposed
+    status: verified
     tags: [ci-gate, wasm-verification, witness, mcdc, do-178c]
     release: v0.45.0
     links:
