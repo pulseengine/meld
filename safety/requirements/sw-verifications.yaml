@@ -674,3 +674,90 @@ artifacts:
     links:
       - type: verifies
         target: SR-59
+  - id: SWV-50
+    type: sw-verification
+    title: "Verification of SR-60: Const-expr fold equivalence-checked against certified QF_BV (ordeal)"
+    description: >
+      Verifies SR-60 via meld-core/src/segments.rs::ordeal_fold_proof (9 tests,
+      test-only + one dev-dep `ordeal 0.18`). Harness A (64 boundary-biased cases
+      per width) encodes each extended-const to bytes with wasm_encoder, drives
+      the SHIPPED fold (parse_const_expr_with_value → fold_extended_const_i32/i64),
+      builds an independent QF_BV term, and asserts ordeal::Solver::prove_equiv is
+      Unsat with cert.recheck() passing (Unknown = hard failure; certificate
+      non-vacuous — ordeal-lrat requires deriving the empty clause). Harness B
+      cross-checks eval_ext_const_i32_with_base. Negative controls (asserted SAT):
+      the #338 `base + 16 == base` truncation refuted symbolically over free base,
+      swapped-sub, and off-by-one add. wasmtime anchoring: 3 wrap-boundary cases.
+      DISCRIMINATION PROVEN by mutation: injecting wrapping→saturating at each of
+      the three fold sites turns the matching harness RED (each caught, reverted).
+      Exercises shipped code, not a re-implementation. Full suite 815/45/0.
+    status: implemented
+    fields:
+      method: automated-test
+    links:
+      - type: verifies
+        target: SR-60
+  - id: SWV-51
+    type: sw-verification
+    title: "Verification of SR-63: Embedder-provided allocator seam survives fusion"
+    description: >
+      Verifies SR-63 via meld-core/tests/rebasing_end_to_end.rs. Oracle
+      test_301_embedder_arena_seam_survives_fusion_differential: two synthetic
+      arena core modules each importing env::__cabi_arena_realloc are fused under
+      SharedMemory + address_rebasing, then asserts (a) the fused core validates
+      (wasmparser all-features), (b) the import is RETAINED — an import-symbol
+      scan finds exactly ONE unresolved env::__cabi_arena_realloc (the two dedup
+      onto one seam, first-wins, not bound to a provider nor dropped), and (c)
+      DIFFERENTIAL EXECUTION on wasmtime with a host bump-arena via Linker: fused
+      return values, handed-out pointer sequence, and in-memory sentinel
+      placement all equal the unfused components run through the same host arena
+      (a_run != b_run, independently wired). A companion
+      test_301_embedder_arena_seam_nonzero_base_requires_relocs pins that module
+      B is placed at a non-zero base (0x10000) and hard-fails MissingRelocMetadata
+      without relocs — anti-vacuity for (c)'s sentinel-at-address check. SCOPE:
+      proves meld's pass-through plumbing with synthetic WAT; the real
+      forked-toolchain artifact path (wit-bindgen#4 / wasm-tools#2) is a
+      documented follow-up, not claimed here. Full suite 817/45/0.
+    status: implemented
+    fields:
+      method: automated-test
+    links:
+      - type: verifies
+        target: SR-63
+  - id: SWV-52
+    type: sw-verification
+    title: "Verification of SR-61: Fused output passes scry abstract interpretation"
+    description: >
+      Verifies SR-61 via .github/workflows/scry-gate.yml, which ran GREEN in CI on
+      PR #374 (the gate's first CI run — a gate never run in CI is not verified).
+      The job builds scry-viz (pinned SCRY_REF v3.2.4), fuses
+      tests/wit_bindgen/fixtures/strings-simple.wasm, and runs `scry-viz check`
+      (586 functions / 7070 program points / 464 call edges well-formed, exit 0),
+      with a non-vacuity guard (function count > 0, captured from stderr) and a
+      negative control (truncated wasm → exit 3 → red). Catches structural
+      corruption the wasm validator does not.
+    status: implemented
+    fields:
+      method: automated-test
+    links:
+      - type: verifies
+        target: SR-61
+  - id: SWV-53
+    type: sw-verification
+    title: "Verification of SR-62: Fused output is witness-instrumentable, zero MC/DC gap"
+    description: >
+      Verifies SR-62 via .github/workflows/witness-gate.yml, which ran GREEN in CI
+      on PR #374 (first CI run). The job builds witness (pinned WITNESS_REF
+      v0.41.0), fuses an import-free seam fixture (tests/gate/, `--preserve-names`),
+      instruments, runs `--invoke-all`, and gates on 100% branch coverage (2/2
+      edges of the seam decision) with zero unresolved MC/DC gap rows, plus a
+      branch-count>=1 and report-format guard; negative controls (simulated 1 gap,
+      1/2 coverage) trip red. Documented limitation: single-condition seam →
+      MC/DC == branch coverage; rich multi-condition MC/DC needs a rustc-built
+      fixture (follow-up).
+    status: implemented
+    fields:
+      method: automated-test
+    links:
+      - type: verifies
+        target: SR-62

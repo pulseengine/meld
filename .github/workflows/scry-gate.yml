@@ -1,0 +1,61 @@
+name: Scry Robustness Gate
+
+# Sound abstract interpretation over a FUSED meld output (meld#302 Track C3,
+# SR-61) — the DO-333 leg of the verification chain. Builds `scry-viz` from a
+# pinned source ref, fuses the real wit_bindgen `strings-simple` fixture with
+# meld, then runs `scry-viz check` — sound over-approximating abstract
+# interpretation over the fused core module — asserting a structurally
+# well-formed result. Red on any malformed result or analyzer crash. Mirrors the
+# org exemplar (pulseengine/wohl scry-gate) build-tool-from-source pattern.
+#
+# Scry does NOT execute the module, so the residual wasi:* imports the real
+# fixture carries are harmless (contrast the witness gate, which executes and so
+# needs an import-free fixture). All inputs are files/metadata; no untrusted
+# free-form PR text is read in `run:` blocks.
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: scry-gate-${{ github.head_ref || github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'workflow_dispatch' }}
+
+permissions:
+  contents: read
+
+env:
+  # Pinned to the scry release tested against locally (586 functions, exit 0).
+  # Bump via PR.
+  SCRY_REF: v3.2.4
+
+jobs:
+  scry:
+    name: Scry sound-AI (fused meld output)
+    runs-on: [self-hosted, linux, x64, rust-cpu]
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: meld
+      - uses: actions/checkout@v4
+        with:
+          repository: pulseengine/scry
+          path: scry
+          ref: ${{ env.SCRY_REF }}
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: scry
+          key: scry-build
+      - name: Build scry-viz
+        run: cargo build --release -p scry-sai-viz --bin scry-viz --manifest-path scry/Cargo.toml
+      - name: Build meld
+        run: cargo build --release --bin meld --manifest-path meld/Cargo.toml
+      - name: Scry robustness gate on a fused meld output
+        env:
+          MELD: ${{ github.workspace }}/meld/target/release/meld
+          SCRY: ${{ github.workspace }}/scry/target/release/scry-viz
+        run: meld/tests/gate/run-scry.sh

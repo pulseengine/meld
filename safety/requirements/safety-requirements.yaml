@@ -2408,7 +2408,7 @@ artifacts:
       symbolically refute the #338 truncation (`prove_equiv(base + N, base)` →
       SAT with witness) and a mutated fold. Closes the #338 silent-miscompile
       class with proof rather than examples (#344).
-    status: proposed
+    status: verified
     tags: [const-expr, verification-hardening, smt, ordeal, correctness]
     release: v0.45.0
     links:
@@ -2450,7 +2450,7 @@ artifacts:
       fused core modules (#302 Track C). This is a wasm-level verification gate on
       the actual product (meld fuses wasm in/out but currently runs no wasm-level
       verification).
-    status: proposed
+    status: verified
     tags: [ci-gate, wasm-verification, scry, abstract-interpretation, do-333]
     release: v0.45.0
     links:
@@ -2485,7 +2485,7 @@ artifacts:
       since hand-written WAT yields zero recoverable decisions, and the fused
       real wit-bindgen output retains wasi imports the core runner cannot stub —
       witness#180).
-    status: proposed
+    status: verified
     tags: [ci-gate, wasm-verification, witness, mcdc, do-178c]
     release: v0.45.0
     links:
@@ -2527,7 +2527,7 @@ artifacts:
       `--import-passthrough`) is NOT covered in-repo and is tracked as a
       follow-up. `--output component` re-exposure (component_wrap arm, Gap B) is
       out of scope here.
-    status: proposed
+    status: verified
     tags: [resolver, embedder-passthrough, mcu, shared-memory, grow-free]
     release: v0.45.0
     links:

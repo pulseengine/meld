@@ -4,6 +4,35 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.45.0] - 2026-08-13
+
+Verification-hardening release: wasm-level CI gates on fused output, an
+SMT-proof harness for the const-expr folder, and a differential oracle for the
+MCU embedder seam. No production behavior change — this release adds evidence.
+
+### Added
+- **`ordeal` SMT proof harness for const-expr folding (SR-60, #344)** — meld's
+  shipped extended-const fold (`fold_extended_const_i32/i64`,
+  `eval_ext_const_i32_with_base`) is now equivalence-checked against a
+  certificate-checked QF_BV SMT reference (`ordeal`), closing the #338
+  silent-miscompile class by proof: `prove_equiv` must return UNSAT with a
+  re-checked LRAT certificate for every generated extended-const, and negative
+  controls symbolically refute the #338 truncation. Discrimination proven by
+  mutation (wrapping→saturating at each fold site turns the harness red).
+- **scry abstract-interpretation CI gate (SR-61, #302)** — `scry-gate.yml` runs
+  `scry-viz check` on a fused core module (well-formed program points + call
+  edges), catching structural corruption the wasm validator does not.
+- **witness MC/DC CI gate (SR-62, #302)** — `witness-gate.yml` instruments a
+  fused import-free seam fixture and gates on 100% branch coverage with zero
+  unresolved MC/DC gap rows. Day-one this is a pipeline + no-regression gate;
+  rich multi-condition MC/DC needs a rustc-built fixture (follow-up).
+- **Embedder-arena seam differential oracle (SR-63, #301)** — proves the
+  `env::__cabi_arena_realloc` grow-free MCU seam survives fusion: the import is
+  retained (deduped to one), and fused execution matches unfused on return
+  values, pointer sequence, and in-memory placement (host arena via wasmtime
+  `Linker`). Synthetic-WAT scope; the forked-toolchain artifact path is a
+  documented follow-up.
+
 ## [0.44.0] - 2026-08-12
 
 Two silent-corruption fixes in the cross-component adapter and the shared-memory
