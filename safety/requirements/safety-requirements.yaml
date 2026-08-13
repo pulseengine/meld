@@ -2584,6 +2584,53 @@ artifacts:
         - "https://github.com/pulseengine/meld/issues/298"
         - "https://github.com/pulseengine/meld/issues/299"
 
+  - id: SR-64
+    type: sw-req
+    title: Embedded, queryable CLI documentation with a coverage invariant
+    description: >
+      The meld CLI shall carry its own documentation compiled INTO the binary
+      (offline, air-gapped by construction) and expose it queryably:
+      `meld docs` lists topics, `meld docs <topic>` shows one, `--grep <q>`
+      searches titles and bodies, and `--format json` emits the list (or a
+      single topic, with its body) for machine consumption — modelled on
+      `rivet docs` and mirroring varve's REQ-DOCS-001. Coverage is a mechanical
+      invariant: every top-level CLI subcommand shall have a documented topic
+      whose slug equals the clap subcommand name, checked by
+      `meld docs check --coverage` (`--strict` exits non-zero — the CI gate)
+      and by a unit test that enumerates the subcommands via
+      `clap::CommandFactory`, so an undocumented subcommand cannot ship. Concept
+      topics (fusion, memory-strategies, address-rebasing, pack-rebase,
+      adapters, attestation, provenance) document meld's domain alongside the
+      per-subcommand topics.
+    status: verified
+    tags: [cli, documentation, coverage-gate, air-gapped, aspice]
+    release: v0.47.0
+    links:
+      - type: derives-from
+        target: SYS-11
+    cited-source:
+      - uri: "https://github.com/pulseengine/varve"
+        kind: github
+        last-checked: 2026-08-13
+    fields:
+      implementation:
+        - meld-cli/src/docs.rs
+        - meld-cli/src/main.rs
+        - meld-cli/docs/
+      verification-method: automated-test
+      verification-description: >
+        PROPOSED. The `meld-cli` unit test
+        `docs::tests::every_cli_subcommand_has_a_documented_topic` builds the
+        clap command via `clap::CommandFactory`, calls `docs::coverage_gaps`,
+        and asserts it is empty — every subcommand (excluding clap's built-in
+        `help`) has a topic. Companion tests cover findable/greppable topics,
+        the JSON list and single-topic forms, the empty-object unknown-topic
+        path, and a "no topic body shorter than ~40 chars" floor. The same
+        `coverage_gaps` invariant is exposed at runtime as
+        `meld docs check --coverage --strict` for use as a CI gate.
+      references:
+        - "https://github.com/pulseengine/varve"
+
   - id: SR-65
     type: sw-req
     title: Pack-rebase reserves the true static extent (__heap_base) or refuses to compact

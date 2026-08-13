@@ -1100,3 +1100,27 @@ artifacts:
       run on the 6.6k-line merger.rs, #376) runtime-proved and then closed an
       imported-memory under-reserve regression in the first cut. Never silently
       under-reserves; supplier must export __heap_base for compaction.
+    status: implemented
+    fields:
+      method: automated-test
+    links:
+      - type: verifies
+        target: SR-65
+
+  - id: SWV-77
+    type: sw-verification
+    title: "Verification of SR-64: Embedded, queryable CLI documentation with a coverage invariant"
+    description: >
+      Verifies SR-64 via meld-cli/src/docs.rs::tests::every_cli_subcommand_has_a_documented_topic
+      (walks the clap command via CommandFactory -> coverage_gaps -> asserts
+      empty), plus findable/greppable, JSON list/single, unknown-topic {}, and
+      no-body-under-40-chars tests (6 tests, green). Runtime gate:
+      `meld docs check --coverage --strict` exits non-zero on any subcommand
+      without a topic. Topics are include_str!-embedded (offline). Mirrors varve
+      REQ-DOCS-001 / rivet docs.
+    status: implemented
+    fields:
+      method: automated-test
+    links:
+      - type: verifies
+        target: SR-64
