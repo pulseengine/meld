@@ -4581,6 +4581,189 @@ mod tests {
         assert_eq!(merged.imports[2].name, "imported_table");
     }
 
+    /// SR-8 — Correct function base offset calculation.
+    ///
+    /// Requirement: the merger computes each component's function base offset
+    /// as the cumulative sum of all preceding components' total function counts
+    /// (imports + defined functions). In a flat wasm index space ALL imports
+    /// are hoisted ahead of ALL defined functions (the module format requires
+    /// it), so the equivalent, mechanically-checkable invariant is:
+    ///
+    ///   fused_index(defined func at array position `p` of module M)
+    ///       = import_counts.func            // the whole hoisted import block
+    ///       + Σ(defined counts of every module merged before M)
+    ///       + p
+    ///
+    /// (SR-8's parenthetical "(imports + defined functions)" describes a
+    /// per-component `[imports][defined]` block layout that the flat wasm index
+    /// space cannot have; this test pins the equivalent correct invariant that
+    /// the implementation must satisfy — see merger.rs:1957-1966.)
+    ///
+    /// Three single-module components with KNOWN counts:
+    ///   comp 0: 1 func import + 2 defined
+    ///   comp 1: 0 imports    + 3 defined
+    ///   comp 2: 1 func import + 1 defined
+    /// Total hoisted func imports = 2; defined counts = [2, 3, 1].
+    /// Expected fused indices: comp0 defined -> [2, 3]; comp1 -> [4, 5, 6];
+    /// comp2 -> [7].
+    ///
+    /// Teeth: dropping the `import_counts.func` term (merger.rs:1961) makes
+    /// comp0 land at [0,1] not [2,3] -> red. Zeroing/ resetting `func_offset`
+    /// per module (losing the cumulative sum) makes comp1 land at [2,3,4] not
+    /// [4,5,6] -> red. An off-by-one in either term shifts the literals -> red.
+    /// A LATER component's import (comp2's) that fails to hoist into the front
+    /// block would leave comp0/comp1 defined indices unshifted -> red.
+    #[test]
+    fn sr8_function_base_offset_is_cumulative() {
+        use crate::parser::{FuncType, ModuleImport, ParsedComponent};
+        use crate::resolver::{DependencyGraph, UnresolvedImport};
+
+        // Build a single-module component: `import_count` unresolved func
+        // imports (module "env") followed by `defined_count` defined functions,
+        // all of the trivial `() -> ()` type 0. No code section is required —
+        // `extract_function_body` stubs an `unreachable` body when
+        // `code_section_range` is None, but `function_index_map` is populated
+        // in the merger's FIRST pass purely from `module.functions`, so the
+        // index arithmetic under test is exercised regardless.
+        fn make_component(import_count: u32, defined_count: u32) -> ParsedComponent {
+            let imports: Vec<ModuleImport> = (0..import_count)
+                .map(|i| ModuleImport {
+                    module: "env".to_string(),
+                    name: format!("host_fn_{i}"),
+                    kind: ImportKind::Function(0),
+                })
+                .collect();
+
+            let module = CoreModule {
+                index: 0,
+                bytes: Vec::new(),
+                types: vec![FuncType {
+                    params: vec![],
+                    results: vec![],
+                }],
+                imports,
+                exports: Vec::new(),
+                // `defined_count` defined functions, each of type 0.
+                functions: vec![0u32; defined_count as usize],
+                memories: vec![MemoryType {
+                    memory64: false,
+                    shared: false,
+                    initial: 1,
+                    maximum: None,
+                }],
+                tables: Vec::new(),
+                globals: Vec::new(),
+                start: None,
+                data_count: None,
+                element_count: 0,
+                custom_sections: Vec::new(),
+                code_section_range: None,
+                global_section_range: None,
+                element_section_range: None,
+                data_section_range: None,
+            };
+
+            ParsedComponent {
+                name: None,
+                core_modules: vec![module],
+                imports: Vec::new(),
+                exports: Vec::new(),
+                types: Vec::new(),
+                instances: Vec::new(),
+                canonical_functions: Vec::new(),
+                sub_components: Vec::new(),
+                component_aliases: Vec::new(),
+                component_instances: Vec::new(),
+                core_entity_order: Vec::new(),
+                component_func_defs: Vec::new(),
+                component_instance_defs: Vec::new(),
+                component_type_defs: Vec::new(),
+                original_size: 0,
+                original_hash: String::new(),
+                depth_0_sections: Vec::new(),
+                p3_async_features: Vec::new(),
+            }
+        }
+
+        // comp 0: 1 import + 2 defined; comp 1: 0 + 3; comp 2: 1 + 1.
+        let components = vec![
+            make_component(1, 2),
+            make_component(0, 3),
+            make_component(1, 1),
+        ];
+
+        // One UnresolvedImport per module func import, so the merger hoists
+        // them into the shared front import block.
+        let unresolved_imports = vec![
+            UnresolvedImport {
+                component_idx: 0,
+                module_idx: 0,
+                module_name: "env".to_string(),
+                field_name: "host_fn_0".to_string(),
+                kind: ImportKind::Function(0),
+                display_module: None,
+                display_field: None,
+            },
+            UnresolvedImport {
+                component_idx: 2,
+                module_idx: 0,
+                module_name: "env".to_string(),
+                field_name: "host_fn_0".to_string(),
+                kind: ImportKind::Function(0),
+                display_module: None,
+                display_field: None,
+            },
+        ];
+
+        let graph = DependencyGraph {
+            instantiation_order: vec![0, 1, 2],
+            resolved_imports: HashMap::new(),
+            adapter_sites: Vec::new(),
+            module_resolutions: Vec::new(),
+            resource_graph: None,
+            stream_pair_graph: None,
+            reexporter_components: Vec::new(),
+            reexporter_resources: Vec::new(),
+            unresolved_imports,
+        };
+
+        let merger = Merger::new(MemoryStrategy::MultiMemory, false);
+        let merged = merger
+            .merge(&components, &graph)
+            .expect("merge of three single-module components must succeed");
+
+        // Both host func imports are hoisted into the single front block.
+        assert_eq!(
+            merged.import_counts.func, 2,
+            "two unresolved func imports hoist into the front block"
+        );
+        // No synthetic functions were inserted between modules; the defined
+        // block is exactly 2 + 3 + 1. (Guards the hard-coded literals below
+        // against a future shim being minted mid-merge.)
+        assert_eq!(
+            merged.functions.len(),
+            6,
+            "defined function count is the plain sum 2 + 3 + 1"
+        );
+
+        // import_counts.func = 2 (whole hoisted import block).
+        //
+        // comp 0's 2 defined funcs have module-local indices 1,2 (after its 1
+        // local import). Cumulative preceding defined = 0. Fused = 2 + {0,1}.
+        assert_eq!(merged.function_index_map.get(&(0, 0, 1)), Some(&2));
+        assert_eq!(merged.function_index_map.get(&(0, 0, 2)), Some(&3));
+
+        // comp 1's 3 defined funcs (no local imports) have module-local indices
+        // 0,1,2. Cumulative preceding defined = 2. Fused = 2 + 2 + {0,1,2}.
+        assert_eq!(merged.function_index_map.get(&(1, 0, 0)), Some(&4));
+        assert_eq!(merged.function_index_map.get(&(1, 0, 1)), Some(&5));
+        assert_eq!(merged.function_index_map.get(&(1, 0, 2)), Some(&6));
+
+        // comp 2's 1 defined func has module-local index 1 (after its 1 local
+        // import). Cumulative preceding defined = 2 + 3 = 5. Fused = 2 + 5 + 0.
+        assert_eq!(merged.function_index_map.get(&(2, 0, 1)), Some(&7));
+    }
+
     // -----------------------------------------------------------------------
     // Import deduplication utility tests
     // -----------------------------------------------------------------------

@@ -210,10 +210,17 @@ artifacts:
     type: sw-req
     title: Correct function base offset calculation
     description: >
-      The merger shall compute each component's function base offset
-      as the cumulative sum of all preceding components' total function
-      counts (imports + defined functions).
-    status: implemented
+      The merger shall place each component's DEFINED functions at the
+      correct merged index: `import_counts.func` (the total imported-function
+      count across the fusion set) plus the cumulative sum of all preceding
+      components' DEFINED function counts, plus the function's position.
+      (Corrected 2026-08-13: the earlier "(imports + defined functions)"
+      per-component wording was inaccurate — a flat wasm index space cannot
+      have per-component `[imports][defined]` blocks; the format requires ALL
+      imports to precede ALL defined functions. The implementation was and is
+      correct; the requirement text is amended to the equivalent flat-index
+      invariant that `sr8_function_base_offset_is_cumulative` pins.)
+    status: verified
     tags: [stpa-derived]
     links:
       - type: derives-from
@@ -358,10 +365,17 @@ artifacts:
     title: Correct memory index usage in adapters
     description: >
       The adapter shall use the correct source and destination memory
-      indices for all memory.copy, i32.load, and i32.store instructions.
-      Source = caller's memory, destination = callee's memory for
-      arguments; reversed for return values.
-    status: implemented
+      indices. For `memory.copy`: source = caller's memory, destination =
+      callee's memory when marshalling ARGUMENTS into the callee buffer;
+      reversed (callee → caller) for the RETURN-value payload. The directional
+      `i32.load` / `i32.store` split holds on the RETURN path — result-area
+      loads read callee memory and retptr stores write caller memory.
+      (Corrected 2026-08-13: the argument-side loads/stores operate ENTIRELY
+      within the callee buffer already copied there, so the load/store
+      caller/callee split applies to the return path, not the argument path;
+      the earlier blanket "for arguments" wording was inaccurate. Pinned by
+      `sr14_adapter_memory_indices_caller_to_callee`.)
+    status: verified
     tags: [stpa-derived]
     links:
       - type: derives-from
@@ -481,7 +495,7 @@ artifacts:
       The adapter shall emit instructions in the correct order:
       cabi_realloc before memory.copy, memory.copy before callee
       function call.
-    status: implemented
+    status: verified
     tags: [stpa-derived]
     links:
       - type: derives-from

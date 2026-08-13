@@ -98,6 +98,7 @@ artifacts:
     title: "Verification of SR-8: Correct function base offset calculation"
     description: >
       Verifies SR-8 via: proofs `proofs/transformations/merge/`.
+      PLUS a direct mutation-verified test sr8_function_base_offset_is_cumulative (merger.rs) pinning base = import_counts.func + Σ preceding defined + position; SR-8 text amended 2026-08-13 to the flat-index invariant.
     status: implemented
     fields:
       method: formal-verification
@@ -170,6 +171,7 @@ artifacts:
     title: "Verification of SR-14: Correct memory index usage in adapters"
     description: >
       Verifies SR-14 via: proofs `proofs/adapter/`.
+      PLUS a direct test sr14_adapter_memory_indices_caller_to_callee (fact.rs) decoding memory.copy src_mem/dst_mem by name (args: caller->callee; return payload: callee->caller); SR-14 text amended 2026-08-13 to scope the load/store split to the return path.
     status: implemented
     fields:
       method: formal-verification
@@ -504,6 +506,7 @@ artifacts:
       Verifies SR-18 via runtime/e2e tests that exercise the full adapter
       instruction path (`meld-core/tests/wit_bindgen_runtime.rs` suite) plus
       code inspection of the emission order in `meld-core/src/adapter/fact.rs`.
+      PLUS a direct structural test sr18_adapter_emits_realloc_before_copy_before_call (fact.rs) decoding the adapter and asserting cabi_realloc call < memory.copy < callee call (mutation-verified) — upgrades inspection to mechanically-checked.
     status: implemented
     fields:
       method: automated-test
