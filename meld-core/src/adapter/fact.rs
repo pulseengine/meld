@@ -13988,6 +13988,345 @@ mod tests {
         );
     }
 
+    // === SR-14 / SR-18 structural adapter fixtures ============================
+    //
+    // Distinct, non-adjacent merged indices so the two `call` targets and the
+    // two memories are unambiguously identifiable in the decoded body.
+    const SR_CALLER_MEM: u32 = 0;
+    const SR_CALLEE_MEM: u32 = 2;
+    const SR_TARGET_FUNC: u32 = 0;
+    const SR_CALLEE_REALLOC: u32 = 5;
+
+    /// Build a MergedModule + sync cross-memory AdapterSite that takes the
+    /// **params-ptr** convention (caller lowers all params behind a single
+    /// pointer into caller memory; the adapter must allocate a buffer in callee
+    /// memory, `memory.copy` the buffer across, then call the callee). No
+    /// pointer pairs inside the buffer -> the minimal shape: exactly one
+    /// `cabi_realloc` call, one bulk `memory.copy`, one callee call.
+    fn sr_params_ptr_merged_and_site() -> (crate::merger::MergedModule, crate::resolver::AdapterSite)
+    {
+        use crate::merger::{MergedFuncType, MergedFunction};
+        let mut merged = empty_merged();
+
+        // type 0: caller (params_ptr: i32) -> ()   [lowered params-ptr]
+        merged.types.push(MergedFuncType {
+            params: vec![wasm_encoder::ValType::I32],
+            results: vec![],
+        });
+        // type 1: callee (params_ptr: i32) -> ()   [lifted params-ptr]
+        merged.types.push(MergedFuncType {
+            params: vec![wasm_encoder::ValType::I32],
+            results: vec![],
+        });
+
+        // Defined functions 0..=SR_CALLEE_REALLOC. import_counts.func == 0, so
+        // defined_func(i) == functions[i]. Target lives at 0 (callee type 1);
+        // the callee realloc lives at 5 (non-adjacent).
+        for _ in 0..=SR_CALLEE_REALLOC {
+            merged.functions.push(MergedFunction {
+                type_idx: 1, // callee params-ptr type; only the target's is read
+                body: wasm_encoder::Function::new([]),
+                origin: (1, 0, 0),
+                synthetic_kind: None,
+            });
+        }
+        // Target export resolves via (to_component, to_module, export_func_idx).
+        merged.function_index_map.insert((1, 0, 0), SR_TARGET_FUNC);
+        // Caller type resolves via type_index_map[(from_comp, from_mod, local)].
+        merged.type_index_map.insert((0, 0, 0), 0);
+
+        // Two distinct memories: caller=0, callee=2.
+        merged.memory_index_map.insert((0, 0, 0), SR_CALLER_MEM);
+        merged.memory_index_map.insert((1, 0, 0), SR_CALLEE_MEM);
+        // Callee cabi_realloc for the cross-memory buffer allocation.
+        merged.realloc_map.insert((1, 0), SR_CALLEE_REALLOC);
+
+        let mut site = crate::resolver::AdapterSite {
+            from_component: 0,
+            from_module: 0,
+            import_name: "params-ptr-call".into(),
+            import_module: "test:dep/iface".into(),
+            import_func_type_idx: Some(0),
+            to_component: 1,
+            to_module: 0,
+            export_name: "params-ptr-call".into(),
+            export_func_idx: 0,
+            crosses_memory: true,
+            is_async_lift: false,
+            requirements: Default::default(),
+        };
+        // A >16-flat-param buffer lives behind one pointer; no inner pointer
+        // pairs -> the clean realloc + bulk-copy + call shape.
+        site.requirements.params_area_byte_size = Some(64);
+        site.requirements.params_area_max_align = 8;
+
+        (merged, site)
+    }
+
+    /// Build a MergedModule + sync cross-memory AdapterSite that takes the
+    /// **retptr** convention (callee returns a return-area pointer into CALLEE
+    /// memory; the adapter copies the return area back to the caller's retptr
+    /// buffer in CALLER memory — the REVERSED memory direction of the args
+    /// copy). No result pointer pairs -> the bulk return-area copy shape.
+    fn sr_retptr_merged_and_site() -> (crate::merger::MergedModule, crate::resolver::AdapterSite) {
+        use crate::merger::{MergedFuncType, MergedFunction};
+        let mut merged = empty_merged();
+
+        // type 0: caller (retptr: i32) -> ()
+        merged.types.push(MergedFuncType {
+            params: vec![wasm_encoder::ValType::I32],
+            results: vec![],
+        });
+        // type 1: callee () -> i32  (returns the return-area pointer)
+        merged.types.push(MergedFuncType {
+            params: vec![],
+            results: vec![wasm_encoder::ValType::I32],
+        });
+        // Target (lifted callee) at merged index 0 (type 1); a caller
+        // cabi_realloc at merged index 3 (non-adjacent) for the result buffer.
+        const SR_CALLER_REALLOC: u32 = 3;
+        for _ in 0..=SR_CALLER_REALLOC {
+            merged.functions.push(MergedFunction {
+                type_idx: 1,
+                body: wasm_encoder::Function::new([]),
+                origin: (1, 0, 0),
+                synthetic_kind: None,
+            });
+        }
+        merged.function_index_map.insert((1, 0, 0), 0);
+        merged.type_index_map.insert((0, 0, 0), 0);
+        merged.memory_index_map.insert((0, 0, 0), SR_CALLER_MEM);
+        merged.memory_index_map.insert((1, 0, 0), SR_CALLEE_MEM);
+        // Caller realloc allocates the copied-back result buffer in caller mem.
+        merged.realloc_map.insert((0, 0), SR_CALLER_REALLOC);
+
+        let mut site = crate::resolver::AdapterSite {
+            from_component: 0,
+            from_module: 0,
+            import_name: "retptr-call".into(),
+            import_module: "test:dep/iface".into(),
+            import_func_type_idx: Some(0),
+            to_component: 1,
+            to_module: 0,
+            export_name: "retptr-call".into(),
+            export_func_idx: 0,
+            crosses_memory: true,
+            is_async_lift: false,
+            requirements: Default::default(),
+        };
+        // retptr convention returning a single `(ptr, len)` string. The result
+        // pointer pair drives the directional result path: load ptr/len FROM the
+        // callee return area, `memory.copy` the payload callee -> caller, then
+        // store the fixed-up (ptr, len) INTO the caller's retptr buffer. This
+        // exercises BOTH the reversed `memory.copy` and the reversed
+        // `i32.load`(callee) / `i32.store`(caller) directions of SR-14.
+        site.requirements.return_area_byte_size = Some(8);
+        site.requirements.result_pointer_pair_offsets = vec![0];
+        site.requirements.result_copy_layouts =
+            vec![crate::resolver::CopyLayout::Bulk { byte_multiplier: 1 }];
+        site.requirements.return_area_slots = vec![crate::resolver::ReturnAreaSlot {
+            byte_offset: 0,
+            byte_size: 4,
+            is_pointer_pair: true,
+        }];
+
+        (merged, site)
+    }
+
+    /// Decoded, owned view of the operators an adapter body needs for the
+    /// SR-14/SR-18 structural checks. Positions are operator indices so
+    /// ordering can be asserted. `memory.copy` fields are destructured BY NAME
+    /// (`dst_mem` / `src_mem`) — the binary encoding is `0xFC 0x0A <dst> <src>`
+    /// (destination first, see the comment at the stackful test above), and
+    /// `wasm_encoder`'s constructor lists `src_mem` first, so a positional
+    /// decode here would silently assert the REVERSE property.
+    struct DecodedAdapter {
+        /// (op_index, dst_mem, src_mem)
+        memcopies: Vec<(usize, u32, u32)>,
+        /// (op_index, function_index)
+        calls: Vec<(usize, u32)>,
+        /// (op_index, memory_index)
+        loads: Vec<(usize, u32)>,
+        /// (op_index, memory_index)
+        stores: Vec<(usize, u32)>,
+    }
+
+    fn decode_adapter(
+        site: crate::resolver::AdapterSite,
+        merged: crate::merger::MergedModule,
+    ) -> DecodedAdapter {
+        use wasmparser::Operator;
+        let gen_ = FactStyleGenerator::new(AdapterConfig::default());
+        let empty = std::collections::HashMap::new();
+        let adapter = gen_
+            .generate_adapter(&site, &merged, 0, &empty, &empty)
+            .expect("adapter must generate");
+        let raw = adapter.body.into_raw_body();
+        let fb = wasmparser::FunctionBody::new(wasmparser::BinaryReader::new(&raw, 0));
+        let mut out = DecodedAdapter {
+            memcopies: Vec::new(),
+            calls: Vec::new(),
+            loads: Vec::new(),
+            stores: Vec::new(),
+        };
+        for (i, op) in fb.get_operators_reader().unwrap().into_iter().enumerate() {
+            match op.expect("operator") {
+                // Destructure by field name — see DecodedAdapter doc comment.
+                Operator::MemoryCopy { dst_mem, src_mem } => {
+                    out.memcopies.push((i, dst_mem, src_mem))
+                }
+                Operator::Call { function_index } => out.calls.push((i, function_index)),
+                Operator::I32Load { memarg }
+                | Operator::I32Load8U { memarg }
+                | Operator::I32Load16U { memarg } => out.loads.push((i, memarg.memory)),
+                Operator::I32Store { memarg }
+                | Operator::I32Store8 { memarg }
+                | Operator::I32Store16 { memarg } => out.stores.push((i, memarg.memory)),
+                _ => {}
+            }
+        }
+        out
+    }
+
+    /// SR-18 — Adapter instruction ordering (converts the inspection-only
+    /// requirement into a mechanically-checked test).
+    ///
+    /// Requirement: the adapter emits `cabi_realloc` BEFORE `memory.copy`, and
+    /// `memory.copy` BEFORE the callee call. Decodes the params-ptr adapter
+    /// (alloc callee buffer -> bulk-copy args across -> call callee) and pins
+    /// the operator order.
+    ///
+    /// Teeth: the two `call`s are identified by their DISTINCT, non-adjacent
+    /// merged indices (realloc = 5, callee = 0), so a swap can't alias. Moving
+    /// the Phase-2 `memory.copy` above the Phase-1 `emit_checked_realloc` in
+    /// `emit_params_area_copy`, or moving the callee call ahead of the copy,
+    /// reorders these positions -> red.
+    #[test]
+    fn sr18_adapter_emits_realloc_before_copy_before_call() {
+        let (merged, site) = sr_params_ptr_merged_and_site();
+        let d = decode_adapter(site, merged);
+
+        // Exactly one bulk copy and exactly two calls (realloc + callee): the
+        // minimal no-inner-pointer shape. Guards against a future shape change
+        // silently invalidating the ordering literals.
+        assert_eq!(
+            d.memcopies.len(),
+            1,
+            "params-ptr adapter must emit exactly one bulk memory.copy; got {:?}",
+            d.memcopies
+        );
+        assert_eq!(
+            d.calls.len(),
+            2,
+            "params-ptr adapter must emit exactly two calls (cabi_realloc + \
+             callee); got {:?}",
+            d.calls
+        );
+
+        let (copy_pos, _dst, _src) = d.memcopies[0];
+        let realloc_call = d
+            .calls
+            .iter()
+            .find(|(_, f)| *f == SR_CALLEE_REALLOC)
+            .expect("a call to the callee cabi_realloc (fn 5) must be present");
+        let target_call = d
+            .calls
+            .iter()
+            .find(|(_, f)| *f == SR_TARGET_FUNC)
+            .expect("a call to the callee target (fn 0) must be present");
+
+        assert!(
+            realloc_call.0 < copy_pos,
+            "SR-18: cabi_realloc (op {}) must precede memory.copy (op {})",
+            realloc_call.0,
+            copy_pos
+        );
+        assert!(
+            copy_pos < target_call.0,
+            "SR-18: memory.copy (op {}) must precede the callee call (op {})",
+            copy_pos,
+            target_call.0
+        );
+    }
+
+    /// SR-14 — Correct memory index usage in adapters (structural assertion
+    /// complementing the cross-memory runtime differentials in
+    /// `wit_bindgen_runtime.rs`).
+    ///
+    /// Requirement: for arguments, `memory.copy` source = caller memory,
+    /// destination = callee memory; for return values the direction is
+    /// reversed, and the same directions govern the `i32.load` / `i32.store`
+    /// used to read the callee return area and write the caller retptr buffer.
+    ///
+    /// Args side (params-ptr adapter): the bulk buffer copy is caller -> callee.
+    /// Result side (retptr adapter, single `(ptr,len)` string result): the
+    /// payload copy is callee -> caller; the ptr/len are LOADED from the callee
+    /// return area and STORED into the caller retptr buffer.
+    ///
+    /// Teeth: memories are asymmetric and non-adjacent (caller = 0, callee = 2)
+    /// and the expected indices are literals, NOT re-derived from the
+    /// `memory_index_map` the fixture populated. Swapping `src_mem`/`dst_mem` at
+    /// fact.rs:6779-6780 (args) or 7491-7493 (result), or using the wrong
+    /// `memory_index` on the result load/store, flips a literal -> red.
+    #[test]
+    fn sr14_adapter_memory_indices_caller_to_callee() {
+        // --- Arguments: caller -> callee ---
+        let (merged, site) = sr_params_ptr_merged_and_site();
+        let args = decode_adapter(site, merged);
+        assert_eq!(
+            args.memcopies.len(),
+            1,
+            "params-ptr args adapter must emit exactly one memory.copy; got {:?}",
+            args.memcopies
+        );
+        let (_, dst, src) = args.memcopies[0];
+        assert_eq!(
+            (src, dst),
+            (SR_CALLER_MEM, SR_CALLEE_MEM),
+            "SR-14 args: memory.copy source must be caller memory ({SR_CALLER_MEM}) \
+             and destination callee memory ({SR_CALLEE_MEM}); got src={src}, dst={dst}"
+        );
+
+        // --- Return values: reversed (callee -> caller), incl. load/store ---
+        let (merged, site) = sr_retptr_merged_and_site();
+        let ret = decode_adapter(site, merged);
+        assert_eq!(
+            ret.memcopies.len(),
+            1,
+            "retptr result adapter must emit exactly one payload memory.copy; got {:?}",
+            ret.memcopies
+        );
+        let (_, dst, src) = ret.memcopies[0];
+        assert_eq!(
+            (src, dst),
+            (SR_CALLEE_MEM, SR_CALLER_MEM),
+            "SR-14 results: memory.copy direction must be REVERSED — source callee \
+             memory ({SR_CALLEE_MEM}), destination caller memory ({SR_CALLER_MEM}); \
+             got src={src}, dst={dst}"
+        );
+        // Every result-area load reads from callee memory; every retptr store
+        // writes to caller memory. (Non-empty so the assertion has bite.)
+        assert!(
+            !ret.loads.is_empty() && !ret.stores.is_empty(),
+            "retptr result path must emit i32.load (callee) and i32.store (caller); \
+             loads={:?}, stores={:?}",
+            ret.loads,
+            ret.stores
+        );
+        assert!(
+            ret.loads.iter().all(|(_, m)| *m == SR_CALLEE_MEM),
+            "SR-14 results: return-area i32.load must read CALLEE memory \
+             ({SR_CALLEE_MEM}); got {:?}",
+            ret.loads
+        );
+        assert!(
+            ret.stores.iter().all(|(_, m)| *m == SR_CALLER_MEM),
+            "SR-14 results: retptr i32.store must write CALLER memory \
+             ({SR_CALLER_MEM}); got {:?}",
+            ret.stores
+        );
+    }
+
     /// Build a merged module + async-lift site for a SINGLE top-level
     /// `(ptr, len)` STRING RESULT crossing memory (caller has a retptr param,
     /// the lift returns void and writes the result via task.return globals),

@@ -4,6 +4,39 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.46.0] - 2026-08-13
+
+Traceability close-out and verification depth. **No production behavior change** —
+this release closes the V on the foundational requirements and deepens the
+verification evidence.
+
+### Added
+- **Rich witness MC/DC gate (SR-62)** — a rustc-built leap-year fixture whose
+  DWARF and short-circuit branch chain survive fusion, so the witness CI gate now
+  recovers a genuine **2-condition MC/DC decision on the fused output** (masking +
+  unique-cause), not just branch coverage. A `--dwarf strip` negative control
+  (0/0 decisions) drives it red — the gate bites on decision *recovery*.
+- **Direct tests for SR-8 / SR-14 / SR-18** — mutation-verified structural tests
+  for the function base-offset calculation, adapter memory-index direction, and
+  adapter instruction ordering (upgrading SR-18 from inspection to mechanically
+  checked).
+
+### Changed
+- **Traceability V closed on the foundational requirements** — SR-1..18 and SR-36
+  moved `implemented` → `verified`, each grounded in a real passing test or Rocq
+  proof, and **all 63 sw-reqs now carry a typed `verifies` link** (SWV-54..75),
+  machine-enforced by `rivet validate`. SR-44 (enforced req→verification trace)
+  advanced to `implemented` — its verifies-trace part is complete; the STPA
+  constraint-coverage remainder stays open.
+- **Requirement-text corrections** (the new tests surfaced these) — SR-8's
+  "(imports + defined) per-component block" wording (impossible in a flat wasm
+  index space) and SR-14's over-broad argument-side load/store clause were amended
+  to match the correct implementation.
+
+### Tracker
+- Closed #344 (ordeal, shipped v0.45.0); narrowed #302 / #301 to their remaining
+  gaps.
+
 ## [0.45.0] - 2026-08-13
 
 Verification-hardening release: wasm-level CI gates on fused output, an

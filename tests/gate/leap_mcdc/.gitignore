@@ -1,0 +1,6 @@
+# Local build noise from build.sh. The built component is force-added at
+# ../leap_component.wasm (outside this dir); nothing here is tracked.
+/target/
+*.wasm
+# Zero external deps — the lock only pins this crate itself; not worth tracking.
+Cargo.lock

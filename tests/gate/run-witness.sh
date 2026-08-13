@@ -9,10 +9,11 @@
 #
 # The fixture's decision is a single `result > 40` guard, so MC/DC == branch
 # coverage here (witness recovers 0 multi-condition decisions; the mcdc report
-# is 0/0 decisions, 0 gap BY CONSTRUCTION). Rich multi-condition MC/DC needs a
-# rustc-built fixture — short-circuit && hand-written in WAT is not fully
-# coverable under witness's condition-to-branch model (the masked condition is
-# recorded absent, not F) — and is tracked as the SR-62 follow-up.
+# is 0/0 decisions, 0 gap BY CONSTRUCTION). Short-circuit && hand-written in WAT
+# is not fully coverable under witness's condition-to-branch model (the masked
+# condition is recorded absent, not F), which is why RICH multi-condition MC/DC
+# uses a rustc-built fixture instead — see tests/gate/run-witness-mcdc.sh and
+# tests/gate/leap_mcdc/ (the SR-62 follow-up, now delivered).
 #
 # This gate is therefore a PIPELINE + BRANCH-COVERAGE no-regression guard with
 # real teeth:

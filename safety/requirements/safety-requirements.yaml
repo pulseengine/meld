@@ -25,7 +25,7 @@ artifacts:
     description: >
       The parser shall extract all core modules from a component,
       including those nested within component instances at any depth.
-    status: implemented
+    status: verified
     tags: [stpa-derived]
     links:
       - type: derives-from
@@ -48,7 +48,7 @@ artifacts:
     description: >
       The parser shall extract every import and export entry declared
       by a component, preserving names, types, and kind.
-    status: implemented
+    status: verified
     tags: [stpa-derived]
     links:
       - type: derives-from
@@ -69,7 +69,7 @@ artifacts:
       canonical_abi_element_size shall return the correctly aligned
       element size for all Canonical ABI types, including records with
       heterogeneous field alignments.
-    status: implemented
+    status: verified
     tags: [stpa-derived]
     links:
       - type: derives-from
@@ -97,7 +97,7 @@ artifacts:
       The parser shall reject components that do not pass wasmparser
       validation with feature flags locked to the Component Model
       baseline spec.
-    status: implemented
+    status: verified
     tags: [stpa-derived]
     links:
       - type: derives-from
@@ -124,7 +124,7 @@ artifacts:
       The resolver shall match every import to exactly one export with
       a matching interface name and compatible type. Ambiguous matches
       (multiple exports with the same name) shall produce an error.
-    status: implemented
+    status: verified
     tags: [stpa-derived]
     links:
       - type: derives-from
@@ -151,7 +151,7 @@ artifacts:
       type into the correct CopyLayout. Types with inner pointer fields
       (strings, lists, records containing pointers) shall be classified
       as Elements with inner_pointers, not as Bulk.
-    status: implemented
+    status: verified
     tags: [stpa-derived]
     links:
       - type: derives-from
@@ -181,7 +181,7 @@ artifacts:
       component appears after all components it imports from. Dependency
       cycles shall be detected and reported as an error (or handled by
       cycle-tolerant sort with documented semantics).
-    status: implemented
+    status: verified
     tags: [stpa-derived]
     links:
       - type: derives-from
@@ -210,10 +210,17 @@ artifacts:
     type: sw-req
     title: Correct function base offset calculation
     description: >
-      The merger shall compute each component's function base offset
-      as the cumulative sum of all preceding components' total function
-      counts (imports + defined functions).
-    status: implemented
+      The merger shall place each component's DEFINED functions at the
+      correct merged index: `import_counts.func` (the total imported-function
+      count across the fusion set) plus the cumulative sum of all preceding
+      components' DEFINED function counts, plus the function's position.
+      (Corrected 2026-08-13: the earlier "(imports + defined functions)"
+      per-component wording was inaccurate — a flat wasm index space cannot
+      have per-component `[imports][defined]` blocks; the format requires ALL
+      imports to precede ALL defined functions. The implementation was and is
+      correct; the requirement text is amended to the equivalent flat-index
+      invariant that `sr8_function_base_offset_is_cumulative` pins.)
+    status: verified
     tags: [stpa-derived]
     links:
       - type: derives-from
@@ -237,7 +244,7 @@ artifacts:
       The rewriter shall remap indices in all instruction types that
       reference functions, memories, tables, globals, or types. This
       includes multi-index instructions (memory.copy, memory.init).
-    status: implemented
+    status: verified
     tags: [stpa-derived]
     links:
       - type: derives-from
@@ -267,7 +274,7 @@ artifacts:
       The merger shall reindex data segment memory indices, element
       segment table indices, and global indices in init expressions
       using the correct per-kind base offset.
-    status: implemented
+    status: verified
     tags: [stpa-derived]
     links:
       - type: derives-from
@@ -290,7 +297,7 @@ artifacts:
     description: >
       The merger shall process components in the same order as the
       resolver's topological sort output.
-    status: implemented
+    status: verified
     tags: [stpa-derived]
     links:
       - type: derives-from
@@ -358,10 +365,17 @@ artifacts:
     title: Correct memory index usage in adapters
     description: >
       The adapter shall use the correct source and destination memory
-      indices for all memory.copy, i32.load, and i32.store instructions.
-      Source = caller's memory, destination = callee's memory for
-      arguments; reversed for return values.
-    status: implemented
+      indices. For `memory.copy`: source = caller's memory, destination =
+      callee's memory when marshalling ARGUMENTS into the callee buffer;
+      reversed (callee → caller) for the RETURN-value payload. The directional
+      `i32.load` / `i32.store` split holds on the RETURN path — result-area
+      loads read callee memory and retptr stores write caller memory.
+      (Corrected 2026-08-13: the argument-side loads/stores operate ENTIRELY
+      within the callee buffer already copied there, so the load/store
+      caller/callee split applies to the return path, not the argument path;
+      the earlier blanket "for arguments" wording was inaccurate. Pinned by
+      `sr14_adapter_memory_indices_caller_to_callee`.)
+    status: verified
     tags: [stpa-derived]
     links:
       - type: derives-from
@@ -412,7 +426,7 @@ artifacts:
       each inner pointer to reference the destination memory. The loop
       stride shall equal canonical_abi_element_size. The loop shall
       process exactly element_count iterations.
-    status: implemented
+    status: verified
     tags: [stpa-derived]
     links:
       - type: derives-from
@@ -481,7 +495,7 @@ artifacts:
       The adapter shall emit instructions in the correct order:
       cabi_realloc before memory.copy, memory.copy before callee
       function call.
-    status: implemented
+    status: verified
     tags: [stpa-derived]
     links:
       - type: derives-from
@@ -1113,7 +1127,7 @@ artifacts:
       meld emits ONE fused trampoline per call site with lowering,
       allocation (a call to the callee's own cabi_realloc) and lifting
       inline, so the honest class unit is the trampoline kind.
-    status: implemented
+    status: verified
     tags: [roadmap, dwarf, witness-mc-dc, v0.23.0, v0.24.0]
     links:
       - type: derives-from
@@ -1515,7 +1529,18 @@ artifacts:
       test names; repair the 34 broken links (issue-refs mis-encoded as trace
       links; host-controller and dangling-UCA references); and reconcile the
       requirement-coverage rule with this project's STPA+requirements topology.
-    status: proposed
+
+      PROGRESS (v0.46.0 traceability close-out): part 1 is DONE — the
+      sw-verification (SWV) artifact type exists and EVERY sw-req (63/63) now
+      carries a typed `verifies` link (`rivet coverage`:
+      `swe1-has-verification 63/63 100%`, `swe6-verifies-swe1 75/75 100%`),
+      machine-enforced by `rivet validate` (PASS, 0 errors). REMAINING (why this
+      is `implemented`, not `verified`): the `requirement-coverage` /
+      `constraint-has-requirement` rules still read 0% — reconciling the STPA
+      system-constraint → requirement topology is a distinct piece that is
+      "partly gated on maintainer STPA judgment" and stays open for a later
+      release.
+    status: implemented
     tags: [process, traceability, verification, v0.36.0]
     links:
       - type: derives-from

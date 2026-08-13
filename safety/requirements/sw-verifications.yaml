@@ -98,6 +98,7 @@ artifacts:
     title: "Verification of SR-8: Correct function base offset calculation"
     description: >
       Verifies SR-8 via: proofs `proofs/transformations/merge/`.
+      PLUS a direct mutation-verified test sr8_function_base_offset_is_cumulative (merger.rs) pinning base = import_counts.func + Σ preceding defined + position; SR-8 text amended 2026-08-13 to the flat-index invariant.
     status: implemented
     fields:
       method: formal-verification
@@ -170,6 +171,7 @@ artifacts:
     title: "Verification of SR-14: Correct memory index usage in adapters"
     description: >
       Verifies SR-14 via: proofs `proofs/adapter/`.
+      PLUS a direct test sr14_adapter_memory_indices_caller_to_callee (fact.rs) decoding memory.copy src_mem/dst_mem by name (args: caller->callee; return payload: callee->caller); SR-14 text amended 2026-08-13 to scope the load/store split to the return path.
     status: implemented
     fields:
       method: formal-verification
@@ -504,6 +506,7 @@ artifacts:
       Verifies SR-18 via runtime/e2e tests that exercise the full adapter
       instruction path (`meld-core/tests/wit_bindgen_runtime.rs` suite) plus
       code inspection of the emission order in `meld-core/src/adapter/fact.rs`.
+      PLUS a direct structural test sr18_adapter_emits_realloc_before_copy_before_call (fact.rs) decoding the adapter and asserting cabi_realloc call < memory.copy < callee call (mutation-verified) — upgrades inspection to mechanically-checked.
     status: implemented
     fields:
       method: automated-test
@@ -753,11 +756,333 @@ artifacts:
       edges of the seam decision) with zero unresolved MC/DC gap rows, plus a
       branch-count>=1 and report-format guard; negative controls (simulated 1 gap,
       1/2 coverage) trip red. Documented limitation: single-condition seam →
-      MC/DC == branch coverage; rich multi-condition MC/DC needs a rustc-built
-      fixture (follow-up).
+      MC/DC == branch coverage; the rich multi-condition leg is delivered via the
+      rustc-built tests/gate/leap_mcdc fixture — witness recovers a real
+      2-condition FullMcdc decision on the fused output (negative control:
+      --dwarf strip -> 0/0 decisions -> gate red).
     status: implemented
     fields:
       method: automated-test
     links:
       - type: verifies
         target: SR-62
+
+  - id: SWV-54
+    type: sw-verification
+    title: "Verification of SR-1: Complete core module extraction"
+    description: >
+      Verifies SR-1 (Complete core module extraction) via 1 passing automated test(s):
+      nested_component::test_parse_composed_component_structure. Mappings carried from safety/requirements/traceability.yaml
+      (each confirmed present and green in the v0.46.0 traceability close-out);
+      status closed implemented -> verified.
+    status: implemented
+    fields:
+      method: automated-test
+    links:
+      - type: verifies
+        target: SR-1
+  - id: SWV-55
+    type: sw-verification
+    title: "Verification of SR-2: Complete import/export extraction"
+    description: >
+      Verifies SR-2 (Complete import/export extraction) via 1 passing automated test(s):
+      release_components::test_no_duplicate_imports. Mappings carried from safety/requirements/traceability.yaml
+      (each confirmed present and green in the v0.46.0 traceability close-out);
+      status closed implemented -> verified.
+    status: implemented
+    fields:
+      method: automated-test
+    links:
+      - type: verifies
+        target: SR-2
+  - id: SWV-56
+    type: sw-verification
+    title: "Verification of SR-3: Correct Canonical ABI element size computation"
+    description: >
+      Verifies SR-3 (Correct Canonical ABI element size computation) via 5 passing automated test(s):
+      parser::tests::test_canonical_abi_element_size_primitive_types, parser::tests::test_canonical_abi_element_size_string, parser::tests::test_canonical_abi_element_size_record_with_padding (+2 more). Mappings carried from safety/requirements/traceability.yaml
+      (each confirmed present and green in the v0.46.0 traceability close-out);
+      status closed implemented -> verified.
+    status: implemented
+    fields:
+      method: automated-test
+    links:
+      - type: verifies
+        target: SR-3
+  - id: SWV-57
+    type: sw-verification
+    title: "Verification of SR-4: Reject malformed components"
+    description: >
+      Verifies SR-4 (Reject malformed components) via 4 passing automated test(s):
+      parser::tests::test_parser_rejects_core_module, parser::tests::test_parser_rejects_invalid_wasm, tests::test_fuser_rejects_core_module_input (+1 more). Mappings carried from safety/requirements/traceability.yaml
+      (each confirmed present and green in the v0.46.0 traceability close-out);
+      status closed implemented -> verified.
+    status: implemented
+    fields:
+      method: automated-test
+    links:
+      - type: verifies
+        target: SR-4
+  - id: SWV-58
+    type: sw-verification
+    title: "Verification of SR-5: Complete and correct import resolution"
+    description: >
+      Verifies SR-5 (Complete and correct import resolution) via 2 passing automated test(s):
+      resolver::tests::test_resolver_strict_mode, resolver::tests::test_resolver_unresolved_import_error. Mappings carried from safety/requirements/traceability.yaml
+      (each confirmed present and green in the v0.46.0 traceability close-out);
+      status closed implemented -> verified.
+    status: implemented
+    fields:
+      method: automated-test
+    links:
+      - type: verifies
+        target: SR-5
+  - id: SWV-59
+    type: sw-verification
+    title: "Verification of SR-6: Correct CopyLayout classification"
+    description: >
+      Verifies SR-6 (Correct CopyLayout classification) via 5 passing automated test(s):
+      resolver::tests::test_copy_layout_flat_list, resolver::tests::test_copy_layout_string_list, resolver::tests::test_copy_layout_record_with_string (+2 more). Mappings carried from safety/requirements/traceability.yaml
+      (each confirmed present and green in the v0.46.0 traceability close-out);
+      status closed implemented -> verified.
+    status: implemented
+    fields:
+      method: automated-test
+    links:
+      - type: verifies
+        target: SR-6
+  - id: SWV-60
+    type: sw-verification
+    title: "Verification of SR-7: Valid topological instantiation order"
+    description: >
+      Verifies SR-7 (Valid topological instantiation order) via 5 passing automated test(s):
+      resolver::tests::test_topological_sort_linear, resolver::tests::test_topological_sort_no_deps, resolver::tests::test_topological_sort_circular_fallback (+2 more). Mappings carried from safety/requirements/traceability.yaml
+      (each confirmed present and green in the v0.46.0 traceability close-out);
+      status closed implemented -> verified.
+    status: implemented
+    fields:
+      method: automated-test
+    links:
+      - type: verifies
+        target: SR-7
+  - id: SWV-61
+    type: sw-verification
+    title: "Verification of SR-9: Complete instruction index rewriting"
+    description: >
+      Verifies SR-9 (Complete instruction index rewriting) via 12 passing automated test(s):
+      rewriter::tests::test_rewrite_memory_copy_rebased, rewriter::tests::test_rewrite_memory_fill_rebased, rewriter::tests::test_rewrite_memory_init_rebased (+9 more). Mappings carried from safety/requirements/traceability.yaml
+      (each confirmed present and green in the v0.46.0 traceability close-out);
+      status closed implemented -> verified.
+    status: implemented
+    fields:
+      method: automated-test
+    links:
+      - type: verifies
+        target: SR-9
+  - id: SWV-62
+    type: sw-verification
+    title: "Verification of SR-10: Correct segment reindexing"
+    description: >
+      Verifies SR-10 (Correct segment reindexing) via 8 passing automated test(s):
+      segments::tests::test_reindex_data_segment_rebases_offset, segments::tests::test_reindex_const_expr_global_get, segments::tests::test_reindex_const_expr_ref_func (+5 more). Mappings carried from safety/requirements/traceability.yaml
+      (each confirmed present and green in the v0.46.0 traceability close-out);
+      status closed implemented -> verified.
+    status: implemented
+    fields:
+      method: automated-test
+    links:
+      - type: verifies
+        target: SR-10
+  - id: SWV-63
+    type: sw-verification
+    title: "Verification of SR-11: Component processing order matches resolver order"
+    description: >
+      Verifies SR-11 (Component processing order matches resolver order) via 3 passing automated test(s):
+      resolver::tests::test_topological_sort_linear, resolver::tests::test_topological_sort_diamond, resolver::tests::test_resolver_preserves_order_stability. Mappings carried from safety/requirements/traceability.yaml
+      (each confirmed present and green in the v0.46.0 traceability close-out);
+      status closed implemented -> verified.
+    status: implemented
+    fields:
+      method: automated-test
+    links:
+      - type: verifies
+        target: SR-11
+  - id: SWV-64
+    type: sw-verification
+    title: "Verification of SR-16: Recursive inner pointer fixup"
+    description: >
+      Verifies SR-16 (Recursive inner pointer fixup) via 1 passing automated test(s):
+      adapter_safety::test_sr16_inner_pointer_fixup_list_string. Mappings carried from safety/requirements/traceability.yaml
+      (each confirmed present and green in the v0.46.0 traceability close-out);
+      status closed implemented -> verified.
+    status: implemented
+    fields:
+      method: automated-test
+    links:
+      - type: verifies
+        target: SR-16
+  - id: SWV-65
+    type: sw-verification
+    title: "Verification of SR-36: Synthesised DWARF DIEs for meld-generated adapter functions"
+    description: >
+      Verifies SR-36 (Synthesised DWARF DIEs for meld-generated adapter functions) via 7 passing automated test(s):
+      dwarf::tests::adapter_spans_identifies_component_synthetic, dwarf::tests::adapter_spans_recognises_fully_synthetic_sentinel, dwarf::tests::adapter_spans_empty_when_all_source (+4 more). Mappings carried from safety/requirements/traceability.yaml
+      (each confirmed present and green in the v0.46.0 traceability close-out);
+      status closed implemented -> verified.
+    status: implemented
+    fields:
+      method: automated-test
+    links:
+      - type: verifies
+        target: SR-36
+
+  - id: SWV-66
+    type: sw-verification
+    title: "Verification of SR-46: DWARF .debug_line row addresses rebased through the offset map"
+    description: >
+      Verifies SR-46 — evidence per the requirement's own verification record:
+      `correct_line_programs` rebuilds each unit's line program, running every source row address through `AddressRemap::translate` and replicating the file/directory table in gimli's add-order so `FileId`s coincide with the DIE `decl_file` (the v5 `file(0)`/ `directory(0)` header seeding is honoured — the latent off-by-one Mythos caught and fixed in 02b70c5). Int
+      (Backlink added in the v0.46.0 traceability close-out; the tests named
+      above already exist and pass — this adds the typed `verifies` edge into
+      the rivet graph.)
+    status: implemented
+    fields:
+      method: automated-test
+    links:
+      - type: verifies
+        target: SR-46
+  - id: SWV-67
+    type: sw-verification
+    title: "Verification of SR-47: Name section coalesced and index-remapped under --preserve-names"
+    description: >
+      Verifies SR-47 — evidence per the requirement's own verification record:
+      `accumulate_remapped_function_names` parses each input `name` section (`wasmparser::NameSectionReader`), remaps `Name::Function` entries through `function_index_map`, drops the unmapped, and accumulates into `MergedModule::fused_function_names` (a BTreeMap for deterministic order); `encode_output` emits one coalesced `name` section from it. Unit oracle `accu
+      (Backlink added in the v0.46.0 traceability close-out; the tests named
+      above already exist and pass — this adds the typed `verifies` edge into
+      the rivet graph.)
+    status: implemented
+    fields:
+      method: automated-test
+    links:
+      - type: verifies
+        target: SR-47
+  - id: SWV-68
+    type: sw-verification
+    title: "Verification of SR-48: Sound shared-memory fusion via relocation-metadata consumption"
+    description: >
+      Verifies SR-48 — evidence per the requirement's own verification record:
+      VERIFIED (#340, merged 2026-07-11). Runtime oracle `test_326_reloc_const_rebasing_end_to_end` (meld-core/tests/rebasing_end_to_end.rs): fuses two components into a shared memory and, via wasmtime, asserts an absolute `i32.const` address literal is rebased to `base + addr` (the datapoint-B `static mut` class). Path-F negative control `test_326_shared_rebase_w
+      (Backlink added in the v0.46.0 traceability close-out; the tests named
+      above already exist and pass — this adds the typed `verifies` edge into
+      the rivet graph.)
+    status: implemented
+    fields:
+      method: automated-test
+    links:
+      - type: verifies
+        target: SR-48
+  - id: SWV-69
+    type: sw-verification
+    title: "Verification of SR-49: Fused shared-memory output is directly MCU-dissolvable"
+    description: >
+      Verifies SR-49 — evidence per the requirement's own verification record:
+      VERIFIED (#343, merged 2026-07-14). meld-core/tests/mcu_dissolve.rs: (1) `stack_pointer_globals_coalesced` — a fused module ends with exactly one mutable-i32 SP-class global and every `global.get`/`global.set` of a coalesced duplicate is redirected to the survivor; `shared_stack_pointer_runtime_non_clobber` (wasmtime) — pre-coalesce two providers' frames ali
+      (Backlink added in the v0.46.0 traceability close-out; the tests named
+      above already exist and pass — this adds the typed `verifies` edge into
+      the rivet graph.)
+    status: implemented
+    fields:
+      method: automated-test
+    links:
+      - type: verifies
+        target: SR-49
+  - id: SWV-70
+    type: sw-verification
+    title: "Verification of SR-50: Drop the vestigial cabi_realloc once the component boundary is interna"
+    description: >
+      Verifies SR-50 — evidence per the requirement's own verification record:
+      VERIFIED (#345, merged 2026-07-14). meld-core/tests/drop_realloc.rs + memory_probe unit tests. Positive `scalar_boundary_drops_realloc_and_defers_grow`: a fused fully-internalised core exports no `cabi_realloc*` and fuses Ok under `--memory shared --address-rebase` (the vestigial `memory.grow` is deferred, not a hard error). Negative controls (verdict conser
+      (Backlink added in the v0.46.0 traceability close-out; the tests named
+      above already exist and pass — this adds the typed `verifies` edge into
+      the rivet graph.)
+    status: implemented
+    fields:
+      method: automated-test
+    links:
+      - type: verifies
+        target: SR-50
+  - id: SWV-71
+    type: sw-verification
+    title: "Verification of SR-51: Extended-const exprs beginning with global.get are preserved, not trun"
+    description: >
+      Verifies SR-51 — evidence per the requirement's own verification record:
+      VERIFIED (#346, merged 2026-07-15). meld-core/tests/const_expr_globalget.rs, executed-vs-wasmtime: a global initializer `g = base + 100` (base=1000) yields 1100 (not the pre-fix 1000); the operand-swapped `test_338_multimodule_const_first_embedded_globalget_remaps` — a multi-module fuse shifting `__memory_base` off import-index 0 — reads the correct base (11
+      (Backlink added in the v0.46.0 traceability close-out; the tests named
+      above already exist and pass — this adds the typed `verifies` edge into
+      the rivet graph.)
+    status: implemented
+    fields:
+      method: automated-test
+    links:
+      - type: verifies
+        target: SR-51
+  - id: SWV-72
+    type: sw-verification
+    title: "Verification of SR-52: Reproducible output depends only on input content"
+    description: >
+      Verifies SR-52 — evidence per the requirement's own verification record:
+      VERIFIED (#341 merged 2026-07-15; #325 v0.38.0). `test_reproducible_attestation_is_byte_stable` (meld-core/src/lib.rs, default features): reproducible fusion is byte-identical across independent runs (#325); byte-identical input under two DIFFERENT paths (`/tmp/pa/falcon.wasm` vs `/tmp/pb/falcon.wasm`) fuses to the SAME output under `--reproducible` (#341, w
+      (Backlink added in the v0.46.0 traceability close-out; the tests named
+      above already exist and pass — this adds the typed `verifies` edge into
+      the rivet graph.)
+    status: implemented
+    fields:
+      method: automated-test
+    links:
+      - type: verifies
+        target: SR-52
+  - id: SWV-73
+    type: sw-verification
+    title: "Verification of SR-53: Stale reloc.CODE offsets hard-fail rather than silently miscompile"
+    description: >
+      Verifies SR-53 — evidence per the requirement's own verification record:
+      VERIFIED. meld-core/tests/rebasing_end_to_end.rs `test_351_stale_reloc_offsets_hard_error`: the exact reproducing components from the issue (clang 22.1.4 + wit-component 0.245.1; b.wasm sha256 481c36…d3a3), whose trailing `ptr-b` SLEB site drifts +4 to code offset 42 (past its `i32.const` operator range [37,41)), now fuse to a hard `MisalignedReloc { offset:
+      (Backlink added in the v0.46.0 traceability close-out; the tests named
+      above already exist and pass — this adds the typed `verifies` edge into
+      the rivet graph.)
+    status: implemented
+    fields:
+      method: automated-test
+    links:
+      - type: verifies
+        target: SR-53
+  - id: SWV-74
+    type: sw-verification
+    title: "Verification of SR-54: --component lifts bare world exports with their real signatures"
+    description: >
+      Verifies SR-54 — evidence per the requirement's own verification record:
+      VERIFIED. meld-core/tests/component_bare_export_355.rs on avrabe's exact fixtures (tests/reloc351/{a,b}.wasm; bare world exports get-b/set-b/ptr-b): `test_355_bare_world_exports_single_component` and `..._two_components` assert (1) the fused --component output is a VALID component (`wasmparser::Validator` with all features — catches the empty-type bug and th
+      (Backlink added in the v0.46.0 traceability close-out; the tests named
+      above already exist and pass — this adds the typed `verifies` edge into
+      the rivet graph.)
+    status: implemented
+    fields:
+      method: automated-test
+    links:
+      - type: verifies
+        target: SR-54
+  - id: SWV-75
+    type: sw-verification
+    title: "Verification of SR-55: Multiply-instantiated module support via core-instance duplication"
+    description: >
+      Verifies SR-55 — evidence per the requirement's own verification record:
+      VERIFIED. The `core_instance_topology` normalization is wired into `Fuser::fuse_with_stats` before resolve/merge, so multiply-instantiated modules fuse. Evidence: (1) structural unit tests (core_instance_topology::tests — single/distinct unchanged; double/triple/interleaved → N distinct module identities; FromExports ignored); (2) differential EXECUTION orac
+      (Backlink added in the v0.46.0 traceability close-out; the tests named
+      above already exist and pass — this adds the typed `verifies` edge into
+      the rivet graph.)
+    status: implemented
+    fields:
+      method: automated-test
+    links:
+      - type: verifies
+        target: SR-55
