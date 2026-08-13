@@ -23,6 +23,8 @@ use std::fs;
 use std::path::Path;
 use std::time::Instant;
 
+mod docs;
+
 #[derive(Parser)]
 #[command(name = "meld")]
 #[command(author = "PulseEngine")]
@@ -162,6 +164,39 @@ enum Commands {
 
     /// Show version information
     Version,
+
+    /// Show embedded, queryable documentation (offline).
+    ///
+    /// `meld docs` lists topics; `meld docs <topic>` shows one;
+    /// `meld docs --grep <q>` searches all topics; `--format json` emits the
+    /// list (or a single topic, with its body) for machine queries.
+    /// `meld docs check --coverage` reports subcommands without a topic
+    /// (`--strict` exits non-zero — the CI gate).
+    Docs {
+        /// A topic slug to show, or `check` to run the coverage invariant.
+        topic: Option<String>,
+
+        /// List all topics (the default when no topic is given).
+        #[arg(long)]
+        list: bool,
+
+        /// Search across all topic titles and bodies.
+        #[arg(long, value_name = "QUERY")]
+        grep: Option<String>,
+
+        /// (check) Report subcommands lacking a documented topic.
+        #[arg(long)]
+        coverage: bool,
+
+        /// (check --coverage) Exit non-zero if any subcommand is undocumented.
+        #[arg(long)]
+        strict: bool,
+
+        /// Output format: `text` (default) or `json` for machine queries —
+        /// applies to the topic list and to a single `meld docs <topic>`.
+        #[arg(long, value_name = "FMT", default_value = "text")]
+        format: String,
+    },
 }
 
 fn main() -> Result<()> {
@@ -231,6 +266,24 @@ fn main() -> Result<()> {
             println!("License: Apache-2.0");
         }
 
+        Some(Commands::Docs {
+            topic,
+            list,
+            grep,
+            coverage,
+            strict,
+            format,
+        }) => {
+            docs_command(
+                topic.as_deref(),
+                list,
+                grep.as_deref(),
+                coverage,
+                strict,
+                &format,
+            )?;
+        }
+
         None => {
             println!("meld - Static WebAssembly Component Fusion");
             println!();
@@ -240,6 +293,7 @@ fn main() -> Result<()> {
             println!("  fuse      Fuse multiple components into a single module");
             println!("  inspect   Inspect a WebAssembly component");
             println!("  version   Show version information");
+            println!("  docs      Show embedded, queryable documentation");
             println!("  help      Print this message or help for subcommands");
             println!();
             println!("For more information, run: meld help <command>");
@@ -612,6 +666,84 @@ fn inspect_command(input: String, show_types: bool, show_interfaces: bool) -> Re
         }
     }
 
+    Ok(())
+}
+
+/// `meld docs` — embedded, queryable documentation (SR-64), modelled on
+/// `rivet docs`. Lists/show/grep topics, `--format json` for machine queries,
+/// and `check --coverage` (`--strict` gate) for the coverage invariant.
+fn docs_command(
+    topic: Option<&str>,
+    list: bool,
+    grep: Option<&str>,
+    coverage: bool,
+    strict: bool,
+    format: &str,
+) -> Result<()> {
+    use clap::CommandFactory;
+
+    let json = match format {
+        "text" => false,
+        "json" => true,
+        other => {
+            return Err(anyhow!(
+                "unknown --format '{other}' (expected `text` or `json`)"
+            ));
+        }
+    };
+
+    // `meld docs check --coverage` (or `--coverage`) — the mechanical invariant.
+    if coverage || topic == Some("check") {
+        let cmd = Cli::command();
+        let total = cmd.get_subcommands().count();
+        let gaps = docs::coverage_gaps(&cmd);
+        if gaps.is_empty() {
+            println!("docs coverage: OK — all {total} subcommands have a topic");
+            return Ok(());
+        }
+        eprintln!("docs coverage: {} subcommand(s) undocumented:", gaps.len());
+        for g in &gaps {
+            eprintln!("  {g}");
+        }
+        if strict {
+            return Err(anyhow!(
+                "undocumented subcommands (SR-64): {}",
+                gaps.join(", ")
+            ));
+        }
+        return Ok(());
+    }
+
+    if let Some(q) = grep {
+        let hits = docs::grep(q);
+        if hits.is_empty() {
+            println!("no topic matches '{q}'");
+        }
+        for (slug, line) in hits {
+            println!("{slug}: {line}");
+        }
+        return Ok(());
+    }
+
+    if list || topic.is_none() {
+        if json {
+            println!("{}", docs::render_json(None));
+        } else {
+            print!("{}", docs::render_list());
+        }
+        return Ok(());
+    }
+
+    let slug = topic.unwrap();
+    match docs::find(slug) {
+        Some(_) if json => println!("{}", docs::render_json(Some(slug))),
+        Some(t) => println!("{}", t.body.trim_end()),
+        None => {
+            eprintln!("no topic '{slug}'.\n");
+            print!("{}", docs::render_list());
+            return Err(anyhow!("unknown topic: {slug}"));
+        }
+    }
     Ok(())
 }
 

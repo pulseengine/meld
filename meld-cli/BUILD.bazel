@@ -5,6 +5,11 @@ package(default_visibility = ["//visibility:public"])
 rust_binary(
     name = "meld",
     srcs = glob(["src/**/*.rs"]),
+    # `src/docs.rs` embeds these via `include_str!(concat!("../docs/", …))`.
+    # cargo reads them from the filesystem; Bazel sandboxes them away unless
+    # they are declared as compile_data. The `meld_test` target inherits this
+    # through `crate = ":meld"`.
+    compile_data = glob(["docs/**/*.md"]),
     crate_name = "meld_cli",
     edition = "2024",
     rustc_env = {
