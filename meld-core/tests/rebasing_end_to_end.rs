@@ -1,10 +1,11 @@
 use meld_core::{Fuser, FuserConfig, MemoryStrategy};
 use wasm_encoder::{
     CodeSection, Component, CustomSection, DataCountSection, DataSection, DataSegment,
-    DataSegmentMode, ExportKind, ExportSection, Function, FunctionSection, Instruction, MemArg,
-    MemorySection, MemoryType, Module, ModuleSection, TypeSection, ValType,
+    DataSegmentMode, EntityType, ExportKind, ExportSection, Function, FunctionSection,
+    ImportSection, Instruction, MemArg, MemorySection, MemoryType, Module, ModuleSection,
+    TypeSection, ValType,
 };
-use wasmtime::{Config, Engine, Instance, Module as RuntimeModule, Store};
+use wasmtime::{Caller, Config, Engine, Instance, Linker, Module as RuntimeModule, Store};
 
 const WASM_PAGE_SIZE: usize = 65_536;
 
@@ -614,4 +615,387 @@ fn test_351_stale_reloc_offsets_hard_error() {
         }
         other => panic!("expected MisalignedReloc at offset 42, got: {other:?}"),
     }
+}
+
+// ─── SR-63 / #301: embedder allocator passthrough survives fusion ────────────
+//
+// The embedder-passthrough resolver code shipped in v0.37.0: a core module
+// importing an unresolved allocator seam (`env::__cabi_arena_realloc`, the
+// arena-backed `cabi_realloc` forwarder from the pulseengine wit-bindgen fork)
+// keeps that import through fusion — gale/jess links it post-fuse over one
+// policy for the whole MCU image. `test_298_fork_arena_realloc_fuses_under_
+// shared_rebase_today` (merger.rs) is the merge-level unit; the test below is
+// its differential-EXECUTION oracle at the public `Fuser` boundary.
+
+/// Host bump arena backing `env::__cabi_arena_realloc` during execution.
+/// `handed_out` records every pointer returned, in call order, so the fused
+/// and unfused pointer *sequences* can be compared directly.
+#[derive(Default)]
+struct HostArena {
+    next: u32,
+    handed_out: Vec<i32>,
+}
+
+/// The starting bump offset. Low enough that the (small) allocations below stay
+/// inside page 0 — in bounds for both the 1-page unfused cores and the 2-page
+/// fused core.
+const ARENA_START: u32 = 0x400;
+
+/// Build one synthetic arena core module. It:
+///   * imports `env::__cabi_arena_realloc : (i32,i32,i32,i32) -> i32`
+///     (the `cabi_realloc` signature — old_ptr, old_len, align, new_len → ptr),
+///   * defines & exports a 1-page shared memory as "memory",
+///   * exports `export_name : () -> i32` whose body calls the import for
+///     `(0, 0, 8, 16)`, stores `sentinel` through the returned pointer, loads it
+///     back, and returns the loaded byte, and
+///   * when `with_linking`, carries a bare `linking` custom section so
+///     `has_reloc_metadata` is true. That flips the ADR-6 path-F gate (a
+///     non-zero-base module doing direct load/store with NO reloc metadata
+///     hard-fails `MissingRelocMetadata`) and — with an empty `reloc.CODE` —
+///     selects the const-reloc rewriter path, which must leave the store/load
+///     `memarg` offsets (genuine 0s, not addresses) untouched. If it instead
+///     rebased them, module B's byte would land at `ptr + 0x10000` and the
+///     sentinel read below would return 0.
+///
+/// `test_301_embedder_arena_seam_nonzero_base_requires_relocs` drops the
+/// `linking` section from the second module and shows fusion hard-fails
+/// `MissingRelocMetadata` — the standing proof that module B is placed at a
+/// non-zero base (so the memarg-rebasing hazard the oracle guards is live, not
+/// vacuous).
+fn build_arena_core_module(export_name: &str, sentinel: u8, with_linking: bool) -> Module {
+    let mut types = TypeSection::new();
+    types.ty().function(
+        [ValType::I32, ValType::I32, ValType::I32, ValType::I32],
+        [ValType::I32],
+    ); // type 0: __cabi_arena_realloc
+    types.ty().function([], [ValType::I32]); // type 1: exported run: () -> i32
+
+    let mut imports = ImportSection::new();
+    imports.import("env", "__cabi_arena_realloc", EntityType::Function(0));
+
+    let mut functions = FunctionSection::new();
+    functions.function(1); // the defined run function (import occupies func 0)
+
+    let mut exports = ExportSection::new();
+    exports.export(export_name, ExportKind::Func, 1);
+    exports.export("memory", ExportKind::Memory, 0);
+
+    let memarg = MemArg {
+        offset: 0,
+        align: 0,
+        memory_index: 0,
+    };
+
+    let mut code = CodeSection::new();
+    let mut run = Function::new([(1, ValType::I32)]); // one i32 local: the arena ptr
+    run.instruction(&Instruction::I32Const(0)); // old_ptr
+    run.instruction(&Instruction::I32Const(0)); // old_len
+    run.instruction(&Instruction::I32Const(8)); // align
+    run.instruction(&Instruction::I32Const(16)); // new_len
+    run.instruction(&Instruction::Call(0)); // -> ptr
+    run.instruction(&Instruction::LocalSet(0));
+    run.instruction(&Instruction::LocalGet(0)); // store address
+    run.instruction(&Instruction::I32Const(sentinel as i32));
+    run.instruction(&Instruction::I32Store8(memarg));
+    run.instruction(&Instruction::LocalGet(0)); // load address
+    run.instruction(&Instruction::I32Load8U(memarg));
+    run.instruction(&Instruction::End); // returns the loaded sentinel byte
+    code.function(&run);
+
+    let mut module = Module::new();
+    module
+        .section(&types)
+        .section(&imports)
+        .section(&functions)
+        .section(&shared_memory_section())
+        .section(&exports)
+        .section(&code);
+    if with_linking {
+        module.section(&CustomSection {
+            name: "linking".into(),
+            data: vec![0x02].into(), // version 2, no subsections
+        });
+    }
+    module
+}
+
+/// Count top-level function imports of `module::name` in a core module.
+fn count_func_imports(bytes: &[u8], module_name: &str, field: &str) -> usize {
+    let mut n = 0;
+    for payload in wasmparser::Parser::new(0).parse_all(bytes) {
+        if let wasmparser::Payload::ImportSection(reader) = payload.expect("payload") {
+            for imp in reader.into_imports() {
+                let imp = imp.expect("import");
+                if imp.module == module_name
+                    && imp.name == field
+                    && matches!(
+                        imp.ty,
+                        wasmparser::TypeRef::Func(_) | wasmparser::TypeRef::FuncExact(_)
+                    )
+                {
+                    n += 1;
+                }
+            }
+        }
+    }
+    n
+}
+
+/// Host `env::__cabi_arena_realloc` wired into `linker`: a bump allocator over
+/// `HostArena` in the store, recording every returned pointer.
+fn add_host_arena(linker: &mut Linker<HostArena>) {
+    linker
+        .func_wrap(
+            "env",
+            "__cabi_arena_realloc",
+            |mut caller: Caller<'_, HostArena>,
+             _old_ptr: i32,
+             _old_len: i32,
+             align: i32,
+             new_len: i32|
+             -> i32 {
+                let arena = caller.data_mut();
+                let align = (align.max(1)) as u32;
+                let aligned = arena.next.div_ceil(align) * align;
+                let ptr = aligned as i32;
+                arena.next = aligned + new_len as u32;
+                arena.handed_out.push(ptr);
+                ptr
+            },
+        )
+        .expect("register host arena import");
+}
+
+fn threaded_engine() -> Engine {
+    let mut cfg = Config::new();
+    cfg.wasm_threads(true);
+    cfg.shared_memory(true);
+    cfg.wasm_bulk_memory(true);
+    Engine::new(&cfg).expect("engine")
+}
+
+/// SR-63 / #301 differential-execution oracle: the embedder allocator seam
+/// (`env::__cabi_arena_realloc`) survives fusion AND behaves identically fused
+/// vs. unfused.
+///
+/// Asserts three things:
+///   (a) the fused core VALIDATES (`wasmparser::Validator`, all features);
+///   (b) it RETAINS *exactly one* unresolved `env::__cabi_arena_realloc` import
+///       — both components' calls dedup onto a single seam, not dropped, not
+///       bound to a fusion-set provider, not duplicated;
+///   (c) DIFFERENTIAL EXECUTION on wasmtime with a HOST-provided arena via a
+///       `Linker`: the fused core's two exports return the same sentinels, hand
+///       out the same pointer sequence, and leave those sentinels at those
+///       pointers in memory as the two UNFUSED cores do when driven through the
+///       same host arena in the same order.
+#[test]
+fn test_301_embedder_arena_seam_survives_fusion_differential() {
+    const SENTINEL_A: u8 = 0xAA;
+    const SENTINEL_B: u8 = 0xBB;
+
+    // Raw core modules — exactly what the Fuser consumes (wrapped) and what the
+    // unfused baseline executes (directly).
+    let core_a = build_arena_core_module("a_run", SENTINEL_A, true).finish();
+    let core_b = build_arena_core_module("b_run", SENTINEL_B, true).finish();
+
+    // ── Fuse the two arena components under shared memory + address rebasing ──
+    let config = FuserConfig {
+        memory_strategy: MemoryStrategy::SharedMemory,
+        address_rebasing: true,
+        pack_rebase: false,
+        ..Default::default()
+    };
+    let mut fuser = Fuser::new(config);
+    fuser
+        .add_component_named(
+            &build_component(build_arena_core_module("a_run", SENTINEL_A, true)),
+            Some("arena-a"),
+        )
+        .unwrap();
+    fuser
+        .add_component_named(
+            &build_component(build_arena_core_module("b_run", SENTINEL_B, true)),
+            Some("arena-b"),
+        )
+        .unwrap();
+    let fused = fuser.fuse().expect("arena-import components must fuse");
+
+    // (a) The fused core is valid wasm.
+    wasmparser::Validator::new_with_features(wasmparser::WasmFeatures::all())
+        .validate_all(&fused)
+        .expect("SR-63(a): fused core with a retained embedder import must validate");
+
+    // (b) Import retained, deduped to exactly one seam.
+    assert_eq!(
+        count_func_imports(&fused, "env", "__cabi_arena_realloc"),
+        1,
+        "SR-63(b): fused core must retain EXACTLY ONE env::__cabi_arena_realloc \
+         import — both components' calls resolve to the single embedder seam"
+    );
+
+    let engine = threaded_engine();
+
+    // ── UNFUSED baseline: both cores in ONE store / ONE host arena, called in
+    //    the same order as the fused core, so the pointer sequence matches. ──
+    let (unfused_ret_a, unfused_ret_b, unfused_handed, unfused_byte_a, unfused_byte_b) = {
+        let mut store = Store::new(
+            &engine,
+            HostArena {
+                next: ARENA_START,
+                handed_out: Vec::new(),
+            },
+        );
+        let mut linker = Linker::new(&engine);
+        add_host_arena(&mut linker);
+
+        let mod_a = RuntimeModule::new(&engine, &core_a).unwrap();
+        let mod_b = RuntimeModule::new(&engine, &core_b).unwrap();
+        let inst_a = linker.instantiate(&mut store, &mod_a).unwrap();
+        let inst_b = linker.instantiate(&mut store, &mod_b).unwrap();
+
+        let a_run = inst_a
+            .get_typed_func::<(), i32>(&mut store, "a_run")
+            .unwrap();
+        let ret_a = a_run.call(&mut store, ()).unwrap();
+        let b_run = inst_b
+            .get_typed_func::<(), i32>(&mut store, "b_run")
+            .unwrap();
+        let ret_b = b_run.call(&mut store, ()).unwrap();
+
+        let mem_a = inst_a.get_shared_memory(&mut store, "memory").unwrap();
+        let mem_b = inst_b.get_shared_memory(&mut store, "memory").unwrap();
+        let handed = store.data().handed_out.clone();
+        assert_eq!(handed.len(), 2, "one allocation per component");
+        let byte_a = read_shared(&mem_a, handed[0] as usize, 1);
+        let byte_b = read_shared(&mem_b, handed[1] as usize, 1);
+        (ret_a, ret_b, handed, byte_a, byte_b)
+    };
+
+    // Baseline sanity: each unfused core round-trips its own sentinel through
+    // the host-arena pointer.
+    assert_eq!(unfused_ret_a, SENTINEL_A as i32);
+    assert_eq!(unfused_ret_b, SENTINEL_B as i32);
+    assert_eq!(unfused_byte_a, vec![SENTINEL_A]);
+    assert_eq!(unfused_byte_b, vec![SENTINEL_B]);
+
+    // ── FUSED execution: one instance, both exports, same host arena. ──
+    let (fused_ret_a, fused_ret_b, fused_handed, fused_byte_a, fused_byte_b) = {
+        let mut store = Store::new(
+            &engine,
+            HostArena {
+                next: ARENA_START,
+                handed_out: Vec::new(),
+            },
+        );
+        let mut linker = Linker::new(&engine);
+        add_host_arena(&mut linker);
+
+        let module = RuntimeModule::new(&engine, &fused).unwrap();
+        let instance = linker.instantiate(&mut store, &module).unwrap();
+
+        let a_run = instance
+            .get_typed_func::<(), i32>(&mut store, "a_run")
+            .unwrap();
+        let ret_a = a_run.call(&mut store, ()).unwrap();
+        let b_run = instance
+            .get_typed_func::<(), i32>(&mut store, "b_run")
+            .unwrap();
+        let ret_b = b_run.call(&mut store, ()).unwrap();
+
+        let mem = instance.get_shared_memory(&mut store, "memory").unwrap();
+        // Two 1-page modules stacked into separate windows ⟹ a ≥2-page merged
+        // memory. This is the in-test evidence the modules did NOT both land at
+        // base 0 — so module B sits at a non-zero base and the memarg-rebasing
+        // hazard guarded below is live. A refactor collapsing the windows turns
+        // this red instead of silently hollowing out the differential.
+        assert!(
+            mem.data_size() >= 2 * WASM_PAGE_SIZE,
+            "fused shared memory must span both modules' windows (≥2 pages)"
+        );
+        let handed = store.data().handed_out.clone();
+        assert_eq!(handed.len(), 2, "one allocation per fused export");
+        let byte_a = read_shared(&mem, handed[0] as usize, 1);
+        let byte_b = read_shared(&mem, handed[1] as usize, 1);
+        (ret_a, ret_b, handed, byte_a, byte_b)
+    };
+
+    // (c) DIFFERENTIAL: the fused seam behaves identically to the unfused cores.
+    // Returned round-trip values match.
+    assert_eq!(
+        fused_ret_a, unfused_ret_a,
+        "SR-63(c): a_run must return the same sentinel fused vs unfused"
+    );
+    assert_eq!(
+        fused_ret_b, unfused_ret_b,
+        "SR-63(c): b_run must return the same sentinel fused vs unfused"
+    );
+    // The two seams are wired independently (not cross-bound to one export).
+    assert_ne!(
+        fused_ret_a, fused_ret_b,
+        "the two components' calls must reach distinct exports"
+    );
+    // Same pointer sequence handed out (proves both fused calls hit the one
+    // shared host arena, in order).
+    assert_eq!(
+        fused_handed, unfused_handed,
+        "SR-63(c): fused and unfused hand out the same arena pointer sequence"
+    );
+    // The sentinel is actually present at the handed-out address in the fused
+    // memory — the assertion with teeth. If fusion had rebased the store's
+    // `memarg` for the base-0x10000 module, B's byte would sit at ptr+0x10000
+    // and this read would return 0.
+    assert_eq!(
+        fused_byte_a, unfused_byte_a,
+        "SR-63(c): fused a_run's sentinel must sit at the handed-out address"
+    );
+    assert_eq!(
+        fused_byte_b, unfused_byte_b,
+        "SR-63(c): fused b_run's sentinel must sit at the handed-out address \
+         (guards against spurious memarg rebasing of the non-zero-base module)"
+    );
+    assert_eq!(fused_byte_a, vec![SENTINEL_A]);
+    assert_eq!(fused_byte_b, vec![SENTINEL_B]);
+}
+
+/// SR-63 / #301 placement proof — the standing evidence that the second arena
+/// module is fused at a NON-ZERO base, so the memarg-rebasing hazard the
+/// differential oracle guards against is real, not vacuous.
+///
+/// Identical to the oracle's setup except the second module carries NO `linking`
+/// custom section. It does direct load/store (`i32.store8`/`i32.load8_u`), so at
+/// a non-zero base with no reloc metadata the ADR-6 path-F gate must hard-fail
+/// `MissingRelocMetadata`. That it fires proves (i) module B is placed at a
+/// non-zero base and (ii) `module_has_direct_memory_access` sees the oracle's
+/// store/load — the two facts that give assertion (c)'s sentinel-at-address
+/// check its teeth.
+#[test]
+fn test_301_embedder_arena_seam_nonzero_base_requires_relocs() {
+    let config = FuserConfig {
+        memory_strategy: MemoryStrategy::SharedMemory,
+        address_rebasing: true,
+        pack_rebase: false,
+        ..Default::default()
+    };
+    let mut fuser = Fuser::new(config);
+    fuser
+        .add_component_named(
+            &build_component(build_arena_core_module("a_run", 0xAA, true)),
+            Some("arena-a"),
+        )
+        .unwrap();
+    // Second module: same direct-memory body, but WITHOUT reloc metadata.
+    fuser
+        .add_component_named(
+            &build_component(build_arena_core_module("b_run", 0xBB, false)),
+            Some("arena-b-no-relocs"),
+        )
+        .unwrap();
+
+    let err = fuser
+        .fuse()
+        .expect_err("a non-zero-base direct-memory module without relocs must hard-fail");
+    assert!(
+        matches!(err, meld_core::Error::MissingRelocMetadata { .. }),
+        "expected MissingRelocMetadata (proves module B is at a non-zero base), got: {err:?}"
+    );
 }

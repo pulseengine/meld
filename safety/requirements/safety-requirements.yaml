@@ -2527,7 +2527,7 @@ artifacts:
       `--import-passthrough`) is NOT covered in-repo and is tracked as a
       follow-up. `--output component` re-exposure (component_wrap arm, Gap B) is
       out of scope here.
-    status: proposed
+    status: verified
     tags: [resolver, embedder-passthrough, mcu, shared-memory, grow-free]
     release: v0.45.0
     links:

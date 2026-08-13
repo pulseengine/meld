@@ -697,3 +697,30 @@ artifacts:
     links:
       - type: verifies
         target: SR-60
+  - id: SWV-51
+    type: sw-verification
+    title: "Verification of SR-63: Embedder-provided allocator seam survives fusion"
+    description: >
+      Verifies SR-63 via meld-core/tests/rebasing_end_to_end.rs. Oracle
+      test_301_embedder_arena_seam_survives_fusion_differential: two synthetic
+      arena core modules each importing env::__cabi_arena_realloc are fused under
+      SharedMemory + address_rebasing, then asserts (a) the fused core validates
+      (wasmparser all-features), (b) the import is RETAINED — an import-symbol
+      scan finds exactly ONE unresolved env::__cabi_arena_realloc (the two dedup
+      onto one seam, first-wins, not bound to a provider nor dropped), and (c)
+      DIFFERENTIAL EXECUTION on wasmtime with a host bump-arena via Linker: fused
+      return values, handed-out pointer sequence, and in-memory sentinel
+      placement all equal the unfused components run through the same host arena
+      (a_run != b_run, independently wired). A companion
+      test_301_embedder_arena_seam_nonzero_base_requires_relocs pins that module
+      B is placed at a non-zero base (0x10000) and hard-fails MissingRelocMetadata
+      without relocs — anti-vacuity for (c)'s sentinel-at-address check. SCOPE:
+      proves meld's pass-through plumbing with synthetic WAT; the real
+      forked-toolchain artifact path (wit-bindgen#4 / wasm-tools#2) is a
+      documented follow-up, not claimed here. Full suite 817/45/0.
+    status: implemented
+    fields:
+      method: automated-test
+    links:
+      - type: verifies
+        target: SR-63
