@@ -6063,6 +6063,7 @@ impl FactStyleGenerator {
                 caller_type_idx,
                 caller_param_count,
                 callee_param_count,
+                resource_rep_imports,
             );
         }
 
@@ -6663,27 +6664,51 @@ impl FactStyleGenerator {
         Ok((adapter_type_idx, func))
     }
 
-    /// Generate an adapter for the params-ptr calling convention.
+    /// Number of i32 scratch locals [`Self::emit_params_area_copy`] requires.
     ///
-    /// When flat param count > MAX_FLAT_PARAMS (16), the canonical ABI stores all
-    /// params in a buffer in linear memory. Both caller and callee use:
-    ///   (params_ptr: i32) → result...
+    /// Layout of the scratch block (starting at the caller-chosen `scratch_base`):
+    ///   +0                : callee_ptr        (allocated buffer in callee memory)
+    ///   +1 ..+1+N         : dest_ptr per (ptr,len) pair
+    ///   +1+N              : loop_counter       (only if a pair has inner resources)
+    ///   last              : pair_len scratch   (only if there is ≥1 pair)
+    fn params_area_copy_scratch_count(site: &AdapterSite) -> u32 {
+        let ptr_pair_offsets = &site.requirements.params_area_pointer_pair_offsets;
+        let copy_layouts = &site.requirements.params_area_copy_layouts;
+        let num_ptr_pairs = ptr_pair_offsets.len() as u32;
+        let has_inner_resources = copy_layouts.iter().any(|cl| {
+            matches!(cl,
+                crate::resolver::CopyLayout::Elements { inner_resources, .. }
+                if !inner_resources.is_empty()
+            )
+        });
+        let loop_counter_count = if has_inner_resources { 1u32 } else { 0 };
+        let pair_len_scratch_count = if num_ptr_pairs > 0 { 1u32 } else { 0 };
+        1 + num_ptr_pairs + loop_counter_count + pair_len_scratch_count
+    }
+
+    /// Emit Phases 1–3.5 of the params-area cross-memory copy: allocate a buffer
+    /// of `params_area_byte_size`/`params_area_max_align` in the callee's memory,
+    /// bulk-copy the caller's params buffer into it, then walk every
+    /// `params_area_pointer_pair_offsets` / `params_area_copy_layouts` entry
+    /// (encoding-aware string/list copy + inner-resource fixups) and every
+    /// `params_area_borrow_fixups` entry (borrow handle → rep). Returns the local
+    /// index holding the pointer to the freshly-allocated callee buffer.
     ///
-    /// The adapter bridges different memories:
-    /// 1. Allocate buffer in callee's memory via cabi_realloc
-    /// 2. Bulk copy the params buffer from caller to callee memory
-    /// 3. Fix up any (ptr, len) pairs inside the buffer — copy pointed-to data
-    ///    from caller memory to callee memory and update the pointers
-    /// 4. Call callee with new pointer
-    /// 5. Return the result(s)
-    fn generate_params_ptr_adapter(
+    /// `params_ptr_local` is the local holding the caller's params buffer pointer.
+    /// `scratch_base` is the first index of a contiguous i32 scratch block of size
+    /// [`Self::params_area_copy_scratch_count`] that the caller has reserved.
+    ///
+    /// Shared by [`Self::generate_params_ptr_adapter`] (pure params-ptr) and
+    /// [`Self::generate_retptr_adapter`] (combined params-ptr + retptr, #371).
+    fn emit_params_area_copy(
         &self,
+        func: &mut Function,
         site: &AdapterSite,
         options: &AdapterOptions,
-        target_func: u32,
-        caller_type_idx: u32,
         resource_rep_imports: &std::collections::HashMap<(String, String), u32>,
-    ) -> Result<(u32, Function)> {
+        params_ptr_local: u32,
+        scratch_base: u32,
+    ) -> Result<u32> {
         let params_area_size = site.requirements.params_area_byte_size.unwrap_or(0);
         let params_area_align = site.requirements.params_area_max_align.max(1);
         let ptr_pair_offsets = &site.requirements.params_area_pointer_pair_offsets;
@@ -6694,7 +6719,6 @@ impl FactStyleGenerator {
             0
         });
 
-        // Check if any list copy layouts contain inner resources (borrow handles)
         let has_inner_resources = copy_layouts.iter().any(|cl| {
             matches!(cl,
                 crate::resolver::CopyLayout::Elements { inner_resources, .. }
@@ -6702,43 +6726,40 @@ impl FactStyleGenerator {
             )
         });
 
-        // Local layout:
-        //   0: params_ptr (the function parameter — pointer to caller's memory)
-        //   1: callee_ptr (allocated pointer in callee's memory)
-        //   2..2+N: dest_ptr for each pointer pair copy
-        //   2+N: loop_counter (if inner resources need fixup)
-        //   last: pair_len_local (scratch for per-pair overflow guard)
+        // #371 / SR-58 fail-loud (surfaced by the Mythos delta-pass): Phase 3
+        // relocates a pointer pair's payload and its `inner_resources`, but NOT
+        // its `inner_pointers` — the per-element nested pointer pairs of a
+        // `list<string>` / `list<list<_>>` / `list<record{string}>` inside the
+        // params buffer. Those nested pointers would stay pointing into CALLER
+        // memory after the bulk copy, so the callee would dereference dangling
+        // addresses (silent cross-memory corruption). This gap pre-dates #371
+        // (it exists in the pure params-ptr path too — this helper is shared),
+        // but rather than leave it silent, refuse to emit. Loud-not-silent
+        // (SR-56/SR-59 philosophy); tracked for real inner_pointers handling.
+        if let Some(bad) = copy_layouts.iter().find(|cl| {
+            matches!(cl,
+                crate::resolver::CopyLayout::Elements { inner_pointers, .. }
+                if !inner_pointers.is_empty()
+            )
+        }) {
+            return Err(crate::Error::AdapterGeneration(format!(
+                "params-area copy for import '{}': a pointer pair carries nested inner pointers \
+                 ({bad:?}) — list<string>/list<list<_>>/list<record{{string}}> inside a \
+                 >16-flat-param buffer is not yet bridged across memories; refusing to emit code \
+                 that would leave the nested pointers dangling in caller memory",
+                site.import_name,
+            )));
+        }
+
         let num_ptr_pairs = ptr_pair_offsets.len() as u32;
         let loop_counter_count = if has_inner_resources { 1u32 } else { 0 };
-        let pair_len_scratch_count = if num_ptr_pairs > 0 { 1u32 } else { 0 };
-        let scratch_count = 1 + num_ptr_pairs + loop_counter_count + pair_len_scratch_count; // callee_ptr + per-pair dest ptrs + loop counter + pair_len
 
-        // Post-return needs result save locals
-        let has_post_return = options.callee_post_return.is_some();
-        // For params-ptr, the results come from the callee directly.
-
-        let mut local_decls: Vec<(u32, wasm_encoder::ValType)> = Vec::new();
-        if scratch_count > 0 {
-            local_decls.push((scratch_count, wasm_encoder::ValType::I32));
-        }
-
-        // We don't know result count from here, so we handle post-return simply:
-        // if there's a post-return, we'll save and restore results.
-        // But for params-ptr functions with resource results, result count should be 1 (i32).
-        // For simplicity: if has_post_return, add 1 i32 result save local.
-        let result_save_base = 1 + scratch_count; // after params_ptr(0) + scratch
-        if has_post_return {
-            local_decls.push((1, wasm_encoder::ValType::I32));
-        }
-
-        let mut func = Function::new(local_decls);
-
-        let params_ptr_local: u32 = 0;
-        let callee_ptr_local: u32 = 1;
-        let pair_dest_base: u32 = 2;
+        // Scratch layout (see params_area_copy_scratch_count):
+        let callee_ptr_local: u32 = scratch_base;
+        let pair_dest_base: u32 = scratch_base + 1;
         // Scratch local holding the length of the current (ptr, len) pair,
-        // used by emit_overflow_guard. Only present when there is at least
-        // one pointer pair.
+        // used by emit_overflow_guard. Only referenced when there is at
+        // least one pointer pair.
         let pair_len_local: u32 = pair_dest_base + num_ptr_pairs + loop_counter_count;
 
         // --- Phase 1: Allocate buffer in callee's memory ---
@@ -6747,7 +6768,7 @@ impl FactStyleGenerator {
         func.instruction(&Instruction::I32Const(0)); // original_size
         func.instruction(&Instruction::I32Const(params_area_align as i32)); // alignment
         func.instruction(&Instruction::I32Const(params_area_size as i32)); // new_size
-        emit_checked_realloc(&mut func, callee_realloc, callee_ptr_local);
+        emit_checked_realloc(func, callee_realloc, callee_ptr_local);
 
         // --- Phase 2: Bulk copy the entire params buffer ---
         // memory.copy $callee_mem $caller_mem (callee_ptr, params_ptr, size)
@@ -6798,12 +6819,12 @@ impl FactStyleGenerator {
             let realloc_align = if is_compact_utf16 { 2 } else { 1 };
 
             // Allocate: new_ptr = cabi_realloc(0, 0, align, <byte count>)
-            emit_overflow_guard(&mut func, pair_len_local, byte_mult);
+            emit_overflow_guard(func, pair_len_local, byte_mult);
             func.instruction(&Instruction::I32Const(0));
             func.instruction(&Instruction::I32Const(0));
             func.instruction(&Instruction::I32Const(realloc_align));
-            emit_copy_byte_count(&mut func, pair_len_local, byte_mult, is_compact_utf16);
-            emit_checked_realloc(&mut func, callee_realloc, dest_local);
+            emit_copy_byte_count(func, pair_len_local, byte_mult, is_compact_utf16);
+            emit_checked_realloc(func, callee_realloc, dest_local);
 
             // Copy data: memory.copy callee caller (new_ptr, old_ptr, <byte count>)
             func.instruction(&Instruction::LocalGet(dest_local)); // dst (in callee mem)
@@ -6816,7 +6837,7 @@ impl FactStyleGenerator {
                 memory_index: options.callee_memory,
             })); // src (in caller mem)
             // Byte count from the stashed (still-tagged) length operand.
-            emit_copy_byte_count(&mut func, pair_len_local, byte_mult, is_compact_utf16);
+            emit_copy_byte_count(func, pair_len_local, byte_mult, is_compact_utf16);
             func.instruction(&Instruction::MemoryCopy {
                 src_mem: options.caller_memory,
                 dst_mem: options.callee_memory,
@@ -6943,6 +6964,55 @@ impl FactStyleGenerator {
             }));
         }
 
+        Ok(callee_ptr_local)
+    }
+
+    /// Generate an adapter for the params-ptr calling convention.
+    ///
+    /// When flat param count > MAX_FLAT_PARAMS (16), the canonical ABI stores all
+    /// params in a buffer in linear memory. Both caller and callee use:
+    ///   (params_ptr: i32) → result...
+    ///
+    /// The adapter bridges different memories:
+    /// 1. Allocate buffer in callee's memory via cabi_realloc
+    /// 2. Bulk copy the params buffer from caller to callee memory
+    /// 3. Fix up any (ptr, len) pairs inside the buffer — copy pointed-to data
+    ///    from caller memory to callee memory and update the pointers
+    /// 4. Call callee with new pointer
+    /// 5. Return the result(s)
+    fn generate_params_ptr_adapter(
+        &self,
+        site: &AdapterSite,
+        options: &AdapterOptions,
+        target_func: u32,
+        caller_type_idx: u32,
+        resource_rep_imports: &std::collections::HashMap<(String, String), u32>,
+    ) -> Result<(u32, Function)> {
+        // Scratch block for the params-area copy helper lives immediately after
+        // the single function parameter (params_ptr = local 0), i.e. base 1.
+        let scratch_count = Self::params_area_copy_scratch_count(site);
+
+        // Post-return needs a result-save local (after params_ptr(0) + scratch).
+        let has_post_return = options.callee_post_return.is_some();
+        let result_save_base = 1 + scratch_count;
+
+        let mut local_decls: Vec<(u32, wasm_encoder::ValType)> = Vec::new();
+        if scratch_count > 0 {
+            local_decls.push((scratch_count, wasm_encoder::ValType::I32));
+        }
+        // We don't know result count from here, so we handle post-return simply:
+        // if there's a post-return, we'll save and restore the (i32) result.
+        if has_post_return {
+            local_decls.push((1, wasm_encoder::ValType::I32));
+        }
+
+        let mut func = Function::new(local_decls);
+
+        // Phases 1–3.5: allocate callee buffer, bulk-copy, fix up pointer pairs
+        // and borrow handles. params_ptr is local 0; scratch starts at index 1.
+        let callee_ptr_local =
+            self.emit_params_area_copy(&mut func, site, options, resource_rep_imports, 0, 1)?;
+
         // --- Phase 4: Call callee with the new pointer ---
         func.instruction(&Instruction::LocalGet(callee_ptr_local));
         func.instruction(&Instruction::Call(target_func));
@@ -6987,6 +7057,7 @@ impl FactStyleGenerator {
         caller_type_idx: u32,
         caller_param_count: usize,
         callee_param_count: usize,
+        resource_rep_imports: &std::collections::HashMap<(String, String), u32>,
     ) -> Result<(u32, Function)> {
         let retptr_local = (caller_param_count - 1) as u32;
         let return_area_size = site.requirements.return_area_byte_size.unwrap_or(8);
@@ -7007,12 +7078,70 @@ impl FactStyleGenerator {
             .conditional_result_pointer_pairs
             .is_empty();
 
+        // #371 / SR-58: COMBINED convention — flat params > 16 AND flat results > 1.
+        //   caller (lowered):  (params_ptr, retptr) → ()
+        //   callee (lifted):   (params_ptr)        → i32 (return area ptr)
+        // The params satisfy the params-ptr convention (all params live behind a
+        // single pointer into caller memory), while the results still satisfy the
+        // retptr convention. When memories differ, the caller's params_ptr cannot
+        // be passed raw to the callee — the whole params buffer (with its inner
+        // string/list/resource pointers) must be copied into callee memory first,
+        // exactly like the pure params-ptr adapter does. The flat
+        // `pointer_pair_positions` describe FLAT param slots that do NOT exist in
+        // this convention (params are behind the pointer), so the outbound flat
+        // copy (Phase 0/1/1b) is meaningless here and MUST be skipped — indexing
+        // those flat positions as locals would corrupt scratch/retptr locals.
+        let uses_params_area = site.requirements.params_area_byte_size.is_some()
+            && options.caller_memory != options.callee_memory;
+
+        if uses_params_area {
+            // Fail LOUD rather than emit silently-wrong code for shapes the
+            // params-area copy cannot bridge.
+            if callee_param_count != 1 {
+                return Err(crate::Error::AdapterGeneration(format!(
+                    "#371 combined params-ptr+retptr adapter for import '{}': expected callee to \
+                     take exactly 1 params_ptr param, found {} — cannot bridge safely",
+                    site.import_name, callee_param_count,
+                )));
+            }
+            if options.callee_realloc.is_none() {
+                return Err(crate::Error::AdapterGeneration(format!(
+                    "#371 combined params-ptr+retptr adapter for import '{}': no callee realloc — \
+                     cannot allocate the cross-memory params buffer",
+                    site.import_name,
+                )));
+            }
+            // emit_params_area_copy only bridges borrow handles inside the buffer
+            // for the 2-component case (callee defines the resource), via
+            // params_area_borrow_fixups. A borrow<T> where the callee does NOT
+            // define T (3-component chain) has no in-buffer fixup emitted (see
+            // the `// 3-component chains ... could be added here` note where
+            // params_area_borrow_fixups is populated), so the handle would reach
+            // the callee UNCONVERTED. Refuse rather than emit a silently-wrong
+            // handle. (Mirrors the same unhandled shape in the pure params-ptr
+            // adapter; own<T> is fine — the callee converts it internally.)
+            if let Some(op) = site
+                .requirements
+                .params_area_resource_positions
+                .iter()
+                .find(|op| !op.is_owned && !op.callee_defines_resource)
+            {
+                return Err(crate::Error::AdapterGeneration(format!(
+                    "#371 combined params-ptr+retptr adapter for import '{}': borrow<{}> inside a \
+                     >16-flat-param buffer needs a 3-component resource-rep chain, which the \
+                     params-area copy does not yet bridge — refusing to emit an unconverted handle",
+                    site.import_name, op.import_field,
+                )));
+            }
+        }
+
         // Scratch locals layout (all i32, after caller params):
         //   [dest_ptr_0..dest_ptr_N]  (one per param pointer pair)
         //   [cond_dest_ptr]           (reused for conditional param/result copies)
         //   [result_ptr]              (return area pointer from callee)
         //   [data_ptr] [data_len] [caller_new_ptr]  (reused for each result pair)
         //   [loop_idx, inner_ptr, inner_len, new_ptr] × depth  (for nested fixup loops)
+        //   [params-area copy scratch block]  (#371, only when uses_params_area)
         let mut scratch_count: u32 = 0;
         let dest_ptr_base = caller_param_count as u32;
         if num_param_pairs > 0 && options.callee_realloc.is_some() {
@@ -7035,17 +7164,55 @@ impl FactStyleGenerator {
         if !options.inner_resource_fixups.is_empty() {
             scratch_count += 1; // resource loop counter
         }
+        // #371: reserve the params-area copy scratch block AT THE END so no
+        // existing scratch/local index shifts. Passed to emit_params_area_copy.
+        let params_area_scratch_base = caller_param_count as u32 + scratch_count;
+        if uses_params_area {
+            scratch_count += Self::params_area_copy_scratch_count(site);
+        }
 
         let local_decls = vec![(scratch_count, wasm_encoder::ValType::I32)];
         let mut func = Function::new(local_decls);
 
-        // Phase 0: Convert borrow resource handles
-        emit_resource_borrow_phase0(&mut func, &options.resource_rep_calls);
+        // Phase 0: Convert borrow resource handles.
+        // #371: resource_rep_calls carry FLAT param indices; in params-area mode
+        // those flat slots don't exist (borrow handles live inside the buffer and
+        // are fixed up by emit_params_area_copy via params_area_borrow_fixups), so
+        // skip the flat Phase 0 to avoid clobbering the retptr / scratch locals.
+        if !uses_params_area {
+            emit_resource_borrow_phase0(&mut func, &options.resource_rep_calls);
+        }
+
+        // #371: emit the cross-memory params-area copy (Phases 1–3.5 of the
+        // params-ptr adapter). params_ptr is caller local 0; the copied callee
+        // buffer pointer is captured for the callee call below.
+        let params_area_callee_ptr = if uses_params_area {
+            log::debug!(
+                "#371 combined params-ptr+retptr adapter: import={} params_buf={}B ({} inner ptr \
+                 pairs, {} borrow fixups) — copying params area across memories",
+                site.import_name,
+                site.requirements.params_area_byte_size.unwrap_or(0),
+                site.requirements.params_area_pointer_pair_offsets.len(),
+                options.params_area_borrow_fixups.len(),
+            );
+            Some(self.emit_params_area_copy(
+                &mut func,
+                site,
+                options,
+                resource_rep_imports,
+                0, // caller params_ptr is local 0
+                params_area_scratch_base,
+            )?)
+        } else {
+            None
+        };
 
         // --- Phase 1: Outbound copy of ALL pointer pairs (caller → callee) ---
+        // Skipped in params-area mode (params live behind the pointer, not in
+        // flat slots — see uses_params_area rationale above).
         if let Some(callee_realloc) = options
             .callee_realloc
-            .filter(|_| !param_ptr_positions.is_empty())
+            .filter(|_| !param_ptr_positions.is_empty() && !uses_params_area)
         {
             let param_layouts = &site.requirements.param_copy_layouts;
             for (pair_idx, &ptr_pos) in param_ptr_positions.iter().enumerate() {
@@ -7180,7 +7347,12 @@ impl FactStyleGenerator {
         }
 
         // --- Phase 1b: Conditional param copy (option/result/variant params) ---
-        if let Some(callee_realloc) = options.callee_realloc.filter(|_| has_cond_param_pairs) {
+        // Skipped in params-area mode (flat conditional params don't exist —
+        // see uses_params_area rationale above).
+        if let Some(callee_realloc) = options
+            .callee_realloc
+            .filter(|_| has_cond_param_pairs && !uses_params_area)
+        {
             for cond in &site.requirements.conditional_pointer_pairs {
                 let ptr_local = cond.ptr_position;
                 let len_local = cond.ptr_position + 1;
@@ -7223,7 +7395,12 @@ impl FactStyleGenerator {
         }
 
         // Push callee params (after all pointer remapping)
-        if !param_ptr_positions.is_empty() && options.callee_realloc.is_some() {
+        if let Some(callee_ptr_local) = params_area_callee_ptr {
+            // #371 combined convention: the callee takes a single params_ptr;
+            // pass the freshly-copied callee-memory buffer, NOT the caller's raw
+            // params_ptr (local 0). callee_param_count == 1 is enforced above.
+            func.instruction(&Instruction::LocalGet(callee_ptr_local));
+        } else if !param_ptr_positions.is_empty() && options.callee_realloc.is_some() {
             for i in 0..callee_param_count as u32 {
                 if let Some(pair_idx) = param_ptr_positions.iter().position(|&pos| pos == i) {
                     func.instruction(&Instruction::LocalGet(dest_ptr_base + pair_idx as u32));

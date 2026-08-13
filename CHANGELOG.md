@@ -4,6 +4,45 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.44.0] - 2026-08-12
+
+Two silent-corruption fixes in the cross-component adapter and the shared-memory
+rebase path, both closing demonstrated divergences with hard runtime oracles.
+
+### Fixed
+- **Fixed-size / large-params calls returned all-zeros (SR-58, #371)** — a
+  cross-component call with flat params > 16 AND flat results > 1 uses the
+  combined `(params_ptr, retptr)` convention; it matched the retptr heuristic and
+  was routed to an adapter that never copied the params buffer across memories,
+  so the callee read its parameters from its own memory at the caller's address →
+  all-zeros. The output validated (silent). The retptr adapter now performs the
+  cross-memory params-area copy (with pointer-pair, inner-resource, and borrow
+  fixups) in the combined convention. Shapes it cannot bridge (3-component borrow
+  chains; nested `list<string>`/`list<list<_>>` inside a >16-param buffer) now
+  **fail loud** instead of emitting silently-wrong code.
+- **Static-PIC global initializers were emitted un-folded (SR-59, #339)** — a
+  global initialized `__memory_base + N` (the real PIC toolchain shape) was not
+  folded to the module's placed address after fusion, producing a module wasmtime
+  rejects (`constant expression required: global.get of locally defined global`).
+  `convert_init_expr` now applies the #353 base-fold to global initializers.
+
+### Changed
+- **Loud acceptance under `--memory shared --address-rebase` (SR-59, #339)** —
+  when meld accepts a no-reloc, non-zero-base module with a code section (the
+  path-F carve-out), it now warns that an absolute address used only as a value
+  will not be rebased, and names `--emit-relocs`. This is observability, not a
+  detector — a precise "is this const an address" test is undecidable without
+  relocations. Corrects SR-48's overstated "shall HARD-ERROR" wording to match
+  the shipped carve-out.
+- **Clearer `memory.grow` rejection (#299)** — the diagnostic now names the
+  remedies (grow-free embedder-arena build, or `--memory multi`).
+
+### Known / residual (documented, not fixed)
+- Bare no-reloc absolute-const globals, address-as-value under no relocs, and the
+  operand-swapped `i32.add(N, global.get $defined_base)` PIC form remain
+  undecidable-or-unobserved residuals (#339 stays open). The last fails loud at
+  instantiation, never silently.
+
 ## [0.43.0] - 2026-08-12
 
 Single-address-space (MCU) memory hardening for `--memory shared` (#370):

@@ -92,6 +92,27 @@ pub fn resolve_address_plan(
     }
 
     if !has_reloc {
+        // Part 2 (#339 Finding A): we reach here for a non-zero-base module with
+        // no reloc metadata that passed the path-F check above (it does no direct
+        // load/store). It is ACCEPTED with an empty plan — but an absolute address
+        // used purely as a VALUE (`i32.const <abs>; call $import`, a returned or
+        // stored pointer) is emitted verbatim and will NOT be rebased, so it can
+        // silently alias a neighbouring module's window. A sound "is this const an
+        // address" detector is undecidable without relocs (a broadened gate was
+        // built, reviewed, and reverted), so this is observability only — warn
+        // loudly and name the remedy rather than corrupt or over-reject.
+        if memory_base_offset != 0 && code_section_range.is_some() {
+            log::warn!(
+                "component '{component_name}' module {module_idx}: placed at \
+                 non-zero shared-memory base {memory_base_offset:#x} with a code \
+                 section but NO relocation metadata. Direct load/store is absent \
+                 (fusion proceeds), but any absolute address used as a VALUE \
+                 (e.g. `i32.const <addr>` passed to a call or returned/stored as \
+                 a pointer) will be emitted UN-REBASED and may alias another \
+                 component's memory. Rebuild with `--emit-relocs` so meld can \
+                 rebase these addresses exactly (#339)."
+            );
+        }
         return Ok(AddressPlan::default());
     }
 

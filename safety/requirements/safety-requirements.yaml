@@ -1676,8 +1676,20 @@ artifacts:
       shared-memory `memory_base` to every `R_WASM_MEMORY_ADDR_SLEB`/`_LEB`/`_I32`
       operand (code literals AND data-section pointers), and strip the consumed
       relocations from the output. When a `--memory shared` input lacks this
-      metadata (non-relocatable / PIC-stripped), meld shall HARD-ERROR rather
-      than emit an un-rebased colliding module. PIC/dylink inputs are out of
+      metadata (non-relocatable / PIC-stripped) AND performs a direct
+      `load`/`store` at a non-zero base, meld shall HARD-ERROR (path-F,
+      `module_has_direct_memory_access`) rather than emit an un-rebased colliding
+      module. RESIDUAL CARVE-OUT (corrected 2026-08-12, was overstated as an
+      unconditional hard-error): a no-reloc module that references an absolute
+      address only as a VALUE (`i32.const <abs>; call`, a returned/stored
+      pointer, or a global initializer), or that accesses memory only via
+      bulk-memory ops, is NOT caught by path-F and is currently accepted — a
+      sound-and-precise "is this const an address" detector is undecidable
+      without relocation metadata (a broadened gate was built, Mythos-reviewed,
+      and reverted for simultaneous over- and under-rejection). SR-59 governs
+      making that acceptance LOUD and closing the one tractable, execution-
+      demonstrated sub-case (global-initializer addresses in `convert_init_expr`).
+      PIC/dylink inputs are out of
       scope: a Component-Model core may import only functions, so
       `wasm-tools component new` rejects a core importing `memory`/`__memory_base`
       globals (ADR-6, path-E rejected). This supersedes, for the shared path,
@@ -2255,3 +2267,294 @@ artifacts:
         - "https://github.com/pulseengine/meld/issues/370"
         - "gale#266"
         - "meld-core/tests/pack_rebase_370.rs"
+
+  - id: SR-58
+    type: sw-req
+    title: Cross-memory params-area copy under the combined params-ptr + retptr convention
+    description: >
+      When a cross-component call flattens to MORE than the ABI flat-param limit
+      (16) AND returns MORE than the flat-result limit (1) — the combined
+      convention where the caller passes `(params_ptr, retptr)` and the callee
+      is `(params_ptr) -> i32` — the generated adapter shall copy the caller's
+      params buffer into CALLEE memory (with pointer-pair and borrow fixups)
+      before the call, in addition to the return-area copy-back. Today the
+      retptr detection wins the dispatch and returns early into
+      `generate_retptr_adapter`, which never consults `params_area_byte_size`,
+      so the callee reads its parameters from its OWN memory at the caller's
+      address → all-zeros (or, for a params area containing strings, cross-memory
+      pointer corruption). The output validates, so this is a silent
+      "validates-but-wrong" divergence (#371). The retptr-only and
+      params-ptr-only paths are unchanged.
+    status: verified
+    tags: [adapter, canonical-abi, cross-memory, correctness, silent-divergence]
+    release: v0.44.0
+    links:
+      - type: derives-from
+        target: SYS-3
+      - type: refines
+        target: SR-12
+    cited-source:
+      - uri: "https://github.com/pulseengine/meld/issues/371"
+        kind: github
+        last-checked: 2026-08-12
+    fields:
+      implementation:
+        - meld-core/src/adapter/fact.rs
+      verification-method: test
+      verification-description: >
+        PROPOSED. Verified by flipping the existing runtime differential test
+        `meld-core/tests/wit_bindgen_runtime.rs::test_runtime_wit_bindgen_fixed_length_lists`
+        from tolerating the guest-side trap to asserting `run()` SUCCEEDS — the
+        guest `assert_eq`s on the round-tripped fixed-size-list values then form
+        the oracle (the test is red today, green only with the params-area copy
+        in the retptr path). A same-PR case shall also cover / fail-loud-guard
+        the >16-flat-params-with-strings + retptr shape (pointer_pair_positions
+        indexing) so it does not silently corrupt.
+      references:
+        - "https://github.com/pulseengine/meld/issues/371"
+        - "meld-core/tests/wit_bindgen_runtime.rs"
+
+  - id: SR-59
+    type: sw-req
+    title: Loud no-reloc acceptance + static-PIC global-initializer fold
+    description: >
+      Two residual gaps in the shared-memory rebase path left by SR-48's path-F
+      carve-out (#339, #326 Finding A). (1) LOUD-NOT-SILENT: when
+      `--memory shared --address-rebase` ACCEPTS a no-reloc, non-zero-base module
+      with a code section (the path-F carve-out — no direct load/store), meld
+      shall emit a diagnostic naming the module and the un-rebased-value risk and
+      the remedy (`--emit-relocs`); it shall never SILENTLY accept one. This is a
+      policy/observability guarantee, NOT a detector — a sound-and-precise
+      "is this const an address" test is undecidable without relocation metadata
+      (see SR-48). (2) STATIC-PIC GLOBAL-INIT FOLD: real PIC toolchains emit a
+      global initialized to `__memory_base + N` (a leading `global.get` of the
+      base + extended-const), NOT a bare absolute const — and global initializers
+      are NEVER reloc-covered (clang/wasm-ld emit no `reloc.GLOBAL`; a data-address
+      global lowers to a `reloc.DATA` DATA symbol instead). `merger.rs::convert_init_expr`
+      previously applied the #353 `__memory_base`-fold ONLY to data/element
+      offsets, so after fusion such a global became `global.get <defined-base>;
+      i32.const N; i32.add`, which wasmtime REJECTS ("constant expression
+      required: global.get of locally defined global") — and where accepted held
+      an un-rebased address. meld shall fold a global initializer whose leading op
+      is a now-DEFINED constant base (`base + N`) to a concrete `i32.const
+      (base + N)` — the module's own placed address — mirroring the #353
+      leading-only offset fold; `__stack_pointer`-class globals stay exempt.
+      RESIDUAL (documented; #339 stays OPEN, NOT claimed fixed): a BARE no-reloc
+      absolute-const global (`(global (i32.const <abs>))`, avrabe's synthetic
+      repro) is byte-identical to an integer and carries no metadata naming the
+      site, so it is neither folded nor rebased — the same undecidability as the
+      value-address carve-out (part 1 / SR-48). Part 2's warn does not cover it
+      either (those modules carry relocs, so path-F never reaches the warn).
+      A second residual (pre-existing, Mythos-surfaced): the OPERAND-SWAPPED PIC
+      form `i32.add(i32.const N, global.get <defined-base>)` is not folded (the
+      fold is leading-base-only) → emitted verbatim → wasm-tools-valid but
+      wasmtime-invalid ("constant expression required"). Not observed from wasm-ld
+      (which emits base-first, which IS folded); fails loud at instantiation, not
+      silent; tracked, not fixed here.
+    status: verified
+    tags: [memory-strategy, shared-memory, relocation, loud-not-silent, silent-corruption]
+    release: v0.44.0
+    links:
+      - type: derives-from
+        target: SYS-6
+      - type: mitigates
+        target: LS-M-11
+      - type: refines
+        target: SR-48
+    cited-source:
+      - uri: "https://github.com/pulseengine/meld/issues/339"
+        kind: github
+        last-checked: 2026-08-12
+    fields:
+      implementation:
+        - meld-core/src/merger.rs
+        - meld-core/src/address_strategy.rs
+        - meld-core/src/segments.rs
+      verification-method: test
+      verification-description: >
+        Part 2 (global-init fold) verified by
+        `meld-core/tests/pic_extended_const_353.rs::pic_extended_const_global_init_valid_and_rebased_339`:
+        a component whose global is initialized `__memory_base + 8` is fused and
+        run on wasmtime — RED before the fix (wasmtime rejects the unfolded
+        `global.get <defined>` init), GREEN after (accepts, and `get_g()` returns
+        the rebased `base + 8 = 65544`). Part 1 (loud acceptance) verified by
+        `meld-core/tests/value_address_warn_339.rs`: a no-reloc value-address
+        module fused under shared+rebase fires the acceptance warning and still
+        validates (non-regression for #298/#304); RED verified via negative
+        control. Explicitly NOT verified / NOT fixed: (a) the gate detecting
+        address-as-value in general, and (b) the bare no-reloc absolute-const
+        global (#339 residual) — both undecidable without relocs (see SR-48).
+        Implementation reuses `segments::eval_ext_const_i32_with_base` (visibility
+        widened to pub(crate)). The #299 memory.grow diagnostic (remedies named)
+        rides in the same change under SR-50.
+      references:
+        - "https://github.com/pulseengine/meld/issues/339"
+        - "https://github.com/pulseengine/meld/issues/326"
+
+  - id: SR-60
+    type: sw-req
+    title: Const-expr offset folding is equivalence-checked against certificate-checked QF_BV semantics
+    description: >
+      Every extended-const fold surface — `segments.rs::fold_extended_const_i32`
+      / `_i64`, `segments.rs::eval_ext_const_i32_with_base` (the #353/#368
+      static-PIC fold), and `merger.rs::convert_init_expr` — shall be validated by
+      a property harness whose reference is `ordeal` (a certificate-checked
+      QF_BV SMT solver, crates.io): for randomly generated well-formed
+      extended-const operator sequences over {i32/i64.const, add, sub, mul,
+      global.get} and base values, the folded value shall equal the wasm
+      stack-machine evaluation (modular bitvector arithmetic) — asserted via
+      `Solver::prove_equiv` returning UNSAT with a re-checkable certificate
+      (`Unknown` is a hard test failure, not a pass). Negative controls shall
+      symbolically refute the #338 truncation (`prove_equiv(base + N, base)` →
+      SAT with witness) and a mutated fold. Closes the #338 silent-miscompile
+      class with proof rather than examples (#344).
+    status: proposed
+    tags: [const-expr, verification-hardening, smt, ordeal, correctness]
+    release: v0.45.0
+    links:
+      - type: derives-from
+        target: SYS-1
+      - type: refines
+        target: SR-51
+    cited-source:
+      - uri: "https://github.com/pulseengine/meld/issues/344"
+        kind: github
+        last-checked: 2026-08-12
+    fields:
+      implementation:
+        - meld-core/src/segments.rs
+      verification-method: test
+      verification-description: >
+        PROPOSED. A proptest generator drives the SHIPPED fold entry points
+        (`parse_const_expr_with_value` via encoded bytes, `eval_ext_const_i32_with_base`)
+        over random valid sequences; `ordeal::Solver::prove_equiv` is the
+        reference (UNSAT + `cert.recheck()`; Unknown = fail). Negative controls:
+        the #338 `base + 16` truncation refuted symbolically over free base, and
+        a deliberately-wrong fold caught. Plus 2-3 wasmtime wrap-boundary
+        ground-truth checks. Test-only change + one dev-dependency; no production
+        code touched. First requirement coverage of `eval_ext_const_i32_with_base`.
+      references:
+        - "https://github.com/pulseengine/meld/issues/344"
+        - "https://github.com/pulseengine/meld/issues/338"
+        - "ordeal 0.18 (crates.io) Solver::prove_equiv"
+
+  - id: SR-61
+    type: sw-req
+    title: Fused output passes sound abstract interpretation (scry gate)
+    description: >
+      The fused core module shall pass a `scry` abstract-interpretation
+      well-formedness check as a CI gate: a representative fused output
+      (`meld fuse` of a checked-in fixture) shall have well-formed program points
+      and call edges (`scry-viz check` exit 0), catching structural corruption
+      the wasm validator does not. scry is explicitly designed to run post-meld on
+      fused core modules (#302 Track C). This is a wasm-level verification gate on
+      the actual product (meld fuses wasm in/out but currently runs no wasm-level
+      verification).
+    status: proposed
+    tags: [ci-gate, wasm-verification, scry, abstract-interpretation, do-333]
+    release: v0.45.0
+    links:
+      - type: derives-from
+        target: SYS-11
+    cited-source:
+      - uri: "https://github.com/pulseengine/meld/issues/302"
+        kind: github
+        last-checked: 2026-08-12
+    fields:
+      implementation:
+        - .github/workflows/scry-gate.yml
+      verification-method: automated-test
+      verification-description: >
+        PROPOSED. `scry-gate.yml` (mirrors wohl's scry-gate) clones the pinned
+        scry ref, builds `scry-viz`, fuses `tests/wit_bindgen/fixtures/strings-simple.wasm`,
+        and runs `scry-viz check` — red on crash/malformed. Verified GREEN today
+        in scoping (586 functions, 7070 program points, 464 call edges, exit 0).
+      references:
+        - "https://github.com/pulseengine/meld/issues/302"
+
+  - id: SR-62
+    type: sw-req
+    title: Fused output is witness-instrumentable with a zero-gap MC/DC gate fixture
+    description: >
+      The fused core module shall be `witness`-instrumentable, and a dedicated
+      MC/DC gate fixture (an import-free seam fused with `--preserve-names`) shall
+      report ZERO unresolved gap rows in the witness MC/DC truth table as a CI
+      gate (#302 Track C). Day-one scope is a pipeline + no-regression gate
+      (instrument → run --invoke-all → report gap==0); rich per-decision MC/DC
+      rows require a rustc-lowered fixture with DWARF (tracked as a follow-up,
+      since hand-written WAT yields zero recoverable decisions, and the fused
+      real wit-bindgen output retains wasi imports the core runner cannot stub —
+      witness#180).
+    status: proposed
+    tags: [ci-gate, wasm-verification, witness, mcdc, do-178c]
+    release: v0.45.0
+    links:
+      - type: derives-from
+        target: SYS-11
+    cited-source:
+      - uri: "https://github.com/pulseengine/meld/issues/302"
+        kind: github
+        last-checked: 2026-08-12
+    fields:
+      implementation:
+        - .github/workflows/witness-gate.yml
+      verification-method: automated-test
+      verification-description: >
+        PROPOSED. `witness-gate.yml` (mirrors wohl's run-witness.sh) checks in a
+        small import-free WAT seam fixture, fuses it with `--preserve-names`,
+        instruments, runs `--invoke-all`, and gates `grep -oE '[0-9]+ gap' == 0`.
+        Honest limitation recorded in the SR: pipeline/no-regression until a
+        rustc-built fixture lands; the flat-decision reconstruction on WAT is
+        the same as wohl's documented finding.
+      references:
+        - "https://github.com/pulseengine/meld/issues/302"
+
+  - id: SR-63
+    type: sw-req
+    title: Embedder-provided allocator seam survives fusion (pulseengine:embedder)
+    description: >
+      The fuser shall preserve embedder-namespace imports (the
+      `pulseengine:embedder` arena-realloc seam) unresolved through
+      `fuse --memory shared --address-rebase` core-module output — never binding
+      them to a fusion-set provider nor rejecting them — so the embedder
+      (synth / native link) binds them at dissolve. This is the grow-free MCU
+      path for the jess/gale Pixhawk pipeline: components route `cabi_realloc` to
+      an embedder import (`env::__cabi_arena_realloc`) instead of growing memory
+      (#301; complements the already-shipped #298 defer-grow/export-drop, SR-50).
+      SCOPE HONESTY: the differential oracle uses a SYNTHETIC-WAT arena component
+      (proves meld's pass-through plumbing); the REAL forked-toolchain artifact
+      path (forked wit-bindgen#4 `cabi-realloc-extern` + wasm-tools#2
+      `--import-passthrough`) is NOT covered in-repo and is tracked as a
+      follow-up. `--output component` re-exposure (component_wrap arm, Gap B) is
+      out of scope here.
+    status: proposed
+    tags: [resolver, embedder-passthrough, mcu, shared-memory, grow-free]
+    release: v0.45.0
+    links:
+      - type: derives-from
+        target: SYS-8
+      - type: mitigates
+        target: LS-R-17
+      - type: refines
+        target: SR-50
+    cited-source:
+      - uri: "https://github.com/pulseengine/meld/issues/301"
+        kind: github
+        last-checked: 2026-08-12
+    fields:
+      implementation:
+        - meld-core/src/resolver.rs
+      verification-method: test
+      verification-description: >
+        PROPOSED. Differential-execution oracle (new test in
+        `meld-core/tests/rebasing_end_to_end.rs`): fuse two SYNTHETIC arena
+        components under `--memory shared --address-rebase`; assert the fused
+        core validates, RETAINS the `env::__cabi_arena_realloc` import (nm-symbol
+        oracle), and — instantiated with a host-provided arena via `Linker` —
+        the export returns the same result as the unfused composition. Verifies
+        meld's plumbing ONLY; the forked-toolchain real-artifact path is a
+        documented follow-up (see SCOPE HONESTY in the description).
+      references:
+        - "https://github.com/pulseengine/meld/issues/301"
+        - "https://github.com/pulseengine/meld/issues/298"
+        - "https://github.com/pulseengine/meld/issues/299"

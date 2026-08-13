@@ -84,3 +84,76 @@ fn pic_extended_const_data_offset_valid_for_wasmtime_353() {
          `global.get` of a now-defined global (#353)",
     );
 }
+
+// ─── #339 / SR-59: the same base-fold gap in GLOBAL INITIALIZERS ────────────
+
+/// `$main` defines+exports `__memory_base` = 0x10000 and owns the memory;
+/// `$lib` imports it and defines a wasm GLOBAL initialized to the base-relative
+/// address `__memory_base + 8` and a getter that returns it. This is the
+/// `global.get`-first extended-const shape a data-address-valued global takes
+/// after `wasm-tools component link`.
+fn pic_globinit_component() -> Vec<u8> {
+    let wat = r#"
+    (component
+      (core module $main
+        (global (export "__memory_base") i32 (i32.const 65536))
+        (memory (export "memory") 2))
+      (core module $lib
+        (import "env" "memory" (memory 1))
+        (import "env" "__memory_base" (global $base i32))
+        (global $g (mut i32) (i32.add (global.get $base) (i32.const 8)))
+        (func (export "get_g") (result i32) (global.get $g)))
+      (core instance $mi (instantiate $main))
+      (core instance $li (instantiate $lib (with "env" (instance $mi)))))
+    "#;
+    wat::parse_str(wat).expect("PIC global-init component WAT must assemble")
+}
+
+/// #339 Part 1 oracle. A global INITIALIZER holding the base-relative address
+/// `__memory_base + N` is NOT rebased by `merger::convert_init_expr`, which
+/// remaps the global index but (pre-fix) never folds the now-DEFINED base. The
+/// re-emitted `global.get <defined>; i32.const 8; i32.add` is:
+///   * INVALID for wasmtime ("constant expression required: global.get of
+///     locally defined global") — the fused module fails to instantiate; and
+///   * semantically the #339 corruption — the initializer must resolve to the
+///     module's own placed address `base + 8`, not a stale value.
+///
+/// RED before the fix: `RuntimeModule::new` fails to parse. After the fix the
+/// initializer folds to `i32.const (base+8)` and `get_g` returns 65544.
+#[test]
+fn pic_extended_const_global_init_valid_and_rebased_339() {
+    let component = pic_globinit_component();
+    let mut fuser = Fuser::new(base_config());
+    fuser
+        .add_component_named(&component, Some("pic-globinit"))
+        .unwrap();
+    let (fused, _) = fuser
+        .fuse_with_stats()
+        .expect("PIC global-init component must fuse");
+
+    assert!(
+        wasmparser::Validator::new().validate_all(&fused).is_ok(),
+        "fused output must validate under wasm-tools"
+    );
+
+    use wasmtime::{Config, Engine, Instance, Module as RuntimeModule, Store};
+    let mut cfg = Config::new();
+    cfg.wasm_multi_memory(true);
+    let engine = Engine::new(&cfg).unwrap();
+    let module = RuntimeModule::new(&engine, &fused).expect(
+        "fused PIC output must be valid for wasmtime: a global initializer of \
+         `__memory_base + N` must be folded to `i32.const (base+N)`, not left as \
+         a `global.get` of a now-defined global (#339)",
+    );
+    let mut store = Store::new(&engine, ());
+    let instance = Instance::new(&mut store, &module, &[]).expect("instantiate");
+    let get_g = instance
+        .get_typed_func::<(), i32>(&mut store, "get_g")
+        .expect("get_g export");
+    assert_eq!(
+        get_g.call(&mut store, ()).unwrap(),
+        65536 + 8,
+        "the global must hold its own REBASED address base+8=65544, not a stale \
+         un-rebased value (#339)"
+    );
+}

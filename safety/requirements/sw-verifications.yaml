@@ -620,3 +620,57 @@ artifacts:
     links:
       - type: verifies
         target: SR-57
+  - id: SWV-48
+    type: sw-verification
+    title: "Verification of SR-58: Cross-memory params-area copy (combined params-ptr + retptr)"
+    description: >
+      Verifies SR-58 by flipping the runtime differential test
+      meld-core/tests/wit_bindgen_runtime.rs::test_runtime_wit_bindgen_fixed_length_lists
+      from tolerating the guest trap to asserting run() SUCCEEDS; the guest
+      assert_eq on the round-tripped fixed-size-list values is the oracle (red
+      before the fix — callee read params from its own memory at the caller's
+      address → all-zeros → trap; green after). Fix in adapter/fact.rs: extracted
+      emit_params_area_copy (Phases 1-3.5 of the params-ptr adapter) and a
+      uses_params_area branch in generate_retptr_adapter that reserves scratch
+      AT THE END (no existing local index shifts), gates the flat-coordinate
+      Phase 0/1/1b behind !uses_params_area, and pushes the copied callee buffer
+      pointer instead of the caller's raw params_ptr. Mythos delta-pass returned
+      NO VALIDATED FINDING (worst-case local map reconstructed, no overlap;
+      refactor byte-identical; full 74-test runtime suite green). It surfaced a
+      pre-existing latent gap — nested inner_pointers (list<string>/list<list>)
+      inside a >16-param buffer were not relocated on either path — now made
+      LOUD (fail-loud Err) in the shared helper rather than left silently
+      dangling. Full suite 804 passed / 44 binaries / 0 failed.
+    status: implemented
+    fields:
+      method: automated-test
+    links:
+      - type: verifies
+        target: SR-58
+  - id: SWV-49
+    type: sw-verification
+    title: "Verification of SR-59: Loud no-reloc acceptance + static-PIC global-init fold"
+    description: >
+      Verifies SR-59 via two wasmtime-backed oracles (both confirmed red→green
+      by stash). Global-init fold:
+      meld-core/tests/pic_extended_const_353.rs::pic_extended_const_global_init_valid_and_rebased_339
+      — a global initialized `__memory_base + 8` fused under shared+rebase; RED
+      before (wasmtime rejects the unfolded `global.get <defined>` init), GREEN
+      after (accepts; get_g() == base+8 == 65544). merger.rs::fold_defined_base_init
+      folds a leading defined-const-base extended-const to a concrete i32.const,
+      extending the #353 offset fold to global initializers (reusing
+      segments::eval_ext_const_i32_with_base). Loud acceptance:
+      meld-core/tests/value_address_warn_339.rs — a no-reloc value-address module
+      fires the address_strategy path-F accept warning and still validates
+      (non-regression for #298/#304). Mythos delta-pass: NO DELTA-INTRODUCED
+      FINDING (immutable-only + i32-only base map rules out mutable-drift/type
+      misfire; value-preserving). Documented residuals NOT claimed fixed: the
+      bare no-reloc absolute-const global and the operand-swapped defined-base
+      form (both undecidable / pre-existing; the latter fails loud at wasmtime
+      instantiation). #299 memory.grow diagnostic rides under SR-50.
+    status: implemented
+    fields:
+      method: automated-test
+    links:
+      - type: verifies
+        target: SR-59

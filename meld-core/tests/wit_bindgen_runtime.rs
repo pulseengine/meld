@@ -586,23 +586,13 @@ fn test_runtime_wit_bindgen_fixed_length_lists() {
     }
     let fused = fuse_fixture("fixed-length-lists", OutputFormat::Component)
         .expect("fixed-length-lists: component fusion should succeed");
-    // Fixed-size list adapter support is new; runtime execution may fail
-    // due to adapter-level issues with inline array data copying.
-    match run_wasi_component(&fused) {
-        Ok(()) => {}
-        Err(e) => {
-            let msg = format!("{e:?}");
-            if msg.contains("unreachable") || msg.contains("wasm trap") || msg.contains("assertion")
-            {
-                eprintln!(
-                    "fixed-length-lists: runtime execution failed \
-                     (adapter limitation for fixed-size lists): {e}"
-                );
-            } else {
-                panic!("fixed-length-lists: unexpected runtime error: {e:?}");
-            }
-        }
-    }
+    // SR-58 (#371): the guest round-trips fixed-size lists and asserts the
+    // values (runner.rs). Before the params-area copy fix the callee read its
+    // params from its own memory at the caller's address → all-zeros → the
+    // guest assertion trapped; the test used to tolerate that. Now it is a real
+    // differential oracle: run() must SUCCEED.
+    run_wasi_component(&fused)
+        .expect("fixed-length-lists: runtime round-trip should succeed (SR-58 / #371)");
 }
 
 #[test]
