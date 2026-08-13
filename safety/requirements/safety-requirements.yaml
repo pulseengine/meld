@@ -1529,7 +1529,18 @@ artifacts:
       test names; repair the 34 broken links (issue-refs mis-encoded as trace
       links; host-controller and dangling-UCA references); and reconcile the
       requirement-coverage rule with this project's STPA+requirements topology.
-    status: proposed
+
+      PROGRESS (v0.46.0 traceability close-out): part 1 is DONE — the
+      sw-verification (SWV) artifact type exists and EVERY sw-req (63/63) now
+      carries a typed `verifies` link (`rivet coverage`:
+      `swe1-has-verification 63/63 100%`, `swe6-verifies-swe1 75/75 100%`),
+      machine-enforced by `rivet validate` (PASS, 0 errors). REMAINING (why this
+      is `implemented`, not `verified`): the `requirement-coverage` /
+      `constraint-has-requirement` rules still read 0% — reconciling the STPA
+      system-constraint → requirement topology is a distinct piece that is
+      "partly gated on maintainer STPA judgment" and stays open for a later
+      release.
+    status: implemented
     tags: [process, traceability, verification, v0.36.0]
     links:
       - type: derives-from
