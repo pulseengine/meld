@@ -97,6 +97,22 @@ Locus of fix: **hybrid** — meld consumes; the producer must emit relocatable
 cores. Oracle: the gating fixtures above, derived from the spike, reproducing
 both gale datapoints under a fused shared memory.
 
+> **Update (2026-08-14) — path-E exclusion was scoped too broadly; see #353 / ADR-7.**
+> This ADR's spike concluded "path-E (PIC) is architecturally excluded" from
+> testing `wasm-tools component **new**`, which does reject a dylink core. But
+> `component **link**` / `wac` **accept** the same core (they are purpose-built
+> for it), and — decisively — meld does **not** need the component pipeline to
+> consume PIC: it can fold each module's `__memory_base` to a static disjoint
+> base and emit one flat core directly. That path shipped in **v0.42.0** (static-
+> PIC data/element-offset folding, #365/#368; oracles `pic_extended_const_353`),
+> so **PIC is now a supported input ABI**, not excluded — ADR-6's rejection holds
+> only for the narrow claim "a PIC core cannot pass `component new`", not for
+> "meld cannot consume PIC". The architecture decision lives in **ADR-7**
+> (path-H: pluggable address strategy with a `static-base-PIC` variant), which
+> supersedes this exclusion. Consuming PIC also structurally dissolves the
+> `reloc.CODE` drift class (#340/#351) — there are no absolute address literals to
+> rebase — the central motivation of #353.
+
 ## References
 
 - meld#326 (corruption + the two gale datapoints + spike result)
@@ -104,6 +120,6 @@ both gale datapoints under a fused shared memory.
 - meld#298 / meld#299 (the MCU-lowering cluster shared mode serves)
 - gale#168 (producer-side relocatable build helper)
 - WebAssembly/tool-conventions `Linking.md` (`linking` v2, `reloc.*`, R_WASM_MEMORY_ADDR_*)
-- WebAssembly/tool-conventions `DynamicLinking.md` (PIC ABI — why path-E can't be a component)
+- WebAssembly/tool-conventions `DynamicLinking.md` (PIC ABI — why a dylink core can't pass `component new`; but meld consumes PIC directly, see the Update above / ADR-7 / #353)
 - ADR-4 (parent isolation model; shared is its retained secondary mode)
 - LS-M-11 (the hazard this makes correct); SR-37 (the v0.38.0 gate mitigation)
