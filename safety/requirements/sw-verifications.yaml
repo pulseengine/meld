@@ -1140,9 +1140,14 @@ artifacts:
       share_stack_rejects_data_below_stack_pointer (both hard-fail). Plan gate
       (merger::memory::share_stack_entry / module_stack_pointer_marker) and
       coalescer (mcu_dissolve::coalesce_stack_pointers, coalesce-all + survivor-
-      init rewrite + count-drift refusal) agree on the SP signal. Non---share
-      paths byte-unchanged. Tier-5 -> local Mythos delta-pass. Supplier
-      precondition: stack-first build (`-Wl,--stack-first`) + `--export=__heap_base`.
+      init rewrite + count-drift refusal) agree on the SP signal. A local Mythos
+      delta-pass runtime-confirmed one silent-corruption hole (an sp-derived
+      bulk-op operand in a no-reloc provider shifted by base_i under the shared
+      stack); closed by a plan gate rejecting bulk-op providers without reloc
+      metadata, with regression share_stack_rejects_bulk_op_without_relocs (plus
+      a --pack-rebase control proving the rejection is share-stack-specific).
+      Non---share paths byte-unchanged. Supplier precondition: stack-first build
+      (`-Wl,--stack-first`) + `--export=__heap_base` + `--emit-relocs`.
     status: implemented
     fields:
       method: automated-test

@@ -218,6 +218,32 @@ impl Merger {
                  layout with the stack below the data."
             )));
         }
+        // Bulk-op / no-reloc soundness (Mythos SR-66 delta-pass): under
+        // `--share-stack` the shared stack is left UN-rebased at `[0, s_raw)` and
+        // the coalesced SP is rewritten to the absolute top, so an sp-derived
+        // runtime address must NOT be shifted. But the legacy no-reloc rebasing
+        // path (`rewriter::append_rebased_address`) adds `base_i` to EVERY
+        // bulk-memory op's runtime address operand — correct for a data-derived
+        // operand, WRONG for an sp-derived one (it lands `base_i` bytes off, into
+        // a neighbour's window; runtime-confirmed). A reloc-covered provider
+        // skips that path entirely (data addresses rebase at their source,
+        // sp-derived operands are left alone), so it is sound. Direct load/store
+        // without relocs is already rejected upstream (#326 path-F), but the
+        // bulk-only case is exempt there — gate it here. `has_reloc_metadata` is
+        // the exact signal `resolve_address_plan` uses to populate
+        // `code_addr_relocs`, so this cannot drift from the rewriter.
+        if module_has_bulk_memory_op(module)?
+            && !crate::reloc::has_reloc_metadata(&module.custom_sections)
+        {
+            return Err(Error::MemoryStrategyUnsupported(format!(
+                "--share-stack: component {comp_idx} module {mod_idx} uses a bulk-memory op \
+                 (memory.copy/fill/init) but carries no reloc metadata; a stack-derived bulk-op \
+                 address would be silently mis-rebased under the shared stack (shifted by the \
+                 module base). Rebuild with `--emit-relocs` so meld rebases data addresses at \
+                 their source and leaves stack-derived operands alone."
+            )));
+        }
+
         // Stack-first gate: every active data segment must start AT OR ABOVE the
         // stack pointer. A constant-offset scan suffices — a non-constant or
         // passive segment already forced `extent` to `None` above (rejected).
@@ -658,6 +684,34 @@ pub(crate) fn module_has_direct_memory_access(module: &CoreModule) -> Result<boo
         let body = body?;
         for op in body.get_operators_reader()? {
             if is_direct_memory_access(&op?) {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+/// True if the module contains any bulk-memory operator (`memory.copy`,
+/// `memory.fill`, `memory.init`) whose runtime address operand the legacy
+/// no-reloc rebasing path (`rewriter::append_rebased_address`) would shift by
+/// `+base_i`. Used by the `--share-stack` gate (SR-66): such a shift is wrong for
+/// an sp-derived operand under the shared un-rebased stack, so a bulk-op provider
+/// must be reloc-covered (which skips that path) to be sound.
+fn module_has_bulk_memory_op(module: &CoreModule) -> Result<bool> {
+    let Some((start, end)) = module.code_section_range else {
+        return Ok(false);
+    };
+    let code_bytes = &module.bytes[start..end];
+    let reader = wasmparser::CodeSectionReader::new(wasmparser::BinaryReader::new(code_bytes, 0))?;
+    for body in reader {
+        let body = body?;
+        for op in body.get_operators_reader()? {
+            if matches!(
+                op?,
+                wasmparser::Operator::MemoryCopy { .. }
+                    | wasmparser::Operator::MemoryFill { .. }
+                    | wasmparser::Operator::MemoryInit { .. }
+            ) {
                 return Ok(true);
             }
         }

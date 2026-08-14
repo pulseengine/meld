@@ -2716,7 +2716,13 @@ artifacts:
       `__stack_pointer` marker (mutable `i32`, single `i32.const` init, named in
       the export table or `name` section); (b) carries a `__heap_base` marker
       (the SR-65 compaction precondition); (c) is stack-first (every active data
-      segment starts `>= sp_i`); and (d) has `sp_i <= extent_i`. The plan gate
+      segment starts `>= sp_i`); (d) has `sp_i <= extent_i`; and (e) is NOT a
+      bulk-memory-op (`memory.copy/fill/init`) provider lacking reloc metadata —
+      under the shared (un-rebased) stack the legacy no-reloc access-point
+      rebasing (`rewriter::append_rebased_address`) would shift an sp-derived
+      bulk-op operand by the module base, silently writing it off-target (a
+      Mythos delta-pass runtime-confirmed this); reloc-covered providers skip
+      that path and are sound. The plan gate
       (`merger::memory::share_stack_entry` / `module_stack_pointer_marker`) and
       the coalescer (`mcu_dissolve::coalesce_stack_pointers`) shall agree on the
       SP signal (both accept export-table AND name-section names), and the

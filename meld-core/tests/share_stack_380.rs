@@ -278,6 +278,80 @@ fn provider(tag: &str, data_sentinel: u8, stack_sentinel: i32, export_memory: bo
     )
 }
 
+/// A stack-first provider with the SP + heap-base markers and a data segment,
+/// but whose only memory access is a BULK op (`memory.fill`) with an sp-derived
+/// destination, and which carries NO reloc metadata. This is the Mythos SR-66
+/// finding: `rewriter::append_rebased_address` would shift the sp-derived operand
+/// by `base_i` on the no-reloc path, silently corrupting it under the shared
+/// stack. `--share-stack` must reject it (the fix gates on
+/// `has_bulk_op && !has_reloc`).
+fn build_bulk_noreloc_provider(tag: &str) -> Vec<u8> {
+    let mut types = TypeSection::new();
+    types.ty().function([], []); // fill_<tag>: () -> ()
+
+    let mut functions = FunctionSection::new();
+    functions.function(0);
+
+    let mut globals = GlobalSection::new();
+    globals.global(
+        GlobalType {
+            val_type: ValType::I32,
+            mutable: false,
+            shared: false,
+        },
+        &ConstExpr::i32_const(HEAP_BASE),
+    );
+    globals.global(
+        GlobalType {
+            val_type: ValType::I32,
+            mutable: true,
+            shared: false,
+        },
+        &ConstExpr::i32_const(SP_INIT),
+    );
+
+    let mut exports = ExportSection::new();
+    exports.export(&format!("fill_{tag}"), ExportKind::Func, 0);
+    exports.export("__heap_base", ExportKind::Global, 0);
+
+    let mut code = CodeSection::new();
+    let mut fill = Function::new([]);
+    // dst = sp - 64 (an sp-derived address that must NOT be rebased)
+    fill.instruction(&Instruction::GlobalGet(1));
+    fill.instruction(&Instruction::I32Const(64));
+    fill.instruction(&Instruction::I32Sub);
+    fill.instruction(&Instruction::I32Const(0xEE)); // value
+    fill.instruction(&Instruction::I32Const(4)); // n
+    fill.instruction(&Instruction::MemoryFill(0));
+    fill.instruction(&Instruction::End);
+    code.function(&fill);
+
+    let mut data = DataSection::new();
+    data.segment(DataSegment {
+        mode: DataSegmentMode::Active {
+            memory_index: 0,
+            offset: &ConstExpr::i32_const(DATA_ADDR),
+        },
+        data: [0xAB],
+    });
+
+    let mut module = Module::new();
+    module.section(&types).section(&functions);
+    module.section(&shared_memory_section());
+    module.section(&globals).section(&exports).section(&code);
+    module.section(&data);
+    // name the SP global — but NO linking / reloc.CODE sections.
+    let mut gnames = NameMap::new();
+    gnames.append(1, "__stack_pointer");
+    let mut names = NameSection::new();
+    names.globals(&gnames);
+    module.section(&names);
+
+    let mut component = Component::new();
+    component.section(&ModuleSection(&module));
+    component.finish()
+}
+
 fn fuse_three(
     providers: [Vec<u8>; 3],
     pack_rebase: bool,
@@ -522,4 +596,34 @@ fn share_stack_rejects_data_below_stack_pointer() {
         err.contains("stack") || err.contains("below") || err.contains("data"),
         "error must explain the data-below-stack layout, got: {err}"
     );
+}
+
+#[test]
+fn share_stack_rejects_bulk_op_without_relocs() {
+    // Mythos SR-66 delta-pass finding: a bulk-only, NO-reloc provider whose
+    // memory.fill uses an sp-derived destination would have that operand shifted
+    // by base_i on the legacy no-reloc rebasing path (append_rebased_address),
+    // silently writing base_i bytes off target into a neighbour's window — while
+    // the shared stack is un-rebased. --share-stack must reject it (reloc-covered
+    // providers skip that path and are sound; the fix gates on
+    // has_bulk_op && !has_reloc). Confirmed at runtime by the review (the fill
+    // landed at s_raw-64 + base_i instead of s_raw-64); this asserts the loud
+    // refusal that replaces the corruption.
+    let a = provider("a", 0xA1, 0x1111, true);
+    let b = build_bulk_noreloc_provider("b");
+    let c = provider("c", 0xC3, 0x3333, false);
+    let err = fuse_three([a, b, c], false, true)
+        .expect_err("must reject a bulk-only, no-reloc provider under --share-stack");
+    assert!(
+        err.contains("bulk") || err.contains("reloc"),
+        "error must name the bulk-op / missing-reloc hazard, got: {err}"
+    );
+
+    // Control: the SAME provider is fine under plain --pack-rebase (the stack is
+    // rebased with the module there, so append's +base_i is correct) — the
+    // rejection is specific to --share-stack.
+    let a2 = provider("a", 0xA1, 0x1111, true);
+    let b2 = build_bulk_noreloc_provider("b");
+    let c2 = provider("c", 0xC3, 0x3333, false);
+    fuse_three([a2, b2, c2], true, false).expect("--pack-rebase accepts the bulk-only provider");
 }
