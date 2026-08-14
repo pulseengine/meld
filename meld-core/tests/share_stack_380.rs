@@ -278,6 +278,72 @@ fn provider(tag: &str, data_sentinel: u8, stack_sentinel: i32, export_memory: bo
     )
 }
 
+/// A minimal stack-first provider for the byte-level F100 budget check: SP +
+/// heap-base markers, a `data_len`-byte data segment starting AT `sp` (data-only,
+/// no code memory access → no reloc needed), `__heap_base = sp + data_len`. Used
+/// to verify the actual size CLAIM (not just the page-granular mechanism): the
+/// packed footprint of thin drivers crosses the 8 KiB SRAM budget while the
+/// shared-stack footprint stays under it.
+fn build_f100_provider(tag: &str, sp: i32, data_len: usize) -> Vec<u8> {
+    let heap_base = sp + data_len as i32;
+
+    let mut types = TypeSection::new();
+    types.ty().function([], []); // nop: () -> ()
+    let mut functions = FunctionSection::new();
+    functions.function(0);
+
+    let mut globals = GlobalSection::new();
+    globals.global(
+        GlobalType {
+            val_type: ValType::I32,
+            mutable: false,
+            shared: false,
+        },
+        &ConstExpr::i32_const(heap_base),
+    );
+    globals.global(
+        GlobalType {
+            val_type: ValType::I32,
+            mutable: true,
+            shared: false,
+        },
+        &ConstExpr::i32_const(sp),
+    );
+
+    let mut exports = ExportSection::new();
+    exports.export(&format!("nop_{tag}"), ExportKind::Func, 0);
+    exports.export("__heap_base", ExportKind::Global, 0);
+
+    let mut code = CodeSection::new();
+    let mut nop = Function::new([]);
+    nop.instruction(&Instruction::End);
+    code.function(&nop);
+
+    let mut data = DataSection::new();
+    data.segment(DataSegment {
+        mode: DataSegmentMode::Active {
+            memory_index: 0,
+            offset: &ConstExpr::i32_const(sp), // data AT sp (stack-first, start == sp)
+        },
+        data: std::iter::repeat_n(0xCDu8, data_len),
+    });
+
+    let mut module = Module::new();
+    module.section(&types).section(&functions);
+    module.section(&shared_memory_section());
+    module.section(&globals).section(&exports).section(&code);
+    module.section(&data);
+    let mut gnames = NameMap::new();
+    gnames.append(1, "__stack_pointer");
+    let mut names = NameSection::new();
+    names.globals(&gnames);
+    module.section(&names);
+
+    let mut component = Component::new();
+    component.section(&ModuleSection(&module));
+    component.finish()
+}
+
 /// A stack-first provider with the SP + heap-base markers and a data segment,
 /// but whose only memory access is a BULK op (`memory.fill`) with an sp-derived
 /// destination, and which carries NO reloc metadata. This is the Mythos SR-66
@@ -626,4 +692,51 @@ fn share_stack_rejects_bulk_op_without_relocs() {
     let b2 = build_bulk_noreloc_provider("b");
     let c2 = provider("c", 0xC3, 0x3333, false);
     fuse_three([a2, b2, c2], true, false).expect("--pack-rebase accepts the bulk-only provider");
+}
+
+#[test]
+fn share_stack_closes_the_f100_8kib_budget() {
+    // The actual size CLAIM behind SR-66/#380, at the REAL shape (not the
+    // page-discriminating SP_INIT=30000 used elsewhere): three thin drivers with
+    // sp = 2048 and ~729 B of data each. The footprint is sub-page, so the wasm
+    // memory minimum is 1 page either way — the F100 (8 KiB SRAM) budget is a
+    // BYTE bound the downstream placer enforces on the packed extent. Assert it
+    // byte-granularly from the fused data layout.
+    const SP: i32 = 2048;
+    const DATA_LEN: usize = 729; // align16 = 736; align16(SP+DATA_LEN=2777) = 2784
+    const F100_SRAM: i32 = 8192;
+
+    let mk = || {
+        [
+            build_f100_provider("a", SP, DATA_LEN),
+            build_f100_provider("b", SP, DATA_LEN),
+            build_f100_provider("c", SP, DATA_LEN),
+        ]
+    };
+    let packed = fuse_three(mk(), true, false).expect("pack-rebase fusion");
+    let shared = fuse_three(mk(), false, true).expect("share-stack fusion");
+
+    // Footprint top = highest byte any provider's data reaches (data is the top
+    // of each provider's window; the shared stack sits below at [0, sp)).
+    let top = |bytes: &[u8]| -> i32 {
+        fused_data_offsets(bytes).into_iter().max().unwrap() + DATA_LEN as i32
+    };
+    let packed_top = top(&packed);
+    let shared_top = top(&shared);
+    eprintln!(
+        "SR-66 F100: --pack-rebase footprint = {packed_top} B, --share-stack = {shared_top} B (budget {F100_SRAM} B)"
+    );
+
+    // --pack-rebase strides each provider by align16(2777)=2784 → 3rd provider's
+    // data reaches ~8345 B: OVER the 8 KiB budget (gale's blocker).
+    assert!(
+        packed_top > F100_SRAM,
+        "--pack-rebase footprint {packed_top} B must exceed the {F100_SRAM} B budget (the gap #380 closes)"
+    );
+    // --share-stack reserves one 2048 B stack + 3×align16(729)=2208 B data →
+    // ~4256 B: UNDER budget with margin.
+    assert!(
+        shared_top < F100_SRAM,
+        "--share-stack footprint {shared_top} B must fit the {F100_SRAM} B budget"
+    );
 }

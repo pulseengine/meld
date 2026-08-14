@@ -2761,13 +2761,18 @@ artifacts:
         oracle, RED before the implementation / GREEN after): three stack-first
         providers stride to 2 pages under --pack-rebase but pack into 1 under
         --share-stack (both page counts asserted, plus byte-exact data offsets
-        above the shared stack); on wasmtime each provider reads back its own
+        above the shared stack). The size CLAIM is verified byte-granularly at the
+        real F100 shape by share_stack_closes_the_f100_8kib_budget (sp=2048,
+        ~729 B data/driver: footprint 8345 B under --pack-rebase — OVER the 8 KiB
+        SRAM budget — vs 4249 B under --share-stack, UNDER it with margin). On
+        wasmtime each provider reads back its own
         data sentinel AND exercises the shared stack (write+read at [sp-16])
         without corrupting data; exactly one mutable-i32 __stack_pointer survives
         with init = the region top; unequal provider inits (30000/29000/28000)
-        still coalesce onto the max; and the gates hard-fail loudly for a
-        provider missing the __stack_pointer marker or whose data sits below the
-        stack pointer (not stack-first). Tier-5 → Mythos adversarial review.
+        still coalesce onto the max; the gates hard-fail loudly for a provider
+        missing the __stack_pointer marker, whose data sits below the stack
+        pointer (not stack-first), or a bulk-op provider lacking reloc metadata
+        (the Mythos-found silent mis-rebase). Tier-5 → Mythos adversarial review.
         Non---share-stack paths byte-unchanged (the pack/page loop is untouched;
         the coalescer's #334 equal-init grouping runs only when
         shared_stack_top is None). SUPPLIER PRECONDITION: stack-first build

@@ -1135,7 +1135,10 @@ artifacts:
       offsets above the shared stack, per-provider data + shared-stack execution
       on wasmtime with no cross-region corruption, one mutable-i32 SP survivor at
       the region top); share_stack_unequal_inits_coalesce_to_max (30000/29000/
-      28000 coalesce onto max); and the two loud gates
+      28000 coalesce onto max); share_stack_closes_the_f100_8kib_budget (the
+      size CLAIM at the real shape: sp=2048, ~729 B data/driver — byte-granular
+      footprint 8345 B under --pack-rebase, OVER the 8 KiB SRAM budget, vs 4249 B
+      under --share-stack, UNDER it); and the two loud gates
       share_stack_requires_stack_pointer_marker and
       share_stack_rejects_data_below_stack_pointer (both hard-fail). Plan gate
       (merger::memory::share_stack_entry / module_stack_pointer_marker) and
