@@ -358,9 +358,9 @@ impl Merger {
                 .get(res.component_idx)
                 .and_then(|c| c.core_modules.get(res.to_module))
                 .is_some_and(|m| {
-                    m.exports
-                        .iter()
-                        .any(|e| e.name == res.export_name && matches!(e.kind, ExportKind::Function))
+                    m.exports.iter().any(|e| {
+                        e.name == res.export_name && matches!(e.kind, ExportKind::Function)
+                    })
                 });
             if is_call {
                 let from = (res.component_idx, res.from_module);
@@ -369,9 +369,8 @@ impl Merger {
             }
         }
 
-        let describe = |ids: &[usize]| -> Vec<(usize, usize)> {
-            ids.iter().map(|&id| label[id]).collect()
-        };
+        let describe =
+            |ids: &[usize]| -> Vec<(usize, usize)> { ids.iter().map(|&id| label[id]).collect() };
 
         match analyze_call_topology(&edges, &sp) {
             CallTopology::NoEdges => Ok(()),
@@ -902,7 +901,10 @@ pub(crate) enum CallTopology {
     /// root-to-leaf sum of `sp` along any path and `worst_path` the component
     /// indices on it. The caller warns only when `worst_sum` exceeds the region
     /// (the region may be undersized, but boundedly so).
-    Acyclic { worst_sum: u64, worst_path: Vec<usize> },
+    Acyclic {
+        worst_sum: u64,
+        worst_path: Vec<usize>,
+    },
     /// A call cycle (A→…→A, or recursion through a sibling) — the live stack is
     /// unbounded. The caller hard-fails.
     Cyclic { cycle: Vec<usize> },
@@ -1121,8 +1123,8 @@ mod topology_tests {
     // --- method-level: graph.adapter_sites -> verdict -> action (SR-67 gate) ---
 
     use crate::MemoryStrategy;
-    use crate::resolver::{AdapterRequirements, AdapterSite, DependencyGraph};
     use crate::merger::Merger;
+    use crate::resolver::{AdapterRequirements, AdapterSite, DependencyGraph};
 
     /// A `((from_component, from_module), (to_component, to_module))` call edge.
     type ModEdge = ((usize, usize), (usize, usize));
