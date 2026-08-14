@@ -23,7 +23,10 @@ It builds on `--pack-rebase` (and so implies `--address-rebase` and requires
 
 The default `wasm-ld` layout puts the shadow stack *between* the data and
 `__heap_base`, which the stack-first gate rejects; build the inputs with
-`-Wl,--stack-first` (alongside `-Wl,--export=__heap_base` and `--emit-relocs`).
+`-Wl,--stack-first` alongside `--emit-relocs`. `--emit-relocs` also exports
+`__heap_base` as an immutable global (verified in the rustc/wasm-ld toolchain by
+the falcon suppliers), so a separate `-Wl,--export=__heap_base` is normally
+unnecessary — add it only if your toolchain does not export the marker.
 
 ## The envelope meld cannot check
 
