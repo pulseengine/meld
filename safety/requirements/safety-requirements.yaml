@@ -2655,9 +2655,12 @@ artifacts:
       shape). This corrects a first-cut regression (imported memory whose data
       exceeds its declared floor) that a Mythos delta-pass runtime-proved.
       SUPPLIER PRECONDITION: to get compaction, publish `__heap_base` retained
-      through `wasm-tools component new` (e.g. `-Wl,--export=__heap_base`)
-      alongside `--emit-relocs` — the marker is discarded by default (verified
-      absent on all published falcon 1.133.0 artifacts).
+      through `wasm-tools component new`. `--emit-relocs` (needed for the reloc
+      rebasing anyway) already exports `__heap_base` as an immutable global in the
+      rustc/wasm-ld toolchain (verified by the falcon suppliers on #370), so it is
+      normally sufficient; `-Wl,--export=__heap_base` is a belt-and-suspenders
+      fallback for a toolchain that does not. The marker was absent on the
+      published falcon 1.133.0 artifacts (built without `--emit-relocs`).
     status: verified
     tags: [merger, memory, shared, mcu, pack-rebase, silent-corruption, bss]
     release: v0.47.0
@@ -2776,7 +2779,8 @@ artifacts:
         Non---share-stack paths byte-unchanged (the pack/page loop is untouched;
         the coalescer's #334 equal-init grouping runs only when
         shared_stack_top is None). SUPPLIER PRECONDITION: stack-first build
-        (`-Wl,--stack-first`) plus SR-65's `-Wl,--export=__heap_base`.
+        (`-Wl,--stack-first`) plus `--emit-relocs` (which also exports
+        `__heap_base`, per SR-65).
       references:
         - "https://github.com/pulseengine/meld/issues/380"
         - "meld-core/tests/share_stack_380.rs"
