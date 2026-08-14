@@ -4,6 +4,35 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.48.0] - 2026-08-14
+
+### Added
+- **`--share-stack`: collapse N per-provider shadow stacks into one shared
+  region (SR-66, #380)** — the last MCU-fit gap after `--pack-rebase` (#370).
+  Even packed to `align16(__heap_base)`, each fused provider still carried its
+  own dead `[0, __stack_pointer)` shadow-stack reservation; N providers reserved
+  N stacks for state only one uses at a time (gale's F100 8 KiB SRAM budget
+  missed by ~140 B on exactly this). `--share-stack` reserves ONE region of
+  `max_i(sp_i)` at fused base 0 and packs each provider's data (which begins at
+  `sp_i` under a stack-first layout) directly above it — `base_i =
+  align16(max sp) − sp_i` (a uniform `+base` shift, so the reloc rewriter is
+  untouched), `stride = align16(extent_i − sp_i)` — coalescing every
+  `__stack_pointer` onto one survivor whose init is rewritten to the region top.
+  Measured on the F100 shape: the packed footprint of three thin drivers is
+  8345 B (over budget) vs 4249 B shared (under, with margin). Builds on
+  `--pack-rebase` (implies it, requires `--memory shared`).
+
+  Hard-fails **loudly, never silently** unless every provider carries a
+  `__stack_pointer` marker (mutable `i32` const, export table or name section)
+  AND a `__heap_base` marker AND is stack-first (all active data `>= sp`) AND
+  `sp <= extent` AND is not a bulk-memory-op provider lacking reloc metadata (a
+  local Mythos delta-pass found that such a provider's sp-derived bulk operand
+  would be silently mis-rebased under the shared un-rebased stack). Sound only
+  under the documented envelope — providers non-reentrant, single-threaded,
+  mutually-non-calling, one-live-at-a-time — and needs a stack-first supplier
+  build (`-Wl,--stack-first`, plus the existing `-Wl,--export=__heap_base` /
+  `--emit-relocs`). See `meld docs share-stack`.
+
 ## [0.47.0] - 2026-08-13
 
 ### Fixed
