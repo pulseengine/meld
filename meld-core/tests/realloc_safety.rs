@@ -508,6 +508,7 @@ fn ls_a_7_every_realloc_call_has_null_guard() {
         component_provenance: false,
         address_rebasing: false,
         pack_rebase: false,
+        share_stack: false,
         preserve_names: false,
         custom_sections: meld_core::CustomSectionHandling::Drop,
         dwarf_handling: meld_core::DwarfHandling::Strip,

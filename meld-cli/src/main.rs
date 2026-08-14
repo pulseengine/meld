@@ -82,6 +82,20 @@ enum Commands {
         #[arg(long)]
         pack_rebase: bool,
 
+        /// Collapse the per-provider shadow stacks into ONE shared region.
+        /// Builds on --pack-rebase (implies it): reserves a single shadow-stack
+        /// region of max(sp) at base 0 and packs each provider's data right
+        /// above it, coalescing every __stack_pointer onto one survivor —
+        /// reclaiming the (N-1) duplicated stack reservations (the last MCU-fit
+        /// gap after --pack-rebase). Requires every provider to carry a
+        /// __stack_pointer AND __heap_base marker and be stack-first (all data
+        /// above sp); fails loud otherwise. OPT-IN and sound ONLY when the
+        /// providers are non-reentrant, single-threaded, mutually-non-calling,
+        /// and one-live-at-a-time (a shared stack sized to the MAX, not the
+        /// SUM, of their stack use).
+        #[arg(long)]
+        share_stack: bool,
+
         /// Show fusion statistics
         #[arg(long)]
         stats: bool,
@@ -226,6 +240,7 @@ fn main() -> Result<()> {
             emit_import_map,
             opaque_rep,
             pack_rebase,
+            share_stack,
         }) => {
             fuse_command(
                 inputs,
@@ -233,6 +248,7 @@ fn main() -> Result<()> {
                 memory,
                 address_rebase,
                 pack_rebase,
+                share_stack,
                 stats,
                 no_attestation,
                 reproducible,
@@ -311,6 +327,7 @@ fn fuse_command(
     memory: String,
     address_rebase: bool,
     pack_rebase: bool,
+    share_stack: bool,
     show_stats: bool,
     no_attestation: bool,
     reproducible: bool,
@@ -366,6 +383,9 @@ fn fuse_command(
         }
     };
 
+    // --share-stack builds on --pack-rebase (SR-66): it needs the packed
+    // byte-granular stride to reclaim the freed stack reservations.
+    let pack_rebase = pack_rebase || share_stack;
     // --pack-rebase is a compact variant of --address-rebase; it requires the
     // same single shared memory and implies address rebasing (SR-57).
     if pack_rebase && memory_strategy != MemoryStrategy::SharedMemory {
@@ -377,6 +397,13 @@ fn fuse_command(
     }
     let address_rebase = address_rebase || pack_rebase;
 
+    if share_stack {
+        println!(
+            "Shared shadow stack (--share-stack): one stack region for all \
+             providers — sound ONLY when they are non-reentrant, \
+             single-threaded, mutually-non-calling, and one-live-at-a-time"
+        );
+    }
     if pack_rebase {
         println!(
             "Compact used-extent rebasing (--pack-rebase): sound only for \
@@ -432,6 +459,7 @@ fn fuse_command(
         component_provenance: !no_component_provenance,
         address_rebasing: address_rebase,
         pack_rebase,
+        share_stack,
         preserve_names,
         output_format,
         opaque_resources,

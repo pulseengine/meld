@@ -8,6 +8,9 @@ pub(crate) struct SharedMemoryPlan {
     pub(crate) memory: EncoderMemoryType,
     pub(crate) import: Option<(String, String)>,
     pub(crate) bases: HashMap<(usize, usize), u64>,
+    /// SR-66 / #380: top of the single shared shadow-stack region under
+    /// `--share-stack` (`max_i(sp_i)`). `None` when `--share-stack` is off.
+    pub(crate) shared_stack_top: Option<u64>,
 }
 
 impl Merger {
@@ -23,6 +26,9 @@ impl Merger {
         // data segment has a constant offset; `None` means "cannot pack — fall
         // back to the declared page stride" (SR-57).
         let mut module_memories: Vec<((usize, usize), MemoryType, Option<u64>)> = Vec::new();
+        // SR-66 / #380: per rebased module `(key, sp_i, extent_i)` for the
+        // shared-stack layout. Only populated (and gated) under `--share-stack`.
+        let mut share_entries: Vec<((usize, usize), u64, u64)> = Vec::new();
 
         for (comp_idx, component) in components.iter().enumerate() {
             for (mod_idx, module) in component.core_modules.iter().enumerate() {
@@ -45,6 +51,10 @@ impl Merger {
                         } else {
                             None
                         };
+                        if self.share_stack {
+                            share_entries
+                                .push(self.share_stack_entry(module, extent, comp_idx, mod_idx)?);
+                        }
                         module_memories.push(((comp_idx, mod_idx), module_memory, extent));
                     }
                 }
@@ -76,15 +86,53 @@ impl Merger {
         };
 
         let mut bases = HashMap::new();
-        if self.address_rebasing {
+        let mut shared_stack_top: Option<u64> = None;
+        // 16-byte alignment keeps `v128` accesses aligned after the uniform
+        // `+base` shift (shared by the pack and share-stack strides below).
+        const PACK_ALIGN: u64 = 16;
+        let overflow =
+            || Error::MemoryStrategyUnsupported("shared memory size overflow".to_string());
+
+        if self.address_rebasing && self.share_stack {
+            // SR-66 / #380: ONE shadow-stack region of `max_i(sp_i)` at fused
+            // base 0; each provider's data (which begins at `sp_i` under the
+            // stack-first gate enforced in `share_stack_entry`) packs directly
+            // above it. `base_i = align16(max sp) - sp_i` (a uniform shift, so
+            // the rewriter is untouched); `stride = align16(extent_i - sp_i)`.
+            let s_raw = share_entries
+                .iter()
+                .map(|&(_, sp, _)| sp)
+                .max()
+                .unwrap_or(0);
+            // `next_base` starts at the top of the shared stack region and only
+            // grows, so `next_base >= s_raw >= sp_i` for every provider — the
+            // `base_i` and `extent_i - sp_i` subtractions below never underflow.
+            let mut next_base = s_raw
+                .checked_next_multiple_of(PACK_ALIGN)
+                .ok_or_else(overflow)?;
+            for &(key, sp, extent) in &share_entries {
+                let base = next_base - sp;
+                if !combined.memory64 && base > u64::from(u32::MAX) {
+                    return Err(Error::MemoryStrategyUnsupported(
+                        "shared memory base offset exceeds 32-bit address space".to_string(),
+                    ));
+                }
+                bases.insert(key, base);
+                let stride = (extent - sp)
+                    .checked_next_multiple_of(PACK_ALIGN)
+                    .ok_or_else(overflow)?;
+                next_base = next_base.checked_add(stride).ok_or_else(overflow)?;
+            }
+            combined.initial = next_base.div_ceil(WASM_PAGE_SIZE).max(1);
+            if let Some(max) = combined.maximum {
+                combined.maximum = Some(max.max(combined.initial));
+            }
+            shared_stack_top = Some(s_raw);
+        } else if self.address_rebasing {
             // Byte-granular running base. Under the default page-granular
             // strategy each module strides by its declared page count; under
             // `--pack-rebase` it strides by its 16-byte-aligned used data
-            // extent (SR-57). 16-byte alignment keeps `v128` accesses aligned
-            // after the uniform `+base` shift.
-            const PACK_ALIGN: u64 = 16;
-            let overflow =
-                || Error::MemoryStrategyUnsupported("shared memory size overflow".to_string());
+            // extent (SR-57).
             let mut next_base: u64 = 0;
             for (key, module_memory, extent) in &module_memories {
                 let base_bytes = next_base;
@@ -126,7 +174,100 @@ impl Merger {
             memory: convert_memory_type(&combined),
             import,
             bases,
+            shared_stack_top,
         }))
+    }
+
+    /// SR-66 / #380: validate one rebased module for `--share-stack` and return
+    /// its `(key, sp_i, extent_i)`. Hard-fails (loud, never silent) when the
+    /// shared-stack preconditions do not hold — an opt-in flag must refuse a
+    /// layout it cannot make sound rather than silently fall back:
+    ///   * the module cannot be compacted (`extent` is `None` — no `__heap_base`
+    ///     marker, or a passive/no-data region the extent scan can't see);
+    ///   * it carries no `__stack_pointer` marker (mutable `i32`, const init);
+    ///   * it is not stack-first (an active data segment starts BELOW `sp_i`, so
+    ///     subtracting the `[0, sp)` stack region would cut into data);
+    ///   * `sp_i > extent_i` (the stack claims to sit above the used top).
+    fn share_stack_entry(
+        &self,
+        module: &CoreModule,
+        extent: Option<u64>,
+        comp_idx: usize,
+        mod_idx: usize,
+    ) -> Result<((usize, usize), u64, u64)> {
+        let extent = extent.ok_or_else(|| {
+            Error::MemoryStrategyUnsupported(format!(
+                "--share-stack: component {comp_idx} module {mod_idx} cannot be compacted \
+                 (no immutable-const `__heap_base` marker, or a passive/no-data region the \
+                 extent scan cannot measure); shared-stack packing requires a packable extent. \
+                 Build the input with `-Wl,--export=__heap_base`."
+            ))
+        })?;
+        let sp = module_stack_pointer_marker(module).ok_or_else(|| {
+            Error::MemoryStrategyUnsupported(format!(
+                "--share-stack: component {comp_idx} module {mod_idx} has no `__stack_pointer` \
+                 marker (a mutable `i32` global with a single `i32.const` init, named in the \
+                 export table or `name` section); cannot place a shared shadow stack it cannot \
+                 locate."
+            ))
+        })?;
+        if sp > extent {
+            return Err(Error::MemoryStrategyUnsupported(format!(
+                "--share-stack: component {comp_idx} module {mod_idx} `__stack_pointer` ({sp}) \
+                 sits above its used-memory top `__heap_base` ({extent}); expected a stack-first \
+                 layout with the stack below the data."
+            )));
+        }
+        // Bulk-op / no-reloc soundness (Mythos SR-66 delta-pass): under
+        // `--share-stack` the shared stack is left UN-rebased at `[0, s_raw)` and
+        // the coalesced SP is rewritten to the absolute top, so an sp-derived
+        // runtime address must NOT be shifted. But the legacy no-reloc rebasing
+        // path (`rewriter::append_rebased_address`) adds `base_i` to EVERY
+        // bulk-memory op's runtime address operand — correct for a data-derived
+        // operand, WRONG for an sp-derived one (it lands `base_i` bytes off, into
+        // a neighbour's window; runtime-confirmed). A reloc-covered provider
+        // skips that path entirely (data addresses rebase at their source,
+        // sp-derived operands are left alone), so it is sound. Direct load/store
+        // without relocs is already rejected upstream (#326 path-F), but the
+        // bulk-only case is exempt there — gate it here. `has_reloc_metadata` is
+        // the exact signal `resolve_address_plan` uses to populate
+        // `code_addr_relocs`, so this cannot drift from the rewriter.
+        if module_has_bulk_memory_op(module)?
+            && !crate::reloc::has_reloc_metadata(&module.custom_sections)
+        {
+            return Err(Error::MemoryStrategyUnsupported(format!(
+                "--share-stack: component {comp_idx} module {mod_idx} uses a bulk-memory op \
+                 (memory.copy/fill/init) but carries no reloc metadata; a stack-derived bulk-op \
+                 address would be silently mis-rebased under the shared stack (shifted by the \
+                 module base). Rebuild with `--emit-relocs` so meld rebases data addresses at \
+                 their source and leaves stack-derived operands alone."
+            )));
+        }
+
+        // Stack-first gate: every active data segment must start AT OR ABOVE the
+        // stack pointer. A constant-offset scan suffices — a non-constant or
+        // passive segment already forced `extent` to `None` above (rejected).
+        for seg in &crate::segments::parse_data_segments(module)? {
+            if let crate::segments::DataSegmentMode_::Active {
+                offset_value: Some(off),
+                ..
+            } = &seg.mode
+            {
+                let start = match off {
+                    crate::segments::ConstExprValue::I32(v) => u64::from(*v as u32),
+                    crate::segments::ConstExprValue::I64(v) => *v as u64,
+                };
+                if start < sp {
+                    return Err(Error::MemoryStrategyUnsupported(format!(
+                        "--share-stack: component {comp_idx} module {mod_idx} has an active data \
+                         segment at {start}, below its `__stack_pointer` ({sp}) — not a \
+                         stack-first layout. Rebuild with `-Wl,--stack-first` so the shadow \
+                         stack sits below the data."
+                    )));
+                }
+            }
+        }
+        Ok(((comp_idx, mod_idx), sp, extent))
     }
 }
 
@@ -465,31 +606,51 @@ fn module_used_data_extent(
 /// a 64 KiB stack between), so packing to `__data_end` would under-reserve the
 /// stack. `__heap_base` is the true top of static usage.
 fn module_heap_base_marker(module: &CoreModule) -> Option<u64> {
-    const MARKER: &str = "__heap_base";
+    // `__heap_base` is IMMUTABLE (the top of static data never moves).
+    module_marker_global(module, "__heap_base", false)
+}
+
+/// Discover a module's `__stack_pointer` marker — the MUTABLE `i32` linear-memory
+/// address the shadow stack descends from (SR-66 / #380). Returns the init value
+/// when a defined, mutable `i32` global named `__stack_pointer` (via the export
+/// table or the `name` section) initialises to a single `i32.const`.
+///
+/// Same lookup as [`module_heap_base_marker`] but requires MUTABLE (a stack
+/// pointer is written at runtime; an immutable global cannot be one). Kept
+/// consistent with `mcu_dissolve::coalesce_stack_pointers`, which reads the same
+/// name-section signal — the plan gate and the coalescer must agree on which
+/// globals are stack pointers, or one could pass while the other declines and
+/// leave two SPs over one shared region.
+fn module_stack_pointer_marker(module: &CoreModule) -> Option<u64> {
+    module_marker_global(module, "__stack_pointer", true)
+}
+
+/// Shared marker lookup: the init value of a DEFINED `i32` global named `name`
+/// (export table preferred — what `-Wl,--export=<name>` controls and what
+/// survives `wasm-tools component new` — then the `name` section fallback), whose
+/// mutability matches `want_mutable` and whose init is a single `i32.const`.
+fn module_marker_global(module: &CoreModule, name: &str, want_mutable: bool) -> Option<u64> {
     let import_globals = module
         .imports
         .iter()
         .filter(|i| matches!(i.kind, ImportKind::Global(_)))
         .count() as u32;
 
-    // Prefer the export table (what a supplier controls via --export=__heap_base
-    // and what survives `wasm-tools component new`); fall back to the name
-    // section's global-name subsection.
     let global_index = module
         .exports
         .iter()
-        .find(|e| matches!(e.kind, ExportKind::Global) && e.name == MARKER)
+        .find(|e| matches!(e.kind, ExportKind::Global) && e.name == name)
         .map(|e| e.index)
-        .or_else(|| module_named_global_index(module, MARKER))?;
+        .or_else(|| module_named_global_index(module, name))?;
 
     // Only a DEFINED global carries a readable initialiser (imported globals do
-    // not). Must be an immutable `i32` initialised to a single `i32.const`.
+    // not).
     if global_index < import_globals {
         return None;
     }
     let defined = (global_index - import_globals) as usize;
     let g = module.globals.get(defined)?;
-    if g.mutable || g.content_type != ValType::I32 {
+    if g.mutable != want_mutable || g.content_type != ValType::I32 {
         return None;
     }
     crate::segments::const_i32_init_value(&g.init_expr_bytes).map(|v| u64::from(v as u32))
@@ -523,6 +684,34 @@ pub(crate) fn module_has_direct_memory_access(module: &CoreModule) -> Result<boo
         let body = body?;
         for op in body.get_operators_reader()? {
             if is_direct_memory_access(&op?) {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+/// True if the module contains any bulk-memory operator (`memory.copy`,
+/// `memory.fill`, `memory.init`) whose runtime address operand the legacy
+/// no-reloc rebasing path (`rewriter::append_rebased_address`) would shift by
+/// `+base_i`. Used by the `--share-stack` gate (SR-66): such a shift is wrong for
+/// an sp-derived operand under the shared un-rebased stack, so a bulk-op provider
+/// must be reloc-covered (which skips that path) to be sound.
+fn module_has_bulk_memory_op(module: &CoreModule) -> Result<bool> {
+    let Some((start, end)) = module.code_section_range else {
+        return Ok(false);
+    };
+    let code_bytes = &module.bytes[start..end];
+    let reader = wasmparser::CodeSectionReader::new(wasmparser::BinaryReader::new(code_bytes, 0))?;
+    for body in reader {
+        let body = body?;
+        for op in body.get_operators_reader()? {
+            if matches!(
+                op?,
+                wasmparser::Operator::MemoryCopy { .. }
+                    | wasmparser::Operator::MemoryFill { .. }
+                    | wasmparser::Operator::MemoryInit { .. }
+            ) {
                 return Ok(true);
             }
         }

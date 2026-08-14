@@ -192,6 +192,7 @@ fn fuse_many(
         component_provenance: false,
         address_rebasing,
         pack_rebase: false,
+        share_stack: false,
         preserve_names: false,
         custom_sections: CustomSectionHandling::Drop,
         dwarf_handling: DwarfHandling::Strip,

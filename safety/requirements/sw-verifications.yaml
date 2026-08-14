@@ -1124,3 +1124,36 @@ artifacts:
     links:
       - type: verifies
         target: SR-64
+
+  - id: SWV-78
+    type: sw-verification
+    title: "Verification of SR-66: Shared shadow-stack region under --share-stack"
+    description: >
+      Verifies SR-66 via meld-core/tests/share_stack_380.rs (differential
+      oracle, RED before / GREEN after): share_stack_reclaims_and_reads_own_data
+      (2 pages under --pack-rebase -> 1 under --share-stack, byte-exact data
+      offsets above the shared stack, per-provider data + shared-stack execution
+      on wasmtime with no cross-region corruption, one mutable-i32 SP survivor at
+      the region top); share_stack_unequal_inits_coalesce_to_max (30000/29000/
+      28000 coalesce onto max); share_stack_closes_the_f100_8kib_budget (the
+      size CLAIM at the real shape: sp=2048, ~729 B data/driver — byte-granular
+      footprint 8345 B under --pack-rebase, OVER the 8 KiB SRAM budget, vs 4249 B
+      under --share-stack, UNDER it); and the two loud gates
+      share_stack_requires_stack_pointer_marker and
+      share_stack_rejects_data_below_stack_pointer (both hard-fail). Plan gate
+      (merger::memory::share_stack_entry / module_stack_pointer_marker) and
+      coalescer (mcu_dissolve::coalesce_stack_pointers, coalesce-all + survivor-
+      init rewrite + count-drift refusal) agree on the SP signal. A local Mythos
+      delta-pass runtime-confirmed one silent-corruption hole (an sp-derived
+      bulk-op operand in a no-reloc provider shifted by base_i under the shared
+      stack); closed by a plan gate rejecting bulk-op providers without reloc
+      metadata, with regression share_stack_rejects_bulk_op_without_relocs (plus
+      a --pack-rebase control proving the rejection is share-stack-specific).
+      Non---share paths byte-unchanged. Supplier precondition: stack-first build
+      (`-Wl,--stack-first`) + `--export=__heap_base` + `--emit-relocs`.
+    status: implemented
+    fields:
+      method: automated-test
+    links:
+      - type: verifies
+        target: SR-66

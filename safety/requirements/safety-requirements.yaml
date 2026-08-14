@@ -2694,3 +2694,89 @@ artifacts:
       references:
         - "https://github.com/pulseengine/meld/issues/370"
         - "meld-core/tests/pack_rebase_370.rs"
+
+  - id: SR-66
+    type: sw-req
+    title: Shared shadow-stack region under pack-rebase (opt-in --share-stack)
+    description: >
+      Under the opt-in `--share-stack` (which implies `--pack-rebase`), meld
+      shall collapse the per-provider shadow stacks into ONE shared region.
+      After `--pack-rebase` each provider still reserves its own dead
+      `[0, __stack_pointer)` stack inside its packed extent; N providers reserve
+      N stacks for state only ONE uses at a time (gale's F100 8 KiB budget misses
+      by ~140 B on exactly this — the last MCU-fit gap). `--share-stack` reserves
+      a single region of `max_i(sp_i)` at fused base 0 and packs each provider's
+      data (which begins at `sp_i`) immediately above it — `base_i =
+      align16(max sp) - sp_i` (a uniform `+base` shift, so the rewriter is
+      unchanged), `stride = align16(extent_i - sp_i)` — and coalesces every
+      `__stack_pointer` onto one survivor whose init is rewritten to the region
+      top (regardless of the providers' original inits). meld shall HARD-FAIL
+      (loud, never silent — an opt-in flag refuses a layout it cannot make sound
+      rather than falling back) unless EVERY rebased provider: (a) carries a
+      `__stack_pointer` marker (mutable `i32`, single `i32.const` init, named in
+      the export table or `name` section); (b) carries a `__heap_base` marker
+      (the SR-65 compaction precondition); (c) is stack-first (every active data
+      segment starts `>= sp_i`); (d) has `sp_i <= extent_i`; and (e) is NOT a
+      bulk-memory-op (`memory.copy/fill/init`) provider lacking reloc metadata —
+      under the shared (un-rebased) stack the legacy no-reloc access-point
+      rebasing (`rewriter::append_rebased_address`) would shift an sp-derived
+      bulk-op operand by the module base, silently writing it off-target (a
+      Mythos delta-pass runtime-confirmed this); reloc-covered providers skip
+      that path and are sound. The plan gate
+      (`merger::memory::share_stack_entry` / `module_stack_pointer_marker`) and
+      the coalescer (`mcu_dissolve::coalesce_stack_pointers`) shall agree on the
+      SP signal (both accept export-table AND name-section names), and the
+      coalescer shall refuse on a count drift (fewer SPs found than rebased
+      memory providers). ENVELOPE meld CANNOT verify (documented contract, not a
+      check): one region of `max_i(sp_i)` is sound only when total live
+      shadow-stack state across any call chain fits it — providers non-reentrant,
+      single-threaded, mutually-non-calling, one-live-at-a-time (a cross-provider
+      call chain needs the SUM, not the max), with no baked-in constant address
+      into `[0, sp)`. Needs a stack-first supplier build (`-Wl,--stack-first`);
+      the default wasm-ld layout places the stack between `__data_end` and
+      `__heap_base`, which the stack-first gate (correctly) rejects (#380).
+    status: verified
+    tags: [merger, memory, shared, mcu, pack-rebase, share-stack, shadow-stack]
+    release: v0.48.0
+    links:
+      - type: derives-from
+        target: SYS-6
+      - type: mitigates
+        target: LS-M-12
+      - type: refines
+        target: SR-65
+      - type: refines
+        target: SR-57
+    cited-source:
+      - uri: "https://github.com/pulseengine/meld/issues/380"
+        kind: github
+        last-checked: 2026-08-14
+    fields:
+      implementation:
+        - meld-core/src/merger/memory.rs
+        - meld-core/src/mcu_dissolve.rs
+      verification-method: test
+      verification-description: >
+        Verified by meld-core/tests/share_stack_380.rs (differential-execution
+        oracle, RED before the implementation / GREEN after): three stack-first
+        providers stride to 2 pages under --pack-rebase but pack into 1 under
+        --share-stack (both page counts asserted, plus byte-exact data offsets
+        above the shared stack). The size CLAIM is verified byte-granularly at the
+        real F100 shape by share_stack_closes_the_f100_8kib_budget (sp=2048,
+        ~729 B data/driver: footprint 8345 B under --pack-rebase — OVER the 8 KiB
+        SRAM budget — vs 4249 B under --share-stack, UNDER it with margin). On
+        wasmtime each provider reads back its own
+        data sentinel AND exercises the shared stack (write+read at [sp-16])
+        without corrupting data; exactly one mutable-i32 __stack_pointer survives
+        with init = the region top; unequal provider inits (30000/29000/28000)
+        still coalesce onto the max; the gates hard-fail loudly for a provider
+        missing the __stack_pointer marker, whose data sits below the stack
+        pointer (not stack-first), or a bulk-op provider lacking reloc metadata
+        (the Mythos-found silent mis-rebase). Tier-5 → Mythos adversarial review.
+        Non---share-stack paths byte-unchanged (the pack/page loop is untouched;
+        the coalescer's #334 equal-init grouping runs only when
+        shared_stack_top is None). SUPPLIER PRECONDITION: stack-first build
+        (`-Wl,--stack-first`) plus SR-65's `-Wl,--export=__heap_base`.
+      references:
+        - "https://github.com/pulseengine/meld/issues/380"
+        - "meld-core/tests/share_stack_380.rs"

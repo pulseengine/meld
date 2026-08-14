@@ -76,6 +76,7 @@ fn bench_config() -> FuserConfig {
         component_provenance: false,
         address_rebasing: false,
         pack_rebase: false,
+        share_stack: false,
         preserve_names: false,
         custom_sections: CustomSectionHandling::Drop,
         dwarf_handling: meld_core::DwarfHandling::Strip,

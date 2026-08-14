@@ -182,6 +182,7 @@ fn test_304_identity_direct_adapter_is_inlined() {
         memory_strategy: MemoryStrategy::SharedMemory,
         address_rebasing: true,
         pack_rebase: false,
+        share_stack: false,
         ..Default::default()
     });
     fuser
