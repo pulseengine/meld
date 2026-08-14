@@ -17,6 +17,7 @@ impl Merger {
     pub(crate) fn compute_shared_memory_plan(
         &self,
         components: &[ParsedComponent],
+        graph: &DependencyGraph,
     ) -> Result<Option<SharedMemoryPlan>> {
         let mut memory_types = Vec::new();
         let mut import_names: Vec<(String, String)> = Vec::new();
@@ -128,6 +129,12 @@ impl Merger {
                 combined.maximum = Some(max.max(combined.initial));
             }
             shared_stack_top = Some(s_raw);
+
+            // SR-67 / #382: the shared region is sized `max_i(sp_i)`, sound only
+            // while at most one provider's stack is live. Check the fused-set
+            // call graph and refuse a cycle (unbounded live stack); warn on a DAG
+            // whose worst call chain exceeds the region.
+            self.check_share_stack_call_topology(graph, &share_entries, s_raw)?;
         } else if self.address_rebasing {
             // Byte-granular running base. Under the default page-granular
             // strategy each module strides by its declared page count; under
@@ -268,6 +275,77 @@ impl Merger {
             }
         }
         Ok(((comp_idx, mod_idx), sp, extent))
+    }
+
+    /// SR-67 / #382: the `--share-stack` call-topology envelope check. The shared
+    /// region is `max_i(sp_i)`, sound only while at most one provider's stack is
+    /// live — i.e. the providers are mutually-non-calling. Every fused
+    /// cross-component function call (an `AdapterSite` with
+    /// `from_component != to_component`) makes a caller live while its callee
+    /// runs, so the live requirement along a call chain is the SUM of stacks.
+    ///
+    /// - no such edges → the region is sound; nothing to do.
+    /// - an acyclic call graph (an orchestrator DAG) whose worst root-to-leaf
+    ///   `sp`-sum exceeds the region → `log::warn!` (the region may be undersized,
+    ///   but boundedly; the integrator judges it against real stack bounds). If
+    ///   the worst chain still fits the region, it is sound — say nothing.
+    /// - a call cycle → the live stack is unbounded → hard-fail (the same
+    ///   loud-refusal posture as the other `--share-stack` gates).
+    ///
+    /// All cross-component edges count — including resource-op and async-lift
+    /// calls, which still execute callee code and keep the (possibly suspended)
+    /// caller stack live. Over-approximating here yields a false warn/refuse at
+    /// worst, never a silent under-reservation.
+    fn check_share_stack_call_topology(
+        &self,
+        graph: &DependencyGraph,
+        share_entries: &[((usize, usize), u64, u64)],
+        region: u64,
+    ) -> Result<()> {
+        // Cross-component call edges (self-edges are intra-component promotions,
+        // not sibling calls — exclude them).
+        let edges: Vec<(usize, usize)> = graph
+            .adapter_sites
+            .iter()
+            .filter(|s| s.from_component != s.to_component)
+            .map(|s| (s.from_component, s.to_component))
+            .collect();
+
+        // Per-component stack size: the largest `sp` among a component's rebased
+        // memory modules (its shadow-stack region).
+        let mut sp_by_comp: HashMap<usize, u64> = HashMap::new();
+        for &((comp_idx, _), sp, _) in share_entries {
+            let slot = sp_by_comp.entry(comp_idx).or_insert(0);
+            *slot = (*slot).max(sp);
+        }
+
+        match analyze_call_topology(&edges, &sp_by_comp) {
+            CallTopology::NoEdges => Ok(()),
+            CallTopology::Acyclic {
+                worst_sum,
+                worst_path,
+            } => {
+                if worst_sum > region {
+                    log::warn!(
+                        "--share-stack: the fused set is not mutually-non-calling — component \
+                         call chain {worst_path:?} needs up to {worst_sum} bytes of shadow stack \
+                         (the sum along the chain), but the shared region is sized {region} bytes \
+                         (the max single provider). At most one provider's stack is assumed live \
+                         at a time; a live caller+callee needs their sum. This is sound only if \
+                         the chain's true peak fits {region} — verify against your per-stage stack \
+                         bounds (e.g. a scry static bound). If it does not, do not use \
+                         --share-stack for this composition."
+                    );
+                }
+                Ok(())
+            }
+            CallTopology::Cyclic { cycle } => Err(Error::MemoryStrategyUnsupported(format!(
+                "--share-stack: the fused set contains a component call CYCLE {cycle:?} — the live \
+                 shadow-stack depth is unbounded, so a single region sized to the largest provider \
+                 cannot be sound. --share-stack requires a non-recursive, one-live-at-a-time \
+                 composition; remove the cycle or drop --share-stack."
+            ))),
+        }
     }
 }
 
@@ -749,4 +827,337 @@ fn is_direct_memory_access(op: &wasmparser::Operator<'_>) -> bool {
             | I64Store16 { .. }
             | I64Store32 { .. }
     )
+}
+
+/// SR-67 / #382: verdict of the fused-set call-topology analysis for
+/// `--share-stack`. The shared shadow-stack region is sized `max_i(sp_i)`, which
+/// is sound only when at most one provider's stack is live at a time. A
+/// cross-component call makes a caller live while its callee runs, so the live
+/// requirement becomes the sum of stacks along the call chain.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum CallTopology {
+    /// No cross-component call edges — mutually-non-calling; `max_i(sp_i)` is
+    /// sound. The current gale (F100) shape. Pass silently.
+    NoEdges,
+    /// Acyclic call graph (an orchestrator DAG). `worst_sum` is the maximum
+    /// root-to-leaf sum of `sp` along any path and `worst_path` the component
+    /// indices on it. The caller warns only when `worst_sum` exceeds the region
+    /// (the region may be undersized, but boundedly so).
+    Acyclic { worst_sum: u64, worst_path: Vec<usize> },
+    /// A call cycle (A→…→A, or recursion through a sibling) — the live stack is
+    /// unbounded. The caller hard-fails.
+    Cyclic { cycle: Vec<usize> },
+}
+
+/// Analyse the fused-set cross-component call graph for the `--share-stack`
+/// envelope (SR-67 / #382). Nodes are component indices; `edges` are
+/// `(from_component, to_component)` function-call edges (self-edges excluded by
+/// the caller). `sp` maps a component to its shadow-stack size (node weight).
+///
+/// Pure and deterministic (sorted iteration) so the graph logic — cycle
+/// detection and longest weighted path — is unit-testable and Mythos-checkable
+/// independently of the fusion pipeline.
+pub(crate) fn analyze_call_topology(
+    edges: &[(usize, usize)],
+    sp: &HashMap<usize, u64>,
+) -> CallTopology {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    if edges.is_empty() {
+        return CallTopology::NoEdges;
+    }
+
+    // Deterministic adjacency (sorted, deduped successors) + node set.
+    let mut adj: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+    let mut nodes: BTreeSet<usize> = BTreeSet::new();
+    for &(f, t) in edges {
+        nodes.insert(f);
+        nodes.insert(t);
+        adj.entry(f).or_default().push(t);
+    }
+    for succ in adj.values_mut() {
+        succ.sort_unstable();
+        succ.dedup();
+    }
+
+    // Iterative DFS with colours (0 = white, 1 = gray/on-path, 2 = black/done).
+    // A back edge to a gray node is a cycle; capture it from `path`. Finish
+    // order accumulates into `topo` (= reverse topological order).
+    let mut colour: BTreeMap<usize, u8> = nodes.iter().map(|&n| (n, 0u8)).collect();
+    let mut topo: Vec<usize> = Vec::new();
+    for &start in &nodes {
+        if colour[&start] != 0 {
+            continue;
+        }
+        *colour.get_mut(&start).unwrap() = 1;
+        let mut stack: Vec<(usize, usize)> = vec![(start, 0)];
+        let mut path: Vec<usize> = vec![start];
+        while let Some(&(node, idx)) = stack.last() {
+            let next = adj.get(&node).and_then(|s| s.get(idx).copied());
+            match next {
+                Some(n) => {
+                    stack.last_mut().unwrap().1 += 1;
+                    match colour[&n] {
+                        0 => {
+                            *colour.get_mut(&n).unwrap() = 1;
+                            stack.push((n, 0));
+                            path.push(n);
+                        }
+                        1 => {
+                            let pos = path.iter().position(|&x| x == n).unwrap();
+                            return CallTopology::Cyclic {
+                                cycle: path[pos..].to_vec(),
+                            };
+                        }
+                        _ => {}
+                    }
+                }
+                None => {
+                    *colour.get_mut(&node).unwrap() = 2;
+                    topo.push(node);
+                    path.pop();
+                    stack.pop();
+                }
+            }
+        }
+    }
+
+    // Longest weighted path over the DAG. `topo` is in finish order, so every
+    // node's successors (which finish earlier) are already resolved when we
+    // reach it. `best[n]` = heaviest sp-sum of a path starting at `n`.
+    let mut best: BTreeMap<usize, u64> = BTreeMap::new();
+    let mut nexthop: BTreeMap<usize, Option<usize>> = BTreeMap::new();
+    for &node in &topo {
+        let w = *sp.get(&node).unwrap_or(&0);
+        let mut bsum = w;
+        let mut bnext = None;
+        if let Some(succs) = adj.get(&node) {
+            for &s in succs {
+                let cand = w.saturating_add(best[&s]);
+                if cand > bsum {
+                    bsum = cand;
+                    bnext = Some(s);
+                }
+            }
+        }
+        best.insert(node, bsum);
+        nexthop.insert(node, bnext);
+    }
+
+    // Worst path = argmax over nodes of `best`; reconstruct via `nexthop`.
+    // Ties break to the lowest index (BTreeMap order) for determinism.
+    let start = best
+        .iter()
+        .max_by(|a, b| a.1.cmp(b.1).then(b.0.cmp(a.0)))
+        .map(|(&n, _)| n)
+        .unwrap();
+    let mut worst_path = vec![start];
+    let mut cur = start;
+    while let Some(&Some(n)) = nexthop.get(&cur) {
+        worst_path.push(n);
+        cur = n;
+    }
+    CallTopology::Acyclic {
+        worst_sum: best[&start],
+        worst_path,
+    }
+}
+
+#[cfg(test)]
+mod topology_tests {
+    use super::{CallTopology, analyze_call_topology};
+    use std::collections::HashMap;
+
+    fn sp(pairs: &[(usize, u64)]) -> HashMap<usize, u64> {
+        pairs.iter().copied().collect()
+    }
+
+    #[test]
+    fn no_edges_is_mutually_non_calling() {
+        assert_eq!(
+            analyze_call_topology(&[], &sp(&[(0, 100), (1, 200)])),
+            CallTopology::NoEdges
+        );
+    }
+
+    #[test]
+    fn chain_sums_along_the_path() {
+        // 0 -> 1 -> 2, sp 10/20/30 => worst path 0,1,2 sum 60.
+        let v = analyze_call_topology(&[(0, 1), (1, 2)], &sp(&[(0, 10), (1, 20), (2, 30)]));
+        assert_eq!(
+            v,
+            CallTopology::Acyclic {
+                worst_sum: 60,
+                worst_path: vec![0, 1, 2]
+            }
+        );
+    }
+
+    #[test]
+    fn fanout_takes_the_heavier_branch() {
+        // 0 -> 1, 0 -> 2, sp 10/5/40 => 0,2 = 50 (heavier than 0,1 = 15).
+        let v = analyze_call_topology(&[(0, 1), (0, 2)], &sp(&[(0, 10), (1, 5), (2, 40)]));
+        assert_eq!(
+            v,
+            CallTopology::Acyclic {
+                worst_sum: 50,
+                worst_path: vec![0, 2]
+            }
+        );
+    }
+
+    #[test]
+    fn diamond_takes_the_longest_route() {
+        // 0->1, 0->2, 1->3, 2->3, sp 1/10/2/100 => 0,1,3 = 111 vs 0,2,3 = 103.
+        let v = analyze_call_topology(
+            &[(0, 1), (0, 2), (1, 3), (2, 3)],
+            &sp(&[(0, 1), (1, 10), (2, 2), (3, 100)]),
+        );
+        assert_eq!(
+            v,
+            CallTopology::Acyclic {
+                worst_sum: 111,
+                worst_path: vec![0, 1, 3]
+            }
+        );
+    }
+
+    #[test]
+    fn two_cycle_is_cyclic() {
+        match analyze_call_topology(&[(0, 1), (1, 0)], &sp(&[(0, 10), (1, 20)])) {
+            CallTopology::Cyclic { cycle } => {
+                assert!(cycle.contains(&0) && cycle.contains(&1), "cycle: {cycle:?}");
+            }
+            other => panic!("expected Cyclic, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cycle_beats_dag_when_both_present() {
+        // 0->1->2->1 : the 1<->2 back edge is a cycle even though 0->1 is a DAG edge.
+        match analyze_call_topology(&[(0, 1), (1, 2), (2, 1)], &sp(&[(0, 1), (1, 1), (2, 1)])) {
+            CallTopology::Cyclic { cycle } => {
+                assert!(cycle.contains(&1) && cycle.contains(&2), "cycle: {cycle:?}");
+            }
+            other => panic!("expected Cyclic, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn self_referential_weight_of_isolated_max_still_bounds() {
+        // Edges only among small nodes; the single heavy node is isolated, so
+        // the worst path (2->3 = 6) is far below it — the caller compares to the
+        // region and would NOT warn. Confirms worst_sum reflects paths, not the
+        // global max node.
+        let v = analyze_call_topology(&[(2, 3)], &sp(&[(2, 2), (3, 4)]));
+        assert_eq!(
+            v,
+            CallTopology::Acyclic {
+                worst_sum: 6,
+                worst_path: vec![2, 3]
+            }
+        );
+    }
+
+    // --- method-level: graph.adapter_sites -> verdict -> action (SR-67 gate) ---
+
+    use crate::MemoryStrategy;
+    use crate::resolver::{AdapterRequirements, AdapterSite, DependencyGraph};
+    use crate::merger::Merger;
+
+    fn site(from: usize, to: usize) -> AdapterSite {
+        AdapterSite {
+            from_component: from,
+            from_module: 0,
+            import_name: "f".into(),
+            import_module: "m".into(),
+            import_func_type_idx: None,
+            to_component: to,
+            to_module: 0,
+            export_name: "f".into(),
+            export_func_idx: 0,
+            crosses_memory: false,
+            is_async_lift: false,
+            requirements: AdapterRequirements::default(),
+        }
+    }
+
+    fn graph(edges: &[(usize, usize)]) -> DependencyGraph {
+        DependencyGraph {
+            instantiation_order: Vec::new(),
+            resolved_imports: HashMap::new(),
+            unresolved_imports: Vec::new(),
+            adapter_sites: edges.iter().map(|&(f, t)| site(f, t)).collect(),
+            resource_graph: None,
+            stream_pair_graph: None,
+            module_resolutions: Vec::new(),
+            reexporter_components: Vec::new(),
+            reexporter_resources: Vec::new(),
+        }
+    }
+
+    fn share_merger() -> Merger {
+        Merger::new(MemoryStrategy::SharedMemory, true)
+            .with_pack_rebase(true)
+            .with_share_stack(true)
+    }
+
+    // share_entries: two providers, comp 0 sp=100, comp 1 sp=50.
+    fn entries() -> Vec<((usize, usize), u64, u64)> {
+        vec![((0, 0), 100, 200), ((1, 0), 50, 100)]
+    }
+
+    #[test]
+    fn gate_passes_with_no_cross_component_calls() {
+        // gale shape: no adapter sites -> mutually-non-calling -> Ok.
+        let m = share_merger();
+        assert!(
+            m.check_share_stack_call_topology(&graph(&[]), &entries(), 100)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn gate_ignores_intra_component_self_edges() {
+        // from == to is an intra-component promotion, not a sibling call.
+        let m = share_merger();
+        assert!(
+            m.check_share_stack_call_topology(&graph(&[(0, 0), (1, 1)]), &entries(), 100)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn gate_hard_fails_on_a_call_cycle() {
+        // 0 -> 1 -> 0 : unbounded live stack -> refuse.
+        let m = share_merger();
+        let err = m
+            .check_share_stack_call_topology(&graph(&[(0, 1), (1, 0)]), &entries(), 100)
+            .expect_err("a call cycle must be refused");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("cycle") || msg.contains("CYCLE"),
+            "error must name the cycle: {msg}"
+        );
+    }
+
+    #[test]
+    fn gate_allows_a_dag_that_fits_the_region() {
+        // 0 -> 1, sum 150, region 200 -> fits -> Ok, silent.
+        let m = share_merger();
+        assert!(
+            m.check_share_stack_call_topology(&graph(&[(0, 1)]), &entries(), 200)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn gate_warns_but_allows_a_dag_that_exceeds_the_region() {
+        // 0 -> 1, sum 150, region 100 -> exceeds -> warn, still Ok (bounded).
+        let m = share_merger();
+        assert!(
+            m.check_share_stack_call_topology(&graph(&[(0, 1)]), &entries(), 100)
+                .is_ok()
+        );
+    }
 }

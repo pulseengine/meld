@@ -458,7 +458,7 @@ impl Merger {
         Self::check_no_duplicate_instantiations(components)?;
 
         let shared_memory_plan = if self.memory_strategy == MemoryStrategy::SharedMemory {
-            self.compute_shared_memory_plan(components)?
+            self.compute_shared_memory_plan(components, graph)?
         } else {
             None
         };

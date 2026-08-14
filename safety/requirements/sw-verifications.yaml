@@ -1157,3 +1157,26 @@ artifacts:
     links:
       - type: verifies
         target: SR-66
+
+  - id: SWV-79
+    type: sw-verification
+    title: "Verification of SR-67: --share-stack call-topology envelope gate"
+    description: >
+      Verifies SR-67 via meld-core/src/merger/memory.rs::topology_tests (12
+      tests). Pure analysis analyze_call_topology (7): no-edges → NoEdges;
+      chain/fanout/diamond → correct worst weighted (sp-sum) path; 2-cycle and
+      cycle-after-a-DAG-prefix → Cyclic. Gate method
+      check_share_stack_call_topology (5, on a constructed DependencyGraph): no
+      cross-component sites → Ok; intra-component self-edges (from == to) ignored
+      → Ok; call cycle → Err naming the cycle; DAG that fits the region → Ok
+      (silent); DAG that exceeds it → Ok (warn). The share_stack_380 oracle
+      (mutually-non-calling providers) confirms the gate is a no-op on the current
+      gale shape. Mechanical form of fathom's #370 residual-import self-check;
+      three-way (pass / warn-DAG / fail-cycle) rather than a blanket refuse so the
+      orchestrator composition is not broken.
+    status: implemented
+    fields:
+      method: automated-test
+    links:
+      - type: verifies
+        target: SR-67
