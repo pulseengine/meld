@@ -230,7 +230,7 @@ artifacts:
       - type: mitigates
         target: LS-M-1
     fields:
-      implementation: meld-core/src/merger.rs
+      implementation: meld-core/src/merger/mod.rs
       verification-method: test, proof
       verification-description: >
         Test with components having different import/defined function
@@ -305,7 +305,7 @@ artifacts:
       - type: addresses-constraint
         target: CC-M-7
     fields:
-      implementation: meld-core/src/merger.rs
+      implementation: meld-core/src/merger/mod.rs
       verification-method: test
       verification-description: >
         Assert merger iteration order matches resolver output order
@@ -636,7 +636,7 @@ artifacts:
       - type: mitigates
         target: LS-M-4
     fields:
-      implementation: meld-core/src/merger.rs
+      implementation: meld-core/src/merger/imports.rs
       verification-method: test
       verification-description: >
         Fuse two components importing same WASI function, verify separate
@@ -873,7 +873,7 @@ artifacts:
         target: LS-M-5
     fields:
       implementation:
-        - meld-core/src/merger.rs
+        - meld-core/src/merger/merge_core.rs
         - meld-core/src/lib.rs
       verification-method: test
       verification-description: >
@@ -1505,7 +1505,7 @@ artifacts:
         last-checked: 2026-06-24
     fields:
       implementation:
-        - meld-core/src/merger.rs
+        - meld-core/src/merger/mod.rs
       verification-method: test
       verification-description: >
         wit_bindgen_runtime::test_runtime_wit_bindgen_resource_floats_opaque
@@ -1672,7 +1672,7 @@ artifacts:
     release: v0.39.0
     fields:
       implementation:
-        - meld-core/src/merger.rs
+        - meld-core/src/merger/imports.rs
         - meld-core/src/lib.rs
       verification-method: test
       verification-description: >
@@ -1738,7 +1738,7 @@ artifacts:
         - meld-core/src/reloc.rs
         - meld-core/src/rewriter.rs
         - meld-core/src/segments.rs
-        - meld-core/src/merger.rs
+        - meld-core/src/merger/mod.rs
       verification-method: test
       verification-description: >
         VERIFIED (#340, merged 2026-07-11). Runtime oracle
@@ -1803,7 +1803,7 @@ artifacts:
     release: v0.41.0
     fields:
       implementation:
-        - meld-core/src/merger.rs
+        - meld-core/src/merger/mod.rs
         - meld-core/src/rewriter.rs
       verification-method: test
       verification-description: >
@@ -1859,7 +1859,7 @@ artifacts:
     fields:
       implementation:
         - meld-core/src/lib.rs
-        - meld-core/src/merger.rs
+        - meld-core/src/merger/mod.rs
         - meld-core/src/rewriter.rs
       verification-method: test
       verification-description: >
@@ -1906,7 +1906,7 @@ artifacts:
     fields:
       implementation:
         - meld-core/src/segments.rs
-        - meld-core/src/merger.rs
+        - meld-core/src/merger/index_maps.rs
       verification-method: test
       verification-description: >
         VERIFIED (#346, merged 2026-07-15). meld-core/tests/const_expr_globalget.rs,
@@ -2008,7 +2008,7 @@ artifacts:
     fields:
       implementation:
         - meld-core/src/reloc.rs
-        - meld-core/src/merger.rs
+        - meld-core/src/merger/mod.rs
         - meld-core/src/error.rs
       verification-method: test
       verification-description: >
@@ -2265,7 +2265,7 @@ artifacts:
         last-checked: 2026-08-12
     fields:
       implementation:
-        - meld-core/src/merger.rs
+        - meld-core/src/merger/memory.rs
         - meld-core/src/lib.rs
         - meld-cli/src/main.rs
       verification-method: test
@@ -2392,7 +2392,7 @@ artifacts:
         last-checked: 2026-08-12
     fields:
       implementation:
-        - meld-core/src/merger.rs
+        - meld-core/src/merger/index_maps.rs
         - meld-core/src/address_strategy.rs
         - meld-core/src/segments.rs
       verification-method: test
@@ -2674,7 +2674,7 @@ artifacts:
         last-checked: 2026-08-13
     fields:
       implementation:
-        - meld-core/src/merger.rs
+        - meld-core/src/merger/memory.rs
       verification-method: test
       verification-description: >
         Verified by meld-core/tests/pack_rebase_370.rs (4 differential-execution

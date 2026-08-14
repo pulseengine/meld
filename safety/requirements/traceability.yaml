@@ -104,7 +104,7 @@ verification-status:
     status: verified
 
   SR-8:
-    implementation-files: [meld-core/src/merger.rs]
+    implementation-files: [meld-core/src/merger/mod.rs]
     tests: []
     proofs: [proofs/transformations/merge/]
     status: partial
@@ -142,7 +142,7 @@ verification-status:
     status: verified
 
   SR-11:
-    implementation-files: [meld-core/src/merger.rs]
+    implementation-files: [meld-core/src/merger/mod.rs]
     tests:
       - resolver::tests::test_topological_sort_linear
       - resolver::tests::test_topological_sort_diamond
@@ -302,13 +302,13 @@ verification-status:
     status: implemented
 
   SR-23:
-    implementation-files: [meld-core/src/merger.rs]
+    implementation-files: [meld-core/src/merger/imports.rs]
     tests:
-      - merger::tests::test_multi_memory_dedup_separates_components
-      - merger::tests::test_shared_memory_dedup_merges_components
-      - merger::tests::test_import_memory_and_realloc_indices_populated
-      - merger::tests::test_cabi_realloc_suffixed_exports_generated
-      - merger::tests::test_shared_memory_no_suffixed_realloc_exports
+      - merger::tests_a::test_multi_memory_dedup_separates_components
+      - merger::tests_a::test_shared_memory_dedup_merges_components
+      - merger::tests_b::test_import_memory_and_realloc_indices_populated
+      - merger::tests_b::test_cabi_realloc_suffixed_exports_generated
+      - merger::tests_b::test_shared_memory_no_suffixed_realloc_exports
     proofs: []
     status: partial
     note: "Component-aware dedup implemented and tested with 5 targeted unit tests."
@@ -376,9 +376,9 @@ verification-status:
     status: partial
 
   SR-31:
-    implementation-files: [meld-core/src/merger.rs]
+    implementation-files: [meld-core/src/merger/merge_core.rs]
     tests:
-      - merger::tests::ls_m_5_multiply_instantiated_module_rejected
+      - merger::tests_b::ls_m_5_multiply_instantiated_module_rejected
     proofs: []
     status: verified
     note: >-

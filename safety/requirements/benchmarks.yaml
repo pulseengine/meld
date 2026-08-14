@@ -58,7 +58,7 @@ artifacts:
     fields:
       implementation:
         - meld-core/benches/fusion_benchmarks.rs
-        - meld-core/src/merger.rs
+        - meld-core/src/merger/mod.rs
       verification-method: test
       verification-description: >
         cargo bench -p meld-core --bench fusion_benchmarks -- merger

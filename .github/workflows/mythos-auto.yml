@@ -106,7 +106,7 @@ jobs:
           set -euo pipefail
           patterns=(
             "meld-core/src/parser.rs"
-            "meld-core/src/merger.rs"
+            "meld-core/src/merger/"
             "meld-core/src/resolver.rs"
             "meld-core/src/rewriter.rs"
             "meld-core/src/component_wrap.rs"
