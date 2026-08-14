@@ -1162,18 +1162,21 @@ artifacts:
     type: sw-verification
     title: "Verification of SR-67: --share-stack call-topology envelope gate"
     description: >
-      Verifies SR-67 via meld-core/src/merger/memory.rs::topology_tests (12
+      Verifies SR-67 via meld-core/src/merger/memory.rs::topology_tests (14
       tests). Pure analysis analyze_call_topology (7): no-edges → NoEdges;
       chain/fanout/diamond → correct worst weighted (sp-sum) path; 2-cycle and
       cycle-after-a-DAG-prefix → Cyclic. Gate method
-      check_share_stack_call_topology (5, on a constructed DependencyGraph): no
-      cross-component sites → Ok; intra-component self-edges (from == to) ignored
-      → Ok; call cycle → Err naming the cycle; DAG that fits the region → Ok
-      (silent); DAG that exceeds it → Ok (warn). The share_stack_380 oracle
-      (mutually-non-calling providers) confirms the gate is a no-op on the current
-      gale shape. Mechanical form of fathom's #370 residual-import self-check;
-      three-way (pass / warn-DAG / fail-cycle) rather than a blanket refuse so the
-      orchestrator composition is not broken.
+      check_share_stack_call_topology (7, on a constructed DependencyGraph): no
+      cross-component sites → Ok; intra-component SAME-module self-edges ignored
+      → Ok; call cycle → Err; DAG that fits the region → Ok (silent); DAG that
+      exceeds it → Ok (warn); plus the Mythos Finding-1 regressions — an intra-
+      component CROSS-module cycle → Err and cross-module DAG over region → warn
+      (per-(component,module) nodes + function-kind module_resolutions edges, the
+      granularity the old per-component gate missed). Local Mythos confirmed the
+      pure engine sound vs missed-cycle/undercount and found the granularity gap.
+      share_stack_380 oracle (mutually-non-calling) confirms the gate is a no-op
+      on the gale shape. Three-way (pass / warn-DAG / fail-cycle), not a blanket
+      refuse, so the orchestrator composition is not broken.
     status: implemented
     fields:
       method: automated-test

@@ -134,7 +134,7 @@ impl Merger {
             // while at most one provider's stack is live. Check the fused-set
             // call graph and refuse a cycle (unbounded live stack); warn on a DAG
             // whose worst call chain exceeds the region.
-            self.check_share_stack_call_topology(graph, &share_entries, s_raw)?;
+            self.check_share_stack_call_topology(graph, components, &share_entries, s_raw)?;
         } else if self.address_rebasing {
             // Byte-granular running base. Under the default page-granular
             // strategy each module strides by its declared page count; under
@@ -278,73 +278,132 @@ impl Merger {
     }
 
     /// SR-67 / #382: the `--share-stack` call-topology envelope check. The shared
-    /// region is `max_i(sp_i)`, sound only while at most one provider's stack is
-    /// live — i.e. the providers are mutually-non-calling. Every fused
-    /// cross-component function call (an `AdapterSite` with
-    /// `from_component != to_component`) makes a caller live while its callee
-    /// runs, so the live requirement along a call chain is the SUM of stacks.
+    /// region is `max_i(sp_i)`, sound only while at most one stack is live at a
+    /// time. But the region is per-MODULE, not per-component:
+    /// `mcu_dissolve::coalesce_stack_pointers` collapses EVERY `__stack_pointer`
+    /// across all components AND modules onto one survivor, so every module's
+    /// stack lives in the single `[0, s_raw)` region. A call from one
+    /// memory-bearing module into another (whether cross-component or
+    /// intra-component cross-module) chains their `sp`s in that region.
     ///
-    /// - no such edges → the region is sound; nothing to do.
-    /// - an acyclic call graph (an orchestrator DAG) whose worst root-to-leaf
-    ///   `sp`-sum exceeds the region → `log::warn!` (the region may be undersized,
-    ///   but boundedly; the integrator judges it against real stack bounds). If
-    ///   the worst chain still fits the region, it is sound — say nothing.
-    /// - a call cycle → the live stack is unbounded → hard-fail (the same
-    ///   loud-refusal posture as the other `--share-stack` gates).
+    /// Nodes are therefore `(component, module)` and edges are cross-module
+    /// function calls from two sources (Mythos SR-67 delta-pass, Finding 1):
+    ///   - `graph.adapter_sites` — every internalized cross-component call, plus
+    ///     intra-component encoding-differing calls (both carry distinct
+    ///     `(from_module, to_module)`);
+    ///   - function-kind `graph.module_resolutions` — intra-component cross-module
+    ///     calls that never become adapter sites (under `SharedMemory` only an
+    ///     encoding difference makes one, so plain cross-module calls stay here).
     ///
-    /// All cross-component edges count — including resource-op and async-lift
-    /// calls, which still execute callee code and keep the (possibly suspended)
-    /// caller stack live. Over-approximating here yields a false warn/refuse at
+    /// Resource-op and async-lift calls count too (they still execute callee code
+    /// on the shared stack). Over-approximating yields a false warn/refuse at
     /// worst, never a silent under-reservation.
+    ///
+    /// Verdict (via [`analyze_call_topology`], weighting each node by its `sp`):
+    ///   - no cross-module edges → sound; proceed silently.
+    ///   - acyclic DAG, worst root-to-leaf `sp`-sum > region → `log::warn!`.
+    ///   - a call cycle → unbounded live stack → hard-fail.
+    ///
+    /// KNOWN GAP (Finding 3, unconfirmed): a standalone resource-DESTRUCTOR
+    /// invocation (drop of an owned handle → the defining component's dtor) that
+    /// is routed through handle tables rather than an adapter site would not
+    /// appear here. Narrow for the scalar MCU driver shape `--share-stack`
+    /// targets (no resources); documented rather than claimed-covered.
     fn check_share_stack_call_topology(
         &self,
         graph: &DependencyGraph,
+        components: &[ParsedComponent],
         share_entries: &[((usize, usize), u64, u64)],
         region: u64,
     ) -> Result<()> {
-        // Cross-component call edges (self-edges are intra-component promotions,
-        // not sibling calls — exclude them).
-        let edges: Vec<(usize, usize)> = graph
-            .adapter_sites
-            .iter()
-            .filter(|s| s.from_component != s.to_component)
-            .map(|s| (s.from_component, s.to_component))
-            .collect();
-
-        // Per-component stack size: the largest `sp` among a component's rebased
-        // memory modules (its shadow-stack region).
-        let mut sp_by_comp: HashMap<usize, u64> = HashMap::new();
-        for &((comp_idx, _), sp, _) in share_entries {
-            let slot = sp_by_comp.entry(comp_idx).or_insert(0);
-            *slot = (*slot).max(sp);
+        // No shared region to protect (defensive — Finding 2). Unreachable via
+        // the plan (a non-empty memory set always yields entries), but explicit.
+        if share_entries.is_empty() {
+            return Ok(());
         }
 
-        match analyze_call_topology(&edges, &sp_by_comp) {
+        // Intern `(component, module)` keys to dense ids so the pure analysis
+        // stays integer-keyed; `label` maps back for diagnostics.
+        let mut id_of: HashMap<(usize, usize), usize> = HashMap::new();
+        let mut label: Vec<(usize, usize)> = Vec::new();
+        let mut intern = |key: (usize, usize)| -> usize {
+            *id_of.entry(key).or_insert_with(|| {
+                label.push(key);
+                label.len() - 1
+            })
+        };
+
+        // Per-module stack weight.
+        let mut sp: HashMap<usize, u64> = HashMap::new();
+        for &(key, weight, _) in share_entries {
+            let id = intern(key);
+            sp.insert(id, weight);
+        }
+
+        // Cross-module call edges from both sources (exclude same-module).
+        let mut edges: Vec<(usize, usize)> = Vec::new();
+        for site in &graph.adapter_sites {
+            let from = (site.from_component, site.from_module);
+            let to = (site.to_component, site.to_module);
+            if from != to {
+                edges.push((intern(from), intern(to)));
+            }
+        }
+        for res in &graph.module_resolutions {
+            if res.from_module == res.to_module {
+                continue;
+            }
+            // FUNCTION-kind only: a memory/global/table wiring is not a call.
+            let is_call = components
+                .get(res.component_idx)
+                .and_then(|c| c.core_modules.get(res.to_module))
+                .is_some_and(|m| {
+                    m.exports
+                        .iter()
+                        .any(|e| e.name == res.export_name && matches!(e.kind, ExportKind::Function))
+                });
+            if is_call {
+                let from = (res.component_idx, res.from_module);
+                let to = (res.component_idx, res.to_module);
+                edges.push((intern(from), intern(to)));
+            }
+        }
+
+        let describe = |ids: &[usize]| -> Vec<(usize, usize)> {
+            ids.iter().map(|&id| label[id]).collect()
+        };
+
+        match analyze_call_topology(&edges, &sp) {
             CallTopology::NoEdges => Ok(()),
             CallTopology::Acyclic {
                 worst_sum,
                 worst_path,
             } => {
                 if worst_sum > region {
+                    let chain = describe(&worst_path);
                     log::warn!(
-                        "--share-stack: the fused set is not mutually-non-calling — component \
-                         call chain {worst_path:?} needs up to {worst_sum} bytes of shadow stack \
-                         (the sum along the chain), but the shared region is sized {region} bytes \
-                         (the max single provider). At most one provider's stack is assumed live \
-                         at a time; a live caller+callee needs their sum. This is sound only if \
-                         the chain's true peak fits {region} — verify against your per-stage stack \
-                         bounds (e.g. a scry static bound). If it does not, do not use \
+                        "--share-stack: the fused set is not mutually-non-calling — the \
+                         (component, module) call chain {chain:?} needs up to {worst_sum} bytes of \
+                         shadow stack (the sum along the chain), but the shared region is sized \
+                         {region} bytes (the largest single module). At most one module's stack is \
+                         assumed live at a time; a live caller+callee needs their sum. Sound only \
+                         if the chain's true peak fits {region} — verify against your per-stage \
+                         stack bounds (e.g. a scry static bound). If it does not, do not use \
                          --share-stack for this composition."
                     );
                 }
                 Ok(())
             }
-            CallTopology::Cyclic { cycle } => Err(Error::MemoryStrategyUnsupported(format!(
-                "--share-stack: the fused set contains a component call CYCLE {cycle:?} — the live \
-                 shadow-stack depth is unbounded, so a single region sized to the largest provider \
-                 cannot be sound. --share-stack requires a non-recursive, one-live-at-a-time \
-                 composition; remove the cycle or drop --share-stack."
-            ))),
+            CallTopology::Cyclic { cycle } => {
+                let chain = describe(&cycle);
+                Err(Error::MemoryStrategyUnsupported(format!(
+                    "--share-stack: the fused set contains a (component, module) call CYCLE \
+                     {chain:?} — the live shadow-stack depth is unbounded, so a single region \
+                     sized to the largest module cannot be sound. --share-stack requires a \
+                     non-recursive, one-live-at-a-time composition; remove the cycle or drop \
+                     --share-stack."
+                )))
+            }
         }
     }
 }
@@ -1065,15 +1124,18 @@ mod topology_tests {
     use crate::resolver::{AdapterRequirements, AdapterSite, DependencyGraph};
     use crate::merger::Merger;
 
-    fn site(from: usize, to: usize) -> AdapterSite {
+    /// A `((from_component, from_module), (to_component, to_module))` call edge.
+    type ModEdge = ((usize, usize), (usize, usize));
+
+    fn site_mod(fc: usize, fm: usize, tc: usize, tm: usize) -> AdapterSite {
         AdapterSite {
-            from_component: from,
-            from_module: 0,
+            from_component: fc,
+            from_module: fm,
             import_name: "f".into(),
             import_module: "m".into(),
             import_func_type_idx: None,
-            to_component: to,
-            to_module: 0,
+            to_component: tc,
+            to_module: tm,
             export_name: "f".into(),
             export_func_idx: 0,
             crosses_memory: false,
@@ -1082,12 +1144,27 @@ mod topology_tests {
         }
     }
 
+    /// Component-level edges (module 0 on both sides).
     fn graph(edges: &[(usize, usize)]) -> DependencyGraph {
+        graph_sites(edges.iter().map(|&(f, t)| site_mod(f, 0, t, 0)).collect())
+    }
+
+    /// `(component, module)` edges.
+    fn graph_mods(edges: &[ModEdge]) -> DependencyGraph {
+        graph_sites(
+            edges
+                .iter()
+                .map(|&((fc, fm), (tc, tm))| site_mod(fc, fm, tc, tm))
+                .collect(),
+        )
+    }
+
+    fn graph_sites(adapter_sites: Vec<AdapterSite>) -> DependencyGraph {
         DependencyGraph {
             instantiation_order: Vec::new(),
             resolved_imports: HashMap::new(),
             unresolved_imports: Vec::new(),
-            adapter_sites: edges.iter().map(|&(f, t)| site(f, t)).collect(),
+            adapter_sites,
             resource_graph: None,
             stream_pair_graph: None,
             module_resolutions: Vec::new(),
@@ -1112,7 +1189,7 @@ mod topology_tests {
         // gale shape: no adapter sites -> mutually-non-calling -> Ok.
         let m = share_merger();
         assert!(
-            m.check_share_stack_call_topology(&graph(&[]), &entries(), 100)
+            m.check_share_stack_call_topology(&graph(&[]), &[], &entries(), 100)
                 .is_ok()
         );
     }
@@ -1122,7 +1199,7 @@ mod topology_tests {
         // from == to is an intra-component promotion, not a sibling call.
         let m = share_merger();
         assert!(
-            m.check_share_stack_call_topology(&graph(&[(0, 0), (1, 1)]), &entries(), 100)
+            m.check_share_stack_call_topology(&graph(&[(0, 0), (1, 1)]), &[], &entries(), 100)
                 .is_ok()
         );
     }
@@ -1132,7 +1209,7 @@ mod topology_tests {
         // 0 -> 1 -> 0 : unbounded live stack -> refuse.
         let m = share_merger();
         let err = m
-            .check_share_stack_call_topology(&graph(&[(0, 1), (1, 0)]), &entries(), 100)
+            .check_share_stack_call_topology(&graph(&[(0, 1), (1, 0)]), &[], &entries(), 100)
             .expect_err("a call cycle must be refused");
         let msg = err.to_string();
         assert!(
@@ -1146,7 +1223,7 @@ mod topology_tests {
         // 0 -> 1, sum 150, region 200 -> fits -> Ok, silent.
         let m = share_merger();
         assert!(
-            m.check_share_stack_call_topology(&graph(&[(0, 1)]), &entries(), 200)
+            m.check_share_stack_call_topology(&graph(&[(0, 1)]), &[], &entries(), 200)
                 .is_ok()
         );
     }
@@ -1156,7 +1233,42 @@ mod topology_tests {
         // 0 -> 1, sum 150, region 100 -> exceeds -> warn, still Ok (bounded).
         let m = share_merger();
         assert!(
-            m.check_share_stack_call_topology(&graph(&[(0, 1)]), &entries(), 100)
+            m.check_share_stack_call_topology(&graph(&[(0, 1)]), &[], &entries(), 100)
+                .is_ok()
+        );
+    }
+
+    // share_entries for a SINGLE component with TWO memory-bearing modules.
+    fn multimodule_entries() -> Vec<((usize, usize), u64, u64)> {
+        vec![((0, 0), 100, 200), ((0, 1), 80, 160)]
+    }
+
+    #[test]
+    fn gate_catches_intra_component_cross_module_cycle() {
+        // Mythos SR-67 Finding 1: the shared stack is per-MODULE, so two modules
+        // in ONE component that call each other (comp0/mod0 <-> comp0/mod1) form
+        // a cycle in the shared region. The old per-component gate dropped these
+        // as `from == to` self-edges and passed silently; per-module nodes catch
+        // it. (A cycle asserts detection unambiguously via the Err.)
+        let m = share_merger();
+        let g = graph_mods(&[((0, 0), (0, 1)), ((0, 1), (0, 0))]);
+        let err = m
+            .check_share_stack_call_topology(&g, &[], &multimodule_entries(), 100)
+            .expect_err("an intra-component cross-module call cycle must be refused");
+        assert!(
+            err.to_string().contains("CYCLE"),
+            "error must name the cycle: {err}"
+        );
+    }
+
+    #[test]
+    fn gate_warns_on_intra_component_cross_module_dag_over_region() {
+        // comp0/mod0 -> comp0/mod1, sp 100 + 80 = 180 > region 100 -> warn, Ok.
+        // The old per-component gate saw a self-edge, dropped it, and was silent.
+        let m = share_merger();
+        let g = graph_mods(&[((0, 0), (0, 1))]);
+        assert!(
+            m.check_share_stack_call_topology(&g, &[], &multimodule_entries(), 100)
                 .is_ok()
         );
     }
