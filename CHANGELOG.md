@@ -4,6 +4,29 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.49.0] - 2026-08-14
+
+### Added
+- **`--share-stack` call-topology envelope gate (SR-67, #382)** — the shared
+  shadow-stack region (SR-66/#380) is sized `max_i(sp_i)`, sound only while at
+  most one stack is live at a time. Since `mcu_dissolve::coalesce_stack_pointers`
+  collapses every `__stack_pointer` across all components *and modules* onto one
+  survivor, the region is per-module and a call from one memory-bearing module
+  into another chains their stacks in it. meld now analyses the fused-set call
+  graph — nodes `(component, module)`, edges = every cross-module function call
+  (`adapter_sites` ∪ function-kind `module_resolutions`), weighted by `sp` — and:
+  no cross-module edges → sound, silent (the gale/F100 shape); an acyclic DAG
+  whose worst root-to-leaf `sp`-sum exceeds the region → `log::warn` naming the
+  chain and the required sum; a call **cycle** → hard-fail (unbounded live
+  stack). This is the mechanical form of the self-check the falcon supplier
+  proposed on #370 ("a seam that vanishes from the residual imports is a
+  component now calling a sibling"), done more precisely than an external
+  undefined-symbol diff. Not a blanket refuse — the orchestrator composition
+  (sound at `max_i(orchestrator + driver_i)`) is warned, only a cycle is refused.
+  A local Mythos delta-pass hardened it (per-module granularity; the pure graph
+  engine verified against missed-cycle / undercount attacks). Known narrow gap
+  (documented): a resource-destructor call routed via handle tables is not seen.
+
 ## [0.48.0] - 2026-08-14
 
 ### Added

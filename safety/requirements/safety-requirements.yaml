@@ -2784,3 +2784,91 @@ artifacts:
       references:
         - "https://github.com/pulseengine/meld/issues/380"
         - "meld-core/tests/share_stack_380.rs"
+
+  - id: SR-67
+    type: sw-req
+    title: Shared-stack call-topology envelope gate (--share-stack, SR-67)
+    description: >
+      Under `--share-stack` (SR-66) the shared shadow-stack region is sized
+      `max_i(sp_i)`, which is sound only while at most one stack is live at a
+      time. The region is per-MODULE, not per-component:
+      `mcu_dissolve::coalesce_stack_pointers` collapses EVERY `__stack_pointer`
+      across all components AND modules onto one survivor, so every module's stack
+      lives in the single region. A call from one memory-bearing module into
+      another — cross-component OR intra-component cross-module — makes the caller
+      live while the callee runs, so the live requirement along a call chain is
+      the SUM of the participants' stacks, not the max. meld shall analyse the
+      fused-set call graph with nodes = `(component, module)` and edges = every
+      cross-module function call: `AdapterSite`s (cross-component + intra-component
+      encoding-differing calls) UNION function-kind `module_resolutions`
+      (intra-component cross-module calls that never become adapter sites).
+      Resource-op and async-lift calls count too (they still execute callee code
+      on the shared stack). Weighting each node by its module `sp`:
+        (a) NO cross-module edges → the region is sound; proceed silently
+            (the current gale/F100 shape).
+        (b) an ACYCLIC call graph (an orchestrator DAG) whose worst root-to-leaf
+            `sp`-sum EXCEEDS the region → `log::warn!`, naming the chain, the
+            required sum, and the region (the region may be undersized but
+            boundedly; the integrator judges it against real per-stage stack
+            bounds). If the worst chain still fits the region, proceed silently
+            (max-sizing already covers it).
+        (c) a call CYCLE (A→…→A, or recursion through a sibling) → the live
+            depth is unbounded → HARD-FAIL (the same loud-refusal posture as
+            SR-66's other gates), naming the cycle.
+      This is the mechanical form of the self-check the falcon supplier (fathom)
+      proposed on #370 ("a seam that vanishes from the residual imports is a
+      component now calling a sibling"): meld sees the internalized call directly
+      (the merger resolves each cross-component import to its export target),
+      more precisely than an external undefined-symbol diff. A blanket refuse on
+      ANY edge was rejected — it would break the natural orchestrator
+      composition, which is sound at `max_i(orchestrator + driver_i)`; the
+      three-way disposition distinguishes it from unbounded recursion.
+    status: implemented
+    tags: [merger, memory, shared, mcu, share-stack, shadow-stack, call-graph]
+    release: v0.49.0
+    links:
+      - type: derives-from
+        target: SYS-6
+      - type: mitigates
+        target: LS-M-12
+      - type: refines
+        target: SR-66
+    cited-source:
+      - uri: "https://github.com/pulseengine/meld/issues/382"
+        kind: github
+        last-checked: 2026-08-14
+    fields:
+      implementation:
+        - meld-core/src/merger/memory.rs
+      verification-method: test
+      verification-description: >
+        Verified by meld-core/src/merger/memory.rs::topology_tests (14 tests).
+        The pure graph analysis analyze_call_topology is covered by 7 unit tests:
+        no-edges → NoEdges; chain/fanout/diamond → the correct worst weighted
+        (sp-sum) path; a 2-cycle and a cycle-with-a-DAG-prefix → Cyclic. The gate
+        method check_share_stack_call_topology is covered by 7 method-level tests
+        on a constructed DependencyGraph: no cross-component sites → Ok; intra-
+        component SAME-module self-edges ignored → Ok; a call cycle → Err naming
+        the cycle; a DAG that fits the region → Ok (silent); a DAG that exceeds it
+        → Ok (warn); AND (Mythos SR-67 Finding 1 regressions) an intra-component
+        CROSS-module cycle → Err and an intra-component cross-module DAG over the
+        region → warn — the per-module granularity the old per-component gate
+        missed. A local Mythos delta-pass confirmed the pure graph engine sound
+        against missed-cycle / undercounted-path attacks, and found the
+        per-component granularity gap (the shared stack is per-module: two modules
+        in one component that call each other share the region); fixed by keying
+        nodes on (component, module) and adding function-kind module_resolutions
+        edges. The share_stack_380 oracle (mutually-non-calling providers) confirms
+        the gate is a no-op on the current shape.
+        NOTE (coverage): a single fixture combining a real cross-component call
+        WITH the --share-stack markers is not built (needs component-model
+        composition machinery); the adapter-site/module_resolutions → gate wiring
+        is covered by the method-level tests plus the existing adapter-site tests
+        rather than one end-to-end fixture.
+        KNOWN GAP (Mythos Finding 3, unconfirmed): a standalone resource-DESTRUCTOR
+        call routed via handle tables rather than an adapter site would not appear
+        as an edge; narrow for the scalar MCU driver shape (no resources),
+        documented rather than claimed-covered.
+      references:
+        - "https://github.com/pulseengine/meld/issues/382"
+        - "meld-core/src/merger/memory.rs"
