@@ -141,6 +141,7 @@ fn test_address_rebasing_end_to_end() {
         memory_strategy: MemoryStrategy::SharedMemory,
         address_rebasing: true,
         pack_rebase: false,
+        share_stack: false,
         ..Default::default()
     };
 
@@ -232,6 +233,7 @@ fn test_298_real_wit_bindgen_component_blocks_shared_rebase() {
         memory_strategy: MemoryStrategy::SharedMemory,
         address_rebasing: true,
         pack_rebase: false,
+        share_stack: false,
         ..Default::default()
     };
     let mut fuser = Fuser::new(config);
@@ -457,6 +459,7 @@ fn test_326_reloc_const_rebasing_end_to_end() {
         memory_strategy: MemoryStrategy::SharedMemory,
         address_rebasing: true,
         pack_rebase: false,
+        share_stack: false,
         ..Default::default()
     };
     let mut fuser = Fuser::new(config);
@@ -551,6 +554,7 @@ fn test_326_shared_rebase_without_relocs_hard_errors() {
         memory_strategy: MemoryStrategy::SharedMemory,
         address_rebasing: true,
         pack_rebase: false,
+        share_stack: false,
         ..Default::default()
     };
     let mut fuser = Fuser::new(config);
@@ -593,6 +597,7 @@ fn test_351_stale_reloc_offsets_hard_error() {
         memory_strategy: MemoryStrategy::SharedMemory,
         address_rebasing: true,
         pack_rebase: false,
+        share_stack: false,
         ..Default::default()
     };
     let mut fuser = Fuser::new(config);
@@ -803,6 +808,7 @@ fn test_301_embedder_arena_seam_survives_fusion_differential() {
         memory_strategy: MemoryStrategy::SharedMemory,
         address_rebasing: true,
         pack_rebase: false,
+        share_stack: false,
         ..Default::default()
     };
     let mut fuser = Fuser::new(config);
@@ -974,6 +980,7 @@ fn test_301_embedder_arena_seam_nonzero_base_requires_relocs() {
         memory_strategy: MemoryStrategy::SharedMemory,
         address_rebasing: true,
         pack_rebase: false,
+        share_stack: false,
         ..Default::default()
     };
     let mut fuser = Fuser::new(config);

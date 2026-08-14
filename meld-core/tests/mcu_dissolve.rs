@@ -121,6 +121,7 @@ fn merged_base() -> MergedModule {
         task_return_shims: HashMap::new(),
         async_result_globals: HashMap::new(),
         segment_bases: HashMap::new(),
+        shared_stack_top: None,
     }
 }
 

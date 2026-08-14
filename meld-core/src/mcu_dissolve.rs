@@ -34,11 +34,11 @@
 
 use std::collections::{HashMap, HashSet};
 
-use wasm_encoder::{ExportKind as EncoderExportKind, Function, ValType};
+use wasm_encoder::{ConstExpr, ExportKind as EncoderExportKind, Function, ValType};
 use wasmparser::{BinaryReader, CodeSectionReader, Operator};
 
 use crate::merger::MergedModule;
-use crate::parser::{ImportKind, ParsedComponent};
+use crate::parser::{ExportKind as ParserExportKind, ImportKind, ParsedComponent};
 use crate::rewriter::{IndexMaps, rewrite_function_body};
 use crate::segments::{ElementSegmentMode, ReindexedElementItems};
 use crate::{Error, Result};
@@ -99,6 +99,12 @@ fn coalesce_stack_pointers(
     components: &[ParsedComponent],
 ) -> Result<usize> {
     let import_base = merged.import_counts.global;
+    // SR-66 / #380: under `--share-stack` the merger sized ONE shared stack
+    // region and recorded its top here. When set, we coalesce EVERY
+    // `__stack_pointer` onto one survivor (regardless of init) and rewrite the
+    // survivor's init to this top. When `None`, the conservative equal-init
+    // grouping below is unchanged (#334 behaviour).
+    let share_top = merged.shared_stack_top;
 
     // Gather candidates from the ORIGINAL parsed globals — the merged
     // `ConstExpr` init is opaque, but the source `init_expr_bytes` is
@@ -109,8 +115,21 @@ fn coalesce_stack_pointers(
     // genuinely-separate SP exactly once.
     let mut candidates: Vec<SpCandidate> = Vec::new();
     let mut seen: HashSet<u32> = HashSet::new();
+    // Count rebased modules carrying a memory — the plan (`share_stack_entry`)
+    // hard-failed unless EACH has an SP, so under `--share-stack` the coalescer
+    // must find one per such module; fewer means a plan/dissolve signal drift
+    // that would leave ≥2 SPs over the single shared region (unsound).
+    let mut memory_module_count: usize = 0;
     for (comp_idx, comp) in components.iter().enumerate() {
         for (mod_idx, module) in comp.core_modules.iter().enumerate() {
+            let has_memory = !module.memories.is_empty()
+                || module
+                    .imports
+                    .iter()
+                    .any(|i| matches!(i.kind, ImportKind::Memory(_)));
+            if has_memory {
+                memory_module_count += 1;
+            }
             let import_global_count = module
                 .imports
                 .iter()
@@ -136,10 +155,21 @@ fn coalesce_stack_pointers(
                 if merged_idx < import_base || !seen.insert(merged_idx) {
                     continue;
                 }
+                // Authoritative signal: the `name` section OR the export table
+                // named this global `__stack_pointer`. The export-table branch
+                // MUST match `merger::memory::module_stack_pointer_marker` (which
+                // the plan gate uses) — otherwise the plan could accept an
+                // export-named SP the coalescer misses, leaving two SPs over the
+                // shared region.
                 let named = names
                     .get(&abs_old)
                     .map(|n| n == "__stack_pointer")
-                    .unwrap_or(false);
+                    .unwrap_or(false)
+                    || module.exports.iter().any(|e| {
+                        matches!(e.kind, ParserExportKind::Global)
+                            && e.index == abs_old
+                            && e.name == "__stack_pointer"
+                    });
                 candidates.push(SpCandidate {
                     merged_idx,
                     init,
@@ -151,9 +181,55 @@ fn coalesce_stack_pointers(
 
     // Decide which sets to coalesce. Correctness over cleanup: only fuse
     // globals we are confident share one shadow stack.
-    let groups = choose_coalesce_groups(&candidates);
+    let groups = choose_coalesce_groups(&candidates, share_top.is_some());
     if groups.is_empty() {
+        // Under `--share-stack` with ≥2 memory providers the plan guaranteed an
+        // SP per provider, so finding no coalescible group is a drift — refuse
+        // rather than silently leave the providers on the stacks the plan
+        // already collapsed into one region.
+        if share_top.is_some() && memory_module_count > 1 {
+            return Err(Error::EncodingError(format!(
+                "--share-stack: no coalescible `__stack_pointer` group found across \
+                 {memory_module_count} memory provider(s); plan/dissolve signal drift"
+            )));
+        }
         return Ok(0);
+    }
+
+    // SR-66 drift detector: the plan enforced one SP per memory provider, so the
+    // coalescer must have seen at least that many `__stack_pointer`-named
+    // candidates. Fewer means the two sides disagree on the SP signal — refuse.
+    if share_top.is_some() {
+        let named_count = candidates.iter().filter(|c| c.named).count();
+        if named_count < memory_module_count {
+            return Err(Error::EncodingError(format!(
+                "--share-stack: found {named_count} `__stack_pointer` global(s) but \
+                 {memory_module_count} rebased memory provider(s); the shared-stack layout \
+                 requires one per provider (plan/dissolve drift)"
+            )));
+        }
+    }
+
+    // SR-66: rewrite each surviving SP's init to the shared stack top. Done
+    // BEFORE the drop, while `merged.globals[survivor - import_base]` still
+    // addresses the survivor (the drop reshuffles the vector). The providers'
+    // original inits (which may differ — a stack-first layout with per-provider
+    // stack sizes) are replaced by the single region top the plan sized; the
+    // value is an absolute fused-space address and the shared region sits at
+    // base 0, so it is NOT rebased (globals are never reloc-covered, #339).
+    if let Some(s_raw) = share_top {
+        let s_raw_i32 = i32::try_from(s_raw).map_err(|_| {
+            Error::EncodingError(format!(
+                "--share-stack: shared stack top {s_raw} exceeds i32 address space"
+            ))
+        })?;
+        for group in &groups {
+            let survivor = *group.iter().min().expect("group is non-empty");
+            let slot = (survivor - import_base) as usize;
+            if let Some(g) = merged.globals.get_mut(slot) {
+                g.init_expr = ConstExpr::i32_const(s_raw_i32);
+            }
+        }
     }
 
     // Build the redirect (dropped -> survivor) and the drop set.
@@ -243,10 +319,30 @@ fn coalesce_stack_pointers(
 /// several SP globals; synth surfaces the multi-SP condition rather than meld
 /// corrupting it). The robust name-free signal, if ever needed, is the
 /// `linking` symbol table — not the init value.
-fn choose_coalesce_groups(candidates: &[SpCandidate]) -> Vec<Vec<u32>> {
-    // Group `__stack_pointer`-named candidates by init value (a shared memory's
-    // SP top is the common `sp_init`); coalesce equal-init groups only —
-    // differing inits would signal a pre-partitioned layout we must not merge.
+fn choose_coalesce_groups(candidates: &[SpCandidate], coalesce_all: bool) -> Vec<Vec<u32>> {
+    // SR-66 / #380 (`--share-stack`): fuse ALL `__stack_pointer`-named
+    // candidates into ONE group regardless of init. The merger sized a single
+    // shared region of `max_i(sp_i)` and the survivor's init is rewritten to
+    // that top, so differing provider inits are expected and correct — each
+    // provider's stack simply descends from the shared top. (This is sound only
+    // under the flag's stated envelope; the plan gate enforces the structural
+    // preconditions, and the flag documents the non-verifiable ones.)
+    if coalesce_all {
+        let all: Vec<u32> = candidates
+            .iter()
+            .filter(|c| c.named)
+            .map(|c| c.merged_idx)
+            .collect();
+        let mut single = HashMap::new();
+        // Key is irrelevant (one group); `0` groups them all together.
+        single.insert(0i32, all);
+        return finalize_groups(single);
+    }
+
+    // Default (#334): group `__stack_pointer`-named candidates by init value (a
+    // shared memory's SP top is the common `sp_init`); coalesce equal-init
+    // groups only — differing inits would signal a pre-partitioned layout we
+    // must not merge.
     let mut by_init: HashMap<i32, Vec<u32>> = HashMap::new();
     for c in candidates.iter().filter(|c| c.named) {
         by_init.entry(c.init).or_default().push(c.merged_idx);

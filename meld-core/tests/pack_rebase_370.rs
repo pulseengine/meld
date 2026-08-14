@@ -372,6 +372,7 @@ fn pack_rebase_passive_init_does_not_clobber() {
     let config = FuserConfig {
         memory_strategy: MemoryStrategy::SharedMemory,
         pack_rebase: true,
+        share_stack: false,
         ..Default::default()
     };
     let mut fuser = Fuser::new(config);
@@ -498,6 +499,7 @@ fn pack_rebase_nodata_module_does_not_alias() {
     let config = FuserConfig {
         memory_strategy: MemoryStrategy::SharedMemory,
         pack_rebase: true,
+        share_stack: false,
         ..Default::default()
     };
     let mut fuser = Fuser::new(config);
@@ -690,6 +692,7 @@ fn fuse_arena(a: &[u8], b: &[u8], c: &[u8]) -> Vec<u8> {
     let config = FuserConfig {
         memory_strategy: MemoryStrategy::SharedMemory,
         pack_rebase: true,
+        share_stack: false,
         ..Default::default()
     };
     let mut fuser = Fuser::new(config);
@@ -955,6 +958,7 @@ fn run_imported_arena(marker: Option<i32>) {
     let config = FuserConfig {
         memory_strategy: MemoryStrategy::SharedMemory,
         pack_rebase: true,
+        share_stack: false,
         ..Default::default()
     };
     let mut fuser = Fuser::new(config);

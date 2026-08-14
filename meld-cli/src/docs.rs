@@ -51,6 +51,11 @@ pub const TOPICS: &[Topic] = &[
         "concept-pack-rebase.md"
     ),
     topic!(
+        "share-stack",
+        "Share-stack — one shadow stack for all providers",
+        "concept-share-stack.md"
+    ),
+    topic!(
         "adapters",
         "Adapters — Canonical-ABI cross-component seams",
         "concept-adapters.md"

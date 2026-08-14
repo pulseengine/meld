@@ -13082,6 +13082,7 @@ mod tests {
             task_return_shims: std::collections::HashMap::new(),
             async_result_globals: std::collections::HashMap::new(),
             segment_bases: std::collections::HashMap::new(),
+            shared_stack_top: None,
         }
     }
 

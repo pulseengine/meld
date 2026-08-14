@@ -209,6 +209,14 @@ pub struct MergedModule {
     /// section. Re-rewrite passes that run after the full merge (when `.len()`
     /// no longer equals the base) look the base up here.
     pub segment_bases: HashMap<(usize, usize), (u32, u32)>,
+
+    /// SR-66 / #380: under `--share-stack`, the top of the single shared
+    /// shadow-stack region (`max_i(sp_i)`, 16-byte-aligned base of the first
+    /// provider's data). `None` when `--share-stack` is off. Consumed by
+    /// `mcu_dissolve::coalesce_stack_pointers` to fuse every `__stack_pointer`
+    /// onto one survivor initialised to this value (regardless of the providers'
+    /// original inits).
+    pub shared_stack_top: Option<u64>,
 }
 
 /// Info about a generated task.return shim function.
@@ -357,6 +365,10 @@ pub struct Merger {
     /// sized to the packed total. See [`FuserConfig::pack_rebase`] for the
     /// soundness envelope.
     pack_rebase: bool,
+    /// SR-66 / #380: collapse the per-provider shadow stacks into one shared
+    /// region. Builds on `pack_rebase` (the caller sets `pack_rebase` too). See
+    /// [`FuserConfig::share_stack`] for the layout and soundness envelope.
+    share_stack: bool,
 }
 
 impl Merger {
@@ -381,6 +393,7 @@ impl Merger {
             defer_grow_under_rebase: false,
             opaque_resources: Vec::new(),
             pack_rebase: false,
+            share_stack: false,
         }
     }
 
@@ -405,6 +418,14 @@ impl Merger {
     /// active, since the per-module base map is only built under rebasing.
     pub fn with_pack_rebase(mut self, pack: bool) -> Self {
         self.pack_rebase = pack;
+        self
+    }
+
+    /// SR-66 / #380: enable shared-shadow-stack packing (see the
+    /// [`share_stack`](Self::share_stack) field). The caller also enables
+    /// `pack_rebase`; this only takes effect on the rebased shared-memory path.
+    pub fn with_share_stack(mut self, share: bool) -> Self {
+        self.share_stack = share;
         self
     }
 
@@ -482,6 +503,7 @@ impl Merger {
             task_return_shims: HashMap::new(),
             async_result_globals: HashMap::new(),
             segment_bases: HashMap::new(),
+            shared_stack_top: None,
         };
 
         // Process components in topological order
@@ -752,6 +774,7 @@ impl Merger {
         }
 
         if let Some(plan) = shared_memory_plan {
+            merged.shared_stack_top = plan.shared_stack_top;
             if plan.import.is_none() {
                 merged.memories.clear();
                 merged.memories.push(plan.memory);

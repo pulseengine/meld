@@ -127,6 +127,28 @@ pub struct FuserConfig {
     /// their memories at a shared base.
     pub pack_rebase: bool,
 
+    /// Collapse the per-provider shadow stacks into ONE shared region (SR-66 /
+    /// #380). Builds on `--pack-rebase` (implies it, and therefore
+    /// `address_rebasing`): instead of packing each provider to
+    /// `align16(__heap_base)` — which keeps every provider's now-dead
+    /// `[0, __stack_pointer)` reservation — it reserves a single shadow-stack
+    /// region of `max_i(sp_i)` at fused base 0 and packs each provider's data
+    /// (which begins at `sp_i` under a stack-first layout) immediately above it
+    /// (`stride = align16(extent_i - sp_i)`, `base_i = align16(max sp) - sp_i`),
+    /// coalescing every `__stack_pointer` onto one survivor initialised to the
+    /// region top. Reclaims `(N-1)` duplicated stacks — the last MCU-fit gap
+    /// after `--pack-rebase` (closes gale's F100 8 KiB budget).
+    ///
+    /// HARD preconditions (loud fail, never silent): every rebased provider
+    /// carries a `__stack_pointer` marker (mutable `i32`, single `i32.const`
+    /// init, named/exported) AND a `__heap_base` marker, is stack-first (every
+    /// active data segment starts `>= sp_i`), and packs (no passive/no-data
+    /// fallback). ENVELOPE meld cannot verify: one region of `max_i(sp_i)` is
+    /// sound only when total live shadow-stack state across any call chain fits
+    /// it — providers non-reentrant, single-threaded, mutually-non-calling,
+    /// one-live-at-a-time; no baked-in constant address into `[0, sp)`.
+    pub share_stack: bool,
+
     /// Whether to preserve debug names
     pub preserve_names: bool,
 
@@ -176,6 +198,7 @@ impl Default for FuserConfig {
             component_provenance: true,
             address_rebasing: false,
             pack_rebase: false,
+            share_stack: false,
             preserve_names: false,
             custom_sections: CustomSectionHandling::Merge,
             dwarf_handling: DwarfHandling::Remap,
@@ -743,10 +766,14 @@ impl Fuser {
         // `--pack-rebase` is a rebasing mode (same reloc machinery, tighter
         // stride), so it implies address rebasing — the per-module base map is
         // only populated under rebasing (SR-57).
-        let address_rebasing = self.config.address_rebasing || self.config.pack_rebase;
+        // `--share-stack` builds on `--pack-rebase` (SR-66 / #380): it needs the
+        // packed byte-granular stride, and rebasing underlies both.
+        let pack_rebase = self.config.pack_rebase || self.config.share_stack;
+        let address_rebasing = self.config.address_rebasing || pack_rebase;
         let merger = Merger::new(self.config.memory_strategy, address_rebasing)
             .with_opaque_resources(self.config.opaque_resources.clone())
-            .with_pack_rebase(self.config.pack_rebase)
+            .with_pack_rebase(pack_rebase)
+            .with_share_stack(self.config.share_stack)
             .with_defer_grow_under_rebase(drop_vestigial_realloc);
         let mut merged = merger.merge(&self.components, &graph)?;
 
