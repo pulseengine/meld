@@ -4,6 +4,37 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.52.0] - 2026-08-19
+
+### Added
+- **Per-module memory placement is attested and observable (SR-70, ADR-7)** —
+  meld now records, for each module it places into a fused address space, where
+  it landed (`base`), how much was reserved for it (`reserved`), and **by which
+  rule**: `packed` (SR-57 used-extent compaction), `shared-stack` (SR-66) or
+  `page-granular`. The records are carried in the fusion attestation and printed
+  by `meld fuse --explain`. Together with the per-boundary call records added in
+  v0.51.0, this completes ADR-7's requirement that each fused strategy be
+  declared, attested and observable — on both the call and the memory axis.
+
+  **The rule reported is the one that actually applied, not the one requested.**
+  This matters for a case that was previously invisible: a module fused under
+  `--pack-rebase` that cannot be compacted — because it publishes no
+  authoritative `__heap_base` marker, or holds a passive/no-data region whose
+  used extent cannot be measured (SR-65) — falls back to a page-granular stride.
+  That fallback is sound, but until now a caller could request a compact
+  single-address-space layout, receive full 64 KiB pages per module, and have no
+  way to observe it from the artifact. This is not hypothetical: the marker was
+  verified absent on published falcon 1.133.0 artifacts, so a supplier rebuild
+  that drops it silently costs the compaction an MCU image depends on. Now both
+  `--explain` and the attestation say `page-granular`, per module.
+
+  Under `--memory multi` no placement records are produced: each module keeps its
+  own memory, so there is no placement decision to record, and the attested
+  `memory_strategy` already states which isolation model is in force.
+
+Fusion behaviour is unchanged — the records are observation only, and like the
+rest of the attestation they sit outside the bytes covered by the artifact hash.
+
 ## [0.51.0] - 2026-08-19
 
 ### Fixed
