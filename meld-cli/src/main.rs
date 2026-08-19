@@ -112,6 +112,15 @@ enum Commands {
         #[arg(long)]
         stats: bool,
 
+        /// Explain the per-boundary strategy: for every fused cross-component
+        /// call, the call-lowering class chosen for it (direct / memory-copy /
+        /// transcode / async-lift) and how it was wired (inlined-direct /
+        /// widening-wrapper / thunk). The same records are embedded in the
+        /// fusion attestation, so a shipped artifact can be audited after the
+        /// fact (ADR-7: per-boundary strategy declared, attested, observable).
+        #[arg(long)]
+        explain: bool,
+
         /// Disable attestation in output
         #[arg(long)]
         no_attestation: bool,
@@ -254,12 +263,14 @@ fn main() -> Result<()> {
             pack_rebase,
             share_stack,
             profile,
+            explain,
         }) => {
             fuse_command(
                 inputs,
                 output,
                 memory,
                 profile,
+                explain,
                 address_rebase,
                 pack_rebase,
                 share_stack,
@@ -340,6 +351,7 @@ fn fuse_command(
     output: String,
     memory: String,
     profile: String,
+    explain: bool,
     address_rebase: bool,
     pack_rebase: bool,
     share_stack: bool,
@@ -578,6 +590,10 @@ fn fuse_command(
     println!("Output: {} ({} bytes)", output, fused_bytes.len());
 
     // Show statistics
+    if explain {
+        print_boundaries(&stats);
+    }
+
     if show_stats {
         print_stats(&stats, total_input_size, elapsed);
     } else {
@@ -603,6 +619,66 @@ fn fuse_command(
 }
 
 /// Print detailed statistics
+/// ADR-7 `--explain`: report the strategy chosen for every fused
+/// cross-component call boundary. The same records are embedded in the fusion
+/// attestation, so this is the live view of an artifact-auditable fact.
+fn print_boundaries(stats: &FusionStats) {
+    println!();
+    println!("Boundary strategies");
+    println!("{}", "=".repeat(50));
+
+    if stats.boundaries.is_empty() {
+        println!();
+        println!("  (no fused cross-component calls — nothing to report)");
+        return;
+    }
+
+    println!();
+    for b in &stats.boundaries {
+        let memory = if b.crosses_memory {
+            "cross-memory"
+        } else {
+            "same-memory"
+        };
+        println!(
+            "  c{}m{} -> c{}m{}  {}::{}",
+            b.from_component, b.from_module, b.to_component, b.to_module, b.interface, b.function
+        );
+        println!(
+            "      lowering: {:<12} wiring: {:<16} {}",
+            b.lowering, b.wiring, memory
+        );
+    }
+
+    // A short tally so the shape is visible without reading every line.
+    let mut direct = 0usize;
+    let mut copy = 0usize;
+    let mut transcode = 0usize;
+    let mut asynch = 0usize;
+    let mut inlined = 0usize;
+    for b in &stats.boundaries {
+        match b.lowering.as_str() {
+            "direct" => direct += 1,
+            "memory-copy" => copy += 1,
+            "transcode" => transcode += 1,
+            _ => asynch += 1,
+        }
+        if b.wiring == "inlined-direct" {
+            inlined += 1;
+        }
+    }
+    println!();
+    println!(
+        "  {} boundaries: {} direct, {} memory-copy, {} transcode, {} async-lift          ({} wired with nothing interposed)",
+        stats.boundaries.len(),
+        direct,
+        copy,
+        transcode,
+        asynch,
+        inlined
+    );
+}
+
 fn print_stats(stats: &FusionStats, total_input_size: usize, elapsed: std::time::Duration) {
     println!();
     println!("Fusion Statistics");

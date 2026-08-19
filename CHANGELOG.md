@@ -4,6 +4,55 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.51.0] - 2026-08-19
+
+### Fixed
+- **Shipped artifacts recorded almost no build configuration (SR-28 / SR-69)** —
+  a traceability defect. SR-28 requires every `FuserConfig` field to be recorded
+  in the fusion attestation so an auditor holding only the artifact can
+  reconstruct how it was fused. The parameter-recording code, however, sat behind
+  the optional `attestation` (wsc) Cargo feature, which **release builds do not
+  enable** — so every published meld artifact recorded nothing beyond the memory
+  strategy. In particular `--share-stack` (which carries a documented soundness
+  envelope), `--pack-rebase`, `--address-rebase` and `--profile` were all
+  **unattested**: an artifact could not be shown to have been built with, or
+  without, them.
+
+  **Artifacts produced by v0.50.0 and earlier therefore carry no configuration
+  attestation.** If you rely on meld attestations as audit evidence, artifacts
+  must be re-fused with v0.51.0 or later to record the build configuration.
+
+  The build configuration is now recorded on the default (shipped) path as a
+  typed `parameters` object — deliberately not a map, so its key order is fixed
+  by declaration and stays byte-stable under `--reproducible`. SR-28 completeness
+  is additionally enforced **at compile time**: the parameter-building function
+  destructures `FuserConfig` exhaustively, so adding a config field fails the
+  build until it is recorded or explicitly acknowledged as not a build parameter.
+  The previous SR-28 sentinel asserted against a map it built inline in the test,
+  which is why three fields had already slipped past it; it now asserts against
+  the real serialized attestation.
+
+### Added
+- **Per-boundary strategy is attested and observable (SR-69, ADR-7)** — meld now
+  records one entry per fused cross-component call: the caller/callee component
+  and module, the callee function and interface, the call-lowering class chosen
+  (`direct` / `memory-copy` / `transcode` / `async-lift`) and how the call was
+  **actually wired** (`inlined-direct` / `widening-wrapper` / `thunk`). This
+  satisfies ADR-7's requirement that each boundary's strategy be declared,
+  attested and observable rather than inferable only from aggregate counts.
+
+  The wiring field is captured at the wiring step rather than from the
+  call-lowering seam's inline *eligibility*, because a widening wrapper takes
+  precedence over inlining — eligibility alone would misreport what shipped.
+
+- **`meld fuse --explain`** — prints those per-boundary decisions, with a tally of
+  how many boundaries are direct / memory-copy / transcode / async-lift and how
+  many were wired with nothing interposed. The same records are embedded in the
+  attestation, so a shipped artifact can be audited after the fact.
+
+Neither addition perturbs artifact hashes: the attestation hash is computed over
+the module with the attestation and provenance sections stripped.
+
 ## [0.50.0] - 2026-08-19
 
 ### Added
