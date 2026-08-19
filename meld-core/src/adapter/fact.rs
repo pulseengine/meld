@@ -13083,6 +13083,7 @@ mod tests {
             async_result_globals: std::collections::HashMap::new(),
             segment_bases: std::collections::HashMap::new(),
             shared_stack_top: None,
+            placements: Vec::new(),
         }
     }
 

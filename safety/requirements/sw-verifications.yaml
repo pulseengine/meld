@@ -1221,3 +1221,21 @@ artifacts:
     links:
       - type: verifies
         target: SR-69
+
+  - id: SWV-82
+    type: sw-verification
+    title: "Verification of SR-70: per-module placement attestation"
+    description: >
+      Verifies SR-70 via meld-core/tests/placement_records_p1.rs (4 tests):
+      markers → `packed` with compact sub-page reservations at distinct ascending
+      bases; no markers under --pack-rebase → `page-granular` at exactly 65536 B
+      (the declined-compaction fallback reported honestly, which is the case this
+      record exists for); records recovered from the artifact's attestation
+      section; and no records under --memory multi, where no placement decision
+      exists. Both feature configurations green.
+    status: implemented
+    fields:
+      method: automated-test
+    links:
+      - type: verifies
+        target: SR-70

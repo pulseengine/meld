@@ -378,6 +378,30 @@ pub struct BoundaryRecord {
     pub crosses_memory: bool,
 }
 
+/// Where ONE module's memory landed in the fused address space, and by which
+/// rule (ADR-7 / SR-70). The memory-axis twin of [`BoundaryRecord`]: together
+/// they make "strategy declared, attested, observable" concrete for both the
+/// call axis and the memory axis.
+///
+/// Only produced on the rebasing (`--memory shared`) path, where a placement
+/// decision actually exists. Under `--memory multi` each module keeps its own
+/// memory and nothing is placed — the attested `memory_strategy` says so.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PlacementRecord {
+    pub component: usize,
+    pub module: usize,
+    /// `page-granular`, `packed` (SR-57 used-extent compaction) or
+    /// `shared-stack` (SR-66). A `--pack-rebase` module that DECLINED to pack —
+    /// no `__heap_base` marker, or a passive/no-data region — is honestly
+    /// reported as `page-granular`, which is what actually happened and exactly
+    /// what an auditor needs to see.
+    pub strategy: String,
+    /// Byte offset this module's addresses were shifted by.
+    pub base: u64,
+    /// Bytes reserved for this module (its stride in the fused memory).
+    pub reserved: u64,
+}
+
 /// Statistics about the fusion process
 #[derive(Debug, Clone, Default)]
 pub struct FusionStats {
@@ -424,6 +448,11 @@ pub struct FusionStats {
     /// it does not perturb the artifact hash) and printed by `meld fuse
     /// --explain`.
     pub boundaries: Vec<BoundaryRecord>,
+
+    /// ADR-7 / SR-70: per-module memory placement, on the rebasing path. Empty
+    /// under `--memory multi`, where each module keeps its own memory and there
+    /// is no placement decision to record.
+    pub placements: Vec<PlacementRecord>,
 }
 
 /// Main fuser interface for static component fusion
@@ -966,6 +995,8 @@ impl Fuser {
                 .retain(|e| !memory_probe::is_vestigial_realloc_export_name(&e.name));
         }
         stats.total_functions = merged.functions.len();
+        // SR-70: carry the per-module placement decisions out for attestation.
+        stats.placements = merged.placements.clone();
         stats.total_exports = merged.exports.len();
 
         // Step 2.4: Lower P3 async canonical built-ins to `pulseengine:async`
@@ -2417,6 +2448,10 @@ impl Fuser {
         metadata.insert(
             "boundaries".to_string(),
             serde_json::json!(stats.boundaries),
+        );
+        metadata.insert(
+            "placements".to_string(),
+            serde_json::json!(stats.placements),
         );
         let size_reduction = if stats.input_size > 0 {
             ((stats.input_size as f64 - stats.output_size as f64) / stats.input_size as f64) * 100.0

@@ -3,6 +3,22 @@
 
 use super::*;
 
+/// SR-70 / ADR-7: where one module's memory was placed in the fused address
+/// space, and by which rule. The memory-axis twin of `BoundaryRecord` (which
+/// covers the call axis) — together they make ADR-7's "strategy declared,
+/// attested, observable" concrete for both.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PlacementEntry {
+    pub(crate) component: usize,
+    pub(crate) module: usize,
+    /// `page-granular`, `packed` (SR-57 used-extent) or `shared-stack` (SR-66).
+    pub(crate) strategy: &'static str,
+    /// Byte offset this module's addresses were shifted by.
+    pub(crate) base: u64,
+    /// Bytes reserved for it (its stride).
+    pub(crate) reserved: u64,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct SharedMemoryPlan {
     pub(crate) memory: EncoderMemoryType,
@@ -11,6 +27,9 @@ pub(crate) struct SharedMemoryPlan {
     /// SR-66 / #380: top of the single shared shadow-stack region under
     /// `--share-stack` (`max_i(sp_i)`). `None` when `--share-stack` is off.
     pub(crate) shared_stack_top: Option<u64>,
+    /// SR-70: per-module placement, in assignment order (deterministic — the
+    /// modules are visited in component/module index order).
+    pub(crate) placements: Vec<PlacementEntry>,
 }
 
 impl Merger {
@@ -87,6 +106,7 @@ impl Merger {
         };
 
         let mut bases = HashMap::new();
+        let mut placements: Vec<PlacementEntry> = Vec::new();
         let mut shared_stack_top: Option<u64> = None;
         // 16-byte alignment keeps `v128` accesses aligned after the uniform
         // `+base` shift (shared by the pack and share-stack strides below).
@@ -122,6 +142,13 @@ impl Merger {
                 let stride = (extent - sp)
                     .checked_next_multiple_of(PACK_ALIGN)
                     .ok_or_else(overflow)?;
+                placements.push(PlacementEntry {
+                    component: key.0,
+                    module: key.1,
+                    strategy: "shared-stack",
+                    base,
+                    reserved: stride,
+                });
                 next_base = next_base.checked_add(stride).ok_or_else(overflow)?;
             }
             combined.initial = next_base.div_ceil(WASM_PAGE_SIZE).max(1);
@@ -153,15 +180,32 @@ impl Merger {
                 // Stride: packed extent when available, else the declared page
                 // count (the fallback also covers a module whose data offsets
                 // are non-constant and therefore cannot be safely packed).
-                let stride = match (self.pack_rebase, extent) {
-                    (true, Some(bytes)) => (*bytes)
-                        .checked_next_multiple_of(PACK_ALIGN)
-                        .ok_or_else(overflow)?,
-                    _ => module_memory
-                        .initial
-                        .checked_mul(WASM_PAGE_SIZE)
-                        .ok_or_else(overflow)?,
+                let (stride, strategy) = match (self.pack_rebase, extent) {
+                    (true, Some(bytes)) => (
+                        (*bytes)
+                            .checked_next_multiple_of(PACK_ALIGN)
+                            .ok_or_else(overflow)?,
+                        "packed",
+                    ),
+                    // Also the honest label for a `--pack-rebase` module that
+                    // DECLINED to pack (no `__heap_base` marker, or a
+                    // passive/no-data region): it really is page-granular, and
+                    // that fallback is exactly what an auditor wants to see.
+                    _ => (
+                        module_memory
+                            .initial
+                            .checked_mul(WASM_PAGE_SIZE)
+                            .ok_or_else(overflow)?,
+                        "page-granular",
+                    ),
                 };
+                placements.push(PlacementEntry {
+                    component: key.0,
+                    module: key.1,
+                    strategy,
+                    base: base_bytes,
+                    reserved: stride,
+                });
                 next_base = next_base.checked_add(stride).ok_or_else(overflow)?;
             }
 
@@ -182,6 +226,7 @@ impl Merger {
             import,
             bases,
             shared_stack_top,
+            placements,
         }))
     }
 
