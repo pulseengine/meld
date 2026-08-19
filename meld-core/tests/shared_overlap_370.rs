@@ -46,6 +46,7 @@ fn fuse_shared(a_off: u32, b_off: u32) -> meld_core::Result<Vec<u8>> {
         address_rebasing: false,
         pack_rebase: false,
         share_stack: false,
+        profile: meld_core::Profile::Ecosystem,
         preserve_names: false,
         custom_sections: CustomSectionHandling::Drop,
         dwarf_handling: DwarfHandling::Strip,

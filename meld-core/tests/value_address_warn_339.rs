@@ -121,6 +121,7 @@ fn value_address_no_reloc_accept_warns_and_validates_339() {
         address_rebasing: true,
         pack_rebase: false,
         share_stack: false,
+        profile: meld_core::Profile::Ecosystem,
         ..Default::default()
     };
     let mut fuser = Fuser::new(config);

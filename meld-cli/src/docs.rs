@@ -36,6 +36,11 @@ pub const TOPICS: &[Topic] = &[
         "concept-fusion.md"
     ),
     topic!(
+        "profiles",
+        "Build profiles — ecosystem and safety",
+        "concept-profiles.md"
+    ),
+    topic!(
         "memory-strategies",
         "Memory strategies — auto, multi, shared",
         "concept-memory-strategies.md"

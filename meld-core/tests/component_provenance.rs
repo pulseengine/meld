@@ -321,6 +321,7 @@ fn opt_out_via_config_drops_the_section() {
         address_rebasing: false,
         pack_rebase: false,
         share_stack: false,
+        profile: meld_core::Profile::Ecosystem,
         preserve_names: false,
         custom_sections: CustomSectionHandling::Merge,
         output_format: OutputFormat::CoreModule,

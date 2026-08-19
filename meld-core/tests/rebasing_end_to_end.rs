@@ -142,6 +142,7 @@ fn test_address_rebasing_end_to_end() {
         address_rebasing: true,
         pack_rebase: false,
         share_stack: false,
+        profile: meld_core::Profile::Ecosystem,
         ..Default::default()
     };
 
@@ -234,6 +235,7 @@ fn test_298_real_wit_bindgen_component_blocks_shared_rebase() {
         address_rebasing: true,
         pack_rebase: false,
         share_stack: false,
+        profile: meld_core::Profile::Ecosystem,
         ..Default::default()
     };
     let mut fuser = Fuser::new(config);
@@ -460,6 +462,7 @@ fn test_326_reloc_const_rebasing_end_to_end() {
         address_rebasing: true,
         pack_rebase: false,
         share_stack: false,
+        profile: meld_core::Profile::Ecosystem,
         ..Default::default()
     };
     let mut fuser = Fuser::new(config);
@@ -555,6 +558,7 @@ fn test_326_shared_rebase_without_relocs_hard_errors() {
         address_rebasing: true,
         pack_rebase: false,
         share_stack: false,
+        profile: meld_core::Profile::Ecosystem,
         ..Default::default()
     };
     let mut fuser = Fuser::new(config);
@@ -598,6 +602,7 @@ fn test_351_stale_reloc_offsets_hard_error() {
         address_rebasing: true,
         pack_rebase: false,
         share_stack: false,
+        profile: meld_core::Profile::Ecosystem,
         ..Default::default()
     };
     let mut fuser = Fuser::new(config);
@@ -809,6 +814,7 @@ fn test_301_embedder_arena_seam_survives_fusion_differential() {
         address_rebasing: true,
         pack_rebase: false,
         share_stack: false,
+        profile: meld_core::Profile::Ecosystem,
         ..Default::default()
     };
     let mut fuser = Fuser::new(config);
@@ -981,6 +987,7 @@ fn test_301_embedder_arena_seam_nonzero_base_requires_relocs() {
         address_rebasing: true,
         pack_rebase: false,
         share_stack: false,
+        profile: meld_core::Profile::Ecosystem,
         ..Default::default()
     };
     let mut fuser = Fuser::new(config);

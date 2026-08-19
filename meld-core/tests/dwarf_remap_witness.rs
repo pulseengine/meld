@@ -56,6 +56,7 @@ fn fuse_remap(input: &[u8]) -> Vec<u8> {
         address_rebasing: false,
         pack_rebase: false,
         share_stack: false,
+        profile: meld_core::Profile::Ecosystem,
         preserve_names: false,
         custom_sections: CustomSectionHandling::Merge,
         output_format: OutputFormat::CoreModule,

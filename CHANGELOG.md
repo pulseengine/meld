@@ -4,6 +4,51 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.50.0] - 2026-08-19
+
+### Added
+- **`--profile safety`: refuse to infer safety-relevant properties (SR-68, #386)**
+  — ADR-7 gave meld a dual identity (the generic RFC-46 reference fuser *and* a
+  sealed-safety product, both first-class) and specified two attested profiles;
+  this adds the signal that separates them. Under `--profile safety` every
+  safety-relevant property must be **stated**, and inferring one is a hard error
+  (`Error::SafetyProfileViolation`) rather than a warning. First enforced
+  property (ADR-4, "explicit, not auto"): the **memory strategy** — `--memory
+  auto` is refused, because it selects the inter-component isolation model, which
+  decides whether a fault in one component can reach another component's state.
+  The check runs *before* fusion, so a violation is a build-configuration error
+  that cannot depend on input shape or leave a partial artifact.
+
+  `--profile ecosystem` (the default) is **unchanged** — nothing breaks. The
+  profile *gates*, it never transforms: a build that succeeds under `safety`
+  emits byte-identical output to the same explicit invocation under `ecosystem`.
+  A profile was needed rather than "strict when attested" because `attestation`
+  defaults on and `--memory` defaults to `auto`, so "attested + auto" is the
+  ordinary invocation. See `meld docs profiles`.
+
+### Fixed
+- **`--memory shared --address-rebase` no longer cries wolf (#386)** — it warned
+  "UNSOUND" unconditionally, including for `--emit-relocs` inputs where it is
+  not, and which is the path `--pack-rebase` (SR-57) and `--share-stack` (SR-66)
+  are built on and that the falcon supplier validated on real components (#370).
+  The text predated the reloc *consumer* (#326→#340): a reloc-covered input is
+  rebased at the source point, so a pointer computed from it is correct by
+  construction. The warning now fires only when an input actually lacks reloc
+  metadata — where the residual risk is real and was already reported precisely,
+  per-module, by the address strategy.
+- **`MemoryStrategy::Auto` documentation contradicted the implementation (#386)**
+  — the public rustdoc described Auto resolving to shared memory + rebasing,
+  which it has never done since #326. Corrected, along with the module-level docs
+  and a dangling reference to a function that does not exist.
+
+### Changed
+- `Auto` now **reports** the single-address-space build that the inputs would
+  support (naming the explicit flags) instead of silently leaving it undiscovered
+  — and still never escalates to it. Escalating on "inputs look reloc-covered"
+  is ruled out permanently: the probe proves reloc *presence*, not *coverage*
+  (undecidable in general, #339), and a safety tool should not move to the
+  stricter-contract strategy on its own.
+
 ## [0.49.0] - 2026-08-14
 
 ### Added

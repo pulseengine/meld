@@ -35,10 +35,10 @@
 //!
 //! ## Memory Strategy
 //!
-//! - **Auto** (default): Resolves to shared memory + address rebasing when
-//!   no input module contains `memory.grow` and the inputs carry two or
-//!   more memories; multi-memory otherwise. See [`MemoryStrategy::Auto`]
-//!   and issue #172.
+//! - **Auto** (default): always resolves to multi-memory — the strategy that
+//!   is sound for every input. Shared memory is never auto-selected; it is an
+//!   explicit choice with an input contract (`--emit-relocs` on every input, or
+//!   PIC). See [`MemoryStrategy::Auto`], issue #172 and #386.
 //! - **Multi-memory**: Each component keeps its own linear memory.
 //!   Cross-component pointer-passing calls use adapters with `cabi_realloc`
 //!   and `memory.copy`. Downstream tools need multi-memory support
@@ -82,6 +82,11 @@ use wasm_encoder::Module as EncodedModule;
 /// Configuration for the fusion process
 #[derive(Debug, Clone)]
 pub struct FuserConfig {
+    /// Which of ADR-7's two attested profiles this build targets. Under
+    /// [`Profile::Safety`] advisory safety checks become hard errors — see
+    /// [`Profile`]. Default: [`Profile::Ecosystem`].
+    pub profile: Profile,
+
     /// Memory strategy for fused output
     pub memory_strategy: MemoryStrategy,
 
@@ -192,6 +197,7 @@ pub struct FuserConfig {
 impl Default for FuserConfig {
     fn default() -> Self {
         Self {
+            profile: Profile::Ecosystem,
             memory_strategy: MemoryStrategy::Auto,
             attestation: true,
             reproducible: false,
@@ -224,23 +230,59 @@ pub enum MemoryStrategy {
     /// space (MCU) targets have no lowering for it (issue #172).
     MultiMemory,
 
-    /// Resolve to `SharedMemory` + address rebasing when that is
-    /// provably sound, `MultiMemory` otherwise (default; issue #172).
+    /// Pick the memory strategy automatically (default; issue #172).
     ///
-    /// Resolution happens once, at the start of fusion, from two
-    /// static facts about the inputs:
-    /// 1. No input module contains a `memory.grow` instruction
-    ///    (`memory_probe`) — growth is what breaks shared memory.
-    /// 2. The inputs carry two or more linear memories — with at most
-    ///    one, multi-memory output is already single-memory, so the
-    ///    rebasing path adds risk without benefit.
+    /// **Auto always resolves to [`MultiMemory`](Self::MultiMemory)** — the
+    /// strategy that is sound for every input. It never selects shared memory:
+    /// shared + rebasing is sound only under an input contract (`--emit-relocs`
+    /// on every input, or PIC) that `Auto` does not require callers to have met,
+    /// and ADR-4 wants an attested build to state its memory strategy
+    /// explicitly rather than inherit one.
     ///
-    /// Both hold → `SharedMemory` with address rebasing. Otherwise →
-    /// `MultiMemory`. If the shared-memory plan itself refuses the
-    /// input (`Error::MemoryStrategyUnsupported`), fusion retries as
-    /// `MultiMemory`, so `Auto` never fails on input that the
-    /// multi-memory strategy accepts.
+    /// Resolution still inspects the inputs to explain the choice: a
+    /// `memory.grow` anywhere (`memory_probe`) rules shared memory out outright
+    /// (growth invalidates a fixed layout), and with fewer than two memories the
+    /// multi-memory output is already single-memory.
+    ///
+    /// For a single-address-space (MCU) target, select it explicitly:
+    /// `--memory shared --address-rebase` (plus `--pack-rebase` /
+    /// `--share-stack`). Whether `Auto` should upgrade when EVERY input is
+    /// reloc-covered is an open defaults question (#386).
     Auto,
+}
+
+/// Which of ADR-7's two attested profiles this build targets.
+///
+/// ADR-7 decided meld has a **dual identity**: the generic RFC-46 reference
+/// fuser *and* a sealed-safety product, both first-class. The difference is not
+/// the fusion algorithm — it is how much the build is allowed to *infer*. A
+/// safety build must **declare** its safety-relevant properties; an ecosystem
+/// build may let meld pick sensible defaults.
+///
+/// The profile therefore only ever turns advisory checks into hard errors. It
+/// never changes what a successful fusion produces: a build that passes under
+/// [`Safety`](Self::Safety) emits byte-identical output to the same explicit
+/// invocation under [`Ecosystem`](Self::Ecosystem).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Profile {
+    /// Open / ecosystem profile (default). Advisory safety checks warn.
+    #[default]
+    Ecosystem,
+
+    /// Sealed-safety profile. Every safety-relevant property must be stated
+    /// explicitly; inferring one is an [`Error::SafetyProfileViolation`] rather
+    /// than a warning.
+    ///
+    /// Enforced today:
+    /// - **ADR-4 — memory strategy must be explicit.** `MemoryStrategy::Auto`
+    ///   picks the inter-component isolation model, which is a safety-relevant
+    ///   property; a safety build must name `--memory`.
+    ///
+    /// Intended future consumers (ADR-7 binding requirements, not yet
+    /// implemented): per-boundary call-lowering/address strategy declared and
+    /// attested, and silent-downgrade-is-a-hard-error at any boundary whose
+    /// declared strategy's preconditions are unmet.
+    Safety,
 }
 
 /// Output format for the fused binary
@@ -493,6 +535,11 @@ impl Fuser {
                 );
             }
         }
+        // ADR-7 sealed-safety profile: refuse to INFER a safety-relevant
+        // property that the build should have DECLARED. Checked before any work
+        // so the build fails fast and never produces a half-inferred artifact.
+        self.check_safety_profile()?;
+
         if self.config.memory_strategy == MemoryStrategy::Auto {
             self.resolve_auto_memory_strategy();
             let result = if self.config.memory_strategy == MemoryStrategy::SharedMemory {
@@ -531,35 +578,96 @@ impl Fuser {
             }
             return result;
         }
-        // #326: explicit `--memory shared --address-rebase` is an opt-in to an
-        // unsound transform — address rebasing does not rebase computed memory
-        // addresses, so it silently corrupts real components. `auto` no longer
-        // selects this path; when a caller requests it explicitly, warn loudly
-        // rather than corrupt silently (LS-D-1). The build still proceeds.
+        // #386: warn about computed-pointer rebasing ONLY when it can actually
+        // apply — i.e. when some input lacks reloc metadata.
+        //
+        // The original blanket warning predates the reloc CONSUMER (#326→#340).
+        // A reloc-covered input is rebased at the SOURCE point: every
+        // reloc-flagged `i32.const` address is relocated at its origin, so a
+        // pointer computed from it is correct by construction (proven by
+        // `rebasing_end_to_end::test_326_reloc_const_rebasing_end_to_end`, which
+        // executes on wasmtime). Warning "UNSOUND" on that path is inaccurate —
+        // and it is the path `--pack-rebase` (SR-57) and `--share-stack` (SR-66)
+        // are built on, supplier-validated on real components (#370). A
+        // safety tool that cries wolf on its supported path trains users to
+        // ignore the warnings that matter.
+        //
+        // The residual risk lives entirely on the NO-reloc path, where it is
+        // already reported precisely and per-module by
+        // `address_strategy::resolve_address_plan` (an absolute address used as
+        // a VALUE, #339) — and the genuinely dangerous case (no relocs WITH
+        // direct load/store) is already a hard error there (path-F).
         if self.config.memory_strategy == MemoryStrategy::SharedMemory
             && self.config.address_rebasing
+            && self.any_component_lacks_reloc_metadata()
         {
             log::warn!(
-                "memory strategy: explicit shared-memory + address rebasing is UNSOUND \
-                 for components that access memory via computed pointers (#326) — the \
-                 dynamic address operand of ordinary loads/stores is not rebased, so \
-                 per-component memory can silently collide. Prefer `--memory multi` \
-                 unless every input addresses memory only via static offsets."
+                "memory strategy: shared memory + address rebasing with at least one \
+                 input that carries NO relocation metadata. Absolute addresses in such \
+                 a module cannot be rebased, so it may silently alias another \
+                 component's memory (#326/#339). Rebuild every input with \
+                 `--emit-relocs`, or use `--memory multi`."
             );
         }
         self.fuse_with_stats_resolved()
     }
 
+    /// ADR-7 / ADR-4: enforce the sealed-safety profile's "declare, don't infer"
+    /// rule. Returns `Ok(())` unmodified under [`Profile::Ecosystem`], where the
+    /// same conditions remain advisory warnings.
+    ///
+    /// Today one property is enforced — the memory strategy (ADR-4). It selects
+    /// the inter-component isolation model (one shared address space vs. one
+    /// memory per component), which decides whether a fault in one component can
+    /// reach another's state. A safety build must state it.
+    ///
+    /// Deliberately checked BEFORE fusion: a profile violation is a build
+    /// configuration error, so it must not depend on the inputs and must not
+    /// leave a partially-produced artifact.
+    fn check_safety_profile(&self) -> Result<()> {
+        if self.config.profile != Profile::Safety {
+            return Ok(());
+        }
+        if self.config.memory_strategy == MemoryStrategy::Auto {
+            return Err(Error::SafetyProfileViolation(
+                "`--memory auto` infers the inter-component isolation model, which is a \
+                 safety-relevant property (ADR-4: explicit, not auto). State it explicitly: \
+                 `--memory multi` (one memory per component — isolation preserved) or \
+                 `--memory shared` (one address space; add `--address-rebase`, and build every \
+                 input with `--emit-relocs`)."
+                    .to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// #386: true when at least one input core module carries no `linking`/
+    /// `reloc.*` metadata — the only condition under which shared-memory
+    /// rebasing can leave an absolute address un-rebased. Uses the same probe
+    /// (`reloc::has_reloc_metadata`) that `resolve_address_plan` gates on, so
+    /// the warning cannot disagree with the strategy that follows it.
+    fn any_component_lacks_reloc_metadata(&self) -> bool {
+        self.components.iter().any(|component| {
+            component
+                .core_modules
+                .iter()
+                .any(|module| !reloc::has_reloc_metadata(&module.custom_sections))
+        })
+    }
+
     /// Resolve `MemoryStrategy::Auto` against the added components.
     ///
-    /// Auto always selects **multi-memory** — it is the sound strategy. Shared
-    /// memory + address rebasing was previously auto-selected for grow-free,
-    /// multi-memory inputs, but that path is **unsound** (#326): rebasing does
-    /// not relocate the dynamic address operand of ordinary loads/stores, so
-    /// components addressing memory via computed pointers silently collide.
-    /// Until correct dynamic rebasing lands, Auto never picks shared+rebase;
-    /// it remains reachable only via explicit `--memory shared --address-rebase`
-    /// (which warns loudly). Any user-supplied `address_rebasing` value is
+    /// Auto always selects **multi-memory** — the strategy that is sound for
+    /// every input, with no producer-side contract. Shared memory + rebasing was
+    /// auto-selected for grow-free multi-memory inputs until #326: before the
+    /// reloc CONSUMER landed, rebasing could not relocate an absolute address at
+    /// all, so a computed pointer silently collided. That consumer since shipped
+    /// (#326→#340) and reloc-covered inputs now rebase soundly at the source
+    /// point — but `Auto` cannot assume the caller met that input contract, and
+    /// ADR-4 wants an attested build to choose explicitly. So Auto still never
+    /// picks shared+rebase; it stays reachable via explicit
+    /// `--memory shared --address-rebase` (which warns only when an input lacks
+    /// reloc metadata, #386). Any user-supplied `address_rebasing` value is
     /// overridden — Auto owns both knobs.
     fn resolve_auto_memory_strategy(&mut self) {
         let mut memory_count = 0usize;
@@ -593,23 +701,45 @@ impl Fuser {
             self.config.memory_strategy = MemoryStrategy::MultiMemory;
             self.config.address_rebasing = false;
         } else {
-            // #326: address rebasing does NOT rebase the dynamic address
-            // operand of ordinary loads/stores (only the static memarg offset
-            // and bulk-memory ops) — so shared-memory fusion silently corrupts
-            // any component that addresses memory via a computed pointer (heap,
-            // shadow stack — i.e. all real components). Until correct dynamic
-            // rebasing lands, `auto` must NOT silently pick shared+rebase.
-            // Fall back to multi-memory, which is sound (LS-D-1: emit correct
-            // output, never a plausible-but-wrong one). Explicit
-            // `--memory shared --address-rebase` remains available as an
-            // opt-in, and warns loudly (see `warn_if_unsound_rebasing`).
-            log::warn!(
-                "memory strategy auto: {memory_count} memories, no memory.grow — \
-                 shared-memory fusion would apply here, but address rebasing is \
-                 unsound for computed memory addresses (#326); selecting \
-                 multi-memory instead. Use `--memory shared --address-rebase` to \
-                 override explicitly (unsound; corrupts computed-pointer access)."
-            );
+            // `auto` does not pick shared+rebase. Historically (#326) because
+            // rebasing could not relocate a computed pointer at all; since the
+            // reloc CONSUMER landed (#326→#340) that is no longer true for
+            // reloc-covered inputs (they rebase at the source point), so the
+            // remaining reasons are: a NO-reloc input can still leave an absolute
+            // address un-rebased (#339), and ADR-4 wants an attested build to
+            // choose its memory strategy EXPLICITLY rather than inherit one.
+            // Multi-memory is sound for every input (LS-D-1: emit correct output,
+            // never a plausible-but-wrong one). Whether `auto` should upgrade
+            // when EVERY input is reloc-covered is an open defaults question
+            // (#386). Explicit `--memory shared --address-rebase` remains
+            // available, and warns when any input lacks reloc metadata.
+            //
+            // #386: `auto` will NOT escalate to shared even when the inputs look
+            // ready for it — `has_reloc_metadata` proves reloc PRESENCE, not
+            // reloc COVERAGE (coverage is undecidable in general, #339), so an
+            // automatic switch to the strategy with an input contract would rest
+            // on a proxy. Instead the tool reports what is available and lets the
+            // caller choose (ADR-4: explicit, not auto).
+            if self.any_component_lacks_reloc_metadata() {
+                log::info!(
+                    "memory strategy auto: {memory_count} memories, no memory.grow — \
+                     selecting multi-memory (sound for every input). A \
+                     single-address-space (MCU) build is available via \
+                     `--memory shared --address-rebase`, but at least one input \
+                     carries no relocation metadata — rebuild every input with \
+                     `--emit-relocs` first."
+                );
+            } else {
+                log::info!(
+                    "memory strategy auto: {memory_count} memories, no memory.grow, \
+                     every input carries relocation metadata — selecting \
+                     multi-memory (`auto` never escalates to shared memory on its \
+                     own, #386). These inputs support a single-address-space (MCU) \
+                     build: select it explicitly with \
+                     `--memory shared --address-rebase` (add `--pack-rebase` to \
+                     compact it, `--share-stack` to share one shadow stack)."
+                );
+            }
             self.config.memory_strategy = MemoryStrategy::MultiMemory;
             self.config.address_rebasing = false;
         }
