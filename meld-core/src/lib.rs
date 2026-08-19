@@ -639,13 +639,33 @@ impl Fuser {
             // when EVERY input is reloc-covered is an open defaults question
             // (#386). Explicit `--memory shared --address-rebase` remains
             // available, and warns when any input lacks reloc metadata.
-            log::info!(
-                "memory strategy auto: {memory_count} memories, no memory.grow — \
-                 selecting multi-memory (sound for every input; `auto` never picks \
-                 shared memory, see #386). For a single-address-space (MCU) target, \
-                 select it explicitly: `--memory shared --address-rebase` — sound \
-                 when every input is built with `--emit-relocs`."
-            );
+            //
+            // #386: `auto` will NOT escalate to shared even when the inputs look
+            // ready for it — `has_reloc_metadata` proves reloc PRESENCE, not
+            // reloc COVERAGE (coverage is undecidable in general, #339), so an
+            // automatic switch to the strategy with an input contract would rest
+            // on a proxy. Instead the tool reports what is available and lets the
+            // caller choose (ADR-4: explicit, not auto).
+            if self.any_component_lacks_reloc_metadata() {
+                log::info!(
+                    "memory strategy auto: {memory_count} memories, no memory.grow — \
+                     selecting multi-memory (sound for every input). A \
+                     single-address-space (MCU) build is available via \
+                     `--memory shared --address-rebase`, but at least one input \
+                     carries no relocation metadata — rebuild every input with \
+                     `--emit-relocs` first."
+                );
+            } else {
+                log::info!(
+                    "memory strategy auto: {memory_count} memories, no memory.grow, \
+                     every input carries relocation metadata — selecting \
+                     multi-memory (`auto` never escalates to shared memory on its \
+                     own, #386). These inputs support a single-address-space (MCU) \
+                     build: select it explicitly with \
+                     `--memory shared --address-rebase` (add `--pack-rebase` to \
+                     compact it, `--share-stack` to share one shadow stack)."
+                );
+            }
             self.config.memory_strategy = MemoryStrategy::MultiMemory;
             self.config.address_rebasing = false;
         }
