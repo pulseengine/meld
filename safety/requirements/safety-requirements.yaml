@@ -3002,3 +3002,63 @@ artifacts:
       references:
         - "https://github.com/pulseengine/meld/issues/386"
         - "meld-core/tests/boundary_records_p1.rs"
+
+  - id: SR-70
+    type: sw-req
+    title: Per-module memory placement is attested and observable
+    description: >
+      Completing ADR-7's "strategy declared, attested, observable" on the MEMORY
+      axis (SR-69 covered the call axis), meld shall record, for each module it
+      places into a fused address space, WHERE it landed (`base`), how much was
+      reserved for it (`reserved`), and BY WHICH RULE: `packed` (SR-57
+      used-extent compaction), `shared-stack` (SR-66) or `page-granular`.
+      The rule label shall report what ACTUALLY applied, not what was requested.
+      In particular, a module fused under `--pack-rebase` that cannot be
+      compacted — no authoritative `__heap_base` marker, or a passive/no-data
+      region whose used extent is invisible (SR-65) — falls back to a
+      page-granular stride, and shall be reported as `page-granular`. That
+      fallback is sound but was previously INVISIBLE: a caller could request a
+      compact single-address-space layout, receive full pages, and have no way to
+      observe it from the artifact.
+      Records shall be emitted in module-visit order (component then module
+      index), which is deterministic, and carried in the fusion attestation as
+      well as printed by `meld fuse --explain`. Under `--memory multi` no
+      placement records are produced — each module keeps its own memory and there
+      is no placement decision to record; the attested `memory_strategy` already
+      states which isolation model is in force.
+    status: implemented
+    tags: [attestation, adr-7, traceability, observability, memory, placement]
+    release: v0.52.0
+    links:
+      - type: derives-from
+        target: SYS-6
+      - type: refines
+        target: SR-69
+      - type: refines
+        target: SR-57
+    cited-source:
+      - uri: "https://github.com/pulseengine/meld/issues/386"
+        kind: github
+        last-checked: 2026-08-19
+    fields:
+      implementation:
+        - meld-core/src/merger/memory.rs
+        - meld-core/src/lib.rs
+        - meld-cli/src/main.rs
+      verification-method: test
+      verification-description: >
+        Verified by meld-core/tests/placement_records_p1.rs (4 tests):
+        pack_rebase_with_markers_reports_packed_placement (marker-carrying
+        modules report `packed` with a sub-page reservation, at distinct
+        ascending bases — i.e. the records describe a real non-overlapping
+        layout); pack_rebase_without_markers_reports_the_page_granular_fallback
+        (the same shape WITHOUT markers reports `page-granular` reserving exactly
+        65536 B — pinning that a declined compaction is reported honestly rather
+        than as the requested strategy); placement_records_reach_the_attestation
+        (records recovered from the artifact's attestation custom section with
+        every expected key); and multi_memory_records_no_placement (no records
+        where there is no placement decision). Both feature configurations green
+        (`--workspace` 862/0, `--all-features` 861/0).
+      references:
+        - "https://github.com/pulseengine/meld/issues/386"
+        - "meld-core/tests/placement_records_p1.rs"

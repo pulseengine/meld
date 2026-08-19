@@ -217,6 +217,11 @@ pub struct MergedModule {
     /// onto one survivor initialised to this value (regardless of the providers'
     /// original inits).
     pub shared_stack_top: Option<u64>,
+
+    /// SR-70: per-module memory placement chosen by the shared-memory plan
+    /// (`(component, module, strategy, base, reserved)`), carried out of the
+    /// merger so it can be attested. Empty when not rebasing.
+    pub placements: Vec<crate::PlacementRecord>,
 }
 
 /// Info about a generated task.return shim function.
@@ -504,6 +509,7 @@ impl Merger {
             async_result_globals: HashMap::new(),
             segment_bases: HashMap::new(),
             shared_stack_top: None,
+            placements: Vec::new(),
         };
 
         // Process components in topological order
@@ -775,6 +781,17 @@ impl Merger {
 
         if let Some(plan) = shared_memory_plan {
             merged.shared_stack_top = plan.shared_stack_top;
+            merged.placements = plan
+                .placements
+                .iter()
+                .map(|p| crate::PlacementRecord {
+                    component: p.component,
+                    module: p.module,
+                    strategy: p.strategy.to_string(),
+                    base: p.base,
+                    reserved: p.reserved,
+                })
+                .collect();
             if plan.import.is_none() {
                 merged.memories.clear();
                 merged.memories.push(plan.memory);

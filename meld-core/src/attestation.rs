@@ -180,6 +180,14 @@ pub struct FusionMetadata {
     /// deserialize.
     #[serde(default)]
     pub boundaries: Vec<crate::BoundaryRecord>,
+
+    /// SR-70: per-module memory placement — where each module landed in the
+    /// fused address space and by which rule (`page-granular` / `packed` /
+    /// `shared-stack`). The memory-axis twin of `boundaries`. Empty under
+    /// `--memory multi`, where each module keeps its own memory and there is no
+    /// placement decision to record.
+    #[serde(default)]
+    pub placements: Vec<crate::PlacementRecord>,
 }
 
 /// Builder for creating fusion attestations
@@ -339,6 +347,7 @@ impl FusionAttestationBuilder {
                 size_reduction_percent: size_reduction,
                 parameters: self.parameters,
                 boundaries: stats.boundaries.clone(),
+                placements: stats.placements.clone(),
             },
         }
     }

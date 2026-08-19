@@ -677,6 +677,36 @@ fn print_boundaries(stats: &FusionStats) {
         asynch,
         inlined
     );
+
+    print_placements(stats);
+}
+
+/// SR-70: the memory-axis half of `--explain` — where each module landed in the
+/// fused address space and by which rule.
+fn print_placements(stats: &FusionStats) {
+    if stats.placements.is_empty() {
+        // Not an omission: under `--memory multi` each module keeps its own
+        // memory, so there is no placement decision to report.
+        return;
+    }
+    println!();
+    println!("Memory placement");
+    println!("{}", "=".repeat(50));
+    println!();
+    let mut total = 0u64;
+    for p in &stats.placements {
+        println!(
+            "  c{}m{}  base {:>10}  reserved {:>10} B  ({})",
+            p.component, p.module, p.base, p.reserved, p.strategy
+        );
+        total += p.reserved;
+    }
+    println!();
+    println!(
+        "  {} modules placed, {} B reserved in total",
+        stats.placements.len(),
+        total
+    );
 }
 
 fn print_stats(stats: &FusionStats, total_input_size: usize, elapsed: std::time::Duration) {
