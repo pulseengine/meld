@@ -82,6 +82,11 @@ use wasm_encoder::Module as EncodedModule;
 /// Configuration for the fusion process
 #[derive(Debug, Clone)]
 pub struct FuserConfig {
+    /// Which of ADR-7's two attested profiles this build targets. Under
+    /// [`Profile::Safety`] advisory safety checks become hard errors — see
+    /// [`Profile`]. Default: [`Profile::Ecosystem`].
+    pub profile: Profile,
+
     /// Memory strategy for fused output
     pub memory_strategy: MemoryStrategy,
 
@@ -192,6 +197,7 @@ pub struct FuserConfig {
 impl Default for FuserConfig {
     fn default() -> Self {
         Self {
+            profile: Profile::Ecosystem,
             memory_strategy: MemoryStrategy::Auto,
             attestation: true,
             reproducible: false,
@@ -243,6 +249,40 @@ pub enum MemoryStrategy {
     /// `--share-stack`). Whether `Auto` should upgrade when EVERY input is
     /// reloc-covered is an open defaults question (#386).
     Auto,
+}
+
+/// Which of ADR-7's two attested profiles this build targets.
+///
+/// ADR-7 decided meld has a **dual identity**: the generic RFC-46 reference
+/// fuser *and* a sealed-safety product, both first-class. The difference is not
+/// the fusion algorithm — it is how much the build is allowed to *infer*. A
+/// safety build must **declare** its safety-relevant properties; an ecosystem
+/// build may let meld pick sensible defaults.
+///
+/// The profile therefore only ever turns advisory checks into hard errors. It
+/// never changes what a successful fusion produces: a build that passes under
+/// [`Safety`](Self::Safety) emits byte-identical output to the same explicit
+/// invocation under [`Ecosystem`](Self::Ecosystem).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Profile {
+    /// Open / ecosystem profile (default). Advisory safety checks warn.
+    #[default]
+    Ecosystem,
+
+    /// Sealed-safety profile. Every safety-relevant property must be stated
+    /// explicitly; inferring one is an [`Error::SafetyProfileViolation`] rather
+    /// than a warning.
+    ///
+    /// Enforced today:
+    /// - **ADR-4 — memory strategy must be explicit.** `MemoryStrategy::Auto`
+    ///   picks the inter-component isolation model, which is a safety-relevant
+    ///   property; a safety build must name `--memory`.
+    ///
+    /// Intended future consumers (ADR-7 binding requirements, not yet
+    /// implemented): per-boundary call-lowering/address strategy declared and
+    /// attested, and silent-downgrade-is-a-hard-error at any boundary whose
+    /// declared strategy's preconditions are unmet.
+    Safety,
 }
 
 /// Output format for the fused binary
@@ -495,6 +535,11 @@ impl Fuser {
                 );
             }
         }
+        // ADR-7 sealed-safety profile: refuse to INFER a safety-relevant
+        // property that the build should have DECLARED. Checked before any work
+        // so the build fails fast and never produces a half-inferred artifact.
+        self.check_safety_profile()?;
+
         if self.config.memory_strategy == MemoryStrategy::Auto {
             self.resolve_auto_memory_strategy();
             let result = if self.config.memory_strategy == MemoryStrategy::SharedMemory {
@@ -565,6 +610,35 @@ impl Fuser {
             );
         }
         self.fuse_with_stats_resolved()
+    }
+
+    /// ADR-7 / ADR-4: enforce the sealed-safety profile's "declare, don't infer"
+    /// rule. Returns `Ok(())` unmodified under [`Profile::Ecosystem`], where the
+    /// same conditions remain advisory warnings.
+    ///
+    /// Today one property is enforced — the memory strategy (ADR-4). It selects
+    /// the inter-component isolation model (one shared address space vs. one
+    /// memory per component), which decides whether a fault in one component can
+    /// reach another's state. A safety build must state it.
+    ///
+    /// Deliberately checked BEFORE fusion: a profile violation is a build
+    /// configuration error, so it must not depend on the inputs and must not
+    /// leave a partially-produced artifact.
+    fn check_safety_profile(&self) -> Result<()> {
+        if self.config.profile != Profile::Safety {
+            return Ok(());
+        }
+        if self.config.memory_strategy == MemoryStrategy::Auto {
+            return Err(Error::SafetyProfileViolation(
+                "`--memory auto` infers the inter-component isolation model, which is a \
+                 safety-relevant property (ADR-4: explicit, not auto). State it explicitly: \
+                 `--memory multi` (one memory per component — isolation preserved) or \
+                 `--memory shared` (one address space; add `--address-rebase`, and build every \
+                 input with `--emit-relocs`)."
+                    .to_string(),
+            ));
+        }
+        Ok(())
     }
 
     /// #386: true when at least one input core module carries no `linking`/

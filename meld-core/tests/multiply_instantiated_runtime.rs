@@ -48,6 +48,7 @@ fn base_config() -> FuserConfig {
         address_rebasing: false,
         pack_rebase: false,
         share_stack: false,
+        profile: meld_core::Profile::Ecosystem,
         preserve_names: false,
         custom_sections: meld_core::CustomSectionHandling::Drop,
         dwarf_handling: meld_core::DwarfHandling::Strip,

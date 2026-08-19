@@ -18,7 +18,9 @@
 
 use anyhow::{Context, Result, anyhow};
 use clap::{Parser, Subcommand};
-use meld_core::{DwarfHandling, Fuser, FuserConfig, FusionStats, MemoryStrategy, OutputFormat};
+use meld_core::{
+    DwarfHandling, Fuser, FuserConfig, FusionStats, MemoryStrategy, OutputFormat, Profile,
+};
 use std::fs;
 use std::path::Path;
 use std::time::Instant;
@@ -64,6 +66,16 @@ enum Commands {
         /// grows memory. See issue #172.
         #[arg(long, default_value = "auto")]
         memory: String,
+
+        /// Build profile: 'ecosystem' (default) or 'safety'. Under 'safety'
+        /// every safety-relevant property must be stated explicitly — inferring
+        /// one is a hard error rather than a warning (ADR-7's sealed-safety
+        /// profile; ADR-4 "explicit, not auto"). Today that means `--memory`
+        /// must be given: 'auto' is refused. A build that passes under 'safety'
+        /// produces byte-identical output to the same explicit invocation under
+        /// 'ecosystem' — the profile only decides what may be inferred.
+        #[arg(long, default_value = "ecosystem")]
+        profile: String,
 
         /// Rebase memory addresses for shared memory (experimental).
         /// Only valid with --memory shared; "auto" decides it itself.
@@ -241,11 +253,13 @@ fn main() -> Result<()> {
             opaque_rep,
             pack_rebase,
             share_stack,
+            profile,
         }) => {
             fuse_command(
                 inputs,
                 output,
                 memory,
+                profile,
                 address_rebase,
                 pack_rebase,
                 share_stack,
@@ -325,6 +339,7 @@ fn fuse_command(
     inputs: Vec<String>,
     output: String,
     memory: String,
+    profile: String,
     address_rebase: bool,
     pack_rebase: bool,
     share_stack: bool,
@@ -343,6 +358,24 @@ fn fuse_command(
         "Meld v{} - Static Component Fusion",
         env!("CARGO_PKG_VERSION")
     );
+
+    // Parse build profile (ADR-7: ecosystem vs sealed-safety).
+    let profile = match profile.as_str() {
+        "ecosystem" => Profile::Ecosystem,
+        "safety" => {
+            println!(
+                "Safety profile: every safety-relevant property must be stated \
+                 explicitly (ADR-4: explicit, not auto)"
+            );
+            Profile::Safety
+        }
+        other => {
+            return Err(anyhow!(
+                "Invalid --profile: {}. Use 'ecosystem' or 'safety'",
+                other
+            ));
+        }
+    };
 
     // Parse memory strategy
     let memory_strategy = match memory.as_str() {
@@ -453,6 +486,7 @@ fn fuse_command(
     };
 
     let config = FuserConfig {
+        profile,
         memory_strategy,
         attestation: !no_attestation,
         reproducible,

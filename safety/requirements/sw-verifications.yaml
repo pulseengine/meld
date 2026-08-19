@@ -1183,3 +1183,22 @@ artifacts:
     links:
       - type: verifies
         target: SR-67
+
+  - id: SWV-80
+    type: sw-verification
+    title: "Verification of SR-68: sealed-safety build profile"
+    description: >
+      Verifies SR-68 via meld-core/tests/safety_profile_386.rs (4 tests): Auto
+      under Profile::Safety → Err(SafetyProfileViolation) naming the remedy;
+      explicit strategy under Safety → fuses; Auto under Profile::Ecosystem →
+      unchanged (the default invocation stays working, which is what makes the
+      profile non-breaking); and byte-identity between a Safety build and the same
+      explicit Ecosystem build (reproducible: true), pinning that the profile
+      GATES rather than transforms. The check runs before fusion, so a violation
+      cannot depend on input shape.
+    status: implemented
+    fields:
+      method: automated-test
+    links:
+      - type: verifies
+        target: SR-68

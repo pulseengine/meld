@@ -2872,3 +2872,63 @@ artifacts:
       references:
         - "https://github.com/pulseengine/meld/issues/382"
         - "meld-core/src/merger/memory.rs"
+
+  - id: SR-68
+    type: sw-req
+    title: Sealed-safety build profile refuses inferred safety-relevant properties
+    description: >
+      meld shall provide an explicit build-profile selector (`--profile`,
+      `FuserConfig::profile`) implementing ADR-7's two attested profiles. Under
+      `Profile::Safety` (the sealed-safety profile) meld shall REFUSE to infer any
+      safety-relevant property that the build should have declared, returning
+      `Error::SafetyProfileViolation` rather than emitting a warning and
+      proceeding. Under `Profile::Ecosystem` (the default) the same conditions
+      remain advisory, so the generic RFC-46 identity is unaffected. The profile
+      shall GATE only: a build that succeeds under `Safety` shall produce
+      byte-identical output to the same explicit invocation under `Ecosystem`.
+      The check shall run BEFORE fusion, so a profile violation is a build
+      configuration error that cannot depend on input shape or leave a partially
+      produced artifact.
+      Enforced property (first consumer, ADR-4 "explicit, not auto"): the MEMORY
+      STRATEGY. `MemoryStrategy::Auto` selects the inter-component isolation model
+      (one shared address space vs one memory per component), which decides
+      whether a fault in one component can reach another's state; a safety build
+      must state `--memory` explicitly. NOTE the profile is required precisely
+      BECAUSE this cannot be gated on attestation: `attestation` defaults true and
+      `--memory` defaults to `auto`, so "attested + Auto" is the DEFAULT
+      invocation, and erroring there would break the ecosystem identity ADR-7
+      declared first-class (#386).
+      Intended future consumers (ADR-7 binding requirements, NOT yet implemented):
+      per-boundary call-lowering / address strategy declared and attested, and
+      silent-downgrade-is-a-hard-error where a declared strategy's preconditions
+      are unmet.
+    status: implemented
+    tags: [profile, safety, adr-7, adr-4, memory, configuration]
+    release: v0.50.0
+    links:
+      - type: derives-from
+        target: SYS-6
+      - type: refines
+        target: SR-57
+    cited-source:
+      - uri: "https://github.com/pulseengine/meld/issues/386"
+        kind: github
+        last-checked: 2026-08-19
+    fields:
+      implementation:
+        - meld-core/src/lib.rs
+      verification-method: test
+      verification-description: >
+        Verified by meld-core/tests/safety_profile_386.rs (4 tests):
+        safety_profile_refuses_to_infer_the_memory_strategy (Auto under Safety →
+        Err naming both the violation and the remedy `--memory`);
+        safety_profile_accepts_an_explicit_memory_strategy (explicit → fuses);
+        ecosystem_profile_still_infers (the DEFAULT path is untouched — this is
+        what makes the profile non-breaking); and profile_gates_but_does_not_
+        transform (a Safety build's bytes equal the same explicit Ecosystem
+        build's, under `reproducible: true` so the comparison is of fusion output
+        rather than attestation nonce) — pinning that the profile gates rather
+        than transforms. Documented as the `profiles` topic in `meld docs`.
+      references:
+        - "https://github.com/pulseengine/meld/issues/386"
+        - "meld-core/tests/safety_profile_386.rs"

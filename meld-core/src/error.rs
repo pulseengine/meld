@@ -121,6 +121,14 @@ pub enum Error {
     #[error("canonical ABI error: {0}")]
     CanonicalAbi(String),
 
+    /// A safety-profile requirement was not met (`--profile safety`).
+    ///
+    /// Under the sealed-safety profile (ADR-7) meld refuses to *infer* a
+    /// safety-relevant property that the build should have *declared*. The
+    /// ecosystem profile keeps the same condition as an advisory warning.
+    #[error("safety profile: {0}")]
+    SafetyProfileViolation(String),
+
     /// Same core module instantiated more than once in a component
     #[error(
         "component {component_idx} instantiates core module {module_idx} more than once (multiply-instantiated modules are not yet supported)"
