@@ -341,6 +341,43 @@ pub enum DwarfHandling {
     Remap,
 }
 
+/// What meld chose for ONE fused cross-component call boundary, and how it
+/// wired it (ADR-7: per-boundary strategy **declared, attested, observable**).
+///
+/// One record per entry in `DependencyGraph::adapter_sites`, emitted in that
+/// vector's order — which the resolver sorts into a total order
+/// (`sort_adapter_sites_for_determinism`), so the records are deterministic and
+/// safe to serialize under `--reproducible` without further sorting.
+///
+/// Names here are *content* (WIT interface / function names), never filesystem
+/// paths, so they carry no build-environment nondeterminism.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct BoundaryRecord {
+    /// Caller side.
+    pub from_component: usize,
+    pub from_module: usize,
+    /// Callee side.
+    pub to_component: usize,
+    pub to_module: usize,
+    /// The callee export this boundary calls.
+    pub function: String,
+    /// The caller's import module name (disambiguates two interfaces exporting
+    /// the same function name).
+    pub interface: String,
+    /// The call-lowering strategy: `direct`, `memory-copy`, `transcode` or
+    /// `async-lift`. This is the ABI decision — what the boundary costs.
+    pub lowering: String,
+    /// How the call was ultimately wired: `inlined-direct` (the caller calls the
+    /// callee with nothing interposed, #304), `widening-wrapper`, or `thunk`.
+    ///
+    /// Recorded at the WIRING step, not from the lowering seam's
+    /// `inline_eligible`: a widening wrapper takes precedence over inlining, so
+    /// eligibility alone would misreport what actually shipped.
+    pub wiring: String,
+    /// Whether the boundary crosses a memory (the fact that forces a copy).
+    pub crosses_memory: bool,
+}
+
 /// Statistics about the fusion process
 #[derive(Debug, Clone, Default)]
 pub struct FusionStats {
@@ -378,6 +415,15 @@ pub struct FusionStats {
     /// "multi"). With `MemoryStrategy::Auto` this reports the resolution
     /// outcome (#172), so callers can tell the user what was selected.
     pub memory_strategy: String,
+
+    /// ADR-7: one record per fused cross-component call boundary, in
+    /// `adapter_sites` order (deterministic — the resolver sorts it). Populated
+    /// at the wiring step, so `wiring` reports what actually shipped rather than
+    /// what was merely eligible. Surfaced two ways: embedded in the fusion
+    /// attestation (auditable after the fact — and outside the hashed bytes, so
+    /// it does not perturb the artifact hash) and printed by `meld fuse
+    /// --explain`.
+    pub boundaries: Vec<BoundaryRecord>,
 }
 
 /// Main fuser interface for static component fusion
@@ -983,7 +1029,10 @@ impl Fuser {
         // re-rewrite the affected function bodies so that call sites go through
         // the adapter trampolines instead of calling the target directly.
         if !adapters.is_empty() {
-            stats.adapters_inlined = self.wire_adapter_indices(&mut merged, &adapters, &graph)?;
+            let (inlined, boundaries) =
+                self.wire_adapter_indices(&mut merged, &adapters, &graph)?;
+            stats.adapters_inlined = inlined;
+            stats.boundaries = boundaries;
         }
 
         // Step 3.6: #334 MCU-dissolve fixups (SR-49, `--memory shared` only).
@@ -1131,10 +1180,12 @@ impl Fuser {
         merged: &mut merger::MergedModule,
         adapters: &[adapter::AdapterFunction],
         graph: &resolver::DependencyGraph,
-    ) -> Result<usize> {
+    ) -> Result<(usize, Vec<BoundaryRecord>)> {
         // #304: count of identity trampolines inlined away (caller wired
         // straight to the target instead of through the thunk).
         let mut inlined_count = 0usize;
+        // ADR-7: per-boundary strategy records, in `adapter_sites` order.
+        let mut boundaries: Vec<BoundaryRecord> = Vec::with_capacity(adapters.len());
         use std::collections::{HashMap, HashSet};
         use wasm_encoder::{Function, Instruction, ValType};
 
@@ -1212,14 +1263,40 @@ impl Fuser {
             // precedence; the two are mutually exclusive since an identity
             // forward has no result widening, but order defensively.) The
             // bypassed thunk is left unreferenced for loom to DCE.
-            let target_idx = if let Some(&wrapper_idx) = adapter_to_wrapper.get(&adapter_offset) {
-                wrapper_idx
-            } else if let Some(inline_target) = adapter.inline_target {
-                inlined_count += 1;
-                inline_target
-            } else {
-                adapter_base + adapter_offset as u32
-            };
+            let (target_idx, wiring) =
+                if let Some(&wrapper_idx) = adapter_to_wrapper.get(&adapter_offset) {
+                    (wrapper_idx, "widening-wrapper")
+                } else if let Some(inline_target) = adapter.inline_target {
+                    inlined_count += 1;
+                    (inline_target, "inlined-direct")
+                } else {
+                    (adapter_base + adapter_offset as u32, "thunk")
+                };
+
+            // ADR-7 per-boundary record. Built HERE because this is the only
+            // point that knows the wiring OUTCOME (a widening wrapper outranks
+            // inlining, so the seam's `inline_eligible` would misreport it).
+            boundaries.push(BoundaryRecord {
+                from_component: adapter.source_component,
+                from_module: adapter.source_module,
+                to_component: adapter.target_component,
+                to_module: adapter.target_module,
+                function: site.export_name.clone(),
+                interface: site.import_module.clone(),
+                lowering: match adapter.class {
+                    adapter::AdapterClass::Direct => "direct",
+                    adapter::AdapterClass::MemoryCopy => "memory-copy",
+                    adapter::AdapterClass::Transcode => "transcode",
+                    // Async sites bypass `resolve_call_lowering_plan` entirely
+                    // (they branch earlier in the generator), so this is the
+                    // honest label rather than a lowering-plan class.
+                    adapter::AdapterClass::Async => "async-lift",
+                }
+                .to_string(),
+                wiring: wiring.to_string(),
+                crosses_memory: site.crosses_memory,
+            });
+
             let comp_idx = adapter.source_component;
             let mod_idx = adapter.source_module;
             let module = &self.components[comp_idx].core_modules[mod_idx];
@@ -1365,7 +1442,7 @@ impl Fuser {
             inlined_count
         );
 
-        Ok(inlined_count)
+        Ok((inlined_count, boundaries))
     }
 
     /// Generate task.return shim functions for internal fused async calls.
@@ -2203,7 +2280,8 @@ impl Fuser {
     ) -> attestation::FusionAttestation {
         let mut builder = FusionAttestationBuilder::new("meld", env!("CARGO_PKG_VERSION"))
             .memory_strategy(self.memory_strategy_label())
-            .reproducible(self.config.reproducible);
+            .reproducible(self.config.reproducible)
+            .parameters(self.attestation_parameters());
 
         for (index, component) in self.components.iter().enumerate() {
             // #341: under `--reproducible` the input name must not carry the
@@ -2330,6 +2408,16 @@ impl Fuser {
             "imports_resolved".to_string(),
             serde_json::json!(stats.imports_resolved),
         );
+        // ADR-7 per-boundary records — kept in step with the default
+        // `build_attestation` path (the two are hand-duplicated, so a field
+        // added to one must be added to the other or the wsc build silently
+        // drops it). The records themselves serialize deterministically (a Vec
+        // in sorted `adapter_sites` order); the surrounding wsc `metadata` map
+        // is the already-documented non-reproducible part of this path.
+        metadata.insert(
+            "boundaries".to_string(),
+            serde_json::json!(stats.boundaries),
+        );
         let size_reduction = if stats.input_size > 0 {
             ((stats.input_size as f64 - stats.output_size as f64) / stats.input_size as f64) * 100.0
         } else {
@@ -2371,6 +2459,64 @@ impl Fuser {
         }
     }
 
+    /// SR-28: the ADR-7 profile as an attestation label.
+    fn profile_label(&self) -> &'static str {
+        match self.config.profile {
+            Profile::Ecosystem => "ecosystem",
+            Profile::Safety => "safety",
+        }
+    }
+
+    /// SR-28: the build configuration, recorded so an auditor holding only the
+    /// artifact can reconstruct how it was fused. Typed (not a map) so the JSON
+    /// key order is deterministic under `--reproducible`.
+    fn attestation_parameters(&self) -> attestation::FusionParameters {
+        // SR-28 completeness, enforced by the COMPILER rather than by a test
+        // that can drift: this destructure is exhaustive (no `..`), so adding a
+        // field to `FuserConfig` fails the build here until the author either
+        // records it below or explicitly acknowledges why it is not a build
+        // parameter. The previous sentinel asserted against a map it built
+        // itself, so it could not catch a field going unrecorded — and several
+        // had (`pack_rebase`, `share_stack`, `profile`).
+        let FuserConfig {
+            // Recorded via label helpers (they normalise the enum spelling).
+            profile: _,
+            memory_strategy: _,
+            custom_sections: _,
+            dwarf_handling: _,
+            output_format: _,
+            // Recorded directly.
+            reproducible,
+            address_rebasing,
+            pack_rebase,
+            share_stack,
+            preserve_names,
+            // NOT build parameters, deliberately:
+            //   `attestation` decides whether this record exists at all — a
+            //     record cannot meaningfully attest its own absence;
+            //   `component_provenance` selects a *separate* custom section that
+            //     is self-describing when present;
+            //   `opaque_resources` is per-resource routing input, not a
+            //     whole-build switch (and can carry user-supplied names).
+            attestation: _,
+            component_provenance: _,
+            opaque_resources: _,
+        } = &self.config;
+
+        attestation::FusionParameters {
+            profile: self.profile_label().to_string(),
+            memory_strategy: self.memory_strategy_label().to_string(),
+            address_rebasing: *address_rebasing,
+            pack_rebase: *pack_rebase,
+            share_stack: *share_stack,
+            preserve_names: *preserve_names,
+            custom_sections: self.custom_sections_label().to_string(),
+            dwarf_handling: self.dwarf_handling_label().to_string(),
+            output_format: self.output_format_label().to_string(),
+            reproducible: *reproducible,
+        }
+    }
+
     fn memory_strategy_label(&self) -> &'static str {
         match self.config.memory_strategy {
             MemoryStrategy::SharedMemory => "shared",
@@ -2381,7 +2527,6 @@ impl Fuser {
         }
     }
 
-    #[cfg(feature = "attestation")]
     fn custom_sections_label(&self) -> &'static str {
         match self.config.custom_sections {
             CustomSectionHandling::Merge => "merge",
@@ -2390,7 +2535,6 @@ impl Fuser {
         }
     }
 
-    #[cfg(feature = "attestation")]
     fn dwarf_handling_label(&self) -> &'static str {
         match self.config.dwarf_handling {
             DwarfHandling::Strip => "strip",
@@ -2399,7 +2543,6 @@ impl Fuser {
         }
     }
 
-    #[cfg(feature = "attestation")]
     fn output_format_label(&self) -> &'static str {
         match self.config.output_format {
             OutputFormat::CoreModule => "core-module",

@@ -2932,3 +2932,73 @@ artifacts:
       references:
         - "https://github.com/pulseengine/meld/issues/386"
         - "meld-core/tests/safety_profile_386.rs"
+
+  - id: SR-69
+    type: sw-req
+    title: Per-boundary strategy and build configuration are attested and observable
+    description: >
+      ADR-7 binds meld to make each fused boundary's strategy DECLARED, ATTESTED
+      and OBSERVABLE. meld shall (a) record one entry per fused cross-component
+      call boundary — caller/callee component+module, the callee function and
+      interface, the call-lowering class chosen (`direct` / `memory-copy` /
+      `transcode` / `async-lift`) and how the call was ACTUALLY wired
+      (`inlined-direct` / `widening-wrapper` / `thunk`) — and (b) record the
+      build configuration that shaped the artifact. Both shall be embedded in the
+      fusion attestation carried by the output, and (a) shall additionally be
+      printable via `meld fuse --explain`.
+      The wiring field shall be captured at the WIRING step, not from the
+      call-lowering seam's `inline_eligible`: a widening wrapper takes precedence
+      over inlining, so eligibility alone would misreport what shipped.
+      Records shall be emitted in `adapter_sites` order, which the resolver sorts
+      into a total order, and the configuration shall be a TYPED structure rather
+      than a map, so both serialize deterministically and `--reproducible` output
+      stays byte-stable. Neither perturbs the artifact hash, which is computed
+      over the module with the attestation and provenance sections stripped.
+      This CORRECTS a traceability defect: SR-28 requires every `FuserConfig`
+      field to be recorded so an auditor can reconstruct the build, but the
+      parameter set was gated behind the optional `attestation` (wsc) feature,
+      which releases do NOT build — so shipped artifacts recorded no
+      configuration beyond the memory strategy. `--share-stack` (a documented
+      soundness envelope), `--pack-rebase`, `--address-rebase` and `--profile`
+      were all unattested. The SR-28 sentinel could not catch it because it
+      asserted against a map built inline in the test rather than real output.
+      SR-28 completeness shall therefore be enforced at COMPILE TIME: the
+      parameter-building function destructures `FuserConfig` exhaustively, so
+      adding a field fails the build until it is recorded or explicitly
+      acknowledged as not a build parameter.
+    status: implemented
+    tags: [attestation, adr-7, traceability, observability, boundary, config]
+    release: v0.51.0
+    links:
+      - type: derives-from
+        target: SYS-6
+      - type: refines
+        target: SR-28
+    cited-source:
+      - uri: "https://github.com/pulseengine/meld/issues/386"
+        kind: github
+        last-checked: 2026-08-19
+    fields:
+      implementation:
+        - meld-core/src/lib.rs
+        - meld-core/src/attestation.rs
+        - meld-cli/src/main.rs
+      verification-method: test
+      verification-description: >
+        Verified by meld-core/tests/boundary_records_p1.rs (3 tests): one record
+        per generated adapter with valid lowering/wiring labels AND agreement
+        between the `inlined-direct` records and `stats.adapters_inlined` (the
+        check that catches eligibility-vs-outcome confusion); records recovered
+        from the attestation custom section of the fused artifact with every
+        expected key present; and byte-stability of the records across two runs.
+        Configuration attestation verified by the strengthened
+        attestation::tests::test_sr28_config_completeness, which now asserts
+        against the REAL serialized attestation (all ten parameter keys present,
+        values round-tripping) instead of a map built inline. The compile-time
+        completeness guarantee was demonstrated by adding a probe field to
+        `FuserConfig` and observing `error[E0027]: pattern does not mention
+        field` at the sentinel, then removing it. Both feature configurations
+        green (`--workspace` 858/0, `--all-features` 857/0).
+      references:
+        - "https://github.com/pulseengine/meld/issues/386"
+        - "meld-core/tests/boundary_records_p1.rs"

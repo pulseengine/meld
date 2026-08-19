@@ -94,6 +94,36 @@ pub struct ToolInfo {
     pub tool_hash: Option<String>,
 }
 
+/// SR-28: the `FuserConfig` switches that shaped this artifact.
+///
+/// Typed rather than a map so the JSON key order is fixed by declaration —
+/// deterministic under `--reproducible` by construction. **When you add a field
+/// to `FuserConfig`, add it here too**; `test_sr28_config_completeness` asserts
+/// against the REAL builder output, so it will fail until you do.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FusionParameters {
+    /// ADR-7 build profile: `ecosystem` or `safety`.
+    pub profile: String,
+    /// Inter-component isolation model: `shared` or `multi`.
+    pub memory_strategy: String,
+    /// Whether per-module addresses were rebased into one memory.
+    pub address_rebasing: bool,
+    /// SR-57: compact used-extent rebasing.
+    pub pack_rebase: bool,
+    /// SR-66: one shared shadow-stack region (carries a soundness envelope).
+    pub share_stack: bool,
+    /// Whether debug names were preserved.
+    pub preserve_names: bool,
+    /// Custom-section handling mode.
+    pub custom_sections: String,
+    /// DWARF handling mode.
+    pub dwarf_handling: String,
+    /// Output format: `core-module` or `component`.
+    pub output_format: String,
+    /// Whether the build was byte-reproducible (#325).
+    pub reproducible: bool,
+}
+
 /// Fusion-specific metadata
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FusionMetadata {
@@ -114,6 +144,42 @@ pub struct FusionMetadata {
 
     /// Size reduction (percentage)
     pub size_reduction_percent: f64,
+
+    /// SR-28: the build configuration, so an auditor holding only the artifact
+    /// can reconstruct how it was fused.
+    ///
+    /// Previously the shipped (default) attestation path recorded no
+    /// configuration beyond `memory_strategy` — the parameter set existed only
+    /// on the optional wsc path, which is not what releases build. That left
+    /// safety-relevant switches unattested: an artifact could not be shown to
+    /// have been built with (or without) `--share-stack`, whose soundness
+    /// envelope is a documented precondition, or `--profile safety`, whose whole
+    /// purpose is "declared and attested".
+    ///
+    /// A typed struct, deliberately not a map: serialization order is fixed by
+    /// declaration, so this is deterministic under `--reproducible` by
+    /// construction (the wsc path's `HashMap` parameters are exactly what makes
+    /// that path non-reproducible).
+    #[serde(default)]
+    pub parameters: FusionParameters,
+
+    /// ADR-7: one record per fused cross-component call boundary — the
+    /// call-lowering strategy chosen for it and how it was ultimately wired.
+    ///
+    /// This is the *attested* half of ADR-7's "per-boundary strategy declared,
+    /// attested, observable": an auditor reading a shipped artifact can see what
+    /// every cross-component call actually costs, rather than inferring it from
+    /// the aggregate counts. Emitted in `adapter_sites` order, which the resolver
+    /// sorts into a total order, so it is stable under `--reproducible`.
+    ///
+    /// Note this section sits OUTSIDE the bytes covered by `output.hash` (the
+    /// hash is taken over the module with the attestation and provenance
+    /// sections stripped), so enriching it does not perturb artifact hashes.
+    ///
+    /// `#[serde(default)]` so attestations written by older meld versions still
+    /// deserialize.
+    #[serde(default)]
+    pub boundaries: Vec<crate::BoundaryRecord>,
 }
 
 /// Builder for creating fusion attestations
@@ -124,6 +190,7 @@ pub struct FusionAttestationBuilder {
     tool_hash: Option<String>,
     memory_strategy: String,
     reproducible: bool,
+    parameters: FusionParameters,
 }
 
 impl FusionAttestationBuilder {
@@ -136,6 +203,7 @@ impl FusionAttestationBuilder {
             tool_hash: None,
             memory_strategy: "shared".to_string(),
             reproducible: false,
+            parameters: FusionParameters::default(),
         }
     }
 
@@ -144,6 +212,13 @@ impl FusionAttestationBuilder {
     /// (default epoch 0) instead of a random UUID + wall clock.
     pub fn reproducible(mut self, reproducible: bool) -> Self {
         self.reproducible = reproducible;
+        self
+    }
+
+    /// SR-28: record the build configuration so an auditor holding only the
+    /// artifact can reconstruct how it was fused.
+    pub fn parameters(mut self, parameters: FusionParameters) -> Self {
+        self.parameters = parameters;
         self
     }
 
@@ -262,6 +337,8 @@ impl FusionAttestationBuilder {
                 adapters_generated: stats.adapter_functions,
                 imports_resolved: stats.imports_resolved,
                 size_reduction_percent: size_reduction,
+                parameters: self.parameters,
+                boundaries: stats.boundaries.clone(),
             },
         }
     }
@@ -601,50 +678,68 @@ mod tests {
         );
     }
 
-    /// SR-28: Config completeness — every FuserConfig field must be recorded
-    /// in the attestation metadata so auditors can reconstruct the exact
-    /// configuration used for fusion.
+    /// SR-28: Config completeness — every `FuserConfig` field must be recorded
+    /// in the attestation so auditors can reconstruct the exact configuration.
     ///
-    /// This test builds an attestation via the builder (which mirrors the
-    /// non-wsc path) and separately checks that the metadata struct captures
-    /// the memory_strategy field. For the wsc-attestation path, the test
-    /// verifies that all expected config keys are present in a tool_parameters
-    /// map built inline (mirroring the pattern from `build_wsc_attestation`).
-    ///
-    /// If a new field is added to FuserConfig but not recorded here, this
-    /// test must be updated — acting as a sentinel for config completeness.
+    /// **The primary guarantee is now compile-time**, not this test:
+    /// `Fuser::attestation_parameters` destructures `FuserConfig`
+    /// EXHAUSTIVELY, so adding a field there fails the build until it is
+    /// recorded or explicitly acknowledged. This test complements it by
+    /// asserting against the REAL serialized attestation — the previous version
+    /// asserted against a map it built inline, which is why it never noticed
+    /// that `pack_rebase`, `share_stack` and `profile` went unrecorded, and that
+    /// the shipped (non-wsc) path emitted no parameters at all.
     #[test]
     fn test_sr28_config_completeness() {
-        // All FuserConfig fields that must appear in attestation metadata.
-        // If you add a new field to FuserConfig, add it here too.
-        let required_keys = [
+        let params = FusionParameters {
+            profile: "safety".to_string(),
+            memory_strategy: "multi".to_string(),
+            address_rebasing: false,
+            pack_rebase: true,
+            share_stack: true,
+            preserve_names: false,
+            custom_sections: "merge".to_string(),
+            dwarf_handling: "strip".to_string(),
+            output_format: "core-module".to_string(),
+            reproducible: true,
+        };
+        let stats = FusionStats::default();
+        let attestation = FusionAttestationBuilder::new("meld", "0.1.0")
+            .memory_strategy("multi")
+            .parameters(params)
+            .add_input(b"test", "test.wasm", 1)
+            .build(b"output", &stats);
+
+        // Assert on the SERIALIZED form — what an auditor actually reads.
+        let json = attestation.to_json().expect("attestation serializes");
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+        let recorded = parsed
+            .get("metadata")
+            .and_then(|m| m.get("parameters"))
+            .expect("shipped attestation records the build parameters");
+
+        for key in [
+            "profile",
             "memory_strategy",
             "address_rebasing",
+            "pack_rebase",
+            "share_stack",
             "preserve_names",
             "custom_sections",
             "dwarf_handling",
             "output_format",
-        ];
-
-        // Build a tool_parameters map the same way build_wsc_attestation does.
-        let mut tool_parameters = std::collections::HashMap::new();
-        tool_parameters.insert("memory_strategy".to_string(), serde_json::json!("multi"));
-        tool_parameters.insert("address_rebasing".to_string(), serde_json::json!(false));
-        tool_parameters.insert("preserve_names".to_string(), serde_json::json!(false));
-        tool_parameters.insert("custom_sections".to_string(), serde_json::json!("merge"));
-        tool_parameters.insert("dwarf_handling".to_string(), serde_json::json!("strip"));
-        tool_parameters.insert(
-            "output_format".to_string(),
-            serde_json::json!("core-module"),
-        );
-
-        for key in &required_keys {
+            "reproducible",
+        ] {
             assert!(
-                tool_parameters.contains_key(*key),
-                "Missing FuserConfig field in attestation tool_parameters: '{key}'. \
-                 If you added a new config field, record it in build_wsc_attestation too."
+                recorded.get(key).is_some(),
+                "attestation parameters must record `{key}` (add it to \
+                 FusionParameters + Fuser::attestation_parameters): {recorded}"
             );
         }
+        // Values must round-trip, not merely be present.
+        assert_eq!(recorded.get("profile").unwrap(), "safety");
+        assert_eq!(recorded.get("share_stack").unwrap(), true);
+        assert_eq!(recorded.get("pack_rebase").unwrap(), true);
 
         // Also verify via the built-in metadata struct (non-wsc path).
         let stats = FusionStats::default();

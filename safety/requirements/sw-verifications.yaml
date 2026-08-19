@@ -1202,3 +1202,22 @@ artifacts:
     links:
       - type: verifies
         target: SR-68
+
+  - id: SWV-81
+    type: sw-verification
+    title: "Verification of SR-69: per-boundary + configuration attestation"
+    description: >
+      Verifies SR-69 via meld-core/tests/boundary_records_p1.rs (3 tests: one
+      record per adapter with valid labels and inlined-count agreement; records
+      recovered from the artifact's attestation section; byte-stability across
+      runs) plus the strengthened attestation::tests::test_sr28_config_
+      completeness, which asserts against the real serialized attestation rather
+      than an inline map. SR-28 completeness is additionally enforced at compile
+      time by an exhaustive `FuserConfig` destructure (demonstrated to fire via a
+      probe field). Both feature configurations green.
+    status: implemented
+    fields:
+      method: automated-test
+    links:
+      - type: verifies
+        target: SR-69
