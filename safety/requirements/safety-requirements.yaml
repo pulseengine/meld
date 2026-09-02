@@ -3093,7 +3093,7 @@ artifacts:
       whenever the caller's type is known. That check is unreachable while the
       lowering seam is correct; its potency is established by disabling the
       bridge dispatch and observing the hard failure in its place.
-    status: implemented
+    status: verified
     tags: [adapter, canonical-abi, adr-7, call-lowering, loud-not-silent]
     release: v0.53.0
     links:
