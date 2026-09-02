@@ -3062,3 +3062,64 @@ artifacts:
       references:
         - "https://github.com/pulseengine/meld/issues/386"
         - "meld-core/tests/placement_records_p1.rs"
+
+  - id: SR-71
+    type: sw-req
+    title: A same-memory boundary is bridged when the calling conventions differ
+    description: >
+      meld shall not assume that a boundary which does not cross a memory also
+      has matching signatures on both sides. The Canonical ABI switches a side to
+      an indirect convention whenever a value exceeds a flattening limit, so a
+      record travelling through linear memory leaves the caller's LOWERED import
+      and the callee's LIFTED export with different core types — typically
+      `(params..., retptr) -> ()` against `(params...) -> i32`.
+      For every such boundary meld shall (a) type the adapter the caller calls
+      from the CALLER's import, never from the callee's export, and (b) emit a
+      bridge that delivers the callee's results to the caller's return-area
+      pointer. Because a bridge is not a pure identity forward, it shall be
+      excluded from #304 identity inlining: wiring the caller straight to a
+      differently-typed callee is itself a defect of this class.
+      A signature mismatch meld cannot bridge soundly — an indirection inside the
+      results, a `post-return` that would free what they point at, resource
+      handle conversions, or an unknown return-area size — shall be a hard error
+      naming the boundary and the reason. Emitting a module that fails validation
+      while exiting 0 is prohibited — loud beats silent, the same stance the
+      call-lowering seam already takes on a same-memory transcode (#361).
+      This requirement is on the CALL axis and is independent of address
+      rebasing: `--memory shared` alone selects the same-memory lowering, and the
+      defect reproduces with no rebase flag present.
+      As defense in depth, the WIRING step shall additionally refuse to rewrite a
+      caller's import to any function whose type differs from that import,
+      whenever the caller's type is known. That check is unreachable while the
+      lowering seam is correct; its potency is established by disabling the
+      bridge dispatch and observing the hard failure in its place.
+    status: verified
+    tags: [adapter, canonical-abi, adr-7, call-lowering, loud-not-silent]
+    release: v0.53.0
+    links:
+      - type: derives-from
+        target: SYS-6
+      - type: refines
+        target: SR-69
+    cited-source:
+      - uri: "https://github.com/pulseengine/meld/issues/390"
+        kind: github
+        last-checked: 2026-09-02
+    fields:
+      implementation:
+        - meld-core/src/adapter/fact.rs
+        - meld-core/src/adapter/call_lowering.rs
+        - meld-core/src/lib.rs
+      verification-method: test
+      verification-description: >
+        Verified by meld-core/tests/record_boundary_390.rs (4 tests, on a
+        hermetic wasm-tools+wac fixture carrying a 4xf32 record across a
+        same-memory boundary) and by 5 unit tests in meld-core/src/adapter
+        (`issue390_*` in fact.rs, `direct_with_mismatched_signatures_not_eligible`
+        in call_lowering.rs). Negative control run: with the bridge dispatch
+        disabled, 3 of the 4 integration tests fail with the reported
+        `type mismatch: expected f32, found i32` while the `--memory multi`
+        control stays green.
+      references:
+        - "https://github.com/pulseengine/meld/issues/390"
+        - "meld-core/tests/record_boundary_390.rs"

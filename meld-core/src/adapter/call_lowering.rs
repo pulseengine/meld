@@ -23,7 +23,9 @@
 //!
 //! `#304` inline-eligibility is *not* an independent flag: an adapter may be
 //! inlined only when its class is `Direct` **and** it carries no resource
-//! rep/new conversions **and** no post-return. That guard has to stay a superset
+//! rep/new conversions **and** no post-return **and** the caller's lowered
+//! import type is identical to the callee's lifted export type (#390). That
+//! guard has to stay a superset
 //! of `generate_direct_adapter`'s pure-trampoline branch (the "#304 INVARIANT"
 //! note there) — the two are coupled and must move together. Computing both the
 //! class and the inline decision in one place ([`resolve_call_lowering_plan`])
@@ -68,6 +70,16 @@ pub struct BoundaryFacts {
     pub has_resource_new_calls: bool,
     /// The callee declares a `post-return` that must run after lifting.
     pub has_post_return: bool,
+    /// The caller's lowered import signature is IDENTICAL to the callee's
+    /// lifted export signature.
+    ///
+    /// #390: this is NOT implied by "same memory". The canonical ABI puts the
+    /// two sides on different conventions whenever a value exceeds a flattening
+    /// limit — a record returned through linear memory lowers the caller to
+    /// `(params..., retptr) -> ()` while the callee lifts to `(params...) ->
+    /// i32`. A boundary like that needs a *bridge*, so it is neither an
+    /// identity forward nor inlinable.
+    pub signatures_match: bool,
 }
 
 /// The resolved lowering decision for one boundary.
@@ -91,8 +103,10 @@ pub struct CallLoweringPlan {
 /// - cross-memory, same encoding → `MemoryCopy`
 /// - same memory, same encoding → `Direct`
 ///
-/// and `inline_eligible` iff inlining is on, the class is `Direct`, and the call
-/// carries no resource conversions and no post-return.
+/// and `inline_eligible` iff inlining is on, the class is `Direct`, the call
+/// carries no resource conversions and no post-return, and the caller's and
+/// callee's signatures are identical (#390 — a convention bridge is not an
+/// identity forward).
 pub fn resolve_call_lowering_plan(facts: BoundaryFacts) -> Result<CallLoweringPlan> {
     // #361: transcoding is required whenever the encodings differ, regardless of
     // whether memory is crossed. Route to `Transcode`; the adapter reads from
@@ -119,7 +133,13 @@ pub fn resolve_call_lowering_plan(facts: BoundaryFacts) -> Result<CallLoweringPl
         && matches!(class, AdapterClass::Direct)
         && !facts.has_resource_rep_calls
         && !facts.has_resource_new_calls
-        && !facts.has_post_return;
+        && !facts.has_post_return
+        // #390: a convention bridge is not an identity forward. When the
+        // caller's lowered import and the callee's lifted export have
+        // different types, `generate_direct_adapter` emits a return-area
+        // bridge typed as the CALLER; wiring the caller straight to the
+        // callee would skip that bridge and produce a type-invalid module.
+        && facts.signatures_match;
 
     Ok(CallLoweringPlan {
         class,
@@ -140,6 +160,7 @@ mod tests {
             has_resource_rep_calls: false,
             has_resource_new_calls: false,
             has_post_return: false,
+            signatures_match: true,
         }
     }
 
@@ -218,6 +239,30 @@ mod tests {
         })
         .unwrap();
         assert!(!plan.inline_eligible);
+    }
+
+    /// #390: a same-memory boundary whose caller and callee disagree on the
+    /// calling convention (a record returned through linear memory) is still
+    /// `Direct` — same memory, same encoding — but it is NOT an identity
+    /// forward. `generate_direct_adapter` emits a return-area bridge for it,
+    /// and inlining would wire the caller past that bridge straight to a
+    /// differently-typed callee, producing a module that fails validation.
+    #[test]
+    fn direct_with_mismatched_signatures_not_eligible() {
+        let plan = resolve_call_lowering_plan(BoundaryFacts {
+            signatures_match: false,
+            ..direct()
+        })
+        .unwrap();
+        assert_eq!(
+            plan.class,
+            AdapterClass::Direct,
+            "same memory + same encoding is still Direct; only the wiring changes"
+        );
+        assert!(
+            !plan.inline_eligible,
+            "#390: a convention bridge must never be inlined away"
+        );
     }
 
     #[test]

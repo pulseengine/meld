@@ -5306,6 +5306,10 @@ impl FactStyleGenerator {
                 has_resource_rep_calls: !options.resource_rep_calls.is_empty(),
                 has_resource_new_calls: !options.resource_new_calls.is_empty(),
                 has_post_return: options.callee_post_return.is_some(),
+                // #390: the caller may be typed differently from the callee even
+                // within one memory. When it is, the Direct body is a bridge —
+                // not an identity forward — and must not be inlined away.
+                signatures_match: self.signatures_match(site, merged),
             },
         )?;
         let class = plan.class;
@@ -5871,6 +5875,55 @@ impl FactStyleGenerator {
     }
 
     /// Generate a simple direct call adapter (no memory crossing)
+    /// The merged type index of the caller's **lowered import** — the type the
+    /// caller's `call` instruction is validated against.
+    ///
+    /// This is not interchangeable with the callee's lifted export type. The
+    /// canonical ABI puts the two sides on different conventions whenever a
+    /// value exceeds a flattening limit (#390), so any adapter the caller calls
+    /// must be typed from HERE, not from the callee.
+    fn caller_import_type_idx(&self, site: &AdapterSite, merged: &MergedModule) -> Option<u32> {
+        site.import_func_type_idx.and_then(|local_ti| {
+            merged
+                .type_index_map
+                .get(&(site.from_component, site.from_module, local_ti))
+                .copied()
+        })
+    }
+
+    /// Do the caller's lowered import and the callee's lifted export have the
+    /// identical core signature? Feeds the #304 inline guard via
+    /// [`call_lowering::BoundaryFacts::signatures_match`] (#390).
+    ///
+    /// Unknown caller type ⇒ `true`: the pre-#390 assumption, kept so sites the
+    /// resolver could not type (`import_func_type_idx: None`) behave exactly as
+    /// before rather than newly hard-failing.
+    fn signatures_match(&self, site: &AdapterSite, merged: &MergedModule) -> bool {
+        let Ok(target_func) = self.resolve_target_function(site, merged) else {
+            return true;
+        };
+        let callee_ti = merged
+            .defined_func(target_func)
+            .map(|f| f.type_idx)
+            .unwrap_or(0);
+        match self.caller_import_type_idx(site, merged) {
+            Some(caller_ti) if caller_ti == callee_ti => true,
+            // Distinct type indices can still be structurally identical (the
+            // merged type section is not deduplicated across inputs); compare
+            // the signatures, not the indices.
+            Some(caller_ti) => {
+                match (
+                    merged.types.get(caller_ti as usize),
+                    merged.types.get(callee_ti as usize),
+                ) {
+                    (Some(a), Some(b)) => a.params == b.params && a.results == b.results,
+                    _ => true,
+                }
+            }
+            None => true,
+        }
+    }
+
     fn generate_direct_adapter(
         &self,
         site: &AdapterSite,
@@ -5884,6 +5937,14 @@ impl FactStyleGenerator {
             .defined_func(target_func)
             .map(|f| f.type_idx)
             .unwrap_or(0);
+
+        // #390: same memory does NOT imply the same signature. When the caller's
+        // lowered import differs from the callee's lifted export, forwarding the
+        // params verbatim emits a body that does not match the type the caller
+        // calls — a module that fails `wasm-tools validate`. Bridge instead.
+        if !self.signatures_match(site, merged) {
+            return self.generate_same_memory_bridge(site, merged, options, target_func, type_idx);
+        }
 
         let func_type = merged.types.get(type_idx as usize);
         let param_count = func_type.map(|t| t.params.len()).unwrap_or(0);
@@ -5987,6 +6048,131 @@ impl FactStyleGenerator {
             func.instruction(&Instruction::End);
             Ok((type_idx, func))
         }
+    }
+
+    /// #390 — bridge a **same-memory** boundary whose caller and callee disagree
+    /// on the calling convention.
+    ///
+    /// `--memory shared` makes every boundary `Direct`, and the `Direct` path
+    /// used to assume "same memory" meant "same signature". It does not. The
+    /// canonical ABI switches a side to an indirect convention whenever a value
+    /// exceeds a flattening limit, so a record travelling through linear memory
+    /// leaves the two sides typed differently:
+    ///
+    /// ```text
+    ///   caller (lowered): (params..., retptr: i32) -> ()
+    ///   callee (lifted):  (params...)              -> i32   ; return-area ptr
+    /// ```
+    ///
+    /// Forwarding the params verbatim (the pre-#390 body) emits a function whose
+    /// body does not match the type the caller calls — the fused module then
+    /// fails `wasm-tools validate` with a stack/type-discipline error, and meld
+    /// exits 0. This emits the missing bridge instead, typed as the CALLER:
+    /// call the callee, then copy its return area to the caller's `retptr`.
+    ///
+    /// The copy is a plain `memory.copy` because both sides are in ONE memory —
+    /// no `cabi_realloc`, no pointer fixup. That is what makes this a different
+    /// (and much smaller) emitter than [`Self::generate_retptr_adapter`], which
+    /// exists for the cross-memory case and cannot be reused here.
+    ///
+    /// Anything this cannot bridge **hard-fails**. A same-memory flat copy is
+    /// only sound when the return area is self-contained: an indirection inside
+    /// the results, or a `post-return` that would free what they point at,
+    /// needs a deep copy this does not do. Loud beats silent (#360/#361).
+    fn generate_same_memory_bridge(
+        &self,
+        site: &AdapterSite,
+        merged: &MergedModule,
+        options: &AdapterOptions,
+        target_func: u32,
+        callee_type_idx: u32,
+    ) -> Result<(u32, Function)> {
+        let caller_type_idx = self.caller_import_type_idx(site, merged).ok_or_else(|| {
+            crate::Error::AdapterGeneration(format!(
+                "#390: same-memory boundary '{}' has no resolvable caller import type",
+                site.import_name
+            ))
+        })?;
+        let unbridgeable = |why: &str| {
+            crate::Error::AdapterGeneration(format!(
+                "#390: cannot fuse the same-memory call to '{}' ({}): {}. The caller's lowered \
+                 import and the callee's lifted export use different calling conventions, and \
+                 meld only bridges the self-contained return-area case within one memory. \
+                 Fuse with `--memory multi` (the cross-memory adapter handles this shape) or \
+                 file the signature pair on meld#390.",
+                site.export_name, site.import_module, why
+            ))
+        };
+
+        let caller_t = merged
+            .types
+            .get(caller_type_idx as usize)
+            .ok_or_else(|| unbridgeable("caller type index out of range"))?;
+        let callee_t = merged
+            .types
+            .get(callee_type_idx as usize)
+            .ok_or_else(|| unbridgeable("callee type index out of range"))?;
+
+        // The one mismatch the canonical ABI can produce on a same-memory,
+        // same-encoding boundary: the caller carries a trailing return-area
+        // pointer the callee returns instead. Params are flattened identically
+        // on both sides, so they must agree pairwise.
+        let callee_params = callee_t.params.len();
+        let is_retptr_shape = caller_t.params.len() == callee_params + 1
+            && caller_t.params[..callee_params] == callee_t.params[..]
+            && caller_t.params.last() == Some(&wasm_encoder::ValType::I32)
+            && caller_t.results.is_empty()
+            && callee_t.results.as_slice() == [wasm_encoder::ValType::I32];
+        if !is_retptr_shape {
+            return Err(unbridgeable(&format!(
+                "unsupported signature pair caller {:?}->{:?} vs callee {:?}->{:?}",
+                caller_t.params, caller_t.results, callee_t.params, callee_t.results
+            )));
+        }
+
+        // A flat return-area copy silently loses anything the results only point
+        // at, and `post-return` would free it out from under the caller.
+        if options.callee_post_return.is_some() {
+            return Err(unbridgeable(
+                "the callee declares a post-return, which would free the return area's \
+                 indirections after a flat copy",
+            ));
+        }
+        if !options.resource_rep_calls.is_empty() || !options.resource_new_calls.is_empty() {
+            return Err(unbridgeable("the call carries resource handle conversions"));
+        }
+        if !site.requirements.result_pointer_pair_offsets.is_empty()
+            || !site
+                .requirements
+                .conditional_result_pointer_pairs
+                .is_empty()
+        {
+            return Err(unbridgeable(
+                "the results carry (ptr, len) indirections, which need a deep copy",
+            ));
+        }
+        let area_size = site.requirements.return_area_byte_size.ok_or_else(|| {
+            unbridgeable("the callee's return-area size is unknown to the resolver")
+        })?;
+
+        // (dst, src, len) is `memory.copy`'s operand order, so pushing the
+        // caller's retptr FIRST lets the callee's returned pointer land as `src`
+        // straight off the call — no scratch local.
+        let retptr_local = callee_params as u32;
+        let mut func = Function::new([]);
+        func.instruction(&Instruction::LocalGet(retptr_local));
+        for i in 0..callee_params {
+            func.instruction(&Instruction::LocalGet(i as u32));
+        }
+        func.instruction(&Instruction::Call(target_func));
+        func.instruction(&Instruction::I32Const(area_size as i32));
+        func.instruction(&Instruction::MemoryCopy {
+            dst_mem: options.caller_memory,
+            src_mem: options.callee_memory,
+        });
+        func.instruction(&Instruction::End);
+
+        Ok((caller_type_idx, func))
     }
 
     /// Generate an adapter that copies data between memories
@@ -13085,6 +13271,206 @@ mod tests {
             shared_stack_top: None,
             placements: Vec::new(),
         }
+    }
+
+    // ---------------------------------------------------------------
+    // #390 — the return-area convention on a SAME-MEMORY boundary.
+    //
+    //   caller (lowered): (params_ptr, sp_ptr, retptr) -> ()
+    //   callee (lifted):  (params_ptr, sp_ptr)         -> i32
+    //
+    // The two signatures DIFFER whenever the canonical ABI's flattening
+    // limits put the sides on different conventions — i.e. exactly when a
+    // record travels through linear memory. `generate_memory_copy_adapter`
+    // already detects this (`uses_retptr`) and routes to
+    // `generate_retptr_adapter`. The `Direct` path has no equivalent.
+
+    fn retptr_same_memory_site() -> (crate::merger::MergedModule, crate::resolver::AdapterSite) {
+        use crate::merger::{MergedFuncType, MergedFunction};
+        use crate::resolver::AdapterSite;
+        let mut merged = empty_merged();
+
+        // type 0 — callee (lifted): (params_ptr, sp_ptr) -> retarea_ptr
+        merged.types.push(MergedFuncType {
+            params: vec![wasm_encoder::ValType::I32, wasm_encoder::ValType::I32],
+            results: vec![wasm_encoder::ValType::I32],
+        });
+        // type 1 — caller (lowered): (params_ptr, sp_ptr, retptr) -> ()
+        merged.types.push(MergedFuncType {
+            params: vec![
+                wasm_encoder::ValType::I32,
+                wasm_encoder::ValType::I32,
+                wasm_encoder::ValType::I32,
+            ],
+            results: vec![],
+        });
+
+        merged.functions.push(MergedFunction {
+            type_idx: 0,
+            body: Function::new([]),
+            origin: (1, 0, 0),
+            synthetic_kind: None,
+        });
+        merged.function_index_map.insert((1, 0, 0), 0);
+        // The caller module's local type 0 IS the lowered import type.
+        merged.type_index_map.insert((0, 0, 0), 1);
+
+        let mut site = AdapterSite {
+            from_component: 0,
+            from_module: 0,
+            import_name: "tick".into(),
+            import_module: "falcon:cascade/rate@0.7.0".into(),
+            import_func_type_idx: Some(0),
+            to_component: 1,
+            to_module: 0,
+            export_name: "tick".into(),
+            export_func_idx: 0,
+            crosses_memory: false, // `--memory shared`
+            is_async_lift: false,
+            requirements: Default::default(),
+        };
+        // `torque-setpoint` is a record of four f32s: 16 bytes of return area,
+        // entirely self-contained (no indirections, no post-return).
+        site.requirements.return_area_byte_size = Some(16);
+        (merged, site)
+    }
+
+    /// #390 — the fix, both halves.
+    ///
+    /// The adapter the caller calls must be typed as the CALLER's import, and
+    /// the boundary must not be inlined (which would wire the caller straight to
+    /// the differently-typed callee). Before the fix this emitted a body typed
+    /// `[i32,i32] -> [i32]` for a caller calling `[i32,i32,i32] -> []`, and set
+    /// `inline_target = Some(callee)` on top — the module failed
+    /// `wasm-tools validate` while meld exited 0.
+    #[test]
+    fn issue390_same_memory_retptr_boundary_is_bridged_not_inlined() {
+        let gen_ = FactStyleGenerator::new(AdapterConfig::default());
+        let (merged, site) = retptr_same_memory_site();
+        let empty = std::collections::HashMap::new();
+        let adapter = gen_
+            .generate_adapter(&site, &merged, 0, &empty, &empty)
+            .expect("adapter generation");
+
+        let caller_ti = merged.type_index_map[&(0, 0, 0)];
+        assert_eq!(
+            adapter.type_idx, caller_ti,
+            "#390: the adapter the caller calls must be typed as the caller's IMPORT, \
+             not as the callee's export"
+        );
+        assert!(
+            adapter.inline_target.is_none(),
+            "#390: a convention bridge is NOT a pure identity forward and must not be \
+             inlined (the #304 INVARIANT)"
+        );
+        assert_eq!(
+            adapter.class,
+            AdapterClass::Direct,
+            "same memory + same encoding stays Direct; only the body and wiring change"
+        );
+    }
+
+    /// The bridge body itself: forward the params, call the callee, and copy its
+    /// return area to the caller's retptr. Pinned as instructions because a body
+    /// that merely *validates* can still copy the wrong bytes.
+    #[test]
+    fn issue390_bridge_copies_the_return_area_to_the_callers_retptr() {
+        let gen_ = FactStyleGenerator::new(AdapterConfig::default());
+        let (merged, site) = retptr_same_memory_site();
+        let empty = std::collections::HashMap::new();
+        let adapter = gen_
+            .generate_adapter(&site, &merged, 0, &empty, &empty)
+            .expect("adapter generation");
+
+        use wasmparser::Operator;
+        let raw = adapter.body.into_raw_body();
+        let fb = wasmparser::FunctionBody::new(wasmparser::BinaryReader::new(&raw, 0));
+        let ops: Vec<String> = fb
+            .get_operators_reader()
+            .expect("operators")
+            .into_iter()
+            .map(|op| match op.expect("operator") {
+                Operator::LocalGet { local_index } => format!("local.get {local_index}"),
+                Operator::Call { function_index } => format!("call {function_index}"),
+                Operator::I32Const { value } => format!("i32.const {value}"),
+                Operator::MemoryCopy { dst_mem, src_mem } => {
+                    format!("memory.copy {dst_mem} {src_mem}")
+                }
+                Operator::End => "end".to_string(),
+                other => format!("{other:?}"),
+            })
+            .collect();
+
+        // (dst, src, len) is `memory.copy`'s operand order, so the caller's
+        // retptr is pushed FIRST and the callee's returned return-area pointer
+        // lands as `src` straight off the call — no scratch local.
+        assert_eq!(
+            ops,
+            vec![
+                "local.get 2".to_string(), // dst = the caller's retptr
+                "local.get 0".to_string(), // forwarded params...
+                "local.get 1".to_string(),
+                "call 0".to_string(),       // src = callee's return-area pointer
+                "i32.const 16".to_string(), // len = return_area_byte_size
+                "memory.copy 0 0".to_string(), // one shared memory
+                "end".to_string(),
+            ],
+            "#390 bridge body"
+        );
+    }
+
+    /// The loud backstop: a signature mismatch meld cannot safely bridge must
+    /// be an error, never a silently-invalid module. A `post-return` would free
+    /// what the results point at after a flat copy, so it is refused.
+    #[test]
+    fn issue390_unbridgeable_mismatch_hard_fails() {
+        let gen_ = FactStyleGenerator::new(AdapterConfig::default());
+        let (mut merged, mut site) = retptr_same_memory_site();
+        // Give the callee a post-return: now a flat return-area copy is unsound.
+        merged.functions.push(crate::merger::MergedFunction {
+            type_idx: 0,
+            body: Function::new([]),
+            origin: (1, 0, 1),
+            synthetic_kind: None,
+        });
+        merged.function_index_map.insert((1, 0, 1), 1);
+        site.requirements.callee_post_return = Some((0, 1));
+
+        let empty = std::collections::HashMap::new();
+        let err = gen_
+            .generate_adapter(&site, &merged, 0, &empty, &empty)
+            .expect_err("#390: an unbridgeable mismatch must fail loudly");
+        let msg = err.to_string();
+        assert!(msg.contains("#390"), "error must name the issue: {msg}");
+        assert!(
+            msg.contains("post-return"),
+            "error must say WHY it cannot bridge: {msg}"
+        );
+    }
+
+    /// The other unbridgeable case, kept explicit because the temptation is to
+    /// "helpfully" default the size. The resolver only records
+    /// `return_area_byte_size` when it exceeds 4 bytes, and a `None` is
+    /// ambiguous between "the area is small" and "the callee's lift info was
+    /// never found". Guessing either way is a memory bug — over-copying reads
+    /// and writes past both areas, under-copying truncates the results — so the
+    /// only sound response is to refuse.
+    #[test]
+    fn issue390_unknown_return_area_size_hard_fails() {
+        let gen_ = FactStyleGenerator::new(AdapterConfig::default());
+        let (merged, mut site) = retptr_same_memory_site();
+        site.requirements.return_area_byte_size = None;
+
+        let empty = std::collections::HashMap::new();
+        let err = gen_
+            .generate_adapter(&site, &merged, 0, &empty, &empty)
+            .expect_err("#390: an unknown return-area size must not be guessed");
+        let msg = err.to_string();
+        assert!(msg.contains("#390"), "error must name the issue: {msg}");
+        assert!(
+            msg.contains("return-area size"),
+            "error must say the SIZE is what is missing: {msg}"
+        );
     }
 
     fn async_lift_site(export_name: &str) -> crate::resolver::AdapterSite {

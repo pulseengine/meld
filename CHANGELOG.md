@@ -4,6 +4,55 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.53.0] - 2026-09-02
+
+### Fixed
+- **A same-memory boundary whose calling conventions differ is now bridged
+  (SR-71, #390)** — `meld fuse --memory shared` exited 0 while emitting a core
+  module that failed `wasm-tools validate`, whenever a wired cross-component call
+  carried a record through linear memory.
+
+  `--memory shared` makes every boundary `Direct`, and the `Direct` lowering
+  assumed "same memory" implied "same signature". It does not. The Canonical ABI
+  switches a side to an indirect convention whenever a value exceeds a flattening
+  limit, so a returned record leaves the two sides typed differently — the caller
+  lowered to `(params..., retptr) -> ()`, the callee lifted to
+  `(params...) -> i32`. meld typed the adapter from the **callee** and forwarded
+  the params verbatim, and on top of that wired the caller straight to the callee
+  (#304 inlining). Both emit a `call` whose operands do not match the callee,
+  producing `values remaining on stack at end of block` or — where a flattened
+  `f32` record met an `i32` pointer — `expected f32, found i32`.
+
+  The `Direct` path now types the adapter from the **caller's** import and emits
+  a bridge: call the callee, then `memory.copy` its return area to the caller's
+  return-area pointer. Because both sides are in one memory this needs no
+  `cabi_realloc` and no pointer fixup, so it is a much smaller emitter than the
+  cross-memory `generate_retptr_adapter` — which already handled this shape, and
+  is why `--memory multi` always validated. A bridge is no longer inline-eligible;
+  the `#304 INVARIANT` required the inline guard to be a superset of the Direct
+  generator's complex-branch trigger, and it was not.
+
+  **This is on the call axis, not the memory axis.** The defect was reported
+  against `--address-rebase` and `--pack-rebase`, but rebasing is not involved:
+  `--memory shared` alone reproduces it. Those flags only appeared alongside it
+  because SR-56 (overlapping data segments) and the path-F relocation gate
+  require them on real inputs.
+
+  A signature mismatch meld cannot bridge soundly — an indirection inside the
+  results, a `post-return` that would free what they point at, resource handle
+  conversions, or an unknown return-area size — is now a hard error naming the
+  boundary and the reason, rather than an invalid module at exit 0. The
+  return-area size is never guessed: it is unrecorded both when the area is small
+  and when the callee's lift info was not found, and over- or under-copying are
+  both memory bugs.
+
+### Added
+- As defense in depth, the wiring step refuses to rewrite a caller's import to
+  any function whose type differs from that import, whenever the caller's type is
+  known. The check is unreachable while the lowering seam is correct; its potency
+  was established by disabling the bridge dispatch and observing the hard failure
+  in its place.
+
 ## [0.52.0] - 2026-08-19
 
 ### Added
