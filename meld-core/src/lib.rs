@@ -1304,6 +1304,62 @@ impl Fuser {
                     (adapter_base + adapter_offset as u32, "thunk")
                 };
 
+            // #390 backstop, defense in depth behind the lowering seam's
+            // `signatures_match`. Whatever the caller's import is rewritten to
+            // call MUST have the caller's own type; anything else is a module
+            // that fails validation while meld exits 0 — the exact defect #390
+            // reported. The seam decides; this asserts the decision held.
+            //
+            // Only checked when the caller's type is known. A site with no
+            // `import_func_type_idx` is a CORE-level resolution (`__main_module__`
+            // linking, or intra-component module wiring) where both sides come
+            // from one linker rather than a Canonical ABI lift/lower pair, so
+            // there is no convention to disagree about.
+            //
+            // This is deliberately UNREACHABLE while the seam is correct — which
+            // is what makes it a backstop rather than a code path, and why it
+            // has no test of its own. Its potency was established by disabling
+            // the bridge dispatch in `generate_direct_adapter`: the #390 fixture
+            // then hard-fails HERE, naming both types, instead of emitting an
+            // invalid module at exit 0. Re-run that experiment if you touch
+            // either side; an assert nobody has ever seen fire is worth exactly
+            // as much as the last time someone proved it could.
+            if wiring != "widening-wrapper"
+                && let Some(local_ti) = site.import_func_type_idx
+                && let Some(&caller_ti) =
+                    merged
+                        .type_index_map
+                        .get(&(site.from_component, site.from_module, local_ti))
+            {
+                let wired_ti = merged
+                    .defined_func(target_idx)
+                    .map(|f| f.type_idx)
+                    .unwrap_or(caller_ti);
+                let same = caller_ti == wired_ti
+                    || match (
+                        merged.types.get(caller_ti as usize),
+                        merged.types.get(wired_ti as usize),
+                    ) {
+                        (Some(a), Some(b)) => a.params == b.params && a.results == b.results,
+                        _ => true,
+                    };
+                if !same {
+                    return Err(Error::AdapterGeneration(format!(
+                        "#390: wiring '{}' -> '{}' ({}) would produce a type-invalid call: the \
+                         caller's import is {:?} -> {:?} but it was wired to a function of type \
+                         {:?} -> {:?}. This is a meld bug — please report it on meld#390 with \
+                         the two components.",
+                        site.import_name,
+                        site.export_name,
+                        wiring,
+                        merged.types[caller_ti as usize].params,
+                        merged.types[caller_ti as usize].results,
+                        merged.types[wired_ti as usize].params,
+                        merged.types[wired_ti as usize].results,
+                    )));
+                }
+            }
+
             // ADR-7 per-boundary record. Built HERE because this is the only
             // point that knows the wiring OUTCOME (a widening wrapper outranks
             // inlining, so the seam's `inline_eligible` would misreport it).

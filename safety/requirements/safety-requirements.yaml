@@ -3088,6 +3088,11 @@ artifacts:
       This requirement is on the CALL axis and is independent of address
       rebasing: `--memory shared` alone selects the same-memory lowering, and the
       defect reproduces with no rebase flag present.
+      As defense in depth, the WIRING step shall additionally refuse to rewrite a
+      caller's import to any function whose type differs from that import,
+      whenever the caller's type is known. That check is unreachable while the
+      lowering seam is correct; its potency is established by disabling the
+      bridge dispatch and observing the hard failure in its place.
     status: implemented
     tags: [adapter, canonical-abi, adr-7, call-lowering, loud-not-silent]
     release: v0.53.0
@@ -3104,6 +3109,7 @@ artifacts:
       implementation:
         - meld-core/src/adapter/fact.rs
         - meld-core/src/adapter/call_lowering.rs
+        - meld-core/src/lib.rs
       verification-method: test
       verification-description: >
         Verified by meld-core/tests/record_boundary_390.rs (4 tests, on a
