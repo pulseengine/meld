@@ -1,0 +1,8 @@
+package golden:recapp@0.1.0;
+interface runner {
+  run: func() -> f32;
+}
+world consumer {
+  import golden:ctrl/lib@0.1.0;
+  export runner;
+}

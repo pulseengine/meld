@@ -1,0 +1,13 @@
+package golden:ctrl@0.1.0;
+interface lib {
+  record torque {
+    tx: f32,
+    ty: f32,
+    tz: f32,
+    thrust: f32,
+  }
+  tick: func(a: f32, b: f32) -> torque;
+}
+world provider {
+  export lib;
+}

@@ -1239,3 +1239,28 @@ artifacts:
     links:
       - type: verifies
         target: SR-70
+
+  - id: SWV-83
+    type: sw-verification
+    title: "Verification of SR-71: same-memory convention bridge"
+    description: >
+      Verifies SR-71 via meld-core/tests/record_boundary_390.rs (4 tests): a
+      record-carrying same-memory boundary fuses to a VALID module; it executes
+      to the same value the unfused composition returns (26 — validity alone
+      would not catch a bridge copying the wrong bytes); the boundary is wired as
+      a `thunk` and never inlined; and the `--memory multi` control, which the
+      cross-memory retptr adapter already handled, stays valid. Plus 4 unit
+      tests: `issue390_same_memory_retptr_boundary_is_bridged_not_inlined`,
+      `issue390_bridge_copies_the_return_area_to_the_callers_retptr` (pins the
+      emitted operator sequence, so a bridge that validates but copies wrongly
+      still fails), `issue390_unbridgeable_mismatch_hard_fails`,
+      `issue390_unknown_return_area_size_hard_fails` (the size is refused, never
+      guessed — over-copying and under-copying are both memory bugs), and
+      `direct_with_mismatched_signatures_not_eligible`.
+      No rebase flag is used by any of these — the defect is on the call axis.
+    status: implemented
+    fields:
+      method: automated-test
+    links:
+      - type: verifies
+        target: SR-71
