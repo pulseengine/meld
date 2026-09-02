@@ -1,0 +1,148 @@
+name: Release readiness
+
+# AGENTS.md marks the rivet release-readiness query MANDATORY before a tag:
+# a release is cuttable only when every artifact scoped to it is `verified`
+# or `accepted`. Nothing ran it. v0.51.0 and v0.52.0 were both tagged and
+# published while `rivet release status` still exited 1 for their own scope
+# (SR-69 and SR-70 were never moved off `implemented`). The work was done —
+# SWV-81 and SWV-82 exist and pass — but a MANDATORY gate that no machine
+# runs is a gate that cannot fail, and it did not.
+#
+# WHEN this fires, and why not simply "at release time":
+#
+#   * PR carrying a version bump — the PRIMARY gate. This repo lands the
+#     version bump inside the feature PR, so a PR whose workspace version
+#     differs from main's IS the release PR. That is the earliest honest
+#     "I am releasing" signal, and the last moment where a red gate costs
+#     nothing to fix.
+#   * tag push — the BACKSTOP, for two distinct holes the PR gate cannot
+#     cover: a tag pushed on a commit that never went through a bump PR,
+#     and an artifact scoped to the release that lands AFTER the bump PR
+#     merged but BEFORE the tag (the PR gate has already run by then).
+#
+# Failing at tag push costs a tag deletion, which is why it is the backstop
+# and not the primary. `compliance.yml` (release: published) would be later
+# still — by then the artifacts are signed and public.
+#
+# A PR that bumps no version SKIPS the check but still reports success, so
+# this is safe to make a required context. Do NOT add a `paths:` filter for
+# Cargo.toml: a required check that never reports on unrelated PRs blocks
+# them forever.
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release to query (e.g. v0.53.0)'
+        required: true
+        type: string
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  # Pinned to match compliance.yml. Bump both together.
+  RIVET_VERSION: v0.22.0
+
+jobs:
+  readiness:
+    name: Release readiness
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Need main to compare the workspace version against.
+          fetch-depth: 0
+
+      - name: Resolve which release (if any) this change claims
+        id: resolve
+        env:
+          EVENT: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          INPUT_VERSION: ${{ inputs.version }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+          version_of() {
+            # First `version = "..."` AFTER the [workspace.package] header,
+            # so [workspace.dependencies] pins cannot be picked up by mistake.
+            printf '%s' "$1" | awk '/^\[workspace\.package\]/{f=1} f && /^version[[:space:]]*=/{split($0,a,"\""); print a[2]; exit}'
+          }
+          HEAD_VER="$(version_of "$(cat Cargo.toml)")"
+          echo "workspace version at HEAD: ${HEAD_VER}"
+
+          case "$EVENT" in
+            workflow_dispatch)
+              echo "target=${INPUT_VERSION}" >> "$GITHUB_OUTPUT"
+              echo "reason=manual query" >> "$GITHUB_OUTPUT"
+              ;;
+            push)
+              # Tag push. The tag and the committed version MUST agree —
+              # this mechanizes the guardrail that was previously a human
+              # remembering to eyeball Cargo.toml before `git tag`.
+              if [ "v${HEAD_VER}" != "$REF_NAME" ]; then
+                echo "::error::tag ${REF_NAME} does not match the workspace version (v${HEAD_VER}) at the tagged commit"
+                exit 1
+              fi
+              echo "target=${REF_NAME}" >> "$GITHUB_OUTPUT"
+              echo "reason=tag push (backstop)" >> "$GITHUB_OUTPUT"
+              ;;
+            pull_request)
+              BASE_VER="$(version_of "$(git show "${BASE_SHA}:Cargo.toml")")"
+              echo "workspace version at base: ${BASE_VER}"
+              if [ "$HEAD_VER" = "$BASE_VER" ]; then
+                echo "target=" >> "$GITHUB_OUTPUT"
+                echo "reason=no version bump — this PR claims no release" >> "$GITHUB_OUTPUT"
+              else
+                echo "target=v${HEAD_VER}" >> "$GITHUB_OUTPUT"
+                echo "reason=version bump ${BASE_VER} -> ${HEAD_VER}" >> "$GITHUB_OUTPUT"
+              fi
+              ;;
+          esac
+
+      - name: Install rivet
+        if: steps.resolve.outputs.target != ''
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/.local/bin"
+          URL="https://github.com/pulseengine/rivet/releases/download/${RIVET_VERSION}/rivet-${RIVET_VERSION}-x86_64-unknown-linux-gnu.tar.gz"
+          curl -sSfL "$URL" | tar xz -C "$HOME/.local/bin/"
+          chmod +x "$HOME/.local/bin/rivet"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Query release readiness
+        if: steps.resolve.outputs.target != ''
+        env:
+          TARGET: ${{ steps.resolve.outputs.target }}
+          REASON: ${{ steps.resolve.outputs.reason }}
+        run: |
+          set -euo pipefail
+          rivet --version
+          echo "Checking ${TARGET} (${REASON})"
+          echo
+          # Exits non-zero when any artifact scoped to this release is not
+          # yet `verified`/`accepted`. That exit code IS the gate.
+          if ! rivet release status "$TARGET"; then
+            echo
+            echo "::error::${TARGET} is NOT cuttable — artifacts scoped to it are not yet verified."
+            echo "::error::Close each one's V (tests passing at the right levels), move it to \`verified\`, and re-run."
+            exit 1
+          fi
+          echo
+          echo "${TARGET} is cuttable."
+
+      - name: Report skip
+        if: steps.resolve.outputs.target == ''
+        env:
+          REASON: ${{ steps.resolve.outputs.reason }}
+        run: |
+          echo "Skipped: ${REASON}"

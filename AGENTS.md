@@ -782,6 +782,14 @@ GitHub REST API).
    rivet release status vX.Y.Z          # human burn-down; exits non-zero when not cuttable
    rivet release status vX.Y.Z --format json   # CI-consumable: {"cuttable": bool, "not_verified": [...]}
    ```
+   **Enforced by CI** since the `Release readiness` workflow
+   (`.github/workflows/release-readiness.yml`): it runs this query on any PR
+   that bumps the workspace version — the earliest point a change claims a
+   release — and again as a backstop on tag push, where it also asserts the tag
+   matches the committed version. Before that workflow existed nothing ran the
+   query, and v0.51.0 and v0.52.0 were both tagged while it still exited 1 for
+   their own scope. Run it locally anyway; CI is the net, not the plan.
+
    The release is **cuttable** only when every scoped artifact is `verified`/`accepted` (an artifact whose V is closed — verification passing at the right levels — moves `implemented`→`verified`). The `compliance.yml` rivet pin is also v0.22.0. (Historical per-release `vX.Y` *tags* on artifacts are "shipped-in" markers and stay; the `release:` field is the single forward scope `rivet release status` queries.)
 
 #### Release Steps

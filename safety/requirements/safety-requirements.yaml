@@ -2966,7 +2966,18 @@ artifacts:
       parameter-building function destructures `FuserConfig` exhaustively, so
       adding a field fails the build until it is recorded or explicitly
       acknowledged as not a build parameter.
-    status: implemented
+
+      STATUS CORRECTED POST HOC, 2026-09-02. This entry shipped in v0.51.0 while
+      still marked `implemented`, so `rivet release status v0.51.0` exited 1 for
+      its own scope at the moment it was tagged — the pre-release readiness
+      query AGENTS.md marks MANDATORY was not run, because at that time nothing
+      in CI ran it and no human did either. The verification itself was real and
+      passing throughout — its linked sw-verification carries the evidence — and
+      only this status field was stale. It is moved
+      to `verified` here rather than silently, so the record shows both the
+      correction and the reason it was needed. The gate that would have caught
+      it is now enforced by `.github/workflows/release-readiness.yml`.
+    status: verified
     tags: [attestation, adr-7, traceability, observability, boundary, config]
     release: v0.51.0
     links:
@@ -3026,7 +3037,18 @@ artifacts:
       placement records are produced — each module keeps its own memory and there
       is no placement decision to record; the attested `memory_strategy` already
       states which isolation model is in force.
-    status: implemented
+
+      STATUS CORRECTED POST HOC, 2026-09-02. This entry shipped in v0.52.0 while
+      still marked `implemented`, so `rivet release status v0.52.0` exited 1 for
+      its own scope at the moment it was tagged — the pre-release readiness
+      query AGENTS.md marks MANDATORY was not run, because at that time nothing
+      in CI ran it and no human did either. The verification itself was real and
+      passing throughout — its linked sw-verification carries the evidence — and
+      only this status field was stale. It is moved
+      to `verified` here rather than silently, so the record shows both the
+      correction and the reason it was needed. The gate that would have caught
+      it is now enforced by `.github/workflows/release-readiness.yml`.
+    status: verified
     tags: [attestation, adr-7, traceability, observability, memory, placement]
     release: v0.52.0
     links:
