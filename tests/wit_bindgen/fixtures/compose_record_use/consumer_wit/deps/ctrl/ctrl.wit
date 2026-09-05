@@ -1,10 +1,16 @@
 package golden:ctrl@0.1.0;
 
-// TWO exported record types, mirroring falcon's `types` interface. This is
-// deliberate, not incidental: a type export allocates a local type index inside
-// the instance type, so an implementation that resolves `use`d types but
-// forgets to allocate for exports gets the FIRST record right and the SECOND
-// wrong. A fixture with one record cannot catch that, and did not.
+// Three exported record types. Two are flat; `command` NESTS one of the others.
+//
+// The count matters: a type export allocates a local type index, so an
+// implementation that resolves `use`d types but skips that allocation gets the
+// first record right and later ones wrong.
+//
+// The nesting matters separately: `command.t` is stored as a reference into the
+// instance type's LOCAL index space. If that reference escapes into the
+// component-level structure unsubstituted, it is later resolved against a
+// different namespace, where an unrelated type answers as an impostor and the
+// size comes back silently wrong. A fixture of flat records cannot reach that.
 interface types {
   record torque {
     tx: f32,
@@ -18,13 +24,17 @@ interface types {
     m3: f32,
     m4: f32,
   }
+  record command {
+    seq: u32,
+    t: torque,
+  }
 }
 
 interface lib {
-  use types.{torque, motor};
-  // Returns the SECOND exported record, so the index shift is load-bearing.
+  use types.{torque, motor, command};
   tick: func(a: f32, b: f32) -> motor;
   blend: func(t: torque) -> f32;
+  pack: func(seq: u32, a: f32) -> command;
 }
 
 world provider {

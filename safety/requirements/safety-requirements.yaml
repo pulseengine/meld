@@ -3170,8 +3170,11 @@ artifacts:
       the first exported type correctly and every later one wrongly; (b) a size
       shall be recorded only when every component of the type is exactly
       sizeable, rather than inferred from the magnitude of a possibly-guessed
-      result; and (c) an unknown return-area size shall be a hard error on every
-      adapter path. Silently emitting a short copy is prohibited — a fused module
+      result; (c) an unknown return-area size shall be a hard error on every
+      adapter path; and (d) a value type captured from an instance type shall be
+      resolved WITHIN that instance type's own index space before being stored,
+      so no local type index escapes into the component-level namespace where an
+      unrelated type could answer in its place. Silently emitting a short copy is prohibited — a fused module
       that computes the wrong answer without trapping is the most severe failure
       this tool can produce, strictly worse than the invalid output of SR-71.
     status: verified
@@ -3194,9 +3197,11 @@ artifacts:
       verification-method: test
       verification-description: >
         Verified by meld-core/tests/used_type_size_393.rs (4 tests) on a hermetic
-        wasm-tools+wac fixture whose `types` interface exports TWO records and
-        whose function returns the SECOND — the shape required to catch a missing
-        type-index allocation. The cross-memory case executes and must return 26;
+        wasm-tools+wac fixture whose `types` interface exports THREE records: the
+        function under test returns the SECOND — the shape required to catch a
+        missing type-index allocation — and a second function returns a NESTED
+        record, so a type reference that escaped its index space is exercised
+        rather than assumed absent. The cross-memory case executes and must return 26;
         before the fix it returned 7 (3 + 4 + 0 + 0) while validating cleanly.
         Negative control run twice: removing the export index allocation makes
         the two-record fixture fail, while the earlier single-record fixture

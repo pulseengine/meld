@@ -30,10 +30,17 @@
 
 use meld_core::{Fuser, FuserConfig, MemoryStrategy};
 
-/// `tick(3, 4)` returns `motor{m1:3, m2:4, m3:7, m4:12}`; `run()` sums the four
-/// fields. A short 8-byte copy yields 3 + 4 + 0 + 0 = 7 — which is exactly what
-/// this returned before the fix, while validating cleanly.
-const EXPECTED: f32 = 26.0;
+/// `run()` folds two record-returning calls:
+///   `tick(3, 4)` -> `motor{3, 4, 7, 12}`            sums to 26
+///   `pack(5, 6)` -> `command{seq: 5, t{6,12,18,24}}` adds 5 + 60
+/// so the whole thing is 91.
+///
+/// The `tick` half is the original #393 symptom: a short 8-byte copy of the
+/// 16-byte `motor` yields 3 + 4 + 0 + 0 = 7, which is exactly what this returned
+/// before the fix — while validating cleanly. The `pack` half additionally
+/// carries a NESTED record, so a size computed through the wrong type namespace
+/// shows up here too.
+const EXPECTED: f32 = 91.0;
 
 fn fixture() -> Option<Vec<u8>> {
     let path = format!(
@@ -91,8 +98,7 @@ fn used_record_is_not_truncated_across_memories() {
     let got = run(&fused, true);
     assert_eq!(
         got, EXPECTED,
-        "#393: a `use`d record must be copied in full across memories — \
-         got {got}, which is what an 8-byte copy of a 16-byte record produces"
+        "#393: a `use`d record must be copied in full across memories — got {got}"
     );
 }
 

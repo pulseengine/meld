@@ -1025,7 +1025,14 @@ impl ComponentParser {
                                         let resolved = match t {
                                             wasmparser::ComponentType::Defined(dt) => {
                                                 match convert_wp_defined_type(dt) {
-                                                    ComponentTypeKind::Defined(v) => Some(v),
+                                                    // Substitute local references
+                                                    // NOW so no local index ever
+                                                    // escapes into the component's
+                                                    // namespace (see
+                                                    // `resolve_within_instance_local`).
+                                                    ComponentTypeKind::Defined(v) => {
+                                                        resolve_within_instance_local(&v, &local)
+                                                    }
                                                     _ => None,
                                                 }
                                             }
@@ -1415,6 +1422,79 @@ impl Default for ComponentParser {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// #393 follow-up (Mythos delta-pass): fully resolve a value type **within an
+/// instance type's own local index space**, before it is stored on the
+/// component.
+///
+/// A type captured from an instance type's declarations may reference other
+/// types declared in that same instance type — `record pose { t: torque }`
+/// stores a `Type(local_idx)` for the field. Storing that verbatim leaves a
+/// local index loose in a component-level structure, and the later size/align
+/// walk resolves it against `component_type_defs` — a DIFFERENT namespace. A
+/// coincidental component-level type at that index then answers as an impostor,
+/// `can_size_exactly` reports true, and the size comes back silently wrong:
+/// exactly the failure #393 exists to remove, reintroduced one level down.
+///
+/// Substituting now makes every stored value self-contained, so no local index
+/// ever escapes. `None` when any part cannot be resolved locally — an alias to
+/// an outer type, say — which the callers treat as unknown and therefore loud.
+///
+/// `local` holds entries that were themselves substituted when pushed, so this
+/// never needs to recurse through a `Type` twice.
+fn resolve_within_instance_local(
+    ty: &ComponentValType,
+    local: &[Option<ComponentValType>],
+) -> Option<ComponentValType> {
+    use ComponentValType as V;
+    Some(match ty {
+        V::Type(i) => local.get(*i as usize)?.clone()?,
+        V::List(inner) => V::List(Box::new(resolve_within_instance_local(inner, local)?)),
+        V::FixedSizeList(inner, n) => {
+            V::FixedSizeList(Box::new(resolve_within_instance_local(inner, local)?), *n)
+        }
+        V::Option(inner) => V::Option(Box::new(resolve_within_instance_local(inner, local)?)),
+        V::Record(fields) => V::Record(
+            fields
+                .iter()
+                .map(|(n, t)| Some((n.clone(), resolve_within_instance_local(t, local)?)))
+                .collect::<Option<Vec<_>>>()?,
+        ),
+        V::Tuple(elems) => V::Tuple(
+            elems
+                .iter()
+                .map(|t| resolve_within_instance_local(t, local))
+                .collect::<Option<Vec<_>>>()?,
+        ),
+        V::Variant(cases) => V::Variant(
+            cases
+                .iter()
+                .map(|(n, t)| {
+                    Some((
+                        n.clone(),
+                        match t {
+                            Some(t) => Some(resolve_within_instance_local(t, local)?),
+                            None => None,
+                        },
+                    ))
+                })
+                .collect::<Option<Vec<_>>>()?,
+        ),
+        V::Result { ok, err } => V::Result {
+            ok: match ok {
+                Some(t) => Some(Box::new(resolve_within_instance_local(t, local)?)),
+                None => None,
+            },
+            err: match err {
+                Some(t) => Some(Box::new(resolve_within_instance_local(t, local)?)),
+                None => None,
+            },
+        },
+        // Primitives, strings, flags and resource handles carry no type index
+        // into the local space.
+        other => other.clone(),
+    })
 }
 
 impl ParsedComponent {

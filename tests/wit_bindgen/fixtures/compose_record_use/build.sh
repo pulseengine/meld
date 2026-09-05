@@ -27,4 +27,4 @@ wasm-tools component embed consumer_wit --world consumer consumer_core.wasm -o c
 wasm-tools component new consumer_embed.wasm -o consumer.wasm
 wac plug consumer.wasm --plug provider.wasm -o composed_record_use.wasm
 wasm-tools validate composed_record_use.wasm
-echo "built composed_record_use.wasm (consumer.runner.run -> 26)"
+echo "built composed_record_use.wasm (consumer.runner.run -> 91)"
