@@ -75,6 +75,7 @@ fn run(fused: &[u8], multi_memory: bool) -> f32 {
 
 /// The severe half: a module that validated and ran, and returned the wrong
 /// number. Nothing trapped; only the value was wrong.
+// rivet: verifies SR-72
 #[test]
 fn used_record_is_not_truncated_across_memories() {
     let Some(bytes) = fixture() else {
@@ -97,6 +98,7 @@ fn used_record_is_not_truncated_across_memories() {
 
 /// The half jess reported: the same unresolvable type made the #390 same-memory
 /// bridge refuse, because an unknown size is (correctly) never guessed.
+// rivet: verifies SR-72
 #[test]
 fn used_record_bridges_in_one_memory() {
     let Some(bytes) = fixture() else {
@@ -119,6 +121,7 @@ fn used_record_bridges_in_one_memory() {
 /// Both strategies must agree with each other and with the unfused component.
 /// Fusion is a semantics-preserving transform; a strategy that changes the
 /// answer is a defect regardless of which one is "right".
+// rivet: verifies SR-72
 #[test]
 fn both_strategies_agree() {
     let Some(bytes) = fixture() else {
@@ -136,6 +139,7 @@ fn both_strategies_agree() {
 /// contract the resolver depends on — if this ever returns false again, the
 /// sizes go back to being unknown and both paths above fail loudly rather than
 /// silently, but they still fail.
+// rivet: verifies SR-72
 #[test]
 fn used_types_are_exactly_sizeable() {
     let Some(bytes) = fixture() else {
