@@ -814,7 +814,16 @@ GitHub REST API).
    gh pr merge <PR#> --squash
    ```
 
-4. **Create release**: Only after merge and main CI passes
+4. **Create release**: Only after merge and main CI passes.
+
+   **Publish LAST, as a draft first.** `release.yml` creates the release itself
+   when it does not already exist; a manual `gh release create` right after the
+   tag push therefore publishes an EMPTY release that the pipeline fills minutes
+   later. Worse, `compliance.yml` triggers on `release: published`, so it fires
+   immediately and uploads its report — which is how v0.53.0 came to sit public
+   carrying one asset while a consumer fetched it (#395). On a busy runner fleet
+   that window is long.
+
    ```bash
    # Pull latest main
    git checkout main && git pull
@@ -822,13 +831,35 @@ GitHub REST API).
    # Verify main CI passed
    gh run list --branch main --limit 1
 
-   # Create and push tag
+   # Guardrail: the tag must match the committed workspace version
+   grep -A1 '^\[workspace.package\]' Cargo.toml | grep '^version'
+
+   # Create and push tag — this starts the build pipeline
    git tag -a vX.Y.Z -m "Release vX.Y.Z"
    git push origin vX.Y.Z
 
-   # Create GitHub release
-   gh release create vX.Y.Z --generate-notes
+   # Create the release as a DRAFT so nothing is public yet
+   gh release create vX.Y.Z --draft --notes-file notes.md
+
+   # Wait for release.yml to finish and upload into the draft
+   gh run watch <release-run-id>
+
+   # Verify the artifacts before anyone can fetch them: checksums AND signature,
+   # each with a negative control (see release-execution)
+   gh release download vX.Y.Z -p 'SHA256SUMS.txt*' -p '*.tar.gz'
+   shasum -a 256 -c SHA256SUMS.txt
+   cosign verify-blob --bundle SHA256SUMS.txt.cosign.bundle \
+     --certificate-identity-regexp 'https://github.com/pulseengine/meld/.*' \
+     --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+     SHA256SUMS.txt
+
+   # Only now make it public
+   gh release edit vX.Y.Z --draft=false
    ```
+
+   `release-assets-gate.yml` runs on publish and fails if the platform binaries,
+   checksums or signature bundle are absent. It reports rather than prevents —
+   GitHub has no pre-publish hook — but it makes forgetting this loud.
 
 #### What NOT to do
 
