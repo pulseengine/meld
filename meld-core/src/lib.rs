@@ -519,8 +519,23 @@ impl Fuser {
     }
 
     /// Get the number of components added
+    /// How many components are in the FLATTENED set — one per component after
+    /// nested sub-components are hoisted out. This is the number the fuser
+    /// actually operates on, and `nested_component` asserts flattening through
+    /// it; for the number the caller passed, use [`Self::input_count`].
     pub fn component_count(&self) -> usize {
         self.components.len()
+    }
+
+    /// How many components the caller ADDED — the files they passed.
+    ///
+    /// Distinct from [`Self::component_count`], which counts the flattened set
+    /// and gains an entry per nested sub-component. Printing the flattened
+    /// number to a user reported two input files as "Fusing 4 components",
+    /// sending readers to look for inputs they never supplied. Anything
+    /// user-facing wants this one.
+    pub fn input_count(&self) -> usize {
+        self.original_components.len()
     }
 
     /// Inspect P3 async usage across all added components.
@@ -674,15 +689,20 @@ impl Fuser {
         // direct load/store) is already a hard error there (path-F).
         if self.config.memory_strategy == MemoryStrategy::SharedMemory
             && self.config.address_rebasing
-            && self.any_component_lacks_reloc_metadata()
         {
-            log::warn!(
-                "memory strategy: shared memory + address rebasing with at least one \
-                 input that carries NO relocation metadata. Absolute addresses in such \
-                 a module cannot be rebased, so it may silently alias another \
-                 component's memory (#326/#339). Rebuild every input with \
-                 `--emit-relocs`, or use `--memory multi`."
-            );
+            let lacking = self.components_lacking_reloc_metadata();
+            if !lacking.is_empty() {
+                log::warn!(
+                    "memory strategy: shared memory + address rebasing, but these \
+                     components carry NO relocation metadata: {}. Absolute addresses in \
+                     such a module cannot be rebased, so it may silently alias another \
+                     component's memory (#326/#339). Rebuild the corresponding input with \
+                     `--emit-relocs`, or use `--memory multi`. (Names are of FUSED \
+                     components, which include ones synthesized from an input's nested \
+                     structure — so a name you do not recognise is not one of your files.)",
+                    lacking.join(", ")
+                );
+            }
         }
         self.fuse_with_stats_resolved()
     }
@@ -722,12 +742,36 @@ impl Fuser {
     /// (`reloc::has_reloc_metadata`) that `resolve_address_plan` gates on, so
     /// the warning cannot disagree with the strategy that follows it.
     fn any_component_lacks_reloc_metadata(&self) -> bool {
-        self.components.iter().any(|component| {
-            component
-                .core_modules
-                .iter()
-                .any(|module| !reloc::has_reloc_metadata(&module.custom_sections))
-        })
+        !self.components_lacking_reloc_metadata().is_empty()
+    }
+
+    /// Which components carry no relocation metadata, by name.
+    ///
+    /// Reported by name because the bare "at least one input" phrasing was a
+    /// false alarm in practice: this walks the FLATTENED component list, which
+    /// includes components synthesized from an input's nested structure — not
+    /// the files the caller passed. A caller whose every input was built with
+    /// `--emit-relocs` could still be told an input lacked them, and go looking
+    /// for a defect in their own artifacts that was never there. Keep the
+    /// flattened scope, since a nested module without relocs is a real hazard,
+    /// but say WHICH one so the reader can tell it apart from their inputs.
+    fn components_lacking_reloc_metadata(&self) -> Vec<String> {
+        self.components
+            .iter()
+            .enumerate()
+            .filter(|(_, component)| {
+                component
+                    .core_modules
+                    .iter()
+                    .any(|module| !reloc::has_reloc_metadata(&module.custom_sections))
+            })
+            .map(|(idx, component)| {
+                component
+                    .name
+                    .clone()
+                    .unwrap_or_else(|| format!("<unnamed component {idx}>"))
+            })
+            .collect()
     }
 
     /// Resolve `MemoryStrategy::Auto` against the added components.
