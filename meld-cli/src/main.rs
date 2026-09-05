@@ -595,7 +595,7 @@ fn fuse_command(
     // wasmparser pass over an artifact already in memory.
     //
     // `--validate` forces it on any path; `--no-validate` opts out.
-    let implied = matches!(memory_strategy, MemoryStrategy::SharedMemory) && !no_validate;
+    let implied = validation_is_implied(&memory_strategy, no_validate);
     if validate || implied {
         println!();
         if implied && !validate {
@@ -1163,5 +1163,65 @@ mod tests {
         assert_eq!(arr[1]["name"], "[method]output-stream.write");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// Does the memory strategy imply validating the output? (#390 / #391)
+///
+/// Pulled out as a total function over its two inputs so the decision can be
+/// enumerated rather than reasoned about: three strategies x two opt-out states
+/// is six cases, all covered below. meld#397 makes the case that meld's own
+/// decision seams deserve this treatment; this is a small one, so it gets it.
+fn validation_is_implied(strategy: &MemoryStrategy, no_validate: bool) -> bool {
+    if no_validate {
+        return false;
+    }
+    // Shared memory is where meld rebases absolute addresses and bridges
+    // calling conventions inside one address space — the rewriting whose
+    // failures (#390, #393) reached consumers as invalid or wrong output.
+    // `--memory multi` leaves each module's memory alone, so its output is not
+    // exposed to that class and validation stays opt-in there.
+    matches!(strategy, MemoryStrategy::SharedMemory)
+}
+
+#[cfg(test)]
+mod validate_default_tests {
+    use super::*;
+
+    /// Every combination, not a sample: the point of a total function is that
+    /// its table can be written down.
+    // rivet: verifies SR-73
+    #[test]
+    fn validation_implication_table() {
+        use MemoryStrategy::*;
+        for (strategy, no_validate, expected) in [
+            (SharedMemory, false, true),
+            (SharedMemory, true, false),
+            (MultiMemory, false, false),
+            (MultiMemory, true, false),
+            (Auto, false, false),
+            (Auto, true, false),
+        ] {
+            assert_eq!(
+                validation_is_implied(&strategy, no_validate),
+                expected,
+                "strategy={strategy:?} no_validate={no_validate}"
+            );
+        }
+    }
+
+    /// The opt-out must win regardless of strategy — otherwise `--no-validate`
+    /// silently does nothing on exactly the path where someone would reach for
+    /// it.
+    // rivet: verifies SR-73
+    #[test]
+    fn no_validate_always_wins() {
+        for strategy in [
+            MemoryStrategy::SharedMemory,
+            MemoryStrategy::MultiMemory,
+            MemoryStrategy::Auto,
+        ] {
+            assert!(!validation_is_implied(&strategy, true));
+        }
     }
 }

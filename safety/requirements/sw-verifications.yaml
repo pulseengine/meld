@@ -1288,3 +1288,22 @@ artifacts:
     links:
       - type: verifies
         target: SR-72
+
+  - id: SWV-85
+    type: sw-verification
+    title: "Verification of SR-73: implied output validation"
+    description: >
+      Verifies SR-73 via the `validate_default_tests` module in meld-cli: an
+      exhaustive implication table over three memory strategies and both opt-out
+      states (six cases, enumerated not sampled), and an assertion that
+      `--no-validate` wins on every strategy — otherwise the opt-out silently
+      does nothing on exactly the path someone would reach for it. Flag routing
+      was additionally exercised end to end across five invocations, including
+      that `--validate` and `--no-validate` conflict rather than resolving
+      silently.
+    status: implemented
+    fields:
+      method: automated-test
+    links:
+      - type: verifies
+        target: SR-73
