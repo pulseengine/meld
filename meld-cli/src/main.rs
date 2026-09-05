@@ -541,7 +541,7 @@ fn fuse_command(
     }
 
     println!();
-    println!("Fusing {} components...", fuser.component_count());
+    println!("Fusing {} components...", fuser.input_count());
 
     // Perform fusion
     let (fused_bytes, stats) = fuser.fuse_with_stats().context("Fusion failed")?;

@@ -143,10 +143,20 @@ fn value_address_no_reloc_accept_warns_and_validates_339() {
     );
 
     // The acceptance warning must fire, naming the module and the remedy.
+    //
+    // Selected on BOTH the module name and "UN-REBASED": the #386 shared+rebase
+    // warning also names the components it complains about, so matching on the
+    // module name alone can pick up the wrong warning. Both properties are still
+    // asserted on one warning — this disambiguates which, it does not relax what.
     let warnings = CAPTURED.lock().unwrap().clone();
-    let hit = warnings.iter().find(|w| w.contains("value-addr-mod"));
+    let hit = warnings
+        .iter()
+        .find(|w| w.contains("value-addr-mod") && w.contains("UN-REBASED"));
     let hit = hit.unwrap_or_else(|| {
-        panic!("expected an acceptance warning naming the module; captured: {warnings:?}")
+        panic!(
+            "expected the per-module acceptance warning naming the module and the \
+             un-rebased risk; captured: {warnings:?}"
+        )
     });
     assert!(
         hit.contains("UN-REBASED") && hit.contains("--emit-relocs"),
