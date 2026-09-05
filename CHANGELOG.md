@@ -4,6 +4,45 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.55.0] - 2026-09-05
+
+### Changed
+- **`--memory shared` now validates its own output by default (#390, #391).**
+  The single-address-space paths — `--memory shared`, and therefore
+  `--address-rebase`, `--pack-rebase` and `--share-stack` — run the fused module
+  through `wasmparser` before writing it. `--no-validate` opts out;
+  `--validate` still forces it on any path.
+
+  This is where meld rewrites most invasively: rebasing absolute addresses and
+  bridging calling conventions inside one address space. It is also where both
+  of the last two releases' defects surfaced — #390 emitted invalid wasm at exit
+  0, and #393 emitted a module that validated but returned the wrong number.
+  The consumer who reported both noted they would have caught the first months
+  earlier had this been the default. The cost is one `wasmparser` pass over an
+  artifact already in memory.
+
+  A module that fails validation is **not written**. Previously an invalid
+  artifact reached disk and only failed later, in whatever consumed it.
+
+### Fixed
+- **The shared+rebase warning named "inputs" it could not have meant (#390).**
+  A consumer whose every input carried relocation metadata was still told an
+  input lacked it, and went auditing artifacts that were fine. Both that warning
+  and the `Fusing N components...` line read the *flattened* component list,
+  which gains an entry per nested sub-component — so two input files printed
+  "Fusing 4 components". The warning now names the components it means and says
+  outright that an unrecognised name is not one of your files; `input_count()`
+  reports what the caller passed.
+
+- **Releases are no longer published before their artifacts exist (#395).**
+  `release.yml` creates the GitHub release itself, so a manual `gh release
+  create` after the tag push published an empty release that the pipeline filled
+  minutes later — and `compliance.yml`, which triggers on publish, uploaded its
+  report into that window. v0.53.0 was fetched in exactly that state. Releases
+  are now created as drafts and published only after their assets are uploaded
+  and verified, and `release-assets-gate.yml` fails loudly if a published
+  release lacks its platform binaries, checksums or signature bundle.
+
 ## [0.54.0] - 2026-09-05
 
 ### Fixed

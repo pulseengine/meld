@@ -156,9 +156,23 @@ enum Commands {
         #[arg(long)]
         preserve_names: bool,
 
-        /// Validate output with wasmparser
+        /// Validate output with wasmparser. Implied on the single-address-space
+        /// paths (`--memory shared`, and therefore `--address-rebase`,
+        /// `--pack-rebase`, `--share-stack`); pass this to force it elsewhere.
         #[arg(long)]
         validate: bool,
+
+        /// Skip the validation that `--memory shared` implies.
+        ///
+        /// Validation is on by default there because that is where meld does its
+        /// most invasive rewriting — rebasing addresses and bridging calling
+        /// conventions inside one address space — and a defect shows up as a
+        /// module that no runtime accepts. #390 and #393 both shipped as invalid
+        /// or wrong output at exit 0; the reporter noted they would have caught
+        /// the first months earlier had this been the default. The cost is one
+        /// wasmparser pass over an artifact just built.
+        #[arg(long, conflicts_with = "validate")]
+        no_validate: bool,
 
         /// Output as P2 component instead of core module
         #[arg(long)]
@@ -257,6 +271,7 @@ fn main() -> Result<()> {
             dwarf,
             preserve_names,
             validate,
+            no_validate,
             component,
             emit_import_map,
             opaque_rep,
@@ -281,6 +296,7 @@ fn main() -> Result<()> {
                 dwarf,
                 preserve_names,
                 validate,
+                no_validate,
                 component,
                 emit_import_map,
                 opaque_rep,
@@ -362,6 +378,7 @@ fn fuse_command(
     dwarf: String,
     preserve_names: bool,
     validate: bool,
+    no_validate: bool,
     component: bool,
     emit_import_map: Option<String>,
     opaque_rep: Vec<String>,
@@ -567,10 +584,27 @@ fn fuse_command(
 
     let elapsed = start.elapsed();
 
-    // Validate if requested
-    if validate {
+    // Validate the output.
+    //
+    // On by default for the single-address-space paths, because that is where
+    // meld rewrites most invasively — rebasing absolute addresses and bridging
+    // calling conventions within one memory — and where a defect surfaces as a
+    // module no runtime will accept. #390 emitted invalid wasm at exit 0 and
+    // #393 emitted a module that validated and returned the wrong number; both
+    // reached a consumer. The cost of catching the first class is one
+    // wasmparser pass over an artifact already in memory.
+    //
+    // `--validate` forces it on any path; `--no-validate` opts out.
+    let implied = matches!(memory_strategy, MemoryStrategy::SharedMemory) && !no_validate;
+    if validate || implied {
         println!();
-        println!("Validating output...");
+        if implied && !validate {
+            println!("Validating output (implied by --memory shared; --no-validate to skip)...");
+        } else {
+            println!("Validating output...");
+        }
+        // Before the write: a module that fails here must not become a file
+        // somebody can pick up.
         validate_wasm(&fused_bytes)?;
         println!("  Validation passed");
     }
