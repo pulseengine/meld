@@ -7246,7 +7246,21 @@ impl FactStyleGenerator {
         resource_rep_imports: &std::collections::HashMap<(String, String), u32>,
     ) -> Result<(u32, Function)> {
         let retptr_local = (caller_param_count - 1) as u32;
-        let return_area_size = site.requirements.return_area_byte_size.unwrap_or(8);
+        // #393: this used to be `.unwrap_or(8)`. An unknown return-area size
+        // became a plausible number that went straight into a `memory.copy`
+        // length, so a 16-byte record was copied as 8 — the fused module
+        // validated, ran without trapping, and returned a value with its later
+        // fields zeroed. A silent wrong answer is the worst failure this tool
+        // can produce; refuse instead.
+        let return_area_size = site.requirements.return_area_byte_size.ok_or_else(|| {
+            crate::Error::AdapterGeneration(format!(
+                "#393: cannot fuse the cross-memory call to '{}' ({}): the callee's return-area \
+                 size is unknown, so the copy length cannot be established. meld will not guess \
+                 it — a short copy silently zeroes the tail of the result. This usually means a \
+                 result type meld could not resolve; please report the interface on meld#393.",
+                site.export_name, site.import_module
+            ))
+        })?;
 
         let param_ptr_positions = &site.requirements.pointer_pair_positions;
         let result_ptr_offsets = &site.requirements.result_pointer_pair_offsets;

@@ -3261,6 +3261,7 @@ mod tests {
                 options: crate::parser::CanonicalOptions::default(),
             }],
             sub_components: Vec::new(),
+            instance_type_exports: Default::default(),
             component_aliases: Vec::new(),
             component_instances: Vec::new(),
             core_entity_order: Vec::new(),

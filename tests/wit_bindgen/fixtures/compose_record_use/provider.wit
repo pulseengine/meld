@@ -1,0 +1,32 @@
+package golden:ctrl@0.1.0;
+
+// TWO exported record types, mirroring falcon's `types` interface. This is
+// deliberate, not incidental: a type export allocates a local type index inside
+// the instance type, so an implementation that resolves `use`d types but
+// forgets to allocate for exports gets the FIRST record right and the SECOND
+// wrong. A fixture with one record cannot catch that, and did not.
+interface types {
+  record torque {
+    tx: f32,
+    ty: f32,
+    tz: f32,
+    thrust: f32,
+  }
+  record motor {
+    m1: f32,
+    m2: f32,
+    m3: f32,
+    m4: f32,
+  }
+}
+
+interface lib {
+  use types.{torque, motor};
+  // Returns the SECOND exported record, so the index shift is load-bearing.
+  tick: func(a: f32, b: f32) -> motor;
+  blend: func(t: torque) -> f32;
+}
+
+world provider {
+  export lib;
+}

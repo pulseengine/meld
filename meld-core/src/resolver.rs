@@ -2986,8 +2986,17 @@ impl Resolver {
                                                 results,
                                             } = &ct.kind
                                         {
+                                            // #393: record the size when it is EXACT. The old
+                                            // `size > 4` test conflated "small" with "unknown":
+                                            // an unresolvable type sizes as 4, so a `use`d record
+                                            // fell through as None on the same-memory path and,
+                                            // worse, as a guessed 8 on the cross-memory one. Ask
+                                            // whether the type is resolvable instead.
                                             let size = to_component.return_area_byte_size(results);
-                                            if size > 4 {
+                                            let exact = results
+                                                .iter()
+                                                .all(|(_, t)| to_component.can_size_exactly(t));
+                                            if exact && size > 0 {
                                                 requirements.return_area_byte_size = Some(size);
                                             }
                                             requirements.pointer_pair_positions = to_component
@@ -3341,8 +3350,17 @@ impl Resolver {
                                         results,
                                     } = &ct.kind
                                 {
+                                    // #393: record the size when it is EXACT. The old
+                                    // `size > 4` test conflated "small" with "unknown":
+                                    // an unresolvable type sizes as 4, so a `use`d record
+                                    // fell through as None on the same-memory path and,
+                                    // worse, as a guessed 8 on the cross-memory one. Ask
+                                    // whether the type is resolvable instead.
                                     let size = to_component.return_area_byte_size(results);
-                                    if size > 4 {
+                                    let exact = results
+                                        .iter()
+                                        .all(|(_, t)| to_component.can_size_exactly(t));
+                                    if exact && size > 0 {
                                         requirements.return_area_byte_size = Some(size);
                                     }
                                     requirements.pointer_pair_positions =
@@ -4452,6 +4470,7 @@ mod tests {
             instances: Vec::new(),
             canonical_functions: Vec::new(),
             sub_components: Vec::new(),
+            instance_type_exports: Default::default(),
             component_aliases: Vec::new(),
             component_instances: Vec::new(),
             core_entity_order: Vec::new(),

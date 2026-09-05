@@ -1264,3 +1264,27 @@ artifacts:
     links:
       - type: verifies
         target: SR-71
+
+  - id: SWV-84
+    type: sw-verification
+    title: "Verification of SR-72: `use`d types are sized exactly"
+    description: >
+      Verifies SR-72 via meld-core/tests/used_type_size_393.rs (4 tests): a
+      record reached through `use` is copied in full across memories (executes to
+      26, where a short copy yields 7); the same record bridges within one memory
+      (the same-memory convention bridge, also 26); both memory strategies agree with each other and
+      with the unfused component, since fusion is semantics-preserving and a
+      strategy that changes the answer is a defect either way; and the parser
+      captures instance-type exports at all, which is the contract the resolver's
+      exact-sizing check depends on.
+      The fixture returns the SECOND of two exported records deliberately: a type
+      export allocates a local type index, and an implementation that forgets it
+      resolves the first record correctly and later ones wrongly. A single-record
+      fixture cannot detect that — verified by negative control, where it
+      reported success against the same injected defect.
+    status: implemented
+    fields:
+      method: automated-test
+    links:
+      - type: verifies
+        target: SR-72
