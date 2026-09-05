@@ -4,6 +4,42 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.54.0] - 2026-09-05
+
+### Fixed
+- **A type reached through `use` is now sized exactly, never guessed (SR-72,
+  #393)** — and the guess it replaces was producing **silently wrong results**,
+  not just a refusal.
+
+  WIT's `use types.{torque}` compiles to an instance-export alias. meld's type
+  resolution followed `Defined` and `ExportAlias` chains but stopped there, so
+  every `use`d record was unresolvable — and an unresolvable type was sized as
+  **4 bytes**. That number is plausible, which is exactly what made it
+  dangerous. One guess, two very different symptoms:
+
+  - **Cross-memory (`--memory multi`)**: the return-area size defaulted to 8, so
+    a 16-byte record was copied as 8. The fused module **validated, ran without
+    trapping, and returned a value with its later fields zeroed**. In the
+    regression fixture that is 7 instead of 26.
+  - **Same-memory (`--memory shared`)**: the resolver recorded a size only when
+    it exceeded 4, so the size stayed unknown and the SR-71 bridge refused. That
+    refusal is the only reason the defect was visible at all — the "never guess
+    the size" guard added in v0.53.0 turned a silent corruption into a report.
+
+  Instance types now have their exported value types captured at parse time,
+  **including the local type index a type export itself allocates**. Omitting
+  that allocation resolves the first exported type correctly and every later one
+  wrongly; falcon's `types` interface exports two, which is what caught it.
+
+  Sizes are now recorded when the type is *exactly sizeable* rather than inferred
+  from the magnitude of a possibly-guessed result, and an unknown return-area
+  size is a hard error on every adapter path — including the cross-memory one,
+  where it was previously `unwrap_or(8)`.
+
+  Reported by jess against falcon's cascade, where all five boundaries carry
+  `use`d records. Those five now fuse and validate; before this they were
+  silently truncating on the only path that appeared to work.
+
 ## [0.53.0] - 2026-09-02
 
 ### Fixed

@@ -166,6 +166,19 @@ pub struct ParsedComponent {
     /// Nested sub-components (from `ComponentSection` payloads)
     pub sub_components: Vec<ParsedComponent>,
 
+    /// Value types exported by *instance types*, keyed by
+    /// `(component type index of the instance type, export name)`.
+    ///
+    /// #393: a `use types.{torque}` in WIT compiles to an
+    /// `alias export <instance> "torque" (type)`, so the function type that
+    /// carries the record refers to it through an instance-export alias rather
+    /// than a locally `Defined` type. Instance type declarations used to be
+    /// discarded (`ComponentTypeKind::Other`), which left that last hop
+    /// unresolvable — and an unresolvable type silently sized as 4 bytes, so a
+    /// 16-byte record was copied as 8 and the fused module returned wrong
+    /// values without trapping. Capturing the exports here closes the hop.
+    pub instance_type_exports: std::collections::HashMap<(u32, String), ComponentValType>,
+
     /// Component-level aliases (from `ComponentAliasSection`)
     pub component_aliases: Vec<ComponentAliasEntry>,
 
@@ -717,6 +730,7 @@ impl ComponentParser {
             instances: Vec::new(),
             canonical_functions: Vec::new(),
             sub_components: Vec::new(),
+            instance_type_exports: std::collections::HashMap::new(),
             component_aliases: Vec::new(),
             component_instances: Vec::new(),
             core_entity_order: Vec::new(),
@@ -992,7 +1006,91 @@ impl ComponentParser {
                         }
                         wasmparser::ComponentType::Defined(dt) => convert_wp_defined_type(&dt),
                         wasmparser::ComponentType::Component(_) => ComponentTypeKind::Other,
-                        wasmparser::ComponentType::Instance(_) => ComponentTypeKind::Other,
+                        wasmparser::ComponentType::Instance(decls) => {
+                            // #393: capture the value types this instance type
+                            // exports. A WIT `use types.{torque}` reaches the
+                            // record through `alias export <instance> "torque"`,
+                            // so without these the type is unresolvable — and an
+                            // unresolvable type was silently sized as 4 bytes.
+                            //
+                            // Declarations build the instance type's OWN type
+                            // index space, separate from the component's, so
+                            // resolve within `local` and never against
+                            // `component.types`.
+                            let ty_idx = component.component_type_defs.len() as u32;
+                            let mut local: Vec<Option<ComponentValType>> = Vec::new();
+                            for decl in decls.iter() {
+                                match decl {
+                                    wasmparser::InstanceTypeDeclaration::Type(t) => {
+                                        let resolved = match t {
+                                            wasmparser::ComponentType::Defined(dt) => {
+                                                match convert_wp_defined_type(dt) {
+                                                    // Substitute local references
+                                                    // NOW so no local index ever
+                                                    // escapes into the component's
+                                                    // namespace (see
+                                                    // `resolve_within_instance_local`).
+                                                    ComponentTypeKind::Defined(v) => {
+                                                        resolve_within_instance_local(&v, &local)
+                                                    }
+                                                    _ => None,
+                                                }
+                                            }
+                                            _ => None,
+                                        };
+                                        local.push(resolved);
+                                    }
+                                    wasmparser::InstanceTypeDeclaration::Export { name, ty } => {
+                                        // `(export (;1;) "torque-setpoint" (type (eq 0)))` — the
+                                        // bound names an earlier local type. NOTE the index on the
+                                        // export ITSELF: a type export allocates a local type index
+                                        // too, so it must push. Skipping that push shifts every
+                                        // later `eq N`, which then resolves the wrong record or
+                                        // none at all — in any instance type exporting more than
+                                        // one type. The real falcon `types` interface exports two,
+                                        // and that is what caught this; the first fixture I wrote
+                                        // had a single type and a single export, so it could not.
+                                        if let wasmparser::ComponentTypeRef::Type(bounds) = ty {
+                                            let resolved = match bounds {
+                                                wasmparser::TypeBounds::Eq(target) => {
+                                                    local.get(*target as usize).cloned().flatten()
+                                                }
+                                                // `(sub resource)` — not a value type.
+                                                wasmparser::TypeBounds::SubResource => None,
+                                            };
+                                            if let Some(v) = &resolved {
+                                                component.instance_type_exports.insert(
+                                                    (ty_idx, name.0.to_string()),
+                                                    v.clone(),
+                                                );
+                                            }
+                                            local.push(resolved);
+                                        }
+                                    }
+                                    // Alias / CoreType declarations still occupy
+                                    // the local index space when they define a
+                                    // type; push a hole so later `eq N` bounds
+                                    // stay correctly aligned rather than
+                                    // silently resolving to the wrong entry.
+                                    wasmparser::InstanceTypeDeclaration::Alias(a) => {
+                                        if matches!(
+                                            a,
+                                            wasmparser::ComponentAlias::Outer {
+                                                kind: wasmparser::ComponentOuterAliasKind::Type,
+                                                ..
+                                            } | wasmparser::ComponentAlias::InstanceExport {
+                                                kind: ComponentExternalKind::Type,
+                                                ..
+                                            }
+                                        ) {
+                                            local.push(None);
+                                        }
+                                    }
+                                    wasmparser::InstanceTypeDeclaration::CoreType(_) => {}
+                                }
+                            }
+                            ComponentTypeKind::Other
+                        }
                         wasmparser::ComponentType::Resource { .. } => ComponentTypeKind::Other,
                     };
                     if let ComponentTypeKind::P3Async(ref desc) = kind {
@@ -1326,6 +1424,79 @@ impl Default for ComponentParser {
     }
 }
 
+/// #393 follow-up (Mythos delta-pass): fully resolve a value type **within an
+/// instance type's own local index space**, before it is stored on the
+/// component.
+///
+/// A type captured from an instance type's declarations may reference other
+/// types declared in that same instance type — `record pose { t: torque }`
+/// stores a `Type(local_idx)` for the field. Storing that verbatim leaves a
+/// local index loose in a component-level structure, and the later size/align
+/// walk resolves it against `component_type_defs` — a DIFFERENT namespace. A
+/// coincidental component-level type at that index then answers as an impostor,
+/// `can_size_exactly` reports true, and the size comes back silently wrong:
+/// exactly the failure #393 exists to remove, reintroduced one level down.
+///
+/// Substituting now makes every stored value self-contained, so no local index
+/// ever escapes. `None` when any part cannot be resolved locally — an alias to
+/// an outer type, say — which the callers treat as unknown and therefore loud.
+///
+/// `local` holds entries that were themselves substituted when pushed, so this
+/// never needs to recurse through a `Type` twice.
+fn resolve_within_instance_local(
+    ty: &ComponentValType,
+    local: &[Option<ComponentValType>],
+) -> Option<ComponentValType> {
+    use ComponentValType as V;
+    Some(match ty {
+        V::Type(i) => local.get(*i as usize)?.clone()?,
+        V::List(inner) => V::List(Box::new(resolve_within_instance_local(inner, local)?)),
+        V::FixedSizeList(inner, n) => {
+            V::FixedSizeList(Box::new(resolve_within_instance_local(inner, local)?), *n)
+        }
+        V::Option(inner) => V::Option(Box::new(resolve_within_instance_local(inner, local)?)),
+        V::Record(fields) => V::Record(
+            fields
+                .iter()
+                .map(|(n, t)| Some((n.clone(), resolve_within_instance_local(t, local)?)))
+                .collect::<Option<Vec<_>>>()?,
+        ),
+        V::Tuple(elems) => V::Tuple(
+            elems
+                .iter()
+                .map(|t| resolve_within_instance_local(t, local))
+                .collect::<Option<Vec<_>>>()?,
+        ),
+        V::Variant(cases) => V::Variant(
+            cases
+                .iter()
+                .map(|(n, t)| {
+                    Some((
+                        n.clone(),
+                        match t {
+                            Some(t) => Some(resolve_within_instance_local(t, local)?),
+                            None => None,
+                        },
+                    ))
+                })
+                .collect::<Option<Vec<_>>>()?,
+        ),
+        V::Result { ok, err } => V::Result {
+            ok: match ok {
+                Some(t) => Some(Box::new(resolve_within_instance_local(t, local)?)),
+                None => None,
+            },
+            err: match err {
+                Some(t) => Some(Box::new(resolve_within_instance_local(t, local)?)),
+                None => None,
+            },
+        },
+        // Primitives, strings, flags and resource handles carry no type index
+        // into the local space.
+        other => other.clone(),
+    })
+}
+
 impl ParsedComponent {
     /// Create an empty `ParsedComponent` with no modules, no imports, etc.
     /// Used as a placeholder when pushing onto the sub-component stack.
@@ -1339,6 +1510,7 @@ impl ParsedComponent {
             instances: Vec::new(),
             canonical_functions: Vec::new(),
             sub_components: Vec::new(),
+            instance_type_exports: std::collections::HashMap::new(),
             component_aliases: Vec::new(),
             component_instances: Vec::new(),
             core_entity_order: Vec::new(),
@@ -1392,6 +1564,66 @@ impl ParsedComponent {
     /// component exports with `(type (eq N))` annotations. Returns `None`
     /// for import-defined or instance-export-alias types that cannot be
     /// resolved locally.
+    /// Resolve a component type index to the value type it ultimately names,
+    /// following `ExportAlias` **and** `InstanceExportAlias` hops (#393).
+    ///
+    /// [`Self::get_type_definition`] stops at an instance-export alias because
+    /// it returns a borrowed `ComponentType`, and the aliased type lives in the
+    /// instance type's own index space rather than this component's. A WIT
+    /// `use types.{torque}` compiles to exactly that alias, so without this hop
+    /// every `use`d record was unresolvable — and an unresolvable type was
+    /// silently sized as 4 bytes, quietly halving a 16-byte return-area copy.
+    ///
+    /// Returns `None` when the type genuinely cannot be resolved. Callers MUST
+    /// treat that as *unknown*, never as a default size: guessing is what made
+    /// #393 a silent wrong answer instead of a loud failure.
+    pub fn resolve_defined_val_type(&self, type_idx: u32) -> Option<ComponentValType> {
+        let mut idx = type_idx;
+        // Bounded like `get_type_definition`: alias chains are acyclic in valid
+        // components, but a hostile input must not spin here.
+        for _ in 0..self.component_type_defs.len().saturating_add(1) {
+            match self.component_type_defs.get(idx as usize)? {
+                ComponentTypeDef::Defined => {
+                    let ct = self.get_type_definition(idx)?;
+                    return match &ct.kind {
+                        ComponentTypeKind::Defined(v) => Some(v.clone()),
+                        _ => None,
+                    };
+                }
+                ComponentTypeDef::ExportAlias(target) => idx = *target,
+                ComponentTypeDef::InstanceExportAlias(alias_idx) => {
+                    let ComponentAliasEntry::InstanceExport {
+                        instance_index,
+                        name,
+                        ..
+                    } = self.component_aliases.get(*alias_idx)?
+                    else {
+                        return None;
+                    };
+                    // Only an IMPORTED instance carries a declared instance type
+                    // whose exports were captured at parse time. An instantiated
+                    // instance's type is structural and not recovered here.
+                    let ComponentInstanceDef::Import(import_idx) =
+                        self.component_instance_defs.get(*instance_index as usize)?
+                    else {
+                        return None;
+                    };
+                    let wasmparser::ComponentTypeRef::Instance(inst_ty_idx) =
+                        self.imports.get(*import_idx)?.ty
+                    else {
+                        return None;
+                    };
+                    return self
+                        .instance_type_exports
+                        .get(&(inst_ty_idx, name.clone()))
+                        .cloned();
+                }
+                ComponentTypeDef::Import(_) => return None,
+            }
+        }
+        None
+    }
+
     pub fn get_type_definition(&self, type_idx: u32) -> Option<&ComponentType> {
         let mut idx = type_idx;
         // Follow ExportAlias chains (bounded to prevent infinite loops)
@@ -3027,10 +3259,8 @@ impl ParsedComponent {
                 disc_size(2).max(oa).max(ea)
             }
             ComponentValType::Type(idx) => {
-                if let Some(ct) = self.get_type_definition(*idx)
-                    && let ComponentTypeKind::Defined(inner) = &ct.kind
-                {
-                    return self.canonical_abi_align(inner);
+                if let Some(inner) = self.resolve_defined_val_type(*idx) {
+                    return self.canonical_abi_align(&inner);
                 }
                 4
             }
@@ -3156,14 +3386,52 @@ impl ParsedComponent {
                 }
             }
             ComponentValType::Type(idx) => {
-                if let Some(ct) = self.get_type_definition(*idx)
-                    && let ComponentTypeKind::Defined(inner) = &ct.kind
-                {
-                    return self.canonical_abi_size_unpadded(inner);
+                // #393: follows instance-export aliases too, so a `use`d record
+                // resolves. The bare `4` remains only for a genuinely
+                // unresolvable type; `can_size_exactly` is what stops that
+                // guess from reaching a memory.copy length.
+                if let Some(inner) = self.resolve_defined_val_type(*idx) {
+                    return self.canonical_abi_size_unpadded(&inner);
                 }
                 4
             }
             ComponentValType::Own(_) | ComponentValType::Borrow(_) => 4,
+        }
+    }
+
+    /// Can every type here be sized EXACTLY, or does some part of it fall back
+    /// to a guess? (#393)
+    ///
+    /// `canonical_abi_size_unpadded` returns a `u32` with no error channel, so
+    /// an unresolvable type silently contributes 4 bytes. That number is
+    /// plausible, which is precisely what made it dangerous: it flowed into a
+    /// `memory.copy` length and halved a 16-byte record without tripping
+    /// validation. Callers that are about to size a real copy ask this first,
+    /// and treat `false` as *unknown* — a loud failure — rather than sizing
+    /// from the guess.
+    pub fn can_size_exactly(&self, ty: &ComponentValType) -> bool {
+        match ty {
+            ComponentValType::Type(idx) => match self.resolve_defined_val_type(*idx) {
+                Some(inner) => self.can_size_exactly(&inner),
+                None => false,
+            },
+            ComponentValType::Record(fields) => {
+                fields.iter().all(|(_, t)| self.can_size_exactly(t))
+            }
+            ComponentValType::Tuple(elems) => elems.iter().all(|t| self.can_size_exactly(t)),
+            ComponentValType::List(inner) | ComponentValType::FixedSizeList(inner, _) => {
+                self.can_size_exactly(inner)
+            }
+            ComponentValType::Option(inner) => self.can_size_exactly(inner),
+            ComponentValType::Variant(cases) => cases
+                .iter()
+                .all(|(_, t)| t.as_ref().is_none_or(|t| self.can_size_exactly(t))),
+            ComponentValType::Result { ok, err } => {
+                ok.as_ref().is_none_or(|t| self.can_size_exactly(t))
+                    && err.as_ref().is_none_or(|t| self.can_size_exactly(t))
+            }
+            // Primitives, strings, flags and handles are sized by construction.
+            _ => true,
         }
     }
 
@@ -4236,6 +4504,7 @@ mod tests {
             instances: vec![],
             canonical_functions: vec![],
             sub_components: vec![],
+            instance_type_exports: Default::default(),
             component_aliases: vec![],
             component_instances: vec![],
             core_entity_order: vec![],
@@ -5933,6 +6202,7 @@ mod tests {
             instances: vec![],
             canonical_functions: vec![],
             sub_components: vec![],
+            instance_type_exports: Default::default(),
             component_aliases: vec![],
             component_instances: vec![],
             core_entity_order: vec![],

@@ -3145,3 +3145,68 @@ artifacts:
       references:
         - "https://github.com/pulseengine/meld/issues/390"
         - "meld-core/tests/record_boundary_390.rs"
+
+  - id: SR-72
+    type: sw-req
+    title: A type reached through `use` is sized exactly, never guessed
+    description: >
+      meld shall resolve a Canonical ABI value type that is reached through an
+      instance-export alias — what WIT's `use types.{torque}` compiles to — and
+      shall never substitute a default size for a type it cannot resolve.
+      Type resolution previously followed `Defined` and `ExportAlias` chains only
+      and stopped at `InstanceExportAlias`, leaving every `use`d record
+      unresolvable. An unresolvable type was then sized as 4 bytes: a plausible
+      number, which is what made it dangerous. That single guess produced two
+      unrelated-looking failures from one cause. On the cross-memory path the
+      return-area size defaulted to 8, so a 16-byte record was copied as 8 — the
+      fused module validated, ran without trapping, and returned a value whose
+      later fields were zero. On the same-memory path the resolver recorded the
+      size only when it exceeded 4, so the size stayed unknown and the SR-71
+      bridge refused; that refusal is the only reason the defect was visible at
+      all.
+      Accordingly: (a) instance types shall have their exported value types
+      captured at parse time, including the local type index a type export
+      itself allocates — an implementation that omits that allocation resolves
+      the first exported type correctly and every later one wrongly; (b) a size
+      shall be recorded only when every component of the type is exactly
+      sizeable, rather than inferred from the magnitude of a possibly-guessed
+      result; (c) an unknown return-area size shall be a hard error on every
+      adapter path; and (d) a value type captured from an instance type shall be
+      resolved WITHIN that instance type's own index space before being stored,
+      so no local type index escapes into the component-level namespace where an
+      unrelated type could answer in its place. Silently emitting a short copy is prohibited — a fused module
+      that computes the wrong answer without trapping is the most severe failure
+      this tool can produce, strictly worse than the invalid output of SR-71.
+    status: verified
+    tags: [canonical-abi, parser, resolver, adapter, loud-not-silent, correctness]
+    release: v0.54.0
+    links:
+      - type: derives-from
+        target: SYS-6
+      - type: refines
+        target: SR-71
+    cited-source:
+      - uri: "https://github.com/pulseengine/meld/issues/393"
+        kind: github
+        last-checked: 2026-09-05
+    fields:
+      implementation:
+        - meld-core/src/parser.rs
+        - meld-core/src/resolver.rs
+        - meld-core/src/adapter/fact.rs
+      verification-method: test
+      verification-description: >
+        Verified by meld-core/tests/used_type_size_393.rs (4 tests) on a hermetic
+        wasm-tools+wac fixture whose `types` interface exports THREE records: the
+        function under test returns the SECOND — the shape required to catch a
+        missing type-index allocation — and a second function returns a NESTED
+        record, so a type reference that escaped its index space is exercised
+        rather than assumed absent. The cross-memory case executes and must return 26;
+        before the fix it returned 7 (3 + 4 + 0 + 0) while validating cleanly.
+        Negative control run twice: removing the export index allocation makes
+        the two-record fixture fail, while the earlier single-record fixture
+        still reported success — recorded because it shows the fixture, not the
+        assertion, was doing the work.
+      references:
+        - "https://github.com/pulseengine/meld/issues/393"
+        - "meld-core/tests/used_type_size_393.rs"

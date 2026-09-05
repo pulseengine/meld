@@ -1513,6 +1513,7 @@ mod tests {
             instances: vec![],
             canonical_functions,
             sub_components: vec![],
+            instance_type_exports: Default::default(),
             component_aliases: vec![],
             component_instances: vec![],
             core_entity_order: vec![],
