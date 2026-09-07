@@ -3210,3 +3210,62 @@ artifacts:
       references:
         - "https://github.com/pulseengine/meld/issues/393"
         - "meld-core/tests/used_type_size_393.rs"
+
+  - id: SR-73
+    type: sw-req
+    title: The single-address-space paths validate their own output
+    description: >
+      meld shall validate the fused module before writing it whenever the memory
+      strategy is `shared` — and therefore under `--address-rebase`,
+      `--pack-rebase` and `--share-stack`, which require it. A module that fails
+      validation shall NOT be written: an invalid artifact on disk fails later,
+      in whatever consumes it, far from the cause.
+      This is the path on which meld rewrites most invasively, rebasing absolute
+      addresses and bridging calling conventions inside one address space, and it
+      is where the defects of the two preceding releases surfaced — SR-71 emitted
+      a module that failed validation at exit 0, and SR-72 emitted one that
+      validated and returned a wrong value. Validation catches the first class
+      outright and costs a single wasmparser pass over an artifact already in
+      memory. The consumer who reported both stated they would have caught the
+      earlier defect months sooner had this been the default.
+      An explicit opt-out (`--no-validate`) shall be honoured on every strategy,
+      and an explicit `--validate` shall force validation on strategies that do
+      not imply it. The two shall be mutually exclusive rather than silently
+      ordered, so a caller cannot express a contradiction and receive one of the
+      two readings without being told.
+      Validation is not claimed to establish correctness: SR-72's defect produced
+      a fully valid module with wrong contents. It establishes only that the
+      output is well-formed, which is a floor, not a ceiling.
+    status: verified
+    tags: [cli, validation, loud-not-silent, correctness]
+    release: v0.55.0
+    links:
+      - type: derives-from
+        target: SYS-6
+      - type: refines
+        target: SR-71
+      - type: refines
+        target: SR-72
+    cited-source:
+      - uri: "https://github.com/pulseengine/meld/issues/390"
+        kind: github
+        last-checked: 2026-09-05
+    fields:
+      implementation:
+        - meld-cli/src/main.rs
+      verification-method: test
+      verification-description: >
+        Verified by the exhaustive implication table in meld-cli
+        (`validate_default_tests`): three strategies against both opt-out states,
+        every case enumerated rather than sampled, plus an assertion that the
+        opt-out wins on every strategy. Potency established by making it fire:
+        with SR-71's bridge dispatch AND the wiring backstop both disabled — so
+        an invalid module is actually produced and validation is the only guard
+        left — `--memory shared` reports `Validation failed: type mismatch:
+        expected f32, found i32` and writes no file. Recorded also that the FIRST
+        attempt at that control never reached validation, because the wiring
+        backstop caught the defect earlier: a control that passes for the wrong
+        reason proves nothing.
+      references:
+        - "https://github.com/pulseengine/meld/issues/390"
+        - "https://github.com/pulseengine/meld/issues/391"

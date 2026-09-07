@@ -156,9 +156,23 @@ enum Commands {
         #[arg(long)]
         preserve_names: bool,
 
-        /// Validate output with wasmparser
+        /// Validate output with wasmparser. Implied on the single-address-space
+        /// paths (`--memory shared`, and therefore `--address-rebase`,
+        /// `--pack-rebase`, `--share-stack`); pass this to force it elsewhere.
         #[arg(long)]
         validate: bool,
+
+        /// Skip the validation that `--memory shared` implies.
+        ///
+        /// Validation is on by default there because that is where meld does its
+        /// most invasive rewriting — rebasing addresses and bridging calling
+        /// conventions inside one address space — and a defect shows up as a
+        /// module that no runtime accepts. #390 and #393 both shipped as invalid
+        /// or wrong output at exit 0; the reporter noted they would have caught
+        /// the first months earlier had this been the default. The cost is one
+        /// wasmparser pass over an artifact just built.
+        #[arg(long, conflicts_with = "validate")]
+        no_validate: bool,
 
         /// Output as P2 component instead of core module
         #[arg(long)]
@@ -257,6 +271,7 @@ fn main() -> Result<()> {
             dwarf,
             preserve_names,
             validate,
+            no_validate,
             component,
             emit_import_map,
             opaque_rep,
@@ -281,6 +296,7 @@ fn main() -> Result<()> {
                 dwarf,
                 preserve_names,
                 validate,
+                no_validate,
                 component,
                 emit_import_map,
                 opaque_rep,
@@ -362,6 +378,7 @@ fn fuse_command(
     dwarf: String,
     preserve_names: bool,
     validate: bool,
+    no_validate: bool,
     component: bool,
     emit_import_map: Option<String>,
     opaque_rep: Vec<String>,
@@ -567,10 +584,27 @@ fn fuse_command(
 
     let elapsed = start.elapsed();
 
-    // Validate if requested
-    if validate {
+    // Validate the output.
+    //
+    // On by default for the single-address-space paths, because that is where
+    // meld rewrites most invasively — rebasing absolute addresses and bridging
+    // calling conventions within one memory — and where a defect surfaces as a
+    // module no runtime will accept. #390 emitted invalid wasm at exit 0 and
+    // #393 emitted a module that validated and returned the wrong number; both
+    // reached a consumer. The cost of catching the first class is one
+    // wasmparser pass over an artifact already in memory.
+    //
+    // `--validate` forces it on any path; `--no-validate` opts out.
+    let implied = validation_is_implied(&memory_strategy, no_validate);
+    if validate || implied {
         println!();
-        println!("Validating output...");
+        if implied && !validate {
+            println!("Validating output (implied by --memory shared; --no-validate to skip)...");
+        } else {
+            println!("Validating output...");
+        }
+        // Before the write: a module that fails here must not become a file
+        // somebody can pick up.
         validate_wasm(&fused_bytes)?;
         println!("  Validation passed");
     }
@@ -1129,5 +1163,65 @@ mod tests {
         assert_eq!(arr[1]["name"], "[method]output-stream.write");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// Does the memory strategy imply validating the output? (#390 / #391)
+///
+/// Pulled out as a total function over its two inputs so the decision can be
+/// enumerated rather than reasoned about: three strategies x two opt-out states
+/// is six cases, all covered below. meld#397 makes the case that meld's own
+/// decision seams deserve this treatment; this is a small one, so it gets it.
+fn validation_is_implied(strategy: &MemoryStrategy, no_validate: bool) -> bool {
+    if no_validate {
+        return false;
+    }
+    // Shared memory is where meld rebases absolute addresses and bridges
+    // calling conventions inside one address space — the rewriting whose
+    // failures (#390, #393) reached consumers as invalid or wrong output.
+    // `--memory multi` leaves each module's memory alone, so its output is not
+    // exposed to that class and validation stays opt-in there.
+    matches!(strategy, MemoryStrategy::SharedMemory)
+}
+
+#[cfg(test)]
+mod validate_default_tests {
+    use super::*;
+
+    /// Every combination, not a sample: the point of a total function is that
+    /// its table can be written down.
+    // rivet: verifies SR-73
+    #[test]
+    fn validation_implication_table() {
+        use MemoryStrategy::*;
+        for (strategy, no_validate, expected) in [
+            (SharedMemory, false, true),
+            (SharedMemory, true, false),
+            (MultiMemory, false, false),
+            (MultiMemory, true, false),
+            (Auto, false, false),
+            (Auto, true, false),
+        ] {
+            assert_eq!(
+                validation_is_implied(&strategy, no_validate),
+                expected,
+                "strategy={strategy:?} no_validate={no_validate}"
+            );
+        }
+    }
+
+    /// The opt-out must win regardless of strategy — otherwise `--no-validate`
+    /// silently does nothing on exactly the path where someone would reach for
+    /// it.
+    // rivet: verifies SR-73
+    #[test]
+    fn no_validate_always_wins() {
+        for strategy in [
+            MemoryStrategy::SharedMemory,
+            MemoryStrategy::MultiMemory,
+            MemoryStrategy::Auto,
+        ] {
+            assert!(!validation_is_implied(&strategy, true));
+        }
     }
 }

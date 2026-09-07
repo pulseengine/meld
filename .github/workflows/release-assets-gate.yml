@@ -1,0 +1,79 @@
+name: Release assets gate
+
+# A published release must actually carry the artifacts people came for.
+#
+# v0.53.0 was published with ONE asset — the compliance report — and a consumer
+# fetched it in that state (#395). The cause was ordering, not a build failure:
+# the documented release steps had a human run `gh release create` right after
+# the tag push, which PUBLISHES immediately. `compliance.yml` triggers on
+# `release: published`, so it fired at once and uploaded its report, while
+# `release.yml` (triggered by the tag push) was still queued behind a busy
+# runner fleet. The binaries arrived minutes later. In between, the release was
+# public and unconsumable.
+#
+# The process fix is to create the release as a DRAFT and publish only once the
+# assets are in (see AGENTS.md). This is the check that makes forgetting loud
+# rather than silent — a documented step nobody verifies is exactly the class of
+# gate this repo keeps finding at the wrong moment.
+#
+# It runs AFTER publication, so it cannot prevent a bad release; it reports one.
+# That is deliberate: GitHub gives no pre-publish hook, and a loud alarm minutes
+# after the fact still beats a consumer discovering it.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to audit (e.g. v0.55.0)'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  assets:
+    name: Release assets gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Assert the release carries its artifacts
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REL_TAG: ${{ github.event.release.tag_name }}
+          INPUT_TAG: ${{ inputs.tag }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          TAG="${INPUT_TAG:-$REL_TAG}"
+          echo "Auditing $TAG"
+
+          NAMES="$(gh release view "$TAG" --repo "$REPO" --json assets --jq '.assets[].name')"
+          echo "Assets present:"
+          printf '%s\n' "$NAMES" | sed 's/^/  /'
+
+          # `compliance.yml` also fires on publish and is additive, so it is not
+          # required here; these are the artifacts the release exists to deliver.
+          missing=0
+          require() {
+            if ! printf '%s\n' "$NAMES" | grep -qF "$1"; then
+              echo "::error::missing release asset matching '$1'"
+              missing=1
+            fi
+          }
+          for target in \
+            aarch64-apple-darwin aarch64-unknown-linux-gnu \
+            x86_64-apple-darwin x86_64-unknown-linux-gnu
+          do
+            require "$target.tar.gz"
+          done
+          require "SHA256SUMS.txt"
+          require "SHA256SUMS.txt.cosign.bundle"
+
+          if [ "$missing" -ne 0 ]; then
+            echo "::error::$TAG is published but incomplete — consumers can fetch it in this state (#395)."
+            exit 1
+          fi
+          echo "$TAG carries its platform binaries, checksums and signature bundle."
