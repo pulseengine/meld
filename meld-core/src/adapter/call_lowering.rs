@@ -164,6 +164,174 @@ mod tests {
         }
     }
 
+    /// The whole truth table — all 128 combinations of the seven facts, checked
+    /// against the DOCUMENTED rules rather than against the implementation.
+    ///
+    /// #397: this seam decides how every fused call is lowered, and it is where
+    /// #390 lived — an inline guard that a comment claimed was a superset of the
+    /// Direct generator's trigger and was not. Nine example-based tests covered
+    /// nine of 128 points; the rule the defect violated was not one of them.
+    ///
+    /// The seam is a total function over booleans, so the table can simply be
+    /// written down. That is the argument #397 makes for meld's own decision
+    /// points, and this is the one that has already cost a release.
+    #[test]
+    fn every_combination_obeys_the_documented_rules() {
+        for bits in 0u8..128 {
+            let facts = BoundaryFacts {
+                crosses_memory: bits & 1 != 0,
+                needs_transcoding: bits & 2 != 0,
+                inline_adapters: bits & 4 != 0,
+                has_resource_rep_calls: bits & 8 != 0,
+                has_resource_new_calls: bits & 16 != 0,
+                has_post_return: bits & 32 != 0,
+                signatures_match: bits & 64 != 0,
+            };
+            let plan = resolve_call_lowering_plan(facts).unwrap();
+
+            // Class selection, exactly as the doc comment states it.
+            let expected_class = if facts.needs_transcoding {
+                AdapterClass::Transcode
+            } else if facts.crosses_memory {
+                AdapterClass::MemoryCopy
+            } else {
+                AdapterClass::Direct
+            };
+            assert_eq!(plan.class, expected_class, "class for {facts:?}");
+
+            // An encoding mismatch outranks memory: transcoding is required
+            // whether or not the boundary crosses a memory (#361).
+            if facts.needs_transcoding {
+                assert_eq!(plan.class, AdapterClass::Transcode, "#361: {facts:?}");
+            }
+
+            // Inline eligibility, as the doc comment states it.
+            let expected_inline = facts.inline_adapters
+                && expected_class == AdapterClass::Direct
+                && !facts.has_resource_rep_calls
+                && !facts.has_resource_new_calls
+                && !facts.has_post_return
+                && facts.signatures_match;
+            assert_eq!(
+                plan.inline_eligible, expected_inline,
+                "inline for {facts:?}"
+            );
+
+            // The invariants the generators rely on, stated independently of
+            // the formula above so a wrong formula cannot satisfy both.
+            if plan.inline_eligible {
+                assert_eq!(
+                    plan.class,
+                    AdapterClass::Direct,
+                    "only Direct is ever inlinable: {facts:?}"
+                );
+                assert!(
+                    facts.inline_adapters,
+                    "inlined with inlining off: {facts:?}"
+                );
+                assert!(
+                    facts.signatures_match,
+                    "#390: inlined a boundary needing a convention bridge: {facts:?}"
+                );
+                assert!(
+                    !facts.has_post_return,
+                    "inlining would skip post-return cleanup: {facts:?}"
+                );
+                assert!(
+                    !facts.has_resource_rep_calls && !facts.has_resource_new_calls,
+                    "inlining would skip resource conversions: {facts:?}"
+                );
+            }
+        }
+    }
+
+    /// Each fact must be able to change the outcome on its own — otherwise the
+    /// table above is satisfied by a function that ignores it. Flips one bit at
+    /// a time from a baseline where every fact is live.
+    #[test]
+    fn every_fact_independently_affects_the_outcome() {
+        // Baseline: same memory, same encoding, inlining on, nothing else set —
+        // the one combination that is eligible.
+        let base = BoundaryFacts {
+            crosses_memory: false,
+            needs_transcoding: false,
+            inline_adapters: true,
+            has_resource_rep_calls: false,
+            has_resource_new_calls: false,
+            has_post_return: false,
+            signatures_match: true,
+        };
+        let baseline = resolve_call_lowering_plan(base).unwrap();
+        assert!(
+            baseline.inline_eligible,
+            "baseline must be the eligible case"
+        );
+
+        let flips: [(&str, BoundaryFacts); 6] = [
+            (
+                "crosses_memory",
+                BoundaryFacts {
+                    crosses_memory: true,
+                    ..base
+                },
+            ),
+            (
+                "needs_transcoding",
+                BoundaryFacts {
+                    needs_transcoding: true,
+                    ..base
+                },
+            ),
+            (
+                "inline_adapters",
+                BoundaryFacts {
+                    inline_adapters: false,
+                    ..base
+                },
+            ),
+            (
+                "has_resource_rep_calls",
+                BoundaryFacts {
+                    has_resource_rep_calls: true,
+                    ..base
+                },
+            ),
+            (
+                "has_post_return",
+                BoundaryFacts {
+                    has_post_return: true,
+                    ..base
+                },
+            ),
+            (
+                "signatures_match",
+                BoundaryFacts {
+                    signatures_match: false,
+                    ..base
+                },
+            ),
+        ];
+        for (name, facts) in flips {
+            let plan = resolve_call_lowering_plan(facts).unwrap();
+            assert!(
+                !plan.inline_eligible,
+                "flipping `{name}` alone must change the outcome — if it does not, \
+                 the seam ignores it and the truth table above proves nothing"
+            );
+        }
+        // `has_resource_new_calls` gets the same treatment; kept separate only
+        // because the array above is already at its readable limit.
+        let plan = resolve_call_lowering_plan(BoundaryFacts {
+            has_resource_new_calls: true,
+            ..base
+        })
+        .unwrap();
+        assert!(
+            !plan.inline_eligible,
+            "flipping `has_resource_new_calls` alone"
+        );
+    }
+
     #[test]
     fn same_memory_is_direct_and_inlinable() {
         let plan = resolve_call_lowering_plan(direct()).unwrap();
