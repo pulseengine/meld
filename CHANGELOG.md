@@ -4,6 +4,28 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.55.1] - 2026-09-09
+
+### Fixed
+- **The attestation reported a count the caller could not check (SR-74, #401).**
+  `components_fused` read meld's *flattened* component list, which gains an
+  entry per nested sub-component — five input files were attested as ten
+  components. v0.55.0 corrected the console line and not this, which made it
+  worse rather than better: for one run the tool printed one number and shipped
+  another. As the reporter put it, two disagreeing numbers read as two
+  independent facts rather than one number and one bug. `modules_merged` was
+  correct throughout and continues to answer the separate question of internal
+  structure.
+
+### Documentation
+- **`--reproducible` also replaces attested input names (#401).** The help text
+  described only the attestation id and timestamp, but the flag additionally
+  substitutes a positional identifier (`component-0`, ...) for each input name,
+  because a caller-supplied path differs between checkouts and would otherwise
+  change the output hash (#341). Input content stays pinned by its recorded
+  sha256, but a provenance story that depends on the names themselves loses them
+  under this flag. The behaviour is deliberate; the documentation was not.
+
 ## [0.55.0] - 2026-09-05
 
 ### Changed
