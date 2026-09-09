@@ -6287,3 +6287,139 @@ mod tests {
         assert_eq!(comp.flat_count(&flags_ty.unwrap()), 1);
     }
 }
+#[cfg(test)]
+mod sizing_seam_tests {
+    use super::*;
+
+    /// A type index that resolves to nothing on an empty component.
+    const UNRESOLVABLE: ComponentValType = ComponentValType::Type(9999);
+
+    fn resolvable() -> ComponentValType {
+        ComponentValType::Primitive(PrimitiveValType::U32)
+    }
+
+    /// Compile-time tripwire (#397). Deliberately has NO wildcard arm: adding a
+    /// variant to `ComponentValType` breaks this test, which forces whoever adds
+    /// it to decide whether `can_size_exactly` must recurse into it.
+    ///
+    /// That matters because `can_size_exactly` ends in `_ => true`. A new
+    /// container variant would fall into it and report "exactly sizeable" while
+    /// holding a type nothing can size — reintroducing #393 one level down,
+    /// silently, with no test failing.
+    fn variant_name(ty: &ComponentValType) -> &'static str {
+        match ty {
+            ComponentValType::Primitive(_) => "Primitive",
+            ComponentValType::String => "String",
+            ComponentValType::List(_) => "List",
+            ComponentValType::FixedSizeList(_, _) => "FixedSizeList",
+            ComponentValType::Record(_) => "Record",
+            ComponentValType::Flags(_) => "Flags",
+            ComponentValType::Variant(_) => "Variant",
+            ComponentValType::Tuple(_) => "Tuple",
+            ComponentValType::Option(_) => "Option",
+            ComponentValType::Result { .. } => "Result",
+            ComponentValType::Own(_) => "Own",
+            ComponentValType::Borrow(_) => "Borrow",
+            ComponentValType::Type(_) => "Type",
+        }
+    }
+
+    /// Every container wrapping the given type, one per container variant.
+    fn wrapped_in_every_container(inner: ComponentValType) -> Vec<ComponentValType> {
+        vec![
+            ComponentValType::List(Box::new(inner.clone())),
+            ComponentValType::FixedSizeList(Box::new(inner.clone()), 4),
+            ComponentValType::Record(vec![("f".into(), inner.clone())]),
+            ComponentValType::Tuple(vec![inner.clone()]),
+            ComponentValType::Option(Box::new(inner.clone())),
+            ComponentValType::Variant(vec![("c".into(), Some(inner.clone()))]),
+            ComponentValType::Result {
+                ok: Some(Box::new(inner.clone())),
+                err: None,
+            },
+            ComponentValType::Result {
+                ok: None,
+                err: Some(Box::new(inner)),
+            },
+        ]
+    }
+
+    /// An unresolvable type must poison EVERY container that can hold one.
+    ///
+    /// A container that forgets to recurse reports its contents as exactly
+    /// sizeable, the resolver records a size derived from the 4-byte fallback,
+    /// and a `memory.copy` runs with a wrong length — which is precisely how
+    /// #393 produced a module that validated and returned the wrong number.
+    #[test]
+    fn an_unresolvable_type_poisons_every_container() {
+        let c = ParsedComponent::empty();
+        assert!(
+            !c.can_size_exactly(&UNRESOLVABLE),
+            "an unresolvable type is not exactly sizeable"
+        );
+        for ty in wrapped_in_every_container(UNRESOLVABLE) {
+            assert!(
+                !c.can_size_exactly(&ty),
+                "#397/#393: {} does not propagate un-sizeability — a type nothing \
+                 can size would be reported as exactly sizeable, and its 4-byte \
+                 fallback would reach a memory.copy length",
+                variant_name(&ty)
+            );
+        }
+    }
+
+    /// The mirror: a resolvable type must NOT be poisoned. Without this, a
+    /// `can_size_exactly` that simply returned `false` would satisfy the test
+    /// above while disabling sizing entirely.
+    #[test]
+    fn a_resolvable_type_stays_sizeable_in_every_container() {
+        let c = ParsedComponent::empty();
+        assert!(c.can_size_exactly(&resolvable()));
+        for ty in wrapped_in_every_container(resolvable()) {
+            assert!(
+                c.can_size_exactly(&ty),
+                "{} wrongly reports a plain u32 as un-sizeable",
+                variant_name(&ty)
+            );
+        }
+    }
+
+    /// Nesting must not launder an unresolvable type. One level of recursion
+    /// per container is not enough if the poison sits three deep.
+    #[test]
+    fn nesting_does_not_launder_an_unresolvable_type() {
+        let c = ParsedComponent::empty();
+        let deep = ComponentValType::Record(vec![(
+            "outer".into(),
+            ComponentValType::Option(Box::new(ComponentValType::Tuple(vec![
+                resolvable(),
+                ComponentValType::List(Box::new(UNRESOLVABLE)),
+            ]))),
+        )]);
+        assert!(
+            !c.can_size_exactly(&deep),
+            "#397: un-sizeability must survive nesting, not just one level"
+        );
+    }
+
+    /// Leaves that are sized by construction stay so — they have no inner type
+    /// to poison, and treating them as un-sizeable would refuse valid fusions.
+    #[test]
+    fn leaves_are_sizeable_by_construction() {
+        let c = ParsedComponent::empty();
+        for ty in [
+            ComponentValType::Primitive(PrimitiveValType::Bool),
+            ComponentValType::Primitive(PrimitiveValType::F64),
+            ComponentValType::String,
+            ComponentValType::Flags(vec!["a".into(), "b".into()]),
+            ComponentValType::Own(0),
+            ComponentValType::Borrow(0),
+        ] {
+            assert!(
+                c.can_size_exactly(&ty),
+                "{} is sized by construction",
+                variant_name(&ty)
+            );
+        }
+    }
+}
