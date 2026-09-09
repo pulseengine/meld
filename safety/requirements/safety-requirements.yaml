@@ -3269,3 +3269,46 @@ artifacts:
       references:
         - "https://github.com/pulseengine/meld/issues/390"
         - "https://github.com/pulseengine/meld/issues/391"
+
+  - id: SR-74
+    type: sw-req
+    title: The attestation reports counts the caller can check
+    description: >
+      A quantity recorded in the fusion attestation shall be one the caller can
+      independently verify, and shall not contradict what the same run reported
+      on the console. `components_fused` shall count the components the caller
+      supplied, not meld's flattened internal list, which gains an entry per
+      nested sub-component; `modules_merged` continues to answer the separate
+      question of internal structure.
+      The two fields answer different questions and shall stay distinct.
+      This corrects a state in which five input files were attested as ten
+      components. The console line was fixed first, which made the defect worse
+      rather than better: for one run the tool printed one number and shipped
+      another, and a reader has no way to tell which is the measurement and
+      which is the bug. An attested quantity that disagrees with the tool's own
+      output is not merely inaccurate — it presents as two independent facts.
+    status: verified
+    tags: [attestation, traceability, observability, correctness]
+    release: v0.55.1
+    links:
+      - type: derives-from
+        target: SYS-6
+      - type: refines
+        target: SR-69
+    cited-source:
+      - uri: "https://github.com/pulseengine/meld/issues/401"
+        kind: github
+        last-checked: 2026-09-09
+    fields:
+      implementation:
+        - meld-core/src/lib.rs
+      verification-method: test
+      verification-description: >
+        Verified by meld-core/tests/attestation_counts_401.rs (2 tests): the
+        attested count equals the caller's input count, and `modules_merged`
+        stays independent. The first test additionally asserts that the fixture
+        genuinely nests (flattened > inputs), so that if flattening ever stopped
+        adding entries the assertion would fail loudly rather than pass while
+        proving nothing.
+      references:
+        - "https://github.com/pulseengine/meld/issues/401"
