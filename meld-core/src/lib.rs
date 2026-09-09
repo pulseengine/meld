@@ -963,7 +963,17 @@ impl Fuser {
         }
 
         let mut stats = FusionStats {
-            components_fused: self.components.len(),
+            // #401: the components the CALLER fused, not the flattened list.
+            //
+            // This is the number that travels in the attestation and that an
+            // auditor reasons from, so it must be the one they can check: the
+            // files they passed. Reading `self.components` reported 10 for five
+            // inputs, because flattening adds an entry per nested sub-component
+            // — and after the console line was corrected in v0.55.0 the two
+            // disagreed for the same run, which reads as two independent facts
+            // rather than one number and one bug. `modules_merged` already
+            // carries the internal structure.
+            components_fused: self.original_components.len(),
             memory_strategy: self.memory_strategy_label().to_string(),
             ..Default::default()
         };

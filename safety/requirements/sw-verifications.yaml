@@ -1307,3 +1307,19 @@ artifacts:
     links:
       - type: verifies
         target: SR-73
+
+  - id: SWV-86
+    type: sw-verification
+    title: "Verification of SR-74: attested counts are checkable"
+    description: >
+      Verifies SR-74 via meld-core/tests/attestation_counts_401.rs (2 tests):
+      `components_fused` equals the caller's input count rather than the
+      flattened list, and `modules_merged` remains an independent measure of
+      internal structure. The first test guards its own potency by asserting the
+      fixture actually nests, so the equality cannot pass vacuously.
+    status: implemented
+    fields:
+      method: automated-test
+    links:
+      - type: verifies
+        target: SR-74

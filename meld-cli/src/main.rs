@@ -129,6 +129,13 @@ enum Commands {
         /// id from the output content and take the timestamp from
         /// `SOURCE_DATE_EPOCH` (default epoch 0) instead of a random UUID +
         /// wall clock, so identical input yields an identical sha256.
+        ///
+        /// Also replaces each attested input NAME with a positional identifier
+        /// (`component-0`, `component-1`, ...), because a caller-supplied path
+        /// differs between checkouts and would otherwise change the hash (#341).
+        /// Input content stays pinned by its recorded sha256, but if your
+        /// provenance story depends on the input names themselves, they are not
+        /// preserved under this flag.
         #[arg(long)]
         reproducible: bool,
 
