@@ -1323,3 +1323,18 @@ artifacts:
     links:
       - type: verifies
         target: SR-74
+
+  - id: SWV-87
+    type: sw-verification
+    title: "Verification of SR-75: attested inputs are the caller's inputs"
+    status: implemented
+    description: "Verifies SR-75 via meld-core/tests/attested_inputs_413.rs (5 tests), each fusing through Fuser::fuse_with_stats and reading the attestation back out of the fused artifact rather than calling the builder. Oracles are independent of meld: sha256 and length of the fixture files. Covers a composed input (every hash was empty) and two flat files (half were phantoms). Negative controls, each with the injection proven to have landed by diff before the result was trusted: reverting the attested-input source to the flattened list fails four tests, the hash test failing on the EMPTY HASH rather than a count; reverting only input_size fails exactly the input_size test (0 vs 1698) while the other four stay green. A first attempt at the second control silently did not inject, because cargo fmt had reformatted the target line, and would have reported a pass against fixed code."
+    fields:
+      method: automated-test
+    links:
+      - type: verifies
+        target: SR-75
+    provenance:
+      created-by: ai-assisted
+      model: claude-opus-5
+      timestamp: 2026-09-16T17:35:27Z

@@ -137,9 +137,7 @@ artifacts:
   - id: SYSV-10
     type: sys-verification
     title: "System verification of SYS-10: Attestation integrity"
-    description: >
-      component_provenance.rs verifies the attestation records a complete,
-      round-trippable binding of input hash, configuration and output hash.
+    description: "attested_inputs_413.rs verifies, by fusing through Fuser::fuse_with_stats and reading the attestation back out of the fused artifact, that every attested input carries the sha256 of the file the caller passed (checked against an independent sha256 of the fixture, not against meld), with its real size and module count, and that input_size is the caller's bytes. CORRECTED 2026-09-16 (#413): this previously named component_provenance.rs, which tests the separate component-provenance custom section and never parses the attestation payload; the one pre-existing input-hash test called FusionAttestationBuilder directly, below the defect, and passed while every shipped artifact attested empty input hashes for composed inputs."
     status: implemented
     fields:
       method: automated-test

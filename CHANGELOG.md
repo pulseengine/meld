@@ -4,6 +4,36 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.56.0] - 2026-09-16
+
+### Fixed
+- **The attestation recorded empty input hashes (SR-75, #413).** For a composed
+  input — the `meld fuse composed.wasm` pipeline the README documents — every
+  attested input carried `hash: ""` and `size: 0`, and the real input's sha256
+  appeared nowhere in the artifact. The supply-chain record bound nothing while
+  presenting as a well-formed attestation at exit 0. Two flat input files
+  produced four entries, two of them phantoms with no hash.
+
+  Both attestation builders iterated meld's *flattened* component list, which
+  gains an entry per nested sub-component; those synthesized children carry no
+  source bytes. Inputs are now the components the caller passed, with their real
+  sha256, size and total core-module count — a nested input's modules are spread
+  across its flattened children, so the count is summed rather than taken from
+  one entry. Both builders read one shared source and cannot diverge again.
+
+  This is the sibling v0.55.1 missed: it moved `components_fused` to the caller's
+  count and left `inputs[]` on the flattened list, so one record could report two
+  components beside four inputs.
+
+- **`input_size` was 0 for a composed input**, for the same reason, and fed a
+  false `size_reduction_percent` into the attestation. It is now the bytes the
+  caller passed. (Found while measuring the above; not in the original report.)
+
+### Changed
+- Under `--reproducible`, positional input names (`component-N`) now count
+  **inputs** rather than flattened sub-components, so a single composed input is
+  `component-0` instead of `component-0` through `component-3`.
+
 ## [0.55.1] - 2026-09-09
 
 ### Fixed
