@@ -4,6 +4,55 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.56.0] - 2026-09-16
+
+### Fixed
+- **The attestation recorded empty input hashes (SR-75, #413).** For a composed
+  input — the `meld fuse composed.wasm` pipeline the README documents — every
+  attested input carried `hash: ""` and `size: 0`, and the real input's sha256
+  appeared nowhere in the artifact. The supply-chain record bound nothing while
+  presenting as a well-formed attestation at exit 0. Two flat input files
+  produced four entries, two of them phantoms with no hash.
+
+  Both attestation builders iterated meld's *flattened* component list, which
+  gains an entry per nested sub-component; those synthesized children carry no
+  source bytes. Inputs are now the components the caller passed, with their real
+  sha256, size and total core-module count — a nested input's modules are spread
+  across its flattened children, so the count is summed rather than taken from
+  one entry. Both builders read one shared source and cannot diverge again.
+
+  This is the sibling v0.55.1 missed: it moved `components_fused` to the caller's
+  count and left `inputs[]` on the flattened list, so one record could report two
+  components beside four inputs.
+
+- **`input_size` was 0 for a composed input**, for the same reason. Two plausible
+  defaults then hid the zero instead of surfacing it: the attestation recorded
+  `size_reduction_percent: 0.0`, and the completion log line reported
+  `100% of input` via a `checked_div(...).unwrap_or(100)`. Both are now computed
+  from the bytes the caller passed. (Found while measuring the above; not in the
+  original report.)
+
+### Changed — attested output for nested and composed inputs
+
+**An attestation recorded by v0.56.0 will not match one recorded by an earlier
+version for the same inputs**, whenever an input is composed or nested. This is
+deliberate — the earlier content was wrong — but it matters to anyone comparing
+attestations across releases, including under `--reproducible`, whose purpose is
+exactly that comparison. Re-baseline recorded attestations when adopting v0.56.0.
+
+What changes, for such an input:
+
+- `inputs[]` has one entry per file the caller passed, instead of one per
+  flattened sub-component (a single composed input: 1 entry, was 4).
+- Each entry carries the input's real sha256 and size (was `""` and `0`).
+- Under `--reproducible`, positional names count **inputs**: a single composed
+  input is `component-0` only, instead of `component-0` through `component-3`.
+- `size_reduction_percent` is the real ratio (was `0.0`). Fusion usually grows
+  the module, so expect a **negative** value.
+
+For inputs that are neither composed nor nested, `inputs[]` loses only its
+phantom entries; the real entries, hashes and sizes are unchanged.
+
 ## [0.55.1] - 2026-09-09
 
 ### Fixed

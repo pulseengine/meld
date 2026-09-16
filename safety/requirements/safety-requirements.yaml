@@ -3312,3 +3312,22 @@ artifacts:
         proving nothing.
       references:
         - "https://github.com/pulseengine/meld/issues/401"
+
+  - id: SR-75
+    type: sw-req
+    title: The attestation records the inputs the caller passed, with their real hashes
+    status: verified
+    description: "Each input recorded in the fusion attestation shall correspond to a component the caller passed to meld, and shall carry that input's sha256, byte size and total core-module count. meld shall not attest the synthesized sub-components that flattening hoists out of a nested input: those carry no source bytes, and attesting them produced entries with an empty hash and zero size. For a composed input every attested hash was the empty string and the real input's sha256 appeared nowhere in the artifact, so the supply-chain record bound nothing while presenting as a well-formed attestation at exit 0. Per-input module counts shall account for every merged core module, since a nested input's modules are spread across its flattened children. The attested input size shall likewise be the bytes the caller passed; summing the flattened list reported zero for a composed input and fed a false size_reduction_percent. Both attestation builders shall draw inputs from one source so they cannot diverge. This is the same defect class as SR-74, where components_fused was corrected to the caller's count while inputs[] was left on the flattened list, so one record could report two components beside four inputs."
+    tags: [attestation, supply-chain, traceability, correctness]
+    fields:
+      verification-method: test
+    links:
+      - type: derives-from
+        target: SYS-10
+      - type: refines
+        target: SR-74
+    provenance:
+      created-by: ai-assisted
+      model: claude-opus-5
+      timestamp: 2026-09-16T17:35:27Z
+    release: v0.56.0

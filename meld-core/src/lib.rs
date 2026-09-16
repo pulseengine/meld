@@ -462,6 +462,13 @@ pub struct Fuser {
     /// Original (un-flattened) parsed components, used by component_wrap
     /// to access depth_0_sections and component_instance_defs.
     original_components: Vec<ParsedComponent>,
+    /// Core modules contributed by each INPUT, parallel to `original_components`.
+    ///
+    /// #413: an input's modules can live entirely in nested sub-components that
+    /// flattening hoists out, so the outer parse does not hold them and the
+    /// flattened entries each hold only a share. Summed at add time, where the
+    /// input-to-flattened mapping is still known.
+    input_module_counts: Vec<usize>,
     /// Directed wiring hints from composition graph.
     wiring_hints: WiringHints,
     /// The memory strategy/rebasing pair as originally requested, captured
@@ -480,6 +487,7 @@ impl Fuser {
             config,
             components: Vec::new(),
             original_components: Vec::new(),
+            input_module_counts: Vec::new(),
             wiring_hints: std::collections::HashMap::new(),
             requested_memory: None,
         }
@@ -508,6 +516,8 @@ impl Fuser {
 
         self.original_components.push(parsed.clone());
         let (flattened, hints) = flatten_nested_components(parsed)?;
+        self.input_module_counts
+            .push(flattened.iter().map(|c| c.core_modules.len()).sum());
         // Adjust wiring hint indices by current component count
         let offset = self.components.len();
         for ((importer, name), exporter) in hints {
@@ -978,9 +988,18 @@ impl Fuser {
             ..Default::default()
         };
 
-        // Calculate input size
+        // #413: input size is the bytes the CALLER passed. Summing the flattened
+        // list reported 0 for a composed input — flattening replaces the outer
+        // component with synthesized children that carry no source bytes — and
+        // was right for flat inputs only because those children contribute 0.
+        // It feeds the attested `size_reduction_percent`.
+        stats.input_size = self
+            .original_components
+            .iter()
+            .map(|c| c.original_size)
+            .sum();
+        // Core modules genuinely live in the flattened set, so this stays there.
         for comp in &self.components {
-            stats.input_size += comp.original_size;
             stats.modules_merged += comp.core_modules.len();
         }
 
@@ -2413,6 +2432,40 @@ impl Fuser {
         }
     }
 
+    /// The inputs to attest: one per component the CALLER passed (#413).
+    ///
+    /// Both attestation builders read this, so they cannot disagree about what
+    /// an input is. Each previously iterated `self.components` — meld's
+    /// flattened list — and attested every synthesized sub-component as an
+    /// "input" with `hash: ""` and `size: 0`. A composed input's real sha256
+    /// appeared nowhere in the artifact.
+    ///
+    /// Under `--reproducible` the name is `component-{i}` where `i` is the
+    /// INPUT index (#341), so it no longer counts synthesized children.
+    fn attested_inputs(&self) -> Vec<(String, usize, String, u64)> {
+        self.original_components
+            .iter()
+            .zip(&self.input_module_counts)
+            .enumerate()
+            .map(|(index, (component, &module_count))| {
+                let name = if self.config.reproducible {
+                    format!("component-{index}")
+                } else {
+                    component
+                        .name
+                        .clone()
+                        .unwrap_or_else(|| format!("component-{index}"))
+                };
+                (
+                    name,
+                    module_count,
+                    component.original_hash.clone(),
+                    component.original_size as u64,
+                )
+            })
+            .collect()
+    }
+
     #[cfg(not(feature = "attestation"))]
     fn build_attestation(
         &self,
@@ -2424,26 +2477,9 @@ impl Fuser {
             .reproducible(self.config.reproducible)
             .parameters(self.attestation_parameters());
 
-        for (index, component) in self.components.iter().enumerate() {
-            // #341: under `--reproducible` the input name must not carry the
-            // caller-supplied path — otherwise byte-identical inputs at
-            // different paths (e.g. two CI checkouts / temp dirs) fuse to
-            // different sha256s. Use the positional identifier; the input's
-            // content stays pinned by `original_hash` below.
-            let name = if self.config.reproducible {
-                format!("component-{}", index)
-            } else {
-                component
-                    .name
-                    .clone()
-                    .unwrap_or_else(|| format!("component-{}", index))
-            };
-            builder = builder.add_input_descriptor(
-                name,
-                component.core_modules.len(),
-                component.original_hash.clone(),
-                component.original_size as u64,
-            );
+        // #341 / #413: see `attested_inputs`.
+        for (name, module_count, hash, size) in self.attested_inputs() {
+            builder = builder.add_input_descriptor(name, module_count, hash, size);
         }
 
         builder.build(output_bytes, stats)
@@ -2478,23 +2514,11 @@ impl Fuser {
         };
 
         let mut inputs = Vec::new();
-        for (index, component) in self.components.iter().enumerate() {
-            // #341: see build_attestation — under `--reproducible` the input
-            // name must not carry the caller-supplied path.
-            let name = if self.config.reproducible {
-                format!("component-{}", index)
-            } else {
-                component
-                    .name
-                    .clone()
-                    .unwrap_or_else(|| format!("component-{}", index))
-            };
+        // #341 / #413: see `attested_inputs`. The wsc schema carries no module
+        // count, so only name, hash and size are used here.
+        for (name, _module_count, hash, size) in self.attested_inputs() {
             inputs.push(InputArtifact {
-                artifact: ArtifactDescriptor {
-                    name,
-                    hash: component.original_hash.clone(),
-                    size: component.original_size as u64,
-                },
+                artifact: ArtifactDescriptor { name, hash, size },
                 signature_status: SignatureStatus::Unsigned,
                 signature_info: None,
                 provenance: None,
