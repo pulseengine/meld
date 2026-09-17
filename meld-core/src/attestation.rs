@@ -315,12 +315,10 @@ impl FusionAttestationBuilder {
             (chrono_timestamp(), generate_uuid())
         };
 
-        let size_reduction = if stats.input_size > 0 {
-            let diff = stats.input_size as i128 - stats.output_size as i128;
-            (diff as f64 / stats.input_size as f64) * 100.0
-        } else {
-            0.0
-        };
+        // 0.0 for a zero-size input keeps the recorded value unchanged (#414);
+        // no parseable input is zero bytes.
+        let size_reduction =
+            crate::size_reduction_percent(stats.input_size, stats.output_size).unwrap_or(0.0);
 
         FusionAttestation {
             version: "1.0".to_string(),
