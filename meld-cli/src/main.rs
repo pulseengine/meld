@@ -641,18 +641,8 @@ fn fuse_command(
     if show_stats {
         print_stats(&stats, total_input_size, elapsed);
     } else {
-        // Fused output can be larger than tiny inputs (adapters, wrapper
-        // sections), so this is a signed delta, not an unsigned reduction.
-        let delta = if total_input_size > 0 {
-            (total_input_size as f64 - fused_bytes.len() as f64) / total_input_size as f64 * 100.0
-        } else {
-            0.0
-        };
-        if delta >= 0.0 {
-            println!("  Size reduction: {:.1}%", delta);
-        } else {
-            println!("  Size increase: {:.1}%", -delta);
-        }
+        let (label, value) = size_change(total_input_size, fused_bytes.len());
+        println!("  {label}: {value}");
         println!("  Time: {:?}", elapsed);
     }
 
@@ -753,6 +743,16 @@ fn print_placements(stats: &FusionStats) {
     );
 }
 
+/// The size-change label and value both summaries print, from the one shared
+/// computation, so `--stats` and the default summary cannot disagree (#414).
+fn size_change(input_bytes: usize, output_bytes: usize) -> (&'static str, String) {
+    match meld_core::size_reduction_percent(input_bytes, output_bytes) {
+        Some(p) if p >= 0.0 => ("Size reduction", format!("{p:.1}%")),
+        Some(p) => ("Size increase", format!("{:.1}%", -p)),
+        None => ("Size change", "unknown (input size is 0)".to_string()),
+    }
+}
+
 fn print_stats(stats: &FusionStats, total_input_size: usize, elapsed: std::time::Duration) {
     println!();
     println!("Fusion Statistics");
@@ -778,12 +778,8 @@ fn print_stats(stats: &FusionStats, total_input_size: usize, elapsed: std::time:
     println!("  Input size:          {} bytes", total_input_size);
     println!("  Output size:         {} bytes", stats.output_size);
 
-    let reduction = if total_input_size > 0 {
-        ((total_input_size - stats.output_size) as f64 / total_input_size as f64) * 100.0
-    } else {
-        0.0
-    };
-    println!("  Reduction:           {:.1}%", reduction);
+    let (label, value) = size_change(total_input_size, stats.output_size);
+    println!("  {:<21}{value}", format!("{label}:"));
 
     println!();
     println!("Performance:");

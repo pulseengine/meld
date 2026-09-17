@@ -4,6 +4,30 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.56.2] - 2026-09-17
+
+### Fixed
+- **`meld fuse --stats` printed a reduction of about 10^18 percent whenever the
+  output was larger than the input (SR-77, #414).** `print_stats` subtracted two
+  `usize` values before converting to floating point, so the subtraction wrapped.
+  A release build printed `Reduction: 1033431040543952384.0%`; a debug build
+  panicked. Output larger than input is the normal case for small compositions,
+  because adapters, attestation and provenance all add bytes. The default summary
+  of the same run, computed separately, printed the correct increase.
+
+  The size change is now computed in one place (`meld_core::size_reduction_percent`),
+  signed, and used by every surface that reports it: the `--stats` block, the
+  default summary, the completion log line, and both attestation builders. Five
+  sites had carried four separate formulas; only the `--stats` one was wrong.
+
+  `--stats` now prints `Size increase: N%` or `Size reduction: N%`, the same label
+  as the default summary. The completion log line reads "N% larger/smaller than
+  input" instead of "N% of input". The attested `size_reduction_percent` is
+  unchanged: byte-identical to v0.56.1 under `--reproducible`.
+
+  First test coverage of the flag-to-output path: the new tests run the `meld`
+  binary and check the printed change against the file sizes on disk.
+
 ## [0.56.1] - 2026-09-17
 
 ### Fixed

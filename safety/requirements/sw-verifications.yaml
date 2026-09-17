@@ -1349,3 +1349,14 @@ artifacts:
     links:
       - type: verifies
         target: SR-76
+
+  - id: SWV-89
+    type: sw-verification
+    title: "Verification of SR-77: one signed size change, reported consistently"
+    status: implemented
+    description: "Verifies SR-77. meld-cli/tests/stats_size_change_414.rs runs the real meld binary on the provider+consumer composition (which grows) and computes the expected change from the file sizes on disk, not from meld's output: stats_reports_an_increase_when_the_output_grows guards that the output did grow, then requires the label 'Size increase' and a value within 0.05 of the on-disk figure; stats_and_default_summary_report_the_same_change requires the --stats and default summaries of the same inputs to agree. Three unit tests on meld_core::size_reduction_percent cover sign (the #414 sizes 1785->2402), the zero-input case (None, not a number), and extreme sizes (no wrap). Before the fix both integration tests failed on the real defect: the debug binary panicked at main.rs:782 'attempt to subtract with overflow'. Negative controls, each shown by diff: restoring the usize subtraction fails both tests via the panic; swapping the arguments in the --stats path only (a plausible wrong value with no panic, the release-build failure mode) fails both tests on their value assertions. Attested size_reduction_percent is byte-identical between the shipped v0.56.1 binary and this change under --reproducible for a growing pair (77.81512605042018) and a shrinking input (44.492073911410074). The pattern search found five sites with four separate formulas; all five now call the helper."
+    fields:
+      method: automated-test
+    links:
+      - type: verifies
+        target: SR-77

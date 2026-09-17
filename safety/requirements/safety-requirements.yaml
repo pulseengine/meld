@@ -3348,3 +3348,16 @@ artifacts:
         target: SR-37
       - type: refines
         target: SR-64
+
+  - id: SR-77
+    type: sw-req
+    title: Every reported size change is computed once, signed, and cannot wrap
+    status: verified
+    description: "meld shall compute the size change between input and output in exactly one place, as a signed percentage in floating point (positive is a reduction, negative an increase), and every surface that reports it shall use that computation: the fuse --stats block, the default completion summary, the completion log line, and the size_reduction_percent recorded by both attestation builders. When the input size is zero the change shall be reported as unknown rather than as a number. Through v0.56.1 print_stats subtracted two usize values before casting, so any output larger than its input (the normal case for small compositions, since adapters, attestation and provenance add bytes) wrapped and printed a reduction such as 1033431040543952384.0% in release builds, and would panic in debug builds; the same run's default summary, computed separately, printed the correct increase. Five sites held four independent formulas; one was wrong. The recorded attestation value shall stay byte-identical for every input with a non-zero size."
+    release: v0.56.2
+    tags: [cli, reporting, attestation, correctness]
+    fields:
+      verification-method: test
+    links:
+      - type: derives-from
+        target: SYS-9

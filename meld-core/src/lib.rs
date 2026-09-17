@@ -402,6 +402,56 @@ pub struct PlacementRecord {
     pub reserved: u64,
 }
 
+/// The size change from `input_bytes` to `output_bytes`, as a percentage of the
+/// input: positive is a reduction, negative an increase. `None` when the input
+/// size is zero, so there is no ratio to report.
+///
+/// The one place meld computes this (SR-77, #414). The `--stats` block, the
+/// default summary, the completion log line and both attestation builders all
+/// call it. Five sites used to carry four separate formulas, and the one in
+/// `--stats` subtracted two `usize` before casting: any output larger than its
+/// input wrapped to a reduction of about 10^18 percent in a release build.
+/// Output larger than input is the normal case for small compositions, since
+/// adapters, attestation and provenance all add bytes.
+pub fn size_reduction_percent(input_bytes: usize, output_bytes: usize) -> Option<f64> {
+    if input_bytes == 0 {
+        return None;
+    }
+    Some((input_bytes as f64 - output_bytes as f64) / input_bytes as f64 * 100.0)
+}
+
+#[cfg(test)]
+mod size_reduction_percent_tests {
+    use super::size_reduction_percent;
+
+    // rivet: verifies SR-77
+    #[test]
+    fn growth_is_negative_and_shrinkage_positive() {
+        // The #414 report: 1785 B in, 2402 B out.
+        let grew = size_reduction_percent(1785, 2402).unwrap();
+        assert!((grew - -34.5658).abs() < 1e-3, "{grew}");
+        let shrank = size_reduction_percent(2402, 1785).unwrap();
+        assert!((shrank - 25.6869).abs() < 1e-3, "{shrank}");
+        assert_eq!(size_reduction_percent(100, 100), Some(0.0));
+    }
+
+    // rivet: verifies SR-77
+    #[test]
+    fn zero_input_is_unknown_not_a_number() {
+        assert_eq!(size_reduction_percent(0, 0), None);
+        assert_eq!(size_reduction_percent(0, 4096), None);
+    }
+
+    // rivet: verifies SR-77
+    #[test]
+    fn extreme_sizes_do_not_wrap() {
+        let p = size_reduction_percent(1, usize::MAX).unwrap();
+        assert!(p.is_finite() && p < 0.0, "{p}");
+        let p = size_reduction_percent(usize::MAX, 1).unwrap();
+        assert!(p > 99.99 && p <= 100.0, "{p}");
+    }
+}
+
 /// Statistics about the fusion process
 #[derive(Debug, Clone, Default)]
 pub struct FusionStats {
@@ -1261,12 +1311,14 @@ impl Fuser {
         stats.output_size = output.len();
 
         log::info!(
-            "Fusion complete: {} components → {} bytes ({}% of input)",
+            "Fusion complete: {} components → {} bytes ({})",
             stats.components_fused,
             stats.output_size,
-            (stats.output_size * 100)
-                .checked_div(stats.input_size)
-                .unwrap_or(100)
+            match size_reduction_percent(stats.input_size, stats.output_size) {
+                Some(p) if p >= 0.0 => format!("{p:.1}% smaller than input"),
+                Some(p) => format!("{:.1}% larger than input", -p),
+                None => "input size unknown".to_string(),
+            }
         );
 
         Ok((output, stats))
@@ -2592,11 +2644,10 @@ impl Fuser {
             "placements".to_string(),
             serde_json::json!(stats.placements),
         );
-        let size_reduction = if stats.input_size > 0 {
-            ((stats.input_size as f64 - stats.output_size as f64) / stats.input_size as f64) * 100.0
-        } else {
-            0.0
-        };
+        // 0.0 for a zero-size input keeps the recorded value unchanged (#414);
+        // no parseable input is zero bytes.
+        let size_reduction =
+            size_reduction_percent(stats.input_size, stats.output_size).unwrap_or(0.0);
         metadata.insert(
             "size_reduction_percent".to_string(),
             serde_json::json!(size_reduction),
