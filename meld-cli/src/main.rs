@@ -54,11 +54,9 @@ enum Commands {
         #[arg(short, long, default_value = "fused.wasm")]
         output: String,
 
-        /// Memory strategy. "auto" (default) picks shared memory with
-        /// address rebasing when no input module contains `memory.grow`
-        /// and there are two or more memories to merge — the resulting
-        /// single-memory module flows through wasm-opt → synth with no
-        /// extra flags — and multi-memory otherwise. "multi" keeps one
+        /// Memory strategy. "auto" (default) always selects multi-memory, the
+        /// strategy that is sound for every input; it never selects shared
+        /// memory or address rebasing on its own (#326, #409). "multi" keeps one
         /// linear memory per input component; the fused module then
         /// needs `wasm-opt --enable-multimemory` and has no single-
         /// address-space (MCU) lowering. "shared" forces one merged
@@ -78,7 +76,8 @@ enum Commands {
         profile: String,
 
         /// Rebase memory addresses for shared memory (experimental).
-        /// Only valid with --memory shared; "auto" decides it itself.
+        /// Only valid with --memory shared. Not accepted with "auto", which
+        /// always selects multi-memory and never rebases.
         #[arg(long)]
         address_rebase: bool,
 
@@ -416,12 +415,12 @@ fn fuse_command(
     // Parse memory strategy
     let memory_strategy = match memory.as_str() {
         "auto" => {
-            // #172: resolved during fusion — shared+rebase when no input
-            // can grow memory and ≥2 memories exist, multi otherwise.
+            // #172 / #409: resolved during fusion, and always to multi-memory.
+            // Auto never selects shared memory or address rebasing (#326).
             if address_rebase {
                 return Err(anyhow!(
                     "--address-rebase requires --memory shared; \
-                     'auto' decides address rebasing itself"
+                     'auto' always selects multi-memory and never rebases"
                 ));
             }
             MemoryStrategy::Auto
@@ -572,6 +571,10 @@ fn fuse_command(
 
     if memory_strategy == MemoryStrategy::Auto {
         match stats.memory_strategy.as_str() {
+            // Unreachable today: auto always resolves to multi-memory (#326,
+            // #409). Kept so that if a future ADR-7 path re-enables automatic
+            // shared selection, the output still names it correctly — not
+            // because auto currently escalates.
             "shared" => println!(
                 "Memory strategy: shared + address rebasing (auto: no \
                  memory.grow in inputs) — single-memory output"
@@ -1086,8 +1089,8 @@ mod tests {
 
     #[test]
     fn test_cli_memory_default_is_auto() {
-        // #172: the `--memory` default is `auto` — shared+rebase when no
-        // input can grow memory, multi otherwise. Pin it so a future
+        // #172: the `--memory` default is `auto`, which always resolves to
+        // multi-memory (#326, #409). Pin it so a future
         // change to the default is a deliberate edit to this test
         // (flipping it is a high-blast-radius decision — see #172).
         let cli = Cli::try_parse_from(["meld", "fuse", "a.wasm", "-o", "out.wasm"])
@@ -1230,5 +1233,154 @@ mod validate_default_tests {
         ] {
             assert!(!validation_is_implied(&strategy, true));
         }
+    }
+}
+
+#[cfg(test)]
+mod auto_memory_claim_tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    /// Does a sentence claim that `auto` itself selects shared memory? (#409)
+    ///
+    /// Returns the offending sentences. A sentence qualifies when it names `auto`,
+    /// names `shared`, and uses a selection verb or states a condition ("when",
+    /// "if") — unless it also carries a negation or a past-tense marker, so "auto
+    /// never selects shared" and "until #326 it chose shared" are left alone.
+    ///
+    /// Deliberately a heuristic over sentences rather than a blocklist of the
+    /// phrasings #409 removed: a blocklist would only catch those exact strings,
+    /// and the defect it guards against was phrased six different ways across
+    /// help text, three doc topics, and code comments.
+    fn claims_auto_selects_shared(text: &str) -> Vec<String> {
+        const SELECTS: &[&str] = &[
+            "pick", "choos", "chose", "select", "resolv", "decide", "escalat", "prefer",
+        ];
+        // Negation is matched on WHOLE WORDS. A substring match let "not" fire
+        // inside "cannot", so "resolve Auto to shared-memory fusion exactly when
+        // growth cannot occur" read as negated and a shipped false claim passed.
+        // "cannot" is deliberately not a negation here: in that sentence it
+        // negates the growth, not the selection.
+        const NEGATED_WORDS: &[&str] = &["never", "not", "until", "formerly", "superseded"];
+        const NEGATED_PHRASES: &[&[&str]] = &[&["no", "longer"], &["used", "to"]];
+        const CONDITIONAL_WORDS: &[&str] = &["when", "if", "unless", "otherwise"];
+        text.split(['.', ';'])
+            .map(|s| s.split_whitespace().collect::<Vec<_>>().join(" "))
+            .filter(|s| {
+                let l = s.to_lowercase();
+                let words: Vec<&str> = l
+                    .split(|c: char| !(c.is_alphanumeric() || c == '\'' || c == '’'))
+                    .filter(|w| !w.is_empty())
+                    .collect();
+                // "default is Auto — shared+rebase when provably safe" states a
+                // conditional selection with no selection verb at all.
+                let conditional = words.iter().any(|w| CONDITIONAL_WORDS.contains(w));
+                let negated = words
+                    .iter()
+                    .any(|w| NEGATED_WORDS.contains(w) || w.ends_with("n't") || w.ends_with("n’t"))
+                    || NEGATED_PHRASES
+                        .iter()
+                        .any(|p| words.windows(p.len()).any(|win| win == *p));
+                l.contains("auto")
+                    && l.contains("shared")
+                    && (SELECTS.iter().any(|v| l.contains(v)) || conditional)
+                    && !negated
+            })
+            .collect()
+    }
+
+    /// The checker must fire on every false phrasing #409 removed. These are
+    /// the real sentences from the shipped text, verbatim — if the checker
+    /// cannot see them, the scan below proves nothing.
+    // rivet: verifies SR-76
+    #[test]
+    fn checker_fires_on_the_phrasings_that_shipped() {
+        for false_claim in [
+            r#""auto" (default) picks shared memory with address rebasing when no input module contains `memory.grow`"#,
+            "`auto` (default) — meld picks the sound single-memory form when it can: shared memory with address rebasing",
+            "`--memory auto` therefore only chooses shared + rebase when no input carries `memory.grow`",
+            "Fuser::fuse_with_stats uses it to resolve MemoryStrategy::Auto to shared-memory fusion exactly when the probe proves growth cannot occur",
+            "the library default is `Auto` — shared+rebase when provably safe, multi-memory otherwise",
+        ] {
+            assert!(
+                !claims_auto_selects_shared(false_claim).is_empty(),
+                "#409: the checker must flag this shipped false claim: {false_claim}"
+            );
+        }
+    }
+
+    /// And must NOT fire on the true statements that replaced them — otherwise
+    /// the scan below would be permanently red and get ignored, or deleted.
+    /// Every sentence here names both `auto` and `shared` and uses a selection
+    /// verb, so each one reaches the negation check instead of passing because
+    /// a keyword is missing.
+    // rivet: verifies SR-76
+    #[test]
+    fn checker_leaves_true_statements_alone() {
+        for true_claim in [
+            r#""auto" (default) always selects multi-memory, the strategy that is sound for every input, and never selects shared memory or address rebasing on its own"#,
+            "`--memory auto` never chooses shared + rebase, which happens only when you select `--memory shared` explicitly",
+            "Until #326, auto chose shared + rebase for inputs without a grow instruction",
+            "The auto strategy does not select shared memory, whatever the probe reports",
+            "Auto no longer picks shared memory for grow-free inputs",
+            "Auto doesn't choose shared memory",
+        ] {
+            assert!(
+                claims_auto_selects_shared(true_claim).is_empty(),
+                "#409: the checker falsely flagged a true statement: {true_claim}"
+            );
+        }
+    }
+
+    /// The recurrence guard. Every string meld ships about the memory strategy —
+    /// the full `fuse --help` and every `meld docs` topic body — must not claim
+    /// that `auto` selects shared memory. SR-64's documentation invariant checks
+    /// only that topics exist and exceed 40 characters, so it passed while three
+    /// topics and the help text described the unsound behaviour SR-37 removed.
+    // rivet: verifies SR-76
+    #[test]
+    fn no_shipped_help_or_doc_topic_claims_auto_selects_shared() {
+        let mut cmd = Cli::command();
+        let fuse = cmd
+            .find_subcommand_mut("fuse")
+            .expect("fuse subcommand exists");
+        let help = fuse.render_long_help().to_string();
+
+        // Guard the guard: prove the scan is reading real text, so an empty or
+        // wrong source cannot pass vacuously.
+        assert!(
+            help.contains("--memory") && help.to_lowercase().contains("auto"),
+            "scan is not reading the real `fuse --help` text"
+        );
+        assert!(
+            docs::TOPICS.len() > 5,
+            "scan is not reading the embedded doc topics"
+        );
+        assert!(
+            docs::find("memory-strategies").is_some(),
+            "the memory-strategies topic must be among the scanned topics"
+        );
+
+        let mut offending = Vec::new();
+        for s in claims_auto_selects_shared(&help) {
+            offending.push(format!("fuse --help: {s}"));
+        }
+        for topic in docs::TOPICS {
+            for s in claims_auto_selects_shared(topic.body) {
+                offending.push(format!("meld docs {}: {s}", topic.slug));
+            }
+        }
+        assert!(
+            offending.is_empty(),
+            "#409: shipped text claims `auto` selects shared memory, which SR-37 \
+             forbids as unsound (auto always selects multi-memory):\n{}",
+            offending.join("\n")
+        );
+
+        // And the positive statement must actually be there.
+        assert!(
+            help.contains("always selects multi-memory"),
+            "`fuse --help` must state what auto selects"
+        );
     }
 }

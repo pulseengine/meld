@@ -32,7 +32,7 @@ to completion across ten minor releases.
 
 | Item | Issue | Rivet | State |
 |---|---|---|---|
-| `--memory auto` default (probe `memory.grow` → shared+rebase iff sound) | #172 | SR-37, LS-M-7, UCA-M-11 | PR #220 green |
+| `--memory auto` default (probe `memory.grow` → shared+rebase iff sound) — **superseded**: auto always selects multi-memory since #326 (SR-37 v0.38.0) | #172 | SR-37, LS-M-7, UCA-M-11 | PR #220 green |
 | Name-based lift resolution for composed multi-component exports | #212 (items 2+3) | LS-CP-5 | PR #216 green |
 | Chore: SR-34 status sync (`planned` → `implemented`; #142 chain shipped v0.12–v0.21) | #142 | SR-34 | this roadmap PR |
 

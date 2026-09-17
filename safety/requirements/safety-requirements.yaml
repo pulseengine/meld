@@ -3331,3 +3331,20 @@ artifacts:
       model: claude-opus-5
       timestamp: 2026-09-16T17:35:27Z
     release: v0.56.0
+
+  - id: SR-76
+    type: sw-req
+    title: Shipped help and documentation state what the auto memory strategy actually selects
+    status: verified
+    description: "Every user-facing statement meld ships about the memory strategy — the fuse --help text and every embedded meld docs topic — shall describe MemoryStrategy::Auto as SR-37 requires it to behave: it always resolves to multi-memory and never selects shared memory or address rebasing on its own; shared memory with rebasing is reached only by explicit --memory shared. Through v0.56.0 the implementation complied with SR-37 while the --memory help, the memory-strategies and address-rebasing topics, the --address-rebase help and error message still described auto as picking shared+rebase for grow-free inputs, calling it 'the sound single-memory form' — the strategy SR-37 classifies as a corrupting transform (#409). v0.50.0 had corrected the internal doc comment and log line and left the text that ships. SR-64's invariant measures only topic presence and length, so it passed over the contradiction. A test shall scan the rendered fuse --help and every topic body for a sentence that names auto and shared together with a selection verb or a conditional and carries no negation, and shall fail naming the surface and sentence. Scope limit: this guards this one claim; it is not a general check that doc topics agree with the requirements they describe."
+    release: v0.56.1
+    tags: [cli, documentation, memory-strategy, correctness]
+    fields:
+      verification-method: test
+    links:
+      - type: derives-from
+        target: SYS-6
+      - type: refines
+        target: SR-37
+      - type: refines
+        target: SR-64

@@ -4,6 +4,33 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.56.1] - 2026-09-17
+
+### Fixed
+- **`--help` recommended the memory strategy the safety record forbids (SR-76,
+  #409).** `meld fuse --help` said the default `--memory auto` "picks shared
+  memory with address rebasing" for inputs without `memory.grow`, and `meld docs
+  memory-strategies` called that "the sound single-memory form". SR-37 classifies
+  it as a corrupting transform, and since v0.38.0 (#326) `auto` has never done
+  it: it always selects multi-memory. The code was right; the text that ships
+  was not. v0.50.0 corrected the internal doc comment and the log line and left
+  the help and the topics saying the old thing.
+
+  Corrected everywhere the claim appeared, found by searching for the pattern
+  rather than the reported lines: the `--memory` and `--address-rebase` help, the
+  error for `--address-rebase` with `auto`, the `memory-strategies`,
+  `address-rebasing` and `fuse` topics, the `memory_probe` module doc (the probe
+  feeds provenance and allocator analysis; it does not select shared memory),
+  and the roadmap row. Behaviour is unchanged.
+
+  A test now reads the rendered `fuse --help` and every embedded topic and fails
+  on a sentence that says `auto` selects shared memory. Its list of the five
+  phrasings that shipped caught two blind spots in the checker before it was
+  trusted: "cannot" was read as a negation, and "default is `Auto` — shared+rebase
+  when provably safe" states the choice without a selection verb. This guards
+  this one claim. It is not a general check that the documentation agrees with
+  the requirements; SR-64 still measures only that topics exist.
+
 ## [0.56.0] - 2026-09-16
 
 ### Fixed
