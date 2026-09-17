@@ -63,11 +63,27 @@ consistency-hazards:
   - id: XH-2
     title: Canonical ABI element size disagreement (Meld ↔ Synth)
     description: >
-      Meld's canonical_abi_element_size() and Synth's synth-abi crate
-      compute different element sizes. When Synth AOT-compiles a
-      meld-fused module, the compiled import dispatch passes arguments
-      with wrong offsets.
+      Meld's canonical_abi_element_size() and the canonical-ABI layout that
+      Synth's compile path applies disagree on element sizes. When Synth
+      AOT-compiles a meld-fused module, the compiled import dispatch passes
+      arguments with wrong offsets.
     tools: [meld, synth]
+    # Corrected 2026-09-17 (#417, pulseengine/synth#1277). This hazard used to
+    # name Synth's `synth-abi` crate as Synth's side of the agreement. That crate
+    # is not in the Synth compiler's build: meld reproduced independently that it
+    # is absent from `synth-cli`'s normal-dependency closure (checked with
+    # `cargo metadata` at synth 17c5345e, a traversal shown to find synth-backend),
+    # that no crate depends on it, and that it is `publish = false`. synth found
+    # 0 of its symbols in the compiler binary. So agreement between meld and
+    # `synth-abi` says nothing about the objects Synth emits.
+    #
+    # The hazard is unchanged: a size disagreement at this boundary would still
+    # corrupt data. What is gone is the named control on Synth's side. No
+    # replacement is named here. The boundary Synth actually emits
+    # (`__meld_dispatch_import`, in synth-backend) has not been measured by meld,
+    # and re-attributing the control to unmeasured code would repeat the defect
+    # this corrects.
+    synth-side-status: unimplemented — no measured Synth-side layout control
     verification:
       - method: test
         description: >
@@ -85,6 +101,12 @@ consistency-hazards:
       element sizes. When Synth-compiled code calls a Kiln-hosted
       function (via __meld_dispatch_import), argument layout disagrees.
     tools: [synth, kiln]
+    # FLAGGED 2026-09-17 (#417), definition deliberately left unchanged. The
+    # Synth side names `synth-abi`, which is not in the Synth compiler's build
+    # (see XH-2). Neither endpoint of this hazard is meld, so meld is only the
+    # host of this record. Re-stating the hazard is for synth and kiln to decide,
+    # not something meld should rewrite on their behalf.
+    synth-side-status: needs synth + kiln — attributed crate is not in Synth's compile path
     verification:
       - method: test
         description: >
