@@ -642,6 +642,11 @@ impl Fuser {
 
         if self.config.memory_strategy == MemoryStrategy::Auto {
             self.resolve_auto_memory_strategy();
+            // #409: this `SharedMemory` arm is unreachable today —
+            // `resolve_auto_memory_strategy` only ever assigns `MultiMemory`.
+            // It is kept as a safety net should a future ADR-7 path re-enable
+            // automatic shared selection. Do not read it as evidence that auto
+            // currently escalates to shared memory.
             let result = if self.config.memory_strategy == MemoryStrategy::SharedMemory {
                 match self.fuse_with_stats_resolved() {
                     Err(Error::MemoryStrategyUnsupported(msg)) => {
@@ -3425,8 +3430,8 @@ mod tests {
         assert!(!fuser.cabi_realloc_drop_provably_safe(&graph));
     }
 
-    /// #172: the library default is `Auto` — shared+rebase when provably
-    /// safe, multi-memory otherwise. Pin it so a change is deliberate.
+    /// #172: the library default is `Auto`, which always resolves to
+    /// multi-memory (#326, #409). Pin it so a change is deliberate.
     #[test]
     fn test_fuser_config_default() {
         let config = FuserConfig::default();

@@ -1,4 +1,4 @@
-//! Memory-usage probing for automatic memory-strategy selection (#172).
+//! Memory-usage probing (#172).
 //!
 //! `MemoryStrategy::SharedMemory` is sound only when no input module can
 //! grow its linear memory at runtime: under address rebasing every module's
@@ -7,13 +7,17 @@
 //! about — allocator state diverges and address spaces silently collide
 //! (merger Bug #7). `memory.grow` is an opcode, so its *absence* is a
 //! static, decidable property of the input. This module provides that
-//! probe; `Fuser::fuse_with_stats` uses it to resolve
-//! `MemoryStrategy::Auto` to shared-memory fusion exactly when the probe
-//! proves growth cannot occur.
+//! probe. It feeds the `bounded_memory` provenance fact, the allocator
+//! dead-grow analysis, and the explanation logged when `MemoryStrategy::Auto`
+//! is resolved.
+//!
+//! It does NOT select shared memory. Until #326 it resolved `Auto` to
+//! shared-memory fusion whenever growth was ruled out; `Auto` now always
+//! resolves to multi-memory whatever the probe reports (#409).
 //!
 //! The probe is deliberately conservative in the right direction: any parse
-//! failure counts as "uses memory.grow", so malformed input can never trick
-//! auto-resolution into the shared path.
+//! failure counts as "uses memory.grow", so malformed input is never treated
+//! as bounded.
 
 use wasmparser::{Operator, Parser, Payload};
 

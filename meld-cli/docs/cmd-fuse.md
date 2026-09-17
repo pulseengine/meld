@@ -10,8 +10,8 @@ Key flags:
 - `--memory <auto|multi|shared>` — how the input memories coexist (default
   `auto`). See the `memory-strategies` topic.
 - `--address-rebase` — relocate each component's data within one shared memory
-  and rewrite its pointers. Valid only with `--memory shared`; `auto` decides
-  it itself. See `address-rebasing`.
+  and rewrite its pointers. Valid only with `--memory shared`; not accepted
+  with `auto`, which always selects `multi`. See `address-rebasing`.
 - `--pack-rebase` — compact used-extent variant of `--address-rebase` for MCU
   targets; implies `--address-rebase`, requires `--memory shared`, and is sound
   only for components that address nothing above their last data segment. See

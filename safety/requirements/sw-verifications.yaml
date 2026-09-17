@@ -1338,3 +1338,14 @@ artifacts:
       created-by: ai-assisted
       model: claude-opus-5
       timestamp: 2026-09-16T17:35:27Z
+
+  - id: SWV-88
+    type: sw-verification
+    title: "Verification of SR-76: no shipped text claims auto selects shared memory"
+    status: implemented
+    description: "Verifies SR-76 via meld-cli/src/main.rs auto_memory_claim_tests (3 tests). no_shipped_help_or_doc_topic_claims_auto_selects_shared renders the real fuse --help through clap and reads every embedded docs::TOPICS body, guarding against a vacuous pass (help must contain --memory and auto, more than five topics, memory-strategies present) and asserting the help states 'always selects multi-memory'. checker_fires_on_the_phrasings_that_shipped feeds the five false sentences #409 removed, verbatim; checker_leaves_true_statements_alone feeds six true sentences that each name auto and shared and a selection verb, so every one reaches the negation check. The checker's own positive list caught two blind spots before it was trusted: substring negation matched 'not' inside 'cannot', passing 'resolve Auto to shared-memory fusion exactly when growth cannot occur'; and 'default is Auto — shared+rebase when provably safe' has no selection verb. Negation is now matched on whole words and a conditional counts as a selection claim. Negative controls, each injection shown by diff before the result was trusted: a false sentence appended to concept-memory-strategies.md fails the scan naming 'meld docs memory-strategies'; the same sentence added to the --memory doc comment fails it naming 'fuse --help'. Both restored and confirmed absent."
+    fields:
+      method: automated-test
+    links:
+      - type: verifies
+        target: SR-76

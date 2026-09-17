@@ -14,6 +14,7 @@ microcontroller runtime and a native linker expect.
 
 Rebasing is sound only when memory does not grow: a `memory.grow` would move a
 component's region out from under fixed offsets another component is still
-using. `--memory auto` therefore only chooses shared + rebase when no input
-carries `memory.grow`. Rebasing places each component at its declared page
-extent; the compact used-extent variant is `--pack-rebase` (see that topic).
+using. `--memory auto` never chooses shared + rebase; rebasing happens only
+when you select `--memory shared` explicitly. Rebasing places each component at
+its declared page extent; the compact used-extent variant is `--pack-rebase`
+(see that topic).
