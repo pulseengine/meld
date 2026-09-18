@@ -68,6 +68,7 @@ pub mod resolver;
 pub mod resource_graph;
 pub mod rewriter;
 pub mod segments;
+pub mod signature_manifest;
 
 pub use adapter::{AdapterConfig, AdapterGenerator};
 pub use error::{Error, Result};
@@ -110,6 +111,19 @@ pub struct FuserConfig {
     /// function; opting out via `--no-component-provenance` is
     /// supported for size-sensitive builds.
     pub component_provenance: bool,
+
+    /// Emit the `meld.signature-manifest` custom section (#400): per export,
+    /// the WIT signature, the core signature meld actually emitted, the
+    /// flattened parameter count, and which memory / allocator / post-return
+    /// a host must use to invoke it.
+    ///
+    /// For a runtime that does not know the component's shape at build time,
+    /// the fused core module otherwise says nothing about its exports, and
+    /// `(i32) -> i32` cannot be told apart from a pointer-taking export — the
+    /// Canonical ABI then passes garbage rather than erroring. OPT-IN while
+    /// the shape settles with its consumers, because the section adds bytes
+    /// to artifacts that may be size-constrained.
+    pub signature_manifest: bool,
 
     /// Whether to rebase per-module memory addresses into a shared memory
     pub address_rebasing: bool,
@@ -202,6 +216,7 @@ impl Default for FuserConfig {
             attestation: true,
             reproducible: false,
             component_provenance: true,
+            signature_manifest: false,
             address_rebasing: false,
             pack_rebase: false,
             share_stack: false,
@@ -1274,6 +1289,25 @@ impl Fuser {
             );
             // SCPV v3 binary payload (#313 / scry#63) — infallible encode.
             extra_sections.push((provenance::SECTION_NAME, provenance.to_bytes()));
+        }
+
+        if self.config.signature_manifest {
+            // `core` is read back from `output_without_extras`: the bytes meld
+            // emitted, not the WIT tree `wit` comes from. Extra custom sections
+            // do not shift function indices, so the types read here are the
+            // ones the final artifact exports.
+            let manifest =
+                signature_manifest::build(&self.components, &merged, &output_without_extras);
+            match serde_json::to_vec(&manifest) {
+                Ok(payload) => extra_sections.push((signature_manifest::SECTION_NAME, payload)),
+                Err(e) => {
+                    // Never ship a half-written manifest: a host would read it
+                    // as authoritative.
+                    return Err(Error::EncodingError(format!(
+                        "could not encode the signature manifest: {e}"
+                    )));
+                }
+            }
         }
 
         let output = if extra_sections.is_empty() {
@@ -2720,11 +2754,13 @@ impl Fuser {
             //   `attestation` decides whether this record exists at all — a
             //     record cannot meaningfully attest its own absence;
             //   `component_provenance` selects a *separate* custom section that
-            //     is self-describing when present;
+            //     is self-describing when present, as does `signature_manifest`
+            //     (#400), which carries its own `version`;
             //   `opaque_resources` is per-resource routing input, not a
             //     whole-build switch (and can carry user-supplied names).
             attestation: _,
             component_provenance: _,
+            signature_manifest: _,
             opaque_resources: _,
         } = &self.config;
 

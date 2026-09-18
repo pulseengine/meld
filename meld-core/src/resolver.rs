@@ -470,6 +470,26 @@ fn find_module_with_export(
     None
 }
 
+/// Which module export each component-level core function came from.
+///
+/// `core_func_index -> (module_index, export_name)`. The signature manifest
+/// (#400) uses it to resolve a lift's `realloc`/`post_return` option to the
+/// function it actually names, so the manifest can report the export that IS
+/// that function rather than one whose name merely looks right.
+/// Which module export each component-level core MEMORY came from.
+///
+/// `core_memory_index -> (module_index, export_name)`. The signature manifest
+/// (#400) uses it to resolve a lift's `memory` option to the memory that export
+/// actually uses: a multi-memory fusion exports several, and naming the wrong
+/// one sends a host's arguments into another component's memory.
+pub fn core_memory_sources(component: &ParsedComponent) -> HashMap<u32, (usize, String)> {
+    build_entity_provenance(component).memory_source
+}
+
+pub fn core_func_sources(component: &ParsedComponent) -> HashMap<u32, (usize, String)> {
+    build_entity_provenance(component).func_source
+}
+
 /// Build provenance map by replaying the core entity definition order.
 ///
 /// Walks `core_entity_order` and maintains per-kind counters. For each
@@ -756,7 +776,7 @@ fn collect_type_copy_layouts(
     ty: &crate::parser::ComponentValType,
     out: &mut Vec<CopyLayout>,
 ) {
-    use crate::parser::{ComponentTypeKind, ComponentValType};
+    use crate::parser::ComponentValType;
     match ty {
         ComponentValType::String | ComponentValType::List(_) => {
             out.push(component.copy_layout(ty));
@@ -786,10 +806,9 @@ fn collect_type_copy_layouts(
             }
         }
         ComponentValType::Type(idx) => {
-            if let Some(ct) = component.get_type_definition(*idx)
-                && let ComponentTypeKind::Defined(inner) = &ct.kind
-            {
-                collect_type_copy_layouts(component, inner, out);
+            // #423: follow the `use` hop that `get_type_definition` stops at.
+            if let Some(inner) = component.resolve_defined_val_type(*idx) {
+                collect_type_copy_layouts(component, &inner, out);
             }
         }
         _ => {} // scalars / options / results / variants — no param-level pointer pairs
@@ -823,7 +842,7 @@ fn collect_param_pointer_wit_types(
     ty: &crate::parser::ComponentValType,
     out: &mut Vec<crate::parser::ComponentValType>,
 ) {
-    use crate::parser::{ComponentTypeKind, ComponentValType};
+    use crate::parser::ComponentValType;
     match ty {
         ComponentValType::String | ComponentValType::List(_) => {
             out.push(ty.clone());
@@ -844,10 +863,9 @@ fn collect_param_pointer_wit_types(
             }
         }
         ComponentValType::Type(idx) => {
-            if let Some(ct) = component.get_type_definition(*idx)
-                && let ComponentTypeKind::Defined(inner) = &ct.kind
-            {
-                collect_param_pointer_wit_types(component, inner, out);
+            // #423: follow the `use` hop that `get_type_definition` stops at.
+            if let Some(inner) = component.resolve_defined_val_type(*idx) {
+                collect_param_pointer_wit_types(component, &inner, out);
             }
         }
         _ => {} // scalars / options / results / variants — no param-level pointer pairs

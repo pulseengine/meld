@@ -506,6 +506,7 @@ fn ls_a_7_every_realloc_call_has_null_guard() {
         attestation: false,
         reproducible: false,
         component_provenance: false,
+        signature_manifest: false,
         address_rebasing: false,
         pack_rebase: false,
         share_stack: false,

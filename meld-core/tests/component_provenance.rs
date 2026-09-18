@@ -318,6 +318,7 @@ fn opt_out_via_config_drops_the_section() {
         attestation: false,
         reproducible: false,
         component_provenance: false,
+        signature_manifest: false,
         address_rebasing: false,
         pack_rebase: false,
         share_stack: false,

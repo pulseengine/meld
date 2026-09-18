@@ -1374,3 +1374,25 @@ artifacts:
     links:
       - type: verifies
         target: SR-78
+
+  - id: SWV-91
+    type: sw-verification
+    title: "Verification of SR-80: the signature manifest, cross-checkable and never guessed"
+    status: implemented
+    description: "Verifies SR-80 via meld-core/tests/signature_manifest_400.rs (5 tests) over the compose_record_use_wide fixture, which contains both branches in one artifact: a wide export needing the guest's memory and allocator, and a runner needing neither, so neither assertion passes vacuously. core_matches_the_emitted_module re-parses the fused bytes independently and requires every entry's core to equal the emitted type. core_comes_from_the_module_not_the_wit is the control for the property that makes the manifest worth carrying: the WIT side is two records of 14 and 4 floats, which would render as 18 flat values if core were derived from it; core is the single pointer the module actually takes, which only the bytes know. a_wide_export_states_the_pointer_shape_and_its_allocator pins flat_param_count 18 against a core of one i32, needs.realloc, the return area 16/4 with its named top-level layout, and that the resolved realloc really is an export of this module rather than a likely-looking name. an_export_that_needs_nothing_names_nothing pins the negative branch. the_section_is_absent_unless_asked_for pins that the section is opt-in, so existing artifacts do not change size. Checked against three independent sources on released artifacts (relay falcon-v1.138.0, scry 3.3.0): meld's emitted numbers match the Canonical ABI reference implementation applied to the WIT and, for the five falcon stages, the guests' own __RET_AREA symbols (56/20/16/16/16)."
+    fields:
+      method: automated-test
+    links:
+      - type: verifies
+        target: SR-80
+
+  - id: SWV-92
+    type: sw-verification
+    title: "Verification of SR-79: `use`d types resolve in every canonical-ABI path"
+    status: implemented
+    description: "Verifies SR-79 via meld-core/tests/wide_used_params_423.rs against a new offline fixture (tests/wit_bindgen/fixtures/compose_record_use_wide, built by its build.sh from WAT with wasm-tools and wac). The fixture is the falcon shape: tick(state: 14 f32, sp: 4 f32) -> out, every record reached through `use`, so the true flattened parameter count is 18 — over MAX_FLAT_PARAMS — and the emitted core signature is a single pointer. The existing compose_record_use fixture cannot reach this: its records are 4 wide, so the wrong count and the right one are both under the limit, which is why #393's size fix was sufficient there. used_records_count_their_real_flat_width asserts meld's own total_flat_params is 18; wide_used_params_survive_fusion fuses and runs the result under wasmtime against an oracle of 120. Red first, and the failure mode it establishes is the severe one: before the fix the count was 2, the fused module VALIDATED, ran without trapping, and returned 0 instead of 120 — a wrong answer at exit 0, not a loud failure. The fix routes sixteen type traversals through resolve_defined_val_type; the full suite then caught a real consequence in wit_bindgen_runtime (test_fuse_wit_bindgen_with), where meld's own parallel-list assertion fired because collect_param_pointer_wit_types in resolver.rs was a seventeenth site still stopping at the alias. Every get_type_definition call site in the workspace was then classified: value-type traversals were converted, function-type lookups were left."
+    fields:
+      method: automated-test
+    links:
+      - type: verifies
+        target: SR-79

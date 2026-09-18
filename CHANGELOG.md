@@ -4,6 +4,56 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.57.0] - 2026-09-18
+
+### Fixed
+- **A `use`d type counted as one flat value, so meld chose the wrong calling
+  convention and the fused module returned a wrong answer at exit 0 (SR-79,
+  #423).** #393 fixed the *size* of a type reached through `use` by routing the
+  size paths through `resolve_defined_val_type`, which follows the
+  instance-export alias a `use` compiles to. Sixteen other traversals still
+  resolved through `get_type_definition`, which stops at that alias, so a `use`d
+  record was reported as one flat value of four bytes, as containing no
+  pointers, and as containing no resources.
+
+  meld selects the calling convention from that flat count: over
+  `MAX_FLAT_PARAMS = 16` the arguments travel through a pointer. jess's shape —
+  `tick(state: 14 × f32, sp: 4 × f32)`, every record reached through `use` — is
+  **18** flattened values and counted as **2**, so meld took the flat branch for
+  a callee whose core signature is a single pointer. The fused module validated,
+  ran without trapping, and returned the wrong value.
+
+  Every `get_type_definition` call site in the workspace was classified: value-
+  type traversals now use the resolver, function-type lookups were left alone.
+  A new offline fixture (`compose_record_use_wide`, built from WAT with
+  `wasm-tools` and `wac`) crosses the limit — the existing `use`d-type fixture
+  has 4-wide records, where the wrong count and the right one are both under it.
+
+### Added
+- **`meld fuse --emit-manifest`: a `meld.signature-manifest` section saying how
+  to invoke each export (SR-80, #400).** Fusing to a core module drops the WIT
+  types, and a core signature does not say enough: `f(x: u32) -> u32` and an
+  18-float `tick` both lower to `(i32) -> (i32)`, where the first `i32` is a
+  value and the second a pointer. The Canonical ABI passes garbage rather than
+  erroring, so a host that guesses wrong gets a clean-looking run and a wrong
+  answer.
+
+  Per export: the WIT signature, the core signature, `flat_param_count`,
+  `needs.{memory,realloc}` (component-model#378's vocabulary), the exported
+  memory / allocator / post-return to use, and the return area's size, alignment
+  and top-level layout.
+
+  `core` is **read back from the emitted bytes**, never derived from the WIT, so
+  a consumer can cross-check its own lowering rather than trust meld. An export
+  whose types do not fully resolve is listed under `omitted` with a reason
+  instead of described by a fallback. `realloc` is resolved through fusion to
+  the allocator that export's own lift names; where that function is not
+  exported, the entry says `null` while `needs.realloc` stays `true` — a
+  contradiction stated on purpose, because the export cannot be invoked as the
+  ABI requires and a host should refuse rather than call a different allocator.
+
+  Opt-in: the section adds bytes. New `meld docs signature-manifest` topic.
+
 ## [0.56.2] - 2026-09-17
 
 ### Fixed

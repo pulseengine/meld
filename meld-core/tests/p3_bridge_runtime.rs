@@ -335,6 +335,7 @@ fn fuse_pair() -> Vec<u8> {
         attestation: false,
         reproducible: false,
         component_provenance: false,
+        signature_manifest: false,
         address_rebasing: false,
         pack_rebase: false,
         share_stack: false,

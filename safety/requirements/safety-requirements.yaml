@@ -3378,3 +3378,26 @@ artifacts:
     links:
       - type: derives-from
         target: SYS-11
+  - id: SR-79
+    type: sw-req
+    title: Types reached through `use` are resolved everywhere the canonical ABI is computed
+    status: verified
+    description: "Every canonical-ABI computation over a component value type shall resolve a type reference through the instance-export alias that a WIT `use` compiles to, so a `use`d type contributes its real flat width, byte layout, pointer positions and resource positions. Through v0.56.2 only the size and alignment paths did so (fixed by #393 for SR-72); fifteen other traversals resolved through `get_type_definition`, which stops at that alias, and silently reported a `use`d record as one flat value of four bytes, as containing no pointers, and as containing no resources. meld selects the calling convention from that flat count: a call whose arguments flatten to 18 values — the shape jess ships, a 14-f32 `vehicle-state` plus a 4-f32 setpoint, both reached through `use` — counted as 2 and took the flat convention for a callee whose core signature is a single pointer. The fused module validated, ran, and returned a wrong answer at exit 0."
+    release: v0.57.0
+    tags: [canonical-abi, correctness, use-types]
+    links:
+      - type: derives-from
+        target: SYS-3
+      - type: refines
+        target: SR-72
+
+  - id: SR-80
+    type: sw-req
+    title: A fused module can state how to invoke its exports
+    status: verified
+    description: "meld shall be able to emit a `meld.signature-manifest` custom section describing, per exported lifted function: the WIT signature, the core signature as emitted, the flattened parameter count, whether invoking it needs the guest's memory and allocator, the exported names of that memory, of the allocator the export's own lift names and of its post-return, and the return area's size, alignment and top-level layout. The core signature shall be read back from the emitted module bytes rather than derived from the WIT, so a consumer can cross-check its own lowering against it instead of trusting meld; derived from one source the two would agree by construction and the field would be decoration. An export whose types do not fully resolve shall be omitted with a stated reason rather than described by a fallback. Where the allocator an export's lift names is not exported by the fused module, the entry shall say so rather than naming another exported allocator that merely looks right. Fusing to a core module otherwise drops the WIT types, and a host that does not know the component's shape at build time cannot tell an export taking a u32 from one taking a pointer, because both lower to (i32) -> (i32); the Canonical ABI then passes garbage rather than erroring, which kiln 0.5.0 does today (#400, bytecodealliance/rfcs#46, component-model#378)."
+    release: v0.57.0
+    tags: [abi, interop, manifest, adr-7]
+    links:
+      - type: derives-from
+        target: SYS-4
