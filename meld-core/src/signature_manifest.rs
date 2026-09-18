@@ -357,6 +357,75 @@ fn fused_index_of(merged: &MergedModule, origin: (usize, usize, u32)) -> Option<
         .map(|defined_idx| merged.import_counts.func + defined_idx as u32)
 }
 
+/// Allocator exports meld must add so the manifest can name them (SR-81, #400).
+///
+/// A lift's `realloc` is usually internal to the fused module: components keep
+/// their own allocators, and only one of them tends to survive as an export.
+/// An entry that says `needs.realloc: true` with `realloc: null` is honest but
+/// uninvocable, so when the manifest is emitted each such allocator is exported
+/// under a deterministic name.
+///
+/// Deliberately NOT one module-level allocator: the falcon cascade carries five
+/// separate 8 KB arenas, so a single name would assert a unification that does
+/// not exist, and arguments written into an arena its owner does not manage are
+/// passed as garbage rather than refused.
+///
+/// Returns `(export name, fused function index)`, sorted, with allocators that
+/// are already exported left alone.
+pub fn allocator_exports(
+    components: &[ParsedComponent],
+    merged: &MergedModule,
+) -> Vec<(String, u32)> {
+    let already_exported: std::collections::HashSet<u32> = merged
+        .exports
+        .iter()
+        .filter(|e| matches!(e.kind, wasm_encoder::ExportKind::Func))
+        .map(|e| e.index)
+        .collect();
+    let taken: std::collections::HashSet<&str> =
+        merged.exports.iter().map(|e| e.name.as_str()).collect();
+
+    let mut wanted: std::collections::BTreeMap<u32, usize> = std::collections::BTreeMap::new();
+    for (comp_idx, component) in components.iter().enumerate() {
+        for (_, (_, options)) in component.lift_info_by_core_func() {
+            let Some(realloc) = options.realloc else {
+                continue;
+            };
+            let Some((_, mod_idx, local_idx)) = locate_core_func(component, realloc) else {
+                continue;
+            };
+            let Some(fused) = fused_index_of(merged, (comp_idx, mod_idx, local_idx)) else {
+                continue;
+            };
+            if already_exported.contains(&fused) {
+                continue;
+            }
+            // Lowest component index wins the name, so it does not depend on
+            // the lift map's iteration order.
+            wanted
+                .entry(fused)
+                .and_modify(|c| *c = (*c).min(comp_idx))
+                .or_insert(comp_idx);
+        }
+    }
+
+    let mut out = Vec::with_capacity(wanted.len());
+    for (fused, comp_idx) in wanted {
+        // NOT `cabi_realloc$<n>`: that is exactly the shape #298 prunes as a
+        // vestigial allocator export so loom can DCE `memory.grow`, and an
+        // allocator the manifest names must stay reachable. A distinct name
+        // also says who added it and why.
+        let mut name = format!("meld:realloc/{comp_idx}");
+        let mut n = 0;
+        while taken.contains(name.as_str()) || out.iter().any(|(existing, _)| *existing == name) {
+            n += 1;
+            name = format!("meld:realloc/{comp_idx}_{n}");
+        }
+        out.push((name, fused));
+    }
+    out
+}
+
 /// Build the manifest for a fused module.
 ///
 /// `components` is the flattened component list (the one the merger worked

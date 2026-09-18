@@ -3401,3 +3401,16 @@ artifacts:
     links:
       - type: derives-from
         target: SYS-4
+
+  - id: SR-81
+    type: sw-req
+    title: Every allocator the manifest requires is reachable as an export
+    status: verified
+    description: "When meld emits the signature manifest, every export whose invocation needs the guest's allocator shall name an allocator that the fused module actually exports, and that name shall be the allocator that export's own lift declares — not another component's. Components keep their own allocators through fusion, and a lift's realloc is usually internal to the fused module, so v0.57.0 could only state `realloc: null` beside `needs.realloc: true` for such an export: honest, and uninvocable. On the falcon cascade that is three of five exports. meld shall therefore export each such allocator under a deterministic name when the manifest is emitted, leaving artifacts without the manifest unchanged. A single module-level allocator shall NOT be synthesised by pointing one name at one component's arena: the cascade carries five separate 8 KB arenas, so a shared name would assert a unification that does not exist, and the Canonical ABI passes garbage rather than erroring when arguments are written into an allocator's region that its owner does not manage. A host holding only the manifest shall be able to allocate the argument area, call the export and read its return area, using only names the manifest states."
+    release: v0.58.0
+    tags: [abi, interop, manifest, adr-7]
+    links:
+      - type: derives-from
+        target: SYS-4
+      - type: refines
+        target: SR-80

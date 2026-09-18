@@ -50,13 +50,15 @@ decoration.
 fallback is how a `use`d record was once silently sized at four bytes.
 
 **It never names a plausible substitute.** `realloc` is resolved through fusion
-to the allocator that export's own lift names. When that function is not
-exported by the fused module, the entry says `"realloc": null` while
-`needs.realloc` stays `true`. That pair is a contradiction on purpose: the
-export cannot be invoked as the ABI requires, and a host should refuse rather
-than call some other exported allocator that happens to look right. Components
-fused together keep their own allocators, so this is the normal state for a
-multi-component fusion today.
+to the allocator that export's own lift names — never matched by a likely
+name. Components keep their own allocators through fusion, and in shared memory
+they all want the name `cabi_realloc`, so meld exports the ones an export needs
+under a distinct name (`meld:realloc/<n>`) and the manifest states it.
+
+If an allocator still cannot be resolved, the entry says `"realloc": null`
+while `needs.realloc` stays `true`. That pair is a contradiction on purpose:
+the export cannot be invoked as the ABI requires, and a host should refuse
+rather than call some other exported allocator that happens to look right.
 
 ## Reading it
 
@@ -71,3 +73,11 @@ microcontroller-sized artifacts.
 Status: the format is version `1` and settling with its consumers (#400). A
 reader that does not recognise the major version should refuse the manifest
 rather than parse it partially.
+
+## Keeping allocators alive
+
+An export whose arguments exceed 16 flattened values, or whose parameters carry
+a string or list, is staged through the callee's allocator. meld therefore keeps
+that allocator exported, which means it — and its `memory.grow` — stay reachable
+for a downstream DCE pass. A build that wants the smallest possible artifact and
+does not need to invoke such exports gets the allocator dropped as before.

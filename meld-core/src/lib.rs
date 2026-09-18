@@ -991,6 +991,17 @@ impl Fuser {
                 {
                     return false;
                 }
+                // #400 / SR-81: pointer-freedom is NOT realloc-freedom. Above
+                // MAX_FLAT_PARAMS the Canonical ABI passes the argument tuple
+                // through a pointer into an area the CALLEE's realloc
+                // allocates, so a host invoking this export needs that
+                // allocator even though no type contains a pointer — records
+                // of f32 reach the limit at 17 fields. Dropping the export
+                // there leaves a lifted export that nothing can call, which is
+                // what kiln hit on the falcon cascade.
+                if comp.total_flat_params(params) > crate::signature_manifest::MAX_FLAT_PARAMS {
+                    return false;
+                }
             }
         }
         true
@@ -1237,6 +1248,29 @@ impl Fuser {
         // code-section offsets are what the DWARF remap targets (trailing
         // custom sections do not shift code offsets, so the same offsets
         // hold in passes B and C).
+        // SR-81 (#400): make every allocator the manifest will name reachable.
+        // This must happen before the FIRST encode: `output_without_extras`
+        // reuses these bytes when there is no DWARF to embed, and the manifest
+        // reads its exports back out of them. Adding the exports after this
+        // point put them in the final artifact but not in the bytes the
+        // manifest parsed, so it reported `realloc: null` for an allocator the
+        // module did export — visible only on the `--memory shared` path,
+        // because multi-memory happened to re-encode for DWARF.
+        //
+        // Only when the manifest is emitted, so every other fuse keeps its
+        // exact export surface — including #298's dropping of the vestigial
+        // `cabi_realloc*` exports, which these deliberately do not re-add
+        // under that name.
+        if self.config.signature_manifest {
+            for (name, index) in signature_manifest::allocator_exports(&self.components, &merged) {
+                merged.exports.push(crate::merger::MergedExport {
+                    name,
+                    kind: wasm_encoder::ExportKind::Func,
+                    index,
+                });
+            }
+        }
+
         let bytes_for_remap = self.encode_output(&merged, &adapters, &[], &[])?;
 
         // Build the remapped `.debug_*` sections (only under Remap; a
