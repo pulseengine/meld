@@ -53,6 +53,21 @@ jobs:
         # disposable per workflow run.
         run: pip install --user --break-system-packages pyyaml
 
+      # #411: four cited tests did not exist, three of them naming behaviour the
+      # code had since deliberately inverted. A citation that resolves to nothing
+      # is mechanically catchable; this is that check. Fails the gate.
+      - name: Cited tests must exist
+        run: python3 tools/check_record_citations.py
+
+      # docs/verification-matrix.md is generated from traceability.yaml. It had
+      # drifted from its own source (statuses and test lists), so the published
+      # matrix disagreed with the record it renders.
+      - name: Verification matrix is up to date
+        run: |
+          python3 scripts/gen-verification-matrix.py
+          git diff --exit-code docs/verification-matrix.md \
+            || { echo "::error::docs/verification-matrix.md is stale — run scripts/gen-verification-matrix.py and commit"; exit 1; }
+
       - name: Run LS-N verification
         id: verify
         continue-on-error: true

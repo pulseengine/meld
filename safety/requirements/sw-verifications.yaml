@@ -206,8 +206,9 @@ artifacts:
   - id: SWV-17
     type: sw-verification
     title: "Verification of SR-17: Correct string transcoding"
-    description: >
-      Verifies SR-17 via: tests `adapter_safety::test_sr17_utf8_to_utf16_string_transcoding`, `adapter_safety::test_sr17_utf8_to_utf16_supplementary_plane_transcoding`, `adapter_safety::test_sr17_utf16_to_utf8_supplementary_plane_transcoding`, `adapter_safety::test_sr17_utf16_to_utf8_lone_high_surrogate_replacement`, `adapter_safety::test_sr17_utf16_to_utf8_midstring_lone_surrogate_replacement`, `adapter_safety::test_sr17_utf16_to_utf8_malformed_surrogate_matrix`, `adapter_safety::test_sr17_utf8_to_utf16_malformed_matrix`, `adapter_safety::test_sr17_latin1_to_utf16_transcoding`, `adapter_safety::test_253_read_latin1_tagclear_to_utf16`, `adapter_safety::test_253_read_latin1_tagclear_to_utf8`, `adapter_safety::test_253_read_latin1_tagset_to_utf16`, `adapter_safety::test_253_read_latin1_tagset_to_utf8_supplementary`, `adapter_safety::test_253_write_utf8_to_latin1_fits`, `adapter_safety::test_253_write_utf8_to_latin1_needs_utf16`, `adapter_safety::test_253_write_utf16_to_latin1_fits`, `adapter_safety::test_253_write_utf16_to_latin1_needs_utf16_supplementary`, `adapter_safety::ls_p_21_latin1_utf16_tag_honored_roundtrip`, `resolver::tests::test_sr17_all_encoding_pairs_transcoding_matrix`.
+    description: |-
+      Verifies SR-17 via: tests `adapter_safety::test_sr17_utf8_to_utf16_string_transcoding`, `adapter_safety::test_sr17_utf8_to_utf16_supplementary_plane_transcoding`, `adapter_safety::test_sr17_utf16_to_utf8_supplementary_plane_transcoding`, `adapter_safety::test_sr17_utf16_to_utf8_lone_high_surrogate_replacement`, `adapter_safety::test_sr17_utf16_to_utf8_midstring_lone_surrogate_replacement`, `adapter_safety::test_sr17_utf16_to_utf8_malformed_surrogate_matrix`, `adapter_safety::ls_p_20_test_sr17_utf8_to_utf16_malformed_matrix`, `adapter_safety::test_sr17_latin1_to_utf16_transcoding`, `adapter_safety::test_253_read_latin1_tagclear_to_utf16`, `adapter_safety::test_253_read_latin1_tagclear_to_utf8`, `adapter_safety::test_253_read_latin1_tagset_to_utf16`, `adapter_safety::test_253_read_latin1_tagset_to_utf8_supplementary`, `adapter_safety::test_253_write_utf8_to_latin1_fits`, `adapter_safety::test_253_write_utf8_to_latin1_needs_utf16`, `adapter_safety::test_253_write_utf16_to_latin1_fits`, `adapter_safety::test_253_write_utf16_to_latin1_needs_utf16_supplementary`, `adapter_safety::ls_p_21_latin1_utf16_tag_honored_roundtrip`, `resolver::tests::test_sr17_all_encoding_pairs_transcoding_matrix`.
+       Citation corrected 2026-09-18 (#411): prefix drift only, `test_sr17_utf8_to_utf16_malformed_matrix` → `ls_p_20_test_sr17_utf8_to_utf16_malformed_matrix`; same assertions.
     status: verified
     fields:
       method: automated-test
@@ -383,8 +384,9 @@ artifacts:
   - id: SWV-32
     type: sw-verification
     title: "Verification of SR-32: Stackful P3 lifting mode emission"
-    description: >
-      Verifies SR-32 via: tests `p3_async::tests::stackful_intrinsic_signatures_pinned`, `p3_async::tests::stackful_lift_is_async_without_callback`, `adapter::fact::tests::sr32_has_callback_export_detects_companion`, `adapter::fact::tests::sr32_stackful_emitter_handles_no_shim_with_default_results`, `adapter::fact::tests::sr32_stackful_emitter_shape_pins_call_drop_globalget`.
+    description: |-
+      Verifies SR-32 via: tests `p3_async::tests::stackful_intrinsic_signatures_pinned`, `p3_async::tests::stackful_lift_is_existential_over_lifts`, `adapter::fact::tests::sr32_has_callback_export_detects_companion`, `adapter::fact::tests::sr32_stackful_emitter_handles_no_shim_with_default_results`, `adapter::fact::tests::sr32_stackful_emitter_shape_pins_call_drop_globalget`.
+       Citation corrected 2026-09-18 (#411): the former `stackful_lift_is_async_without_callback` named the derivation the code calls wrong — `uses_stackful_lift` as `uses_async_lift && !uses_callback_lift` mis-classified mixed-mode components. The successor `stackful_lift_is_existential_over_lifts` pins the LS-A-12 fix: the flag is existential over the component's lifts, so a component with both a callback lift and a stackful lift reports true. SR-32's requirement is per-lift and is unchanged.
     status: implemented
     fields:
       method: automated-test
@@ -491,8 +493,9 @@ artifacts:
   - id: SWV-41
     type: sw-verification
     title: "Verification of SR-41: Async cross-encoding string transcoding"
-    description: >
-      Verifies SR-41 via: tests `async_cross_encoding::inc1_async_utf8_to_utf16_param_transcodes_hello`, `async_cross_encoding::inc1_async_utf8_to_utf16_param_transcodes_supplementary_plane`, `async_cross_encoding::inc2_async_utf16_to_utf8_param_transcodes_supplementary_plane`, `async_cross_encoding::inc4a_async_latin1_to_utf16_tag_set_nihon`, `async_cross_encoding::inc4a_async_latin1_to_utf8_tag_set_nihon`, `async_cross_encoding::inc4b_async_utf8_to_latin1_emoji_surrogate_pair`, `async_cross_encoding::inc4b_async_utf16_to_latin1_nihon_utf16`, `adapter::fact::tests::inc3_async_utf8_to_utf16_top_level_string_result_allowed`, `async_cross_encoding::inc5a_async_nested_list_string_utf8_to_utf16_transcodes`, `async_cross_encoding::inc5a_async_nested_list_u8_result_not_transcoded`, `async_cross_encoding::inc5b_nested_list_string_utf16_to_latin1`, `async_cross_encoding::inc5c_a_async_nested_list_string_param_utf8_to_utf16_transcodes`, `async_cross_encoding::inc5c_b_same_encoding_utf16_nested_param_deep_copies_full_codeunits`, `adapter::fact::tests::inc1_callback_adapter_transcode_locals_within_budget`, `adapter::fact::tests::inc5c_b_callback_adapter_nested_param_dest_latin1_locals_within_budget`, `adapter::fact::tests::inc5c_b_async_deeper_list_nesting_param_fails_loud_all_directions`.
+    description: |-
+      Verifies SR-41 via: tests `async_cross_encoding::inc1_async_utf8_to_utf16_param_transcodes_hello`, `async_cross_encoding::inc1_async_utf8_to_utf16_param_transcodes_supplementary_plane`, `async_cross_encoding::inc2_async_utf16_to_utf8_param_transcodes_supplementary_plane`, `async_cross_encoding::inc4a_async_latin1_to_utf16_tag_set_nihon`, `async_cross_encoding::inc4a_async_latin1_to_utf8_tag_set_nihon`, `async_cross_encoding::inc4b_async_utf8_to_latin1_emoji_surrogate_pair`, `async_cross_encoding::inc4b_async_utf16_to_latin1_nihon_utf16`, `adapter::fact::tests::inc3_async_utf8_to_utf16_top_level_string_result_allowed`, `async_cross_encoding::inc5a_async_nested_list_string_utf8_to_utf16_transcodes`, `async_cross_encoding::inc5a_async_nested_list_u8_result_not_transcoded`, `async_cross_encoding::inc5b_nested_list_string_utf16_to_latin1`, `async_cross_encoding::inc5c_a_async_nested_list_string_param_utf8_to_utf16_transcodes`, `async_cross_encoding::inc5c_b_same_encoding_utf16_nested_param_deep_copies_full_codeunits`, `adapter::fact::tests::inc1_callback_adapter_transcode_locals_within_budget`, `adapter::fact::tests::inc5c_b_callback_adapter_nested_param_dest_latin1_locals_within_budget`, `adapter::fact::tests::d5d_async_deeper_list_nesting_param_allowed_all_directions`.
+       Citation corrected 2026-09-18 (#411): the former `inc5c_b_async_deeper_list_nesting_param_fails_loud_all_directions` was renamed AND inverted by #286 5d — depth-2 `list<list<string>>` params are now ALLOWED, and the LS-F-27 fail-loud boundary moved to depth-3 and nested `list<u8>` (`d5d_async_nested_depth3_param_fail_loud`, `d5d_async_nested_list_list_u8_param_fail_loud`, both cited in SR-41's verification-description). SR-41's own text already states the depth-2 allow-set, so the requirement did not change — only this citation was left describing the refuted invariant.
     status: verified
     fields:
       method: automated-test
@@ -1360,3 +1363,14 @@ artifacts:
     links:
       - type: verifies
         target: SR-77
+
+  - id: SWV-90
+    type: sw-verification
+    title: "Verification of SR-78: cited tests resolve, matrix is regenerated"
+    status: implemented
+    description: "Verifies SR-78 via tools/check_record_citations.py, run by the required LS-N verification gate workflow, plus a second step that regenerates docs/verification-matrix.md and fails on any diff. The checker extracts module-qualified citations (backticked, file.rs::name, and bare YAML list items), skips CamelCase-qualified prose references to struct fields, and requires each name to appear in some .rs file — appearance rather than a literal fn, because tests are also produced by macros (runtime_test!) and citations legitimately name test modules (segments.rs::ordeal_fold_proof, merger/memory.rs::topology_tests). It guards against passing vacuously: it fails if fewer than 1000 identifiers are read from the sources or if any record file yields no citations. Negative control: run against origin/main's record in a git worktree, it reports all 11 occurrences of the 4 names #411 filed, at the exact lines the issue names; against the corrected record, 426 citations resolve. An earlier version of the YAML list-item pattern excluded ':' from the path prefix and silently missed multi-segment citations (p3_async::tests::name) in traceability.yaml, catching them only via the generated matrix; the control exposed that. Matrix step: regeneration is idempotent against the committed file, and a hand-edited or stale copy differs from the regenerated output. Known limit: a name appearing only in a comment would resolve; the check targets citations that resolve to nothing."
+    fields:
+      method: automated-test
+    links:
+      - type: verifies
+        target: SR-78
