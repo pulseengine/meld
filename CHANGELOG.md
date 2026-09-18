@@ -4,6 +4,44 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.58.0] - 2026-09-18
+
+### Fixed
+- **A fused export could need the guest's allocator and have none to call
+  (SR-81, #400).** An export whose arguments exceed 16 flattened values is
+  staged through an area the *callee's* allocator provides. Two independent
+  paths left that allocator unreachable, so no host could invoke the export:
+
+  1. **It was pruned.** #298 drops the vestigial `cabi_realloc*` exports so a
+     downstream pass can eliminate `memory.grow`, gated on a check that treated
+     "no parameter type *contains* a pointer" as "no allocator needed". A record
+     of 17 floats contains no pointer and still needs one. `meld fuse
+     provider.wasm --memory shared --address-rebase` emitted a module whose only
+     function export was the lifted function itself.
+  2. **It was never exported.** In shared memory every component names its
+     allocator `cabi_realloc`, so only one can hold that name; the rest were
+     absent. On a five-component cascade that left three of five exports with no
+     reachable allocator.
+
+  Now: the drop check also asks whether the flattened parameters exceed the
+  limit, and where several components each need one, meld exports them under
+  distinct names (`meld:realloc/<n>`). The signature manifest names whichever
+  applies. **This changes which exports a fused module carries** on those paths:
+  an allocator an export needs stays exported, and stays reachable for DCE.
+
+### Added
+- The manifest is now actionable end to end: a host reading only
+  `meld.signature-manifest` can allocate the argument area with the allocator it
+  names, write into the memory it names, invoke the export, and read the return
+  area at the offsets it describes. Pinned by a test that does exactly that.
+
+### Notes
+- `tests/wit_bindgen/fixtures/compose_record_use_wide/build.sh` now exists. The
+  v0.57.0 record said the fixture was built by it while it had in fact been
+  built by hand with the same commands; the script reproduces the committed
+  artifacts byte-identically, and the record entry (SWV-92) records the
+  correction.
+
 ## [0.57.0] - 2026-09-18
 
 ### Fixed

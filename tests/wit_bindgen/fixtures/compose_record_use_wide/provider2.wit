@@ -1,0 +1,32 @@
+package golden:wide2@0.1.0;
+
+// The falcon shape: a wide state record plus a small setpoint, both reached
+// through `use`. 14 + 4 = 18 flattened params, which is over
+// MAX_FLAT_PARAMS = 16, so the canonical ABI passes them through a pointer to
+// a params area rather than flat.
+//
+// That threshold is the point of this fixture. meld computed the flat count
+// through `get_type_definition`, which stops at the instance-export alias a
+// `use` compiles to, so every `use`d record counted as ONE flat value: 2
+// instead of 18, on the wrong side of the limit (#423).
+interface types {
+  record state {
+    f1: f32, f2: f32, f3: f32, f4: f32, f5: f32, f6: f32, f7: f32,
+    f8: f32, f9: f32, f10: f32, f11: f32, f12: f32, f13: f32, f14: f32,
+  }
+  record setpoint {
+    r1: f32, r2: f32, r3: f32, r4: f32,
+  }
+  record out {
+    o1: f32, o2: f32, o3: f32, o4: f32,
+  }
+}
+
+interface lib {
+  use types.{state, setpoint, out};
+  tick: func(s: state, sp: setpoint) -> out;
+}
+
+world provider {
+  export lib;
+}
