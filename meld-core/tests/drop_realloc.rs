@@ -681,6 +681,7 @@ fn shared_rebase_config() -> FuserConfig {
         attestation: false,
         reproducible: false,
         component_provenance: false,
+        signature_manifest: false,
         ..Default::default()
     }
 }
@@ -788,6 +789,7 @@ fn adapter_site_keeps_realloc_and_hard_errors_on_grow() {
             attestation: false,
             reproducible: false,
             component_provenance: false,
+            signature_manifest: false,
             ..Default::default()
         });
         fuser
@@ -877,6 +879,7 @@ fn non_shared_fuse_preserves_realloc() {
         attestation: false,
         reproducible: false,
         component_provenance: false,
+        signature_manifest: false,
         ..Default::default()
     };
 

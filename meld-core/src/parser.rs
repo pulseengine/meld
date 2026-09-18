@@ -1789,12 +1789,11 @@ impl ParsedComponent {
                 w
             }
             ComponentValType::Type(idx) => {
-                if let Some(ct) = self.get_type_definition(*idx) {
-                    if let ComponentTypeKind::Defined(inner) = &ct.kind {
-                        self.flat_width_list(inner)?
-                    } else {
-                        vec![4]
-                    }
+                // #423: `get_type_definition` stops at the instance-export
+                // alias a WIT `use` compiles to, so every `use`d type used to
+                // widen to a single 4-byte value here.
+                if let Some(inner) = self.resolve_defined_val_type(*idx) {
+                    self.flat_width_list(&inner)?
                 } else {
                     vec![4]
                 }
@@ -2147,10 +2146,8 @@ impl ParsedComponent {
                 }
             }
             ComponentValType::Type(idx) => {
-                if let Some(ct) = self.get_type_definition(*idx)
-                    && let ComponentTypeKind::Defined(inner) = &ct.kind
-                {
-                    self.collect_return_area_type_slots(inner, base, out);
+                if let Some(inner) = self.resolve_defined_val_type(*idx) {
+                    self.collect_return_area_type_slots(&inner, base, out);
                 } else {
                     // Fallback: treat as i32
                     out.push(ReturnAreaSlot {
@@ -2204,11 +2201,9 @@ impl ParsedComponent {
             ComponentValType::Own(id) => Some((*id, true)),
             ComponentValType::Borrow(id) => Some((*id, false)),
             ComponentValType::Type(idx) => {
-                // Follow type definition chain
-                if let Some(ct) = self.get_type_definition(*idx)
-                    && let ComponentTypeKind::Defined(inner) = &ct.kind
-                {
-                    match inner {
+                // Follow the type chain, including the `use` hop (#423).
+                if let Some(inner) = self.resolve_defined_val_type(*idx) {
+                    match &inner {
                         ComponentValType::Own(id) => Some((*id, true)),
                         ComponentValType::Borrow(id) => Some((*id, false)),
                         _ => None,
@@ -2355,10 +2350,8 @@ impl ParsedComponent {
                 }
             }
             ComponentValType::Type(idx) => {
-                if let Some(ct) = self.get_type_definition(*idx)
-                    && let ComponentTypeKind::Defined(inner) = &ct.kind
-                {
-                    self.collect_resource_byte_positions(inner, base, out);
+                if let Some(inner) = self.resolve_defined_val_type(*idx) {
+                    self.collect_resource_byte_positions(&inner, base, out);
                 }
             }
             // Lists contain resource handles but they're in a separate memory area,
@@ -2523,10 +2516,8 @@ impl ParsedComponent {
                 }
             }
             ComponentValType::Type(idx) => {
-                if let Some(ct) = self.get_type_definition(*idx)
-                    && let ComponentTypeKind::Defined(inner) = &ct.kind
-                {
-                    self.collect_pointer_positions(inner, base, out);
+                if let Some(inner) = self.resolve_defined_val_type(*idx) {
+                    self.collect_pointer_positions(&inner, base, out);
                 }
             }
             // Scalars, options, results, resources — no pointer pairs at param level
@@ -2573,10 +2564,8 @@ impl ParsedComponent {
                 }
             }
             ComponentValType::Type(idx) => {
-                if let Some(ct) = self.get_type_definition(*idx)
-                    && let ComponentTypeKind::Defined(inner) = &ct.kind
-                {
-                    self.collect_pointer_positions_with_layout(inner, base, out);
+                if let Some(inner) = self.resolve_defined_val_type(*idx) {
+                    self.collect_pointer_positions_with_layout(&inner, base, out);
                 }
             }
             _ => {}
@@ -2618,10 +2607,9 @@ impl ParsedComponent {
                 }
             }
             ComponentValType::Type(idx) => {
-                if let Some(ct) = self.get_type_definition(*idx)
-                    && let ComponentTypeKind::Defined(inner) = &ct.kind
-                {
-                    self.collect_pointer_byte_offsets(inner, base, out);
+                // #423: follow the `use` hop, which `get_type_definition` stops at.
+                if let Some(inner) = self.resolve_defined_val_type(*idx) {
+                    self.collect_pointer_byte_offsets(&inner, base, out);
                 }
             }
             _ => {}
@@ -2668,10 +2656,9 @@ impl ParsedComponent {
                 }
             }
             ComponentValType::Type(idx) => {
-                if let Some(ct) = self.get_type_definition(*idx)
-                    && let ComponentTypeKind::Defined(inner) = &ct.kind
-                {
-                    self.collect_pointer_byte_offsets_with_layout(inner, base, out);
+                // #423: follow the `use` hop, which `get_type_definition` stops at.
+                if let Some(inner) = self.resolve_defined_val_type(*idx) {
+                    self.collect_pointer_byte_offsets_with_layout(&inner, base, out);
                 }
             }
             _ => {}
@@ -2890,10 +2877,9 @@ impl ParsedComponent {
                 }
             }
             ComponentValType::Type(idx) => {
-                if let Some(ct) = self.get_type_definition(*idx)
-                    && let ComponentTypeKind::Defined(inner) = &ct.kind
-                {
-                    self.collect_conditional_pointers(inner, base, outer_guards, out);
+                // #423: follow the `use` hop, which `get_type_definition` stops at.
+                if let Some(inner) = self.resolve_defined_val_type(*idx) {
+                    self.collect_conditional_pointers(&inner, base, outer_guards, out);
                 }
             }
             _ => {}
@@ -3082,10 +3068,9 @@ impl ParsedComponent {
                 }
             }
             ComponentValType::Type(idx) => {
-                if let Some(ct) = self.get_type_definition(*idx)
-                    && let ComponentTypeKind::Defined(inner) = &ct.kind
-                {
-                    self.collect_conditional_result_pointers(inner, base, outer_guards, out);
+                // #423: follow the `use` hop, which `get_type_definition` stops at.
+                if let Some(inner) = self.resolve_defined_val_type(*idx) {
+                    self.collect_conditional_result_pointers(&inner, base, outer_guards, out);
                 }
             }
             _ => {}
@@ -3110,10 +3095,9 @@ impl ParsedComponent {
                 .iter()
                 .any(|(_, t)| t.as_ref().is_some_and(|t| self.type_contains_pointers(t))),
             ComponentValType::Type(idx) => {
-                if let Some(ct) = self.get_type_definition(*idx)
-                    && let ComponentTypeKind::Defined(inner) = &ct.kind
-                {
-                    self.type_contains_pointers(inner)
+                // #423: follow the `use` hop, which `get_type_definition` stops at.
+                if let Some(inner) = self.resolve_defined_val_type(*idx) {
+                    self.type_contains_pointers(&inner)
                 } else {
                     false
                 }
@@ -3147,10 +3131,9 @@ impl ParsedComponent {
                 .iter()
                 .any(|(_, t)| t.as_ref().is_some_and(|t| self.type_contains_resources(t))),
             ComponentValType::Type(idx) => {
-                if let Some(ct) = self.get_type_definition(*idx)
-                    && let ComponentTypeKind::Defined(inner) = &ct.kind
-                {
-                    self.type_contains_resources(inner)
+                // #423: follow the `use` hop, which `get_type_definition` stops at.
+                if let Some(inner) = self.resolve_defined_val_type(*idx) {
+                    self.type_contains_resources(&inner)
                 } else {
                     false
                 }
@@ -3187,14 +3170,13 @@ impl ParsedComponent {
                 1u32.saturating_add(max_c)
             }
             ComponentValType::Type(idx) => {
-                if let Some(ct) = self.get_type_definition(*idx) {
-                    if let ComponentTypeKind::Defined(inner) = &ct.kind {
-                        self.flat_count(inner)
-                    } else {
-                        1
-                    }
-                } else {
-                    1
+                // #423: a `use`d record counted as ONE flat value, so an
+                // 18-value argument tuple read as 2 and meld chose the flat
+                // calling convention for a callee expecting a pointer. The
+                // fused module validated, ran, and returned the wrong answer.
+                match self.resolve_defined_val_type(*idx) {
+                    Some(inner) => self.flat_count(&inner),
+                    None => 1,
                 }
             }
             ComponentValType::FixedSizeList(elem, len) => {
@@ -3617,10 +3599,9 @@ impl ParsedComponent {
                 }
             }
             ComponentValType::Type(idx) => {
-                if let Some(ct) = self.get_type_definition(*idx)
-                    && let ComponentTypeKind::Defined(inner) = &ct.kind
-                {
-                    return self.element_inner_pointers(inner, base, outer_guards);
+                // #423: follow the `use` hop, which `get_type_definition` stops at.
+                if let Some(inner) = self.resolve_defined_val_type(*idx) {
+                    return self.element_inner_pointers(&inner, base, outer_guards);
                 }
             }
             _ => {} // scalars, flags, resources — no pointer pairs
@@ -3776,10 +3757,9 @@ impl ParsedComponent {
                 }
             }
             ComponentValType::Type(idx) => {
-                if let Some(ct) = self.get_type_definition(*idx)
-                    && let ComponentTypeKind::Defined(inner) = &ct.kind
-                {
-                    return self.element_inner_resources(inner, base, outer_guards);
+                // #423: follow the `use` hop, which `get_type_definition` stops at.
+                if let Some(inner) = self.resolve_defined_val_type(*idx) {
+                    return self.element_inner_resources(&inner, base, outer_guards);
                 }
             }
             _ => {} // scalars, strings, dynamic lists — no in-element handle

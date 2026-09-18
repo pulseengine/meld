@@ -122,6 +122,7 @@ fn test_cross_module_call() {
         attestation: false,
         reproducible: false,
         component_provenance: false,
+        signature_manifest: false,
         ..Default::default()
     };
 
@@ -179,6 +180,7 @@ fn test_304_identity_direct_adapter_is_inlined() {
         attestation: false,
         reproducible: false,
         component_provenance: false,
+        signature_manifest: false,
         memory_strategy: MemoryStrategy::SharedMemory,
         address_rebasing: true,
         pack_rebase: false,
@@ -216,6 +218,7 @@ fn test_cross_module_call_with_different_args() {
         attestation: false,
         reproducible: false,
         component_provenance: false,
+        signature_manifest: false,
         ..Default::default()
     };
 
@@ -362,6 +365,7 @@ fn test_unresolved_import_index_offset() {
         attestation: false,
         reproducible: false,
         component_provenance: false,
+        signature_manifest: false,
         ..Default::default()
     };
 

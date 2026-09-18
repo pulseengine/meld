@@ -12,6 +12,9 @@ Key flags:
 - `--address-rebase` — relocate each component's data within one shared memory
   and rewrite its pointers. Valid only with `--memory shared`; not accepted
   with `auto`, which always selects `multi`. See `address-rebasing`.
+- `--emit-manifest` — add the `meld.signature-manifest` section describing, per
+  export, the WIT and core signatures, the flattened parameter count, and the
+  memory / allocator / post-return a host must use. See `signature-manifest`.
 - `--pack-rebase` — compact used-extent variant of `--address-rebase` for MCU
   targets; implies `--address-rebase`, requires `--memory shared`, and is sound
   only for components that address nothing above their last data segment. See

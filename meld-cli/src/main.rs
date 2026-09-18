@@ -147,6 +147,16 @@ enum Commands {
         #[arg(long)]
         no_component_provenance: bool,
 
+        /// Emit the `meld.signature-manifest` section (#400): per export, the
+        /// WIT signature, the core signature meld emitted, the flattened
+        /// parameter count, and the memory / allocator / post-return a host
+        /// must use to invoke it. Without it a host cannot tell an export
+        /// taking a plain `u32` from one taking a pointer — both lower to
+        /// `(i32) -> i32`, and the Canonical ABI passes garbage rather than
+        /// erroring. Opt-in: the section adds bytes.
+        #[arg(long)]
+        emit_manifest: bool,
+
         /// DWARF debug-info handling: `remap` (default since v0.25.0 —
         /// translate code addresses to the fused code section; meld-
         /// generated code is attributed to per-class `<meld-adapter>`
@@ -274,6 +284,7 @@ fn main() -> Result<()> {
             no_attestation,
             reproducible,
             no_component_provenance,
+            emit_manifest,
             dwarf,
             preserve_names,
             validate,
@@ -299,6 +310,7 @@ fn main() -> Result<()> {
                 no_attestation,
                 reproducible,
                 no_component_provenance,
+                emit_manifest,
                 dwarf,
                 preserve_names,
                 validate,
@@ -381,6 +393,7 @@ fn fuse_command(
     no_attestation: bool,
     reproducible: bool,
     no_component_provenance: bool,
+    emit_manifest: bool,
     dwarf: String,
     preserve_names: bool,
     validate: bool,
@@ -526,6 +539,7 @@ fn fuse_command(
         attestation: !no_attestation,
         reproducible,
         component_provenance: !no_component_provenance,
+        signature_manifest: emit_manifest,
         address_rebasing: address_rebase,
         pack_rebase,
         share_stack,

@@ -336,15 +336,13 @@ fn canonical_structural_key(
         // cross-component identity yet → None keeps it host-routed.
         ComponentValType::Own(_) | ComponentValType::Borrow(_) => None,
         ComponentValType::Type(idx) => {
-            let ct = comp.get_type_definition(*idx)?;
-            match &ct.kind {
-                ComponentTypeKind::Defined(inner) => canonical_structural_key(comp, inner, child),
-                // A `Type(N)` that resolves to anything other than a
-                // defined value type (resource declaration, function,
-                // instance, nested async) has no structural value key —
-                // stay conservative.
-                _ => None,
-            }
+            // #423: `resolve_defined_val_type` also follows the instance-export
+            // alias a `use` compiles to. A `Type(N)` that resolves to anything
+            // other than a defined value type (resource declaration, function,
+            // instance, nested async) has no structural value key — stay
+            // conservative.
+            let inner = comp.resolve_defined_val_type(*idx)?;
+            canonical_structural_key(comp, &inner, child)
         }
     }
 }

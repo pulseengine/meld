@@ -1,0 +1,10 @@
+package golden:wideapp@0.1.0;
+
+interface runner {
+  run: func() -> f32;
+}
+
+world consumer {
+  import golden:wide/lib@0.1.0;
+  export runner;
+}

@@ -2559,14 +2559,10 @@ pub(crate) fn resolve_component_val_type(
     use parser::ComponentValType as CVT;
     match ty {
         CVT::Type(idx) => {
-            if let Some(td) = comp.get_type_definition(*idx) {
-                if let parser::ComponentTypeKind::Defined(inner) = &td.kind {
-                    resolve_component_val_type(inner, comp)
-                } else {
-                    ty.clone()
-                }
-            } else {
-                ty.clone()
+            // #423: follow the `use` hop that `get_type_definition` stops at.
+            match comp.resolve_defined_val_type(*idx) {
+                Some(inner) => resolve_component_val_type(&inner, comp),
+                None => ty.clone(),
             }
         }
         CVT::List(inner) => CVT::List(Box::new(resolve_component_val_type(inner, comp))),
@@ -2633,16 +2629,11 @@ fn flat_component_val_type_resolved(
     use wasm_encoder::ValType;
     match ty {
         parser::ComponentValType::Type(idx) => {
-            // Resolve the type index to its definition
-            if let Some(type_def) = comp.get_type_definition(*idx) {
-                match &type_def.kind {
-                    parser::ComponentTypeKind::Defined(inner) => {
-                        flat_component_val_type_resolved(inner, comp)
-                    }
-                    _ => vec![ValType::I32], // function types etc. → handle
-                }
-            } else {
-                vec![ValType::I32] // unknown → default i32
+            // Resolve the type index to its definition, including the `use`
+            // hop (#423): without it a `use`d record flattened to one i32.
+            match comp.resolve_defined_val_type(*idx) {
+                Some(inner) => flat_component_val_type_resolved(&inner, comp),
+                None => vec![ValType::I32], // unknown → default i32
             }
         }
         parser::ComponentValType::Record(fields) => {

@@ -46,6 +46,11 @@ pub const TOPICS: &[Topic] = &[
         "concept-memory-strategies.md"
     ),
     topic!(
+        "signature-manifest",
+        "Signature manifest — invoking a fused export",
+        "concept-signature-manifest.md"
+    ),
+    topic!(
         "address-rebasing",
         "Address rebasing — one memory, no collisions",
         "concept-address-rebasing.md"

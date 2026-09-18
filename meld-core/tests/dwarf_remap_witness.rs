@@ -53,6 +53,7 @@ fn fuse_remap(input: &[u8]) -> Vec<u8> {
         attestation: false,
         reproducible: false,
         component_provenance: true,
+        signature_manifest: false,
         address_rebasing: false,
         pack_rebase: false,
         share_stack: false,
