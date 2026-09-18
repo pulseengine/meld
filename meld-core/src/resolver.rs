@@ -476,6 +476,16 @@ fn find_module_with_export(
 /// (#400) uses it to resolve a lift's `realloc`/`post_return` option to the
 /// function it actually names, so the manifest can report the export that IS
 /// that function rather than one whose name merely looks right.
+/// Which module export each component-level core MEMORY came from.
+///
+/// `core_memory_index -> (module_index, export_name)`. The signature manifest
+/// (#400) uses it to resolve a lift's `memory` option to the memory that export
+/// actually uses: a multi-memory fusion exports several, and naming the wrong
+/// one sends a host's arguments into another component's memory.
+pub fn core_memory_sources(component: &ParsedComponent) -> HashMap<u32, (usize, String)> {
+    build_entity_provenance(component).memory_source
+}
+
 pub fn core_func_sources(component: &ParsedComponent) -> HashMap<u32, (usize, String)> {
     build_entity_provenance(component).func_source
 }

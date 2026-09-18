@@ -257,8 +257,8 @@ pub struct EmittedExports {
     pub funcs: std::collections::BTreeMap<String, CoreSignature>,
     /// export name -> function index
     pub func_indices: std::collections::BTreeMap<String, u32>,
-    /// the first exported memory, if any
-    pub memory: Option<String>,
+    /// exported memory name -> memory index
+    pub memories: std::collections::BTreeMap<String, u32>,
 }
 
 /// Read every exported function's emitted type out of a core module.
@@ -310,7 +310,7 @@ pub fn emitted_exports(module_bytes: &[u8]) -> EmittedExports {
                                 .insert(export.name.to_string(), export.index);
                         }
                         wasmparser::ExternalKind::Memory => {
-                            out.memory.get_or_insert_with(|| export.name.to_string());
+                            out.memories.insert(export.name.to_string(), export.index);
                         }
                         _ => {}
                     }
@@ -468,7 +468,14 @@ pub fn build(
                 core,
                 flat_param_count,
                 needs,
-                memory: needs.memory.then(|| emitted.memory.clone()).flatten(),
+                memory: needs
+                    .memory
+                    .then(|| {
+                        options.memory.and_then(|m| {
+                            exported_memory_name(component, comp_idx, merged, &emitted, m)
+                        })
+                    })
+                    .flatten(),
                 realloc,
                 post_return,
                 return_area,
@@ -517,6 +524,37 @@ fn exported_name_of_core_func(
     let fused_idx = fused_index_of(merged, (comp_idx, mod_idx, local_idx))?;
     emitted
         .func_indices
+        .iter()
+        .find(|(_, idx)| **idx == fused_idx)
+        .map(|(name, _)| name.clone())
+}
+
+/// Resolve the memory an export's lift names to the name the fused module
+/// exports it under. A multi-memory fusion exports one per input component, so
+/// naming the first would send a host's arguments into another component's
+/// memory — the guess this manifest exists to remove. `None` when it cannot be
+/// resolved.
+fn exported_memory_name(
+    component: &ParsedComponent,
+    comp_idx: usize,
+    merged: &MergedModule,
+    emitted: &EmittedExports,
+    core_memory_index: u32,
+) -> Option<String> {
+    let sources = crate::resolver::core_memory_sources(component);
+    let (mod_idx, export_name) = sources.get(&core_memory_index)?.clone();
+    let local_idx = component
+        .core_modules
+        .get(mod_idx)?
+        .exports
+        .iter()
+        .find(|e| e.name == export_name)
+        .map(|e| e.index)?;
+    let fused_idx = *merged
+        .memory_index_map
+        .get(&(comp_idx, mod_idx, local_idx))?;
+    emitted
+        .memories
         .iter()
         .find(|(_, idx)| **idx == fused_idx)
         .map(|(name, _)| name.clone())

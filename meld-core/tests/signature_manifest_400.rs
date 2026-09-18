@@ -218,6 +218,75 @@ fn an_export_that_needs_nothing_names_nothing() {
     );
 }
 
+/// Found by the Mythos delta-pass on this change: the manifest named the FIRST
+/// exported memory for every export. A multi-memory fusion exports one memory
+/// per input component, so half the entries pointed a host at another
+/// component's memory — the exact guess this manifest exists to remove. Each
+/// export must name the memory ITS OWN lift uses, resolved through fusion.
+// rivet: verifies SR-80
+#[test]
+fn each_export_names_its_own_memory() {
+    let dir = format!(
+        "{}/../tests/wit_bindgen/fixtures",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let (Ok(wide), Ok(narrow)) = (
+        std::fs::read(format!("{dir}/compose_record_use_wide/provider.wasm")),
+        std::fs::read(format!("{dir}/compose_record_use/provider.wasm")),
+    ) else {
+        eprintln!("provider fixtures absent — skipping");
+        return;
+    };
+
+    let mut fuser = Fuser::new(FuserConfig {
+        memory_strategy: MemoryStrategy::MultiMemory,
+        attestation: false,
+        reproducible: true,
+        signature_manifest: true,
+        ..Default::default()
+    });
+    fuser
+        .add_component_named(&wide, Some("wide"))
+        .expect("parses");
+    fuser
+        .add_component_named(&narrow, Some("narrow"))
+        .expect("parses");
+    let fused = fuser.fuse().expect("fusion succeeds");
+    let manifest = read_manifest(&fused).expect("the section is present");
+    let emitted = signature_manifest::emitted_exports(&fused);
+
+    assert!(
+        emitted.memories.len() >= 2,
+        "guard: two components must contribute two memories, got {:?}",
+        emitted.memories
+    );
+
+    let named: Vec<(&str, &str)> = manifest
+        .exports
+        .iter()
+        .filter_map(|e| Some((e.export.as_str(), e.memory.as_deref()?)))
+        .collect();
+    assert!(
+        named.len() >= 2,
+        "guard: at least two exports must need a memory, got {named:?}"
+    );
+    for (export, memory) in &named {
+        assert!(
+            emitted.memories.contains_key(*memory),
+            "{export} names `{memory}`, which this module does not export"
+        );
+    }
+    assert!(
+        named
+            .iter()
+            .map(|(_, m)| *m)
+            .collect::<std::collections::BTreeSet<_>>()
+            .len()
+            >= 2,
+        "#400: exports from different components must not all name one memory: {named:?}"
+    );
+}
+
 /// Opt-in: a default fusion carries no manifest, so existing artifacts do not
 /// change size.
 // rivet: verifies SR-80
