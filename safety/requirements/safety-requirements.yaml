@@ -3342,7 +3342,7 @@ artifacts:
     type: sw-req
     title: Shipped help and documentation state what the auto memory strategy actually selects
     status: verified
-    description: "Every user-facing statement meld ships about the memory strategy — the fuse --help text and every embedded meld docs topic — shall describe MemoryStrategy::Auto as SR-37 requires it to behave: it always resolves to multi-memory and never selects shared memory or address rebasing on its own; shared memory with rebasing is reached only by explicit --memory shared. Through v0.56.0 the implementation complied with SR-37 while the --memory help, the memory-strategies and address-rebasing topics, the --address-rebase help and error message still described auto as picking shared+rebase for grow-free inputs, calling it 'the sound single-memory form' — the strategy SR-37 classifies as a corrupting transform (#409). v0.50.0 had corrected the internal doc comment and log line and left the text that ships. SR-64's invariant measures only topic presence and length, so it passed over the contradiction. A test shall scan the rendered fuse --help and every topic body for a sentence that names auto and shared together with a selection verb or a conditional and carries no negation, and shall fail naming the surface and sentence. Scope limit: this guards this one claim; it is not a general check that doc topics agree with the requirements they describe."
+    description: "Every user-facing statement meld ships about the memory strategy — the fuse --help text and every embedded meld docs topic — shall describe MemoryStrategy::Auto as SR-37 requires it to behave: it always resolves to multi-memory and never selects shared memory or address rebasing on its own; shared memory with rebasing is reached only by explicit --memory shared. Through v0.56.0 the implementation complied with SR-37 while the --memory help, the memory-strategies and address-rebasing topics, the --address-rebase help and error message still described auto as picking shared+rebase for grow-free inputs, calling it 'the sound single-memory form' — the strategy SR-37 classifies as a corrupting transform (#409). v0.50.0 had corrected the internal doc comment and log line and left the text that ships. SR-64's invariant measures only topic presence and length, so it passed over the contradiction. A test shall scan the rendered fuse --help and every topic body for a sentence that names auto and shared together with a selection verb or a conditional and carries no negation, and shall fail naming the surface and sentence. Scope limit: this guards this one claim; it is not a general check that doc topics agree with the requirements they describe. Scope correction (v0.58.1): 'user-facing' includes RUNTIME MESSAGES, not only help and doc topics. The --memory multi warning told users that `--memory auto` (the default) 'picks a single-memory form when sound' in v0.56.1 through v0.58.0 — the claim #409 removed, surviving in a string the guard never read — and a dead print arm described auto producing 'single-memory output'. Neither says the word 'shared', so the check must key on the OUTCOME however it is spelled, and must also catch a label that attributes an outcome to auto with no verb at all."
     release: v0.56.1
     tags: [cli, documentation, memory-strategy, correctness]
     fields:
@@ -3414,3 +3414,16 @@ artifacts:
         target: SYS-4
       - type: refines
         target: SR-80
+
+  - id: SR-82
+    type: sw-req
+    title: User-facing strings include runtime messages, not only help and documentation
+    status: verified
+    description: The guard that keeps shipped text from claiming that the auto memory strategy selects shared memory shall scan every string meld ships to a user, including runtime messages in the crate's own source, not only the rendered help and the embedded documentation topics. SR-76 shipped in v0.56.1 with that narrower surface, and the --memory multi warning went on telling users that `--memory auto` (the default) picks a single-memory form when sound through v0.58.0, with a dead print arm describing auto producing single-memory output beside it. The check shall key on the OUTCOME however it is spelled, because neither claim used the word shared, and shall catch a label that attributes an outcome to auto with no selection verb at all.
+    release: v0.58.1
+    tags: [cli, documentation, correctness, guard-scope]
+    links:
+      - type: derives-from
+        target: SYS-9
+      - type: refines
+        target: SR-76

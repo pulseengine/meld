@@ -447,8 +447,10 @@ fn fuse_command(
                 "warning: --memory multi produces a multi-memory module \
                  when inputs carry more than one memory. wasm-opt needs \
                  --enable-multimemory to consume it, and it has no \
-                 single-address-space (MCU) lowering. `--memory auto` \
-                 (the default) picks a single-memory form when sound."
+                 single-address-space (MCU) lowering. The default, \
+                 `--memory auto`, resolves to multi-memory too; a \
+                 single-address-space build needs `--memory shared` with \
+                 `--address-rebase` or `--pack-rebase`, chosen explicitly."
             );
             MemoryStrategy::MultiMemory
         }
@@ -584,25 +586,20 @@ fn fuse_command(
     let (fused_bytes, stats) = fuser.fuse_with_stats().context("Fusion failed")?;
 
     if memory_strategy == MemoryStrategy::Auto {
-        match stats.memory_strategy.as_str() {
-            // Unreachable today: auto always resolves to multi-memory (#326,
-            // #409). Kept so that if a future ADR-7 path re-enables automatic
-            // shared selection, the output still names it correctly — not
-            // because auto currently escalates.
-            "shared" => println!(
-                "Memory strategy: shared + address rebasing (auto: no \
-                 memory.grow in inputs) — single-memory output"
-            ),
-            resolved => {
-                println!("Memory strategy: {resolved} (auto)");
-                if resolved == "multi" {
-                    eprintln!(
-                        "note: multi-memory output needs `wasm-opt \
-                         --enable-multimemory` and has no single-address-\
-                         space (MCU) lowering. See issue #172."
-                    );
-                }
-            }
+        // #409 kept a dead `"shared"` arm here for a future ADR-7 path. It
+        // described auto producing a single-memory output, which auto has not
+        // done since #326, and the source-string guard flags it — correctly: a
+        // false sentence about current behaviour does not earn its keep by
+        // being unreachable. Naming whatever auto resolved to is what such a
+        // path would need anyway.
+        let resolved = stats.memory_strategy.as_str();
+        println!("Memory strategy: {resolved} (auto)");
+        if resolved == "multi" {
+            eprintln!(
+                "note: multi-memory output needs `wasm-opt \
+                 --enable-multimemory` and has no single-address-\
+                 space (MCU) lowering. See issue #172."
+            );
         }
     }
 
@@ -1274,6 +1271,17 @@ mod auto_memory_claim_tests {
         const NEGATED_WORDS: &[&str] = &["never", "not", "until", "formerly", "superseded"];
         const NEGATED_PHRASES: &[&[&str]] = &[&["no", "longer"], &["used", "to"]];
         const CONDITIONAL_WORDS: &[&str] = &["when", "if", "unless", "otherwise"];
+        // The OUTCOME auto is wrongly said to select, however it is spelled.
+        // "shared" alone was too narrow: the `--memory multi` warning said auto
+        // "picks a single-memory form when sound" and never used the word, so
+        // the guard read past it for three releases (found while measuring for
+        // #427).
+        const SUBJECT: &[&str] = &["shared", "single-memory", "single memory", "one memory"];
+        // A label can attribute an outcome to auto with no verb at all:
+        // "Memory strategy: shared + address rebasing (auto: no memory.grow in
+        // inputs)". Note `--memory <auto|multi|shared>` carries neither marker,
+        // so enumerating the values stays unflagged.
+        const ATTRIBUTION: &[&str] = &["(auto", "auto:"];
         text.split(['.', ';'])
             .map(|s| s.split_whitespace().collect::<Vec<_>>().join(" "))
             .filter(|s| {
@@ -1292,8 +1300,10 @@ mod auto_memory_claim_tests {
                         .iter()
                         .any(|p| words.windows(p.len()).any(|win| win == *p));
                 l.contains("auto")
-                    && l.contains("shared")
-                    && (SELECTS.iter().any(|v| l.contains(v)) || conditional)
+                    && SUBJECT.iter().any(|w| l.contains(w))
+                    && (SELECTS.iter().any(|v| l.contains(v))
+                        || conditional
+                        || ATTRIBUTION.iter().any(|a| l.contains(a)))
                     && !negated
             })
             .collect()
@@ -1311,6 +1321,13 @@ mod auto_memory_claim_tests {
             "`--memory auto` therefore only chooses shared + rebase when no input carries `memory.grow`",
             "Fuser::fuse_with_stats uses it to resolve MemoryStrategy::Auto to shared-memory fusion exactly when the probe proves growth cannot occur",
             "the library default is `Auto` — shared+rebase when provably safe, multi-memory otherwise",
+            // Found on 2026-09-18 while measuring boundary strategies for #427:
+            // the `--memory multi` warning, shipped v0.56.1..v0.58.0. It never
+            // says "shared" — the claim is spelled "single-memory form", which
+            // the checker read past until SUBJECT was widened.
+            "`--memory auto` (the default) picks a single-memory form when sound",
+            // The dead `"shared"` print arm #409 kept, removed in the same pass.
+            "Memory strategy: shared + address rebasing (auto: no memory.grow in inputs) — single-memory output",
         ] {
             assert!(
                 !claims_auto_selects_shared(false_claim).is_empty(),
@@ -1340,6 +1357,111 @@ mod auto_memory_claim_tests {
                 "#409: the checker falsely flagged a true statement: {true_claim}"
             );
         }
+    }
+
+    /// Source text with `#[cfg(test)]` modules removed, so a scan of shipped
+    /// strings does not trip over this module's own fixtures — the verbatim
+    /// false sentences it must flag.
+    ///
+    /// Line-based on purpose: a brace counter is fooled by the `'{'` and `'}'`
+    /// char literals in this very module, and silently under-strips. A
+    /// top-level module closes with `}` in column 0, which no string literal
+    /// does in rustfmt-formatted source.
+    fn without_test_modules(src: &str) -> String {
+        let mut out = Vec::new();
+        let mut skipping = false;
+        for line in src.lines() {
+            if !skipping && line.trim_start().starts_with("#[cfg(test)]") {
+                skipping = true;
+                continue;
+            }
+            if skipping {
+                if line == "}" {
+                    skipping = false;
+                }
+                continue;
+            }
+            out.push(line);
+        }
+        out.join("\n")
+    }
+
+    /// The human-readable text of a source file: comment bodies and string
+    /// literals, with the code between them dropped.
+    ///
+    /// Scanning raw source made the guard flag its own explanation, because a
+    /// line like `if memory_strategy == MemoryStrategy::Auto {` supplies the
+    /// word "auto" while the keyword `if` reads as the conditional in
+    /// "shared … if …". The requirement is about text meld SHOWS a user, so
+    /// the scan reads text.
+    ///
+    /// Character-level, not line-based, because the claim that prompted this
+    /// is a multi-line string with `\` continuations: no single line of it
+    /// holds a matched pair of quotes, and a line-based extractor dropped the
+    /// whole thing — a control that passed for exactly that reason.
+    fn prose_and_literals(src: &str) -> String {
+        let mut out = String::new();
+        let mut chars = src.chars().peekable();
+        while let Some(c) = chars.next() {
+            match c {
+                '/' if chars.peek() == Some(&'/') => {
+                    for c in chars.by_ref() {
+                        if c == '\n' {
+                            break;
+                        }
+                        out.push(c);
+                    }
+                    out.push('\n');
+                }
+                '"' => {
+                    while let Some(c) = chars.next() {
+                        match c {
+                            '\\' => {
+                                // Skip the escaped character; a line
+                                // continuation contributes nothing but
+                                // whitespace anyway.
+                                chars.next();
+                                out.push(' ');
+                            }
+                            '"' => break,
+                            _ => out.push(c),
+                        }
+                    }
+                    out.push('\n');
+                }
+                _ => {}
+            }
+        }
+        out
+    }
+
+    /// The same claim, hiding in a runtime message. #409 corrected the help and
+    /// the doc topics; the `--memory multi` warning went on telling users that
+    /// `auto` "picks a single-memory form when sound" for three more releases,
+    /// because the scan above reads rendered help and topic bodies, not message
+    /// literals. Found while measuring boundary strategies for #427.
+    // rivet: verifies SR-82
+    #[test]
+    fn no_shipped_source_string_claims_auto_selects_shared() {
+        let mut offending = Vec::new();
+        for (label, src) in [
+            ("meld-cli/src/main.rs", include_str!("main.rs")),
+            ("meld-cli/src/docs.rs", include_str!("docs.rs")),
+        ] {
+            let scanned = prose_and_literals(&without_test_modules(src));
+            assert!(
+                scanned.len() > 1000,
+                "guard: {label} scan is empty after stripping test modules"
+            );
+            for s in claims_auto_selects_shared(&scanned) {
+                offending.push(format!("{label}: {s}"));
+            }
+        }
+        assert!(
+            offending.is_empty(),
+            "#409: shipped source text claims `auto` selects shared memory:\n{}",
+            offending.join("\n")
+        );
     }
 
     /// The recurrence guard. Every string meld ships about the memory strategy —

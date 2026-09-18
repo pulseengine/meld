@@ -4,6 +4,33 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.58.1] - 2026-09-18
+
+### Fixed
+- **A runtime warning still told users that `auto` picks a single-memory form
+  (SR-76, #409).** `meld fuse --memory multi` printed:
+
+  > `--memory auto` (the default) picks a single-memory form when sound.
+
+  `auto` has always resolved to multi-memory since #326, and v0.56.1 corrected
+  the help text and the documentation topics on exactly that point. The warning
+  went on saying the opposite for three releases, because #409's guard reads the
+  rendered help and the doc topic bodies — not message literals in the source.
+  A dead print arm describing auto producing "single-memory output" is removed
+  in the same pass.
+
+  The guard now also scans the crate's own source with test modules stripped,
+  and its vocabulary was widened twice, each time by a control that passed when
+  it should have failed:
+  - neither claim contains the word "shared" — both spell it "single-memory" —
+    so the check keys on the outcome however it is phrased;
+  - a label can attribute an outcome to auto with no verb at all
+    (`Memory strategy: shared … (auto: no memory.grow in inputs)`), which a
+    sentence split on `.` had additionally fragmented.
+
+  Both phrasings are now in the checker's verbatim fixture list. Found while
+  measuring boundary strategies for #427.
+
 ## [0.58.0] - 2026-09-18
 
 ### Fixed
