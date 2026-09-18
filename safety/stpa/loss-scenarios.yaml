@@ -3459,21 +3459,22 @@ loss-scenarios:
     status: approved
     priority: high
     fix: >
-      `Fuser::resolve_auto_memory_strategy` only selects shared when
-      `memory_probe::module_uses_memory_grow` is false for every core
-      module of every component; the probe returns true on any parse
-      failure (conservative direction). A shared-plan refusal
-      downgrades to multi-memory rather than failing, so the sound
-      strategy is also the fallback. Pinned by
-      `ls_m_7_auto_keeps_multi_when_input_grows` (integration,
-      tests/auto_memory.rs: a growing input must resolve to "multi"
-      with both memories preserved) and
-      `ls_m_7_malformed_input_counts_as_grow` (unit,
-      memory_probe::tests: unparseable bytes must probe as growing).
-      `auto_selects_shared_for_growfree_inputs` covers the other
-      direction end-to-end: grow-free inputs produce a single-memory
-      output that validates without multi-memory and behaves
-      correctly at runtime (B's data at its rebased base).
+      Fuser::resolve_auto_memory_strategy resolves Auto to multi-memory for EVERY input: since #326
+      (v0.38.0) it never selects shared memory, because address rebasing does not relocate
+      the dynamic address operand of ordinary loads/stores. The probe
+      (memory_probe::module_uses_memory_grow, true on any parse failure - the conservative
+      direction) still runs, but no branch can select shared: it only shapes the log line and the
+      bounded_memory provenance premise. The shared-plan downgrade to multi-memory is kept as an
+      unreachable safety net. Pinned by ls_m_11_auto_gates_unsound_shared_rebase (integration,
+      tests/auto_memory.rs: grow-free inputs must still resolve to "multi" with both memories
+      preserved, and the output must NOT validate with multi-memory disabled) and
+      ls_m_7_auto_keeps_multi_when_input_grows (a growing input resolves to "multi"), with
+      ls_m_7_malformed_input_counts_as_grow (unit, memory_probe::tests: unparseable bytes probe as
+      growing). Narrative corrected 2026-09-18 (#411): until #326 this fix read that auto selected
+      shared when the probe was false, and cited auto_selects_shared_for_growfree_inputs - a test
+      that never existed - as proving grow-free inputs produce a single-memory output with B's data
+      at its rebased base. That is the behaviour the memory-strategy requirement now forbids, so the citation described the
+      hazard rather than the fix.
 
   - id: LS-M-8
     title: Element/data segment index operands not relocated during fusion

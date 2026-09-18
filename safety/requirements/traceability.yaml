@@ -194,7 +194,7 @@ verification-status:
       - adapter_safety::test_sr17_utf16_to_utf8_lone_high_surrogate_replacement
       - adapter_safety::test_sr17_utf16_to_utf8_midstring_lone_surrogate_replacement
       - adapter_safety::test_sr17_utf16_to_utf8_malformed_surrogate_matrix
-      - adapter_safety::test_sr17_utf8_to_utf16_malformed_matrix
+      - adapter_safety::ls_p_20_test_sr17_utf8_to_utf16_malformed_matrix
       - adapter_safety::test_sr17_latin1_to_utf16_transcoding
       - adapter_safety::test_253_read_latin1_tagclear_to_utf16
       - adapter_safety::test_253_read_latin1_tagclear_to_utf8
@@ -396,7 +396,7 @@ verification-status:
       - meld-core/src/adapter/fact.rs
     tests:
       - p3_async::tests::stackful_intrinsic_signatures_pinned
-      - p3_async::tests::stackful_lift_is_async_without_callback
+      - p3_async::tests::stackful_lift_is_existential_over_lifts
       - adapter::fact::tests::sr32_has_callback_export_detects_companion
       - adapter::fact::tests::sr32_stackful_emitter_handles_no_shim_with_default_results
       - adapter::fact::tests::sr32_stackful_emitter_shape_pins_call_drop_globalget
@@ -496,7 +496,7 @@ verification-status:
       - meld-core/src/memory_probe.rs
       - meld-core/src/lib.rs
     tests:
-      - meld-core/tests/auto_memory.rs::auto_selects_shared_for_growfree_inputs
+      - meld-core/tests/auto_memory.rs::ls_m_11_auto_gates_unsound_shared_rebase
       - meld-core/tests/auto_memory.rs::ls_m_7_auto_keeps_multi_when_input_grows
       - meld-core/tests/auto_memory.rs::ls_m_7_auto_reprobes_after_add_component
       - meld-core/tests/auto_memory.rs::auto_keeps_multi_for_single_memory_input
@@ -584,8 +584,12 @@ verification-status:
       # integration compensating control; full e2e is kiln-gated)
       - adapter::fact::tests::inc1_callback_adapter_transcode_locals_within_budget
       - adapter::fact::tests::inc5c_b_callback_adapter_nested_param_dest_latin1_locals_within_budget
-      # The fail-loud guard (LS-F-27) for the not-yet-supported deeper-nesting edge
-      - adapter::fact::tests::inc5c_b_async_deeper_list_nesting_param_fails_loud_all_directions
+      # Depth-2 nesting is ALLOWED since #286 5d, which deliberately inverted the
+      # old inc5c_b fail-loud guard; the LS-F-27 boundary moved to depth-3 and
+      # nested list<u8>
+      - adapter::fact::tests::d5d_async_deeper_list_nesting_param_allowed_all_directions
+      - adapter::fact::tests::d5d_async_nested_depth3_param_fail_loud
+      - adapter::fact::tests::d5d_async_nested_list_list_u8_param_fail_loud
     proofs: []
     status: verified
     note: >-

@@ -938,13 +938,15 @@ artifacts:
         - meld-core/src/adapter/fact.rs    # trampoline emitter (Phase 2)
       verification-method: test
       verification-description: >
-        Foundation: stackful_intrinsic_signatures_pinned +
-        stackful_lift_is_async_without_callback. Emitter:
-        sr32_has_callback_export_detects_companion (detection),
-        sr32_stackful_emitter_handles_no_shim_with_default_results
-        (no-shim fallback), and
-        sr32_stackful_emitter_shape_pins_call_drop_globalget
-        (byte-scan structural pin on the emitted wasm trampoline).
+        Foundation: stackful_intrinsic_signatures_pinned + stackful_lift_is_existential_over_lifts.
+        Emitter: sr32_has_callback_export_detects_companion (detection),
+        sr32_stackful_emitter_handles_no_shim_with_default_results (no-shim fallback), and
+        sr32_stackful_emitter_shape_pins_call_drop_globalget (byte-scan structural pin on the
+        emitted wasm trampoline). Name corrected 2026-09-18 (#411): the former
+        stackful_lift_is_async_without_callback encoded the mis-classifying uses_async_lift &&
+        !uses_callback_lift derivation; the successor pins the LS-A-12 fix, that the flag is
+        existential over the component's lifts. SR-32's requirement is per-lift and unchanged.
+
       milestone: v0.8.0
 
   - id: SR-33
@@ -1213,21 +1215,25 @@ artifacts:
         - meld-core/src/lib.rs
       verification-method: test
       verification-description: >
-        Unit tests on the probe (grow detected anywhere in any body;
-        memory.size not a false positive; malformed input counts as
-        growing — `ls_m_7_malformed_input_counts_as_grow`). Integration
-        oracle in tests/auto_memory.rs: grow-free inputs fuse to a
-        single-memory output that validates with multi-memory disabled
-        (the `wasm-opt -Os` feature set) and behaves correctly at
-        runtime; a growing input resolves to multi with both memories
-        preserved (`ls_m_7_auto_keeps_multi_when_input_grows`);
-        explicit strategies are never overridden. Manual evidence on
-        the issue repro: `meld fuse a b -o fused.wasm` then
-        `wasm-opt -Os fused.wasm` succeeds with no flags; the explicit
-        `--memory multi` control still reproduces the rejection.
-        Verified (v0.31.0 audit): tests/auto_memory.rs suite 5/5 green
-        plus the ls_m_7_* tests discovered and passing through the LS
-        verification gate.
+        Unit tests on the probe (grow detected anywhere in any body; memory.size not a false
+        positive; malformed input counts as growing - ls_m_7_malformed_input_counts_as_grow).
+        Integration oracles in tests/auto_memory.rs: ls_m_11_auto_gates_unsound_shared_rebase
+        asserts that grow-free inputs - the case the superseded requirement wanted fused into one
+        memory - still resolve to "multi", keep both memories, and produce output that does NOT
+        validate with multi-memory disabled; ls_m_7_auto_keeps_multi_when_input_grows covers a
+        growing input; auto_keeps_multi_for_single_memory_input covers nothing-to-merge;
+        ls_m_7_auto_reprobes_after_add_component covers re-derivation after a late input;
+        explicit_multi_is_not_overridden covers explicit strategies never being overridden.
+        resolve_auto_memory_strategy still runs the probe, but every branch assigns MultiMemory -
+        the probe result only shapes the log line and the bounded_memory provenance premise.
+        Citation corrected 2026-09-18 (#411): this field previously cited
+        auto_selects_shared_for_growfree_inputs, a test that does not exist, and described grow-free
+        inputs fusing to a single-memory output that validates without multi-memory - the v0.22.0
+        behaviour #326 removed as a corrupting transform (SR-37 v0.38.0). The manual wasm-opt -Os
+        evidence recorded with it is void for the same reason: multi-memory output requires
+        --enable-multimemory. Verified (v0.31.0 audit): tests/auto_memory.rs suite green through the
+        LS verification gate.
+
       milestone: v0.22.0
 
   - id: SR-38
@@ -3361,3 +3367,14 @@ artifacts:
     links:
       - type: derives-from
         target: SYS-9
+
+  - id: SR-78
+    type: sw-req
+    title: Every test the safety record cites exists in the source tree
+    status: verified
+    description: "Every test cited as verification evidence in safety/requirements/sw-verifications.yaml, safety/requirements/traceability.yaml and docs/verification-matrix.md shall resolve to a test that exists in the source tree, and CI shall fail when one does not. docs/verification-matrix.md is generated from traceability.yaml and shall be regenerated whenever its source changes, so the published matrix cannot disagree with the record it renders. Through v0.56.2 four cited tests did not exist (#411). Three of them named a behaviour the codebase had since deliberately inverted: inc5c_b_async_deeper_list_nesting_param_fails_loud_all_directions (depth-2 list nesting is allowed since #286 5d, and the fail-loud boundary moved to depth-3), stackful_lift_is_async_without_callback (that derivation mis-classified mixed-mode components; the flag is existential over lifts), and auto_selects_shared_for_growfree_inputs (which described the corrupting shared+rebase transform the memory-strategy requirement forbids, cited as evidence FOR the very requirement that forbids it). A citation naming a refuted invariant reads as coherent evidence, so an auditor has no reason to look further, which is why it needs a mechanical check rather than review. The committed matrix had also drifted from its own source in both statuses and test lists."
+    tags: [traceability, record-integrity, ci-gate]
+    fields:
+    links:
+      - type: derives-from
+        target: SYS-11
