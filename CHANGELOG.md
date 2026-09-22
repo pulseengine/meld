@@ -22,10 +22,14 @@ All notable changes to this project will be documented in this file.
   declared count never exceeds its bytes. The same input now merges in 187 µs
   and is still rejected, because it is still malformed.
 
-  meld fuses components other people build, so unbounded work from a declared
-  number is a denial-of-service shape rather than a tidiness problem. The input
-  is committed to `fuzz/corpus/fuzz_merger_idempotent/` so the fuzzer replays
-  it, and driven directly by a test so the property holds without a fuzz run.
+  **Reachability, precisely:** `meld fuse` was never exposed — the CLI parses
+  with validation, which rejects this input before the merger runs (measured at
+  8 ms on both v0.58.1 and v0.58.2). The reachable paths are the public
+  `ComponentParser::without_validation()` and the fuzz targets, which is where
+  it surfaced. A library-API robustness fix, not an exploitable path in the
+  shipped CLI. The input is committed to `fuzz/corpus/fuzz_merger_idempotent/`
+  so the fuzzer replays it, and driven directly by a test so the property holds
+  without a fuzz run.
 
 ## [0.58.1] - 2026-09-18
 
