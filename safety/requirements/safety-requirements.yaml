@@ -3427,3 +3427,14 @@ artifacts:
         target: SYS-9
       - type: refines
         target: SR-76
+
+  - id: SR-83
+    type: sw-req
+    title: A count read from an input module is bounded by that input
+    status: verified
+    description: "Work meld does on an input shall be bounded by the size of that input. A count declared in a module's section header shall not be trusted beyond what the section's bytes can encode: every segment costs at least one byte, so a declared count larger than the section length cannot describe real segments, and meld shall clamp it rather than allocate or iterate on it. Through v0.58.1 the per-module segment index map was sized from the declared count alone. A 60-byte fuzz input whose 9-byte element section declares 134,069,110 segments made the merger insert one map entry per declared index: 95 seconds of work and gigabytes of allocation before returning the parse error it could have returned immediately, which libFuzzer reports as an out-of-memory under its 2 GB limit. meld fuses components other people build, so an input that costs 95 seconds and unbounded memory for 60 bytes is a denial-of-service shape. For a valid module the clamp changes nothing, because its declared count never exceeds its bytes."
+    release: v0.58.2
+    tags: [robustness, dos, fuzz, correctness]
+    links:
+      - type: derives-from
+        target: SYS-9
