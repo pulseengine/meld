@@ -1418,3 +1418,14 @@ artifacts:
     links:
       - type: verifies
         target: SR-82
+
+  - id: SWV-95
+    type: sw-verification
+    title: "Verification of SR-83: declared counts are bounded by their section"
+    status: implemented
+    description: "Verifies SR-83 via meld-core/tests/bounded_segment_counts_426.rs (2 tests) driving the fuzz finding itself, which is committed to fuzz/corpus/fuzz_merger_idempotent/oom_426_element_count.bin so the fuzzer replays it as well. a_declared_count_cannot_exceed_its_section guards that the input really carries a 9-byte element section, then requires the counted segments not to exceed it; merging_a_hostile_count_stays_bounded requires the merge of those 60 bytes to finish inside 5 seconds AND to still fail, because the module is malformed and rejecting it is correct — only the cost changed (94.8 s before, 187 microseconds after). The cause was located by sampling the running process rather than by reading code: 3608 of 3715 samples sat in build_index_maps_for_module, which sizes the per-module segment index map from the declared count. Negative control: removing the clamp from the element counter fails both tests, the timing one visibly hanging past 60 seconds with 95 s of user time for the run. Pattern check: every other declared-count read in the workspace was classified — component_wrap's type_count is stored but drives no loop, its memory_count appears in a test assertion, and the data-segment counter shares the fix."
+    fields:
+      method: automated-test
+    links:
+      - type: verifies
+        target: SR-83

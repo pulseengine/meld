@@ -556,9 +556,26 @@ pub fn count_element_segments(module: &CoreModule) -> u32 {
     };
     let binary_reader = wasmparser::BinaryReader::new(&module.bytes[start..end], 0);
     match ElementSectionReader::new(binary_reader) {
-        Ok(reader) => reader.count(),
+        Ok(reader) => bound_by_section(reader.count(), start, end),
         Err(_) => 0,
     }
+}
+
+/// Clamp a count declared in a section header to what the section's bytes can
+/// encode (SR-83, #426).
+///
+/// The count is read from the input without parsing the entries — that is the
+/// point of these helpers — so it is an unvalidated number. Every segment costs
+/// at least one byte, so a declared count above the section length cannot
+/// describe real segments. For a valid module this is a no-op.
+///
+/// It is not a no-op for a hostile one: a 9-byte element section declaring
+/// 134,069,110 segments made the caller insert one index-map entry per declared
+/// index — 95 seconds and gigabytes for a 60-byte input, before returning the
+/// parse error it could have returned at once.
+fn bound_by_section(declared: u32, start: usize, end: usize) -> u32 {
+    let section_len = end.saturating_sub(start);
+    declared.min(u32::try_from(section_len).unwrap_or(u32::MAX))
 }
 
 /// Count a module's data segments without fully parsing each entry.
@@ -570,7 +587,7 @@ pub fn count_data_segments(module: &CoreModule) -> u32 {
     };
     let binary_reader = wasmparser::BinaryReader::new(&module.bytes[start..end], 0);
     match DataSectionReader::new(binary_reader) {
-        Ok(reader) => reader.count(),
+        Ok(reader) => bound_by_section(reader.count(), start, end),
         Err(_) => 0,
     }
 }

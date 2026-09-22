@@ -4,6 +4,29 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.58.2] - 2026-09-22
+
+### Fixed
+- **A 60-byte input could cost 95 seconds and gigabytes before failing anyway
+  (SR-83, #426).** The per-module segment index map was sized from the count
+  declared in a section header, which is read without parsing the entries and is
+  therefore whatever the input claims. A fuzz input whose **9-byte** element
+  section declared **134,069,110** segments made the merger insert one map entry
+  per declared index — 94.8 seconds and gigabytes of allocation, and then it
+  returned the parse error it could have returned immediately. libFuzzer reports
+  that as an out-of-memory under its 2 GB limit, which is how it surfaced.
+
+  A declared count is now clamped to what the section's bytes can encode: every
+  segment costs at least one byte, so a count above the section length cannot
+  describe real segments. **For a valid module this changes nothing** — its
+  declared count never exceeds its bytes. The same input now merges in 187 µs
+  and is still rejected, because it is still malformed.
+
+  meld fuses components other people build, so unbounded work from a declared
+  number is a denial-of-service shape rather than a tidiness problem. The input
+  is committed to `fuzz/corpus/fuzz_merger_idempotent/` so the fuzzer replays
+  it, and driven directly by a test so the property holds without a fuzz run.
+
 ## [0.58.1] - 2026-09-18
 
 ### Fixed
