@@ -4,6 +4,49 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.58.3] - 2026-09-23
+
+### Added
+- **Statically linked Linux binaries for x86_64 and aarch64 (SR-84, #432).**
+  The Linux assets were gnu-only with a measured `GLIBC_2.34` floor, so they do
+  not run on Alpine, distroless-static, RHEL 8 or Ubuntu 20.04. These binaries
+  are ingested into a varve realm layer whose portability is the *maximum* floor
+  across its payloads, which makes the floor a property of the toolchain a
+  consumer installs rather than of this repo alone.
+
+  `meld-<tag>-x86_64-unknown-linux-musl.tar.gz` and the aarch64 equivalent now
+  ship beside the gnu ones. Naming is unchanged, so a consumer deriving asset
+  names from the Rust triple picks them up without other changes.
+
+  The usual musl caveats were checked rather than assumed: meld opens no shared
+  libraries (no `dlopen`/`libloading` in the tree) and performs no name
+  resolution, socket or user lookup, so neither NSS nor `dlopen` is reachable.
+  Its dependencies are pure Rust.
+
+  The claim was checked rather than assumed, at each level it could be: both
+  targets link (no `PT_INTERP`, no `PT_DYNAMIC`, no `GLIBC_*` symbols — where
+  the shipped v0.58.2 gnu asset, read the same way, carries all three), and the
+  x86_64 binary now runs inside `alpine:3.20` in CI, which has no glibc at all.
+
+### Changed
+- **The release workflow now runs what it builds.** It built, stripped,
+  packaged and uploaded without ever executing a binary, so a start-up crash
+  would have shipped. Each asset is now checked as far as its runner allows —
+  **three of the six targets are executed** (`aarch64-apple-darwin`,
+  `x86_64-unknown-linux-gnu`, and `x86_64-unknown-linux-musl`, the last also
+  inside Alpine), and the three that no runner can execute
+  (`x86_64-apple-darwin`, and both cross-built aarch64 Linux targets) are
+  inspected instead: `readelf` reads foreign architectures, so the aarch64
+  musl asset's static linkage is still checked even though it cannot be run.
+- The release assets gate now **requires** both musl triples, so a build that
+  silently stops shipping one fails the gate instead of publishing quietly.
+- `tools/check_release_targets.py` holds the build matrix and the gate's
+  required list in agreement, and runs on the pull request. They are two
+  independent lists that a comment asked a human to keep in sync, and the gate
+  that would notice a drift only runs *after* a release is published — so
+  "built but not required" was invisible and "required but not built" was
+  discovered in public.
+
 ## [0.58.2] - 2026-09-22
 
 ### Fixed

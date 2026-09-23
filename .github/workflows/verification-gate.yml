@@ -59,6 +59,16 @@ jobs:
       - name: Cited tests must exist
         run: python3 tools/check_record_citations.py
 
+      # What a release ships is decided by two independent lists — the build
+      # matrix and the assets gate's required set — kept in sync by a comment
+      # asking a human to remember. The gate only runs after publication, so a
+      # target that quietly stops being built is either invisible (built, not
+      # required) or discovered in public (required, not built). Checked here,
+      # on the pull request, where drift is still free to fix. Added with the
+      # musl assets (#432), which is what made it two lists worth drifting.
+      - name: Release matrix and assets gate agree
+        run: python3 tools/check_release_targets.py
+
       # docs/verification-matrix.md is generated from traceability.yaml. It had
       # drifted from its own source (statuses and test lists), so the published
       # matrix disagreed with the record it renders.

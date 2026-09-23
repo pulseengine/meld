@@ -63,9 +63,14 @@ jobs:
               missing=1
             fi
           }
+          # Both lists change together: the matrix in release.yml builds these
+          # and this gate is what notices when one of them silently stops
+          # shipping. musl added for #432.
           for target in \
             aarch64-apple-darwin aarch64-unknown-linux-gnu \
-            x86_64-apple-darwin x86_64-unknown-linux-gnu
+            aarch64-unknown-linux-musl \
+            x86_64-apple-darwin x86_64-unknown-linux-gnu \
+            x86_64-unknown-linux-musl
           do
             require "$target.tar.gz"
           done

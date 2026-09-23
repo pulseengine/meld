@@ -3438,3 +3438,14 @@ artifacts:
     links:
       - type: derives-from
         target: SYS-9
+
+  - id: SR-84
+    type: sw-req
+    title: Linux release assets run on systems without glibc
+    status: verified
+    description: "Each release shall publish statically linked Linux binaries for x86_64 and aarch64 alongside the dynamically linked gnu ones, and the release assets gate shall require all of them, so a missing musl asset fails the gate rather than shipping quietly. Through v0.58.2 the Linux assets were gnu only, with a measured GLIBC_2.34 floor: they do not run on Alpine, distroless-static, RHEL 8 or Ubuntu 20.04. These binaries are ingested into a varve realm layer whose portability is the maximum floor across its payloads, so the floor is a property of the toolchain a consumer installs, not of this repo alone. The usual musl caveats do not apply here, checked rather than assumed: meld opens no shared libraries (no dlopen or libloading anywhere in the tree) and performs no name resolution, socket or user lookup, so neither NSS nor dlopen is reachable; its dependencies are pure Rust. Asset naming stays meld-<tag>-<triple>.tar.gz so a consumer deriving names from the Rust triple picks the new assets up without other changes."
+    release: v0.58.3
+    tags: [release, portability, supply-chain]
+    links:
+      - type: derives-from
+        target: SYS-11

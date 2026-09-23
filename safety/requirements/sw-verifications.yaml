@@ -1429,3 +1429,14 @@ artifacts:
     links:
       - type: verifies
         target: SR-83
+
+  - id: SWV-96
+    type: sw-verification
+    title: "Verification of SR-84: musl assets are built and required"
+    status: implemented
+    description: "Verifies SR-84 at four levels, because a claim about running on a system without glibc is not the same claim as one about compiling for it. (1) Linkage, locally: both musl targets were built to completion with zig as the cross-linker (zig cc -target <arch>-linux-musl, -C link-self-contained=no -C target-feature=+crt-static), exit 0 each. The resulting binaries carry no PT_INTERP, no PT_DYNAMIC and no GLIBC_* symbol versions; the shipped v0.58.2 aarch64-gnu asset, checked the same way as a negative control, carries all three and shows the GLIBC_2.34 floor this requirement exists to remove. (2) Linkage, in CI: a new smoke-test step in release.yml fails the build if any musl asset requests a dynamic interpreter. readelf reads foreign architectures, so the cross-built aarch64 asset is covered even though it cannot be executed there. (3) Execution: the same step runs the built binary whenever the runner's architecture matches the target, and runs the x86_64 musl binary inside alpine:3.20 — a system with no glibc at all — which is the requirement's own claim rather than a proxy for it. (4) Presence: release-assets-gate.yml requires both triples among the published assets. That requirement was shown to be potent by dispatching the updated gate against v0.58.2, which carries no musl assets: the old gate passed on that tag and the new one failed on it, naming both missing archives. Guard against a check that passes by absence: the linkage step demands readelf before reading its output, because readelf | grep -q is false when readelf is missing. Separately, tools/check_release_targets.py holds the build matrix and the gate's required list in agreement on the pull request, since the gate itself only runs after publication."
+    fields:
+      method: automated-test
+    links:
+      - type: verifies
+        target: SR-84

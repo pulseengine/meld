@@ -48,6 +48,19 @@ jobs:
           - target: aarch64-unknown-linux-gnu
             runner: ubuntu-latest
             use_cross: true
+          # musl, statically linked (#432): the gnu assets carry a GLIBC_2.34
+          # floor, which excludes Alpine, distroless-static, RHEL 8 and
+          # Ubuntu 20.04. meld opens no shared libraries and does no name
+          # resolution — no dlopen/libloading, no sockets, no user lookup — so
+          # neither musl caveat (NSS, dlopen) applies. Built with `cross` for
+          # the same reason aarch64-gnu is: it launches a Docker image, and the
+          # podman shim on the self-hosted runner is untested for those.
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-latest
+            use_cross: true
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-latest
+            use_cross: true
           # Stays on macos-14: smithy is Linux x86_64 only.
           - target: x86_64-apple-darwin
             runner: macos-14
@@ -90,6 +103,88 @@ jobs:
           BIN="target/${TARGET}/release/meld"
           if command -v strip >/dev/null 2>&1; then
             strip "$BIN" || true
+          fi
+
+      # A binary that links is not a binary that runs. Until #432 nothing in
+      # this workflow ever executed what it built, so a start-up crash would
+      # have shipped — and for the musl assets the whole claim ("runs where
+      # there is no glibc") was resting on the linker flags being right.
+      #
+      # Three tiers, because a runner cannot execute every target it builds:
+      # linkage is inspectable for any architecture, native execution needs a
+      # matching `uname -m`, and the Alpine run is the only one that actually
+      # tests the claim rather than a proxy for it.
+      # rivet: verifies SR-84
+      - name: Smoke-test the built binary
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          BIN="target/${TARGET}/release/meld"
+          [ -f "$BIN" ] || { echo "::error::${TARGET}: no binary at ${BIN} — nothing was built to test"; exit 1; }
+
+          case "$TARGET" in
+            *-linux-musl)
+              # No interpreter is the property that makes the asset portable.
+              # `readelf` reads foreign architectures, so this also holds the
+              # line for the cross-built aarch64 asset, which cannot be run.
+              #
+              # Read the output into a variable first. `readelf -l "$BIN" |
+              # grep -q INTERP` is false BOTH when there is no interpreter and
+              # when readelf never produced output — a missing tool, an
+              # unreadable file, a non-ELF input. Testing this check against a
+              # path that did not exist, it reported "statically linked" for a
+              # file that was not there. A check whose failure mode is a pass
+              # is not a check.
+              command -v readelf >/dev/null 2>&1 || { echo "::error::readelf unavailable — the static-linkage check cannot run and must not be assumed"; exit 1; }
+              headers="$(readelf -l "$BIN")" || { echo "::error::readelf failed on ${BIN} — the static-linkage check cannot run and must not be assumed"; exit 1; }
+              case "$headers" in
+                "") echo "::error::readelf produced no program headers for ${BIN} — cannot conclude it is statically linked"; exit 1 ;;
+                *INTERP*)
+                  echo "::error::${TARGET} requests a dynamic interpreter — it is not statically linked and the glibc floor is back"
+                  printf '%s\n' "$headers" | grep -B2 -A2 INTERP
+                  exit 1 ;;
+              esac
+              echo "${TARGET}: statically linked, no interpreter"
+              ;;
+          esac
+
+          host_arch="$(uname -m)"
+          host_os="$(uname -s)"
+          # Darwin reports arm64 where the Rust triple says aarch64. Without
+          # this the one darwin target that CAN run natively on macos-14 falls
+          # into the "cannot execute here" branch and quietly loses its check.
+          case "$host_arch" in arm64) host_arch=aarch64 ;; esac
+          case "$TARGET" in
+            *-linux-*)   target_os=Linux  ;;
+            *-apple-*)   target_os=Darwin ;;
+            *)           target_os=other  ;;
+          esac
+          target_arch="${TARGET%%-*}"
+
+          if [ "$target_os" = "$host_os" ] && [ "$target_arch" = "$host_arch" ]; then
+            out="$("$BIN" --version)"
+            echo "${TARGET}: ran here -> ${out}"
+            case "$out" in
+              meld\ *) ;;
+              *) echo "::error::${TARGET} ran but did not identify itself: ${out}"; exit 1 ;;
+            esac
+          else
+            echo "${TARGET}: built on ${host_os}/${host_arch}, cannot execute here"
+          fi
+
+          # The claim itself: a system with no glibc at all. Only reachable for
+          # the target whose architecture matches the runner's.
+          if [ "$TARGET" = "x86_64-unknown-linux-musl" ] && [ "$host_arch" = "x86_64" ]; then
+            # Demanded, not probed: `&& command -v docker` would silently skip
+            # the one check that tests the claim instead of a proxy for it.
+            command -v docker >/dev/null 2>&1 || { echo "::error::docker unavailable — the glibc-free run cannot happen and must not be assumed"; exit 1; }
+            out="$(docker run --rm -v "$PWD/$BIN:/meld:ro" alpine:3.20 /meld --version)"
+            echo "${TARGET}: ran on alpine (no glibc) -> ${out}"
+            case "$out" in
+              meld\ *) ;;
+              *) echo "::error::${TARGET} failed to run on a glibc-free system: ${out}"; exit 1 ;;
+            esac
           fi
 
       - name: Package archive
