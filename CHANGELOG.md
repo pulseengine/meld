@@ -23,11 +23,26 @@ All notable changes to this project will be documented in this file.
   resolution, socket or user lookup, so neither NSS nor `dlopen` is reachable.
   Its dependencies are pure Rust.
 
+  The claim was checked rather than assumed, at each level it could be: both
+  targets link (no `PT_INTERP`, no `PT_DYNAMIC`, no `GLIBC_*` symbols — where
+  the shipped v0.58.2 gnu asset, read the same way, carries all three), and the
+  x86_64 binary now runs inside `alpine:3.20` in CI, which has no glibc at all.
+
 ### Changed
+- **The release workflow now runs what it builds.** It built, stripped,
+  packaged and uploaded without ever executing a binary, so a start-up crash
+  would have shipped. Each asset is now checked as far as its runner allows:
+  static linkage for the musl targets (`readelf` reads foreign architectures,
+  so the cross-built aarch64 asset is covered too), native execution where the
+  runner's architecture matches, and the Alpine run above.
 - The release assets gate now **requires** both musl triples, so a build that
-  silently stops shipping one fails the gate instead of publishing quietly. The
-  matrix and the gate's required list are the two places that must change
-  together, and the gate is what notices when they drift.
+  silently stops shipping one fails the gate instead of publishing quietly.
+- `tools/check_release_targets.py` holds the build matrix and the gate's
+  required list in agreement, and runs on the pull request. They are two
+  independent lists that a comment asked a human to keep in sync, and the gate
+  that would notice a drift only runs *after* a release is published — so
+  "built but not required" was invisible and "required but not built" was
+  discovered in public.
 
 ## [0.58.2] - 2026-09-22
 
