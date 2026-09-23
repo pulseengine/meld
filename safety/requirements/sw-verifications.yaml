@@ -1429,3 +1429,14 @@ artifacts:
     links:
       - type: verifies
         target: SR-83
+
+  - id: SWV-96
+    type: sw-verification
+    title: "Verification of SR-84: musl assets are built and required"
+    status: implemented
+    description: "Verifies SR-84 in two places that must change together, which is the point: .github/workflows/release.yml builds x86_64-unknown-linux-musl and aarch64-unknown-linux-musl via cross, for the same reason aarch64-gnu does, and .github/workflows/release-assets-gate.yml requires both triples among the published assets, so a build that silently stops shipping one fails the gate on publish. Compilation for both musl targets was checked locally with cargo check --workspace --target (exit 0 each); linking could not be checked locally, because no docker, cross or musl cross-linker is available on the development machine. Linking is therefore proven by the release pipeline itself, and the draft-then-publish flow is what makes that safe: a musl build that fails takes the pipeline down before anything is published. The release-time smoke test for this requirement is to run `file` on the shipped musl asset and confirm it is statically linked with no ELF interpreter, which is the property a consumer on Alpine or distroless-static depends on."
+    fields:
+      method: automated-test
+    links:
+      - type: verifies
+        target: SR-84

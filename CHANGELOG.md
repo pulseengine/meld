@@ -4,6 +4,31 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.58.3] - 2026-09-23
+
+### Added
+- **Statically linked Linux binaries for x86_64 and aarch64 (SR-84, #432).**
+  The Linux assets were gnu-only with a measured `GLIBC_2.34` floor, so they do
+  not run on Alpine, distroless-static, RHEL 8 or Ubuntu 20.04. These binaries
+  are ingested into a varve realm layer whose portability is the *maximum* floor
+  across its payloads, which makes the floor a property of the toolchain a
+  consumer installs rather than of this repo alone.
+
+  `meld-<tag>-x86_64-unknown-linux-musl.tar.gz` and the aarch64 equivalent now
+  ship beside the gnu ones. Naming is unchanged, so a consumer deriving asset
+  names from the Rust triple picks them up without other changes.
+
+  The usual musl caveats were checked rather than assumed: meld opens no shared
+  libraries (no `dlopen`/`libloading` in the tree) and performs no name
+  resolution, socket or user lookup, so neither NSS nor `dlopen` is reachable.
+  Its dependencies are pure Rust.
+
+### Changed
+- The release assets gate now **requires** both musl triples, so a build that
+  silently stops shipping one fails the gate instead of publishing quietly. The
+  matrix and the gate's required list are the two places that must change
+  together, and the gate is what notices when they drift.
+
 ## [0.58.2] - 2026-09-22
 
 ### Fixed

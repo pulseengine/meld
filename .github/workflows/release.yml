@@ -48,6 +48,19 @@ jobs:
           - target: aarch64-unknown-linux-gnu
             runner: ubuntu-latest
             use_cross: true
+          # musl, statically linked (#432): the gnu assets carry a GLIBC_2.34
+          # floor, which excludes Alpine, distroless-static, RHEL 8 and
+          # Ubuntu 20.04. meld opens no shared libraries and does no name
+          # resolution — no dlopen/libloading, no sockets, no user lookup — so
+          # neither musl caveat (NSS, dlopen) applies. Built with `cross` for
+          # the same reason aarch64-gnu is: it launches a Docker image, and the
+          # podman shim on the self-hosted runner is untested for those.
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-latest
+            use_cross: true
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-latest
+            use_cross: true
           # Stays on macos-14: smithy is Linux x86_64 only.
           - target: x86_64-apple-darwin
             runner: macos-14
