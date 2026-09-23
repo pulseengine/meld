@@ -853,8 +853,28 @@ GitHub REST API).
      --certificate-oidc-issuer https://token.actions.githubusercontent.com \
      SHA256SUMS.txt
 
+   # Check the BINARIES, not only the hashes over them. A correct checksum
+   # over a broken binary verifies perfectly. Run the asset whose platform
+   # matches this machine; inspect the ones it cannot run.
+   tar xzf meld-vX.Y.Z-aarch64-apple-darwin.tar.gz
+   ./meld-vX.Y.Z-aarch64-apple-darwin/meld --version    # must print vX.Y.Z
+
+   # The musl assets carry the portability claim, and no Apple-silicon Mac can
+   # execute them. `readelf`/`llvm-readelf` reads foreign architectures:
+   # an INTERP header means the asset is dynamically linked and the glibc
+   # floor is back. Say "inspected", not "smoke-tested", in the notes —
+   # claiming more than was done is how #426's severity got overstated.
+   tar xzf meld-vX.Y.Z-x86_64-unknown-linux-musl.tar.gz
+   llvm-readelf -l meld-vX.Y.Z-x86_64-unknown-linux-musl/meld | grep INTERP \
+     && echo "NOT static — do not publish"
+
    # Only now make it public
    gh release edit vX.Y.Z --draft=false
+
+   # Confirm the assets gate went GREEN on the published tag. The dispatch
+   # against an older release proves the gate can fail; this is the half that
+   # proves the required list and the build matrix agree in production.
+   gh run list --workflow=release-assets-gate.yml --limit 1
    ```
 
    `release-assets-gate.yml` runs on publish and fails if the platform binaries,
