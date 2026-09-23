@@ -31,10 +31,13 @@ All notable changes to this project will be documented in this file.
 ### Changed
 - **The release workflow now runs what it builds.** It built, stripped,
   packaged and uploaded without ever executing a binary, so a start-up crash
-  would have shipped. Each asset is now checked as far as its runner allows:
-  static linkage for the musl targets (`readelf` reads foreign architectures,
-  so the cross-built aarch64 asset is covered too), native execution where the
-  runner's architecture matches, and the Alpine run above.
+  would have shipped. Each asset is now checked as far as its runner allows —
+  **three of the six targets are executed** (`aarch64-apple-darwin`,
+  `x86_64-unknown-linux-gnu`, and `x86_64-unknown-linux-musl`, the last also
+  inside Alpine), and the three that no runner can execute
+  (`x86_64-apple-darwin`, and both cross-built aarch64 Linux targets) are
+  inspected instead: `readelf` reads foreign architectures, so the aarch64
+  musl asset's static linkage is still checked even though it cannot be run.
 - The release assets gate now **requires** both musl triples, so a build that
   silently stops shipping one fails the gate instead of publishing quietly.
 - `tools/check_release_targets.py` holds the build matrix and the gate's

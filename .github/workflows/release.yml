@@ -121,6 +121,7 @@ jobs:
         run: |
           set -euo pipefail
           BIN="target/${TARGET}/release/meld"
+          [ -f "$BIN" ] || { echo "::error::${TARGET}: no binary at ${BIN} — nothing was built to test"; exit 1; }
 
           case "$TARGET" in
             *-linux-musl)
@@ -128,22 +129,32 @@ jobs:
               # `readelf` reads foreign architectures, so this also holds the
               # line for the cross-built aarch64 asset, which cannot be run.
               #
-              # Demand the tool before reading its output: `readelf | grep -q`
-              # is *false* when readelf is absent, so without this the check
-              # would pass by absence — the exact way three negative controls
-              # in this repo passed for the wrong reason.
+              # Read the output into a variable first. `readelf -l "$BIN" |
+              # grep -q INTERP` is false BOTH when there is no interpreter and
+              # when readelf never produced output — a missing tool, an
+              # unreadable file, a non-ELF input. Testing this check against a
+              # path that did not exist, it reported "statically linked" for a
+              # file that was not there. A check whose failure mode is a pass
+              # is not a check.
               command -v readelf >/dev/null 2>&1 || { echo "::error::readelf unavailable — the static-linkage check cannot run and must not be assumed"; exit 1; }
-              if readelf -l "$BIN" | grep -q INTERP; then
-                echo "::error::${TARGET} requests a dynamic interpreter — it is not statically linked and the glibc floor is back"
-                readelf -l "$BIN" | grep -B2 -A2 INTERP
-                exit 1
-              fi
+              headers="$(readelf -l "$BIN")" || { echo "::error::readelf failed on ${BIN} — the static-linkage check cannot run and must not be assumed"; exit 1; }
+              case "$headers" in
+                "") echo "::error::readelf produced no program headers for ${BIN} — cannot conclude it is statically linked"; exit 1 ;;
+                *INTERP*)
+                  echo "::error::${TARGET} requests a dynamic interpreter — it is not statically linked and the glibc floor is back"
+                  printf '%s\n' "$headers" | grep -B2 -A2 INTERP
+                  exit 1 ;;
+              esac
               echo "${TARGET}: statically linked, no interpreter"
               ;;
           esac
 
           host_arch="$(uname -m)"
           host_os="$(uname -s)"
+          # Darwin reports arm64 where the Rust triple says aarch64. Without
+          # this the one darwin target that CAN run natively on macos-14 falls
+          # into the "cannot execute here" branch and quietly loses its check.
+          case "$host_arch" in arm64) host_arch=aarch64 ;; esac
           case "$TARGET" in
             *-linux-*)   target_os=Linux  ;;
             *-apple-*)   target_os=Darwin ;;
@@ -164,7 +175,10 @@ jobs:
 
           # The claim itself: a system with no glibc at all. Only reachable for
           # the target whose architecture matches the runner's.
-          if [ "$TARGET" = "x86_64-unknown-linux-musl" ] && [ "$host_arch" = "x86_64" ] && command -v docker >/dev/null 2>&1; then
+          if [ "$TARGET" = "x86_64-unknown-linux-musl" ] && [ "$host_arch" = "x86_64" ]; then
+            # Demanded, not probed: `&& command -v docker` would silently skip
+            # the one check that tests the claim instead of a proxy for it.
+            command -v docker >/dev/null 2>&1 || { echo "::error::docker unavailable — the glibc-free run cannot happen and must not be assumed"; exit 1; }
             out="$(docker run --rm -v "$PWD/$BIN:/meld:ro" alpine:3.20 /meld --version)"
             echo "${TARGET}: ran on alpine (no glibc) -> ${out}"
             case "$out" in
