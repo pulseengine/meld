@@ -41,6 +41,34 @@ Unlike composition tools that produce linked-but-separate component graphs, Meld
 
 ## Quick Start
 
+### Prebuilt binaries
+
+Every release ships archives for six targets. On Linux, pick by what the
+machine has rather than by architecture alone:
+
+| | use |
+|---|---|
+| glibc 2.34 or newer (Ubuntu 22.04+, Debian 12+, Fedora) | `*-unknown-linux-gnu` |
+| **anything older, or no glibc at all** — Alpine, distroless-static, RHEL 8, Ubuntu 20.04 | `*-unknown-linux-musl` |
+| macOS | `*-apple-darwin` |
+
+The musl archives are statically linked: no dynamic loader, no glibc symbol
+versions, nothing to install alongside them. If you are not sure which your
+target has, the musl one runs in both places.
+
+```bash
+TAG=v0.58.3
+TARGET=x86_64-unknown-linux-musl
+gh release download "$TAG" --repo pulseengine/meld --pattern "meld-${TAG}-${TARGET}.tar.gz"
+tar xzf "meld-${TAG}-${TARGET}.tar.gz"
+./meld-${TAG}-${TARGET}/meld --version
+```
+
+Verify what you downloaded before running it — see
+[Verifying a Release](#verifying-a-release).
+
+### From source
+
 ```bash
 # From source (Cargo)
 cargo install --path meld-cli

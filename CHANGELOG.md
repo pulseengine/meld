@@ -23,10 +23,22 @@ All notable changes to this project will be documented in this file.
   resolution, socket or user lookup, so neither NSS nor `dlopen` is reachable.
   Its dependencies are pure Rust.
 
-  The claim was checked rather than assumed, at each level it could be: both
-  targets link (no `PT_INTERP`, no `PT_DYNAMIC`, no `GLIBC_*` symbols — where
-  the shipped v0.58.2 gnu asset, read the same way, carries all three), and the
-  x86_64 binary now runs inside `alpine:3.20` in CI, which has no glibc at all.
+  The claim was checked rather than assumed, at each level it could be. Read
+  off the published archives:
+
+  | asset | ELF type | interpreter | shared libs needed | `GLIBC_*` symbols |
+  |---|---|---|---|---|
+  | `x86_64-unknown-linux-musl` | `ET_DYN` (static-PIE) | none | 0 | none |
+  | `aarch64-unknown-linux-musl` | `ET_EXEC` | none | no dynamic segment | none |
+  | `x86_64-unknown-linux-gnu` | `ET_DYN` | `ld-linux-x86-64.so.2` | 2 | to `GLIBC_2.34` |
+
+  The two musl assets are not the same ELF shape. The x86_64 one is a
+  **static-PIE**: it keeps a `PT_DYNAMIC` segment so it can relocate itself,
+  while needing no shared library at all. An earlier draft of this entry said
+  the musl binaries have "no `PT_DYNAMIC`", which was true of the binaries
+  linked locally while developing this and not of what the pipeline ships.
+  The property that matters — no interpreter, nothing to load, no glibc symbol
+  — holds for both, and the `alpine:3.20` run is what demonstrates it.
 
 ### Changed
 - **The release workflow now runs what it builds.** It built, stripped,
