@@ -673,9 +673,11 @@ runtime_test!(
 );
 runtime_test!(test_runtime_wit_bindgen_resource_floats, "resource_floats");
 // #305: opaque-rep re-exporter resource chain (built from wit-bindgen fork
-// feat/opaque-rep-attribute, with the user-supplied dtor). Fixture is gitignored
-// (~11 MB build artifact, regenerate per tests/wit_bindgen/README.md); the test
-// skips when absent. Runtime variant exercises construct+drop — the #305 trap.
+// feat/opaque-rep-attribute, with the user-supplied dtor). The fixture is now
+// committed (~11 MB) rather than gitignored: it is built from a non-mainline
+// wit-bindgen branch, so no CI runner and few developers can regenerate it, and
+// leaving it out meant this test reported success without running — for a
+// construct+drop path that is the #305 trap (SR-85, #405).
 runtime_test!(
     test_runtime_wit_bindgen_resource_floats_opaque,
     "resource_floats_opaque"
