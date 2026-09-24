@@ -49,7 +49,7 @@ fn read_manifest(fused: &[u8]) -> Option<SignatureManifest> {
 fn core_matches_the_emitted_module() {
     let Some(bytes) = fixture() else {
         panic!(
-            "compose_record_use_wide fixture absent — skipping — every fixture a test reads is tracked in the repository \
+            "compose_record_use_wide fixture absent — every fixture a test reads is tracked in the repository \
              (SR-85); a missing one is a repository error, not a reason to report success"
         );
     };
@@ -95,7 +95,7 @@ fn core_matches_the_emitted_module() {
 fn core_comes_from_the_module_not_the_wit() {
     let Some(bytes) = fixture() else {
         panic!(
-            "compose_record_use_wide fixture absent — skipping — every fixture a test reads is tracked in the repository \
+            "compose_record_use_wide fixture absent — every fixture a test reads is tracked in the repository \
              (SR-85); a missing one is a repository error, not a reason to report success"
         );
     };
@@ -139,7 +139,7 @@ fn core_comes_from_the_module_not_the_wit() {
 fn a_wide_export_states_the_pointer_shape_and_its_allocator() {
     let Some(bytes) = fixture() else {
         panic!(
-            "compose_record_use_wide fixture absent — skipping — every fixture a test reads is tracked in the repository \
+            "compose_record_use_wide fixture absent — every fixture a test reads is tracked in the repository \
              (SR-85); a missing one is a repository error, not a reason to report success"
         );
     };
@@ -197,7 +197,7 @@ fn a_wide_export_states_the_pointer_shape_and_its_allocator() {
 fn an_export_that_needs_nothing_names_nothing() {
     let Some(bytes) = fixture() else {
         panic!(
-            "compose_record_use_wide fixture absent — skipping — every fixture a test reads is tracked in the repository \
+            "compose_record_use_wide fixture absent — every fixture a test reads is tracked in the repository \
              (SR-85); a missing one is a repository error, not a reason to report success"
         );
     };
@@ -243,7 +243,7 @@ fn each_export_names_its_own_memory() {
         std::fs::read(format!("{dir}/compose_record_use/provider.wasm")),
     ) else {
         panic!(
-            "provider fixtures absent — skipping — every fixture a test reads is tracked in the repository \
+            "provider fixtures absent — every fixture a test reads is tracked in the repository \
              (SR-85); a missing one is a repository error, not a reason to report success"
         );
     };
@@ -304,7 +304,7 @@ fn each_export_names_its_own_memory() {
 fn the_section_is_absent_unless_asked_for() {
     let Some(bytes) = fixture() else {
         panic!(
-            "compose_record_use_wide fixture absent — skipping — every fixture a test reads is tracked in the repository \
+            "compose_record_use_wide fixture absent — every fixture a test reads is tracked in the repository \
              (SR-85); a missing one is a repository error, not a reason to report success"
         );
     };

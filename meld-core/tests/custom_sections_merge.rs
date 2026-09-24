@@ -22,7 +22,7 @@ fn fixture() -> Option<Vec<u8>> {
         Ok(bytes) => Some(bytes),
         Err(_) => {
             panic!(
-                "skipping: fixture not found at {FIXTURE} — every fixture a test reads is tracked in the repository \
+                "fixture not found at {FIXTURE} — every fixture a test reads is tracked in the repository \
                  (SR-85); a missing one is a repository error, not a reason to report success"
             );
         }

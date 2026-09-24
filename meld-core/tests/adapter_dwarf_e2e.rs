@@ -241,7 +241,7 @@ fn dwarf_331_line_rows_within_code_section_multi_source() {
         std::fs::read("../tests/wit_bindgen/fixtures/release-0.2.0/hello_c_cli.wasm"),
     ) else {
         panic!(
-            "skipping #331: release fixtures absent — every fixture a test reads is tracked in the repository \
+            "#331: release fixtures absent — every fixture a test reads is tracked in the repository \
              (SR-85); a missing one is a repository error, not a reason to report success"
         );
     };

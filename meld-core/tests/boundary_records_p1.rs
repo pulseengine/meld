@@ -43,7 +43,7 @@ fn fuse(bytes: &[u8]) -> (Vec<u8>, meld_core::FusionStats) {
 fn every_fused_boundary_is_recorded_with_its_strategy() {
     let Some(bytes) = composed_fixture() else {
         panic!(
-            "composed.wasm fixture absent — skipping — every fixture a test reads is tracked in the repository \
+            "composed.wasm fixture absent — every fixture a test reads is tracked in the repository \
              (SR-85); a missing one is a repository error, not a reason to report success"
         );
     };
@@ -102,7 +102,7 @@ fn every_fused_boundary_is_recorded_with_its_strategy() {
 fn boundary_records_reach_the_attestation() {
     let Some(bytes) = composed_fixture() else {
         panic!(
-            "composed.wasm fixture absent — skipping — every fixture a test reads is tracked in the repository \
+            "composed.wasm fixture absent — every fixture a test reads is tracked in the repository \
              (SR-85); a missing one is a repository error, not a reason to report success"
         );
     };
@@ -156,7 +156,7 @@ fn boundary_records_reach_the_attestation() {
 fn boundary_records_are_stable_across_runs() {
     let Some(bytes) = composed_fixture() else {
         panic!(
-            "composed.wasm fixture absent — skipping — every fixture a test reads is tracked in the repository \
+            "composed.wasm fixture absent — every fixture a test reads is tracked in the repository \
              (SR-85); a missing one is a repository error, not a reason to report success"
         );
     };

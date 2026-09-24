@@ -212,7 +212,7 @@ fn fixture_bytes(name: &str) -> Option<Vec<u8>> {
     let path = format!("{FIXTURES_DIR}/{name}.wasm");
     std::fs::read(&path).ok().or_else(|| {
         panic!(
-            "skipping: fixture not found at {path} — every fixture a test reads is tracked in the repository \
+            "fixture not found at {path} — every fixture a test reads is tracked in the repository \
              (SR-85); a missing one is a repository error, not a reason to report success"
         );
     })
@@ -368,7 +368,7 @@ fn composed_golden() -> Option<(Vec<u8>, (u32, u8))> {
 fn tier_b_fused_composed_matches_host_linked() {
     let Some((composed, golden)) = composed_golden() else {
         panic!(
-            "skipping: compose fixtures not found in {COMPOSE_DIR} (run build.sh) — every fixture a test reads is tracked in the repository \
+            "compose fixtures not found in {COMPOSE_DIR} (run build.sh) — every fixture a test reads is tracked in the repository \
              (SR-85); a missing one is a repository error, not a reason to report success"
         );
     };
@@ -416,7 +416,7 @@ fn tier_b_separate_inputs_internalise_link() {
         composed_golden(),
     ) else {
         panic!(
-            "skipping: compose fixtures not found in {COMPOSE_DIR} — every fixture a test reads is tracked in the repository \
+            "compose fixtures not found in {COMPOSE_DIR} — every fixture a test reads is tracked in the repository \
              (SR-85); a missing one is a repository error, not a reason to report success"
         );
     };

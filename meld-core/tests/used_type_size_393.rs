@@ -87,7 +87,7 @@ fn run(fused: &[u8], multi_memory: bool) -> f32 {
 fn used_record_is_not_truncated_across_memories() {
     let Some(bytes) = fixture() else {
         panic!(
-            "compose_record_use fixture absent — skipping — every fixture a test reads is tracked in the repository \
+            "compose_record_use fixture absent — every fixture a test reads is tracked in the repository \
              (SR-85); a missing one is a repository error, not a reason to report success"
         );
     };
@@ -111,7 +111,7 @@ fn used_record_is_not_truncated_across_memories() {
 fn used_record_bridges_in_one_memory() {
     let Some(bytes) = fixture() else {
         panic!(
-            "compose_record_use fixture absent — skipping — every fixture a test reads is tracked in the repository \
+            "compose_record_use fixture absent — every fixture a test reads is tracked in the repository \
              (SR-85); a missing one is a repository error, not a reason to report success"
         );
     };
@@ -136,7 +136,7 @@ fn used_record_bridges_in_one_memory() {
 fn both_strategies_agree() {
     let Some(bytes) = fixture() else {
         panic!(
-            "compose_record_use fixture absent — skipping — every fixture a test reads is tracked in the repository \
+            "compose_record_use fixture absent — every fixture a test reads is tracked in the repository \
              (SR-85); a missing one is a repository error, not a reason to report success"
         );
     };
@@ -156,7 +156,7 @@ fn both_strategies_agree() {
 fn used_types_are_exactly_sizeable() {
     let Some(bytes) = fixture() else {
         panic!(
-            "compose_record_use fixture absent — skipping — every fixture a test reads is tracked in the repository \
+            "compose_record_use fixture absent — every fixture a test reads is tracked in the repository \
              (SR-85); a missing one is a repository error, not a reason to report success"
         );
     };

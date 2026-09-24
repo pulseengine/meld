@@ -43,7 +43,7 @@ fn fixture_available() -> bool {
         true
     } else {
         panic!(
-            "skipping: fixture not found at {SINGLE_SOURCE_FIXTURE} — every fixture a test reads is tracked in the repository \
+            "fixture not found at {SINGLE_SOURCE_FIXTURE} — every fixture a test reads is tracked in the repository \
              (SR-85); a missing one is a repository error, not a reason to report success"
         );
     }
@@ -216,7 +216,7 @@ const RANGES_FIXTURE: &str = "../tests/wit_bindgen/fixtures/records.wasm";
 fn inc2_die_ranges_stay_within_enclosing_subprogram() {
     if !std::path::Path::new(RANGES_FIXTURE).is_file() {
         panic!(
-            "skipping: fixture not found at {RANGES_FIXTURE} — every fixture a test reads is tracked in the repository \
+            "fixture not found at {RANGES_FIXTURE} — every fixture a test reads is tracked in the repository \
              (SR-85); a missing one is a repository error, not a reason to report success"
         );
     }
@@ -312,7 +312,7 @@ fn inc2_die_ranges_stay_within_enclosing_subprogram() {
 fn inc3_location_list_ranges_stay_in_module() {
     if !std::path::Path::new(RANGES_FIXTURE).is_file() {
         panic!(
-            "skipping: fixture not found at {RANGES_FIXTURE} — every fixture a test reads is tracked in the repository \
+            "fixture not found at {RANGES_FIXTURE} — every fixture a test reads is tracked in the repository \
              (SR-85); a missing one is a repository error, not a reason to report success"
         );
     }

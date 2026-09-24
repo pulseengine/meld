@@ -69,7 +69,7 @@ fn run(fused: &[u8]) -> f32 {
 fn used_records_count_their_real_flat_width() {
     let Some(bytes) = fixture() else {
         panic!(
-            "compose_record_use_wide fixture absent — skipping — every fixture a test reads is tracked in the repository \
+            "compose_record_use_wide fixture absent — every fixture a test reads is tracked in the repository \
              (SR-85); a missing one is a repository error, not a reason to report success"
         );
     };
@@ -110,7 +110,7 @@ fn used_records_count_their_real_flat_width() {
 fn wide_used_params_survive_fusion() {
     let Some(bytes) = fixture() else {
         panic!(
-            "compose_record_use_wide fixture absent — skipping — every fixture a test reads is tracked in the repository \
+            "compose_record_use_wide fixture absent — every fixture a test reads is tracked in the repository \
              (SR-85); a missing one is a repository error, not a reason to report success"
         );
     };

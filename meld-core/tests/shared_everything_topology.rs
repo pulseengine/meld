@@ -44,7 +44,7 @@ fn shared_everything_fuses_to_valid_single_memory_core() {
     // nested_component.rs) so CI never breaks on a missing fixture.
     let Ok(component) = std::fs::read("../tests/pic-fixtures/shared_everything_linked.wasm") else {
         panic!(
-            "skipping: shared_everything_linked.wasm fixture not present — every fixture a test reads is tracked in the repository \
+            "shared_everything_linked.wasm fixture not present — every fixture a test reads is tracked in the repository \
              (SR-85); a missing one is a repository error, not a reason to report success"
         );
     };

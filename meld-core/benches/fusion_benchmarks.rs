@@ -61,7 +61,7 @@ fn read_fixture(name: &str) -> Option<Vec<u8>> {
     let path = format!("{FIXTURES_DIR}/{name}.wasm");
     if !Path::new(&path).is_file() {
         panic!(
-            "skipping {name}: fixture not found at {path} — every fixture a test reads is tracked in the repository \
+            "{name}: fixture not found at {path} — every fixture a test reads is tracked in the repository \
              (SR-85); a missing one is a repository error, not a reason to report success"
         );
     }
@@ -245,7 +245,7 @@ fn bench_end_to_end(c: &mut Criterion) {
     for (label, fixtures) in [("small", small), ("medium", medium), ("large", large)] {
         let Some(fuser) = build_fuser(fixtures) else {
             panic!(
-                "skipping end_to_end/{label}: missing fixtures — every fixture a test reads is tracked in the repository \
+                "end_to_end/{label}: missing fixtures — every fixture a test reads is tracked in the repository \
                  (SR-85); a missing one is a repository error, not a reason to report success"
             );
         };

@@ -33,7 +33,7 @@ fn oom_input() -> Option<Vec<u8>> {
 fn a_declared_count_cannot_exceed_its_section() {
     let Some(data) = oom_input() else {
         panic!(
-            "corpus input absent — skipping — every fixture a test reads is tracked in the repository \
+            "corpus input absent — every fixture a test reads is tracked in the repository \
              (SR-85); a missing one is a repository error, not a reason to report success"
         );
     };
@@ -68,7 +68,7 @@ fn a_declared_count_cannot_exceed_its_section() {
 fn merging_a_hostile_count_stays_bounded() {
     let Some(data) = oom_input() else {
         panic!(
-            "corpus input absent — skipping — every fixture a test reads is tracked in the repository \
+            "corpus input absent — every fixture a test reads is tracked in the repository \
              (SR-85); a missing one is a repository error, not a reason to report success"
         );
     };

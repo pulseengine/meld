@@ -61,7 +61,7 @@ fn fuse_shared(bytes: &[u8]) -> (Vec<u8>, meld_core::FusionStats) {
 fn same_memory_record_boundary_emits_valid_wasm() {
     let Some(bytes) = composed_record_fixture() else {
         panic!(
-            "compose_record fixture absent — skipping — every fixture a test reads is tracked in the repository \
+            "compose_record fixture absent — every fixture a test reads is tracked in the repository \
              (SR-85); a missing one is a repository error, not a reason to report success"
         );
     };
@@ -83,7 +83,7 @@ fn same_memory_record_boundary_computes_the_same_answer() {
 
     let Some(bytes) = composed_record_fixture() else {
         panic!(
-            "compose_record fixture absent — skipping — every fixture a test reads is tracked in the repository \
+            "compose_record fixture absent — every fixture a test reads is tracked in the repository \
              (SR-85); a missing one is a repository error, not a reason to report success"
         );
     };
@@ -117,7 +117,7 @@ fn same_memory_record_boundary_computes_the_same_answer() {
 fn a_record_carrying_boundary_is_never_inlined() {
     let Some(bytes) = composed_record_fixture() else {
         panic!(
-            "compose_record fixture absent — skipping — every fixture a test reads is tracked in the repository \
+            "compose_record fixture absent — every fixture a test reads is tracked in the repository \
              (SR-85); a missing one is a repository error, not a reason to report success"
         );
     };
@@ -156,7 +156,7 @@ fn a_record_carrying_boundary_is_never_inlined() {
 fn multi_memory_control_still_valid() {
     let Some(bytes) = composed_record_fixture() else {
         panic!(
-            "compose_record fixture absent — skipping — every fixture a test reads is tracked in the repository \
+            "compose_record fixture absent — every fixture a test reads is tracked in the repository \
              (SR-85); a missing one is a repository error, not a reason to report success"
         );
     };

@@ -20,7 +20,7 @@ fn fixtures_available() -> bool {
         true
     } else {
         panic!(
-            "skipping: fixtures not found at {FIXTURES_DIR} — every fixture a test reads is tracked in the repository \
+            "fixtures not found at {FIXTURES_DIR} — every fixture a test reads is tracked in the repository \
              (SR-85); a missing one is a repository error, not a reason to report success"
         );
     }

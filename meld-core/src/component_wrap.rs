@@ -3386,7 +3386,7 @@ mod tests {
         let path = "../tests/wit_bindgen/fixtures/release-0.2.0/hello_c_cli.wasm";
         let Ok(bytes) = std::fs::read(path) else {
             panic!(
-                "skipping: fixture not found at {path} — every fixture a test reads is tracked in the repository \
+                "fixture not found at {path} — every fixture a test reads is tracked in the repository \
                  (SR-85); a missing one is a repository error, not a reason to report success"
             );
         };

@@ -63,7 +63,7 @@ fn fuse(inputs: &[(&str, Vec<u8>)], config: FuserConfig) -> Vec<u8> {
 fn a_needed_allocator_is_not_pruned() {
     let Some(provider) = fixture("provider.wasm") else {
         panic!(
-            "fixture absent — skipping — every fixture a test reads is tracked in the repository \
+            "fixture absent — every fixture a test reads is tracked in the repository \
              (SR-85); a missing one is a repository error, not a reason to report success"
         );
     };
@@ -105,7 +105,7 @@ fn a_needed_allocator_is_not_pruned() {
 fn every_export_that_needs_an_allocator_can_call_one() {
     let (Some(a), Some(b)) = (fixture("provider.wasm"), fixture("provider2.wasm")) else {
         panic!(
-            "fixtures absent — skipping — every fixture a test reads is tracked in the repository \
+            "fixtures absent — every fixture a test reads is tracked in the repository \
              (SR-85); a missing one is a repository error, not a reason to report success"
         );
     };
