@@ -3449,3 +3449,13 @@ artifacts:
     links:
       - type: derives-from
         target: SYS-11
+
+  - id: SR-85
+    type: sw-req
+    title: A test whose fixture is absent must fail, not report success
+    status: verified
+    description: "Eighteen tests reported success in CI without executing their subject, because the fixtures they read are not in the repository. tests/wit_bindgen/fixtures/release-0.2.0/ holds eleven components that exist on a developer disk and are matched by .gitignore's *.wasm rule; the fixtures.yml workflow force-adds only the top-level glob tests/wit_bindgen/fixtures/*.wasm, which never matches a subdirectory, so this set was never added while 57 siblings were. Each affected test guards on the file being readable and returns early when it is not. Measured by hiding the directory and re-running: adapter_dwarf_e2e, custom_sections_merge and release_components complete in 0.00s with every test 'ok', the suite exits 0, and the skip messages are invisible because cargo captures stdout for passing tests — the only trace is a duration. Two consequences stand out. DwarfHandling::Remap has been the default since v0.25.0 and dwarf_remap_witness.rs is its only address-correctness witness. golden_e2e.rs asserts that its corpus ran, but the assertion is satisfied by nine fixtures its own source calls a 'run-ok signal; mostly empty stdout' while the three it calls 'the strong differential: fused output must print byte-identical text' are the absent ones. meld shall carry every fixture its tests read, and a fixture that a test reads shall be tracked, so that absence is a failure rather than a silent pass."
+    release: v0.59.0
+    links:
+      - type: derives-from
+        target: SYS-11

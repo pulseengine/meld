@@ -60,8 +60,10 @@ const FIXTURES: &[&str] = &[
 fn read_fixture(name: &str) -> Option<Vec<u8>> {
     let path = format!("{FIXTURES_DIR}/{name}.wasm");
     if !Path::new(&path).is_file() {
-        eprintln!("skipping {name}: fixture not found at {path}");
-        return None;
+        panic!(
+            "{name}: fixture not found at {path} — every fixture a test reads is tracked in the repository \
+             (SR-85); a missing one is a repository error, not a reason to report success"
+        );
     }
     std::fs::read(&path).ok()
 }
@@ -242,8 +244,10 @@ fn bench_end_to_end(c: &mut Criterion) {
 
     for (label, fixtures) in [("small", small), ("medium", medium), ("large", large)] {
         let Some(fuser) = build_fuser(fixtures) else {
-            eprintln!("skipping end_to_end/{label}: missing fixtures");
-            continue;
+            panic!(
+                "end_to_end/{label}: missing fixtures — every fixture a test reads is tracked in the repository \
+                 (SR-85); a missing one is a repository error, not a reason to report success"
+            );
         };
         let component_count = fuser.component_count() as u64;
         group.throughput(Throughput::Elements(component_count));

@@ -27,8 +27,10 @@ fn fixture_available() -> bool {
     if std::path::Path::new(FIXTURE).is_file() {
         true
     } else {
-        eprintln!("skipping: fixture not found at {FIXTURE}");
-        false
+        panic!(
+            "fixture not found at {FIXTURE} — every fixture a test reads is tracked in the repository \
+             (SR-85); a missing one is a repository error, not a reason to report success"
+        );
     }
 }
 

@@ -42,8 +42,10 @@ fn fuse(bytes: &[u8]) -> (Vec<u8>, meld_core::FusionStats) {
 #[test]
 fn every_fused_boundary_is_recorded_with_its_strategy() {
     let Some(bytes) = composed_fixture() else {
-        eprintln!("composed.wasm fixture absent — skipping");
-        return;
+        panic!(
+            "composed.wasm fixture absent — every fixture a test reads is tracked in the repository \
+             (SR-85); a missing one is a repository error, not a reason to report success"
+        );
     };
     let (_out, stats) = fuse(&bytes);
 
@@ -99,8 +101,10 @@ fn every_fused_boundary_is_recorded_with_its_strategy() {
 #[test]
 fn boundary_records_reach_the_attestation() {
     let Some(bytes) = composed_fixture() else {
-        eprintln!("composed.wasm fixture absent — skipping");
-        return;
+        panic!(
+            "composed.wasm fixture absent — every fixture a test reads is tracked in the repository \
+             (SR-85); a missing one is a repository error, not a reason to report success"
+        );
     };
     let (out, stats) = fuse(&bytes);
     assert!(
@@ -151,8 +155,10 @@ fn boundary_records_reach_the_attestation() {
 #[test]
 fn boundary_records_are_stable_across_runs() {
     let Some(bytes) = composed_fixture() else {
-        eprintln!("composed.wasm fixture absent — skipping");
-        return;
+        panic!(
+            "composed.wasm fixture absent — every fixture a test reads is tracked in the repository \
+             (SR-85); a missing one is a repository error, not a reason to report success"
+        );
     };
     // `adapter_sites` is sorted into a total order by the resolver, so records
     // emitted in that order must be identical run to run — otherwise embedding

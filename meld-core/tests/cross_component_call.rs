@@ -166,8 +166,10 @@ fn test_304_identity_direct_adapter_is_inlined() {
         env!("CARGO_MANIFEST_DIR")
     );
     let Ok(composed) = std::fs::read(&path) else {
-        eprintln!("compose fixture absent ({path}); skipping");
-        return;
+        panic!(
+            "compose fixture absent ({path}); skipping — every fixture a test reads is tracked in the repository \
+             (SR-85); a missing one is a repository error, not a reason to report success"
+        );
     };
 
     // Identity-adapter inlining (#304) is exercised on the shared-memory

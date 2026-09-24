@@ -211,13 +211,17 @@ fn fuse_many(
 fn fixture_bytes(name: &str) -> Option<Vec<u8>> {
     let path = format!("{FIXTURES_DIR}/{name}.wasm");
     std::fs::read(&path).ok().or_else(|| {
-        eprintln!("skipping: fixture not found at {path}");
-        None
+        panic!(
+            "fixture not found at {path} — every fixture a test reads is tracked in the repository \
+             (SR-85); a missing one is a repository error, not a reason to report success"
+        );
     })
 }
 
 /// Tier A: for every fixture, fusing (as a Component) must preserve the
 /// unfused observable behaviour, under both memory strategies.
+// rivet: verifies SR-85 — the corpus assertion now requires the strong
+// differential cases, which were the absent ones.
 #[test]
 fn tier_a_fusion_preserves_component_behaviour() {
     let mut ran = 0usize;
@@ -259,9 +263,19 @@ fn tier_a_fusion_preserves_component_behaviour() {
             ran += 1;
         }
     }
-    assert!(
-        ran > 0,
-        "no fixtures exercised — corpus missing? (looked in {FIXTURES_DIR})"
+    // `ran > 0` was satisfied by the nine wit-bindgen components above, which
+    // this file's own comment calls a "run-ok signal; mostly empty stdout",
+    // while the three that print real text — the only byte-identical
+    // differential in the suite — were absent from the repository and skipped.
+    // An assertion a weak case can satisfy does not cover the strong one, so
+    // require the whole corpus (SR-85, #405).
+    assert_eq!(
+        ran,
+        TIER_A_CORPUS.len(),
+        "only {ran} of {} corpus fixtures ran — the strong differential cases are \
+         the ones that print to stdout, and a count that stops at `> 0` is satisfied \
+         without them (looked in {FIXTURES_DIR})",
+        TIER_A_CORPUS.len()
     );
     eprintln!("Tier A: {ran} fuse-and-run equivalence checks passed");
 }
@@ -353,8 +367,10 @@ fn composed_golden() -> Option<(Vec<u8>, (u32, u8))> {
 #[test]
 fn tier_b_fused_composed_matches_host_linked() {
     let Some((composed, golden)) = composed_golden() else {
-        eprintln!("skipping: compose fixtures not found in {COMPOSE_DIR} (run build.sh)");
-        return;
+        panic!(
+            "compose fixtures not found in {COMPOSE_DIR} (run build.sh) — every fixture a test reads is tracked in the repository \
+             (SR-85); a missing one is a repository error, not a reason to report success"
+        );
     };
 
     let mut ran = 0usize;
@@ -399,8 +415,10 @@ fn tier_b_separate_inputs_internalise_link() {
         std::fs::read(format!("{COMPOSE_DIR}/provider.wasm")),
         composed_golden(),
     ) else {
-        eprintln!("skipping: compose fixtures not found in {COMPOSE_DIR}");
-        return;
+        panic!(
+            "compose fixtures not found in {COMPOSE_DIR} — every fixture a test reads is tracked in the repository \
+             (SR-85); a missing one is a repository error, not a reason to report success"
+        );
     };
     let fused = fuse_many(
         &[("consumer", &consumer), ("provider", &provider)],

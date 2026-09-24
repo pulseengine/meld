@@ -781,6 +781,11 @@ mod tests {
     }
 
     #[test]
+    // SPIKE_DIR is /tmp/spike326 — scratch from the #326 investigation that
+    // exists on no CI runner and on no machine that has since rebooted. These
+    // three reported `ok` without executing. `ignore` states that honestly:
+    // they now show up as ignored rather than as passing evidence (SR-85, #405).
+    #[ignore = "needs the #326 spike fixture in /tmp/spike326; not in the repository (#405)"]
     fn parse_reloc_code_matches_spike_fixture() {
         let path = format!("{SPIKE_DIR}/reloc.wasm");
         if !Path::new(&path).exists() {
@@ -800,6 +805,11 @@ mod tests {
     }
 
     #[test]
+    // SPIKE_DIR is /tmp/spike326 — scratch from the #326 investigation that
+    // exists on no CI runner and on no machine that has since rebooted. These
+    // three reported `ok` without executing. `ignore` states that honestly:
+    // they now show up as ignored rather than as passing evidence (SR-85, #405).
+    #[ignore = "needs the #326 spike fixture in /tmp/spike326; not in the repository (#405)"]
     fn reloc_metadata_survives_component_new() {
         let path = format!("{SPIKE_DIR}/reloc.component.wasm");
         if !Path::new(&path).exists() {
@@ -822,6 +832,11 @@ mod tests {
     }
 
     #[test]
+    // SPIKE_DIR is /tmp/spike326 — scratch from the #326 investigation that
+    // exists on no CI runner and on no machine that has since rebooted. These
+    // three reported `ok` without executing. `ignore` states that honestly:
+    // they now show up as ignored rather than as passing evidence (SR-85, #405).
+    #[ignore = "needs the #326 spike fixture in /tmp/spike326; not in the repository (#405)"]
     fn has_reloc_metadata_false_for_baseline() {
         let path = format!("{SPIKE_DIR}/baseline.component.wasm");
         if !Path::new(&path).exists() {

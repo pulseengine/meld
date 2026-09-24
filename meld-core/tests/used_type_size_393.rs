@@ -86,8 +86,10 @@ fn run(fused: &[u8], multi_memory: bool) -> f32 {
 #[test]
 fn used_record_is_not_truncated_across_memories() {
     let Some(bytes) = fixture() else {
-        eprintln!("compose_record_use fixture absent — skipping");
-        return;
+        panic!(
+            "compose_record_use fixture absent — every fixture a test reads is tracked in the repository \
+             (SR-85); a missing one is a repository error, not a reason to report success"
+        );
     };
     let fused = fuse(&bytes, MemoryStrategy::MultiMemory);
 
@@ -108,8 +110,10 @@ fn used_record_is_not_truncated_across_memories() {
 #[test]
 fn used_record_bridges_in_one_memory() {
     let Some(bytes) = fixture() else {
-        eprintln!("compose_record_use fixture absent — skipping");
-        return;
+        panic!(
+            "compose_record_use fixture absent — every fixture a test reads is tracked in the repository \
+             (SR-85); a missing one is a repository error, not a reason to report success"
+        );
     };
     let fused = fuse(&bytes, MemoryStrategy::SharedMemory);
 
@@ -131,8 +135,10 @@ fn used_record_bridges_in_one_memory() {
 #[test]
 fn both_strategies_agree() {
     let Some(bytes) = fixture() else {
-        eprintln!("compose_record_use fixture absent — skipping");
-        return;
+        panic!(
+            "compose_record_use fixture absent — every fixture a test reads is tracked in the repository \
+             (SR-85); a missing one is a repository error, not a reason to report success"
+        );
     };
     let multi = run(&fuse(&bytes, MemoryStrategy::MultiMemory), true);
     let shared = run(&fuse(&bytes, MemoryStrategy::SharedMemory), false);
@@ -149,8 +155,10 @@ fn both_strategies_agree() {
 #[test]
 fn used_types_are_exactly_sizeable() {
     let Some(bytes) = fixture() else {
-        eprintln!("compose_record_use fixture absent — skipping");
-        return;
+        panic!(
+            "compose_record_use fixture absent — every fixture a test reads is tracked in the repository \
+             (SR-85); a missing one is a repository error, not a reason to report success"
+        );
     };
     let parsed = meld_core::parser::ComponentParser::new()
         .parse(&bytes)

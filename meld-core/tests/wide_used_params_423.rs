@@ -68,8 +68,10 @@ fn run(fused: &[u8]) -> f32 {
 #[test]
 fn used_records_count_their_real_flat_width() {
     let Some(bytes) = fixture() else {
-        eprintln!("compose_record_use_wide fixture absent — skipping");
-        return;
+        panic!(
+            "compose_record_use_wide fixture absent — every fixture a test reads is tracked in the repository \
+             (SR-85); a missing one is a repository error, not a reason to report success"
+        );
     };
     let parsed = meld_core::parser::ComponentParser::new()
         .parse(&bytes)
@@ -107,8 +109,10 @@ fn used_records_count_their_real_flat_width() {
 #[test]
 fn wide_used_params_survive_fusion() {
     let Some(bytes) = fixture() else {
-        eprintln!("compose_record_use_wide fixture absent — skipping");
-        return;
+        panic!(
+            "compose_record_use_wide fixture absent — every fixture a test reads is tracked in the repository \
+             (SR-85); a missing one is a repository error, not a reason to report success"
+        );
     };
     let fused = match fuse(&bytes, MemoryStrategy::MultiMemory) {
         Ok(f) => f,

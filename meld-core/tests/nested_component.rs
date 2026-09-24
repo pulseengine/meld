@@ -12,8 +12,10 @@ use meld_core::{Fuser, FuserConfig, MemoryStrategy};
 fn test_parse_composed_component_structure() {
     let path = "../tests/wit_bindgen/fixtures/strings.wasm";
     let Ok(bytes) = std::fs::read(path) else {
-        eprintln!("skipping: fixture not found at {path}");
-        return;
+        panic!(
+            "fixture not found at {path} — every fixture a test reads is tracked in the repository \
+             (SR-85); a missing one is a repository error, not a reason to report success"
+        );
     };
 
     let parser = meld_core::ComponentParser::new();
@@ -57,8 +59,10 @@ fn test_parse_composed_component_structure() {
 fn test_fuse_composed_p2_component() {
     let path = "../tests/wit_bindgen/fixtures/strings.wasm";
     let Ok(bytes) = std::fs::read(path) else {
-        eprintln!("skipping: fixture not found at {path}");
-        return;
+        panic!(
+            "fixture not found at {path} — every fixture a test reads is tracked in the repository \
+             (SR-85); a missing one is a repository error, not a reason to report success"
+        );
     };
 
     let config = FuserConfig {

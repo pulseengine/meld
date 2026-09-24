@@ -32,8 +32,10 @@ fn oom_input() -> Option<Vec<u8>> {
 #[test]
 fn a_declared_count_cannot_exceed_its_section() {
     let Some(data) = oom_input() else {
-        eprintln!("corpus input absent — skipping");
-        return;
+        panic!(
+            "corpus input absent — every fixture a test reads is tracked in the repository \
+             (SR-85); a missing one is a repository error, not a reason to report success"
+        );
     };
     let parsed = ComponentParser::without_validation()
         .parse(&data)
@@ -65,8 +67,10 @@ fn a_declared_count_cannot_exceed_its_section() {
 #[test]
 fn merging_a_hostile_count_stays_bounded() {
     let Some(data) = oom_input() else {
-        eprintln!("corpus input absent — skipping");
-        return;
+        panic!(
+            "corpus input absent — every fixture a test reads is tracked in the repository \
+             (SR-85); a missing one is a repository error, not a reason to report success"
+        );
     };
     let parsed = ComponentParser::without_validation()
         .parse(&data)

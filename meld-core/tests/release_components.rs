@@ -13,12 +13,16 @@ use meld_core::{ComponentParser, Fuser, FuserConfig, MemoryStrategy, OutputForma
 const FIXTURES_DIR: &str = "../tests/wit_bindgen/fixtures/release-0.2.0";
 
 /// Returns true if the fixture directory exists; prints skip message and returns false otherwise.
+// rivet: verifies SR-85 — absence of the fixture directory is now a failure;
+// these eleven tests previously reported `ok` in 0.00s.
 fn fixtures_available() -> bool {
     if std::path::Path::new(FIXTURES_DIR).is_dir() {
         true
     } else {
-        eprintln!("skipping: fixtures not found at {FIXTURES_DIR}");
-        false
+        panic!(
+            "fixtures not found at {FIXTURES_DIR} — every fixture a test reads is tracked in the repository \
+             (SR-85); a missing one is a repository error, not a reason to report success"
+        );
     }
 }
 
