@@ -3385,8 +3385,10 @@ mod tests {
     fn test_count_replayed_types_hello_c_cli() {
         let path = "../tests/wit_bindgen/fixtures/release-0.2.0/hello_c_cli.wasm";
         let Ok(bytes) = std::fs::read(path) else {
-            eprintln!("skipping: fixture not found at {path}");
-            return;
+            panic!(
+                "skipping: fixture not found at {path} — every fixture a test reads is tracked in the repository \
+                 (SR-85); a missing one is a repository error, not a reason to report success"
+            );
         };
         let parser = crate::ComponentParser::new();
         let parsed = parser.parse(&bytes).unwrap();

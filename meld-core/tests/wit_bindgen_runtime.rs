@@ -23,8 +23,10 @@ fn fixture_exists(name: &str) -> bool {
     if std::path::Path::new(&path).is_file() {
         true
     } else {
-        eprintln!("skipping: fixture not found at {path}");
-        false
+        panic!(
+            "skipping: fixture not found at {path} — every fixture a test reads is tracked in the repository \
+             (SR-85); a missing one is a repository error, not a reason to report success"
+        );
     }
 }
 

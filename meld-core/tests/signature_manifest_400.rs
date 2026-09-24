@@ -48,8 +48,10 @@ fn read_manifest(fused: &[u8]) -> Option<SignatureManifest> {
 #[test]
 fn core_matches_the_emitted_module() {
     let Some(bytes) = fixture() else {
-        eprintln!("compose_record_use_wide fixture absent — skipping");
-        return;
+        panic!(
+            "compose_record_use_wide fixture absent — skipping — every fixture a test reads is tracked in the repository \
+             (SR-85); a missing one is a repository error, not a reason to report success"
+        );
     };
     let fused = fuse_with_manifest(&bytes);
     let manifest = read_manifest(&fused).expect("the section is present");
@@ -92,8 +94,10 @@ fn core_matches_the_emitted_module() {
 #[test]
 fn core_comes_from_the_module_not_the_wit() {
     let Some(bytes) = fixture() else {
-        eprintln!("compose_record_use_wide fixture absent — skipping");
-        return;
+        panic!(
+            "compose_record_use_wide fixture absent — skipping — every fixture a test reads is tracked in the repository \
+             (SR-85); a missing one is a repository error, not a reason to report success"
+        );
     };
     let fused = fuse_with_manifest(&bytes);
     let manifest = read_manifest(&fused).expect("the section is present");
@@ -134,8 +138,10 @@ fn core_comes_from_the_module_not_the_wit() {
 #[test]
 fn a_wide_export_states_the_pointer_shape_and_its_allocator() {
     let Some(bytes) = fixture() else {
-        eprintln!("compose_record_use_wide fixture absent — skipping");
-        return;
+        panic!(
+            "compose_record_use_wide fixture absent — skipping — every fixture a test reads is tracked in the repository \
+             (SR-85); a missing one is a repository error, not a reason to report success"
+        );
     };
     let fused = fuse_with_manifest(&bytes);
     let manifest = read_manifest(&fused).expect("the section is present");
@@ -190,8 +196,10 @@ fn a_wide_export_states_the_pointer_shape_and_its_allocator() {
 #[test]
 fn an_export_that_needs_nothing_names_nothing() {
     let Some(bytes) = fixture() else {
-        eprintln!("compose_record_use_wide fixture absent — skipping");
-        return;
+        panic!(
+            "compose_record_use_wide fixture absent — skipping — every fixture a test reads is tracked in the repository \
+             (SR-85); a missing one is a repository error, not a reason to report success"
+        );
     };
     let fused = fuse_with_manifest(&bytes);
     let manifest = read_manifest(&fused).expect("the section is present");
@@ -234,8 +242,10 @@ fn each_export_names_its_own_memory() {
         std::fs::read(format!("{dir}/compose_record_use_wide/provider.wasm")),
         std::fs::read(format!("{dir}/compose_record_use/provider.wasm")),
     ) else {
-        eprintln!("provider fixtures absent — skipping");
-        return;
+        panic!(
+            "provider fixtures absent — skipping — every fixture a test reads is tracked in the repository \
+             (SR-85); a missing one is a repository error, not a reason to report success"
+        );
     };
 
     let mut fuser = Fuser::new(FuserConfig {
@@ -293,8 +303,10 @@ fn each_export_names_its_own_memory() {
 #[test]
 fn the_section_is_absent_unless_asked_for() {
     let Some(bytes) = fixture() else {
-        eprintln!("compose_record_use_wide fixture absent — skipping");
-        return;
+        panic!(
+            "compose_record_use_wide fixture absent — skipping — every fixture a test reads is tracked in the repository \
+             (SR-85); a missing one is a repository error, not a reason to report success"
+        );
     };
     let mut fuser = Fuser::new(FuserConfig {
         memory_strategy: MemoryStrategy::MultiMemory,

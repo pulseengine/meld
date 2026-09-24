@@ -30,8 +30,10 @@ fn fixture() -> Option<Vec<u8>> {
 #[test]
 fn components_fused_counts_inputs_not_flattened_components() {
     let Some(bytes) = fixture() else {
-        eprintln!("compose_record_use fixture absent — skipping");
-        return;
+        panic!(
+            "compose_record_use fixture absent — skipping — every fixture a test reads is tracked in the repository \
+             (SR-85); a missing one is a repository error, not a reason to report success"
+        );
     };
     let mut fuser = Fuser::new(FuserConfig {
         memory_strategy: MemoryStrategy::MultiMemory,
@@ -70,8 +72,10 @@ fn components_fused_counts_inputs_not_flattened_components() {
 #[test]
 fn modules_merged_is_independent_of_the_input_count() {
     let Some(bytes) = fixture() else {
-        eprintln!("compose_record_use fixture absent — skipping");
-        return;
+        panic!(
+            "compose_record_use fixture absent — skipping — every fixture a test reads is tracked in the repository \
+             (SR-85); a missing one is a repository error, not a reason to report success"
+        );
     };
     let mut fuser = Fuser::new(FuserConfig {
         memory_strategy: MemoryStrategy::MultiMemory,

@@ -1,3 +1,10 @@
+// The osxcar components are third-party binaries fetched from osxcar.de by
+// `tests/osxcar/download.sh` and composed by `build.sh`; only those scripts,
+// the WIT and a README are in the repository. No CI runner has them, so these
+// five reported `ok` without executing anything. `ignore` states that: they
+// now appear as ignored rather than as passing evidence. Running them is
+// `tests/osxcar/download.sh && tests/osxcar/build.sh`, then `--ignored`
+// (SR-85, #405).
 //! Integration test for OSxCAR anti-pinch component fusion.
 //!
 //! Verifies that the three osxcar components (anti_pinch_v2, motor_driver_v2,
@@ -40,6 +47,7 @@ fn fuse_components(
 }
 
 #[test]
+#[ignore = "needs tests/osxcar/{download,build}.sh — third-party binaries, not in the repository (#405)"]
 fn test_osxcar_anti_pinch_fuses() {
     if !component_exists("anti_pinch_v2") {
         return;
@@ -55,6 +63,7 @@ fn test_osxcar_anti_pinch_fuses() {
 }
 
 #[test]
+#[ignore = "needs tests/osxcar/{download,build}.sh — third-party binaries, not in the repository (#405)"]
 fn test_osxcar_motor_driver_fuses() {
     if !component_exists("motor_driver_v2") {
         return;
@@ -66,6 +75,7 @@ fn test_osxcar_motor_driver_fuses() {
 }
 
 #[test]
+#[ignore = "needs tests/osxcar/{download,build}.sh — third-party binaries, not in the repository (#405)"]
 fn test_osxcar_soft_start_stop_fuses() {
     if !component_exists("soft_start_stop") {
         return;
@@ -77,6 +87,7 @@ fn test_osxcar_soft_start_stop_fuses() {
 }
 
 #[test]
+#[ignore = "needs tests/osxcar/{download,build}.sh — third-party binaries, not in the repository (#405)"]
 fn test_osxcar_all_three_fuse_core_module() {
     for name in &["anti_pinch_v2", "motor_driver_v2", "soft_start_stop"] {
         if !component_exists(name) {
@@ -106,6 +117,7 @@ fn test_osxcar_all_three_fuse_core_module() {
 }
 
 #[test]
+#[ignore = "needs tests/osxcar/{download,build}.sh — third-party binaries, not in the repository (#405)"]
 fn test_osxcar_all_three_fuse_component() {
     for name in &["anti_pinch_v2", "motor_driver_v2", "soft_start_stop"] {
         if !component_exists(name) {

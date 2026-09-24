@@ -49,8 +49,10 @@ fn read_manifest(fused: &[u8]) -> Option<SignatureManifest> {
 #[test]
 fn a_host_with_only_the_manifest_can_invoke_a_wide_export() {
     let Some((wide, narrow)) = fixtures() else {
-        eprintln!("provider fixtures absent — skipping");
-        return;
+        panic!(
+            "provider fixtures absent — skipping — every fixture a test reads is tracked in the repository \
+             (SR-85); a missing one is a repository error, not a reason to report success"
+        );
     };
 
     let mut fuser = Fuser::new(FuserConfig {

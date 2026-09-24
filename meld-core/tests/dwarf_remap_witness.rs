@@ -42,8 +42,10 @@ fn fixture_available() -> bool {
     if std::path::Path::new(SINGLE_SOURCE_FIXTURE).is_file() {
         true
     } else {
-        eprintln!("skipping: fixture not found at {SINGLE_SOURCE_FIXTURE}");
-        false
+        panic!(
+            "skipping: fixture not found at {SINGLE_SOURCE_FIXTURE} — every fixture a test reads is tracked in the repository \
+             (SR-85); a missing one is a repository error, not a reason to report success"
+        );
     }
 }
 
@@ -132,6 +134,8 @@ fn subprogram_low_pcs(sections: &std::collections::HashMap<String, Vec<u8>>) -> 
     low_pcs
 }
 
+// rivet: verifies SR-85 — the only address-correctness witness for the default
+// DwarfHandling::Remap, dark in CI since v0.25.0.
 #[test]
 fn remapped_subprogram_low_pcs_match_fused_body_starts() {
     if !fixture_available() {
@@ -211,8 +215,10 @@ const RANGES_FIXTURE: &str = "../tests/wit_bindgen/fixtures/records.wasm";
 #[test]
 fn inc2_die_ranges_stay_within_enclosing_subprogram() {
     if !std::path::Path::new(RANGES_FIXTURE).is_file() {
-        eprintln!("skipping: fixture not found at {RANGES_FIXTURE}");
-        return;
+        panic!(
+            "skipping: fixture not found at {RANGES_FIXTURE} — every fixture a test reads is tracked in the repository \
+             (SR-85); a missing one is a repository error, not a reason to report success"
+        );
     }
     let input = std::fs::read(RANGES_FIXTURE).expect("read fixture");
     let fused = fuse_remap(&input);
@@ -305,8 +311,10 @@ fn inc2_die_ranges_stay_within_enclosing_subprogram() {
 #[test]
 fn inc3_location_list_ranges_stay_in_module() {
     if !std::path::Path::new(RANGES_FIXTURE).is_file() {
-        eprintln!("skipping: fixture not found at {RANGES_FIXTURE}");
-        return;
+        panic!(
+            "skipping: fixture not found at {RANGES_FIXTURE} — every fixture a test reads is tracked in the repository \
+             (SR-85); a missing one is a repository error, not a reason to report success"
+        );
     }
     let input = std::fs::read(RANGES_FIXTURE).expect("read fixture");
     let fused = fuse_remap(&input);

@@ -21,8 +21,10 @@ fn fixture() -> Option<Vec<u8>> {
     match std::fs::read(FIXTURE) {
         Ok(bytes) => Some(bytes),
         Err(_) => {
-            eprintln!("skipping: fixture not found at {FIXTURE}");
-            None
+            panic!(
+                "skipping: fixture not found at {FIXTURE} — every fixture a test reads is tracked in the repository \
+                 (SR-85); a missing one is a repository error, not a reason to report success"
+            );
         }
     }
 }

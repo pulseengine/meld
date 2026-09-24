@@ -1440,3 +1440,13 @@ artifacts:
     links:
       - type: verifies
         target: SR-84
+
+  - id: SWV-97
+    type: sw-verification
+    title: "Verification of SR-85: a missing fixture fails the suite"
+    status: implemented
+    description: "Verifies SR-85 empirically rather than by inspection, by running the suite in the state CI sees. Before: with the 33 untracked fixtures removed, cargo test --workspace reported 914 passed, 0 failed and exited 0, while 36 tests across 11 binaries announced a skip and executed nothing; the announcements are invisible in CI because cargo captures stdout for passing tests, so the only trace was a 0.00s duration. After: the same removal exits 101. Every fixture the tests read is now tracked (11 components under release-0.2.0 that .gitignore's *.wasm rule hid, and 22 outputs under four compose* directories whose .wat sources were tracked but whose build.sh no workflow runs), and the 50 guards that returned early on absence now fail instead. Two sets cannot be satisfied from the repository and are marked ignored rather than left reporting success: three reloc tests read /tmp/spike326, scratch from the #326 investigation that exists on no machine, and five osxcar tests read third-party binaries that tests/osxcar/download.sh fetches from osxcar.de. golden_e2e's corpus assertion was 'ran > 0', which the nine fixtures its own source calls a run-ok signal satisfied while the three it calls the strong differential were absent; it now requires the whole corpus. Recurrence is closed by the change itself rather than by a separate checker: a new fixture that a test reads but nobody commits now fails CI, because the test fails instead of skipping. Gate: fmt 0, clippy 0, test --workspace 0 (906 passed, 11 ignored), test --workspace --all-features 0 (905 passed, 11 ignored)."
+    release: v0.59.0
+    links:
+      - type: verifies
+        target: SR-85

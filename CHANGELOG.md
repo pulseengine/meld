@@ -4,6 +4,57 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+- **36 tests reported success in CI without executing anything (SR-85, #405).**
+  The worst shape a test gap takes: the suite was green, and green because the
+  tests never ran.
+
+  Two independent mechanisms, both invisible. Eleven components under
+  `tests/wit_bindgen/fixtures/release-0.2.0/` were matched by `.gitignore`'s
+  `*.wasm` rule and never force-added, because `fixtures.yml` force-adds only
+  `fixtures/*.wasm`, a glob that cannot match a subdirectory — while 57
+  siblings at the top level were added. Twenty-two more under four `compose*`
+  directories have tracked `.wat` sources and a `build.sh`, but **no workflow
+  runs `build.sh`**, so the outputs existed only on a developer disk.
+
+  Every affected test guarded on the file being readable and returned early.
+  Measured by removing the 33 files and re-running:
+
+  | | before | after |
+  |---|---|---|
+  | `cargo test --workspace` | **exit 0**, 914 passed | **exit 101** |
+  | tests executing nothing | 36, across 11 binaries | 0 |
+
+  The skip messages never appeared in CI at all — cargo captures stdout for
+  passing tests, so the only trace was a `0.00s` duration next to `ok`.
+
+  Among the dark tests were the regression tests for defects fixed this month:
+  `allocator_reachable_81` (SR-81, v0.58.0), `signature_manifest_400` and
+  `invoke_via_manifest_400` (#400), and `wide_used_params_423` (#423, v0.57.0).
+  Also `dwarf_remap_witness`, the only address-correctness witness for
+  `DwarfHandling::Remap` — the default since v0.25.0.
+
+  All 33 fixtures are now tracked, the workflow's globs are recursive, and the
+  50 guards fail instead of returning early. Recurrence is closed by the change
+  itself rather than by a new checker: a fixture someone uses but does not
+  commit now fails CI, because the test fails rather than skips.
+
+- **An assertion that a weak case could satisfy (SR-85).** `golden_e2e`'s
+  Tier A asserted `ran > 0` over a corpus its own source splits into nine
+  fixtures that are a "run-ok signal; mostly empty stdout" and three that are
+  "the strong differential: fused output must print byte-identical text". The
+  three were the absent ones, so the assertion passed on the weak nine for as
+  long as the strong three were missing. It now requires the whole corpus.
+
+### Changed
+- **Eight tests that cannot run here now say so.** Three `reloc` tests read
+  `/tmp/spike326`, scratch from the #326 investigation that exists on no CI
+  runner and no machine that has rebooted; five `osxcar` tests read
+  third-party binaries `tests/osxcar/download.sh` fetches from osxcar.de.
+  Neither can be satisfied from the repository, so they are `#[ignore]`d with
+  the reason — visible as ignored rather than counted as passing evidence.
+
+
 ## [0.58.3] - 2026-09-23
 
 ### Added

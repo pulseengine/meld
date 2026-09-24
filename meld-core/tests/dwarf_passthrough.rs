@@ -103,8 +103,10 @@ fn fixture_available() -> bool {
     if std::path::Path::new(DEBUG_INFO_FIXTURE).is_file() {
         true
     } else {
-        eprintln!("skipping: fixture not found at {DEBUG_INFO_FIXTURE}");
-        false
+        panic!(
+            "skipping: fixture not found at {DEBUG_INFO_FIXTURE} — every fixture a test reads is tracked in the repository \
+             (SR-85); a missing one is a repository error, not a reason to report success"
+        );
     }
 }
 

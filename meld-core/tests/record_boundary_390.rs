@@ -60,8 +60,10 @@ fn fuse_shared(bytes: &[u8]) -> (Vec<u8>, meld_core::FusionStats) {
 #[test]
 fn same_memory_record_boundary_emits_valid_wasm() {
     let Some(bytes) = composed_record_fixture() else {
-        eprintln!("compose_record fixture absent — skipping");
-        return;
+        panic!(
+            "compose_record fixture absent — skipping — every fixture a test reads is tracked in the repository \
+             (SR-85); a missing one is a repository error, not a reason to report success"
+        );
     };
     let (fused, _stats) = fuse_shared(&bytes);
 
@@ -80,8 +82,10 @@ fn same_memory_record_boundary_computes_the_same_answer() {
     use wasmtime::{Config, Engine, Instance, Module, Store};
 
     let Some(bytes) = composed_record_fixture() else {
-        eprintln!("compose_record fixture absent — skipping");
-        return;
+        panic!(
+            "compose_record fixture absent — skipping — every fixture a test reads is tracked in the repository \
+             (SR-85); a missing one is a repository error, not a reason to report success"
+        );
     };
     let (fused, _stats) = fuse_shared(&bytes);
 
@@ -112,8 +116,10 @@ fn same_memory_record_boundary_computes_the_same_answer() {
 #[test]
 fn a_record_carrying_boundary_is_never_inlined() {
     let Some(bytes) = composed_record_fixture() else {
-        eprintln!("compose_record fixture absent — skipping");
-        return;
+        panic!(
+            "compose_record fixture absent — skipping — every fixture a test reads is tracked in the repository \
+             (SR-85); a missing one is a repository error, not a reason to report success"
+        );
     };
     let (_fused, stats) = fuse_shared(&bytes);
 
@@ -149,8 +155,10 @@ fn a_record_carrying_boundary_is_never_inlined() {
 #[test]
 fn multi_memory_control_still_valid() {
     let Some(bytes) = composed_record_fixture() else {
-        eprintln!("compose_record fixture absent — skipping");
-        return;
+        panic!(
+            "compose_record fixture absent — skipping — every fixture a test reads is tracked in the repository \
+             (SR-85); a missing one is a repository error, not a reason to report success"
+        );
     };
     let mut fuser = Fuser::new(FuserConfig {
         memory_strategy: MemoryStrategy::MultiMemory,
