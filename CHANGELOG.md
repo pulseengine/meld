@@ -4,6 +4,52 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.59.0] - 2026-09-25
+
+### Added
+- **`--domain`: fuse within a domain, keep the Canonical ABI between (SR-86, #427).**
+
+  `fuse` took one global `--memory`, so fusion was all-or-nothing: every
+  component in one memory, or every component in its own. An MCU privilege
+  boundary needs a third shape — tenants fused with each other for size, and
+  the copy kept between a tenant and its supervisor, because **the copy meld
+  elides under shared memory *is* the boundary**.
+
+  ```
+  meld fuse a.wasm b.wasm c.wasm --memory shared --address-rebase \
+       --domain tenant=a.wasm,b.wasm --domain supervisor=c.wasm
+  ```
+
+  Measured on a three-component fixture (two tenants calling one provider
+  across an interface carrying `own<task>`, `borrow<task>` and a scalar):
+
+  | invocation | boundaries | memories | |
+  |---|---|---|---|
+  | `--memory multi` | 8 memory-copy | 3 | isolated, **unfittable** |
+  | `--memory shared --address-rebase` | 8 direct | 1 | fits, **unisolated** |
+  | **with `--domain`** | **4 direct + 4 memory-copy** | **2** | what the boundary needs |
+
+  The third row was previously unreachable. The same interface, from the same
+  generated call sites, lowers `direct` inside a domain and `memory-copy`
+  across one — the lowering is a function of the grouping alone.
+
+  **A grouping is a trust decision, not a layout hint.** Handle tables are
+  regions in linear memory reached through `memory_index_map`, so two
+  components sharing a domain can address each other's — unforgeability is a
+  property of the domain boundary, not of the handle. Grouping two mutually
+  distrusting tenants to save space re-opens the hazard the boundary exists to
+  close. meld therefore records the grouping in the attestation, states each
+  boundary's domains in `--explain`, and **refuses** rather than infers:
+
+  - a grouping that does not partition the inputs — a component in no domain,
+    in two, or one that does not exist;
+  - a grouping under `--memory multi`, where every component already has its
+    own memory and the grouping would silently do nothing;
+  - `--component` output with domains, because the wrapper names one memory in
+    its lift options and would hand every export the first domain's memory.
+
+  Without `--domain` the layout is byte-identical to before.
+
 ### Fixed
 - **36 tests reported success in CI without executing anything (SR-85, #405).**
   The worst shape a test gap takes: the suite was green, and green because the

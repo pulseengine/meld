@@ -107,6 +107,24 @@ enum Commands {
         #[arg(long)]
         share_stack: bool,
 
+        /// SR-86 / #427: group inputs into memory domains — fuse within a
+        /// domain, keep the Canonical ABI between. Repeat once per domain:
+        ///
+        ///   --domain tenant=a.wasm,b.wasm --domain supervisor=c.wasm
+        ///
+        /// Every input must be named in exactly one domain; meld refuses a
+        /// grouping that does not partition them rather than placing a
+        /// component somewhere by default. Requires --memory shared (with
+        /// --address-rebase), because under --memory multi every component
+        /// already has its own memory and the grouping would do nothing.
+        ///
+        /// A grouping is a TRUST decision, not a layout hint: components in
+        /// one domain share a linear memory and can therefore address each
+        /// other's handle tables, so two mutually distrusting tenants must not
+        /// share a domain. It is recorded in the attestation for that reason.
+        #[arg(long = "domain", value_name = "NAME=INPUT[,INPUT...]")]
+        domain: Vec<String>,
+
         /// Show fusion statistics
         #[arg(long)]
         stats: bool,
@@ -296,6 +314,7 @@ fn main() -> Result<()> {
             share_stack,
             profile,
             explain,
+            domain,
         }) => {
             fuse_command(
                 inputs,
@@ -303,6 +322,7 @@ fn main() -> Result<()> {
                 memory,
                 profile,
                 explain,
+                domain,
                 address_rebase,
                 pack_rebase,
                 share_stack,
@@ -378,6 +398,46 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+/// SR-86 / #427: turn `--domain NAME=a.wasm,b.wasm` specs into the index
+/// groups the core API takes.
+///
+/// Resolves against the input list the user actually wrote, so the error can
+/// name the file rather than an index. Refusing an unknown name matters more
+/// than it looks: a typo would otherwise drop that input into no domain, and
+/// "in no domain" is the one thing a privilege boundary must never be.
+fn parse_domains(specs: &[String], inputs: &[String]) -> Result<Vec<Vec<usize>>> {
+    let mut groups = Vec::with_capacity(specs.len());
+    for spec in specs {
+        let (name, members) = spec.split_once('=').ok_or_else(|| {
+            anyhow::anyhow!(
+                "--domain expects NAME=INPUT[,INPUT...], got {spec:?} (no '='). \
+                 Example: --domain tenant=a.wasm,b.wasm"
+            )
+        })?;
+        if name.trim().is_empty() {
+            return Err(anyhow::anyhow!("--domain {spec:?} has an empty name"));
+        }
+        let mut group = Vec::new();
+        for member in members.split(',').map(str::trim).filter(|m| !m.is_empty()) {
+            let idx = inputs.iter().position(|i| i == member).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "--domain {name}={member:?} names an input that was not given. \
+                     Inputs are: {}",
+                    inputs.join(", ")
+                )
+            })?;
+            group.push(idx);
+        }
+        if group.is_empty() {
+            return Err(anyhow::anyhow!(
+                "--domain {name} lists no inputs — an empty domain states nothing"
+            ));
+        }
+        groups.push(group);
+    }
+    Ok(groups)
+}
+
 /// Fuse command implementation
 #[allow(clippy::too_many_arguments)]
 fn fuse_command(
@@ -386,6 +446,7 @@ fn fuse_command(
     memory: String,
     profile: String,
     explain: bool,
+    domain: Vec<String>,
     address_rebase: bool,
     pack_rebase: bool,
     share_stack: bool,
@@ -535,6 +596,10 @@ fn fuse_command(
         }
     };
 
+    // SR-86: resolve the grouping against the inputs before building the
+    // config, so a typo in a trust boundary fails before any work is done.
+    let domains = parse_domains(&domain, &inputs)?;
+
     let config = FuserConfig {
         profile,
         memory_strategy,
@@ -549,6 +614,7 @@ fn fuse_command(
         output_format,
         opaque_resources,
         dwarf_handling,
+        domains,
         ..Default::default()
     };
 

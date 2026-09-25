@@ -56,6 +56,7 @@ fn fuse_remap(input: &[u8]) -> Vec<u8> {
         reproducible: false,
         component_provenance: true,
         signature_manifest: false,
+        domains: Vec::new(),
         address_rebasing: false,
         pack_rebase: false,
         share_stack: false,

@@ -56,6 +56,16 @@ pub enum Error {
     #[error("memory strategy not supported: {0}")]
     MemoryStrategyUnsupported(String),
 
+    /// SR-86 / #427: the memory-domain grouping does not partition the inputs,
+    /// or asks for something the chosen memory strategy cannot express.
+    ///
+    /// Separate from `MemoryStrategyUnsupported` because the remedy is
+    /// different: the strategy is fine, the *grouping* is wrong, and meld
+    /// refuses to repair it. A component placed in a domain by default is a
+    /// privilege boundary meld chose rather than the caller.
+    #[error("invalid memory-domain grouping: {0}")]
+    InvalidDomains(String),
+
     /// A core module must be placed at a non-zero shared-memory base but
     /// carries no relocation metadata, so meld cannot rebase its absolute
     /// addresses into the shared window (issue #326, ADR-6 path-F). Emitting

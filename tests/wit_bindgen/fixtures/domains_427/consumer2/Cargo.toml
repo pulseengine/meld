@@ -1,0 +1,18 @@
+[workspace]
+[package]
+name = "capfix-consumer2"
+version = "0.1.0"
+edition = "2021"
+description = "meld#427 fixture: the tenant side that holds and uses that handle across the boundary (gale#408)."
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen = { version = "0.52", default-features = false, features = ["macros"] }
+
+[profile.release]
+panic = "abort"
+opt-level = "s"
+lto = true
+codegen-units = 1
