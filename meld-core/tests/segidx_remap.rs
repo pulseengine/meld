@@ -49,6 +49,7 @@ fn fuser_config() -> FuserConfig {
         reproducible: false,
         component_provenance: false,
         signature_manifest: false,
+        domains: Vec::new(),
         address_rebasing: false,
         pack_rebase: false,
         share_stack: false,

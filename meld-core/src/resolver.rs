@@ -1645,6 +1645,14 @@ pub struct Resolver {
     allow_unresolved: bool,
     /// Memory strategy (affects crosses_memory detection)
     memory_strategy: MemoryStrategy,
+    /// SR-86 / #427: memory domains over INTERNAL component indices, canonical
+    /// order. Empty means one implicit domain.
+    ///
+    /// Under shared memory a call crossed no memory, full stop. With a
+    /// grouping that is true only *within* a domain: a call leaving its domain
+    /// lands in a different linear memory and must copy, which is the whole
+    /// point — the elided copy is the privilege boundary.
+    domains: Vec<Vec<usize>>,
 }
 
 impl Resolver {
@@ -1653,6 +1661,7 @@ impl Resolver {
         Self {
             allow_unresolved: true,
             memory_strategy: MemoryStrategy::MultiMemory,
+            domains: Vec::new(),
         }
     }
 
@@ -1667,6 +1676,28 @@ impl Resolver {
     /// never disagree about what `Auto` means. The strategy matches below
     /// also carry `MultiMemory | Auto` arms as a compiler-enforced
     /// backstop should a future code path bypass this constructor.
+    /// SR-86: set the memory-domain grouping (internal component indices).
+    pub fn with_domains(mut self, domains: Vec<Vec<usize>>) -> Self {
+        self.domains = domains;
+        self
+    }
+
+    /// SR-86: which domain a component is in; 0 when there is no grouping.
+    fn domain_of(&self, component: usize) -> usize {
+        if self.domains.is_empty() {
+            return 0;
+        }
+        self.domains
+            .iter()
+            .position(|d| d.contains(&component))
+            .unwrap_or_else(|| {
+                unreachable!(
+                    "component {component} is in no domain — the grouping is validated to \
+                     partition the inputs before resolution"
+                )
+            })
+    }
+
     pub fn with_strategy(memory_strategy: MemoryStrategy) -> Self {
         let memory_strategy = match memory_strategy {
             MemoryStrategy::Auto => MemoryStrategy::MultiMemory,
@@ -1675,6 +1706,7 @@ impl Resolver {
         Self {
             allow_unresolved: true,
             memory_strategy,
+            domains: Vec::new(),
         }
     }
 
@@ -1683,6 +1715,7 @@ impl Resolver {
         Self {
             allow_unresolved: false,
             memory_strategy: MemoryStrategy::MultiMemory,
+            domains: Vec::new(),
         }
     }
 
@@ -2882,7 +2915,11 @@ impl Resolver {
                     // Determine if this call crosses a memory boundary (shared
                     // across all functions in the interface).
                     let crosses_memory = match self.memory_strategy {
-                        MemoryStrategy::SharedMemory => false,
+                        // SR-86: within a domain nothing crosses; across
+                        // domains everything does.
+                        MemoryStrategy::SharedMemory => {
+                            self.domain_of(*from_comp) != self.domain_of(*to_comp)
+                        }
                         MemoryStrategy::MultiMemory | MemoryStrategy::Auto => {
                             let has_memory = |c: &ParsedComponent| {
                                 c.core_modules.iter().any(|m| {

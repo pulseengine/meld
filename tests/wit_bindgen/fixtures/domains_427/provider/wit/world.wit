@@ -1,0 +1,23 @@
+package gale:capfix@0.1.0;
+
+/// A capability interface that carries a RESOURCE HANDLE, which is the case
+/// meld#427 needs measured: handle tables are built per COMPONENT today, and
+/// "domain" and "component" stop being interchangeable once several components
+/// share a domain. Shaped after gust:os/spawn + timer, which gale intends to
+/// move from bare u32 handles to resources for exactly this reason (gale#408).
+interface caps {
+    resource task {
+        /// Hand out a handle. In gust this is spawn.start.
+        constructor(entry: u32);
+        /// Use the handle. In gust this is timer.sleep / exec.state.
+        tick: func(ticks: u32) -> u32;
+        /// A borrow, so the fixture exercises both own<> and borrow<>.
+        peek: func() -> u32;
+    }
+    /// Scalar op alongside the handle ops, so a boundary carries both.
+    now: func() -> u32;
+}
+
+world provider {
+    export caps;
+}

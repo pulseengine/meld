@@ -88,9 +88,17 @@ impl Merger {
 
         // Merge memories
         if self.memory_strategy == MemoryStrategy::SharedMemory {
+            // SR-86 / #427: every memory of this module maps to its DOMAIN's
+            // memory. Without a grouping that is memory 0 for everyone, which
+            // is what this said before. With one, this is the line that makes
+            // the grouping mean something — a module left pointing at 0 would
+            // encode and validate perfectly while addressing another domain.
+            let domain_memory = self.domain_of_component(comp_idx) as u32;
             let total_memories = import_mem_count + module.memories.len() as u32;
             for idx in 0..total_memories {
-                merged.memory_index_map.insert((comp_idx, mod_idx, idx), 0);
+                merged
+                    .memory_index_map
+                    .insert((comp_idx, mod_idx, idx), domain_memory);
             }
         } else {
             // Multi-memory: each component keeps its own memory.

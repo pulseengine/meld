@@ -38,6 +38,18 @@ impl Merger {
         components: &[ParsedComponent],
         graph: &DependencyGraph,
     ) -> Result<Option<SharedMemoryPlan>> {
+        self.compute_shared_memory_plan_for(components, graph, None)
+    }
+
+    /// SR-86: the plan for ONE domain. `members` restricts the walk to that
+    /// domain's components; `None` means every component, i.e. the single
+    /// implicit domain that predates grouping.
+    pub(crate) fn compute_shared_memory_plan_for(
+        &self,
+        components: &[ParsedComponent],
+        graph: &DependencyGraph,
+        members: Option<&[usize]>,
+    ) -> Result<Option<SharedMemoryPlan>> {
         let mut memory_types = Vec::new();
         let mut import_names: Vec<(String, String)> = Vec::new();
         let mut has_defined = false;
@@ -51,6 +63,11 @@ impl Merger {
         let mut share_entries: Vec<((usize, usize), u64, u64)> = Vec::new();
 
         for (comp_idx, component) in components.iter().enumerate() {
+            // SR-86: a domain's plan sees only its own components, so each
+            // domain's bases start at 0 in its own memory.
+            if members.is_some_and(|m| !m.contains(&comp_idx)) {
+                continue;
+            }
             for (mod_idx, module) in component.core_modules.iter().enumerate() {
                 for import in &module.imports {
                     if let ImportKind::Memory(mem) = &import.kind {

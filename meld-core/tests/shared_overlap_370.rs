@@ -44,6 +44,7 @@ fn fuse_shared(a_off: u32, b_off: u32) -> meld_core::Result<Vec<u8>> {
         reproducible: false,
         component_provenance: false,
         signature_manifest: false,
+        domains: Vec::new(),
         address_rebasing: false,
         pack_rebase: false,
         share_stack: false,

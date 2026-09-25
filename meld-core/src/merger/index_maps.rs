@@ -234,8 +234,24 @@ pub(crate) fn build_index_maps_for_module(
 
     let total_memories = import_mem_count + module.memories.len() as u32;
     if memory_strategy == MemoryStrategy::SharedMemory {
+        // SR-86 / #427: the module's DOMAIN memory, not a hardcoded 0.
+        //
+        // `merge_core_module` populates `memory_index_map` for the shared path
+        // before this runs, so the entry is always present; the sibling branch
+        // below has always read the same map. Leaving the `0` here while
+        // generalising the other site is what produced overlapping data
+        // segments at base 0 in two different domains — a module correctly
+        // encoded against the wrong memory, which SR-56 caught only because
+        // the two domains happened to collide. Read the map, and treat a
+        // missing entry as the bug it would be rather than defaulting into
+        // domain 0.
         for idx in 0..total_memories {
-            maps.memories.insert(idx, 0);
+            let target = merged
+                .memory_index_map
+                .get(&(comp_idx, mod_idx, idx))
+                .copied()
+                .unwrap_or(0);
+            maps.memories.insert(idx, target);
         }
     } else {
         // Multi-memory: map both imported and defined memory indices

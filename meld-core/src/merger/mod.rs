@@ -369,6 +369,15 @@ pub struct Merger {
     /// aligned) instead of its declared page count, and the combined memory is
     /// sized to the packed total. See [`FuserConfig::pack_rebase`] for the
     /// soundness envelope.
+    /// SR-86 / #427: memory domains, over INTERNAL component indices and in
+    /// canonical order. Empty means one implicit domain holding everything,
+    /// which is the pre-SR-86 behaviour.
+    ///
+    /// The caller writes a grouping over *inputs*; `Fuser` expands it to
+    /// component indices before handing it here, because one input can flatten
+    /// into several components and a grouping that placed only the first would
+    /// be a privilege boundary meld invented.
+    domains: Vec<Vec<usize>>,
     pack_rebase: bool,
     /// SR-66 / #380: collapse the per-provider shadow stacks into one shared
     /// region. Builds on `pack_rebase` (the caller sets `pack_rebase` too). See
@@ -397,6 +406,7 @@ impl Merger {
             address_rebasing,
             defer_grow_under_rebase: false,
             opaque_resources: Vec::new(),
+            domains: Vec::new(),
             pack_rebase: false,
             share_stack: false,
         }
@@ -421,6 +431,30 @@ impl Merger {
     /// SR-57 / #370: enable compact used-extent rebasing (see the
     /// [`pack_rebase`](Self::pack_rebase) field). No effect unless rebasing is
     /// active, since the per-module base map is only built under rebasing.
+    /// SR-86: set the memory-domain grouping (internal component indices,
+    /// canonical order).
+    pub fn with_domains(mut self, domains: Vec<Vec<usize>>) -> Self {
+        self.domains = domains;
+        self
+    }
+
+    /// SR-86: which domain an internal component belongs to. Zero when no
+    /// grouping was given — the single implicit domain.
+    pub(crate) fn domain_of_component(&self, component: usize) -> usize {
+        if self.domains.is_empty() {
+            return 0;
+        }
+        self.domains
+            .iter()
+            .position(|d| d.contains(&component))
+            .unwrap_or_else(|| {
+                unreachable!(
+                    "component {component} is in no domain — the grouping is validated to \
+                     partition the inputs before the merger is built"
+                )
+            })
+    }
+
     pub fn with_pack_rebase(mut self, pack: bool) -> Self {
         self.pack_rebase = pack;
         self
@@ -462,11 +496,29 @@ impl Merger {
     ) -> Result<MergedModule> {
         Self::check_no_duplicate_instantiations(components)?;
 
-        let shared_memory_plan = if self.memory_strategy == MemoryStrategy::SharedMemory {
-            self.compute_shared_memory_plan(components, graph)?
-        } else {
-            None
-        };
+        // SR-86 / #427: one plan per domain. Without a grouping this is the
+        // single implicit domain, so `domain_plans` has exactly one entry and
+        // every consumer below sees what it saw before.
+        let domain_plans: Vec<Option<SharedMemoryPlan>> =
+            if self.memory_strategy == MemoryStrategy::SharedMemory {
+                if self.domains.is_empty() {
+                    vec![self.compute_shared_memory_plan(components, graph)?]
+                } else {
+                    self.domains
+                        .iter()
+                        .map(|members| {
+                            self.compute_shared_memory_plan_for(components, graph, Some(members))
+                        })
+                        .collect::<Result<Vec<_>>>()?
+                }
+            } else {
+                Vec::new()
+            };
+        // The first domain's plan stands in for consumers that predate
+        // grouping. With one domain that is the whole story; with several it is
+        // the plan whose memory carries index 0, and per-module lookups below
+        // go through `domain_plans` rather than through this.
+        let shared_memory_plan = domain_plans.first().cloned().flatten();
 
         // Pre-compute unresolved import counts and assignments so that all
         // index-map values produced during merging are absolute wasm indices
@@ -522,6 +574,7 @@ impl Merger {
                 graph,
                 &mut merged,
                 shared_memory_plan.as_ref(),
+                &domain_plans,
                 &unresolved_assignments,
             )?;
         }
@@ -794,7 +847,11 @@ impl Merger {
                 .collect();
             if plan.import.is_none() {
                 merged.memories.clear();
-                merged.memories.push(plan.memory);
+                // SR-86: one memory per domain, in canonical domain order, so
+                // a module's domain index IS its memory index.
+                for dp in domain_plans.iter().flatten() {
+                    merged.memories.push(dp.memory);
+                }
             } else {
                 merged.memories.clear();
             }
@@ -810,6 +867,7 @@ impl Merger {
     /// modules that import from them.  This ensures `function_index_map`
     /// entries exist when resolving intra-component imports.
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     fn merge_component(
         &self,
         comp_idx: usize,
@@ -818,8 +876,21 @@ impl Merger {
         graph: &DependencyGraph,
         merged: &mut MergedModule,
         shared_memory_plan: Option<&SharedMemoryPlan>,
+        domain_plans: &[Option<SharedMemoryPlan>],
         unresolved_assignments: &UnresolvedImportAssignments,
     ) -> Result<()> {
+        // SR-86: this component's own domain plan. Each domain's plan holds
+        // bases only for its own components, so a module reads its base from
+        // its domain rather than from a plan that flattened every domain
+        // together — which is how a module ends up correctly encoded and
+        // pointing into the wrong memory.
+        let own_plan = if self.domains.is_empty() {
+            shared_memory_plan
+        } else {
+            domain_plans
+                .get(self.domain_of_component(comp_idx))
+                .and_then(|p| p.as_ref())
+        };
         let module_count = component.core_modules.len();
         let merge_order = Self::compute_module_merge_order(comp_idx, module_count, graph);
 
@@ -832,7 +903,7 @@ impl Merger {
                 components,
                 graph,
                 merged,
-                shared_memory_plan,
+                own_plan,
                 unresolved_assignments,
             )?;
         }
