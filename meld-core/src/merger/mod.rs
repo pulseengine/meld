@@ -514,6 +514,22 @@ impl Merger {
             } else {
                 Vec::new()
             };
+        // SR-86: the imported-memory path adds ONE shared memory import, guarded
+        // by `shared_memory_import_added`, so N domains would all be wired to
+        // the first import rather than to a memory each. Not reachable for
+        // components that define their memory (the case this release is for),
+        // and refused rather than silently collapsed for those that import it —
+        // a module wired to another domain's memory validates and is wrong.
+        if !self.domains.is_empty() && domain_plans.iter().flatten().any(|p| p.import.is_some()) {
+            return Err(Error::InvalidDomains(
+                "--domain cannot yet group components that IMPORT their memory: the merged \
+                 module carries a single shared memory import, so every domain would be wired \
+                 to the same imported memory and the grouping would not isolate anything. \
+                 Fuse components that define their own memory, or drop --domain."
+                    .to_string(),
+            ));
+        }
+
         // The first domain's plan stands in for consumers that predate
         // grouping. With one domain that is the whole story; with several it is
         // the plan whose memory carries index 0, and per-module lookups below
