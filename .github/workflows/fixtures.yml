@@ -76,7 +76,12 @@ jobs:
           # subdirectory, which is how the eleven `release-0.2.0/` components
           # stayed untracked while 57 siblings were added, leaving 18 tests
           # passing in CI without executing anything (#405, SR-85).
-          git add --force 'tests/wit_bindgen/fixtures/**/*.wasm' tests/wit_bindgen/fixtures/*.wasm
+          # `--force` overrides .gitignore, including a fixture's own `target/`
+          # rule, so exclude build trees explicitly or the weekly job sweeps
+          # compiler output into the repository alongside the fixtures.
+          git add --force 'tests/wit_bindgen/fixtures/**/*.wasm' \
+            tests/wit_bindgen/fixtures/*.wasm \
+            ':(exclude)tests/wit_bindgen/fixtures/**/target/**'
           if git diff --cached --quiet; then
             echo "changed=false" >> "$GITHUB_OUTPUT"
           else
@@ -101,5 +106,6 @@ jobs:
           add-paths: |
             tests/wit_bindgen/fixtures/*.wasm
             tests/wit_bindgen/fixtures/**/*.wasm
+            :(exclude)tests/wit_bindgen/fixtures/**/target/**
           labels: ci
           delete-branch: true
