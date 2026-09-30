@@ -3459,3 +3459,13 @@ artifacts:
     links:
       - type: derives-from
         target: SYS-11
+
+  - id: SR-86
+    type: sw-req
+    title: fuse groups components into memory domains, fusing within and preserving the Canonical ABI between
+    status: verified
+    description: "meld fuse takes one global --memory strategy, so fusion is all-or-nothing: every component shares one memory, or every component keeps its own. gale/fathom needs a third shape for an MCU privilege boundary (gale#408): tenants fused with each other for size, and the Canonical ABI kept between a tenant and its supervisor, because the copy that meld elides under shared memory IS the boundary. Measured on gale's handle-carrying fixture (gale#412) at v0.58.3: --memory multi gives 4 memory-copy boundaries across 2 memories, --memory shared --address-rebase gives 4 direct boundaries wired with nothing interposed in 1 memory, and the resource constructor and both methods erase exactly like a scalar. Today a two-domain node is therefore either unfittable or unisolated. meld shall accept a grouping of its inputs into named domains, fuse within each domain under the chosen memory strategy, keep cross-domain calls on the Canonical ABI, and state each boundary's domains in --explain and in the attestation. Absent an explicit grouping the behaviour is exactly today's single implicit domain, byte-identically. Design note, established from the code rather than assumed: handle tables are keyed per component (merger/mod.rs) and HandleTableInfo carries memory_idx and table_base_addr, so a handle table is a region in linear memory reached through memory_index_map. Components sharing a domain therefore have mutually addressable handle tables by construction, which makes unforgeability a property of the domain boundary rather than of the handle — grouping two tenants into one domain re-opens the STPA-Sec hazard the work exists to close, so the grouping a user writes is a trust decision and must be recorded as one."
+    release: v0.59.0
+    links:
+      - type: derives-from
+        target: SYS-6

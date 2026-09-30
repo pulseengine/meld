@@ -1,0 +1,7 @@
+package gale:capfix-consumer@0.1.0;
+
+world consumer {
+    import gale:capfix/caps@0.1.0;
+    /// The tenant-side entry a supervisor would call.
+    export run: func() -> u32;
+}

@@ -122,6 +122,18 @@ pub struct FusionParameters {
     pub output_format: String,
     /// Whether the build was byte-reproducible (#325).
     pub reproducible: bool,
+    /// SR-86 / #427: the memory-domain grouping, canonicalised — each inner
+    /// list is the component indices sharing one memory, sorted, with the
+    /// domains ordered by their lowest member so the record does not depend on
+    /// the order the caller wrote them.
+    ///
+    /// Empty means one implicit domain holding every input. This is the most
+    /// consequential parameter in the record: it states which calls kept the
+    /// Canonical ABI, and therefore where the privilege boundaries are. Two
+    /// components in one domain can address each other's handle tables, so a
+    /// reader checking an isolation claim checks this first.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub domains: Vec<Vec<usize>>,
 }
 
 /// Fusion-specific metadata
@@ -709,6 +721,7 @@ mod tests {
             dwarf_handling: "strip".to_string(),
             output_format: "core-module".to_string(),
             reproducible: true,
+            domains: Vec::new(),
         };
         let stats = FusionStats::default();
         let attestation = FusionAttestationBuilder::new("meld", "0.1.0")

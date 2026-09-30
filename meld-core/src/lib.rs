@@ -125,6 +125,29 @@ pub struct FuserConfig {
     /// to artifacts that may be size-constrained.
     pub signature_manifest: bool,
 
+    /// SR-86 / #427: group the inputs into memory domains — fuse within a
+    /// domain, keep the Canonical ABI between. Each inner `Vec` is the set of
+    /// component indices sharing one memory.
+    ///
+    /// Empty (the default) means one implicit domain holding every input,
+    /// which is the behaviour before this existed and produces the same bytes.
+    ///
+    /// The motivating case is an MCU privilege boundary (gale#408): a tenant
+    /// fused with its supervisor is smaller, but the copy meld elides under
+    /// shared memory *is* the boundary, so fusing across it removes the
+    /// isolation. With one global strategy a two-domain node is either
+    /// unfittable (`multi`) or unisolated (`shared`).
+    ///
+    /// **A grouping is a trust decision, not a layout hint.** Handle tables
+    /// are regions in linear memory reached through `memory_index_map`, so two
+    /// components sharing a domain have mutually addressable handle tables by
+    /// construction — unforgeability is a property of the domain boundary, not
+    /// of the handle. Grouping two mutually distrusting tenants to save memory
+    /// silently re-opens the hazard the boundary exists to close. That is why
+    /// this is attested, why it must partition the inputs exactly, and why
+    /// meld refuses to infer it.
+    pub domains: Vec<Vec<usize>>,
+
     /// Whether to rebase per-module memory addresses into a shared memory
     pub address_rebasing: bool,
 
@@ -217,6 +240,9 @@ impl Default for FuserConfig {
             reproducible: false,
             component_provenance: true,
             signature_manifest: false,
+            // One implicit domain holding every input — the behaviour before
+            // SR-86, byte-for-byte.
+            domains: Vec::new(),
             address_rebasing: false,
             pack_rebase: false,
             share_stack: false,
@@ -391,6 +417,17 @@ pub struct BoundaryRecord {
     pub wiring: String,
     /// Whether the boundary crosses a memory (the fact that forces a copy).
     pub crosses_memory: bool,
+    /// SR-86 / #427: the memory domain each side runs in, as a canonical index
+    /// (members sorted, domains ordered by lowest member, so the id does not
+    /// depend on the order the caller wrote the grouping).
+    ///
+    /// Equal on both sides means the call was fused; different means it kept
+    /// the Canonical ABI because it left its domain. Without an explicit
+    /// grouping every component is in domain 0, so these agree everywhere —
+    /// which is the honest statement that there was one domain, not that
+    /// isolation was checked.
+    pub from_domain: usize,
+    pub to_domain: usize,
 }
 
 /// Where ONE module's memory landed in the fused address space, and by which
@@ -428,6 +465,111 @@ pub struct PlacementRecord {
 /// input wrapped to a reduction of about 10^18 percent in a release build.
 /// Output larger than input is the normal case for small compositions, since
 /// adapters, attestation and provenance all add bytes.
+/// SR-86: which canonical domain a component belongs to.
+///
+/// `validate_domains` has already established that the grouping partitions the
+/// inputs, so a component with no domain is a bug in meld rather than bad
+/// input — and it must say so rather than defaulting to 0, which would report
+/// two components as co-resident when meld had in fact lost track of one.
+pub(crate) fn domain_of(canonical: &[Vec<usize>], component: usize) -> usize {
+    if canonical.is_empty() {
+        return 0; // one implicit domain
+    }
+    canonical
+        .iter()
+        .position(|d| d.contains(&component))
+        .unwrap_or_else(|| {
+            unreachable!(
+                "component {component} is in no domain after validation — validate_domains \
+                 guarantees a partition, so reaching here means the grouping and the component \
+                 set went out of step"
+            )
+        })
+}
+
+/// SR-86: canonical form of a domain grouping, so the attestation does not
+/// depend on the order the caller happened to write it. Members sorted within
+/// a domain; domains ordered by their lowest member.
+pub(crate) fn canonical_domains(domains: &[Vec<usize>]) -> Vec<Vec<usize>> {
+    let mut out: Vec<Vec<usize>> = domains
+        .iter()
+        .map(|d| {
+            let mut d = d.clone();
+            d.sort_unstable();
+            d
+        })
+        .collect();
+    out.sort_by_key(|d| d.first().copied().unwrap_or(usize::MAX));
+    out
+}
+
+/// SR-86: a grouping must **partition** the inputs — every component in
+/// exactly one domain, and every named component real.
+///
+/// Refusing rather than repairing is the point. A component silently placed in
+/// a default domain, or in the first of two that name it, is a trust boundary
+/// meld invented on the caller's behalf; the one thing a privilege boundary
+/// must never be is inferred (ADR-4, "explicit, not auto").
+pub(crate) fn validate_domains(
+    domains: &[Vec<usize>],
+    component_count: usize,
+    memory_strategy: MemoryStrategy,
+) -> Result<()> {
+    if domains.is_empty() {
+        return Ok(()); // one implicit domain: the pre-SR-86 behaviour
+    }
+    if memory_strategy != MemoryStrategy::SharedMemory {
+        return Err(Error::InvalidDomains(format!(
+            "--domain groups components into shared memories, but --memory {} already gives \
+             every component its own memory, so the grouping would do nothing. Either drop \
+             --domain, or pass --memory shared (with --address-rebase) to make the grouping \
+             mean something.",
+            match memory_strategy {
+                MemoryStrategy::MultiMemory => "multi",
+                MemoryStrategy::Auto => "auto (which resolves to multi)",
+                MemoryStrategy::SharedMemory => unreachable!(),
+            }
+        )));
+    }
+
+    let mut seen: Vec<Option<usize>> = vec![None; component_count];
+    for (domain_idx, members) in domains.iter().enumerate() {
+        if members.is_empty() {
+            return Err(Error::InvalidDomains(format!(
+                "domain {domain_idx} is empty — an empty domain states nothing"
+            )));
+        }
+        for &c in members {
+            let slot = seen.get_mut(c).ok_or_else(|| {
+                Error::InvalidDomains(format!(
+                    "domain {domain_idx} names component {c}, but only {component_count} \
+                     component(s) were given — a typo in a trust boundary must be loud"
+                ))
+            })?;
+            if let Some(first) = *slot {
+                return Err(Error::InvalidDomains(format!(
+                    "component {c} is in domain {first} and domain {domain_idx}; a component \
+                     lives in exactly one memory, and meld will not pick one for you"
+                )));
+            }
+            *slot = Some(domain_idx);
+        }
+    }
+    let unplaced: Vec<usize> = seen
+        .iter()
+        .enumerate()
+        .filter_map(|(c, d)| d.is_none().then_some(c))
+        .collect();
+    if !unplaced.is_empty() {
+        return Err(Error::InvalidDomains(format!(
+            "component(s) {unplaced:?} are in no domain. Every input must be placed \
+             explicitly — a component put somewhere by default is a privilege boundary meld \
+             chose rather than you."
+        )));
+    }
+    Ok(())
+}
+
 pub fn size_reduction_percent(input_bytes: usize, output_bytes: usize) -> Option<f64> {
     if input_bytes == 0 {
         return None;
@@ -534,6 +676,15 @@ pub struct Fuser {
     /// flattened entries each hold only a share. Summed at add time, where the
     /// input-to-flattened mapping is still known.
     input_module_counts: Vec<usize>,
+    /// SR-86 / #427: for each FLATTENED component, the index of the INPUT it
+    /// came from.
+    ///
+    /// A domain grouping is written over inputs — the files the caller named —
+    /// but `components` holds the flattened list, and one input can flatten
+    /// into several. Without this map a grouping naming an input would place
+    /// only its first component and leave the rest to a default, which is a
+    /// privilege boundary meld invented rather than one the caller stated.
+    component_to_input: Vec<usize>,
     /// Directed wiring hints from composition graph.
     wiring_hints: WiringHints,
     /// The memory strategy/rebasing pair as originally requested, captured
@@ -553,6 +704,7 @@ impl Fuser {
             components: Vec::new(),
             original_components: Vec::new(),
             input_module_counts: Vec::new(),
+            component_to_input: Vec::new(),
             wiring_hints: std::collections::HashMap::new(),
             requested_memory: None,
         }
@@ -589,8 +741,45 @@ impl Fuser {
             self.wiring_hints
                 .insert((importer + offset, name), exporter + offset);
         }
+        let input_idx = self.original_components.len() - 1;
+        self.component_to_input
+            .extend(std::iter::repeat_n(input_idx, flattened.len()));
         self.components.extend(flattened);
         Ok(())
+    }
+
+    /// SR-86: the input a flattened component came from.
+    ///
+    /// Falls back to treating the component index as an input index only when
+    /// the map was never built (direct `components` manipulation in tests); in
+    /// the normal path every flattened component has an entry, because
+    /// `add_component_named` records one per component it appends.
+    /// SR-86 / #427: the caller's grouping — written over INPUTS — expanded
+    /// into internal component indices.
+    ///
+    /// One input can flatten into several components, so a grouping applied
+    /// directly to component indices would place only part of an input and
+    /// leave the rest to whichever domain came first: a privilege boundary
+    /// meld invented rather than one the caller stated.
+    pub(crate) fn component_domains(&self) -> Vec<Vec<usize>> {
+        if self.config.domains.is_empty() {
+            return Vec::new();
+        }
+        crate::canonical_domains(&self.config.domains)
+            .iter()
+            .map(|inputs| {
+                (0..self.components.len())
+                    .filter(|&c| inputs.contains(&self.input_of(c)))
+                    .collect()
+            })
+            .collect()
+    }
+
+    pub(crate) fn input_of(&self, component: usize) -> usize {
+        self.component_to_input
+            .get(component)
+            .copied()
+            .unwrap_or(component)
     }
 
     /// Get the number of components added
@@ -668,6 +857,33 @@ impl Fuser {
             .get_or_insert((self.config.memory_strategy, self.config.address_rebasing));
         self.config.memory_strategy = requested_strategy;
         self.config.address_rebasing = requested_rebasing;
+
+        // SR-86 / #427: check the grouping against the component set BEFORE any
+        // work, so a typo in a trust boundary fails at once rather than after a
+        // partial merge. Validated here rather than at construction because the
+        // component set is built up by `add_component*` after the config.
+        crate::validate_domains(
+            &self.config.domains,
+            self.original_components.len(),
+            requested_strategy,
+        )?;
+
+        // SR-86: the component wrapper names ONE memory in its lift options
+        // (`CanonicalOption::Memory(0)`), so a multi-domain fusion wrapped as a
+        // component would hand every export domain 0's memory regardless of
+        // which domain the export actually lives in. That validates and is
+        // wrong — the shape this repo refuses to ship (cf. the #364 gating).
+        // Core-module output is unaffected, which is what an MCU target uses.
+        if !self.config.domains.is_empty() && self.config.output_format == OutputFormat::Component {
+            return Err(Error::InvalidDomains(
+                "--component cannot yet express a multi-domain fusion: the component wrapper \
+                 names a single memory in its lift options, so every export would be handed \
+                 the first domain's memory whichever domain it belongs to. Emit a core module \
+                 instead (the single-address-space target this is for), or fuse without \
+                 domains."
+                    .to_string(),
+            ));
+        }
 
         // RFC-46 Q1 (ADR-7 path-H inc 3): normalize multiply-instantiated core
         // modules into distinct module identities *before* resolve/merge, so each
@@ -1089,7 +1305,8 @@ impl Fuser {
             "Resolving dependencies for {} components",
             self.components.len()
         );
-        let resolver = Resolver::with_strategy(self.config.memory_strategy);
+        let resolver = Resolver::with_strategy(self.config.memory_strategy)
+            .with_domains(self.component_domains());
         let graph = resolver.resolve_with_hints(&self.components, &self.wiring_hints)?;
         stats.imports_resolved = graph.resolved_imports.len();
 
@@ -1130,6 +1347,7 @@ impl Fuser {
         let pack_rebase = self.config.pack_rebase || self.config.share_stack;
         let address_rebasing = self.config.address_rebasing || pack_rebase;
         let merger = Merger::new(self.config.memory_strategy, address_rebasing)
+            .with_domains(self.component_domains())
             .with_opaque_resources(self.config.opaque_resources.clone())
             .with_pack_rebase(pack_rebase)
             .with_share_stack(self.config.share_stack)
@@ -1414,6 +1632,9 @@ impl Fuser {
         // straight to the target instead of through the thunk).
         let mut inlined_count = 0usize;
         // ADR-7: per-boundary strategy records, in `adapter_sites` order.
+        // SR-86: canonicalise once — the domain ids in the records must not
+        // depend on the order the caller wrote the grouping.
+        let canonical_domains = crate::canonical_domains(&self.config.domains);
         let mut boundaries: Vec<BoundaryRecord> = Vec::with_capacity(adapters.len());
         use std::collections::{HashMap, HashSet};
         use wasm_encoder::{Function, Instruction, ValType};
@@ -1566,6 +1787,17 @@ impl Fuser {
                 from_module: adapter.source_module,
                 to_component: adapter.target_component,
                 to_module: adapter.target_module,
+                // SR-86: stated from the grouping, not inferred from the
+                // lowering — so the record and the lowering can be checked
+                // against each other rather than one standing in for the other.
+                from_domain: crate::domain_of(
+                    &canonical_domains,
+                    self.input_of(adapter.source_component),
+                ),
+                to_domain: crate::domain_of(
+                    &canonical_domains,
+                    self.input_of(adapter.target_component),
+                ),
                 function: site.export_name.clone(),
                 interface: site.import_module.clone(),
                 lowering: match adapter.class {
@@ -2784,6 +3016,10 @@ impl Fuser {
             pack_rebase,
             share_stack,
             preserve_names,
+            // SR-86: the grouping decides which calls keep the Canonical ABI,
+            // i.e. where the privilege boundaries are. That is the most
+            // consequential thing a caller can state, so it is attested.
+            domains,
             // NOT build parameters, deliberately:
             //   `attestation` decides whether this record exists at all — a
             //     record cannot meaningfully attest its own absence;
@@ -2809,6 +3045,7 @@ impl Fuser {
             dwarf_handling: self.dwarf_handling_label().to_string(),
             output_format: self.output_format_label().to_string(),
             reproducible: *reproducible,
+            domains: canonical_domains(domains),
         }
     }
 
@@ -3851,6 +4088,7 @@ mod tests {
 
         let config = FuserConfig {
             memory_strategy: MemoryStrategy::MultiMemory,
+            domains: Vec::new(),
             address_rebasing: true,
             attestation: false,
             ..FuserConfig::default()

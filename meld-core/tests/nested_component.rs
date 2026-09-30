@@ -71,6 +71,7 @@ fn test_fuse_composed_p2_component() {
         reproducible: false,
         component_provenance: false,
         signature_manifest: false,
+        domains: Vec::new(),
         address_rebasing: false,
         pack_rebase: false,
         share_stack: false,

@@ -1,0 +1,3 @@
+# Build trees only. The .comp.wasm outputs are COMMITTED — a fixture a test
+# reads but nobody commits makes the test pass without running (SR-85, #405).
+target/
