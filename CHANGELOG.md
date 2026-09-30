@@ -4,7 +4,7 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
-## [0.59.0] - 2026-09-25
+## [0.59.0] - 2026-09-30
 
 ### Added
 - **`--domain`: fuse within a domain, keep the Canonical ABI between (SR-86, #427).**
