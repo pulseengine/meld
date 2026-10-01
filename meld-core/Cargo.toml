@@ -55,7 +55,7 @@ criterion.workspace = true
 # extended-const FOLD (proves the #338 miscompile class closed by proof,
 # not just examples). Default features only — pure Rust, wasm-clean, no
 # external solver (z3/cadical stay behind non-default features).
-ordeal = { version = "0.18", default-features = false }
+ordeal = { version = "0.22.1", default-features = false }
 
 [features]
 default = []
