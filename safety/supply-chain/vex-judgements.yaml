@@ -1,0 +1,57 @@
+# VEX judgements — hand-authored, never generated (#433, SR-87)
+#
+# `tools/gen_vex.py` produces the MATCH LIST mechanically from `cargo audit`
+# against the committed lockfile. The judgements live here because
+# `not_affected` is a claim about this source tree, and a generated claim is a
+# false statement signed into a release.
+#
+# An advisory that matches a component in the release's SBOM and has no entry
+# here **fails the release**. It is not omitted and it does not default to
+# `not_affected`. That is the only property of this file that matters: a
+# generator that quietly asserted safety for an advisory nobody had looked at
+# would be worse than having no VEX at all.
+#
+# ## Scope
+#
+# Only advisories affecting components in `meld-<version>.cdx.json`, which
+# contains **shipped dependencies only**. Dev-dependency advisories need no
+# entry: they are absent from the SBOM, so a consumer scanning it never matches
+# them. At v0.59.0 that excluded 20 vulnerabilities, 19 in `wasmtime` /
+# `wasmtime-wasi` — used to *execute* fused modules in tests, never to fuse
+# them. Verified rather than assumed:
+#
+#     cargo tree -p meld-cli  --edges normal | grep -c wasmtime   -> 0
+#     cargo tree -p meld-core --edges normal | grep -c wasmtime   -> 0
+#     strings <shipped release binary> | grep -ci wasmtime        -> 0
+#
+# ## Format
+#
+#     RUSTSEC-YYYY-NNNN:
+#       state: not_affected          # CycloneDX: not_affected | affected |
+#                                    #   resolved | false_positive | in_triage |
+#                                    #   exploitable
+#       justification: code_not_reachable   # required when not_affected
+#       detail: >
+#         Why, and the check that establishes it. This text is published.
+#
+# Valid justifications are CycloneDX's, and the generator rejects anything else
+# rather than letting a consumer's parser drop the field:
+#   code_not_present · code_not_reachable · requires_configuration ·
+#   requires_dependency · requires_environment · protected_by_compiler ·
+#   protected_at_runtime · protected_at_perimeter ·
+#   protected_by_mitigating_control
+#
+# ## Prefer fixing to justifying
+#
+# This file is **empty of entries**, and that is a result rather than a
+# starting state. When the gate was added, exactly one advisory matched the
+# shipped graph: RUSTSEC-2026-0190, unsoundness in anyhow's
+# `Error::downcast_mut()`. meld never calls `downcast_mut` — or `downcast` at
+# all — so it would have justified cleanly as `code_not_reachable`.
+#
+# It was fixed instead: anyhow 1.0.102 -> 1.0.104. A justification is a claim
+# someone has to re-check every time the surrounding code changes; an upgrade
+# is not. Reach for an entry here when a fix is unavailable or worse than the
+# exposure, not when a fix is merely more work.
+#
+# (no entries — the shipped graph is clean as of 2026-10-01)

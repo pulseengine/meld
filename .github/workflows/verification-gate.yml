@@ -72,6 +72,21 @@ jobs:
       # docs/verification-matrix.md is generated from traceability.yaml. It had
       # drifted from its own source (statuses and test lists), so the published
       # matrix disagreed with the record it renders.
+      # #433 / SR-87: the advisory state of what meld SHIPS. Scoped by
+      # deny.toml's `exclude-dev`, so this is about the artifact a consumer
+      # runs, not about the test harness — see that file for why, and for what
+      # it deliberately does not cover.
+      #
+      # Runs on the pull request because an advisory that lands between
+      # releases should be assessed then, not discovered by the release job
+      # when someone is trying to cut a tag. The release's VEX generator
+      # refuses to default a judgement, so an unassessed advisory blocks a
+      # release either way; this makes it block earlier and more cheaply.
+      - name: Shipped dependencies carry no known advisory
+        run: |
+          cargo install --locked cargo-deny || true
+          cargo deny check advisories
+
       - name: Verification matrix is up to date
         run: |
           python3 scripts/gen-verification-matrix.py

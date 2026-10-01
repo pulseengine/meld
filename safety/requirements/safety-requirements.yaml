@@ -3469,3 +3469,13 @@ artifacts:
     links:
       - type: derives-from
         target: SYS-6
+
+  - id: SR-87
+    type: sw-req
+    title: Each release publishes a VEX stating what its advisories mean for the shipped artifact
+    status: verified
+    description: "An SBOM says what is in the product; it cannot say what an advisory means for it. A consumer pinned to a meld release asks one question nothing in the ecosystem answered: is advisory RUSTSEC-XXXX-YYYY present in what I am actually running? Raised from the varve side (#433), where a pinned consumer's question becomes visible, because varve can match components against an advisory database but can never assert not_affected on the ground that the vulnerable path is unreachable in this source tree. That is a fact only this repo can state. meld shall publish a CycloneDX VEX with each release, generated before the checksum step so its digest enters SHA256SUMS.txt and the cosign signature covers it, audited against the tag's committed lockfile rather than whatever main holds when the job runs. Scope follows the SBOM: meld-<version>.cdx.json carries shipped dependencies only, so an advisory is in scope when its package appears there. Auditing the whole lockfile reports 20 vulnerabilities, 19 in wasmtime and wasmtime-wasi, every one a dev-dependency used to execute fused modules in tests and never to fuse them — absent from the SBOM, never matched by a consumer scanning it, and therefore not listed, because emitting component_not_present for components the SBOM does not mention would bury any entry that mattered. The match list is mechanical and the judgements are not: not_affected with a justification is a claim about this source tree, so an advisory affecting an SBOM component with no hand-authored judgement in safety/supply-chain/vex-judgements.yaml shall fail the release rather than default to not_affected or be omitted. A generated justification is a false statement signed into a release. The judgements file is empty of entries by result rather than by default: the one advisory matching the shipped graph when this was added, RUSTSEC-2026-0190 (unsoundness in anyhow Error::downcast_mut, which meld never calls), was fixed by upgrading anyhow 1.0.102 to 1.0.104 rather than justified, because a justification is a claim someone must re-check whenever the surrounding code changes and an upgrade is not."
+    release: v0.60.0
+    links:
+      - type: derives-from
+        target: SYS-10

@@ -1459,3 +1459,12 @@ artifacts:
     links:
       - type: verifies
         target: SR-86
+
+  - id: SWV-99
+    type: sw-verification
+    title: "Verification of SR-87: an unassessed advisory fails the release"
+    status: implemented
+    description: "Verifies SR-87 by exercising the property that makes the document worth signing: the generator refuses to assert safety nobody assessed. Four controls, each observed to fail or pass as stated. (1) Against the real shipped SBOM for v0.59.0 the generator writes a valid CycloneDX 1.5 VEX: 0 in-scope judgements, 26 advisories out of scope, 60 shipped components, linked to the SBOM's serialNumber. (2) Given an SBOM that does list wasmtime, nineteen advisories become in-scope with no judgement and the generator exits 1 naming each — it does not omit them and does not default not_affected. (3) Given one in-scope advisory with an invalid justification string the generator exits 1 citing the justification specifically; isolated with a single-component SBOM so the unjudged check could not be the cause, and paired with (4) the same entry carrying a valid CycloneDX justification, which exits 0 — so control (3) is known to have failed for the justification reason rather than for absence. (5) An SBOM with an empty component list exits 1 rather than declaring every advisory out of scope and emitting a vacuously clean document. Placement verified in the workflow step order: SBOM, then VEX, then SHA256SUMS, then cosign — so the VEX digest enters the signed checksum manifest. The assets gate now requires both .cdx.json and .vex.json; the SBOM had shipped since v0.53.0 without ever being required, so it could have gone missing silently. Separately, deny.toml scopes the advisory check to the shipped graph via exclude-dev, with the three verifications that establish wasmtime is dev-only recorded in the file (cargo tree --edges normal gives 0 for both crates, and the shipped release binary contains 0 wasmtime or cranelift strings), and it carries no ignore entries: the one shipped-graph advisory found when the gate was added was fixed, not ignored. cargo deny check passes all four of advisories, licenses, bans and sources with zero exceptions — bans only after fixing a real defect it found, meld-cli depending on meld-core by path with no version requirement, which crates.io rejects outright and which would have blocked the publish in #442."
+    links:
+      - type: verifies
+        target: SR-87

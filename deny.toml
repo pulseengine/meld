@@ -1,0 +1,77 @@
+# cargo-deny configuration — https://embarkstudios.github.io/cargo-deny/
+#
+# Added with the VEX work (#433), which needed an advisory check to generate
+# from in the first place.
+#
+# The question this gate answers is deliberately narrow: **is the artifact meld
+# ships affected?** That is the question a consumer pinned to a release asks,
+# and it is the question the published VEX answers.
+
+[graph]
+# Scope the advisory check to the SHIPPED dependency graph.
+#
+# Without this, `cargo audit` on meld's lockfile reports 20 vulnerabilities, 19
+# of them in `wasmtime`/`wasmtime-wasi` 41.0.4 — sandbox escapes, OOB reads,
+# data leakage. Every one is a dev-dependency: meld uses wasmtime to *execute*
+# fused modules in tests (`wit_bindgen_runtime`, `golden_e2e`, the DWARF
+# witness), never to fuse them. Verified three ways rather than assumed:
+#
+#   cargo tree -p meld-cli  --edges normal | grep -c wasmtime   -> 0
+#   cargo tree -p meld-core --edges normal | grep -c wasmtime   -> 0
+#   strings <shipped release binary> | grep -ci wasmtime        -> 0
+#
+# Pinning 19 advisory IDs into `ignore` would mean re-editing this file on
+# every wasmtime bump, and an `ignore` list that long stops being read. Scoping
+# the graph states the actual reason once.
+#
+# **What this deliberately does NOT cover:** a compromised dev-dependency is a
+# real risk to the build, just a different one — it threatens CI and the
+# machine that runs it, not the artifact's runtime behaviour. That is not
+# assessed here, and this file should not be read as asserting it is safe.
+exclude-dev = true
+
+[advisories]
+version = 2
+# Vulnerabilities in the shipped graph are denied. Yanked crates warn.
+#
+# `ignore` is EMPTY, and that is a result rather than a default: the one
+# shipped-graph advisory this check found when it was added — RUSTSEC-2026-0190,
+# unsoundness in anyhow's `Error::downcast_mut()` — was fixed by bumping anyhow
+# 1.0.102 -> 1.0.104, not ignored. meld never calls `downcast_mut` (or
+# `downcast` at all), so it could have been justified as unreachable; upgrading
+# is strictly better than carrying a justification that someone later has to
+# re-check.
+#
+# Before adding an entry here: an `ignore` is an ASSESSMENT, not a deferral.
+# Write why the advisory does not apply, with the check that establishes it, the
+# way rivet's deny.toml does. An undated, unexplained ignore is how a gate goes
+# quiet.
+ignore = []
+
+[licenses]
+version = 2
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+    "CC0-1.0",
+]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+# No `allow-wildcard-paths` exception. This gate found a real one when it was
+# added — `meld-cli` depended on `meld-core` by path with no version, which
+# crates.io rejects outright, so the crate could never have been published
+# (#442). Fixed at the source by adding the version requirement rather than
+# allowed here, which is the difference between a gate and a formality.
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

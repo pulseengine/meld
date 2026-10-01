@@ -15,7 +15,11 @@ name = "meld"
 path = "src/main.rs"
 
 [dependencies]
-meld-core = { path = "../meld-core" }
+# `version` alongside `path`: cargo uses the path locally and the version when
+# published. Without it this is a wildcard dependency, which crates.io rejects
+# outright — so the crate could never be published (#442). cargo-deny caught it
+# before `cargo publish --dry-run` would have.
+meld-core = { path = "../meld-core", version = "0.60.0" }
 
 # CLI
 clap.workspace = true
