@@ -70,11 +70,8 @@ Verify what you downloaded before running it — see
 ### From source
 
 ```bash
-# From source (Cargo)
+# From source (Cargo) — the only build for meld itself
 cargo install --path meld-cli
-
-# From source (Bazel)
-bazel build //meld-cli:meld
 
 # Fuse two components
 meld fuse component_a.wasm component_b.wasm -o fused.wasm
@@ -107,8 +104,16 @@ meld_fuse(
         ":component_a",
         ":component_b",
     ],
+    # Mandatory: the meld binary that will be recorded as the producer in the
+    # fused artifact's attestation. There is deliberately no default — the old
+    # one pointed at a Bazel self-build that stamped a version matching nothing
+    # (#406).
+    meld = "@meld_release//:meld",
 )
 ```
+
+`meld_fuse` is for projects that build *their* components with Bazel. It is not
+exercised by meld's own CI, so treat it as community-supported.
 
 ## How It Works
 
@@ -219,7 +224,7 @@ See [`proofs/`](proofs/) for the full proof tree and [`PROOF_GUIDE.md`](proofs/P
 ```bash
 cargo build                # Build
 cargo test                 # Test
-bazel build //...          # Bazel build
+bazel build //proofs/...   # Rocq proofs only (there is no Bazel build of meld)
 RUST_LOG=debug cargo run -- fuse a.wasm b.wasm -o out.wasm
 ```
 

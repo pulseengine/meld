@@ -15,6 +15,8 @@ meld_fuse(
         ":component_a",
         ":component_b",
     ],
+    # Mandatory — see the `meld` attribute. No default, on purpose (#406).
+    meld = "@meld_release//:meld",
 )
 
 # Fuse with options
@@ -76,7 +78,7 @@ def _meld_fuse_impl(ctx):
     """Implementation of meld_fuse rule."""
 
     # Get the meld binary
-    meld = ctx.executable._meld
+    meld = ctx.executable.meld
 
     # Collect input component files
     component_files = _get_component_files(ctx, ctx.attr.components)
@@ -209,9 +211,17 @@ in browsers or WASM runtimes.
             doc = "Validate the output module with wasmparser.",
             default = False,
         ),
-        "_meld": attr.label(
-            doc = "The meld CLI tool.",
-            default = Label("//meld-cli:meld"),
+        "meld": attr.label(
+            doc = """The meld CLI binary to fuse with.
+
+            Mandatory, and deliberately without a default. It used to default
+            to `//meld-cli:meld`, meld's own Bazel-built binary — which stamped
+            `0.1.0` into `--version` and `0.0.0` into every fused artifact's
+            attestation while the real version was something else entirely
+            (#406). That build is gone; supply the binary you actually want to
+            be recorded as the producer, e.g. a release asset or your own
+            cargo-built meld.""",
+            mandatory = True,
             executable = True,
             cfg = "exec",
         ),
@@ -237,8 +247,14 @@ meld_toolchain = rule(
             cfg = "exec",
         ),
         "version": attr.string(
-            doc = "Version of the meld tool.",
-            default = "0.1.0",
+            doc = """Version of the meld tool, as it should appear in evidence.
+
+            Mandatory, and deliberately without a default. It defaulted to
+            `0.1.0`, which is the same defect as #406 one file over: a
+            plausible-looking version that was not the one that built anything.
+            A toolchain that cannot state its true version should refuse to
+            guess one.""",
+            mandatory = True,
         ),
     },
 )

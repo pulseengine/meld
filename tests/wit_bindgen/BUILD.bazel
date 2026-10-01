@@ -73,29 +73,14 @@ WIT_BINDGEN_TESTS = [
     "xcrate",
 ]
 
-# Fuse composed component with meld
-[
-    genrule(
-        name = "{}_fused".format(test),
-        srcs = ["fixtures/{}.wasm".format(test)],
-        outs = ["{}_fused.wasm".format(test)],
-        cmd = "$(execpath //meld-cli:meld) fuse $(SRCS) -o $@",
-        tools = ["//meld-cli:meld"],
-        tags = ["manual"],
-    )
-    for test in WIT_BINDGEN_TESTS
-]
-
-# Run fused modules with wasmtime, invoking run()
-[
-    wasm_test(
-        name = "{}_e2e_test".format(test),
-        wasm_file = ":{}_fused".format(test),
-        module_args = ["--invoke", "run"],
-        tags = ["manual"],
-    )
-    for test in WIT_BINDGEN_TESTS
-]
+# The fuse + wasmtime-e2e rules that lived here built meld with Bazel
+# (`//meld-cli:meld`) and fused these fixtures with it. That binary stamped
+# `0.1.0` into `--version` and `0.0.0` into every artifact's attestation
+# while the real version was something else (#406), and nothing in CI ever
+# built it (#407). The targets are removed rather than repointed: the same
+# fixtures are exercised by `cargo test -p meld-core --test golden_e2e` and
+# the `wit_bindgen_runtime` suite, which DO run in CI and which actually
+# execute the fused modules under wasmtime.
 
 # Test suite (manual until fixtures are added)
 test_suite(
