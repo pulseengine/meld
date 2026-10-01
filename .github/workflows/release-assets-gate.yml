@@ -76,6 +76,14 @@ jobs:
           done
           require "SHA256SUMS.txt"
           require "SHA256SUMS.txt.cosign.bundle"
+          # Supply-chain documents (#433). Required for the same reason the
+          # binaries are: a release that quietly stops shipping its VEX leaves
+          # a consumer pinned to it unable to answer "is this advisory present
+          # in what I am running", and nothing else would notice. The SBOM has
+          # shipped since v0.53.0 and was never required — so it could have
+          # gone missing silently too.
+          require ".cdx.json"
+          require ".vex.json"
 
           if [ "$missing" -ne 0 ]; then
             echo "::error::$TAG is published but incomplete — consumers can fetch it in this state (#395)."

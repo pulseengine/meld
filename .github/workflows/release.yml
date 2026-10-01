@@ -278,6 +278,38 @@ jobs:
           echo "::notice::Toolchain SBOM written to release-assets/meld-${BARE}.cdx.json"
           ls -la release-assets/
 
+      # Phase 6b: CycloneDX VEX (#433, SR-87). Also BEFORE SHA256SUMS, so the
+      # VEX's digest enters the checksum manifest and the cosign signature over
+      # SHA256SUMS.txt covers it — the same machinery as the SBOM.
+      #
+      # It answers the one question an SBOM cannot, for a consumer pinned to
+      # this release: is advisory RUSTSEC-XXXX-YYYY present in what I am
+      # running? Scoped to the components in THIS release's SBOM, and audited
+      # against the TAG's committed lockfile — the exact dependency set that
+      # was built, not whatever `main` holds when this job runs.
+      #
+      # `gen_vex.py` fails if an advisory affects an SBOM component and has no
+      # hand-authored judgement. It will not default `not_affected`, because a
+      # generated justification is a false statement signed into a release.
+      # That means a NEW advisory landing between releases fails this job until
+      # someone assesses it, which is the intended behaviour and not a flake.
+      - name: Install cargo-audit
+        run: cargo install --locked cargo-audit
+
+      - name: Generate CycloneDX VEX
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          VERSION="${INPUT_TAG:-${GITHUB_REF#refs/tags/}}"
+          BARE="${VERSION#v}"
+          python3 tools/gen_vex.py \
+            --sbom "release-assets/meld-${BARE}.cdx.json" \
+            --version "${BARE}" \
+            --out "release-assets/meld-${BARE}.vex.json"
+          echo "::notice::VEX written to release-assets/meld-${BARE}.vex.json"
+          ls -la release-assets/
+
       - name: Generate SHA256 checksums
         run: |
           set -euo pipefail

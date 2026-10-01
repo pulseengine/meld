@@ -4,6 +4,57 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.60.0] - 2026-10-01
+
+### Added
+- **A CycloneDX VEX with every release (SR-87, #433).** An SBOM says what is in
+  the product; it cannot say what an advisory *means* for it. A consumer pinned
+  to a release asks one question nothing answered: **is RUSTSEC-XXXX-YYYY
+  present in what I am actually running?**
+
+  `meld-<version>.vex.json` ships beside the SBOM, generated **before** the
+  checksum step so its digest enters `SHA256SUMS.txt` and the cosign signature
+  covers it, and audited against the **tag's** committed lockfile rather than
+  whatever `main` holds when the job runs.
+
+  **Scope follows the SBOM.** `meld-<version>.cdx.json` carries shipped
+  dependencies only — 60 components at v0.59.0. Auditing the whole lockfile
+  reports 20 vulnerabilities, 19 of them in `wasmtime`/`wasmtime-wasi`, every
+  one a dev-dependency used to *execute* fused modules in tests and never to
+  fuse them. They are absent from the SBOM, so a consumer scanning it never
+  matches them, so the VEX does not list them: emitting 19
+  `component_not_present` entries about components the SBOM does not mention
+  would bury any entry that mattered.
+
+  **A judgement is never generated.** The match list is mechanical; the
+  judgements are hand-authored in `safety/supply-chain/vex-judgements.yaml`.
+  An advisory affecting an SBOM component with **no** judgement **fails the
+  release** — it is not omitted and does not default to `not_affected`,
+  because a generated justification is a false statement signed into a
+  release.
+
+  The judgements file is **empty of entries by result, not by default**: the
+  one advisory matching the shipped graph when this was added —
+  RUSTSEC-2026-0190, unsoundness in anyhow's `Error::downcast_mut()`, which
+  meld never calls — was **fixed** (anyhow 1.0.102 → 1.0.104) rather than
+  justified. A justification is a claim someone must re-check whenever the
+  surrounding code changes; an upgrade is not.
+
+### Changed
+- **`anyhow` 1.0.102 → 1.0.104**, closing RUSTSEC-2026-0190 in the shipped
+  dependency graph. Found by the new advisory gate on its first run.
+- **`meld-cli` now declares a version requirement on `meld-core`.** It
+  depended on it by path alone, which is a wildcard dependency that crates.io
+  **rejects outright** — so the crate could never have been published (#442).
+  `cargo deny check bans` found it before `cargo publish --dry-run` would have.
+- The release assets gate now requires **`.cdx.json` and `.vex.json`**. The
+  SBOM had shipped since v0.53.0 without ever being required, so it could have
+  gone missing silently — which is the defect class the gate exists for (#395).
+- A new required CI check, **"Shipped dependencies carry no known advisory"**,
+  so an advisory landing between releases is assessed on the pull request
+  rather than discovered by the release job mid-tag.
+
+
 ### Changed
 - **`ordeal` 0.18 → 0.22.1** for the soundness advisory
   [GHSA-xfxf-qxr3-435x](https://github.com/pulseengine/ordeal/issues/182) (#440),
