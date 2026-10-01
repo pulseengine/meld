@@ -164,21 +164,28 @@ cargo run --bin meld -- fuse input.wasm -o output.wasm
 cargo build --target wasm32-wasip2 --profile release-wasm
 ```
 
-#### Bazel (Production/CI)
+#### Bazel — **cargo is the only build for meld itself**
 
-```bash
-# Build all targets
-bazel build //...
+There is no Bazel build of the meld binary, deliberately. There was one, and it
+produced a second artifact that **disagreed with itself** about which meld made
+it: `meld-cli/BUILD.bazel` hardcoded `CARGO_PKG_VERSION` as `0.1.0`, while
+`meld-core/BUILD.bazel` set no version at all so `rules_rust` defaulted it to
+`0.0.0` — so `meld --version` said one thing and the attestation embedded in
+every fused artifact said another, and neither was the real version (#406).
+Nothing in CI built it, and it could not compile the current tree (#407). A
+build path nobody exercises, which stamps a false producer into the supply-chain
+record, is worse than not having a second build path.
 
-# Build specific target
-bazel build //meld-cli:meld
+Bazel is still used for two things, which remain:
 
-# Run tests
-bazel test //...
-
-# Build with release config
-bazel build --config=release //meld-cli:meld
-```
+- **`rules/meld.bzl`** — the consumer-facing `meld_fuse` rule, for projects that
+  build *their* components with Bazel. It takes the meld binary and its version
+  as **mandatory** attributes now; it used to default them to the removed
+  self-build and to `0.1.0`, which was the same false-version defect one file
+  over.
+- **`proofs/**/BUILD.bazel`** — the Rocq proof targets via `rules_rocq_rust`
+  (see the formal-verification section below). Note these are not run by CI
+  either; that is tracked separately and is not a claim this document makes.
 
 ### Architecture
 

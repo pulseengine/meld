@@ -53,9 +53,6 @@ All notable changes to this project will be documented in this file.
 - A new required CI check, **"Shipped dependencies carry no known advisory"**,
   so an advisory landing between releases is assessed on the pull request
   rather than discovered by the release job mid-tag.
-
-
-### Changed
 - **`ordeal` 0.18 → 0.22.1** for the soundness advisory
   [GHSA-xfxf-qxr3-435x](https://github.com/pulseengine/ordeal/issues/182) (#440),
   which mis-encoded `bvshl`/`bvlshr`/`bvashr` and rotations at bit-widths that
@@ -78,6 +75,30 @@ All notable changes to this project will be documented in this file.
   vacuously green.
 
   The upgrade is dependency hygiene, not a fix for a defect meld could reach.
+
+### Removed
+- **The Bazel build of meld itself (#406, #407).** It produced a second binary
+  that disagreed with itself about its own provenance: `meld-cli/BUILD.bazel`
+  hardcoded `CARGO_PKG_VERSION` as `0.1.0`, while `meld-core/BUILD.bazel` set
+  no version so `rules_rust` defaulted it to `0.0.0`. So `meld --version`
+  reported one value and the attestation embedded in **every fused artifact**
+  reported another, and neither was the real version.
+
+  | build path | `meld --version` | version stamped in each artifact |
+  |---|---|---|
+  | cargo | `0.59.0` | `0.59.0` |
+  | Bazel (removed) | `0.1.0` | `0.0.0` |
+
+  No CI built it and it could not compile the current tree, so a false record
+  was the only thing it reliably produced. **cargo is now the only build for
+  meld**, and no Bazel file sets a version at all.
+
+  Two Bazel users are deliberately **kept**: `rules/meld.bzl`, the
+  consumer-facing `meld_fuse` rule, and `proofs/**/BUILD.bazel`, the Rocq proof
+  targets. `meld_fuse` now takes the meld binary and its version as
+  **mandatory** attributes — they defaulted to the removed self-build and to
+  `0.1.0`, the same false-version defect one file over, and a toolchain that
+  cannot state its true version should refuse to guess one.
 
 
 ## [0.59.0] - 2026-09-30
