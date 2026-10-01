@@ -4,6 +4,31 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+- **`ordeal` 0.18 → 0.22.1** for the soundness advisory
+  [GHSA-xfxf-qxr3-435x](https://github.com/pulseengine/ordeal/issues/182) (#440),
+  which mis-encoded `bvshl`/`bvlshr`/`bvashr` and rotations at bit-widths that
+  are not a power of two — returning `Unsat` with a certificate that re-checks,
+  because the certificate certified the wrong CNF.
+
+  **meld was not affected**, on three independent grounds, each checked rather
+  than assumed:
+
+  | | |
+  |---|---|
+  | reachability | the only `ordeal` use is `segments.rs::ordeal_fold_proof`, a `#[cfg(test)]` module — `ordeal` is never in a shipped binary |
+  | operators | the terms built are exactly `BvTerm::{Add, Const, Mul, Sub, Var}`; **no shift or rotate operator appears at all**, so the defective encoding is unreachable |
+  | widths | `Sort::new(32)` and `Sort::new(64)` only, both powers of two, both named unaffected by the advisory |
+
+  No cached `Unsat` verdicts exist to re-run: the proof is rebuilt from source
+  on every test run. The nine fold-proof tests pass on 0.22.1, including the
+  three negative controls that assert `Sat` for deliberately-wrong folds — so
+  the harness still discriminates on the new version rather than having gone
+  vacuously green.
+
+  The upgrade is dependency hygiene, not a fix for a defect meld could reach.
+
+
 ## [0.59.0] - 2026-09-30
 
 ### Added
