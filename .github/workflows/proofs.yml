@@ -129,7 +129,11 @@ jobs:
       - name: Re-check the proofs
         run: |
           set -uo pipefail
-          bazel test //proofs:verify_all --test_output=errors
+          # `--keep_going`: a proof gate should report EVERY broken proof, not
+          # abort at the first. Without it the first failure masks the rest, and
+          # the first run of this workflow would have reported one broken file
+          # when the true extent was unknown.
+          bazel test //proofs:verify_all --test_output=errors --keep_going
           rc=$?
           case "$rc" in
             0)
