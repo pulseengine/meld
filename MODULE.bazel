@@ -195,9 +195,25 @@ git_repo(
 ###############################################################################
 
 rust = use_extension("@rules_rust//rust:extensions.bzl", "rust")
+# `extra_target_triples = ["wasm32-wasip2"]` was REMOVED (#447).
+#
+# rules_rust 0.56.0 rejects it outright — `triple()` requires at least three
+# sections separated by "-" and `wasm32-wasip2` has two, so the rust module
+# extension failed during analysis and no proof target could be built:
+#
+#   Error in fail: Expected target triple to contain at least three sections
+#   ERROR: Analysis of target '//proofs:attestation_proofs_test' failed
+#
+# It was there for a bazel-side wasm build that no longer exists: #444 removed
+# the rust_binary/rust_library targets, and nothing under BUILD.bazel compiles
+# Rust any more. The rust toolchain itself STAYS, because
+# `coq_of_rust_library` needs it to translate Rust into Coq.
+#
+# This is the third thing standing between these proofs and ever being checked,
+# after "nothing names the targets" (#447) and the /tmp module override. None
+# was visible until something tried to build them.
 rust.toolchain(
     edition = "2024",
-    extra_target_triples = ["wasm32-wasip2"],
     versions = ["1.85.0"],
 )
 use_repo(rust, "rust_toolchains")
