@@ -3479,3 +3479,13 @@ artifacts:
     links:
       - type: derives-from
         target: SYS-10
+
+  - id: SR-88
+    type: sw-req
+    title: The Rocq proofs are re-checked by CI, and a run that selects nothing fails
+    status: verified
+    description: "meld carries 14,487 lines of Rocq across 28 files with 350 Qed and 0 Admitted, and nothing has ever re-checked them. Doubly unreachable: all 14 rocq_proof_test targets are tagged manual, so a wildcard like //... skips them, and no workflow in the repository invokes bazel at all, so nothing names them explicitly either. A proof nothing runs is a document rather than evidence, and this is the worse case because proofs/STATUS.md reads as a verification story with nothing live behind it — the same shape as SR-85 (#405), where 36 tests reported ok without executing, and as #412, where a requirement claimed rivet validate mechanically enforces something no workflow ran. Found by an org-wide audit applying the gate-potency rule that a defined check implies an enforced one; of 13 repos carrying proof artefacts meld was the only one where nothing invoked a checker (#447). meld shall re-check its Rocq proofs in CI. The manual tags stay, because rules_rocq_rust needs nix and a bare bazel test //... on a runner without it should not begin failing; a test_suite naming its members explicitly reaches them regardless, since manual suppresses wildcard expansion rather than explicit reference. A run that matches no tests shall FAIL: bazel returns exit 4 for NO TESTS MATCHED, and a gate that selects nothing while reporting success is precisely the defect this requirement exists to close, so the exit-code mapping is itself verified against a selection known to match nothing rather than assumed. Not established by this requirement: whether the proofs currently compile. They have never been built in CI, so the first run is the first time anyone finds out; a red first run is the finding rather than a regression."
+    release: v0.61.0
+    links:
+      - type: derives-from
+        target: SYS-11

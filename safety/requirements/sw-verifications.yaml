@@ -1468,3 +1468,12 @@ artifacts:
     links:
       - type: verifies
         target: SR-87
+
+  - id: SWV-100
+    type: sw-verification
+    title: "Verification of SR-88: the proof gate fails when it selects nothing"
+    status: implemented
+    description: "Verifies SR-88 by exercising the failure paths rather than asserting them, because the defect being closed is a check that reports success while checking nothing. The gate step was extracted from .github/workflows/proofs.yml and run against a stub bazel at each exit code: 0 passes with a notice naming the 14 targets; 4 fails with exit 4 and an annotation stating that the suite selected zero tests and therefore proved nothing; 3 and 1 propagate unchanged with an annotation distinguishing a broken proof from an empty selection, because the two need different fixes. No tolerance for exit 4 is present anywhere in the step — synth hit exactly that with an || [ 0 -eq 4 ] and documents it (synth#945). The census step enforces floors rather than only printing counts, since a printed number nobody reads is not a gate: 28 .v files, 350 Qed, 14 rocq_proof_test targets, 14 members in //proofs:verify_all, and zero Admitted. Three controls, each observed to fail with its own distinct message: dropping one member from the test_suite reports 13 members against the floor of 14; injecting an Admitted reports the count and names proofs/parser/parser.v:11; deleting two spec files reports 26 files against 28 and 288 Qed against 350. The census itself was found broken by running it against a healthy tree, where it exited 1: grep -c exits 1 when a file has zero matches and find -exec + propagates that, so under set -e -o pipefail the step aborted after assigning — and the Admitted counter hit it immediately because no file contains one. All four counters are now guarded. Not established: whether the proofs compile. They have never been built in CI and this machine has neither nix nor bazel, so the first run of the workflow is the first time anyone finds out; a red first run is the finding rather than a regression introduced by this change."
+    links:
+      - type: verifies
+        target: SR-88

@@ -4,6 +4,38 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+- **The Rocq proofs are re-checked by CI (SR-88, #447).** meld carries 14,487
+  lines of Rocq across 28 files — **350 `Qed`, 0 `Admitted`** — and nothing had
+  ever re-checked any of it.
+
+  Doubly unreachable: all 14 `rocq_proof_test` targets are tagged `manual`, so
+  `bazel test //...` skipped them, and **no workflow invoked bazel at all**, so
+  nothing named them either. A proof nothing runs is a document, not evidence —
+  and `proofs/STATUS.md` reads as a verification story, so the absence was
+  actively misleading.
+
+  `//proofs:verify_all` lists all 14 targets explicitly (`manual` suppresses
+  wildcard expansion, not explicit reference, so wildcards stay fast and nix
+  stays optional for everyone else), and `.github/workflows/proofs.yml` runs it.
+
+  **A run that selects nothing fails.** `bazel test` returns **4** for
+  NO TESTS MATCHED; tolerating that is how a proof gate passes while checking
+  zero tests, which synth hit and documents (synth#945). There is no tolerance
+  here, and exit 4 is reported distinctly from a broken proof because the two
+  need different fixes. Exercised against a stub at each exit code rather than
+  asserted: `0 → pass`, `4 → fail`, `3 → 3`, other → propagates.
+
+  The census **enforces** floors rather than only printing counts — 28 files,
+  350 `Qed`, 14 targets, 14 suite members, zero `Admitted`. Controls observed:
+  dropping a suite member reports 13 against 14; injecting an `Admitted` names
+  the file and line; deleting two spec files reports 26 files and 288 `Qed`.
+
+  **Not established: whether the proofs compile.** They have never been built
+  in CI, so the first run of this workflow is the first time anyone finds out.
+  A red first run is the finding, not a regression.
+
+
 ## [0.60.0] - 2026-10-01
 
 ### Added
