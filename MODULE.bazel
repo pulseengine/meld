@@ -20,15 +20,27 @@ bazel_dep(name = "bazel_skylib", version = "1.7.1")
 bazel_dep(name = "platforms", version = "0.0.10")
 
 # WebAssembly component rules for building WASM targets
-bazel_dep(name = "rules_wasm_component", version = "1.0.0")
+# rules_wasm_component was REMOVED (#447).
+#
+# It carried a `local_path_override` to "/tmp/rules_wasm_component_local" — a
+# path that exists on one developer's machine, and only until /tmp is cleared.
+# Bazel resolves the module graph before building anything, so that override
+# made EVERY bazel invocation fail from a clean checkout:
+#
+#   ERROR: fetching local_repository rule //:rules_wasm_component+:
+#   The repository's path is "/tmp/rules_wasm_component_local" but it does not
+#   exist or is not a directory.
+#
+# That is why the Rocq proofs had never run. #447 found that nothing NAMED
+# them; this is the second half — nothing COULD have built them either, and the
+# first run of the new proofs workflow is what surfaced it.
+#
+# Removed rather than repointed because it has no consumers left: its only real
+# load was `wasm_test` in tests/wit_bindgen/BUILD.bazel, whose targets #444
+# removed, leaving the load dangling. The mention in rules/meld.bzl is inside a
+# docstring showing CONSUMERS how to combine the two rule sets; a consumer
+# brings their own.
 
-# Override to local copy with fixed componentize-py canary checksum
-# TODO: revert to git_override once pulseengine/rules_wasm_component
-# updates the componentize-py canary hash
-local_path_override(
-    module_name = "rules_wasm_component",
-    path = "/tmp/rules_wasm_component_local",
-)
 
 ###############################################################################
 # Rocq/Coq Formal Verification (rules_rocq_rust)
