@@ -106,3 +106,41 @@ filegroup(
         "//proofs/transformations/adapter:copy_layout_proofs",
     ],
 )
+
+# Every proof test, named explicitly.
+#
+# The individual `rocq_proof_test` targets are tagged `manual` because
+# rules_rocq_rust needs nix, and a bare `bazel test //...` on a runner without
+# it would fail. `manual` keeps them out of wildcard expansion — which also kept
+# them out of EVERY build: all 15 were tagged, and no workflow invoked bazel at
+# all, so 14,487 lines of Rocq with 350 `Qed` were never re-checked. A proof
+# nothing runs is a document, not evidence.
+#
+# A suite that lists its tests explicitly reaches them anyway: `manual` suppresses
+# wildcard expansion, not an explicit reference. So the tags stay (wildcards stay
+# fast and green on runners without nix) and `.github/workflows/proofs.yml` runs
+# this one target.
+#
+# ADDING A PROOF: add its test target here too, or it is invisible again. The
+# audit that found this is scripts/audit-verification-enforcement.py in
+# pulseengine.eu — re-run it rather than trusting that this list is complete.
+test_suite(
+    name = "verify_all",
+    tests = [
+        ":adapter_proofs_test",
+        ":attestation_proofs_test",
+        ":merger_proofs_test",
+        ":parser_proofs_test",
+        ":resolver_proofs_test",
+        ":rewriter_proofs_test",
+        ":segments_proofs_test",
+        "//proofs/rust_verified:index_map_proofs_test",
+        "//proofs/rust_verified:merger_core_proofs_test",
+        "//proofs/rust_verified:resolver_core_proofs_test",
+        "//proofs/transformations/adapter:adapter_spec_test",
+        "//proofs/transformations/adapter:copy_layout_proofs_test",
+        "//proofs/transformations/merge:merge_spec_test",
+        "//proofs/transformations/resolve:resolve_spec_test",
+        "//verification/verus-pilot:verus_pilot_test",
+    ],
+)
