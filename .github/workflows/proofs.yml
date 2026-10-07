@@ -1,0 +1,241 @@
+name: Rocq proofs
+
+# rivet: verifies SR-88
+# rivet: verifies SR-89
+
+# SR-88 / #447 — re-check the Rocq proofs.
+#
+# meld carries 14,487 lines of Rocq across 28 files (350 `Qed`, 0 `Admitted`),
+# and until this workflow existed nothing re-checked any of it. The proofs were
+# DOUBLY unreachable: all 14 `rocq_proof_test` targets are tagged `manual`, so
+# `bazel test //...` skips them, and no workflow in the repository invoked bazel
+# at all, so nothing named them explicitly either.
+#
+# A proof nothing runs is a document, not evidence — and `proofs/STATUS.md`
+# reads as a verification story, so the absence was actively misleading. Same
+# shape as SR-85 (#405: 36 tests reported `ok` without executing) and #412
+# (a requirement claiming `rivet validate` "mechanically enforces" something no
+# workflow ran).
+#
+# Runs on ubuntu-latest, not the self-hosted fleet: `rules_rocq_rust` needs Nix,
+# which smithy does not provision. Provisioning copied from synth's working
+# proof job rather than invented.
+
+on:
+  pull_request:
+    paths:
+      - 'proofs/**'
+      - '.github/workflows/proofs.yml'
+      - 'MODULE.bazel'
+      - 'MODULE.bazel.lock'
+      - '.bazelrc'
+      - '.bazelversion'
+  push:
+    branches: [main]
+    paths:
+      - 'proofs/**'
+      - '.github/workflows/proofs.yml'
+      - 'MODULE.bazel'
+      - 'MODULE.bazel.lock'
+      - '.bazelrc'
+      - '.bazelversion'
+  workflow_dispatch:
+
+# This is the longest job in the repository (see timeout-minutes below), and it
+# was the only workflow here with no concurrency group — so every push to a PR
+# started another full-length run while the superseded ones kept going. Three
+# were queued at once on this very branch, which is up to 9 hours of runner time
+# for one PR. Same form as ci.yml/bench.yml/fuzz.yml: supersede on a PR, but let
+# a push to main finish, because that run is the record for main.
+#
+# A run cancelled by SUPERSESSION is not the same thing as one cancelled by the
+# timeout, though GitHub reports both as "cancelled" and `gh pr checks` shows
+# both as "fail". Only the newest run on a branch is the result.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  proofs:
+    name: Rocq proofs
+    runs-on: ubuntu-latest
+    # Re-derived after #450. The original 60 was exceeded and the job was
+    # KILLED mid-build, which reads as "cancelled" rather than as a proof
+    # failure — a gate that dies silently is barely better than one that never
+    # runs. It was then raised to 180 on the belief that a proof was simply
+    # expensive. That belief was wrong in a way worth recording:
+    #
+    #   * `merge_resolution.v` had NEVER compiled, in any version. A
+    #     `rewrite !fold_left_add_shift` could not fail, because that lemma's
+    #     RHS contains an instance of its own LHS, so the proof term grew
+    #     without bound: killed at a 900s cap holding 2.5 GB and climbing.
+    #   * Fixed in #450, it compiles in **2 seconds**. 27 of 28 .v files now
+    #     build; the one exception is the excluded generator stub (#449).
+    #
+    # So no proof in this tree is expensive, and the runtime is now set by
+    # provisioning Nix plus the bazel path, not by a single file. 90 is
+    # deliberately generous and still PROVISIONAL: the first completed run
+    # gives the real number, and this should be tightened to it rather than
+    # left wide. A timeout nobody has measured is how 60 became 180 on a
+    # misdiagnosis.
+    #
+    # Also corrected here: an earlier version of this comment blamed the
+    # rules_rocq_rust/bazel path for a three-orders-of-magnitude slowdown and
+    # attributed 3522s to `//proofs/spec:fusion_spec`. Both were wrong. Bazel's
+    # progress line names a target's FIRST src, not the file in hand — the same
+    # log reports "wasm_core.v failed" for an error at `fusion_spec.v:2644` —
+    # and the slow thing turned out to be a looping tactic, not the tooling.
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      # The census runs BEFORE the proofs, so a suite that has quietly shrunk is
+      # visible even when the build later fails for an unrelated reason.
+      #
+      # #447 asked for these numbers to be printed. They are also ENFORCED: a
+      # printed number nobody reads is not a gate, and the failure this whole
+      # workflow exists to prevent is precisely a proof suite that got smaller
+      # without anyone noticing. The floors are deliberately set at the current
+      # values — raise them when the suite grows; lowering one is a decision
+      # someone has to write down in the diff.
+      - name: Proof census, with a non-vacuity floor
+        run: |
+          set -euo pipefail
+          # Every counter below is guarded, because `grep -c` exits 1 when a
+          # file has zero matches and `find -exec … +` propagates that; under
+          # `set -e -o pipefail` the step then aborts AFTER assigning. The
+          # `Admitted` counter hit this immediately — no file contains one, so
+          # every grep exited 1 — and the gate failed on a healthy tree. Found
+          # by running it, not by reading it; same shape as the readelf pipeline
+          # in release.yml, except this one failed closed rather than open.
+          files=$(find proofs -name '*.v' | wc -l | tr -d ' ')
+          lines=$( { find proofs -name '*.v' -exec cat {} + || true; } | wc -l | tr -d ' ')
+          qed=$( { find proofs -name '*.v' -exec grep -ho 'Qed\.' {} + || true; } | wc -l | tr -d ' ')
+          admitted=$( { find proofs -name '*.v' -exec grep -ho 'Admitted\.' {} + || true; } | wc -l | tr -d ' ')
+          # `grep -c` / `grep -rc` exit 1 when a file has zero matches, and under
+          # `set -e -o pipefail` that aborts the step — so these counters are
+          # guarded. Found by running this against a healthy tree, where it
+          # failed: the same shape as the readelf pipeline in release.yml, except
+          # this one failed closed rather than open.
+          targets=$( { grep -rho 'rocq_proof_test(' proofs --include=BUILD.bazel || true; } | wc -l | tr -d ' ')
+          members=$( { sed -n '/test_suite(/,/^)/p' proofs/BUILD.bazel | grep -c '_test",' || true; } | tail -1)
+
+          echo "proof census:"
+          printf '  .v files            %s\n' "$files"
+          printf '  lines               %s\n' "$lines"
+          printf '  Qed                 %s\n' "$qed"
+          printf '  Admitted            %s\n' "$admitted"
+          printf '  rocq_proof_test     %s\n' "$targets"
+          printf '  verify_all members  %s\n' "$members"
+
+          fail=0
+          # Floors: the measured values, raised as the suite grows. 350 -> 357
+          # with the two helper lemmas #450 added. Lowering one is a decision
+          # someone has to write into a diff.
+          [ "$files"    -ge 28  ] || { echo "::error::proof files fell to $files (floor 28)"; fail=1; }
+          [ "$qed"      -ge 357 ] || { echo "::error::Qed count fell to $qed (floor 357) — proofs were removed or weakened"; fail=1; }
+          [ "$targets"  -ge 16  ] || { echo "::error::rocq_proof_test targets fell to $targets (floor 16)"; fail=1; }
+          [ "$members"  -ge 16  ] || { echo "::error:://proofs:verify_all lists $members members (floor 16) — a target was dropped from the suite, so it would no longer be checked"; fail=1; }
+
+          # An `Admitted` is an unproved hole wearing a proof's clothes. There
+          # are zero today; a new one must be a deliberate, visible decision.
+          if [ "$admitted" -ne 0 ]; then
+            echo "::error::$admitted Admitted in the proof tree — an admitted goal is an assumption, not a proof, and proofs/STATUS.md presents these as verification"
+            find proofs -name '*.v' -exec grep -Hn 'Admitted\.' {} +
+            fail=1
+          fi
+          [ "$fail" -eq 0 ]
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@v31
+        with:
+          nix_path: nixpkgs=channel:nixos-unstable
+
+      - name: Setup Bazel
+        uses: bazel-contrib/setup-bazel@0.19.0
+        with:
+          bazelisk-cache: true
+          disk-cache: ${{ github.workflow }}
+          repository-cache: true
+
+      # A census COUNTS files; it does not show that anything CHECKS them.
+      # These two numbers have to agree, or the census reports proofs as
+      # evidence which the gate never builds — the #447 defect one level down,
+      # and it was real: `alias_spec.v` (395 lines, 4 Qed) and
+      # `p1_adapter_spec.v` (268 lines, 6 Qed) were `rocq_library` targets with
+      # no test and no reverse dependency, so //proofs:verify_all never reached
+      # them. p1_adapter_spec.v did not even compile. Both are now in the suite;
+      # this step is what stops the next one appearing unnoticed.
+      - name: Every .v file must be inside the gate
+        run: |
+          set -uo pipefail
+          # No pipeline here, so $? is bazel's own status and not some grep's —
+          # that confusion has already made healthy files read as broken twice
+          # in this repository's history.
+          bazel query 'kind("source file", deps(//proofs:verify_all))' --output=label > labels.txt
+          rc=$?
+          if [ "$rc" -ne 0 ]; then
+            echo "::error::bazel query failed (exit $rc). Coverage is therefore UNKNOWN, which is a failure and not a pass."
+            exit "$rc"
+          fi
+          # //proofs/spec:wasm_core.v -> proofs/spec/wasm_core.v
+          sed -n 's|^//||; s|:|/|; p' labels.txt | grep '\.v$' | sort -u > covered.txt
+          find proofs -name '*.v' | sed 's|^\./||' | sort -u > present.txt
+
+          # Potency control. If the query silently returns nothing useful, the
+          # comparison below would call EVERY file an orphan and the real reason
+          # would be invisible; and were the comparison inverted, it would call
+          # none of them orphans. A file we know the suite builds must appear.
+          if ! grep -qx 'proofs/spec/fusion_spec.v' covered.txt; then
+            echo "::error::potency control failed: proofs/spec/fusion_spec.v IS a dependency of //proofs:verify_all, but the query did not list it — this check is not measuring what it claims."
+            exit 1
+          fi
+
+          sed 's/#.*//' proofs/gate-exclusions.txt | tr -d ' \t' | grep -v '^$' | sort -u > excluded.txt
+          comm -23 present.txt covered.txt | sort -u > uncovered.txt
+          comm -23 uncovered.txt excluded.txt > orphans.txt
+
+          printf 'gate coverage: %s of %s .v files are built by //proofs:verify_all (%s excluded by proofs/gate-exclusions.txt)\n' \
+            "$(wc -l < covered.txt | tr -d ' ')" "$(wc -l < present.txt | tr -d ' ')" "$(wc -l < excluded.txt | tr -d ' ')"
+
+          if [ -s orphans.txt ]; then
+            echo "::error::these .v files live in proofs/ but no target in //proofs:verify_all depends on them, so the census counts their proofs and nothing re-checks them:"
+            sed 's/^/  /' orphans.txt
+            echo "Add a rocq_proof_test for each, or list it in proofs/gate-exclusions.txt with a written reason."
+            exit 1
+          fi
+          echo "::notice::every .v file outside gate-exclusions.txt is built by //proofs:verify_all"
+
+      # The gate itself.
+      #
+      # `bazel test` returns 4 for NO TESTS MATCHED. Tolerating that — with
+      # `|| [ $? -eq 4 ]` or similar — is how a proof gate passes while
+      # selecting nothing; synth hit exactly this and documents it in its own
+      # workflow (synth#945). There is therefore NO tolerance here, and exit 4
+      # is reported explicitly rather than left to look like any other failure,
+      # because "no tests matched" and "a proof broke" need different fixes.
+      - name: Re-check the proofs
+        run: |
+          set -uo pipefail
+          # `--keep_going`: a proof gate should report EVERY broken proof, not
+          # abort at the first. Without it the first failure masks the rest, and
+          # the first run of this workflow would have reported one broken file
+          # when the true extent was unknown.
+          bazel test //proofs:verify_all --test_output=errors --keep_going
+          rc=$?
+          case "$rc" in
+            0)
+              echo "::notice::all 16 Rocq proof targets re-checked"
+              ;;
+            4)
+              echo "::error::bazel exited 4 — NO TESTS MATCHED. The suite selected ZERO tests, so this run proved nothing. That is a gate failure, not an empty-matrix nuisance: a proof check that matches nothing and reports success is the defect this workflow exists to remove (#447)."
+              exit 4
+              ;;
+            *)
+              echo "::error::bazel exited $rc — a proof failed to re-check. If this is the first run of this workflow, that is the finding (#447): these proofs had never been built in CI, so a red first run means they do not currently compile, not that this change broke them."
+              exit "$rc"
+              ;;
+          esac

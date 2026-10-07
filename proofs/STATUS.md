@@ -73,7 +73,12 @@ The resolver proofs (`resolve_spec.v`, `resolver.v`) prove that topological sort
 
 ### Specification layer
 
-The spec files (`fusion_spec.v`, `fusion_types.v`, `wasm_semantics.v`, `wasm_core.v`, `wasm_core_generated.v`, `component_model.v`) define a forward simulation relation between composed and fused execution. Instruction-level correspondence is established for index-sensitive operations: `call`, `global.get`/`global.set`, `table.get`/`table.set`, `memory.load`/`memory.store`, `elem.drop`, and `data.drop`. Twenty-one rewrite rules are specified in `fusion_types.v` and connected to implementation-level index maps via bridge lemmas in `merge_bridge.v`.
+The spec files (`fusion_spec.v`, `fusion_types.v`, `wasm_semantics.v`, `wasm_core.v`, `component_model.v`) define a forward simulation relation between composed and fused execution. Instruction-level correspondence is established for index-sensitive operations: `call`, `global.get`/`global.set`, `table.get`/`table.set`, `memory.load`/`memory.store`, `elem.drop`, and `data.drop`. Twenty-one rewrite rules are specified in `fusion_types.v` and connected to implementation-level index maps via bridge lemmas in `merge_bridge.v`.
+
+`wasm_core_generated.v` was previously listed here. It is not part of this
+argument: it is experimental output from `//tools/spec-sync`, contains 0 `Qed`
+(definitions only), and does not currently compile. It is excluded from
+`//proofs:verify_all` via `proofs/gate-exclusions.txt` and tracked in #449.
 
 ### Rust-verified (rocq-of-rust)
 

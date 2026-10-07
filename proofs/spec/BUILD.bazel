@@ -1,4 +1,4 @@
-load("@rules_rocq_rust//rocq:defs.bzl", "rocq_library")
+load("@rules_rocq_rust//rocq:defs.bzl", "rocq_library", "rocq_proof_test")
 
 package(default_visibility = ["//visibility:public"])
 
@@ -79,6 +79,22 @@ rocq_library(
         ":fusion_types",
     ],
     include_path = "MeldSpec",
+)
+
+# alias_spec and p1_adapter_spec were libraries with no test target and no
+# reverse dependency: //proofs:verify_all never reached them, so their proofs
+# were counted by the census and checked by nothing. p1_adapter_spec did not
+# compile. Same shape as #447 itself, one level down.
+rocq_proof_test(
+    name = "alias_spec_test",
+    deps = [":alias_spec"],
+    tags = ["manual", "proofs"],
+)
+
+rocq_proof_test(
+    name = "p1_adapter_spec_test",
+    deps = [":p1_adapter_spec"],
+    tags = ["manual", "proofs"],
 )
 
 # CopyLayout and ConditionalPointerPair specification.

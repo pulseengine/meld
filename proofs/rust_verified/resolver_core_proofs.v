@@ -23,7 +23,7 @@
   6. Bridge: decompose matches compute_offset (decompose_matches_offset)
 *)
 
-From Stdlib Require Import List ZArith Lia Arith.
+From Stdlib Require Import List ZArith Lia Arith FinFun.
 Import ListNotations.
 
 (* -------------------------------------------------------------------------
@@ -134,6 +134,16 @@ Proof.
   intro counts. reflexivity.
 Qed.
 
+(* total_count, one constructor at a time. Its body is an application
+   (prefix_sum counts (length counts)), not a fixpoint, so simpl never
+   unfolds it; these are the rewrites to use on hypotheses instead. *)
+Lemma total_count_nil : total_count [] = 0.
+Proof. reflexivity. Qed.
+
+Lemma total_count_cons :
+  forall c cs, total_count (c :: cs) = c + total_count cs.
+Proof. intros c cs. reflexivity. Qed.
+
 (* prefix_sum is additive: prefix_sum(i+1) = prefix_sum(i) + nth i counts 0 *)
 Lemma prefix_sum_step :
   forall counts i,
@@ -144,7 +154,9 @@ Proof.
   induction counts as [|c cs IH]; intros i Hi.
   - simpl in Hi. lia.
   - destruct i as [|i'].
-    + simpl. lia.
+    + (* prefix_sum recurses on counts, so prefix_sum cs 0 only reduces
+         once cs is a constructor *)
+      destruct cs; simpl; lia.
     + simpl. simpl in Hi.
       rewrite IH by lia. lia.
 Qed.
@@ -153,9 +165,17 @@ Qed.
    Decompose Properties
    ------------------------------------------------------------------------- *)
 
-(* Helper: decompose_aux with offset running and base i *)
+(* Helper: decompose_aux with offset running and base i.
+
+   running <= index is the loop invariant of decompose_func_index: running
+   starts at 0 and only advances past counts whose whole range lies below
+   index (the recursive call happens exactly when running + c <= index).
+   It is the same precondition decompose_aux_total carries. Without it the
+   statement is false: decompose_aux [0] 0 5 0 = Some (0, 0), yet
+   5 + prefix_sum [0] 0 + 0 <> 0 and 0 < nth 0 [0] 0 fails. *)
 Lemma decompose_aux_spec :
   forall counts index running i mod_idx local_idx,
+    running <= index ->
     decompose_aux counts index running i = Some (mod_idx, local_idx) ->
     (* mod_idx is within range *)
     i <= mod_idx < i + length counts /\
@@ -165,7 +185,7 @@ Lemma decompose_aux_spec :
     running + prefix_sum counts (mod_idx - i) + local_idx = index.
 Proof.
   intros counts.
-  induction counts as [|c cs IH]; intros index running i mod_idx local_idx Hdecomp.
+  induction counts as [|c cs IH]; intros index running i mod_idx local_idx Hge Hdecomp.
   - (* counts = [] *)
     simpl in Hdecomp. discriminate.
   - (* counts = c :: cs *)
@@ -173,12 +193,14 @@ Proof.
     destruct (index <? running + c) eqn:Hlt.
     + (* Found: index is in this module *)
       apply Nat.ltb_lt in Hlt.
-      injection Hdecomp as Hmod Hlocal. subst.
+      (* name the eliminated variables: a bare subst may remove i instead
+         of mod_idx, and the replace below mentions i *)
+      injection Hdecomp as Hmod Hlocal. subst mod_idx local_idx.
       replace (i - i) with 0 by lia.
       simpl. repeat split; lia.
     + (* Not found: recurse *)
       apply Nat.ltb_ge in Hlt.
-      specialize (IH index (running + c) (S i) mod_idx local_idx Hdecomp).
+      specialize (IH index (running + c) (S i) mod_idx local_idx Hlt Hdecomp).
       destruct IH as [Hrange [Hlocal Hsum]].
       replace (mod_idx - i) with (S (mod_idx - S i)) by lia.
       simpl. repeat split; try lia.
@@ -195,7 +217,7 @@ Proof.
   intros counts.
   induction counts as [|c cs IH]; intros index running i Hge Hlt.
   - (* counts = [] *)
-    simpl in Hlt. lia.
+    rewrite total_count_nil in Hlt. lia.
   - (* counts = c :: cs *)
     simpl.
     destruct (index <? running + c) eqn:Hcmp.
@@ -203,7 +225,7 @@ Proof.
       eexists. eexists. reflexivity.
     + (* Recurse *)
       apply Nat.ltb_ge in Hcmp.
-      simpl in Hlt.
+      rewrite total_count_cons in Hlt.
       apply IH; lia.
 Qed.
 
@@ -228,8 +250,8 @@ Proof.
   - simpl. reflexivity.
   - simpl.
     destruct (index <? running + c) eqn:Hcmp.
-    + apply Nat.ltb_lt in Hcmp. simpl in Hge. lia.
-    + apply IH. simpl in Hge. lia.
+    + apply Nat.ltb_lt in Hcmp. rewrite total_count_cons in Hge. lia.
+    + apply IH. rewrite total_count_cons in Hge. lia.
 Qed.
 
 Lemma decompose_none :
@@ -276,7 +298,7 @@ Proof.
   destruct (decompose_total counts index Hlt) as [mod_idx [local_idx Hdecomp]].
   exists mod_idx, local_idx.
   unfold decompose in Hdecomp.
-  pose proof (decompose_aux_spec counts index 0 0 mod_idx local_idx Hdecomp)
+  pose proof (decompose_aux_spec counts index 0 0 mod_idx local_idx (Nat.le_0_l index) Hdecomp)
     as [Hrange [Hlocal Hsum]].
   replace (mod_idx - 0) with mod_idx in * by lia.
   split; [|split; [|split]].
@@ -300,8 +322,8 @@ Theorem decompose_injective :
 Proof.
   intros counts i1 i2 k1 l1 k2 l2 Hd1 Hd2 Hneq.
   unfold decompose in Hd1, Hd2.
-  pose proof (decompose_aux_spec counts i1 0 0 k1 l1 Hd1) as [_ [_ Hsum1]].
-  pose proof (decompose_aux_spec counts i2 0 0 k2 l2 Hd2) as [_ [_ Hsum2]].
+  pose proof (decompose_aux_spec counts i1 0 0 k1 l1 (Nat.le_0_l i1) Hd1) as [_ [_ Hsum1]].
+  pose proof (decompose_aux_spec counts i2 0 0 k2 l2 (Nat.le_0_l i2) Hd2) as [_ [_ Hsum2]].
   replace (k1 - 0) with k1 in * by lia.
   replace (k2 - 0) with k2 in * by lia.
   intro Heq. injection Heq as Hkeq Hleq. subst.
@@ -329,7 +351,7 @@ Proof.
     { intros l. induction l as [|h t IHl]; intro base.
       - simpl. lia.
       - simpl. rewrite IHl. rewrite (IHl h). lia. }
-    rewrite Hshift. lia.
+    rewrite (Hshift cs c). lia.
 Qed.
 
 (* Total length of the index map = total defined functions *)
@@ -398,7 +420,7 @@ Proof.
     + (* NoDup in the mapped seq for this module *)
       apply FinFun.Injective_map_NoDup.
       * intros x y Heq. lia.
-      * apply NoDup_seq.
+      * apply seq_NoDup.
     + (* NoDup in the rest *)
       apply IH.
     + (* Disjointness: entries from this module don't appear in the rest *)
@@ -480,10 +502,10 @@ Proof.
     + simpl. reflexivity.
     + simpl. simpl in Hn.
       rewrite IH by lia.
-      rewrite fold_left_add_shift_nat with (f := fun x => x).
-      simpl. f_equal. f_equal.
-      clear. induction (firstn n' cs) as [|h t IHl]; simpl; [lia|].
-      rewrite IHl. lia.
+      (* c + fold_left (+) l 0 = fold_left (+) l c is fold_left_add_shift_nat
+         with f := id; an inline induction on l would need to generalise
+         over the accumulator, which the lemma already does. *)
+      symmetry. exact (fold_left_add_shift_nat (fun x => x) (firstn n' cs) c).
 Qed.
 
 (* The decompose model matches compute_offset when applied to extracted counts.
@@ -500,7 +522,7 @@ Theorem decompose_matches_offset :
 Proof.
   intros counts index mod_idx local_idx Hdecomp.
   unfold decompose in Hdecomp.
-  pose proof (decompose_aux_spec counts index 0 0 mod_idx local_idx Hdecomp)
+  pose proof (decompose_aux_spec counts index 0 0 mod_idx local_idx (Nat.le_0_l index) Hdecomp)
     as [Hrange [Hlocal Hsum]].
   replace (mod_idx - 0) with mod_idx in * by lia.
   split; [|split].
@@ -535,9 +557,58 @@ Proof.
   simpl.
   rewrite nth_error_app1.
   - rewrite nth_error_map.
-    rewrite nth_error_seq by lia.
-    simpl. f_equal. lia.
+    (* Stdlib's nth_error_seq is unconditional:
+         nth_error (seq start len) n = if n <? len then Some (start + n) else None
+       so the bound is discharged by rewriting the test, not as a side goal. *)
+    rewrite nth_error_seq.
+    rewrite (proj2 (Nat.ltb_lt pos c) Hpos).
+    simpl. f_equal; lia.
   - rewrite length_map. rewrite length_seq. exact Hpos.
+Qed.
+
+(* index_map_entry_value is stated before index_map_matches_decompose,
+   which rewrites with it. *)
+(* Each entry of build_index_map_aux equals import_count + cumulative + its
+   flat position. Generalised over cumulative so the induction goes through:
+   the conclusion of index_map_entry_value mentions no cumulative, so it
+   cannot serve as its own induction hypothesis (the old proof generalised
+   0 as cumulative, which made the goal false for cumulative <> 0). *)
+Lemma build_index_map_aux_entry_value :
+  forall import_count defined_counts cumulative pos,
+    pos < length (build_index_map_aux import_count defined_counts cumulative) ->
+    nth_error (build_index_map_aux import_count defined_counts cumulative) pos
+    = Some (import_count + cumulative + pos).
+Proof.
+  intros import_count defined_counts.
+  induction defined_counts as [|c cs IH]; intros cumulative pos Hpos.
+  - simpl in Hpos. lia.
+  - simpl in Hpos. rewrite length_app, length_map, length_seq in Hpos.
+    simpl.
+    destruct (Nat.lt_ge_cases pos c) as [Hlt | Hge].
+    + (* pos < c: in this module's block *)
+      rewrite nth_error_app1 by (rewrite length_map, length_seq; exact Hlt).
+      rewrite nth_error_map, nth_error_seq.
+      rewrite (proj2 (Nat.ltb_lt pos c) Hlt).
+      simpl. f_equal; lia.
+    + (* pos >= c: in the rest, at pos - c with cumulative + c *)
+      rewrite nth_error_app2 by (rewrite length_map, length_seq; exact Hge).
+      rewrite length_map, length_seq.
+      rewrite IH by lia.
+      f_equal. lia.
+Qed.
+
+(* Simpler statement: each entry equals import_count + its flat position
+   in the defined function array *)
+Theorem index_map_entry_value :
+  forall import_count defined_counts pos,
+    pos < length (build_index_map import_count defined_counts) ->
+    nth_error (build_index_map import_count defined_counts) pos
+    = Some (import_count + pos).
+Proof.
+  intros import_count defined_counts pos Hpos.
+  unfold build_index_map in *.
+  rewrite (build_index_map_aux_entry_value _ _ _ _ Hpos).
+  f_equal. lia.
 Qed.
 
 (* Bridge: the nth entry of build_index_map equals
@@ -564,36 +635,6 @@ Proof.
   (* reconstruct = prefix_sum + local_pos = pos *)
   unfold reconstruct in Hrecon.
   f_equal. lia.
-Qed.
-
-(* Simpler statement: each entry equals import_count + its flat position
-   in the defined function array *)
-Theorem index_map_entry_value :
-  forall import_count defined_counts pos,
-    pos < length (build_index_map import_count defined_counts) ->
-    nth_error (build_index_map import_count defined_counts) pos
-    = Some (import_count + pos).
-Proof.
-  intros import_count defined_counts pos Hpos.
-  unfold build_index_map.
-  (* The build_index_map_aux creates entries import_count + 0, import_count + 1, ...
-     because cumulative starts at 0 and each module adds its count. *)
-  generalize dependent pos.
-  generalize 0 as cumulative.
-  induction defined_counts as [|c cs IH]; intros cumulative pos Hpos.
-  - simpl in Hpos. simpl. lia.
-  - simpl in *.
-    rewrite length_app in Hpos. rewrite length_map, length_seq in Hpos.
-    destruct (Nat.lt_ge_cases pos c) as [Hlt | Hge].
-    + (* pos < c: in the current module's map *)
-      rewrite nth_error_app1 by (rewrite length_map, length_seq; exact Hlt).
-      rewrite nth_error_map, nth_error_seq by lia.
-      simpl. f_equal. lia.
-    + (* pos >= c: in the rest *)
-      rewrite nth_error_app2 by (rewrite length_map, length_seq; exact Hge).
-      rewrite length_map, length_seq.
-      rewrite IH by (rewrite build_index_map_aux_length in *; lia).
-      f_equal. lia.
 Qed.
 
 (* Corollary: defined_func inverts the index map *)

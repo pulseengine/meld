@@ -120,8 +120,13 @@ Proof.
   destruct (icas_callee_options site) as [enc mem realloc].
   simpl.
   rewrite Nat.eqb_refl.
-  destruct mem; [rewrite Nat.eqb_refl |]; simpl;
-  destruct realloc; [rewrite Nat.eqb_refl |]; simpl; reflexivity.
+  (* `destruct mem; [t|]; simpl; destruct realloc; [t|]` supplied 2 branches
+     for the 4 goals the second destruct produces -- Ltac's `;` applies the
+     second destruct to BOTH goals of the first. Handle the 4 cases
+     uniformly instead; `repeat` covers the None/None case, where there is
+     no Nat.eqb left to rewrite. *)
+  destruct mem as [m|], realloc as [r|]; simpl;
+    repeat rewrite Nat.eqb_refl; reflexivity.
 Qed.
 
 (* -------------------------------------------------------------------------

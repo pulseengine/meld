@@ -20,15 +20,27 @@ bazel_dep(name = "bazel_skylib", version = "1.7.1")
 bazel_dep(name = "platforms", version = "0.0.10")
 
 # WebAssembly component rules for building WASM targets
-bazel_dep(name = "rules_wasm_component", version = "1.0.0")
+# rules_wasm_component was REMOVED (#447).
+#
+# It carried a `local_path_override` to "/tmp/rules_wasm_component_local" — a
+# path that exists on one developer's machine, and only until /tmp is cleared.
+# Bazel resolves the module graph before building anything, so that override
+# made EVERY bazel invocation fail from a clean checkout:
+#
+#   ERROR: fetching local_repository rule //:rules_wasm_component+:
+#   The repository's path is "/tmp/rules_wasm_component_local" but it does not
+#   exist or is not a directory.
+#
+# That is why the Rocq proofs had never run. #447 found that nothing NAMED
+# them; this is the second half — nothing COULD have built them either, and the
+# first run of the new proofs workflow is what surfaced it.
+#
+# Removed rather than repointed because it has no consumers left: its only real
+# load was `wasm_test` in tests/wit_bindgen/BUILD.bazel, whose targets #444
+# removed, leaving the load dangling. The mention in rules/meld.bzl is inside a
+# docstring showing CONSUMERS how to combine the two rule sets; a consumer
+# brings their own.
 
-# Override to local copy with fixed componentize-py canary checksum
-# TODO: revert to git_override once pulseengine/rules_wasm_component
-# updates the componentize-py canary hash
-local_path_override(
-    module_name = "rules_wasm_component",
-    path = "/tmp/rules_wasm_component_local",
-)
 
 ###############################################################################
 # Rocq/Coq Formal Verification (rules_rocq_rust)
@@ -183,9 +195,25 @@ git_repo(
 ###############################################################################
 
 rust = use_extension("@rules_rust//rust:extensions.bzl", "rust")
+# `extra_target_triples = ["wasm32-wasip2"]` was REMOVED (#447).
+#
+# rules_rust 0.56.0 rejects it outright — `triple()` requires at least three
+# sections separated by "-" and `wasm32-wasip2` has two, so the rust module
+# extension failed during analysis and no proof target could be built:
+#
+#   Error in fail: Expected target triple to contain at least three sections
+#   ERROR: Analysis of target '//proofs:attestation_proofs_test' failed
+#
+# It was there for a bazel-side wasm build that no longer exists: #444 removed
+# the rust_binary/rust_library targets, and nothing under BUILD.bazel compiles
+# Rust any more. The rust toolchain itself STAYS, because
+# `coq_of_rust_library` needs it to translate Rust into Coq.
+#
+# This is the third thing standing between these proofs and ever being checked,
+# after "nothing names the targets" (#447) and the /tmp module override. None
+# was visible until something tried to build them.
 rust.toolchain(
     edition = "2024",
-    extra_target_triples = ["wasm32-wasip2"],
     versions = ["1.85.0"],
 )
 use_repo(rust, "rust_toolchains")

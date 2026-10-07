@@ -100,8 +100,27 @@ filegroup(
     ],
 )
 
+# Depends on the rocq_library targets directly, NOT on the `:merge_spec`
+# filegroup above. A filegroup carries no `RocqInfo`, so `rocq_proof_test`
+# rejected it:
+#
+#   in deps attribute of rocq_proof_test //proofs/transformations/merge:merge_spec_test:
+#   '//proofs/transformations/merge:merge_spec' does not have mandatory providers: 'RocqInfo'
+#
+# The filegroup stays — `bazel build //proofs/transformations/merge:merge_spec`
+# is the documented way to build the aggregate, and it works for that. It was
+# only ever wrong as a *test* dependency, and nothing had built this target to
+# find out (#447). Swept the other 13 `rocq_proof_test` targets: all depend on
+# a `rocq_library`, so this was the only instance.
 rocq_proof_test(
     name = "merge_spec_test",
-    deps = [":merge_spec"],
+    deps = [
+        ":merge_bridge",
+        ":merge_correctness",
+        ":merge_defs",
+        ":merge_layout",
+        ":merge_remap",
+        ":merge_resolution",
+    ],
     tags = ["manual", "proofs"],
 )
