@@ -99,8 +99,14 @@ enum Commands {
         /// above it, coalescing every __stack_pointer onto one survivor —
         /// reclaiming the (N-1) duplicated stack reservations (the last MCU-fit
         /// gap after --pack-rebase). Requires every provider to carry a
-        /// __stack_pointer AND __heap_base marker and be stack-first (all data
-        /// above sp); fails loud otherwise. OPT-IN and sound ONLY when the
+        /// __heap_base marker and be stack-first (all data above sp); fails
+        /// loud otherwise. A provider with NO __stack_pointer global at all is
+        /// STACKLESS — wasm-ld drops it from a module whose code never touches
+        /// the shadow stack — and is admitted as contributing no stack, named
+        /// in the attestation as shared-stack-stackless; a __stack_pointer that
+        /// is present but unreadable still fails, and an all-stackless set is
+        /// refused because the flag would have nothing to do. OPT-IN and sound
+        /// ONLY when the
         /// providers are non-reentrant, single-threaded, mutually-non-calling,
         /// and one-live-at-a-time (a shared stack sized to the MAX, not the
         /// SUM, of their stack use).

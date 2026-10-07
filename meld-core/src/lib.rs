@@ -182,10 +182,22 @@ pub struct FuserConfig {
     /// after `--pack-rebase` (closes gale's F100 8 KiB budget).
     ///
     /// HARD preconditions (loud fail, never silent): every rebased provider
-    /// carries a `__stack_pointer` marker (mutable `i32`, single `i32.const`
-    /// init, named/exported) AND a `__heap_base` marker, is stack-first (every
-    /// active data segment starts `>= sp_i`), and packs (no passive/no-data
-    /// fallback). ENVELOPE meld cannot verify: one region of `max_i(sp_i)` is
+    /// carries a `__heap_base` marker, is stack-first (every active data
+    /// segment starts `>= sp_i`), and packs (no passive/no-data fallback).
+    ///
+    /// `__stack_pointer` is NOT required of every provider (#446). A module
+    /// with no `__stack_pointer` global AT ALL is stackless — `wasm-ld` strips
+    /// the global from a module whose code never touches the shadow stack, and
+    /// whether a module is stackless is a codegen decision that moves between
+    /// rustc releases with no source change. Such a provider is planned as
+    /// `sp_i = 0`, which is the stack region it actually has (`[0, 0)`), so it
+    /// adds nothing to `max_i(sp_i)`, strides by its whole extent, and
+    /// satisfies stack-firstness trivially; it is recorded in the attestation
+    /// as `shared-stack-stackless` rather than silently treated as handled. A
+    /// `__stack_pointer` that EXISTS but cannot be read as a marker still fails
+    /// loud — absence means stackless only when the global is genuinely absent
+    /// — and an all-stackless set is refused, since the flag has nothing to
+    /// collapse. ENVELOPE meld cannot verify: one region of `max_i(sp_i)` is
     /// sound only when total live shadow-stack state across any call chain fits
     /// it — providers non-reentrant, single-threaded, mutually-non-calling,
     /// one-live-at-a-time; no baked-in constant address into `[0, sp)`.

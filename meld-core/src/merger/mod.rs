@@ -217,6 +217,9 @@ pub struct MergedModule {
     /// onto one survivor initialised to this value (regardless of the providers'
     /// original inits).
     pub shared_stack_top: Option<u64>,
+    /// #446: count of providers planned as stackless (no `__stack_pointer`
+    /// global at all). The dissolve's drift detector subtracts these.
+    pub stackless_providers: usize,
 
     /// SR-70: per-module memory placement chosen by the shared-memory plan
     /// (`(component, module, strategy, base, reserved)`), carried out of the
@@ -577,6 +580,7 @@ impl Merger {
             async_result_globals: HashMap::new(),
             segment_bases: HashMap::new(),
             shared_stack_top: None,
+            stackless_providers: 0,
             placements: Vec::new(),
         };
 
@@ -850,6 +854,7 @@ impl Merger {
 
         if let Some(plan) = shared_memory_plan {
             merged.shared_stack_top = plan.shared_stack_top;
+            merged.stackless_providers = plan.stackless_providers;
             merged.placements = plan
                 .placements
                 .iter()

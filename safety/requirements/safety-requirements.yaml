@@ -3502,3 +3502,16 @@ artifacts:
       created-by: ai-assisted
       model: claude-opus-5
       timestamp: 2026-10-07T03:30:37Z
+
+  - id: SR-90
+    type: sw-req
+    title: A provider with no __stack_pointer global at all is stackless, not an error
+    status: implemented
+    description: "SR-66 (#380) required a `__stack_pointer` marker in EVERY fused provider under `--share-stack`, and `meld fuse --help` stated that requirement unambiguously. The implementation matched the documentation, so the refusal fathom (gale) hit was the flag doing exactly what it said. The defect is in the contract, not the code: a stackless module cannot carry the marker, so the requirement is not always satisfiable by a well-formed input. wasm-ld drops the `__stack_pointer` global from a module whose code never touches the shadow stack, which is what gales thin seam forwarders are -- a handful of calls to imports, needing no frame. fathom measured the consequence: the same sources, same meld, same wasm-tools 1.245.1 and wac-cli 0.10.1, went from 5 of 5 providers carrying the marker under rustc 1.98.1 to 1 of 5 under rustc 1.99.0, and the fuse that had succeeded began refusing at component 3. The survivor was the one component owning a real executor, hence genuine stack traffic. Whether a module is stackless is a codegen decision, so a contract resting on it will keep breaking with no source change. meld shall admit a provider with NO `__stack_pointer` global at all as contributing no shadow stack, planning it as sp = 0. That value is not a special case but the region such a module actually has, the empty [0, 0): it adds nothing to max(sp_i), takes base_i = next_base - 0, strides by align16(extent_i), and satisfies both preconditions trivially since nothing can start below 0 and 0 <= extent. Skipping the module instead would be UNSOUND -- `bases` is populated only from the share-stack entries on that path, so a skipped provider would receive no base and alias whatever sits at 0. The decision is mechanical rather than a judgement: absence of the global is a fact read off the module, distinguishable from a `__stack_pointer` that EXISTS but cannot be read as a marker (imported, wrong type or mutability, or a computed initialiser), which shall keep failing loud. Absence means stackless only when the global is genuinely absent. An all-stackless set shall be refused, since there is then no shadow stack to collapse and the flag has nothing to do. Each admitted stackless provider shall be recorded as `shared-stack-stackless` in the attestation placements and in --explain, never folded into `shared-stack`: a component that silently contributed nothing to a safety envelope is how the envelope stops meaning anything. The dissolve drift detector, which cross-checked that the coalescer saw one `__stack_pointer` per memory provider, shall subtract the planned stackless count -- it remains a real check, catching a stack-carrying provider whose marker the coalescer cannot see. SR-66/SR-67 envelope is unchanged: non-reentrant, single-threaded, mutually-non-calling, one-live-at-a-time, sized to max rather than sum. A stackless provider cannot widen it, since it contributes no live stack state."
+    links:
+      - type: derives-from
+        target: SYS-11
+    provenance:
+      created-by: ai-assisted
+      model: claude-opus-5
+      timestamp: 2026-10-07T10:13:29Z
