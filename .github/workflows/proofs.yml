@@ -62,30 +62,33 @@ jobs:
   proofs:
     name: Rocq proofs
     runs-on: ubuntu-latest
-    # 60 was not enough and the job was KILLED mid-build, which reads as
-    # "cancelled" rather than as a proof failure — a gate that dies silently is
-    # barely better than one that never runs.
+    # Re-derived after #450. The original 60 was exceeded and the job was
+    # KILLED mid-build, which reads as "cancelled" rather than as a proof
+    # failure — a gate that dies silently is barely better than one that never
+    # runs. It was then raised to 180 on the belief that a proof was simply
+    # expensive. That belief was wrong in a way worth recording:
     #
-    # What is actually measured, kept separate from any explanation:
+    #   * `merge_resolution.v` had NEVER compiled, in any version. A
+    #     `rewrite !fold_left_add_shift` could not fail, because that lemma's
+    #     RHS contains an instance of its own LHS, so the proof term grew
+    #     without bound: killed at a 900s cap holding 2.5 GB and climbing.
+    #   * Fixed in #450, it compiles in **2 seconds**. 27 of 28 .v files now
+    #     build; the one exception is the excluded generator stub (#449).
     #
-    #   * CI reached `13 / 14 tests, 3 failed` and was still compiling one
-    #     action at **3522s** when the 60-minute limit cancelled it.
-    #   * Locally, under Rocq 9.0.1 via nix-shell, 25 of 28 .v files compile in
-    #     seconds each, but `merge_resolution.v` exceeds a **900s** cap in plain
-    #     `coqc` — no bazel involved — holding ~2 GB RSS at 100% CPU.
+    # So no proof in this tree is expensive, and the runtime is now set by
+    # provisioning Nix plus the bazel path, not by a single file. 90 is
+    # deliberately generous and still PROVISIONAL: the first completed run
+    # gives the real number, and this should be tightened to it rather than
+    # left wide. A timeout nobody has measured is how 60 became 180 on a
+    # misdiagnosis.
     #
-    # An earlier version of this comment blamed the rules_rocq_rust/bazel path
-    # for a 3-orders-of-magnitude slowdown and attributed the 3522s to
-    # `//proofs/spec:fusion_spec`. Both were wrong. Bazel's progress line names
-    # a target's FIRST src, not the file it is working on — the same log reports
-    # "wasm_core.v failed" for an error that is in `fusion_spec.v:2644` — so the
-    # 3522s was never attributable to fusion_spec, and the local measurement
-    # shows a genuinely slow proof rather than slow tooling.
-    #
-    # So 180 is an interim that lets the gate REPORT instead of being cancelled.
-    # The real fix is making `merge_resolution.v` fast (#450); when that lands,
-    # bring this number back down.
-    timeout-minutes: 180
+    # Also corrected here: an earlier version of this comment blamed the
+    # rules_rocq_rust/bazel path for a three-orders-of-magnitude slowdown and
+    # attributed 3522s to `//proofs/spec:fusion_spec`. Both were wrong. Bazel's
+    # progress line names a target's FIRST src, not the file in hand — the same
+    # log reports "wasm_core.v failed" for an error at `fusion_spec.v:2644` —
+    # and the slow thing turned out to be a looping tactic, not the tooling.
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
 
@@ -129,9 +132,11 @@ jobs:
           printf '  verify_all members  %s\n' "$members"
 
           fail=0
-          # Floors: the values at the time this gate was added (#447).
+          # Floors: the measured values, raised as the suite grows. 350 -> 357 with
+      # the two helper lemmas #450 added. Lowering one is a decision someone has
+      # to write into a diff.
           [ "$files"    -ge 28  ] || { echo "::error::proof files fell to $files (floor 28)"; fail=1; }
-          [ "$qed"      -ge 350 ] || { echo "::error::Qed count fell to $qed (floor 350) — proofs were removed or weakened"; fail=1; }
+          [ "$qed"      -ge 357 ] || { echo "::error::Qed count fell to $qed (floor 357) — proofs were removed or weakened"; fail=1; }
           [ "$targets"  -ge 16  ] || { echo "::error::rocq_proof_test targets fell to $targets (floor 16)"; fail=1; }
           [ "$members"  -ge 16  ] || { echo "::error:://proofs:verify_all lists $members members (floor 16) — a target was dropped from the suite, so it would no longer be checked"; fail=1; }
 
