@@ -32,7 +32,10 @@
 
 From Stdlib Require Import List ZArith Lia Bool Arith.
 From MeldSpec Require Import wasm_core component_model fusion_types.
-From MeldMerge Require Import merge_defs merge_layout merge_remap merge_correctness.
+(* merge_bridge provides module_wf and gen_all_remaps_enables_rewriting,
+   both referenced by resolved_enables_rewriting (Section 8). *)
+From MeldMerge Require Import merge_defs merge_layout merge_remap merge_correctness
+  merge_bridge.
 Import ListNotations.
 
 (* =========================================================================
@@ -256,9 +259,61 @@ Definition total_resolved_space_count (resolve : import_resolved)
     acc + resolved_space_count resolve (fst sm) (snd sm) space
   ) input 0.
 
+(* Accumulating a pointwise-smaller summand from a smaller base yields a
+   smaller fold.  This is the one fact the two "resolved <= flat" lemmas
+   below need; the base is generalised so the induction goes through
+   directly on the list.
+
+   Do NOT prove these with `rewrite !fold_left_add_shift`: that lemma's
+   right-hand side (`base + fold_left _ l 0`) contains an instance of its
+   own left-hand side (`fold_left _ l 0`, base := 0), so the `!` iteration
+   never fails and never terminates — every step adds one `0 +` to the goal
+   and the proof term grows quadratically (#450).  Siblings use the lemma
+   only with explicit arguments for the same reason; see
+   merge_correctness.v (fold_left_add_split). *)
+Lemma fold_left_add_le_pointwise :
+  forall {A : Type} (f g : A -> nat),
+    (forall x, f x <= g x) ->
+    forall (l : list A) (base1 base2 : nat),
+      base1 <= base2 ->
+      fold_left (fun acc x => acc + f x) l base1 <=
+      fold_left (fun acc x => acc + g x) l base2.
+Proof.
+  intros A f g Hfg l.
+  induction l as [|x l' IH]; intros base1 base2 Hb; simpl.
+  - exact Hb.
+  - apply IH. specialize (Hfg x). lia.
+Qed.
+
+(* Splitting a prefix fold at an element: the fold over the first i items
+   plus the i-th item is bounded by the fold over any longer prefix
+   (j > i).  This is the "non-overlapping ranges" fact that
+   resolved_remap_injective needs for modules at different positions.
+   fold_left_add_shift is applied with explicit arguments only. *)
+Lemma fold_left_add_firstn_step :
+  forall {A : Type} (f : A -> nat) (i j : nat) (l : list A) (x : A),
+    i < j ->
+    nth_error l i = Some x ->
+    fold_left (fun acc y => acc + f y) (firstn i l) 0 + f x <=
+    fold_left (fun acc y => acc + f y) (firstn j l) 0.
+Proof.
+  intros A f i.
+  induction i as [|i' IH]; intros j l x Hij Hnth;
+    destruct l as [|a l']; simpl in Hnth; try discriminate Hnth;
+    (destruct j as [|j']; [exfalso; lia | simpl]).
+  - (* i = 0, l = a :: l', j = S j' *)
+    injection Hnth as Hax. subst a.
+    rewrite (fold_left_add_shift f (firstn j' l') (f x)). lia.
+  - (* i = S i', l = a :: l', j = S j' *)
+    rewrite (fold_left_add_shift f (firstn i' l') (f a)).
+    rewrite (fold_left_add_shift f (firstn j' l') (f a)).
+    specialize (IH j' l' x ltac:(lia) Hnth). lia.
+Qed.
+
 (* Resolved offsets are <= flat offsets.
-   Proof strategy: induction on mod_idx, using resolved_space_count_le
-   at each step to show the per-module contribution is smaller. *)
+   Proof strategy: both sides are a fold_left over the same prefix of input
+   with pointwise-ordered summands (resolved_space_count_le), so
+   fold_left_add_le_pointwise applies directly. *)
 Lemma resolved_offset_le_flat :
   forall resolve input space mod_idx,
     resolved_offset resolve input space mod_idx <=
@@ -266,39 +321,11 @@ Lemma resolved_offset_le_flat :
 Proof.
   intros resolve input space mod_idx.
   unfold resolved_offset, compute_offset.
-  set (prior := firstn mod_idx input).
-  (* Induction on prior (the prefix of input up to mod_idx) *)
-  induction prior as [|sm rest IH]; simpl.
+  apply (fold_left_add_le_pointwise
+           (fun sm => resolved_space_count resolve (fst sm) (snd sm) space)
+           (fun sm => space_count_of_module (snd sm) space)).
+  - intros sm. apply resolved_space_count_le.
   - lia.
-  - rewrite !fold_left_add_shift.
-    rewrite (fold_left_add_shift
-      (fun sm0 => resolved_space_count resolve (fst sm0) (snd sm0) space) rest).
-    pose proof (resolved_space_count_le resolve (fst sm) (snd sm) space) as Hle.
-    (* Need to show that replacing sm's contribution and using IH gives the bound *)
-    assert (Hrest:
-      fold_left (fun acc x =>
-        acc + resolved_space_count resolve (fst x) (snd x) space) rest 0
-      <= fold_left (fun acc x =>
-        acc + match space with
-              | TypeIdx => length (mod_types (snd x))
-              | FuncIdx => count_func_imports (snd x) + length (mod_funcs (snd x))
-              | TableIdx => count_table_imports (snd x) + length (mod_tables (snd x))
-              | MemIdx => count_mem_imports (snd x) + length (mod_mems (snd x))
-              | GlobalIdx => count_global_imports (snd x) + length (mod_globals (snd x))
-              | ElemIdx => length (mod_elems (snd x))
-              | DataIdx => length (mod_datas (snd x))
-              end) rest 0).
-    { clear IH Hle sm.
-      induction rest as [|sm' rest' IH']; simpl.
-      - lia.
-      - rewrite !fold_left_add_shift.
-        rewrite (fold_left_add_shift
-          (fun sm0 => resolved_space_count resolve (fst sm0) (snd sm0) space) rest').
-        pose proof (resolved_space_count_le resolve (fst sm') (snd sm') space).
-        unfold resolved_space_count, space_count_of_module in H.
-        destruct space; lia. }
-    unfold resolved_space_count, space_count_of_module in Hle.
-    destruct space; lia.
 Qed.
 
 (* Total resolved space count <= total flat space count *)
@@ -308,15 +335,12 @@ Lemma total_resolved_le_flat :
     total_space_count input space.
 Proof.
   intros resolve input space.
-  unfold total_resolved_space_count, total_space_count, space_count_of_module.
-  induction input as [|sm rest IH]; simpl.
+  unfold total_resolved_space_count, total_space_count.
+  apply (fold_left_add_le_pointwise
+           (fun sm => resolved_space_count resolve (fst sm) (snd sm) space)
+           (fun sm => space_count_of_module (snd sm) space)).
+  - intros sm. apply resolved_space_count_le.
   - lia.
-  - rewrite !fold_left_add_shift.
-    rewrite (fold_left_add_shift
-      (fun sm0 => resolved_space_count resolve (fst sm0) (snd sm0) space) rest).
-    pose proof (resolved_space_count_le resolve (fst sm) (snd sm) space).
-    unfold resolved_space_count, space_count_of_module in H.
-    destruct space; lia.
 Qed.
 
 (* =========================================================================
@@ -329,16 +353,19 @@ Qed.
 
 Definition trivial_resolve : import_resolved := fun _ _ => false.
 
+(* With trivial_resolve unfolded, the unresolved-import predicate is
+   `... => negb false | _ => false` and count_func_imports's is
+   `... => true | _ => false`: convertible, so the goal closes by
+   conversion.  (An `f_equal` here already discharges the goal via
+   reflexivity, which left the original induction script with no goal
+   to operate on — "No such goal" at the first bullet.) *)
 Lemma trivial_resolve_func_count :
   forall src m,
     count_unresolved_func_imports trivial_resolve src m = count_func_imports m.
 Proof.
   intros src m.
   unfold count_unresolved_func_imports, count_func_imports, trivial_resolve.
-  f_equal.
-  induction (mod_imports m) as [|imp rest IH]; simpl.
-  - reflexivity.
-  - destruct (imp_desc imp); simpl; f_equal; exact IH.
+  reflexivity.
 Qed.
 
 Lemma trivial_resolve_table_count :
@@ -347,10 +374,7 @@ Lemma trivial_resolve_table_count :
 Proof.
   intros src m.
   unfold count_unresolved_table_imports, count_table_imports, trivial_resolve.
-  f_equal.
-  induction (mod_imports m) as [|imp rest IH]; simpl.
-  - reflexivity.
-  - destruct (imp_desc imp); simpl; f_equal; exact IH.
+  reflexivity.
 Qed.
 
 Lemma trivial_resolve_mem_count :
@@ -359,10 +383,7 @@ Lemma trivial_resolve_mem_count :
 Proof.
   intros src m.
   unfold count_unresolved_mem_imports, count_mem_imports, trivial_resolve.
-  f_equal.
-  induction (mod_imports m) as [|imp rest IH]; simpl.
-  - reflexivity.
-  - destruct (imp_desc imp); simpl; f_equal; exact IH.
+  reflexivity.
 Qed.
 
 Lemma trivial_resolve_global_count :
@@ -371,10 +392,7 @@ Lemma trivial_resolve_global_count :
 Proof.
   intros src m.
   unfold count_unresolved_global_imports, count_global_imports, trivial_resolve.
-  f_equal.
-  induction (mod_imports m) as [|imp rest IH]; simpl.
-  - reflexivity.
-  - destruct (imp_desc imp); simpl; f_equal; exact IH.
+  reflexivity.
 Qed.
 
 (* The trivial resolution preserves space counts exactly *)
@@ -385,11 +403,11 @@ Lemma trivial_resolved_space_count :
 Proof.
   intros src m space.
   unfold resolved_space_count, space_count_of_module.
-  destruct space; try reflexivity.
-  - rewrite trivial_resolve_func_count. reflexivity.
-  - rewrite trivial_resolve_table_count. reflexivity.
-  - rewrite trivial_resolve_mem_count. reflexivity.
-  - rewrite trivial_resolve_global_count. reflexivity.
+  (* All seven cases close by conversion (the four import-bearing ones for
+     the reason given at trivial_resolve_func_count).  No `try`: if a case
+     ever stops being convertible this must fail loudly, not fall through
+     to a bullet that has no goal. *)
+  destruct space; reflexivity.
 Qed.
 
 (* =========================================================================
@@ -497,9 +515,13 @@ Proof.
         rewrite <- skipn_skipn. rewrite Hskip. reflexivity. }
   rewrite Hsplit at 2.
   rewrite fold_left_app. simpl.
-  rewrite fold_left_add_shift.
+  (* Shift the fold over the SUFFIX explicitly.  A bare
+     `rewrite fold_left_add_shift` picks the first matching subterm, which
+     is the prefix fold on the left (base := 0) — a no-op that leaves the
+     suffix fold's base buried, and lia has no witness. *)
+  rewrite (fold_left_add_shift _ (skipn (S mod_idx) input)).
   unfold resolved_space_count, defined_count in *.
-  destruct space; simpl; lia.
+  destruct space; simpl in *; lia.
 Qed.
 
 (* Theorem 2: Resolved remap for defined items is injective.
@@ -523,7 +545,10 @@ Proof.
   intros resolve input src1 m1 idx1 src2 m2 idx2 space local1 local2
          Hnth1 Hnth2 Hbound1 Hbound2 Hfused_eq.
   unfold resolved_defined_fused_idx in Hfused_eq.
-  (* Compare module positions idx1 and idx2 using offset monotonicity *)
+  (* Compare module positions idx1 and idx2 using offset monotonicity.
+     The "non-overlapping ranges" step is fold_left_add_firstn_step: the
+     fold over firstn idx1 plus module idx1's whole contribution is bounded
+     by the fold over firstn idx2 whenever idx1 < idx2. *)
   destruct (Nat.lt_trichotomy idx1 idx2) as [Hlt | [Heq | Hgt]].
   - (* idx1 < idx2: contradiction via non-overlapping ranges *)
     exfalso.
@@ -538,32 +563,11 @@ Proof.
                    resolved_space_count resolve src1 m1 space <=
                    resolved_offset resolve input space idx2).
     { unfold resolved_offset.
-      assert (Hsplit: firstn idx2 input =
-        firstn idx1 input ++ ((src1, m1) :: skipn (S idx1) (firstn idx2 input))).
-      { rewrite <- (firstn_skipn idx1 (firstn idx2 input)) at 1.
-        f_equal.
-        assert (Hlen_firstn: length (firstn idx2 input) = idx2).
-        { rewrite length_firstn. apply nth_error_Some in Hnth2.
-          rewrite Hnth2. lia. }
-        destruct (skipn idx1 (firstn idx2 input)) as [|x rest] eqn:Hskip.
-        - exfalso. assert (length (skipn idx1 (firstn idx2 input)) = 0)
-            by (rewrite Hskip; reflexivity).
-          rewrite length_skipn in H. lia.
-        - f_equal.
-          + assert (nth_error (firstn idx2 input) idx1 = Some (src1, m1)).
-            { rewrite nth_error_firstn; [exact Hnth1 | lia]. }
-            assert (nth_error (skipn idx1 (firstn idx2 input)) 0 = Some (src1, m1)).
-            { rewrite nth_error_skipn. rewrite Nat.add_0_r. exact H. }
-            rewrite Hskip in H0. simpl in H0. congruence.
-          + reflexivity. }
-      rewrite Hsplit. rewrite fold_left_app. simpl.
-      rewrite fold_left_add_shift.
-      pose proof (fold_left_add_nonneg_ge
-        (fun sm => resolved_space_count resolve (fst sm) (snd sm) space)
-        (skipn (S idx1) (firstn idx2 input)) 0) as Hge.
-      simpl. lia. }
+      exact (fold_left_add_firstn_step
+               (fun sm => resolved_space_count resolve (fst sm) (snd sm) space)
+               idx1 idx2 input (src1, m1) Hlt Hnth1). }
     unfold resolved_space_count, defined_count in *.
-    destruct space; lia.
+    destruct space; simpl in *; lia.
   - (* idx1 = idx2: same module, so local indices must match *)
     subst idx2.
     rewrite Hnth1 in Hnth2. injection Hnth2 as Hsrc_eq Hm_eq.
@@ -575,32 +579,11 @@ Proof.
                    resolved_space_count resolve src2 m2 space <=
                    resolved_offset resolve input space idx1).
     { unfold resolved_offset.
-      assert (Hsplit: firstn idx1 input =
-        firstn idx2 input ++ ((src2, m2) :: skipn (S idx2) (firstn idx1 input))).
-      { rewrite <- (firstn_skipn idx2 (firstn idx1 input)) at 1.
-        f_equal.
-        assert (Hlen_firstn: length (firstn idx1 input) = idx1).
-        { rewrite length_firstn. apply nth_error_Some in Hnth1.
-          rewrite Hnth1. lia. }
-        destruct (skipn idx2 (firstn idx1 input)) as [|x rest] eqn:Hskip.
-        - exfalso. assert (length (skipn idx2 (firstn idx1 input)) = 0)
-            by (rewrite Hskip; reflexivity).
-          rewrite length_skipn in H. lia.
-        - f_equal.
-          + assert (nth_error (firstn idx1 input) idx2 = Some (src2, m2)).
-            { rewrite nth_error_firstn; [exact Hnth2 | lia]. }
-            assert (nth_error (skipn idx2 (firstn idx1 input)) 0 = Some (src2, m2)).
-            { rewrite nth_error_skipn. rewrite Nat.add_0_r. exact H. }
-            rewrite Hskip in H0. simpl in H0. congruence.
-          + reflexivity. }
-      rewrite Hsplit. rewrite fold_left_app. simpl.
-      rewrite fold_left_add_shift.
-      pose proof (fold_left_add_nonneg_ge
-        (fun sm => resolved_space_count resolve (fst sm) (snd sm) space)
-        (skipn (S idx2) (firstn idx1 input)) 0) as Hge.
-      simpl. lia. }
+      exact (fold_left_add_firstn_step
+               (fun sm => resolved_space_count resolve (fst sm) (snd sm) space)
+               idx2 idx1 input (src2, m2) Hgt Hnth2). }
     unfold resolved_space_count, defined_count in *.
-    destruct space; lia.
+    destruct space; simpl in *; lia.
 Qed.
 
 (* Theorem 3: Resolved remap for defined items is complete.
@@ -705,8 +688,26 @@ Qed.
    table, sidestepping the need to construct a resolved-specific table.
    This works because gen_all_remaps overapproximates the resolved model
    (it maps ALL indices, including resolved imports). *)
+(* `strategy` is bound here but appears in no hypothesis and no conclusion —
+   a vacuous quantifier — so Rocq could not infer its type and this statement
+   has never elaborated: "Cannot infer the type of strategy". Only the proof
+   body forces it, via gen_all_remaps : merge_input -> memory_strategy ->
+   remap_table, and that is elaborated too late to help.
+
+   Annotated explicitly rather than left to an `Implicit Types strategy :
+   memory_strategy` declaration above the theorem. The logical content is
+   identical either way — the type was already forced, so writing it down
+   is not a change of claim — but a binder's type belongs where a reader of
+   the statement can see it, and `Implicit Types` would also silently capture
+   every later binder named `strategy` in this file, which is a wider effect
+   than the problem.
+
+   Left alone deliberately: the vacuous quantification itself. Dropping an
+   unused `forall` WOULD change the statement, and the proof does need some
+   strategy to instantiate gen_all_remaps with. Worth revisiting on its own
+   merits rather than inside a performance fix. *)
 Theorem resolved_enables_rewriting :
-  forall resolve input strategy,
+  forall resolve input (strategy : memory_strategy),
     resolution_wf input resolve ->
     unique_sources input ->
     forall src m f,
