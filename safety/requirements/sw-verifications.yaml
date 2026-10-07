@@ -1503,3 +1503,15 @@ artifacts:
       created-by: ai-assisted
       model: claude-opus-5
       timestamp: 2026-10-07T10:13:51Z
+  - id: SWV-104
+    type: sw-verification
+    title: "Verification of SR-92: the added lint failed on the tree it was added to"
+    status: implemented
+    description: "Verifies SR-92 by measurement rather than by reading the diff. The lint half: `cargo clippy --workspace --all-targets --all-features -- -D warnings` exited 101 before this change, reporting `methods profile_label and attestation_parameters are never used` — both reachable only from a build_attestation gated to the default build, hence dead with the feature on. Gating the two helpers the same way as their only caller returns that command to exit 0. So the lint step added to CI is one that FAILED on the tree it was added to, which is the evidence that it checks something; a lint step introduced already-green proves only that it compiled. The documentation half is a text correction and carries no oracle beyond review, which is stated rather than dressed up. Also recorded: why the determinism test stays compiled out of the configuration where determinism is doubted, since that reads like evasion. A HashMaps iteration order is seeded ONCE PER PROCESS in Rust, so two fusions inside one test observe the same order and compare equal; the divergence appears only between separate processes. An inverted test asserting the optional path is not byte-stable would pass or fail on which process it ran in, which is worse than no test. That reasoning is now a comment at the test. Local gate on this change: cargo fmt --all -- --check exit 0; clippy --workspace --all-targets -D warnings exit 0; clippy --workspace --all-targets --all-features -D warnings exit 0; cargo test --workspace exit 0 with 914 passed and 0 failed; cargo test --workspace --all-features exit 0 with 913 passed and 0 failed. Not established: that the optional path is reproducible. It is not, and the change says so where users read the promise instead of fixing it."
+    links:
+      - type: verifies
+        target: SR-92
+    provenance:
+      created-by: ai-assisted
+      model: claude-opus-5
+      timestamp: 2026-10-07T10:49:18Z

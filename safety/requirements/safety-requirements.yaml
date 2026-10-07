@@ -3521,3 +3521,16 @@ artifacts:
       model: claude-opus-5
       timestamp: 2026-10-07T10:13:29Z
     release: v0.61.0
+
+  - id: SR-92
+    type: sw-req
+    title: The reproducibility promise is stated where it holds, and the optional feature is linted
+    status: implemented
+    description: "meld-cli/docs/concept-attestation.md stated that `fuse --reproducible` makes the artifact byte-for-byte deterministic, with no caveat. That document is embedded in the shipped binary and served by `meld docs`, so it is the text a user reads before deciding to compare a rebuild against a published digest. The claim is false for one configuration the project itself builds: under the optional `attestation` cargo feature the fusion parameters are recorded through wsc-attestation, whose parameter map is a HashMap, and Rust seeds a HashMaps iteration order once per process, so two builds of the same inputs serialize the parameters in different orders and the digests differ. The default path records them in a typed struct whose field order is fixed by declaration, which is what makes it deterministic by construction. The repository already documented the cause in meld-core/src/attestation.rs, so the gap was between what the code knew and what the user-facing document said. The failure mode is why it matters: a digest mismatch is indistinguishable from tampering, and the correct response to one is alarm, so a false promise here manufactures a security scare out of a serialization order. The local verification convention in this project is --workspace AND --all-features, so it is a configuration people actually build. meld shall state, where users read the reproducibility promise, that it holds for the default build and not under the optional attestation feature, and shall say why and what that means for comparing digests. meld shall additionally lint the optional feature in CI. That path was linted by nothing: the clippy job ran without it, releases build without it, and the only job compiling it at all was coverage, which does not lint. Enabling it failed immediately on dead code behind the feature gate, which is exactly what a lint is for and what nobody was positioned to see. Deliberately NOT claimed: that the optional path is made reproducible. Fixing the ordering upstream and deleting the configuration split is the real close-out; until then the promise is caveated where it is read and the path is linted so it does not rot unobserved."
+    links:
+      - type: derives-from
+        target: SYS-10
+    provenance:
+      created-by: ai-assisted
+      model: claude-opus-5
+      timestamp: 2026-10-07T10:49:18Z
