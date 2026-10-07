@@ -161,7 +161,13 @@ Proof.
   destruct Hwf as [Hpos [Hbounds [[_ Hlist_wf] Hdisjoint]]].
   simpl.
   split; [exact Hpos |].
-  split; [intros offset inner_cl Hin; apply Hbounds; right; exact Hin |].
+  (* `apply Hbounds` cannot infer inner_cl: Hbounds' conclusion
+     (offset + 8 <= s) does not mention it. Name it explicitly, as lines
+     750/753 of this file already do. Pre-existing — reproduced standalone
+     with a hand-written hypothesis of the same shape and no reference to
+     copy_layout_wf, so it is independent of the nested-fix repair (#447). *)
+  split; [intros offset inner_cl Hin;
+          apply Hbounds with (inner_cl := inner_cl); right; exact Hin |].
   split; [exact Hlist_wf |].
   intros i j ip1 ip2 Hi Hj Hneq.
   apply (Hdisjoint (S i) (S j) ip1 ip2).

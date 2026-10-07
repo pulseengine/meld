@@ -53,4 +53,10 @@ verification-results.json
 # Coq/Rocq auxiliary files
 *.aux
 *.glob
+# Rocq/Coq build artifacts. `*.glob` was already here; these three were not,
+# so a local `coqc` run left them as untracked noise (#447 — nobody had ever
+# compiled the proofs locally, so nobody had hit it).
+*.vo
+*.vok
+*.vos
 .lia.cache
