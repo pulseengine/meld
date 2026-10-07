@@ -1,0 +1,55 @@
+# Companion to proofs.yml's `paths:` filter, so that `Rocq proofs` can be made
+# a REQUIRED status check on main.
+#
+# proofs.yml only triggers on proofs/** and the bazel/toolchain files. A
+# required context that never reports leaves the PR unmergeable forever — this
+# repository already learned that with Test/Clippy/Format and ci.yml's
+# paths-ignore (observed on the roadmap PR #221, 2026-06-10), and
+# ci-docs-stub.yml is the fix it settled on. This is the same device for the
+# proof gate.
+#
+# Why bother making it required at all: #447's premise is that a proof nothing
+# runs is a document rather than evidence. A gate that runs but cannot BLOCK is
+# the next station on that line — it is advisory, and a red proofs run on main
+# would simply sit there. Now affordable: the gate's job takes 1m13s, of which
+# bazel test is 41s.
+#
+# Keep the `paths-ignore` list byte-aligned with proofs.yml's `paths`.
+#
+# A PR touching BOTH sets triggers both workflows, because `paths-ignore` skips
+# a run only when EVERY changed file matches. The real run then carries the
+# verdict that matters and the stub's success is redundant rather than masking:
+# branch protection requires every reported run of a context to pass. That is
+# the same reasoning ci-docs-stub.yml records, and it is the property that
+# makes this safe.
+#
+# Deliberately a different workflow name and concurrency group from proofs.yml
+# — sharing a group with cancel-in-progress would let the stub cancel a real
+# proof run on a mixed PR.
+
+name: Rocq proofs (not-applicable stub)
+
+concurrency:
+  group: proofs-stub-${{ github.ref }}
+  cancel-in-progress: true
+
+on:
+  pull_request:
+    branches: [main]
+    paths-ignore:
+      - 'proofs/**'
+      - '.github/workflows/proofs.yml'
+      - 'MODULE.bazel'
+      - 'MODULE.bazel.lock'
+      - '.bazelrc'
+      - '.bazelversion'
+
+permissions:
+  contents: read
+
+jobs:
+  proofs-stub:
+    name: Rocq proofs
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "no proofs/ or bazel/toolchain files touched — the Rocq proof gate is not applicable to this change (see proofs.yml paths)"
