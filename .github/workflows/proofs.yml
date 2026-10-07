@@ -132,9 +132,9 @@ jobs:
           printf '  verify_all members  %s\n' "$members"
 
           fail=0
-          # Floors: the measured values, raised as the suite grows. 350 -> 357 with
-      # the two helper lemmas #450 added. Lowering one is a decision someone has
-      # to write into a diff.
+          # Floors: the measured values, raised as the suite grows. 350 -> 357
+          # with the two helper lemmas #450 added. Lowering one is a decision
+          # someone has to write into a diff.
           [ "$files"    -ge 28  ] || { echo "::error::proof files fell to $files (floor 28)"; fail=1; }
           [ "$qed"      -ge 357 ] || { echo "::error::Qed count fell to $qed (floor 357) — proofs were removed or weakened"; fail=1; }
           [ "$targets"  -ge 16  ] || { echo "::error::rocq_proof_test targets fell to $targets (floor 16)"; fail=1; }

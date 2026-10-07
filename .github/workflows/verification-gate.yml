@@ -69,6 +69,20 @@ jobs:
       - name: Release matrix and assets gate agree
         run: python3 tools/check_release_targets.py
 
+      # The proof gate's own checks live inside `run: |` block scalars, and a
+      # block ends at the first line indented LESS than its content — even a
+      # COMMENT. One under-indented line therefore drops every check below it.
+      # That happened while building the gate (#447): a comment ended the
+      # census step just above its four floor assertions. There the leftover
+      # shell did not parse as YAML, so GitHub rejected the file and it was
+      # loud; de-indent where the remainder still parses and the step runs a
+      # shorter script and passes, with a floor or the Admitted check simply
+      # gone. A vacuous gate made by whitespace. Asserted here, against the
+      # extracted block text rather than the raw file, because the indentation
+      # rule is what produces the truncation and grep cannot see it.
+      - name: Proof gate's own checks are intact
+        run: python3 scripts/check_workflow_gates.py
+
       # docs/verification-matrix.md is generated from traceability.yaml. It had
       # drifted from its own source (statuses and test lists), so the published
       # matrix disagreed with the record it renders.
