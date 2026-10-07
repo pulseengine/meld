@@ -3511,6 +3511,10 @@ artifacts:
     links:
       - type: derives-from
         target: SYS-11
+      - type: refines
+        target: SR-66
+      - type: refines
+        target: SR-67
     provenance:
       created-by: ai-assisted
       model: claude-opus-5
