@@ -108,6 +108,40 @@ jobs:
           git clone --depth 1 --branch v${{ env.WIT_BINDGEN_VERSION }} \
             https://github.com/bytecodealliance/wit-bindgen /tmp/wit-bindgen
 
+      # Upstream's own test sources use the deprecated `max_value()`/`min_value()`
+      # associated functions, and its harness denies warnings, so a current rustc
+      # turns them into errors: 115 of 116 tests built and
+      # tests/runtime/numbers/runner.rs aborted with 32 of them.
+      #
+      # `RUSTFLAGS: --cap-lints=warn` does NOT help, which was measured, not
+      # assumed: `wit-bindgen test` invokes rustc directly, and RUSTFLAGS is a
+      # CARGO variable that never reaches it.
+      #
+      # Patching the pinned upstream checkout is deterministic — it is a fixed
+      # tag, not a moving branch — and it is a lint fix that changes no
+      # behaviour: `i64::max_value()` and `i64::MAX` are the same value. We
+      # generate FIXTURES here; vetting upstream's lint hygiene is not this
+      # job's purpose, and pinning rustc instead would only relocate the next
+      # breakage to the next lint.
+      #
+      # It FAILS if it matched nothing, so that when upstream fixes this the
+      # workaround is removed rather than quietly becoming a no-op that nobody
+      # notices — the shape #405 and #447 were both about.
+      - name: Patch upstream's deprecated int-limit calls
+        working-directory: /tmp/wit-bindgen
+        run: |
+          set -euo pipefail
+          before=$(grep -rlE '(max|min)_value\(\)' tests/ | wc -l | tr -d ' ')
+          if [ "$before" -eq 0 ]; then
+            echo "::error::no max_value()/min_value() found in wit-bindgen ${WIT_BINDGEN_VERSION} tests/ — upstream has fixed this, so remove this step rather than leaving a patch that silently does nothing"
+            exit 1
+          fi
+          grep -rlE '(max|min)_value\(\)' tests/ \
+            | xargs sed -i -E 's/\b(max)_value\(\)/MAX/g; s/\b(min)_value\(\)/MIN/g'
+          after=$(grep -rlE '(max|min)_value\(\)' tests/ | wc -l | tr -d ' ')
+          printf 'patched %s file(s); %s remaining\n' "$before" "$after"
+          [ "$after" -eq 0 ]
+
       # `--cap-lints=warn` because this compiles UPSTREAM wit-bindgen's own test
       # sources, which deny warnings. 115 of 116 built; the last aborted on
       # `tests/runtime/numbers/runner.rs` using the deprecated
