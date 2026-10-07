@@ -13,6 +13,7 @@ on:
 env:
   CARGO_TERM_COLOR: always
   WIT_BINDGEN_VERSION: "0.54.0"
+  WASMTIME_VERSION: "49.0.2"
 
 jobs:
   update-fixtures:
@@ -29,8 +30,64 @@ jobs:
         with:
           targets: wasm32-wasip2
 
+      # `bytecodealliance/actions/wasmtime/setup@v1` resolves $HOME to
+      # /home/runner11 — the runner's NAME, not a directory that exists — and
+      # failed with `ENOENT: no such file or directory, mkdir '/home/runner11'`
+      # on every scheduled run since at least 2026-08-24 (#429). Five weeks,
+      # never once succeeded. Other workflows on the same rust-cpu label pass,
+      # so it is the action's assumption about $HOME, not a broken box.
+      #
+      # HOME is overridden for this step alone, which is the smallest fix that
+      # does not change what the job installs.
+      #
+      # It is NOT dead weight, though it looked like it: nothing in this file
+      # invokes `wasmtime`, and the e2e rules that executed fused modules under
+      # it went away with the Bazel build (#406/#407). I removed the step on
+      # that reading and dispatched the job to check. It got further and then
+      # failed:
+      #
+      #     Error: runner `wasmtime` failed to spawn
+      #     Caused by: No such file or directory (os error 2)
+      #
+      # `wit-bindgen test` spawns the wasmtime CLI to RUN the generated tests.
+      # The dependency is real and invisible in this file — hence this comment,
+      # so the next person reading it does not reach the same wrong conclusion.
+      # Installed directly rather than via bytecodealliance/actions/wasmtime/setup@v1,
+      # which cannot work on this runner topology. Measured across three
+      # dispatches (#429): the action downloads and extracts fine and then dies
+      # on `ENOENT: no such file or directory, mkdir '/home/runner12'`. That
+      # path is not in the environment — a diagnostic step on the same runner
+      # printed HOME, RUNNER_TOOL_CACHE, RUNNER_TEMP and the passwd home all as
+      # /var/lib/runners/runner12, which exists. Overriding HOME and
+      # RUNNER_TOOL_CACHE on the step changed nothing: both appeared in the
+      # step env and it still tried /home/<username>. The action composes that
+      # path itself, so there is no variable to set.
+      #
+      # It had failed every scheduled run since at least 2026-08-24 — five
+      # weeks, never once green.
+      #
+      # `wit-bindgen test` DOES need this binary; it spawns `wasmtime` to run
+      # the generated tests, which no step in this file makes visible. An
+      # earlier attempt removed the install on that reading and got
+      # `Error: runner `wasmtime` failed to spawn`.
+      #
+      # Pinned rather than `latest`, which the action defaulted to: a corpus
+      # regenerated weekly should not also drift its runtime silently.
       - name: Install wasmtime
-        uses: bytecodealliance/actions/wasmtime/setup@v1
+        run: |
+          set -euo pipefail
+          dest="$RUNNER_TEMP/wasmtime"
+          mkdir -p "$dest"
+          curl -fsSL \
+            "https://github.com/bytecodealliance/wasmtime/releases/download/v${WASMTIME_VERSION}/wasmtime-v${WASMTIME_VERSION}-x86_64-linux.tar.xz" \
+            | tar -xJ -C "$dest" --strip-components=1
+          # Demand the binary rather than trusting the extract: `tool | grep -q`
+          # in an `if` passes when the TOOL fails, not only when it is absent,
+          # and that shape once reported "statically linked" for a file that did
+          # not exist (#432).
+          test -x "$dest/wasmtime" || { echo "::error::wasmtime not extracted to $dest"; exit 1; }
+          "$dest/wasmtime" --version
+          echo "$dest" >> "$GITHUB_PATH"
 
       - name: Install wit-bindgen CLI
         run: cargo install wit-bindgen-cli@${{ env.WIT_BINDGEN_VERSION }}
@@ -51,8 +108,25 @@ jobs:
           git clone --depth 1 --branch v${{ env.WIT_BINDGEN_VERSION }} \
             https://github.com/bytecodealliance/wit-bindgen /tmp/wit-bindgen
 
+      # `--cap-lints=warn` because this compiles UPSTREAM wit-bindgen's own test
+      # sources, which deny warnings. 115 of 116 built; the last aborted on
+      # `tests/runtime/numbers/runner.rs` using the deprecated
+      # `i64::max_value()`, which a current rustc reports and that crate's
+      # deny(warnings) turns into 32 errors.
+      #
+      # Capping rather than pinning rustc: the failure is not specific to this
+      # lint. A weekly job that compiles third-party source under deny(warnings)
+      # against `stable` breaks whenever rustc adds or sharpens ANY lint, so a
+      # pin would only move the next breakage to the next bump. We are
+      # generating FIXTURES here, not vetting upstream's lint hygiene.
+      #
+      # Note `--cap-lints` is normally a dependency-only tool; it is applied
+      # deliberately to the whole invocation, which is what downgrades the
+      # crate-level `deny` that a bare `-A deprecated` would lose to.
       - name: Generate test artifacts
         working-directory: /tmp/wit-bindgen
+        env:
+          RUSTFLAGS: --cap-lints=warn
         run: wit-bindgen test --languages rust --artifacts artifacts tests/runtime
 
       - name: Copy fixtures
