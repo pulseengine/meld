@@ -13,6 +13,7 @@ on:
 env:
   CARGO_TERM_COLOR: always
   WIT_BINDGEN_VERSION: "0.54.0"
+  WASMTIME_VERSION: "49.0.2"
 
 jobs:
   update-fixtures:
@@ -29,8 +30,64 @@ jobs:
         with:
           targets: wasm32-wasip2
 
+      # `bytecodealliance/actions/wasmtime/setup@v1` resolves $HOME to
+      # /home/runner11 — the runner's NAME, not a directory that exists — and
+      # failed with `ENOENT: no such file or directory, mkdir '/home/runner11'`
+      # on every scheduled run since at least 2026-08-24 (#429). Five weeks,
+      # never once succeeded. Other workflows on the same rust-cpu label pass,
+      # so it is the action's assumption about $HOME, not a broken box.
+      #
+      # HOME is overridden for this step alone, which is the smallest fix that
+      # does not change what the job installs.
+      #
+      # It is NOT dead weight, though it looked like it: nothing in this file
+      # invokes `wasmtime`, and the e2e rules that executed fused modules under
+      # it went away with the Bazel build (#406/#407). I removed the step on
+      # that reading and dispatched the job to check. It got further and then
+      # failed:
+      #
+      #     Error: runner `wasmtime` failed to spawn
+      #     Caused by: No such file or directory (os error 2)
+      #
+      # `wit-bindgen test` spawns the wasmtime CLI to RUN the generated tests.
+      # The dependency is real and invisible in this file — hence this comment,
+      # so the next person reading it does not reach the same wrong conclusion.
+      # Installed directly rather than via bytecodealliance/actions/wasmtime/setup@v1,
+      # which cannot work on this runner topology. Measured across three
+      # dispatches (#429): the action downloads and extracts fine and then dies
+      # on `ENOENT: no such file or directory, mkdir '/home/runner12'`. That
+      # path is not in the environment — a diagnostic step on the same runner
+      # printed HOME, RUNNER_TOOL_CACHE, RUNNER_TEMP and the passwd home all as
+      # /var/lib/runners/runner12, which exists. Overriding HOME and
+      # RUNNER_TOOL_CACHE on the step changed nothing: both appeared in the
+      # step env and it still tried /home/<username>. The action composes that
+      # path itself, so there is no variable to set.
+      #
+      # It had failed every scheduled run since at least 2026-08-24 — five
+      # weeks, never once green.
+      #
+      # `wit-bindgen test` DOES need this binary; it spawns `wasmtime` to run
+      # the generated tests, which no step in this file makes visible. An
+      # earlier attempt removed the install on that reading and got
+      # `Error: runner `wasmtime` failed to spawn`.
+      #
+      # Pinned rather than `latest`, which the action defaulted to: a corpus
+      # regenerated weekly should not also drift its runtime silently.
       - name: Install wasmtime
-        uses: bytecodealliance/actions/wasmtime/setup@v1
+        run: |
+          set -euo pipefail
+          dest="$RUNNER_TEMP/wasmtime"
+          mkdir -p "$dest"
+          curl -fsSL \
+            "https://github.com/bytecodealliance/wasmtime/releases/download/v${WASMTIME_VERSION}/wasmtime-v${WASMTIME_VERSION}-x86_64-linux.tar.xz" \
+            | tar -xJ -C "$dest" --strip-components=1
+          # Demand the binary rather than trusting the extract: `tool | grep -q`
+          # in an `if` passes when the TOOL fails, not only when it is absent,
+          # and that shape once reported "statically linked" for a file that did
+          # not exist (#432).
+          test -x "$dest/wasmtime" || { echo "::error::wasmtime not extracted to $dest"; exit 1; }
+          "$dest/wasmtime" --version
+          echo "$dest" >> "$GITHUB_PATH"
 
       - name: Install wit-bindgen CLI
         run: cargo install wit-bindgen-cli@${{ env.WIT_BINDGEN_VERSION }}
@@ -46,19 +103,85 @@ jobs:
           key: ${{ runner.os }}-fixtures-${{ env.WIT_BINDGEN_VERSION }}
           restore-keys: ${{ runner.os }}-fixtures-
 
+      # $RUNNER_TEMP, not /tmp. This job runs on a SELF-HOSTED runner, where
+      # /tmp persists between runs — so the second dispatch failed in the clone
+      # with the destination already existing. On a GitHub-hosted runner /tmp is
+      # fresh each time and this would never have shown up. $RUNNER_TEMP is
+      # per-job and cleaned, which also removes any chance of generating
+      # fixtures from a stale checkout.
+      #
+      # The job had never run far enough to reach this, which is what a gate
+      # dead for five weeks looks like: each fix uncovers the next layer.
       - name: Clone wit-bindgen
         run: |
           git clone --depth 1 --branch v${{ env.WIT_BINDGEN_VERSION }} \
-            https://github.com/bytecodealliance/wit-bindgen /tmp/wit-bindgen
+            https://github.com/bytecodealliance/wit-bindgen "$RUNNER_TEMP/wit-bindgen"
 
+      # Upstream's own test sources use the deprecated `max_value()`/`min_value()`
+      # associated functions, and its harness denies warnings, so a current rustc
+      # turns them into errors: 115 of 116 tests built and
+      # tests/runtime/numbers/runner.rs aborted with 32 of them.
+      #
+      # `RUSTFLAGS: --cap-lints=warn` does NOT help, which was measured, not
+      # assumed: `wit-bindgen test` invokes rustc directly, and RUSTFLAGS is a
+      # CARGO variable that never reaches it.
+      #
+      # Patching the pinned upstream checkout is deterministic — it is a fixed
+      # tag, not a moving branch — and it is a lint fix that changes no
+      # behaviour: `i64::max_value()` and `i64::MAX` are the same value. We
+      # generate FIXTURES here; vetting upstream's lint hygiene is not this
+      # job's purpose, and pinning rustc instead would only relocate the next
+      # breakage to the next lint.
+      #
+      # It FAILS if it matched nothing, so that when upstream fixes this the
+      # workaround is removed rather than quietly becoming a no-op that nobody
+      # notices — the shape #405 and #447 were both about.
+      - name: Patch upstream's deprecated int-limit calls
+        working-directory: ${{ runner.temp }}/wit-bindgen
+        run: |
+          set -euo pipefail
+          # Both counters are guarded. `grep` exits 1 on ZERO matches and
+          # `set -euo pipefail` then aborts at the assignment — so the success
+          # case (nothing left to patch) killed the step before it could print
+          # anything, which is why attempt seven failed with a bare exit 1 and
+          # no output. Same trap as the proofs census (#447), written a second
+          # time here by the same hand.
+          before=$( { grep -rlE '(max|min)_value\(\)' tests/ || true; } | wc -l | tr -d ' ')
+          if [ "$before" -eq 0 ]; then
+            echo "::error::no max_value()/min_value() found in wit-bindgen ${WIT_BINDGEN_VERSION} tests/ — upstream has fixed this, so remove this step rather than leaving a patch that silently does nothing"
+            exit 1
+          fi
+          grep -rlE '(max|min)_value\(\)' tests/ \
+            | xargs -r sed -i -E 's/\b(max)_value\(\)/MAX/g; s/\b(min)_value\(\)/MIN/g'
+          after=$( { grep -rlE '(max|min)_value\(\)' tests/ || true; } | wc -l | tr -d ' ')
+          printf 'patched %s file(s); %s remaining\n' "$before" "$after"
+          [ "$after" -eq 0 ]
+
+      # `--cap-lints=warn` because this compiles UPSTREAM wit-bindgen's own test
+      # sources, which deny warnings. 115 of 116 built; the last aborted on
+      # `tests/runtime/numbers/runner.rs` using the deprecated
+      # `i64::max_value()`, which a current rustc reports and that crate's
+      # deny(warnings) turns into 32 errors.
+      #
+      # Capping rather than pinning rustc: the failure is not specific to this
+      # lint. A weekly job that compiles third-party source under deny(warnings)
+      # against `stable` breaks whenever rustc adds or sharpens ANY lint, so a
+      # pin would only move the next breakage to the next bump. We are
+      # generating FIXTURES here, not vetting upstream's lint hygiene.
+      #
+      # Note `--cap-lints` is normally a dependency-only tool; it is applied
+      # deliberately to the whole invocation, which is what downgrades the
+      # crate-level `deny` that a bare `-A deprecated` would lose to.
       - name: Generate test artifacts
-        working-directory: /tmp/wit-bindgen
+        working-directory: ${{ runner.temp }}/wit-bindgen
+        env:
+          RUSTFLAGS: --cap-lints=warn
         run: wit-bindgen test --languages rust --artifacts artifacts tests/runtime
 
       - name: Copy fixtures
         run: |
           # Copy all composed artifacts from wit-bindgen
-          for dir in /tmp/wit-bindgen/artifacts/*/; do
+          for dir in "$RUNNER_TEMP"/wit-bindgen/artifacts/*/; do
             test=$(basename "$dir")
             src=$(find "$dir" -name 'composed-*.wasm' -print -quit 2>/dev/null)
             dst="tests/wit_bindgen/fixtures/${test}.wasm"
@@ -88,24 +211,40 @@ jobs:
             echo "changed=true" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Create pull request
+      # Pushes the branch and reports, rather than opening the PR.
+      #
+      # `peter-evans/create-pull-request` got all the way to pushing the branch
+      # and then failed: `GitHub Actions is not permitted to create or approve
+      # pull requests`. That is a repository/organisation setting ("Allow
+      # GitHub Actions to create and approve pull requests"), not something a
+      # workflow can grant itself — the job already declares
+      # `pull-requests: write` — and there is no PAT secret here to fall back
+      # on (only GITHUB_TOKEN and CLAUDE_CODE_OAUTH_TOKEN).
+      #
+      # So the job does its work, pushes the result, and prints the link to
+      # open the PR by hand. Failing on a permission it structurally cannot
+      # have would leave this red forever and teach everyone to ignore it,
+      # which is how it came to be dead for five weeks in the first place.
+      - name: Push the refreshed corpus and report
         if: steps.diff.outputs.changed == 'true'
-        uses: peter-evans/create-pull-request@v6
-        with:
-          commit-message: "fix(tests): update wit-bindgen fixtures to v${{ env.WIT_BINDGEN_VERSION }}"
-          branch: ci/update-wit-bindgen-fixtures
-          title: "Update wit-bindgen test fixtures"
-          body: |
-            Automated update of wit-bindgen test fixtures.
+        env:
+          BRANCH: ci/update-wit-bindgen-fixtures
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # The diff step has already force-added the fixture paths, so the
+          # index holds exactly what should be committed.
+          git checkout -B "$BRANCH"
+          git commit -q -m "fix(tests): update wit-bindgen fixtures to v${WIT_BINDGEN_VERSION}"
+          git push -q --force-with-lease origin "$BRANCH"
+          {
+            printf '### wit-bindgen fixtures refreshed\n\n'
+            printf 'Pushed `%s` against pinned wit-bindgen `v%s`.\n\n' "$BRANCH" "$WIT_BINDGEN_VERSION"
+            printf '**Open the PR:** https://github.com/%s/compare/main...%s?expand=1\n\n' "$GITHUB_REPOSITORY" "$BRANCH"
+            printf 'Not opened automatically: "Allow GitHub Actions to create and approve pull requests" is disabled for this repository, so `GITHUB_TOKEN` cannot do it and no PAT secret exists. Enabling that setting, or adding a PAT, is all that is missing.\n'
+          } >> "$GITHUB_STEP_SUMMARY"
 
-            - wit-bindgen version: `v${{ env.WIT_BINDGEN_VERSION }}`
-            - Generated via `wit-bindgen test --languages rust --artifacts`
-
-            All composed fixtures from `wit-bindgen test --languages rust` are copied automatically.
-          # Both globs, for the same reason as the force-add above.
-          add-paths: |
-            tests/wit_bindgen/fixtures/*.wasm
-            tests/wit_bindgen/fixtures/**/*.wasm
-            :(exclude)tests/wit_bindgen/fixtures/**/target/**
-          labels: ci
-          delete-branch: true
+      - name: Say so when nothing drifted
+        if: steps.diff.outputs.changed != 'true'
+        run: echo "::notice::the fixture corpus already matches wit-bindgen v${WIT_BINDGEN_VERSION} — nothing to push"
