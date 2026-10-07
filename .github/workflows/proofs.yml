@@ -62,33 +62,37 @@ jobs:
   proofs:
     name: Rocq proofs
     runs-on: ubuntu-latest
-    # Re-derived after #450. The original 60 was exceeded and the job was
-    # KILLED mid-build, which reads as "cancelled" rather than as a proof
-    # failure — a gate that dies silently is barely better than one that never
-    # runs. It was then raised to 180 on the belief that a proof was simply
-    # expensive. That belief was wrong in a way worth recording:
+    # Measured, after #450 removed the one file that did not terminate.
     #
-    #   * `merge_resolution.v` had NEVER compiled, in any version. A
-    #     `rewrite !fold_left_add_shift` could not fail, because that lemma's
-    #     RHS contains an instance of its own LHS, so the proof term grew
-    #     without bound: killed at a 900s cap holding 2.5 GB and climbing.
-    #   * Fixed in #450, it compiles in **2 seconds**. 27 of 28 .v files now
-    #     build; the one exception is the excluded generator stub (#449).
+    # The green run 37569422631, step by step:
     #
-    # So no proof in this tree is expensive, and the runtime is now set by
-    # provisioning Nix plus the bazel path, not by a single file. 90 is
-    # deliberately generous and still PROVISIONAL: the first completed run
-    # gives the real number, and this should be tightened to it rather than
-    # left wide. A timeout nobody has measured is how 60 became 180 on a
-    # misdiagnosis.
+    #     job total                              1m13s
+    #       Install Nix                              6s
+    #       Setup Bazel                              2s
+    #       Every .v file must be inside the gate   11s
+    #       Re-check the proofs (bazel test)        41s
     #
-    # Also corrected here: an earlier version of this comment blamed the
+    # Earlier runs agree: the bazel step has taken 37-41s whenever it ran at
+    # all. The 16 minutes of WALL CLOCK on that run was queueing for a hosted
+    # runner, which `timeout-minutes` does not count.
+    #
+    # Not measured: a fully cold cache. Every run so far reused the
+    # bazelisk/disk/repository caches, and the two 60-minute casualties were
+    # dominated by the non-terminating proof rather than by provisioning, so
+    # they say nothing about a cold toolchain build. 30 is therefore ~25x the
+    # observed job as headroom for the case nobody has seen, not a measurement
+    # of it. Tighten again once a cold run has been observed.
+    #
+    # History worth keeping, because it is how this number went wrong twice:
+    # 60 was exceeded and the job was KILLED, which reads as "cancelled" rather
+    # than as a proof failure; it was then raised to 180 on the belief that a
+    # proof was simply expensive. merge_resolution.v had in fact never compiled
+    # in any version — a `rewrite !` whose lemma re-matches its own output — and
+    # now takes 2s. An earlier version of this comment also blamed the
     # rules_rocq_rust/bazel path for a three-orders-of-magnitude slowdown and
-    # attributed 3522s to `//proofs/spec:fusion_spec`. Both were wrong. Bazel's
-    # progress line names a target's FIRST src, not the file in hand — the same
-    # log reports "wasm_core.v failed" for an error at `fusion_spec.v:2644` —
-    # and the slow thing turned out to be a looping tactic, not the tooling.
-    timeout-minutes: 90
+    # attributed 3522s to //proofs/spec:fusion_spec. Both were wrong: bazel's
+    # progress line names a target's FIRST src, not the file in hand.
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 
