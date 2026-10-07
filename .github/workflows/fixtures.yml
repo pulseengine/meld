@@ -103,10 +103,19 @@ jobs:
           key: ${{ runner.os }}-fixtures-${{ env.WIT_BINDGEN_VERSION }}
           restore-keys: ${{ runner.os }}-fixtures-
 
+      # $RUNNER_TEMP, not /tmp. This job runs on a SELF-HOSTED runner, where
+      # /tmp persists between runs — so the second dispatch failed in the clone
+      # with the destination already existing. On a GitHub-hosted runner /tmp is
+      # fresh each time and this would never have shown up. $RUNNER_TEMP is
+      # per-job and cleaned, which also removes any chance of generating
+      # fixtures from a stale checkout.
+      #
+      # The job had never run far enough to reach this, which is what a gate
+      # dead for five weeks looks like: each fix uncovers the next layer.
       - name: Clone wit-bindgen
         run: |
           git clone --depth 1 --branch v${{ env.WIT_BINDGEN_VERSION }} \
-            https://github.com/bytecodealliance/wit-bindgen /tmp/wit-bindgen
+            https://github.com/bytecodealliance/wit-bindgen "$RUNNER_TEMP/wit-bindgen"
 
       # Upstream's own test sources use the deprecated `max_value()`/`min_value()`
       # associated functions, and its harness denies warnings, so a current rustc
@@ -128,7 +137,7 @@ jobs:
       # workaround is removed rather than quietly becoming a no-op that nobody
       # notices — the shape #405 and #447 were both about.
       - name: Patch upstream's deprecated int-limit calls
-        working-directory: /tmp/wit-bindgen
+        working-directory: ${{ runner.temp }}/wit-bindgen
         run: |
           set -euo pipefail
           before=$(grep -rlE '(max|min)_value\(\)' tests/ | wc -l | tr -d ' ')
@@ -158,7 +167,7 @@ jobs:
       # deliberately to the whole invocation, which is what downgrades the
       # crate-level `deny` that a bare `-A deprecated` would lose to.
       - name: Generate test artifacts
-        working-directory: /tmp/wit-bindgen
+        working-directory: ${{ runner.temp }}/wit-bindgen
         env:
           RUSTFLAGS: --cap-lints=warn
         run: wit-bindgen test --languages rust --artifacts artifacts tests/runtime
@@ -166,7 +175,7 @@ jobs:
       - name: Copy fixtures
         run: |
           # Copy all composed artifacts from wit-bindgen
-          for dir in /tmp/wit-bindgen/artifacts/*/; do
+          for dir in "$RUNNER_TEMP"/wit-bindgen/artifacts/*/; do
             test=$(basename "$dir")
             src=$(find "$dir" -name 'composed-*.wasm' -print -quit 2>/dev/null)
             dst="tests/wit_bindgen/fixtures/${test}.wasm"
