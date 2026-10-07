@@ -2255,6 +2255,31 @@ Proof.
   - (* Eval_Pure *) split_all; assumption.
 Qed.
 
+(* For Call, locals are preserved as well. Eval_Pure is the only
+   eval_instr constructor that leaves ms_locals unconstrained, and it
+   requires is_pure_instr i = true — but is_pure_instr (Call _) = false,
+   so that branch is contradictory. is_pure_instr is Global Opaque in
+   wasm_semantics.v, so it is made transparent locally for the
+   discriminate, mirroring instr_rewrites_preserves_purity above. *)
+Transparent is_pure_instr.
+
+Lemma eval_call_preserves_locals :
+  forall ms funcidx ms',
+    eval_instr ms (Call funcidx) ms' ->
+    ms_locals ms' = ms_locals ms.
+Proof.
+  intros ms funcidx ms' Heval.
+  inversion Heval; subst.
+  - (* Eval_Call *) apply set_stack_locals.
+  - (* Eval_Pure: is_pure_instr (Call funcidx) = true is impossible *)
+    match goal with
+    | [ Hpure : is_pure_instr (Call _) = true |- _ ] =>
+        simpl in Hpure; discriminate Hpure
+    end.
+Qed.
+
+Opaque is_pure_instr.
+
 (* -------------------------------------------------------------------------
    Forward Simulation
 
@@ -2636,13 +2661,16 @@ Proof.
         simpl. intros ms0 Hlookup0.
         rewrite Htgt_final in Hlookup0.
         injection Hlookup0 as Hms0. subst ms0.
-        (* ms_locals ms_tgt' = ms_locals ms_tgt (set_stack preserves)
-           ms_locals (set_stack fes ...) = ms_locals fes (set_stack preserves)
+        (* ms_locals (set_stack fes ...) = ms_locals fes (set_stack preserves)
+           ms_locals ms_tgt' = ms_locals ms_tgt (eval_call_preserves_locals:
+             ms_tgt' is abstract — Heval_tgt is an eval_instr derivation,
+             not a syntactic set_stack — so set_stack_locals alone cannot
+             see through it)
            ms_locals ms_tgt = ms_locals ms_src (Hlocals_eq)
            ms_locals ms_src = ms_locals fes (old sc_locals_eq) *)
         rewrite set_stack_locals.
+        rewrite (eval_call_preserves_locals _ _ _ Heval_tgt).
         rewrite Hlocals_eq.
-        rewrite set_stack_locals.
         exact (sc_locals_eq _ _ _ _ Hcorr ms_src Hlookup_src).
       * (* sc_funcs_eq: 3-way case split on src *)
         simpl. intros src ms0 src_idx func_addr' Hlookup0 Hnth.
@@ -2778,14 +2806,16 @@ Proof.
         rewrite set_stack_mems in Hfused_mem.
         destruct (sc_memory_surj _ _ _ _ Hcorr _ _ Hfused_mem)
           as [src [ms_old [src_idx [mem_old [Hlookup_old [Hnth_old [Hr Hmc]]]]]]].
-        exists src, ms_old, src_idx, mem_old.
         (* The composed state updated source and target, but memories
-           are preserved by set_stack and Eval_Call. We need to show
-           lookup src in the new state gives a module with the same mems. *)
+           are preserved by set_stack and Eval_Call. The witness module
+           state must be the one the NEW state maps src to — ms_tgt' for
+           target, set_stack ms_src _ for the old active, ms_old otherwise —
+           so it is chosen per branch, after the case split. *)
         destruct (module_source_eqb src target) eqn:Htgt_eq.
         -- apply module_source_eqb_eq in Htgt_eq. subst src.
            rewrite Hlookup_tgt in Hlookup_old.
            injection Hlookup_old as Hms_eq. subst ms_old.
+           exists target, ms_tgt', src_idx, mem_old.
            split; [exact Htgt_final|]. split.
            ++ rewrite Htgt_mems. exact Hnth_old.
            ++ split; [exact Hr|exact Hmc].
@@ -2804,6 +2834,7 @@ Proof.
                   (ces_active ces) = Some (set_stack ms_src new_src_stack)).
               { rewrite (lookup_update_other _ _ target _ _ _ Hneq_eqb).
                 apply (lookup_update_same _ _ ms_src _ _ _ Hlookup_src). }
+              exists (ces_active ces), (set_stack ms_src new_src_stack), src_idx, mem_old.
               split; [exact Hsrc_final|]. split.
               ** rewrite set_stack_mems. exact Hnth_old.
               ** split; [exact Hr|exact Hmc].
@@ -2819,6 +2850,7 @@ Proof.
               { rewrite (lookup_update_other _ _ target _ _ _ Htgt_eq).
                 rewrite (lookup_update_other _ _ _ _ _ _ Hact_eq).
                 exact Hlookup_old. }
+              exists src, ms_old, src_idx, mem_old.
               split; [exact Hother_final|]. split; [exact Hnth_old|].
               split; [exact Hr|exact Hmc].
       * (* sc_table_surj: same structure as sc_memory_surj *)
@@ -2826,11 +2858,11 @@ Proof.
         rewrite set_stack_tables in Hfused_tab.
         destruct (sc_table_surj _ _ _ _ Hcorr _ _ Hfused_tab)
           as [src [ms_old [src_idx [tab_old [Hlookup_old [Hnth_old [Hr Htc]]]]]]].
-        exists src, ms_old, src_idx, tab_old.
         destruct (module_source_eqb src target) eqn:Htgt_eq.
         -- apply module_source_eqb_eq in Htgt_eq. subst src.
            rewrite Hlookup_tgt in Hlookup_old.
            injection Hlookup_old as Hms_eq. subst ms_old.
+           exists target, ms_tgt', src_idx, tab_old.
            split; [exact Htgt_final|]. split.
            ++ rewrite Htgt_tables. exact Hnth_old.
            ++ split; [exact Hr|exact Htc].
@@ -2849,6 +2881,7 @@ Proof.
                   (ces_active ces) = Some (set_stack ms_src new_src_stack)).
               { rewrite (lookup_update_other _ _ target _ _ _ Hneq_eqb).
                 apply (lookup_update_same _ _ ms_src _ _ _ Hlookup_src). }
+              exists (ces_active ces), (set_stack ms_src new_src_stack), src_idx, tab_old.
               split; [exact Hsrc_final|]. split.
               ** rewrite set_stack_tables. exact Hnth_old.
               ** split; [exact Hr|exact Htc].
@@ -2864,6 +2897,7 @@ Proof.
               { rewrite (lookup_update_other _ _ target _ _ _ Htgt_eq).
                 rewrite (lookup_update_other _ _ _ _ _ _ Hact_eq).
                 exact Hlookup_old. }
+              exists src, ms_old, src_idx, tab_old.
               split; [exact Hother_final|]. split; [exact Hnth_old|].
               split; [exact Hr|exact Htc].
   Unshelve. all: exact 0.

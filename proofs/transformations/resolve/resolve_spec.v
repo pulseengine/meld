@@ -1588,8 +1588,13 @@ Theorem fully_ordered_has_module_orders :
     ) (cc_components cc).
 Proof.
   intros cc inter_graph intra_graphs [_ [Hwell_ordered _]].
+  (* all_components_well_ordered is a folded Forall; rewrite in H needs it
+     open. The goal's Forall body starts with `let mdg := ...`, which intros
+     binds as a local definition — name it, or Hvalid would be that
+     definition instead of the module_edges_valid premise. *)
+  unfold all_components_well_ordered in Hwell_ordered.
   rewrite Forall_forall in Hwell_ordered |- *.
-  intros c Hin Hvalid.
+  intros c Hin mdg Hvalid.
   specialize (Hwell_ordered c Hin).
   destruct Hwell_ordered as [_ Hacyclic].
   apply module_topo_sort_exists; assumption.
