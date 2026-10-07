@@ -59,4 +59,7 @@ verification-results.json
 *.vo
 *.vok
 *.vos
+# `nia`/`lia` leave these next to the proofs.
+.nia.cache
+.lia.cache
 .lia.cache

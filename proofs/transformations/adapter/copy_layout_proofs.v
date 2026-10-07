@@ -666,7 +666,15 @@ Theorem inner_pointer_read_in_bounds :
     elem_base + inner_offset + 8 <= elem_base + elem_size.
 Proof.
   intros elem_size ips inner_offset inner_cl elem_base Hwf Hin.
-  apply elements_wf_inner_bounds in Hin; [lia | exact Hwf].
+  (* `apply elements_wf_inner_bounds in Hin` cannot instantiate s: `apply in`
+     matches premises right-to-left, so Hin fills the In-premise, but s is
+     only determined by the copy_layout_wf premise, which is left as a goal,
+     and `apply in` refuses an evar in the rewritten hypothesis. Pre-existing:
+     reproduced standalone with an opaque predicate in place of copy_layout_wf,
+     so it is independent of the nested-fix repair (#447). Instantiate fully. *)
+  pose proof (elements_wf_inner_bounds elem_size ips inner_offset inner_cl
+                Hwf Hin) as Hbound.
+  lia.
 Qed.
 
 (* -------------------------------------------------------------------------
@@ -752,12 +760,19 @@ Proof.
      Since fst k + 8 <= elem_size and fst l + 8 <= elem_size,
      and elements are elem_size apart, the ranges don't overlap
      when i <> j. *)
+  (* The goal here is `In (fst k, snd k) ips` and Hk_in is `In k ips`.
+     `rewrite surjective_pairing` (forward) cannot run: the lemma's LHS is a
+     bare variable `p`, which `rewrite` refuses as a pattern ("Unable to find
+     an instance for the variables A, B"). The backward direction has the
+     pair-headed pattern `(fst ?p, snd ?p)` and folds the goal to `In k ips`.
+     Pre-existing: reproduced standalone with a hand-written hypothesis and no
+     copy_layout_wf, so independent of the nested-fix repair (#447). *)
   assert (Hk_bound: fst k + 8 <= elem_size).
   { apply Hbounds with (inner_cl := snd k).
-    rewrite surjective_pairing. exact Hk_in. }
+    rewrite <- surjective_pairing. exact Hk_in. }
   assert (Hl_bound: fst l + 8 <= elem_size).
   { apply Hbounds with (inner_cl := snd l).
-    rewrite surjective_pairing. exact Hl_in. }
+    rewrite <- surjective_pairing. exact Hl_in. }
   destruct (Nat.lt_ge_cases i j) as [Hij | Hij].
   - left. nia.
   - right. assert (j < i) by lia. nia.
