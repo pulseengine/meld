@@ -41,6 +41,20 @@ on:
       - '.bazelversion'
   workflow_dispatch:
 
+# This is the longest job in the repository (see timeout-minutes below), and it
+# was the only workflow here with no concurrency group — so every push to a PR
+# started another full-length run while the superseded ones kept going. Three
+# were queued at once on this very branch, which is up to 9 hours of runner time
+# for one PR. Same form as ci.yml/bench.yml/fuzz.yml: supersede on a PR, but let
+# a push to main finish, because that run is the record for main.
+#
+# A run cancelled by SUPERSESSION is not the same thing as one cancelled by the
+# timeout, though GitHub reports both as "cancelled" and `gh pr checks` shows
+# both as "fail". Only the newest run on a branch is the result.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 permissions:
   contents: read
 
