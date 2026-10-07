@@ -754,6 +754,46 @@ fn share_stack_rejects_an_unusable_stack_pointer() {
 }
 
 #[test]
+fn share_stack_with_multiple_domains_is_refused() {
+    // Mythos delta-pass finding on SR-90 (#446). `compute_shared_memory_plan`
+    // runs PER DOMAIN, but the merger takes `domain_plans.first()` as THE plan
+    // (`merger/mod.rs`: `domain_plans.first().cloned().flatten()`), so
+    // `shared_stack_top` — and the stackless count SR-90 adds beside it —
+    // describe domain 0 only, and are then applied while coalescing every
+    // `__stack_pointer` across ALL domains. Those are separate address spaces,
+    // so domain 1's stack pointers would be rewritten to domain 0's region top.
+    //
+    // It validated and was wrong, with no guard anywhere. Same shape as the
+    // `--component` + domains refusal already in lib.rs, and refused the same
+    // way: an opt-in flag must decline a layout it cannot make sound.
+    //
+    // The unsoundness predates SR-90 — `shared_stack_top` was already domain
+    // 0's — but SR-90 is what made the interaction legible.
+    let a = provider("a", 0xA1, 0x1111, true);
+    let b = provider("b", 0xB2, 0x2222, false);
+    let c = provider("c", 0xC3, 0x3333, false);
+    let config = FuserConfig {
+        memory_strategy: MemoryStrategy::SharedMemory,
+        share_stack: true,
+        domains: vec![vec![0], vec![1, 2]],
+        ..Default::default()
+    };
+    let mut fuser = Fuser::new(config);
+    fuser.add_component_named(&a, Some("comp-a")).unwrap();
+    fuser.add_component_named(&b, Some("comp-b")).unwrap();
+    fuser.add_component_named(&c, Some("comp-c")).unwrap();
+    let err = fuser
+        .fuse()
+        .map_err(|e| e.to_string())
+        .expect_err("--share-stack with more than one domain must be refused");
+    assert!(
+        err.contains("multi-domain") && err.contains("domain 0"),
+        "the error must say the shared stack is planned per domain but only the \
+         first domain's plan reaches the coalescer, got: {err}"
+    );
+}
+
+#[test]
 fn share_stack_rejects_an_all_stackless_set() {
     // Every provider stackless: there is no shadow stack to collapse, so the
     // flag cannot do what it was asked. Refuse with that reason rather than

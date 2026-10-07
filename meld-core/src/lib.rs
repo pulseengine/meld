@@ -897,6 +897,26 @@ impl Fuser {
             ));
         }
 
+        // Mythos delta-pass on SR-90 (#446): `--share-stack` cannot yet express a
+        // multi-domain fusion, for the same reason `--component` cannot above.
+        // `compute_shared_memory_plan` runs PER DOMAIN, but the merger takes
+        // `domain_plans.first()` as THE plan, so `shared_stack_top` — and the
+        // stackless count SR-90 adds beside it — describe domain 0 only and are
+        // then applied while coalescing every `__stack_pointer` across ALL
+        // domains. Those are separate address spaces, so domain 1's stack
+        // pointers would be rewritten to domain 0's region top. It validates
+        // and is wrong, which is the shape this repo refuses to ship.
+        //
+        // The unsoundness predates SR-90 — `shared_stack_top` was already taken
+        // from domain 0 — but SR-90 is what made the interaction legible, so it
+        // gets refused here rather than left as a latent combination.
+        if self.config.domains.len() > 1 && self.config.share_stack {
+            return Err(Error::InvalidDomains(
+                "--share-stack cannot yet express a multi-domain fusion: the shared shadow-stack                  region is planned per domain, but only the FIRST domain's plan reaches the                  stack-pointer coalescer, so every domain's `__stack_pointer` would be rewritten                  to domain 0's region top — a different address space. Fuse without --domain, or                  without --share-stack."
+                    .to_string(),
+            ));
+        }
+
         // RFC-46 Q1 (ADR-7 path-H inc 3): normalize multiply-instantiated core
         // modules into distinct module identities *before* resolve/merge, so each
         // instantiation is allocated independent functions/memory/tables/globals
