@@ -256,36 +256,9 @@ Definition total_resolved_space_count (resolve : import_resolved)
     acc + resolved_space_count resolve (fst sm) (snd sm) space
   ) input 0.
 
-(* Accumulating a pointwise-smaller summand from a smaller base yields a
-   smaller fold.  This is the one fact the two "resolved <= flat" lemmas
-   below need; the base is generalised so the induction goes through
-   directly on the list.
-
-   Do NOT prove these with `rewrite !fold_left_add_shift`: that lemma's
-   right-hand side (`base + fold_left _ l 0`) contains an instance of its
-   own left-hand side (`fold_left _ l 0`, base := 0), so the `!` iteration
-   never fails and never terminates — every step adds one `0 +` to the goal
-   and the proof term grows quadratically (#450).  Siblings use the lemma
-   only with explicit arguments for the same reason; see
-   merge_correctness.v (fold_left_add_split). *)
-Lemma fold_left_add_le_pointwise :
-  forall {A : Type} (f g : A -> nat),
-    (forall x, f x <= g x) ->
-    forall (l : list A) (base1 base2 : nat),
-      base1 <= base2 ->
-      fold_left (fun acc x => acc + f x) l base1 <=
-      fold_left (fun acc x => acc + g x) l base2.
-Proof.
-  intros A f g Hfg l.
-  induction l as [|x l' IH]; intros base1 base2 Hb; simpl.
-  - exact Hb.
-  - apply IH. specialize (Hfg x). lia.
-Qed.
-
 (* Resolved offsets are <= flat offsets.
-   Proof strategy: both sides are a fold_left over the same prefix of input
-   with pointwise-ordered summands (resolved_space_count_le), so
-   fold_left_add_le_pointwise applies directly. *)
+   Proof strategy: induction on mod_idx, using resolved_space_count_le
+   at each step to show the per-module contribution is smaller. *)
 Lemma resolved_offset_le_flat :
   forall resolve input space mod_idx,
     resolved_offset resolve input space mod_idx <=
@@ -293,11 +266,39 @@ Lemma resolved_offset_le_flat :
 Proof.
   intros resolve input space mod_idx.
   unfold resolved_offset, compute_offset.
-  apply (fold_left_add_le_pointwise
-           (fun sm => resolved_space_count resolve (fst sm) (snd sm) space)
-           (fun sm => space_count_of_module (snd sm) space)).
-  - intros sm. apply resolved_space_count_le.
+  set (prior := firstn mod_idx input).
+  (* Induction on prior (the prefix of input up to mod_idx) *)
+  induction prior as [|sm rest IH]; simpl.
   - lia.
+  - rewrite !fold_left_add_shift.
+    rewrite (fold_left_add_shift
+      (fun sm0 => resolved_space_count resolve (fst sm0) (snd sm0) space) rest).
+    pose proof (resolved_space_count_le resolve (fst sm) (snd sm) space) as Hle.
+    (* Need to show that replacing sm's contribution and using IH gives the bound *)
+    assert (Hrest:
+      fold_left (fun acc x =>
+        acc + resolved_space_count resolve (fst x) (snd x) space) rest 0
+      <= fold_left (fun acc x =>
+        acc + match space with
+              | TypeIdx => length (mod_types (snd x))
+              | FuncIdx => count_func_imports (snd x) + length (mod_funcs (snd x))
+              | TableIdx => count_table_imports (snd x) + length (mod_tables (snd x))
+              | MemIdx => count_mem_imports (snd x) + length (mod_mems (snd x))
+              | GlobalIdx => count_global_imports (snd x) + length (mod_globals (snd x))
+              | ElemIdx => length (mod_elems (snd x))
+              | DataIdx => length (mod_datas (snd x))
+              end) rest 0).
+    { clear IH Hle sm.
+      induction rest as [|sm' rest' IH']; simpl.
+      - lia.
+      - rewrite !fold_left_add_shift.
+        rewrite (fold_left_add_shift
+          (fun sm0 => resolved_space_count resolve (fst sm0) (snd sm0) space) rest').
+        pose proof (resolved_space_count_le resolve (fst sm') (snd sm') space).
+        unfold resolved_space_count, space_count_of_module in H.
+        destruct space; lia. }
+    unfold resolved_space_count, space_count_of_module in Hle.
+    destruct space; lia.
 Qed.
 
 (* Total resolved space count <= total flat space count *)
@@ -307,12 +308,15 @@ Lemma total_resolved_le_flat :
     total_space_count input space.
 Proof.
   intros resolve input space.
-  unfold total_resolved_space_count, total_space_count.
-  apply (fold_left_add_le_pointwise
-           (fun sm => resolved_space_count resolve (fst sm) (snd sm) space)
-           (fun sm => space_count_of_module (snd sm) space)).
-  - intros sm. apply resolved_space_count_le.
+  unfold total_resolved_space_count, total_space_count, space_count_of_module.
+  induction input as [|sm rest IH]; simpl.
   - lia.
+  - rewrite !fold_left_add_shift.
+    rewrite (fold_left_add_shift
+      (fun sm0 => resolved_space_count resolve (fst sm0) (snd sm0) space) rest).
+    pose proof (resolved_space_count_le resolve (fst sm) (snd sm) space).
+    unfold resolved_space_count, space_count_of_module in H.
+    destruct space; lia.
 Qed.
 
 (* =========================================================================
