@@ -1,6 +1,7 @@
 name: Rocq proofs
 
 # rivet: verifies SR-88
+# rivet: verifies SR-89
 
 # SR-88 / #447 — re-check the Rocq proofs.
 #
