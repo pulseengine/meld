@@ -63,3 +63,7 @@ verification-results.json
 .nia.cache
 .lia.cache
 .lia.cache
+
+# Python bytecode (a stray .pyc from running a checker locally got committed once)
+__pycache__/
+*.pyc
