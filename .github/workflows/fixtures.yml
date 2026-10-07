@@ -211,24 +211,40 @@ jobs:
             echo "changed=true" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Create pull request
+      # Pushes the branch and reports, rather than opening the PR.
+      #
+      # `peter-evans/create-pull-request` got all the way to pushing the branch
+      # and then failed: `GitHub Actions is not permitted to create or approve
+      # pull requests`. That is a repository/organisation setting ("Allow
+      # GitHub Actions to create and approve pull requests"), not something a
+      # workflow can grant itself — the job already declares
+      # `pull-requests: write` — and there is no PAT secret here to fall back
+      # on (only GITHUB_TOKEN and CLAUDE_CODE_OAUTH_TOKEN).
+      #
+      # So the job does its work, pushes the result, and prints the link to
+      # open the PR by hand. Failing on a permission it structurally cannot
+      # have would leave this red forever and teach everyone to ignore it,
+      # which is how it came to be dead for five weeks in the first place.
+      - name: Push the refreshed corpus and report
         if: steps.diff.outputs.changed == 'true'
-        uses: peter-evans/create-pull-request@v6
-        with:
-          commit-message: "fix(tests): update wit-bindgen fixtures to v${{ env.WIT_BINDGEN_VERSION }}"
-          branch: ci/update-wit-bindgen-fixtures
-          title: "Update wit-bindgen test fixtures"
-          body: |
-            Automated update of wit-bindgen test fixtures.
+        env:
+          BRANCH: ci/update-wit-bindgen-fixtures
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # The diff step has already force-added the fixture paths, so the
+          # index holds exactly what should be committed.
+          git checkout -B "$BRANCH"
+          git commit -q -m "fix(tests): update wit-bindgen fixtures to v${WIT_BINDGEN_VERSION}"
+          git push -q --force-with-lease origin "$BRANCH"
+          {
+            printf '### wit-bindgen fixtures refreshed\n\n'
+            printf 'Pushed `%s` against pinned wit-bindgen `v%s`.\n\n' "$BRANCH" "$WIT_BINDGEN_VERSION"
+            printf '**Open the PR:** https://github.com/%s/compare/main...%s?expand=1\n\n' "$GITHUB_REPOSITORY" "$BRANCH"
+            printf 'Not opened automatically: "Allow GitHub Actions to create and approve pull requests" is disabled for this repository, so `GITHUB_TOKEN` cannot do it and no PAT secret exists. Enabling that setting, or adding a PAT, is all that is missing.\n'
+          } >> "$GITHUB_STEP_SUMMARY"
 
-            - wit-bindgen version: `v${{ env.WIT_BINDGEN_VERSION }}`
-            - Generated via `wit-bindgen test --languages rust --artifacts`
-
-            All composed fixtures from `wit-bindgen test --languages rust` are copied automatically.
-          # Both globs, for the same reason as the force-add above.
-          add-paths: |
-            tests/wit_bindgen/fixtures/*.wasm
-            tests/wit_bindgen/fixtures/**/*.wasm
-            :(exclude)tests/wit_bindgen/fixtures/**/target/**
-          labels: ci
-          delete-branch: true
+      - name: Say so when nothing drifted
+        if: steps.diff.outputs.changed != 'true'
+        run: echo "::notice::the fixture corpus already matches wit-bindgen v${WIT_BINDGEN_VERSION} — nothing to push"
