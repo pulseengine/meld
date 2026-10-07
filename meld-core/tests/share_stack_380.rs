@@ -66,6 +66,17 @@ enum Sp {
     /// failed to interpret. Without this control, the #446 change would be
     /// indistinguishable from deleting the check.
     Unusable,
+    /// A real, usable `__stack_pointer` global — mutable `i32`, const init —
+    /// that NOTHING names: not exported, not in the `name` section. The shape
+    /// of a stripped binary, or any toolchain that does not pass
+    /// `-Wl,--export=__stack_pointer`.
+    ///
+    /// This module HAS a shadow stack. Classifying it stackless would size the
+    /// shared region without it and leave its pointer un-rewritten, so its
+    /// frames would descend into a neighbour's data — a wrong answer where the
+    /// pre-#446 contract gave a loud failure. Caught by the auto-Mythos
+    /// delta-pass on the first cut of SR-90.
+    Unnamed,
 }
 
 fn write_uleb(out: &mut Vec<u8>, mut v: u32) {
@@ -188,7 +199,9 @@ fn build_stack_provider(
             globals.global(
                 GlobalType {
                     val_type: ValType::I32,
-                    mutable: sp_kind == Sp::Usable,
+                    // Unnamed carries a REAL stack pointer: mutable, so it is a
+                    // genuine candidate that meld must not wave through.
+                    mutable: sp_kind == Sp::Usable || sp_kind == Sp::Unnamed,
                     shared: false,
                 },
                 &ConstExpr::i32_const(sp_init),
@@ -216,7 +229,7 @@ fn build_stack_provider(
         // forwarder looks like, and it now EXECUTES (#446) rather than only
         // feeding a control that errored before instantiation.
         let mut stack = Function::new([]);
-        if sp_kind == Sp::Usable {
+        if sp_kind == Sp::Usable || sp_kind == Sp::Unnamed {
             stack.instruction(&Instruction::GlobalGet(1));
             stack.instruction(&Instruction::I32Const(STACK_SLOT_DELTA));
             stack.instruction(&Instruction::I32Sub);
@@ -251,8 +264,9 @@ fn build_stack_provider(
         module.section(&data);
         // name section: name the SP global `__stack_pointer` (the gale signal).
         // Named for Unusable too — that is the whole point of the control: the
-        // name resolves, the marker read does not.
-        if sp_kind != Sp::Absent {
+        // name resolves, the marker read does not. NOT named for Unnamed,
+        // which is its whole point: the global is there and nothing says so.
+        if sp_kind != Sp::Absent && sp_kind != Sp::Unnamed {
             let mut gnames = NameMap::new();
             gnames.append(1, "__stack_pointer");
             let mut names = NameSection::new();
@@ -790,6 +804,42 @@ fn share_stack_with_multiple_domains_is_refused() {
         err.contains("multi-domain") && err.contains("domain 0"),
         "the error must say the shared stack is planned per domain but only the \
          first domain's plan reaches the coalescer, got: {err}"
+    );
+}
+
+#[test]
+fn share_stack_rejects_an_unnamed_stack_pointer_candidate() {
+    // The finding the auto-Mythos delta-pass raised against the first cut of
+    // SR-90, and the reason "absence means stackless" needs a second half.
+    //
+    // Provider "b" HAS a working shadow stack — a defined mutable `i32` global
+    // with a const init — that nothing names: not exported, absent from the
+    // `name` section. meld's lookup reads only those two places, so the first
+    // cut classified it stackless (sp = 0). The consequence is not a missing
+    // optimisation, it is corruption: the shared region would be sized to the
+    // OTHER providers' stacks, this module's pointer would never be rewritten
+    // (the coalescer cannot find it either), and its frames would descend from
+    // their original value straight through the shared region into a
+    // neighbour's data. Exit 0, valid wasm, wrong answer.
+    //
+    // And the pre-#446 contract REFUSED this input, so admitting it would have
+    // traded a loud failure for a silent one. That is the direction no change
+    // gets to go.
+    //
+    // Reachable, not theoretical: this path needs a discoverable `__heap_base`
+    // to get as far as the stack-pointer check, and meld's own diagnostic tells
+    // people to build with `-Wl,--export=__heap_base` while `__stack_pointer`
+    // is conventionally left unexported. Exported heap_base plus a stripped
+    // `name` section is exactly this shape.
+    let a = provider("a", 0xA1, 0x1111, true);
+    let b = build_stack_provider("b", 0xB2, 0x2222, SP_INIT, false, Sp::Unnamed, DATA_ADDR);
+    let c = provider("c", 0xC3, 0x3333, false);
+    let err = fuse_three([a, b, c], false, true)
+        .expect_err("a module with an unnamed stack-pointer-shaped global must be refused");
+    assert!(
+        err.contains("no NAMED") && err.contains("constant initialiser"),
+        "the error must say the marker is unnamed but a stack-pointer-shaped \
+         global is present, distinguishing it from genuinely stackless, got: {err}"
     );
 }
 

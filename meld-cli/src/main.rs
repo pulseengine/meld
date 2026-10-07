@@ -100,13 +100,18 @@ enum Commands {
         /// reclaiming the (N-1) duplicated stack reservations (the last MCU-fit
         /// gap after --pack-rebase). Requires every provider to carry a
         /// __heap_base marker and be stack-first (all data above sp); fails
-        /// loud otherwise. A provider with NO __stack_pointer global at all is
-        /// STACKLESS — wasm-ld drops it from a module whose code never touches
-        /// the shadow stack — and is admitted as contributing no stack, named
-        /// in the attestation as shared-stack-stackless; a __stack_pointer that
-        /// is present but unreadable still fails, and an all-stackless set is
-        /// refused because the flag would have nothing to do. OPT-IN and sound
-        /// ONLY when the
+        /// loud otherwise. A provider is treated as STACKLESS only when
+        /// NOTHING names a __stack_pointer AND it carries no defined mutable
+        /// i32 global with a const init (the shape of one) — wasm-ld drops the
+        /// pointer from a module whose code never touches the shadow stack, so
+        /// a genuinely stackless module has no such global. Stackless providers
+        /// contribute no stack and are named in the attestation as
+        /// shared-stack-stackless. Everything else fails loud: a named
+        /// __stack_pointer meld cannot read, an UNNAMED global shaped like one
+        /// (meld cannot tell a stripped marker from none, and guessing would
+        /// leave that module's stack descending into a neighbour's data), and
+        /// an all-stackless set, which gives the flag nothing to do. OPT-IN and
+        /// sound ONLY when the
         /// providers are non-reentrant, single-threaded, mutually-non-calling,
         /// and one-live-at-a-time (a shared stack sized to the MAX, not the
         /// SUM, of their stack use).

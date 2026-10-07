@@ -186,18 +186,33 @@ pub struct FuserConfig {
     /// segment starts `>= sp_i`), and packs (no passive/no-data fallback).
     ///
     /// `__stack_pointer` is NOT required of every provider (#446). A module
-    /// with no `__stack_pointer` global AT ALL is stackless — `wasm-ld` strips
-    /// the global from a module whose code never touches the shadow stack, and
-    /// whether a module is stackless is a codegen decision that moves between
-    /// rustc releases with no source change. Such a provider is planned as
-    /// `sp_i = 0`, which is the stack region it actually has (`[0, 0)`), so it
-    /// adds nothing to `max_i(sp_i)`, strides by its whole extent, and
-    /// satisfies stack-firstness trivially; it is recorded in the attestation
-    /// as `shared-stack-stackless` rather than silently treated as handled. A
-    /// `__stack_pointer` that EXISTS but cannot be read as a marker still fails
-    /// loud — absence means stackless only when the global is genuinely absent
-    /// — and an all-stackless set is refused, since the flag has nothing to
-    /// collapse. ENVELOPE meld cannot verify: one region of `max_i(sp_i)` is
+    /// is treated as STACKLESS when two things hold together: nothing names a
+    /// `__stack_pointer` (export table or `name` section), AND the module
+    /// carries no defined mutable `i32` global with a constant initialiser —
+    /// the shape of a stack pointer. `wasm-ld` strips the pointer from a module
+    /// whose code never touches the shadow stack, so a genuinely stackless
+    /// module has no such global; and whether a module is stackless is a
+    /// codegen decision that moves between rustc releases with no source
+    /// change. Such a provider is planned as `sp_i = 0`, the stack region it
+    /// actually has (`[0, 0)`), so it adds nothing to `max_i(sp_i)`, strides by
+    /// its whole extent, and satisfies stack-firstness trivially; it is
+    /// recorded in the attestation as `shared-stack-stackless` rather than
+    /// silently treated as handled.
+    ///
+    /// Both halves are load-bearing. The name lookup reads only the export
+    /// table and the `name` section, so a module can HAVE a shadow stack while
+    /// neither naming nor exporting its pointer — a stripped binary, or any
+    /// toolchain not passing `-Wl,--export=__stack_pointer`. Calling that
+    /// stackless would size the shared region without it, leave its pointer
+    /// un-rewritten (the coalescer cannot find it either), and send its frames
+    /// descending into a neighbour's data at exit 0. The pre-#446 contract
+    /// refused such input, and trading a loud failure for a silent wrong answer
+    /// is not a direction this change gets to go; the auto-Mythos delta-pass
+    /// caught precisely that in SR-90's first cut.
+    ///
+    /// So three cases still fail loud: a named `__stack_pointer` that cannot be
+    /// read as a marker, an UNNAMED global shaped like one, and an
+    /// all-stackless set, which leaves the flag nothing to collapse. ENVELOPE meld cannot verify: one region of `max_i(sp_i)` is
     /// sound only when total live shadow-stack state across any call chain fits
     /// it — providers non-reentrant, single-threaded, mutually-non-calling,
     /// one-live-at-a-time; no baked-in constant address into `[0, sp)`.

@@ -351,7 +351,32 @@ impl Merger {
         // means stackless only when the global is genuinely not there.
         let (sp, stackless) = match module_stack_pointer_marker(module) {
             Some(sp) => (sp, false),
-            None if module_global_index_by_name(module, "__stack_pointer").is_none() => (0, true),
+            // Stackless requires BOTH: nothing named `__stack_pointer`, AND no
+            // unnamed global shaped like one. See
+            // `module_has_unnamed_sp_candidate` — without the second half this
+            // silently mis-classifies a stripped module that does have a
+            // shadow stack, which is a wrong answer where the old contract gave
+            // a loud failure.
+            None if module_global_index_by_name(module, "__stack_pointer").is_none()
+                && !module_has_unnamed_sp_candidate(module) =>
+            {
+                (0, true)
+            }
+            None if module_global_index_by_name(module, "__stack_pointer").is_none() => {
+                return Err(Error::MemoryStrategyUnsupported(format!(
+                    "--share-stack: component {comp_idx} module {mod_idx} has no NAMED \
+                     `__stack_pointer`, but does carry a defined mutable `i32` global with a \
+                     constant initialiser — the exact shape of a stack pointer. meld cannot \
+                     tell whether that global IS the shadow-stack pointer under a different \
+                     name, or whether the name information was stripped, so it will not assume \
+                     the module is stackless: doing so would size the shared region without it \
+                     and leave its pointer un-rewritten, and its frames would descend into a \
+                     neighbour's data. Export the marker with \
+                     `-Wl,--export=__stack_pointer`, or keep the `name` section, or drop \
+                     `--share-stack` for this set. A genuinely stackless module has no such \
+                     global, because the pointer is what `wasm-ld` removed."
+                )));
+            }
             None => {
                 return Err(Error::MemoryStrategyUnsupported(format!(
                     "--share-stack: component {comp_idx} module {mod_idx} HAS a \
@@ -930,6 +955,50 @@ fn module_global_index_by_name(module: &CoreModule, name: &str) -> Option<u32> {
         .find(|e| matches!(e.kind, ExportKind::Global) && e.name == name)
         .map(|e| e.index)
         .or_else(|| module_named_global_index(module, name))
+}
+
+/// Does the module contain a DEFINED, mutable `i32` global with a constant
+/// initialiser — i.e. a global shaped exactly like a `__stack_pointer` — that
+/// no name information identifies?
+///
+/// This is what makes "absence means stackless" safe (#446, caught by the
+/// auto-Mythos delta-pass on the first cut of SR-90). The lookup in
+/// [`module_global_index_by_name`] reads the export table and the `name`
+/// custom section. A module can *have* a shadow stack while neither names nor
+/// exports its pointer — a stripped binary, or any toolchain that does not
+/// pass `-Wl,--export=__stack_pointer` — and that is not a corner case,
+/// because meld's own `__heap_base` diagnostic tells people to export
+/// `__heap_base` while `__stack_pointer` is conventionally left unexported.
+///
+/// Treating that module as stackless would be silent corruption: the shared
+/// region gets sized to the OTHER providers' stacks, this module's pointer is
+/// never rewritten (the coalescer cannot find it either), and its frames
+/// descend from the original value straight through the shared region and into
+/// a neighbour's data. The previous contract REFUSED such input, so admitting
+/// it would be a regression into a wrong answer from a loud failure.
+///
+/// A module that `wasm-ld` actually stripped the shadow stack from has no such
+/// global, because the pointer is the thing that was removed. So "no named SP
+/// AND no candidate" is the faithful test, and anything else is refused.
+fn module_has_unnamed_sp_candidate(module: &CoreModule) -> bool {
+    let import_globals = module
+        .imports
+        .iter()
+        .filter(|i| matches!(i.kind, ImportKind::Global(_)))
+        .count() as u32;
+    // Only globals no name information resolves to; a named one is handled by
+    // the marker read and its own error path.
+    let named: Vec<u32> = ["__stack_pointer"]
+        .iter()
+        .filter_map(|n| module_global_index_by_name(module, n))
+        .collect();
+    module.globals.iter().enumerate().any(|(defined, g)| {
+        let global_index = import_globals + defined as u32;
+        g.mutable
+            && g.content_type == ValType::I32
+            && crate::segments::const_i32_init_value(&g.init_expr_bytes).is_some()
+            && !named.contains(&global_index)
+    })
 }
 
 fn module_marker_global(module: &CoreModule, name: &str, want_mutable: bool) -> Option<u64> {
