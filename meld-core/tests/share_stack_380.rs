@@ -27,6 +27,8 @@
 //!   5. GATES — a provider missing the `__stack_pointer` marker, or one whose
 //!      data sits BELOW its stack pointer (not stack-first), hard-fails loudly.
 
+// rivet: verifies SR-90
+
 use meld_core::{Fuser, FuserConfig, MemoryStrategy};
 use wasm_encoder::{
     CodeSection, Component, ConstExpr, CustomSection, DataSection, DataSegment, DataSegmentMode,
@@ -48,6 +50,34 @@ const DATA_ADDR: i32 = SP_INIT + 0x100; // 30256
 const HEAP_BASE: i32 = DATA_ADDR + 1; // 30257
 /// Per-call scratch slot the stack exercise touches, `[sp-16]`.
 const STACK_SLOT_DELTA: i32 = 16;
+
+/// What `__stack_pointer` a provider carries (#446).
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Sp {
+    /// A DEFINED, mutable `i32` global with a single `i32.const` init, named in
+    /// the `name` section — the gale-shaped signal meld can read and place.
+    Usable,
+    /// NO `__stack_pointer` global at all, which is how `wasm-ld` leaves a
+    /// module whose code never touches the shadow stack. Genuinely stackless.
+    Absent,
+    /// A global NAMED `__stack_pointer` that meld cannot read as a marker —
+    /// immutable here. This case must keep failing loud, and it is what stops
+    /// "absence means stackless" from swallowing a real marker meld merely
+    /// failed to interpret. Without this control, the #446 change would be
+    /// indistinguishable from deleting the check.
+    Unusable,
+    /// A real, usable `__stack_pointer` global — mutable `i32`, const init —
+    /// that NOTHING names: not exported, not in the `name` section. The shape
+    /// of a stripped binary, or any toolchain that does not pass
+    /// `-Wl,--export=__stack_pointer`.
+    ///
+    /// This module HAS a shadow stack. Classifying it stackless would size the
+    /// shared region without it and leave its pointer un-rewritten, so its
+    /// frames would descend into a neighbour's data — a wrong answer where the
+    /// pre-#446 contract gave a loud failure. Caught by the auto-Mythos
+    /// delta-pass on the first cut of SR-90.
+    Unnamed,
+}
 
 fn write_uleb(out: &mut Vec<u8>, mut v: u32) {
     loop {
@@ -130,7 +160,7 @@ fn build_stack_provider(
     stack_sentinel: i32,
     sp_init: i32,
     export_memory: bool,
-    has_sp: bool,
+    sp_kind: Sp,
     data_addr: i32,
 ) -> Vec<u8> {
     let byte_memarg = MemArg {
@@ -163,11 +193,15 @@ fn build_stack_provider(
             },
             &ConstExpr::i32_const(HEAP_BASE),
         );
-        if has_sp {
+        // Absent: no global at all. Unusable: present and named, but IMMUTABLE,
+        // so meld's marker read rejects it while the name lookup still finds it.
+        if sp_kind != Sp::Absent {
             globals.global(
                 GlobalType {
                     val_type: ValType::I32,
-                    mutable: true,
+                    // Unnamed carries a REAL stack pointer: mutable, so it is a
+                    // genuine candidate that meld must not wave through.
+                    mutable: sp_kind == Sp::Usable || sp_kind == Sp::Unnamed,
                     shared: false,
                 },
                 &ConstExpr::i32_const(sp_init),
@@ -190,11 +224,12 @@ fn build_stack_provider(
         read.instruction(&Instruction::End);
         code.function(&read);
         // stack_<tag>: sp -= 16; mem[sp] = stack_sentinel; load it back; sp += 16.
-        // If has_sp the SP is global 1; otherwise this provider has no SP and the
-        // body is a no-op returning 0 (only used by the missing-marker control,
-        // which errors before execution).
+        // With a Usable SP the pointer is global 1. Otherwise the body is a
+        // no-op returning 0 — which is what a genuinely stackless thin
+        // forwarder looks like, and it now EXECUTES (#446) rather than only
+        // feeding a control that errored before instantiation.
         let mut stack = Function::new([]);
-        if has_sp {
+        if sp_kind == Sp::Usable || sp_kind == Sp::Unnamed {
             stack.instruction(&Instruction::GlobalGet(1));
             stack.instruction(&Instruction::I32Const(STACK_SLOT_DELTA));
             stack.instruction(&Instruction::I32Sub);
@@ -228,7 +263,10 @@ fn build_stack_provider(
         module.section(&globals).section(&exports).section(&code);
         module.section(&data);
         // name section: name the SP global `__stack_pointer` (the gale signal).
-        if has_sp {
+        // Named for Unusable too — that is the whole point of the control: the
+        // name resolves, the marker read does not. NOT named for Unnamed,
+        // which is its whole point: the global is there and nothing says so.
+        if sp_kind != Sp::Absent && sp_kind != Sp::Unnamed {
             let mut gnames = NameMap::new();
             gnames.append(1, "__stack_pointer");
             let mut names = NameSection::new();
@@ -273,7 +311,7 @@ fn provider(tag: &str, data_sentinel: u8, stack_sentinel: i32, export_memory: bo
         stack_sentinel,
         SP_INIT,
         export_memory,
-        true,
+        Sp::Usable,
         DATA_ADDR,
     )
 }
@@ -604,9 +642,9 @@ fn share_stack_unequal_inits_coalesce_to_max() {
     // Providers with DIFFERENT sp inits (30000/29000/28000). --share-stack
     // coalesces them regardless of init (unlike the equal-init-only default
     // coalescer) onto one survivor initialised to the MAX = the shared top.
-    let a = build_stack_provider("a", 0xA1, 0x1111, 30_000, true, true, 30_000 + 0x100);
-    let b = build_stack_provider("b", 0xB2, 0x2222, 29_000, false, true, 29_000 + 0x100);
-    let c = build_stack_provider("c", 0xC3, 0x3333, 28_000, false, true, 28_000 + 0x100);
+    let a = build_stack_provider("a", 0xA1, 0x1111, 30_000, true, Sp::Usable, 30_000 + 0x100);
+    let b = build_stack_provider("b", 0xB2, 0x2222, 29_000, false, Sp::Usable, 29_000 + 0x100);
+    let c = build_stack_provider("c", 0xC3, 0x3333, 28_000, false, Sp::Usable, 28_000 + 0x100);
     let shared = fuse_three([a, b, c], false, true).expect("share-stack fusion");
 
     let muts: Vec<_> = fused_globals(&shared)
@@ -635,17 +673,190 @@ fn share_stack_unequal_inits_coalesce_to_max() {
 }
 
 #[test]
-fn share_stack_requires_stack_pointer_marker() {
-    // Provider "b" carries NO __stack_pointer marker. --share-stack cannot place
-    // a shared stack it can't measure → hard-fail, never silent.
+fn share_stack_proceeds_for_a_stackless_provider() {
+    // #446: provider "b" has NO `__stack_pointer` global at all — the shape
+    // `wasm-ld` leaves when a module's code never touches the shadow stack
+    // (gale's thin seam forwarders). It contributes no stack, so there is
+    // nothing for --share-stack to collapse in it and nothing to relocate;
+    // including it is a no-op and the fuse must PROCEED.
+    //
+    // This test previously asserted the opposite. It also passed for the wrong
+    // reason: its only assertion was `err.contains("stack")`, which every
+    // error from `share_stack_entry` satisfies via the `--share-stack:` prefix.
+    // The error it was actually observing was neither the one it named nor the
+    // sp gate — it was the dissolve's `found N __stack_pointer global(s) but M
+    // rebased memory provider(s)` drift detector. Hence the specific
+    // assertions below.
     let a = provider("a", 0xA1, 0x1111, true);
-    let b = build_stack_provider("b", 0xB2, 0x2222, SP_INIT, false, false, DATA_ADDR);
+    let b = build_stack_provider("b", 0xB2, 0x2222, SP_INIT, false, Sp::Absent, DATA_ADDR);
     let c = provider("c", 0xC3, 0x3333, false);
-    let err =
-        fuse_three([a, b, c], false, true).expect_err("must reject a provider with no SP marker");
+    let fused = fuse_three([a, b, c], false, true)
+        .expect("a provider with no __stack_pointer global at all must not fail the fuse");
+
+    // RECORDED, not silently handled. A component that contributed nothing to
+    // a safety envelope without saying so is how the envelope stops meaning
+    // anything, so the attestation has to name it.
+    let text = String::from_utf8_lossy(&fused);
     assert!(
-        err.contains("stack") || err.contains("__stack_pointer"),
-        "error must name the missing stack-pointer marker, got: {err}"
+        text.contains("shared-stack-stackless"),
+        "the stackless provider must be recorded as such in the attestation \
+         placements, so --explain can say which modules brought no stack"
+    );
+    // And the stack-carrying providers must still be recorded plainly, or the
+    // assertion above could be satisfied by labelling everything stackless.
+    assert_eq!(
+        text.matches("\"strategy\":\"shared-stack\"").count(),
+        2,
+        "exactly the two stack-carrying providers keep the plain shared-stack \
+         strategy; got: {}",
+        text.matches("\"strategy\":\"shared-stack").count()
+    );
+
+    // DATA isolation still holds with a stackless module in the set: each
+    // provider reads back ITS OWN sentinel. A base that overlapped the
+    // stackless module's window with a neighbour's surfaces as a wrong read.
+    let (mut store, instance) = instantiate(&fused);
+    assert_eq!(
+        call(&mut store, &instance, "read_a"),
+        0xA1,
+        "a reads its own"
+    );
+    assert_eq!(
+        call(&mut store, &instance, "read_b"),
+        0xB2,
+        "b reads its own"
+    );
+    assert_eq!(
+        call(&mut store, &instance, "read_c"),
+        0xC3,
+        "c reads its own"
+    );
+    // The stack-carrying providers still share the one region correctly, and a
+    // data read afterwards is intact (stack and data did not collide).
+    assert_eq!(call(&mut store, &instance, "stack_a"), 0x1111);
+    assert_eq!(call(&mut store, &instance, "stack_c"), 0x3333);
+    assert_eq!(
+        call(&mut store, &instance, "read_b"),
+        0xB2,
+        "the stackless provider's data must survive the others' stack traffic"
+    );
+}
+
+#[test]
+fn share_stack_rejects_an_unusable_stack_pointer() {
+    // The control that keeps #446 honest. Provider "b" HAS a global named
+    // `__stack_pointer`, so the name lookup finds it, but it is immutable and
+    // therefore not a marker meld can place. "Absence means stackless" must
+    // not swallow a real marker meld merely failed to interpret, so this still
+    // fails loud.
+    //
+    // Without this test the #446 change would be indistinguishable from
+    // deleting the gate.
+    let a = provider("a", 0xA1, 0x1111, true);
+    let b = build_stack_provider("b", 0xB2, 0x2222, SP_INIT, false, Sp::Unusable, DATA_ADDR);
+    let c = provider("c", 0xC3, 0x3333, false);
+    let err = fuse_three([a, b, c], false, true)
+        .expect_err("a present-but-unreadable __stack_pointer must still be refused");
+    // Specific: not `contains("stack")`, which every error from this path
+    // satisfies through the `--share-stack:` prefix — the exact looseness that
+    // let the old version of this test pass on an unrelated error.
+    assert!(
+        err.contains("HAS a") && err.contains("cannot read it as a marker"),
+        "the error must say the marker is PRESENT and unusable, distinguishing \
+         it from the stackless case, got: {err}"
+    );
+}
+
+#[test]
+fn share_stack_with_multiple_domains_is_refused() {
+    // Mythos delta-pass finding on SR-90 (#446). `compute_shared_memory_plan`
+    // runs PER DOMAIN, but the merger takes `domain_plans.first()` as THE plan
+    // (`merger/mod.rs`: `domain_plans.first().cloned().flatten()`), so
+    // `shared_stack_top` — and the stackless count SR-90 adds beside it —
+    // describe domain 0 only, and are then applied while coalescing every
+    // `__stack_pointer` across ALL domains. Those are separate address spaces,
+    // so domain 1's stack pointers would be rewritten to domain 0's region top.
+    //
+    // It validated and was wrong, with no guard anywhere. Same shape as the
+    // `--component` + domains refusal already in lib.rs, and refused the same
+    // way: an opt-in flag must decline a layout it cannot make sound.
+    //
+    // The unsoundness predates SR-90 — `shared_stack_top` was already domain
+    // 0's — but SR-90 is what made the interaction legible.
+    let a = provider("a", 0xA1, 0x1111, true);
+    let b = provider("b", 0xB2, 0x2222, false);
+    let c = provider("c", 0xC3, 0x3333, false);
+    let config = FuserConfig {
+        memory_strategy: MemoryStrategy::SharedMemory,
+        share_stack: true,
+        domains: vec![vec![0], vec![1, 2]],
+        ..Default::default()
+    };
+    let mut fuser = Fuser::new(config);
+    fuser.add_component_named(&a, Some("comp-a")).unwrap();
+    fuser.add_component_named(&b, Some("comp-b")).unwrap();
+    fuser.add_component_named(&c, Some("comp-c")).unwrap();
+    let err = fuser
+        .fuse()
+        .map_err(|e| e.to_string())
+        .expect_err("--share-stack with more than one domain must be refused");
+    assert!(
+        err.contains("multi-domain") && err.contains("domain 0"),
+        "the error must say the shared stack is planned per domain but only the \
+         first domain's plan reaches the coalescer, got: {err}"
+    );
+}
+
+#[test]
+fn share_stack_rejects_an_unnamed_stack_pointer_candidate() {
+    // The finding the auto-Mythos delta-pass raised against the first cut of
+    // SR-90, and the reason "absence means stackless" needs a second half.
+    //
+    // Provider "b" HAS a working shadow stack — a defined mutable `i32` global
+    // with a const init — that nothing names: not exported, absent from the
+    // `name` section. meld's lookup reads only those two places, so the first
+    // cut classified it stackless (sp = 0). The consequence is not a missing
+    // optimisation, it is corruption: the shared region would be sized to the
+    // OTHER providers' stacks, this module's pointer would never be rewritten
+    // (the coalescer cannot find it either), and its frames would descend from
+    // their original value straight through the shared region into a
+    // neighbour's data. Exit 0, valid wasm, wrong answer.
+    //
+    // And the pre-#446 contract REFUSED this input, so admitting it would have
+    // traded a loud failure for a silent one. That is the direction no change
+    // gets to go.
+    //
+    // Reachable, not theoretical: this path needs a discoverable `__heap_base`
+    // to get as far as the stack-pointer check, and meld's own diagnostic tells
+    // people to build with `-Wl,--export=__heap_base` while `__stack_pointer`
+    // is conventionally left unexported. Exported heap_base plus a stripped
+    // `name` section is exactly this shape.
+    let a = provider("a", 0xA1, 0x1111, true);
+    let b = build_stack_provider("b", 0xB2, 0x2222, SP_INIT, false, Sp::Unnamed, DATA_ADDR);
+    let c = provider("c", 0xC3, 0x3333, false);
+    let err = fuse_three([a, b, c], false, true)
+        .expect_err("a module with an unnamed stack-pointer-shaped global must be refused");
+    assert!(
+        err.contains("no NAMED") && err.contains("constant initialiser"),
+        "the error must say the marker is unnamed but a stack-pointer-shaped \
+         global is present, distinguishing it from genuinely stackless, got: {err}"
+    );
+}
+
+#[test]
+fn share_stack_rejects_an_all_stackless_set() {
+    // Every provider stackless: there is no shadow stack to collapse, so the
+    // flag cannot do what it was asked. Refuse with that reason rather than
+    // emit a fused artifact whose --share-stack did nothing.
+    let a = build_stack_provider("a", 0xA1, 0x1111, SP_INIT, true, Sp::Absent, DATA_ADDR);
+    let b = build_stack_provider("b", 0xB2, 0x2222, SP_INIT, false, Sp::Absent, DATA_ADDR);
+    let c = build_stack_provider("c", 0xC3, 0x3333, SP_INIT, false, Sp::Absent, DATA_ADDR);
+    let err = fuse_three([a, b, c], false, true)
+        .expect_err("--share-stack over an all-stackless set must be refused");
+    assert!(
+        err.contains("all 3 fused module(s) are stackless"),
+        "the error must say the whole set is stackless and the flag has nothing \
+         to do, got: {err}"
     );
 }
 
@@ -654,7 +865,7 @@ fn share_stack_rejects_data_below_stack_pointer() {
     // Provider "b" places its data BELOW the stack pointer (not stack-first):
     // subtracting the [0, sp) stack region would cut into data → hard-fail.
     let a = provider("a", 0xA1, 0x1111, true);
-    let b = build_stack_provider("b", 0xB2, 0x2222, SP_INIT, false, true, 0x40); // data at 64 < sp
+    let b = build_stack_provider("b", 0xB2, 0x2222, SP_INIT, false, Sp::Usable, 0x40); // data at 64 < sp
     let c = provider("c", 0xC3, 0x3333, false);
     let err =
         fuse_three([a, b, c], false, true).expect_err("must reject a non-stack-first provider");

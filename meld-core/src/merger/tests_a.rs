@@ -168,6 +168,7 @@ fn test_multi_memory_index_maps() {
         async_result_globals: HashMap::new(),
         segment_bases: HashMap::new(),
         shared_stack_top: None,
+        stackless_providers: 0,
         placements: Vec::new(),
     };
 

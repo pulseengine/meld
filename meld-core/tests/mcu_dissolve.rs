@@ -122,6 +122,7 @@ fn merged_base() -> MergedModule {
         async_result_globals: HashMap::new(),
         segment_bases: HashMap::new(),
         shared_stack_top: None,
+        stackless_providers: 0,
         placements: Vec::new(),
     }
 }

@@ -187,7 +187,12 @@ fn coalesce_stack_pointers(
         // SP per provider, so finding no coalescible group is a drift — refuse
         // rather than silently leave the providers on the stacks the plan
         // already collapsed into one region.
-        if share_top.is_some() && memory_module_count > 1 {
+        // #446: with only one stack-carrying provider there is nothing to
+        // coalesce WITH, and that is not drift — it is a set where one module
+        // owns the stack and the rest are stackless forwarders, which is
+        // exactly gale's shape. The all-stackless case is refused in the plan.
+        let stack_carrying = memory_module_count.saturating_sub(merged.stackless_providers);
+        if share_top.is_some() && memory_module_count > 1 && stack_carrying > 1 {
             return Err(Error::EncodingError(format!(
                 "--share-stack: no coalescible `__stack_pointer` group found across \
                  {memory_module_count} memory provider(s); plan/dissolve signal drift"
@@ -201,11 +206,20 @@ fn coalesce_stack_pointers(
     // candidates. Fewer means the two sides disagree on the SP signal — refuse.
     if share_top.is_some() {
         let named_count = candidates.iter().filter(|c| c.named).count();
-        if named_count < memory_module_count {
+        // #446: the plan guarantees an SP per STACK-CARRYING provider, not per
+        // provider. A module with no `__stack_pointer` global at all is planned
+        // stackless (`sp_i = 0`), so it contributes no candidate here and must
+        // be subtracted — otherwise this detector reports the new contract as a
+        // drift. It stays a real cross-check: a stack-carrying provider whose
+        // SP the coalescer cannot see is still caught.
+        let expected = memory_module_count.saturating_sub(merged.stackless_providers);
+        if named_count < expected {
             return Err(Error::EncodingError(format!(
-                "--share-stack: found {named_count} `__stack_pointer` global(s) but \
-                 {memory_module_count} rebased memory provider(s); the shared-stack layout \
-                 requires one per provider (plan/dissolve drift)"
+                "--share-stack: found {named_count} `__stack_pointer` global(s) but expected \
+                 {expected} ({memory_module_count} rebased memory provider(s) minus {} planned \
+                 stackless); the shared-stack layout requires one per stack-carrying provider \
+                 (plan/dissolve drift)",
+                merged.stackless_providers
             )));
         }
     }
