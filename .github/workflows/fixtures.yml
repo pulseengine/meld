@@ -140,14 +140,20 @@ jobs:
         working-directory: ${{ runner.temp }}/wit-bindgen
         run: |
           set -euo pipefail
-          before=$(grep -rlE '(max|min)_value\(\)' tests/ | wc -l | tr -d ' ')
+          # Both counters are guarded. `grep` exits 1 on ZERO matches and
+          # `set -euo pipefail` then aborts at the assignment — so the success
+          # case (nothing left to patch) killed the step before it could print
+          # anything, which is why attempt seven failed with a bare exit 1 and
+          # no output. Same trap as the proofs census (#447), written a second
+          # time here by the same hand.
+          before=$( { grep -rlE '(max|min)_value\(\)' tests/ || true; } | wc -l | tr -d ' ')
           if [ "$before" -eq 0 ]; then
             echo "::error::no max_value()/min_value() found in wit-bindgen ${WIT_BINDGEN_VERSION} tests/ — upstream has fixed this, so remove this step rather than leaving a patch that silently does nothing"
             exit 1
           fi
           grep -rlE '(max|min)_value\(\)' tests/ \
-            | xargs sed -i -E 's/\b(max)_value\(\)/MAX/g; s/\b(min)_value\(\)/MIN/g'
-          after=$(grep -rlE '(max|min)_value\(\)' tests/ | wc -l | tr -d ' ')
+            | xargs -r sed -i -E 's/\b(max)_value\(\)/MAX/g; s/\b(min)_value\(\)/MIN/g'
+          after=$( { grep -rlE '(max|min)_value\(\)' tests/ || true; } | wc -l | tr -d ' ')
           printf 'patched %s file(s); %s remaining\n' "$before" "$after"
           [ "$after" -eq 0 ]
 
