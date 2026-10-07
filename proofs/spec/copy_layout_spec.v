@@ -74,19 +74,39 @@ Definition range_accessible (mem : memory) (base len : nat) : Prop :=
    ------------------------------------------------------------------------- *)
 
 (* Structural depth of a CopyLayout (for reasoning about fixup nesting).
-   Because copy_layout is a nested inductive (list of pairs containing
-   copy_layout), we define depth via a mutual fixpoint over the type
-   and its inner pointer list. *)
+
+   copy_layout is a NESTED inductive: it recurses through [list] and [prod],
+   which are not members of its own inductive block. That rules out a
+   [Fixpoint ... with ...] pairing a function on copy_layout with one on
+   [list (nat * copy_layout)]: the list-side function's decreasing argument
+   is checked against [list]'s own subterm structure, in which the element
+   type is a mere parameter, so the [cl] pulled out of the head pair is not
+   a recognised subterm and the call back into the copy_layout-side function
+   is rejected ("principal argument equal to cl instead of rest", #447).
+   The accepted idiom is an inner [fix] over the list, placed inside the
+   [CLElements] branch: there [ips] is a structural subterm of [cl], and the
+   subterm structure Rocq computed for copy_layout itself carries the
+   list/pair nesting, so each element of [ips] counts as a subterm of [cl]. *)
 Fixpoint copy_layout_depth (cl : copy_layout) : nat :=
   match cl with
   | CLBulk _ => 0
   | CLElements _ ips =>
       match ips with
       | [] => 0
-      | _ => 1 + copy_layout_list_max_depth ips
+      | _ =>
+          1 + (fix list_max_depth (l : list (nat * copy_layout)) : nat :=
+                 match l with
+                 | [] => 0
+                 | (_, inner) :: rest =>
+                     Nat.max (copy_layout_depth inner) (list_max_depth rest)
+                 end) ips
       end
-  end
-with copy_layout_list_max_depth (ips : list (nat * copy_layout)) : nat :=
+  end.
+
+(* The list-level maximum as a standalone function. Its body is the inner
+   fix above with the constant [copy_layout_depth] in place of the fix
+   variable; the recursion is on [ips] alone, so it is plainly guarded. *)
+Fixpoint copy_layout_list_max_depth (ips : list (nat * copy_layout)) : nat :=
   match ips with
   | [] => 0
   | (_, cl) :: rest => Nat.max (copy_layout_depth cl) (copy_layout_list_max_depth rest)
@@ -131,9 +151,10 @@ Definition inner_pointers_disjoint (ips : list (nat * copy_layout)) : Prop :=
     i <> j ->
     pointer_pairs_disjoint (fst ip1) (fst ip2).
 
-(* Well-formedness of a CopyLayout, defined via mutual recursion over
-   the nested structure. The list recursion ensures Rocq accepts
-   the termination argument for the nested inductive type. *)
+(* Well-formedness of a CopyLayout. Same nested-inductive shape as
+   copy_layout_depth above: the list side is an inner [fix] inside the
+   [CLElements] branch, not a mutual [with], which the guard checker
+   rejects for a nested inductive (see the note at copy_layout_depth). *)
 Fixpoint copy_layout_wf (cl : copy_layout) : Prop :=
   match cl with
   | CLBulk byte_mult =>
@@ -145,15 +166,40 @@ Fixpoint copy_layout_wf (cl : copy_layout) : Prop :=
         In (offset, inner_cl) ips ->
         offset + 8 <= elem_size) /\
       (* Every inner layout is itself well-formed *)
-      copy_layout_list_wf ips /\
+      (fix list_wf (l : list (nat * copy_layout)) : Prop :=
+         match l with
+         | [] => True
+         | (_, inner) :: rest => copy_layout_wf inner /\ list_wf rest
+         end) ips /\
       (* Inner pointer pairs do not overlap *)
       inner_pointers_disjoint ips
-  end
-with copy_layout_list_wf (ips : list (nat * copy_layout)) : Prop :=
+  end.
+
+(* The list-level predicate as a standalone function. Its body is the inner
+   fix above with the constant [copy_layout_wf] in place of the fix
+   variable, so the two are convertible; [copy_layout_wf_Elements] below
+   records that, for proofs that want the named form after [simpl]. *)
+Fixpoint copy_layout_list_wf (ips : list (nat * copy_layout)) : Prop :=
   match ips with
   | [] => True
   | (_, cl) :: rest => copy_layout_wf cl /\ copy_layout_list_wf rest
   end.
+
+(* Unfolding equation for the Elements case, stated with the named list
+   predicate. Holds by conversion: [copy_layout_list_wf] delta-unfolds to
+   the same fix that [copy_layout_wf (CLElements _ _)] iota-reduces to. *)
+Lemma copy_layout_wf_Elements : forall elem_size ips,
+  copy_layout_wf (CLElements elem_size ips) =
+  (elem_size > 0 /\
+   (forall offset inner_cl,
+     In (offset, inner_cl) ips ->
+     offset + 8 <= elem_size) /\
+   copy_layout_list_wf ips /\
+   inner_pointers_disjoint ips).
+Proof.
+  intros elem_size ips.
+  reflexivity.
+Qed.
 
 (* Relate list well-formedness to In-based formulation *)
 Lemma copy_layout_list_wf_In : forall ips offset inner_cl,
