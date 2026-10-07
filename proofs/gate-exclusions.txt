@@ -1,0 +1,10 @@
+# Files deliberately OUTSIDE //proofs:verify_all.
+#
+# The coverage step in .github/workflows/proofs.yml fails on any .v file that
+# no target in //proofs:verify_all depends on, unless it is listed here with a
+# reason. An entry is a decision someone wrote down in a diff; an orphan that
+# is NOT listed is a proof the census counts and nothing checks.
+#
+# Format: path, then whitespace, then `# why`.
+
+proofs/spec/wasm_core_generated.v  # generator output (//tools/spec-sync); references Defwasm_type, which nothing defines, so it does not compile. 0 Qed -- definitions only, no proofs. Its BUILD target already carries tags=["manual"] with the same note. Tracked in #449.

@@ -47,7 +47,30 @@ jobs:
   proofs:
     name: Rocq proofs
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    # 60 was not enough and the job was KILLED mid-build, which reads as
+    # "cancelled" rather than as a proof failure — a gate that dies silently is
+    # barely better than one that never runs.
+    #
+    # What is actually measured, kept separate from any explanation:
+    #
+    #   * CI reached `13 / 14 tests, 3 failed` and was still compiling one
+    #     action at **3522s** when the 60-minute limit cancelled it.
+    #   * Locally, under Rocq 9.0.1 via nix-shell, 25 of 28 .v files compile in
+    #     seconds each, but `merge_resolution.v` exceeds a **900s** cap in plain
+    #     `coqc` — no bazel involved — holding ~2 GB RSS at 100% CPU.
+    #
+    # An earlier version of this comment blamed the rules_rocq_rust/bazel path
+    # for a 3-orders-of-magnitude slowdown and attributed the 3522s to
+    # `//proofs/spec:fusion_spec`. Both were wrong. Bazel's progress line names
+    # a target's FIRST src, not the file it is working on — the same log reports
+    # "wasm_core.v failed" for an error that is in `fusion_spec.v:2644` — so the
+    # 3522s was never attributable to fusion_spec, and the local measurement
+    # shows a genuinely slow proof rather than slow tooling.
+    #
+    # So 180 is an interim that lets the gate REPORT instead of being cancelled.
+    # The real fix is making `merge_resolution.v` fast (#450); when that lands,
+    # bring this number back down.
+    timeout-minutes: 180
     steps:
       - uses: actions/checkout@v4
 
@@ -94,8 +117,8 @@ jobs:
           # Floors: the values at the time this gate was added (#447).
           [ "$files"    -ge 28  ] || { echo "::error::proof files fell to $files (floor 28)"; fail=1; }
           [ "$qed"      -ge 350 ] || { echo "::error::Qed count fell to $qed (floor 350) — proofs were removed or weakened"; fail=1; }
-          [ "$targets"  -ge 14  ] || { echo "::error::rocq_proof_test targets fell to $targets (floor 14)"; fail=1; }
-          [ "$members"  -ge 14  ] || { echo "::error:://proofs:verify_all lists $members members (floor 14) — a target was dropped from the suite, so it would no longer be checked"; fail=1; }
+          [ "$targets"  -ge 16  ] || { echo "::error::rocq_proof_test targets fell to $targets (floor 16)"; fail=1; }
+          [ "$members"  -ge 16  ] || { echo "::error:://proofs:verify_all lists $members members (floor 16) — a target was dropped from the suite, so it would no longer be checked"; fail=1; }
 
           # An `Admitted` is an unproved hole wearing a proof's clothes. There
           # are zero today; a new one must be a deliberate, visible decision.
@@ -118,6 +141,54 @@ jobs:
           disk-cache: ${{ github.workflow }}
           repository-cache: true
 
+      # A census COUNTS files; it does not show that anything CHECKS them.
+      # These two numbers have to agree, or the census reports proofs as
+      # evidence which the gate never builds — the #447 defect one level down,
+      # and it was real: `alias_spec.v` (395 lines, 4 Qed) and
+      # `p1_adapter_spec.v` (268 lines, 6 Qed) were `rocq_library` targets with
+      # no test and no reverse dependency, so //proofs:verify_all never reached
+      # them. p1_adapter_spec.v did not even compile. Both are now in the suite;
+      # this step is what stops the next one appearing unnoticed.
+      - name: Every .v file must be inside the gate
+        run: |
+          set -uo pipefail
+          # No pipeline here, so $? is bazel's own status and not some grep's —
+          # that confusion has already made healthy files read as broken twice
+          # in this repository's history.
+          bazel query 'kind("source file", deps(//proofs:verify_all))' --output=label > labels.txt
+          rc=$?
+          if [ "$rc" -ne 0 ]; then
+            echo "::error::bazel query failed (exit $rc). Coverage is therefore UNKNOWN, which is a failure and not a pass."
+            exit "$rc"
+          fi
+          # //proofs/spec:wasm_core.v -> proofs/spec/wasm_core.v
+          sed -n 's|^//||; s|:|/|; p' labels.txt | grep '\.v$' | sort -u > covered.txt
+          find proofs -name '*.v' | sed 's|^\./||' | sort -u > present.txt
+
+          # Potency control. If the query silently returns nothing useful, the
+          # comparison below would call EVERY file an orphan and the real reason
+          # would be invisible; and were the comparison inverted, it would call
+          # none of them orphans. A file we know the suite builds must appear.
+          if ! grep -qx 'proofs/spec/fusion_spec.v' covered.txt; then
+            echo "::error::potency control failed: proofs/spec/fusion_spec.v IS a dependency of //proofs:verify_all, but the query did not list it — this check is not measuring what it claims."
+            exit 1
+          fi
+
+          sed 's/#.*//' proofs/gate-exclusions.txt | tr -d ' \t' | grep -v '^$' | sort -u > excluded.txt
+          comm -23 present.txt covered.txt | sort -u > uncovered.txt
+          comm -23 uncovered.txt excluded.txt > orphans.txt
+
+          printf 'gate coverage: %s of %s .v files are built by //proofs:verify_all (%s excluded by proofs/gate-exclusions.txt)\n' \
+            "$(wc -l < covered.txt | tr -d ' ')" "$(wc -l < present.txt | tr -d ' ')" "$(wc -l < excluded.txt | tr -d ' ')"
+
+          if [ -s orphans.txt ]; then
+            echo "::error::these .v files live in proofs/ but no target in //proofs:verify_all depends on them, so the census counts their proofs and nothing re-checks them:"
+            sed 's/^/  /' orphans.txt
+            echo "Add a rocq_proof_test for each, or list it in proofs/gate-exclusions.txt with a written reason."
+            exit 1
+          fi
+          echo "::notice::every .v file outside gate-exclusions.txt is built by //proofs:verify_all"
+
       # The gate itself.
       #
       # `bazel test` returns 4 for NO TESTS MATCHED. Tolerating that — with
@@ -137,7 +208,7 @@ jobs:
           rc=$?
           case "$rc" in
             0)
-              echo "::notice::all 14 Rocq proof targets re-checked"
+              echo "::notice::all 16 Rocq proof targets re-checked"
               ;;
             4)
               echo "::error::bazel exited 4 — NO TESTS MATCHED. The suite selected ZERO tests, so this run proved nothing. That is a gate failure, not an empty-matrix nuisance: a proof check that matches nothing and reports success is the defect this workflow exists to remove (#447)."

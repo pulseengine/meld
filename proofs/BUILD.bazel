@@ -143,6 +143,8 @@ test_suite(
         "//proofs/rust_verified:resolver_core_proofs_test",
         "//proofs/transformations/adapter:adapter_spec_test",
         "//proofs/transformations/adapter:copy_layout_proofs_test",
+        "//proofs/spec:alias_spec_test",
+        "//proofs/spec:p1_adapter_spec_test",
         "//proofs/transformations/merge:merge_spec_test",
         "//proofs/transformations/resolve:resolve_spec_test",
     ],
