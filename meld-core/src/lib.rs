@@ -3032,6 +3032,12 @@ impl Fuser {
     }
 
     /// SR-28: the ADR-7 profile as an attestation label.
+    ///
+    /// Gated like its only caller, `build_attestation`. Without the gate
+    /// `clippy --all-features` reports this and `attestation_parameters` as
+    /// never used and fails — which nothing noticed, because no CI job ran
+    /// clippy with the feature on (#408).
+    #[cfg(not(feature = "attestation"))]
     fn profile_label(&self) -> &'static str {
         match self.config.profile {
             Profile::Ecosystem => "ecosystem",
@@ -3042,6 +3048,7 @@ impl Fuser {
     /// SR-28: the build configuration, recorded so an auditor holding only the
     /// artifact can reconstruct how it was fused. Typed (not a map) so the JSON
     /// key order is deterministic under `--reproducible`.
+    #[cfg(not(feature = "attestation"))]
     fn attestation_parameters(&self) -> attestation::FusionParameters {
         // SR-28 completeness, enforced by the COMPILER rather than by a test
         // that can drift: this destructure is exhaustive (no `..`), so adding a
@@ -3956,6 +3963,22 @@ mod tests {
     /// full byte-reproducibility on that path needs an upstream fix (sorted /
     /// BTreeMap serialization). The default `FusionAttestationBuilder` path has
     /// no such maps and is fully reproducible.
+    // Gated to the default build deliberately, and worth saying why, because
+    // "a determinism test compiled out of the configuration where determinism
+    // is doubted" reads like evasion (#408).
+    //
+    // Under the `attestation` feature the parameters go through
+    // `wsc-attestation`, whose parameter map is a `HashMap`. Rust seeds a
+    // `HashMap`'s iteration order ONCE PER PROCESS, so two fusions inside one
+    // test observe the SAME order and compare equal — the divergence only
+    // appears between separate processes. An inverted test asserting the wsc
+    // path is NOT byte-stable would therefore pass or fail on which process it
+    // happened to run in, which is worse than no test.
+    //
+    // What closes this properly is fixing the ordering upstream and deleting
+    // the split. Until then the claim is caveated where users read it, in
+    // meld-cli/docs/concept-attestation.md, and the feature is linted in CI so
+    // the path is at least not rotting unobserved.
     #[cfg(not(feature = "attestation"))]
     #[test]
     fn test_reproducible_attestation_is_byte_stable() {

@@ -112,6 +112,19 @@ jobs:
       - name: Run clippy
         run: cargo clippy --all-targets -- -D warnings
 
+      # #408: the optional `attestation` feature was linted by NOTHING. The
+      # clippy job above runs without it, release.yml builds without it, and
+      # the only job that compiled it at all was coverage. Turning it on here
+      # immediately failed — `profile_label` and `attestation_parameters` were
+      # dead code with the feature on — which is the kind of thing a lint is
+      # for and nobody had been in a position to see.
+      #
+      # A separate invocation rather than adding --all-features above, because
+      # the two configurations are genuinely different code and both should be
+      # clean; folding them into one run would hide whichever passed.
+      - name: Run clippy (--all-features)
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
   fmt:
     name: Format
     runs-on: [self-hosted, linux, x64, light]
