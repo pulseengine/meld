@@ -4,18 +4,69 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+
+## [0.61.0] - 2026-10-08
+
 ### Added
-- **The Rocq proofs are re-checked by CI (SR-88, #447).** meld carries 14,487
-  lines of Rocq across 28 files — **350 `Qed`, 0 `Admitted`** — and nothing had
+- **`--share-stack` admits a stackless provider instead of refusing the fuse
+  (SR-90, #446).** `--share-stack` required a `__stack_pointer` marker in EVERY
+  fused provider, and `meld fuse --help` said so. The implementation matched its
+  documentation, so the defect was the **contract**: `wasm-ld` drops the
+  `__stack_pointer` global from a module whose code never touches the shadow
+  stack — gale's thin seam forwarders, whose bodies are a handful of `call`s to
+  imports — so the stated requirement is not satisfiable by a well-formed input.
+
+  fathom's measurement is the argument for changing behaviour rather than
+  documenting harder. Same sources, same meld, same `wasm-tools 1.245.1` and
+  `wac-cli 0.10.1`; only rustc differs:
+
+  | rustc | providers carrying the marker | result |
+  |---|---|---|
+  | 1.98.1 | 5 of 5 | fuses |
+  | 1.99.0 | **1 of 5** | refuses at component 3 |
+
+  The survivor was the one component owning a real executor, hence genuine
+  stack traffic. Whether a module is stackless is a codegen decision, so a
+  contract resting on it keeps breaking with no source change.
+
+  A stackless provider is planned as `sp_i = 0` — the stack region it actually
+  has, the empty `[0, 0)` — so every layout formula holds unchanged: it adds
+  nothing to `max_i(sp_i)`, takes `base_i = next_base - 0`, strides by
+  `align16(extent_i)`, and satisfies stack-firstness trivially. **Skipping the
+  module would have been unsound:** on this path `bases` is populated only from
+  these entries, so a skipped provider would receive no base and alias whatever
+  sits at 0. Each admitted provider is recorded as `shared-stack-stackless` in
+  the attestation and `--explain`, never folded into `shared-stack`.
+
+  **Stackless requires two things, and the second is load-bearing:** nothing
+  names a `__stack_pointer`, AND the module carries no defined mutable `i32`
+  global with a constant initialiser. The name lookup reads only the export
+  table and the `name` section, so a module can *have* a shadow stack while
+  neither naming nor exporting its pointer — a stripped binary, or any
+  toolchain not passing `-Wl,--export=__stack_pointer`. Calling that stackless
+  would size the shared region without it, leave its pointer un-rewritten, and
+  send its frames descending into a neighbour's data at exit 0; the previous
+  contract refused such input, so admitting it would trade a loud failure for a
+  silent wrong answer. The auto-Mythos delta-pass caught exactly that in this
+  change's first cut. A module `wasm-ld` genuinely stripped has no such global,
+  because the pointer is what was removed.
+
+  Three cases still fail loud: a named `__stack_pointer` meld cannot read as a
+  marker, an unnamed global shaped like one, and an all-stackless set, which
+  leaves the flag nothing to collapse. SR-66/SR-67's envelope is untouched — a
+  provider contributing no live stack state cannot widen it.
+
+- **The Rocq proofs are re-checked by CI (SR-88, #447).** meld carries 14,640
+  lines of Rocq across 28 files — **357 `Qed`, 0 `Admitted`** — and nothing had
   ever re-checked any of it.
 
-  Doubly unreachable: all 14 `rocq_proof_test` targets are tagged `manual`, so
+  Doubly unreachable: all 16 `rocq_proof_test` targets are tagged `manual`, so
   `bazel test //...` skipped them, and **no workflow invoked bazel at all**, so
   nothing named them either. A proof nothing runs is a document, not evidence —
   and `proofs/STATUS.md` reads as a verification story, so the absence was
   actively misleading.
 
-  `//proofs:verify_all` lists all 14 targets explicitly (`manual` suppresses
+  `//proofs:verify_all` lists all 16 targets explicitly (`manual` suppresses
   wildcard expansion, not explicit reference, so wildcards stay fast and nix
   stays optional for everyone else), and `.github/workflows/proofs.yml` runs it.
 
@@ -27,13 +78,100 @@ All notable changes to this project will be documented in this file.
   asserted: `0 → pass`, `4 → fail`, `3 → 3`, other → propagates.
 
   The census **enforces** floors rather than only printing counts — 28 files,
-  350 `Qed`, 14 targets, 14 suite members, zero `Admitted`. Controls observed:
-  dropping a suite member reports 13 against 14; injecting an `Admitted` names
+  357 `Qed`, 16 targets, 16 suite members, zero `Admitted`. Controls observed:
+  dropping a suite member reports one fewer than the floor; injecting an `Admitted` names
   the file and line; deleting two spec files reports 26 files and 288 `Qed`.
 
-  **Not established: whether the proofs compile.** They have never been built
-  in CI, so the first run of this workflow is the first time anyone finds out.
-  A red first run is the finding, not a regression.
+  **The first runs were red, and that was the finding.** SIX `.v` files did not
+  compile — every error pre-existing, with the files checkable against
+  merge-base `875690b` byte-identical to it and reproducing their errors there.
+  Nothing had ever built these proofs, so nothing had ever reported it:
+
+  | file | error |
+  |---|---|
+  | `copy_layout_spec.v` | nested inductive needed an inner `fix`, not `Fixpoint … with` |
+  | `copy_layout_proofs.v` | 3 tactic errors downstream of the above |
+  | `fusion_spec.v` | `exists` committed to one witness *before* a 3-way case split |
+  | `resolve_spec.v` | `intros` bound a `let`-definition instead of the premise |
+  | `p1_adapter_spec.v` | 2 branches supplied for the 4 goals `destruct` produced |
+  | `resolver_core_proofs.v` | **`decompose_aux_spec` was false as stated** |
+  | `merge_resolution.v` | **had never compiled, in any version** |
+
+  `decompose_aux_spec` claimed, for ANY `running`, that a successful decompose
+  satisfies `running + prefix_sum … + local_idx = index`. But
+  `decompose_aux [0] 0 5 0 = Some (0, 0)`: `0 <? 5 + 0` holds, so it returns
+  `(i, index - running)` — and NAT SUBTRACTION TRUNCATES `0 - 5` to `0`. The
+  conclusions then read `0 < nth 0 [0] 0` and `5 + 0 + 0 = 0`. The added
+  `running <= index` is the loop invariant of the Rust it models, is already
+  carried by the sibling `decompose_aux_total`, and is the condition under
+  which that Rust is defined at all — there the subtraction is `u32`, which
+  panics in debug or wraps in release. All three callers pass `running = 0` and
+  discharge it with `Nat.le_0_l`, a closed proof term rather than an
+  assumption, so the downstream theorem statements are byte-identical.
+
+  `merge_resolution.v` had no `.vo` anywhere: a `rewrite !fold_left_add_shift`
+  could never fail, because that lemma's RHS contains an instance of its own
+  LHS, so the proof term grew without bound — killed at a 900s cap holding
+  2.5 GB. Now 2 seconds. Its 19 `Qed` had been counted by the census and
+  checked by nothing. The repository already warned about this exact tactic in
+  `merge_correctness.v:31`; this file used the forbidden form three times
+  anyway, because nothing built it. **A comment is not a gate.**
+
+  **The gate had the hole it was built to close.** Three files were counted by
+  the census while no `//proofs:verify_all` target depended on them —
+  `alias_spec.v` (4 `Qed`, compiles), `p1_adapter_spec.v` (6 `Qed`, did not
+  compile) and `wasm_core_generated.v` (0 `Qed`, does not compile). Found as a
+  PATTERN, not as the instance in hand: a grep for the two broken names would
+  have missed `alias_spec.v`. The first two are now in the suite; the third is
+  excluded in `proofs/gate-exclusions.txt` with a written reason (#449),
+  because `STATUS.md` had been citing a zero-proof non-compiling generator stub
+  as one of the files establishing the forward-simulation relation.
+
+  A coverage step now diffs `find proofs -name '*.v'` against
+  `bazel query 'deps(//proofs:verify_all)'` and fails on anything uncovered
+  and unexcused, with its own positive control so an empty query cannot read as
+  "every file is an orphan". First green run on main: **16 of 16 tests pass,
+  108 build actions, 27 of 28 .v files covered (1 excluded)**.
+
+  Also fixed here: an under-indented comment in this workflow terminated a
+  `run: |` block above four floor assertions, which GitHub rejected outright.
+  It was loud only by luck — de-indent where the remainder still parses and the
+  step runs a SHORTER script and PASSES, with a floor silently absent.
+  `scripts/check_workflow_gates.py` now asserts the gate's own checks against
+  the extracted block text, proven against seven mutations.
+
+### Fixed
+- **`--share-stack` with `--domain` is refused (#446, Mythos delta-pass).**
+  `compute_shared_memory_plan` runs per domain, but the merger took
+  `domain_plans.first()` as *the* plan, so `shared_stack_top` described domain 0
+  and was then applied while coalescing every `__stack_pointer` across all
+  domains — separate address spaces. Demonstrated rather than argued: with the
+  guard disabled, fusing three providers under two domains succeeds and emits an
+  attestation listing **one placement for three components**. Refused in the
+  same shape as the existing `--component`-with-domains refusal. Pre-existing;
+  SR-90 made it legible.
+
+- **The weekly `Update wit-bindgen Fixtures` job had never succeeded (#429).**
+  Five consecutive scheduled runs, never once green, so the corpus it
+  regenerates against pinned `wit-bindgen 0.54.0` had been drifting silently —
+  the same corpus where untracked fixtures once left 36 tests reporting `ok`
+  without executing (#405). Five distinct faults, each found by dispatching the
+  job rather than reading it: the wasmtime setup action composes
+  `/home/<username>`, a path absent from the environment and unfixable by any
+  variable (replaced with a pinned direct download); `wit-bindgen test` spawns
+  the wasmtime CLI, which no step in the file reveals; upstream's own test
+  sources deny warnings and abort on a deprecated `i64::max_value()`, and
+  `RUSTFLAGS` never reaches them because the harness invokes rustc directly;
+  `/tmp` persists between runs on a self-hosted runner; and a `grep` exiting 1
+  on zero matches aborted the patch step **because the patch had worked**. It
+  now runs green end to end and found **49 files** of drift. The final
+  PR-creation step cannot be fixed in a workflow — `GitHub Actions is not
+  permitted to create or approve pull requests` is a repository setting — so the
+  job pushes the branch and prints the compare link instead.
+
+- **A doc claim and two stale proof counts.** `proofs/STATUS.md` cited
+  `wasm_core_generated.v` — 0 `Qed`, does not compile — as one of the files
+  establishing the forward-simulation relation (#449).
 
 
 ## [0.60.0] - 2026-10-01

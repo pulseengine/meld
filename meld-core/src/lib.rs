@@ -182,10 +182,37 @@ pub struct FuserConfig {
     /// after `--pack-rebase` (closes gale's F100 8 KiB budget).
     ///
     /// HARD preconditions (loud fail, never silent): every rebased provider
-    /// carries a `__stack_pointer` marker (mutable `i32`, single `i32.const`
-    /// init, named/exported) AND a `__heap_base` marker, is stack-first (every
-    /// active data segment starts `>= sp_i`), and packs (no passive/no-data
-    /// fallback). ENVELOPE meld cannot verify: one region of `max_i(sp_i)` is
+    /// carries a `__heap_base` marker, is stack-first (every active data
+    /// segment starts `>= sp_i`), and packs (no passive/no-data fallback).
+    ///
+    /// `__stack_pointer` is NOT required of every provider (#446). A module
+    /// is treated as STACKLESS when two things hold together: nothing names a
+    /// `__stack_pointer` (export table or `name` section), AND the module
+    /// carries no defined mutable `i32` global with a constant initialiser —
+    /// the shape of a stack pointer. `wasm-ld` strips the pointer from a module
+    /// whose code never touches the shadow stack, so a genuinely stackless
+    /// module has no such global; and whether a module is stackless is a
+    /// codegen decision that moves between rustc releases with no source
+    /// change. Such a provider is planned as `sp_i = 0`, the stack region it
+    /// actually has (`[0, 0)`), so it adds nothing to `max_i(sp_i)`, strides by
+    /// its whole extent, and satisfies stack-firstness trivially; it is
+    /// recorded in the attestation as `shared-stack-stackless` rather than
+    /// silently treated as handled.
+    ///
+    /// Both halves are load-bearing. The name lookup reads only the export
+    /// table and the `name` section, so a module can HAVE a shadow stack while
+    /// neither naming nor exporting its pointer — a stripped binary, or any
+    /// toolchain not passing `-Wl,--export=__stack_pointer`. Calling that
+    /// stackless would size the shared region without it, leave its pointer
+    /// un-rewritten (the coalescer cannot find it either), and send its frames
+    /// descending into a neighbour's data at exit 0. The pre-#446 contract
+    /// refused such input, and trading a loud failure for a silent wrong answer
+    /// is not a direction this change gets to go; the auto-Mythos delta-pass
+    /// caught precisely that in SR-90's first cut.
+    ///
+    /// So three cases still fail loud: a named `__stack_pointer` that cannot be
+    /// read as a marker, an UNNAMED global shaped like one, and an
+    /// all-stackless set, which leaves the flag nothing to collapse. ENVELOPE meld cannot verify: one region of `max_i(sp_i)` is
     /// sound only when total live shadow-stack state across any call chain fits
     /// it — providers non-reentrant, single-threaded, mutually-non-calling,
     /// one-live-at-a-time; no baked-in constant address into `[0, sp)`.
@@ -881,6 +908,26 @@ impl Fuser {
                  the first domain's memory whichever domain it belongs to. Emit a core module \
                  instead (the single-address-space target this is for), or fuse without \
                  domains."
+                    .to_string(),
+            ));
+        }
+
+        // Mythos delta-pass on SR-90 (#446): `--share-stack` cannot yet express a
+        // multi-domain fusion, for the same reason `--component` cannot above.
+        // `compute_shared_memory_plan` runs PER DOMAIN, but the merger takes
+        // `domain_plans.first()` as THE plan, so `shared_stack_top` — and the
+        // stackless count SR-90 adds beside it — describe domain 0 only and are
+        // then applied while coalescing every `__stack_pointer` across ALL
+        // domains. Those are separate address spaces, so domain 1's stack
+        // pointers would be rewritten to domain 0's region top. It validates
+        // and is wrong, which is the shape this repo refuses to ship.
+        //
+        // The unsoundness predates SR-90 — `shared_stack_top` was already taken
+        // from domain 0 — but SR-90 is what made the interaction legible, so it
+        // gets refused here rather than left as a latent combination.
+        if self.config.domains.len() > 1 && self.config.share_stack {
+            return Err(Error::InvalidDomains(
+                "--share-stack cannot yet express a multi-domain fusion: the shared shadow-stack                  region is planned per domain, but only the FIRST domain's plan reaches the                  stack-pointer coalescer, so every domain's `__stack_pointer` would be rewritten                  to domain 0's region top — a different address space. Fuse without --domain, or                  without --share-stack."
                     .to_string(),
             ));
         }
@@ -2985,6 +3032,12 @@ impl Fuser {
     }
 
     /// SR-28: the ADR-7 profile as an attestation label.
+    ///
+    /// Gated like its only caller, `build_attestation`. Without the gate
+    /// `clippy --all-features` reports this and `attestation_parameters` as
+    /// never used and fails — which nothing noticed, because no CI job ran
+    /// clippy with the feature on (#408).
+    #[cfg(not(feature = "attestation"))]
     fn profile_label(&self) -> &'static str {
         match self.config.profile {
             Profile::Ecosystem => "ecosystem",
@@ -2995,6 +3048,7 @@ impl Fuser {
     /// SR-28: the build configuration, recorded so an auditor holding only the
     /// artifact can reconstruct how it was fused. Typed (not a map) so the JSON
     /// key order is deterministic under `--reproducible`.
+    #[cfg(not(feature = "attestation"))]
     fn attestation_parameters(&self) -> attestation::FusionParameters {
         // SR-28 completeness, enforced by the COMPILER rather than by a test
         // that can drift: this destructure is exhaustive (no `..`), so adding a
@@ -3909,6 +3963,22 @@ mod tests {
     /// full byte-reproducibility on that path needs an upstream fix (sorted /
     /// BTreeMap serialization). The default `FusionAttestationBuilder` path has
     /// no such maps and is fully reproducible.
+    // Gated to the default build deliberately, and worth saying why, because
+    // "a determinism test compiled out of the configuration where determinism
+    // is doubted" reads like evasion (#408).
+    //
+    // Under the `attestation` feature the parameters go through
+    // `wsc-attestation`, whose parameter map is a `HashMap`. Rust seeds a
+    // `HashMap`'s iteration order ONCE PER PROCESS, so two fusions inside one
+    // test observe the SAME order and compare equal — the divergence only
+    // appears between separate processes. An inverted test asserting the wsc
+    // path is NOT byte-stable would therefore pass or fail on which process it
+    // happened to run in, which is worse than no test.
+    //
+    // What closes this properly is fixing the ordering upstream and deleting
+    // the split. Until then the claim is caveated where users read it, in
+    // meld-cli/docs/concept-attestation.md, and the feature is linted in CI so
+    // the path is at least not rotting unobserved.
     #[cfg(not(feature = "attestation"))]
     #[test]
     fn test_reproducible_attestation_is_byte_stable() {
