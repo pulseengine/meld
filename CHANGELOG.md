@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 ## [Unreleased]
 
 
-## [0.61.0] - 2026-10-07
+## [0.61.0] - 2026-10-08
 
 ### Added
 - **`--share-stack` admits a stackless provider instead of refusing the fuse
