@@ -3534,3 +3534,18 @@ artifacts:
       created-by: ai-assisted
       model: claude-opus-5
       timestamp: 2026-10-07T10:49:18Z
+  - id: SR-91
+    type: sw-req
+    title: The traceability validator runs on every PR, at a threshold that can fail
+    status: implemented
+    description: "Its verification artifact asserted that `rivet validate` mechanically enforces the requirement-to-verification backlink, and that the passing gate is itself the verification measure. No workflow ran `rivet validate`; it would have emitted a warning and exited 0 if it had; and the rule it named is Info severity, below any threshold then in use. That is the fourth instance in one month of a check that exists and cannot fail, after #405 (36 tests reporting ok without executing), #412s own siblings, and #447 (14 proof targets nothing ever built). meld shall run the traceability validator on every pull request, with a threshold that can actually fail. The gate is `rivet validate --new-since origin/<base> --fail-on info`: it fails when the change under review ADDS a diagnostic at info severity or above. Two deliberate choices. First, `--new-since` rather than an absolute threshold, because the tree carries 111 pre-existing warnings and a gate that is red from its first run is a gate someone disables, at which point the property stops being guarded at all -- the ratchet asks the question a pull request can answer, which is whether it made things worse. Second, `--fail-on info` rather than `warning`, because the specific rule previously claimed to be enforced is Info severity, so a warning threshold would leave the claim false while looking stricter. The gate shall report a non-zero, non-one exit as a failure in its own right: a validator that did not reach a verdict leaves coverage UNKNOWN, which is not a pass. Deliberately NOT claimed: that every sw-req carries a backlink. The ratchet prevents new gaps and does not clear the backlog; SR-44 acceptance stays unmet until requirement-coverage is driven up, tracked in #410 and #412. Also not yet done: making this a REQUIRED status context. proofs.yml (#447) is the precedent -- prove a new gate green on its own first, because a required check that cannot pass blocks every unrelated pull request."
+    links:
+      - type: derives-from
+        target: SYS-11
+      - type: refines
+        target: SR-44
+    provenance:
+      created-by: ai-assisted
+      reviewed-by: avrabe
+      model: claude-opus-5
+      timestamp: 2026-10-07T10:36:59Z

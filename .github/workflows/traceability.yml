@@ -1,0 +1,105 @@
+name: Traceability
+
+# rivet: verifies SR-91
+
+# SR-91 / #412 — run the traceability validator, and make it able to fail.
+#
+# SWV-44 claimed that `rivet validate` "mechanically enforces" the sw-req →
+# sw-verification backlink, and that "the passing gate is itself the
+# verification measure". Three things were wrong with that at once:
+#
+#   * NO workflow ran `rivet validate`. `release-readiness.yml` runs
+#     `rivet release status`, a different command; `compliance.yml` is a
+#     post-publish report generator that fires on `release: published`. There
+#     was no passing gate to be the measure.
+#   * It would not have failed if it had run. Deleting an SWV block leaves a
+#     WARNING and `exit 0`; the rule SWV-44 actually names
+#     (`swe1-has-verification`) is INFO severity. `--fail-on` existed and was
+#     used nowhere.
+#   * SR-44's own acceptance criterion — every SR linked by `verifies` — was
+#     unmet at 5 of 89.
+#
+# Why `--new-since` and not a flat `--fail-on info`
+# -------------------------------------------------
+# The tree carries 111 pre-existing warnings. A gate set to zero would be red
+# from the first run, and a gate nobody can make green gets disabled — which
+# is how the thing it was guarding stops being guarded. `--new-since` asks the
+# question a PR can actually answer: does THIS change add a diagnostic? It
+# ratchets rather than demanding a backlog be cleared first.
+#
+# `--fail-on info` deliberately, not `warning`: the specific rule SWV-44
+# claimed is enforced is an Info diagnostic, so a `warning` threshold would
+# leave the claim still false while looking stricter than it is.
+#
+# Potency, measured before this landed: adding an sw-req with no backlink
+# produces `EXIT=1` at both `info` and `warning`; a clean tree gives `EXIT=0`.
+# On its first real use it caught an omission in the change that introduced
+# it — SR-90 cited SR-66/SR-67 in prose with no typed link — which is the
+# behaviour wanted, on the author rather than on someone else.
+#
+# Not yet a required context. proofs.yml (#447) is the precedent: prove a new
+# gate green on its own first, then make it required, because a required check
+# that cannot pass blocks every unrelated PR.
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  no-new-diagnostics:
+    name: Traceability (no new diagnostics)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      RIVET_VERSION: "0.40.0"
+    steps:
+      # fetch-depth: 0 because `--new-since` validates a WORKTREE of the base
+      # ref, which needs that commit present.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install rivet
+        run: |
+          set -euo pipefail
+          dest="$RUNNER_TEMP/rivet"
+          mkdir -p "$dest"
+          curl -fsSL \
+            "https://github.com/pulseengine/rivet/releases/download/v${RIVET_VERSION}/rivet-v${RIVET_VERSION}-x86_64-unknown-linux-gnu.tar.gz" \
+            | tar -xz -C "$dest"
+          bin=$(find "$dest" -type f -name rivet -perm -u+x | head -1)
+          # Demand the binary and run it. `tool | grep -q` inside an `if`
+          # passes when the TOOL fails, not only when it is absent, and that
+          # shape once reported "statically linked" for a file that did not
+          # exist (#432).
+          test -n "$bin" || { echo "::error::no rivet binary in the tarball"; exit 1; }
+          "$bin" --version
+          echo "$(dirname "$bin")" >> "$GITHUB_PATH"
+
+      - name: No new traceability diagnostics
+        run: |
+          set -uo pipefail
+          base="${{ github.base_ref || 'main' }}"
+          # The PR checkout does not necessarily leave origin/<base> as a local
+          # ref, and --new-since needs that commit to build its worktree.
+          git fetch -q --no-tags origin "+refs/heads/$base:refs/remotes/origin/$base"
+
+          # No pipeline, so $? is rivet's own status and not some grep's. That
+          # confusion has produced a wrong answer three times in this
+          # repository's CI already, including in the step that measured this
+          # very command.
+          rivet validate --new-since "origin/$base" --fail-on info
+          rc=$?
+          case "$rc" in
+            0) echo "::notice::this change adds no new traceability diagnostics" ;;
+            1) echo "::error::this change ADDS traceability diagnostics (listed above). Link the artifacts it mentions, or remove the mention. The pre-existing backlog is deliberately not counted — only what this change adds." ; exit 1 ;;
+            *) echo "::error::rivet validate exited $rc — it did not run to a verdict, so coverage is UNKNOWN, which is a failure and not a pass" ; exit "$rc" ;;
+          esac
