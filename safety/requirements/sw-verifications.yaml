@@ -549,10 +549,7 @@ artifacts:
   - id: SWV-44
     type: sw-verification
     title: "Verification of SR-44: Enforced requirement->verification traceability"
-    description: >
-      Verifies SR-44 by static analysis: `rivet validate` mechanically enforces
-      that every sw-req carries a typed sw-verification backlink (the ASPICE SWE
-      tier, ADR-5). The passing gate is itself the verification measure.
+    description: "CORRECTED 2026-10-07 (#412). The previous text claimed that `rivet validate` mechanically enforces the sw-req to sw-verification backlink and that \"the passing gate is itself the verification measure\". None of that held. No workflow ran `rivet validate` at all: release-readiness.yml runs `rivet release status`, a different command, and compliance.yml is a post-publish report generator triggered on `release: published`. So there was no passing gate to be the measure. It would also not have failed had it run -- deleting an SWV block leaves a WARNING and exit 0, and the specific rule named here, `swe1-has-verification`, is INFO severity, while `--fail-on` existed and was used nowhere. This requirement's acceptance also required every SR linked by `verifies`, which stood at 5 of 89. What IS verified now, by .github/workflows/traceability.yml, under the requirement that introduced it: `rivet validate --new-since origin/<base> --fail-on info` runs on every pull request and fails when the change ADDS any diagnostic at info severity or above. That is a ratchet rather than an absolute: the tree carries 111 pre-existing warnings, and a gate set to zero would be red from its first run, which is how a gate gets disabled and stops guarding anything. Potency measured rather than asserted -- adding an sw-req with no backlink gives exit 1 at both info and warning, a clean tree gives exit 0, and on its first real use it caught an omission in the very change that introduced it (a requirement citing the two it refines in prose, with no typed link). NOT established, and deliberately so: that every sw-req carries a backlink today. The ratchet prevents new gaps; it does not clear the backlog, and acceptance remains unmet until requirement-coverage is driven up. Tracked in #412 and #410."
     status: implemented
     fields:
       method: static-analysis
@@ -1515,3 +1512,16 @@ artifacts:
       created-by: ai-assisted
       model: claude-opus-5
       timestamp: 2026-10-07T10:49:18Z
+  - id: SWV-103
+    type: sw-verification
+    title: "Verification of SR-91: the traceability ratchet fails on an added diagnostic and passes on a clean tree"
+    status: implemented
+    description: "Verifies SR-91 by exercising the gate at both polarities before it landed, rather than by observing it pass on the tree it was written against. Measured, with rivets own exit code captured directly rather than through a pipeline: on an unmodified tree `rivet validate --new-since origin/main --fail-on info` reports \"New diagnostics since origin/main: 0\" and exits 0. With a deliberately unlinked sw-req added (SR-999, no backlink, no derives-from) it reports 4 new diagnostics -- 1 error, 1 warning, 2 infos, naming cardinality, swe1-derives-from-sys, swe1-has-verification and orphan-artifact -- and exits 1 at both `--fail-on info` and `--fail-on warning`, while `--fail-on error` exits 0. That last number is why the threshold is `info` and not `warning`: the rule previously claimed to be enforced, swe1-has-verification, is Info severity, so a warning threshold would have left that claim false. The 111 pre-existing diagnostics stay out of the result in every case, which is what makes the gate a ratchet rather than a backlog demand. Independently of the synthetic control, the gate caught a REAL omission on its first use against actual work: run against the stackless-provider branch it reported exactly 2 new warnings, both `prose-mention-without-typed-link`, on a requirement that amended an earlier one's precondition with no typed link to it, so a reader tracing from that earlier requirement would not have found the one that changed its contract. Adding the two missing `refines` links returned the gate to 0 new diagnostics and exit 0. A checker that finds its authors mistake before anyone elses is the evidence wanted here. The exit-code mapping is itself part of the gate: 0 passes with a notice, 1 fails naming what to do, and any other code fails as UNKNOWN coverage rather than being treated as a pass. Not established: that the pre-existing backlog is clean, or that every sw-req carries a backlink. Neither is claimed, and the parent requirement's acceptance stays unmet -- see the issues tracked for requirement coverage."
+    links:
+      - type: verifies
+        target: SR-91
+    provenance:
+      created-by: ai-assisted
+      reviewed-by: avrabe
+      model: claude-opus-5
+      timestamp: 2026-10-07T10:37:15Z
