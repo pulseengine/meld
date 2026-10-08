@@ -19,6 +19,21 @@ pub(crate) struct PlacementEntry {
     pub(crate) reserved: u64,
 }
 
+/// One provider's contribution to the `--share-stack` layout (SR-66 / #380).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ShareStackEntry {
+    /// `(component, module)`.
+    pub(crate) key: (usize, usize),
+    /// Its `__stack_pointer` value, or 0 when the module is stackless (#446).
+    pub(crate) sp: u64,
+    /// Its used-memory top (`__heap_base`).
+    pub(crate) extent: u64,
+    /// #446: the module carries NO `__stack_pointer` global at all, so it
+    /// contributes no shadow stack and was planned as `sp = 0` — the empty
+    /// `[0, 0)` region it actually has.
+    pub(crate) stackless: bool,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct SharedMemoryPlan {
     pub(crate) memory: EncoderMemoryType,
@@ -27,6 +42,16 @@ pub(crate) struct SharedMemoryPlan {
     /// SR-66 / #380: top of the single shared shadow-stack region under
     /// `--share-stack` (`max_i(sp_i)`). `None` when `--share-stack` is off.
     pub(crate) shared_stack_top: Option<u64>,
+    /// #446: how many fused providers carry NO `__stack_pointer` global at all
+    /// and were therefore planned as stackless (`sp_i = 0`).
+    ///
+    /// Carried to the dissolve because its drift detector cross-checks the
+    /// plan: it used to require one `__stack_pointer` candidate per memory
+    /// provider, which the plan guaranteed. The plan now guarantees one per
+    /// STACK-CARRYING provider, so the detector has to subtract these or it
+    /// reports a drift that is really the new contract. Still a real check —
+    /// a genuine plan/dissolve disagreement remains visible.
+    pub(crate) stackless_providers: usize,
     /// SR-70: per-module placement, in assignment order (deterministic — the
     /// modules are visited in component/module index order).
     pub(crate) placements: Vec<PlacementEntry>,
@@ -61,6 +86,11 @@ impl Merger {
         // SR-66 / #380: per rebased module `(key, sp_i, extent_i)` for the
         // shared-stack layout. Only populated (and gated) under `--share-stack`.
         let mut share_entries: Vec<((usize, usize), u64, u64)> = Vec::new();
+        // #446: modules with no `__stack_pointer` global at all. Tracked
+        // separately rather than widened into the tuple above, which
+        // `check_share_stack_call_topology` also destructures.
+        let mut stackless: std::collections::HashSet<(usize, usize)> =
+            std::collections::HashSet::new();
 
         for (comp_idx, component) in components.iter().enumerate() {
             // SR-86: a domain's plan sees only its own components, so each
@@ -89,8 +119,11 @@ impl Merger {
                             None
                         };
                         if self.share_stack {
-                            share_entries
-                                .push(self.share_stack_entry(module, extent, comp_idx, mod_idx)?);
+                            let e = self.share_stack_entry(module, extent, comp_idx, mod_idx)?;
+                            if e.stackless {
+                                stackless.insert(e.key);
+                            }
+                            share_entries.push((e.key, e.sp, e.extent));
                         }
                         module_memories.push(((comp_idx, mod_idx), module_memory, extent));
                     }
@@ -162,7 +195,16 @@ impl Merger {
                 placements.push(PlacementEntry {
                     component: key.0,
                     module: key.1,
-                    strategy: "shared-stack",
+                    // #446: name the stackless case rather than folding it into
+                    // "shared-stack". A component that silently contributed
+                    // nothing to a safety envelope is how the envelope stops
+                    // meaning anything, so --explain and the attestation have
+                    // to be able to say which modules brought no stack.
+                    strategy: if stackless.contains(&key) {
+                        "shared-stack-stackless"
+                    } else {
+                        "shared-stack"
+                    },
                     base,
                     reserved: stride,
                 });
@@ -171,6 +213,19 @@ impl Merger {
             combined.initial = next_base.div_ceil(WASM_PAGE_SIZE).max(1);
             if let Some(max) = combined.maximum {
                 combined.maximum = Some(max.max(combined.initial));
+            }
+            // #446: if EVERY module is stackless there is no shadow stack to
+            // share, so the flag cannot do what it was asked to do. Refuse here
+            // with the reason rather than letting the coalescer downstream
+            // report "no coalescible `__stack_pointer` group found", which is
+            // true but says nothing about why.
+            if stackless.len() == share_entries.len() {
+                return Err(Error::MemoryStrategyUnsupported(format!(
+                    "--share-stack: all {} fused module(s) are stackless (no `__stack_pointer` \
+                     global at all), so there is no shadow stack to collapse and the flag has \
+                     nothing to do. Drop `--share-stack` for this set.",
+                    share_entries.len()
+                )));
             }
             shared_stack_top = Some(s_raw);
 
@@ -243,6 +298,7 @@ impl Merger {
             import,
             bases,
             shared_stack_top,
+            stackless_providers: stackless.len(),
             placements,
         }))
     }
@@ -263,7 +319,7 @@ impl Merger {
         extent: Option<u64>,
         comp_idx: usize,
         mod_idx: usize,
-    ) -> Result<((usize, usize), u64, u64)> {
+    ) -> Result<ShareStackEntry> {
         let extent = extent.ok_or_else(|| {
             Error::MemoryStrategyUnsupported(format!(
                 "--share-stack: component {comp_idx} module {mod_idx} cannot be compacted \
@@ -272,14 +328,67 @@ impl Merger {
                  Build the input with `-Wl,--export=__heap_base`."
             ))
         })?;
-        let sp = module_stack_pointer_marker(module).ok_or_else(|| {
-            Error::MemoryStrategyUnsupported(format!(
-                "--share-stack: component {comp_idx} module {mod_idx} has no `__stack_pointer` \
-                 marker (a mutable `i32` global with a single `i32.const` init, named in the \
-                 export table or `name` section); cannot place a shared shadow stack it cannot \
-                 locate."
-            ))
-        })?;
+        // #446: a module with NO `__stack_pointer` global contributes no shadow
+        // stack. `wasm-ld` strips the global from a module whose code never
+        // touches the stack — gale's thin seam forwarders, whose bodies are a
+        // few `call`s to imports and need no frame — so its absence is a fact
+        // read off the module, not an inference. fathom measured the same
+        // sources going from 5-of-5 carrying the marker under rustc 1.98.1 to
+        // 1-of-5 under 1.99.0, with no source change: whether a module is
+        // stackless is a codegen decision, and it moves.
+        //
+        // Such a module is encoded as `sp_i = 0`, which is what it actually
+        // has: an empty `[0, 0)` stack region. That is not a special case in
+        // the layout arithmetic below, it is the faithful value — it adds
+        // nothing to `max_i(sp_i)`, takes `base_i = next_base - 0`, strides by
+        // its whole `extent_i`, and satisfies both preconditions trivially
+        // (nothing can start below 0; `0 <= extent`). Skipping the module
+        // instead would be unsound: `bases` is populated ONLY from these
+        // entries on this path, so a skipped module would get no base at all
+        // and alias whatever sits at 0.
+        //
+        // An unreadable marker is a different thing and still fails: absence
+        // means stackless only when the global is genuinely not there.
+        let (sp, stackless) = match module_stack_pointer_marker(module) {
+            Some(sp) => (sp, false),
+            // Stackless requires BOTH: nothing named `__stack_pointer`, AND no
+            // unnamed global shaped like one. See
+            // `module_has_unnamed_sp_candidate` — without the second half this
+            // silently mis-classifies a stripped module that does have a
+            // shadow stack, which is a wrong answer where the old contract gave
+            // a loud failure.
+            None if module_global_index_by_name(module, "__stack_pointer").is_none()
+                && !module_has_unnamed_sp_candidate(module) =>
+            {
+                (0, true)
+            }
+            None if module_global_index_by_name(module, "__stack_pointer").is_none() => {
+                return Err(Error::MemoryStrategyUnsupported(format!(
+                    "--share-stack: component {comp_idx} module {mod_idx} has no NAMED \
+                     `__stack_pointer`, but does carry a defined mutable `i32` global with a \
+                     constant initialiser — the exact shape of a stack pointer. meld cannot \
+                     tell whether that global IS the shadow-stack pointer under a different \
+                     name, or whether the name information was stripped, so it will not assume \
+                     the module is stackless: doing so would size the shared region without it \
+                     and leave its pointer un-rewritten, and its frames would descend into a \
+                     neighbour's data. Export the marker with \
+                     `-Wl,--export=__stack_pointer`, or keep the `name` section, or drop \
+                     `--share-stack` for this set. A genuinely stackless module has no such \
+                     global, because the pointer is what `wasm-ld` removed."
+                )));
+            }
+            None => {
+                return Err(Error::MemoryStrategyUnsupported(format!(
+                    "--share-stack: component {comp_idx} module {mod_idx} HAS a \
+                     `__stack_pointer` global, but meld cannot read it as a marker (it must be \
+                     a DEFINED, mutable `i32` global with a single `i32.const` initialiser; an \
+                     imported global, another type, or a computed initialiser cannot be \
+                     placed). Refusing rather than assuming the module is stackless — a module \
+                     with no `__stack_pointer` global at all IS treated as stackless (#446), \
+                     so this error means the marker is present and unusable."
+                )));
+            }
+        };
         if sp > extent {
             return Err(Error::MemoryStrategyUnsupported(format!(
                 "--share-stack: component {comp_idx} module {mod_idx} `__stack_pointer` ({sp}) \
@@ -336,7 +445,12 @@ impl Merger {
                 }
             }
         }
-        Ok(((comp_idx, mod_idx), sp, extent))
+        Ok(ShareStackEntry {
+            key: (comp_idx, mod_idx),
+            sp,
+            extent,
+            stackless,
+        })
     }
 
     /// SR-67 / #382: the `--share-stack` call-topology envelope check. The shared
@@ -827,6 +941,66 @@ fn module_stack_pointer_marker(module: &CoreModule) -> Option<u64> {
 /// (export table preferred — what `-Wl,--export=<name>` controls and what
 /// survives `wasm-tools component new` — then the `name` section fallback), whose
 /// mutability matches `want_mutable` and whose init is a single `i32.const`.
+/// Index of the global named `name`, by export table then `name` section —
+/// the same lookup [`module_marker_global`] uses, factored out so a caller can
+/// tell "no such global exists" from "it exists but is not a readable marker".
+///
+/// #446 turns on exactly that distinction: `wasm-ld` drops `__stack_pointer`
+/// from a module whose code never touches the shadow stack, so its absence is
+/// a fact about the module, while an unreadable marker must still fail loud.
+fn module_global_index_by_name(module: &CoreModule, name: &str) -> Option<u32> {
+    module
+        .exports
+        .iter()
+        .find(|e| matches!(e.kind, ExportKind::Global) && e.name == name)
+        .map(|e| e.index)
+        .or_else(|| module_named_global_index(module, name))
+}
+
+/// Does the module contain a DEFINED, mutable `i32` global with a constant
+/// initialiser — i.e. a global shaped exactly like a `__stack_pointer` — that
+/// no name information identifies?
+///
+/// This is what makes "absence means stackless" safe (#446, caught by the
+/// auto-Mythos delta-pass on the first cut of SR-90). The lookup in
+/// [`module_global_index_by_name`] reads the export table and the `name`
+/// custom section. A module can *have* a shadow stack while neither names nor
+/// exports its pointer — a stripped binary, or any toolchain that does not
+/// pass `-Wl,--export=__stack_pointer` — and that is not a corner case,
+/// because meld's own `__heap_base` diagnostic tells people to export
+/// `__heap_base` while `__stack_pointer` is conventionally left unexported.
+///
+/// Treating that module as stackless would be silent corruption: the shared
+/// region gets sized to the OTHER providers' stacks, this module's pointer is
+/// never rewritten (the coalescer cannot find it either), and its frames
+/// descend from the original value straight through the shared region and into
+/// a neighbour's data. The previous contract REFUSED such input, so admitting
+/// it would be a regression into a wrong answer from a loud failure.
+///
+/// A module that `wasm-ld` actually stripped the shadow stack from has no such
+/// global, because the pointer is the thing that was removed. So "no named SP
+/// AND no candidate" is the faithful test, and anything else is refused.
+fn module_has_unnamed_sp_candidate(module: &CoreModule) -> bool {
+    let import_globals = module
+        .imports
+        .iter()
+        .filter(|i| matches!(i.kind, ImportKind::Global(_)))
+        .count() as u32;
+    // Only globals no name information resolves to; a named one is handled by
+    // the marker read and its own error path.
+    let named: Vec<u32> = ["__stack_pointer"]
+        .iter()
+        .filter_map(|n| module_global_index_by_name(module, n))
+        .collect();
+    module.globals.iter().enumerate().any(|(defined, g)| {
+        let global_index = import_globals + defined as u32;
+        g.mutable
+            && g.content_type == ValType::I32
+            && crate::segments::const_i32_init_value(&g.init_expr_bytes).is_some()
+            && !named.contains(&global_index)
+    })
+}
+
 fn module_marker_global(module: &CoreModule, name: &str, want_mutable: bool) -> Option<u64> {
     let import_globals = module
         .imports
@@ -834,12 +1008,7 @@ fn module_marker_global(module: &CoreModule, name: &str, want_mutable: bool) -> 
         .filter(|i| matches!(i.kind, ImportKind::Global(_)))
         .count() as u32;
 
-    let global_index = module
-        .exports
-        .iter()
-        .find(|e| matches!(e.kind, ExportKind::Global) && e.name == name)
-        .map(|e| e.index)
-        .or_else(|| module_named_global_index(module, name))?;
+    let global_index = module_global_index_by_name(module, name)?;
 
     // Only a DEFINED global carries a readable initialiser (imported globals do
     // not).

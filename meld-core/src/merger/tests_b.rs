@@ -1002,6 +1002,7 @@ fn empty_merged_fixture() -> MergedModule {
         async_result_globals: std::collections::HashMap::new(),
         segment_bases: std::collections::HashMap::new(),
         shared_stack_top: None,
+        stackless_providers: 0,
         placements: Vec::new(),
     }
 }
