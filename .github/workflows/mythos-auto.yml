@@ -301,6 +301,25 @@ jobs:
           if [ -z "${RESULT_JSON:-}" ]; then
             RESULT_JSON='{"verdict":"FINDING","file":"'"$F"'","hypothesis":"discover step failed before emitting structured output — see workflow logs"}'
           fi
+          # Stamp the file name from the MATRIX rather than trusting the model
+          # to echo it back. `file` is optional in the json-schema above, and a
+          # NO_FINDINGS result does not generally include it — so every clean
+          # row in the aggregated table came out as an empty name:
+          #
+          #     | File | Verdict      |
+          #     | ``   | NO FINDINGS  |   x5
+          #
+          # which cannot be checked. A reviewer could not tell which five files
+          # were examined, and — worse — could not distinguish "five files
+          # checked, all clean" from "five rows emitted, nothing examined",
+          # because the count comes from counting these artifacts. Note the
+          # failure placeholder above already set `file`, so a FAILED job named
+          # its file and a successful one did not, which is backwards.
+          #
+          # The matrix value is authoritative here: this job was dispatched FOR
+          # that file, so it is the right source regardless of what the model
+          # reports.
+          RESULT_JSON=$(printf '%s' "$RESULT_JSON" | jq --arg f "$F" '.file = $f')
           printf '%s' "$RESULT_JSON" > "mythos-out/${SLUG}.json"
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
@@ -341,6 +360,14 @@ jobs:
             [ -e "$f" ] || continue
             verdict=$(jq -r '.verdict' "$f")
             file=$(jq -r '.file // ""' "$f")
+            # A nameless row is an unverifiable row: the table exists so a
+            # reviewer can confirm the files they care about were covered.
+            # Fail loudly rather than emit `| `` |` as this did for every clean
+            # file before the matrix stamp above.
+            if [ -z "$file" ]; then
+              echo "::error::$f carries no .file — the per-file result must name its file, or the verdict table cannot be checked"
+              exit 1
+            fi
             hyp=$(jq -r '.hypothesis // ""' "$f")
             if [ "$verdict" = "FINDING" ]; then
               findings=$((findings + 1))
