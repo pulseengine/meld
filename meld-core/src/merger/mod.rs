@@ -38,7 +38,7 @@ use wasm_encoder::{
 mod handle_tables;
 mod imports;
 mod index_maps;
-mod memory;
+pub(crate) mod memory;
 mod merge_core;
 mod naming;
 

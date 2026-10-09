@@ -1025,11 +1025,19 @@ impl Fuser {
         // safety tool that cries wolf on its supported path trains users to
         // ignore the warnings that matter.
         //
-        // The residual risk lives entirely on the NO-reloc path, where it is
-        // already reported precisely and per-module by
-        // `address_strategy::resolve_address_plan` (an absolute address used as
-        // a VALUE, #339) — and the genuinely dangerous case (no relocs WITH
-        // direct load/store) is already a hard error there (path-F).
+        // NOT TRUE, and corrected here (#461): this comment used to claim the
+        // genuinely dangerous case (no relocs WITH direct load/store) "is
+        // already a hard error there (path-F)". cpetig's report shows a fused
+        // module that silently aliases another component's memory at exit 0
+        // with validation passing, so some dangerous input reaches the output
+        // without path-F refusing it.
+        //
+        // What IS true: path-F fires only when a module carries NO reloc
+        // metadata at all. A module WITH relocs is trusted to have them for
+        // every absolute address it holds, and that trust is what #461
+        // breaches — its constants are rebased while absolute addresses folded
+        // into memarg offsets are not. The corruption is tracked in #461 and
+        // is NOT fixed by this change, which only makes the warning accurate.
         if self.config.memory_strategy == MemoryStrategy::SharedMemory
             && self.config.address_rebasing
         {
@@ -1102,12 +1110,7 @@ impl Fuser {
         self.components
             .iter()
             .enumerate()
-            .filter(|(_, component)| {
-                component
-                    .core_modules
-                    .iter()
-                    .any(|module| !reloc::has_reloc_metadata(&module.custom_sections))
-            })
+            .filter(|(_, component)| component.core_modules.iter().any(module_reloc_risk))
             .map(|(idx, component)| {
                 component
                     .name
@@ -3706,6 +3709,126 @@ fn generate_stabilizing_shim(
 
     body.instruction(&Instruction::End);
     body
+}
+
+/// #461: does this core module's MISSING reloc metadata actually put a fused
+/// artifact at risk?
+///
+/// True only when the module BOTH defines its own memory AND lacks
+/// `linking`/`reloc.*`. Those two together are what make an un-rebasable
+/// absolute address possible:
+///
+///  * `compute_shared_memory_plan` populates `bases` from exactly this
+///    "defines a memory" predicate, so a module without one provably gets
+///    base 0 and cannot be shifted into a neighbour's window;
+///  * with relocs present, `address_strategy::resolve_address_plan` builds a
+///    rebase plan for the module instead.
+///
+/// This replaces `any(!has_reloc)` over ALL of a component's core modules,
+/// which tainted a whole component when any one module lacked relocs. A
+/// component whose imports pass records by pointer gets three core modules
+/// from wit-component — the real one, a lowered-import shim and a fixup — and
+/// the latter two carry no relocs by construction and define no memory. So a
+/// component whose real module was fully reloc-covered was reported as
+/// carrying none, and the remedy the warning named ("rebuild with
+/// `--emit-relocs`") was already satisfied.
+///
+/// Measured on the #461 inputs, split's three modules are
+/// `(memory, code, reloc)` = `(yes, yes, yes)`, `(no, yes, no)`, `(no, no, no)`.
+/// Only the first can be rebased; the other two were the entire false report.
+///
+/// This does NOT fix the aliasing in #461. That is a separate defect: a module
+/// WITH relocs is trusted to have them for every absolute address it holds,
+/// and there the trust is misplaced.
+fn module_reloc_risk(module: &parser::CoreModule) -> bool {
+    let defines_memory = matches!(
+        crate::merger::memory::module_memory_type(module),
+        Ok(Some(_))
+    );
+    defines_memory && !reloc::has_reloc_metadata(&module.custom_sections)
+}
+
+#[cfg(test)]
+mod reloc_risk_tests {
+    use super::*;
+    use crate::parser::{CoreModule, MemoryType};
+
+    fn module(defines_memory: bool, has_reloc: bool) -> CoreModule {
+        CoreModule {
+            index: 0,
+            bytes: Vec::new(),
+            types: Vec::new(),
+            imports: Vec::new(),
+            exports: Vec::new(),
+            functions: Vec::new(),
+            memories: if defines_memory {
+                vec![MemoryType {
+                    memory64: false,
+                    shared: false,
+                    initial: 1,
+                    maximum: None,
+                }]
+            } else {
+                Vec::new()
+            },
+            tables: Vec::new(),
+            globals: Vec::new(),
+            start: None,
+            data_count: None,
+            element_count: 0,
+            custom_sections: if has_reloc {
+                vec![
+                    ("linking".to_string(), Vec::new()),
+                    ("reloc.CODE".to_string(), Vec::new()),
+                ]
+            } else {
+                vec![("producers".to_string(), Vec::new())]
+            },
+            code_section_range: None,
+            global_section_range: None,
+            element_section_range: None,
+            data_section_range: None,
+        }
+    }
+
+    /// #461: the three shapes a pointer-passing component actually produces.
+    ///
+    /// wit-component emits the real module plus a lowered-import shim and a
+    /// fixup. Measured on the reporter's inputs, those are
+    /// `(memory, reloc)` = `(yes, yes)`, `(no, no)`, `(no, no)`.
+    ///
+    /// The old `any(!has_reloc)` predicate reported the whole component as
+    /// carrying no relocs because of the latter two, telling the user to
+    /// rebuild with `--emit-relocs` when they already had.
+    #[test]
+    fn a_shim_without_relocs_does_not_taint_a_reloc_covered_component() {
+        // the real module: defines a memory, has relocs -> not a risk
+        assert!(!module_reloc_risk(&module(true, true)));
+        // the lowered-import shim and the fixup: no memory, no relocs.
+        // These cannot be placed at a non-zero base, so they cannot alias.
+        assert!(!module_reloc_risk(&module(false, false)));
+    }
+
+    /// The control that keeps the fix honest: a module that DOES define a
+    /// memory and genuinely lacks relocs must still be reported, because that
+    /// is the case whose absolute addresses cannot be rebased. Verified
+    /// end-to-end as well — such an input still warns AND still hard-fails
+    /// path-F with `MissingRelocMetadata`.
+    #[test]
+    fn a_memory_defining_module_without_relocs_is_still_a_risk() {
+        assert!(module_reloc_risk(&module(true, false)));
+    }
+
+    /// A module with relocs is never a risk by this predicate regardless of
+    /// whether it owns a memory — #461's aliasing is a DIFFERENT defect, where
+    /// relocs are present but do not cover every absolute address. This test
+    /// exists so that a future change which "fixes" #461 by widening this
+    /// predicate fails here instead of silently re-tainting shims.
+    #[test]
+    fn relocs_present_is_never_a_risk_by_this_predicate() {
+        assert!(!module_reloc_risk(&module(true, true)));
+        assert!(!module_reloc_risk(&module(false, true)));
+    }
 }
 
 #[cfg(test)]
