@@ -1933,7 +1933,34 @@ impl Fuser {
         for &(comp_idx, mod_idx) in &affected_modules {
             let module = &self.components[comp_idx].core_modules[mod_idx];
 
-            let memory_base_offset = 0u64; // only nonzero for shared-memory rebasing
+            // #461: this used to be `0u64`, with the comment "only nonzero for
+            // shared-memory rebasing" — which is false here, because shared-
+            // memory rebasing IS active on this path.
+            //
+            // This loop regenerates every function body of a module whose
+            // import was redirected to an adapter, FROM THE ORIGINAL MODULE
+            // BYTES, and the result replaces what the merge pass produced. With
+            // base 0 the regenerated body carries the module's ORIGINAL
+            // absolute addresses, silently discarding the rebasing already
+            // applied. Its data segments are not regenerated here, so they keep
+            // their rebased addresses — data moves, code reverts, and the
+            // module reads a neighbour's statics at exit 0 with validation
+            // passing.
+            //
+            // Reported by cpetig (#461) on a three-component fuse where the
+            // middle component's own `i32.load offset=8224` ended up reading
+            // the first component's data, which begins at 8192. Measured
+            // affected on every released binary tested, v0.20.0 through
+            // v0.61.0.
+            //
+            // The base comes from the merge-time placement record, which is the
+            // same number `compute_shared_memory_plan` assigned.
+            let memory_base_offset = merged
+                .placements
+                .iter()
+                .find(|p| p.component == comp_idx && p.module == mod_idx)
+                .map(|p| p.base)
+                .unwrap_or(0);
             let module_memory = if self.config.address_rebasing {
                 merger::module_memory_type(module)?
             } else {
@@ -1954,6 +1981,22 @@ impl Fuser {
                 .copied()
                 .unwrap_or((0, 0));
 
+            // #461: recompute this module's address plan at its real base, so
+            // the regenerated body keeps the rebasing. Same call the merge pass
+            // makes in `merger::merge_core`; it also re-applies the path-F and
+            // memory64 rejections, which is harmless because a module that
+            // failed them would not have reached this point.
+            let address_plan = crate::address_strategy::resolve_address_plan(
+                &module.custom_sections,
+                module.code_section_range,
+                &module.bytes,
+                memory_base_offset,
+                self.config.address_rebasing,
+                &merger::component_display_name(&self.components, comp_idx),
+                mod_idx,
+                || merger::module_has_direct_memory_access(module),
+            )?;
+
             let index_maps = merger::build_index_maps_for_module(
                 comp_idx,
                 mod_idx,
@@ -1966,10 +2009,16 @@ impl Fuser {
                 memory_initial_pages,
                 data_segment_base,
                 elem_segment_base,
-                // #326: this adapter-redirect re-rewrite runs with
-                // `memory_base_offset == 0` (no rebasing), so no reloc
-                // consumption is needed here.
-                None,
+                // #461: the reloc plan must come too. `convert_memarg`
+                // rebases an offset only when a MEMORY_ADDR site lands on it;
+                // with `None` it falls back to the blanket branch, which would
+                // shift genuine struct-field displacements as well. So the
+                // regenerated body needs exactly the plan the merge pass used.
+                //
+                // The previous comment here asserted this pass runs with
+                // `memory_base_offset == 0` and therefore needs no relocs.
+                // That was the same false premise as the base above.
+                address_plan.code_addr_relocs.clone(),
             );
 
             let import_func_count = module

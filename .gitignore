@@ -12,6 +12,13 @@ bazel-*
 !tests/**/*.wat
 !examples/**/*.wat
 
+# Committed test FIXTURES are inputs, not build artifacts, so they are exempt.
+# Negated explicitly rather than left to `git add --force`: an untracked
+# fixture is how 36 tests came to report `ok` in CI without executing (#405),
+# and #461's regression test reproduces a memory-aliasing bug that only these
+# exact inputs trigger. A rule beats remembering a flag.
+!meld-core/tests/fixtures/**/*.wasm
+
 # Profiling
 **/*.profraw
 *.profdata
