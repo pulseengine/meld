@@ -3562,5 +3562,6 @@ artifacts:
         target: SR-48
     provenance:
       created-by: ai-assisted
+      reviewed-by: avrabe
       model: claude-opus-5-5
       timestamp: 2026-10-13T19:56:07Z
