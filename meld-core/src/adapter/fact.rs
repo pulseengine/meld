@@ -13281,7 +13281,7 @@ mod tests {
             handle_tables: std::collections::HashMap::new(),
             task_return_shims: std::collections::HashMap::new(),
             async_result_globals: std::collections::HashMap::new(),
-            segment_bases: std::collections::HashMap::new(),
+            rewrite_params: std::collections::HashMap::new(),
             shared_stack_top: None,
             stackless_providers: 0,
             placements: Vec::new(),

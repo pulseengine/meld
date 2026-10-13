@@ -23,7 +23,7 @@
 //! - each instance gets **independent** functions/memory/tables/globals — two
 //!   instances cannot share mutable state (the STPA **H-1** hazard the "duplicate"
 //!   option must avoid); and
-//! - every `(component, module)`-keyed merge map (`segment_bases`, `realloc_map`,
+//! - every `(component, module)`-keyed merge map (`rewrite_params`, `realloc_map`,
 //!   the resource maps, the five index maps) gets a **distinct key per instance**,
 //!   so the second instance can never overwrite the first (the silent-corruption
 //!   failure mode of naïve duplication).

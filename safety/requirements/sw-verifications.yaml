@@ -1525,3 +1525,16 @@ artifacts:
       reviewed-by: avrabe
       model: claude-opus-5
       timestamp: 2026-10-07T10:37:15Z
+
+  - id: SWV-105
+    type: sw-verification
+    title: "Verification of SR-93: replaying the record reproduces every merged body, and the old parameters do not"
+    status: implemented
+    description: "Verifies SR-93 in meld-core/src/merger/tests_rerewrite.rs, on cpetig's three #461 components merged under shared memory with address rebasing. replaying_the_record_reproduces_every_merged_body regenerates every defined function of every merged module through index_maps_for_rerewrite and asserts the encoded body equals the one the merge produced; it first asserts that at least one module sits at a non-zero base with a reloc plan, so it cannot pass on inputs where rebasing is absent. the_old_zero_base_parameters_do_not_reproduce_a_rebased_module is the control: the parameters the passes used to hand-pick (the module's real strategy and rebasing flag, base 0, no plan) must NOT reproduce a rebased module's bodies, which shows the comparison is sensitive to rebasing at all. a_module_without_a_record_is_an_error_not_a_default asserts the missing-record error. Potency measured by mutation: recording an empty reloc plan while building the merge's maps from the real one makes the replay test fail at component 2 module 0 function 2; recording base 0 with no plan trips its non-vacuity guard. A mutation applied to the shared builder that both the merge and the replay use does NOT fail the test, correctly, since the two then agree; the test guards the record, not the builder. End-to-end coverage of the adapter-redirect path remains meld-core/tests/adapter_rerewrite_rebase_461.rs from #466. Not established here: an end-to-end reproduction through the four other passes on relocated inputs. The fixture corpus cannot reach them under shared+rebase, since the P3 and resource fixtures carry no reloc metadata and are refused by path-F, and a probe at the handle-table site could not have fired regardless because merged.placements is populated only after that pass runs. Those passes are corrected by construction, not demonstrated."
+    links:
+      - type: verifies
+        target: SR-93
+    provenance:
+      created-by: ai-assisted
+      model: claude-opus-5-5
+      timestamp: 2026-10-13T19:56:18Z

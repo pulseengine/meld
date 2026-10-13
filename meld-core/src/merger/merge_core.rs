@@ -582,40 +582,31 @@ impl Merger {
         // before this module's own segments are appended (lines below), so
         // they count only PRIOR modules' segments — exactly mirroring how
         // `func_offset = merged.functions.len()` is captured before this
-        // module's functions are pushed. Record them on `merged` so the
-        // post-merge re-rewrite pass (resource-import redirect) can recover
-        // the correct base after `.len()` no longer equals it.
+        // module's functions are pushed.
         let data_segment_base = merged.data_segments.len() as u32;
         let elem_segment_base = merged.elements.len() as u32;
-        merged
-            .segment_bases
-            .insert((comp_idx, mod_idx), (data_segment_base, elem_segment_base));
 
-        let mut index_maps = build_index_maps_for_module(
-            comp_idx,
-            mod_idx,
-            module,
-            merged,
-            self.memory_strategy,
-            self.address_rebasing,
+        // Record every rewrite decision for this module, then build its maps
+        // FROM that record. Post-merge passes that regenerate these bodies
+        // read the same record (`index_maps_for_rerewrite`), so they cannot
+        // rewrite the module differently from how it was merged (#461).
+        let params = ModuleRewriteParams {
+            memory_strategy: self.memory_strategy,
+            address_rebasing: self.address_rebasing,
             memory_base_offset,
             memory64,
             memory_initial_pages,
             data_segment_base,
             elem_segment_base,
             code_addr_relocs,
-        );
-        // #353: hand the data/element offset reindex the set of DEFINED
-        // constant-i32 globals so a `global.get` of a post-fusion `__memory_base`
-        // in an offset is folded to `i32.const` (imported globals stay verbatim).
-        index_maps
-            .defined_global_i32_consts
-            .clone_from(&merged.defined_global_i32_const);
-        // #298: only under the upstream vestigial-allocator verdict does a
-        // `memory.grow` reached during rebasing become `unreachable` (the
-        // allocator is provably dead) instead of a hard error. Inert when
-        // `address_rebasing` is off (the rewriter checks it only under rebase).
-        index_maps.defer_grow_under_rebase = self.defer_grow_under_rebase;
+            // #298: only under the upstream vestigial-allocator verdict does a
+            // `memory.grow` reached during rebasing become `unreachable` (the
+            // allocator is provably dead) instead of a hard error. Inert when
+            // `address_rebasing` is off (the rewriter checks it only under rebase).
+            defer_grow_under_rebase: self.defer_grow_under_rebase,
+        };
+        let index_maps = index_maps_from_params(comp_idx, mod_idx, module, merged, &params);
+        merged.rewrite_params.insert((comp_idx, mod_idx), params);
 
         // Second pass: extract and rewrite function bodies
         for (old_idx, old_func_idx, new_type_idx, type_idx) in func_type_indices {

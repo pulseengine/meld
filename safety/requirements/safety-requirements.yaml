@@ -3549,3 +3549,18 @@ artifacts:
       reviewed-by: avrabe
       model: claude-opus-5
       timestamp: 2026-10-07T10:36:59Z
+
+  - id: SR-93
+    type: sw-req
+    title: A pass that regenerates merged function bodies rewrites them exactly as the merge did
+    status: implemented
+    description: "Several passes run after the main merge and regenerate a module's function bodies from its ORIGINAL bytes, so that already-encoded call instructions pick up a changed function index: the adapter redirect, the P3 task.return shims, resource handle-table routing, the cross-component stream bridge, and the P3 async import shift. Regenerating from the original bytes means every other transformation the merge applied must be applied again, identically. Each of these passes derived its own rewrite parameters, and four of the five assumed a zero shared-memory base and no relocation plan (the P3 async shift additionally forced multi-memory and rebasing off). Under --memory shared --address-rebase that silently discarded the rebasing of any module it touched: the regenerated code carried the module's pre-fusion absolute addresses while its data segments kept their rebased ones, so the module read and wrote a neighbour's memory at exit 0 with validation passing. cpetig reported the adapter-redirect instance (#461), measured on every released binary tested from v0.20.0 through v0.61.0; #466 corrected that one site. meld shall record, for every merged module, the complete set of inputs the main loop used to build its index maps -- memory strategy, rebasing flag, shared-memory base, memory64, initial page count, data and element segment bases, the reloc-driven code rebasing plan, and the #298 memory.grow deferral -- and every post-merge pass that regenerates bodies shall obtain its index maps only by replaying that record, so a regenerated body can differ from the merged one only in the function indices the pass changed. This shall hold by construction rather than by review: the function that assembles index maps from loose parameters is private to the merger, and code outside it can obtain index maps for a merged module only through the replay accessor. A module with no record shall be an error, never a default, since a default of base 0 and no plan is the failure this requirement exists to prevent. Path-F (MissingRelocMetadata) cannot catch this class of fault, because the loss happens after it has run; the guarantee has to come from the regenerating passes themselves. The same change removes two loud divergences of the same origin: the task.return pass supplied no initial page count, so a memory.size in a rebased module it regenerated would have failed the fuse, and no regenerating pass carried the #298 deferral, so a module under the vestigial-allocator verdict could fail on a memory.grow the merge had already proven dead."
+    links:
+      - type: derives-from
+        target: SYS-6
+      - type: refines
+        target: SR-48
+    provenance:
+      created-by: ai-assisted
+      model: claude-opus-5-5
+      timestamp: 2026-10-13T19:56:07Z

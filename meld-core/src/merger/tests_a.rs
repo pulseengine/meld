@@ -166,7 +166,7 @@ fn test_multi_memory_index_maps() {
         handle_tables: HashMap::new(),
         task_return_shims: HashMap::new(),
         async_result_globals: HashMap::new(),
-        segment_bases: HashMap::new(),
+        rewrite_params: HashMap::new(),
         shared_stack_top: None,
         stackless_providers: 0,
         placements: Vec::new(),

@@ -101,11 +101,11 @@ use std::collections::{BTreeMap, HashMap};
 
 use wasm_encoder::{BlockType, EntityType, Function, Instruction, MemArg, MemoryType, ValType};
 
+use crate::Result;
 use crate::merger::{MergedFuncType, MergedFunction, MergedModule, SyntheticKind};
 use crate::p3_async::{self, HOST_INTRINSIC_MODULE};
 use crate::p3_stream::StreamPairGraph;
 use crate::parser::{ImportKind, ParsedComponent};
-use crate::{MemoryStrategy, Result};
 
 // ─── Bridge memory layout ──────────────────────────────────────────────
 //
@@ -221,8 +221,6 @@ pub fn emit_stream_bridge(
     merged: &mut MergedModule,
     components: &[ParsedComponent],
     stream_pairs: &StreamPairGraph,
-    memory_strategy: MemoryStrategy,
-    address_rebasing: bool,
 ) -> Result<Option<BridgePlan>> {
     if stream_pairs.is_empty() {
         return Ok(None);
@@ -375,33 +373,9 @@ pub fn emit_stream_bridge(
     for &(c, m) in usage.keys() {
         let module = &components[c].core_modules[m];
 
-        let module_memory = if address_rebasing {
-            crate::merger::module_memory_type(module)?
-        } else {
-            None
-        };
-        let memory64 = module_memory
-            .as_ref()
-            .map(|mem| mem.memory64)
-            .unwrap_or(false);
-        let memory_initial_pages = module_memory.as_ref().map(|mem| mem.initial);
-
-        let (data_segment_base, elem_segment_base) =
-            merged.segment_bases.get(&(c, m)).copied().unwrap_or((0, 0));
-        let index_maps = crate::merger::build_index_maps_for_module(
-            c,
-            m,
-            module,
-            merged,
-            memory_strategy,
-            address_rebasing,
-            0, // memory_base_offset — matches wire_adapter_indices
-            memory64,
-            memory_initial_pages,
-            data_segment_base,
-            elem_segment_base,
-            None, // code_addr_relocs (#326): adapter/shim re-rewrite, no relocs
-        );
+        // Regenerates bodies from the original bytes; replay the merge pass's
+        // rewrite decisions so shared-memory rebasing survives (#461).
+        let index_maps = crate::merger::index_maps_for_rerewrite(c, m, module, merged)?;
 
         let import_func_count = module
             .imports
