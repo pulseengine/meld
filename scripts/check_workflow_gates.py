@@ -261,6 +261,15 @@ def check_traceability_gate(fails):
             "be some other command's status — the confusion that has produced a wrong verdict "
             "in this repo's CI more than once"
         )
+    # Actions runs `run:` blocks under `bash -e`, so a failing command
+    # substitution aborts the step before a following `rc=$?` can run, and the
+    # diagnostics are never printed. The status must be taken on the same line.
+    if "--fail-on info 2>&1) || rc=$?" not in run:
+        fails.append(
+            f"{TRACEABILITY}: rivet's exit status is not captured with `|| rc=$?` on the "
+            "assignment itself; under the runner's `bash -e`, a failing rivet aborts the step "
+            "before the diagnostics are printed"
+        )
 
 
 if __name__ == "__main__":

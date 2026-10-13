@@ -97,8 +97,14 @@ jobs:
           # several times in this repository's CI — including in the step that
           # measured this very command. An assignment preserves rivet's own
           # exit code.
-          out=$(rivet validate --new-since "origin/$base" --fail-on info 2>&1)
-          rc=$?
+          #
+          # `|| rc=$?`, not a bare `rc=$?` on the next line: Actions runs this
+          # block as `bash -e {0}`, so `-e` is on whatever `set` line comes
+          # first, and a non-zero assignment aborts the step BEFORE `rc` is
+          # read. The verdict was still "fail", but the step printed nothing:
+          # a PR that added diagnostics was never told which ones (#468).
+          rc=0
+          out=$(rivet validate --new-since "origin/$base" --fail-on info 2>&1) || rc=$?
           printf '%s\n' "$out"
 
           # POTENCY CONTROL. Everything below trusts `rc`, and `rc=0` has two
