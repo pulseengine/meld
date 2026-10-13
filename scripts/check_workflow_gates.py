@@ -222,8 +222,45 @@ def check(path=WORKFLOW):
     want("gate-exclusions.txt" in cov, "coverage step no longer reads the exclusion list")
 
     check_stub_alignment(fails)
+    check_traceability_gate(fails)
 
     return fails
+
+
+TRACEABILITY = ".github/workflows/traceability.yml"
+
+
+def check_traceability_gate(fails):
+    """The traceability ratchet's own checks (#412).
+
+    Its exit code carries the verdict, and `rc=0` has two meanings: rivet
+    compared the trees and found nothing new, or rivet never compared anything.
+    The second would pass the gate while checking nothing, so the step demands
+    evidence of a comparison. Asserted here so that control cannot be dropped
+    silently — the same reason the proofs census's floors are asserted above.
+    """
+    p = pathlib.Path(TRACEABILITY)
+    if not p.exists():
+        fails.append(f"{TRACEABILITY} is missing")
+        return
+    run = extract_run_blocks(p.read_text()).get("No new traceability diagnostics", "")
+    if not run:
+        fails.append(f"{TRACEABILITY}: no 'No new traceability diagnostics' step with a run block")
+        return
+    for needle, why in (
+        ("--fail-on info", "the threshold dropped below info, where the backlink rule lives"),
+        ("New diagnostics since", "the potency control is gone: an exit 0 with nothing compared would pass"),
+        ("--new-since", "the ratchet became an absolute threshold"),
+    ):
+        if needle not in run:
+            fails.append(f"{TRACEABILITY}: {why} (missing {needle!r})")
+    # `$?` must read rivet's own status, not a pipeline's last command.
+    if "out=$(rivet validate" not in run:
+        fails.append(
+            f"{TRACEABILITY}: rivet's output is no longer captured into a variable, so $? may "
+            "be some other command's status — the confusion that has produced a wrong verdict "
+            "in this repo's CI more than once"
+        )
 
 
 if __name__ == "__main__":

@@ -92,12 +92,30 @@ jobs:
           # ref, and --new-since needs that commit to build its worktree.
           git fetch -q --no-tags origin "+refs/heads/$base:refs/remotes/origin/$base"
 
-          # No pipeline, so $? is rivet's own status and not some grep's. That
-          # confusion has produced a wrong answer three times in this
-          # repository's CI already, including in the step that measured this
-          # very command.
-          rivet validate --new-since "origin/$base" --fail-on info
+          # Captured into a variable, not piped: `$?` after a pipeline is the
+          # LAST command's status, a confusion that has produced a wrong answer
+          # several times in this repository's CI — including in the step that
+          # measured this very command. An assignment preserves rivet's own
+          # exit code.
+          out=$(rivet validate --new-since "origin/$base" --fail-on info 2>&1)
           rc=$?
+          printf '%s\n' "$out"
+
+          # POTENCY CONTROL. Everything below trusts `rc`, and `rc=0` has two
+          # possible meanings: rivet compared the trees and found nothing new,
+          # or rivet did not compare anything at all. The second would pass this
+          # gate while checking nothing — the exact defect this workflow exists
+          # to remove (#412), one level up.
+          #
+          # So demand the evidence of a comparison. rivet prints
+          # "New diagnostics since <ref>: N (...)" on every run that reaches a
+          # verdict; absence of that line means the verdict is not about this
+          # change, whatever the exit code says.
+          if ! printf '%s' "$out" | grep -q "New diagnostics since"; then
+            echo "::error::rivet validate exited $rc but never reported a comparison — it did not reach a verdict about this change, so this gate proved nothing. Treating as a failure rather than a pass."
+            exit 1
+          fi
+
           case "$rc" in
             0) echo "::notice::this change adds no new traceability diagnostics" ;;
             1) echo "::error::this change ADDS traceability diagnostics (listed above). Link the artifacts it mentions, or remove the mention. The pre-existing backlog is deliberately not counted — only what this change adds." ; exit 1 ;;
