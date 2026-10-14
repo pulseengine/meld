@@ -15,6 +15,9 @@ design-paths:
 
 # ADR-4 — Inter-component memory-isolation model for the dissolved library-OS
 
+**Status update (2026-10-14):** The option listed under "Not done" below, erroring instead of warning when `Auto` is used, is implemented for `--profile safety` (`meld-core/src/lib.rs`, `check_safety_profile`; `Error::SafetyProfileViolation`). It applies to the safety profile rather than through a separate `require_explicit_memory_strategy` config option. Under the default `--profile ecosystem`, `--memory auto` remains accepted and resolves to multi-memory.
+
+
 ## Context
 
 The cross-repo dissolved-library-OS work (gale#86, gale#404, synth#404,
