@@ -183,9 +183,15 @@ fn a_wide_export_states_the_pointer_shape_and_its_allocator() {
     assert_eq!(
         area.layout
             .iter()
-            .map(|l| (l.offset, l.field.as_str(), l.size))
+            .map(|l| (l.offset, l.field.as_str(), l.size, l.ty.as_str()))
             .collect::<Vec<_>>(),
-        vec![(0, "o1", 4), (4, "o2", 4), (8, "o3", 4), (12, "o4", 4)]
+        vec![
+            (0, "o1", 4, "f32"),
+            (4, "o2", 4, "f32"),
+            (8, "o3", 4, "f32"),
+            (12, "o4", 4, "f32")
+        ],
+        "#469: the field types come through a `use`d record on a real fused module"
     );
 }
 

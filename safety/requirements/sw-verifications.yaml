@@ -1539,3 +1539,17 @@ artifacts:
       reviewed-by: avrabe
       model: claude-opus-5-5
       timestamp: 2026-10-13T19:56:18Z
+
+  - id: SWV-106
+    type: sw-verification
+    title: "Verification of SR-94: layout entries carry types that distinguish same-sized fields"
+    status: implemented
+    description: "Verifies SR-94. Unit test each_layout_entry_carries_its_type (meld-core/src/signature_manifest.rs) builds kiln's shape -- a u32 beside an f32 of the same size -- plus a bool, a string and a nested record, and asserts every (offset, field, size, type) tuple, so the canonical-ABI offsets (string aligned to 12 after the bool, the f64 record to 24) are checked alongside the types. the_type_is_serialized_as_type asserts the JSON key is \"type\" and that the Rust field name does not leak. an_unresolvable_field_type_yields_no_layout asserts that an unresolvable field type produces no layout, which the caller turns into an omitted export. On a real fused module, a_wide_export_states_the_pointer_shape_and_its_allocator (meld-core/tests/signature_manifest_400.rs) now asserts the types of the record \"out\" reached through a WIT use on compose_record_use_wide. Potency measured by mutation: reporting every scalar as f32 -- the indistinguishable case the requirement exists to remove -- fails each_layout_entry_carries_its_type. Not covered: no corpus fixture returns a record that mixes scalar types through a real fused module; that shape is exercised by the unit test only."
+    links:
+      - type: verifies
+        target: SR-94
+    provenance:
+      created-by: ai-assisted
+      reviewed-by: avrabe
+      model: claude-opus-5-5
+      timestamp: 2026-10-14T05:06:14Z

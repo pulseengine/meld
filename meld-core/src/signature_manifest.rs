@@ -133,6 +133,15 @@ pub struct LayoutEntry {
     pub offset: u32,
     pub field: String,
     pub size: u32,
+    /// What the field holds (#469): the WIT primitive name for a scalar
+    /// (`u32`, `f32`, `char`, …), otherwise the kind of the type (`record`,
+    /// `list`, `string`, `variant`, …). Size alone cannot tell a `u32` from an
+    /// `f32`, and without this a reader had to recover it by parsing the
+    /// rendered WIT text in `wit.result`. A compound field names only its
+    /// kind; its own layout is not described yet, and a reader should refuse
+    /// to decode below it rather than infer one.
+    #[serde(rename = "type")]
+    pub ty: String,
 }
 
 /// Render a WIT type structurally. `None` when a type reference does not
@@ -501,12 +510,28 @@ pub fn build(
             let return_area = result_ty.as_ref().and_then(|ty| {
                 // One flat result is returned directly; more go through the
                 // return area the callee owns.
-                (component.flat_count(ty) > 1).then(|| ReturnArea {
-                    size: component.canonical_abi_element_size(ty),
-                    align: component.canonical_abi_align(ty),
-                    layout: top_level_layout(component, ty),
+                (component.flat_count(ty) > 1).then(|| {
+                    top_level_layout(component, ty).map(|layout| ReturnArea {
+                        size: component.canonical_abi_element_size(ty),
+                        align: component.canonical_abi_align(ty),
+                        layout,
+                    })
                 })
             });
+            // `Some(None)`: a return area exists but a field's type does not
+            // resolve. Omit the export rather than describe it with a guessed
+            // type, as for an unresolvable parameter or result (#393).
+            let return_area = match return_area {
+                Some(None) => {
+                    omitted.push(OmittedExport {
+                        export: export_name,
+                        reason: "a return-area field type does not resolve".to_string(),
+                    });
+                    continue;
+                }
+                Some(Some(area)) => Some(area),
+                None => None,
+            };
 
             let needs = Needs {
                 realloc: flat_param_count > MAX_FLAT_PARAMS
@@ -629,10 +654,14 @@ fn exported_memory_name(
         .map(|(name, _)| name.clone())
 }
 
-/// Top-level `(offset, field, size)` of a value stored in memory.
-fn top_level_layout(component: &ParsedComponent, ty: &ComponentValType) -> Vec<LayoutEntry> {
+/// Top-level `(offset, field, size, type)` of a value stored in memory.
+/// `None` when a field's type does not resolve.
+fn top_level_layout(
+    component: &ParsedComponent,
+    ty: &ComponentValType,
+) -> Option<Vec<LayoutEntry>> {
     let resolved = resolve_alias(component, ty);
-    match resolved.as_ref().unwrap_or(ty) {
+    Some(match resolved.as_ref().unwrap_or(ty) {
         ComponentValType::Record(fields) => {
             let mut out = Vec::with_capacity(fields.len());
             let mut offset = 0u32;
@@ -644,6 +673,7 @@ fn top_level_layout(component: &ParsedComponent, ty: &ComponentValType) -> Vec<L
                     offset,
                     field: name.clone(),
                     size,
+                    ty: layout_type_name(component, field_ty)?.to_string(),
                 });
                 offset = offset.saturating_add(size);
             }
@@ -653,8 +683,34 @@ fn top_level_layout(component: &ParsedComponent, ty: &ComponentValType) -> Vec<L
             offset: 0,
             field: "value".to_string(),
             size: component.canonical_abi_element_size(other),
+            ty: layout_type_name(component, other)?.to_string(),
         }],
-    }
+    })
+}
+
+/// The `type` of a layout entry: a scalar's WIT name, or a compound's kind,
+/// looking through type aliases. `None` when an alias does not resolve.
+///
+/// An `enum` reaches meld as a payload-less `variant`, so it is named
+/// `variant`: that is the layout it has (a discriminant), and naming it `enum`
+/// would assert a distinction the parsed component does not record.
+fn layout_type_name(component: &ParsedComponent, ty: &ComponentValType) -> Option<&'static str> {
+    let resolved = resolve_alias(component, ty);
+    Some(match resolved.as_ref().unwrap_or(ty) {
+        ComponentValType::Primitive(p) => render_primitive(p),
+        ComponentValType::String => "string",
+        ComponentValType::List(_) => "list",
+        ComponentValType::FixedSizeList(..) => "fixed-size-list",
+        ComponentValType::Record(_) => "record",
+        ComponentValType::Flags(_) => "flags",
+        ComponentValType::Variant(_) => "variant",
+        ComponentValType::Tuple(_) => "tuple",
+        ComponentValType::Option(_) => "option",
+        ComponentValType::Result { .. } => "result",
+        ComponentValType::Own(_) => "own",
+        ComponentValType::Borrow(_) => "borrow",
+        ComponentValType::Type(_) => return None,
+    })
 }
 
 fn resolve_alias(component: &ParsedComponent, ty: &ComponentValType) -> Option<ComponentValType> {
@@ -672,4 +728,99 @@ fn align_to(offset: u32, align: u32) -> u32 {
         return offset;
     }
     offset.div_ceil(align) * align
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::parser::PrimitiveValType as P;
+
+    fn empty_component() -> ParsedComponent {
+        ParsedComponent {
+            name: None,
+            core_modules: Vec::new(),
+            imports: Vec::new(),
+            exports: Vec::new(),
+            types: Vec::new(),
+            instances: Vec::new(),
+            canonical_functions: Vec::new(),
+            sub_components: Vec::new(),
+            instance_type_exports: Default::default(),
+            component_aliases: Vec::new(),
+            component_instances: Vec::new(),
+            core_entity_order: Vec::new(),
+            component_func_defs: Vec::new(),
+            component_instance_defs: Vec::new(),
+            component_type_defs: Vec::new(),
+            original_size: 0,
+            original_hash: String::new(),
+            depth_0_sections: Vec::new(),
+            p3_async_features: Vec::new(),
+        }
+    }
+
+    /// #469: kiln's `observer#read-state` shape mixes a `u32` with `f32`s of
+    /// the same size, so offset and size alone cannot say which is which.
+    /// Each entry must carry its type, and a compound field its kind.
+    // rivet: verifies SR-94
+    #[test]
+    fn each_layout_entry_carries_its_type() {
+        let c = empty_component();
+        let ty = ComponentValType::Record(vec![
+            ("tick-head".to_string(), ComponentValType::Primitive(P::U32)),
+            ("qw".to_string(), ComponentValType::Primitive(P::F32)),
+            ("ok".to_string(), ComponentValType::Primitive(P::Bool)),
+            ("label".to_string(), ComponentValType::String),
+            (
+                "pos".to_string(),
+                ComponentValType::Record(vec![
+                    ("x".to_string(), ComponentValType::Primitive(P::F64)),
+                    ("y".to_string(), ComponentValType::Primitive(P::F64)),
+                ]),
+            ),
+        ]);
+        let layout = top_level_layout(&c, &ty).expect("every field resolves");
+        let got: Vec<_> = layout
+            .iter()
+            .map(|l| (l.offset, l.field.as_str(), l.size, l.ty.as_str()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (0, "tick-head", 4, "u32"),
+                (4, "qw", 4, "f32"),
+                (8, "ok", 1, "bool"),
+                (12, "label", 8, "string"),
+                (24, "pos", 16, "record"),
+            ]
+        );
+    }
+
+    #[test]
+    fn the_type_is_serialized_as_type() {
+        let entry = LayoutEntry {
+            offset: 4,
+            field: "qw".to_string(),
+            size: 4,
+            ty: "f32".to_string(),
+        };
+        let json = serde_json::to_value(&entry).expect("serializes");
+        assert_eq!(json["type"], "f32", "kiln reads the key `type`: {json}");
+        assert!(
+            json.get("ty").is_none(),
+            "the Rust field name must not leak: {json}"
+        );
+    }
+
+    /// A field whose type does not resolve yields no layout, so the caller
+    /// omits the export rather than describing it with a guessed type.
+    #[test]
+    fn an_unresolvable_field_type_yields_no_layout() {
+        let c = empty_component();
+        let ty = ComponentValType::Record(vec![
+            ("a".to_string(), ComponentValType::Primitive(P::U32)),
+            ("b".to_string(), ComponentValType::Type(999)),
+        ]);
+        assert!(top_level_layout(&c, &ty).is_none());
+    }
 }
