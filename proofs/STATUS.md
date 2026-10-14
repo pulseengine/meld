@@ -4,19 +4,19 @@ Implementation vs formal verification coverage for the Meld fusion pipeline.
 
 ## Numbers at a Glance
 
-Counts refreshed 2026-06-11 (v0.31.0 traceability audit).
+Counts refreshed 2026-10-14 (v0.62.0).
 
 | Metric | Count |
 |--------|-------|
 | Rocq `.v` files | 28 |
-| Rocq lines (total) | 14,487 |
-| Closed proofs (Qed) | 350 |
+| Rocq lines (total) | 14,640 |
+| Closed proofs (Qed) | 357 |
 | Admitted proofs | 0 |
-| Rust lines (`meld-core/src`, recursive, incl. inline tests) | 41,378 |
-| Proof-to-code ratio | 0.35x |
+| Rust lines (`meld-core/src`, recursive, incl. inline tests) | 65,443 |
+| Proof-to-code ratio | 0.22x |
 
 Measurement method: Rocq counts via `find proofs -name "*.v"` (file
-count, total `wc -l`, `grep -c "Qed."` summed). Rust lines via
+count, total `wc -l`, `grep -c "Qed."` summed; occurrences inside `(* ... *)` comments excluded, which changes no count). Rust lines via
 `find meld-core/src -name "*.rs" | xargs wc -l` — this counts ALL
 sources under `meld-core/src` including `adapter/` and the inline
 `#[cfg(test)]` test modules (a large share of the total), so the

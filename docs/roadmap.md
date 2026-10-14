@@ -1,6 +1,11 @@
 # Meld release roadmap (v0.22 → v0.31)
 
-> Drafted 2026-06-09. Living document — update each release.
+> **Archived plan.** This document covers v0.22 to v0.31 as drafted on
+> 2026-06-09 and is no longer updated. For what has shipped, see
+> [`CHANGELOG.md`](../CHANGELOG.md); for what is planned for a release,
+> see the `release:` field on the rivet artifacts (`rivet list`).
+
+> Drafted 2026-06-09.
 > Supersedes the v0.8→v0.11 roadmap (all four shipped; v0.12–v0.21
 > shipped issue-driven without a standing roadmap — this document
 > restores the practice).

@@ -14,6 +14,9 @@ design-paths:
 
 # ADR-1 — P3 async lowering
 
+**Status update (2026-10-14):** The lowering pass is wired into fusion: `p3_async::lower_p3_async_intrinsics` runs from `meld-core/src/lib.rs` after the merge, and the `stream<T>`/`future<T>` data-plane rewrite onto the `pulseengine:async` ABI has shipped (see the CHANGELOG entry "P3 async lowering pass"). Components using P3 async features are no longer left with unresolved `(canon stream.*)` constructs. Support is partial: it is exercised for the shapes covered by the test suite, async cross-component calls and async cross-encoding transcoding are bounded to those shapes, and the full P3 async surface is not supported (README, Limitations). The ABI still requires a host that provides the `pulseengine:async` imports. Statements below that fusion "still cannot lower" P3 async describe the intermediate state before the pass landed. The status stays `open` for the remaining surface.
+
+
 ## Context
 
 WASM Component Model 0.3 (P3) introduces `stream<T>`, `future<T>`, and

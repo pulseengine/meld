@@ -50,7 +50,7 @@ pre-commit run --all-files
 
 ### Clippy Configuration
 
-Our clippy configuration treats all warnings as errors (`-D warnings`). See [clippy.toml](clippy.toml) for details.
+Our clippy configuration treats all warnings as errors (`-D warnings`). The `-D warnings` flag is passed by the pre-commit hooks and CI; [clippy.toml](clippy.toml) contains no settings and only documents the lints we care about in comments.
 
 Common clippy lints we enforce:
 

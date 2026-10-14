@@ -1083,12 +1083,11 @@ fn correct_line_programs<R: gimli::read::Reader<Offset = usize>>(
 ///
 /// - no input module carries DWARF AND the fusion generated no adapter
 ///   code, or
-/// - **more than one** module carries DWARF (merging independent DWARF
-///   unit sets into one consistent `.debug_info` is a separate problem,
-///   #208 — emitting either source's addresses against the merged code
-///   section would be wrong for the other). The synthetic adapter unit
-///   IS still emitted in this case: it references only meld-generated
-///   ranges, so no wrong source addresses are involved, or
+/// - every DWARF-bearing module fails remap or conversion, or the merge of
+///   several modules' DWARF falls outside the bounded relocation
+///   repertoire. In those cases only the synthetic adapter unit is
+///   emitted (when adapter code exists); it references only
+///   meld-generated ranges, so no wrong source addresses are involved, or
 /// - the remap or gimli round-trip fails any consistency check.
 ///
 /// `output_bytes` must be the fused module encoded *without* the

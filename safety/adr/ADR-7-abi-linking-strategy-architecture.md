@@ -21,6 +21,12 @@ design-paths:
 
 # ADR-7 — ABI & linking-strategy architecture
 
+**Status update (2026-10-14):** Two statements below describe the position at decision time and no longer hold as written.
+
+- `sealed-safety` shipped as `--profile safety` (`meld-core/src/lib.rs`, `check_safety_profile`; CLI help in `meld-cli/src/main.rs`). Today it enforces one property: it refuses `--memory auto`, so the isolation model must be stated explicitly (ADR-4, "explicit, not auto"). It does not restrict the build to symmetric+PIC inputs and does not reject adapter or `cabi_realloc` boundaries; a build under `--profile safety` may still contain memory-copy adapter boundaries, which `--explain` reports. Output is byte-identical to the same explicit invocation under `--profile ecosystem`. The stronger rejection described in recommendation 6 is not implemented.
+- RFC-46 Q1 (multiply-instantiated modules) is handled in the core-instance topology layer (`meld-core/src/core_instance_topology.rs`, `expand_multiply_instantiated_modules`, called from `meld-core/src/lib.rs`). Under `--memory multi` such modules are duplicated into distinct identities; under other strategies the `DuplicateModuleInstantiation` error (SR-31) applies. Statements elsewhere in this ADR that Q1 is "not yet handled" or "unresolved" refer to the state before that layer landed.
+
+
 ## Context
 
 ### The invariant: RFC-46 conformance and maximum mix-and-match
