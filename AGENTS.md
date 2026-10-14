@@ -16,7 +16,7 @@
 This project uses **Rivet** for SDLC artifact traceability.
 - Config: `rivet.yaml`
 - Schemas: common, stpa, aspice, dev
-- Artifacts: 213 across 11 types
+- Artifacts: 553 across 16 types (`rivet stats`, taken 2026-10-14)
 - Validation: `rivet validate` (current status: pass)
 
 ## Available Commands
@@ -36,34 +36,26 @@ This project uses **Rivet** for SDLC artifact traceability.
 
 ## Artifact Types
 
+Counts from `rivet stats` on 2026-10-14; types with no artifacts are omitted.
+
 | Type | Count | Description |
 |------|------:|-------------|
 | `control-action` | 26 | An action issued by a controller to a controlled process or another controller. |
 | `controlled-process` | 5 | A process being controlled — the physical or data transformation acted upon by controllers. |
-| `controller` | 7 | A system component (human or automated) responsible for issuing control actions. Each controller has a process model — its internal beliefs about the state of the controlled process. |
-| `controller-constraint` | 45 | A constraint on a controller's behavior derived by inverting a UCA. Specifies what the controller must or must not do. |
-| `hazard` | 10 | A system state or set of conditions that, together with worst-case environmental conditions, will lead to a loss. |
-| `loss` | 5 | An undesired or unplanned event involving something of value to stakeholders. Losses define what the analysis aims to prevent. |
-| `loss-scenario` | 21 | A causal pathway describing how a UCA could occur or how the control action could be improperly executed, leading to a hazard. |
-| `requirement` | 27 | A functional or non-functional requirement |
-| `sub-hazard` | 10 | A refinement of a hazard into a more specific unsafe condition. |
+| `controller` | 10 | A system component (human or automated) responsible for issuing control actions. Each controller has a process model — its internal beliefs about the state of the controlled process. |
+| `controller-constraint` | 60 | A constraint on a controller's behavior derived by inverting a UCA. Specifies what the controller must or must not do. |
+| `hazard` | 17 | A system state or set of conditions that, together with worst-case environmental conditions, will lead to a loss. |
+| `loss` | 10 | An undesired or unplanned event involving something of value to stakeholders. Losses define what the analysis aims to prevent. |
+| `loss-scenario` | 89 | A causal pathway describing how a UCA could occur or how the control action could be improperly executed, leading to a hazard. |
+| `requirement` | 4 | A functional or non-functional requirement |
+| `stakeholder-req` | 2 | Stakeholder requirement (SYS.1) |
+| `sub-hazard` | 19 | A refinement of a hazard into a more specific unsafe condition. |
+| `sw-req` | 94 | Software requirement (SWE.1) |
+| `sw-verification` | 106 | Software verification measure against SW requirements (SWE.6 — Software Verification) |
+| `sys-verification` | 11 | System verification measure against system requirements (SYS.5 — System Verification) |
 | `system-constraint` | 12 | A condition or behavior that must be satisfied to prevent a hazard. Each constraint is the inversion of a hazard. |
-| `uca` | 45 | An Unsafe Control Action — a control action that, in a particular context and worst-case environment, leads to a hazard. Four types (provably complete): 1. Not providing the control action leads to a hazard 2. Providing the control action leads to a hazard 3. Providing too early, too late, or in the wrong order 4. Control action stopped too soon or applied too long |
-| `design-decision` | 0 | An architectural or design decision with rationale |
-| `feature` | 0 | A user-visible capability or feature |
-| `stakeholder-req` | 0 | Stakeholder requirement (SYS.1) |
-| `sw-arch-component` | 0 | Software architectural element (SWE.2) |
-| `sw-detail-design` | 0 | Software detailed design or unit specification (SWE.3) |
-| `sw-integration-verification` | 0 | Software component and integration verification measure (SWE.5 — Software Component Verification and Integration Verification) |
-| `sw-req` | 0 | Software requirement (SWE.1) |
-| `sw-verification` | 0 | Software verification measure against SW requirements (SWE.6 — Software Verification) |
-| `sys-integration-verification` | 0 | System integration and integration verification measure (SYS.4 — System Integration and Integration Verification) |
-| `sys-verification` | 0 | System verification measure against system requirements (SYS.5 — System Verification) |
-| `system-arch-component` | 0 | System architectural element (SYS.3) |
-| `system-req` | 0 | System requirement derived from stakeholder needs (SYS.2) |
-| `unit-verification` | 0 | Unit verification measure (SWE.4 — Software Unit Verification) |
-| `verification-execution` | 0 | A verification execution run against a specific version |
-| `verification-verdict` | 0 | Pass/fail verdict for a single verification measure in an execution run |
+| `system-req` | 11 | System requirement derived from stakeholder needs (SYS.2) |
+| `uca` | 77 | An Unsafe Control Action — a control action that, in a particular context and worst-case environment, leads to a hazard. Four types (provably complete): 1. Not providing the control action leads to a hazard 2. Providing the control action leads to a hazard 3. Providing too early, too late, or in the wrong order 4. Control action stopped too soon or applied too long |
 
 ## Working with Artifacts
 
@@ -233,7 +225,8 @@ P2/P3 Components → Parser → Resolver → Merger → Adapter Gen → Single M
 
 #### Memory Strategies
 
-- **Multi-memory** (default): Each component keeps its own linear memory.
+- **Multi-memory** (default): `--memory auto`, the default flag value, resolves
+  to multi-memory; `--memory multi` selects it explicitly. Each component keeps its own linear memory.
   Cross-component calls that pass pointers use adapters that allocate in
   the callee's memory via `cabi_realloc`, copy data with `memory.copy`,
   call the target, and copy results back. Requires WebAssembly multi-memory
@@ -727,9 +720,12 @@ maintainer (`avrabe`, immutable user id `10056645`) via the
 `anthropics/claude-code-action` running against the maintainer's Max-
 plan OAuth token. On every PR that touches a Tier-5 file:
 
-1. The detect job lists touched Tier-5 paths (same path-list as
-   `mythos-gate.yml`) and **path-shape-validates** each one before
-   passing into the matrix.
+1. The detect job lists touched Tier-5 paths and **path-shape-validates**
+   each one before passing into the matrix. Its path list is the
+   `mythos-gate.yml` list (11 patterns) plus two more, for 13:
+   `meld-core/src/provenance.rs` and `meld-core/src/dwarf.rs`. A PR
+   touching only those two files is scanned by the auto-runner but does
+   not require the `mythos-pass-done` label under `mythos-gate.yml`.
 2. Per-file matrix runs the `claude-code-action`-pinned-by-SHA with
    the discover.md prompt, asking for a structured JSON verdict
    (`NO_FINDINGS` or `FINDING`).
