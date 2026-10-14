@@ -5,6 +5,74 @@ All notable changes to this project will be documented in this file.
 ## [Unreleased]
 
 
+## [0.62.0] - 2026-10-14
+
+### Security
+- **`--memory shared --address-rebase` could discard a component's address
+  rebasing after the merge (#461).** Several passes run after the merge and
+  rebuild a module's function bodies from its original bytes so that call
+  instructions pick up changed function indices. The confirmed trigger is the
+  adapter redirect: a component with an import routed through a generated
+  adapter, which `wit-component` produces for any import that passes a pointer.
+  The task.return, handle-table, stream-bridge and P3 async passes did the same.
+  These rebuilds used a zero shared-memory base and no relocation plan. A
+  component placed above 0 therefore ended up with code still using its
+  pre-fusion absolute addresses while its data had moved, so at run time it
+  read and wrote another component's memory. The fuse exited 0 and the output
+  validated. Measured on released binaries 0.20.0 through 0.61.0, on inputs
+  reported by cpetig. The default (`auto`, which always selects multi-memory)
+  and `--memory multi` are not affected.
+
+  Fixed in two steps. #466 corrected the adapter-redirect pass. #468 fixes the
+  class: the merge now records every per-module rewrite decision
+  (`MergedModule::rewrite_params`), and every pass that rebuilds bodies
+  replays that record through `merger::index_maps_for_rerewrite`. The
+  loose-parameter builder is now private to the merger, so no call site can
+  pick a base of its own, and a module without a record is an error rather
+  than base 0. Replaying the record reproduces every merged body byte for
+  byte; the old parameters do not (SR-93 / SWV-105). Across the fixture corpus
+  under all three memory modes, #468 changes no output relative to the build
+  before it; the one apparent difference is a fixture whose output already
+  varied between runs (#467).
+
+### Added
+- **Each return-area layout entry in the signature manifest now states its
+  field's type (SR-94, #469, #471).** A layout entry carried an offset and a
+  size, which cannot tell a 4-byte `f32` from a 4-byte `u32`, so kiln recovered
+  field types by parsing the rendered WIT text. Every entry now has a `type`:
+  the WIT primitive name for a scalar (`bool`, `s8` ... `u64`, `f32`, `f64`,
+  `char`), otherwise the kind of the type (`string`, `list`, `fixed-size-list`,
+  `record`, `flags`, `variant`, `tuple`, `option`, `result`, `own`, `borrow`),
+  looking through type aliases. An `enum` is reported as `variant`, which is
+  the shape meld parses. A compound field names only its kind; its own layout
+  is not described. An export with a field type that does not resolve is
+  omitted with a stated reason rather than given a guessed type. The addition
+  is backward compatible, so the manifest version stays 1.
+
+### Fixed
+- The shared-memory warning about missing relocation metadata named a whole
+  component when only one of its small generated shim modules lacked relocs.
+  It now considers only modules that define a memory and carry no relocs
+  (#464).
+- Two rebuild paths failed a fuse they should have accepted under rebasing:
+  `memory.size` in a module rebuilt by the task.return pass, and a `memory.grow`
+  already proven dead under the #298 vestigial-allocator verdict. Both now
+  follow the merge's own handling (#468).
+
+### Changed
+- `MergedModule::segment_bases` is replaced by `rewrite_params`, and
+  `p3_bridge::emit_stream_bridge` no longer takes `memory_strategy` and
+  `address_rebasing` (#468).
+- CI: the traceability ratchet runs on every PR at `--fail-on info` (SR-91,
+  #454) and now prints the diagnostics it fails on (#470). The Rocq proof gate
+  is a required check (#456). The wit-bindgen fixture corpus is refreshed to
+  v0.54.0 (#460). The auto-Mythos verdict table names the file each verdict
+  is for (#457).
+- The reproducibility promise is now caveated where it does not hold (the
+  optional `wsc-attestation` feature), and that feature is linted in CI
+  (SR-92, #455).
+
+
 ## [0.61.0] - 2026-10-08
 
 ### Added
