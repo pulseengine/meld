@@ -1033,11 +1033,12 @@ impl Fuser {
         // without path-F refusing it.
         //
         // What IS true: path-F fires only when a module carries NO reloc
-        // metadata at all. A module WITH relocs is trusted to have them for
-        // every absolute address it holds, and that trust is what #461
-        // breaches — its constants are rebased while absolute addresses folded
-        // into memarg offsets are not. The corruption is tracked in #461 and
-        // is NOT fixed by this change, which only makes the warning accurate.
+        // metadata at all; a module WITH relocs is rebased from them. #461 was
+        // not a gap in that rule but a later pass undoing it: a post-merge
+        // re-rewrite regenerated the module's bodies at base 0, discarding the
+        // rebasing. Those passes now replay the merge's recorded parameters
+        // (`merger::index_maps_for_rerewrite`). Path-F cannot catch that class
+        // of fault by construction, since the loss happens after it has run.
         if self.config.memory_strategy == MemoryStrategy::SharedMemory
             && self.config.address_rebasing
         {
@@ -1454,13 +1455,7 @@ impl Fuser {
         if let Some(stream_pairs) = graph.stream_pair_graph.as_ref()
             && !stream_pairs.is_empty()
         {
-            p3_bridge::emit_stream_bridge(
-                &mut merged,
-                &self.components,
-                stream_pairs,
-                self.config.memory_strategy,
-                self.config.address_rebasing,
-            )?;
+            p3_bridge::emit_stream_bridge(&mut merged, &self.components, stream_pairs)?;
         }
 
         // Step 3: Generate adapters
@@ -1933,93 +1928,22 @@ impl Fuser {
         for &(comp_idx, mod_idx) in &affected_modules {
             let module = &self.components[comp_idx].core_modules[mod_idx];
 
-            // #461: this used to be `0u64`, with the comment "only nonzero for
-            // shared-memory rebasing" — which is false here, because shared-
-            // memory rebasing IS active on this path.
+            // #461: this pass regenerates every function body of a module
+            // whose import was redirected to an adapter, FROM THE ORIGINAL
+            // MODULE BYTES, and the result replaces what the merge pass
+            // produced. It used to build its own rewrite parameters with a
+            // zero shared-memory base and no relocation plan, so the
+            // regenerated body carried the module's ORIGINAL absolute
+            // addresses while its data segments kept their rebased ones — the
+            // module read a neighbour's statics at exit 0 with validation
+            // passing. Reported by cpetig (#461); measured on every released
+            // binary tested, v0.20.0 through v0.61.0.
             //
-            // This loop regenerates every function body of a module whose
-            // import was redirected to an adapter, FROM THE ORIGINAL MODULE
-            // BYTES, and the result replaces what the merge pass produced. With
-            // base 0 the regenerated body carries the module's ORIGINAL
-            // absolute addresses, silently discarding the rebasing already
-            // applied. Its data segments are not regenerated here, so they keep
-            // their rebased addresses — data moves, code reverts, and the
-            // module reads a neighbour's statics at exit 0 with validation
-            // passing.
-            //
-            // Reported by cpetig (#461) on a three-component fuse where the
-            // middle component's own `i32.load offset=8224` ended up reading
-            // the first component's data, which begins at 8192. Measured
-            // affected on every released binary tested, v0.20.0 through
-            // v0.61.0.
-            //
-            // The base comes from the merge-time placement record, which is the
-            // same number `compute_shared_memory_plan` assigned.
-            let memory_base_offset = merged
-                .placements
-                .iter()
-                .find(|p| p.component == comp_idx && p.module == mod_idx)
-                .map(|p| p.base)
-                .unwrap_or(0);
-            let module_memory = if self.config.address_rebasing {
-                merger::module_memory_type(module)?
-            } else {
-                None
-            };
-            let memory64 = module_memory
-                .as_ref()
-                .map(|mem| mem.memory64)
-                .unwrap_or(false);
-            let memory_initial_pages = module_memory.as_ref().map(|mem| mem.initial);
-
-            // Post-merge re-rewrite: recover this module's segment bases from
-            // the merge-time record (`merged.*.len()` is now the total, not
-            // the base).
-            let (data_segment_base, elem_segment_base) = merged
-                .segment_bases
-                .get(&(comp_idx, mod_idx))
-                .copied()
-                .unwrap_or((0, 0));
-
-            // #461: recompute this module's address plan at its real base, so
-            // the regenerated body keeps the rebasing. Same call the merge pass
-            // makes in `merger::merge_core`; it also re-applies the path-F and
-            // memory64 rejections, which is harmless because a module that
-            // failed them would not have reached this point.
-            let address_plan = crate::address_strategy::resolve_address_plan(
-                &module.custom_sections,
-                module.code_section_range,
-                &module.bytes,
-                memory_base_offset,
-                self.config.address_rebasing,
-                &merger::component_display_name(&self.components, comp_idx),
-                mod_idx,
-                || merger::module_has_direct_memory_access(module),
-            )?;
-
-            let index_maps = merger::build_index_maps_for_module(
-                comp_idx,
-                mod_idx,
-                module,
-                merged,
-                self.config.memory_strategy,
-                self.config.address_rebasing,
-                memory_base_offset,
-                memory64,
-                memory_initial_pages,
-                data_segment_base,
-                elem_segment_base,
-                // #461: the reloc plan must come too. `convert_memarg`
-                // rebases an offset only when a MEMORY_ADDR site lands on it;
-                // with `None` it falls back to the blanket branch, which would
-                // shift genuine struct-field displacements as well. So the
-                // regenerated body needs exactly the plan the merge pass used.
-                //
-                // The previous comment here asserted this pass runs with
-                // `memory_base_offset == 0` and therefore needs no relocs.
-                // That was the same false premise as the base above.
-                address_plan.code_addr_relocs.clone(),
-            );
+            // The maps now replay exactly what the merge pass used for this
+            // module (base, reloc plan, memory64, page count, segment bases,
+            // the #298 grow deferral), so only the redirected call indices
+            // differ.
+            let index_maps = merger::index_maps_for_rerewrite(comp_idx, mod_idx, module, merged)?;
 
             let import_func_count = module
                 .imports
@@ -2521,25 +2445,9 @@ impl Fuser {
         // Re-rewrite function bodies for affected modules
         for &(comp_idx, mod_idx) in &affected_modules {
             let module = &self.components[comp_idx].core_modules[mod_idx];
-            let (data_segment_base, elem_segment_base) = merged
-                .segment_bases
-                .get(&(comp_idx, mod_idx))
-                .copied()
-                .unwrap_or((0, 0));
-            let index_maps = merger::build_index_maps_for_module(
-                comp_idx,
-                mod_idx,
-                module,
-                merged,
-                self.config.memory_strategy,
-                self.config.address_rebasing,
-                0u64,
-                false,
-                None,
-                data_segment_base,
-                elem_segment_base,
-                None, // code_addr_relocs (#326): base 0, no rebasing on this pass
-            );
+            // Regenerates bodies from the original bytes; replay the merge
+            // pass's rewrite decisions so rebasing survives (#461).
+            let index_maps = merger::index_maps_for_rerewrite(comp_idx, mod_idx, module, merged)?;
             let import_func_count = module
                 .imports
                 .iter()

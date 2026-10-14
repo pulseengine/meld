@@ -46,15 +46,20 @@ mod naming;
 mod tests_a;
 #[cfg(test)]
 mod tests_b;
+#[cfg(test)]
+mod tests_rerewrite;
 
 pub(crate) use self::imports::UnresolvedImportAssignments;
 pub(crate) use self::imports::{
     accumulate_remapped_function_names, compute_unresolved_import_assignments,
 };
+// Private on purpose: outside the merger an `IndexMaps` comes only from
+// `index_maps_for_rerewrite`, which replays the main loop's decisions (#461).
+use self::index_maps::index_maps_from_params;
 pub(crate) use self::index_maps::{
-    build_index_maps_for_module, component_memory_index, component_realloc_index,
-    convert_global_type, convert_init_expr, convert_table_type,
-    decompose_component_core_func_index, extract_function_body, remap_concrete_val_type,
+    component_memory_index, component_realloc_index, convert_global_type, convert_init_expr,
+    convert_table_type, decompose_component_core_func_index, extract_function_body,
+    index_maps_for_rerewrite, remap_concrete_val_type,
 };
 pub(crate) use self::memory::{
     SharedMemoryPlan, convert_memory_type, module_has_direct_memory_access, module_memory_type,
@@ -67,6 +72,8 @@ pub(crate) use self::naming::{
 // non-test build would flag as unused under `-D warnings`).
 #[cfg(test)]
 pub(crate) use self::imports::find_exact_resource_import_idx;
+#[cfg(test)]
+use self::index_maps::build_index_maps_for_module;
 #[cfg(test)]
 pub(crate) use self::index_maps::create_global_init;
 #[cfg(test)]
@@ -87,6 +94,29 @@ pub struct ImportCounts {
     pub table: u32,
     pub memory: u32,
     pub global: u32,
+}
+
+/// The per-module inputs to [`build_index_maps_for_module`] that the main merge
+/// loop decides, recorded so a later pass that regenerates the module's bodies
+/// rewrites them exactly as the merge did (see [`MergedModule::rewrite_params`]).
+#[derive(Debug, Clone)]
+pub struct ModuleRewriteParams {
+    pub memory_strategy: MemoryStrategy,
+    pub address_rebasing: bool,
+    /// This module's shared-memory base (0 unless rebasing placed it higher).
+    pub memory_base_offset: u64,
+    pub memory64: bool,
+    pub memory_initial_pages: Option<u64>,
+    /// Where this module's local data / element segment indices land in the
+    /// concatenated sections: the count of segments contributed by all PRIOR
+    /// modules, captured before this module's own segments were appended.
+    pub data_segment_base: u32,
+    pub elem_segment_base: u32,
+    /// The reloc-driven rebasing plan (#326); `None` = no reloc metadata.
+    pub code_addr_relocs: Option<HashSet<u32>>,
+    /// #298: under the vestigial-allocator verdict a reached `memory.grow`
+    /// becomes `unreachable` rather than a hard error.
+    pub defer_grow_under_rebase: bool,
 }
 
 /// A merged WebAssembly module ready for encoding
@@ -199,16 +229,21 @@ pub struct MergedModule {
     /// Built after element segment patching. Used by the callback-driving adapter.
     pub async_result_globals: HashMap<(usize, String), Vec<(u32, ValType)>>,
 
-    /// Per-module base offsets into the concatenated `data_segments` / `elements`
-    /// vectors: maps (component_idx, module_idx) → (data_segment_base, elem_base).
+    /// How the main merge loop rewrote each module's function bodies, keyed
+    /// `(component_idx, module_idx)`. Recorded in `merge_core_module` at the
+    /// point the module's `IndexMaps` is built.
     ///
-    /// Recorded in `merge_core_module` at the point the module's `IndexMaps` is
-    /// built — i.e. BEFORE this module's own segments are appended — so the base
-    /// equals the count of segments contributed by all PRIOR modules, which is
-    /// exactly where this module's local segment indices land in the fused
-    /// section. Re-rewrite passes that run after the full merge (when `.len()`
-    /// no longer equals the base) look the base up here.
-    pub segment_bases: HashMap<(usize, usize), (u32, u32)>,
+    /// Several passes run after the merge and regenerate a module's bodies
+    /// from its ORIGINAL bytes so that already-encoded `call` instructions
+    /// pick up a changed function index (adapter redirects, task.return shims,
+    /// resource handle tables, stream bridges, the P3 async index shift).
+    /// Regenerating from the original bytes means every other transformation
+    /// must be applied again, identically. Each of those passes used to
+    /// re-derive the rewrite parameters itself, and most assumed a zero
+    /// shared-memory base and no relocation plan, which silently discarded
+    /// address rebasing (#461). They now read this record instead, through
+    /// [`index_maps_for_rerewrite`].
+    pub rewrite_params: HashMap<(usize, usize), ModuleRewriteParams>,
 
     /// SR-66 / #380: under `--share-stack`, the top of the single shared
     /// shadow-stack region (`max_i(sp_i)`, 16-byte-aligned base of the first
@@ -578,7 +613,7 @@ impl Merger {
             handle_tables: HashMap::new(),
             task_return_shims: HashMap::new(),
             async_result_globals: HashMap::new(),
-            segment_bases: HashMap::new(),
+            rewrite_params: HashMap::new(),
             shared_stack_top: None,
             stackless_providers: 0,
             placements: Vec::new(),
@@ -797,28 +832,10 @@ impl Merger {
             // redirected to handle table functions.
             for &(comp_idx, mod_idx) in &affected_modules {
                 let module = &components[comp_idx].core_modules[mod_idx];
-                // This pass runs AFTER the full merge, so `merged.*.len()` is
-                // the total segment count, not this module's base. Recover the
-                // correct per-module base recorded during the main merge loop.
-                let (data_segment_base, elem_segment_base) = merged
-                    .segment_bases
-                    .get(&(comp_idx, mod_idx))
-                    .copied()
-                    .unwrap_or((0, 0));
-                let index_maps = build_index_maps_for_module(
-                    comp_idx,
-                    mod_idx,
-                    module,
-                    &merged,
-                    self.memory_strategy,
-                    false, // address_rebasing
-                    0u64,  // memory_base_offset
-                    false, // memory64
-                    None,  // memory_initial_pages
-                    data_segment_base,
-                    elem_segment_base,
-                    None, // code_addr_relocs (rebasing off in this re-rewrite pass)
-                );
+                // Regenerates bodies from the original bytes; replay the merge
+                // pass's rewrite decisions (segment bases, and the shared-memory
+                // base + reloc plan this pass used to drop — #461).
+                let index_maps = index_maps_for_rerewrite(comp_idx, mod_idx, module, &merged)?;
                 let import_func_count = module
                     .imports
                     .iter()

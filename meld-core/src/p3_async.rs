@@ -1336,38 +1336,12 @@ fn shift_function_indices(
             continue;
         };
 
-        // Build index maps for this module using the updated merged state.
-        // Memory/global/etc maps are unaffected by the function-index shift.
-        let memory_strategy = if !merged.memories.is_empty() {
-            // Strategy doesn't affect function-index rewriting; multi-memory
-            // is the safe default for general re-extraction here.
-            crate::MemoryStrategy::MultiMemory
-        } else {
-            crate::MemoryStrategy::SharedMemory
-        };
-        let module_memory = crate::merger::module_memory_type(module).ok().flatten();
-        let memory64 = module_memory.as_ref().map(|m| m.memory64).unwrap_or(false);
-        let memory_initial_pages = module_memory.as_ref().map(|m| m.initial);
-
-        let (data_segment_base, elem_segment_base) = merged
-            .segment_bases
-            .get(&(comp_idx, mod_idx))
-            .copied()
-            .unwrap_or((0, 0));
-        let index_maps = crate::merger::build_index_maps_for_module(
-            comp_idx,
-            mod_idx,
-            module,
-            merged,
-            memory_strategy,
-            false,
-            0,
-            memory64,
-            memory_initial_pages,
-            data_segment_base,
-            elem_segment_base,
-            None, // code_addr_relocs (#326): adapter/shim re-rewrite, no relocs
-        );
+        // Regenerates bodies from the original bytes with the shifted function
+        // indices; every other input replays the merge pass, so the shift does
+        // not undo shared-memory rebasing (#461). This pass used to force
+        // multi-memory, rebasing off and base 0 for every module.
+        let index_maps =
+            crate::merger::index_maps_for_rerewrite(comp_idx, mod_idx, module, merged)?;
 
         let import_func_count = module
             .imports

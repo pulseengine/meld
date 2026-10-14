@@ -123,12 +123,79 @@ pub(crate) fn convert_global_type(
     }
 }
 
+/// IndexMaps for a pass that regenerates an already-merged module's function
+/// bodies from its original bytes, using the CURRENT function index map.
+///
+/// Every other input is the one the main merge loop used for this module,
+/// read back from [`MergedModule::rewrite_params`], so the regenerated bodies
+/// differ from the merged ones only in the function indices the caller
+/// changed. Code outside the merger has no other way to build an `IndexMaps`
+/// for a module: [`build_index_maps_for_module`] is private to it. That is the
+/// point. Re-deriving these values at each call site is how five passes came
+/// to assume a zero shared-memory base and no relocation plan (#461).
+///
+/// A module with no record was never merged, and regenerating its bodies
+/// would encode them against an invented placement; that is an error rather
+/// than a default.
+pub(crate) fn index_maps_for_rerewrite(
+    comp_idx: usize,
+    mod_idx: usize,
+    module: &CoreModule,
+    merged: &MergedModule,
+) -> Result<IndexMaps> {
+    let params = merged
+        .rewrite_params
+        .get(&(comp_idx, mod_idx))
+        .ok_or_else(|| {
+            Error::EncodingError(format!(
+                "internal: component {comp_idx} module {mod_idx} has no recorded rewrite \
+                 parameters, so its function bodies cannot be regenerated as merged (#461)"
+            ))
+        })?;
+    Ok(index_maps_from_params(
+        comp_idx, mod_idx, module, merged, params,
+    ))
+}
+
+/// The one place an `IndexMaps` is assembled from a [`ModuleRewriteParams`],
+/// shared by the main merge loop and [`index_maps_for_rerewrite`] so the two
+/// cannot drift apart.
+pub(super) fn index_maps_from_params(
+    comp_idx: usize,
+    mod_idx: usize,
+    module: &CoreModule,
+    merged: &MergedModule,
+    params: &ModuleRewriteParams,
+) -> IndexMaps {
+    let mut maps = build_index_maps_for_module(
+        comp_idx,
+        mod_idx,
+        module,
+        merged,
+        params.memory_strategy,
+        params.address_rebasing,
+        params.memory_base_offset,
+        params.memory64,
+        params.memory_initial_pages,
+        params.data_segment_base,
+        params.elem_segment_base,
+        params.code_addr_relocs.clone(),
+    );
+    // #353: data/element offset reindex folds a `global.get` of a defined
+    // constant-i32 global (a post-fusion `__memory_base`) to `i32.const`.
+    maps.defined_global_i32_consts
+        .clone_from(&merged.defined_global_i32_const);
+    maps.defer_grow_under_rebase = params.defer_grow_under_rebase;
+    maps
+}
+
 /// Build IndexMaps for a module from the merger's index maps
 ///
 /// This creates a local view of index remappings for a specific module,
-/// which is used when rewriting function bodies.
+/// which is used when rewriting function bodies. Private to the merger:
+/// callers elsewhere go through [`index_maps_for_rerewrite`].
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn build_index_maps_for_module(
+pub(super) fn build_index_maps_for_module(
     comp_idx: usize,
     mod_idx: usize,
     module: &CoreModule,
