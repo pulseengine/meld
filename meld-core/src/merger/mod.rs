@@ -48,6 +48,8 @@ mod tests_a;
 mod tests_b;
 #[cfg(test)]
 mod tests_rerewrite;
+#[cfg(test)]
+mod tests_unmapped_462;
 
 pub(crate) use self::imports::UnresolvedImportAssignments;
 pub(crate) use self::imports::{
@@ -245,6 +247,15 @@ pub struct MergedModule {
     /// [`index_maps_for_rerewrite`].
     pub rewrite_params: HashMap<(usize, usize), ModuleRewriteParams>,
 
+    /// #462: `(component, module, import position in the function-import
+    /// index space)` -> fused index of the trapping stub standing in for that
+    /// function import in `elem` slots. Present only for imports that no
+    /// resolution step mapped AND that an `elem` segment names (wit-component
+    /// fixup modules fill their shim table with such imports). Keeps the fused
+    /// function-index space honest: values are bumped by every pass that
+    /// inserts function imports, exactly like `function_index_map`.
+    pub unmapped_import_stubs: HashMap<(usize, usize, u32), u32>,
+
     /// SR-66 / #380: under `--share-stack`, the top of the single shared
     /// shadow-stack region (`max_i(sp_i)`, 16-byte-aligned base of the first
     /// provider's data). `None` when `--share-stack` is off. Consumed by
@@ -357,6 +368,9 @@ pub enum SyntheticKind {
     /// bridge ring memory and forwards host handles to the retained
     /// `pulseengine:async` imports.
     StreamBridge,
+    /// `unreachable` stub standing in an `elem` slot for a function import
+    /// that no resolution step mapped (#462).
+    TrapStub,
 }
 
 /// Global in merged module
@@ -614,6 +628,7 @@ impl Merger {
             task_return_shims: HashMap::new(),
             async_result_globals: HashMap::new(),
             rewrite_params: HashMap::new(),
+            unmapped_import_stubs: HashMap::new(),
             shared_stack_top: None,
             stackless_providers: 0,
             placements: Vec::new(),

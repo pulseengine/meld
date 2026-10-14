@@ -28,6 +28,141 @@ impl Merger {
         Ok(())
     }
 
+    /// #462: give every function import that no resolution step mapped, and
+    /// that an `elem` segment names, a trapping stub of the import's own type.
+    ///
+    /// wit-component's fixup module imports the `canon lower`ed functions as
+    /// `"" "0"`, `"" "1"`, ... and fills its shim table with them. When no
+    /// resolution step maps such an import, the identity fallback used to put
+    /// whatever fused function shared the import's index into the slot. A stub
+    /// keeps the slot's position and type but traps at `unreachable`, so a
+    /// call through the (otherwise dead) trampoline fails loudly instead of
+    /// reaching an unrelated function.
+    ///
+    /// The stub takes the IMPORT's type, which is the type of the slot it
+    /// stands in: wit-component types the trampoline's `call_indirect` with the
+    /// same lowered signature, so an indirect call traps at `unreachable`
+    /// rather than on a signature mismatch. If a producer ever disagreed, the
+    /// call would still trap (`indirect call type mismatch`), so the choice
+    /// cannot turn a trap into a silent wrong call.
+    ///
+    /// A global initialiser `ref.func` of an unmapped import is an error here
+    /// (a global's init cannot be given a stub without changing its meaning).
+    fn create_trap_stubs_for_unmapped_imports(
+        &self,
+        comp_idx: usize,
+        mod_idx: usize,
+        module: &CoreModule,
+        merged: &mut MergedModule,
+    ) -> Result<()> {
+        // (import position, import type index) for each unmapped func import.
+        let mut unmapped: Vec<(u32, u32, &crate::parser::ModuleImport)> = Vec::new();
+        let mut pos = 0u32;
+        for imp in &module.imports {
+            if let ImportKind::Function(type_idx) = imp.kind {
+                if !merged
+                    .function_index_map
+                    .contains_key(&(comp_idx, mod_idx, pos))
+                {
+                    unmapped.push((pos, type_idx, imp));
+                }
+                pos += 1;
+            }
+        }
+        if unmapped.is_empty() {
+            return Ok(());
+        }
+
+        let unmapped_err =
+            |imp: &crate::parser::ModuleImport, use_site: &str| Error::UnmappedFunctionImport {
+                component: comp_idx,
+                module: mod_idx,
+                import_module: imp.module.clone(),
+                import_name: imp.name.clone(),
+                use_site: use_site.to_string(),
+            };
+
+        // A global initialiser naming an unmapped import cannot be stubbed.
+        for global in &module.globals {
+            if global.init_expr_bytes.is_empty() {
+                continue;
+            }
+            let mut full = global.init_expr_bytes.clone();
+            full.push(0x0B);
+            let expr = wasmparser::ConstExpr::new(wasmparser::BinaryReader::new(&full, 0));
+            if let Some(Ok(wasmparser::Operator::RefFunc { function_index })) =
+                expr.get_operators_reader().into_iter().next()
+                && let Some((_, _, imp)) = unmapped.iter().find(|(p, _, _)| *p == function_index)
+            {
+                return Err(unmapped_err(imp, "a global initialiser (`ref.func`)"));
+            }
+        }
+
+        // Unmapped imports an element segment names.
+        let mut in_elem: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
+        for segment in crate::segments::parse_element_segments(module)? {
+            match &segment.items {
+                crate::segments::ElementItems_::Functions(fs) => in_elem.extend(fs.iter()),
+                crate::segments::ElementItems_::Expressions(es) => {
+                    for e in es {
+                        if let crate::segments::ParsedConstExpr::RefFunc(f) = e {
+                            in_elem.insert(*f);
+                        }
+                    }
+                }
+            }
+        }
+
+        for (pos, type_idx, imp) in unmapped {
+            if !in_elem.contains(&pos) {
+                continue;
+            }
+            let merged_type = *merged
+                .type_index_map
+                .get(&(comp_idx, mod_idx, type_idx))
+                .ok_or(Error::IndexOutOfBounds {
+                    kind: "type",
+                    index: type_idx,
+                    max: module.types.len() as u32,
+                })?;
+            log::debug!(
+                "trap stub for unmapped func import: comp {} mod {} import {}::{}({})",
+                comp_idx,
+                mod_idx,
+                imp.module,
+                imp.name,
+                pos,
+            );
+            // One stub per distinct signature: reuse an existing stub whose
+            // type is structurally identical.
+            let sig = merged.types[merged_type as usize].clone();
+            let existing = merged.functions.iter().position(|f| {
+                f.synthetic_kind == Some(SyntheticKind::TrapStub)
+                    && merged.types[f.type_idx as usize].params == sig.params
+                    && merged.types[f.type_idx as usize].results == sig.results
+            });
+            let stub_idx = match existing {
+                Some(p) => merged.import_counts.func + p as u32,
+                None => {
+                    let mut body = wasm_encoder::Function::new(vec![]);
+                    body.instruction(&wasm_encoder::Instruction::Unreachable);
+                    body.instruction(&wasm_encoder::Instruction::End);
+                    merged.functions.push(MergedFunction {
+                        type_idx: merged_type,
+                        body,
+                        origin: (usize::MAX, usize::MAX, 0), // synthetic function
+                        synthetic_kind: Some(SyntheticKind::TrapStub),
+                    });
+                    merged.import_counts.func + merged.functions.len() as u32 - 1
+                }
+            };
+            merged
+                .unmapped_import_stubs
+                .insert((comp_idx, mod_idx, pos), stub_idx);
+        }
+        Ok(())
+    }
+
     /// Merge a single core module
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn merge_core_module(
@@ -515,6 +650,12 @@ impl Merger {
             }
         }
 
+        // #462: function imports that nothing mapped. Each one an `elem` segment
+        // names gets a trapping stub in its slot; any live use is rejected by
+        // the rewriter. This MUST run before `func_offset` is captured, because
+        // the stubs are ordinary fused functions.
+        self.create_trap_stubs_for_unmapped_imports(comp_idx, mod_idx, module, merged)?;
+
         // First pass: build all function index mappings.
         // Values are absolute wasm indices: import_count + array position.
         let func_offset = merged.functions.len() as u32;
@@ -629,10 +770,12 @@ impl Merger {
         for export in &module.exports {
             let (kind, old_idx) = match export.kind {
                 ExportKind::Function => {
-                    let new_idx = *merged
-                        .function_index_map
-                        .get(&(comp_idx, mod_idx, export.index))
-                        .unwrap_or(&export.index);
+                    // #462: exporting an unmapped import would publish the
+                    // identity index, i.e. an unrelated fused function.
+                    let new_idx = index_maps.remap_func_live(
+                        export.index,
+                        &format!("function export {:?}", export.name),
+                    )?;
                     (EncoderExportKind::Func, new_idx)
                 }
                 ExportKind::Table => {
@@ -884,7 +1027,7 @@ impl Merger {
         // Parse and merge element segments with reindexing
         let element_segments = crate::segments::parse_element_segments(module)?;
         for segment in element_segments {
-            let reindexed = crate::segments::reindex_element_segment(&segment, &index_maps);
+            let reindexed = crate::segments::reindex_element_segment(&segment, &index_maps)?;
             merged.elements.push(reindexed);
         }
 

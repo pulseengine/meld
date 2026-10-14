@@ -224,9 +224,31 @@ pub(super) fn build_index_maps_for_module(
         .count() as u32;
 
     // Map imported functions (they're resolved elsewhere, map to self for now)
-    for i in 0..import_func_count {
+    let mut func_import_pos = 0u32;
+    for imp in &module.imports {
+        if !matches!(imp.kind, ImportKind::Function(_)) {
+            continue;
+        }
+        let i = func_import_pos;
+        func_import_pos += 1;
         if let Some(&new_idx) = merged.function_index_map.get(&(comp_idx, mod_idx, i)) {
             maps.functions.insert(i, new_idx);
+        } else {
+            // #462: no resolution step mapped this import. It must never fall
+            // back to the identity index (an unrelated fused function).
+            maps.unmapped_func_imports.insert(
+                i,
+                crate::rewriter::UnmappedFuncImport {
+                    component: comp_idx,
+                    module: mod_idx,
+                    import_module: imp.module.clone(),
+                    import_name: imp.name.clone(),
+                    stub: merged
+                        .unmapped_import_stubs
+                        .get(&(comp_idx, mod_idx, i))
+                        .copied(),
+                },
+            );
         }
     }
 
