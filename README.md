@@ -131,11 +131,11 @@ Cross-component calls may require adapters that handle string transcoding (UTF-8
 
 ### Auto (Default)
 
-Resolves to shared memory + address rebasing when that is provably sound — no input module contains `memory.grow` and there are at least two memories to merge — and to multi-memory otherwise. The point: out-of-the-box output flows through `wasm-opt → synth` with no extra flags whenever soundness permits a single-memory form (issue #172).
+Always selects multi-memory, the strategy that is sound for every input. Auto never selects shared memory or address rebasing on its own (#326, #409); both remain available explicitly via `--memory shared --address-rebase`. The fused module therefore keeps one linear memory per input component, needs `wasm-opt --enable-multimemory` downstream, and has no single-address-space (MCU) lowering (issue #172).
 
 ```bash
 meld fuse a.wasm b.wasm -o fused.wasm
-wasm-opt -Os fused.wasm -o fused.opt.wasm   # no --enable-multimemory needed
+wasm-opt -Os --enable-multimemory fused.wasm -o fused.opt.wasm
 ```
 
 ### Multi-Memory
@@ -148,7 +148,7 @@ meld fuse --memory multi a.wasm b.wasm -o fused.wasm
 
 ### Shared Memory
 
-All components share a single linear memory; pair with `--address-rebase`. Unsound if any component uses `memory.grow` — one component's growth corrupts every other component's address space, which is why `auto` only selects this form when no input can grow.
+All components share a single linear memory; pair with `--address-rebase`. Unsound if any component uses `memory.grow` — one component's growth corrupts every other component's address space, which is why `auto` never selects this form on its own.
 
 ```bash
 meld fuse --memory shared --address-rebase a.wasm b.wasm -o fused.wasm
@@ -196,10 +196,10 @@ Meld's **core** transformations carry mechanized Rocq proofs — 350 closed proo
 Proven properties (Rocq):
 - **Merge correctness** — Index remapping preserves function/memory/table references (injectivity, completeness, boundedness); memory-layout disjointness.
 - **Resolve correctness** — Topological sort produces a valid instantiation order; cycle detection terminates.
-- **Adapter correctness** — Canonical-ABI lift/lower roundtrip and crossing-adapter semantics (one FACT parameter-match lemma remains `Admitted`).
+- **Adapter correctness** — Canonical-ABI lift/lower roundtrip and crossing-adapter semantics (no `Admitted` lemmas remain in `proofs/`).
 - **Forward simulation** — The fused module simulates the original component graph step-by-step (forward direction; fully proved).
 
-In addition, the Canonical-ABI layout invariants (size/alignment saturating arithmetic, the #141 stream ring model) carry **Kani** bounded-model-checking harnesses (`abi_proofs.rs`, `resolver.rs`, `merger.rs`) that were `VERIFICATION SUCCESSFUL` locally (SR-40); these are **not gated in CI** (the shared runners do not ship the Kani toolchain), and the ABI size/alignment and aggregate-padding contracts that did not converge in CBMC fall back to unit tests.
+In addition, the Canonical-ABI layout invariants (size/alignment saturating arithmetic, the #141 stream ring model) carry **Kani** bounded-model-checking harnesses (`abi_proofs.rs`, `resolver.rs`, `merger/`) that were `VERIFICATION SUCCESSFUL` locally (SR-40); these are **not gated in CI** (the shared runners do not ship the Kani toolchain), and the ABI size/alignment and aggregate-padding contracts that did not converge in CBMC fall back to unit tests.
 
 Proofs are built via Bazel using [`rules_rocq_rust`](https://github.com/pulseengine/rules_rocq_rust):
 
@@ -216,8 +216,8 @@ See [`proofs/`](proofs/) for the full proof tree and [`PROOF_GUIDE.md`](proofs/P
 ## Limitations
 
 - **Resources** — Resource handle transfer across components is limited
-- **Async** — Async component functions not yet supported
-- **String transcoding** — UTF-8/UTF-16 and Latin-1/UTF-8 are implemented; UTF-8/Latin-1 is not yet supported
+- **Async** — P3 async lowering (`stream<T>`, `future<T>`, async lift/lower) is partial; async cross-component calls are covered only for the shapes exercised by the test suite, and the full async surface is not yet supported
+- **String transcoding** — all pairs of UTF-8, UTF-16 and `latin1+utf16` are implemented for synchronous calls; async cross-encoding transcoding covers a bounded set of types (nested `list<list<string>>` to depth 2)
 
 ## Development
 

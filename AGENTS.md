@@ -196,7 +196,14 @@ meld/
 │   │   ├── lib.rs          # Public API
 │   │   ├── parser.rs       # Component parsing (wasmparser)
 │   │   ├── resolver.rs     # Dependency resolution
-│   │   ├── merger.rs       # Module merging
+│   │   ├── merger/         # Module merging (index maps, memory, imports, handle tables)
+│   │   ├── rewriter.rs     # Instruction rewriting (index remapping)
+│   │   ├── p3_async.rs     # P3 async lowering: host-intrinsic ABI for stream/future/async built-ins
+│   │   ├── p3_bridge.rs    # Cross-component stream-bridge emitter (#141)
+│   │   ├── p3_stream.rs    # Cross-component stream<T> pairing detection (#141)
+│   │   ├── reloc.rs        # Relocation-metadata reader (linking + reloc.* sections)
+│   │   ├── resource_graph.rs # Resource ownership graph for cross-component handle routing
+│   │   ├── core_instance_topology.rs # Core-instance topology normalization (multiply-instantiated modules)
 │   │   ├── adapter/        # Adapter generation
 │   │   │   ├── mod.rs      # Trait interface
 │   │   │   └── fact.rs     # FACT-style implementation
@@ -247,7 +254,7 @@ P2/P3 Components → Parser → Resolver → Merger → Adapter Gen → Single M
 
 - `meld-core/src/parser.rs` — Component binary parsing
 - `meld-core/src/resolver.rs` — Import/export resolution
-- `meld-core/src/merger.rs` — Module merging logic
+- `meld-core/src/merger/` — Module merging logic
 - `meld-core/src/rewriter.rs` — Instruction rewriting (index remapping)
 - `meld-core/src/adapter/mod.rs` — Adapter trait definition
 - `meld-core/src/adapter/fact.rs` — FACT-style adapter generation
@@ -605,7 +612,7 @@ There are zero `Admitted` theorems, zero `admit` tactics, and zero
 |--------------------------|----------------------------|--------------------------------|
 | `proofs/parser/`         | `meld-core/src/parser.rs`  | Parsing and decoding           |
 | `proofs/resolver/`       | `meld-core/src/resolver.rs`| Import/export resolution       |
-| `proofs/merger/`         | `meld-core/src/merger.rs`  | Index-space merging            |
+| `proofs/merger/`         | `meld-core/src/merger/`    | Index-space merging            |
 | `proofs/adapter/`        | `meld-core/src/adapter/`   | Canonical ABI adapters         |
 | `proofs/rewriter/`       | `meld-core/src/rewriter.rs`| Rewrite passes                 |
 | `proofs/segments/`       | `meld-core/src/segments.rs`| Segment layout                 |
@@ -686,16 +693,19 @@ Before creating a release tag, run a Mythos delta pass scoped by release type:
 Procedure:
 
 ```bash
-# Identify changed tier-5 files (meld-core parser / fusion / types / writer)
+# Identify changed tier-5 files (same pattern list as .github/workflows/mythos-gate.yml)
 git diff --name-only v<last>..HEAD -- \
   meld-core/src/parser.rs \
-  meld-core/src/merger.rs \
-  'meld-core/src/fuse/**' \
-  'meld-core/src/fusion/**' \
-  'meld-core/src/types/**' \
-  'meld-core/src/type_check/**' \
-  'meld-core/src/writer.rs' \
-  'meld-core/src/emit/**'
+  meld-core/src/merger/ \
+  meld-core/src/resolver.rs \
+  meld-core/src/rewriter.rs \
+  meld-core/src/component_wrap.rs \
+  meld-core/src/p3_async.rs \
+  meld-core/src/p3_stream.rs \
+  meld-core/src/p3_bridge.rs \
+  meld-core/src/adapter/ \
+  meld-core/src/resource_graph.rs \
+  meld-core/src/segments.rs
 ```
 
 For each file, in a fresh Claude Code session:
