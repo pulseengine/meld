@@ -233,6 +233,12 @@ pub(super) fn build_index_maps_for_module(
         func_import_pos += 1;
         if let Some(&new_idx) = merged.function_index_map.get(&(comp_idx, mod_idx, i)) {
             maps.functions.insert(i, new_idx);
+        } else if merged
+            .pending_wired_imports
+            .contains(&(comp_idx, mod_idx, i))
+        {
+            // Mapped later by `wire_adapter_indices`, which re-rewrites the
+            // body: keep the placeholder behaviour (#462).
         } else {
             // #462: no resolution step mapped this import. It must never fall
             // back to the identity index (an unrelated fused function).

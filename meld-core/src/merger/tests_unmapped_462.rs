@@ -181,3 +181,70 @@ fn every_live_use_of_an_unmapped_import_is_an_error() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Merge order: a promoted intra-component AdapterSite orders provider first.
+// ---------------------------------------------------------------------------
+
+pub(super) fn site(from: usize, to: usize) -> crate::resolver::AdapterSite {
+    crate::resolver::AdapterSite {
+        from_component: 0,
+        from_module: from,
+        import_name: "f".to_string(),
+        import_module: "b".to_string(),
+        import_func_type_idx: None,
+        to_component: 0,
+        to_module: to,
+        export_name: "f".to_string(),
+        export_func_idx: 0,
+        crosses_memory: false,
+        is_async_lift: false,
+        requirements: Default::default(),
+    }
+}
+
+pub(super) fn graph_with(sites: Vec<crate::resolver::AdapterSite>) -> DependencyGraph {
+    DependencyGraph {
+        instantiation_order: vec![0],
+        resolved_imports: HashMap::new(),
+        adapter_sites: sites,
+        module_resolutions: Vec::new(),
+        resource_graph: None,
+        stream_pair_graph: None,
+        reexporter_components: Vec::new(),
+        reexporter_resources: Vec::new(),
+        unresolved_imports: Vec::new(),
+    }
+}
+
+/// The resolver removes a promoted `module_resolutions` entry, leaving only
+/// the `AdapterSite`; the provider (module 1) must still precede the importer
+/// (module 0). Negative control: with no site, definition order is kept.
+#[test]
+fn a_promoted_site_orders_the_provider_before_the_importer() {
+    assert_eq!(
+        Merger::compute_module_merge_order(0, 2, &graph_with(vec![site(0, 1)])),
+        vec![1, 0]
+    );
+    assert_eq!(
+        Merger::compute_module_merge_order(0, 2, &graph_with(vec![])),
+        vec![0, 1]
+    );
+    // A site of ANOTHER component imposes nothing on this one.
+    let mut other = site(0, 1);
+    other.from_component = 1;
+    other.to_component = 1;
+    assert_eq!(
+        Merger::compute_module_merge_order(0, 2, &graph_with(vec![other])),
+        vec![0, 1]
+    );
+}
+
+/// A cycle falls back to a total order (every module exactly once).
+#[test]
+fn a_cyclic_site_pair_still_yields_a_permutation() {
+    let order = Merger::compute_module_merge_order(0, 2, &graph_with(vec![site(0, 1), site(1, 0)]));
+    let mut sorted = order.clone();
+    sorted.sort_unstable();
+    assert_eq!(sorted, vec![0, 1], "got {order:?}");
+}

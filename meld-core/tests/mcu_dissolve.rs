@@ -123,6 +123,7 @@ fn merged_base() -> MergedModule {
         async_result_globals: HashMap::new(),
         rewrite_params: HashMap::new(),
         unmapped_import_stubs: HashMap::new(),
+        pending_wired_imports: std::collections::HashSet::new(),
         shared_stack_top: None,
         stackless_providers: 0,
         placements: Vec::new(),
