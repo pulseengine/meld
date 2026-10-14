@@ -866,4 +866,70 @@ mod tests {
             assert!(!rg.defines_resource(1, "svc:lib/api", "thing"));
         }
     }
+
+    /// #467 follow-up: two TERMINAL candidates (neither imports the other)
+    /// both survive re-exporter removal; the lowest component index is the
+    /// definer on every build, independent of hash order.
+    #[test]
+    fn issue_467_two_terminal_candidates_tie_break_to_the_lowest_index() {
+        let make = || {
+            let mut c = empty_pc();
+            c.canonical_functions
+                .push(CanonicalEntry::ResourceRep { resource: 0 });
+            let mut m = empty_cm();
+            m.imports.push(imp("svc:lib/api", "[resource-rep]thing"));
+            c.core_modules.push(m);
+            c
+        };
+        let comps = [make(), make()];
+        let resolved = HashMap::new();
+        for run in 0..200 {
+            let rg = ResourceGraph::build(&resolved, &comps);
+            assert_eq!(
+                rg.resource_definer("svc:lib/api", "thing"),
+                Some(0),
+                "run {run}: the tie between two terminal candidates goes to the lowest index"
+            );
+            assert!(rg.defines_resource(0, "svc:lib/api", "thing"));
+            assert!(rg.defines_resource(1, "svc:lib/api", "thing"));
+        }
+    }
+
+    /// #467 follow-up: when EVERY candidate also imports the resource's
+    /// interface, all are removed as re-exporters and the resource keeps an
+    /// explicit absence of definer. This pins the behaviour the change
+    /// preserved (the old code also ended at `None` here); it is coverage of
+    /// the branch, not a regression test for #467.
+    #[test]
+    fn issue_467_all_candidates_reexporters_leaves_no_definer() {
+        let make = || {
+            let mut c = empty_pc();
+            c.canonical_functions
+                .push(CanonicalEntry::ResourceRep { resource: 0 });
+            let mut m = empty_cm();
+            m.imports.push(imp("svc:lib/api", "[resource-rep]thing"));
+            c.core_modules.push(m);
+            c
+        };
+        let comps = [make(), make()];
+        let mut resolved = HashMap::new();
+        resolved.insert(
+            (0usize, "svc:lib/api".to_string()),
+            (1usize, "svc:lib/api".to_string()),
+        );
+        resolved.insert(
+            (1usize, "svc:lib/api".to_string()),
+            (0usize, "svc:lib/api".to_string()),
+        );
+        for run in 0..50 {
+            let rg = ResourceGraph::build(&resolved, &comps);
+            assert_eq!(
+                rg.resource_definer("svc:lib/api", "thing"),
+                None,
+                "run {run}: no candidate survives, so there is no definer"
+            );
+            assert!(!rg.defines_resource(0, "svc:lib/api", "thing"));
+            assert!(!rg.defines_resource(1, "svc:lib/api", "thing"));
+        }
+    }
 }
