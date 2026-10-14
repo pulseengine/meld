@@ -2,7 +2,10 @@
 
 **Status:** accepted (design) — execution in progress
 **Date:** 2026-06-24
+
 **Supersedes the model choice in:** #303 / SR-44 enforcement discussion
+
+**Status update (2026-10-14):** The migration has been carried out for the requirement and verification tiers. `rivet stats` on this date reports 94 `sw-req`, 106 `sw-verification`, 11 `system-req`, 2 `stakeholder-req`, 11 `sys-verification` and 4 legacy `requirement` artifacts. The "44 `type: requirement` SRs" and "not typed `sw-verification`" statements in the Context section describe the pre-migration model.
 
 ## Context
 

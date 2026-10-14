@@ -14,6 +14,9 @@ design-paths:
 
 # ADR-6 — Address relocation for the shared-memory fusion mode
 
+**Status update (2026-10-14):** The "rejected" and "architecturally excluded" wording for path-E applies only to the claim that a PIC core cannot pass `wasm-tools component new`. PIC is a supported input ABI since v0.42.0 (see the 2026-08-14 update below and ADR-7). Path-F is a hard error only under a specific condition (`meld-core/src/address_strategy.rs`, `resolve_address_plan`): `--address-rebase` is in effect, the module's memory base is non-zero, the module carries no `linking`/`reloc.*` metadata, and it performs direct (non-bulk) memory access. `Error::MissingRelocMetadata` is raised in that case. A module without reloc metadata that does no direct load/store is accepted with an empty rebase plan, and meld logs a warning that absolute addresses used purely as values are emitted un-rebased and may alias another component's window. `--memory shared` is therefore not a hard error for all inputs lacking relocation metadata.
+
+
 ## Context
 
 ADR-4 chose **multi-memory** as the committed isolation model and retained

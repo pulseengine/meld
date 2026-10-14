@@ -57,7 +57,7 @@ versions, nothing to install alongside them. If you are not sure which your
 target has, the musl one runs in both places.
 
 ```bash
-TAG=v0.58.3
+TAG=v0.62.0
 TARGET=x86_64-unknown-linux-musl
 gh release download "$TAG" --repo pulseengine/meld --pattern "meld-${TAG}-${TARGET}.tar.gz"
 tar xzf "meld-${TAG}-${TARGET}.tar.gz"
@@ -154,6 +154,21 @@ All components share a single linear memory; pair with `--address-rebase`. Unsou
 meld fuse --memory shared --address-rebase a.wasm b.wasm -o fused.wasm
 ```
 
+### Further `fuse` Options
+
+Options for single-address-space targets and for auditing a fusion; the first three require `--memory shared`. Run `meld fuse --help` for the full text of each.
+
+| Flag | Effect |
+|------|--------|
+| `--pack-rebase` | Place each component at its used data extent (16-byte aligned) instead of its declared page count, and size the merged memory to the packed total. Implies `--address-rebase`. Opt-in; sound only when a component references no address above its last data segment. |
+| `--share-stack` | Collapse the per-provider shadow stacks into one shared region. Implies `--pack-rebase`. Requires every provider to carry a `__heap_base` marker and be stack-first, and fails loudly otherwise. Opt-in; sound only for non-reentrant, single-threaded, mutually non-calling providers. |
+| `--domain NAME=INPUT[,INPUT...]` | Group inputs into memory domains: fuse within a domain, keep the Canonical ABI between domains. Repeat once per domain; every input must be named in exactly one. A domain is a trust boundary and is recorded in the attestation. |
+| `--profile safety` | Require safety-relevant properties to be stated rather than inferred. Today this means `--memory` must be given: `auto` is refused. Output is byte-identical to the same explicit invocation under the default `--profile ecosystem`. |
+| `--explain` | Report, for every fused cross-component call, the call-lowering class chosen (direct, memory-copy, transcode, async-lift) and how it was wired. The same records are embedded in the attestation. |
+| `--emit-manifest` | Emit a `meld.signature-manifest` section giving, per export, the WIT and core signatures, the flattened parameter count, and the memory, allocator and post-return a host must use to invoke it. Opt-in. |
+| `--reproducible` | Produce a byte-reproducible artifact: the attestation id is derived from the output content and the timestamp from `SOURCE_DATE_EPOCH` (default 0). Attested input names are replaced by positional identifiers (`component-0`, ...). |
+| `--opaque-rep IFACE.RESOURCE` | Mark a resource as opaque-rep, for re-exporters whose representation is treated as a `u32` rather than a boxed pointer. Such resources skip the per-resource handle table layer. Repeatable. |
+
 ## Supply Chain Security
 
 Meld integrates with [Sigil](https://github.com/pulseengine/sigil) for supply chain attestation. Each fusion operation records input component hashes, tool version and configuration, and transformation metadata. The attestation is embedded in the output module's custom section.
@@ -164,7 +179,7 @@ Every tagged release ships with a CycloneDX SBOM, a cosign-signed `SHA256SUMS.tx
 
 ```bash
 # 1. Download an archive plus the signed checksum manifest from the release page.
-TAG=v0.11.0
+TAG=v0.62.0
 TARGET=x86_64-unknown-linux-gnu
 gh release download "$TAG" --repo pulseengine/meld \
   --pattern "meld-${TAG}-${TARGET}.tar.gz" \
@@ -191,7 +206,7 @@ Step 2 proves the checksum file came from this repo's `release.yml`; step 3 ties
 
 ## Formal Verification
 
-Meld's **core** transformations carry mechanized Rocq proofs — 350 closed proofs (`Qed`) across the resolver, merger, adapter, and specification layers (see [`proofs/STATUS.md`](proofs/STATUS.md) for the per-stage coverage matrix). This is real, substantial verification on the core; it is **not** yet a whole-pipeline proof: the parser, rewriter, segments, and attestation stages are specified but their proofs are placeholders, orchestration (`lib.rs`) is unproven, and the semantic-preservation result is a **forward** simulation (the fused module simulates the original graph step-by-step; the reverse direction and the backward half of trap-equivalence are not yet proved).
+Meld's **core** transformations carry mechanized Rocq proofs — 357 closed proofs (`Qed`) across the resolver, merger, adapter, and specification layers (see [`proofs/STATUS.md`](proofs/STATUS.md) for the per-stage coverage matrix). This is real, substantial verification on the core; it is **not** yet a whole-pipeline proof: the parser, rewriter, segments, and attestation stages are specified but their proofs are placeholders, orchestration (`lib.rs`) is unproven, and the semantic-preservation result is a **forward** simulation (the fused module simulates the original graph step-by-step; the reverse direction and the backward half of trap-equivalence are not yet proved).
 
 Proven properties (Rocq):
 - **Merge correctness** — Index remapping preserves function/memory/table references (injectivity, completeness, boundedness); memory-layout disjointness.
