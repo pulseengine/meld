@@ -192,8 +192,10 @@ enum Commands {
         /// lines), `strip` (drop all `.debug_*`), or `passthrough`
         /// (copy verbatim; addresses are wrong against the fused code
         /// section). With multiple DWARF-bearing input modules, `remap`
-        /// drops the source DWARF (never wrong addresses, #208) but
-        /// still emits the synthetic adapter unit.
+        /// remaps each module's DWARF and merges the sets into one
+        /// consistent `.debug_info` (#208); a module whose DWARF fails
+        /// remap is dropped, and if the merge cannot be done it falls
+        /// back to the synthetic adapter unit alone.
         #[arg(long, value_name = "MODE", default_value = "remap")]
         dwarf: String,
 

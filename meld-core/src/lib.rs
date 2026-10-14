@@ -1426,8 +1426,8 @@ impl Fuser {
         // core-module imports. This adds one import per distinct intrinsic
         // (stream.new, stream.read, …, future.drop-writable) and shifts
         // every reference to defined functions up to make room. No-op when
-        // the components contain no P3 async data-plane constructs (the
-        // 73-test wit_bindgen_runtime suite). See `p3_async::lower_p3_async_intrinsics`
+        // the components contain no P3 async data-plane constructs (e.g.
+        // the wit_bindgen_runtime suite). See `p3_async::lower_p3_async_intrinsics`
         // and ADR-1 for the full design.
         let _p3_lowering_plan = p3_async::lower_p3_async_intrinsics(&mut merged, &self.components)?;
 
