@@ -4,6 +4,15 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+- **Fused output no longer varies between runs when two components qualify as
+  a resource's definer (SR-95, #467).** A component and the component that
+  re-exports it can both carry a resource representation. meld picked the
+  definer in hash-map iteration order, and when it picked the re-exporter it
+  then discarded it, leaving the real definer without a handle table. The same
+  input could fuse to different bytes from run to run, even with
+  `--reproducible`. The definer is now the candidate that survives
+  re-exporter removal, with the lowest component index as tie-break.
 
 ## [0.62.0] - 2026-10-14
 

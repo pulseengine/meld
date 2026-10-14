@@ -258,7 +258,13 @@ impl ResourceGraph {
         // 2. It exports the resource's interface but does NOT import it
         //    (terminal exporter in the composition chain = the definer).
         let mut defines_cache = HashMap::new();
-        let mut definer_cache = HashMap::new();
+        // #467: `definer_cache` is NOT filled incrementally. Several components
+        // can qualify as the definer of one `(interface, resource)` (e.g. a
+        // component and the component that wraps/re-exports it both carry a
+        // `ResourceRep`), and the passes below walk `HashMap`s, so a
+        // `.insert`/`.or_insert` here would let hash order pick the winner.
+        // The cache is derived once, order-independently, after the
+        // re-exporter removal step (see "Derive `definer_cache`" below).
 
         // Collect components with Defines edges (candidates, may include re-exporters)
         let mut defines_candidates: HashMap<(usize, String, String), bool> = HashMap::new();
@@ -342,7 +348,6 @@ impl ResourceGraph {
                         && !rep_backed_resources.contains(&(norm_iface.to_string(), rn.clone()))
                     {
                         defines_cache.insert((*to_comp, iface.clone(), rn.clone()), true);
-                        definer_cache.insert((iface.clone(), rn.clone()), Some(*to_comp));
                     }
                 }
             }
@@ -353,10 +358,16 @@ impl ResourceGraph {
             defines_cache
                 .entry((*idx, iface.clone(), rn.clone()))
                 .or_insert(true);
-            definer_cache
-                .entry((iface.clone(), rn.clone()))
-                .or_insert(Some(*idx));
         }
+
+        // Every resource that had at least one definer candidate. A resource
+        // whose candidates are ALL removed below keeps an explicit `None`
+        // entry (an exact-key miss would otherwise fall through to the
+        // `[export]`-variant lookups in `resource_definer`).
+        let candidate_resources: std::collections::BTreeSet<(String, String)> = defines_cache
+            .keys()
+            .map(|(_idx, iface, rn)| (iface.clone(), rn.clone()))
+            .collect();
 
         // Remove defines entries for components that also import the SAME
         // resource interface (they're re-exporters, not definers).
@@ -389,13 +400,34 @@ impl ResourceGraph {
                     .collect();
                 for key in keys_to_remove {
                     defines_cache.remove(&key);
-                    if let Some(entry) = definer_cache.get_mut(&(key.1.clone(), key.2.clone()))
-                        && *entry == Some(*from_comp)
-                    {
-                        *entry = None;
-                    }
                 }
             }
+        }
+
+        // Derive `definer_cache` (#467). The definer of a resource is a
+        // component that still DEFINES it after the re-exporter removal
+        // above: one that does not itself import the resource's interface
+        // (the terminal of the composition chain). Deriving it from the
+        // surviving `defines_cache` makes the answer independent of the
+        // order the passes visited candidates in; the previous
+        // first/last-visited-wins choice could crown a component that the
+        // removal step then discarded as a re-exporter, leaving NO definer
+        // for a resource that had a perfectly good one.
+        //
+        // If more than one survivor remains (two components both terminal
+        // for the same interface+resource, which a well-formed composition
+        // does not produce) the LOWEST component index wins: component
+        // indices are the input order the caller supplied, so the tie-break
+        // is a function of the input, not of hashing.
+        let mut definer_cache: HashMap<(String, String), Option<usize>> = candidate_resources
+            .into_iter()
+            .map(|key| (key, None))
+            .collect();
+        for (idx, iface, rn) in defines_cache.keys() {
+            let slot = definer_cache
+                .get_mut(&(iface.clone(), rn.clone()))
+                .expect("every defines_cache key is a candidate resource");
+            *slot = Some(slot.map_or(*idx, |cur| cur.min(*idx)));
         }
 
         ResourceGraph {
@@ -795,5 +827,43 @@ mod tests {
              a graph node for that resource (LS-A-18); otherwise the \
              merger routes the drop to the wrong handle table"
         );
+    }
+
+    /// #467 — two components qualify as definer; hash order must not pick.
+    ///
+    /// Comp 0 and comp 1 both hold a `ResourceRep` for `svc:lib/api#thing`
+    /// (rep-backed candidates). Comp 1 ALSO imports `svc:lib/api` from comp 0,
+    /// so it is a re-exporter and comp 0 is the terminal definer. The old
+    /// code recorded whichever candidate its `HashMap` walk visited first and
+    /// then discarded comp 1 as a re-exporter, so `resource_definer` answered
+    /// `None` on roughly half of the builds. Each `build` draws fresh hash
+    /// seeds, so repeating it exercises both orders.
+    #[test]
+    fn issue_467_definer_is_the_terminal_candidate_not_the_first_visited() {
+        let make = || {
+            let mut c = empty_pc();
+            c.canonical_functions
+                .push(CanonicalEntry::ResourceRep { resource: 0 });
+            let mut m = empty_cm();
+            m.imports.push(imp("svc:lib/api", "[resource-rep]thing"));
+            c.core_modules.push(m);
+            c
+        };
+        let comps = [make(), make()];
+        let mut resolved = HashMap::new();
+        resolved.insert(
+            (1usize, "svc:lib/api".to_string()),
+            (0usize, "svc:lib/api".to_string()),
+        );
+        for run in 0..200 {
+            let rg = ResourceGraph::build(&resolved, &comps);
+            assert_eq!(
+                rg.resource_definer("svc:lib/api", "thing"),
+                Some(0),
+                "run {run}: the terminal exporter (comp 0) is the definer"
+            );
+            assert!(rg.defines_resource(0, "svc:lib/api", "thing"));
+            assert!(!rg.defines_resource(1, "svc:lib/api", "thing"));
+        }
     }
 }
