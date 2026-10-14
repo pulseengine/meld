@@ -3549,3 +3549,19 @@ artifacts:
       reviewed-by: avrabe
       model: claude-opus-5
       timestamp: 2026-10-07T10:36:59Z
+
+  - id: SR-94
+    type: sw-req
+    title: Each return-area layout entry states the type of the field it describes
+    status: implemented
+    description: "The signature manifest (SR-80) describes an export's return area as a top-level layout of (offset, field, size) entries. Size alone cannot distinguish types of the same width: a 4-byte f32 and a 4-byte u32 are identical in the layout, and kiln's observer#read-state mixes exactly those (tick-head: u32, qw: f32). kiln therefore recovered field types by parsing the rendered WIT text in wit.result and matching fields by name and order (#469) -- re-deriving part of the ABI from text, the pattern the manifest exists to remove, and one that cannot extend to nested layouts. meld shall give every layout entry a type: the WIT primitive name for a scalar (bool, s8 ... u64, f32, f64, char), otherwise the kind of the type (string, list, fixed-size-list, record, flags, variant, tuple, option, result, own, borrow), looking through type aliases. An enum is reported as variant, since that is the shape meld parses and the layout it has; reporting enum would assert a distinction the parsed component does not record. A compound field names only its kind: its own layout is not described, and a reader shall refuse to decode below it rather than infer one. A field whose type does not resolve shall cause the export to be omitted with a stated reason, never described with a guessed type (#393). The addition is backward compatible, so the manifest version stays 1; kiln refuses only an unknown major version and cross-checks the new field against wit.result."
+    links:
+      - type: derives-from
+        target: SYS-4
+      - type: refines
+        target: SR-80
+    provenance:
+      created-by: ai-assisted
+      reviewed-by: avrabe
+      model: claude-opus-5-5
+      timestamp: 2026-10-14T05:06:14Z
