@@ -16,9 +16,26 @@ use meld_core::{Fuser, FuserConfig, MemoryStrategy};
 use std::collections::BTreeSet;
 use std::path::Path;
 
-/// The unfixed code gives two outcomes at roughly even odds, so a run of this
-/// length passes by luck with probability about 2^-(RUNS-1).
-const RUNS: usize = 20;
+/// Each run also asserts the outcome (component 0 gets its handle table),
+/// which the unfixed code got wrong on about half of all runs, so a few runs
+/// suffice here; the order-independence itself is exercised 200 times by the
+/// unit test `issue_467_definer_is_the_terminal_candidate_not_the_first_visited`.
+const RUNS: usize = 4;
+
+/// Number of `$ht_new_*` exports: one per handle table meld generated.
+fn handle_table_count(fused: &[u8]) -> usize {
+    let mut n = 0;
+    for payload in wasmparser::Parser::new(0).parse_all(fused) {
+        if let Ok(wasmparser::Payload::ExportSection(reader)) = payload {
+            for export in reader.into_iter().flatten() {
+                if export.name.starts_with("$ht_new_") {
+                    n += 1;
+                }
+            }
+        }
+    }
+    n
+}
 
 fn fuse_once(bytes: &[u8]) -> Vec<u8> {
     let config = FuserConfig {
@@ -47,8 +64,17 @@ fn two_candidate_definers_fuse_to_identical_bytes() {
     let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("fixture {}: {e}", path.display()));
 
     let mut distinct: BTreeSet<Vec<u8>> = BTreeSet::new();
-    for _ in 0..RUNS {
-        distinct.insert(fuse_once(&bytes));
+    for run in 0..RUNS {
+        let fused = fuse_once(&bytes);
+        // Component 0 (the definer) and component 3 (the re-exporter) each
+        // get a handle table. Picking the re-exporter as definer and then
+        // discarding it left component 0 without one.
+        assert_eq!(
+            handle_table_count(&fused),
+            2,
+            "run {run}: the definer must get its own handle table (#467)"
+        );
+        distinct.insert(fused);
     }
     assert_eq!(
         distinct.len(),
