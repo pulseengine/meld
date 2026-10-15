@@ -11,7 +11,10 @@ All notable changes to this project will be documented in this file.
   internally, `__heap_base`/`__data_end`, and toolchain allocators. With
   `--exports world` only the world's exports remain, plus the memory, realloc,
   post-return, destructors and start function they need; function bodies are
-  untouched. A world export that cannot be mapped is an error. The default,
+  untouched. World functions are found through their canon lifts and
+  exported under their world names; exports that the remaining imports need
+  are kept, and a needed allocator is exported as `meld:realloc/<n>`. A
+  world function that cannot be mapped is an error. The default,
   `--exports all`, is unchanged, and the option is refused with `--component`,
   where the wrapper already exposes exactly the outer world.
 
