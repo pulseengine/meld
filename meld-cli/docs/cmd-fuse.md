@@ -19,6 +19,19 @@ Key flags:
   targets; implies `--address-rebase`, requires `--memory shared`, and is sound
   only for components that address nothing above their last data segment. See
   `pack-rebase`.
+- `--exports <all|world>` — which exports the fused core module keeps (default
+  `all`: every export of every inner module). `world` keeps only the exports
+  that implement the outer world of the input(s) — for a composition, its own
+  interfaces rather than the internal ones it wired together — plus what
+  invoking them needs: the memory the kept lifts use, their `cabi_post_*`,
+  `[dtor]` and realloc exports, and the start function. `__data_end`,
+  `__heap_base` and every other global or table export are dropped. Only the
+  export list changes; function bodies stay, so a downstream tool can drop what
+  becomes unreachable. A world export that cannot be mapped to a fused export
+  (for example one renamed on the way out) is an error naming it, never
+  silently dropped. With `--emit-manifest` the manifest lists only the kept
+  exports. Not valid with `--component`, which already exports exactly the
+  outer world. Recorded in the attestation when set.
 - `--component` — emit a P2 component instead of a core module.
 - `--dwarf <remap|strip|passthrough>` — debug-info handling (default `remap`).
 - `--opaque-rep <iface.resource>` — treat a resource's representation as a

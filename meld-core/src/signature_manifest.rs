@@ -358,7 +358,7 @@ fn val_type_name(t: &wasmparser::ValType) -> String {
 
 /// Which fused function index a component-local function ended up at, or
 /// `None` when it was not merged into the output.
-fn fused_index_of(merged: &MergedModule, origin: (usize, usize, u32)) -> Option<u32> {
+pub(crate) fn fused_index_of(merged: &MergedModule, origin: (usize, usize, u32)) -> Option<u32> {
     merged
         .functions
         .iter()
@@ -381,9 +381,14 @@ fn fused_index_of(merged: &MergedModule, origin: (usize, usize, u32)) -> Option<
 ///
 /// Returns `(export name, fused function index)`, sorted, with allocators that
 /// are already exported left alone.
+///
+/// `world_kept` (#463): under `--exports world`, the lifted export names that
+/// survived pruning. Only their allocators are added, so the manifest does not
+/// re-export an allocator that belongs to a removed export.
 pub fn allocator_exports(
     components: &[ParsedComponent],
     merged: &MergedModule,
+    world_kept: Option<&std::collections::HashSet<String>>,
 ) -> Vec<(String, u32)> {
     let already_exported: std::collections::HashSet<u32> = merged
         .exports
@@ -396,7 +401,14 @@ pub fn allocator_exports(
 
     let mut wanted: std::collections::BTreeMap<u32, usize> = std::collections::BTreeMap::new();
     for (comp_idx, component) in components.iter().enumerate() {
-        for (_, (_, options)) in component.lift_info_by_core_func() {
+        for (lift_func, (_, options)) in component.lift_info_by_core_func() {
+            if let Some(kept) = world_kept {
+                let survives = locate_core_func(component, lift_func)
+                    .is_some_and(|(export_name, _, _)| kept.contains(&export_name));
+                if !survives {
+                    continue;
+                }
+            }
             let Some(realloc) = options.realloc else {
                 continue;
             };
@@ -588,7 +600,7 @@ pub fn build(
 
 /// The module export name, module index and module-local index of a
 /// component-level core function.
-fn locate_core_func(
+pub(crate) fn locate_core_func(
     component: &ParsedComponent,
     core_func_index: u32,
 ) -> Option<(String, usize, u32)> {

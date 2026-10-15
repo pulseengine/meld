@@ -201,6 +201,7 @@ fn fuse_many(
         dwarf_handling: DwarfHandling::Strip,
         output_format,
         opaque_resources: Vec::new(),
+        ..Default::default()
     };
     let mut fuser = Fuser::new(config);
     for (name, bytes) in inputs {

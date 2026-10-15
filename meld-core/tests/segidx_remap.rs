@@ -59,6 +59,7 @@ fn fuser_config() -> FuserConfig {
         dwarf_handling: meld_core::DwarfHandling::Strip,
         output_format: meld_core::OutputFormat::CoreModule,
         opaque_resources: Vec::new(),
+        ..Default::default()
     }
 }
 

@@ -444,6 +444,7 @@ fn test_sr12_adapter_generation_for_string_param() {
         dwarf_handling: meld_core::DwarfHandling::Strip,
         output_format: meld_core::OutputFormat::CoreModule,
         opaque_resources: Vec::new(),
+        ..Default::default()
     };
 
     let mut fuser = Fuser::new(config);
@@ -838,6 +839,7 @@ fn test_sr13_cabi_realloc_targets_correct_memory() {
         dwarf_handling: meld_core::DwarfHandling::Strip,
         output_format: meld_core::OutputFormat::CoreModule,
         opaque_resources: Vec::new(),
+        ..Default::default()
     };
 
     let mut fuser = Fuser::new(config);
@@ -1260,6 +1262,7 @@ fn test_sr15_list_copy_length() {
         dwarf_handling: meld_core::DwarfHandling::Strip,
         output_format: meld_core::OutputFormat::CoreModule,
         opaque_resources: Vec::new(),
+        ..Default::default()
     };
 
     let mut fuser = Fuser::new(config);
@@ -1762,6 +1765,7 @@ fn test_sr16_inner_pointer_fixup_list_string() {
         dwarf_handling: meld_core::DwarfHandling::Strip,
         output_format: meld_core::OutputFormat::CoreModule,
         opaque_resources: Vec::new(),
+        ..Default::default()
     };
 
     let mut fuser = Fuser::new(config);
@@ -2068,6 +2072,7 @@ fn test_sr17_utf8_to_utf16_string_transcoding() {
         dwarf_handling: meld_core::DwarfHandling::Strip,
         output_format: meld_core::OutputFormat::CoreModule,
         opaque_resources: Vec::new(),
+        ..Default::default()
     };
 
     let mut fuser = Fuser::new(config);
@@ -2148,6 +2153,7 @@ fn test_361_same_memory_utf8_to_utf16_transcoding() {
         dwarf_handling: meld_core::DwarfHandling::Strip,
         output_format: meld_core::OutputFormat::CoreModule,
         opaque_resources: Vec::new(),
+        ..Default::default()
     };
 
     let mut fuser = Fuser::new(config);
@@ -2227,6 +2233,7 @@ fn test_sr17_utf8_to_utf16_supplementary_plane_transcoding() {
         dwarf_handling: meld_core::DwarfHandling::Strip,
         output_format: meld_core::OutputFormat::CoreModule,
         opaque_resources: Vec::new(),
+        ..Default::default()
     };
 
     let mut fuser = Fuser::new(config);
@@ -2758,6 +2765,7 @@ fn test_sr17_utf16_to_utf8_supplementary_plane_transcoding() {
         dwarf_handling: meld_core::DwarfHandling::Strip,
         output_format: meld_core::OutputFormat::CoreModule,
         opaque_resources: Vec::new(),
+        ..Default::default()
     };
 
     let mut fuser = Fuser::new(config);
@@ -2838,6 +2846,7 @@ fn test_sr17_utf16_to_utf8_lone_high_surrogate_replacement() {
         dwarf_handling: meld_core::DwarfHandling::Strip,
         output_format: meld_core::OutputFormat::CoreModule,
         opaque_resources: Vec::new(),
+        ..Default::default()
     };
 
     let mut fuser = Fuser::new(config);
@@ -2908,6 +2917,7 @@ fn test_sr17_utf16_to_utf8_midstring_lone_surrogate_replacement() {
         dwarf_handling: meld_core::DwarfHandling::Strip,
         output_format: meld_core::OutputFormat::CoreModule,
         opaque_resources: Vec::new(),
+        ..Default::default()
     };
 
     let mut fuser = Fuser::new(config);
@@ -3003,6 +3013,7 @@ fn test_sr17_utf16_to_utf8_malformed_surrogate_matrix() {
             dwarf_handling: meld_core::DwarfHandling::Strip,
             output_format: meld_core::OutputFormat::CoreModule,
             opaque_resources: Vec::new(),
+            ..Default::default()
         };
         let mut fuser = Fuser::new(config);
         fuser
@@ -3144,6 +3155,7 @@ fn ls_p_20_test_sr17_utf8_to_utf16_malformed_matrix() {
             dwarf_handling: meld_core::DwarfHandling::Strip,
             output_format: meld_core::OutputFormat::CoreModule,
             opaque_resources: Vec::new(),
+            ..Default::default()
         };
         let mut fuser = Fuser::new(config);
         fuser
@@ -3225,6 +3237,7 @@ fn test_sr17_latin1_to_utf16_transcoding() {
             dwarf_handling: meld_core::DwarfHandling::Strip,
             output_format: meld_core::OutputFormat::CoreModule,
             opaque_resources: Vec::new(),
+            ..Default::default()
         };
         let mut fuser = Fuser::new(config);
         fuser
@@ -3714,6 +3727,7 @@ fn fuse_run_i32(caller: &[u8], callee: &[u8], label: &str) -> i32 {
         dwarf_handling: meld_core::DwarfHandling::Strip,
         output_format: meld_core::OutputFormat::CoreModule,
         opaque_resources: Vec::new(),
+        ..Default::default()
     };
     let mut fuser = Fuser::new(config);
     fuser

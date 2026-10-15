@@ -1,0 +1,9 @@
+package test:reexp;
+
+let est = new pulseengine:estimator { ... };
+let ctl = new pulseengine:control { ... };
+let split = new pulseengine:split { "pulseengine:falcon-cascade/estimator@0.11.0": est["pulseengine:falcon-cascade/estimator@0.11.0"], "pulseengine:falcon-cascade/flight-control@0.11.0": ctl["pulseengine:falcon-cascade/flight-control@0.11.0"], ... };
+
+export split["pulseengine:falcon-cascade/controller@0.11.0"];
+export split["pulseengine:falcon-cascade/observer@0.11.0"];
+export est["pulseengine:falcon-cascade/estimator@0.11.0"];

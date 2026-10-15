@@ -19,7 +19,8 @@
 use anyhow::{Context, Result, anyhow};
 use clap::{Parser, Subcommand};
 use meld_core::{
-    DwarfHandling, Fuser, FuserConfig, FusionStats, MemoryStrategy, OutputFormat, Profile,
+    DwarfHandling, ExportPolicy, Fuser, FuserConfig, FusionStats, MemoryStrategy, OutputFormat,
+    Profile,
 };
 use std::fs;
 use std::path::Path;
@@ -221,6 +222,27 @@ enum Commands {
         #[arg(long, conflicts_with = "validate")]
         no_validate: bool,
 
+        /// Which exports the fused core module keeps (#463). "all" (default)
+        /// keeps every export of every inner module. "world" keeps only the
+        /// exports that implement the OUTER world of the input(s) — for a
+        /// composition, its own interfaces rather than the internal ones it
+        /// wired together — plus what invoking them needs: the memory the
+        /// kept lifts use, their `cabi_post_*`, `[dtor]` and realloc exports,
+        /// and the start function. `__data_end`, `__heap_base` and every other
+        /// global or table export are dropped. Only the export LIST changes:
+        /// function bodies stay, so a downstream tool can drop what becomes
+        /// unreachable. A world export that cannot be mapped to a fused export
+        /// is an error, never silently dropped. Not valid with --component,
+        /// which already exports exactly the outer world. With --emit-manifest
+        /// the manifest lists only the kept exports.
+        #[arg(
+            long,
+            value_name = "MODE",
+            default_value = "all",
+            value_parser = ["all", "world"]
+        )]
+        exports: String,
+
         /// Output as P2 component instead of core module
         #[arg(long)]
         component: bool,
@@ -328,6 +350,7 @@ fn main() -> Result<()> {
             profile,
             explain,
             domain,
+            exports,
         }) => {
             fuse_command(
                 inputs,
@@ -336,6 +359,7 @@ fn main() -> Result<()> {
                 profile,
                 explain,
                 domain,
+                exports,
                 address_rebase,
                 pack_rebase,
                 share_stack,
@@ -460,6 +484,7 @@ fn fuse_command(
     profile: String,
     explain: bool,
     domain: Vec<String>,
+    exports: String,
     address_rebase: bool,
     pack_rebase: bool,
     share_stack: bool,
@@ -613,6 +638,25 @@ fn fuse_command(
     // config, so a typo in a trust boundary fails before any work is done.
     let domains = parse_domains(&domain, &inputs)?;
 
+    // #463: `--exports` is value-checked by clap (exit 2). The combination with
+    // --component is refused here the same way: the wrapper already exports
+    // exactly the outer world, so the flag would do nothing there.
+    let export_policy = match exports.as_str() {
+        "world" => ExportPolicy::World,
+        _ => ExportPolicy::All,
+    };
+    if export_policy == ExportPolicy::World && component {
+        use clap::CommandFactory;
+        Cli::command()
+            .error(
+                clap::error::ErrorKind::ArgumentConflict,
+                "--exports world cannot be combined with --component: the component \
+                 already exports exactly the outer world (the core module is internal to \
+                 it). Drop one of the two flags.",
+            )
+            .exit();
+    }
+
     let config = FuserConfig {
         profile,
         memory_strategy,
@@ -628,6 +672,7 @@ fn fuse_command(
         opaque_resources,
         dwarf_handling,
         domains,
+        export_policy,
         ..Default::default()
     };
 
