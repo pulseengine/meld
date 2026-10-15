@@ -369,6 +369,14 @@ pub struct MergedGlobal {
     /// in structured form, as `ReindexedElementItems` does for element
     /// segments, letting `p3_async::shift_function_indices` move it (#482).
     pub init_ref_func: Option<u32>,
+    /// The `(component, module, module-local function index)` that
+    /// `init_ref_func` was resolved from. [`MergedModule::refresh_global_ref_funcs`]
+    /// re-resolves it from the FINAL `function_index_map`, because later passes
+    /// (resource re-export, adapter wiring, task.return shims, stream bridge)
+    /// overwrite map entries and rebuild function bodies, but cannot see this
+    /// opaque `ConstExpr` (#482: a global's `ref.func` must name exactly what a
+    /// body `call` of the same local index names).
+    pub init_ref_origin: Option<(usize, usize, u32)>,
 }
 
 /// Export in merged module
@@ -380,6 +388,32 @@ pub struct MergedExport {
 }
 
 impl MergedModule {
+    /// Re-resolve every global `ref.func` initialiser from the current
+    /// `function_index_map` (#482). Call after any pass that rewrites map
+    /// entries; idempotent. A recorded origin with no mapping is an error.
+    pub fn refresh_global_ref_funcs(&mut self) -> Result<()> {
+        for slot in 0..self.globals.len() {
+            let Some(origin) = self.globals[slot].init_ref_origin else {
+                continue;
+            };
+            let fused = self
+                .function_index_map
+                .get(&origin)
+                .copied()
+                .ok_or_else(|| {
+                    Error::EncodingError(format!(
+                        "global initialiser `ref.func {}` of component {} module {} has no \
+                         fused function mapping",
+                        origin.2, origin.0, origin.1
+                    ))
+                })?;
+            let g = &mut self.globals[slot];
+            g.init_ref_func = Some(fused);
+            g.init_expr = ConstExpr::ref_func(fused);
+        }
+        Ok(())
+    }
+
     /// Look up a defined function by its absolute wasm index.
     /// Returns `None` if the index refers to an imported function.
     pub fn defined_func(&self, wasm_idx: u32) -> Option<&MergedFunction> {

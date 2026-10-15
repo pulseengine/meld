@@ -317,6 +317,7 @@ impl Merger {
                 ty,
                 init_expr,
                 init_ref_func: None,
+                init_ref_origin: None,
             });
         }
 
@@ -578,6 +579,7 @@ impl Merger {
             let g = &mut merged.globals[slot];
             g.init_expr = ConstExpr::ref_func(fused);
             g.init_ref_func = Some(fused);
+            g.init_ref_origin = Some((comp_idx, mod_idx, local_func));
         }
 
         // Build IndexMaps for this module's function bodies

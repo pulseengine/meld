@@ -243,6 +243,7 @@ fn coalesce_stack_pointers(
             if let Some(g) = merged.globals.get_mut(slot) {
                 g.init_expr = ConstExpr::i32_const(s_raw_i32);
                 g.init_ref_func = None;
+                g.init_ref_origin = None;
             }
         }
     }

@@ -1438,6 +1438,7 @@ mod tests {
             },
             init_expr: wasm_encoder::ConstExpr::ref_func(t),
             init_ref_func: Some(t),
+            init_ref_origin: None,
         };
         // f_old = 2: index 1 is an import (unchanged), 3 a defined function.
         merged.globals.push(mk(1));
