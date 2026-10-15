@@ -1279,6 +1279,17 @@ fn shift_function_indices(
         *s = bump(*s);
     }
 
+    // global initialisers: a `ref.func` init names a fused function index and
+    // must shift like every other function reference (#482). Recorded
+    // structurally in `init_ref_func` because `init_expr` is opaque.
+    for g in merged.globals.iter_mut() {
+        if let Some(t) = g.init_ref_func {
+            let n = bump(t);
+            g.init_ref_func = Some(n);
+            g.init_expr = wasm_encoder::ConstExpr::ref_func(n);
+        }
+    }
+
     // element segments: function refs
     for seg in merged.elements.iter_mut() {
         match &mut seg.items {
@@ -1411,6 +1422,41 @@ mod tests {
             depth_0_sections: vec![],
             p3_async_features: vec![],
         }
+    }
+
+    /// #482: a global `ref.func` initialiser is an opaque `ConstExpr`; the P3
+    /// shift must move it (recorded in `init_ref_func`) like element segments.
+    #[test]
+    fn shift_moves_global_ref_func_init_482() {
+        use wasm_encoder::Encode;
+        let mut merged = crate::merger::tests_b::empty_merged_fixture();
+        let mk = |t: u32| crate::merger::MergedGlobal {
+            ty: wasm_encoder::GlobalType {
+                val_type: wasm_encoder::ValType::Ref(wasm_encoder::RefType::FUNCREF),
+                mutable: false,
+                shared: false,
+            },
+            init_expr: wasm_encoder::ConstExpr::ref_func(t),
+            init_ref_func: Some(t),
+        };
+        // f_old = 2: index 1 is an import (unchanged), 3 a defined function.
+        merged.globals.push(mk(1));
+        merged.globals.push(mk(3));
+        shift_function_indices(&mut merged, &[], 2, 2).unwrap();
+        let enc = |g: &crate::merger::MergedGlobal| {
+            let mut v = Vec::new();
+            g.init_expr.encode(&mut v);
+            v
+        };
+        let expect = |t: u32| {
+            let mut v = Vec::new();
+            wasm_encoder::ConstExpr::ref_func(t).encode(&mut v);
+            v
+        };
+        assert_eq!(merged.globals[0].init_ref_func, Some(1));
+        assert_eq!(enc(&merged.globals[0]), expect(1));
+        assert_eq!(merged.globals[1].init_ref_func, Some(5));
+        assert_eq!(enc(&merged.globals[1]), expect(5));
     }
 
     #[test]

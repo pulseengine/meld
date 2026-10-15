@@ -269,19 +269,35 @@ impl Merger {
         // Runs AFTER imported-global resolution so init exprs can remap any
         // `global.get` of an imported global (#338).
         let global_offset = merged.globals.len() as u32;
+        // (merged.globals position, module-local function index) of `ref.func`
+        // initialisers awaiting this module's function maps (#482).
+        let mut deferred_ref_func_globals: Vec<(usize, u32)> = Vec::new();
         for (old_idx, global) in module.globals.iter().enumerate() {
             let new_idx = merged.import_counts.global + global_offset + old_idx as u32;
             merged.global_index_map.insert(
                 (comp_idx, mod_idx, import_global_count + old_idx as u32),
                 new_idx,
             );
-            let init_expr = convert_init_expr(
-                &global.init_expr_bytes,
-                comp_idx,
-                mod_idx,
-                merged,
-                &global.content_type,
-            );
+            // #482: a `ref.func` initialiser names a function of THIS module,
+            // whose fused index is not assigned until the function-import block
+            // and first defined-function pass below. Converting it here would
+            // miss `function_index_map`; defer it (placeholder now, real
+            // value below) and never fall back to the module-local index.
+            let deferred_ref_func = ref_func_init_target(&global.init_expr_bytes);
+            let init_expr = if deferred_ref_func.is_some() {
+                ConstExpr::ref_null(wasm_encoder::HeapType::FUNC)
+            } else {
+                convert_init_expr(
+                    &global.init_expr_bytes,
+                    comp_idx,
+                    mod_idx,
+                    merged,
+                    &global.content_type,
+                )?
+            };
+            if let Some(local_func) = deferred_ref_func {
+                deferred_ref_func_globals.push((merged.globals.len(), local_func));
+            }
             // #353: record this DEFINED global's constant i32 value (if any) so a
             // data/element offset that `global.get`s it (a post-fusion
             // `__memory_base`) can be folded to `i32.const` — a data const-expr
@@ -297,7 +313,11 @@ impl Merger {
                 merged.defined_global_i32_const.insert(new_idx, v);
             }
             let ty = convert_global_type(global, comp_idx, mod_idx, merged);
-            merged.globals.push(MergedGlobal { ty, init_expr });
+            merged.globals.push(MergedGlobal {
+                ty,
+                init_expr,
+                init_ref_func: None,
+            });
         }
 
         // Resolve imported table indices via intra-component module_resolutions.
@@ -539,6 +559,25 @@ impl Merger {
                 })?;
 
             func_type_indices.push((old_idx, old_func_idx, new_type_idx, type_idx));
+        }
+
+        // #482: now that this module's function maps exist (imports above, defined
+        // functions in the first pass), resolve the deferred `ref.func` global
+        // initialisers. A missing mapping is an error, never the local index.
+        for (slot, local_func) in deferred_ref_func_globals {
+            let fused = merged
+                .function_index_map
+                .get(&(comp_idx, mod_idx, local_func))
+                .copied()
+                .ok_or_else(|| {
+                    Error::EncodingError(format!(
+                        "global initialiser `ref.func {local_func}` of component {comp_idx} \
+                         module {mod_idx} has no fused function mapping"
+                    ))
+                })?;
+            let g = &mut merged.globals[slot];
+            g.init_expr = ConstExpr::ref_func(fused);
+            g.init_ref_func = Some(fused);
         }
 
         // Build IndexMaps for this module's function bodies

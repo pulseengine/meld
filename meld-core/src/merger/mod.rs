@@ -45,7 +45,7 @@ mod naming;
 #[cfg(test)]
 mod tests_a;
 #[cfg(test)]
-mod tests_b;
+pub(crate) mod tests_b;
 #[cfg(test)]
 mod tests_rerewrite;
 
@@ -59,7 +59,7 @@ use self::index_maps::index_maps_from_params;
 pub(crate) use self::index_maps::{
     component_memory_index, component_realloc_index, convert_global_type, convert_init_expr,
     convert_table_type, decompose_component_core_func_index, extract_function_body,
-    index_maps_for_rerewrite, remap_concrete_val_type,
+    index_maps_for_rerewrite, ref_func_init_target, remap_concrete_val_type,
 };
 pub(crate) use self::memory::{
     SharedMemoryPlan, convert_memory_type, module_has_direct_memory_access, module_memory_type,
@@ -364,6 +364,11 @@ pub enum SyntheticKind {
 pub struct MergedGlobal {
     pub ty: EncoderGlobalType,
     pub init_expr: ConstExpr,
+    /// `Some(f)` when `init_expr` is exactly `ref.func f` (a fused function
+    /// index). `init_expr` is an opaque `ConstExpr`, so this records the target
+    /// in structured form, as `ReindexedElementItems` does for element
+    /// segments, letting `p3_async::shift_function_indices` move it (#482).
+    pub init_ref_func: Option<u32>,
 }
 
 /// Export in merged module

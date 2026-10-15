@@ -135,6 +135,7 @@ fn mut_i32_global(init: i32) -> MergedGlobal {
             shared: false,
         },
         init_expr: ConstExpr::i32_const(init),
+        init_ref_func: None,
     }
 }
 

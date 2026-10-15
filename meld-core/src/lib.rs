@@ -2217,6 +2217,7 @@ impl Fuser {
             for param_ty in &import_type.params {
                 let global_idx = merged.import_counts.global + merged.globals.len() as u32;
                 merged.globals.push(merger::MergedGlobal {
+                    init_ref_func: None,
                     ty: wasm_encoder::GlobalType {
                         val_type: *param_ty,
                         mutable: true,
