@@ -4,6 +4,17 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+- **`--exports world` limits the fused module's exports to the outer world
+  of its inputs (SR-100, #463).** For a composed input, the fused core module
+  exported every inner module's exports: interfaces the composition wires
+  internally, `__heap_base`/`__data_end`, and toolchain allocators. With
+  `--exports world` only the world's exports remain, plus the memory, realloc,
+  post-return, destructors and start function they need; function bodies are
+  untouched. A world export that cannot be mapped is an error. The default,
+  `--exports all`, is unchanged, and the option is refused with `--component`,
+  where the wrapper already exposes exactly the outer world.
+
 
 ## [0.63.0] - 2026-10-15
 
