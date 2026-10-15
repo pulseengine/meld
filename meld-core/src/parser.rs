@@ -201,6 +201,11 @@ pub struct ParsedComponent {
     /// Tracks what created each component instance index (imports,
     /// ComponentInstanceSection entries, instance-export aliases).
     pub component_instance_defs: Vec<ComponentInstanceDef>,
+    /// For each component-level `(export .. (instance N))`: how many entries
+    /// `component_instance_defs` had when it was seen, and the exported
+    /// instance index `N`. Each of these binds a real instance index that has
+    /// no slot in `component_instance_defs` (see `world_exports`).
+    pub instance_export_slots: Vec<(usize, u32)>,
 
     /// Ordered sequence of component type definitions.
     /// Tracks what created each component type index (imports with Type refs,
@@ -736,6 +741,7 @@ impl ComponentParser {
             core_entity_order: Vec::new(),
             component_func_defs: Vec::new(),
             component_instance_defs: Vec::new(),
+            instance_export_slots: Vec::new(),
             component_type_defs: Vec::new(),
             original_size: bytes.len(),
             original_hash: compute_sha256(bytes),
@@ -931,6 +937,16 @@ impl ComponentParser {
                         component
                             .component_func_defs
                             .push(ComponentFuncDef::ExportAlias(export.index));
+                    }
+                    // An `Instance` export binds a new component-instance index too,
+                    // but `component_instance_defs` is deliberately NOT given a
+                    // slot (that would shift every later lookup and change
+                    // existing output). Record where it falls instead, so a
+                    // real index can be translated (#463).
+                    if export.kind == ComponentExternalKind::Instance {
+                        component
+                            .instance_export_slots
+                            .push((component.component_instance_defs.len(), export.index));
                     }
                     component.exports.push(ComponentExport {
                         name: export.name.0.to_string(),
@@ -1516,6 +1532,7 @@ impl ParsedComponent {
             core_entity_order: Vec::new(),
             component_func_defs: Vec::new(),
             component_instance_defs: Vec::new(),
+            instance_export_slots: Vec::new(),
             component_type_defs: Vec::new(),
             original_size: 0,
             original_hash: String::new(),
@@ -4490,6 +4507,7 @@ mod tests {
             core_entity_order: vec![],
             component_func_defs: vec![],
             component_instance_defs: vec![],
+            instance_export_slots: Vec::new(),
             component_type_defs: vec![],
             original_size: 0,
             original_hash: String::new(),
@@ -6188,6 +6206,7 @@ mod tests {
             core_entity_order: vec![],
             component_func_defs: vec![],
             component_instance_defs: vec![],
+            instance_export_slots: Vec::new(),
             component_type_defs: vec![],
             original_size: 0,
             original_hash: String::new(),

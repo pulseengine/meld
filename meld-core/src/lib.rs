@@ -69,6 +69,7 @@ pub mod resource_graph;
 pub mod rewriter;
 pub mod segments;
 pub mod signature_manifest;
+pub mod world_exports;
 
 pub use adapter::{AdapterConfig, AdapterGenerator};
 pub use error::{Error, Result};
@@ -256,6 +257,40 @@ pub struct FuserConfig {
     ///    the un-fused composition's semantics where each component owns
     ///    its own resource table.
     pub opaque_resources: Vec<(String, String)>,
+
+    /// Which exports the fused core module keeps (#463). Default
+    /// [`ExportPolicy::All`] keeps every export of every inner module, as
+    /// before; [`ExportPolicy::World`] cuts the list down to the outer
+    /// component's world plus the exports those need to be invoked.
+    pub export_policy: ExportPolicy,
+}
+
+/// Which exports the fused core module keeps (#463).
+///
+/// The export list only: function bodies stay, so a downstream tool
+/// (`loom`, `wasm-opt`, `synth`) can drop whatever the shorter list leaves
+/// unreachable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ExportPolicy {
+    /// Every export of every inner module (today's behaviour, the default).
+    #[default]
+    All,
+    /// Only the exports that implement the outer world of the input(s), plus
+    /// what invoking them needs: the memory the kept lifts use, their
+    /// `cabi_post_*` and reallocs, the `[dtor]` exports of the interfaces
+    /// they belong to, and the start function. Refuses when a world export
+    /// cannot be mapped to a fused export.
+    World,
+}
+
+impl ExportPolicy {
+    /// The CLI / attestation spelling.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ExportPolicy::All => "all",
+            ExportPolicy::World => "world",
+        }
+    }
 }
 
 impl Default for FuserConfig {
@@ -278,6 +313,7 @@ impl Default for FuserConfig {
             dwarf_handling: DwarfHandling::Remap,
             output_format: OutputFormat::CoreModule,
             opaque_resources: Vec::new(),
+            export_policy: ExportPolicy::All,
         }
     }
 }
@@ -912,6 +948,24 @@ impl Fuser {
             ));
         }
 
+        // #463: `--exports world` limits the CORE module's export list. Under
+        // `--component` the wrapper already lifts exactly the outer world's
+        // exports and the core module is internal to the component, so the flag
+        // would change nothing the consumer sees, while pruning could remove an
+        // export (`cabi_realloc`, a `[dtor]`, the memory) the wrapper wires its
+        // canon lowers through. Refuse rather than accept a flag that does
+        // nothing or quietly breaks the wrapper.
+        if self.config.export_policy == ExportPolicy::World
+            && self.config.output_format == OutputFormat::Component
+        {
+            return Err(Error::InvalidExports(
+                "--exports world applies to the core module's export list, and --component \
+                 already exports exactly the outer world (the core module is internal to the \
+                 component). Drop one of the two flags."
+                    .to_string(),
+            ));
+        }
+
         // Mythos delta-pass on SR-90 (#446): `--share-stack` cannot yet express a
         // multi-domain fusion, for the same reason `--component` cannot above.
         // `compute_shared_memory_plan` runs PER DOMAIN, but the merger takes
@@ -1504,6 +1558,23 @@ impl Fuser {
         // they name what a body `call` of the same index names.
         merged.refresh_global_ref_funcs()?;
 
+        // #463: `--exports world` cuts the export list down to the outer
+        // world. Runs after every pass that adds or renumbers exports and
+        // before encoding, so the manifest, attestation and provenance all see
+        // the shortened list. Function bodies are untouched.
+        let kept_world_exports = if self.config.export_policy == ExportPolicy::World {
+            let kept = world_exports::prune_to_world(
+                &mut merged,
+                &self.components,
+                &self.original_components,
+                &self.component_to_input,
+            )?;
+            stats.total_exports = merged.exports.len();
+            Some(kept)
+        } else {
+            None
+        };
+
         // Step 4: Encode output module.
         //
         // Two-pass dance: first encode without any self-referential
@@ -1531,7 +1602,11 @@ impl Fuser {
         // `cabi_realloc*` exports, which these deliberately do not re-add
         // under that name.
         if self.config.signature_manifest {
-            for (name, index) in signature_manifest::allocator_exports(&self.components, &merged) {
+            for (name, index) in signature_manifest::allocator_exports(
+                &self.components,
+                &merged,
+                kept_world_exports.as_ref(),
+            ) {
                 merged.exports.push(crate::merger::MergedExport {
                     name,
                     kind: wasm_encoder::ExportKind::Func,
@@ -1599,8 +1674,12 @@ impl Fuser {
             // emitted, not the WIT tree `wit` comes from. Extra custom sections
             // do not shift function indices, so the types read here are the
             // ones the final artifact exports.
-            let manifest =
-                signature_manifest::build(&self.components, &merged, &output_without_extras);
+            let manifest = signature_manifest::build(
+                &self.components,
+                &merged,
+                &output_without_extras,
+                kept_world_exports.as_ref(),
+            );
             match serde_json::to_vec(&manifest) {
                 Ok(payload) => extra_sections.push((signature_manifest::SECTION_NAME, payload)),
                 Err(e) => {
@@ -2923,6 +3002,11 @@ impl Fuser {
             "output_format".to_string(),
             serde_json::json!(self.output_format_label()),
         );
+        // #463: recorded only when not the default, so default records stay
+        // byte-identical (same rule as `attestation_parameters`).
+        if let Some(policy) = wsc_recorded_export_policy(&self.config) {
+            tool_parameters.insert("exports".to_string(), serde_json::json!(policy));
+        }
 
         let mut metadata = HashMap::new();
         metadata.insert(
@@ -3054,6 +3138,11 @@ impl Fuser {
             component_provenance: _,
             signature_manifest: _,
             opaque_resources: _,
+            // #463: the export policy changes what the artifact exports, so a
+            // reader holding only the artifact needs to know the shorter list
+            // was deliberate. Recorded only when not the default, so default
+            // records stay byte-identical.
+            export_policy,
         } = &self.config;
 
         attestation::FusionParameters {
@@ -3068,6 +3157,8 @@ impl Fuser {
             output_format: self.output_format_label().to_string(),
             reproducible: *reproducible,
             domains: canonical_domains(domains),
+            exports: (*export_policy != ExportPolicy::All)
+                .then(|| export_policy.as_str().to_string()),
         }
     }
 
@@ -3103,6 +3194,41 @@ impl Fuser {
             OutputFormat::Component => "component",
         }
     }
+}
+
+/// SR-28 for the wsc-attestation build: the exhaustive `FuserConfig`
+/// destructure the default path has in `attestation_parameters`, so a field
+/// added to the config fails to compile under `--features attestation` until it
+/// is recorded or acknowledged here. Returns the export policy when it is not
+/// the default.
+///
+/// Fields bound to `_` below are NOT recorded by this path today (it predates
+/// the typed `FusionParameters`); they are acknowledged, not endorsed.
+#[cfg(feature = "attestation")]
+fn wsc_recorded_export_policy(config: &FuserConfig) -> Option<&'static str> {
+    let FuserConfig {
+        // Already recorded by `build_wsc_attestation`.
+        memory_strategy: _,
+        address_rebasing: _,
+        preserve_names: _,
+        custom_sections: _,
+        dwarf_handling: _,
+        output_format: _,
+        // Not recorded by this path (recorded by the default path).
+        profile: _,
+        reproducible: _,
+        pack_rebase: _,
+        share_stack: _,
+        domains: _,
+        // Not build parameters (see `attestation_parameters`).
+        attestation: _,
+        component_provenance: _,
+        signature_manifest: _,
+        opaque_resources: _,
+        // #463.
+        export_policy,
+    } = config;
+    (*export_policy != ExportPolicy::All).then(|| export_policy.as_str())
 }
 
 /// Recursively flatten nested sub-components into a flat `Vec<ParsedComponent>`.
@@ -3850,6 +3976,7 @@ mod tests {
             core_entity_order: Vec::new(),
             component_func_defs: Vec::new(),
             component_instance_defs: Vec::new(),
+            instance_export_slots: Vec::new(),
             component_type_defs: vec![crate::parser::ComponentTypeDef::Defined],
             original_size: 0,
             original_hash: String::new(),

@@ -19,7 +19,8 @@
 use anyhow::{Context, Result, anyhow};
 use clap::{Parser, Subcommand};
 use meld_core::{
-    DwarfHandling, Fuser, FuserConfig, FusionStats, MemoryStrategy, OutputFormat, Profile,
+    DwarfHandling, ExportPolicy, Fuser, FuserConfig, FusionStats, MemoryStrategy, OutputFormat,
+    Profile,
 };
 use std::fs;
 use std::path::Path;
@@ -221,6 +222,35 @@ enum Commands {
         #[arg(long, conflicts_with = "validate")]
         no_validate: bool,
 
+        /// Which exports the fused core module keeps (#463). "all" (default)
+        /// keeps every export of every inner module. "world" keeps only the
+        /// functions that implement the OUTER world of the input(s), found by
+        /// tracing each world function through its `canon lift` to a fused
+        /// function (never by name), and exports each under its WORLD name
+        /// (`<interface>#<function>`): where the merger named a function
+        /// `iface#f$1` because an internal one took `iface#f`, the world name
+        /// is rebound to the world function and the internal one is dropped.
+        /// It also keeps what the kept surface and the imports the module still
+        /// has need: their lifts' and lowers' memory and realloc (a realloc
+        /// nothing exports is exported as `meld:realloc/<component>`, with or
+        /// without --emit-manifest), `cabi_post_*`, the `[dtor]` exports of
+        /// resources whose intrinsics are still imported, and the start
+        /// function. `__data_end`, `__heap_base` and every other global or
+        /// table export are dropped. Only the export LIST changes: function
+        /// bodies stay, so a downstream tool can drop what becomes unreachable.
+        /// A world function that cannot be traced to a fused function that
+        /// some export carries is an error naming it, never silently dropped.
+        /// Not valid with --component, which already exports exactly the outer
+        /// world. With --emit-manifest the manifest lists only the world's
+        /// functions, under their world names.
+        #[arg(
+            long,
+            value_name = "MODE",
+            default_value = "all",
+            value_parser = ["all", "world"]
+        )]
+        exports: String,
+
         /// Output as P2 component instead of core module
         #[arg(long)]
         component: bool,
@@ -328,6 +358,7 @@ fn main() -> Result<()> {
             profile,
             explain,
             domain,
+            exports,
         }) => {
             fuse_command(
                 inputs,
@@ -336,6 +367,7 @@ fn main() -> Result<()> {
                 profile,
                 explain,
                 domain,
+                exports,
                 address_rebase,
                 pack_rebase,
                 share_stack,
@@ -460,6 +492,7 @@ fn fuse_command(
     profile: String,
     explain: bool,
     domain: Vec<String>,
+    exports: String,
     address_rebase: bool,
     pack_rebase: bool,
     share_stack: bool,
@@ -613,6 +646,25 @@ fn fuse_command(
     // config, so a typo in a trust boundary fails before any work is done.
     let domains = parse_domains(&domain, &inputs)?;
 
+    // #463: `--exports` is value-checked by clap (exit 2). The combination with
+    // --component is refused here the same way: the wrapper already exports
+    // exactly the outer world, so the flag would do nothing there.
+    let export_policy = match exports.as_str() {
+        "world" => ExportPolicy::World,
+        _ => ExportPolicy::All,
+    };
+    if export_policy == ExportPolicy::World && component {
+        use clap::CommandFactory;
+        Cli::command()
+            .error(
+                clap::error::ErrorKind::ArgumentConflict,
+                "--exports world cannot be combined with --component: the component \
+                 already exports exactly the outer world (the core module is internal to \
+                 it). Drop one of the two flags.",
+            )
+            .exit();
+    }
+
     let config = FuserConfig {
         profile,
         memory_strategy,
@@ -628,6 +680,7 @@ fn fuse_command(
         opaque_resources,
         dwarf_handling,
         domains,
+        export_policy,
         ..Default::default()
     };
 

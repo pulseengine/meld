@@ -517,6 +517,7 @@ fn ls_a_7_every_realloc_call_has_null_guard() {
         dwarf_handling: meld_core::DwarfHandling::Strip,
         output_format: meld_core::OutputFormat::CoreModule,
         opaque_resources: Vec::new(),
+        ..Default::default()
     };
 
     let mut fuser = Fuser::new(config);

@@ -2946,7 +2946,7 @@ fn source_string_encoding_option(
 /// With exactly one fused memory, 0 is the only possible answer and no
 /// resolution is needed. Otherwise an unresolvable option is an error, never
 /// a guess.
-fn resolve_source_memory(
+pub(crate) fn resolve_source_memory(
     owner: &ParsedComponent,
     all_components: &[ParsedComponent],
     merged: &MergedModule,
@@ -3024,18 +3024,18 @@ fn resolve_source_memory(
 
 /// What a SOURCE `canon lower` asks of its fused replacement (#484).
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct LowerSpec {
+pub(crate) struct LowerSpec {
     /// Fused memory the source's `memory` option names (`None`: it names none).
-    memory: Option<u32>,
+    pub(crate) memory: Option<u32>,
     /// Fused function index of the source's `realloc` option (`None`: none).
-    realloc: Option<u32>,
-    encoding: parser::CanonStringEncoding,
+    pub(crate) realloc: Option<u32>,
+    pub(crate) encoding: parser::CanonStringEncoding,
 }
 
 /// The fused function index a SOURCE `realloc` option (a core function index of
 /// `owner`) refers to: source core func -> (module, export) -> module-local
 /// function -> `function_index_map` (#484).
-fn resolve_source_realloc(
+pub(crate) fn resolve_source_realloc(
     owner: &ParsedComponent,
     comp_idx: usize,
     merged: &MergedModule,
@@ -3073,7 +3073,7 @@ fn resolve_source_realloc(
 /// lowering options, and silently picking one would hand the host the wrong
 /// memory/allocator/encoding for the others. Returns `None` when no lower was
 /// traced for this import.
-fn resolve_lower_spec(
+pub(crate) fn resolve_lower_spec(
     all_components: &[ParsedComponent],
     merged: &MergedModule,
     fused_memory_count: usize,
@@ -4049,6 +4049,7 @@ mod tests {
             core_entity_order: Vec::new(),
             component_func_defs: Vec::new(),
             component_instance_defs: vec![ComponentInstanceDef::Import(0)],
+            instance_export_slots: Vec::new(),
             component_type_defs: Vec::new(),
             original_size: 0,
             original_hash: String::new(),
@@ -4116,6 +4117,7 @@ mod tests {
             core_entity_order: Vec::new(),
             component_func_defs: Vec::new(),
             component_instance_defs: vec![ComponentInstanceDef::Import(0)],
+            instance_export_slots: Vec::new(),
             component_type_defs: Vec::new(),
             original_size: 0,
             original_hash: String::new(),
@@ -4175,6 +4177,7 @@ mod tests {
             core_entity_order: Vec::new(),
             component_func_defs: Vec::new(),
             component_instance_defs: vec![ComponentInstanceDef::Import(0)],
+            instance_export_slots: Vec::new(),
             component_type_defs: Vec::new(),
             original_size: 0,
             original_hash: String::new(),
@@ -4217,6 +4220,7 @@ mod tests {
             core_entity_order: vec![],
             component_func_defs: vec![],
             component_instance_defs: vec![],
+            instance_export_slots: Vec::new(),
             component_type_defs: vec![],
             original_size: 0,
             original_hash: String::new(),
