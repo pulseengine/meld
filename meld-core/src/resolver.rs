@@ -529,6 +529,58 @@ pub fn core_lower_options(
     out
 }
 
+/// `core func index -> (instance index, export name)` for every core func that
+/// is an alias of a core instance export (#484).
+fn core_func_alias_targets(component: &ParsedComponent) -> HashMap<u32, (u32, String)> {
+    use crate::parser::{ComponentAliasEntry, CoreEntityDef};
+    let mut out = HashMap::new();
+    let mut func_idx = 0u32;
+    for def in &component.core_entity_order {
+        match def {
+            CoreEntityDef::CanonicalFunction(_) => func_idx += 1,
+            CoreEntityDef::CoreAlias(alias_idx) => {
+                if let Some(ComponentAliasEntry::CoreInstanceExport {
+                    kind,
+                    instance_index,
+                    name,
+                }) = component.component_aliases.get(*alias_idx)
+                    && *kind == wasmparser::ExternalKind::Func
+                {
+                    out.insert(func_idx, (*instance_index, name.clone()));
+                    func_idx += 1;
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Follow a core func through any chain of alias re-exports (`alias core export`
+/// of a bag instance) to the `canon lower` that defines it. Returns the lower's
+/// core func index, or `None` if the chain ends anywhere else (a module export,
+/// a non-lower canon built-in, a missing entry) (#484).
+fn trace_core_func_to_lower(
+    mut func: u32,
+    lowers: &HashMap<u32, crate::parser::CanonicalOptions>,
+    aliases: &HashMap<u32, (u32, String)>,
+    bags: &HashMap<u32, Vec<(String, ExportKind, u32)>>,
+) -> Option<u32> {
+    // Each hop goes to an earlier-defined entity, so this terminates; the
+    // bound is belt and braces against a malformed component.
+    for _ in 0..256 {
+        if lowers.contains_key(&func) {
+            return Some(func);
+        }
+        let (inst, name) = aliases.get(&func)?;
+        func = bags
+            .get(inst)?
+            .iter()
+            .find(|(n, k, _)| n == name && *k == ExportKind::Function)
+            .map(|(_, _, idx)| *idx)?;
+    }
+    None
+}
+
 /// Build provenance map by replaying the core entity definition order.
 ///
 /// Walks `core_entity_order` and maintains per-kind counters. For each
@@ -2472,6 +2524,7 @@ impl Resolver {
         // Build canonical lower → WASI name mapping for renaming ""::N imports
         let canon_import_names = build_canon_import_names(component);
         let canon_lower_sites = core_lower_options(component);
+        let core_func_aliases = core_func_alias_targets(component);
 
         // Step 1: Build instance content map.
         // For each instance, record what module it instantiates and how its
@@ -2650,9 +2703,12 @@ impl Resolver {
                                     display_module = Some(mod_name.clone());
                                     display_field = Some(field_name.clone());
                                 }
-                                if canon_lower_sites.contains_key(entity_idx) {
-                                    lower_core_func = Some(*entity_idx);
-                                }
+                                lower_core_func = trace_core_func_to_lower(
+                                    *entity_idx,
+                                    &canon_lower_sites,
+                                    &core_func_aliases,
+                                    &from_exports_infos,
+                                );
                                 break;
                             }
                         }

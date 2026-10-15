@@ -185,11 +185,23 @@ impl Merger {
                         // Duplicate with matching type — skip emitting.
                         // Its `canon lower` still counts: the wrapper checks
                         // that every lower sharing this slot agrees (#484).
-                        if let (Some(core_func), Some(&slot)) =
-                            (unresolved.lower_core_func, func_lower_slot.get(&dedup_key))
-                        {
-                            merged.import_lower_sites[slot]
-                                .push((unresolved.component_idx, core_func));
+                        // An untraced duplicate is recorded too, so the wrapper
+                        // can refuse rather than merge it silently.
+                        if let Some(&slot) = func_lower_slot.get(&dedup_key) {
+                            let s = &mut merged.import_lower_sites[slot];
+                            s.members += 1;
+                            match unresolved.lower_core_func {
+                                Some(core_func) => {
+                                    s.sites.push((unresolved.component_idx, core_func))
+                                }
+                                None => s.untraced.push(format!(
+                                    "component {} module {} {}::{}",
+                                    unresolved.component_idx,
+                                    unresolved.module_idx,
+                                    unresolved.module_name,
+                                    unresolved.field_name
+                                )),
+                            }
                         }
                         // Still record per-component resource tracking: find the
                         // func index already assigned to this resource name.
@@ -274,14 +286,27 @@ impl Merger {
                     let realloc_idx = component_realloc_index(merged, unresolved.component_idx);
                     merged.import_memory_indices.push(mem_idx);
                     merged.import_realloc_indices.push(realloc_idx);
-                    func_lower_slot.insert(dedup_key.clone(), merged.import_lower_sites.len());
-                    merged.import_lower_sites.push(
-                        unresolved
-                            .lower_core_func
-                            .map(|f| (unresolved.component_idx, f))
-                            .into_iter()
-                            .collect(),
-                    );
+                    // A type-mismatched import is emitted fresh and must not
+                    // re-point the key: later duplicates of the FIRST type
+                    // belong to the first slot.
+                    func_lower_slot
+                        .entry(dedup_key.clone())
+                        .or_insert(merged.import_lower_sites.len());
+                    let mut slot = LowerSlot {
+                        members: 1,
+                        ..Default::default()
+                    };
+                    match unresolved.lower_core_func {
+                        Some(f) => slot.sites.push((unresolved.component_idx, f)),
+                        None => slot.untraced.push(format!(
+                            "component {} module {} {}::{}",
+                            unresolved.component_idx,
+                            unresolved.module_idx,
+                            unresolved.module_name,
+                            unresolved.field_name
+                        )),
+                    }
+                    merged.import_lower_sites.push(slot);
 
                     merged.imports.push(MergedImport {
                         module,

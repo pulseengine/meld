@@ -1463,11 +1463,23 @@ fn assemble_component(
                     // attempted) when there is more than one fused memory.
                     let multi = memory_strategy == MemoryStrategy::MultiMemory
                         && fused_info.memories.len() > 1;
-                    let sites = merged
-                        .import_lower_sites
-                        .get(i)
-                        .map(Vec::as_slice)
-                        .unwrap_or(&[]);
+                    let slot = merged.import_lower_sites.get(i);
+                    let sites = slot.map(|s| s.sites.as_slice()).unwrap_or(&[]);
+                    // An untraced lower that shares its fused import with any
+                    // other import cannot be checked against it: refuse.
+                    if let Some(slot) = slot
+                        && slot.members > 1
+                        && let Some(first) = slot.untraced.first()
+                    {
+                        return Err(Error::EncodingError(format!(
+                            "fused import {}::{} merges {} imports and the canon lower of \
+                             {first} could not be traced, so its memory/realloc/encoding \
+                             cannot be checked against the others",
+                            fused_info.func_imports[i].0,
+                            fused_info.func_imports[i].1,
+                            slot.members
+                        )));
+                    }
                     let spec = resolve_lower_spec(
                         all_components,
                         merged,
@@ -1475,14 +1487,6 @@ fn assemble_component(
                         multi,
                         sites,
                     )?;
-                    if multi && spec.is_none() {
-                        return Err(Error::EncodingError(format!(
-                            "cannot determine the canon lower options for fused import \
-                             {}::{}: under --memory multi the memory it passes to the host \
-                             must come from the source lower, and none could be traced",
-                            fused_info.func_imports[i].0, fused_info.func_imports[i].1
-                        )));
-                    }
                     // A source lower that names no memory cannot touch one, so
                     // the choice is inert; keep the (now deterministic)
                     // per-component default rather than churn the output.

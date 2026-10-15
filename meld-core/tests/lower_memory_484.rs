@@ -240,3 +240,106 @@ fn lower_realloc_follows_source_option() {
         check(&format!("realloc order {order}"), &wat);
     }
 }
+
+/// Two modules lower the same host `log`, each with its OWN memory ($ma / $mc),
+/// so the two lowers share one dedup key but disagree on `memory`. A reaches its
+/// lower through a plain bag; C reaches its lower either directly
+/// (`via_alias == false`) or through an ALIAS re-export of another bag
+/// (`via_alias == true`), which the resolver used to leave untraced. Unfused,
+/// the host receives ["hello", "WORLD"].
+fn shared_key_fixture(c_first: bool, via_alias: bool) -> String {
+    let a = r#"(core module $A
+    (import "env" "mem" (memory 1))
+    (import "my:h/host" "log" (func $log (param i32 i32) (result i32)))
+    (data (i32.const 0) "hello")
+    (func (export "runa") (result i32) i32.const 0 i32.const 5 call $log))"#;
+    let c = r#"(core module $C
+    (import "env" "mem" (memory 1))
+    (import "my:h/host" "log" (func $log (param i32 i32) (result i32)))
+    (data (i32.const 0) "WORLD")
+    (func (export "runc") (result i32) i32.const 0 i32.const 5 call $log))"#;
+    let ia = r#"(core instance $a (instantiate $A (with "env" (instance $enva)) (with "my:h/host" (instance $hosta))))"#;
+    let ic = r#"(core instance $c (instantiate $C (with "env" (instance $envc)) (with "my:h/host" (instance $hostc))))"#;
+    let (first_mod, second_mod, first_inst, second_inst) = if c_first {
+        (c, a, ic, ia)
+    } else {
+        (a, c, ia, ic)
+    };
+    let hostc = if via_alias {
+        r#"(core instance $hostc (export "log" (func $hostx "log")))"#
+    } else {
+        r#"(core instance $hostc (export "log" (func $lowc)))"#
+    };
+    format!(
+        r#"(component
+  (import "my:h/host" (instance $h (export "log" (func (param "s" string) (result u32)))))
+  (core module $MA (memory (export "mem") 1) (func (export "cabi_realloc") (param i32 i32 i32 i32) (result i32) i32.const 0))
+  (core module $MC (memory (export "mem") 1))
+  {first_mod}
+  {second_mod}
+  (core instance $ma (instantiate $MA))
+  (core instance $mc (instantiate $MC))
+  (alias export $h "log" (func $log))
+  (core func $lowa (canon lower (func $log) (memory $ma "mem")))
+  (core func $lowc (canon lower (func $log) (memory $mc "mem")))
+  (core instance $hosta (export "log" (func $lowa)))
+  (core instance $hostx (export "log" (func $lowc)))
+  {hostc}
+  (core instance $enva (export "mem" (memory $ma "mem")))
+  (core instance $envc (export "mem" (memory $mc "mem")))
+  {first_inst}
+  {second_inst}
+  (func $runa (result u32) (canon lift (core func $a "runa")))
+  (func $runc (result u32) (canon lift (core func $c "runc")))
+  (core module $R
+    (import "a" "run" (func $ra (result i32)))
+    (import "c" "run" (func $rc (result i32)))
+    (func (export "run") (result i32) (i32.add (call $ra) (call $rc))))
+  (core instance $ra (export "run" (func $a "runa")))
+  (core instance $rc (export "run" (func $c "runc")))
+  (core instance $r (instantiate $R (with "a" (instance $ra)) (with "c" (instance $rc))))
+  (func $run (result u32) (canon lift (core func $r "run")))
+  (export "run" (func $run)))"#
+    )
+}
+
+/// Never a silent wrong delivery: each fusion either delivers exactly what the
+/// unfused component does or is refused loudly. Here the two lowers need two
+/// different memories behind one fused import, so it must be refused, and the
+/// refusal must not depend on whether C's lower was reached through an alias.
+#[test]
+fn shared_import_with_disagreeing_lowers_is_never_silently_merged() {
+    for via_alias in [false, true] {
+        for c_first in [false, true] {
+            let bytes = wat::parse_str(shared_key_fixture(c_first, via_alias)).unwrap();
+            let want = run(&bytes).unwrap().1;
+            assert_eq!(want, vec!["hello".to_string(), "WORLD".to_string()]);
+            let (mut silent_wrong, mut refused) = (0, 0);
+            for _ in 0..RUNS {
+                match fuse(&bytes) {
+                    Err(e) => {
+                        assert!(
+                            e.contains("disagree"),
+                            "via_alias={via_alias} c_first={c_first}: refused for the wrong reason: {e}"
+                        );
+                        refused += 1;
+                    }
+                    Ok(f) => {
+                        if run(&f).map(|r| r.1) != Ok(want.clone()) {
+                            silent_wrong += 1;
+                        }
+                    }
+                }
+            }
+            assert_eq!(
+                silent_wrong, 0,
+                "via_alias={via_alias} c_first={c_first}: {silent_wrong}/{RUNS} fusions \
+                 exited 0 and delivered the wrong bytes"
+            );
+            assert_eq!(
+                refused, RUNS,
+                "via_alias={via_alias} c_first={c_first}: expected every fusion refused"
+            );
+        }
+    }
+}
