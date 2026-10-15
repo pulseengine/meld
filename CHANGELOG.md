@@ -16,6 +16,16 @@ All notable changes to this project will be documented in this file.
   or global initialiser naming an unmapped import is an error. Under
   `--memory shared`, the dead `"0"`, `"1"` and `"$imports"` exports are now
   dropped, so the fused module no longer carries wit-component scaffolding.
+- **`--component` lifts each export with the memory its source lift names
+  (SR-97, #481).** The wrapper lifted every export from fused memory 0, and
+  indexed the `task.return` memory option by the source component's own
+  memory index. Under `--memory multi`, memory 0 is whichever memory-owning
+  module merged first, so a component with two memory-owning core modules
+  could return another module's bytes from a string or list export, at exit
+  0 with a valid component. The lift now maps the source memory through the
+  merger's numbering, and a memory option that cannot be resolved is an
+  error. Components with a single memory-owning module are unaffected
+  (byte-identical output across the wit-bindgen corpus).
 - **Fused output no longer varies between runs when two components qualify as
   a resource's definer (SR-95, #467).** A component and the component that
   re-exports it can both carry a resource representation. meld picked the

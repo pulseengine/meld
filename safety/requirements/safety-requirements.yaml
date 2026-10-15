@@ -3602,6 +3602,24 @@ artifacts:
       model: claude-opus-5-5
       timestamp: 2026-10-14T12:32:22Z
 
+  - id: SR-97
+    type: sw-req
+    title: "--component lifts each export with the memory its source lift names"
+    status: implemented
+    description: "When meld wraps the fused module as a component (--component), each export is lifted with a canon lift whose memory option tells the host where to read the returned pointer and length. The wrapper emitted a constant fused memory 0 for export lifts, and indexed the task.return memory option directly by the source component's core memory index. Under --memory multi, fused memory 0 belongs to whichever memory-owning module merged first, which need not be the module the source lift names, so a component with two memory-owning core modules could return another module's bytes from a string or list export at exit 0 with a valid component (#481: \"\" instead of \"hello\" when the module order put the other memory first). meld shall lift each export, and encode each task.return, with the fused memory that corresponds to the memory the source lift names: source core memory, to its defining module and export, to the module-local memory, to the merger's memory_index_map. With exactly one fused memory, 0 is the only answer. Any other memory option that cannot be resolved shall be an error, never a guess of 0. Deliberately unchanged: a source lift that names no memory keeps the historical option, since there is no source memory to misread. Not established here: lifts with string or list parameters do not carry a realloc option from this path; whether that is covered elsewhere is not examined by this requirement."
+    links:
+      - type: derives-from
+        target: SYS-4
+      - type: refines
+        target: SR-21
+      - type: refines
+        target: SR-14
+    provenance:
+      created-by: ai-assisted
+      reviewed-by: avrabe
+      model: claude-opus-5-5
+      timestamp: 2026-10-15T03:52:33Z
+
   - id: SR-96
     type: sw-req
     title: An unmapped function import is never resolved to an unrelated function
