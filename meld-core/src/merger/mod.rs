@@ -48,6 +48,8 @@ mod tests_a;
 mod tests_b;
 #[cfg(test)]
 mod tests_rerewrite;
+#[cfg(test)]
+mod tests_unmapped_462;
 
 pub(crate) use self::imports::UnresolvedImportAssignments;
 pub(crate) use self::imports::{
@@ -245,6 +247,22 @@ pub struct MergedModule {
     /// [`index_maps_for_rerewrite`].
     pub rewrite_params: HashMap<(usize, usize), ModuleRewriteParams>,
 
+    /// #462: `(component, module, import position in the function-import
+    /// index space)` -> fused index of the trapping stub standing in for that
+    /// function import in `elem` slots. Present only for imports that no
+    /// resolution step mapped AND that an `elem` segment names (wit-component
+    /// fixup modules fill their shim table with such imports). Keeps the fused
+    /// function-index space honest: values are bumped by every pass that
+    /// inserts function imports, exactly like `function_index_map`.
+    pub unmapped_import_stubs: HashMap<(usize, usize, u32), u32>,
+
+    /// #462: function imports whose AdapterSite target was not yet merged when
+    /// the importer was (a cyclic intra-component dependency, where
+    /// `compute_module_merge_order` cannot put the provider first).
+    /// `wire_adapter_indices` maps them later and re-rewrites the bodies, so
+    /// they are NOT "unmapped": calls keep the placeholder-then-rewire path.
+    pub pending_wired_imports: std::collections::HashSet<(usize, usize, u32)>,
+
     /// SR-66 / #380: under `--share-stack`, the top of the single shared
     /// shadow-stack region (`max_i(sp_i)`, 16-byte-aligned base of the first
     /// provider's data). `None` when `--share-stack` is off. Consumed by
@@ -357,6 +375,9 @@ pub enum SyntheticKind {
     /// bridge ring memory and forwards host handles to the retained
     /// `pulseengine:async` imports.
     StreamBridge,
+    /// `unreachable` stub standing in an `elem` slot for a function import
+    /// that no resolution step mapped (#462).
+    TrapStub,
 }
 
 /// Global in merged module
@@ -614,6 +635,8 @@ impl Merger {
             task_return_shims: HashMap::new(),
             async_result_globals: HashMap::new(),
             rewrite_params: HashMap::new(),
+            unmapped_import_stubs: HashMap::new(),
+            pending_wired_imports: HashSet::new(),
             shared_stack_top: None,
             stackless_providers: 0,
             placements: Vec::new(),
@@ -960,22 +983,63 @@ impl Merger {
         module_count: usize,
         graph: &DependencyGraph,
     ) -> Vec<usize> {
-        // Build adjacency list: from_module depends on to_module
-        let mut in_degree = vec![0usize; module_count];
-        let mut adj: Vec<Vec<usize>> = vec![Vec::new(); module_count];
+        let edges = Self::module_merge_edges(
+            comp_idx,
+            module_count,
+            &graph.module_resolutions,
+            &graph.adapter_sites,
+        );
+        Self::topo_merge_order(module_count, &edges)
+    }
 
-        for res in &graph.module_resolutions {
-            if res.component_idx == comp_idx && res.from_module != res.to_module {
-                // to_module must be processed before from_module
-                // Edge: to_module → from_module (to_module comes first)
-                if res.to_module < module_count && res.from_module < module_count {
-                    adj[res.to_module].push(res.from_module);
-                    in_degree[res.from_module] += 1;
-                }
+    /// `(provider, importer)` edges within one component: the provider must be
+    /// merged first.
+    ///
+    /// Split out of [`Self::compute_module_merge_order`] so the Kani harness
+    /// can check the property without constructing a `DependencyGraph` (its
+    /// `HashMap`s need OS randomness, which Kani cannot model).
+    pub(crate) fn module_merge_edges(
+        comp_idx: usize,
+        module_count: usize,
+        module_resolutions: &[crate::resolver::ModuleResolution],
+        adapter_sites: &[crate::resolver::AdapterSite],
+    ) -> Vec<(usize, usize)> {
+        let mut edges = Vec::new();
+        for res in module_resolutions {
+            if res.component_idx == comp_idx
+                && res.from_module != res.to_module
+                && res.to_module < module_count
+                && res.from_module < module_count
+            {
+                edges.push((res.to_module, res.from_module));
             }
         }
+        // #462: an intra-component AdapterSite REPLACES its module resolution
+        // (the resolver removes the latter), so it must contribute the same
+        // edge, or the importer can be merged before its provider and its
+        // import is unmapped at merge time.
+        for site in adapter_sites {
+            if site.from_component == comp_idx
+                && site.to_component == comp_idx
+                && site.from_module != site.to_module
+                && site.to_module < module_count
+                && site.from_module < module_count
+            {
+                edges.push((site.to_module, site.from_module));
+            }
+        }
+        edges
+    }
 
-        // Deduplicate edges and recount in-degrees
+    /// Kahn's algorithm over `(first, second)` edges, original index as the
+    /// tiebreaker; a cycle falls back to sequential order for the remainder.
+    pub(crate) fn topo_merge_order(module_count: usize, edges: &[(usize, usize)]) -> Vec<usize> {
+        let mut adj: Vec<Vec<usize>> = vec![Vec::new(); module_count];
+        for &(first, second) in edges {
+            adj[first].push(second);
+        }
+
+        // Deduplicate edges and count in-degrees
         let mut in_degree = vec![0usize; module_count];
         for edges in adj.iter_mut().take(module_count) {
             edges.sort_unstable();

@@ -18,6 +18,7 @@ use std::collections::{BTreeMap, HashMap};
 use meld_core::mcu_dissolve::dissolve_fixups;
 use meld_core::merger::{
     ImportCounts, MergedExport, MergedFuncType, MergedFunction, MergedGlobal, MergedModule,
+    SyntheticKind,
 };
 use meld_core::parser::{self, CoreModule, ParsedComponent};
 use meld_core::segments::{ElementSegmentMode, ReindexedElementItems, ReindexedElementSegment};
@@ -121,6 +122,8 @@ fn merged_base() -> MergedModule {
         task_return_shims: HashMap::new(),
         async_result_globals: HashMap::new(),
         rewrite_params: HashMap::new(),
+        unmapped_import_stubs: HashMap::new(),
+        pending_wired_imports: std::collections::HashSet::new(),
         shared_stack_top: None,
         stackless_providers: 0,
         placements: Vec::new(),
@@ -508,6 +511,11 @@ fn shared_stack_pointer_runtime_non_clobber() {
 /// Part 2: a dead lowered-import trampoline's numeric keep-alive export is
 /// dropped, while real exports, vtable-backed trampolines, and non-trampoline
 /// numeric exports are left alone.
+///
+/// NOTE (#462): this models the dead table as holding an IMPORTED function.
+/// That is not the shape wit-component's fixup module produces after fusion;
+/// see `dead_trampoline_over_trap_stub_table_is_dropped_with_its_table_export`
+/// for the real one.
 #[test]
 fn dead_import_trampoline_export_dropped() {
     let mut m = merged_base();
@@ -633,6 +641,147 @@ fn dead_import_trampoline_export_dropped() {
         names.contains(&"7"),
         "non-trampoline numeric export preserved"
     );
+}
+
+/// #462: the REAL shape of the wit-component shim, which the test above does
+/// not model. There the fixup module's slots held no imported function: the
+/// fixup's `"" "N"` imports were unmapped, so the merger stands a trapping
+/// stub in each slot. The table is therefore "all stubs", not "an imported
+/// func", and before #462 the identity fallback made it look like a vtable
+/// (the slot held an unrelated DEFINED function), so Part 2 kept the export.
+///
+/// Dropped here: the numeric trampoline Func exports over the stub table AND
+/// the `"$imports"` Table export. Kept (each is a negative control, so a Part 2
+/// that simply dropped everything numeric or everything named `$imports` fails):
+/// a trampoline that is called, one over a table holding a real function, a
+/// real export, and an `"$imports"` table that is not statically populated.
+#[test]
+fn dead_trampoline_over_trap_stub_table_is_dropped_with_its_table_export() {
+    let mut m = merged_base();
+    m.import_counts.func = 0; // the real shape: no imported functions at all
+
+    // t0 = () -> (), t1 = (i32) -> ().
+    m.types = vec![
+        MergedFuncType {
+            params: vec![],
+            results: vec![],
+        },
+        MergedFuncType {
+            params: vec![ValType::I32],
+            results: vec![],
+        },
+    ];
+    let funcref_table = || wasm_encoder::TableType {
+        element_type: RefType::FUNCREF,
+        minimum: 2,
+        maximum: Some(2),
+        table64: false,
+        shared: false,
+    };
+    // table 0: stubs only (the dead `$imports`); table 1: a real function in
+    // it (a vtable); table 2: no static segment (host-populated).
+    m.tables = vec![funcref_table(), funcref_table(), funcref_table()];
+    let seg = |table_index: u32, fs: Vec<u32>| ReindexedElementSegment {
+        mode: ElementSegmentMode::Active {
+            table_index,
+            offset: ConstExpr::i32_const(0),
+        },
+        element_type: RefType::FUNCREF,
+        items: ReindexedElementItems::Functions(fs),
+    };
+    m.elements = vec![seg(0, vec![0, 0]), seg(1, vec![0, 5])];
+
+    let trampoline = |table: u32| {
+        let mut f = Function::new([]);
+        f.instructions().i32_const(0).call_indirect(table, 0).end();
+        f
+    };
+    let stub = || {
+        let mut f = Function::new([]);
+        f.instructions().unreachable().end();
+        MergedFunction {
+            type_idx: 0,
+            body: f,
+            origin: (usize::MAX, usize::MAX, 0),
+            synthetic_kind: Some(SyntheticKind::TrapStub),
+        }
+    };
+    let mut caller = Function::new([]);
+    caller.instructions().call(2).end(); // calls trampoline "3": it is LIVE
+    let mut real = Function::new([]);
+    real.instructions().end();
+
+    m.functions = vec![
+        stub(),                        // 0: trap stub
+        merged_func(0, trampoline(0)), // 1: dead trampoline over the stub table
+        merged_func(0, trampoline(0)), // 2: called trampoline over the stub table
+        merged_func(0, caller),        // 3: the caller
+        merged_func(0, trampoline(1)), // 4: trampoline over a vtable
+        merged_func(0, real),          // 5: a real function (held by table 1)
+    ];
+    // trampoline "3" is function 2; it is referenced by `caller`.
+    let export = |name: &str, kind: ExportKind, index: u32| MergedExport {
+        name: name.to_string(),
+        kind,
+        index,
+    };
+    m.exports = vec![
+        export("0", ExportKind::Func, 1),         // dead trampoline: DROP
+        export("3", ExportKind::Func, 2),         // called: keep
+        export("greet", ExportKind::Func, 3),     // real export: keep
+        export("4", ExportKind::Func, 4),         // over a vtable: keep
+        export("$imports", ExportKind::Table, 0), // stub-only table: DROP
+    ];
+
+    let stats = dissolve_fixups(&mut m, &[]).unwrap();
+    let names: Vec<(&str, bool)> = m
+        .exports
+        .iter()
+        .map(|e| (e.name.as_str(), matches!(e.kind, ExportKind::Table)))
+        .collect();
+    assert!(
+        !names.contains(&("0", false)),
+        "dead trampoline export dropped"
+    );
+    assert!(
+        !names.contains(&("$imports", true)),
+        "the stub-only `$imports` table export is dropped with it"
+    );
+    assert_eq!(stats.trampoline_exports_dropped, 2);
+    for keep in ["3", "greet", "4"] {
+        assert!(names.contains(&(keep, false)), "{keep} must be preserved");
+    }
+    // Only exports are removed, never the functions behind them.
+    assert_eq!(m.functions.len(), 6, "no function is removed");
+
+    // Negative controls for the table export: a vtable, and a table with no
+    // static segment, both named `$imports`, are kept.
+    for table in [1u32, 2u32] {
+        let mut m2 = merged_base();
+        m2.types = m.types.clone();
+        m2.tables = vec![funcref_table(), funcref_table(), funcref_table()];
+        m2.elements = vec![seg(0, vec![0, 0]), seg(1, vec![0, 5])];
+        m2.functions = vec![
+            stub(),
+            merged_func(0, trampoline(0)),
+            merged_func(0, Function::new([])),
+        ];
+        m2.functions[2] = merged_func(0, {
+            let mut f = Function::new([]);
+            f.instructions().end();
+            f
+        });
+        // functions 3..5 so that table 1's real function index 5 exists.
+        for _ in 3..6 {
+            let mut f = Function::new([]);
+            f.instructions().end();
+            m2.functions.push(merged_func(0, f));
+        }
+        m2.exports = vec![export("$imports", ExportKind::Table, table)];
+        let stats2 = dissolve_fixups(&mut m2, &[]).unwrap();
+        assert_eq!(stats2.trampoline_exports_dropped, 0);
+        assert_eq!(m2.exports.len(), 1, "table {table} export must be kept");
+    }
 }
 
 /// Guard: a single-SP shared module (nothing to coalesce) and a two-SP module

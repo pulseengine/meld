@@ -120,6 +120,29 @@ pub struct IndexMaps {
     /// absent from this map and stay verbatim, preserving the #338 behaviour).
     /// Empty by default → no folding, so every other caller is unaffected.
     pub defined_global_i32_consts: std::collections::HashMap<u32, i32>,
+    /// #462: function imports of this module that no resolution step mapped,
+    /// keyed by their index in the module's function index space. A `call` or
+    /// `ref.func` naming one is an error ([`IndexMaps::remap_func_live`]); an
+    /// `elem` item naming one is replaced by its trapping stub
+    /// (`UnmappedFuncImport::stub`). Empty by default, so partial maps built by
+    /// other passes (which never touch function indices) are unaffected.
+    pub unmapped_func_imports: HashMap<u32, UnmappedFuncImport>,
+}
+
+/// A function import that no resolution step mapped to a fused function.
+#[derive(Debug, Clone)]
+pub struct UnmappedFuncImport {
+    /// Component index within the fusion input order.
+    pub component: usize,
+    /// Module index within the component.
+    pub module: usize,
+    /// The import's module string.
+    pub import_module: String,
+    /// The import's field name.
+    pub import_name: String,
+    /// Fused index of the trapping stub standing in for this import in `elem`
+    /// slots, when an `elem` segment names it.
+    pub stub: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -136,9 +159,55 @@ impl IndexMaps {
         Self::default()
     }
 
-    /// Remap a function index
+    /// Remap a function index in a CONSTANT context (`elem` items, const
+    /// expressions). An unmapped function import resolves to its trapping stub
+    /// (#462) rather than to the identity index, which in the fused index space
+    /// names an unrelated function. Instruction operands use
+    /// [`Self::remap_func_live`] instead.
     pub fn remap_func(&self, idx: u32) -> u32 {
-        *self.functions.get(&idx).unwrap_or(&idx)
+        if let Some(&new) = self.functions.get(&idx) {
+            return new;
+        }
+        if let Some(stub) = self.unmapped_func_imports.get(&idx).and_then(|u| u.stub) {
+            return stub;
+        }
+        idx
+    }
+
+    /// Remap a function index named by an `elem` item. An unmapped function
+    /// import resolves to its trapping stub; one with no stub is an error
+    /// (the merger creates a stub for every unmapped import an `elem` names,
+    /// so a miss is a merger bug, not an input shape).
+    pub fn remap_func_elem(&self, idx: u32) -> Result<u32> {
+        if let Some(&new) = self.functions.get(&idx) {
+            return Ok(new);
+        }
+        match self.unmapped_func_imports.get(&idx) {
+            Some(UnmappedFuncImport {
+                stub: Some(stub), ..
+            }) => Ok(*stub),
+            Some(_) => self.remap_func_live(idx, "an element segment with no trap stub"),
+            None => Ok(idx),
+        }
+    }
+
+    /// Remap a function index named by a LIVE use (`call`, `ref.func`, function
+    /// export): an unmapped function import is an error, never the identity
+    /// index (#462).
+    pub fn remap_func_live(&self, idx: u32, use_site: &str) -> Result<u32> {
+        if let Some(&new) = self.functions.get(&idx) {
+            return Ok(new);
+        }
+        if let Some(u) = self.unmapped_func_imports.get(&idx) {
+            return Err(Error::UnmappedFunctionImport {
+                component: u.component,
+                module: u.module,
+                import_module: u.import_module.clone(),
+                import_name: u.import_name.clone(),
+                use_site: use_site.to_string(),
+            });
+        }
+        Ok(idx)
     }
 
     /// Remap a type index
@@ -407,7 +476,9 @@ fn rewrite_operator(
         Return => Instruction::Return,
 
         // Calls - these need index remapping
-        Call { function_index } => Instruction::Call(maps.remap_func(function_index)),
+        Call { function_index } => {
+            Instruction::Call(maps.remap_func_live(function_index, "a `call` instruction")?)
+        }
         CallIndirect {
             type_index,
             table_index,
@@ -420,7 +491,9 @@ fn rewrite_operator(
         // Reference types
         RefNull { hty } => Instruction::RefNull(convert_heap_type(hty, maps)?),
         RefIsNull => Instruction::RefIsNull,
-        RefFunc { function_index } => Instruction::RefFunc(maps.remap_func(function_index)),
+        RefFunc { function_index } => {
+            Instruction::RefFunc(maps.remap_func_live(function_index, "a `ref.func` instruction")?)
+        }
 
         // Parametric
         Drop => Instruction::Drop,

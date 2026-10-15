@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 ## [Unreleased]
 
 ### Fixed
+- **An unmapped function import is never resolved to an unrelated function
+  (SR-96, #462).** When a component's lowered imports were resolved through an
+  adapter, the wit-component fix-up module's matching imports were left
+  unmapped, and its table entries silently took the identity index: whatever
+  fused function carried that number. The trampolines reading those entries
+  had no callers but were exported (`"0"`, `"1"`, `"0$0"`, ...), so a host
+  calling one could reach an unrelated import. Such entries now hold a
+  trapping stub of the import's own type, and a live call, `ref.func`, export
+  or global initialiser naming an unmapped import is an error. Under
+  `--memory shared`, the dead `"0"`, `"1"` and `"$imports"` exports are now
+  dropped, so the fused module no longer carries wit-component scaffolding.
 - **`--component` lifts each export with the memory its source lift names
   (SR-97, #481).** The wrapper lifted every export from fused memory 0, and
   indexed the `task.return` memory option by the source component's own
