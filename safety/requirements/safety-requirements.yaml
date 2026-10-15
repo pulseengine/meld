@@ -3589,7 +3589,7 @@ artifacts:
   - id: SR-95
     type: sw-req
     title: A resource's definer does not depend on the order meld visits its candidates in
-    status: implemented
+    status: verified
     description: "Several components of one composition can qualify as the definer of the same resource: a component and the component that wraps and re-exports it can both carry a ResourceRep for it. ResourceGraph::build chose among them while walking HashMaps, recording whichever candidate it visited first (or, for non-rep-backed candidates, last), and a later step then discarded candidates that import the resource's interface as re-exporters. When the visit order put the re-exporter first, it was recorded as the definer and then discarded, leaving the resource with NO definer although a valid one existed; the true definer then got no handle table. Because HashMap seeds differ per process, the same input fused to different bytes from run to run, even with --reproducible (#467, measured as 2 distinct outputs in 20 runs on resource-import-and-export.wasm, including on released v0.61.0). meld shall determine a resource's definer independently of iteration order: it is a candidate that survives the re-exporter removal, that is, one that does not itself import the resource's interface, and it is derived once from the surviving candidates after that removal rather than filled in while walking. If more than one candidate survives, which a well-formed composition does not produce, the lowest component index wins, so the tie-break is a function of the caller's input order and not of hashing. A resource whose candidates are all re-exporters keeps an explicit absence of definer, preserving the existing lookup behaviour. Not claimed: that no other hash-order dependence exists outside ResourceGraph::build; the audit covered resource_graph.rs and the resolver's use of the definer."
     links:
       - type: derives-from
@@ -3601,11 +3601,12 @@ artifacts:
       reviewed-by: avrabe
       model: claude-opus-5-5
       timestamp: 2026-10-14T12:32:22Z
+    release: v0.63.0
 
   - id: SR-97
     type: sw-req
     title: "--component lifts each export with the memory its source lift names"
-    status: implemented
+    status: verified
     description: "When meld wraps the fused module as a component (--component), each export is lifted with a canon lift whose memory option tells the host where to read the returned pointer and length. The wrapper emitted a constant fused memory 0 for export lifts, and indexed the task.return memory option directly by the source component's core memory index. Under --memory multi, fused memory 0 belongs to whichever memory-owning module merged first, which need not be the module the source lift names, so a component with two memory-owning core modules could return another module's bytes from a string or list export at exit 0 with a valid component (#481: \"\" instead of \"hello\" when the module order put the other memory first). meld shall lift each export, and encode each task.return, with the fused memory that corresponds to the memory the source lift names: source core memory, to its defining module and export, to the module-local memory, to the merger's memory_index_map. With exactly one fused memory, 0 is the only answer. Any other memory option that cannot be resolved shall be an error, never a guess of 0. Deliberately unchanged: a source lift that names no memory keeps the historical option, since there is no source memory to misread. Not established here: lifts with string or list parameters do not carry a realloc option from this path; whether that is covered elsewhere is not examined by this requirement."
     links:
       - type: derives-from
@@ -3619,11 +3620,12 @@ artifacts:
       reviewed-by: avrabe
       model: claude-opus-5-5
       timestamp: 2026-10-15T03:52:33Z
+    release: v0.63.0
 
   - id: SR-96
     type: sw-req
     title: An unmapped function import is never resolved to an unrelated function
-    status: implemented
+    status: verified
     description: "A core module's function import that no resolution step maps to a fused function had no entry in the module's function index map, and IndexMaps::remap_func fell back to the identity index, so any reference to it silently named whatever fused function happened to carry that index. wit-component emits exactly this shape: a fixup module imports the lowered functions (\"\" \"0\", \"\" \"1\", ...) and fills the shim module's table with them through an elem segment, and when the main module's import of the same name is resolved through an adapter site, the fixup's import is skipped and left unmapped (#462). Across the wit-bindgen corpus under --memory multi, 26 of 49 fixtures carried such slots (126 in total), every one reached only by trampolines with no callers, but each trampoline is exported, and in 21 of the 126 slots the signature matched, so a host calling the exported trampoline would have invoked an unrelated import. On cpetig's inputs the same slots kept mcu_dissolve from recognising the shim, so its exports \"0\", \"1\" and \"$imports\" survived fusion and synth refused the module. meld shall never resolve an unmapped function import to an identity index. An elem item that names one shall be replaced by a trapping stub of the import's own type (body `unreachable`, one per distinct type), so slot positions and types are preserved and a call through the slot traps instead of reaching another function. A live use -- a call, ref.func, function export, or global initialiser naming an unmapped import -- shall be an error naming the component, module and import, since no stub can stand in for code that runs. mcu_dissolve's dead-trampoline pass shall treat a table filled only with stubs or imports as an import-trampoline table, and drop its numeric trampoline exports and the dead \"$imports\" table export, keeping the functions themselves. Deliberately not done: wiring the fixup import to the adapter the main module's import resolves to, which would make a dead path live; the module-index-blind skip in merger/imports.rs that leaves the import unmapped is noted for later."
     links:
       - type: derives-from
@@ -3637,11 +3639,12 @@ artifacts:
       reviewed-by: avrabe
       model: claude-opus-5-5
       timestamp: 2026-10-14T16:31:15Z
+    release: v0.63.0
 
   - id: SR-98
     type: sw-req
     title: A global's ref.func initialiser names the fused function, and follows later index shifts
-    status: implemented
+    status: verified
     description: "A defined global whose initialiser is ref.func names a function in its own module's index space, and the merger must rewrite that index into the fused function index space (SC-3: every index in an init expression is remapped). merge_core_module converted global initialisers before it had recorded the module's function mappings, so the lookup missed and convert_init_expr fell back to the module-local index, which in the fused module names a different module's function. The output validated and meld exited 0, and a call through the global ran the wrong function (#482: 42 instead of 7). Separately, global initialisers were held as an opaque ConstExpr, so the P3 async pass that shifts function indices did not reach them. meld shall convert a global's ref.func initialiser only after the module's function mappings exist, and a missing mapping shall be an error, never the module-local index. The fused ref.func target shall be recorded with the global so that later function-index shifts, including P3 async import insertion, update it. Not covered: initialisers meld does not recognise (for example GC struct.new expressions containing ref.func) are still copied as raw bytes, as before."
     links:
       - type: derives-from
@@ -3655,11 +3658,12 @@ artifacts:
       reviewed-by: avrabe
       model: claude-opus-5-5
       timestamp: 2026-10-15T04:28:21Z
+    release: v0.63.0
 
   - id: SR-99
     type: sw-req
     title: "--component lowers each import with the memory, realloc and encoding its source lower names"
-    status: implemented
+    status: verified
     description: "When meld wraps the fused module as a component (--component), each host import is lowered with a canon lower whose options tell the host where arguments live (memory), how to allocate for results (realloc), and how strings are encoded. The wrapper took the memory from a per-component default that component_memory_index chose by iterating a HashMap, took realloc from that memory's allocator, and hard-coded UTF-8. Under --memory multi, a component with more than one memory-owning core module could therefore hand the host another module's bytes, and the same input fused to different outputs from run to run (#484: 6 of 20 runs delivered \"WORLD\" instead of \"hello\", 2 distinct outputs). A UTF-16 source lower was emitted as UTF-8 (20 of 20 runs diverged). meld shall lower each import with the options the source lower names: its memory resolved through the merger's numbering, its realloc resolved to the fused function, and its string encoding carried through. Lowers that share one fused import and disagree on these options shall be an error, never a choice. component_memory_index shall be deterministic, choosing memory 0 of the lowest-indexed module by a documented rule. A source lower that names no memory keeps the per-component default, since it cannot touch memory. Not established here: the cross-component adapters in adapter/fact.rs also take the per-component default memory; they are now deterministic, but whether that default is the memory the call site uses is not examined by this requirement."
     links:
       - type: derives-from
@@ -3673,3 +3677,4 @@ artifacts:
       reviewed-by: avrabe
       model: claude-opus-5-5
       timestamp: 2026-10-15T05:36:17Z
+    release: v0.63.0

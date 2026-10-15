@@ -4,6 +4,9 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+
+## [0.63.0] - 2026-10-15
+
 ### Fixed
 - **A lowered import's realloc comes from its source lower in every memory
   strategy (SR-99, #484).** With a single fused memory, which includes every
@@ -58,6 +61,15 @@ All notable changes to this project will be documented in this file.
   input could fuse to different bytes from run to run, even with
   `--reproducible`. The definer is now the candidate that survives
   re-exporter removal, with the lowest component index as tie-break.
+
+### Changed
+- Documentation brought in line with the code (#415, #474, #478): the README
+  no longer claims `--memory auto` selects shared memory (it always selects
+  multi-memory), the `--dwarf` help describes the multi-input merge, ADRs
+  carry dated status updates, AGENTS.md artifact counts come from
+  `rivet stats`, and the README documents the remaining `fuse` options.
+- Tests: the resource-definer tie-break and all-removed branches are covered
+  (#480).
 
 ## [0.62.0] - 2026-10-14
 
