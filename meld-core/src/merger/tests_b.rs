@@ -108,6 +108,7 @@ fn test_import_memory_and_realloc_indices_populated() {
                 kind: ImportKind::Function(0),
                 display_module: Some("wasi:cli/stderr@0.2.6".to_string()),
                 display_field: Some("get-stderr".to_string()),
+                lower_core_func: None,
             },
             UnresolvedImport {
                 component_idx: 1,
@@ -117,6 +118,7 @@ fn test_import_memory_and_realloc_indices_populated() {
                 kind: ImportKind::Function(0),
                 display_module: Some("wasi:cli/stderr@0.2.6".to_string()),
                 display_field: Some("get-stderr".to_string()),
+                lower_core_func: None,
             },
         ],
     };
@@ -268,6 +270,7 @@ fn test_cabi_realloc_suffixed_exports_generated() {
                 kind: ImportKind::Function(0),
                 display_module: Some("wasi:io/error@0.2.6".to_string()),
                 display_field: Some("drop".to_string()),
+                lower_core_func: None,
             },
             UnresolvedImport {
                 component_idx: 1,
@@ -277,6 +280,7 @@ fn test_cabi_realloc_suffixed_exports_generated() {
                 kind: ImportKind::Function(0),
                 display_module: Some("wasi:io/error@0.2.6".to_string()),
                 display_field: Some("drop".to_string()),
+                lower_core_func: None,
             },
             UnresolvedImport {
                 component_idx: 2,
@@ -286,6 +290,7 @@ fn test_cabi_realloc_suffixed_exports_generated() {
                 kind: ImportKind::Function(0),
                 display_module: Some("wasi:io/error@0.2.6".to_string()),
                 display_field: Some("drop".to_string()),
+                lower_core_func: None,
             },
         ],
     };
@@ -421,6 +426,7 @@ fn test_shared_memory_no_suffixed_realloc_exports() {
                 kind: ImportKind::Function(0),
                 display_module: Some("wasi:io/error@0.2.6".to_string()),
                 display_field: Some("drop".to_string()),
+                lower_core_func: None,
             },
             UnresolvedImport {
                 component_idx: 1,
@@ -430,6 +436,7 @@ fn test_shared_memory_no_suffixed_realloc_exports() {
                 kind: ImportKind::Function(0),
                 display_module: Some("wasi:io/error@0.2.6".to_string()),
                 display_field: Some("drop".to_string()),
+                lower_core_func: None,
             },
         ],
     };
@@ -595,6 +602,7 @@ fn test_298_vestigial_grow_blocks_shared_rebase_fusion() {
                 kind: ImportKind::Function(0),
                 display_module: Some("wasi:io/error@0.2.6".to_string()),
                 display_field: Some("drop".to_string()),
+                lower_core_func: None,
             },
             UnresolvedImport {
                 component_idx: 1,
@@ -604,6 +612,7 @@ fn test_298_vestigial_grow_blocks_shared_rebase_fusion() {
                 kind: ImportKind::Function(0),
                 display_module: Some("wasi:io/error@0.2.6".to_string()),
                 display_field: Some("drop".to_string()),
+                lower_core_func: None,
             },
         ],
     };
@@ -763,6 +772,7 @@ fn test_298_fork_arena_realloc_fuses_under_shared_rebase_today() {
                 kind: ImportKind::Function(0),
                 display_module: Some("pulseengine:embedder/arena".to_string()),
                 display_field: Some("__cabi_arena_realloc".to_string()),
+                lower_core_func: None,
             },
             UnresolvedImport {
                 component_idx: 1,
@@ -772,6 +782,7 @@ fn test_298_fork_arena_realloc_fuses_under_shared_rebase_today() {
                 kind: ImportKind::Function(0),
                 display_module: Some("pulseengine:embedder/arena".to_string()),
                 display_field: Some("__cabi_arena_realloc".to_string()),
+                lower_core_func: None,
             },
         ],
     };
@@ -995,6 +1006,7 @@ pub(crate) fn empty_merged_fixture() -> MergedModule {
         import_counts: Default::default(),
         import_memory_indices: Vec::new(),
         import_realloc_indices: Vec::new(),
+        import_lower_sites: Vec::new(),
         resource_rep_by_component: std::collections::HashMap::new(),
         resource_new_by_component: std::collections::HashMap::new(),
         handle_tables: std::collections::HashMap::new(),

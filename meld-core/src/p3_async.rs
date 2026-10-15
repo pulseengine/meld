@@ -1192,6 +1192,7 @@ pub fn lower_p3_async_intrinsics(
         // Intrinsic imports do not need a memory or realloc binding.
         merged.import_memory_indices.push(0);
         merged.import_realloc_indices.push(None);
+        merged.import_lower_sites.push(Default::default());
         plan.emitted.push((*intr, merged_idx));
     }
 

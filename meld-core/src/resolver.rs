@@ -69,6 +69,12 @@ pub struct UnresolvedImport {
     pub display_module: Option<String>,
     /// Display field name for the emitted import (overrides `field_name` in output).
     pub display_field: Option<String>,
+    /// The source component's core function index of the `canon lower` that
+    /// supplies this import, when the import is a lowered host function and
+    /// the instance graph could trace it (#484). Its `canon lower` options
+    /// (memory, realloc, string encoding) are the ones the P2 wrapper must
+    /// reproduce on the fused import; `None` when untraceable.
+    pub lower_core_func: Option<u32>,
 }
 
 /// A cross-component call that needs an adapter
@@ -488,6 +494,103 @@ pub fn core_memory_sources(component: &ParsedComponent) -> HashMap<u32, (usize, 
 
 pub fn core_func_sources(component: &ParsedComponent) -> HashMap<u32, (usize, String)> {
     build_entity_provenance(component).func_source
+}
+
+/// `core func index -> canon lower options` for every `canon lower` in the
+/// component (#484). Core function indices are counted exactly as
+/// [`build_entity_provenance`] counts them: every canonical function and every
+/// core func alias takes the next index.
+pub fn core_lower_options(
+    component: &ParsedComponent,
+) -> HashMap<u32, crate::parser::CanonicalOptions> {
+    use crate::parser::{CanonicalEntry, ComponentAliasEntry, CoreEntityDef};
+    let mut out = HashMap::new();
+    let mut func_idx = 0u32;
+    for def in &component.core_entity_order {
+        match def {
+            CoreEntityDef::CanonicalFunction(canon_idx) => {
+                if let Some(CanonicalEntry::Lower { options, .. }) =
+                    component.canonical_functions.get(*canon_idx)
+                {
+                    out.insert(func_idx, options.clone());
+                }
+                func_idx += 1;
+            }
+            CoreEntityDef::CoreAlias(alias_idx) => {
+                if let Some(ComponentAliasEntry::CoreInstanceExport { kind, .. }) =
+                    component.component_aliases.get(*alias_idx)
+                    && *kind == wasmparser::ExternalKind::Func
+                {
+                    func_idx += 1;
+                }
+            }
+        }
+    }
+    out
+}
+
+/// `core func index -> (instance index, export name)` for every core func that
+/// is an alias of a core instance export (#484).
+fn core_func_alias_targets(component: &ParsedComponent) -> HashMap<u32, (u32, String)> {
+    use crate::parser::{ComponentAliasEntry, CoreEntityDef};
+    let mut out = HashMap::new();
+    let mut func_idx = 0u32;
+    for def in &component.core_entity_order {
+        match def {
+            CoreEntityDef::CanonicalFunction(_) => func_idx += 1,
+            CoreEntityDef::CoreAlias(alias_idx) => {
+                if let Some(ComponentAliasEntry::CoreInstanceExport {
+                    kind,
+                    instance_index,
+                    name,
+                }) = component.component_aliases.get(*alias_idx)
+                    && *kind == wasmparser::ExternalKind::Func
+                {
+                    out.insert(func_idx, (*instance_index, name.clone()));
+                    func_idx += 1;
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Follow a core func through any chain of alias re-exports (`alias core export`
+/// of a bag instance) to the `canon lower` that defines it (#484).
+///
+/// `Ok(Some(lower))`: the chain ends at that `canon lower`. `Ok(None)`: it ends
+/// anywhere else (a module export, a non-lower canon built-in, a missing
+/// entry). `Err`: the walk exceeded the number of aliases, which an acyclic
+/// chain cannot do, so the input is cyclic or malformed; that is never filed as
+/// "untraced".
+fn trace_core_func_to_lower(
+    mut func: u32,
+    lowers: &HashMap<u32, crate::parser::CanonicalOptions>,
+    aliases: &HashMap<u32, (u32, String)>,
+    bags: &HashMap<u32, Vec<(String, ExportKind, u32)>>,
+) -> Result<Option<u32>> {
+    // Every alias is visited at most once on an acyclic chain, so aliases + 1
+    // steps reach any lower.
+    for _ in 0..=aliases.len() {
+        if lowers.contains_key(&func) {
+            return Ok(Some(func));
+        }
+        let Some((inst, name)) = aliases.get(&func) else {
+            return Ok(None);
+        };
+        let Some(next) = bags.get(inst).and_then(|b| {
+            b.iter()
+                .find(|(n, k, _)| n == name && *k == ExportKind::Function)
+                .map(|(_, _, idx)| *idx)
+        }) else {
+            return Ok(None);
+        };
+        func = next;
+    }
+    Err(Error::EncodingError(format!(
+        "core function alias chain starting at {func} does not terminate \
+         (cyclic or malformed component)"
+    )))
 }
 
 /// Build provenance map by replaying the core entity definition order.
@@ -2154,6 +2257,7 @@ impl Resolver {
                 kind: ImportKind::Function(i32_to_i32),
                 display_module: Some(module.clone()),
                 display_field: Some(field.clone()),
+                lower_core_func: None,
             });
 
             added.insert(key);
@@ -2399,6 +2503,7 @@ impl Resolver {
                         kind: import.kind.clone(),
                         display_module: None,
                         display_field: None,
+                        lower_core_func: None,
                     });
                 }
             }
@@ -2430,6 +2535,8 @@ impl Resolver {
 
         // Build canonical lower → WASI name mapping for renaming ""::N imports
         let canon_import_names = build_canon_import_names(component);
+        let canon_lower_sites = core_lower_options(component);
+        let core_func_aliases = core_func_alias_targets(component);
 
         // Step 1: Build instance content map.
         // For each instance, record what module it instantiates and how its
@@ -2512,6 +2619,7 @@ impl Resolver {
                             kind: import.kind.clone(),
                             display_module: None,
                             display_field: None,
+                            lower_core_func: None,
                         });
                     }
                     continue;
@@ -2559,6 +2667,7 @@ impl Resolver {
                             kind: import.kind.clone(),
                             display_module: None,
                             display_field: None,
+                            lower_core_func: None,
                         });
                         continue;
                     }
@@ -2595,12 +2704,22 @@ impl Resolver {
                     // the WASI name goes into display_module/display_field.
                     let mut display_module = None;
                     let mut display_field = None;
+                    let mut lower_core_func = None;
 
                     if let Some(fe_exports) = from_exports_infos.get(&source_inst_idx) {
                         for (name, kind, entity_idx) in fe_exports {
                             if name == &import.name && *kind == ExportKind::Function {
+                                lower_core_func = trace_core_func_to_lower(
+                                    *entity_idx,
+                                    &canon_lower_sites,
+                                    &core_func_aliases,
+                                    &from_exports_infos,
+                                )?;
+                                // Look the WASI name up by the traced lower, so
+                                // a lower reached through alias re-exports
+                                // keeps its display name.
                                 if let Some((mod_name, field_name)) =
-                                    canon_import_names.get(entity_idx)
+                                    canon_import_names.get(&lower_core_func.unwrap_or(*entity_idx))
                                 {
                                     display_module = Some(mod_name.clone());
                                     display_field = Some(field_name.clone());
@@ -2618,6 +2737,7 @@ impl Resolver {
                         kind: import.kind.clone(),
                         display_module,
                         display_field,
+                        lower_core_func,
                     });
                 }
             }
@@ -6114,5 +6234,62 @@ mod kani_proofs {
                  resolutions), import_module falls back to import_name"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod trace_core_func_tests {
+    use super::*;
+
+    fn bag(entries: &[(&str, u32)]) -> Vec<(String, ExportKind, u32)> {
+        entries
+            .iter()
+            .map(|(n, i)| (n.to_string(), ExportKind::Function, *i))
+            .collect()
+    }
+
+    /// A chain longer than any fixed constant still reaches its lower.
+    #[test]
+    fn long_acyclic_chain_is_traced() {
+        let hops = 1000u32;
+        let mut lowers = HashMap::new();
+        lowers.insert(0, crate::parser::CanonicalOptions::default());
+        let (mut aliases, mut bags) = (HashMap::new(), HashMap::new());
+        // func k (k>=1) = alias of bag k's export "f", which exports func k-1.
+        for k in 1..=hops {
+            aliases.insert(k, (k, "f".to_string()));
+            bags.insert(k, bag(&[("f", k - 1)]));
+        }
+        assert_eq!(
+            trace_core_func_to_lower(hops, &lowers, &aliases, &bags).unwrap(),
+            Some(0)
+        );
+    }
+
+    /// A chain that ends at something that is not a lower is `Ok(None)`.
+    #[test]
+    fn chain_ending_elsewhere_is_untraced_not_an_error() {
+        let lowers = HashMap::new();
+        let mut aliases = HashMap::new();
+        aliases.insert(1, (0, "f".to_string()));
+        let mut bags = HashMap::new();
+        bags.insert(0, bag(&[("f", 0)])); // func 0 is not an alias or lower
+        assert_eq!(
+            trace_core_func_to_lower(1, &lowers, &aliases, &bags).unwrap(),
+            None
+        );
+    }
+
+    /// Two aliases that re-export each other terminate with an error.
+    #[test]
+    fn cyclic_chain_errors_instead_of_hanging() {
+        let lowers = HashMap::new();
+        let mut aliases = HashMap::new();
+        aliases.insert(1, (10, "f".to_string()));
+        aliases.insert(2, (11, "f".to_string()));
+        let mut bags = HashMap::new();
+        bags.insert(10, bag(&[("f", 2)]));
+        bags.insert(11, bag(&[("f", 1)]));
+        assert!(trace_core_func_to_lower(1, &lowers, &aliases, &bags).is_err());
     }
 }

@@ -117,6 +117,9 @@ impl Merger {
         // Track already-emitted dedup keys per entity kind (includes component
         // dimension in multi-memory mode so each component gets its own slot).
         let mut emitted_func: HashSet<DedupKey> = HashSet::new();
+        // Dedup key -> position in `merged.import_lower_sites` (#484), so a
+        // deduplicated duplicate can still contribute its `canon lower`.
+        let mut func_lower_slot: HashMap<DedupKey, usize> = HashMap::new();
         let mut emitted_table: HashSet<DedupKey> = HashSet::new();
         let mut emitted_global: HashSet<DedupKey> = HashSet::new();
 
@@ -180,6 +183,26 @@ impl Merger {
                     ));
                     if !is_type_mismatch && !emitted_func.insert(dedup_key.clone()) {
                         // Duplicate with matching type — skip emitting.
+                        // Its `canon lower` still counts: the wrapper checks
+                        // that every lower sharing this slot agrees (#484).
+                        // An untraced duplicate is recorded too, so the wrapper
+                        // can refuse rather than merge it silently.
+                        if let Some(&slot) = func_lower_slot.get(&dedup_key) {
+                            let s = &mut merged.import_lower_sites[slot];
+                            s.members += 1;
+                            match unresolved.lower_core_func {
+                                Some(core_func) => {
+                                    s.sites.push((unresolved.component_idx, core_func))
+                                }
+                                None => s.untraced.push(format!(
+                                    "component {} module {} {}::{}",
+                                    unresolved.component_idx,
+                                    unresolved.module_idx,
+                                    unresolved.module_name,
+                                    unresolved.field_name
+                                )),
+                            }
+                        }
                         // Still record per-component resource tracking: find the
                         // func index already assigned to this resource name.
                         let eff_field = &dedup_key.1;
@@ -263,6 +286,27 @@ impl Merger {
                     let realloc_idx = component_realloc_index(merged, unresolved.component_idx);
                     merged.import_memory_indices.push(mem_idx);
                     merged.import_realloc_indices.push(realloc_idx);
+                    // A type-mismatched import is emitted fresh and must not
+                    // re-point the key: later duplicates of the FIRST type
+                    // belong to the first slot.
+                    func_lower_slot
+                        .entry(dedup_key.clone())
+                        .or_insert(merged.import_lower_sites.len());
+                    let mut slot = LowerSlot {
+                        members: 1,
+                        ..Default::default()
+                    };
+                    match unresolved.lower_core_func {
+                        Some(f) => slot.sites.push((unresolved.component_idx, f)),
+                        None => slot.untraced.push(format!(
+                            "component {} module {} {}::{}",
+                            unresolved.component_idx,
+                            unresolved.module_idx,
+                            unresolved.module_name,
+                            unresolved.field_name
+                        )),
+                    }
+                    merged.import_lower_sites.push(slot);
 
                     merged.imports.push(MergedImport {
                         module,

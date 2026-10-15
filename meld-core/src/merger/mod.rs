@@ -121,6 +121,17 @@ pub struct ModuleRewriteParams {
     pub defer_grow_under_rebase: bool,
 }
 
+/// The source `canon lower`s that share one fused function import (#484).
+#[derive(Debug, Clone, Default)]
+pub struct LowerSlot {
+    /// `(component_idx, core func index)` of each traced `canon lower`.
+    pub sites: Vec<(usize, u32)>,
+    /// How many unresolved imports were merged into this fused import.
+    pub members: usize,
+    /// Display names of merged imports whose lower could not be traced.
+    pub untraced: Vec<String>,
+}
+
 /// A merged WebAssembly module ready for encoding
 #[derive(Debug, Clone)]
 pub struct MergedModule {
@@ -205,6 +216,14 @@ pub struct MergedModule {
     /// of the component's cabi_realloc. Used by component_wrap to select the
     /// correct CanonicalOption::Realloc(N) per import.
     pub import_realloc_indices: Vec<Option<u32>>,
+
+    /// For each emitted function import (by position), the source
+    /// `(component_idx, core func index)` of every `canon lower` that was
+    /// deduplicated into it (#484). The P2 wrapper reads the lower's own
+    /// `memory` / `realloc` / string-encoding options from these instead of
+    /// the per-component defaults in `import_memory_indices` /
+    /// `import_realloc_indices`. Empty when no lower could be traced.
+    pub import_lower_sites: Vec<LowerSlot>,
 
     /// Maps (component_idx, resource_name) → merged function index for [resource-rep].
     /// Used by adapter generation to find the correct component's [resource-rep]
@@ -668,6 +687,7 @@ impl Merger {
             import_counts,
             import_memory_indices: Vec::new(),
             import_realloc_indices: Vec::new(),
+            import_lower_sites: Vec::new(),
             resource_rep_by_component: HashMap::new(),
             resource_new_by_component: HashMap::new(),
             handle_tables: HashMap::new(),
