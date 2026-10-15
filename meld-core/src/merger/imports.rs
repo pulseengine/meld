@@ -117,6 +117,9 @@ impl Merger {
         // Track already-emitted dedup keys per entity kind (includes component
         // dimension in multi-memory mode so each component gets its own slot).
         let mut emitted_func: HashSet<DedupKey> = HashSet::new();
+        // Dedup key -> position in `merged.import_lower_sites` (#484), so a
+        // deduplicated duplicate can still contribute its `canon lower`.
+        let mut func_lower_slot: HashMap<DedupKey, usize> = HashMap::new();
         let mut emitted_table: HashSet<DedupKey> = HashSet::new();
         let mut emitted_global: HashSet<DedupKey> = HashSet::new();
 
@@ -180,6 +183,14 @@ impl Merger {
                     ));
                     if !is_type_mismatch && !emitted_func.insert(dedup_key.clone()) {
                         // Duplicate with matching type — skip emitting.
+                        // Its `canon lower` still counts: the wrapper checks
+                        // that every lower sharing this slot agrees (#484).
+                        if let (Some(core_func), Some(&slot)) =
+                            (unresolved.lower_core_func, func_lower_slot.get(&dedup_key))
+                        {
+                            merged.import_lower_sites[slot]
+                                .push((unresolved.component_idx, core_func));
+                        }
                         // Still record per-component resource tracking: find the
                         // func index already assigned to this resource name.
                         let eff_field = &dedup_key.1;
@@ -263,6 +274,14 @@ impl Merger {
                     let realloc_idx = component_realloc_index(merged, unresolved.component_idx);
                     merged.import_memory_indices.push(mem_idx);
                     merged.import_realloc_indices.push(realloc_idx);
+                    func_lower_slot.insert(dedup_key.clone(), merged.import_lower_sites.len());
+                    merged.import_lower_sites.push(
+                        unresolved
+                            .lower_core_func
+                            .map(|f| (unresolved.component_idx, f))
+                            .into_iter()
+                            .collect(),
+                    );
 
                     merged.imports.push(MergedImport {
                         module,

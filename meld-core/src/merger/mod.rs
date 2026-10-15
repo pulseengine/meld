@@ -204,6 +204,14 @@ pub struct MergedModule {
     /// correct CanonicalOption::Realloc(N) per import.
     pub import_realloc_indices: Vec<Option<u32>>,
 
+    /// For each emitted function import (by position), the source
+    /// `(component_idx, core func index)` of every `canon lower` that was
+    /// deduplicated into it (#484). The P2 wrapper reads the lower's own
+    /// `memory` / `realloc` / string-encoding options from these instead of
+    /// the per-component defaults in `import_memory_indices` /
+    /// `import_realloc_indices`. Empty when no lower could be traced.
+    pub import_lower_sites: Vec<Vec<(usize, u32)>>,
+
     /// Maps (component_idx, resource_name) → merged function index for [resource-rep].
     /// Used by adapter generation to find the correct component's [resource-rep]
     /// in multi-component chains where multiple components have the same resource.
@@ -608,6 +616,7 @@ impl Merger {
             import_counts,
             import_memory_indices: Vec::new(),
             import_realloc_indices: Vec::new(),
+            import_lower_sites: Vec::new(),
             resource_rep_by_component: HashMap::new(),
             resource_new_by_component: HashMap::new(),
             handle_tables: HashMap::new(),

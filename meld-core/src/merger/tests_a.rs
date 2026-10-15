@@ -161,6 +161,7 @@ fn test_multi_memory_index_maps() {
         import_counts: ImportCounts::default(),
         import_memory_indices: Vec::new(),
         import_realloc_indices: Vec::new(),
+        import_lower_sites: Vec::new(),
         resource_rep_by_component: HashMap::new(),
         resource_new_by_component: HashMap::new(),
         handle_tables: HashMap::new(),
@@ -542,6 +543,7 @@ fn test_import_order_invariant_holds() {
                 kind: ImportKind::Function(0),
                 display_module: None,
                 display_field: None,
+                lower_core_func: None,
             },
             UnresolvedImport {
                 component_idx: 0,
@@ -555,6 +557,7 @@ fn test_import_order_invariant_holds() {
                 }),
                 display_module: None,
                 display_field: None,
+                lower_core_func: None,
             },
             UnresolvedImport {
                 component_idx: 0,
@@ -568,6 +571,7 @@ fn test_import_order_invariant_holds() {
                 }),
                 display_module: None,
                 display_field: None,
+                lower_core_func: None,
             },
         ],
     };
@@ -721,6 +725,7 @@ fn sr8_function_base_offset_is_cumulative() {
             kind: ImportKind::Function(0),
             display_module: None,
             display_field: None,
+            lower_core_func: None,
         },
         UnresolvedImport {
             component_idx: 2,
@@ -730,6 +735,7 @@ fn sr8_function_base_offset_is_cumulative() {
             kind: ImportKind::Function(0),
             display_module: None,
             display_field: None,
+            lower_core_func: None,
         },
     ];
 
@@ -941,6 +947,7 @@ fn test_import_dedup_exact_match() {
                 kind: ImportKind::Function(0),
                 display_module: Some("wasi:cli/stderr@0.2.6".to_string()),
                 display_field: Some("get-stderr".to_string()),
+                lower_core_func: None,
             },
             UnresolvedImport {
                 component_idx: 0,
@@ -950,6 +957,7 @@ fn test_import_dedup_exact_match() {
                 kind: ImportKind::Function(0),
                 display_module: Some("wasi:cli/stderr@0.2.6".to_string()),
                 display_field: Some("get-stderr".to_string()),
+                lower_core_func: None,
             },
         ],
     };
@@ -994,6 +1002,7 @@ fn test_import_dedup_version_mismatch() {
                 kind: ImportKind::Function(0),
                 display_module: Some("wasi:io/error@0.2.0".to_string()),
                 display_field: Some("drop".to_string()),
+                lower_core_func: None,
             },
             UnresolvedImport {
                 component_idx: 0,
@@ -1003,6 +1012,7 @@ fn test_import_dedup_version_mismatch() {
                 kind: ImportKind::Function(0),
                 display_module: Some("wasi:io/error@0.2.6".to_string()),
                 display_field: Some("drop".to_string()),
+                lower_core_func: None,
             },
         ],
     };
@@ -1055,6 +1065,7 @@ fn test_import_dedup_different_fields_not_deduped() {
                 kind: ImportKind::Function(0),
                 display_module: Some("wasi:cli/stderr@0.2.6".to_string()),
                 display_field: Some("get-stderr".to_string()),
+                lower_core_func: None,
             },
             UnresolvedImport {
                 component_idx: 0,
@@ -1064,6 +1075,7 @@ fn test_import_dedup_different_fields_not_deduped() {
                 kind: ImportKind::Function(0),
                 display_module: Some("wasi:cli/stderr@0.2.6".to_string()),
                 display_field: Some("write".to_string()),
+                lower_core_func: None,
             },
         ],
     };
@@ -1107,6 +1119,7 @@ fn test_multi_memory_dedup_separates_components() {
                 kind: ImportKind::Function(0),
                 display_module: Some("wasi:cli/stderr@0.2.6".to_string()),
                 display_field: Some("get-stderr".to_string()),
+                lower_core_func: None,
             },
             UnresolvedImport {
                 component_idx: 1,
@@ -1116,6 +1129,7 @@ fn test_multi_memory_dedup_separates_components() {
                 kind: ImportKind::Function(0),
                 display_module: Some("wasi:cli/stderr@0.2.6".to_string()),
                 display_field: Some("get-stderr".to_string()),
+                lower_core_func: None,
             },
         ],
     };
@@ -1163,6 +1177,7 @@ fn test_shared_memory_dedup_merges_components() {
                 kind: ImportKind::Function(0),
                 display_module: Some("wasi:cli/stderr@0.2.6".to_string()),
                 display_field: Some("get-stderr".to_string()),
+                lower_core_func: None,
             },
             UnresolvedImport {
                 component_idx: 1,
@@ -1172,6 +1187,7 @@ fn test_shared_memory_dedup_merges_components() {
                 kind: ImportKind::Function(0),
                 display_module: Some("wasi:cli/stderr@0.2.6".to_string()),
                 display_field: Some("get-stderr".to_string()),
+                lower_core_func: None,
             },
         ],
     };
@@ -1225,6 +1241,7 @@ fn ls_m_10_test_global_import_type_mismatch_not_deduped() {
                 }),
                 display_module: None,
                 display_field: None,
+                lower_core_func: None,
             },
             UnresolvedImport {
                 component_idx: 1,
@@ -1238,6 +1255,7 @@ fn ls_m_10_test_global_import_type_mismatch_not_deduped() {
                 }),
                 display_module: None,
                 display_field: None,
+                lower_core_func: None,
             },
         ],
     };
@@ -1294,6 +1312,7 @@ fn test_table_import_type_mismatch_not_deduped() {
                 }),
                 display_module: None,
                 display_field: None,
+                lower_core_func: None,
             },
             UnresolvedImport {
                 component_idx: 1,
@@ -1307,6 +1326,7 @@ fn test_table_import_type_mismatch_not_deduped() {
                 }),
                 display_module: None,
                 display_field: None,
+                lower_core_func: None,
             },
         ],
     };
@@ -1350,6 +1370,7 @@ fn test_global_import_same_type_still_deduped() {
         }),
         display_module: None,
         display_field: None,
+        lower_core_func: None,
     };
 
     let graph = DependencyGraph {
@@ -1398,6 +1419,7 @@ fn test_table_import_same_type_still_deduped() {
         }),
         display_module: None,
         display_field: None,
+        lower_core_func: None,
     };
 
     let graph = DependencyGraph {

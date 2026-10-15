@@ -13276,6 +13276,7 @@ mod tests {
             import_counts: Default::default(),
             import_memory_indices: Vec::new(),
             import_realloc_indices: Vec::new(),
+            import_lower_sites: Vec::new(),
             resource_rep_by_component: std::collections::HashMap::new(),
             resource_new_by_component: std::collections::HashMap::new(),
             handle_tables: std::collections::HashMap::new(),

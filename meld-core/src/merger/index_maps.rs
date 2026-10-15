@@ -618,14 +618,23 @@ pub(crate) fn extract_function_body(
 }
 
 /// Pre-compute unresolved import counts and per-import index assignments.
-/// Find the merged memory index for a component's first defined memory.
+/// Find the merged memory index of a component's *default* memory.
+///
+/// Rule (#484): the module-local memory 0 of the component's **lowest-indexed
+/// module that defines one**, falling back to fused memory 0 when the component
+/// defines none. This is a per-component convention, not an answer to "which
+/// memory does this call use": a component with several memory-owning modules
+/// has several, and a caller that knows the real source (a `canon lower`'s
+/// `memory` option) must resolve that instead. It never depends on `HashMap`
+/// iteration order, so the result is identical on every run.
 pub(crate) fn component_memory_index(merged: &MergedModule, comp_idx: usize) -> u32 {
-    for (&(ci, _mi, mem_i), &merged_idx) in &merged.memory_index_map {
-        if ci == comp_idx && mem_i == 0 {
-            return merged_idx;
-        }
-    }
-    0 // fallback: memory 0
+    merged
+        .memory_index_map
+        .iter()
+        .filter(|&(&(ci, _mi, mem_i), _)| ci == comp_idx && mem_i == 0)
+        .min_by_key(|&(&(_, mi, _), _)| mi)
+        .map(|(_, &merged_idx)| merged_idx)
+        .unwrap_or(0) // fallback: memory 0
 }
 
 /// Find the merged function index of a component's cabi_realloc.

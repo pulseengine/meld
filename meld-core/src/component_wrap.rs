@@ -1275,6 +1275,9 @@ fn assemble_component(
 
     // realloc_core_indices[memory_idx] = core func idx of that component's cabi_realloc
     let mut realloc_core_indices: Vec<Option<u32>> = vec![None; num_memories];
+    // fused function index -> wrapper core func index of its alias (#484).
+    let mut realloc_by_fused_func: std::collections::HashMap<u32, u32> =
+        std::collections::HashMap::new();
 
     if has_non_resource_op && n > 0 {
         // Alias cabi_realloc for component 0
@@ -1295,6 +1298,15 @@ fn assemble_component(
         });
         component.section(&aliases);
         realloc_core_indices[0] = Some(core_func_idx);
+        if let Some((_, _, fused_fn)) = fused_info
+            .exports
+            .iter()
+            .find(|(n, k, _)| *k == wasmparser::ExternalKind::Func && n == "cabi_realloc")
+        {
+            realloc_by_fused_func
+                .entry(*fused_fn)
+                .or_insert(core_func_idx);
+        }
         core_func_idx += 1;
 
         // In multi-memory mode, alias per-component cabi_realloc$N
@@ -1313,6 +1325,13 @@ fn assemble_component(
                     });
                     component.section(&aliases);
                     realloc_core_indices[i] = Some(core_func_idx);
+                    if let Some((_, _, fused_fn)) = fused_info.exports.iter().find(|(n, k, _)| {
+                        *k == wasmparser::ExternalKind::Func && *n == realloc_name
+                    }) {
+                        realloc_by_fused_func
+                            .entry(*fused_fn)
+                            .or_insert(core_func_idx);
+                    }
                     core_func_idx += 1;
                 } else {
                     // Fall back to component 0's realloc
@@ -1438,10 +1457,41 @@ fn assemble_component(
                     });
                     component.section(&alias_section);
 
-                    let mem_idx = if memory_strategy == MemoryStrategy::MultiMemory {
-                        merged.import_memory_indices.get(i).copied().unwrap_or(0) as usize
-                    } else {
-                        0
+                    // #484: the lower's options come from the SOURCE lower that
+                    // supplied this import, not from a per-component default.
+                    // Memory/realloc resolution only matters (and is only
+                    // attempted) when there is more than one fused memory.
+                    let multi = memory_strategy == MemoryStrategy::MultiMemory
+                        && fused_info.memories.len() > 1;
+                    let sites = merged
+                        .import_lower_sites
+                        .get(i)
+                        .map(Vec::as_slice)
+                        .unwrap_or(&[]);
+                    let spec = resolve_lower_spec(
+                        all_components,
+                        merged,
+                        fused_info.memories.len(),
+                        multi,
+                        sites,
+                    )?;
+                    if multi && spec.is_none() {
+                        return Err(Error::EncodingError(format!(
+                            "cannot determine the canon lower options for fused import \
+                             {}::{}: under --memory multi the memory it passes to the host \
+                             must come from the source lower, and none could be traced",
+                            fused_info.func_imports[i].0, fused_info.func_imports[i].1
+                        )));
+                    }
+                    // A source lower that names no memory cannot touch one, so
+                    // the choice is inert; keep the (now deterministic)
+                    // per-component default rather than churn the output.
+                    let mem_idx = match spec.as_ref().and_then(|s| s.memory) {
+                        Some(m) => m as usize,
+                        None if memory_strategy == MemoryStrategy::MultiMemory => {
+                            merged.import_memory_indices.get(i).copied().unwrap_or(0) as usize
+                        }
+                        None => 0,
                     };
 
                     let core_mem = memory_core_indices
@@ -1449,11 +1499,51 @@ fn assemble_component(
                         .copied()
                         .unwrap_or(memory_core_indices[0]);
 
-                    let realloc_idx = realloc_core_indices
-                        .get(mem_idx)
-                        .and_then(|r| *r)
-                        .or_else(|| realloc_core_indices[0])
-                        .expect("realloc_core_idx must be set for non-resource-drop");
+                    let source_realloc = spec.as_ref().and_then(|s| s.realloc);
+                    let realloc_idx = match source_realloc {
+                        Some(fused_fn) => {
+                            if let Some(&c) = realloc_by_fused_func.get(&fused_fn) {
+                                c
+                            } else {
+                                // Not one of the pre-aliased cabi_realloc*
+                                // exports: alias whichever export carries it.
+                                let name = fused_info
+                                    .exports
+                                    .iter()
+                                    .find(|(_, k, idx)| {
+                                        *k == wasmparser::ExternalKind::Func && *idx == fused_fn
+                                    })
+                                    .map(|(n, _, _)| n.clone())
+                                    .ok_or_else(|| {
+                                        Error::EncodingError(format!(
+                                            "the realloc a canon lower names (fused function \
+                                             {fused_fn}) is not exported from the fused module"
+                                        ))
+                                    })?;
+                                let mut aliases = ComponentAliasSection::new();
+                                aliases.alias(Alias::CoreInstanceExport {
+                                    instance: fused_instance,
+                                    kind: ExportKind::Func,
+                                    name: &name,
+                                });
+                                component.section(&aliases);
+                                let c = core_func_idx;
+                                core_func_idx += 1;
+                                realloc_by_fused_func.insert(fused_fn, c);
+                                c
+                            }
+                        }
+                        None => realloc_core_indices
+                            .get(mem_idx)
+                            .and_then(|r| *r)
+                            .or_else(|| realloc_core_indices[0])
+                            .expect("realloc_core_idx must be set for non-resource-drop"),
+                    };
+
+                    let encoding = spec
+                        .as_ref()
+                        .map(|s| source_string_encoding_option(s.encoding))
+                        .unwrap_or(CanonicalOption::UTF8);
 
                     let mut canon = CanonicalFunctionSection::new();
                     canon.lower(
@@ -1461,7 +1551,7 @@ fn assemble_component(
                         [
                             CanonicalOption::Memory(core_mem),
                             CanonicalOption::Realloc(realloc_idx),
-                            CanonicalOption::UTF8,
+                            encoding,
                         ],
                     );
                     component.section(&canon);
@@ -1726,7 +1816,7 @@ fn assemble_component(
                             // component that owns the task.return — map it
                             // through the merger, don't index by it.
                             let fused_mem = match source_comp {
-                                Some(owner) => resolve_lift_memory(
+                                Some(owner) => resolve_source_memory(
                                     owner,
                                     all_components,
                                     merged,
@@ -1993,7 +2083,7 @@ fn assemble_component(
             let lift_memory = match &lift_info {
                 Some((lc, _, o)) => match o.memory {
                     Some(m) => {
-                        let fused_mem = resolve_lift_memory(
+                        let fused_mem = resolve_source_memory(
                             lc,
                             all_components,
                             merged,
@@ -2196,7 +2286,7 @@ fn assemble_component(
             // #481: map the source lift's memory option to its fused index.
             let bare_memory = match source_lift.as_ref().and_then(|(_, o)| o.memory) {
                 Some(m) => {
-                    let fused_mem = resolve_lift_memory(
+                    let fused_mem = resolve_source_memory(
                         source,
                         all_components,
                         merged,
@@ -2827,7 +2917,7 @@ fn source_string_encoding_option(
 }
 
 /// The fused memory index (== wrapper core memory index) a SOURCE canon-lift /
-/// task.return `memory` option refers to (#481).
+/// task.return / canon-lower `memory` option refers to (#481, #484).
 ///
 /// The option is a core-memory index in the OWNING source component's core
 /// memory index space. Fused memory 0 is simply whichever memory-owning module
@@ -2839,7 +2929,7 @@ fn source_string_encoding_option(
 /// With exactly one fused memory, 0 is the only possible answer and no
 /// resolution is needed. Otherwise an unresolvable option is an error, never
 /// a guess.
-fn resolve_lift_memory(
+fn resolve_source_memory(
     owner: &ParsedComponent,
     all_components: &[ParsedComponent],
     merged: &MergedModule,
@@ -2913,6 +3003,109 @@ fn resolve_lift_memory(
             "the owning component is ambiguous or maps out of range",
         )),
     }
+}
+
+/// What a SOURCE `canon lower` asks of its fused replacement (#484).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LowerSpec {
+    /// Fused memory the source's `memory` option names (`None`: it names none).
+    memory: Option<u32>,
+    /// Fused function index of the source's `realloc` option (`None`: none).
+    realloc: Option<u32>,
+    encoding: parser::CanonStringEncoding,
+}
+
+/// The fused function index a SOURCE `realloc` option (a core function index of
+/// `owner`) refers to: source core func -> (module, export) -> module-local
+/// function -> `function_index_map` (#484).
+fn resolve_source_realloc(
+    owner: &ParsedComponent,
+    comp_idx: usize,
+    merged: &MergedModule,
+    realloc: u32,
+) -> Result<u32> {
+    let fail = |why: &str| {
+        Error::EncodingError(format!(
+            "cannot resolve the realloc named by a canon lower option \
+             (source core func {realloc}) to a fused function: {why}"
+        ))
+    };
+    let (mod_idx, export_name) = crate::resolver::core_func_sources(owner)
+        .get(&realloc)
+        .cloned()
+        .ok_or_else(|| fail("no traceable core func with that index in the owning component"))?;
+    let local_idx = owner
+        .core_modules
+        .get(mod_idx)
+        .and_then(|m| {
+            m.exports
+                .iter()
+                .find(|e| e.name == export_name && e.kind == parser::ExportKind::Function)
+        })
+        .map(|e| e.index)
+        .ok_or_else(|| fail("the function's defining module export was not found"))?;
+    merged
+        .function_index_map
+        .get(&(comp_idx, mod_idx, local_idx))
+        .copied()
+        .ok_or_else(|| fail("the merger has no mapping for that function"))
+}
+
+/// Resolve every `canon lower` that was deduplicated into one fused import to a
+/// [`LowerSpec`]. All of them must agree: one fused import has one set of
+/// lowering options, and silently picking one would hand the host the wrong
+/// memory/allocator/encoding for the others. Returns `None` when no lower was
+/// traced for this import.
+fn resolve_lower_spec(
+    all_components: &[ParsedComponent],
+    merged: &MergedModule,
+    fused_memory_count: usize,
+    resolve_alloc: bool,
+    sites: &[(usize, u32)],
+) -> Result<Option<LowerSpec>> {
+    let mut agreed: Option<LowerSpec> = None;
+    for &(comp_idx, core_func) in sites {
+        let owner = all_components.get(comp_idx).ok_or_else(|| {
+            Error::EncodingError(format!("canon lower names unknown component {comp_idx}"))
+        })?;
+        let opts = crate::resolver::core_lower_options(owner)
+            .remove(&core_func)
+            .ok_or_else(|| {
+                Error::EncodingError(format!(
+                    "no canon lower for core func {core_func} in component {comp_idx}"
+                ))
+            })?;
+        let memory = match opts.memory {
+            Some(m) => Some(resolve_source_memory(
+                owner,
+                all_components,
+                merged,
+                fused_memory_count,
+                m,
+            )?),
+            None => None,
+        };
+        let realloc = match (opts.realloc, resolve_alloc) {
+            (Some(r), true) => Some(resolve_source_realloc(owner, comp_idx, merged, r)?),
+            _ => None,
+        };
+        let spec = LowerSpec {
+            memory,
+            realloc,
+            encoding: opts.string_encoding,
+        };
+        match &agreed {
+            None => agreed = Some(spec),
+            Some(prev) if *prev == spec => {}
+            Some(prev) => {
+                return Err(Error::EncodingError(format!(
+                    "canon lowers of one fused import disagree on their options \
+                     ({prev:?} vs {spec:?}); a single fused import cannot serve both"
+                )));
+            }
+        }
+    }
+    Ok(agreed)
 }
 
 /// Resolve the canon-lift type index + options for an exported function,

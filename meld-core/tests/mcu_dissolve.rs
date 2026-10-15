@@ -115,6 +115,7 @@ fn merged_base() -> MergedModule {
         },
         import_memory_indices: Vec::new(),
         import_realloc_indices: Vec::new(),
+        import_lower_sites: Vec::new(),
         resource_rep_by_component: HashMap::new(),
         resource_new_by_component: HashMap::new(),
         handle_tables: HashMap::new(),
