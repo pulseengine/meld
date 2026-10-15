@@ -14,6 +14,13 @@ All notable changes to this project will be documented in this file.
   different outputs from run to run; a UTF-16 lower was emitted as UTF-8. Each
   lower now uses its source lower's options, and lowers that share one fused
   import but disagree are an error.
+- **A global's `ref.func` initialiser names the fused function (SR-98,
+  #482).** Global initialisers were converted before the module's function
+  indices were assigned, so a `ref.func` initialiser kept its module-local
+  index and, in the fused module, named another module's function: a call
+  through the global ran the wrong code at exit 0. The conversion now happens
+  after the function map is built, a missing mapping is an error, and the
+  recorded target follows the P3 async index shift.
 - **An unmapped function import is never resolved to an unrelated function
   (SR-96, #462).** When a component's lowered imports were resolved through an
   adapter, the wit-component fix-up module's matching imports were left

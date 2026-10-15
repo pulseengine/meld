@@ -45,7 +45,7 @@ mod naming;
 #[cfg(test)]
 mod tests_a;
 #[cfg(test)]
-mod tests_b;
+pub(crate) mod tests_b;
 #[cfg(test)]
 mod tests_rerewrite;
 #[cfg(test)]
@@ -61,7 +61,7 @@ use self::index_maps::index_maps_from_params;
 pub(crate) use self::index_maps::{
     component_memory_index, component_realloc_index, convert_global_type, convert_init_expr,
     convert_table_type, decompose_component_core_func_index, extract_function_body,
-    index_maps_for_rerewrite, remap_concrete_val_type,
+    index_maps_for_rerewrite, ref_func_init_target, remap_concrete_val_type,
 };
 pub(crate) use self::memory::{
     SharedMemoryPlan, convert_memory_type, module_has_direct_memory_access, module_memory_type,
@@ -404,6 +404,19 @@ pub enum SyntheticKind {
 pub struct MergedGlobal {
     pub ty: EncoderGlobalType,
     pub init_expr: ConstExpr,
+    /// `Some(f)` when `init_expr` is exactly `ref.func f` (a fused function
+    /// index). `init_expr` is an opaque `ConstExpr`, so this records the target
+    /// in structured form, as `ReindexedElementItems` does for element
+    /// segments, letting `p3_async::shift_function_indices` move it (#482).
+    pub init_ref_func: Option<u32>,
+    /// The `(component, module, module-local function index)` that
+    /// `init_ref_func` was resolved from. [`MergedModule::refresh_global_ref_funcs`]
+    /// re-resolves it from the FINAL `function_index_map`, because later passes
+    /// (resource re-export, adapter wiring, task.return shims, stream bridge)
+    /// overwrite map entries and rebuild function bodies, but cannot see this
+    /// opaque `ConstExpr` (#482: a global's `ref.func` must name exactly what a
+    /// body `call` of the same local index names).
+    pub init_ref_origin: Option<(usize, usize, u32)>,
 }
 
 /// Export in merged module
@@ -415,6 +428,32 @@ pub struct MergedExport {
 }
 
 impl MergedModule {
+    /// Re-resolve every global `ref.func` initialiser from the current
+    /// `function_index_map` (#482). Call after any pass that rewrites map
+    /// entries; idempotent. A recorded origin with no mapping is an error.
+    pub fn refresh_global_ref_funcs(&mut self) -> Result<()> {
+        for slot in 0..self.globals.len() {
+            let Some(origin) = self.globals[slot].init_ref_origin else {
+                continue;
+            };
+            let fused = self
+                .function_index_map
+                .get(&origin)
+                .copied()
+                .ok_or_else(|| {
+                    Error::EncodingError(format!(
+                        "global initialiser `ref.func {}` of component {} module {} has no \
+                         fused function mapping",
+                        origin.2, origin.0, origin.1
+                    ))
+                })?;
+            let g = &mut self.globals[slot];
+            g.init_ref_func = Some(fused);
+            g.init_expr = ConstExpr::ref_func(fused);
+        }
+        Ok(())
+    }
+
     /// Look up a defined function by its absolute wasm index.
     /// Returns `None` if the index refers to an imported function.
     pub fn defined_func(&self, wasm_idx: u32) -> Option<&MergedFunction> {

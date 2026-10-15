@@ -68,6 +68,8 @@ impl Merger {
             // Start at base+4 to skip slot 0 (handle=0 means "no handle").
             let next_ptr_global = merged.import_counts.global + merged.globals.len() as u32;
             merged.globals.push(MergedGlobal {
+                init_ref_func: None,
+                init_ref_origin: None,
                 ty: EncoderGlobalType {
                     val_type: ValType::I32,
                     mutable: true,

@@ -443,9 +443,9 @@ pub(crate) fn convert_init_expr(
     mod_idx: usize,
     merged: &MergedModule,
     val_type: &ValType,
-) -> ConstExpr {
+) -> Result<ConstExpr> {
     if bytes.is_empty() {
-        return create_global_init(val_type);
+        return Ok(create_global_init(val_type));
     }
 
     // Append the End opcode so wasmparser sees a complete const-expr
@@ -458,10 +458,10 @@ pub(crate) fn convert_init_expr(
 
     let op = match ops.read() {
         Ok(op) => op,
-        Err(_) => return ConstExpr::raw(bytes.iter().copied()),
+        Err(_) => return Ok(ConstExpr::raw(bytes.iter().copied())),
     };
 
-    match op {
+    Ok(match op {
         // For an i32 / i64 const, the wasm 2.0 extended-const proposal
         // permits further `i32.add` / `i32.sub` / `i32.mul` (and i64
         // counterparts) before `end`. Fold them into a single value via
@@ -572,11 +572,19 @@ pub(crate) fn convert_init_expr(
             }
         }
         wasmparser::Operator::RefFunc { function_index } => {
+            // A missing mapping must NEVER fall back to the module-local
+            // index: in the fused index space it names an unrelated function
+            // (#482, SC-3). Refuse instead.
             let remapped = merged
                 .function_index_map
                 .get(&(comp_idx, mod_idx, function_index))
                 .copied()
-                .unwrap_or(function_index);
+                .ok_or_else(|| {
+                    Error::EncodingError(String::from(
+                        "global initialiser `ref.func` has no fused function mapping \
+                         (converted before the module's function indices were assigned?)",
+                    ))
+                })?;
             ConstExpr::ref_func(remapped)
         }
         wasmparser::Operator::RefNull { hty } => {
@@ -599,6 +607,24 @@ pub(crate) fn convert_init_expr(
         }
         // Unrecognised pattern — emit the raw bytes as-is
         _ => ConstExpr::raw(bytes.iter().copied()),
+    })
+}
+
+/// If `bytes` is a bare `ref.func f` initialiser, return `f` (module-local).
+///
+/// `merge_core_module` defers converting these until the module's function
+/// maps are populated (#482).
+pub(crate) fn ref_func_init_target(bytes: &[u8]) -> Option<u32> {
+    if bytes.is_empty() {
+        return None;
+    }
+    let mut full = bytes.to_vec();
+    full.push(0x0B);
+    let reader = wasmparser::BinaryReader::new(&full, 0);
+    let expr = wasmparser::ConstExpr::new(reader);
+    match expr.get_operators_reader().read() {
+        Ok(wasmparser::Operator::RefFunc { function_index }) => Some(function_index),
+        _ => None,
     }
 }
 
@@ -692,4 +718,88 @@ pub(crate) fn component_realloc_index(merged: &MergedModule, comp_idx: usize) ->
     module_idxs
         .first()
         .and_then(|mi| merged.realloc_map.get(&(comp_idx, *mi)).copied())
+}
+
+// #482 Kani harness: a global `ref.func` initialiser with no fused mapping is
+// refused, never emitted with the module-local index.
+#[cfg(kani)]
+mod kani_global_ref_func_482 {
+    use super::*;
+
+    fn empty_merged() -> MergedModule {
+        MergedModule {
+            types: Vec::new(),
+            imports: Vec::new(),
+            functions: Vec::new(),
+            tables: Vec::new(),
+            memories: Vec::new(),
+            globals: Vec::new(),
+            defined_global_i32_const: HashMap::new(),
+            exports: Vec::new(),
+            start_function: None,
+            elements: Vec::new(),
+            data_segments: Vec::new(),
+            custom_sections: Vec::new(),
+            fused_function_names: std::collections::BTreeMap::new(),
+            function_index_map: HashMap::new(),
+            memory_index_map: HashMap::new(),
+            table_index_map: HashMap::new(),
+            global_index_map: HashMap::new(),
+            type_index_map: HashMap::new(),
+            realloc_map: HashMap::new(),
+            import_counts: Default::default(),
+            import_memory_indices: Vec::new(),
+            import_realloc_indices: Vec::new(),
+            import_lower_sites: Vec::new(),
+            resource_rep_by_component: HashMap::new(),
+            resource_new_by_component: HashMap::new(),
+            handle_tables: HashMap::new(),
+            task_return_shims: HashMap::new(),
+            async_result_globals: HashMap::new(),
+            rewrite_params: HashMap::new(),
+            shared_stack_top: None,
+            stackless_providers: 0,
+            placements: Vec::new(),
+            unmapped_import_stubs: HashMap::new(),
+            pending_wired_imports: std::collections::HashSet::new(),
+        }
+    }
+
+    /// (Run: `cargo kani -p meld-core --harness global_ref_func_init_names_the_fused_function`.)
+    /// The fused module already holds `prior` defined functions (from modules
+    /// merged earlier). This module's defined function `local` (no imports)
+    /// therefore lands at fused index `prior + local`. `merge_core_module`
+    /// converts global initialisers BEFORE it records that mapping, so this is
+    /// exactly the `merged` state `convert_init_expr` sees for the call.
+    /// Deterministic `RandomState` (Kani cannot model the OS RNG).
+    fn fixed_random_state() -> std::collections::hash_map::RandomState {
+        // SAFETY: RandomState is two u64 keys; only used under Kani.
+        unsafe { std::mem::transmute::<[u64; 2], std::collections::hash_map::RandomState>([0, 0]) }
+    }
+
+    #[kani::proof]
+    #[kani::unwind(8)]
+    #[kani::stub(std::collections::hash_map::RandomState::new, fixed_random_state)]
+    fn global_ref_func_init_names_the_fused_function() {
+        let local: u32 = kani::any();
+        kani::assume(local <= 1);
+        let merged = empty_merged();
+        // `ref.func local` (LEB128 fits one byte), no trailing `end`.
+        let bytes = [0xD2u8, local as u8];
+        let got = convert_init_expr(
+            &bytes,
+            1,
+            0,
+            &merged,
+            &ValType::Ref(wasm_encoder::RefType::FUNCREF),
+        );
+        // #462 rule: an index absent from `function_index_map` is never emitted
+        // verbatim (it names an unrelated fused function).
+        let refused = got.is_err();
+        core::mem::forget(got);
+        assert!(
+            refused,
+            "global ref.func init with no fused mapping must not fall back to the local index"
+        );
+    }
 }
