@@ -476,3 +476,45 @@ fn the_world_pruned_module_computes_what_the_unfused_composition_computes() {
         "--exports world changes nothing observable"
     );
 }
+
+// ---------------------------------------------------------------------------
+// SR-28: the policy is attested in EVERY build configuration.
+// ---------------------------------------------------------------------------
+
+fn attested(policy: ExportPolicy) -> Vec<u8> {
+    let mut cfg = config(policy, false);
+    cfg.attestation = true;
+    fuse("composed.wasm", cfg).expect("fuses")
+}
+
+fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack.windows(needle.len()).any(|w| w == needle)
+}
+
+/// Default build: the typed `FusionParameters` record.
+#[cfg(not(feature = "attestation"))]
+#[test]
+fn the_attestation_records_the_export_policy_only_when_set() {
+    assert!(contains(
+        &attested(ExportPolicy::World),
+        br#""exports":"world""#
+    ));
+    assert!(!contains(
+        &attested(ExportPolicy::All),
+        br#""exports":"world""#
+    ));
+}
+
+/// wsc-attestation build: a separate builder, which must record it too.
+#[cfg(feature = "attestation")]
+#[test]
+fn the_wsc_attestation_records_the_export_policy_only_when_set() {
+    assert!(contains(
+        &attested(ExportPolicy::World),
+        br#""exports":"world""#
+    ));
+    assert!(!contains(
+        &attested(ExportPolicy::All),
+        br#""exports":"world""#
+    ));
+}

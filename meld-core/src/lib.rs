@@ -2997,6 +2997,11 @@ impl Fuser {
             "output_format".to_string(),
             serde_json::json!(self.output_format_label()),
         );
+        // #463: recorded only when not the default, so default records stay
+        // byte-identical (same rule as `attestation_parameters`).
+        if let Some(policy) = wsc_recorded_export_policy(&self.config) {
+            tool_parameters.insert("exports".to_string(), serde_json::json!(policy));
+        }
 
         let mut metadata = HashMap::new();
         metadata.insert(
@@ -3184,6 +3189,41 @@ impl Fuser {
             OutputFormat::Component => "component",
         }
     }
+}
+
+/// SR-28 for the wsc-attestation build: the exhaustive `FuserConfig`
+/// destructure the default path has in `attestation_parameters`, so a field
+/// added to the config fails to compile under `--features attestation` until it
+/// is recorded or acknowledged here. Returns the export policy when it is not
+/// the default.
+///
+/// Fields bound to `_` below are NOT recorded by this path today (it predates
+/// the typed `FusionParameters`); they are acknowledged, not endorsed.
+#[cfg(feature = "attestation")]
+fn wsc_recorded_export_policy(config: &FuserConfig) -> Option<&'static str> {
+    let FuserConfig {
+        // Already recorded by `build_wsc_attestation`.
+        memory_strategy: _,
+        address_rebasing: _,
+        preserve_names: _,
+        custom_sections: _,
+        dwarf_handling: _,
+        output_format: _,
+        // Not recorded by this path (recorded by the default path).
+        profile: _,
+        reproducible: _,
+        pack_rebase: _,
+        share_stack: _,
+        domains: _,
+        // Not build parameters (see `attestation_parameters`).
+        attestation: _,
+        component_provenance: _,
+        signature_manifest: _,
+        opaque_resources: _,
+        // #463.
+        export_policy,
+    } = config;
+    (*export_policy != ExportPolicy::All).then(|| export_policy.as_str())
 }
 
 /// Recursively flatten nested sub-components into a flat `Vec<ParsedComponent>`.
