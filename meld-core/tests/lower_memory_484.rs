@@ -343,3 +343,69 @@ fn shared_import_with_disagreeing_lowers_is_never_silently_merged() {
         }
     }
 }
+
+/// One module A whose `host::log` import is a UTF-16 lower (memory $m) reached
+/// through `hops` alias re-exports. B owns a second memory ("WORLD"), so a
+/// silently defaulted lower (UTF-8, wrong memory) would deliver "WO".
+/// `core_mod` is the core import module name A uses.
+fn chain_fixture(hops: usize, core_mod: &str) -> String {
+    let mut bags = String::from("(core instance $b0 (export \"log\" (func $low)))\n");
+    for k in 1..=hops {
+        bags.push_str(&format!(
+            "(core instance $b{k} (export \"log\" (func $b{} \"log\")))\n",
+            k - 1
+        ));
+    }
+    format!(
+        r#"(component
+  (import "my:h/host" (instance $h (export "log" (func (param "s" string) (result u32)))))
+  (core module $B (memory (export "mem") 1) (data (i32.const 0) "WORLD"))
+  (core module $M (memory (export "mem") 1) (func (export "cabi_realloc") (param i32 i32 i32 i32) (result i32) i32.const 0))
+  (core module $A
+    (import "env" "mem" (memory 1))
+    (import "{core_mod}" "log" (func $log (param i32 i32) (result i32)))
+    (data (i32.const 0) "h\00i\00")
+    (func (export "run") (result i32) i32.const 0 i32.const 2 call $log))
+  (core instance $b (instantiate $B))
+  (core instance $m (instantiate $M))
+  (alias export $h "log" (func $log))
+  (core func $low (canon lower (func $log) string-encoding=utf16 (memory $m "mem")))
+  {bags}
+  (core instance $envi (export "mem" (memory $m "mem")))
+  (core instance $a (instantiate $A (with "env" (instance $envi)) (with "{core_mod}" (instance $b{hops}))))
+  (func $run (result u32) (canon lift (core func $a "run")))
+  (export "run" (func $run)))"#
+    )
+}
+
+/// A lower reached through any number of alias hops is traced (no fixed hop
+/// limit), so fusion delivers what the unfused component does. At minimum it
+/// may never exit 0 with other bytes.
+#[test]
+fn long_alias_chain_lower_is_never_silently_defaulted() {
+    for hops in [1usize, 255, 256, 300] {
+        let bytes = wat::parse_str(chain_fixture(hops, "my:h/host")).unwrap();
+        let want = run(&bytes).unwrap();
+        assert_eq!(want.1, vec!["hi".to_string()], "unfused, hops={hops}");
+        match fuse(&bytes) {
+            Ok(f) => assert_eq!(
+                run(&f).unwrap(),
+                want,
+                "hops={hops}: fused exited 0 and delivered other bytes"
+            ),
+            Err(e) => panic!("hops={hops}: a traceable lower was refused: {e}"),
+        }
+    }
+}
+
+/// One alias hop with a plain core import name (`host::log`, not the WASI
+/// name): the display name must be recovered through the traced lower, or
+/// fusion fails with "cannot resolve fused import host::log".
+#[test]
+fn one_hop_alias_keeps_plain_core_import_name() {
+    let bytes = wat::parse_str(chain_fixture(1, "host")).unwrap();
+    let want = run(&bytes).unwrap();
+    assert_eq!(want.1, vec!["hi".to_string()]);
+    let fused = fuse(&bytes).unwrap_or_else(|e| panic!("1-hop `host::log` refused: {e}"));
+    assert_eq!(run(&fused).unwrap(), want);
+}

@@ -1487,6 +1487,21 @@ fn assemble_component(
                         multi,
                         sites,
                     )?;
+                    // A lowered host import whose lower could not be traced
+                    // would silently get the per-component default memory and
+                    // UTF-8: refuse, whether or not it shares its slot.
+                    if memory_strategy == MemoryStrategy::MultiMemory && spec.is_none() {
+                        let who = slot
+                            .and_then(|s| s.untraced.first().cloned())
+                            .unwrap_or_default();
+                        return Err(Error::EncodingError(format!(
+                            "cannot determine the canon lower options for fused import \
+                             {}::{} ({who}): under --memory multi the memory, realloc and \
+                             string encoding it passes to the host must come from the \
+                             source lower, and none could be traced",
+                            fused_info.func_imports[i].0, fused_info.func_imports[i].1
+                        )));
+                    }
                     // A source lower that names no memory cannot touch one, so
                     // the choice is inert; keep the (now deterministic)
                     // per-component default rather than churn the output.
