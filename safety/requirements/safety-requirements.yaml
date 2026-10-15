@@ -3619,3 +3619,21 @@ artifacts:
       reviewed-by: avrabe
       model: claude-opus-5-5
       timestamp: 2026-10-15T03:52:33Z
+
+  - id: SR-99
+    type: sw-req
+    title: "--component lowers each import with the memory, realloc and encoding its source lower names"
+    status: implemented
+    description: "When meld wraps the fused module as a component (--component), each host import is lowered with a canon lower whose options tell the host where arguments live (memory), how to allocate for results (realloc), and how strings are encoded. The wrapper took the memory from a per-component default that component_memory_index chose by iterating a HashMap, took realloc from that memory's allocator, and hard-coded UTF-8. Under --memory multi, a component with more than one memory-owning core module could therefore hand the host another module's bytes, and the same input fused to different outputs from run to run (#484: 6 of 20 runs delivered \"WORLD\" instead of \"hello\", 2 distinct outputs). A UTF-16 source lower was emitted as UTF-8 (20 of 20 runs diverged). meld shall lower each import with the options the source lower names: its memory resolved through the merger's numbering, its realloc resolved to the fused function, and its string encoding carried through. Lowers that share one fused import and disagree on these options shall be an error, never a choice. component_memory_index shall be deterministic, choosing memory 0 of the lowest-indexed module by a documented rule. A source lower that names no memory keeps the per-component default, since it cannot touch memory. Not established here: the cross-component adapters in adapter/fact.rs also take the per-component default memory; they are now deterministic, but whether that default is the memory the call site uses is not examined by this requirement."
+    links:
+      - type: derives-from
+        target: SYS-4
+      - type: refines
+        target: SR-97
+      - type: refines
+        target: SR-14
+    provenance:
+      created-by: ai-assisted
+      reviewed-by: avrabe
+      model: claude-opus-5-5
+      timestamp: 2026-10-15T05:36:17Z

@@ -5,6 +5,15 @@ All notable changes to this project will be documented in this file.
 ## [Unreleased]
 
 ### Fixed
+- **`--component` lowers each import with the memory, realloc and string
+  encoding its source lower names (SR-99, #484).** The wrapper took each
+  lowered import's memory from a per-component default chosen in hash-map
+  order, its realloc from that memory, and always used UTF-8. Under
+  `--memory multi`, a component with more than one memory-owning core module
+  could hand the host another module's bytes, and the same input fused to
+  different outputs from run to run; a UTF-16 lower was emitted as UTF-8. Each
+  lower now uses its source lower's options, and lowers that share one fused
+  import but disagree are an error.
 - **`--component` lifts each export with the memory its source lift names
   (SR-97, #481).** The wrapper lifted every export from fused memory 0, and
   indexed the `task.return` memory option by the source component's own
