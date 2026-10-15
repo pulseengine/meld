@@ -1498,6 +1498,12 @@ impl Fuser {
             mcu_dissolve::dissolve_fixups(&mut merged, &self.components)?;
         }
 
+        // #482: every pass that rewrites `function_index_map` (resource
+        // re-export, task.return shims, stream bridge, adapter wiring) has now
+        // run. Re-resolve global `ref.func` initialisers from the FINAL map so
+        // they name what a body `call` of the same index names.
+        merged.refresh_global_ref_funcs()?;
+
         // Step 4: Encode output module.
         //
         // Two-pass dance: first encode without any self-referential
@@ -2217,6 +2223,8 @@ impl Fuser {
             for param_ty in &import_type.params {
                 let global_idx = merged.import_counts.global + merged.globals.len() as u32;
                 merged.globals.push(merger::MergedGlobal {
+                    init_ref_func: None,
+                    init_ref_origin: None,
                     ty: wasm_encoder::GlobalType {
                         val_type: *param_ty,
                         mutable: true,

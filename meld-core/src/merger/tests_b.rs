@@ -971,7 +971,7 @@ fn test_no_instances_accepted() {
 // Shared empty-merged fixture used by both regression suites.
 // ---------------------------------------------------------------
 
-fn empty_merged_fixture() -> MergedModule {
+pub(crate) fn empty_merged_fixture() -> MergedModule {
     MergedModule {
         types: Vec::new(),
         imports: Vec::new(),
@@ -1019,7 +1019,7 @@ fn ls_a_11_convert_init_expr_folds_extended_const_i32_add() {
     let bytes: Vec<u8> = vec![0x41, 5, 0x41, 10, 0x6A];
     let merged = empty_merged_fixture();
 
-    let expr = convert_init_expr(&bytes, 0, 0, &merged, &ValType::I32);
+    let expr = convert_init_expr(&bytes, 0, 0, &merged, &ValType::I32).unwrap();
 
     let mut encoded = Vec::new();
     wasm_encoder::Encode::encode(&expr, &mut encoded);
@@ -1040,7 +1040,7 @@ fn ls_a_11_convert_init_expr_preserves_single_const() {
     let bytes: Vec<u8> = vec![0x41, 5];
     let merged = empty_merged_fixture();
 
-    let expr = convert_init_expr(&bytes, 0, 0, &merged, &ValType::I32);
+    let expr = convert_init_expr(&bytes, 0, 0, &merged, &ValType::I32).unwrap();
     let mut encoded = Vec::new();
     wasm_encoder::Encode::encode(&expr, &mut encoded);
     let mut expected = Vec::new();
@@ -1182,4 +1182,23 @@ fn ls_a_19_resource_new_lookup_is_also_exact() {
         "[resource-new]float",
     );
     assert_eq!(idx, Some(1));
+}
+
+// #482: a `ref.func` init with no fused mapping must be refused, never emitted
+// with the module-local index (which names an unrelated fused function).
+#[test]
+fn convert_init_expr_refuses_unmapped_ref_func_482() {
+    let merged = empty_merged_fixture();
+    let bytes: Vec<u8> = vec![0xD2, 0]; // ref.func 0
+    let funcref = ValType::Ref(wasm_encoder::RefType::FUNCREF);
+    assert!(convert_init_expr(&bytes, 1, 0, &merged, &funcref).is_err());
+
+    let mut mapped = empty_merged_fixture();
+    mapped.function_index_map.insert((1, 0, 0), 7);
+    let expr = convert_init_expr(&bytes, 1, 0, &mapped, &funcref).unwrap();
+    let mut got = Vec::new();
+    wasm_encoder::Encode::encode(&expr, &mut got);
+    let mut want = Vec::new();
+    wasm_encoder::Encode::encode(&ConstExpr::ref_func(7), &mut want);
+    assert_eq!(got, want);
 }
