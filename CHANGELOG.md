@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 ## [Unreleased]
 
 ### Fixed
+- **A global's `ref.func` initialiser names the fused function (SR-98,
+  #482).** Global initialisers were converted before the module's function
+  indices were assigned, so a `ref.func` initialiser kept its module-local
+  index and, in the fused module, named another module's function: a call
+  through the global ran the wrong code at exit 0. The conversion now happens
+  after the function map is built, a missing mapping is an error, and the
+  recorded target follows the P3 async index shift.
 - **Fused output no longer varies between runs when two components qualify as
   a resource's definer (SR-95, #467).** A component and the component that
   re-exports it can both carry a resource representation. meld picked the

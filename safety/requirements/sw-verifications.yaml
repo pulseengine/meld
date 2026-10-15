@@ -1571,3 +1571,17 @@ artifacts:
       reviewed-by: avrabe
       model: claude-opus-5-5
       timestamp: 2026-10-14T12:32:23Z
+
+  - id: SWV-110
+    type: sw-verification
+    title: "Verification of SR-98: the fused global calls the function the source named"
+    status: implemented
+    description: "Verifies SR-98. meld-core/tests/global_reffunc_482.rs fuses a two-module component in which module A holds (global funcref (ref.func $seven)), stores it in a table and calls it through call_indirect, while module B defines a function returning 42; it runs the fused module under wasmtime and asserts 7, matching the unfused component, with a control that uses the same ref.func in code. A unit test in merger/tests_b.rs asserts an unmapped ref.func initialiser is refused, and shift_moves_global_ref_func_init_482 in p3_async.rs asserts the P3 index shift updates the recorded target. A Kani harness over the real convert_init_expr reports VERIFICATION SUCCESSFUL on the fix (322 s, 0 of 21294 checks failed) and FAILED with the identity fallback restored. Potency: with the deferral removed and the identity fallback restored, the PoC fails with 42 against 7 and the control still passes; with the P3 bump removed, the shift test fails. Corpus: all 49 wit-bindgen fixtures under --memory multi produce byte-identical output before and after. Local gate: fmt 0; clippy 0 with and without --all-features; cargo test --workspace exit 0 with 937 passed and 0 failed; --all-features exit 0 with 936 passed and 0 failed."
+    links:
+      - type: verifies
+        target: SR-98
+    provenance:
+      created-by: ai-assisted
+      reviewed-by: avrabe
+      model: claude-opus-5-5
+      timestamp: 2026-10-15T04:28:21Z

@@ -3601,3 +3601,21 @@ artifacts:
       reviewed-by: avrabe
       model: claude-opus-5-5
       timestamp: 2026-10-14T12:32:22Z
+
+  - id: SR-98
+    type: sw-req
+    title: A global's ref.func initialiser names the fused function, and follows later index shifts
+    status: implemented
+    description: "A defined global whose initialiser is ref.func names a function in its own module's index space, and the merger must rewrite that index into the fused function index space (SC-3: every index in an init expression is remapped). merge_core_module converted global initialisers before it had recorded the module's function mappings, so the lookup missed and convert_init_expr fell back to the module-local index, which in the fused module names a different module's function. The output validated and meld exited 0, and a call through the global ran the wrong function (#482: 42 instead of 7). Separately, global initialisers were held as an opaque ConstExpr, so the P3 async pass that shifts function indices did not reach them. meld shall convert a global's ref.func initialiser only after the module's function mappings exist, and a missing mapping shall be an error, never the module-local index. The fused ref.func target shall be recorded with the global so that later function-index shifts, including P3 async import insertion, update it. Not covered: initialisers meld does not recognise (for example GC struct.new expressions containing ref.func) are still copied as raw bytes, as before."
+    links:
+      - type: derives-from
+        target: SYS-2
+      - type: refines
+        target: SR-9
+      - type: addresses-constraint
+        target: SC-3
+    provenance:
+      created-by: ai-assisted
+      reviewed-by: avrabe
+      model: claude-opus-5-5
+      timestamp: 2026-10-15T04:28:21Z
