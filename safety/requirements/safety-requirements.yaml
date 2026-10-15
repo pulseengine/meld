@@ -3620,6 +3620,24 @@ artifacts:
       model: claude-opus-5-5
       timestamp: 2026-10-15T03:52:33Z
 
+  - id: SR-96
+    type: sw-req
+    title: An unmapped function import is never resolved to an unrelated function
+    status: implemented
+    description: "A core module's function import that no resolution step maps to a fused function had no entry in the module's function index map, and IndexMaps::remap_func fell back to the identity index, so any reference to it silently named whatever fused function happened to carry that index. wit-component emits exactly this shape: a fixup module imports the lowered functions (\"\" \"0\", \"\" \"1\", ...) and fills the shim module's table with them through an elem segment, and when the main module's import of the same name is resolved through an adapter site, the fixup's import is skipped and left unmapped (#462). Across the wit-bindgen corpus under --memory multi, 26 of 49 fixtures carried such slots (126 in total), every one reached only by trampolines with no callers, but each trampoline is exported, and in 21 of the 126 slots the signature matched, so a host calling the exported trampoline would have invoked an unrelated import. On cpetig's inputs the same slots kept mcu_dissolve from recognising the shim, so its exports \"0\", \"1\" and \"$imports\" survived fusion and synth refused the module. meld shall never resolve an unmapped function import to an identity index. An elem item that names one shall be replaced by a trapping stub of the import's own type (body `unreachable`, one per distinct type), so slot positions and types are preserved and a call through the slot traps instead of reaching another function. A live use -- a call, ref.func, function export, or global initialiser naming an unmapped import -- shall be an error naming the component, module and import, since no stub can stand in for code that runs. mcu_dissolve's dead-trampoline pass shall treat a table filled only with stubs or imports as an import-trampoline table, and drop its numeric trampoline exports and the dead \"$imports\" table export, keeping the functions themselves. Deliberately not done: wiring the fixup import to the adapter the main module's import resolves to, which would make a dead path live; the module-index-blind skip in merger/imports.rs that leaves the import unmapped is noted for later."
+    links:
+      - type: derives-from
+        target: SYS-2
+      - type: refines
+        target: SR-9
+      - type: refines
+        target: SR-10
+    provenance:
+      created-by: ai-assisted
+      reviewed-by: avrabe
+      model: claude-opus-5-5
+      timestamp: 2026-10-14T16:31:15Z
+
   - id: SR-98
     type: sw-req
     title: A global's ref.func initialiser names the fused function, and follows later index shifts

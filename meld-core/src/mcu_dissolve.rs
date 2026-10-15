@@ -37,10 +37,10 @@ use std::collections::{HashMap, HashSet};
 use wasm_encoder::{ConstExpr, ExportKind as EncoderExportKind, Function, ValType};
 use wasmparser::{BinaryReader, CodeSectionReader, Operator};
 
-use crate::merger::MergedModule;
+use crate::merger::{MergedModule, SyntheticKind};
 use crate::parser::{ExportKind as ParserExportKind, ImportKind, ParsedComponent};
 use crate::rewriter::{IndexMaps, rewrite_function_body};
-use crate::segments::{ElementSegmentMode, ReindexedElementItems};
+use crate::segments::{ElementSegmentMode, ParsedConstExpr, ReindexedElementItems};
 use crate::{Error, Result};
 
 /// Outcome of an MCU-dissolve pass, for logging and test assertions.
@@ -463,17 +463,49 @@ fn drop_dead_import_trampolines(merged: &mut MergedModule) -> Result<usize> {
         collect_reachable(&f.body, &mut reachable)?;
     }
 
-    // Tables that hold at least one DEFINED function via a static element
-    // segment are ordinary indirect-call tables, NOT the host-populated
-    // lowered-import table. The `$imports` table holds only imported
-    // functions (or is filled at instantiation with no static segment).
+    // #462: the trapping stubs the merger put in the slots of unmapped
+    // lowered-import functions. A slot holding a stub is an IMPORT slot for
+    // this analysis: it is the stand-in for the host-supplied function the
+    // wit-component fixup module would have installed.
+    let trap_stubs: HashSet<u32> = merged
+        .functions
+        .iter()
+        .enumerate()
+        .filter(|(_, f)| f.synthetic_kind == Some(SyntheticKind::TrapStub))
+        .map(|(i, _)| func_base + i as u32)
+        .collect();
+    // A slot is "real" when it holds a defined function that is not a stub.
+    let is_real_fn = |fi: u32| fi >= func_base && !trap_stubs.contains(&fi);
+
+    // Tables that hold at least one REAL defined function via a static element
+    // segment are ordinary indirect-call tables, NOT the lowered-import table.
+    // The `$imports` table holds only imported functions or trap stubs (or is
+    // filled at instantiation with no static segment).
     let mut table_has_defined_fn: HashSet<u32> = HashSet::new();
+    // Tables with at least one static Active segment, all of whose items so far
+    // are imports or stubs (the dead `$imports` shape).
+    let mut table_has_static_import_slots: HashSet<u32> = HashSet::new();
     for seg in &merged.elements {
-        if let ElementSegmentMode::Active { table_index, .. } = seg.mode
-            && let ReindexedElementItems::Functions(fs) = &seg.items
-            && fs.iter().any(|&fi| fi >= func_base)
-        {
+        let ElementSegmentMode::Active { table_index, .. } = seg.mode else {
+            continue;
+        };
+        let (any_real, any_item) = match &seg.items {
+            ReindexedElementItems::Functions(fs) => {
+                (fs.iter().any(|&fi| is_real_fn(fi)), !fs.is_empty())
+            }
+            ReindexedElementItems::Expressions(es) => (
+                es.iter().any(|e| match e {
+                    ParsedConstExpr::RefFunc(fi) => is_real_fn(*fi),
+                    _ => false,
+                }),
+                !es.is_empty(),
+            ),
+        };
+        if any_real {
             table_has_defined_fn.insert(table_index);
+        }
+        if any_item {
+            table_has_static_import_slots.insert(table_index);
         }
     }
 
@@ -508,13 +540,35 @@ fn drop_dead_import_trampolines(merged: &mut MergedModule) -> Result<usize> {
         to_drop.push((e.name.clone(), fidx));
     }
 
-    if to_drop.is_empty() {
+    // #462: the shim's `"$imports"` TABLE export is the same scaffolding as
+    // its numeric trampolines. Drop it only when the table is statically
+    // populated and every slot is an import or trap stub, i.e. nothing but the
+    // fixup module's own lowered imports ever lived there. A table with no
+    // static segment may be filled by the host through this very export, and a
+    // table holding a real function is an ordinary vtable: both stay.
+    let tables_to_drop: Vec<(String, u32)> = merged
+        .exports
+        .iter()
+        .filter(|e| {
+            matches!(e.kind, EncoderExportKind::Table)
+                && e.name == "$imports"
+                && table_has_static_import_slots.contains(&e.index)
+                && !table_has_defined_fn.contains(&e.index)
+        })
+        .map(|e| (e.name.clone(), e.index))
+        .collect();
+
+    if to_drop.is_empty() && tables_to_drop.is_empty() {
         return Ok(0);
     }
     let before = merged.exports.len();
     merged.exports.retain(|e| {
-        !(matches!(e.kind, EncoderExportKind::Func)
-            && to_drop.iter().any(|(n, i)| *n == e.name && *i == e.index))
+        let victims = match e.kind {
+            EncoderExportKind::Func => &to_drop,
+            EncoderExportKind::Table => &tables_to_drop,
+            _ => return true,
+        };
+        !victims.iter().any(|(n, i)| *n == e.name && *i == e.index)
     });
     Ok(before - merged.exports.len())
 }

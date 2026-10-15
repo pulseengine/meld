@@ -1547,6 +1547,7 @@ impl From<crate::merger::SyntheticKind> for AdapterRole {
             crate::merger::SyntheticKind::AdapterShim => AdapterRole::AdapterShim,
             crate::merger::SyntheticKind::TaskReturnShim => AdapterRole::TaskReturnShim,
             crate::merger::SyntheticKind::StreamBridge => AdapterRole::StreamBridge,
+            crate::merger::SyntheticKind::TrapStub => AdapterRole::Generated,
         }
     }
 }
