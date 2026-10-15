@@ -1722,8 +1722,34 @@ fn assemble_component(
 
                         let mut enc_options: Vec<CanonicalOption> = Vec::new();
                         if let Some(mem) = options.memory {
-                            enc_options
-                                .push(CanonicalOption::Memory(memory_core_indices[mem as usize]));
+                            // #481: the option names a core memory of the
+                            // component that owns the task.return — map it
+                            // through the merger, don't index by it.
+                            let fused_mem = match source_comp {
+                                Some(owner) => resolve_lift_memory(
+                                    owner,
+                                    all_components,
+                                    merged,
+                                    fused_info.memories.len(),
+                                    mem,
+                                )?,
+                                None if fused_info.memories.len() <= 1 => 0,
+                                None => {
+                                    return Err(Error::EncodingError(format!(
+                                        "task.return names core memory {mem} but its owning \
+                                         component is unknown"
+                                    )));
+                                }
+                            };
+                            let core_mem = memory_core_indices
+                                .get(fused_mem as usize)
+                                .copied()
+                                .ok_or_else(|| {
+                                    Error::EncodingError(format!(
+                                        "fused memory {fused_mem} has no wrapper core memory"
+                                    ))
+                                })?;
+                            enc_options.push(CanonicalOption::Memory(core_mem));
                         }
                         match options.string_encoding {
                             parser::CanonStringEncoding::Utf8 => {
@@ -1961,9 +1987,35 @@ fn assemble_component(
                 .map(|(_, _, opts)| source_string_encoding_option(opts.string_encoding))
                 .unwrap_or(CanonicalOption::UTF8);
             let mut lift_options: Vec<CanonicalOption> = Vec::new();
+            // #481: the memory the SOURCE lift names, mapped to its fused index.
+            // A source lift that names none keeps the historical 0 (there is
+            // no source memory to be wrong about).
+            let lift_memory = match &lift_info {
+                Some((lc, _, o)) => match o.memory {
+                    Some(m) => {
+                        let fused_mem = resolve_lift_memory(
+                            lc,
+                            all_components,
+                            merged,
+                            fused_info.memories.len(),
+                            m,
+                        )?;
+                        memory_core_indices
+                            .get(fused_mem as usize)
+                            .copied()
+                            .ok_or_else(|| {
+                                Error::EncodingError(format!(
+                                    "fused memory {fused_mem} has no wrapper core memory"
+                                ))
+                            })?
+                    }
+                    None => 0,
+                },
+                None => 0,
+            };
             if func_info.has_post_return {
                 // String/list-returning functions need memory + encoding + post-return
-                lift_options.push(CanonicalOption::Memory(0)); // shim memory = shared memory
+                lift_options.push(CanonicalOption::Memory(lift_memory));
                 lift_options.push(source_string_encoding);
                 if let Some(pr_idx) = post_return_core_idx {
                     lift_options.push(CanonicalOption::PostReturn(pr_idx));
@@ -1978,7 +2030,7 @@ fn assemble_component(
                         .iter()
                         .any(|o| matches!(o, CanonicalOption::Memory(_)))
                     {
-                        lift_options.push(CanonicalOption::Memory(0));
+                        lift_options.push(CanonicalOption::Memory(lift_memory));
                     }
                     if !lift_options.iter().any(|o| {
                         matches!(
@@ -2141,7 +2193,28 @@ fn assemble_component(
         // needed (scalar exports keep the empty option list).
         let mut lift_options: Vec<CanonicalOption> = Vec::new();
         if let Some(pr_idx) = post_return_core_idx {
-            lift_options.push(CanonicalOption::Memory(0));
+            // #481: map the source lift's memory option to its fused index.
+            let bare_memory = match source_lift.as_ref().and_then(|(_, o)| o.memory) {
+                Some(m) => {
+                    let fused_mem = resolve_lift_memory(
+                        source,
+                        all_components,
+                        merged,
+                        fused_info.memories.len(),
+                        m,
+                    )?;
+                    memory_core_indices
+                        .get(fused_mem as usize)
+                        .copied()
+                        .ok_or_else(|| {
+                            Error::EncodingError(format!(
+                                "fused memory {fused_mem} has no wrapper core memory"
+                            ))
+                        })?
+                }
+                None => 0,
+            };
+            lift_options.push(CanonicalOption::Memory(bare_memory));
             let enc = source_lift
                 .as_ref()
                 .map(|(_, opts)| source_string_encoding_option(opts.string_encoding))
@@ -2750,6 +2823,95 @@ fn source_string_encoding_option(
         parser::CanonStringEncoding::Utf8 => wasm_encoder::CanonicalOption::UTF8,
         parser::CanonStringEncoding::Utf16 => wasm_encoder::CanonicalOption::UTF16,
         parser::CanonStringEncoding::CompactUtf16 => wasm_encoder::CanonicalOption::CompactUTF16,
+    }
+}
+
+/// The fused memory index (== wrapper core memory index) a SOURCE canon-lift /
+/// task.return `memory` option refers to (#481).
+///
+/// The option is a core-memory index in the OWNING source component's core
+/// memory index space. Fused memory 0 is simply whichever memory-owning module
+/// merged first, so emitting a constant 0 under `--memory multi` makes the
+/// lift read the returned (ptr, len) out of another module's memory: wrong
+/// bytes, exit 0. Resolve it the way the merger numbered it: source core memory
+/// -> (module, export) -> module-local memory -> `memory_index_map`.
+///
+/// With exactly one fused memory, 0 is the only possible answer and no
+/// resolution is needed. Otherwise an unresolvable option is an error, never
+/// a guess.
+fn resolve_lift_memory(
+    owner: &ParsedComponent,
+    all_components: &[ParsedComponent],
+    merged: &MergedModule,
+    fused_memory_count: usize,
+    mem: u32,
+) -> Result<u32> {
+    if fused_memory_count <= 1 {
+        return Ok(0);
+    }
+    let fail = |why: &str| {
+        Error::EncodingError(format!(
+            "cannot resolve the memory named by a canon lift/task.return option \
+             (source core memory {mem}) to a fused memory: {why}"
+        ))
+    };
+    let (mod_idx, export_name) = crate::resolver::core_memory_sources(owner)
+        .get(&mem)
+        .cloned()
+        .ok_or_else(|| fail("no core memory with that index in the owning component"))?;
+    let local_idx = owner
+        .core_modules
+        .get(mod_idx)
+        .and_then(|m| {
+            m.exports
+                .iter()
+                .find(|e| e.name == export_name && e.kind == parser::ExportKind::Memory)
+        })
+        .map(|e| e.index)
+        .ok_or_else(|| fail("the memory's defining module export was not found"))?;
+
+    // Locate the owner among the flattened components the merger numbered.
+    // The wrapper's `source` may be the un-flattened original, so fall back to
+    // a structural match; if that is ambiguous, accept only when every
+    // candidate resolves to the same fused memory.
+    let mut candidates: Vec<usize> = all_components
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| std::ptr::eq(*c, owner))
+        .map(|(i, _)| i)
+        .collect();
+    if candidates.is_empty() {
+        let names =
+            |c: &ParsedComponent| c.exports.iter().map(|e| e.name.clone()).collect::<Vec<_>>();
+        candidates = all_components
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| {
+                c.name == owner.name
+                    && c.core_modules.len() == owner.core_modules.len()
+                    && c.canonical_functions.len() == owner.canonical_functions.len()
+                    && names(c) == names(owner)
+            })
+            .map(|(i, _)| i)
+            .collect();
+    }
+    let mut resolved: Vec<u32> = candidates
+        .iter()
+        .filter_map(|&ci| {
+            merged
+                .memory_index_map
+                .get(&(ci, mod_idx, local_idx))
+                .copied()
+        })
+        .collect();
+    resolved.sort_unstable();
+    resolved.dedup();
+    match resolved.as_slice() {
+        [one] if (*one as usize) < fused_memory_count => Ok(*one),
+        [] => Err(fail("the merger has no mapping for that memory")),
+        _ => Err(fail(
+            "the owning component is ambiguous or maps out of range",
+        )),
     }
 }
 
