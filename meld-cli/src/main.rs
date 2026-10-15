@@ -224,17 +224,25 @@ enum Commands {
 
         /// Which exports the fused core module keeps (#463). "all" (default)
         /// keeps every export of every inner module. "world" keeps only the
-        /// exports that implement the OUTER world of the input(s) — for a
-        /// composition, its own interfaces rather than the internal ones it
-        /// wired together — plus what invoking them needs: the memory the
-        /// kept lifts use, their `cabi_post_*`, `[dtor]` and realloc exports,
-        /// and the start function. `__data_end`, `__heap_base` and every other
-        /// global or table export are dropped. Only the export LIST changes:
-        /// function bodies stay, so a downstream tool can drop what becomes
-        /// unreachable. A world export that cannot be mapped to a fused export
-        /// is an error, never silently dropped. Not valid with --component,
-        /// which already exports exactly the outer world. With --emit-manifest
-        /// the manifest lists only the kept exports.
+        /// functions that implement the OUTER world of the input(s), found by
+        /// tracing each world function through its `canon lift` to a fused
+        /// function (never by name), and exports each under its WORLD name
+        /// (`<interface>#<function>`): where the merger named a function
+        /// `iface#f$1` because an internal one took `iface#f`, the world name
+        /// is rebound to the world function and the internal one is dropped.
+        /// It also keeps what the kept surface and the imports the module still
+        /// has need: their lifts' and lowers' memory and realloc (a realloc
+        /// nothing exports is exported as `meld:realloc/<component>`, with or
+        /// without --emit-manifest), `cabi_post_*`, the `[dtor]` exports of
+        /// resources whose intrinsics are still imported, and the start
+        /// function. `__data_end`, `__heap_base` and every other global or
+        /// table export are dropped. Only the export LIST changes: function
+        /// bodies stay, so a downstream tool can drop what becomes unreachable.
+        /// A world function that cannot be traced to a fused function that
+        /// some export carries is an error naming it, never silently dropped.
+        /// Not valid with --component, which already exports exactly the outer
+        /// world. With --emit-manifest the manifest lists only the world's
+        /// functions, under their world names.
         #[arg(
             long,
             value_name = "MODE",

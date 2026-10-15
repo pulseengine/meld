@@ -49,4 +49,23 @@ nothing (SR-85).
 `composed_renamed.wasm` (sha256 322ef1daf0d16c529e2d863957ae612572203c88ed6617fd45a164b2c474c6be,
 source `composed_renamed.wac`, same `wac compose` command) exports the estimator
 as `test:renamed/est@0.1.0`. The fused module keeps the lifted export's own
-name, so that world export has no fused counterpart: it is the refusal case.
+name. The world is found through the lifts, so the rename is no obstacle: the
+functions are exported under `test:renamed/est@0.1.0#…`.
+
+## Review fixtures (hand-written components)
+
+Built from `src/*.wat` with `wasm-tools parse`; `middleware.wasm` is
+`wac plug --plug svc.wasm mid.wasm`. sha256:
+
+    import_needs.wasm  479fabc929b4d5c897503e6ded96ee25e71400091cf9fc8b388d264bdeee24e1
+    drop_g.wasm        bb638e96321fec324e7ca46b689270edaa9f0f7aefdd0107ed42ee797fa268c5
+    svc.wasm           159c9991d8c93dd5bab86502592be402ca12f850395cc0715a947e4f4c35d309
+    mid.wasm           5a702634629dd5669cb80146f453e733c428a489276cabb1aa93c31424cf1661
+    middleware.wasm    5af35d85de1ea3066e279226eca9f55ebb539584db0efcf4f80ab5da26d232bb
+
+- `import_needs`: the kept `run` calls two lowered imports whose `canon lower`
+  names a memory and an allocator.
+- `drop_g`: interface `test:x/i` with `f` (core `test:x/i#f`) and `g` (core
+  `impl_g`).
+- `middleware`: the outer world is `mid`'s `test:x/i`; `svc` is internal; both
+  have the core export `test:x/i#f`.

@@ -1567,6 +1567,7 @@ impl Fuser {
                 &mut merged,
                 &self.components,
                 &self.original_components,
+                &self.component_to_input,
             )?;
             stats.total_exports = merged.exports.len();
             Some(kept)
@@ -1673,8 +1674,12 @@ impl Fuser {
             // emitted, not the WIT tree `wit` comes from. Extra custom sections
             // do not shift function indices, so the types read here are the
             // ones the final artifact exports.
-            let manifest =
-                signature_manifest::build(&self.components, &merged, &output_without_extras);
+            let manifest = signature_manifest::build(
+                &self.components,
+                &merged,
+                &output_without_extras,
+                kept_world_exports.as_ref(),
+            );
             match serde_json::to_vec(&manifest) {
                 Ok(payload) => extra_sections.push((signature_manifest::SECTION_NAME, payload)),
                 Err(e) => {
@@ -3971,6 +3976,7 @@ mod tests {
             core_entity_order: Vec::new(),
             component_func_defs: Vec::new(),
             component_instance_defs: Vec::new(),
+            instance_export_slots: Vec::new(),
             component_type_defs: vec![crate::parser::ComponentTypeDef::Defined],
             original_size: 0,
             original_hash: String::new(),

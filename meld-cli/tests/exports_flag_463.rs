@@ -61,12 +61,15 @@ fn world_limits_the_export_list_and_all_is_the_default() {
     );
     let world = exports(&std::fs::read(&out).expect("output"));
     let _ = std::fs::remove_file(&out);
-    assert_eq!(world.len(), 4, "memory + three world functions: {world:?}");
-    assert!(
-        world
-            .iter()
-            .all(|n| n == "memory" || n.contains("/controller@") || n.contains("/observer@"))
+    assert_eq!(
+        world.len(),
+        5,
+        "memory, three world functions and the allocator step needs: {world:?}"
     );
+    assert!(world.iter().all(|n| n == "memory"
+        || n.starts_with("meld:realloc/")
+        || n.contains("/controller@")
+        || n.contains("/observer@")));
 }
 
 #[test]

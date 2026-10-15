@@ -382,13 +382,13 @@ pub(crate) fn fused_index_of(merged: &MergedModule, origin: (usize, usize, u32))
 /// Returns `(export name, fused function index)`, sorted, with allocators that
 /// are already exported left alone.
 ///
-/// `world_kept` (#463): under `--exports world`, the lifted export names that
-/// survived pruning. Only their allocators are added, so the manifest does not
-/// re-export an allocator that belongs to a removed export.
+/// `world` (#463): under `--exports world`, the lifts that implement the outer
+/// world. Only their allocators are added, so the manifest does not re-export
+/// an allocator that belongs to a removed export.
 pub fn allocator_exports(
     components: &[ParsedComponent],
     merged: &MergedModule,
-    world_kept: Option<&std::collections::HashSet<String>>,
+    world: Option<&crate::world_exports::WorldPlan>,
 ) -> Vec<(String, u32)> {
     let already_exported: std::collections::HashSet<u32> = merged
         .exports
@@ -402,12 +402,10 @@ pub fn allocator_exports(
     let mut wanted: std::collections::BTreeMap<u32, usize> = std::collections::BTreeMap::new();
     for (comp_idx, component) in components.iter().enumerate() {
         for (lift_func, (_, options)) in component.lift_info_by_core_func() {
-            if let Some(kept) = world_kept {
-                let survives = locate_core_func(component, lift_func)
-                    .is_some_and(|(export_name, _, _)| kept.contains(&export_name));
-                if !survives {
-                    continue;
-                }
+            if let Some(plan) = world
+                && !plan.lifts.contains_key(&(comp_idx, lift_func))
+            {
+                continue;
             }
             let Some(realloc) = options.realloc else {
                 continue;
@@ -456,6 +454,7 @@ pub fn build(
     components: &[ParsedComponent],
     merged: &MergedModule,
     output_bytes: &[u8],
+    world: Option<&crate::world_exports::WorldPlan>,
 ) -> SignatureManifest {
     let emitted = emitted_exports(output_bytes);
     let mut exports = Vec::new();
@@ -464,11 +463,21 @@ pub fn build(
     for (comp_idx, component) in components.iter().enumerate() {
         let lifts = component.lift_info_by_core_func();
         for (core_func_index, (type_index, options)) in lifts {
-            let Some((export_name, mod_idx, local_idx)) =
+            let Some((mut export_name, mod_idx, local_idx)) =
                 locate_core_func(component, core_func_index)
             else {
                 continue;
             };
+            // Under `--exports world` only the lifts that implement the world
+            // are described, and under the WORLD name: the fused module may
+            // carry that function under another one, and another function
+            // under this lift's core name.
+            if let Some(plan) = world {
+                match plan.lifts.get(&(comp_idx, core_func_index)) {
+                    Some(world_name) => export_name = world_name.clone(),
+                    None => continue,
+                }
+            }
             // The fused module keeps the lifted export's name.
             let Some(core) = emitted.funcs.get(&export_name).cloned() else {
                 continue;
@@ -763,6 +772,7 @@ mod tests {
             core_entity_order: Vec::new(),
             component_func_defs: Vec::new(),
             component_instance_defs: Vec::new(),
+            instance_export_slots: Vec::new(),
             component_type_defs: Vec::new(),
             original_size: 0,
             original_hash: String::new(),
