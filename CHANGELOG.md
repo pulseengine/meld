@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 ## [Unreleased]
 
 ### Fixed
+- **A lowered import's realloc comes from its source lower in every memory
+  strategy (SR-99, #484).** With a single fused memory, which includes every
+  `--memory shared` fuse, a lowered host import fell back to `cabi_realloc`
+  instead of the allocator its source lower names. Components adapted with
+  the WASI preview1 adapter name the adapter's `cabi_import_realloc` for
+  `get-environment` and stdin reads; a fused WASI program that read its
+  environment received empty values and then failed an adapter assertion.
+  An allocator that cannot be resolved is now an error.
 - **`--component` lowers each import with the memory, realloc and string
   encoding its source lower names (SR-99, #484).** The wrapper took each
   lowered import's memory from a per-component default chosen in hash-map

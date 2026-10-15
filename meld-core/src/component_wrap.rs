@@ -1459,10 +1459,9 @@ fn assemble_component(
 
                     // #484: the lower's options come from the SOURCE lower that
                     // supplied this import, not from a per-component default.
-                    // Memory/realloc resolution only matters (and is only
-                    // attempted) when there is more than one fused memory.
-                    let multi = memory_strategy == MemoryStrategy::MultiMemory
-                        && fused_info.memories.len() > 1;
+                    // Memory, realloc and encoding are ALWAYS resolved from it:
+                    // which allocator runs does not depend on how many memories
+                    // there are or on the memory strategy.
                     let slot = merged.import_lower_sites.get(i);
                     let sites = slot.map(|s| s.sites.as_slice()).unwrap_or(&[]);
                     // An untraced lower that shares its fused import with any
@@ -1484,7 +1483,6 @@ fn assemble_component(
                         all_components,
                         merged,
                         fused_info.memories.len(),
-                        multi,
                         sites,
                     )?;
                     // A lowered host import whose lower could not be traced
@@ -3079,7 +3077,6 @@ fn resolve_lower_spec(
     all_components: &[ParsedComponent],
     merged: &MergedModule,
     fused_memory_count: usize,
-    resolve_alloc: bool,
     sites: &[(usize, u32)],
 ) -> Result<Option<LowerSpec>> {
     let mut agreed: Option<LowerSpec> = None;
@@ -3104,9 +3101,9 @@ fn resolve_lower_spec(
             )?),
             None => None,
         };
-        let realloc = match (opts.realloc, resolve_alloc) {
-            (Some(r), true) => Some(resolve_source_realloc(owner, comp_idx, merged, r)?),
-            _ => None,
+        let realloc = match opts.realloc {
+            Some(r) => Some(resolve_source_realloc(owner, comp_idx, merged, r)?),
+            None => None,
         };
         let spec = LowerSpec {
             memory,
