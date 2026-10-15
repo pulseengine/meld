@@ -111,6 +111,31 @@ pub enum Error {
         offset: u32,
     },
 
+    /// A live use of a function import that no resolution step mapped.
+    ///
+    /// A `call`, `ref.func`, or function export that names an import with no
+    /// entry in the fused function-index map would otherwise be encoded with
+    /// the *unmapped* index, which in the fused index space is some unrelated
+    /// function (#462). Only a dead `elem` slot may name such an import (it
+    /// is replaced by a trapping stub); every live use is an error.
+    #[error(
+        "function import {import_module}::{import_name} of component {component}, module \
+         {module} is not resolved to any fused function, but is used by {use_site}; \
+         encoding it would silently call an unrelated function (#462)"
+    )]
+    UnmappedFunctionImport {
+        /// Component index within the fusion input order.
+        component: usize,
+        /// Module index within the component.
+        module: usize,
+        /// The import's module string.
+        import_module: String,
+        /// The import's field name.
+        import_name: String,
+        /// What referenced it (`call`, `ref.func`, `function export "x"`, ...).
+        use_site: String,
+    },
+
     /// Adapter generation error
     #[error("adapter generation failed: {0}")]
     AdapterGeneration(String),

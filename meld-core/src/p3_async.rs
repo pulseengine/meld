@@ -1238,6 +1238,11 @@ fn shift_function_indices(
         *v = bump(*v);
     }
 
+    // #462: trap-stub indices are defined-function indices too.
+    for v in merged.unmapped_import_stubs.values_mut() {
+        *v = bump(*v);
+    }
+
     // realloc map values are function indices
     for v in merged.realloc_map.values_mut() {
         *v = bump(*v);
