@@ -409,3 +409,59 @@ fn one_hop_alias_keeps_plain_core_import_name() {
     let fused = fuse(&bytes).unwrap_or_else(|e| panic!("1-hop `host::log` refused: {e}"));
     assert_eq!(run(&fused).unwrap(), want);
 }
+
+/// ONE memory, two allocators: `cabi_realloc` returns 0, `import_realloc`
+/// returns 100, and the lower names `import_realloc` (the shape wit-component
+/// emits for the WASI preview1 adapter's `cabi_import_realloc`). Which allocator
+/// runs does not depend on the memory count or the strategy. `run` returns
+/// ptr + first byte: 100 + 'f' = 202 (102 if the wrong allocator runs).
+const SINGLE_MEMORY_REALLOC: &str = r#"(component
+  (import "my:h/host" (instance $h (export "get" (func (result string)))))
+  (core module $M
+    (memory (export "mem") 1)
+    (func (export "cabi_realloc") (param i32 i32 i32 i32) (result i32) i32.const 0)
+    (func (export "import_realloc") (param i32 i32 i32 i32) (result i32) i32.const 100))
+  (core module $A
+    (import "env" "mem" (memory 1))
+    (import "host" "get" (func $get (param i32)))
+    (func (export "run") (result i32)
+      (local $p i32)
+      (call $get (i32.const 8))
+      (local.set $p (i32.load (i32.const 8)))
+      (i32.add (local.get $p) (i32.load8_u (local.get $p)))))
+  (core instance $m (instantiate $M))
+  (alias export $h "get" (func $get))
+  (core func $low (canon lower (func $get) (memory $m "mem") (realloc (func $m "import_realloc"))))
+  (core instance $host (export "get" (func $low)))
+  (core instance $envi (export "mem" (memory $m "mem")))
+  (core instance $a (instantiate $A (with "env" (instance $envi)) (with "host" (instance $host))))
+  (func $run (result u32) (canon lift (core func $a "run")))
+  (export "run" (func $run)))"#;
+
+fn fuse_with(bytes: &[u8], strategy: MemoryStrategy) -> Result<Vec<u8>, String> {
+    let mut fuser = Fuser::new(FuserConfig {
+        memory_strategy: strategy,
+        attestation: false,
+        output_format: OutputFormat::Component,
+        ..Default::default()
+    });
+    fuser
+        .add_component_named(bytes, Some("poc.wasm"))
+        .map_err(|e| format!("add: {e:?}"))?;
+    fuser.fuse().map_err(|e| format!("fuse: {e:?}"))
+}
+
+#[test]
+fn lower_realloc_is_the_source_one_with_a_single_memory() {
+    let bytes = wat::parse_str(SINGLE_MEMORY_REALLOC).unwrap();
+    assert_eq!(run(&bytes).unwrap().0, 202, "unfused");
+    for strategy in [MemoryStrategy::MultiMemory, MemoryStrategy::SharedMemory] {
+        let fused = fuse_with(&bytes, strategy)
+            .unwrap_or_else(|e| panic!("{strategy:?}: a resolvable realloc was refused: {e}"));
+        assert_eq!(
+            run(&fused).unwrap().0,
+            202,
+            "{strategy:?}: the lower used a different allocator than its source names"
+        );
+    }
+}
