@@ -127,6 +127,11 @@ pub struct IndexMaps {
     /// (`UnmappedFuncImport::stub`). Empty by default, so partial maps built by
     /// other passes (which never touch function indices) are unaffected.
     pub unmapped_func_imports: HashMap<u32, UnmappedFuncImport>,
+    /// #488: function imports a pending `AdapterSite` will wire after the
+    /// merge (intra-component cycle). An `elem` item naming one keeps a
+    /// placeholder and records its origin; the pre-encode refresh resolves it
+    /// from the final map, and errors if it was never wired.
+    pub pending_wired_func_imports: std::collections::HashSet<u32>,
 }
 
 /// A function import that no resolution step mapped to a fused function.

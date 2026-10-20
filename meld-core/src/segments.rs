@@ -398,6 +398,16 @@ pub struct ReindexedElementSegment {
     pub element_type: RefType,
     /// Function indices (reindexed)
     pub items: ReindexedElementItems,
+    /// For each item, the `(component, module, module-local function index)`
+    /// its fused index was resolved from, or `None` for an item with no
+    /// refreshable origin (a trap stub, a non-`ref.func` expression). Empty
+    /// means no item has one. [`MergedModule::refresh_out_of_body_func_refs`]
+    /// re-resolves every `Some` origin from the FINAL `function_index_map`
+    /// (#488): passes that rewrite the map after the merge (adapter wiring)
+    /// cannot see these items.
+    ///
+    /// [`MergedModule::refresh_out_of_body_func_refs`]: crate::merger::MergedModule::refresh_out_of_body_func_refs
+    pub origins: Vec<Option<(usize, usize, u32)>>,
 }
 
 /// Reindexed element items
@@ -724,7 +734,16 @@ fn remap_ref_type(rt: RefType, maps: &IndexMaps) -> RefType {
 pub fn reindex_element_segment(
     segment: &ParsedElementSegment,
     maps: &IndexMaps,
+    comp_idx: usize,
+    mod_idx: usize,
 ) -> Result<ReindexedElementSegment> {
+    // #488: record where each function item came from. Only items whose value
+    // is (or will be) the map's answer get an origin; a trap stub (#462) does
+    // not, so it stays a stub.
+    let origin = |f: u32| -> Option<(usize, usize, u32)> {
+        (maps.functions.contains_key(&f) || maps.pending_wired_func_imports.contains(&f))
+            .then_some((comp_idx, mod_idx, f))
+    };
     let mode = match &segment.mode {
         ParsedElementSegmentMode::Active {
             table_index,
@@ -737,20 +756,28 @@ pub fn reindex_element_segment(
         ParsedElementSegmentMode::Declared => ElementSegmentMode::Declared,
     };
 
-    let items = match &segment.items {
+    let (items, origins) = match &segment.items {
         ElementItems_::Functions(funcs) => {
+            let origins: Vec<_> = funcs.iter().map(|&f| origin(f)).collect();
             // #462: an item naming an unmapped function import becomes its
             // trapping stub, never the identity index.
             let remapped: Vec<u32> = funcs
                 .iter()
                 .map(|&f| maps.remap_func_elem(f))
                 .collect::<Result<_>>()?;
-            ReindexedElementItems::Functions(remapped)
+            (ReindexedElementItems::Functions(remapped), origins)
         }
         ElementItems_::Expressions(exprs) => {
             // Keep the STRUCTURED, merger-reindexed form so a later
             // function-index shift (P3-async) can still bump `ref.func`.
             // Encoding is deferred to `encode_element_segment`.
+            let origins: Vec<_> = exprs
+                .iter()
+                .map(|e| match e {
+                    ParsedConstExpr::RefFunc(f) => origin(*f),
+                    _ => None,
+                })
+                .collect();
             let remapped: Vec<ParsedConstExpr> = exprs
                 .iter()
                 .map(|e| match e {
@@ -760,7 +787,7 @@ pub fn reindex_element_segment(
                     other => Ok(other.reindex(maps)),
                 })
                 .collect::<Result<_>>()?;
-            ReindexedElementItems::Expressions(remapped)
+            (ReindexedElementItems::Expressions(remapped), origins)
         }
     };
 
@@ -768,6 +795,7 @@ pub fn reindex_element_segment(
         mode,
         element_type: remap_ref_type(segment.element_type, maps),
         items,
+        origins,
     })
 }
 
@@ -1307,7 +1335,7 @@ mod tests {
         let mut maps = IndexMaps::new();
         maps.tables.insert(0, 3);
 
-        let reindexed = reindex_element_segment(&segment, &maps).unwrap();
+        let reindexed = reindex_element_segment(&segment, &maps, 0, 0).unwrap();
         match &reindexed.mode {
             ElementSegmentMode::Active { table_index, .. } => {
                 assert_eq!(
@@ -1333,7 +1361,7 @@ mod tests {
         maps.functions.insert(1, 11);
         maps.functions.insert(2, 12);
 
-        let reindexed = reindex_element_segment(&segment, &maps).unwrap();
+        let reindexed = reindex_element_segment(&segment, &maps, 0, 0).unwrap();
         match &reindexed.items {
             ReindexedElementItems::Functions(funcs) => {
                 assert_eq!(funcs, &[10, 11, 12], "function indices should be remapped");
@@ -1422,7 +1450,7 @@ mod tests {
         let mut maps = IndexMaps::new();
         maps.types.insert(0, 4);
 
-        let reindexed = reindex_element_segment(&segment, &maps).unwrap();
+        let reindexed = reindex_element_segment(&segment, &maps, 0, 0).unwrap();
         let ReindexedElementItems::Expressions(exprs) = &reindexed.items else {
             panic!("expected Expressions variant in reindexed items");
         };
@@ -1460,7 +1488,7 @@ mod tests {
         let mut maps = IndexMaps::new();
         maps.types.insert(0, 4);
 
-        let reindexed = reindex_element_segment(&segment, &maps).unwrap();
+        let reindexed = reindex_element_segment(&segment, &maps, 0, 0).unwrap();
         assert_eq!(
             reindexed.element_type,
             RefType {
@@ -1526,7 +1554,7 @@ mod tests {
         // Reindex with identity maps (single module), re-encode the segment
         // into a fresh module, and validate it.
         let maps = IndexMaps::new();
-        let reindexed = reindex_element_segment(&parsed[0], &maps).unwrap();
+        let reindexed = reindex_element_segment(&parsed[0], &maps, 0, 0).unwrap();
 
         let mut types = wasm_encoder::TypeSection::new();
         types.ty().function([], []);
