@@ -65,6 +65,12 @@ def id_to_test_prefix(ls_id: str) -> str:
 
 
 def load_approved_ids(yaml_path: Path) -> list[str]:
+    # meld#500: NOT migrated to `rivet list --format json`. This file is a rivet
+    # `stpa-yaml` source, but rivet's adapter does not surface the per-scenario
+    # `status:` field (every loss-scenario lists as status "-" in rivet 0.40.0),
+    # and `status: approved` is exactly what this gate filters on. The route is
+    # blocked on pulseengine/rivet#1094 (a subcommand that prints a YAML file as
+    # JSON); once it lands, read this file through it and drop PyYAML here.
     data = yaml.safe_load(yaml_path.read_text())
     scenarios = data.get("loss-scenarios", [])
     return [s["id"] for s in scenarios if s.get("status") == "approved"]
