@@ -46,6 +46,8 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      # Only gen-verification-matrix.py still needs it (traceability.yaml is not
+      # a rivet artifact file; rivet#1094).
       - name: Install PyYAML
         # Self-hosted runners ship Debian/Ubuntu Python with PEP 668
         # protection; `--break-system-packages` is the documented opt-out
@@ -53,8 +55,8 @@ jobs:
         # disposable per workflow run.
         run: pip install --user --break-system-packages pyyaml
 
-      # meld#500: scripts/gen-verification-matrix.py reads requirement titles
-      # through `rivet list --format json`. Same pin and install shape as
+      # meld#500: gen-verification-matrix.py (titles) and run_ls_verification.py
+      # (approved LS ids) read artifacts through `rivet list --format json`. Same pin and install shape as
       # traceability.yml (0.40.0 is the version `list --format json` was
       # verified against).
       - name: Install rivet

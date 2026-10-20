@@ -6,8 +6,8 @@ Each approved loss scenario must have at least one `#[test] fn
 ls_<letter>_<num>_*` in `meld-core` (e.g. `LS-A-11` → `ls_a_11_*`).
 This script:
 
-1. Reads `safety/stpa/loss-scenarios.yaml` and filters entries where
-   `status: approved`.
+1. Reads the project's loss scenarios via `rivet list --format json`
+   (rivet on PATH, or $RIVET) and keeps those with `status: approved`.
 2. For each ID, derives the test-name prefix (`LS-A-11` → `ls_a_11_`)
    and runs `cargo test --lib --no-fail-fast <prefix>`.
 3. Buckets the result as `passed` (≥1 test, all green), `failed` (any
@@ -35,18 +35,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import subprocess
 import sys
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
-
-try:
-    import yaml
-except ImportError:
-    print("PyYAML required (pip install pyyaml)", file=sys.stderr)
-    sys.exit(2)
-
 
 @dataclass
 class Result:
@@ -65,15 +59,25 @@ def id_to_test_prefix(ls_id: str) -> str:
 
 
 def load_approved_ids(yaml_path: Path) -> list[str]:
-    # meld#500: NOT migrated to `rivet list --format json`. This file is a rivet
-    # `stpa-yaml` source, but rivet's adapter does not surface the per-scenario
-    # `status:` field (every loss-scenario lists as status "-" in rivet 0.40.0),
-    # and `status: approved` is exactly what this gate filters on. The route is
-    # blocked on pulseengine/rivet#1094 (a subcommand that prints a YAML file as
-    # JSON); once it lands, read this file through it and drop PyYAML here.
-    data = yaml.safe_load(yaml_path.read_text())
-    scenarios = data.get("loss-scenarios", [])
-    return [s["id"] for s in scenarios if s.get("status") == "approved"]
+    """Approved loss-scenario IDs, read through `rivet list --format json`.
+
+    meld#500 (org policy: read your own inputs through rivet). Needs `rivet`
+    >= 0.40 on PATH, or set $RIVET. rivet loads the project's sources from the
+    repo root (cwd); `yaml_path` is only the file the caller checked exists, it
+    is no longer parsed here. Order is rivet's (sorted by id), not file order.
+    """
+    rivet = os.environ.get("RIVET", "rivet")
+    try:
+        proc = subprocess.run(
+            [rivet, "list", "--type", "loss-scenario", "--format", "json"],
+            capture_output=True, text=True, check=True,
+        )
+    except (OSError, subprocess.CalledProcessError) as e:
+        detail = getattr(e, "stderr", "") or e
+        print(f"`{rivet} list --format json` failed: {detail}", file=sys.stderr)
+        sys.exit(2)
+    return [a["id"] for a in json.loads(proc.stdout)["artifacts"]
+            if a.get("type") == "loss-scenario" and a.get("status") == "approved"]
 
 
 _TEST_LINE = re.compile(r"^test result: (?P<verdict>ok|FAILED)\. "
