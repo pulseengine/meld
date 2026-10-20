@@ -706,9 +706,14 @@ fn the_world_name_runs_the_world_function_not_the_internal_one_sharing_its_name(
     // `svc` (internal, returns 1) and `mid` (the outer world's, returns the
     // imported value + 100) both have a core export `test:x/i#f`, so the merger
     // names the second `test:x/i#f$1`. Under `world`, the name
-    // `test:x/i#f` must run `mid`'s function. The import `mid` calls is served
-    // here by the host with 1, so the world function returns 101 and the
-    // internal one 1.
+    // `test:x/i#f` must run `mid`'s function.
+    //
+    // The composition is closed (`svc` is plugged into `mid`), yet meld leaves
+    // `mid`'s import of `test:x/i` as a HOST import instead of wiring `svc`
+    // (#499, pre-existing, not fixed here). So the host serves it, and with a
+    // value DISTINCT from `svc`'s (5, not 1): a stub returning 1 would make the
+    // internal service and the wired composition look identical and hide that.
+    // The world function returns host + 100.
     use wasmtime::{FuncType, Linker, ValType};
     let mut cfg = config(ExportPolicy::World, false);
     cfg.memory_strategy = MemoryStrategy::MultiMemory;
@@ -716,6 +721,13 @@ fn the_world_name_runs_the_world_function_not_the_internal_one_sharing_its_name(
     let fused = fuse("middleware.wasm", cfg).expect("fuses");
     validate(&fused);
     assert_eq!(export_set(&fused), set(&["func:test:x/i#f"]));
+
+    // Structural: the world name is bound to `mid`'s implementation, the
+    // function that calls the import, not to `svc`'s constant.
+    assert!(
+        export_body_calls_a_function(&fused, "test:x/i#f"),
+        "the world name must bind to the implementation that calls the import"
+    );
 
     let engine = wasmtime_engine();
     let mut linker = Linker::<()>::new(&engine);
@@ -725,7 +737,7 @@ fn the_world_name_runs_the_world_function_not_the_internal_one_sharing_its_name(
             "f",
             FuncType::new(&engine, [], [ValType::I32]),
             |_c, _p, out| {
-                out[0] = wasmtime::Val::I32(1);
+                out[0] = wasmtime::Val::I32(5);
                 Ok(())
             },
         )
@@ -736,7 +748,60 @@ fn the_world_name_runs_the_world_function_not_the_internal_one_sharing_its_name(
         .expect("exported")
         .call(&mut store, ())
         .expect("runs");
-    assert_eq!(got, 101, "the world function, not the internal service (1)");
+    assert_eq!(
+        got, 105,
+        "host (5) + 100: the world function, not the internal service (1)"
+    );
+}
+
+/// Does the function the export `name` points at contain a `call`?
+fn export_body_calls_a_function(wasm: &[u8], name: &str) -> bool {
+    use wasmparser::{ExternalKind, Operator, Parser, Payload, TypeRef};
+    let mut imported_funcs = 0u32;
+    let mut target = None;
+    let mut bodies = Vec::new();
+    for payload in Parser::new(0).parse_all(wasm).flatten() {
+        match payload {
+            Payload::ImportSection(r) => {
+                for imp in r.into_imports().flatten() {
+                    if matches!(imp.ty, TypeRef::Func(_) | TypeRef::FuncExact(_)) {
+                        imported_funcs += 1;
+                    }
+                }
+            }
+            Payload::ExportSection(r) => {
+                for e in r.into_iter().flatten() {
+                    if e.name == name && e.kind == ExternalKind::Func {
+                        target = Some(e.index);
+                    }
+                }
+            }
+            Payload::CodeSectionEntry(b) => bodies.push(b),
+            _ => {}
+        }
+    }
+    let idx = target.expect("the export exists");
+    let body = &bodies[(idx - imported_funcs) as usize];
+    body.get_operators_reader()
+        .unwrap()
+        .into_iter()
+        .flatten()
+        .any(|op| matches!(op, Operator::Call { .. }))
+}
+
+#[test]
+fn a_nested_instance_in_a_world_interface_is_refused_not_skipped() {
+    // `test:y/bag` holds `f` and a nested instance exporting `g`. The unfused
+    // component serves `g`; `world` used to keep only `#f` and exit 0.
+    let err = fuse("nested.wasm", config(ExportPolicy::World, false))
+        .expect_err("an item the walk cannot enumerate must be refused");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("test:y/bag") && msg.contains("nested"),
+        "names the interface and the item: {msg}"
+    );
+    // It fuses without the flag, so the refusal is the flag's.
+    fuse("nested.wasm", config(ExportPolicy::All, false)).expect("fuses without it");
 }
 
 #[test]

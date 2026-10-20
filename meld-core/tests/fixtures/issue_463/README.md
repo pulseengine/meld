@@ -67,5 +67,8 @@ Built from `src/*.wat` with `wasm-tools parse`; `middleware.wasm` is
   names a memory and an allocator.
 - `drop_g`: interface `test:x/i` with `f` (core `test:x/i#f`) and `g` (core
   `impl_g`).
+- `nested.wasm` (sha256 e2f5be95b997b19b9148e3298a71863c04b7ab47ee30255a847c758f87f6f88e):
+  interface `test:y/bag` holding `f` and a nested instance exporting `g`;
+  `--exports world` refuses it.
 - `middleware`: the outer world is `mid`'s `test:x/i`; `svc` is internal; both
   have the core export `test:x/i#f`.

@@ -383,6 +383,15 @@ fn resolve_func<'a>(
     }
 }
 
+/// A world item this walk does not handle (a nested instance, a module, a
+/// component, a value): an error naming it, never a silent skip.
+fn unsupported_item(parent: &str, name: &str, kind: ComponentExternalKind) -> Error {
+    refuse(format!(
+        "world export `{parent}` contains `{name}`, a {kind:?}, which `--exports world` cannot \
+         enumerate; refusing rather than dropping it. Fuse without --exports world."
+    ))
+}
+
 /// Prune `merged.exports` to the outer world of `original_components`.
 ///
 /// `component_to_input` maps each flattened component to the input it came
@@ -432,8 +441,14 @@ pub fn prune_to_world(
                             env,
                         } => {
                             for (fname, kind, fidx) in items {
-                                if *kind == ComponentExternalKind::Func {
-                                    funcs.push((fname.clone(), n, env.clone(), *fidx));
+                                match kind {
+                                    ComponentExternalKind::Func => {
+                                        funcs.push((fname.clone(), n, env.clone(), *fidx));
+                                    }
+                                    ComponentExternalKind::Type => {}
+                                    other => {
+                                        return Err(unsupported_item(&export.name, fname, *other));
+                                    }
                                 }
                             }
                         }
@@ -445,8 +460,14 @@ pub fn prune_to_world(
                         } => {
                             let env2 = with_frame(&env, parent, args);
                             for e in &sub.comp.exports {
-                                if e.kind == ComponentExternalKind::Func {
-                                    funcs.push((e.name.clone(), sub, env2.clone(), e.index));
+                                match e.kind {
+                                    ComponentExternalKind::Func => {
+                                        funcs.push((e.name.clone(), sub, env2.clone(), e.index));
+                                    }
+                                    ComponentExternalKind::Type => {}
+                                    other => {
+                                        return Err(unsupported_item(&export.name, &e.name, other));
+                                    }
                                 }
                             }
                         }
@@ -458,8 +479,10 @@ pub fn prune_to_world(
                         world.push((full, Some(export.name.clone()), lift));
                     }
                 }
-                // Types, modules, components and values have no core export.
-                _ => {}
+                // A type has no core export. Anything else would be a part of the
+                // world this walk cannot enumerate: refuse, never skip.
+                ComponentExternalKind::Type => {}
+                other => return Err(unsupported_item("(world)", &export.name, other)),
             }
         }
     }
