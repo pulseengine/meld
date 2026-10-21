@@ -4,6 +4,15 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+- **`--pack-rebase` leaves a 7-byte guard after each provider's data (SR-102,
+  #479).** A provider's last data byte could sit a few bytes before the next
+  provider's first segment. Translation validators that cannot prove an
+  access's width treat it as up to 8 bytes, so synth's VCR-VER-003 refused a
+  correct packed composite. Each placement now ends with at least 7 bytes that
+  no segment writes, keeping the 16-byte stride; this costs 16 bytes per
+  provider in practice. Output without `--pack-rebase` is unchanged.
+
 ### Added
 - **`--exports world` limits the fused module's exports to the outer world
   of its inputs (SR-100, #463).** For a composed input, the fused core module
