@@ -1415,6 +1415,7 @@ dependencies = [
  "wasmparser 0.246.2",
  "wasmprinter 0.246.2",
  "wasmtime",
+ "wasmtime-environ",
  "wasmtime-wasi",
  "wat",
  "wsc-attestation",

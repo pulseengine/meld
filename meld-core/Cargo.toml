@@ -56,11 +56,24 @@ criterion.workspace = true
 # not just examples). Default features only — pure Rust, wasm-clean, no
 # external solver (z3/cadical stay behind non-default features).
 ordeal = { version = "0.22.1", default-features = false }
+# ADR-8: wasmtime's component translator as a pinned, dev-only DIFFERENTIAL
+# ORACLE for meld's own component resolution (lift/lower canonical options).
+# Pinned `=` to the exact version `wasmtime` above already pulls in, with the
+# features it already enables, so it adds no crate to the graph. Never a
+# runtime dependency; upgraded deliberately (see ADR-8).
+wasmtime-environ = { version = "=41.0.4", features = ["compile", "component-model"] }
 
 [features]
 default = []
 # Enable wsc-attestation integration for supply chain tracking
 attestation = ["wsc-attestation"]
+# ADR-8: compile the wasmtime-environ differential-oracle test and the
+# read-only hook it needs (`Fuser::oracle_index_maps`). Changes no behaviour.
+oracle = []
+
+[[test]]
+name = "oracle_wasmtime_environ"
+required-features = ["oracle"]
 
 [[bench]]
 name = "fusion_benchmarks"
