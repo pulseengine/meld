@@ -11,13 +11,15 @@ the v0.36 traceability-model decision (#303).
 
 Run: python3 scripts/gen-verification-matrix.py  (regenerates docs/verification-matrix.md)
 """
+import json
+import os
+import subprocess
 import sys
 import pathlib
 import yaml
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 TRACE = ROOT / "safety/requirements/traceability.yaml"
-REQS = ROOT / "safety/requirements/safety-requirements.yaml"
 OUT = ROOT / "docs/verification-matrix.md"
 
 
@@ -26,23 +28,34 @@ def load(p):
         return yaml.safe_load(f)
 
 
+def rivet_titles():
+    """id -> title for every artifact, read through `rivet list --format json`.
+
+    meld#500 (org policy: read your own inputs through rivet). Needs `rivet`
+    >= 0.40 on PATH, or set $RIVET. rivet prints load warnings (e.g. an
+    unreachable external) on stderr; stdout is `{"artifacts": [{"id", "title",
+    ...}]}`. `traceability.yaml` above is NOT a rivet artifact file (rivet does
+    not ingest it), so it is still read with PyYAML; moving that is blocked on
+    pulseengine/rivet#1094 (a subcommand that prints a YAML file as JSON).
+    """
+    rivet = os.environ.get("RIVET", "rivet")
+    try:
+        proc = subprocess.run(
+            [rivet, "list", "--format", "json"],
+            cwd=ROOT, capture_output=True, text=True, check=True,
+        )
+    except (OSError, subprocess.CalledProcessError) as e:
+        detail = getattr(e, "stderr", "") or e
+        sys.exit(f"gen-verification-matrix: `{rivet} list --format json` failed: {detail}")
+    return {a["id"]: a.get("title", "") for a in json.loads(proc.stdout)["artifacts"]}
+
+
 def main():
     trace = load(TRACE) or {}
-    reqs = load(REQS) or {}
     vstatus = trace.get("verification-status", {}) or {}
 
-    # SR id -> title (from the requirements file's list structure).
-    titles = {}
-    for r in (reqs.get("requirements") or reqs.get("artifacts") or []):
-        if isinstance(r, dict) and r.get("id"):
-            titles[r["id"]] = r.get("title", "")
-    # Fallback: some repos nest requirements under a top-level key list.
-    if not titles:
-        for v in reqs.values() if isinstance(reqs, dict) else []:
-            if isinstance(v, list):
-                for r in v:
-                    if isinstance(r, dict) and r.get("id"):
-                        titles[r["id"]] = r.get("title", "")
+    # SR id -> title, via rivet (the lookup below only ever asks for SR-*).
+    titles = rivet_titles()
 
     def sr_key(k):
         try:
