@@ -6630,6 +6630,24 @@ impl FactStyleGenerator {
                 func.instruction(&Instruction::End); // block
             }
 
+            // 2d. Conditional (option/result/variant) pointer pairs. These used
+            // to be copied only in the `else if needs_conditional_copy` arm
+            // below, so as soon as a call ALSO had an unconditional pointer
+            // param (`f(a: string, x: option<string>)`) the conditional ones
+            // reached the callee as raw caller-memory addresses: a silently
+            // wrong value, or an out-of-bounds trap. Their positions are
+            // disjoint from `param_ptr_positions`, so the in-place update is
+            // picked up by the `LocalGet(i)` arm of step 3.
+            if needs_conditional_copy {
+                Self::emit_flat_conditional_param_copies(
+                    &mut func,
+                    site,
+                    options,
+                    callee_realloc,
+                    cond_param_scratch_base,
+                );
+            }
+
             // 3. Call target with remapped pointer pairs
             for i in 0..param_count as u32 {
                 if let Some(pair_idx) = param_ptr_positions.iter().position(|&pos| pos == i) {
@@ -13653,6 +13671,32 @@ mod tests {
             issue512_realloc_calls(&merged, &site, 2, "#512 memcopy conditional param"),
             2,
             "#512: outer list realloc + one per-element string realloc in callee memory"
+        );
+    }
+
+    /// #512 sibling, memory-copy adapter with BOTH an unconditional and a
+    /// conditional pointer param: `(a: string, x: option<string>) -> u32`
+    /// (flat: a_ptr, a_len, disc, x_ptr, x_len). Shape `q` of the fixture.
+    /// The conditional copy lived only in the `else` arm of the unconditional
+    /// one, so `x` reached the callee as a raw caller address.
+    #[test]
+    fn issue512_memcopy_mixed_params_copy_the_conditional_pair_too() {
+        use wasm_encoder::ValType::I32;
+        let sig = (vec![I32; 5], vec![I32]);
+        let (merged, mut site) = issue512_cross_memory_site(sig.clone(), sig);
+        site.requirements.pointer_pair_positions = vec![0];
+        site.requirements.param_copy_layouts =
+            vec![crate::resolver::CopyLayout::Bulk { byte_multiplier: 1 }];
+        site.requirements.conditional_pointer_pairs = vec![issue512_cond_pair(
+            2,
+            3,
+            4,
+            crate::resolver::CopyLayout::Bulk { byte_multiplier: 1 },
+        )];
+        assert_eq!(
+            issue512_realloc_calls(&merged, &site, 2, "#512 memcopy mixed params"),
+            2,
+            "one callee realloc for `a`, one for `x`"
         );
     }
 
