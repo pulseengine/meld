@@ -2,7 +2,7 @@
 id: ADR-8
 type: design-question
 title: wasmtime-environ's component translator as a pinned, dev-only differential oracle for meld's component resolution
-status: open
+status: resolved
 gating-fixtures:
   # Run with `cargo test -p meld-core --features oracle --test oracle_wasmtime_environ`
   # (also run by every `--all-features` test run, e.g. the CI coverage job).
@@ -63,17 +63,17 @@ the resolution as a whole.
 
 There is already a second, independent, production-grade implementation of
 exactly this resolution in the dependency graph. meld dev-depends on
-`wasmtime = "41.0.1"` for its runtime tests, and that pulls in
-`wasmtime-environ 41.0.4`. Its component translator inlines a component into
+`wasmtime` for its runtime tests (41.0.1 when this ADR was written, 50.0.0 since #508), and that pulls in
+the matching `wasmtime-environ`. Its component translator inlines a component into
 a flat list of `GlobalInitializer`s and records the `CanonicalOptions` it
 resolved for every lift and lower. meld already mirrors wasmtime on the
 adapter side: the FACT adapter generator follows wasmtime's `fact` module.
 This ADR applies the same idea to resolution, as a cross-check rather than a
 mirror.
 
-## Decision (proposed)
+## Decision
 
-> **Status note.** The direction -- keep meld's own implementation and cross-test it against wasmtime-environ as a pinned, dev-only oracle -- was decided by the maintainer on 2026-10-20. The policy details below (pinning, tie-break, what the oracle must not do) are proposed in this document; the ADR is `open` until they are accepted in review, after which it is promoted to `resolved`.
+> **Status: resolved (2026-10-21).** The direction -- keep meld's own implementation and cross-test it against wasmtime-environ as a pinned, dev-only oracle -- was decided by the maintainer on 2026-10-20, and the policy in this document (pinning, tie-break, what the oracle must not do) was accepted by the maintainer on 2026-10-21 in review of #505. The oracle was moved to wasmtime 50.0.0 together with `wasmtime` in #508, as the policy requires.
 
 meld keeps its own implementation of component resolution: the parser, the
 resolver, the canonical-option resolution in `component_wrap.rs`, and the
@@ -92,7 +92,7 @@ It is never a runtime dependency.
 
 ### Feasibility (spike, 2026-10-21)
 
-Everything the comparison needs is public in `wasmtime-environ 41.0.4`, under
+Everything the comparison needs is public in `wasmtime-environ` (established on 41.0.4; unchanged on 50.0.0, see #508), under
 the `compile` and `component-model` features. `wasmtime` already enables
 both, so the dev-dependency adds no crate and no feature to the graph (checked
 with `cargo tree -e features -i wasmtime-environ`; `Cargo.lock` gains one
@@ -287,7 +287,7 @@ wasmtime) remain the check for that.
 ### Pinning and upgrade policy
 
 - **Pin exactly.** The dev-dependency is
-  `wasmtime-environ = { version = "=41.0.4", features = ["compile", "component-model"] }`,
+  `wasmtime-environ = { version = "=50.0.0", features = ["compile", "component-model"] }`,
   the same version `wasmtime` resolves.
   - wasmtime pins its internal crates with `=`, so any other spec would pull
     a second copy.
@@ -394,9 +394,13 @@ at the next upgrade.
 - `meld-core/tests/oracle_wasmtime_environ.rs`: the harness.
 - `meld-core/src/lib.rs`: `OracleIndexMaps`, `Fuser::oracle_index_maps`
   (feature `oracle`).
-- `wasmtime-environ 41.0.4`: `src/component/translate.rs` (`Translator`),
+- `wasmtime-environ` (paths as of 41.0.4; the same in 50.0.0): `src/component/translate.rs` (`Translator`),
   `src/component/info.rs` (`Component`, `GlobalInitializer`,
   `CanonicalOptions`, `Trampoline`), `src/component/translate/adapt.rs`
   (adapter partitioning; the private `dfg::Adapter`).
 - ADR-1 and ADR-2 (P3 async lowering and error conventions): the constructs
   the later comparison measures.
+
+### Upgrade log
+
+- 2026-10-21, #508: `wasmtime`, `wasmtime-wasi` and `wasmtime-environ` 41 -> 50.0.0. Every compared fact identical (155 agree, 0 disagree; the three known-issue fixtures fail identically). The shipped meld binary's output is byte-identical with the new lockfile.
