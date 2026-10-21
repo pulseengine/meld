@@ -1123,6 +1123,12 @@ fn oracle_wit_bindgen_composed() {
     for (rel, min) in [
         ("compose/composed.wasm", 14),
         ("compose_record/composed_record.wasm", 7),
+        // #512: C wit-bindgen compositions (wasm-tools compose). The oracle
+        // checks the boundary's canonical options, not the bytes the internal
+        // adapter copies — the #512 defect itself is invisible to it; see
+        // `nested_list_string_result_512.rs` for the runtime differential.
+        ("issue_512/cx/composed.wasm", 7),
+        ("issue_512/shapes/composed.wasm", 7),
     ] {
         let bytes = fixture(&format!("../tests/wit_bindgen/fixtures/{rel}"));
         assert_agrees(&format!("{rel} (output)"), &differential(&[&bytes]), min);

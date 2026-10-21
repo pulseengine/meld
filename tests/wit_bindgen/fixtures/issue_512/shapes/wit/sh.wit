@@ -1,0 +1,22 @@
+package demo:sh@0.1.0;
+
+interface s {
+  record wrap { tags: list<string> }
+  record item { name: string, qty: u32, tags: list<string> }
+  a-list: func() -> list<string>;
+  b-rec: func() -> wrap;
+  c-opt-list: func() -> option<list<string>>;
+  d-opt-item: func() -> option<item>;
+  e-opt-str: func() -> option<string>;
+  f-res-list: func() -> result<list<string>, string>;
+  g-opt-wrap: func() -> option<wrap>;
+  h-list-opt-str: func() -> list<option<string>>;
+  p-opt-list: func(x: option<list<string>>) -> string;
+  q-mix: func(a: string, x: option<string>) -> u32;
+  r-opt-list: func(x: option<list<string>>) -> u32;
+}
+
+interface app { run-all: func() -> string; }
+
+world provider { export s; }
+world guest { import s; export app; }
