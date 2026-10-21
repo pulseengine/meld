@@ -4,6 +4,16 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+- **A function table entry for an adapted import no longer bypasses the
+  adapter (SR-101, #488).** Element segment items were remapped when their
+  module was merged, before adapter wiring rewrote the import to its adapter,
+  so a table slot kept the callee: a call through the table skipped the
+  canonical-ABI copy and returned a wrong result at exit 0, and a declarative
+  segment produced invalid output. Element items are now resolved from the
+  final function map just before encoding, with global `ref.func`
+  initialisers.
+
 
 ## [0.63.0] - 2026-10-15
 

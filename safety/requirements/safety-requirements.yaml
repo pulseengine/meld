@@ -3678,3 +3678,23 @@ artifacts:
       model: claude-opus-5-5
       timestamp: 2026-10-15T05:36:17Z
     release: v0.63.0
+
+  - id: SR-101
+    type: sw-req
+    title: Function references outside function bodies are resolved from the final function map
+    status: implemented
+    description: "Element segment items name functions by index, and the merger remaps those indices into the fused index space when it merges a module. For an import that crosses a component boundary through an adapter, the function map still names the callee at that point; adapter wiring rewrites the map entry to the adapter afterwards but rebuilds only function bodies. An active segment therefore kept the callee in its table slot, so a call through the table bypassed the canonical-ABI adapter and a cross-memory string arrived uncopied (#488: 3000 instead of 3090 at exit 0), and a declarative segment kept naming the callee while the body's ref.func named the adapter, so the output failed validation. meld shall resolve every function reference held outside function bodies -- element segment items of every kind and global ref.func initialisers -- from the final function map, after adapter wiring and every other pass that rewrites the map, so that a table slot and a body call of the same import name the same fused function. An origin that is not mapped when references are resolved shall be an error, never the module-local index. A slot that stands for an unmapped import keeps its trapping stub (SR-96)."
+    links:
+      - type: derives-from
+        target: SYS-2
+      - type: refines
+        target: SR-10
+      - type: refines
+        target: SR-98
+      - type: refines
+        target: SR-96
+    provenance:
+      created-by: ai-assisted
+      reviewed-by: avrabe
+      model: claude-opus-5-5
+      timestamp: 2026-10-20T21:15:56Z
