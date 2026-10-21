@@ -54,6 +54,7 @@ fn fuse_shared(a_off: u32, b_off: u32) -> meld_core::Result<Vec<u8>> {
         dwarf_handling: DwarfHandling::Strip,
         output_format: OutputFormat::CoreModule,
         opaque_resources: vec![],
+        ..Default::default()
     };
     let mut f = Fuser::new(cfg);
     f.add_component_named(&a, Some("a")).unwrap();

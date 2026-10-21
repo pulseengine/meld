@@ -66,6 +66,7 @@ fn fuse_remap(input: &[u8]) -> Vec<u8> {
         output_format: OutputFormat::CoreModule,
         opaque_resources: Vec::new(),
         dwarf_handling: DwarfHandling::Remap,
+        ..Default::default()
     });
     fuser
         .add_component_named(input, Some("hello-rust"))
