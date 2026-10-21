@@ -1574,6 +1574,10 @@ impl Fuser {
             stats.boundaries = boundaries;
         }
 
+        // #488: the dissolve analysis below reads element items, so give it the
+        // post-wiring values. Idempotent; repeated before encoding.
+        merged.refresh_out_of_body_func_refs()?;
+
         // Step 3.6: #334 MCU-dissolve fixups (SR-49, `--memory shared` only).
         //
         // Coalesce the N per-provider `__stack_pointer` globals into one
@@ -1592,8 +1596,9 @@ impl Fuser {
         // #482: every pass that rewrites `function_index_map` (resource
         // re-export, task.return shims, stream bridge, adapter wiring) has now
         // run. Re-resolve global `ref.func` initialisers from the FINAL map so
-        // they name what a body `call` of the same index names.
-        merged.refresh_global_ref_funcs()?;
+        // they name what a body `call` of the same index names. #488: the same
+        // for element-segment items.
+        merged.refresh_out_of_body_func_refs()?;
 
         // #463: `--exports world` cuts the export list down to the outer
         // world. Runs after every pass that adds or renumbers exports and
