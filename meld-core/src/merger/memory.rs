@@ -3,6 +3,34 @@
 
 use super::*;
 
+/// #479: bytes of unwritten padding reserved after each packed provider's used
+/// data extent, before the next provider's base (`--pack-rebase`, SR-57, and the
+/// `--share-stack` packing built on it, SR-66/SR-90).
+///
+/// 7 is the widest scalar access (8 bytes: i64/f64) minus one: an access that
+/// STARTS on the last used byte of a provider's data can then end at most
+/// 7 bytes later, still inside the padding, so it can never reach a
+/// neighbour's bytes. Translation validators that over-approximate access
+/// width (synth VCR-VER-003, synth#1563) treat a 1-byte access at the end of a
+/// tight segment as a possible 8-byte one; without the guard they would flag a
+/// correct packed layout as straddling into the next provider. No segment is
+/// ever emitted over the guard, so the runtime image reads 0 there. The stride
+/// is still rounded up to 16 bytes, so the guard costs 7..=22 bytes per
+/// provider. Not applied when `--pack-rebase` is off.
+pub(crate) const PACK_GUARD: u64 = 7;
+
+/// 16-byte alignment keeps `v128` accesses aligned after the uniform `+base`
+/// shift (shared by the pack and share-stack strides).
+const PACK_ALIGN: u64 = 16;
+
+/// Stride of one packed provider whose used data spans `used` bytes:
+/// `align16(used + PACK_GUARD)`. `None` on overflow. The `PACK_GUARD` bytes
+/// after `used` are never covered by a segment (#479).
+fn packed_stride(used: u64) -> Option<u64> {
+    used.checked_add(PACK_GUARD)?
+        .checked_next_multiple_of(PACK_ALIGN)
+}
+
 /// SR-70 / ADR-7: where one module's memory was placed in the fused address
 /// space, and by which rule. The memory-axis twin of `BoundaryRecord` (which
 /// covers the call axis) — together they make ADR-7's "strategy declared,
@@ -158,9 +186,6 @@ impl Merger {
         let mut bases = HashMap::new();
         let mut placements: Vec<PlacementEntry> = Vec::new();
         let mut shared_stack_top: Option<u64> = None;
-        // 16-byte alignment keeps `v128` accesses aligned after the uniform
-        // `+base` shift (shared by the pack and share-stack strides below).
-        const PACK_ALIGN: u64 = 16;
         let overflow =
             || Error::MemoryStrategyUnsupported("shared memory size overflow".to_string());
 
@@ -189,9 +214,7 @@ impl Merger {
                     ));
                 }
                 bases.insert(key, base);
-                let stride = (extent - sp)
-                    .checked_next_multiple_of(PACK_ALIGN)
-                    .ok_or_else(overflow)?;
+                let stride = packed_stride(extent - sp).ok_or_else(overflow)?;
                 placements.push(PlacementEntry {
                     component: key.0,
                     module: key.1,
@@ -253,12 +276,7 @@ impl Merger {
                 // count (the fallback also covers a module whose data offsets
                 // are non-constant and therefore cannot be safely packed).
                 let (stride, strategy) = match (self.pack_rebase, extent) {
-                    (true, Some(bytes)) => (
-                        (*bytes)
-                            .checked_next_multiple_of(PACK_ALIGN)
-                            .ok_or_else(overflow)?,
-                        "packed",
-                    ),
+                    (true, Some(bytes)) => (packed_stride(*bytes).ok_or_else(overflow)?, "packed"),
                     // Also the honest label for a `--pack-rebase` module that
                     // DECLINED to pack (no `__heap_base` marker, or a
                     // passive/no-data region): it really is page-granular, and
@@ -1504,5 +1522,33 @@ mod topology_tests {
             m.check_share_stack_call_topology(&g, &[], &multimodule_entries(), 100)
                 .is_ok()
         );
+    }
+}
+
+#[cfg(test)]
+mod pack_guard_tests {
+    use super::{PACK_ALIGN, PACK_GUARD, packed_stride};
+
+    /// #479: no access of up to 8 bytes starting on a provider's last used
+    /// byte may reach the next provider's base, and strides stay 16-aligned.
+    #[test]
+    fn packed_stride_leaves_the_guard_and_stays_aligned() {
+        assert_eq!(PACK_GUARD, 7);
+        for used in 0..=4096u64 {
+            let stride = packed_stride(used).unwrap();
+            assert_eq!(stride % PACK_ALIGN, 0, "used={used}");
+            // last used byte is `used - 1`; an 8-byte access from it ends at
+            // `used + 6`, which must be < stride (the next base).
+            assert!(stride >= used + PACK_GUARD, "used={used} stride={stride}");
+            // never over-pads by more than one alignment unit
+            assert!(stride < used + PACK_GUARD + PACK_ALIGN, "used={used}");
+        }
+        // The gale shape: a 16-byte-aligned extent used to stride by itself
+        // (no slack at all); it now gains one alignment unit.
+        assert_eq!(packed_stride(16), Some(32));
+        assert_eq!(packed_stride(1), Some(16));
+        assert_eq!(packed_stride(9), Some(16));
+        assert_eq!(packed_stride(10), Some(32));
+        assert_eq!(packed_stride(u64::MAX), None);
     }
 }
