@@ -2,7 +2,7 @@
 id: ADR-8
 type: design-question
 title: wasmtime-environ's component translator as a pinned, dev-only differential oracle for meld's component resolution
-status: proposed
+status: open
 gating-fixtures:
   # Run with `cargo test -p meld-core --features oracle --test oracle_wasmtime_environ`
   # (also run by every `--all-features` test run, e.g. the CI coverage job).
@@ -72,6 +72,8 @@ This ADR applies the same idea to resolution, as a cross-check rather than a
 mirror.
 
 ## Decision (proposed)
+
+> **Status note.** The direction -- keep meld's own implementation and cross-test it against wasmtime-environ as a pinned, dev-only oracle -- was decided by the maintainer on 2026-10-20. The policy details below (pinning, tie-break, what the oracle must not do) are proposed in this document; the ADR is `open` until they are accepted in review, after which it is promoted to `resolved`.
 
 meld keeps its own implementation of component resolution: the parser, the
 resolver, the canonical-option resolution in `component_wrap.rs`, and the
