@@ -22,6 +22,15 @@ All notable changes to this project will be documented in this file.
   where the wrapper already exposes exactly the outer world.
 
 ### Changed
+- **Differential oracle for component resolution (ADR-8, #505, #508).**
+  meld's resolution of each exported lift and lowered host import (memory,
+  realloc, post-return, callback, string encoding, async) is cross-checked
+  against wasmtime-environ's component translator, pinned as a dev-only
+  dependency under the `oracle` feature and run by every `--all-features`
+  test run. It would have caught #481, #484 and #490. The dev-only wasmtime
+  stack moves from 41 to 50.0.0; the lockfile moves `indexmap`, `hashbrown`
+  and `libc` in the shipped binary, whose fused output is byte-identical
+  before and after (measured across the fixture corpus).
 - Tooling: the verification-matrix and loss-scenario scripts read rivet
   artifacts through `rivet list --format json` instead of parsing the YAML
   (#500), and the release-readiness gate runs on rivet 0.40.0; the compliance
