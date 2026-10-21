@@ -331,6 +331,7 @@ fn opt_out_via_config_drops_the_section() {
         output_format: OutputFormat::CoreModule,
         opaque_resources: Vec::new(),
         dwarf_handling: DwarfHandling::Strip,
+        ..Default::default()
     });
     fuser
         .add_component_named(&bytes, Some("auth"))

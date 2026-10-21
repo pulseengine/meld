@@ -73,6 +73,7 @@ fn fuse_fixture(name: &str, output_format: OutputFormat) -> anyhow::Result<Vec<u
         dwarf_handling: meld_core::DwarfHandling::Strip,
         output_format,
         opaque_resources: Vec::new(),
+        ..Default::default()
     };
 
     let mut fuser = Fuser::new(config);
