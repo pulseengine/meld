@@ -762,6 +762,8 @@ mod kani_global_ref_func_482 {
             placements: Vec::new(),
             unmapped_import_stubs: HashMap::new(),
             pending_wired_imports: std::collections::HashSet::new(),
+            import_aliases: Default::default(),
+            import_export_origins: Default::default(),
         }
     }
 

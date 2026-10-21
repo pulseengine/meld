@@ -1557,6 +1557,10 @@ impl Fuser {
         // run. Re-resolve global `ref.func` initialisers from the FINAL map so
         // they name what a body `call` of the same index names.
         merged.refresh_global_ref_funcs()?;
+        // #504: a function export that re-exports a module's own import must
+        // name what a body `call` of that import names (the adapter), not the
+        // callee the merge-time map entry pointed at.
+        merged.refresh_import_exports();
 
         // #463: `--exports world` cuts the export list down to the outer
         // world. Runs after every pass that adds or renumbers exports and
@@ -1959,10 +1963,12 @@ impl Fuser {
                 if (imp.name == site.import_name || imp.module == site.import_name)
                     && (imp.module == site.import_module || imp.name == site.import_module)
                 {
-                    merged
-                        .function_index_map
-                        .insert((comp_idx, mod_idx, import_func_idx), target_idx);
-                    affected_modules.insert((comp_idx, mod_idx));
+                    // #504: also re-points every import that aliases this one
+                    // (another module importing what this module re-exports),
+                    // and returns their modules for the body re-rewrite.
+                    affected_modules.extend(
+                        merged.rewire_import((comp_idx, mod_idx, import_func_idx), target_idx),
+                    );
                     found = true;
                     break;
                 }
@@ -2240,6 +2246,7 @@ impl Fuser {
         // Per-component cursor into comp_taskreturn_types — advances each
         // time we need to claim a TaskReturn entry by ordered position.
         let mut comp_tr_cursor: HashMap<usize, usize> = HashMap::new();
+        let mut shim_rewires: Vec<((usize, usize, u32), u32)> = Vec::new();
 
         for (import_idx, imp) in merged.imports.iter().enumerate() {
             if !imp.name.starts_with("[task-return]") {
@@ -2454,6 +2461,9 @@ impl Fuser {
                             .function_index_map
                             .insert((comp_idx, mod_idx, func_idx), shim_func_idx);
                         affected_modules.insert((comp_idx, mod_idx));
+                        // #504: aliases are followed after the loop (it holds
+                        // a borrow of `merged.imports`).
+                        shim_rewires.push(((comp_idx, mod_idx, func_idx), shim_func_idx));
                     }
                     func_idx += 1;
                 }
@@ -2527,6 +2537,11 @@ impl Fuser {
                     .map(|(g, _)| *g)
                     .collect::<Vec<_>>(),
             );
+        }
+
+        // #504: modules that import what a rewired module re-exports follow it.
+        for (key, shim) in shim_rewires {
+            affected_modules.extend(merged.rewire_import(key, shim));
         }
 
         // Re-rewrite function bodies for affected modules

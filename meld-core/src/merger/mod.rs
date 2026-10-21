@@ -282,6 +282,24 @@ pub struct MergedModule {
     /// they are NOT "unmapped": calls keep the placeholder-then-rewire path.
     pub pending_wired_imports: std::collections::HashSet<(usize, usize, u32)>,
 
+    /// #504: `alias -> source`, both `(component, module, import position in
+    /// the function-import index space)`. Recorded when the intra-component
+    /// fallback resolves a module's import by COPYING another module's map
+    /// entry (module `$cm` imports what module `$bm` re-exports from its own
+    /// import). The copy is taken before adapters exist, so it names the
+    /// callee; when a later pass re-points the source import (adapter wiring,
+    /// resource re-export, task.return shim, stream bridge) every alias must
+    /// follow or the alias bypasses the adapter. Use
+    /// [`MergedModule::rewire_import`], never a bare map insert, for those.
+    pub import_aliases: HashMap<(usize, usize, u32), (usize, usize, u32)>,
+
+    /// #504: exported function name -> the `(component, module, import
+    /// position)` it re-exports. Only recorded for exports whose function is
+    /// an IMPORT of the exporting module, the only ones a later pass can
+    /// re-point. [`MergedModule::refresh_import_exports`] re-resolves them
+    /// from the final `function_index_map`.
+    pub import_export_origins: HashMap<String, (usize, usize, u32)>,
+
     /// SR-66 / #380: under `--share-stack`, the top of the single shared
     /// shadow-stack region (`max_i(sp_i)`, 16-byte-aligned base of the first
     /// provider's data). `None` when `--share-stack` is off. Consumed by
@@ -428,6 +446,51 @@ pub struct MergedExport {
 }
 
 impl MergedModule {
+    /// Point the function import `key` at `target`, and every import that
+    /// aliases it (transitively, #504) at the same target. Returns the
+    /// `(component, module)` of every entry rewritten, `key`'s own first, so
+    /// the caller can add them ALL to its set of modules whose bodies must be
+    /// re-rewritten.
+    pub fn rewire_import(&mut self, key: (usize, usize, u32), target: u32) -> Vec<(usize, usize)> {
+        let mut touched = vec![(key.0, key.1)];
+        self.function_index_map.insert(key, target);
+        let mut stack = vec![key];
+        let mut seen = std::collections::HashSet::new();
+        seen.insert(key);
+        while let Some(src) = stack.pop() {
+            let aliases: Vec<_> = self
+                .import_aliases
+                .iter()
+                .filter(|(_, s)| **s == src)
+                .map(|(a, _)| *a)
+                .collect();
+            for a in aliases {
+                if seen.insert(a) {
+                    self.function_index_map.insert(a, target);
+                    touched.push((a.0, a.1));
+                    stack.push(a);
+                }
+            }
+        }
+        touched
+    }
+
+    /// Re-resolve every function export that re-exports a module import from
+    /// the FINAL `function_index_map` (#504). Call after the last pass that
+    /// rewrites map entries; idempotent.
+    pub fn refresh_import_exports(&mut self) {
+        for e in &mut self.exports {
+            if e.kind != EncoderExportKind::Func {
+                continue;
+            }
+            if let Some(origin) = self.import_export_origins.get(&e.name)
+                && let Some(&fused) = self.function_index_map.get(origin)
+            {
+                e.index = fused;
+            }
+        }
+    }
+
     /// Re-resolve every global `ref.func` initialiser from the current
     /// `function_index_map` (#482). Call after any pass that rewrites map
     /// entries; idempotent. A recorded origin with no mapping is an error.
@@ -696,6 +759,8 @@ impl Merger {
             rewrite_params: HashMap::new(),
             unmapped_import_stubs: HashMap::new(),
             pending_wired_imports: HashSet::new(),
+            import_aliases: Default::default(),
+            import_export_origins: Default::default(),
             shared_stack_top: None,
             stackless_providers: 0,
             placements: Vec::new(),
@@ -897,9 +962,10 @@ impl Merger {
                                 "drop" => ht.drop_func,
                                 _ => unreachable!(),
                             };
-                            merged
-                                .function_index_map
-                                .insert((comp_idx, mod_idx, import_func_idx), target);
+                            // #504: also re-points modules aliasing this import.
+                            affected_modules.extend(
+                                merged.rewire_import((comp_idx, mod_idx, import_func_idx), target),
+                            );
                             changed = true;
                         }
                         import_func_idx += 1;
@@ -912,6 +978,8 @@ impl Merger {
 
             // Re-rewrite function bodies for modules that had resource imports
             // redirected to handle table functions.
+            affected_modules.sort_unstable();
+            affected_modules.dedup();
             for &(comp_idx, mod_idx) in &affected_modules {
                 let module = &components[comp_idx].core_modules[mod_idx];
                 // Regenerates bodies from the original bytes; replay the merge

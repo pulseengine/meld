@@ -649,6 +649,17 @@ impl Merger {
                                 merged
                                     .function_index_map
                                     .insert((comp_idx, mod_idx, import_func_idx), target_idx);
+                                // #504: the entry just copied is only as final as
+                                // the source's. When the exporting module
+                                // re-exports one of ITS OWN imports, a later pass
+                                // may re-point that import (adapter wiring), so
+                                // record the dependency to follow it.
+                                if export.index < module_func_import_count(target_module) {
+                                    merged.import_aliases.insert(
+                                        (comp_idx, mod_idx, import_func_idx),
+                                        (res.component_idx, res.to_module, export.index),
+                                    );
+                                }
                             } else {
                                 log::warn!(
                                     "intra-comp func resolve MISS: comp {} mod {} import {}({}) -> comp {} mod {} export {}[{}] NOT IN function_index_map",
@@ -912,6 +923,15 @@ impl Merger {
                 export.name.clone()
             };
 
+            // #504: a function export that re-exports one of this module's own
+            // imports must follow that import if a later pass re-points it.
+            if export.kind == ExportKind::Function
+                && export.index < module_func_import_count(module)
+            {
+                merged
+                    .import_export_origins
+                    .insert(export_name.clone(), (comp_idx, mod_idx, export.index));
+            }
             merged.exports.push(MergedExport {
                 name: export_name,
                 kind,
@@ -1130,4 +1150,14 @@ impl Merger {
 
         Ok(())
     }
+}
+
+/// Number of function imports of `module` (the size of its function-import
+/// index space).
+fn module_func_import_count(module: &CoreModule) -> u32 {
+    module
+        .imports
+        .iter()
+        .filter(|i| matches!(i.kind, ImportKind::Function(_)))
+        .count() as u32
 }

@@ -13285,6 +13285,8 @@ mod tests {
             rewrite_params: std::collections::HashMap::new(),
             unmapped_import_stubs: std::collections::HashMap::new(),
             pending_wired_imports: std::collections::HashSet::new(),
+            import_aliases: Default::default(),
+            import_export_origins: Default::default(),
             shared_stack_top: None,
             stackless_providers: 0,
             placements: Vec::new(),
