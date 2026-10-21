@@ -564,6 +564,7 @@ fn dead_import_trampoline_export_dropped() {
             },
             element_type: RefType::FUNCREF,
             items: ReindexedElementItems::Functions(vec![0]), // imported func
+            origins: Vec::new(),
         },
         ReindexedElementSegment {
             mode: ElementSegmentMode::Active {
@@ -572,6 +573,7 @@ fn dead_import_trampoline_export_dropped() {
             },
             element_type: RefType::FUNCREF,
             items: ReindexedElementItems::Functions(vec![2]), // defined func
+            origins: Vec::new(),
         },
     ];
 
@@ -693,6 +695,7 @@ fn dead_trampoline_over_trap_stub_table_is_dropped_with_its_table_export() {
         },
         element_type: RefType::FUNCREF,
         items: ReindexedElementItems::Functions(fs),
+        origins: Vec::new(),
     };
     m.elements = vec![seg(0, vec![0, 0]), seg(1, vec![0, 5])];
 

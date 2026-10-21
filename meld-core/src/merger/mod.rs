@@ -517,6 +517,69 @@ impl MergedModule {
         Ok(())
     }
 
+    /// Re-resolve every function reference that lives OUTSIDE a function body
+    /// from the FINAL `function_index_map`: global `ref.func` initialisers
+    /// (#482) and element-segment items, active, passive and declarative
+    /// (#488). Call after the last pass that rewrites map entries; idempotent.
+    ///
+    /// Function bodies are re-extracted by those passes, but these references
+    /// are baked at merge time and cannot be seen by them, so an import that
+    /// adapter wiring later redirected would otherwise keep naming the callee
+    /// (an active slot bypasses the adapter; a declarative one no longer
+    /// matches the body's `ref.func`, which fails validation).
+    ///
+    /// An origin missing from the map is an error, never the identity index.
+    /// Items with no recorded origin (trap stubs, #462) are untouched.
+    pub fn refresh_out_of_body_func_refs(&mut self) -> Result<()> {
+        self.refresh_global_ref_funcs()?;
+        self.refresh_element_func_refs()
+    }
+
+    /// Element-segment half of [`Self::refresh_out_of_body_func_refs`] (#488).
+    pub fn refresh_element_func_refs(&mut self) -> Result<()> {
+        // `generate_task_return_shims` patches element items naming a
+        // `task.return` import with its shim. Its map rewrite covers only
+        // name-matched imports, so reapply the substitution to what the map
+        // resolves to, or this refresh would undo that patch.
+        let import_to_shim: HashMap<u32, u32> = self
+            .task_return_shims
+            .iter()
+            .map(|(import_idx, info)| (*import_idx, info.shim_func))
+            .collect();
+        let map = &self.function_index_map;
+        let resolve = |origin: (usize, usize, u32)| -> Result<u32> {
+            let fused = map.get(&origin).copied().ok_or_else(|| {
+                Error::EncodingError(format!(
+                    "element segment item `func {}` of component {} module {} has no \
+                     fused function mapping",
+                    origin.2, origin.0, origin.1
+                ))
+            })?;
+            Ok(import_to_shim.get(&fused).copied().unwrap_or(fused))
+        };
+        for seg in &mut self.elements {
+            match &mut seg.items {
+                crate::segments::ReindexedElementItems::Functions(funcs) => {
+                    for (item, origin) in funcs.iter_mut().zip(seg.origins.iter()) {
+                        if let Some(origin) = *origin {
+                            *item = resolve(origin)?;
+                        }
+                    }
+                }
+                crate::segments::ReindexedElementItems::Expressions(exprs) => {
+                    for (item, origin) in exprs.iter_mut().zip(seg.origins.iter()) {
+                        if let (crate::segments::ParsedConstExpr::RefFunc(idx), Some(origin)) =
+                            (item, *origin)
+                        {
+                            *idx = resolve(origin)?;
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Look up a defined function by its absolute wasm index.
     /// Returns `None` if the index refers to an imported function.
     pub fn defined_func(&self, wasm_idx: u32) -> Option<&MergedFunction> {

@@ -757,6 +757,28 @@ pub struct Fuser {
     /// fuse sequence would reuse a stale resolution (Mythos finding A,
     /// PR #220 / UCA-M-11).
     requested_memory: Option<(MemoryStrategy, bool)>,
+    /// ADR-8: the merger's index maps from the last fuse, kept for the
+    /// wasmtime-environ differential oracle. Written, never read, by the
+    /// pipeline; compiled only under the dev-only `oracle` feature. A `Mutex`
+    /// because the pipeline writes it through `&self`, so the default build's
+    /// signatures stay exactly as they are.
+    #[cfg(feature = "oracle")]
+    oracle_index_maps: std::sync::Mutex<Option<OracleIndexMaps>>,
+}
+
+/// ADR-8: a read-only snapshot of the merger's index maps, taken just before
+/// the fused core module is (optionally) wrapped as a component. Keys are
+/// `(flattened component index, module index, module-local index)` exactly
+/// as in [`MergedModule`]; values are fused indices. The oracle uses them to
+/// join wasmtime-environ's resolution of the SOURCE component to its
+/// resolution of meld's OUTPUT component.
+#[cfg(feature = "oracle")]
+#[derive(Debug, Clone)]
+pub struct OracleIndexMaps {
+    /// `MergedModule::memory_index_map`.
+    pub memory: std::collections::HashMap<(usize, usize, u32), u32>,
+    /// `MergedModule::function_index_map`.
+    pub function: std::collections::HashMap<(usize, usize, u32), u32>,
 }
 
 impl Fuser {
@@ -770,7 +792,22 @@ impl Fuser {
             component_to_input: Vec::new(),
             wiring_hints: std::collections::HashMap::new(),
             requested_memory: None,
+            #[cfg(feature = "oracle")]
+            oracle_index_maps: std::sync::Mutex::new(None),
         }
+    }
+
+    /// ADR-8: the merger's index maps from the most recent [`Fuser::fuse`]
+    /// that got as far as the (optional) component wrap, for the
+    /// wasmtime-environ differential oracle. `None` before then; a later fuse
+    /// that fails earlier leaves the previous snapshot in place, so read it
+    /// only after a successful fuse. Dev-only (`oracle` feature); read-only.
+    #[cfg(feature = "oracle")]
+    pub fn oracle_index_maps(&self) -> Option<OracleIndexMaps> {
+        self.oracle_index_maps
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// Create a fuser with default configuration
@@ -1537,6 +1574,10 @@ impl Fuser {
             stats.boundaries = boundaries;
         }
 
+        // #488: the dissolve analysis below reads element items, so give it the
+        // post-wiring values. Idempotent; repeated before encoding.
+        merged.refresh_out_of_body_func_refs()?;
+
         // Step 3.6: #334 MCU-dissolve fixups (SR-49, `--memory shared` only).
         //
         // Coalesce the N per-provider `__stack_pointer` globals into one
@@ -1555,8 +1596,9 @@ impl Fuser {
         // #482: every pass that rewrites `function_index_map` (resource
         // re-export, task.return shims, stream bridge, adapter wiring) has now
         // run. Re-resolve global `ref.func` initialisers from the FINAL map so
-        // they name what a body `call` of the same index names.
-        merged.refresh_global_ref_funcs()?;
+        // they name what a body `call` of the same index names. #488: the same
+        // for element-segment items.
+        merged.refresh_out_of_body_func_refs()?;
         // #504: a function export that re-exports a module's own import must
         // name what a body `call` of that import names (the adapter), not the
         // callee the merge-time map entry pointed at.
@@ -1711,6 +1753,18 @@ impl Fuser {
         // defect no matter which merge path produced it. A probe across the
         // full suite confirmed no legitimate fixture trips it.
         segments::check_no_overlapping_data_segments(&output)?;
+
+        // ADR-8: snapshot the index maps for the differential oracle (dev-only).
+        #[cfg(feature = "oracle")]
+        {
+            *self
+                .oracle_index_maps
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = Some(OracleIndexMaps {
+                memory: merged.memory_index_map.clone(),
+                function: merged.function_index_map.clone(),
+            });
+        }
 
         // Optionally wrap the fused core module as a P2 component
         let output = if self.config.output_format == OutputFormat::Component {

@@ -4,8 +4,11 @@
 space (MCU) targets. Plain `--address-rebase` reserves each component's full
 declared page count (a multiple of 64 KiB). `--pack-rebase` instead places each
 component at its actual used data extent — the end of its last data segment,
-rounded up to a 16-byte alignment — and sizes the merged memory to the packed
-total. Three thin drivers that would each claim a 64 KiB page fit in a few KiB.
+plus a 7-byte unwritten guard (#479), rounded up to a 16-byte alignment — and
+sizes the merged memory to the packed total. The guard keeps an access of up to
+8 bytes that starts inside one component's data from reaching its neighbour, so
+width-over-approximating validators (synth VCR-VER-003) stay sound on the packed
+layout; it costs 7 to 22 bytes per component. Three thin drivers that would each claim a 64 KiB page fit in a few KiB.
 
 It implies `--address-rebase` and requires `--memory shared`. It is OPT-IN
 because it is sound only under a strict precondition: the component must

@@ -238,7 +238,9 @@ pub(super) fn build_index_maps_for_module(
             .contains(&(comp_idx, mod_idx, i))
         {
             // Mapped later by `wire_adapter_indices`, which re-rewrites the
-            // body: keep the placeholder behaviour (#462).
+            // body: keep the placeholder behaviour (#462). An `elem` item
+            // naming it is resolved by the pre-encode refresh (#488).
+            maps.pending_wired_func_imports.insert(i);
         } else {
             // #462: no resolution step mapped this import. It must never fall
             // back to the identity index (an unrelated fused function).
