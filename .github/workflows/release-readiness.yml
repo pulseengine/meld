@@ -49,8 +49,12 @@ permissions:
   contents: read
 
 env:
-  # Pinned to match compliance.yml. Bump both together.
-  RIVET_VERSION: v0.22.0
+  # rivet 0.40.0, the version the PR traceability gate uses. Measured against
+  # 0.22.0: identical `rivet release status` verdict and exit code for every
+  # shipped release v0.49.0..v0.63.0; 0.40 additionally fails a release with
+  # NO scoped artifacts, which 0.22 passed vacuously. compliance.yml stays on
+  # 0.22.0 until pulseengine/rivet#1106 (cited-source lists) is resolved.
+  RIVET_VERSION: v0.40.0
 
 jobs:
   readiness:
