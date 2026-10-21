@@ -52,14 +52,14 @@ fn component3(mode: Mode) -> String {
         i32.add))
     (core instance $ai (instantiate $am))
     (func (export "f") (param "s" string) (result u32)
-      (canon lift (core func $ai "f") (memory $ai "mem") (realloc (func $ai "cabi_realloc")))))
+      (canon lift (core func $ai "f") (memory (core memory $ai "mem")) (realloc (core func $ai "cabi_realloc")))))
   (component $B
     (import "f" (func $f (param "s" string) (result u32)))
     (core module $mm
       (memory (export "mem") 1)
       (data (i32.const 100) "Z"))
     (core instance $mi (instantiate $mm))
-    (core func $fl (canon lower (func $f) (memory $mi "mem")))
+    (core func $fl (canon lower (func $f) (memory (core memory $mi "mem"))))
     (core module $bm
       (import "env" "mem" (memory 1))
       (import "env" "f" (func $fi (param i32 i32) (result i32)))
