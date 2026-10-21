@@ -3712,3 +3712,19 @@ artifacts:
       reviewed-by: avrabe
       model: claude-opus-5-5
       timestamp: 2026-10-20T21:15:56Z
+
+  - id: SR-102
+    type: sw-req
+    title: "--pack-rebase leaves a guard after each placement so no 8-byte access reaches a neighbour"
+    status: implemented
+    description: "--pack-rebase places each provider's data at its used extent, rounded to a 16-byte stride, so a provider's last data byte can sit a few bytes before the next provider's first segment. Translation validators that cannot prove the width of an access over-approximate it: synth's VCR-VER-003 treats a constant-address access as possibly 8 bytes wide and checks that the whole span agrees with the runtime image. On gale's five gust:os providers fused with --memory shared --pack-rebase --share-stack, spawn's 1-byte constructor guard ends 3 bytes before timer's first segment, so the assumed span reached timer's bytes and synth refused a correct composite (#479; synth#1563 tracks the width inference). meld shall leave a guard of at least 7 bytes, written by no segment, after each provider's used extent before the next provider's base, keeping the stride 16-byte aligned, so that no access of up to 8 bytes (the widest scalar access) that starts inside one provider's data can reach another provider's bytes. Layouts without --pack-rebase shall be unchanged. The page-granular fallback for a module that declines packing already leaves whole pages and is unchanged."
+    links:
+      - type: derives-from
+        target: SYS-6
+      - type: refines
+        target: SR-57
+    provenance:
+      created-by: ai-assisted
+      reviewed-by: avrabe
+      model: claude-opus-5-5
+      timestamp: 2026-10-21T07:20:28Z
