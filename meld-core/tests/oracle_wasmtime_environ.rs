@@ -136,10 +136,10 @@ fn facts(
     let mut lowered_imports = HashMap::new();
     for init in &c.initializers {
         match init {
-            GlobalInitializer::InstantiateModule(InstantiateModule::Static(m, args)) => {
+            GlobalInitializer::InstantiateModule(InstantiateModule::Static(m, args), _) => {
                 instances.push(Some((*m, &args[..])))
             }
-            GlobalInitializer::InstantiateModule(InstantiateModule::Import(..)) => {
+            GlobalInitializer::InstantiateModule(InstantiateModule::Import(..), _) => {
                 instances.push(None)
             }
             GlobalInitializer::ExtractMemory(e) => {
@@ -181,15 +181,18 @@ fn facts(
     };
 
     let mut lifts = BTreeMap::new();
-    let mut stack: Vec<(String, wasmtime_environ::component::ExportIndex)> =
-        c.exports.raw_iter().map(|(n, i)| (n.clone(), *i)).collect();
+    let mut stack: Vec<(String, wasmtime_environ::component::ExportIndex)> = c
+        .exports
+        .raw_iter()
+        .map(|(n, (i, _))| (n.to_string(), *i))
+        .collect();
     while let Some((path, idx)) = stack.pop() {
         match &c.export_items[idx] {
             Export::LiftedFunction { func, options, .. } => {
                 lifts.insert(path, (resolver.def(func), opts(*options)));
             }
             Export::Instance { exports, .. } => {
-                for (n, i) in exports.raw_iter() {
+                for (n, (i, _)) in exports.raw_iter() {
                     stack.push((format!("{path}/{n}"), *i));
                 }
             }
@@ -264,7 +267,13 @@ impl Resolve<'_, '_> {
                 let module = &self.modules[m].module;
                 let ent = match &e.item {
                     ExportItem::Index(i) => *i,
-                    ExportItem::Name(n) => module.exports[n.as_str()],
+                    ExportItem::Name(n) => {
+                        let atom = module
+                            .strings
+                            .get_atom(n.as_str())
+                            .expect("export name is interned in the module's string pool");
+                        module.exports[&atom]
+                    }
                 };
                 // Imported? Then the instantiation argument at that import's
                 // position is the real definition.
@@ -903,7 +912,7 @@ fn fixture_484(order: &str, lower_opts: &str) -> Vec<u8> {
   (core instance $m (instantiate $M))
   (core instance $b (instantiate $B))
   (alias export $h "log" (func $log))
-  (core func $low (canon lower (func $log) {lower_opts} (memory $m "mem")))
+  (core func $low (canon lower (func $log) {lower_opts} (memory (core memory $m "mem"))))
   (core instance $host (export "log" (func $low)))
   (core instance $envi (export "mem" (memory $m "mem")))
   (core instance $a (instantiate $A (with "env" (instance $envi)) (with "host" (instance $host))))
@@ -947,7 +956,7 @@ fn fixture_484_realloc(order: &str) -> Vec<u8> {
   (core instance $m (instantiate $M))
   (core instance $b (instantiate $B))
   (alias export $h "get" (func $get))
-  (core func $low (canon lower (func $get) (memory $b "mem") (realloc (func $b "cabi_realloc"))))
+  (core func $low (canon lower (func $get) (memory (core memory $b "mem")) (realloc (core func $b "cabi_realloc"))))
   (core instance $host (export "get" (func $low)))
   (core instance $envi (export "mem" (memory $b "mem")))
   (core instance $a (instantiate $A (with "env" (instance $envi)) (with "host" (instance $host))))
@@ -983,7 +992,7 @@ fn fixture_alias_chain(hops: usize) -> Vec<u8> {
   (core instance $b (instantiate $B))
   (core instance $m (instantiate $M))
   (alias export $h "log" (func $log))
-  (core func $low (canon lower (func $log) string-encoding=utf16 (memory $m "mem")))
+  (core func $low (canon lower (func $log) string-encoding=utf16 (memory (core memory $m "mem"))))
   {bags}
   (core instance $envi (export "mem" (memory $m "mem")))
   (core instance $a (instantiate $A (with "env" (instance $envi)) (with "my:h/host" (instance $b{hops}))))
@@ -1011,7 +1020,7 @@ fn fixture_485() -> Vec<u8> {
     (data (i32.const 0) "hello")
     (func (export "run") (result i32) i32.const 0 i32.const 5 call $log))
   (core instance $m (instantiate $M))
-  (core func $low (canon lower (func $log) (memory $m "mem")))
+  (core func $low (canon lower (func $log) (memory (core memory $m "mem"))))
   (core instance $host (export "log" (func $low)))
   (core instance $envi (export "mem" (memory $m "mem")))
   (core instance $a (instantiate $A (with "env" (instance $envi)) (with "host" (instance $host))))

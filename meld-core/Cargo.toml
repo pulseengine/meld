@@ -47,8 +47,8 @@ wasmprinter.workspace = true
 # parse and validate the remapped DWARF in the fused output.
 gimli.workspace = true
 wat = "1.219"
-wasmtime = "41.0.1"
-wasmtime-wasi = "41.0.4"
+wasmtime = "50.0.0"
+wasmtime-wasi = "50.0.0"
 bitflags.workspace = true  # Required for wit-bindgen component bindings
 criterion.workspace = true
 # SR-60 / #344: certificate-checked QF_BV SMT reference oracle for the
@@ -61,7 +61,7 @@ ordeal = { version = "0.22.1", default-features = false }
 # Pinned `=` to the exact version `wasmtime` above already pulls in, with the
 # features it already enables, so it adds no crate to the graph. Never a
 # runtime dependency; upgraded deliberately (see ADR-8).
-wasmtime-environ = { version = "=41.0.4", features = ["compile", "component-model"] }
+wasmtime-environ = { version = "=50.0.0", features = ["compile", "component-model"] }
 
 [features]
 default = []

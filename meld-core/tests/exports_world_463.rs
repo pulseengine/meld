@@ -422,7 +422,6 @@ fn run_unfused() -> [f32; 4] {
     configure
         .call(&mut store, &[cfg], &mut [])
         .expect("configure runs");
-    configure.post_return(&mut store).expect("post-return");
 
     let sensors = rec(&[
         (
@@ -452,7 +451,6 @@ fn run_unfused() -> [f32; 4] {
     let mut results = [Val::Bool(false)];
     step.call(&mut store, &[sensors, target], &mut results)
         .expect("step runs");
-    step.post_return(&mut store).expect("post-return");
     let Val::Record(fields) = &results[0] else {
         panic!("step returns a record, got {:?}", results[0]);
     };

@@ -370,7 +370,7 @@ struct HostCounters {
 /// `Err` (→ wasm trap) on any bit-31-tagged handle reaching the host.
 fn guard(handle: i32, op: &str) -> wasmtime::Result<()> {
     if (handle as u32) & LOCAL_TAG != 0 {
-        anyhow::bail!("bridge-local handle {handle:#x} crossed the host boundary via {op}");
+        wasmtime::bail!("bridge-local handle {handle:#x} crossed the host boundary via {op}");
     }
     Ok(())
 }
