@@ -48,6 +48,10 @@ const TIER_A_CORPUS: &[&str] = &[
     "many-arguments",
     "flavorful",
     "results",
+    // #512: `list<string>` inside option/result/variant params. Its fused
+    // runner failed (ok=false) until conditional pointer pairs were
+    // deep-copied; it was in the corpus but not in this differential.
+    "list-in-variant",
     // Real cross-language command components that print to stdout — the
     // strong differential: fused output must print byte-identical text.
     "release-0.2.0/hello_rust",

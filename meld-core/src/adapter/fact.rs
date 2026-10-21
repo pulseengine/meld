@@ -6416,6 +6416,22 @@ impl FactStyleGenerator {
         } else {
             0 // post-return-only path (no copy needed)
         };
+        // #512: the conditional param copy gets its OWN scratch block, at the
+        // END of the copy scratch so no index above shifts: one dest_ptr plus
+        // 4 locals per nesting level of inner (ptr, len) fixup. It used to
+        // borrow `dest_ptr_local` and declare no fixup locals at all, so the
+        // inner strings of an `option<list<string>>` were never deep-copied.
+        let cond_param_fixup_depth = if needs_conditional_copy {
+            Self::max_cond_fixup_depth(&site.requirements.conditional_pointer_pairs)
+        } else {
+            0
+        };
+        let cond_param_scratch_base = param_count as u32 + copy_scratch_count;
+        let copy_scratch_count = if needs_conditional_copy {
+            copy_scratch_count + 1 + 4 * cond_param_fixup_depth
+        } else {
+            copy_scratch_count
+        };
 
         // Build local declarations: copy scratch (i32) + result save (typed)
         let mut local_decls: Vec<(u32, wasm_encoder::ValType)> = Vec::new();
@@ -6630,55 +6646,13 @@ impl FactStyleGenerator {
             // copy the pointed-to data if the variant is active.
             let callee_realloc = options.callee_realloc.unwrap();
 
-            // We need scratch locals: one dest_ptr per conditional pair
-            // These were NOT allocated in the main scratch pool above,
-            // so we extend the function with extra locals.
-            // NOTE: We handle this by modifying the params in-place using
-            // local.set on the original param slots.
-            for cond in &site.requirements.conditional_pointer_pairs {
-                let ptr_local = cond.ptr_position;
-                let len_local = cond.ptr_position + 1;
-                let byte_mult = match &cond.copy_layout {
-                    crate::resolver::CopyLayout::Bulk { byte_multiplier } => *byte_multiplier,
-                    crate::resolver::CopyLayout::Elements { element_size, .. } => *element_size,
-                };
-                // Param-side (caller → callee) tagged latin1+utf16 string: see
-                // the unconditional param-copy loop above.
-                let is_compact_utf16 =
-                    options.caller_string_encoding == StringEncoding::Latin1 && byte_mult == 1;
-                let realloc_align = if is_compact_utf16 { 2 } else { 1 };
-
-                // if (all guards in chain hold) { copy and replace ptr }
-                // — outer-guard ANDing matters for nested option/result/variant
-                // payloads where reading only the inner disc byte could be
-                // sampling unrelated payload bytes in another arm (LS-P-10).
-                emit_conditional_guard_chain_flat(&mut func, cond, 0);
-                func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
-
-                // Allocate: new_ptr = cabi_realloc(0, 0, align, <byte count>)
-                emit_overflow_guard(&mut func, len_local, byte_mult);
-                func.instruction(&Instruction::I32Const(0));
-                func.instruction(&Instruction::I32Const(0));
-                func.instruction(&Instruction::I32Const(realloc_align));
-                emit_copy_byte_count(&mut func, len_local, byte_mult, is_compact_utf16);
-                // Save as dest_ptr (reuse a scratch local)
-                emit_checked_realloc(&mut func, callee_realloc, dest_ptr_local);
-
-                // Copy: memory.copy callee caller (dest, src, <byte count>)
-                func.instruction(&Instruction::LocalGet(dest_ptr_local));
-                func.instruction(&Instruction::LocalGet(ptr_local));
-                emit_copy_byte_count(&mut func, len_local, byte_mult, is_compact_utf16);
-                func.instruction(&Instruction::MemoryCopy {
-                    src_mem: options.caller_memory,
-                    dst_mem: options.callee_memory,
-                });
-
-                // Replace the original ptr with the new ptr in callee memory
-                func.instruction(&Instruction::LocalGet(dest_ptr_local));
-                func.instruction(&Instruction::LocalSet(ptr_local));
-
-                func.instruction(&Instruction::End); // end if
-            }
+            Self::emit_flat_conditional_param_copies(
+                &mut func,
+                site,
+                options,
+                callee_realloc,
+                cond_param_scratch_base,
+            );
 
             // Pass all args through (with modified ptr values)
             for i in 0..param_count {
@@ -7270,7 +7244,15 @@ impl FactStyleGenerator {
         // Compute fixup depth: each nesting level needs 4 scratch locals
         let param_fixup_depth = Self::max_fixup_depth(&site.requirements.param_copy_layouts);
         let result_fixup_depth = Self::max_fixup_depth(&site.requirements.result_copy_layouts);
-        let max_fixup_depth = param_fixup_depth.max(result_fixup_depth);
+        // #512: conditional pairs (option/result/variant payloads) need the
+        // same per-level scratch as unconditional ones (Phase 1b / 5b).
+        let cond_fixup_depth =
+            Self::max_cond_fixup_depth(&site.requirements.conditional_pointer_pairs).max(
+                Self::max_cond_fixup_depth(&site.requirements.conditional_result_pointer_pairs),
+            );
+        let max_fixup_depth = param_fixup_depth
+            .max(result_fixup_depth)
+            .max(cond_fixup_depth);
 
         let has_cond_param_pairs = !site.requirements.conditional_pointer_pairs.is_empty();
         let has_cond_result_pairs = !site
@@ -7586,6 +7568,22 @@ impl FactStyleGenerator {
                     dst_mem: options.callee_memory,
                 });
 
+                // #512: deep-copy the buffer's inner (ptr, len) pairs, e.g.
+                // the strings of an `option<list<string>>` param.
+                Self::emit_conditional_inner_fixup(
+                    &mut func,
+                    cond,
+                    ptr_local,           // src_base (caller's original)
+                    cond_dest_ptr_local, // dst_base (callee's copy)
+                    len_local,           // count
+                    options.caller_memory,
+                    options.callee_memory,
+                    callee_realloc,
+                    fixup_locals_base,
+                    // Param-side: governed by the caller's string encoding.
+                    options.caller_string_encoding == StringEncoding::Latin1,
+                );
+
                 // Replace ptr with callee's copy
                 func.instruction(&Instruction::LocalGet(cond_dest_ptr_local));
                 func.instruction(&Instruction::LocalSet(ptr_local));
@@ -7866,6 +7864,24 @@ impl FactStyleGenerator {
                     dst_mem: options.caller_memory,
                 });
 
+                // #512: deep-copy the buffer's inner (ptr, len) pairs — the
+                // strings of `tags: list<string>` inside a returned
+                // `option<record>`. Must run before Phase 6 post-return,
+                // which frees the callee's source buffers.
+                Self::emit_conditional_inner_fixup(
+                    &mut func,
+                    cond,
+                    data_ptr_local,       // src_base (callee's original)
+                    caller_new_ptr_local, // dst_base (caller's copy)
+                    data_len_local,       // count
+                    options.callee_memory,
+                    options.caller_memory,
+                    caller_realloc,
+                    fixup_locals_base,
+                    // Result-side: governed by the callee's string encoding.
+                    options.callee_string_encoding == StringEncoding::Latin1,
+                );
+
                 // Write fixed-up ptr to caller's retptr
                 func.instruction(&Instruction::LocalGet(retptr_local));
                 func.instruction(&Instruction::LocalGet(caller_new_ptr_local));
@@ -7911,6 +7927,146 @@ impl FactStyleGenerator {
             }
         }
         layouts.iter().map(depth).max().unwrap_or(0)
+    }
+
+    /// [`Self::max_fixup_depth`] over the copy layouts of conditional
+    /// (option/result/variant payload) pointer pairs.
+    ///
+    /// #512: these layouts were never counted, so an adapter whose ONLY
+    /// nested indirection sat behind a discriminant (`option<list<string>>`)
+    /// declared no fixup scratch locals at all — and no fixup was emitted.
+    fn max_cond_fixup_depth(conds: &[crate::resolver::ConditionalPointerPair]) -> u32 {
+        conds
+            .iter()
+            .map(|c| Self::max_fixup_depth(std::slice::from_ref(&c.copy_layout)))
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// Deep-copy the per-element inner (ptr, len) pairs of a conditional
+    /// pointer pair's buffer, after that buffer has been bulk-copied from
+    /// `src_base` to `dst_base`.
+    ///
+    /// #512: the conditional copy paths copied the OUTER buffer only. For a
+    /// `list<string>` behind an option/result/variant discriminant (e.g. the
+    /// `tags` field of a returned `option<record { .., tags: list<string> }>`)
+    /// that copies the array of `(ptr, len)` string descriptors verbatim, so
+    /// every descriptor in the destination still holds a SOURCE-memory
+    /// address. The fused module validated, ran at exit 0, and the reader
+    /// saw whatever bytes happened to live at those addresses in its own
+    /// memory — the reporter saw empty strings. The unconditional pair paths
+    /// have always done this fixup; the conditional ones now do the same.
+    ///
+    /// No-op for `Bulk` layouts and for `Elements` without inner pointers.
+    #[allow(clippy::too_many_arguments)]
+    fn emit_conditional_inner_fixup(
+        func: &mut Function,
+        cond: &crate::resolver::ConditionalPointerPair,
+        src_base_local: u32,
+        dst_base_local: u32,
+        count_local: u32,
+        src_mem: u32,
+        dst_mem: u32,
+        realloc_func: u32,
+        locals_base: u32,
+        is_compact_utf16: bool,
+    ) {
+        if let crate::resolver::CopyLayout::Elements {
+            element_size,
+            inner_pointers,
+            ..
+        } = &cond.copy_layout
+            && !inner_pointers.is_empty()
+        {
+            Self::emit_inner_pointer_fixup(
+                func,
+                inner_pointers,
+                *element_size,
+                src_base_local,
+                dst_base_local,
+                count_local,
+                src_mem,
+                dst_mem,
+                realloc_func,
+                locals_base,
+                is_compact_utf16,
+            );
+        }
+    }
+
+    /// Memory-copy adapter: copy every conditional (option/result/variant
+    /// payload) pointer pair among the FLAT params into callee memory,
+    /// replacing each param's pointer local in place when its guard chain
+    /// holds.
+    ///
+    /// `scratch_base` is a block of `1 + 4 * max_cond_fixup_depth` i32 locals
+    /// reserved for this copy alone: `+0` is the destination pointer, `+1..`
+    /// the inner-fixup levels (#512).
+    fn emit_flat_conditional_param_copies(
+        func: &mut Function,
+        site: &AdapterSite,
+        options: &AdapterOptions,
+        callee_realloc: u32,
+        scratch_base: u32,
+    ) {
+        let dest_ptr_local = scratch_base;
+        for cond in &site.requirements.conditional_pointer_pairs {
+            let ptr_local = cond.ptr_position;
+            let len_local = cond.ptr_position + 1;
+            let byte_mult = match &cond.copy_layout {
+                crate::resolver::CopyLayout::Bulk { byte_multiplier } => *byte_multiplier,
+                crate::resolver::CopyLayout::Elements { element_size, .. } => *element_size,
+            };
+            // Param-side (caller → callee) tagged latin1+utf16 string: see
+            // the unconditional param-copy loop in the memory-copy adapter.
+            let is_compact_utf16 =
+                options.caller_string_encoding == StringEncoding::Latin1 && byte_mult == 1;
+            let realloc_align = if is_compact_utf16 { 2 } else { 1 };
+
+            // if (all guards in chain hold) { copy and replace ptr }
+            // — outer-guard ANDing matters for nested option/result/variant
+            // payloads where reading only the inner disc byte could be
+            // sampling unrelated payload bytes in another arm (LS-P-10).
+            emit_conditional_guard_chain_flat(func, cond, 0);
+            func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+
+            // Allocate: new_ptr = cabi_realloc(0, 0, align, <byte count>)
+            emit_overflow_guard(func, len_local, byte_mult);
+            func.instruction(&Instruction::I32Const(0));
+            func.instruction(&Instruction::I32Const(0));
+            func.instruction(&Instruction::I32Const(realloc_align));
+            emit_copy_byte_count(func, len_local, byte_mult, is_compact_utf16);
+            emit_checked_realloc(func, callee_realloc, dest_ptr_local);
+
+            // Copy: memory.copy callee caller (dest, src, <byte count>)
+            func.instruction(&Instruction::LocalGet(dest_ptr_local));
+            func.instruction(&Instruction::LocalGet(ptr_local));
+            emit_copy_byte_count(func, len_local, byte_mult, is_compact_utf16);
+            func.instruction(&Instruction::MemoryCopy {
+                src_mem: options.caller_memory,
+                dst_mem: options.callee_memory,
+            });
+
+            // #512: deep-copy the buffer's inner (ptr, len) pairs.
+            Self::emit_conditional_inner_fixup(
+                func,
+                cond,
+                ptr_local,      // src_base (caller's original)
+                dest_ptr_local, // dst_base (callee's copy)
+                len_local,      // count
+                options.caller_memory,
+                options.callee_memory,
+                callee_realloc,
+                scratch_base + 1,
+                options.caller_string_encoding == StringEncoding::Latin1,
+            );
+
+            // Replace the original ptr with the new ptr in callee memory
+            func.instruction(&Instruction::LocalGet(dest_ptr_local));
+            func.instruction(&Instruction::LocalSet(ptr_local));
+
+            func.instruction(&Instruction::End); // end if
+        }
     }
 
     /// Emit the per-element discriminant-guard chain for an inner-resource
@@ -13351,6 +13507,153 @@ mod tests {
         // entirely self-contained (no indirections, no post-return).
         site.requirements.return_area_byte_size = Some(16);
         (merged, site)
+    }
+
+    /// #512 fixture: a cross-memory site with the given caller (lowered) and
+    /// callee (lifted) core signatures. Callee lift = merged func 0; caller
+    /// realloc = merged func 1 (component 0, memory 0); callee realloc =
+    /// merged func 2 (component 1, memory 1).
+    fn issue512_cross_memory_site(
+        caller: (Vec<wasm_encoder::ValType>, Vec<wasm_encoder::ValType>),
+        callee: (Vec<wasm_encoder::ValType>, Vec<wasm_encoder::ValType>),
+    ) -> (crate::merger::MergedModule, crate::resolver::AdapterSite) {
+        use crate::merger::{MergedFuncType, MergedFunction};
+        use wasm_encoder::ValType;
+        let mut merged = empty_merged();
+        merged.types.push(MergedFuncType {
+            params: callee.0,
+            results: callee.1,
+        }); // type 0: callee
+        merged.types.push(MergedFuncType {
+            params: caller.0,
+            results: caller.1,
+        }); // type 1: caller
+        merged.types.push(MergedFuncType {
+            params: vec![ValType::I32; 4],
+            results: vec![ValType::I32],
+        }); // type 2: cabi_realloc
+        for (type_idx, origin) in [(0, (1, 0, 0)), (2, (0, 0, 1)), (2, (1, 0, 1))] {
+            merged.functions.push(MergedFunction {
+                type_idx,
+                body: Function::new([]),
+                origin,
+                synthetic_kind: None,
+            });
+        }
+        merged.function_index_map.insert((1, 0, 0), 0);
+        merged.type_index_map.insert((0, 0, 0), 1);
+        merged.realloc_map.insert((0, 0), 1);
+        merged.realloc_map.insert((1, 0), 2);
+        merged.memory_index_map.insert((0, 0, 0), 0);
+        merged.memory_index_map.insert((1, 0, 0), 1);
+        let site = crate::resolver::AdapterSite {
+            from_component: 0,
+            from_module: 0,
+            import_name: "get".into(),
+            import_module: "demo:cx/store@0.1.0".into(),
+            import_func_type_idx: Some(0),
+            to_component: 1,
+            to_module: 0,
+            export_name: "get".into(),
+            export_func_idx: 0,
+            crosses_memory: true,
+            is_async_lift: false,
+            requirements: Default::default(),
+        };
+        (merged, site)
+    }
+
+    /// `list<string>`: 8-byte `(ptr, len)` elements, each a byte string.
+    fn issue512_list_string_layout() -> crate::resolver::CopyLayout {
+        crate::resolver::CopyLayout::Elements {
+            element_size: 8,
+            inner_pointers: vec![crate::resolver::InnerPointer::unconditional(
+                0,
+                crate::resolver::CopyLayout::Bulk { byte_multiplier: 1 },
+            )],
+            inner_resources: Vec::new(),
+        }
+    }
+
+    fn issue512_cond_pair(
+        disc: u32,
+        ptr: u32,
+        disc_size: u32,
+        layout: crate::resolver::CopyLayout,
+    ) -> crate::resolver::ConditionalPointerPair {
+        crate::resolver::ConditionalPointerPair {
+            discriminant_position: disc,
+            discriminant_value: 1,
+            ptr_position: ptr,
+            copy_layout: layout,
+            discriminant_byte_size: disc_size,
+            outer_guards: Vec::new(),
+        }
+    }
+
+    /// Generate the adapter, check every referenced local is declared, and
+    /// return how many times it calls merged function `realloc`.
+    fn issue512_realloc_calls(
+        merged: &crate::merger::MergedModule,
+        site: &crate::resolver::AdapterSite,
+        realloc: u32,
+        label: &str,
+    ) -> usize {
+        let gen_ = FactStyleGenerator::new(AdapterConfig::default());
+        let empty = std::collections::HashMap::new();
+        let adapter = gen_
+            .generate_adapter(site, merged, 0, &empty, &empty)
+            .expect("adapter generation");
+        let raw = adapter.body.clone().into_raw_body();
+        let fb = wasmparser::FunctionBody::new(wasmparser::BinaryReader::new(&raw, 0));
+        let calls = fb
+            .get_operators_reader()
+            .expect("operators")
+            .into_iter()
+            .filter(|op| {
+                matches!(op, Ok(wasmparser::Operator::Call { function_index }) if *function_index == realloc)
+            })
+            .count();
+        assert_locals_within_budget(adapter.body, site_caller_param_count(site, merged), label);
+        calls
+    }
+
+    /// #512, the reported shape: `-> option<list<string>>` (and every
+    /// `option<record{.., list<string>}>`) through the retptr adapter's
+    /// conditional result copy (Phase 5b). One realloc for the outer
+    /// descriptor array is not enough: each string needs its own, in the
+    /// CALLER's memory. Before the fix the inner fixup was never emitted.
+    #[test]
+    fn issue512_retptr_conditional_result_list_string_is_deep_copied() {
+        use wasm_encoder::ValType::I32;
+        // caller: (retptr) -> ();  callee: () -> i32 (return area ptr)
+        let (merged, mut site) =
+            issue512_cross_memory_site((vec![I32], vec![]), (vec![], vec![I32]));
+        // return area: disc u8 @0, list (ptr, len) @4..12
+        site.requirements.return_area_byte_size = Some(12);
+        site.requirements.conditional_result_pointer_pairs =
+            vec![issue512_cond_pair(0, 4, 1, issue512_list_string_layout())];
+        assert_eq!(
+            issue512_realloc_calls(&merged, &site, 1, "#512 retptr Phase 5b"),
+            2,
+            "#512: outer list realloc + one per-element string realloc in caller memory"
+        );
+    }
+
+    /// #512, param side, memory-copy adapter: `(option<list<string>>) -> u32`
+    /// (flat: disc, ptr, len). Shape `r` of the fixture.
+    #[test]
+    fn issue512_memcopy_conditional_param_list_string_is_deep_copied() {
+        use wasm_encoder::ValType::I32;
+        let sig = (vec![I32, I32, I32], vec![I32]);
+        let (merged, mut site) = issue512_cross_memory_site(sig.clone(), sig);
+        site.requirements.conditional_pointer_pairs =
+            vec![issue512_cond_pair(0, 1, 4, issue512_list_string_layout())];
+        assert_eq!(
+            issue512_realloc_calls(&merged, &site, 2, "#512 memcopy conditional param"),
+            2,
+            "#512: outer list realloc + one per-element string realloc in callee memory"
+        );
     }
 
     /// #390 — the fix, both halves.
