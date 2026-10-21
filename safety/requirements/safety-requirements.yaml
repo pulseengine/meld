@@ -3682,7 +3682,7 @@ artifacts:
   - id: SR-100
     type: sw-req
     title: "--exports world limits the fused module's exports to the outer world of its inputs"
-    status: implemented
+    status: verified
     description: "When the input is a composition, the fused core module exports every export of every inner module, including interfaces that the composition wires internally and never exposes, link-time markers such as __heap_base and __data_end, and toolchain allocators. A consumer that wants exactly the composed component's public surface, such as synth building an embedded image, must prune these by hand (#463, reported by cpetig for a wac-composed cascade). meld shall offer --exports world, which keeps only the exports that implement the outer world of the input components, together with what those exports need: the memory or memories the kept lifts use, the realloc and post-return functions they name, the destructors of resources in kept interfaces, and the start function. Other exports shall be removed from the export list only; function bodies are untouched. Membership shall be decided by tracing each world function to its canon lift and the fused function that implements it, never by export name or prefix; a world function with no fused export, or a world name claimed by two functions, shall be an error naming it, never silently dropped. Each world function shall be exported under its world name, so that name runs the world implementation even when an internal component exports a function of the same name. Exports needed by the imports the fused module still has shall also be kept: the memory and realloc of each remaining import's canon lower, and the destructors of resources whose intrinsics are still imported. A needed allocator that nothing exports shall be exported as meld:realloc/<component>. The default, --exports all, shall produce output byte-identical to the behaviour before this option existed. The option shall be refused with --component, where the wrapper already exposes exactly the outer world and pruning the core exports could remove functions the wrapper wires. The chosen policy shall be recorded in the attestation, in every build configuration, whenever it is not the default. Known limits: an exported interface with no functions is refused; with several inputs the world is the union of their exports; a destructor for a resource defined outside the world but handed out by a kept function is not specially handled."
     links:
       - type: derives-from
@@ -3692,11 +3692,12 @@ artifacts:
       reviewed-by: avrabe
       model: claude-opus-5-5
       timestamp: 2026-10-15T20:52:26Z
+    release: v0.64.0
 
   - id: SR-101
     type: sw-req
     title: Function references outside function bodies are resolved from the final function map
-    status: implemented
+    status: verified
     description: "Element segment items name functions by index, and the merger remaps those indices into the fused index space when it merges a module. For an import that crosses a component boundary through an adapter, the function map still names the callee at that point; adapter wiring rewrites the map entry to the adapter afterwards but rebuilds only function bodies. An active segment therefore kept the callee in its table slot, so a call through the table bypassed the canonical-ABI adapter and a cross-memory string arrived uncopied (#488: 3000 instead of 3090 at exit 0), and a declarative segment kept naming the callee while the body's ref.func named the adapter, so the output failed validation. meld shall resolve every function reference held outside function bodies -- element segment items of every kind and global ref.func initialisers -- from the final function map, after adapter wiring and every other pass that rewrites the map, so that a table slot and a body call of the same import name the same fused function. An origin that is not mapped when references are resolved shall be an error, never the module-local index. A slot that stands for an unmapped import keeps its trapping stub (SR-96)."
     links:
       - type: derives-from
@@ -3712,11 +3713,12 @@ artifacts:
       reviewed-by: avrabe
       model: claude-opus-5-5
       timestamp: 2026-10-20T21:15:56Z
+    release: v0.64.0
 
   - id: SR-102
     type: sw-req
     title: "--pack-rebase leaves a guard after each placement so no 8-byte access reaches a neighbour"
-    status: implemented
+    status: verified
     description: "--pack-rebase places each provider's data at its used extent, rounded to a 16-byte stride, so a provider's last data byte can sit a few bytes before the next provider's first segment. Translation validators that cannot prove the width of an access over-approximate it: synth's VCR-VER-003 treats a constant-address access as possibly 8 bytes wide and checks that the whole span agrees with the runtime image. On gale's five gust:os providers fused with --memory shared --pack-rebase --share-stack, spawn's 1-byte constructor guard ends 3 bytes before timer's first segment, so the assumed span reached timer's bytes and synth refused a correct composite (#479; synth#1563 tracks the width inference). meld shall leave a guard of at least 7 bytes, written by no segment, after each provider's used extent before the next provider's base, keeping the stride 16-byte aligned, so that no access of up to 8 bytes (the widest scalar access) that starts inside one provider's data can reach another provider's bytes. Layouts without --pack-rebase shall be unchanged. The page-granular fallback for a module that declines packing already leaves whole pages and is unchanged."
     links:
       - type: derives-from
@@ -3728,6 +3730,7 @@ artifacts:
       reviewed-by: avrabe
       model: claude-opus-5-5
       timestamp: 2026-10-21T07:20:28Z
+    release: v0.64.0
 
   - id: SR-103
     type: sw-req
