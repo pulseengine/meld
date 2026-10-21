@@ -3679,6 +3679,20 @@ artifacts:
       timestamp: 2026-10-15T05:36:17Z
     release: v0.63.0
 
+  - id: SR-100
+    type: sw-req
+    title: "--exports world limits the fused module's exports to the outer world of its inputs"
+    status: implemented
+    description: "When the input is a composition, the fused core module exports every export of every inner module, including interfaces that the composition wires internally and never exposes, link-time markers such as __heap_base and __data_end, and toolchain allocators. A consumer that wants exactly the composed component's public surface, such as synth building an embedded image, must prune these by hand (#463, reported by cpetig for a wac-composed cascade). meld shall offer --exports world, which keeps only the exports that implement the outer world of the input components, together with what those exports need: the memory or memories the kept lifts use, the realloc and post-return functions they name, the destructors of resources in kept interfaces, and the start function. Other exports shall be removed from the export list only; function bodies are untouched. Membership shall be decided by tracing each world function to its canon lift and the fused function that implements it, never by export name or prefix; a world function with no fused export, or a world name claimed by two functions, shall be an error naming it, never silently dropped. Each world function shall be exported under its world name, so that name runs the world implementation even when an internal component exports a function of the same name. Exports needed by the imports the fused module still has shall also be kept: the memory and realloc of each remaining import's canon lower, and the destructors of resources whose intrinsics are still imported. A needed allocator that nothing exports shall be exported as meld:realloc/<component>. The default, --exports all, shall produce output byte-identical to the behaviour before this option existed. The option shall be refused with --component, where the wrapper already exposes exactly the outer world and pruning the core exports could remove functions the wrapper wires. The chosen policy shall be recorded in the attestation, in every build configuration, whenever it is not the default. Known limits: an exported interface with no functions is refused; with several inputs the world is the union of their exports; a destructor for a resource defined outside the world but handed out by a kept function is not specially handled."
+    links:
+      - type: derives-from
+        target: SYS-4
+    provenance:
+      created-by: ai-assisted
+      reviewed-by: avrabe
+      model: claude-opus-5-5
+      timestamp: 2026-10-15T20:52:26Z
+
   - id: SR-101
     type: sw-req
     title: Function references outside function bodies are resolved from the final function map

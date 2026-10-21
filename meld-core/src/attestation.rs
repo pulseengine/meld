@@ -134,6 +134,14 @@ pub struct FusionParameters {
     /// reader checking an isolation claim checks this first.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub domains: Vec<Vec<usize>>,
+    /// #463: the core module's export policy. Absent means the default
+    /// (`all`: every export of every inner module is kept, which is the
+    /// behaviour before the flag existed and keeps default records
+    /// byte-identical); `world` means the export list was cut down to the
+    /// outer component's world, so a consumer knows the missing exports were
+    /// removed on purpose rather than lost.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exports: Option<String>,
 }
 
 /// Fusion-specific metadata
@@ -722,6 +730,7 @@ mod tests {
             output_format: "core-module".to_string(),
             reproducible: true,
             domains: Vec::new(),
+            exports: None,
         };
         let stats = FusionStats::default();
         let attestation = FusionAttestationBuilder::new("meld", "0.1.0")
@@ -780,6 +789,20 @@ mod tests {
             metadata.get("memory_strategy").is_some(),
             "metadata.memory_strategy missing from serialized attestation"
         );
+    }
+
+    /// #463: the export policy is recorded only when it is not the default, so
+    /// a default record stays byte-identical to what it was before the flag.
+    #[test]
+    fn export_policy_is_recorded_only_when_not_default() {
+        let default = serde_json::to_string(&FusionParameters::default()).unwrap();
+        assert!(!default.contains("exports"), "{default}");
+        let world = FusionParameters {
+            exports: Some("world".to_string()),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&world).unwrap();
+        assert!(json.contains("\"exports\":\"world\""), "{json}");
     }
 
     /// SR-29: Attestation round-trip — serialize to JSON and back, verifying

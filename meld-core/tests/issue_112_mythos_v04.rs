@@ -187,6 +187,7 @@ fn fuse_config() -> FuserConfig {
         custom_sections: meld_core::CustomSectionHandling::Drop,
         dwarf_handling: meld_core::DwarfHandling::Strip,
         opaque_resources: Vec::new(),
+        ..Default::default()
     }
 }
 
