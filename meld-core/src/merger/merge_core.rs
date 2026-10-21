@@ -57,8 +57,6 @@ impl Merger {
     ) -> Result<()> {
         // (import position, import type index) for each unmapped func import.
         let mut unmapped: Vec<(u32, u32, &crate::parser::ModuleImport)> = Vec::new();
-        // Imports a pending AdapterSite will wire after the merge (cycle).
-        let mut pending: Vec<(u32, &crate::parser::ModuleImport)> = Vec::new();
         let mut pos = 0u32;
         for imp in &module.imports {
             if let ImportKind::Function(type_idx) = imp.kind {
@@ -66,19 +64,20 @@ impl Merger {
                     .function_index_map
                     .contains_key(&(comp_idx, mod_idx, pos))
                 {
-                    if merged
+                    // An import a pending AdapterSite will wire after the merge
+                    // (cycle) is not unmapped: the pre-encode refresh resolves
+                    // it (#488).
+                    if !merged
                         .pending_wired_imports
                         .contains(&(comp_idx, mod_idx, pos))
                     {
-                        pending.push((pos, imp));
-                    } else {
                         unmapped.push((pos, type_idx, imp));
                     }
                 }
                 pos += 1;
             }
         }
-        if unmapped.is_empty() && pending.is_empty() {
+        if unmapped.is_empty() {
             return Ok(());
         }
 
@@ -119,23 +118,6 @@ impl Merger {
                         }
                     }
                 }
-            }
-        }
-
-        // A pending-wired import in an elem slot cannot be given its target
-        // yet, and nothing re-indexes element segments after
-        // `wire_adapter_indices`. Both fallbacks are wrong (identity names an
-        // unrelated function; a stub silently traps a call that should work),
-        // so refuse. This needs an intra-component import cycle AND the
-        // import in a table; a loud error is the honest answer until elem
-        // re-indexing after wiring exists.
-        for (pos, imp) in &pending {
-            if in_elem.contains(pos) {
-                return Err(unmapped_err(
-                    imp,
-                    "an element segment, but its provider is merged later (cyclic \
-                     intra-component adapter); element slots are not re-indexed after wiring",
-                ));
             }
         }
 
@@ -1100,7 +1082,8 @@ impl Merger {
         // Parse and merge element segments with reindexing
         let element_segments = crate::segments::parse_element_segments(module)?;
         for segment in element_segments {
-            let reindexed = crate::segments::reindex_element_segment(&segment, &index_maps)?;
+            let reindexed =
+                crate::segments::reindex_element_segment(&segment, &index_maps, comp_idx, mod_idx)?;
             merged.elements.push(reindexed);
         }
 

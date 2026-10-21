@@ -1647,6 +1647,20 @@ artifacts:
       model: claude-opus-5-5
       timestamp: 2026-10-15T20:52:26Z
 
+  - id: SWV-113
+    type: sw-verification
+    title: "Verification of SR-101: a table slot and a body call of an adapted import name the same function"
+    status: implemented
+    description: "Verifies SR-101 in meld-core/tests/elem_refresh_488.rs, on the #488 fixture: component B lowers f: func(s: string) -> u32 from component A through a memory-copy adapter, and calls it with a string held in B's memory, so the correct result is 3090. Tests: the import placed in an active element segment as a function index, and as a ref.func expression, each called through call_indirect, return 3090 under wasmtime, matching the unfused component; the declarative-segment form (elem declare plus a body ref.func) validates and returns 3090; two structural tests assert that the element item and a body call of the same import name the same fused function; a direct-call control returns 3090. Potency: with the element half of the refresh disabled, five of the six fail (both active forms return 3000, the declarative form fails validation with \"undeclared function reference\", both structural tests fail) and the control passes. Corpus: all 49 wit-bindgen fixtures under --memory multi produce byte-identical output before and after, since none places an adapted import in an element segment. Local gate: fmt 0; clippy 0 with and without --all-features; cargo test --workspace exit 0 with 969 passed and 0 failed; --all-features exit 0 with 968 passed and 0 failed; wit_bindgen_runtime 74 passed. Not covered by a dedicated test: an element slot whose import is wired only after its module is merged (a cyclic intra-component dependency, which the resolver rejects before merging)."
+    links:
+      - type: verifies
+        target: SR-101
+    provenance:
+      created-by: ai-assisted
+      reviewed-by: avrabe
+      model: claude-opus-5-5
+      timestamp: 2026-10-20T21:15:56Z
+
   - id: SWV-114
     type: sw-verification
     title: "Verification of SR-102: gale's composite passes both synth versions and computes the same"
