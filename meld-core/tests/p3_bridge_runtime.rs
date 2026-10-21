@@ -346,6 +346,7 @@ fn fuse_pair() -> Vec<u8> {
         dwarf_handling: meld_core::DwarfHandling::Strip,
         output_format: meld_core::OutputFormat::CoreModule,
         opaque_resources: Vec::new(),
+        ..Default::default()
     };
     let mut fuser = Fuser::new(config);
     fuser

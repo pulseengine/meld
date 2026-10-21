@@ -141,6 +141,7 @@ fn test_from_exports_resolution_runtime() {
         dwarf_handling: meld_core::DwarfHandling::Strip,
         output_format: meld_core::OutputFormat::CoreModule,
         opaque_resources: Vec::new(),
+        ..Default::default()
     };
 
     let mut fuser = Fuser::new(config);
@@ -199,6 +200,7 @@ fn test_from_exports_shared_memory_strategy() {
         dwarf_handling: meld_core::DwarfHandling::Strip,
         output_format: meld_core::OutputFormat::CoreModule,
         opaque_resources: Vec::new(),
+        ..Default::default()
     };
 
     let mut fuser = Fuser::new(config);
@@ -257,6 +259,7 @@ fn test_from_exports_function_count() {
         dwarf_handling: meld_core::DwarfHandling::Strip,
         output_format: meld_core::OutputFormat::CoreModule,
         opaque_resources: Vec::new(),
+        ..Default::default()
     };
 
     let mut fuser = Fuser::new(config);

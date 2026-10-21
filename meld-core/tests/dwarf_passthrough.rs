@@ -180,6 +180,7 @@ fn fuse_passthrough(input: &[u8]) -> Vec<u8> {
         output_format: OutputFormat::CoreModule,
         opaque_resources: Vec::new(),
         dwarf_handling: DwarfHandling::PassThrough,
+        ..Default::default()
     });
     fuser
         .add_component_named(input, Some("dwarf-fixture"))
@@ -209,6 +210,7 @@ fn fuse_remap(input: &[u8]) -> Vec<u8> {
         output_format: OutputFormat::CoreModule,
         opaque_resources: Vec::new(),
         dwarf_handling: DwarfHandling::Remap,
+        ..Default::default()
     });
     fuser
         .add_component_named(input, Some("dwarf-fixture"))
@@ -233,6 +235,7 @@ fn fuse_with_drop(input: &[u8]) -> Vec<u8> {
         output_format: OutputFormat::CoreModule,
         opaque_resources: Vec::new(),
         dwarf_handling: DwarfHandling::Strip,
+        ..Default::default()
     });
     fuser
         .add_component_named(input, Some("dwarf-fixture"))

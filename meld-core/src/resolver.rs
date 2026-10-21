@@ -4651,6 +4651,7 @@ mod tests {
             core_entity_order: Vec::new(),
             component_func_defs: Vec::new(),
             component_instance_defs: Vec::new(),
+            instance_export_slots: Vec::new(),
             component_type_defs: Vec::new(),
             original_size: 0,
             original_hash: String::new(),

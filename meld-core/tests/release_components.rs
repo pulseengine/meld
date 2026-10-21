@@ -86,6 +86,7 @@ fn try_fuse(path: &str, name: &str) -> (bool, usize, String) {
         dwarf_handling: meld_core::DwarfHandling::Strip,
         output_format: OutputFormat::CoreModule,
         opaque_resources: Vec::new(),
+        ..Default::default()
     };
 
     let mut fuser = Fuser::new(config);
@@ -252,6 +253,7 @@ fn test_fused_output_validates() {
             dwarf_handling: meld_core::DwarfHandling::Strip,
             output_format: OutputFormat::CoreModule,
             opaque_resources: Vec::new(),
+            ..Default::default()
         };
 
         let mut fuser = Fuser::new(config);
@@ -352,6 +354,7 @@ fn test_p1_adapter_detection_with_instances() {
             dwarf_handling: meld_core::DwarfHandling::Strip,
             output_format: OutputFormat::CoreModule,
             opaque_resources: Vec::new(),
+            ..Default::default()
         };
         let mut fuser = Fuser::new(config);
         if fuser.add_component_named(&bytes, Some(file)).is_err() {
@@ -440,6 +443,7 @@ fn test_reasonable_memory_count() {
             dwarf_handling: meld_core::DwarfHandling::Strip,
             output_format: OutputFormat::CoreModule,
             opaque_resources: Vec::new(),
+            ..Default::default()
         };
 
         let mut fuser = Fuser::new(config);
@@ -534,6 +538,7 @@ fn test_write_fused_output_for_runtime() {
             dwarf_handling: meld_core::DwarfHandling::Strip,
             output_format: OutputFormat::CoreModule,
             opaque_resources: Vec::new(),
+            ..Default::default()
         };
 
         let mut fuser = Fuser::new(config);
@@ -607,6 +612,7 @@ fn test_no_duplicate_imports() {
             dwarf_handling: meld_core::DwarfHandling::Strip,
             output_format: OutputFormat::CoreModule,
             opaque_resources: Vec::new(),
+            ..Default::default()
         };
 
         let mut fuser = Fuser::new(config);
@@ -699,6 +705,7 @@ fn test_adapter_generation_for_release_components() {
             dwarf_handling: meld_core::DwarfHandling::Strip,
             output_format: OutputFormat::CoreModule,
             opaque_resources: Vec::new(),
+            ..Default::default()
         };
 
         let mut fuser = Fuser::new(config);
@@ -774,6 +781,7 @@ fn test_adapter_call_site_wiring() {
             dwarf_handling: meld_core::DwarfHandling::Strip,
             output_format: OutputFormat::CoreModule,
             opaque_resources: Vec::new(),
+            ..Default::default()
         };
 
         let mut fuser = Fuser::new(config);
@@ -933,6 +941,7 @@ fn test_no_stale_resource_drop_versions() {
             dwarf_handling: meld_core::DwarfHandling::Strip,
             output_format: OutputFormat::CoreModule,
             opaque_resources: Vec::new(),
+            ..Default::default()
         };
 
         let mut fuser = Fuser::new(config);
@@ -1025,6 +1034,7 @@ fn test_component_wrap_validates() {
             dwarf_handling: meld_core::DwarfHandling::Strip,
             output_format: OutputFormat::Component,
             opaque_resources: Vec::new(),
+            ..Default::default()
         };
 
         let mut fuser = Fuser::new(config);

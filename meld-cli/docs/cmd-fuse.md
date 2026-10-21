@@ -19,6 +19,26 @@ Key flags:
   targets; implies `--address-rebase`, requires `--memory shared`, and is sound
   only for components that address nothing above their last data segment. See
   `pack-rebase`.
+- `--exports <all|world>` — which exports the fused core module keeps (default
+  `all`: every export of every inner module). `world` keeps only the functions
+  that implement the outer world of the input(s). Each world function is traced
+  through its `canon lift` to a fused function (membership is never decided by
+  a name or prefix) and exported under its **world name**,
+  `<interface>#<function>`: when the merger named it `iface#f$1` because an
+  internal function took `iface#f`, the world name is rebound to the world
+  function and the internal one is dropped. Also kept: the memory and realloc
+  of the kept lifts **and of every `canon lower` behind an import the module
+  still has** (a realloc nothing exports is exported as
+  `meld:realloc/<component>`, with or without `--emit-manifest`), `cabi_post_*`,
+  the `[dtor]` exports of resources whose `new`/`rep`/`drop` are still
+  imported, and the start function. `__data_end`, `__heap_base` and every other
+  global or table export are dropped. Only the export list changes; function
+  bodies stay, so a downstream tool can drop what becomes unreachable. A world
+  function that cannot be traced to a fused function that some export carries
+  is an error naming it, never silently dropped. With `--emit-manifest` the
+  manifest lists only the world's functions. Not valid with `--component`,
+  which already exports exactly the outer world. Recorded in the attestation
+  when set.
 - `--component` — emit a P2 component instead of a core module.
 - `--dwarf <remap|strip|passthrough>` — debug-info handling (default `remap`).
 - `--opaque-rep <iface.resource>` — treat a resource's representation as a

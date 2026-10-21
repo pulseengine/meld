@@ -66,6 +66,12 @@ pub enum Error {
     #[error("invalid memory-domain grouping: {0}")]
     InvalidDomains(String),
 
+    /// #463: `--exports world` could not be honoured — a world export has no
+    /// fused counterpart, or the flag was combined with `--component`. Meld
+    /// refuses rather than dropping an export the caller's world requires.
+    #[error("cannot limit exports to the outer world: {0}")]
+    InvalidExports(String),
+
     /// A core module must be placed at a non-zero shared-memory base but
     /// carries no relocation metadata, so meld cannot rebase its absolute
     /// addresses into the shared window (issue #326, ADR-6 path-F). Emitting
