@@ -3728,3 +3728,19 @@ artifacts:
       reviewed-by: avrabe
       model: claude-opus-5-5
       timestamp: 2026-10-21T07:20:28Z
+
+  - id: SR-103
+    type: sw-req
+    title: An import aliased through a core re-export follows every later redirect of the import it aliases
+    status: implemented
+    description: "Inside one component, a core module can re-export an import it received, and another core module can import that re-export. The merger resolves the second module's import by copying the first module's map entry at merge time. When the original import crosses a component boundary through an adapter, that entry still names the callee at merge time; adapter wiring later rewrote only the first module's entry, so the copy stayed stale, and the second module's calls, element items and the re-export itself named the callee directly, bypassing the canonical-ABI adapter (#504: 3000 instead of 3090 at exit 0, with a cross-memory string never copied). meld shall record, whenever an import's resolution is copied from another import, which import it aliases, and every pass that later redirects an import (adapter wiring, the resource re-export redirect, task.return shims, the stream bridge) shall apply the redirect to every alias, transitively, and rebuild the affected modules' bodies. A core export that re-exports one of its module's own imports shall be resolved from the final function map, so it names what a call of that import names."
+    links:
+      - type: derives-from
+        target: SYS-2
+      - type: refines
+        target: SR-101
+    provenance:
+      created-by: ai-assisted
+      reviewed-by: avrabe
+      model: claude-opus-5-5
+      timestamp: 2026-10-21T12:10:43Z
