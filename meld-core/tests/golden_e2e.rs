@@ -163,7 +163,6 @@ fn invoke_run(
     };
     let mut results = [];
     func.call(&mut *store, &[], &mut results)?;
-    func.post_return(&mut *store)?;
     Ok(())
 }
 
@@ -328,7 +327,6 @@ fn call_runner(wasm: &[u8]) -> anyhow::Result<(u32, u8)> {
         .ok_or_else(|| anyhow::anyhow!("compute is not a function"))?
         .typed::<(), (u32,)>(&store)?; // fails if compute isn't typed u32
     let (c,) = compute.call(&mut store, ())?;
-    compute.post_return(&mut store)?;
 
     let (_, gidx) = instance
         .get_export(&mut store, Some(&iface), "greet")
@@ -338,7 +336,6 @@ fn call_runner(wasm: &[u8]) -> anyhow::Result<(u32, u8)> {
         .ok_or_else(|| anyhow::anyhow!("greet is not a function"))?
         .typed::<(), (u8,)>(&store)?; // fails if greet isn't typed u8
     let (g,) = greet.call(&mut store, ())?;
-    greet.post_return(&mut store)?;
 
     Ok((c, g))
 }

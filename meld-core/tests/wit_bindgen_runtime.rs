@@ -146,7 +146,6 @@ fn run_wasi_component(wasm: &[u8]) -> anyhow::Result<()> {
 
     let mut results = [];
     func.call(&mut store, &[], &mut results)?;
-    func.post_return(&mut store)?;
 
     Ok(())
 }
