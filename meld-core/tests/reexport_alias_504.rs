@@ -37,14 +37,14 @@ fn comp(bm_body: &str, extra_b: &str, b_wiring: &str, outer_exports: &str) -> St
         i32.add))
     (core instance $ai (instantiate $am))
     (func (export "f") (param "s" string) (result u32)
-      (canon lift (core func $ai "f") (memory $ai "mem") (realloc (func $ai "cabi_realloc")))))
+      (canon lift (core func $ai "f") (memory (core memory $ai "mem")) (realloc (core func $ai "cabi_realloc")))))
   (component $B
     (import "f" (func $f (param "s" string) (result u32)))
     (core module $mm
       (memory (export "mem") 1)
       (data (i32.const 100) "Z"))
     (core instance $mi (instantiate $mm))
-    (core func $fl (canon lower (func $f) (memory $mi "mem")))
+    (core func $fl (canon lower (func $f) (memory (core memory $mi "mem"))))
     (core module $bm
       {bm_body})
     (core instance $env (export "mem" (memory $mi "mem")) (export "f" (func $fl)))
@@ -141,11 +141,9 @@ fn reexported_import_called_by_another_module_goes_through_the_adapter() {
     assert_matches_unfused(&comp(BM_REEXPORT, CM_CALL, WIRE_RUN, EXPORT_RUN));
 }
 
-/// Element items are baked at merge time on main; they follow the map only once
-/// #488 (PR #503) lands. The map entry this test depends on is the one #504
-/// fixes, so un-ignore it together with #503.
+/// Element items are re-resolved from the final map (#488), so the map entry
+/// this test depends on, the one #504 fixes, reaches the element segment.
 #[test]
-#[ignore = "needs #488/#503 (element items re-resolved from the final map)"]
 fn reexported_import_in_an_element_segment_goes_through_the_adapter() {
     assert_matches_unfused(&comp(BM_REEXPORT, CM_ELEM, WIRE_RUN, EXPORT_RUN));
 }
