@@ -4,6 +4,38 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+
+## [0.64.0] - 2026-10-21
+
+### Added
+- **`--exports world` limits the fused module's exports to the outer world
+  of its inputs (SR-100, #463).** For a composed input, the fused core module
+  exported every inner module's exports: interfaces the composition wires
+  internally, `__heap_base`/`__data_end`, and toolchain allocators. With
+  `--exports world` only the world's exports remain, plus the memory, realloc,
+  post-return, destructors and start function they need; function bodies are
+  untouched. World functions are found through their canon lifts and
+  exported under their world names; exports that the remaining imports need
+  are kept, and a needed allocator is exported as `meld:realloc/<n>`. A
+  world function that cannot be mapped is an error. The default,
+  `--exports all`, is unchanged, and the option is refused with `--component`,
+  where the wrapper already exposes exactly the outer world.
+
+### Changed
+- **Differential oracle for component resolution (ADR-8, #505, #508).**
+  meld's resolution of each exported lift and lowered host import (memory,
+  realloc, post-return, callback, string encoding, async) is cross-checked
+  against wasmtime-environ's component translator, pinned as a dev-only
+  dependency under the `oracle` feature and run by every `--all-features`
+  test run. It would have caught #481, #484 and #490. The dev-only wasmtime
+  stack moves from 41 to 50.0.0; the lockfile moves `indexmap`, `hashbrown`
+  and `libc` in the shipped binary, whose fused output is byte-identical
+  before and after (measured across the fixture corpus).
+- Tooling: the verification-matrix and loss-scenario scripts read rivet
+  artifacts through `rivet list --format json` instead of parsing the YAML
+  (#500), and the release-readiness gate runs on rivet 0.40.0; the compliance
+  report stays on 0.22.0 until pulseengine/rivet#1106 (#502).
+
 ### Fixed
 - **`--pack-rebase` leaves a 7-byte guard after each provider's data (SR-102,
   #479).** A provider's last data byte could sit a few bytes before the next
@@ -20,20 +52,6 @@ All notable changes to this project will be documented in this file.
   segment produced invalid output. Element items are now resolved from the
   final function map just before encoding, with global `ref.func`
   initialisers.
-### Added
-- **`--exports world` limits the fused module's exports to the outer world
-  of its inputs (SR-100, #463).** For a composed input, the fused core module
-  exported every inner module's exports: interfaces the composition wires
-  internally, `__heap_base`/`__data_end`, and toolchain allocators. With
-  `--exports world` only the world's exports remain, plus the memory, realloc,
-  post-return, destructors and start function they need; function bodies are
-  untouched. World functions are found through their canon lifts and
-  exported under their world names; exports that the remaining imports need
-  are kept, and a needed allocator is exported as `meld:realloc/<n>`. A
-  world function that cannot be mapped is an error. The default,
-  `--exports all`, is unchanged, and the option is refused with `--component`,
-  where the wrapper already exposes exactly the outer world.
-
 
 ## [0.63.0] - 2026-10-15
 
