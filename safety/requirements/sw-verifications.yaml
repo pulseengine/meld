@@ -1691,3 +1691,17 @@ artifacts:
       reviewed-by: avrabe
       model: claude-opus-5-5
       timestamp: 2026-10-21T12:10:43Z
+
+  - id: SWV-116
+    type: sw-verification
+    title: "Verification of SR-104: the fused component returns the composition's strings for every nested shape"
+    status: implemented
+    description: "Verifies SR-104. meld-core/tests/nested_list_string_result_512.rs fuses the reporter's C wit-bindgen component (tests/wit_bindgen/fixtures/issue_512/, built with wasi-sdk 34 and wit-bindgen 0.63.0; sources, build script, tool versions and sha256s recorded) with --component and asserts that run-all under wasmtime 50 returns exactly the composition's output, including get=apple,3,[red,big]. A shapes fixture compares, call by call, option<list<string>>, result<list<string>,string>, option<record{tags}>, option<record{name,qty,tags}>, optional list arguments with plain and memory returns, mixed plain and optional pointer arguments, and controls that already worked (list<string>, record{tags}, option<string>, list<option<string>>). Three unit tests in fact.rs assert the generated adapter makes one realloc per nested string on the result path, the optional-argument path and the mixed-argument path. The existing corpus fixture list-in-variant, which failed when fused on main, is added to the Tier A run-and-compare suite. Potency: with the fix disabled the reporter test yields get=apple,3,[,], the shapes test traps, the three unit tests see one realloc instead of two, and Tier A fails on list-in-variant; with only the mixed-argument fix disabled, exactly that shape diverges. The wasmtime-environ oracle agrees on both new fixtures but cannot observe this class, since it compares boundary canonical options, not copied bytes. Corpus: 46 of 49 fixtures byte-identical; list-in-variant gains the per-string copy loops; flavorful and options only renumber scratch locals. Local gate with rustc 1.99.0: fmt 0; clippy 0 with and without --all-features; cargo test --workspace exit 0 with 998 passed and 0 failed; --all-features exit 0 with 1007 passed and 0 failed."
+    links:
+      - type: verifies
+        target: SR-104
+    provenance:
+      created-by: ai-assisted
+      reviewed-by: avrabe
+      model: claude-opus-5-5
+      timestamp: 2026-10-22T00:02:49Z
