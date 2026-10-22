@@ -323,6 +323,16 @@ pub struct AdapterRequirements {
     pub callee_post_return: Option<(usize, u32)>,
     /// Callee's realloc function (component-local core function index)
     pub callee_realloc: Option<u32>,
+    /// #515: the callee's `realloc` option (`canon lift`), decomposed to
+    /// `(module_idx, module_local_func_idx)` in the callee component. The lift's
+    /// option is authoritative; the merger's per-module `realloc_map` only knows
+    /// the module that DEFINES the allocator, which need not be the module the
+    /// adapter targets.
+    pub callee_realloc_fn: Option<(usize, u32)>,
+    /// #515: the caller's `realloc` option (`canon lower`), decomposed to
+    /// `(module_idx, module_local_func_idx)` in the CALLER component. Same
+    /// rationale as `callee_realloc_fn`: the calling module need not define it.
+    pub caller_realloc_fn: Option<(usize, u32)>,
     /// Byte size of the callee's return area when using retptr convention.
     /// Computed from the component function type's flat result layout.
     pub return_area_byte_size: Option<u32>,
@@ -771,6 +781,44 @@ fn build_module_export_to_core_func(component: &ParsedComponent) -> HashMap<(usi
         .into_iter()
         .map(|(core_idx, (mod_idx, name))| ((mod_idx, name), core_idx))
         .collect()
+}
+
+/// #515: pick the `realloc` option of the `canon lower` that supplies the
+/// caller's side of a call.
+///
+/// `exact` is the lower matched by import name. When the match was only a
+/// heuristic (no exact lower), the realloc is used only if EVERY lower in the
+/// component that names one names the SAME function; if they disagree, picking
+/// one would hand the adapter the wrong allocator, so `None` is returned and the
+/// merger's per-module `realloc_map` remains the fallback.
+fn pick_caller_realloc(
+    exact: Option<&crate::parser::CanonicalOptions>,
+    lower_map: &HashMap<u32, &crate::parser::CanonicalOptions>,
+) -> Option<u32> {
+    if let Some(lo) = exact {
+        return lo.realloc;
+    }
+    let mut it = lower_map.values().filter_map(|lo| lo.realloc);
+    let first = it.next()?;
+    it.all(|r| r == first).then_some(first)
+}
+
+/// #515: decompose a component-level core function index naming a `realloc`
+/// option to `(module_idx, module_local_func_idx)` via the entity provenance
+/// map. Logs and returns `None` when untraceable (the merger's `realloc_map`
+/// remains the fallback; the adapter then fails loudly if it needs a realloc
+/// that is still absent).
+fn decompose_realloc(component: &ParsedComponent, realloc: Option<u32>) -> Option<(usize, u32)> {
+    let idx = realloc?;
+    let found = build_core_func_to_module_local(component)
+        .get(&idx)
+        .copied();
+    if found.is_none() {
+        log::warn!(
+            "#515: cannot trace the canonical `realloc` option (core func {idx}) to a              module function; falling back to the per-module realloc map"
+        );
+    }
+    found
 }
 
 /// Build a map from core_func_idx → (module_idx, module_local_func_idx).
@@ -3151,6 +3199,8 @@ impl Resolver {
                                                 callee_core_to_local.get(&pr_idx).copied()
                                             });
                                         requirements.callee_realloc = lift_opts.realloc;
+                                        requirements.callee_realloc_fn =
+                                            decompose_realloc(to_component, lift_opts.realloc);
 
                                         // Compute layout info from the component function type
                                         // (needed for retptr bridging and multi-pointer copy).
@@ -3361,6 +3411,7 @@ impl Resolver {
                                     let caller_lower_map = from_component.lower_options_by_func();
                                     // Try to find the Lower entry matching the interface import
                                     let mut matched_caller_enc = None;
+                                    let mut exact_caller_lower = None;
                                     {
                                         let mut comp_func_idx = 0u32;
                                         for ci in &from_component.imports {
@@ -3374,6 +3425,7 @@ impl Resolver {
                                                     {
                                                         matched_caller_enc =
                                                             Some(lo.string_encoding);
+                                                        exact_caller_lower = Some(*lo);
                                                     }
                                                     break;
                                                 }
@@ -3428,6 +3480,12 @@ impl Resolver {
                                     if let Some(enc) = matched_caller_enc {
                                         requirements.caller_encoding = Some(enc);
                                     }
+                                    // #515: the caller's allocator is the one its
+                                    // `canon lower` names, wherever it is defined.
+                                    requirements.caller_realloc_fn = decompose_realloc(
+                                        from_component,
+                                        pick_caller_realloc(exact_caller_lower, &caller_lower_map),
+                                    );
                                     if let (Some(ce), Some(ce2)) =
                                         (requirements.caller_encoding, requirements.callee_encoding)
                                     {
@@ -3516,6 +3574,8 @@ impl Resolver {
                                     .post_return
                                     .and_then(|pr_idx| fb_core_to_local.get(&pr_idx).copied());
                                 requirements.callee_realloc = lift_opts.realloc;
+                                requirements.callee_realloc_fn =
+                                    decompose_realloc(to_component, lift_opts.realloc);
 
                                 // Populate layout and resource info from component
                                 // function type (mirrors per-function path).
@@ -3691,6 +3751,7 @@ impl Resolver {
                             // Caller side: look up lower options by import func index.
                             let caller_lower_map = from_component.lower_options_by_func();
                             let mut matched_caller_encoding = None;
+                            let mut exact_caller_lower = None;
 
                             {
                                 let mut comp_func_idx = 0u32;
@@ -3705,6 +3766,7 @@ impl Resolver {
                                             {
                                                 matched_caller_encoding =
                                                     Some(lower_opts.string_encoding);
+                                                exact_caller_lower = Some(*lower_opts);
                                             }
                                             break;
                                         }
@@ -3753,6 +3815,12 @@ impl Resolver {
                             if let Some(enc) = matched_caller_encoding {
                                 requirements.caller_encoding = Some(enc);
                             }
+
+                            // #515: see the primary site above.
+                            requirements.caller_realloc_fn = decompose_realloc(
+                                from_component,
+                                pick_caller_realloc(exact_caller_lower, &caller_lower_map),
+                            );
 
                             if let (Some(caller_enc), Some(callee_enc)) =
                                 (requirements.caller_encoding, requirements.callee_encoding)
@@ -3865,7 +3933,12 @@ impl Resolver {
 
             let caller_encoding = caller_lower.map(|l| l.string_encoding);
             let caller_memory = caller_lower.and_then(|l| l.memory);
-            let _caller_realloc = caller_lower.and_then(|l| l.realloc);
+            // #515: the lower's `realloc` option is the authoritative caller
+            // allocator. `find_lower_for_intra_import` may fall back to a
+            // heuristic lower, so only trust it when it is unambiguous (every
+            // lower naming a realloc names the same one).
+            let caller_realloc_fn =
+                decompose_realloc(component, pick_caller_realloc(None, &lower_map));
 
             // Check if an adapter is needed: different encoding, different memory,
             // or different realloc on callee side.
@@ -3948,6 +4021,7 @@ impl Resolver {
                 caller_encoding,
                 callee_encoding,
                 callee_realloc,
+                caller_realloc_fn,
                 ..Default::default()
             };
 
@@ -3956,6 +4030,7 @@ impl Resolver {
                 requirements.callee_post_return = lift_opts
                     .post_return
                     .and_then(|pr_idx| intra_core_to_local.get(&pr_idx).copied());
+                requirements.callee_realloc_fn = decompose_realloc(component, lift_opts.realloc);
             }
 
             // Set string_transcoding flag

@@ -5384,15 +5384,27 @@ impl FactStyleGenerator {
         }
 
         // Look up cabi_realloc for caller and callee
-        if let Some(&realloc_idx) = merged
-            .realloc_map
-            .get(&(site.from_component, site.from_module))
-        {
-            options.caller_realloc = Some(realloc_idx);
-        }
-        if let Some(&realloc_idx) = merged.realloc_map.get(&(site.to_component, site.to_module)) {
-            options.callee_realloc = Some(realloc_idx);
-        }
+        // #515: the `realloc` option of the `canon lower` / `canon lift` is
+        // authoritative -- the allocator it names may live in a DIFFERENT core
+        // module than the one calling / exporting. `realloc_map` is keyed by the
+        // module that defines the allocator, so it is only the fallback.
+        let resolved = |comp: usize, f: Option<(usize, u32)>| {
+            f.and_then(|(m, local)| merged.function_index_map.get(&(comp, m, local)).copied())
+        };
+        options.caller_realloc = resolved(site.from_component, site.requirements.caller_realloc_fn)
+            .or_else(|| {
+                merged
+                    .realloc_map
+                    .get(&(site.from_component, site.from_module))
+                    .copied()
+            });
+        options.callee_realloc = resolved(site.to_component, site.requirements.callee_realloc_fn)
+            .or_else(|| {
+                merged
+                    .realloc_map
+                    .get(&(site.to_component, site.to_module))
+                    .copied()
+            });
 
         // Use canonical options from the resolver if available, fall back to UTF-8
         options.caller_string_encoding = site
@@ -6175,6 +6187,43 @@ impl FactStyleGenerator {
         Ok((caller_type_idx, func))
     }
 
+    /// #515: a cross-memory call whose data must be COPIED needs an allocator on
+    /// the receiving side, and meld must be able to name it. The emitters used to
+    /// gate each copy on `realloc.is_some()` and silently skip it when none was
+    /// found: the adapter validated, fusion exited 0, and the receiver read its own
+    /// memory at the other side's pointer. Refuse instead.
+    fn require_reallocs_for_copy(site: &AdapterSite, options: &AdapterOptions) -> Result<()> {
+        if options.caller_memory == options.callee_memory {
+            return Ok(());
+        }
+        let r = &site.requirements;
+        let copies_result = options.returns_pointer_pair
+            || !r.result_pointer_pair_offsets.is_empty()
+            || !r.conditional_result_flat_pairs.is_empty()
+            || !r.conditional_result_pointer_pairs.is_empty();
+        if copies_result && options.caller_realloc.is_none() {
+            return Err(crate::Error::AdapterGeneration(format!(
+                "#515: the cross-memory call to '{}' ({}) returns data that must be copied into \
+                 the caller's memory, but no caller `realloc` could be resolved (the `canon \
+                 lower` names none, or it could not be traced to a function). meld will not \
+                 skip the copy: the caller would read its own memory at the callee's pointer.",
+                site.export_name, site.import_module
+            )));
+        }
+        let copies_params =
+            !r.pointer_pair_positions.is_empty() || !r.conditional_pointer_pairs.is_empty();
+        if copies_params && options.callee_realloc.is_none() {
+            return Err(crate::Error::AdapterGeneration(format!(
+                "#515: the cross-memory call to '{}' ({}) passes data that must be copied into \
+                 the callee's memory, but no callee `realloc` could be resolved (the `canon \
+                 lift` names none, or it could not be traced to a function). meld will not \
+                 skip the copy: the callee would read its own memory at the caller's pointer.",
+                site.export_name, site.import_module
+            )));
+        }
+        Ok(())
+    }
+
     /// Generate an adapter that copies data between memories
     ///
     /// When caller and callee use different memories, pointer arguments must
@@ -6199,6 +6248,7 @@ impl FactStyleGenerator {
         options: &AdapterOptions,
         resource_rep_imports: &std::collections::HashMap<(String, String), u32>,
     ) -> Result<(u32, Function)> {
+        Self::require_reallocs_for_copy(site, options)?;
         let target_func = self.resolve_target_function(site, merged)?;
 
         // --- Determine callee's type (what we call) ---
@@ -15079,6 +15129,42 @@ mod tests {
             "SR-14 results: retptr i32.store must write CALLER memory \
              ({SR_CALLER_MEM}); got {:?}",
             ret.stores
+        );
+    }
+
+    /// #515: the realloc named by the `canon lower` (decomposed onto the site)
+    /// wins over `realloc_map`, which only knows the module that DEFINES the
+    /// allocator -- here the caller module (0) defines none, module 7 does.
+    #[test]
+    fn caller_realloc_comes_from_the_lower_not_the_calling_module_515() {
+        let (mut merged, mut site) = sr_retptr_merged_and_site();
+        merged.realloc_map.clear();
+        merged.function_index_map.insert((0, 7, 2), 3);
+        site.requirements.caller_realloc_fn = Some((7, 2));
+        let decoded = decode_adapter(site, merged);
+        assert!(
+            decoded.calls.iter().any(|(_, f)| *f == 3),
+            "#515: the result copy must allocate with the lower's realloc (merged 3); \
+             calls={:?}",
+            decoded.calls
+        );
+    }
+
+    /// #515: a cross-memory result copy with NO resolvable caller realloc must be
+    /// refused, never skipped (the old behaviour returned the callee's pointer).
+    #[test]
+    fn missing_caller_realloc_is_an_error_not_a_skipped_copy_515() {
+        let (mut merged, site) = sr_retptr_merged_and_site();
+        merged.realloc_map.clear();
+        let gen_ = FactStyleGenerator::new(AdapterConfig::default());
+        let empty = std::collections::HashMap::new();
+        let err = match gen_.generate_adapter(&site, &merged, 0, &empty, &empty) {
+            Ok(_) => panic!("#515: an uncopyable result must not generate an adapter"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            err.contains("#515") && err.contains("caller `realloc`"),
+            "{err}"
         );
     }
 
