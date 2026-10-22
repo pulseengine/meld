@@ -4,6 +4,15 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+- **A re-exported adapted import reaches the adapter from every importer
+  (SR-103, #504).** When one core module re-exported an import that crosses
+  a component boundary through an adapter, and another module imported that
+  re-export, the second module's resolution was copied before adapter wiring
+  and never updated: its calls, table entries and the re-export itself
+  bypassed the canonical-ABI adapter and returned a wrong result at exit 0.
+  Aliased imports now follow every later redirect of the import they alias.
+
 
 ## [0.64.0] - 2026-10-21
 
