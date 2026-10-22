@@ -55,6 +55,7 @@ pub mod core_instance_topology;
 pub mod custom_merge;
 pub mod dwarf;
 mod error;
+pub mod import_map;
 pub mod mcu_dissolve;
 pub mod memory_probe;
 pub mod merger;
@@ -723,6 +724,12 @@ pub struct FusionStats {
     /// under `--memory multi`, where each module keeps its own memory and there
     /// is no placement decision to record.
     pub placements: Vec<PlacementRecord>,
+
+    /// #513: per function import of the fused CORE module, the component,
+    /// memory, realloc and string encoding resolved from that import's own
+    /// source `canon lower`. Side-output only: nothing in the artifact or its
+    /// attestation reads it.
+    pub import_map: Vec<import_map::ImportMapEntry>,
 }
 
 /// Main fuser interface for static component fusion
@@ -1765,6 +1772,10 @@ impl Fuser {
                 function: merged.function_index_map.clone(),
             });
         }
+
+        // #513: the per-import host contract, read off the CORE module before
+        // any component wrap. Side-output only.
+        stats.import_map = import_map::build_import_map(&self.components, &merged, &output);
 
         // Optionally wrap the fused core module as a P2 component
         let output = if self.config.output_format == OutputFormat::Component {

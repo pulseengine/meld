@@ -45,6 +45,34 @@ Key flags:
   `u32` per component rather than the shared-by-name boxed default; repeatable.
 - `--no-attestation` / `--reproducible` — see the `attestation` topic.
 - `--no-component-provenance` — drop the per-function origin map (`provenance`).
-- `--stats`, `--validate`, `--preserve-names`, `--emit-import-map <PATH>` —
-  fusion statistics, wasmparser validation, name preservation, and a JSON
-  import map for synth/kiln integration.
+- `--stats`, `--validate`, `--preserve-names` — fusion statistics, wasmparser
+  validation, name preservation.
+- `--emit-import-map <PATH>` — a JSON import map of the fused module's function
+  imports, for hosts that implement them (synth/kiln, a native WASI host for
+  wasm2c output). The file is `{"version": 2, "imports": [...]}`; version 2
+  (#513) only adds fields, and `index`, `kind`, `module` and `name` are as
+  before. Per import:
+  - `component` — the flattened component that owns it (the `N` of a `$N`
+    name suffix). Under `--memory shared` identical lowers of several
+    components merge into one import; the others are listed in
+    `also_components`.
+  - `memory` — `{"index": <fused memory>, "export": <its export name or null>}`:
+    the memory the import's pointer arguments index.
+  - `realloc` — `{"func": <fused function>, "export": <name or null>}`: the
+    `cabi_realloc` to allocate list/string results with.
+  - `encoding` — `utf8`, `utf16` or `latin1+utf16`, for string arguments.
+  - `resource` — only on `[resource-new]` / `[resource-rep]` /
+    `[resource-drop]` imports: `operation`, `resource` (type name),
+    `interface`, `definer` (the importer defines the type), `dtor_export` (the
+    `<interface>#[dtor]<resource>` export, or `null`; when it is `null`
+    because several exports could match they are in `dtor_candidates`).
+
+  All of this is resolved from the import's OWN source `canon lower`, not from
+  a per-component default, so two components lowering the same WASI function
+  (`write`, `write$1`) each name their own memory and allocator. Read each
+  value three ways: `null` means the lower has no such option (the import
+  cannot touch a memory / allocate; resource intrinsics are always `null`);
+  an object with `index`/`func` is the answer; `{"unknown": "<reason>"}` means
+  meld could not trace the lower, and a host must not treat it as `null` or
+  guess. With `--component`, entries are joined to the output by their unique
+  `(module, name)`.
