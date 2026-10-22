@@ -5373,14 +5373,14 @@ impl FactStyleGenerator {
         // realloc with an untraced memory (allocate in one, copy into another).
         let traced = |comp: usize, a: Option<crate::resolver::ResolvedAlloc>| {
             let a = a?;
-            Some((
-                *merged
-                    .memory_index_map
-                    .get(&(comp, a.memory.0, a.memory.1))?,
-                *merged
-                    .function_index_map
-                    .get(&(comp, a.realloc.0, a.realloc.1))?,
-            ))
+            let mem = *merged
+                .memory_index_map
+                .get(&(comp, a.memory.0, a.memory.1))?;
+            let re = match a.realloc {
+                None => None,
+                Some((m, l)) => Some(*merged.function_index_map.get(&(comp, m, l))?),
+            };
+            Some((mem, re))
         };
         let module_pair = |comp: usize, module: usize| {
             (
@@ -5388,36 +5388,46 @@ impl FactStyleGenerator {
                 merged.realloc_map.get(&(comp, module)).copied(),
             )
         };
-        if let Some((mem, re)) = traced(site.from_component, site.requirements.caller_alloc) {
-            options.caller_memory = mem;
-            options.caller_realloc = Some(re);
-        } else {
-            let (mem, re) = module_pair(site.from_component, site.from_module);
-            // The calling module's own pair is the base behaviour. The
-            // (heuristic, untraced) unanimous pair of the component's lowers may
-            // replace its REALLOC only when it names the very memory the module
-            // uses: then the pair stays coherent. A different memory means the
-            // heuristic is describing some other module -- distrust it.
-            let fallback = traced(site.from_component, site.requirements.caller_alloc_fallback)
-                .filter(|(fmem, _)| Some(*fmem) == mem);
-            if let Some((fmem, fre)) = fallback {
-                options.caller_memory = fmem;
-                options.caller_realloc = Some(fre);
-            } else {
-                options.caller_memory = mem.unwrap_or(0);
-                options.caller_realloc = re;
-                options.memory_unresolved |= mem.is_none();
+        // A memory-only traced set (the side that does not allocate) keeps its
+        // traced memory; its realloc comes from the module's map only when the
+        // module's memory IS that memory, so the pair stays coherent.
+        let side = |comp: usize,
+                    module: usize,
+                    alloc: Option<crate::resolver::ResolvedAlloc>,
+                    fallback: Option<crate::resolver::ResolvedAlloc>|
+         -> (u32, Option<u32>, bool) {
+            let (mod_mem, mod_re) = module_pair(comp, module);
+            if let Some((mem, re)) = traced(comp, alloc) {
+                let re = re.or(if Some(mem) == mod_mem { mod_re } else { None });
+                return (mem, re, false);
             }
-        }
-        if let Some((mem, re)) = traced(site.to_component, site.requirements.callee_alloc) {
-            options.callee_memory = mem;
-            options.callee_realloc = Some(re);
-        } else {
-            let (mem, re) = module_pair(site.to_component, site.to_module);
-            options.callee_memory = mem.unwrap_or(0);
-            options.callee_realloc = re;
-            options.memory_unresolved |= mem.is_none();
-        }
+            // Heuristic unanimous pair (untraced sites): may replace the
+            // module's realloc only when it names the memory the module uses.
+            if let Some((fmem, fre)) = traced(comp, fallback)
+                && Some(fmem) == mod_mem
+                && fre.is_some()
+            {
+                return (fmem, fre, false);
+            }
+            (mod_mem.unwrap_or(0), mod_re, mod_mem.is_none())
+        };
+        let (cm, cr, cu) = side(
+            site.from_component,
+            site.from_module,
+            site.requirements.caller_alloc,
+            site.requirements.caller_alloc_fallback,
+        );
+        let (em, er, eu) = side(
+            site.to_component,
+            site.to_module,
+            site.requirements.callee_alloc,
+            None,
+        );
+        options.caller_memory = cm;
+        options.caller_realloc = cr;
+        options.callee_memory = em;
+        options.callee_realloc = er;
+        options.memory_unresolved = cu || eu;
 
         // Use canonical options from the resolver if available, fall back to UTF-8
         options.caller_string_encoding = site
@@ -6206,11 +6216,27 @@ impl FactStyleGenerator {
     /// found: the adapter validated, fusion exited 0, and the receiver read its own
     /// memory at the other side's pointer. Refuse instead.
     fn require_reallocs_for_copy(site: &AdapterSite, options: &AdapterOptions) -> Result<()> {
+        let r = &site.requirements;
+        let copies_result = options.returns_pointer_pair
+            || !r.result_pointer_pair_offsets.is_empty()
+            || !r.conditional_result_flat_pairs.is_empty()
+            || !r.conditional_result_pointer_pairs.is_empty();
+        // The >16-flat-param buffer (`params_area_byte_size`) is a parameter copy
+        // too: it is allocated in the callee with the callee's realloc.
+        let copies_params = !r.pointer_pair_positions.is_empty()
+            || !r.conditional_pointer_pairs.is_empty()
+            || r.params_area_byte_size.is_some();
+        if !(copies_result || copies_params) {
+            // Scalar-only: nothing is copied, so an unknown memory is harmless
+            // (a plain forward is correct, as on the base).
+            return Ok(());
+        }
         // A crossing site whose memory lookup MISSED defaulted to memory 0 and
         // looks same-memory; deciding "same memory" from those defaults would
         // skip every copy. `crosses_memory` is the resolver's per-site verdict
         // (domains differ / both components have memory), so trust it over the
-        // defaults and refuse when the actual memories are unknown.
+        // defaults and refuse when the actual memories are unknown -- but only
+        // once a copy is actually required.
         if site.crosses_memory && options.memory_unresolved {
             return Err(crate::Error::AdapterGeneration(format!(
                 "#515: the call to '{}' ({}) crosses memories but meld could not resolve \
@@ -6223,11 +6249,6 @@ impl FactStyleGenerator {
         if options.caller_memory == options.callee_memory {
             return Ok(());
         }
-        let r = &site.requirements;
-        let copies_result = options.returns_pointer_pair
-            || !r.result_pointer_pair_offsets.is_empty()
-            || !r.conditional_result_flat_pairs.is_empty()
-            || !r.conditional_result_pointer_pairs.is_empty();
         if copies_result && options.caller_realloc.is_none() {
             return Err(crate::Error::AdapterGeneration(format!(
                 "#515: the cross-memory call to '{}' ({}) returns data that must be copied into \
@@ -6237,11 +6258,6 @@ impl FactStyleGenerator {
                 site.export_name, site.import_module
             )));
         }
-        // The >16-flat-param buffer (`params_area_byte_size`) is a parameter copy
-        // too: it is allocated in the callee with the callee's realloc.
-        let copies_params = !r.pointer_pair_positions.is_empty()
-            || !r.conditional_pointer_pairs.is_empty()
-            || r.params_area_byte_size.is_some();
         if copies_params && options.callee_realloc.is_none() {
             return Err(crate::Error::AdapterGeneration(format!(
                 "#515: the cross-memory call to '{}' ({}) passes data that must be copied into \
@@ -15288,7 +15304,7 @@ mod tests {
         merged.function_index_map.insert((0, 7, 2), 3);
         site.requirements.caller_alloc = Some(crate::resolver::ResolvedAlloc {
             memory: (7, 0),
-            realloc: (7, 2),
+            realloc: Some((7, 2)),
         });
         merged.memory_index_map.insert((0, 7, 0), SR_CALLER_MEM);
         let decoded = decode_adapter(site, merged);

@@ -310,7 +310,9 @@ pub struct ResolvedResourceOp {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ResolvedAlloc {
     pub memory: (usize, u32),
-    pub realloc: (usize, u32),
+    /// `None` for a memory-only option set (the side that does not allocate).
+    /// A traced realloc is NEVER present without its traced memory.
+    pub realloc: Option<(usize, u32)>,
 }
 
 /// Requirements for an adapter function
@@ -342,10 +344,12 @@ pub struct AdapterRequirements {
     /// #515: the same for the CALLER's `canon lower`, found by tracing the
     /// calling module's import. Never a realloc without its memory.
     pub caller_alloc: Option<ResolvedAlloc>,
-    /// #515: used ONLY when `caller_alloc` is `None` AND the calling module has
-    /// no allocator of its own: the one `(memory, realloc)` pair that every
-    /// complete `canon lower` in the caller component agrees on. A heuristic
-    /// (the site did not trace), so it never overrides the module's own pair.
+    /// #515: used ONLY when `caller_alloc` is `None`: the one `(memory, realloc)`
+    /// pair that EVERY `canon lower` in the caller component (all of them
+    /// complete) resolves to. A heuristic for sites that did not trace, so the
+    /// adapter applies it only when it names the memory the calling module
+    /// uses (see `analyze_call_site`); then it also replaces the module's own
+    /// `cabi_realloc`, because every lowering the call could use names it.
     pub caller_alloc_fallback: Option<ResolvedAlloc>,
     /// Byte size of the callee's return area when using retptr convention.
     /// Computed from the component function type's flat result layout.
@@ -798,14 +802,18 @@ fn build_module_export_to_core_func(component: &ParsedComponent) -> HashMap<(usi
 }
 
 /// #515: resolve one canonical option set to a coherent [`ResolvedAlloc`].
-/// `None` unless BOTH `memory` and `realloc` are named and traceable.
+///
+/// * no `memory` named: `None` (nothing to trace).
+/// * `memory` only: the traced memory with `realloc: None` -- normal for the
+///   side that does not allocate, and its memory must still be honoured.
+/// * `memory` + `realloc`: both, or `None` if EITHER cannot be traced (never a
+///   traced realloc with an untraced memory).
 fn alloc_of_options(
     component: &ParsedComponent,
     memory: Option<u32>,
     realloc: Option<u32>,
 ) -> Option<ResolvedAlloc> {
-    let (mem, re) = (memory?, realloc?);
-    let realloc = build_core_func_to_module_local(component).get(&re).copied();
+    let mem = memory?;
     let memory = core_memory_sources(component)
         .get(&mem)
         .and_then(|(m, name)| {
@@ -817,12 +825,28 @@ fn alloc_of_options(
                 .find(|e| e.name == *name && e.kind == ExportKind::Memory)
                 .map(|e| (*m, e.index))
         });
-    match (memory, realloc) {
-        (Some(memory), Some(realloc)) => Some(ResolvedAlloc { memory, realloc }),
-        _ => {
+    let realloc_fn = match realloc {
+        None => None,
+        Some(re) => match build_core_func_to_module_local(component).get(&re).copied() {
+            Some(f) => Some(f),
+            None => {
+                log::warn!(
+                    "#515: cannot trace canonical realloc (core func {re}) to a module \
+                     function; falling back to the per-module maps"
+                );
+                return None;
+            }
+        },
+    };
+    match memory {
+        Some(memory) => Some(ResolvedAlloc {
+            memory,
+            realloc: realloc_fn,
+        }),
+        None => {
             log::warn!(
-                "#515: cannot trace canonical options (memory {mem}, realloc {re}) to module \
-                 entities; falling back to the per-module maps"
+                "#515: cannot trace canonical memory (core memory {mem}) to a module \
+                 memory; falling back to the per-module maps"
             );
             None
         }
@@ -909,9 +933,26 @@ fn traced_caller_alloc(
     }
 
     if !imports.is_empty() && traced.len() == imports.len() {
-        let key = |l: u32| lowers.get(&l).map(|o| (o.memory, o.realloc));
+        // Agreement is decided on what the options RESOLVE to, not on raw
+        // component core indices: two lowers that name the same memory and
+        // realloc through separate inline aliases have different raw indices.
+        // (When either side does not resolve, fall back to the raw indices.)
+        let resolve = |l: u32| {
+            lowers.get(&l).map(|o| {
+                (
+                    o.memory,
+                    o.realloc,
+                    alloc_of_options(component, o.memory, o.realloc),
+                )
+            })
+        };
+        let same = |a: u32, b: u32| match (resolve(a), resolve(b)) {
+            (Some((_, _, Some(x))), Some((_, _, Some(y)))) => x == y,
+            (Some((m1, r1, _)), Some((m2, r2, _))) => (m1, r1) == (m2, r2),
+            (x, y) => x.is_none() && y.is_none(),
+        };
         let (m0, f0, l0) = traced[0];
-        if let Some((m, f, _)) = traced.iter().find(|(_, _, l)| key(*l) != key(l0)) {
+        if let Some((m, f, _)) = traced.iter().find(|(_, _, l)| !same(*l, l0)) {
             return Err(Error::AdapterGeneration(format!(
                 "#515: the calling module's imports '{m0}'.'{f0}' and '{m}'.'{f}' are lowered \
                  with different memory/realloc options and meld cannot tell which one the \
@@ -927,18 +968,21 @@ fn traced_caller_alloc(
         ));
     }
 
-    // Untraced site: unanimity over every complete lower, else nothing.
-    let mut it = lowers
-        .values()
-        .filter(|o| o.memory.is_some() && o.realloc.is_some())
-        .map(|o| (o.memory, o.realloc));
-    let Some(first) = it.next() else {
-        return Ok((None, None));
-    };
-    if it.all(|k| k == first) {
-        Ok((None, alloc_of_options(component, first.0, first.1)))
-    } else {
-        Ok((None, None))
+    // Untraced site: heuristic unanimity. The call must go through SOME
+    // `canon lower` of this component; if EVERY lower in the component is
+    // complete and they all resolve to the same pair, that pair is the answer
+    // whichever one the call uses. A lower that is incomplete (memory-only, or
+    // none) could be the one in use, so its presence disables the heuristic.
+    let mut resolved: Vec<ResolvedAlloc> = Vec::new();
+    for o in lowers.values() {
+        match alloc_of_options(component, o.memory, o.realloc) {
+            Some(a) if a.realloc.is_some() => resolved.push(a),
+            _ => return Ok((None, None)),
+        }
+    }
+    match resolved.split_first() {
+        Some((first, rest)) if rest.iter().all(|a| a == first) => Ok((None, Some(*first))),
+        _ => Ok((None, None)),
     }
 }
 
