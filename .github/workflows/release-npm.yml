@@ -1,0 +1,300 @@
+name: Release NPM
+
+# `npm install @pulseengine/meld` (command: `meld`): one platform package per
+# release target plus a launcher root package whose optionalDependencies pull in
+# only the matching one (#442). Binaries are repacked from the signed GitHub
+# release tarballs, never rebuilt. There are NO install scripts and no
+# downloads at install time (unlike the rivet package's install.js).
+#
+# TRIGGER: `release: published`, NOT `workflow_run` (which rivet/synth use).
+# Our release is created as a DRAFT, release.yml fills it, a human verifies it
+# and only then publishes it (AGENTS.md, "draft-then-publish"). `workflow_run`
+# would fire when release.yml finishes, while the release is still an
+# unverified draft, and registry uploads are immutable: `npm unpublish` is
+# restricted and a version number can never be reused. `published` is the
+# human's "this is good". (A release published by a workflow using GITHUB_TOKEN
+# would NOT trigger this; the publish is a maintainer's
+# `gh release edit --draft=false`, which does.)
+#
+# SAFETY DEFAULT: an automatic run is a DRY RUN unless the repository variable
+# NPM_RELEASE_TARGET is `publish`. A manual dispatch chooses explicitly
+# (default dry-run).
+#
+# AUTH: npm Trusted Publishing (OIDC, npm >= 11.5.1, hence node 24) - no
+# long-lived token in steady state, and `--provenance` attestations. A
+# maintainer must configure a trusted publisher (repo pulseengine/meld,
+# workflow release-npm.yml, environment `npm`) on EACH of the 7 packages. npm
+# only lets you do that for a package that already exists, so the very first
+# publish of each package may still need a token: if the repository secret
+# NPM_TOKEN is set it is used (bootstrap only; remove it afterwards). That
+# bootstrap constraint is the maintainer-side step this workflow cannot do.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag (e.g. v0.65.0)'
+        required: true
+        type: string
+      target:
+        description: 'dry-run packs and `npm publish --dry-run`s; publish uploads'
+        required: true
+        type: choice
+        options: [dry-run, publish]
+        default: dry-run
+
+# Never cancel: a cancelled publish can leave platform packages published but
+# the root missing.
+concurrency:
+  group: release-npm-${{ inputs.tag || github.event.release.tag_name }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Verify and build npm packages
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    outputs:
+      tag: ${{ steps.resolve.outputs.tag }}
+      version: ${{ steps.resolve.outputs.version }}
+      target: ${{ steps.resolve.outputs.target }}
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Resolve tag and target
+        id: resolve
+        env:
+          EVENT_TAG: ${{ github.event.release.tag_name }}
+          INPUT_TAG: ${{ inputs.tag }}
+          INPUT_TARGET: ${{ inputs.target }}
+          VAR_TARGET: ${{ vars.NPM_RELEASE_TARGET }}
+        run: |
+          set -euo pipefail
+          TAG="${INPUT_TAG:-$EVENT_TAG}"
+          TARGET="${INPUT_TARGET:-${VAR_TARGET:-dry-run}}"
+          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::'$TAG' is not a vX.Y.Z release tag"; exit 1
+          fi
+          case "$TARGET" in dry-run|publish) ;; *) echo "::error::bad target '$TARGET'"; exit 1 ;; esac
+          {
+            echo "tag=$TAG"
+            echo "version=${TAG#v}"
+            echo "target=$TARGET"
+          } >> "$GITHUB_OUTPUT"
+          echo "$TAG -> npm ($TARGET)"
+
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.12'
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '24'
+
+      - name: Refuse a draft release for a real publish
+        env:
+          TAG: ${{ steps.resolve.outputs.tag }}
+          TARGET: ${{ steps.resolve.outputs.target }}
+        run: |
+          set -euo pipefail
+          draft="$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft)"
+          if [ "$draft" = "true" ] && [ "$TARGET" = "publish" ]; then
+            echo "::error::$TAG is still a draft; verify and publish the release first (AGENTS.md)."
+            exit 1
+          fi
+
+      - name: Download release assets
+        env:
+          TAG: ${{ steps.resolve.outputs.tag }}
+        run: |
+          set -euo pipefail
+          mkdir assets
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir assets \
+            --pattern 'SHA256SUMS.txt' --pattern 'SHA256SUMS.txt.cosign.bundle' --pattern '*.tar.gz'
+          ls -la assets
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3
+        with:
+          cosign-release: 'v2.4.1'
+
+      # Same identity/issuer as release.yml's signing step documents.
+      - name: Verify the cosign bundle over SHA256SUMS.txt
+        run: |
+          set -euo pipefail
+          cosign verify-blob \
+            --bundle assets/SHA256SUMS.txt.cosign.bundle \
+            --certificate-identity-regexp 'https://github.com/pulseengine/meld/.github/workflows/release.yml@.*' \
+            --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
+            assets/SHA256SUMS.txt
+
+      - name: Fetch the tag's Cargo.toml
+        env:
+          TAG: ${{ steps.resolve.outputs.tag }}
+        run: |
+          gh api -H 'Accept: application/vnd.github.raw' \
+            "repos/$GITHUB_REPOSITORY/contents/Cargo.toml?ref=$TAG" > Cargo.tag.toml
+
+      # Same verification path as the wheels (npm/build_npm.py loads
+      # python/build_wheels.py): every tarball checked against SHA256SUMS.txt,
+      # tag == `meld --version` == workspace version.
+      - name: Build and pack
+        env:
+          TAG: ${{ steps.resolve.outputs.tag }}
+        run: |
+          set -euo pipefail
+          python3 -I npm/build_npm.py --tag "$TAG" --assets assets \
+            --out out --cargo-toml Cargo.tag.toml --pack
+          cat out/npm-sha256.txt
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: npm-tarballs
+          path: |
+            out/tarballs/*.tgz
+            out/npm-sha256.txt
+          if-no-files-found: error
+
+  test:
+    name: Install test (${{ matrix.name }})
+    needs: build
+    runs-on: ${{ matrix.runner }}
+    container: ${{ matrix.container }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: linux-x64-glibc,   runner: ubuntu-24.04,     container: '',               platform: linux-x64-gnu }
+          - { name: linux-arm64-glibc, runner: ubuntu-24.04-arm, container: '',               platform: linux-arm64-gnu }
+          - { name: linux-x64-musl,    runner: ubuntu-24.04,     container: 'node:22-alpine', platform: linux-x64-musl }
+          - { name: linux-arm64-musl,  runner: ubuntu-24.04-arm, container: 'node:22-alpine', platform: linux-arm64-musl }
+          - { name: macos-x64,         runner: macos-15-intel,   container: '',               platform: darwin-x64 }
+          - { name: macos-arm64,       runner: macos-15,         container: '',               platform: darwin-arm64 }
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: npm-tarballs
+          path: npm-out
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        if: matrix.container == ''
+        with:
+          node-version: '24'
+
+      # Clean project, install the root package and the matching platform
+      # package from the local tarballs, run through npx.
+      - name: Install into a clean prefix and run
+        env:
+          TAG: ${{ needs.build.outputs.tag }}
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          set -eu
+          VERSION="${TAG#v}"
+          T="$PWD/npm-out/tarballs"
+          ls "$T"
+          mkdir "$RUNNER_TEMP/proj" && cd "$RUNNER_TEMP/proj"
+          npm init -y > /dev/null
+          npm install --ignore-scripts --no-audit --no-fund \
+            "$T/pulseengine-meld-$VERSION.tgz" "$T/pulseengine-meld-$PLATFORM-$VERSION.tgz"
+          got="$(npx --no-install meld --version)"
+          echo "meld --version -> $got"
+          [ "$got" = "meld $VERSION" ] || { echo "::error::expected 'meld $VERSION'"; exit 1; }
+          npx --no-install meld --help > /dev/null
+
+  dry-run:
+    name: npm publish --dry-run
+    needs: [build, test]
+    if: needs.build.outputs.target == 'dry-run'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '24'
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: npm-tarballs
+          path: npm-out
+      - name: Dry-run every package (platform packages first, root last)
+        env:
+          VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          set -euo pipefail
+          cd npm-out/tarballs
+          ROOT="pulseengine-meld-$VERSION.tgz"
+          for f in *.tgz; do
+            [ "$f" = "$ROOT" ] && continue
+            npm publish "$f" --dry-run --access public
+          done
+          npm publish "$ROOT" --dry-run --access public
+
+  publish:
+    name: npm publish
+    needs: [build, test]
+    if: needs.build.outputs.target == 'publish'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    environment: npm
+    permissions:
+      contents: read
+      id-token: write  # npm Trusted Publishing + provenance
+    env:
+      # Bootstrap only (see header): empty once trusted publishers exist.
+      NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+    steps:
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '24'  # npm >= 11.5.1 is required for OIDC trusted publishing
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: npm-tarballs
+          path: npm-out
+
+      - name: Use the bootstrap token (only if the secret is set)
+        if: env.NPM_TOKEN != ''
+        run: npm config set "//registry.npmjs.org/:_authToken" "$NPM_TOKEN"
+
+      # No skip-existing equivalent: a version that is already on the registry
+      # (even a partial set) stops the run for a human.
+      - name: Refuse if any package@version already exists
+        env:
+          VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          set -u
+          bad=0
+          for f in npm-out/tarballs/*.tgz; do
+            name="$(tar -xzOf "$f" package/package.json | jq -r .name)"
+            rc=0; out="$(npm view "$name@$VERSION" version 2>&1)" || rc=$?
+            if [ "$rc" -eq 0 ]; then
+              echo "::error::$name@$VERSION already exists on npm"; bad=1
+            elif ! printf '%s' "$out" | grep -q 'E404'; then
+              echo "::error::unexpected response for $name@$VERSION (not a clean 404): $out"; bad=1
+            else
+              echo "$name@$VERSION is free"
+            fi
+          done
+          exit "$bad"
+
+      # Platform packages MUST be published before the root so that the root's
+      # optionalDependencies resolve on the first install after publication.
+      - name: Publish platform packages, then the root
+        env:
+          VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          set -euo pipefail
+          cd npm-out/tarballs
+          ROOT="pulseengine-meld-$VERSION.tgz"
+          for f in *.tgz; do
+            [ "$f" = "$ROOT" ] && continue
+            npm publish "$f" --access public --provenance
+          done
+          npm publish "$ROOT" --access public --provenance

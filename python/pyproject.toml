@@ -1,0 +1,95 @@
+# Single source of truth for the PyPI and npm distribution metadata (#442).
+#
+# This is NOT a buildable Python project: meld is a Rust CLI and the wheels are
+# repacked from the signed release tarballs by `python/build_wheels.py`, which
+# reads this file (stdlib `tomllib`). `npm/build_npm.py` reads it too, and so
+# does `tools/check_release_targets.py`, so a target added to release.yml
+# without a row here fails the pull request.
+#
+# `version` is deliberately absent: it comes from the release tag and is
+# asserted against `meld --version` and the workspace Cargo.toml.
+
+[project]
+name = "meld-cli"
+description = "Static WebAssembly component fusion (the `meld` command-line tool)"
+requires-python = ">=3.8"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+dynamic = ["version"]
+keywords = ["webassembly", "component-model", "fusion", "cli"]
+authors = [{ name = "PulseEngine" }]
+classifiers = [
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "Programming Language :: Rust",
+  "Topic :: Software Development :: Compilers",
+]
+
+[project.urls]
+Homepage = "https://github.com/pulseengine/meld"
+Repository = "https://github.com/pulseengine/meld"
+Changelog = "https://github.com/pulseengine/meld/blob/main/CHANGELOG.md"
+Issues = "https://github.com/pulseengine/meld/issues"
+
+[tool.meld-dist]
+# The executable name inside the release tarballs and on PATH.
+binary = "meld"
+# npm root package; per-platform packages are `<npm-name>-<npm-platform>`.
+npm-name = "@pulseengine/meld"
+
+# One row per release target (the keys must equal the release.yml build matrix;
+# tools/check_release_targets.py enforces that).
+#   os / libc / wheel-arch : cross-checked against the ELF / Mach-O the tarball
+#       actually contains. The wheel TAG is derived from the binary, never read
+#       from this table; a mismatch here fails the build.
+#   npm-*  : the npm `os` / `cpu` / `libc` package.json fields and the suffix
+#       of the per-platform package name.
+[tool.meld-dist.targets."x86_64-unknown-linux-gnu"]
+os = "linux"
+libc = "glibc"
+wheel-arch = "x86_64"
+npm-platform = "linux-x64-gnu"
+npm-os = "linux"
+npm-cpu = "x64"
+npm-libc = "glibc"
+
+[tool.meld-dist.targets."aarch64-unknown-linux-gnu"]
+os = "linux"
+libc = "glibc"
+wheel-arch = "aarch64"
+npm-platform = "linux-arm64-gnu"
+npm-os = "linux"
+npm-cpu = "arm64"
+npm-libc = "glibc"
+
+[tool.meld-dist.targets."x86_64-unknown-linux-musl"]
+os = "linux"
+libc = "musl"
+wheel-arch = "x86_64"
+npm-platform = "linux-x64-musl"
+npm-os = "linux"
+npm-cpu = "x64"
+npm-libc = "musl"
+
+[tool.meld-dist.targets."aarch64-unknown-linux-musl"]
+os = "linux"
+libc = "musl"
+wheel-arch = "aarch64"
+npm-platform = "linux-arm64-musl"
+npm-os = "linux"
+npm-cpu = "arm64"
+npm-libc = "musl"
+
+[tool.meld-dist.targets."x86_64-apple-darwin"]
+os = "macos"
+wheel-arch = "x86_64"
+npm-platform = "darwin-x64"
+npm-os = "darwin"
+npm-cpu = "x64"
+
+[tool.meld-dist.targets."aarch64-apple-darwin"]
+os = "macos"
+wheel-arch = "arm64"
+npm-platform = "darwin-arm64"
+npm-os = "darwin"
+npm-cpu = "arm64"

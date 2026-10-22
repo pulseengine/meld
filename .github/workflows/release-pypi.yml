@@ -1,0 +1,255 @@
+name: Release PyPI
+
+# Platform wheels for `pip install meld-cli` (command: `meld`), repacked from the
+# signed GitHub release tarballs (#442). Nothing is rebuilt: the binary in each
+# wheel is the one whose sha256 is in the cosign-signed SHA256SUMS.txt.
+#
+# TRIGGER: `release: published`, NOT `workflow_run` (which rivet/synth use for
+# npm). Our release is created as a DRAFT, release.yml fills it, a human
+# verifies it (checksums, signature, binaries) and only then publishes it (see
+# AGENTS.md, "draft-then-publish"). `workflow_run` would fire when release.yml
+# finishes - while the release is still an unverified draft - and registry
+# uploads are immutable: a wheel built from a release that is later found bad
+# can be yanked but never replaced. `published` is the human's "this is good".
+# (A release published by a workflow using GITHUB_TOKEN would NOT trigger this;
+# the publish step is a maintainer's `gh release edit --draft=false`, which does.)
+#
+# SAFETY DEFAULT: an automatic run targets TestPyPI unless the repository
+# variable PYPI_RELEASE_TARGET is set to `pypi`. A manual dispatch chooses
+# explicitly (default testpypi).
+#
+# Trusted Publishing (OIDC): no API token exists anywhere. The maintainer must
+# register this workflow (release-pypi.yml) + environment as a trusted publisher
+# on test.pypi.org (environment `testpypi`) and pypi.org (environment `pypi`);
+# see AGENTS.md. PEP 740 attestations are produced by the publish action.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to publish (e.g. v0.65.0)'
+        required: true
+        type: string
+      target:
+        description: 'Index to publish to'
+        required: true
+        type: choice
+        options: [testpypi, pypi]
+        default: testpypi
+
+# Never cancel: an interrupted upload can leave a partial wheel set on the
+# index, and that cannot be repaired by re-uploading.
+concurrency:
+  group: release-pypi-${{ inputs.tag || github.event.release.tag_name }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Verify and build wheels
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    outputs:
+      tag: ${{ steps.resolve.outputs.tag }}
+      version: ${{ steps.resolve.outputs.version }}
+      target: ${{ steps.resolve.outputs.target }}
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Resolve tag and target
+        id: resolve
+        env:
+          EVENT_TAG: ${{ github.event.release.tag_name }}
+          INPUT_TAG: ${{ inputs.tag }}
+          INPUT_TARGET: ${{ inputs.target }}
+          VAR_TARGET: ${{ vars.PYPI_RELEASE_TARGET }}
+        run: |
+          set -euo pipefail
+          TAG="${INPUT_TAG:-$EVENT_TAG}"
+          TARGET="${INPUT_TARGET:-${VAR_TARGET:-testpypi}}"
+          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::'$TAG' is not a vX.Y.Z release tag"; exit 1
+          fi
+          case "$TARGET" in testpypi|pypi) ;; *) echo "::error::bad target '$TARGET'"; exit 1 ;; esac
+          {
+            echo "tag=$TAG"
+            echo "version=${TAG#v}"
+            echo "target=$TARGET"
+          } >> "$GITHUB_OUTPUT"
+          echo "Publishing $TAG to $TARGET"
+
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.12'
+
+      - name: Refuse a draft release for the real index
+        env:
+          TAG: ${{ steps.resolve.outputs.tag }}
+          TARGET: ${{ steps.resolve.outputs.target }}
+        run: |
+          set -euo pipefail
+          draft="$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft)"
+          if [ "$draft" = "true" ] && [ "$TARGET" = "pypi" ]; then
+            echo "::error::$TAG is still a draft; verify and publish the release first (AGENTS.md)."
+            exit 1
+          fi
+
+      - name: Refuse if this version already exists on the index
+        env:
+          VERSION: ${{ steps.resolve.outputs.version }}
+          TARGET: ${{ steps.resolve.outputs.target }}
+        run: python3 -I python/check_registry_absent.py --index "$TARGET" --version "$VERSION"
+
+      - name: Download release assets
+        env:
+          TAG: ${{ steps.resolve.outputs.tag }}
+        run: |
+          set -euo pipefail
+          mkdir assets
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir assets \
+            --pattern 'SHA256SUMS.txt' --pattern 'SHA256SUMS.txt.cosign.bundle' --pattern '*.tar.gz'
+          ls -la assets
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3
+        with:
+          cosign-release: 'v2.4.1'
+
+      # Same identity/issuer as release.yml's signing step documents.
+      - name: Verify the cosign bundle over SHA256SUMS.txt
+        run: |
+          set -euo pipefail
+          cosign verify-blob \
+            --bundle assets/SHA256SUMS.txt.cosign.bundle \
+            --certificate-identity-regexp 'https://github.com/pulseengine/meld/.github/workflows/release.yml@.*' \
+            --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
+            assets/SHA256SUMS.txt
+
+      # The tag's own Cargo.toml (not the checkout's: a backfill dispatch may
+      # run from a newer commit than the tag being published).
+      - name: Fetch the tag's Cargo.toml
+        env:
+          TAG: ${{ steps.resolve.outputs.tag }}
+        run: |
+          gh api -H 'Accept: application/vnd.github.raw' \
+            "repos/$GITHUB_REPOSITORY/contents/Cargo.toml?ref=$TAG" > Cargo.tag.toml
+
+      # Verifies every tarball against SHA256SUMS.txt (fail closed), derives the
+      # platform tags from the binaries, asserts tag == `meld --version` (native
+      # binary) == Cargo.toml workspace version.
+      - name: Build wheels
+        env:
+          TAG: ${{ steps.resolve.outputs.tag }}
+        run: |
+          set -euo pipefail
+          python3 -I python/build_wheels.py --tag "$TAG" --assets assets \
+            --out out --cargo-toml Cargo.tag.toml
+          mkdir -p wheels && mv out/*.whl wheels/
+          cat out/wheel-sha256.txt
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: wheels
+          path: wheels/*.whl
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: wheel-sha256
+          path: out/wheel-sha256.txt
+          if-no-files-found: error
+
+  test:
+    name: Install test (${{ matrix.name }})
+    needs: build
+    runs-on: ${{ matrix.runner }}
+    # musl runs in an Alpine container (node image: the JS actions need node).
+    container: ${{ matrix.container }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: linux-x64-glibc,  runner: ubuntu-24.04,     container: '',                 expect: manylinux }
+          - { name: linux-arm64-glibc, runner: ubuntu-24.04-arm, container: '',                expect: manylinux }
+          - { name: linux-x64-musl,   runner: ubuntu-24.04,     container: 'node:22-alpine',   expect: musllinux }
+          - { name: linux-arm64-musl, runner: ubuntu-24.04-arm, container: 'node:22-alpine',   expect: musllinux }
+          - { name: macos-x64,        runner: macos-15-intel,   container: '',                 expect: macosx }
+          - { name: macos-arm64,      runner: macos-15,         container: '',                 expect: macosx }
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: wheels
+          path: wheels
+
+      - name: Install Python (Alpine only)
+        if: matrix.expect == 'musllinux'
+        run: apk add --no-cache python3 py3-pip
+
+      # Clean venv, no network index: pip must pick the right wheel for this
+      # platform from the local set, which also exercises the tag derivation.
+      - name: Install into a clean venv and run
+        env:
+          TAG: ${{ needs.build.outputs.tag }}
+          EXPECT: ${{ matrix.expect }}
+        run: |
+          set -eu
+          VERSION="${TAG#v}"
+          python3 -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/pip" install --no-index --find-links wheels "meld-cli==$VERSION"
+          got="$("$RUNNER_TEMP/venv/bin/meld" --version)"
+          echo "meld --version -> $got"
+          [ "$got" = "meld $VERSION" ] || { echo "::error::expected 'meld $VERSION'"; exit 1; }
+          "$RUNNER_TEMP/venv/bin/meld" --help > /dev/null
+          grep -h '^Tag:' "$RUNNER_TEMP"/venv/lib/python*/site-packages/meld_cli-*.dist-info/WHEEL
+          grep -h '^Tag:' "$RUNNER_TEMP"/venv/lib/python*/site-packages/meld_cli-*.dist-info/WHEEL | grep -q "$EXPECT" \
+            || { echo "::error::pip selected a wheel that is not a $EXPECT wheel"; exit 1; }
+
+  publish:
+    name: Publish to ${{ needs.build.outputs.target }}
+    needs: [build, test]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    # `testpypi` / `pypi` environments; trusted publishers are bound to them.
+    environment: ${{ needs.build.outputs.target }}
+    permissions:
+      contents: read
+      id-token: write  # Trusted Publishing (OIDC) + PEP 740 attestations
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.12'
+
+      # Re-checked right before upload: the build job's check can be a while old.
+      - name: Refuse if this version already exists on the index
+        env:
+          VERSION: ${{ needs.build.outputs.version }}
+          TARGET: ${{ needs.build.outputs.target }}
+        run: python3 -I python/check_registry_absent.py --index "$TARGET" --version "$VERSION"
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: wheels
+          path: wheels
+
+      - name: Publish to TestPyPI
+        if: needs.build.outputs.target == 'testpypi'
+        uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # release/v1
+        with:
+          repository-url: https://test.pypi.org/legacy/
+          packages-dir: wheels
+          # skip-existing is deliberately NOT set: see the pre-check above.
+
+      - name: Publish to PyPI
+        if: needs.build.outputs.target == 'pypi'
+        uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # release/v1
+        with:
+          packages-dir: wheels
