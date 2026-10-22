@@ -136,6 +136,7 @@ fn assert_matches_unfused(wat: &str) {
     }
 }
 
+// rivet: verifies SWV-115
 #[test]
 fn reexported_import_called_by_another_module_goes_through_the_adapter() {
     assert_matches_unfused(&comp(BM_REEXPORT, CM_CALL, WIRE_RUN, EXPORT_RUN));
@@ -143,6 +144,7 @@ fn reexported_import_called_by_another_module_goes_through_the_adapter() {
 
 /// Element items are re-resolved from the final map (#488), so the map entry
 /// this test depends on, the one #504 fixes, reaches the element segment.
+// rivet: verifies SWV-115
 #[test]
 fn reexported_import_in_an_element_segment_goes_through_the_adapter() {
     assert_matches_unfused(&comp(BM_REEXPORT, CM_ELEM, WIRE_RUN, EXPORT_RUN));
@@ -201,6 +203,7 @@ fn export_index(fused: &[u8], name: &str) -> u32 {
         .1
 }
 
+// rivet: verifies SWV-115
 #[test]
 fn reexporting_module_and_importing_module_call_the_same_function() {
     let wat = comp(BM_REEXPORT, CM_CALL, WIRE_RUN_BRUN, EXPORT_RUN_BRUN);
@@ -223,6 +226,7 @@ fn reexporting_module_and_importing_module_call_the_same_function() {
 
 /// `$bm` -> `$cm` -> `$dm`: `$cm` imports `$bm`'s `fx` and re-exports it as
 /// `gx`; `$dm` imports `gx`. The alias of an alias must follow too.
+// rivet: verifies SWV-115
 #[test]
 fn a_two_hop_reexport_chain_goes_through_the_adapter() {
     let extra = r#"(core module $cm

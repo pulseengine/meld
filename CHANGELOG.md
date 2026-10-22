@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.65.0] - 2026-10-22
+
 ### Added
 - **`--emit-import-map` states each import's memory, realloc, string encoding
   and owning component (SR-105, #513).** A host implementing a fused

@@ -116,6 +116,7 @@ const CX_EXPECTED: &str = "put=ok:0;put0=err:qty must be > 0;get=apple,3,[red,bi
                            counter=15,counter=15,peek=100";
 
 // rivet: verifies SR-16
+// rivet: verifies SWV-116
 #[test]
 fn issue_512_reporter_component_fused_matches_composed() {
     let composed = fixture("cx/composed.wasm");
@@ -170,6 +171,7 @@ fn split_shapes(s: &str) -> Vec<(String, String)> {
 
 /// Shape-by-shape, so a failure names the shape rather than one long string.
 // rivet: verifies SR-16
+// rivet: verifies SWV-116
 #[test]
 fn issue_512_every_shape_fused_matches_composed() {
     let composed = fixture("shapes/composed.wasm");
