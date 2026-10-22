@@ -16,6 +16,15 @@ All notable changes to this project will be documented in this file.
   unchanged. Requested by @o-murphy.
 
 ### Fixed
+- **Nested lists and strings inside option, result and variant values are
+  deep-copied across memories (SR-104, #512).** A `list<string>` behind an
+  option, result or variant had its pointer array copied to the other
+  component but not the strings it points to, so the receiver read its own
+  memory at the other component's addresses: empty or garbage strings, or a
+  trap, at exit 0. This affected results and arguments under `--memory
+  multi` (reported for `option<record{..., tags: list<string>}>`). A call with
+  both plain and optional pointer arguments also skipped copying the optional
+  one. Reported by @o-murphy.
 - **A re-exported adapted import reaches the adapter from every importer
   (SR-103, #504).** When one core module re-exported an import that crosses
   a component boundary through an adapter, and another module imported that

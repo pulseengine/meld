@@ -1,0 +1,28 @@
+package demo:cx@0.1.0;
+
+interface store {
+  record item { name: string, qty: u32, tags: list<string> }
+  variant shape { circle(u32), rect(tuple<u32, u32>), none }
+  enum level { low, mid, high }
+  flags perms { read, write, exec }
+  resource counter {
+    constructor(start: u32);
+    bump: func(by: u32) -> u32;
+    label: func() -> string;
+  }
+  put: func(it: item) -> result<u32, string>;
+  get: func(id: u32) -> option<item>;
+  area: func(s: shape) -> u64;
+  classify: func(n: u32) -> level;
+  check: func(p: perms) -> perms;
+  sum: func(xs: list<u32>) -> u64;
+  make: func(start: u32) -> counter;
+  peek: func(c: borrow<counter>) -> u32;
+}
+
+interface app {
+  run-all: func() -> string;
+}
+
+world provider { export store; }
+world guest { import store; export app; }
