@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.65.1] - 2026-10-22
+
 ### Added
 - **`pip install meld-cli` and `npm install @pulseengine/meld` (#442).**
   Platform wheels and npm packages repack the cosign-signed release binaries
