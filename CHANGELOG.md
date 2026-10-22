@@ -4,6 +4,19 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+- **The adapter allocates with the caller's own memory and realloc, wherever
+  they are defined (SR-106, #515).** When a component's `cabi_realloc` lived
+  in a different core module from the code calling an adapted import, or the
+  canon lower named another module's memory, the copy of a string or list
+  into the caller was skipped and the caller read its own memory at the
+  callee's address, at exit 0. Memory and realloc now come together from the
+  canon lower (or lift) the module actually imports, traced through
+  instantiation arguments and aliases. A copy whose allocator or memory
+  cannot be resolved, or whose imports name conflicting ones, is an error
+  instead of a skipped copy. Calls that copy nothing are unaffected, and the
+  wit-bindgen corpus fuses byte-identically.
+
 ## [0.65.0] - 2026-10-22
 
 ### Added

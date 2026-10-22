@@ -303,6 +303,18 @@ pub struct ResolvedResourceOp {
     pub caller_already_converted: bool,
 }
 
+/// #515: the `memory` and `realloc` named by ONE `canon lower` / `canon lift`
+/// option set, each decomposed to `(module_idx, module-local index)`. They are
+/// always used as a pair: pairing a traced realloc with a differently-sourced
+/// memory allocates in one memory and copies into another.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResolvedAlloc {
+    pub memory: (usize, u32),
+    /// `None` for a memory-only option set (the side that does not allocate).
+    /// A traced realloc is NEVER present without its traced memory.
+    pub realloc: Option<(usize, u32)>,
+}
+
 /// Requirements for an adapter function
 #[derive(Debug, Clone, Default)]
 pub struct AdapterRequirements {
@@ -323,6 +335,22 @@ pub struct AdapterRequirements {
     pub callee_post_return: Option<(usize, u32)>,
     /// Callee's realloc function (component-local core function index)
     pub callee_realloc: Option<u32>,
+    /// #515: the callee's `memory` + `realloc` options (`canon lift`), resolved
+    /// TOGETHER from the one option set and decomposed to module-local indices.
+    /// The lift's options are authoritative; the merger's per-module
+    /// `realloc_map` / `memory_index_map[..0]` only describe the module that
+    /// DEFINES them, which need not be the module the adapter targets.
+    pub callee_alloc: Option<ResolvedAlloc>,
+    /// #515: the same for the CALLER's `canon lower`, found by tracing the
+    /// calling module's import. Never a realloc without its memory.
+    pub caller_alloc: Option<ResolvedAlloc>,
+    /// #515: used ONLY when `caller_alloc` is `None`: the one `(memory, realloc)`
+    /// pair that EVERY `canon lower` in the caller component (all of them
+    /// complete) resolves to. A heuristic for sites that did not trace, so the
+    /// adapter applies it only when it names the memory the calling module
+    /// uses (see `analyze_call_site`); then it also replaces the module's own
+    /// `cabi_realloc`, because every lowering the call could use names it.
+    pub caller_alloc_fallback: Option<ResolvedAlloc>,
     /// Byte size of the callee's return area when using retptr convention.
     /// Computed from the component function type's flat result layout.
     pub return_area_byte_size: Option<u32>,
@@ -771,6 +799,191 @@ fn build_module_export_to_core_func(component: &ParsedComponent) -> HashMap<(usi
         .into_iter()
         .map(|(core_idx, (mod_idx, name))| ((mod_idx, name), core_idx))
         .collect()
+}
+
+/// #515: resolve one canonical option set to a coherent [`ResolvedAlloc`].
+///
+/// * no `memory` named: `None` (nothing to trace).
+/// * `memory` only: the traced memory with `realloc: None` -- normal for the
+///   side that does not allocate, and its memory must still be honoured.
+/// * `memory` + `realloc`: both, or `None` if EITHER cannot be traced (never a
+///   traced realloc with an untraced memory).
+fn alloc_of_options(
+    component: &ParsedComponent,
+    memory: Option<u32>,
+    realloc: Option<u32>,
+) -> Option<ResolvedAlloc> {
+    let mem = memory?;
+    let memory = core_memory_sources(component)
+        .get(&mem)
+        .and_then(|(m, name)| {
+            component
+                .core_modules
+                .get(*m)?
+                .exports
+                .iter()
+                .find(|e| e.name == *name && e.kind == ExportKind::Memory)
+                .map(|e| (*m, e.index))
+        });
+    let realloc_fn = match realloc {
+        None => None,
+        Some(re) => match build_core_func_to_module_local(component).get(&re).copied() {
+            Some(f) => Some(f),
+            None => {
+                log::warn!(
+                    "#515: cannot trace canonical realloc (core func {re}) to a module \
+                     function; falling back to the per-module maps"
+                );
+                return None;
+            }
+        },
+    };
+    match memory {
+        Some(memory) => Some(ResolvedAlloc {
+            memory,
+            realloc: realloc_fn,
+        }),
+        None => {
+            log::warn!(
+                "#515: cannot trace canonical memory (core memory {mem}) to a module \
+                 memory; falling back to the per-module maps"
+            );
+            None
+        }
+    }
+}
+
+/// #515: the coherent `(memory, realloc)` of the `canon lower` that supplies the
+/// CALLING module's import(s) `imports` (`(import module, import field)` pairs).
+///
+/// The lower is found by TRACING the calling module's actual import: module
+/// instantiation `with` argument -> export bag entry -> core func -> (through
+/// any alias re-exports) its `canon lower`. That is the only attribution that
+/// is right when one component function is lowered more than once or a
+/// `canon lift` precedes the import; the by-name / by-func-index maps get both
+/// wrong.
+///
+/// * EVERY matched import traces and they agree: that lower's options.
+/// * EVERY matched import traces but they name DIFFERENT options: `Err` -- the
+///   caller cannot tell which one the call uses, and guessing allocates from one
+///   module and copies into another.
+/// * ANY matched import does not trace (or there is none): the site is
+///   untraced. A traced sibling must NOT decide it. The first element is then
+///   `None`; the second is the heuristic fallback -- the one `(memory, realloc)`
+///   pair every complete `canon lower` in the component names, if they all agree.
+///
+/// Returns `(traced, fallback)`.
+fn traced_caller_alloc(
+    component: &ParsedComponent,
+    from_module: usize,
+    imports: &[(&str, &str)],
+) -> Result<(Option<ResolvedAlloc>, Option<ResolvedAlloc>)> {
+    use crate::parser::{InstanceArg, InstanceKind};
+    let lowers = core_lower_options(component);
+    let aliases = core_func_alias_targets(component);
+
+    let mut args_of_module: Option<&Vec<(String, InstanceArg)>> = None;
+    let mut bags: HashMap<u32, Vec<(String, ExportKind, u32)>> = HashMap::new();
+    for inst in &component.instances {
+        match &inst.kind {
+            InstanceKind::Instantiate { module_idx, args }
+                if *module_idx as usize == from_module && args_of_module.is_none() =>
+            {
+                args_of_module = Some(args);
+            }
+            InstanceKind::FromExports(exports) => {
+                bags.insert(
+                    inst.index,
+                    exports
+                        .iter()
+                        .filter(|(_, kind, _)| {
+                            matches!(
+                                kind,
+                                wasmparser::ExternalKind::Func
+                                    | wasmparser::ExternalKind::FuncExact
+                            )
+                        })
+                        .map(|(n, _, idx)| (n.clone(), ExportKind::Function, *idx))
+                        .collect(),
+                );
+            }
+            _ => {}
+        }
+    }
+
+    let mut traced: Vec<(&str, &str, u32)> = Vec::new();
+    for (module, field) in imports {
+        let lower = args_of_module
+            .and_then(|args| {
+                args.iter().find_map(|(n, a)| match a {
+                    InstanceArg::Instance(i) if n == module => Some(*i),
+                    _ => None,
+                })
+            })
+            .and_then(|src| bags.get(&src))
+            .and_then(|b| b.iter().find(|(n, _, _)| n == field).map(|(_, _, i)| *i))
+            .and_then(|entity| {
+                trace_core_func_to_lower(entity, &lowers, &aliases, &bags)
+                    .ok()
+                    .flatten()
+            });
+        if let Some(l) = lower {
+            traced.push((module, field, l));
+        }
+    }
+
+    if !imports.is_empty() && traced.len() == imports.len() {
+        // Agreement is decided on what the options RESOLVE to, not on raw
+        // component core indices: two lowers that name the same memory and
+        // realloc through separate inline aliases have different raw indices.
+        // (When either side does not resolve, fall back to the raw indices.)
+        let resolve = |l: u32| {
+            lowers.get(&l).map(|o| {
+                (
+                    o.memory,
+                    o.realloc,
+                    alloc_of_options(component, o.memory, o.realloc),
+                )
+            })
+        };
+        let same = |a: u32, b: u32| match (resolve(a), resolve(b)) {
+            (Some((_, _, Some(x))), Some((_, _, Some(y)))) => x == y,
+            (Some((m1, r1, _)), Some((m2, r2, _))) => (m1, r1) == (m2, r2),
+            (x, y) => x.is_none() && y.is_none(),
+        };
+        let (m0, f0, l0) = traced[0];
+        if let Some((m, f, _)) = traced.iter().find(|(_, _, l)| !same(*l, l0)) {
+            return Err(Error::AdapterGeneration(format!(
+                "#515: the calling module's imports '{m0}'.'{f0}' and '{m}'.'{f}' are lowered \
+                 with different memory/realloc options and meld cannot tell which one the \
+                 call uses; refusing rather than allocating from one module and copying into \
+                 another"
+            )));
+        }
+        return Ok((
+            lowers
+                .get(&l0)
+                .and_then(|o| alloc_of_options(component, o.memory, o.realloc)),
+            None,
+        ));
+    }
+
+    // Untraced site: heuristic unanimity. The call must go through SOME
+    // `canon lower` of this component; if EVERY lower in the component is
+    // complete and they all resolve to the same pair, that pair is the answer
+    // whichever one the call uses. A lower that is incomplete (memory-only, or
+    // none) could be the one in use, so its presence disables the heuristic.
+    let mut resolved: Vec<ResolvedAlloc> = Vec::new();
+    for o in lowers.values() {
+        match alloc_of_options(component, o.memory, o.realloc) {
+            Some(a) if a.realloc.is_some() => resolved.push(a),
+            _ => return Ok((None, None)),
+        }
+    }
+    match resolved.split_first() {
+        Some((first, rest)) if rest.iter().all(|a| a == first) => Ok((None, Some(*first))),
+        _ => Ok((None, None)),
+    }
 }
 
 /// Build a map from core_func_idx → (module_idx, module_local_func_idx).
@@ -3151,6 +3364,11 @@ impl Resolver {
                                                 callee_core_to_local.get(&pr_idx).copied()
                                             });
                                         requirements.callee_realloc = lift_opts.realloc;
+                                        requirements.callee_alloc = alloc_of_options(
+                                            to_component,
+                                            lift_opts.memory,
+                                            lift_opts.realloc,
+                                        );
 
                                         // Compute layout info from the component function type
                                         // (needed for retptr bridging and multi-pointer copy).
@@ -3428,6 +3646,16 @@ impl Resolver {
                                     if let Some(enc) = matched_caller_enc {
                                         requirements.caller_encoding = Some(enc);
                                     }
+                                    // #515: the caller's allocator is the one its
+                                    // `canon lower` names, wherever it is defined.
+                                    (
+                                        requirements.caller_alloc,
+                                        requirements.caller_alloc_fallback,
+                                    ) = traced_caller_alloc(
+                                        from_component,
+                                        from_mod_idx,
+                                        &[(import_name.as_str(), &**func_name)],
+                                    )?;
                                     if let (Some(ce), Some(ce2)) =
                                         (requirements.caller_encoding, requirements.callee_encoding)
                                     {
@@ -3516,6 +3744,11 @@ impl Resolver {
                                     .post_return
                                     .and_then(|pr_idx| fb_core_to_local.get(&pr_idx).copied());
                                 requirements.callee_realloc = lift_opts.realloc;
+                                requirements.callee_alloc = alloc_of_options(
+                                    to_component,
+                                    lift_opts.memory,
+                                    lift_opts.realloc,
+                                );
 
                                 // Populate layout and resource info from component
                                 // function type (mirrors per-function path).
@@ -3754,6 +3987,24 @@ impl Resolver {
                                 requirements.caller_encoding = Some(enc);
                             }
 
+                            // #515: see the primary site above.
+                            (
+                                requirements.caller_alloc,
+                                requirements.caller_alloc_fallback,
+                            ) = traced_caller_alloc(
+                                from_component,
+                                from_mod_idx,
+                                &from_module
+                                    .imports
+                                    .iter()
+                                    .filter(|imp| {
+                                        (imp.name == *import_name || imp.module == *import_name)
+                                            && matches!(imp.kind, ImportKind::Function(_))
+                                    })
+                                    .map(|imp| (imp.module.as_str(), imp.name.as_str()))
+                                    .collect::<Vec<_>>(),
+                            )?;
+
                             if let (Some(caller_enc), Some(callee_enc)) =
                                 (requirements.caller_encoding, requirements.callee_encoding)
                             {
@@ -3865,7 +4116,14 @@ impl Resolver {
 
             let caller_encoding = caller_lower.map(|l| l.string_encoding);
             let caller_memory = caller_lower.and_then(|l| l.memory);
-            let _caller_realloc = caller_lower.and_then(|l| l.realloc);
+            // #515: the lower's `realloc` option is the authoritative caller
+            // allocator, found by tracing the calling module's import (see
+            // `traced_caller_realloc`), not via the heuristic `caller_lower`.
+            let (caller_alloc, caller_alloc_fallback) = traced_caller_alloc(
+                component,
+                res.from_module,
+                &[(res.from_import_module.as_str(), res.import_name.as_str())],
+            )?;
 
             // Check if an adapter is needed: different encoding, different memory,
             // or different realloc on callee side.
@@ -3948,6 +4206,8 @@ impl Resolver {
                 caller_encoding,
                 callee_encoding,
                 callee_realloc,
+                caller_alloc,
+                caller_alloc_fallback,
                 ..Default::default()
             };
 
@@ -3956,6 +4216,8 @@ impl Resolver {
                 requirements.callee_post_return = lift_opts
                     .post_return
                     .and_then(|pr_idx| intra_core_to_local.get(&pr_idx).copied());
+                requirements.callee_alloc =
+                    alloc_of_options(component, lift_opts.memory, lift_opts.realloc);
             }
 
             // Set string_transcoding flag

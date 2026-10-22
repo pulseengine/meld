@@ -5367,32 +5367,67 @@ impl FactStyleGenerator {
         // Determine memory indices
         // In shared memory mode, all components use memory 0
         // In multi-memory mode, each component gets its own memory
-        if let Some(&caller_mem) =
-            merged
+        // #515: memory and realloc come from the SAME canonical option set
+        // (`canon lower` for the caller, `canon lift` for the callee) when it
+        // traces; otherwise from the per-module maps, as a pair. Never a traced
+        // realloc with an untraced memory (allocate in one, copy into another).
+        let traced = |comp: usize, a: Option<crate::resolver::ResolvedAlloc>| {
+            let a = a?;
+            let mem = *merged
                 .memory_index_map
-                .get(&(site.from_component, site.from_module, 0))
-        {
-            options.caller_memory = caller_mem;
-        }
-
-        if let Some(&callee_mem) =
-            merged
-                .memory_index_map
-                .get(&(site.to_component, site.to_module, 0))
-        {
-            options.callee_memory = callee_mem;
-        }
-
-        // Look up cabi_realloc for caller and callee
-        if let Some(&realloc_idx) = merged
-            .realloc_map
-            .get(&(site.from_component, site.from_module))
-        {
-            options.caller_realloc = Some(realloc_idx);
-        }
-        if let Some(&realloc_idx) = merged.realloc_map.get(&(site.to_component, site.to_module)) {
-            options.callee_realloc = Some(realloc_idx);
-        }
+                .get(&(comp, a.memory.0, a.memory.1))?;
+            let re = match a.realloc {
+                None => None,
+                Some((m, l)) => Some(*merged.function_index_map.get(&(comp, m, l))?),
+            };
+            Some((mem, re))
+        };
+        let module_pair = |comp: usize, module: usize| {
+            (
+                merged.memory_index_map.get(&(comp, module, 0)).copied(),
+                merged.realloc_map.get(&(comp, module)).copied(),
+            )
+        };
+        // A memory-only traced set (the side that does not allocate) keeps its
+        // traced memory; its realloc comes from the module's map only when the
+        // module's memory IS that memory, so the pair stays coherent.
+        let side = |comp: usize,
+                    module: usize,
+                    alloc: Option<crate::resolver::ResolvedAlloc>,
+                    fallback: Option<crate::resolver::ResolvedAlloc>|
+         -> (u32, Option<u32>, bool) {
+            let (mod_mem, mod_re) = module_pair(comp, module);
+            if let Some((mem, re)) = traced(comp, alloc) {
+                let re = re.or(if Some(mem) == mod_mem { mod_re } else { None });
+                return (mem, re, false);
+            }
+            // Heuristic unanimous pair (untraced sites): may replace the
+            // module's realloc only when it names the memory the module uses.
+            if let Some((fmem, fre)) = traced(comp, fallback)
+                && Some(fmem) == mod_mem
+                && fre.is_some()
+            {
+                return (fmem, fre, false);
+            }
+            (mod_mem.unwrap_or(0), mod_re, mod_mem.is_none())
+        };
+        let (cm, cr, cu) = side(
+            site.from_component,
+            site.from_module,
+            site.requirements.caller_alloc,
+            site.requirements.caller_alloc_fallback,
+        );
+        let (em, er, eu) = side(
+            site.to_component,
+            site.to_module,
+            site.requirements.callee_alloc,
+            None,
+        );
+        options.caller_memory = cm;
+        options.caller_realloc = cr;
+        options.callee_memory = em;
+        options.callee_realloc = er;
+        options.memory_unresolved = cu || eu;
 
         // Use canonical options from the resolver if available, fall back to UTF-8
         options.caller_string_encoding = site
@@ -6175,6 +6210,96 @@ impl FactStyleGenerator {
         Ok((caller_type_idx, func))
     }
 
+    /// The canonical ABI uses the retptr convention when flat results exceed
+    /// `MAX_FLAT_RESULTS`: the lowered caller takes a trailing `retptr: i32` and
+    /// returns nothing; the lifted callee returns the return-area pointer. The
+    /// retptr adapter ALWAYS copies that return area across memories (bulk, or
+    /// slot by slot when it holds pointers), so this one predicate both selects
+    /// the emitter and tells the #515 gate a memory is needed.
+    fn is_retptr_call(
+        caller_param_count: usize,
+        callee_param_count: usize,
+        caller_result_count: usize,
+        callee_result_count: usize,
+        callee_first_result: Option<&wasm_encoder::ValType>,
+    ) -> bool {
+        caller_param_count > callee_param_count
+            && caller_result_count == 0
+            && callee_result_count == 1
+            && callee_first_result == Some(&wasm_encoder::ValType::I32)
+    }
+
+    /// #515: a cross-memory call whose data must be COPIED needs an allocator on
+    /// the receiving side, and meld must be able to name it. The emitters used to
+    /// gate each copy on `realloc.is_some()` and silently skip it when none was
+    /// found: the adapter validated, fusion exited 0, and the receiver read its own
+    /// memory at the other side's pointer. Refuse instead.
+    ///
+    /// `copies_return_area` is true when the adapter being generated emits the
+    /// retptr return-area `memory.copy` (callee memory -> caller memory). That
+    /// copy needs the CALLER'S MEMORY but no realloc, so it counts as a copy for
+    /// the unresolved-memory refusal even when the result holds no pointers
+    /// (`tuple<u32, u32>`); the caller passes the SAME predicate
+    /// ([`Self::is_retptr_call`]) that selects the retptr emitter.
+    fn require_reallocs_for_copy(
+        site: &AdapterSite,
+        options: &AdapterOptions,
+        copies_return_area: bool,
+    ) -> Result<()> {
+        let r = &site.requirements;
+        let copies_result = options.returns_pointer_pair
+            || !r.result_pointer_pair_offsets.is_empty()
+            || !r.conditional_result_flat_pairs.is_empty()
+            || !r.conditional_result_pointer_pairs.is_empty();
+        // The >16-flat-param buffer (`params_area_byte_size`) is a parameter copy
+        // too: it is allocated in the callee with the callee's realloc.
+        let copies_params = !r.pointer_pair_positions.is_empty()
+            || !r.conditional_pointer_pairs.is_empty()
+            || r.params_area_byte_size.is_some();
+        if !(copies_result || copies_params || copies_return_area) {
+            // Scalar-only: nothing is copied, so an unknown memory is harmless
+            // (a plain forward is correct, as on the base).
+            return Ok(());
+        }
+        // A crossing site whose memory lookup MISSED defaulted to memory 0 and
+        // looks same-memory; deciding "same memory" from those defaults would
+        // skip every copy. `crosses_memory` is the resolver's per-site verdict
+        // (domains differ / both components have memory), so trust it over the
+        // defaults and refuse when the actual memories are unknown -- but only
+        // once a copy is actually required.
+        if site.crosses_memory && options.memory_unresolved {
+            return Err(crate::Error::AdapterGeneration(format!(
+                "#515: the call to '{}' ({}) crosses memories but meld could not resolve \
+                 the caller's or callee's memory (the calling module has no memory and its \
+                 `canon lower` could not be traced); refusing rather than treating it as a \
+                 same-memory call and skipping every copy.",
+                site.export_name, site.import_module
+            )));
+        }
+        if options.caller_memory == options.callee_memory {
+            return Ok(());
+        }
+        if copies_result && options.caller_realloc.is_none() {
+            return Err(crate::Error::AdapterGeneration(format!(
+                "#515: the cross-memory call to '{}' ({}) returns data that must be copied into \
+                 the caller's memory, but no caller `realloc` could be resolved (the `canon \
+                 lower` names none, or it could not be traced to a function). meld will not \
+                 skip the copy: the caller would read its own memory at the callee's pointer.",
+                site.export_name, site.import_module
+            )));
+        }
+        if copies_params && options.callee_realloc.is_none() {
+            return Err(crate::Error::AdapterGeneration(format!(
+                "#515: the cross-memory call to '{}' ({}) passes data that must be copied into \
+                 the callee's memory, but no callee `realloc` could be resolved (the `canon \
+                 lift` names none, or it could not be traced to a function). meld will not \
+                 skip the copy: the callee would read its own memory at the caller's pointer.",
+                site.export_name, site.import_module
+            )));
+        }
+        Ok(())
+    }
+
     /// Generate an adapter that copies data between memories
     ///
     /// When caller and callee use different memories, pointer arguments must
@@ -6235,10 +6360,15 @@ impl FactStyleGenerator {
         // The canonical ABI uses retptr when flat results > MAX_FLAT_RESULTS:
         //   caller (lowered): params..., retptr:i32 → void
         //   callee (lifted):  params...            → i32 (return area ptr)
-        let uses_retptr = caller_param_count > callee_param_count
-            && caller_result_count == 0
-            && callee_result_count == 1
-            && callee_result_types.first() == Some(&wasm_encoder::ValType::I32);
+        let uses_retptr = Self::is_retptr_call(
+            caller_param_count,
+            callee_param_count,
+            caller_result_count,
+            callee_result_count,
+            callee_result_types.first(),
+        );
+        // #515: the gate and the retptr emitter must agree on what copies.
+        Self::require_reallocs_for_copy(site, options, uses_retptr)?;
 
         if uses_retptr {
             return self.generate_retptr_adapter(
@@ -6892,10 +7022,14 @@ impl FactStyleGenerator {
         let ptr_pair_offsets = &site.requirements.params_area_pointer_pair_offsets;
         let copy_layouts = &site.requirements.params_area_copy_layouts;
 
-        let callee_realloc = options.callee_realloc.unwrap_or_else(|| {
-            log::warn!("params-ptr adapter: no callee realloc, buffer copy may fail");
-            0
-        });
+        // #515: never substitute function 0 for a missing allocator.
+        let callee_realloc = options.callee_realloc.ok_or_else(|| {
+            crate::Error::AdapterGeneration(format!(
+                "#515: the params-area copy for '{}' ({}) needs a callee `realloc` to allocate \
+                 the buffer in the callee's memory, but none could be resolved",
+                site.export_name, site.import_module
+            ))
+        })?;
 
         let has_inner_resources = copy_layouts.iter().any(|cl| {
             matches!(cl,
@@ -8379,6 +8513,25 @@ impl FactStyleGenerator {
         merged: &MergedModule,
         options: &AdapterOptions,
     ) -> Result<(u32, Function)> {
+        // #515: the transcoding emitters fall back to a plain direct call when
+        // there is no callee realloc -- the callee would then read the CALLER's
+        // pointer (and, same-memory, the wrong encoding). Refuse instead.
+        Self::require_reallocs_for_copy(site, options, false)?;
+        if options.caller_string_encoding != options.callee_string_encoding
+            && !site.requirements.pointer_pair_positions.is_empty()
+            && options.callee_realloc.is_none()
+        {
+            return Err(crate::Error::AdapterGeneration(format!(
+                "#515: the call to '{}' ({}) must transcode string/list parameters \
+                 ({:?} -> {:?}) into the callee's memory, but no callee `realloc` could be \
+                 resolved (the `canon lift` names none, or it could not be traced to a \
+                 function). meld will not forward the caller's pointer unconverted.",
+                site.export_name,
+                site.import_module,
+                options.caller_string_encoding,
+                options.callee_string_encoding
+            )));
+        }
         let target_func = self.resolve_target_function(site, merged)?;
         let type_idx = merged
             .defined_func(target_func)
@@ -15079,6 +15232,139 @@ mod tests {
             "SR-14 results: retptr i32.store must write CALLER memory \
              ({SR_CALLER_MEM}); got {:?}",
             ret.stores
+        );
+    }
+
+    /// #515: a cross-memory TRANSCODING site (UTF-8 caller -> UTF-16 callee,
+    /// string param) with no resolvable callee realloc used to fall back to a
+    /// direct call that handed the callee the CALLER's pointer. Refuse.
+    #[test]
+    fn transcode_cross_memory_without_callee_realloc_is_refused_515() {
+        use crate::merger::{MergedFuncType, MergedFunction};
+        let mut merged = empty_merged();
+        merged.types.push(MergedFuncType {
+            params: vec![wasm_encoder::ValType::I32, wasm_encoder::ValType::I32],
+            results: vec![],
+        });
+        merged.functions.push(MergedFunction {
+            type_idx: 0,
+            body: wasm_encoder::Function::new([]),
+            origin: (1, 0, 0),
+            synthetic_kind: None,
+        });
+        merged.function_index_map.insert((1, 0, 0), 0);
+        merged.type_index_map.insert((0, 0, 0), 0);
+        merged.memory_index_map.insert((0, 0, 0), SR_CALLER_MEM);
+        merged.memory_index_map.insert((1, 0, 0), SR_CALLEE_MEM);
+        // No realloc anywhere (neither `realloc_map` nor `callee_alloc`).
+        let mut site = crate::resolver::AdapterSite {
+            from_component: 0,
+            from_module: 0,
+            import_name: "greet".into(),
+            import_module: "test:dep/iface".into(),
+            import_func_type_idx: Some(0),
+            to_component: 1,
+            to_module: 0,
+            export_name: "greet".into(),
+            export_func_idx: 0,
+            crosses_memory: true,
+            is_async_lift: false,
+            requirements: Default::default(),
+        };
+        site.requirements.pointer_pair_positions = vec![0];
+        site.requirements.param_copy_layouts =
+            vec![crate::resolver::CopyLayout::Bulk { byte_multiplier: 1 }];
+        site.requirements.caller_encoding = Some(crate::parser::CanonStringEncoding::Utf8);
+        site.requirements.callee_encoding = Some(crate::parser::CanonStringEncoding::Utf16);
+
+        let gen_ = FactStyleGenerator::new(AdapterConfig::default());
+        let empty = std::collections::HashMap::new();
+        let err = match gen_.generate_adapter(&site, &merged, 0, &empty, &empty) {
+            Ok(_) => panic!("#515: a transcode with no callee realloc must not generate"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            err.contains("#515") && err.contains("callee `realloc`"),
+            "{err}"
+        );
+    }
+
+    /// #515: the >16-flat-param buffer is a parameter copy; with no callee
+    /// realloc the old code called function 0 (here the TARGET) as the allocator.
+    #[test]
+    fn params_area_without_callee_realloc_is_refused_not_function_zero_515() {
+        let (mut merged, site) = sr_params_ptr_merged_and_site();
+        merged.realloc_map.clear();
+        let gen_ = FactStyleGenerator::new(AdapterConfig::default());
+        let empty = std::collections::HashMap::new();
+        let err = match gen_.generate_adapter(&site, &merged, 0, &empty, &empty) {
+            Ok(_) => panic!("#515: a params-area copy with no callee realloc must not generate"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            err.contains("#515") && err.contains("callee `realloc`"),
+            "{err}"
+        );
+    }
+
+    /// #515 (F2): a crossing site whose calling module has NO memory (and no
+    /// traced lower) used to default `caller_memory` to 0 -- the callee's memory
+    /// -- so the site looked same-memory and the gate and every copy were skipped.
+    /// `crosses_memory` is the resolver's verdict; with the memory unknown, refuse.
+    #[test]
+    fn crossing_site_with_unresolved_memory_is_refused_not_same_memory_515() {
+        let (mut merged, site) = sr_retptr_merged_and_site();
+        assert!(site.crosses_memory);
+        merged.memory_index_map.remove(&(0, 0, 0));
+        let gen_ = FactStyleGenerator::new(AdapterConfig::default());
+        let empty = std::collections::HashMap::new();
+        let err = match gen_.generate_adapter(&site, &merged, 0, &empty, &empty) {
+            Ok(_) => panic!("#515: an unresolvable caller memory must not look same-memory"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            err.contains("#515") && err.contains("could not resolve"),
+            "{err}"
+        );
+    }
+
+    /// #515: the realloc named by the `canon lower` (decomposed onto the site)
+    /// wins over `realloc_map`, which only knows the module that DEFINES the
+    /// allocator -- here the caller module (0) defines none, module 7 does.
+    #[test]
+    fn caller_realloc_comes_from_the_lower_not_the_calling_module_515() {
+        let (mut merged, mut site) = sr_retptr_merged_and_site();
+        merged.realloc_map.clear();
+        merged.function_index_map.insert((0, 7, 2), 3);
+        site.requirements.caller_alloc = Some(crate::resolver::ResolvedAlloc {
+            memory: (7, 0),
+            realloc: Some((7, 2)),
+        });
+        merged.memory_index_map.insert((0, 7, 0), SR_CALLER_MEM);
+        let decoded = decode_adapter(site, merged);
+        assert!(
+            decoded.calls.iter().any(|(_, f)| *f == 3),
+            "#515: the result copy must allocate with the lower's realloc (merged 3); \
+             calls={:?}",
+            decoded.calls
+        );
+    }
+
+    /// #515: a cross-memory result copy with NO resolvable caller realloc must be
+    /// refused, never skipped (the old behaviour returned the callee's pointer).
+    #[test]
+    fn missing_caller_realloc_is_an_error_not_a_skipped_copy_515() {
+        let (mut merged, site) = sr_retptr_merged_and_site();
+        merged.realloc_map.clear();
+        let gen_ = FactStyleGenerator::new(AdapterConfig::default());
+        let empty = std::collections::HashMap::new();
+        let err = match gen_.generate_adapter(&site, &merged, 0, &empty, &empty) {
+            Ok(_) => panic!("#515: an uncopyable result must not generate an adapter"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            err.contains("#515") && err.contains("caller `realloc`"),
+            "{err}"
         );
     }
 

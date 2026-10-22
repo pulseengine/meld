@@ -230,6 +230,12 @@ pub struct AdapterOptions {
     /// Memory index for callee
     pub callee_memory: u32,
 
+    /// Set when a memory lookup missed (the calling/exporting module has no
+    /// memory of its own and no traced `canon` option named one), so
+    /// `caller_memory` / `callee_memory` hold the default 0 rather than a
+    /// resolved index (#515).
+    pub memory_unresolved: bool,
+
     /// Realloc function for caller (if any)
     pub caller_realloc: Option<u32>,
 
@@ -337,6 +343,7 @@ impl Default for AdapterOptions {
             caller_memory: 0,
             callee_memory: 0,
             caller_realloc: None,
+            memory_unresolved: false,
             callee_realloc: None,
             returns_pointer_pair: false,
             callee_post_return: None,
