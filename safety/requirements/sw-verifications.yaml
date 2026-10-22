@@ -1733,5 +1733,6 @@ artifacts:
         target: SR-106
     provenance:
       created-by: ai-assisted
+      reviewed-by: avrabe
       model: claude-opus-5-5
       timestamp: 2026-10-22T13:34:11Z
