@@ -5367,44 +5367,57 @@ impl FactStyleGenerator {
         // Determine memory indices
         // In shared memory mode, all components use memory 0
         // In multi-memory mode, each component gets its own memory
-        if let Some(&caller_mem) =
-            merged
-                .memory_index_map
-                .get(&(site.from_component, site.from_module, 0))
-        {
-            options.caller_memory = caller_mem;
-        }
-
-        if let Some(&callee_mem) =
-            merged
-                .memory_index_map
-                .get(&(site.to_component, site.to_module, 0))
-        {
-            options.callee_memory = callee_mem;
-        }
-
-        // Look up cabi_realloc for caller and callee
-        // #515: the `realloc` option of the `canon lower` / `canon lift` is
-        // authoritative -- the allocator it names may live in a DIFFERENT core
-        // module than the one calling / exporting. `realloc_map` is keyed by the
-        // module that defines the allocator, so it is only the fallback.
-        let resolved = |comp: usize, f: Option<(usize, u32)>| {
-            f.and_then(|(m, local)| merged.function_index_map.get(&(comp, m, local)).copied())
+        // #515: memory and realloc come from the SAME canonical option set
+        // (`canon lower` for the caller, `canon lift` for the callee) when it
+        // traces; otherwise from the per-module maps, as a pair. Never a traced
+        // realloc with an untraced memory (allocate in one, copy into another).
+        let traced = |comp: usize, a: Option<crate::resolver::ResolvedAlloc>| {
+            let a = a?;
+            Some((
+                *merged
+                    .memory_index_map
+                    .get(&(comp, a.memory.0, a.memory.1))?,
+                *merged
+                    .function_index_map
+                    .get(&(comp, a.realloc.0, a.realloc.1))?,
+            ))
         };
-        options.caller_realloc = resolved(site.from_component, site.requirements.caller_realloc_fn)
-            .or_else(|| {
-                merged
-                    .realloc_map
-                    .get(&(site.from_component, site.from_module))
-                    .copied()
-            });
-        options.callee_realloc = resolved(site.to_component, site.requirements.callee_realloc_fn)
-            .or_else(|| {
-                merged
-                    .realloc_map
-                    .get(&(site.to_component, site.to_module))
-                    .copied()
-            });
+        let module_pair = |comp: usize, module: usize| {
+            (
+                merged.memory_index_map.get(&(comp, module, 0)).copied(),
+                merged.realloc_map.get(&(comp, module)).copied(),
+            )
+        };
+        if let Some((mem, re)) = traced(site.from_component, site.requirements.caller_alloc) {
+            options.caller_memory = mem;
+            options.caller_realloc = Some(re);
+        } else {
+            let (mem, re) = module_pair(site.from_component, site.from_module);
+            // The calling module's own pair is the base behaviour. The
+            // (heuristic, untraced) unanimous pair of the component's lowers may
+            // replace its REALLOC only when it names the very memory the module
+            // uses: then the pair stays coherent. A different memory means the
+            // heuristic is describing some other module -- distrust it.
+            let fallback = traced(site.from_component, site.requirements.caller_alloc_fallback)
+                .filter(|(fmem, _)| Some(*fmem) == mem);
+            if let Some((fmem, fre)) = fallback {
+                options.caller_memory = fmem;
+                options.caller_realloc = Some(fre);
+            } else {
+                options.caller_memory = mem.unwrap_or(0);
+                options.caller_realloc = re;
+                options.memory_unresolved |= mem.is_none();
+            }
+        }
+        if let Some((mem, re)) = traced(site.to_component, site.requirements.callee_alloc) {
+            options.callee_memory = mem;
+            options.callee_realloc = Some(re);
+        } else {
+            let (mem, re) = module_pair(site.to_component, site.to_module);
+            options.callee_memory = mem.unwrap_or(0);
+            options.callee_realloc = re;
+            options.memory_unresolved |= mem.is_none();
+        }
 
         // Use canonical options from the resolver if available, fall back to UTF-8
         options.caller_string_encoding = site
@@ -6193,6 +6206,20 @@ impl FactStyleGenerator {
     /// found: the adapter validated, fusion exited 0, and the receiver read its own
     /// memory at the other side's pointer. Refuse instead.
     fn require_reallocs_for_copy(site: &AdapterSite, options: &AdapterOptions) -> Result<()> {
+        // A crossing site whose memory lookup MISSED defaulted to memory 0 and
+        // looks same-memory; deciding "same memory" from those defaults would
+        // skip every copy. `crosses_memory` is the resolver's per-site verdict
+        // (domains differ / both components have memory), so trust it over the
+        // defaults and refuse when the actual memories are unknown.
+        if site.crosses_memory && options.memory_unresolved {
+            return Err(crate::Error::AdapterGeneration(format!(
+                "#515: the call to '{}' ({}) crosses memories but meld could not resolve \
+                 the caller's or callee's memory (the calling module has no memory and its \
+                 `canon lower` could not be traced); refusing rather than treating it as a \
+                 same-memory call and skipping every copy.",
+                site.export_name, site.import_module
+            )));
+        }
         if options.caller_memory == options.callee_memory {
             return Ok(());
         }
@@ -15179,7 +15206,7 @@ mod tests {
         merged.type_index_map.insert((0, 0, 0), 0);
         merged.memory_index_map.insert((0, 0, 0), SR_CALLER_MEM);
         merged.memory_index_map.insert((1, 0, 0), SR_CALLEE_MEM);
-        // No realloc anywhere (neither `realloc_map` nor `callee_realloc_fn`).
+        // No realloc anywhere (neither `realloc_map` nor `callee_alloc`).
         let mut site = crate::resolver::AdapterSite {
             from_component: 0,
             from_module: 0,
@@ -15230,6 +15257,27 @@ mod tests {
         );
     }
 
+    /// #515 (F2): a crossing site whose calling module has NO memory (and no
+    /// traced lower) used to default `caller_memory` to 0 -- the callee's memory
+    /// -- so the site looked same-memory and the gate and every copy were skipped.
+    /// `crosses_memory` is the resolver's verdict; with the memory unknown, refuse.
+    #[test]
+    fn crossing_site_with_unresolved_memory_is_refused_not_same_memory_515() {
+        let (mut merged, site) = sr_retptr_merged_and_site();
+        assert!(site.crosses_memory);
+        merged.memory_index_map.remove(&(0, 0, 0));
+        let gen_ = FactStyleGenerator::new(AdapterConfig::default());
+        let empty = std::collections::HashMap::new();
+        let err = match gen_.generate_adapter(&site, &merged, 0, &empty, &empty) {
+            Ok(_) => panic!("#515: an unresolvable caller memory must not look same-memory"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            err.contains("#515") && err.contains("could not resolve"),
+            "{err}"
+        );
+    }
+
     /// #515: the realloc named by the `canon lower` (decomposed onto the site)
     /// wins over `realloc_map`, which only knows the module that DEFINES the
     /// allocator -- here the caller module (0) defines none, module 7 does.
@@ -15238,7 +15286,11 @@ mod tests {
         let (mut merged, mut site) = sr_retptr_merged_and_site();
         merged.realloc_map.clear();
         merged.function_index_map.insert((0, 7, 2), 3);
-        site.requirements.caller_realloc_fn = Some((7, 2));
+        site.requirements.caller_alloc = Some(crate::resolver::ResolvedAlloc {
+            memory: (7, 0),
+            realloc: (7, 2),
+        });
+        merged.memory_index_map.insert((0, 7, 0), SR_CALLER_MEM);
         let decoded = decode_adapter(site, merged);
         assert!(
             decoded.calls.iter().any(|(_, f)| *f == 3),
