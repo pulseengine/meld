@@ -17,6 +17,13 @@ directions:
     publication, which is loud but only reaches anyone once the release is
     already public.
 
+A third consumer joined in #442: the PyPI wheels and npm packages are repacked
+from the release archives, one per target, from the table in
+python/pyproject.toml ([tool.meld-dist.targets.*]). A target built but absent
+there silently never reaches pip/npm users; a target there that is not built
+makes every publish fail after the GitHub release is already public. This
+script checks that table against the same matrix.
+
 Neither is caught by any test today, and the gate itself only runs *after* a
 release is published. This runs on the pull request, where a drift is still
 free to fix.
@@ -27,13 +34,20 @@ Exit 1 naming the offending targets, 0 when the two lists agree.
 
 # rivet: verifies SR-84
 
+import json
 import pathlib
 import re
 import sys
+import tomllib
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 RELEASE = ROOT / ".github/workflows/release.yml"
 GATE = ROOT / ".github/workflows/release-assets-gate.yml"
+DIST = ROOT / "python/pyproject.toml"
+NPM_ROOT = ROOT / "npm/package.json"
+
+# Per-target keys every row of the distribution table must carry.
+DIST_KEYS = {"os", "wheel-arch", "npm-platform", "npm-os", "npm-cpu"}
 
 # `- target: x86_64-unknown-linux-musl` in the build matrix.
 MATRIX_TARGET = re.compile(r"^\s*-\s*target:\s*(\S+)\s*$")
@@ -66,6 +80,53 @@ def gate_targets() -> set:
     return set(m.group(1).replace("\\", " ").split())
 
 
+def dist_problems(built: set) -> list:
+    """Wheel/npm target table vs the release matrix; returns error strings."""
+    rel = DIST.relative_to(ROOT)
+    try:
+        data = tomllib.loads(DIST.read_text())
+        dist = data["tool"]["meld-dist"]
+        table = dist["targets"]
+    except (OSError, KeyError, tomllib.TOMLDecodeError) as e:
+        # Absence must fail, for the same reason as the gate list above.
+        return [f"error: cannot read [tool.meld-dist.targets] from {rel}: {e!r}"]
+
+    problems = []
+    listed = set(table)
+    for target in sorted(built - listed):
+        problems.append(
+            f"error: {target} is built by release.yml but has no wheel/npm row in {rel} "
+            f"- pip and npm users silently never get it"
+        )
+    for target in sorted(listed - built):
+        problems.append(
+            f"error: {target} has a wheel/npm row in {rel} but release.yml does not build it "
+            f"- every PyPI/npm publish would fail after the release is public"
+        )
+    for target, row in sorted(table.items()):
+        missing = DIST_KEYS - set(row)
+        if missing:
+            problems.append(f"error: {rel} [{target}] is missing {sorted(missing)}")
+        if "linux" in target and row.get("os") == "linux" and not {"libc", "npm-libc"} <= set(row):
+            problems.append(f"error: {rel} [{target}] is a linux row without libc / npm-libc")
+    platforms = [row.get("npm-platform") for row in table.values()]
+    if len(platforms) != len(set(platforms)):
+        problems.append(f"error: {rel} has duplicate npm-platform values: {sorted(platforms)}")
+    wheel_keys = [(row.get("os"), row.get("libc"), row.get("wheel-arch")) for row in table.values()]
+    if len(wheel_keys) != len(set(wheel_keys)):
+        problems.append(f"error: {rel} has two rows that would produce the same wheel tag")
+    try:
+        npm_name = json.loads(NPM_ROOT.read_text())["name"]
+        if npm_name != dist.get("npm-name"):
+            problems.append(
+                f"error: {NPM_ROOT.relative_to(ROOT)} name {npm_name!r} != npm-name "
+                f"{dist.get('npm-name')!r} in {rel}"
+            )
+    except (OSError, KeyError, json.JSONDecodeError) as e:
+        problems.append(f"error: cannot read {NPM_ROOT.relative_to(ROOT)}: {e!r}")
+    return problems
+
+
 def main() -> int:
     quiet = "--quiet" in sys.argv
     built = matrix_targets()
@@ -91,6 +152,18 @@ def main() -> int:
             file=sys.stderr,
         )
 
+    dist_errors = dist_problems(built)
+    for line in dist_errors:
+        print(line, file=sys.stderr)
+
+    if dist_errors:
+        print(
+            "\nThe PyPI/npm table (python/pyproject.toml) changes together with the "
+            "release.yml matrix too.",
+            file=sys.stderr,
+        )
+        return 1
+
     if unrequired or unbuilt:
         print(
             "\nBoth lists change together: the matrix in release.yml and the "
@@ -100,7 +173,7 @@ def main() -> int:
         return 1
 
     if not quiet:
-        print(f"release matrix and assets gate agree on {len(built)} targets:")
+        print(f"release matrix, assets gate and wheel/npm table agree on {len(built)} targets:")
         for target in sorted(built):
             print(f"  {target}")
     return 0

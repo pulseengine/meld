@@ -1,0 +1,25 @@
+{
+  "name": "@pulseengine/meld",
+  "version": "0.0.0",
+  "description": "Static WebAssembly component fusion (the `meld` command-line tool)",
+  "license": "Apache-2.0",
+  "bin": {
+    "meld": "bin/meld.js"
+  },
+  "files": [
+    "bin/meld.js",
+    "README.md",
+    "LICENSE"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/pulseengine/meld.git",
+    "directory": "npm"
+  },
+  "homepage": "https://github.com/pulseengine/meld",
+  "bugs": "https://github.com/pulseengine/meld/issues",
+  "keywords": ["webassembly", "component-model", "fusion", "cli"],
+  "publishConfig": {
+    "access": "public"
+  }
+}

@@ -4,6 +4,16 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+- **`pip install meld-cli` and `npm install @pulseengine/meld` (#442).**
+  Platform wheels and npm packages repack the cosign-signed release binaries
+  (byte-identical to the release tarballs, checked against `SHA256SUMS.txt`
+  before packing) and put `meld` on PATH; nothing is downloaded at install
+  time. Publishing runs only after a release is published, never from a
+  draft, using trusted publishing (OIDC) with attestations. Until the
+  maintainer switches it live, PyPI publishes to TestPyPI and npm runs as a
+  dry run.
+
 ### Fixed
 - **The adapter allocates with the caller's own memory and realloc, wherever
   they are defined (SR-106, #515).** When a component's `cabi_realloc` lived

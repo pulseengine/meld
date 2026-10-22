@@ -894,6 +894,55 @@ GitHub REST API).
    checksums or signature bundle are absent. It reports rather than prevents —
    GitHub has no pre-publish hook — but it makes forgetting this loud.
 
+#### PyPI and npm distribution (#442)
+
+`pip install meld-cli` and `npm install @pulseengine/meld` both install the
+`meld` command from **repacked release binaries**: nothing is rebuilt, and the
+binary is the one whose hash is in the cosign-signed `SHA256SUMS.txt`.
+
+- Code: `python/build_wheels.py` (stdlib; the shared verification path),
+  `python/pyproject.toml` (the ONE place for name/license/URLs/target table),
+  `npm/build_npm.py` + `npm/bin/meld.js`, `python/check_registry_absent.py`.
+  Workflows: `release-pypi.yml`, `release-npm.yml`.
+- Both workflows trigger on `release: published` (never `workflow_run`: that
+  would fire on the unverified draft, and registry uploads are immutable). So
+  the order is the draft-then-publish flow above, and `gh release edit
+  --draft=false` is what starts them. They download the assets, run
+  `cosign verify-blob` over `SHA256SUMS.txt`, check every tarball hash, build,
+  install each artifact on matching runners (glibc/musl x64/arm64, macOS
+  x64/arm64) and assert `meld --version` equals the tag, and only then publish.
+  A version already on the registry stops the run (no `--skip-existing`).
+- Automatic runs are conservative: TestPyPI and npm dry-run. Set the repository
+  variables `PYPI_RELEASE_TARGET=pypi` / `NPM_RELEASE_TARGET=publish` to go live
+  on publish. Manual backfill: Actions -> run workflow with `tag` and `target`.
+- Wheel tags are derived from the binary (glibc floor from `GLIBC_2.N` in the
+  ELF's version-needs; macOS minimum from the Mach-O `LC_BUILD_VERSION`
+  `minos`, rounded up to a whole major for macOS >= 11). A new release target
+  needs a row in `python/pyproject.toml`; `tools/check_release_targets.py`
+  fails the PR if it is missing.
+- Windows has no release target, so it has no wheel or npm package.
+
+**One-time maintainer setup** (needs a human with registry access; the agents
+and workflows cannot do it):
+
+1. test.pypi.org and pypi.org: create project `meld-cli` (a "pending publisher"
+   works before the first upload) and add a Trusted Publisher: owner
+   `pulseengine`, repo `meld`, workflow `release-pypi.yml`, environment
+   `testpypi` / `pypi` respectively.
+2. GitHub: create environments `testpypi`, `pypi` and `npm` (add required
+   reviewers on `pypi` and `npm` if a second pair of eyes is wanted).
+3. npmjs.com: the `@pulseengine` scope must exist. For each of the 7 packages
+   (`@pulseengine/meld` and `@pulseengine/meld-{darwin,linux}-...`) add a
+   Trusted Publisher (repo `pulseengine/meld`, workflow `release-npm.yml`,
+   environment `npm`). npm can only configure this on an existing package, so
+   the first publish of each may need a one-off token in the `NPM_TOKEN`
+   secret; delete it afterwards.
+4. Rollout: TestPyPI first, then `npm publish --dry-run` (the default), then
+   flip the repository variables.
+
+Partial uploads cannot be repaired by re-uploading. If a publish dies midway,
+yank/deprecate the partial set and ship the next patch version.
+
 #### What NOT to do
 
 - **NEVER** release without CI verification
