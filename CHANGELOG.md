@@ -4,6 +4,17 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+- **`--emit-import-map` states each import's memory, realloc, string encoding
+  and owning component (SR-105, #513).** A host implementing a fused
+  module's imports can now see, per function import, the memory its pointer
+  arguments refer to and the allocator for list and string results (fused
+  index and export name), resolved from that import's own lower, plus the
+  string encoding; resource intrinsics also name their resource and `[dtor]`
+  export. `null` means the lower has no such option; `{"unknown": ...}` means
+  it could not be traced. The map gains `"version": 2`; existing fields are
+  unchanged. Requested by @o-murphy.
+
 ### Fixed
 - **A re-exported adapted import reaches the adapter from every importer
   (SR-103, #504).** When one core module re-exported an import that crosses

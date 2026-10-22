@@ -3747,3 +3747,19 @@ artifacts:
       reviewed-by: avrabe
       model: claude-opus-5-5
       timestamp: 2026-10-21T12:10:43Z
+
+  - id: SR-105
+    type: sw-req
+    title: The import map states each import's memory, realloc, string encoding and owning component
+    status: implemented
+    description: A host that implements a fused module's imports, for example a native WASI host for a module compiled by wasm2c, must know for each function import which linear memory its pointer arguments refer to, which cabi_realloc to call for list and string results, and how strings are encoded. Under --memory multi the fused module keeps one memory per component and duplicates an import lowered by several components under a $N suffix, so this cannot be inferred from names or export order (#513, reported by o-murphy). meld's --emit-import-map shall state, for every function import, the owning component, the memory and realloc of the canon lower that import came from (as the fused index and, where one exists, the export name), and the string encoding; for resource intrinsics left as imports it shall state the component, the resource, whether the component defines it, and its [dtor] export. A lower that has no memory or realloc option shall be reported as null; an import whose lower cannot be traced or resolved shall be reported as unknown with a reason, never as a guessed index. The addition is versioned (version 2) and leaves existing fields unchanged, and the fused module itself is unaffected.
+    links:
+      - type: derives-from
+        target: SYS-4
+      - type: refines
+        target: SR-99
+    provenance:
+      created-by: ai-assisted
+      reviewed-by: avrabe
+      model: claude-opus-5-5
+      timestamp: 2026-10-22T03:48:23Z
