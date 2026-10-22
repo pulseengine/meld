@@ -170,6 +170,8 @@ fn test_multi_memory_index_maps() {
         rewrite_params: HashMap::new(),
         unmapped_import_stubs: HashMap::new(),
         pending_wired_imports: HashSet::new(),
+        import_aliases: Default::default(),
+        import_export_origins: Default::default(),
         shared_stack_top: None,
         stackless_providers: 0,
         placements: Vec::new(),

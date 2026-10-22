@@ -358,11 +358,13 @@ pub fn emit_stream_bridge(
     }
 
     // ── 6. Rewire call sites: import position → shim. ─────────────────
+    let mut affected: std::collections::BTreeSet<(usize, usize)> = usage.keys().copied().collect();
     for (&(c, m), ops) in &usage {
         for (&op, positions) in ops {
             let shim = shim_index[&(c, m, op)];
             for &pos in positions {
-                merged.function_index_map.insert((c, m, pos), shim);
+                // #504: also re-points modules that alias this import.
+                affected.extend(merged.rewire_import((c, m, pos), shim));
             }
         }
     }
@@ -370,7 +372,7 @@ pub fn emit_stream_bridge(
     // ── 7. Re-extract function bodies of affected modules so already-
     //       encoded `call` instructions pick up the shim indices (same
     //       mechanism as `wire_adapter_indices`). ──────────────────────
-    for &(c, m) in usage.keys() {
+    for &(c, m) in &affected {
         let module = &components[c].core_modules[m];
 
         // Regenerates bodies from the original bytes; replay the merge pass's
