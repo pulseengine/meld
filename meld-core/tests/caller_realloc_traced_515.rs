@@ -717,3 +717,93 @@ fn f2_memory_only_lower_keeps_its_traced_memory() {
     // The lower names memory 1 of the calling module and no realloc.
     assert_oracle(&p4(), 104);
 }
+
+// ---------------------------------------------------------------------------
+// The gate's "does this call copy anything" predicate must be the emitter's:
+// the retptr adapter copies the RETURN AREA (callee memory -> caller memory)
+// even when the result holds no pointers, and that copy needs the caller's
+// memory. With the caller's memory unresolved it would target memory 0.
+// ---------------------------------------------------------------------------
+
+/// `pair: func() -> tuple<u32, u32>` (retptr, no pointers). The caller lower is
+/// reached through a re-exporting module (untraced) and the calling module
+/// owns no memory.
+const RETPTR_SCALAR_UNTRACED: &str = r#"(component
+  (component $A
+    (core module $am
+      (memory (export "mem") 1)
+      (data (i32.const 16) "\07\00\00\00\e8\03\00\00")
+      (func (export "pair") (result i32) i32.const 16))
+    (core instance $ai (instantiate $am))
+    (func (export "pair") (result (tuple u32 u32))
+      (canon lift (core func $ai "pair") (memory (core memory $ai "mem")))))
+  (component $B
+    (import "pair" (func $pair (result (tuple u32 u32))))
+    (core module $mm
+      (memory (export "mem") 1)
+      (func (export "get") (param i32) (result i32) local.get 0 i32.load))
+    (core instance $mi (instantiate $mm))
+    (core func $pl (canon lower (func $pair) (memory (core memory $mi "mem"))))
+    (core module $s
+      (import "in" "pair" (func $p (param i32)))
+      (export "pair" (func $p)))
+    (core instance $env (export "pair" (func $pl)))
+    (core instance $si (instantiate $s (with "in" (instance $env))))
+    (core module $bm
+      (import "env" "pair" (func $pair (param i32)))
+      (import "m" "get" (func $get (param i32) (result i32)))
+      (func (export "run") (result i32)
+        (call $pair (i32.const 128))
+        (i32.add (call $get (i32.const 128)) (call $get (i32.const 132)))))
+    (core instance $bi (instantiate $bm (with "env" (instance $si)) (with "m" (instance $mi))))
+    (func (export "run") (result u32) (canon lift (core func $bi "run"))))
+  (instance $a (instantiate $A))
+  (instance $b (instantiate $B (with "pair" (func $a "pair"))))
+  (export "run" (func $b "run")))"#;
+
+/// Same component with the lower reached DIRECTLY (traced): the memory comes
+/// from the `canon lower` and the call is sound.
+fn retptr_scalar_traced() -> String {
+    RETPTR_SCALAR_UNTRACED.replace(
+        "(with \"env\" (instance $si))",
+        "(with \"env\" (instance $env))",
+    )
+}
+
+/// The same with `tuple<u64, u64>` (a 16-byte return area).
+fn retptr_u64_pair(traced: bool) -> String {
+    let base = if traced {
+        retptr_scalar_traced()
+    } else {
+        RETPTR_SCALAR_UNTRACED.to_string()
+    };
+    base.replace("tuple u32 u32", "tuple u64 u64")
+        .replace(
+            "(data (i32.const 16) \"\\07\\00\\00\\00\\e8\\03\\00\\00\")",
+            "(data (i32.const 16) \"\\07\\00\\00\\00\\00\\00\\00\\00\\e8\\03\\00\\00\\00\\00\\00\\00\")",
+        )
+        .replace("(call $get (i32.const 132))", "(call $get (i32.const 136))")
+}
+
+// rivet: verifies SR-16
+#[test]
+fn retptr_without_pointers_and_unresolved_caller_memory_is_refused() {
+    assert_eq!(run_unfused(RETPTR_SCALAR_UNTRACED), 1007, "oracle");
+    assert_refused(RETPTR_SCALAR_UNTRACED);
+}
+
+// rivet: verifies SR-16
+#[test]
+fn retptr_without_pointers_with_traced_caller_memory_is_correct() {
+    assert_oracle(&retptr_scalar_traced(), 1007);
+}
+
+// rivet: verifies SR-16
+#[test]
+fn retptr_u64_pair_unresolved_is_refused_and_traced_is_correct() {
+    let w = retptr_u64_pair(false);
+    assert!(w.contains("tuple u64 u64") && w.contains("i32.const 136"));
+    assert_eq!(run_unfused(&w), 1007, "oracle");
+    assert_refused(&w);
+    assert_oracle(&retptr_u64_pair(true), 1007);
+}

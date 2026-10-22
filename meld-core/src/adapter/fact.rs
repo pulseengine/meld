@@ -6210,12 +6210,42 @@ impl FactStyleGenerator {
         Ok((caller_type_idx, func))
     }
 
+    /// The canonical ABI uses the retptr convention when flat results exceed
+    /// `MAX_FLAT_RESULTS`: the lowered caller takes a trailing `retptr: i32` and
+    /// returns nothing; the lifted callee returns the return-area pointer. The
+    /// retptr adapter ALWAYS copies that return area across memories (bulk, or
+    /// slot by slot when it holds pointers), so this one predicate both selects
+    /// the emitter and tells the #515 gate a memory is needed.
+    fn is_retptr_call(
+        caller_param_count: usize,
+        callee_param_count: usize,
+        caller_result_count: usize,
+        callee_result_count: usize,
+        callee_first_result: Option<&wasm_encoder::ValType>,
+    ) -> bool {
+        caller_param_count > callee_param_count
+            && caller_result_count == 0
+            && callee_result_count == 1
+            && callee_first_result == Some(&wasm_encoder::ValType::I32)
+    }
+
     /// #515: a cross-memory call whose data must be COPIED needs an allocator on
     /// the receiving side, and meld must be able to name it. The emitters used to
     /// gate each copy on `realloc.is_some()` and silently skip it when none was
     /// found: the adapter validated, fusion exited 0, and the receiver read its own
     /// memory at the other side's pointer. Refuse instead.
-    fn require_reallocs_for_copy(site: &AdapterSite, options: &AdapterOptions) -> Result<()> {
+    ///
+    /// `copies_return_area` is true when the adapter being generated emits the
+    /// retptr return-area `memory.copy` (callee memory -> caller memory). That
+    /// copy needs the CALLER'S MEMORY but no realloc, so it counts as a copy for
+    /// the unresolved-memory refusal even when the result holds no pointers
+    /// (`tuple<u32, u32>`); the caller passes the SAME predicate
+    /// ([`Self::is_retptr_call`]) that selects the retptr emitter.
+    fn require_reallocs_for_copy(
+        site: &AdapterSite,
+        options: &AdapterOptions,
+        copies_return_area: bool,
+    ) -> Result<()> {
         let r = &site.requirements;
         let copies_result = options.returns_pointer_pair
             || !r.result_pointer_pair_offsets.is_empty()
@@ -6226,7 +6256,7 @@ impl FactStyleGenerator {
         let copies_params = !r.pointer_pair_positions.is_empty()
             || !r.conditional_pointer_pairs.is_empty()
             || r.params_area_byte_size.is_some();
-        if !(copies_result || copies_params) {
+        if !(copies_result || copies_params || copies_return_area) {
             // Scalar-only: nothing is copied, so an unknown memory is harmless
             // (a plain forward is correct, as on the base).
             return Ok(());
@@ -6294,7 +6324,6 @@ impl FactStyleGenerator {
         options: &AdapterOptions,
         resource_rep_imports: &std::collections::HashMap<(String, String), u32>,
     ) -> Result<(u32, Function)> {
-        Self::require_reallocs_for_copy(site, options)?;
         let target_func = self.resolve_target_function(site, merged)?;
 
         // --- Determine callee's type (what we call) ---
@@ -6331,10 +6360,15 @@ impl FactStyleGenerator {
         // The canonical ABI uses retptr when flat results > MAX_FLAT_RESULTS:
         //   caller (lowered): params..., retptr:i32 → void
         //   callee (lifted):  params...            → i32 (return area ptr)
-        let uses_retptr = caller_param_count > callee_param_count
-            && caller_result_count == 0
-            && callee_result_count == 1
-            && callee_result_types.first() == Some(&wasm_encoder::ValType::I32);
+        let uses_retptr = Self::is_retptr_call(
+            caller_param_count,
+            callee_param_count,
+            caller_result_count,
+            callee_result_count,
+            callee_result_types.first(),
+        );
+        // #515: the gate and the retptr emitter must agree on what copies.
+        Self::require_reallocs_for_copy(site, options, uses_retptr)?;
 
         if uses_retptr {
             return self.generate_retptr_adapter(
@@ -8482,7 +8516,7 @@ impl FactStyleGenerator {
         // #515: the transcoding emitters fall back to a plain direct call when
         // there is no callee realloc -- the callee would then read the CALLER's
         // pointer (and, same-memory, the wrong encoding). Refuse instead.
-        Self::require_reallocs_for_copy(site, options)?;
+        Self::require_reallocs_for_copy(site, options, false)?;
         if options.caller_string_encoding != options.callee_string_encoding
             && !site.requirements.pointer_pair_positions.is_empty()
             && options.callee_realloc.is_none()
