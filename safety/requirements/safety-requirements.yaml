@@ -3782,3 +3782,18 @@ artifacts:
       model: claude-opus-5-5
       timestamp: 2026-10-22T03:48:23Z
     release: v0.65.0
+
+  - id: SR-106
+    type: sw-req
+    title: The adapter allocates with the memory and realloc the caller's canon lower names, wherever they are defined
+    status: implemented
+    description: "When a cross-component call copies a string or list across memories, the adapter allocates in the receiving component's memory with that component's allocator and writes there. meld took the caller's allocator from the calling core module only, and the caller's memory from that module's memory 0. When the component's cabi_realloc lived in a different core module, or the canon lower named another module's memory, the copy was silently skipped, so the caller received the callee's pointer and read its own memory at exit 0 (#515). meld shall take the memory and realloc the adapter uses on each side from the canon lower (caller) or canon lift (callee) that the calling or exporting core module actually imports or exports, traced through instantiation arguments, export bundles and aliases. Memory and realloc shall come from one option set: a traced realloc is never paired with an untraced memory, and a memory-only option set keeps its traced memory. When a module's matched imports trace to lowers naming different memory or realloc pairs, fusion shall fail with an error naming them. When the trace is partial or absent, meld shall use the module's own memory and realloc, replacing the realloc only when every lower in the component is complete and resolves to the same pair naming that memory. A cross-memory call that needs a copy for which no realloc, or no memory, can be resolved shall fail with an error, in the memory-copy, transcoding and params-area paths, and never skip the copy, call function 0 or treat the call as same-memory; a call that copies nothing is unaffected. Known limits recorded as separate issues: an untraced lower reached through wit-component's shim falls back to the module's own allocator (#523); synchronous transcoding of string results (#522); the async adapters (#491); a core function lifted twice with different reallocs uses the last lift."
+    links:
+      - type: derives-from
+        target: SYS-3
+      - type: refines
+        target: SR-14
+    provenance:
+      created-by: ai-assisted
+      model: claude-opus-5-5
+      timestamp: 2026-10-22T13:33:59Z
