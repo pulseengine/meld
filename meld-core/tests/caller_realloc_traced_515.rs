@@ -575,12 +575,14 @@ fn assert_refused(wat_text: &str) {
 const SENTINEL_ANSWER: u32 = (b'S' as u32) * 256 + b'h' as u32;
 
 // rivet: verifies SR-16
+// rivet: verifies SWV-118
 #[test]
 fn lead1_traced_imports_that_disagree_are_refused() {
     assert_refused(&lead1());
 }
 
 // rivet: verifies SR-16
+// rivet: verifies SWV-118
 #[test]
 fn lead1_single_import_trace_wins_over_own_realloc() {
     let w = lead1()
@@ -601,6 +603,7 @@ fn lead2b_single() -> String {
 }
 
 // rivet: verifies SR-16
+// rivet: verifies SWV-118
 #[test]
 fn lead2b_control_single_lowering_untraced_import() {
     let w = lead2b_single();
@@ -613,6 +616,7 @@ fn lead2b_control_single_lowering_untraced_import() {
 /// lower of a scalar function) could be the one the call uses. Its presence
 /// disables the heuristic, and with no allocator of its own the site is refused.
 // rivet: verifies SR-16
+// rivet: verifies SWV-118
 #[test]
 fn incomplete_lower_disables_the_unanimity_heuristic() {
     let rep = |w: String, from: &str, to: &str| {
@@ -654,6 +658,7 @@ fn incomplete_lower_disables_the_unanimity_heuristic() {
 }
 
 // rivet: verifies SR-16
+// rivet: verifies SWV-118
 #[test]
 fn lead3_traced_sibling_must_not_decide_an_untraced_call() {
     let w = lead3();
@@ -662,18 +667,21 @@ fn lead3_traced_sibling_must_not_decide_an_untraced_call() {
 }
 
 // rivet: verifies SR-16
+// rivet: verifies SWV-118
 #[test]
 fn poc1_calling_module_without_memory_copies_into_the_lowers_memory() {
     assert_oracle(POC1, 104);
 }
 
 // rivet: verifies SR-16
+// rivet: verifies SWV-118
 #[test]
 fn poc2_lower_memory_is_not_the_calling_modules_memory_0() {
     assert_oracle(POC2, 104);
 }
 
 // rivet: verifies SR-16
+// rivet: verifies SWV-118
 #[test]
 fn poc2b_traced_realloc_never_writes_the_other_memory() {
     // Sentinel `S` (83) in `$om`'s memory must survive.
@@ -681,18 +689,21 @@ fn poc2b_traced_realloc_never_writes_the_other_memory() {
 }
 
 // rivet: verifies SR-16
+// rivet: verifies SWV-118
 #[test]
 fn g1_scalar_call_from_a_memoryless_caller_module_is_not_refused() {
     assert_oracle(CALLER_MEMLESS, 42);
 }
 
 // rivet: verifies SR-16
+// rivet: verifies SWV-118
 #[test]
 fn g1_scalar_call_into_a_memoryless_callee_module_is_not_refused() {
     assert_oracle(CALLEE_MEMLESS, 42);
 }
 
 // rivet: verifies SR-16
+// rivet: verifies SWV-118
 #[test]
 fn f1_identical_options_through_separate_aliases_are_not_a_disagreement() {
     // 'h' = 104 (string byte) ...
@@ -705,6 +716,7 @@ fn f1_identical_options_through_separate_aliases_are_not_a_disagreement() {
 }
 
 // rivet: verifies SR-16
+// rivet: verifies SWV-118
 #[test]
 fn f2_memory_only_lift_keeps_its_traced_memory() {
     // The lift names memory 1 of its module and no realloc (result string).
@@ -712,6 +724,7 @@ fn f2_memory_only_lift_keeps_its_traced_memory() {
 }
 
 // rivet: verifies SR-16
+// rivet: verifies SWV-118
 #[test]
 fn f2_memory_only_lower_keeps_its_traced_memory() {
     // The lower names memory 1 of the calling module and no realloc.
@@ -786,6 +799,7 @@ fn retptr_u64_pair(traced: bool) -> String {
 }
 
 // rivet: verifies SR-16
+// rivet: verifies SWV-118
 #[test]
 fn retptr_without_pointers_and_unresolved_caller_memory_is_refused() {
     assert_eq!(run_unfused(RETPTR_SCALAR_UNTRACED), 1007, "oracle");
@@ -793,12 +807,14 @@ fn retptr_without_pointers_and_unresolved_caller_memory_is_refused() {
 }
 
 // rivet: verifies SR-16
+// rivet: verifies SWV-118
 #[test]
 fn retptr_without_pointers_with_traced_caller_memory_is_correct() {
     assert_oracle(&retptr_scalar_traced(), 1007);
 }
 
 // rivet: verifies SR-16
+// rivet: verifies SWV-118
 #[test]
 fn retptr_u64_pair_unresolved_is_refused_and_traced_is_correct() {
     let w = retptr_u64_pair(false);

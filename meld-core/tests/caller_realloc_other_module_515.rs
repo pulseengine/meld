@@ -120,6 +120,7 @@ fn fuse_and_run(result_variant: bool) -> i32 {
 }
 
 // rivet: verifies SR-16
+// rivet: verifies SWV-118
 #[test]
 fn option_string_copied_when_realloc_is_in_another_module() {
     assert_eq!(
@@ -130,6 +131,7 @@ fn option_string_copied_when_realloc_is_in_another_module() {
 }
 
 // rivet: verifies SR-16
+// rivet: verifies SWV-118
 #[test]
 fn result_string_copied_when_realloc_is_in_another_module() {
     assert_eq!(
@@ -382,6 +384,7 @@ fn run_unfused_export(wat_text: &str, export: &str) -> u32 {
 const SENTINEL_ANSWER: u32 = (b'S' as u32) * 256 + b'h' as u32;
 
 // rivet: verifies SR-16
+// rivet: verifies SWV-118
 #[test]
 fn double_lowered_import_uses_the_lowering_the_caller_imports() {
     assert_eq!(
@@ -397,6 +400,7 @@ fn double_lowered_import_uses_the_lowering_the_caller_imports() {
 }
 
 // rivet: verifies SR-16
+// rivet: verifies SWV-118
 #[test]
 fn double_lowered_import_second_caller_uses_its_own_lowering() {
     // The fused core module exposes one component export, so export `$by`'s
@@ -430,6 +434,7 @@ fn double_lowered_import_second_caller_uses_its_own_lowering() {
 }
 
 // rivet: verifies SR-16
+// rivet: verifies SWV-118
 #[test]
 fn lift_before_import_does_not_shift_the_lower_attribution() {
     assert_eq!(
@@ -445,6 +450,7 @@ fn lift_before_import_does_not_shift_the_lower_attribution() {
 }
 
 // rivet: verifies SR-16
+// rivet: verifies SWV-118
 #[test]
 fn double_lowered_import_declared_in_the_other_order_control() {
     assert_eq!(
