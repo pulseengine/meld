@@ -783,22 +783,89 @@ fn build_module_export_to_core_func(component: &ParsedComponent) -> HashMap<(usi
         .collect()
 }
 
-/// #515: pick the `realloc` option of the `canon lower` that supplies the
-/// caller's side of a call.
+/// #515: the `realloc` option of the `canon lower` that supplies the CALLING
+/// module's import(s) `imports` (`(import module, import field)` pairs).
 ///
-/// `exact` is the lower matched by import name. When the match was only a
-/// heuristic (no exact lower), the realloc is used only if EVERY lower in the
-/// component that names one names the SAME function; if they disagree, picking
-/// one would hand the adapter the wrong allocator, so `None` is returned and the
-/// merger's per-module `realloc_map` remains the fallback.
-fn pick_caller_realloc(
-    exact: Option<&crate::parser::CanonicalOptions>,
-    lower_map: &HashMap<u32, &crate::parser::CanonicalOptions>,
+/// The lower is found by TRACING the calling module's actual import: module
+/// instantiation `with` argument -> export bag entry -> core func -> (through
+/// any alias re-exports) its `canon lower`. That is the only attribution that
+/// is right when one component function is lowered more than once (into
+/// different memories/reallocs) or a `canon lift` precedes the import in the
+/// component function space; the by-name / by-func-index maps get both wrong.
+///
+/// If no import traces to a lower, fall back ONLY when unambiguous: every
+/// `canon lower` in the component that names a realloc names the same one.
+/// Imports that trace to lowers with DIFFERENT reallocs yield `None` (the
+/// merger's per-module `realloc_map` is then the fallback; the adapter refuses
+/// if that cannot be trusted either).
+fn traced_caller_realloc(
+    component: &ParsedComponent,
+    from_module: usize,
+    imports: &[(&str, &str)],
 ) -> Option<u32> {
-    if let Some(lo) = exact {
-        return lo.realloc;
+    use crate::parser::{InstanceArg, InstanceKind};
+    let lowers = core_lower_options(component);
+    let aliases = core_func_alias_targets(component);
+
+    let mut args_of_module: Option<&Vec<(String, InstanceArg)>> = None;
+    let mut bags: HashMap<u32, Vec<(String, ExportKind, u32)>> = HashMap::new();
+    for inst in &component.instances {
+        match &inst.kind {
+            InstanceKind::Instantiate { module_idx, args }
+                if *module_idx as usize == from_module && args_of_module.is_none() =>
+            {
+                args_of_module = Some(args);
+            }
+            InstanceKind::FromExports(exports) => {
+                bags.insert(
+                    inst.index,
+                    exports
+                        .iter()
+                        .filter(|(_, kind, _)| {
+                            matches!(
+                                kind,
+                                wasmparser::ExternalKind::Func
+                                    | wasmparser::ExternalKind::FuncExact
+                            )
+                        })
+                        .map(|(n, _, idx)| (n.clone(), ExportKind::Function, *idx))
+                        .collect(),
+                );
+            }
+            _ => {}
+        }
     }
-    let mut it = lower_map.values().filter_map(|lo| lo.realloc);
+
+    let mut traced: Vec<Option<u32>> = Vec::new();
+    if let Some(args) = args_of_module {
+        for (module, field) in imports {
+            let Some(src) = args.iter().find_map(|(n, a)| match a {
+                InstanceArg::Instance(i) if n == module => Some(*i),
+                _ => None,
+            }) else {
+                continue;
+            };
+            let Some(entity) = bags.get(&src).and_then(|b| {
+                b.iter()
+                    .find(|(n, _, _)| n == field)
+                    .map(|(_, _, idx)| *idx)
+            }) else {
+                continue;
+            };
+            if let Ok(Some(lower)) = trace_core_func_to_lower(entity, &lowers, &aliases, &bags) {
+                traced.push(lowers.get(&lower).and_then(|o| o.realloc));
+            }
+        }
+    }
+    if let Some(&first) = traced.first() {
+        return traced
+            .iter()
+            .all(|r| *r == first)
+            .then_some(first)
+            .flatten();
+    }
+
+    let mut it = lowers.values().filter_map(|o| o.realloc);
     let first = it.next()?;
     it.all(|r| r == first).then_some(first)
 }
@@ -3412,7 +3479,6 @@ impl Resolver {
                                     let caller_lower_map = from_component.lower_options_by_func();
                                     // Try to find the Lower entry matching the interface import
                                     let mut matched_caller_enc = None;
-                                    let mut exact_caller_lower = None;
                                     {
                                         let mut comp_func_idx = 0u32;
                                         for ci in &from_component.imports {
@@ -3426,7 +3492,6 @@ impl Resolver {
                                                     {
                                                         matched_caller_enc =
                                                             Some(lo.string_encoding);
-                                                        exact_caller_lower = Some(*lo);
                                                     }
                                                     break;
                                                 }
@@ -3485,7 +3550,11 @@ impl Resolver {
                                     // `canon lower` names, wherever it is defined.
                                     requirements.caller_realloc_fn = decompose_realloc(
                                         from_component,
-                                        pick_caller_realloc(exact_caller_lower, &caller_lower_map),
+                                        traced_caller_realloc(
+                                            from_component,
+                                            from_mod_idx,
+                                            &[(import_name.as_str(), &**func_name)],
+                                        ),
                                     );
                                     if let (Some(ce), Some(ce2)) =
                                         (requirements.caller_encoding, requirements.callee_encoding)
@@ -3752,7 +3821,6 @@ impl Resolver {
                             // Caller side: look up lower options by import func index.
                             let caller_lower_map = from_component.lower_options_by_func();
                             let mut matched_caller_encoding = None;
-                            let mut exact_caller_lower = None;
 
                             {
                                 let mut comp_func_idx = 0u32;
@@ -3767,7 +3835,6 @@ impl Resolver {
                                             {
                                                 matched_caller_encoding =
                                                     Some(lower_opts.string_encoding);
-                                                exact_caller_lower = Some(*lower_opts);
                                             }
                                             break;
                                         }
@@ -3820,7 +3887,19 @@ impl Resolver {
                             // #515: see the primary site above.
                             requirements.caller_realloc_fn = decompose_realloc(
                                 from_component,
-                                pick_caller_realloc(exact_caller_lower, &caller_lower_map),
+                                traced_caller_realloc(
+                                    from_component,
+                                    from_mod_idx,
+                                    &from_module
+                                        .imports
+                                        .iter()
+                                        .filter(|imp| {
+                                            (imp.name == *import_name || imp.module == *import_name)
+                                                && matches!(imp.kind, ImportKind::Function(_))
+                                        })
+                                        .map(|imp| (imp.module.as_str(), imp.name.as_str()))
+                                        .collect::<Vec<_>>(),
+                                ),
                             );
 
                             if let (Some(caller_enc), Some(callee_enc)) =
@@ -3935,11 +4014,16 @@ impl Resolver {
             let caller_encoding = caller_lower.map(|l| l.string_encoding);
             let caller_memory = caller_lower.and_then(|l| l.memory);
             // #515: the lower's `realloc` option is the authoritative caller
-            // allocator. `find_lower_for_intra_import` may fall back to a
-            // heuristic lower, so only trust it when it is unambiguous (every
-            // lower naming a realloc names the same one).
-            let caller_realloc_fn =
-                decompose_realloc(component, pick_caller_realloc(None, &lower_map));
+            // allocator, found by tracing the calling module's import (see
+            // `traced_caller_realloc`), not via the heuristic `caller_lower`.
+            let caller_realloc_fn = decompose_realloc(
+                component,
+                traced_caller_realloc(
+                    component,
+                    res.from_module,
+                    &[(res.from_import_module.as_str(), res.import_name.as_str())],
+                ),
+            );
 
             // Check if an adapter is needed: different encoding, different memory,
             // or different realloc on callee side.

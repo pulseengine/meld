@@ -6210,8 +6210,11 @@ impl FactStyleGenerator {
                 site.export_name, site.import_module
             )));
         }
-        let copies_params =
-            !r.pointer_pair_positions.is_empty() || !r.conditional_pointer_pairs.is_empty();
+        // The >16-flat-param buffer (`params_area_byte_size`) is a parameter copy
+        // too: it is allocated in the callee with the callee's realloc.
+        let copies_params = !r.pointer_pair_positions.is_empty()
+            || !r.conditional_pointer_pairs.is_empty()
+            || r.params_area_byte_size.is_some();
         if copies_params && options.callee_realloc.is_none() {
             return Err(crate::Error::AdapterGeneration(format!(
                 "#515: the cross-memory call to '{}' ({}) passes data that must be copied into \
@@ -6942,10 +6945,14 @@ impl FactStyleGenerator {
         let ptr_pair_offsets = &site.requirements.params_area_pointer_pair_offsets;
         let copy_layouts = &site.requirements.params_area_copy_layouts;
 
-        let callee_realloc = options.callee_realloc.unwrap_or_else(|| {
-            log::warn!("params-ptr adapter: no callee realloc, buffer copy may fail");
-            0
-        });
+        // #515: never substitute function 0 for a missing allocator.
+        let callee_realloc = options.callee_realloc.ok_or_else(|| {
+            crate::Error::AdapterGeneration(format!(
+                "#515: the params-area copy for '{}' ({}) needs a callee `realloc` to allocate \
+                 the buffer in the callee's memory, but none could be resolved",
+                site.export_name, site.import_module
+            ))
+        })?;
 
         let has_inner_resources = copy_layouts.iter().any(|cl| {
             matches!(cl,
@@ -8429,6 +8436,25 @@ impl FactStyleGenerator {
         merged: &MergedModule,
         options: &AdapterOptions,
     ) -> Result<(u32, Function)> {
+        // #515: the transcoding emitters fall back to a plain direct call when
+        // there is no callee realloc -- the callee would then read the CALLER's
+        // pointer (and, same-memory, the wrong encoding). Refuse instead.
+        Self::require_reallocs_for_copy(site, options)?;
+        if options.caller_string_encoding != options.callee_string_encoding
+            && !site.requirements.pointer_pair_positions.is_empty()
+            && options.callee_realloc.is_none()
+        {
+            return Err(crate::Error::AdapterGeneration(format!(
+                "#515: the call to '{}' ({}) must transcode string/list parameters \
+                 ({:?} -> {:?}) into the callee's memory, but no callee `realloc` could be \
+                 resolved (the `canon lift` names none, or it could not be traced to a \
+                 function). meld will not forward the caller's pointer unconverted.",
+                site.export_name,
+                site.import_module,
+                options.caller_string_encoding,
+                options.callee_string_encoding
+            )));
+        }
         let target_func = self.resolve_target_function(site, merged)?;
         let type_idx = merged
             .defined_func(target_func)
@@ -15129,6 +15155,78 @@ mod tests {
             "SR-14 results: retptr i32.store must write CALLER memory \
              ({SR_CALLER_MEM}); got {:?}",
             ret.stores
+        );
+    }
+
+    /// #515: a cross-memory TRANSCODING site (UTF-8 caller -> UTF-16 callee,
+    /// string param) with no resolvable callee realloc used to fall back to a
+    /// direct call that handed the callee the CALLER's pointer. Refuse.
+    #[test]
+    fn transcode_cross_memory_without_callee_realloc_is_refused_515() {
+        use crate::merger::{MergedFuncType, MergedFunction};
+        let mut merged = empty_merged();
+        merged.types.push(MergedFuncType {
+            params: vec![wasm_encoder::ValType::I32, wasm_encoder::ValType::I32],
+            results: vec![],
+        });
+        merged.functions.push(MergedFunction {
+            type_idx: 0,
+            body: wasm_encoder::Function::new([]),
+            origin: (1, 0, 0),
+            synthetic_kind: None,
+        });
+        merged.function_index_map.insert((1, 0, 0), 0);
+        merged.type_index_map.insert((0, 0, 0), 0);
+        merged.memory_index_map.insert((0, 0, 0), SR_CALLER_MEM);
+        merged.memory_index_map.insert((1, 0, 0), SR_CALLEE_MEM);
+        // No realloc anywhere (neither `realloc_map` nor `callee_realloc_fn`).
+        let mut site = crate::resolver::AdapterSite {
+            from_component: 0,
+            from_module: 0,
+            import_name: "greet".into(),
+            import_module: "test:dep/iface".into(),
+            import_func_type_idx: Some(0),
+            to_component: 1,
+            to_module: 0,
+            export_name: "greet".into(),
+            export_func_idx: 0,
+            crosses_memory: true,
+            is_async_lift: false,
+            requirements: Default::default(),
+        };
+        site.requirements.pointer_pair_positions = vec![0];
+        site.requirements.param_copy_layouts =
+            vec![crate::resolver::CopyLayout::Bulk { byte_multiplier: 1 }];
+        site.requirements.caller_encoding = Some(crate::parser::CanonStringEncoding::Utf8);
+        site.requirements.callee_encoding = Some(crate::parser::CanonStringEncoding::Utf16);
+
+        let gen_ = FactStyleGenerator::new(AdapterConfig::default());
+        let empty = std::collections::HashMap::new();
+        let err = match gen_.generate_adapter(&site, &merged, 0, &empty, &empty) {
+            Ok(_) => panic!("#515: a transcode with no callee realloc must not generate"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            err.contains("#515") && err.contains("callee `realloc`"),
+            "{err}"
+        );
+    }
+
+    /// #515: the >16-flat-param buffer is a parameter copy; with no callee
+    /// realloc the old code called function 0 (here the TARGET) as the allocator.
+    #[test]
+    fn params_area_without_callee_realloc_is_refused_not_function_zero_515() {
+        let (mut merged, site) = sr_params_ptr_merged_and_site();
+        merged.realloc_map.clear();
+        let gen_ = FactStyleGenerator::new(AdapterConfig::default());
+        let empty = std::collections::HashMap::new();
+        let err = match gen_.generate_adapter(&site, &merged, 0, &empty, &empty) {
+            Ok(_) => panic!("#515: a params-area copy with no callee realloc must not generate"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            err.contains("#515") && err.contains("callee `realloc`"),
+            "{err}"
         );
     }
 
