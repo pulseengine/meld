@@ -1722,3 +1722,17 @@ artifacts:
       model: claude-opus-5-5
       timestamp: 2026-10-22T03:48:23Z
     release: v0.65.0
+
+  - id: SWV-118
+    type: sw-verification
+    title: "Verification of SR-106: the adapter uses the lower's own memory and realloc, or refuses"
+    status: implemented
+    description: "Verifies SR-106. meld-core/tests/caller_realloc_other_module_515.rs and caller_realloc_traced_515.rs fuse hand-built components under --memory multi and compare against the unfused component under wasmtime: the reported shape (caller's cabi_realloc in a different core module; option<string> and result<string,u32>: 104, base 0); an import lowered twice into different modules in either order and a canon lift placed before the import (21352, base 21248 or the wrong allocator's 26728); a caller module that owns no memory (104, base 90); a lower naming another module's memory (PoC-2 104, base 0; PoC-2B 83, the unrelated module's memory untouched); memory-only lifts and lowers (104, base 0 and 87); identical options reached through separate aliases (104 and pointer 1024); scalar calls whose caller or callee module has no memory (42, unchanged from base); a return-pointer result without pointers (tuple<u32,u32> and tuple<u64,u64>) whose caller lower is traced returns 1007, and whose caller memory cannot be resolved is refused (base returned 0). Refusal tests: matched imports that trace to different pairs; a partial trace whose called import is untraced; an incomplete lower that disables the unanimity fallback. Unit tests in fact.rs: the traced realloc wins over the per-module map; a missing caller realloc, a cross-memory transcode without a callee realloc and a params-area copy without one are errors; a crossing site with an unresolved memory is refused. Potency: each fix reverted on its own fails its tests (round-4 table in the PR); with base 3a01633's resolver and fact.rs the reported tests return the wrong values above. Corpus: 87 input sets under --memory multi and shared, 174 runs, 123 byte-identical to 3a01633, 0 differ, 0 newly refused, 51 failing identically on both. Review: Mythos rounds 1-3 used one fresh agent per Tier-5 file, and round 4 one fresh delta reviewer; they found two corruption regressions (rounds 1 and 2) and one availability regression (round 3) in earlier versions of the fix, and in round 4 a pre-existing silent wrong answer the round-4 gate let through (a return area copied into an unresolved caller memory); each was fixed with a test. The gate and the return-area emitter now share one predicate (is_retptr_call), so they cannot disagree. Local gate with rustc 1.99.0: fmt 0; clippy 0 with and without --all-features; cargo test --workspace exit 0 with 1036 passed and 0 failed; --all-features exit 0 with 1045 passed and 0 failed."
+    links:
+      - type: verifies
+        target: SR-106
+    provenance:
+      created-by: ai-assisted
+      reviewed-by: avrabe
+      model: claude-opus-5-5
+      timestamp: 2026-10-22T13:34:11Z
