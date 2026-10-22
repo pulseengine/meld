@@ -173,6 +173,7 @@ fn resolved(core: &Core, e: &ImportMapEntry) -> (u32, String, u32, String) {
 /// memory 0") is B's memory, while the lower names M's. Each M allocator
 /// returns a distinct constant (100 / 300), so the test can tell from the
 /// fused bodies WHICH component's allocator an index is.
+// rivet: verifies SWV-117
 #[test]
 fn duplicated_wasi_import_reports_its_own_lowers_memory_and_realloc() {
     let c0 = component("BMA", "", 100, 200);
@@ -234,6 +235,7 @@ fn duplicated_wasi_import_reports_its_own_lowers_memory_and_realloc() {
 }
 
 /// Resolution does not depend on which module the merger numbered first.
+// rivet: verifies SWV-117
 #[test]
 fn memory_follows_the_lower_in_every_module_order() {
     for order in ["MBA", "MAB", "BMA", "BAM", "AMB", "ABM"] {
@@ -253,6 +255,7 @@ fn memory_follows_the_lower_in_every_module_order() {
     }
 }
 
+// rivet: verifies SWV-117
 #[test]
 fn string_encoding_is_reported_per_lower() {
     for (opts, want) in [
@@ -271,6 +274,7 @@ fn string_encoding_is_reported_per_lower() {
 
 /// A lower with no memory / realloc option reports `null` (Absent): it cannot
 /// touch a memory. Never a per-component default.
+// rivet: verifies SWV-117
 #[test]
 fn absent_options_are_null_not_a_default() {
     let wat = |opts: &str| {
@@ -318,6 +322,7 @@ fn absent_options_are_null_not_a_default() {
 
 /// Resource intrinsics are canonical builtins: no memory/realloc, but the
 /// component, the resource type and the `[dtor]` export they belong to.
+// rivet: verifies SWV-117
 #[test]
 fn resource_intrinsics_name_component_resource_and_dtor() {
     let path = concat!(
@@ -381,6 +386,7 @@ fn resource_intrinsics_name_component_resource_and_dtor() {
 
 /// Under `--memory shared` there is one memory; a traced lower still reports
 /// its realloc and encoding, and the memory is index 0 of that single memory.
+// rivet: verifies SWV-117
 #[test]
 fn shared_memory_reports_the_single_memory() {
     let (out, map) = fuse_core(
