@@ -255,7 +255,15 @@ enum Commands {
         #[arg(long)]
         component: bool,
 
-        /// Write a JSON import map to the given path (for synth/kiln integration)
+        /// Write a JSON import map to the given path (for synth/kiln integration).
+        ///
+        /// Per function import: `index`, `kind`, `module`, `name`, plus (schema
+        /// version 2) the owning `component`, the `memory` its pointers index
+        /// and the `realloc` it allocates with (each `{index|func, export}`),
+        /// the string `encoding` (`utf8`/`utf16`/`latin1+utf16`), and for
+        /// resource intrinsics a `resource` object naming the type and its
+        /// `[dtor]` export. `null` means the source `canon lower` has no such
+        /// option; `{"unknown": reason}` means it could not be traced.
         #[arg(long, value_name = "PATH")]
         emit_import_map: Option<String>,
 
@@ -767,7 +775,7 @@ fn fuse_command(
 
     // Emit import map if requested
     if let Some(ref map_path) = emit_import_map {
-        write_import_map(&fused_bytes, map_path)
+        write_import_map(&fused_bytes, map_path, &stats.import_map)
             .with_context(|| format!("Failed to write import map to {}", map_path))?;
         println!();
         println!("Import map: {}", map_path);
@@ -1098,11 +1106,65 @@ fn docs_command(
     Ok(())
 }
 
+/// Schema version of the `--emit-import-map` JSON. Version 1 (implicit, no
+/// `version` field) carried `index`/`kind`/`module`/`name` per import; version
+/// 2 (#513) adds the per-import `component`, `memory`, `realloc`, `encoding`
+/// and `resource` fields. Existing fields are unchanged.
+const IMPORT_MAP_VERSION: u32 = 2;
+
+/// Render one lower-derived option: `null` (the lower has none), the resolved
+/// value, or `{"unknown": reason}` (meld could not establish it).
+fn option_json<T>(
+    opt: &meld_core::import_map::LowerOption<T>,
+    render: impl FnOnce(&T) -> serde_json::Value,
+) -> serde_json::Value {
+    use meld_core::import_map::LowerOption;
+    match opt {
+        LowerOption::Absent => serde_json::Value::Null,
+        LowerOption::Present(v) => render(v),
+        LowerOption::Unknown(why) => serde_json::json!({ "unknown": why }),
+    }
+}
+
+/// The #513 fields of one import entry.
+fn host_contract_json(e: &meld_core::import_map::ImportMapEntry) -> serde_json::Value {
+    use serde_json::json;
+    let mut v = json!({
+        "component": e.component,
+        "memory": option_json(&e.memory, |m| json!({ "index": m.index, "export": m.export })),
+        "realloc": option_json(&e.realloc, |r| json!({ "func": r.func, "export": r.export })),
+        "encoding": option_json(&e.encoding, |s| json!(s)),
+    });
+    if !e.also_components.is_empty() {
+        v["also_components"] = json!(e.also_components);
+    }
+    if let Some(r) = &e.resource {
+        v["resource"] = json!({
+            "operation": r.operation,
+            "resource": r.resource,
+            "interface": r.interface,
+            "definer": r.definer,
+            "dtor_export": r.dtor_export,
+            "dtor_candidates": r.dtor_candidates,
+        });
+    }
+    v
+}
+
 /// Write a JSON import map listing all function imports in the fused module.
 ///
 /// The output is consumed by downstream tools (synth/kiln) to wire up host
-/// imports when instantiating the fused core module.
-fn write_import_map(wasm_bytes: &[u8], path: &str) -> Result<()> {
+/// imports when instantiating the fused core module. `host_contract` is the
+/// per-import resolution from the fuser (#513); it is joined to the imports
+/// parsed from `wasm_bytes` by their (unique) `(module, name)`, because for
+/// `--component` output the bytes are a component and the positions are not the
+/// core module's. An import with no unique match gets
+/// `{"unknown": ...}` rather than a guess.
+fn write_import_map(
+    wasm_bytes: &[u8],
+    path: &str,
+    host_contract: &[meld_core::import_map::ImportMapEntry],
+) -> Result<()> {
     use wasmparser::{Parser, Payload};
 
     let mut imports = Vec::new();
@@ -1118,19 +1180,38 @@ fn write_import_map(wasm_bytes: &[u8], path: &str) -> Result<()> {
                     import.ty,
                     wasmparser::TypeRef::Func(_) | wasmparser::TypeRef::FuncExact(_)
                 ) {
-                    imports.push(serde_json::json!({
+                    let mut entry = serde_json::json!({
                         "index": func_index,
                         "module": import.module,
                         "name": import.name,
                         "kind": classify_import(import.module, import.name),
-                    }));
+                    });
+                    let mut matches = host_contract
+                        .iter()
+                        .filter(|e| e.module == import.module && e.name == import.name);
+                    let contract = match (matches.next(), matches.next()) {
+                        (Some(e), None) => host_contract_json(e),
+                        _ => {
+                            let why = "no unique fused-module import with this module and name";
+                            serde_json::json!({
+                                "component": null,
+                                "memory": { "unknown": why },
+                                "realloc": { "unknown": why },
+                                "encoding": { "unknown": why },
+                            })
+                        }
+                    };
+                    if let (Some(dst), Some(src)) = (entry.as_object_mut(), contract.as_object()) {
+                        dst.extend(src.iter().map(|(k, v)| (k.clone(), v.clone())));
+                    }
+                    imports.push(entry);
                     func_index += 1;
                 }
             }
         }
     }
 
-    let map = serde_json::json!({ "imports": imports });
+    let map = serde_json::json!({ "version": IMPORT_MAP_VERSION, "imports": imports });
     let json = serde_json::to_string_pretty(&map).context("Failed to serialize import map")?;
     fs::write(path, json).with_context(|| format!("Failed to write {}", path))?;
 
@@ -1295,7 +1376,7 @@ mod tests {
         let _ = std::fs::create_dir_all(&dir);
         let map_path = dir.join("test_imports.json");
 
-        write_import_map(&wasm_bytes, map_path.to_str().unwrap()).unwrap();
+        write_import_map(&wasm_bytes, map_path.to_str().unwrap(), &[]).unwrap();
 
         let contents = std::fs::read_to_string(&map_path).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&contents).unwrap();
@@ -1310,6 +1391,78 @@ mod tests {
         assert_eq!(arr[1]["index"], 1);
         assert_eq!(arr[1]["module"], "wasi:io/streams@0.2.6");
         assert_eq!(arr[1]["name"], "[method]output-stream.write");
+
+        // Without fuser data the new fields are `unknown`, never a guess, and
+        // the version says the new fields are there.
+        assert_eq!(parsed["version"], 2);
+        assert!(arr[0]["memory"]["unknown"].is_string());
+        assert!(arr[0]["realloc"]["unknown"].is_string());
+        assert!(arr[0]["component"].is_null());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #513: `null` (the lower has no such option), a resolved value and
+    /// `unknown` (could not be traced) are three different JSON shapes, and the
+    /// pre-existing fields are untouched.
+    #[test]
+    fn test_import_map_host_contract_shapes() {
+        use meld_core::import_map::{ImportMapEntry, LowerOption, MemoryRef, ReallocRef};
+        use wasm_encoder::{ImportSection, Module, TypeSection, ValType};
+
+        let mut module = Module::new();
+        let mut types = TypeSection::new();
+        types.ty().function(vec![ValType::I32], vec![]);
+        module.section(&types);
+        let mut imports = ImportSection::new();
+        for (m, n) in [("wasi:a/b@0.2.12", "f"), ("wasi:a/b@0.2.12", "g$1")] {
+            imports.import(m, n, wasm_encoder::EntityType::Function(0));
+        }
+        module.section(&imports);
+        let wasm_bytes = module.finish();
+
+        let entry = |index, name: &str, component| ImportMapEntry {
+            index,
+            module: "wasi:a/b@0.2.12".into(),
+            name: name.into(),
+            component: Some(component),
+            also_components: vec![],
+            memory: LowerOption::Present(MemoryRef {
+                index: 2,
+                export: Some("memory$1".into()),
+            }),
+            realloc: LowerOption::Absent,
+            encoding: LowerOption::Present("utf16"),
+            resource: None,
+        };
+        let mut g = entry(1, "g$1", 1);
+        g.realloc = LowerOption::Present(ReallocRef {
+            func: 7,
+            export: None,
+        });
+        g.memory = LowerOption::Unknown("no lower".into());
+        let contract = vec![entry(0, "f", 0), g];
+
+        let dir = std::env::temp_dir().join("meld_test_import_map_513");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("m.json");
+        write_import_map(&wasm_bytes, path.to_str().unwrap(), &contract).unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let a = v["imports"].as_array().unwrap();
+
+        assert_eq!(a[0]["index"], 0);
+        assert_eq!(a[0]["kind"], "wasi");
+        assert_eq!(a[0]["component"], 0);
+        assert_eq!(a[0]["memory"]["index"], 2);
+        assert_eq!(a[0]["memory"]["export"], "memory$1");
+        assert!(a[0]["realloc"].is_null());
+        assert_eq!(a[0]["encoding"], "utf16");
+
+        assert_eq!(a[1]["component"], 1);
+        assert_eq!(a[1]["memory"]["unknown"], "no lower");
+        assert_eq!(a[1]["realloc"]["func"], 7);
+        assert!(a[1]["realloc"]["export"].is_null());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

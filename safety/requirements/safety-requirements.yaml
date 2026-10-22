@@ -3735,7 +3735,7 @@ artifacts:
   - id: SR-103
     type: sw-req
     title: An import aliased through a core re-export follows every later redirect of the import it aliases
-    status: implemented
+    status: verified
     description: "Inside one component, a core module can re-export an import it received, and another core module can import that re-export. The merger resolves the second module's import by copying the first module's map entry at merge time. When the original import crosses a component boundary through an adapter, that entry still names the callee at merge time; adapter wiring later rewrote only the first module's entry, so the copy stayed stale, and the second module's calls, element items and the re-export itself named the callee directly, bypassing the canonical-ABI adapter (#504: 3000 instead of 3090 at exit 0, with a cross-memory string never copied). meld shall record, whenever an import's resolution is copied from another import, which import it aliases, and every pass that later redirects an import (adapter wiring, the resource re-export redirect, task.return shims, the stream bridge) shall apply the redirect to every alias, transitively, and rebuild the affected modules' bodies. A core export that re-exports one of its module's own imports shall be resolved from the final function map, so it names what a call of that import names."
     links:
       - type: derives-from
@@ -3747,11 +3747,12 @@ artifacts:
       reviewed-by: avrabe
       model: claude-opus-5-5
       timestamp: 2026-10-21T12:10:43Z
+    release: v0.65.0
 
   - id: SR-104
     type: sw-req
     title: Nested lists and strings inside option, result and variant values are deep-copied across memories
-    status: implemented
+    status: verified
     description: "When a cross-component call passes or returns a value whose canonical-ABI representation contains pointers, the adapter copies it from one component's linear memory into the other's. For a list<string> held inside an option, result or variant, the adapter copied the outer array of (pointer, length) pairs but not the strings those pairs point to, so the receiving component got pointers into the other component's memory and read its own memory at those addresses: empty or garbage strings, or an out-of-bounds trap, at exit 0 (#512: option<record{name, qty, tags: list<string>}> returned tags as [,]). This affected results (option, result, variant) and arguments, while the same list outside an option was copied correctly. Separately, when a call had both plain and optional pointer arguments, the optional one was not copied at all. meld shall deep-copy every nested list and string reachable from a value of option, result or variant type, in both directions, into the destination memory through the destination's realloc, before the source's post-return frees it, and shall copy optional pointer arguments regardless of what other arguments the call has. Known limits recorded as separate issues: the realloc calls pass alignment 1 rather than the element alignment; a caller whose realloc is in a different core module skips the optional-result copy; paths with more than 16 flat parameters, the async and transcoding adapters, and option<list<own<r>>> are not yet covered by tests."
     links:
       - type: derives-from
@@ -3763,3 +3764,21 @@ artifacts:
       reviewed-by: avrabe
       model: claude-opus-5-5
       timestamp: 2026-10-22T00:02:49Z
+    release: v0.65.0
+
+  - id: SR-105
+    type: sw-req
+    title: The import map states each import's memory, realloc, string encoding and owning component
+    status: verified
+    description: A host that implements a fused module's imports, for example a native WASI host for a module compiled by wasm2c, must know for each function import which linear memory its pointer arguments refer to, which cabi_realloc to call for list and string results, and how strings are encoded. Under --memory multi the fused module keeps one memory per component and duplicates an import lowered by several components under a $N suffix, so this cannot be inferred from names or export order (#513, reported by o-murphy). meld's --emit-import-map shall state, for every function import, the owning component, the memory and realloc of the canon lower that import came from (as the fused index and, where one exists, the export name), and the string encoding; for resource intrinsics left as imports it shall state the component, the resource, whether the component defines it, and its [dtor] export. A lower that has no memory or realloc option shall be reported as null; an import whose lower cannot be traced or resolved shall be reported as unknown with a reason, never as a guessed index. The addition is versioned (version 2) and leaves existing fields unchanged, and the fused module itself is unaffected.
+    links:
+      - type: derives-from
+        target: SYS-4
+      - type: refines
+        target: SR-99
+    provenance:
+      created-by: ai-assisted
+      reviewed-by: avrabe
+      model: claude-opus-5-5
+      timestamp: 2026-10-22T03:48:23Z
+    release: v0.65.0
