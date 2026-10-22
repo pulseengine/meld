@@ -815,7 +815,8 @@ fn decompose_realloc(component: &ParsedComponent, realloc: Option<u32>) -> Optio
         .copied();
     if found.is_none() {
         log::warn!(
-            "#515: cannot trace the canonical `realloc` option (core func {idx}) to a              module function; falling back to the per-module realloc map"
+            "#515: cannot trace the canonical `realloc` option (core func {idx}) to a \
+             module function; falling back to the per-module realloc map"
         );
     }
     found
