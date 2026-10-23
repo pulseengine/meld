@@ -118,7 +118,7 @@ def main(argv=None):
             args.tag, args.assets, config, pathlib.Path(args.cargo_toml) if args.cargo_toml else None,
             no_cargo_check=args.no_cargo_check,
         )
-        out = pathlib.Path(args.out)
+        out = pathlib.Path(args.out).resolve()  # npm pack runs with cwd=<package>, so relative paths break
         staged = []
         for rec in recs:
             staged.append(stage_platform(config, version, rec, out))

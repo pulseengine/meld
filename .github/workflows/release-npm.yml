@@ -166,18 +166,20 @@ jobs:
     name: Install test (${{ matrix.name }})
     needs: build
     runs-on: ${{ matrix.runner }}
-    container: ${{ matrix.container }}
+    # musl rows run their test in Alpine via `docker run` on the host, not as a
+    # job container: GitHub refuses to run JS actions (download-artifact) inside
+    # an Alpine job container on arm64 runners ("only supported on x64 Linux").
     timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
         include:
-          - { name: linux-x64-glibc,   runner: ubuntu-24.04,     container: '',               platform: linux-x64-gnu }
-          - { name: linux-arm64-glibc, runner: ubuntu-24.04-arm, container: '',               platform: linux-arm64-gnu }
-          - { name: linux-x64-musl,    runner: ubuntu-24.04,     container: 'node:22-alpine', platform: linux-x64-musl }
-          - { name: linux-arm64-musl,  runner: ubuntu-24.04-arm, container: 'node:22-alpine', platform: linux-arm64-musl }
-          - { name: macos-x64,         runner: macos-15-intel,   container: '',               platform: darwin-x64 }
-          - { name: macos-arm64,       runner: macos-15,         container: '',               platform: darwin-arm64 }
+          - { name: linux-x64-glibc,   runner: ubuntu-24.04,     docker: '',               platform: linux-x64-gnu }
+          - { name: linux-arm64-glibc, runner: ubuntu-24.04-arm, docker: '',               platform: linux-arm64-gnu }
+          - { name: linux-x64-musl,    runner: ubuntu-24.04,     docker: 'node:22-alpine', platform: linux-x64-musl }
+          - { name: linux-arm64-musl,  runner: ubuntu-24.04-arm, docker: 'node:22-alpine', platform: linux-arm64-musl }
+          - { name: macos-x64,         runner: macos-15-intel,   docker: '',               platform: darwin-x64 }
+          - { name: macos-arm64,       runner: macos-15,         docker: '',               platform: darwin-arm64 }
     steps:
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
@@ -185,7 +187,7 @@ jobs:
           path: npm-out
 
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
-        if: matrix.container == ''
+        if: matrix.docker == ''
         with:
           node-version: '24'
 
@@ -195,19 +197,30 @@ jobs:
         env:
           TAG: ${{ needs.build.outputs.tag }}
           PLATFORM: ${{ matrix.platform }}
+          DOCKER_IMAGE: ${{ matrix.docker }}
         run: |
           set -eu
           VERSION="${TAG#v}"
-          T="$PWD/npm-out/tarballs"
-          ls "$T"
-          mkdir "$RUNNER_TEMP/proj" && cd "$RUNNER_TEMP/proj"
+          ls "$PWD/npm-out/tarballs"
+          # POSIX sh, so the same script runs on the host and inside Alpine.
+          cat > "$RUNNER_TEMP/install-test.sh" <<'SH'
+          set -eu
+          V="$1"; T="$2"; P="$3"; PROJ="$4"
+          mkdir -p "$PROJ" && cd "$PROJ"
           npm init -y > /dev/null
           npm install --ignore-scripts --no-audit --no-fund \
-            "$T/pulseengine-meld-$VERSION.tgz" "$T/pulseengine-meld-$PLATFORM-$VERSION.tgz"
+            "$T/pulseengine-meld-$V.tgz" "$T/pulseengine-meld-$P-$V.tgz"
           got="$(npx --no-install meld --version)"
           echo "meld --version -> $got"
-          [ "$got" = "meld $VERSION" ] || { echo "::error::expected 'meld $VERSION'"; exit 1; }
+          [ "$got" = "meld $V" ] || { echo "::error::expected 'meld $V'"; exit 1; }
           npx --no-install meld --help > /dev/null
+          SH
+          if [ -n "$DOCKER_IMAGE" ]; then
+            docker run --rm -v "$PWD/npm-out/tarballs:/t:ro" -v "$RUNNER_TEMP/install-test.sh:/s.sh:ro" \
+              "$DOCKER_IMAGE" sh /s.sh "$VERSION" /t "$PLATFORM" /tmp/proj
+          else
+            sh "$RUNNER_TEMP/install-test.sh" "$VERSION" "$PWD/npm-out/tarballs" "$PLATFORM" "$RUNNER_TEMP/proj"
+          fi
 
   dry-run:
     name: npm publish --dry-run
