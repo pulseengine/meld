@@ -169,28 +169,25 @@ jobs:
     name: Install test (${{ matrix.name }})
     needs: build
     runs-on: ${{ matrix.runner }}
-    # musl runs in an Alpine container (node image: the JS actions need node).
-    container: ${{ matrix.container }}
+    # musl rows run their test in Alpine via `docker run` on the host, not as a
+    # job container: GitHub refuses to run JS actions (download-artifact) inside
+    # an Alpine job container on arm64 runners ("only supported on x64 Linux").
     timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
         include:
-          - { name: linux-x64-glibc,  runner: ubuntu-24.04,     container: '',                 expect: manylinux }
-          - { name: linux-arm64-glibc, runner: ubuntu-24.04-arm, container: '',                expect: manylinux }
-          - { name: linux-x64-musl,   runner: ubuntu-24.04,     container: 'node:22-alpine',   expect: musllinux }
-          - { name: linux-arm64-musl, runner: ubuntu-24.04-arm, container: 'node:22-alpine',   expect: musllinux }
-          - { name: macos-x64,        runner: macos-15-intel,   container: '',                 expect: macosx }
-          - { name: macos-arm64,      runner: macos-15,         container: '',                 expect: macosx }
+          - { name: linux-x64-glibc,  runner: ubuntu-24.04,     docker: '',                 expect: manylinux }
+          - { name: linux-arm64-glibc, runner: ubuntu-24.04-arm, docker: '',                expect: manylinux }
+          - { name: linux-x64-musl,   runner: ubuntu-24.04,     docker: 'python:3.12-alpine',   expect: musllinux }
+          - { name: linux-arm64-musl, runner: ubuntu-24.04-arm, docker: 'python:3.12-alpine',   expect: musllinux }
+          - { name: macos-x64,        runner: macos-15-intel,   docker: '',                 expect: macosx }
+          - { name: macos-arm64,      runner: macos-15,         docker: '',                 expect: macosx }
     steps:
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: wheels
           path: wheels
-
-      - name: Install Python (Alpine only)
-        if: matrix.expect == 'musllinux'
-        run: apk add --no-cache python3 py3-pip
 
       # Clean venv, no network index: pip must pick the right wheel for this
       # platform from the local set, which also exercises the tag derivation.
@@ -198,18 +195,30 @@ jobs:
         env:
           TAG: ${{ needs.build.outputs.tag }}
           EXPECT: ${{ matrix.expect }}
+          DOCKER_IMAGE: ${{ matrix.docker }}
         run: |
           set -eu
           VERSION="${TAG#v}"
-          python3 -m venv "$RUNNER_TEMP/venv"
-          "$RUNNER_TEMP/venv/bin/pip" install --no-index --find-links wheels "meld-cli==$VERSION"
-          got="$("$RUNNER_TEMP/venv/bin/meld" --version)"
+          # POSIX sh, so the same script runs on the host and inside Alpine.
+          cat > "$RUNNER_TEMP/install-test.sh" <<'SH'
+          set -eu
+          V="$1"; W="$2"; E="$3"; VENV="$4"
+          python3 -m venv "$VENV"
+          "$VENV/bin/pip" install --no-index --find-links "$W" "meld-cli==$V"
+          got="$("$VENV/bin/meld" --version)"
           echo "meld --version -> $got"
-          [ "$got" = "meld $VERSION" ] || { echo "::error::expected 'meld $VERSION'"; exit 1; }
-          "$RUNNER_TEMP/venv/bin/meld" --help > /dev/null
-          grep -h '^Tag:' "$RUNNER_TEMP"/venv/lib/python*/site-packages/meld_cli-*.dist-info/WHEEL
-          grep -h '^Tag:' "$RUNNER_TEMP"/venv/lib/python*/site-packages/meld_cli-*.dist-info/WHEEL | grep -q "$EXPECT" \
-            || { echo "::error::pip selected a wheel that is not a $EXPECT wheel"; exit 1; }
+          [ "$got" = "meld $V" ] || { echo "::error::expected 'meld $V'"; exit 1; }
+          "$VENV/bin/meld" --help > /dev/null
+          grep -h '^Tag:' "$VENV"/lib/python*/site-packages/meld_cli-*.dist-info/WHEEL
+          grep -h '^Tag:' "$VENV"/lib/python*/site-packages/meld_cli-*.dist-info/WHEEL | grep -q "$E" \
+            || { echo "::error::pip selected a wheel that is not a $E wheel"; exit 1; }
+          SH
+          if [ -n "$DOCKER_IMAGE" ]; then
+            docker run --rm -v "$PWD/wheels:/wheels:ro" -v "$RUNNER_TEMP/install-test.sh:/t.sh:ro" \
+              "$DOCKER_IMAGE" sh /t.sh "$VERSION" /wheels "$EXPECT" /tmp/venv
+          else
+            sh "$RUNNER_TEMP/install-test.sh" "$VERSION" wheels "$EXPECT" "$RUNNER_TEMP/venv"
+          fi
 
   publish:
     name: Publish to ${{ needs.build.outputs.target }}
