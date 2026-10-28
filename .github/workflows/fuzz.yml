@@ -21,13 +21,12 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 on:
-  push:
-    branches: [main]
-    paths-ignore:
-      - '**/*.md'
-      - 'safety/**'
-      - 'scripts/mythos/**'
-      - 'tools/*.py'
+  # Not on push to main: each change already ran this on its PR, and the
+  # main re-run only queued on the shared rust-cpu pool (measured ~100 min
+  # queue per main push, 2026-10). A nightly run still covers main itself.
+  schedule:
+    - cron: '17 2 * * *'
+  workflow_dispatch:
   pull_request:
     branches: [main]
     paths-ignore:
@@ -62,19 +61,14 @@ env:
 
 jobs:
   fuzz-smoke:
-    name: Fuzz smoke (${{ matrix.target }})
+    # One job runs all four targets in sequence (was a 4-way matrix: four
+    # queue slots on the shared rust-cpu pool for ~1.5-9 min of work each).
+    # Every target still runs even if an earlier one fails.
+    name: Fuzz smoke
     runs-on: [self-hosted, linux, x64, rust-cpu]
     continue-on-error: true
-    strategy:
-      fail-fast: false
-      matrix:
-        target:
-          - fuzz_parse_component
-          - fuzz_resolver_terminates
-          - fuzz_merger_idempotent
-          - fuzz_fusion_roundtrip
     env:
-      FUZZ_TARGET: ${{ matrix.target }}
+      FUZZ_TARGETS: fuzz_parse_component fuzz_resolver_terminates fuzz_merger_idempotent fuzz_fusion_roundtrip
     steps:
       - uses: actions/checkout@v4
 
@@ -89,7 +83,7 @@ jobs:
       # host gnu target (no `targets:` line, no `--target` flag on
       # `cargo fuzz run`) so the sanitizer stays compatible.
       # Inputs here are workflow-static (no untrusted event payloads):
-      # `matrix.target` is hardcoded in the strategy matrix and
+      # `FUZZ_TARGETS` is hardcoded in the job env and
       # `runner.os` is GitHub-provided runner metadata.
       # See pulseengine/meld#168 for the recurring failure pattern.
       - name: Install nightly Rust
@@ -110,8 +104,8 @@ jobs:
           # taken while the toolchain still had musl as an extra target
           # (#168). Bump again if a future change should invalidate all
           # existing caches in lock-step.
-          key: ${{ runner.os }}-fuzz-v2-${{ matrix.target }}-${{ hashFiles('fuzz/Cargo.toml', 'meld-core/Cargo.toml') }}
-          restore-keys: ${{ runner.os }}-fuzz-v2-${{ matrix.target }}-
+          key: ${{ runner.os }}-fuzz-v3-${{ hashFiles('fuzz/Cargo.toml', 'meld-core/Cargo.toml') }}
+          restore-keys: ${{ runner.os }}-fuzz-v3-
 
       # Layer 3 defense against #168 (the layer that actually holds): an
       # EXPLICIT `--target` on `cargo fuzz run`. Layer 2 (`CARGO_BUILD_TARGET`
@@ -126,13 +120,24 @@ jobs:
       # uses, forcing the host gnu target on every runner: no musl std, no
       # cross-compiler, sanitizer stays compatible. Harmless on clean runners
       # (gnu IS the native host triple). See pulseengine/meld#168.
-      - name: Run target for 60 s
-        run: cargo +nightly fuzz run --release --target x86_64-unknown-linux-gnu "$FUZZ_TARGET" -- -max_total_time=60
+      - name: Run each target for 60 s
+        run: |
+          failed=""
+          for t in $FUZZ_TARGETS; do
+            echo "::group::$t"
+            cargo +nightly fuzz run --release --target x86_64-unknown-linux-gnu "$t" -- -max_total_time=60 \
+              || failed="$failed $t"
+            echo "::endgroup::"
+          done
+          if [ -n "$failed" ]; then
+            echo "::error::fuzz targets failed:$failed"
+            exit 1
+          fi
 
       - name: Upload crash artifacts on failure
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: fuzz-artifacts-${{ matrix.target }}
+          name: fuzz-artifacts
           path: fuzz/artifacts/
           if-no-files-found: ignore
