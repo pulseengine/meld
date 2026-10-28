@@ -730,11 +730,13 @@ plan OAuth token. On every PR that touches a Tier-5 file:
    the discover.md prompt, asking for a structured JSON verdict
    (`NO_FINDINGS` or `FINDING`).
 3. The aggregate job composes a sticky `<!-- mythos-auto-gate -->`
-   PR comment with the per-file table, and applies the
-   `mythos-pass-done` label when every file is `NO_FINDINGS`.
-4. If any file is `FINDING`, the job fails and the label is not
-   applied; the label-only `mythos-gate.yml` then keeps the PR
-   blocked until a human reviews the finding.
+   PR comment with the per-file table. It does not apply the
+   `mythos-pass-done` label: a maintainer applies it after reading the
+   verdict. The model runs read-only (`Read,Grep,Glob`) and follows
+   `discover.md` as it is on the PR's base commit, not the PR head.
+4. If any file is `FINDING`, the job fails; the label-only
+   `mythos-gate.yml` keeps the PR blocked until a human reviews the
+   finding and applies the label.
 
 **This auto-runner is single-actor scoped.** The job has a top-level
 `if: github.actor == 'avrabe' && github.actor_id == '10056645'`

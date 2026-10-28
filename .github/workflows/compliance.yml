@@ -37,7 +37,7 @@ jobs:
           case "$TAG" in v*) ;; *) echo "::error::tag '$TAG' must start with v"; exit 1 ;; esac
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           ref: ${{ steps.tag.outputs.tag }}
 
@@ -46,7 +46,7 @@ jobs:
         # Held at v0.22.0: the v0.40.0 action fails the job when `rivet validate`
         # fails, and 0.40 rejects meld's multi-citation cited-source lists (43
         # diagnostics on SR-32..SR-74). Bump once pulseengine/rivet#1106 lands.
-        uses: pulseengine/rivet/.github/actions/compliance@v0.22.0
+        uses: pulseengine/rivet/.github/actions/compliance@8542cb96909bda9455f425f723ea2140c66c335f # v0.22.0
         with:
           theme: dark
           rivet-version: v0.22.0
