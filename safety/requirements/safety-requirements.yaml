@@ -3810,5 +3810,6 @@ artifacts:
         target: SYS-3
     provenance:
       created-by: ai-assisted
+      reviewed-by: avrabe
       model: claude-sonnet-5-5
       timestamp: 2026-10-28T13:54:56Z
