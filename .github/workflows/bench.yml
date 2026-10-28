@@ -19,13 +19,12 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 on:
-  push:
-    branches: [main]
-    paths-ignore:
-      - '**/*.md'
-      - 'safety/**'
-      - 'scripts/mythos/**'
-      - 'tools/*.py'
+  # Not on push to main: each change already ran this on its PR, and the
+  # main re-run only queued on the shared rust-cpu pool (measured ~100 min
+  # queue per main push, 2026-10). A nightly run still covers main itself.
+  schedule:
+    - cron: '47 2 * * *'
+  workflow_dispatch:
   pull_request:
     branches: [main]
     paths-ignore:

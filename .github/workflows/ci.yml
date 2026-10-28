@@ -98,6 +98,10 @@ jobs:
 
   clippy:
     name: Clippy
+    # PR-only: every change reaches main through a PR that ran Clippy on the
+    # same tree. Re-running it on the main push only occupied a shared
+    # rust-cpu runner (measured: ~100 min queue per main push, 2026-10).
+    if: github.event_name == 'pull_request'
     runs-on: [self-hosted, linux, x64, rust-cpu]
     steps:
       - uses: actions/checkout@v4
