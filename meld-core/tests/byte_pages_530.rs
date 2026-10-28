@@ -326,3 +326,67 @@ fn the_page_size_is_attested_only_when_not_the_default() {
     assert!(record_page, "control: the attestation record is present");
     assert!(!page, "the default is not recorded");
 }
+
+/// Mythos #530 review: under `Auto` or `MultiMemory` no shared plan exists,
+/// so nothing can be byte-paged. Accepting the flag there recorded
+/// `memory_page_size: 1` in the attestation for ordinary 64 KiB memories.
+// rivet: verifies SWV-119
+#[test]
+fn byte_pages_are_refused_unless_the_memory_is_shared() {
+    for strategy in [MemoryStrategy::Auto, MemoryStrategy::MultiMemory] {
+        let mut cfg = config(true, MemoryPageSize::Byte);
+        cfg.memory_strategy = strategy;
+        cfg.address_rebasing = false;
+        // No --domain: that is refused under Auto/Multi for its own reason,
+        // which would hide the case the review found.
+        cfg.domains = Vec::new();
+        let mut fuser = Fuser::new(cfg);
+        for name in ["consumer", "consumer2", "provider"] {
+            fuser
+                .add_component_named(&fixture(name), Some(name))
+                .unwrap();
+        }
+        let err = fuser
+            .fuse()
+            .expect_err("byte pages must be refused without a shared memory")
+            .to_string();
+        assert!(
+            err.contains("requires --memory shared"),
+            "{strategy:?}: {err}"
+        );
+    }
+}
+
+/// Mythos #530 review: with `--domain` every domain's bases start at 0, so a
+/// placement must say which memory it is in. Within one memory placements
+/// never overlap, and each memory's placements add up to its declared size.
+// rivet: verifies SWV-119
+#[test]
+fn every_placement_names_its_memory_and_none_overlap() {
+    let (bytes, stats) = fuse(true, MemoryPageSize::Byte).expect("byte-paged fusion succeeds");
+    let mems = memories(&bytes);
+    let in_mem: Vec<Vec<_>> = (0..mems.len() as u32)
+        .map(|m| stats.placements.iter().filter(|p| p.memory == m).collect())
+        .collect();
+    assert_eq!(
+        in_mem.iter().map(Vec::len).sum::<usize>(),
+        stats.placements.len(),
+        "every placement names a memory that exists"
+    );
+    for (m, ps) in in_mem.iter().enumerate() {
+        assert!(!ps.is_empty(), "memory {m} has placements");
+        let total: u64 = ps.iter().map(|p| p.reserved).sum();
+        assert_eq!(
+            total, mems[m].0,
+            "memory {m}: placements sum to its declared bytes"
+        );
+        let mut spans: Vec<(u64, u64)> = ps.iter().map(|p| (p.base, p.base + p.reserved)).collect();
+        spans.sort();
+        for w in spans.windows(2) {
+            assert!(
+                w[0].1 <= w[1].0,
+                "memory {m}: placements overlap: {spans:?}"
+            );
+        }
+    }
+}

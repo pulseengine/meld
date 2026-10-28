@@ -970,8 +970,8 @@ fn print_placements(stats: &FusionStats) {
     let mut total = 0u64;
     for p in &stats.placements {
         println!(
-            "  c{}m{}  base {:>10}  reserved {:>10} B  ({})",
-            p.component, p.module, p.base, p.reserved, p.strategy
+            "  c{}m{}  memory {}  base {:>10}  reserved {:>10} B  ({})",
+            p.component, p.module, p.memory, p.base, p.reserved, p.strategy
         );
         total += p.reserved;
     }

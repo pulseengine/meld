@@ -1122,16 +1122,20 @@ impl Merger {
             // they were placed — and a byte-sized memory's extent could not be
             // checked against its placements. With one domain (the default)
             // `domain_plans` has one entry and this is what it was.
+            // Each record carries its memory index: the plans are flattened
+            // in the same order the memories are pushed below.
             merged.placements = domain_plans
                 .iter()
                 .flatten()
-                .flat_map(|dp| dp.placements.iter())
-                .map(|p| crate::PlacementRecord {
+                .enumerate()
+                .flat_map(|(mem, dp)| dp.placements.iter().map(move |p| (mem, p)))
+                .map(|(mem, p)| crate::PlacementRecord {
                     component: p.component,
                     module: p.module,
                     strategy: p.strategy.to_string(),
                     base: p.base,
                     reserved: p.reserved,
+                    memory: u32::try_from(mem).unwrap_or(u32::MAX),
                 })
                 .collect();
             if plan.import.is_none() {

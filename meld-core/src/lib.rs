@@ -549,6 +549,17 @@ pub struct PlacementRecord {
     pub base: u64,
     /// Bytes reserved for this module (its stride in the fused memory).
     pub reserved: u64,
+    /// SR-107 / #530: the fused memory this module was placed in, which is
+    /// its `--domain` index (one memory per domain). Every domain's bases
+    /// start at 0, so without it two placements in different memories look
+    /// like an overlap. Omitted when 0, so single-memory attestations are
+    /// unchanged; absent means memory 0.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub memory: u32,
+}
+
+fn is_zero_u32(v: &u32) -> bool {
+    *v == 0
 }
 
 /// The size change from `input_bytes` to `output_bytes`, as a percentage of the
@@ -1452,6 +1463,17 @@ impl Fuser {
         // SR-107 / #530: byte-sized memories are meaningful only for the packed
         // extent, and the component wrapper re-declares the memory in pages.
         if self.config.memory_page_size == MemoryPageSize::Byte {
+            // Mythos #530 review: under Auto (resolved to multi-memory) or
+            // MultiMemory no shared plan is computed, so nothing would be
+            // byte-paged while the attestation recorded `memory_page_size: 1`.
+            if self.config.memory_strategy != MemoryStrategy::SharedMemory {
+                return Err(Error::MemoryStrategyUnsupported(
+                    "--memory-page-size 1 requires --memory shared: only the packed shared \
+                     memory has a byte extent, and under any other strategy the flag would be \
+                     recorded in the attestation without being applied"
+                        .to_string(),
+                ));
+            }
             if !(self.config.pack_rebase || self.config.share_stack) {
                 return Err(Error::MemoryStrategyUnsupported(
                     "--memory-page-size 1 requires --pack-rebase (or --share-stack): a byte \
