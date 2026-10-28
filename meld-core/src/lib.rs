@@ -50,6 +50,7 @@ pub mod abi_proofs;
 pub mod adapter;
 pub mod address_strategy;
 pub mod attestation;
+pub mod byte_pages;
 pub mod component_wrap;
 pub mod core_instance_topology;
 pub mod custom_merge;
@@ -264,6 +265,37 @@ pub struct FuserConfig {
     /// before; [`ExportPolicy::World`] cuts the list down to the outer
     /// component's world plus the exports those need to be invoked.
     pub export_policy: ExportPolicy,
+
+    /// Page size the rebased memories are declared with (SR-107 / #530).
+    /// Default [`MemoryPageSize::Page`]: every memory in 64 KiB pages, as
+    /// always. [`MemoryPageSize::Byte`] declares each packed memory with the
+    /// custom-page-sizes proposal's `(pagesize 1)` and `min == max ==` the
+    /// packed extent in BYTES. Refused unless `--pack-rebase` (or
+    /// `--share-stack`) is in effect, with an imported memory, and with
+    /// `--component`.
+    pub memory_page_size: MemoryPageSize,
+}
+
+/// Page size a fused memory is declared with (SR-107 / #530).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MemoryPageSize {
+    /// The core-wasm default, 65536 bytes per page (today's behaviour).
+    #[default]
+    Page,
+    /// The custom-page-sizes proposal's `(pagesize 1)`: the memory is sized in
+    /// bytes. A module that declares it does not load in a runtime that has
+    /// not enabled that proposal, which is why this is opt-in.
+    Byte,
+}
+
+impl MemoryPageSize {
+    /// The page size in bytes (`65536` or `1`), the CLI / attestation value.
+    pub fn bytes(self) -> u32 {
+        match self {
+            MemoryPageSize::Page => 65536,
+            MemoryPageSize::Byte => 1,
+        }
+    }
 }
 
 /// Which exports the fused core module keeps (#463).
@@ -315,6 +347,7 @@ impl Default for FuserConfig {
             output_format: OutputFormat::CoreModule,
             opaque_resources: Vec::new(),
             export_policy: ExportPolicy::All,
+            memory_page_size: MemoryPageSize::Page,
         }
     }
 }
@@ -673,6 +706,19 @@ mod size_reduction_percent_tests {
     }
 }
 
+/// One memory of the fused core module as declared (SR-107 / #530).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemoryDeclaration {
+    /// Index in the fused module's memory index space (defined memories).
+    pub index: usize,
+    /// Declared minimum, in units of `page_size` bytes.
+    pub minimum: u64,
+    /// Declared maximum, in units of `page_size` bytes.
+    pub maximum: Option<u64>,
+    /// Page size in bytes: `65536`, or `1` for `(pagesize 1)`.
+    pub page_size: u64,
+}
+
 /// Statistics about the fusion process
 #[derive(Debug, Clone, Default)]
 pub struct FusionStats {
@@ -724,6 +770,11 @@ pub struct FusionStats {
     /// under `--memory multi`, where each module keeps its own memory and there
     /// is no placement decision to record.
     pub placements: Vec<PlacementRecord>,
+
+    /// SR-107 / #530: the memories of the fused core module as declared, in
+    /// index order, so `--explain` can show that a memory is byte-sized.
+    /// Side-output only: not part of the attestation (the page size is).
+    pub memories: Vec<MemoryDeclaration>,
 
     /// #513: per function import of the fused CORE module, the component,
     /// memory, realloc and string encoding resolved from that import's own
@@ -1398,6 +1449,25 @@ impl Fuser {
     /// The fusion pipeline proper. `self.config.memory_strategy` is a
     /// concrete strategy here — `Auto` has been resolved by the caller.
     fn fuse_with_stats_resolved(&self) -> Result<(Vec<u8>, FusionStats)> {
+        // SR-107 / #530: byte-sized memories are meaningful only for the packed
+        // extent, and the component wrapper re-declares the memory in pages.
+        if self.config.memory_page_size == MemoryPageSize::Byte {
+            if !(self.config.pack_rebase || self.config.share_stack) {
+                return Err(Error::MemoryStrategyUnsupported(
+                    "--memory-page-size 1 requires --pack-rebase (or --share-stack): a byte \
+                     size is only meaningful for the packed extent"
+                        .to_string(),
+                ));
+            }
+            if self.config.output_format == OutputFormat::Component {
+                return Err(Error::MemoryStrategyUnsupported(
+                    "--memory-page-size 1 cannot be combined with --component: the component \
+                     wrapper re-declares the memory in 64 KiB pages, which would silently drop \
+                     the byte size. Emit the core module instead."
+                        .to_string(),
+                ));
+            }
+        }
         if self.config.address_rebasing
             && self.config.memory_strategy != MemoryStrategy::SharedMemory
         {
@@ -1500,6 +1570,7 @@ impl Fuser {
             .with_opaque_resources(self.config.opaque_resources.clone())
             .with_pack_rebase(pack_rebase)
             .with_share_stack(self.config.share_stack)
+            .with_memory_page_size(self.config.memory_page_size)
             .with_defer_grow_under_rebase(drop_vestigial_realloc);
         let mut merged = merger.merge(&self.components, &graph)?;
 
@@ -1668,6 +1739,17 @@ impl Fuser {
             }
         }
 
+        stats.memories = merged
+            .memories
+            .iter()
+            .enumerate()
+            .map(|(index, m)| MemoryDeclaration {
+                index,
+                minimum: m.minimum,
+                maximum: m.maximum,
+                page_size: m.page_size_log2.map_or(65536, |l| 1u64 << l),
+            })
+            .collect();
         let bytes_for_remap = self.encode_output(&merged, &adapters, &[], &[])?;
 
         // Build the remapped `.debug_*` sections (only under Remap; a
@@ -1760,6 +1842,13 @@ impl Fuser {
         // defect no matter which merge path produced it. A probe across the
         // full suite confirmed no legitimate fixture trips it.
         segments::check_no_overlapping_data_segments(&output)?;
+
+        // SR-107 / #530: on the OUTPUT, not a hope — no `memory.size`/`memory.grow`
+        // may address a byte-paged memory (their unit would silently change),
+        // and every active data segment must fit the byte extent.
+        if self.config.memory_page_size == MemoryPageSize::Byte {
+            byte_pages::check_byte_paged_memories(&output)?;
+        }
 
         // ADR-8: snapshot the index maps for the differential oracle (dev-only).
         #[cfg(feature = "oracle")]
@@ -3084,8 +3173,12 @@ impl Fuser {
         );
         // #463: recorded only when not the default, so default records stay
         // byte-identical (same rule as `attestation_parameters`).
-        if let Some(policy) = wsc_recorded_export_policy(&self.config) {
+        let (wsc_policy, wsc_page_size) = wsc_recorded_optionals(&self.config);
+        if let Some(policy) = wsc_policy {
             tool_parameters.insert("exports".to_string(), serde_json::json!(policy));
+        }
+        if let Some(page_size) = wsc_page_size {
+            tool_parameters.insert("memory_page_size".to_string(), serde_json::json!(page_size));
         }
 
         let mut metadata = HashMap::new();
@@ -3223,6 +3316,10 @@ impl Fuser {
             // was deliberate. Recorded only when not the default, so default
             // records stay byte-identical.
             export_policy,
+            // SR-107 / #530: changes the memory's unit and the runtime that can
+            // load it. Recorded only when not the default (byte-identical
+            // default records), in the wsc build too.
+            memory_page_size,
         } = &self.config;
 
         attestation::FusionParameters {
@@ -3239,6 +3336,8 @@ impl Fuser {
             domains: canonical_domains(domains),
             exports: (*export_policy != ExportPolicy::All)
                 .then(|| export_policy.as_str().to_string()),
+            memory_page_size: (*memory_page_size != MemoryPageSize::Page)
+                .then(|| memory_page_size.bytes()),
         }
     }
 
@@ -3285,7 +3384,7 @@ impl Fuser {
 /// Fields bound to `_` below are NOT recorded by this path today (it predates
 /// the typed `FusionParameters`); they are acknowledged, not endorsed.
 #[cfg(feature = "attestation")]
-fn wsc_recorded_export_policy(config: &FuserConfig) -> Option<&'static str> {
+fn wsc_recorded_optionals(config: &FuserConfig) -> (Option<&'static str>, Option<u32>) {
     let FuserConfig {
         // Already recorded by `build_wsc_attestation`.
         memory_strategy: _,
@@ -3307,8 +3406,13 @@ fn wsc_recorded_export_policy(config: &FuserConfig) -> Option<&'static str> {
         opaque_resources: _,
         // #463.
         export_policy,
+        // SR-107 / #530.
+        memory_page_size,
     } = config;
-    (*export_policy != ExportPolicy::All).then(|| export_policy.as_str())
+    (
+        (*export_policy != ExportPolicy::All).then(|| export_policy.as_str()),
+        (*memory_page_size != MemoryPageSize::Page).then(|| memory_page_size.bytes()),
+    )
 }
 
 /// Recursively flatten nested sub-components into a flat `Vec<ParsedComponent>`.

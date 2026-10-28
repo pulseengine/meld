@@ -142,6 +142,13 @@ pub struct FusionParameters {
     /// removed on purpose rather than lost.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exports: Option<String>,
+    /// SR-107 / #530: the page size, in bytes, the fused memories were declared
+    /// with. Absent means the default (65536; default records stay
+    /// byte-identical); `1` means `(pagesize 1)` with byte-exact `min == max`,
+    /// so a consumer knows the memory is sized in bytes on purpose and needs a
+    /// runtime with custom-page-sizes enabled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_page_size: Option<u32>,
 }
 
 /// Fusion-specific metadata
@@ -731,6 +738,7 @@ mod tests {
             reproducible: true,
             domains: Vec::new(),
             exports: None,
+            memory_page_size: Some(1),
         };
         let stats = FusionStats::default();
         let attestation = FusionAttestationBuilder::new("meld", "0.1.0")
@@ -758,6 +766,7 @@ mod tests {
             "dwarf_handling",
             "output_format",
             "reproducible",
+            "memory_page_size",
         ] {
             assert!(
                 recorded.get(key).is_some(),

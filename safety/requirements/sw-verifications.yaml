@@ -1737,3 +1737,16 @@ artifacts:
       model: claude-opus-5-5
       timestamp: 2026-10-22T13:34:11Z
     release: v0.65.1
+
+  - id: SWV-119
+    type: sw-verification
+    title: "Verification of SR-107: byte-extent memories declared with (pagesize 1), refusals and the memory.size/grow guard"
+    status: implemented
+    description: "Verifies SR-107. meld-core/tests/byte_pages_530.rs fuses the domains_427 fixture (two domains) and asserts each memory declares page_size_log2 = 0 with minimum equal to maximum equal to the sum of its domain's placement strides (derived from the placements, not hardcoded) and at least the highest data-segment end; that without the flag no memory declares a pagesize; that the flag is refused without --pack-rebase and with --component; that the page size is attested only when it is not the default; and a wasmtime differential: the byte-paged and page-sized outputs return the same results for every function export called with zero arguments (only `now`, the allocators and the deallocator complete; the fixture's run, run2, constructor and methods run out of fuel in every strategy including --memory multi, so they compare trap to trap) and the byte-sized memory image equals the page-sized one over its extent, with a default wasmtime shown to reject (pagesize 1). meld-core/tests/byte_pages_guard_530.rs runs a cross-domain list<list<string>> deep copy on byte-sized memories: both outputs return 104 and every exported memory image matches over the extent. meld-core/tests/share_stack_380.rs shows the --share-stack branch declaring align16(max sp) + the stride sum = 4256 bytes at the F100 shape. Unit tests in meld-core/src/byte_pages.rs show the output guard firing on a hand-built module for memory.size and memory.grow (naming the function), for a data segment past the extent and for a growable byte-paged memory, and staying silent for a page-sized memory; meld-core/src/merger/tests_byte_pages_530.rs shows resource re-exporters refused; meld-core/tests/pack_rebase_370.rs shows an imported shared memory refused. meld-cli/tests/memory_page_size_530.rs shows --memory-page-size 1 accepted with --memory shared --pack-rebase (validated with custom-page-sizes enabled) and exit code 2 for 4096, for a missing --pack-rebase and for --component. Potency: each fix reverted on its own fails its tests (planner keeps pages; pages-rounded value under pagesize 1; guard no-op; guard wired; imported refusal; share-stack and plain-pack branches; placements aggregation; handle-table refusal; CLI validation feature; CLI usage refusal). Not verified: the guard's refusal through the pipeline, and the real gale cores."
+    links:
+      - type: verifies
+        target: SR-107
+    provenance:
+      created-by: ai-assisted
+      model: claude-sonnet-5-5
+      timestamp: 2026-10-28T13:54:56Z

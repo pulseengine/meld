@@ -1032,3 +1032,38 @@ fn pack_rebase_imported_memory_above_floor_no_marker_no_clobber() {
 fn pack_rebase_imported_memory_marker_not_clamped_to_floor_no_clobber() {
     run_imported_arena(Some(IMP_ARENA_TOP));
 }
+
+/// SR-107 (#530): a byte size cannot be declared for an IMPORTED memory — the
+/// page size of an import must match what the importer provides — so
+/// `--memory-page-size 1` is refused rather than silently ignored. The same
+/// fusion without the option succeeds (control: the refusal is the option's).
+// rivet: verifies SWV-119
+#[test]
+fn byte_pages_are_refused_for_an_imported_shared_memory() {
+    let fuse = |page: meld_core::MemoryPageSize| {
+        let mut fuser = Fuser::new(FuserConfig {
+            memory_strategy: MemoryStrategy::SharedMemory,
+            pack_rebase: true,
+            memory_page_size: page,
+            ..Default::default()
+        });
+        fuser
+            .add_component_named(
+                &build_imported_arena_component("a", 0xA1, Some(IMP_ARENA_TOP)),
+                Some("comp-a"),
+            )
+            .unwrap();
+        fuser
+            .add_component_named(
+                &build_imported_arena_component("b", 0xB2, Some(IMP_ARENA_TOP)),
+                Some("comp-b"),
+            )
+            .unwrap();
+        fuser.fuse()
+    };
+    fuse(meld_core::MemoryPageSize::Page).expect("control: page-sized import fuses");
+    let err = fuse(meld_core::MemoryPageSize::Byte)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("IMPORTED shared memory"), "{err}");
+}

@@ -982,7 +982,7 @@ fn fold_i64_binop(stack: &mut Vec<i64>, op: fn(i64, i64) -> i64) -> Result<()> {
     Ok(())
 }
 
-fn parse_const_expr_with_value(
+pub(crate) fn parse_const_expr_with_value(
     expr: &wasmparser::ConstExpr<'_>,
 ) -> Result<(ParsedConstExpr, Option<ConstExprValue>)> {
     let mut ops = expr.get_operators_reader();

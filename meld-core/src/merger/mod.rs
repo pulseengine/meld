@@ -47,6 +47,8 @@ mod tests_a;
 #[cfg(test)]
 pub(crate) mod tests_b;
 #[cfg(test)]
+mod tests_byte_pages_530;
+#[cfg(test)]
 mod tests_rerewrite;
 #[cfg(test)]
 mod tests_unmapped_462;
@@ -626,6 +628,10 @@ pub struct Merger {
     /// region. Builds on `pack_rebase` (the caller sets `pack_rebase` too). See
     /// [`FuserConfig::share_stack`] for the layout and soundness envelope.
     share_stack: bool,
+    /// SR-107 / #530: declare each packed memory with `(pagesize 1)` and a
+    /// byte-exact `min == max`. Requires `pack_rebase`; see
+    /// [`FuserConfig::memory_page_size`].
+    memory_page_size: crate::MemoryPageSize,
 }
 
 impl Merger {
@@ -652,6 +658,7 @@ impl Merger {
             domains: Vec::new(),
             pack_rebase: false,
             share_stack: false,
+            memory_page_size: crate::MemoryPageSize::Page,
         }
     }
 
@@ -711,6 +718,12 @@ impl Merger {
         self
     }
 
+    /// SR-107 / #530: size the packed memories in bytes (`(pagesize 1)`).
+    pub fn with_memory_page_size(mut self, size: crate::MemoryPageSize) -> Self {
+        self.memory_page_size = size;
+        self
+    }
+
     /// Find an existing function type or add a new one, returning its index.
     #[allow(dead_code)]
     pub(crate) fn find_or_add_type(
@@ -738,6 +751,24 @@ impl Merger {
         graph: &DependencyGraph,
     ) -> Result<MergedModule> {
         Self::check_no_duplicate_instantiations(components)?;
+
+        // SR-107 / #530: `allocate_handle_tables` places a re-exporter's handle
+        // table at `memory.minimum * 65536` and grows the memory by one PAGE.
+        // On a `(pagesize 1)` memory both are in the wrong unit, so the table
+        // would land inside (or beyond) the packed data. Refused rather than
+        // converted: the table is not part of any placement the pack planner
+        // sized.
+        if self.memory_page_size == crate::MemoryPageSize::Byte
+            && !graph.reexporter_resources.is_empty()
+        {
+            return Err(Error::MemoryStrategyUnsupported(
+                "--memory-page-size 1 cannot be combined with resource re-exporters: their \
+                 handle tables are allocated in 64 KiB pages of the memory, outside the packed \
+                 extent that a byte-sized memory is declared at. Fuse without \
+                 --memory-page-size 1."
+                    .to_string(),
+            ));
+        }
 
         // SR-86 / #427: one plan per domain. Without a grouping this is the
         // single implicit domain, so `domain_plans` has exactly one entry and
@@ -1085,9 +1116,16 @@ impl Merger {
         if let Some(plan) = shared_memory_plan {
             merged.shared_stack_top = plan.shared_stack_top;
             merged.stackless_providers = plan.stackless_providers;
-            merged.placements = plan
-                .placements
+            // SR-107 / #530: EVERY domain's placements, in domain order. This
+            // read only the first domain's plan, so a second domain's modules
+            // were missing from `--explain` and the attestation even though
+            // they were placed — and a byte-sized memory's extent could not be
+            // checked against its placements. With one domain (the default)
+            // `domain_plans` has one entry and this is what it was.
+            merged.placements = domain_plans
                 .iter()
+                .flatten()
+                .flat_map(|dp| dp.placements.iter())
                 .map(|p| crate::PlacementRecord {
                     component: p.component,
                     module: p.module,
