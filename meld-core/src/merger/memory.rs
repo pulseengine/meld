@@ -186,6 +186,10 @@ impl Merger {
         let mut bases = HashMap::new();
         let mut placements: Vec<PlacementEntry> = Vec::new();
         let mut shared_stack_top: Option<u64> = None;
+        // SR-107 / #530: the packed total in BYTES (`next_base`), recorded by
+        // whichever packing branch ran. This is the value the byte-paged
+        // memory is declared with, before any rounding to 64 KiB pages.
+        let mut packed_total_bytes: Option<u64> = None;
         let overflow =
             || Error::MemoryStrategyUnsupported("shared memory size overflow".to_string());
 
@@ -233,6 +237,7 @@ impl Merger {
                 });
                 next_base = next_base.checked_add(stride).ok_or_else(overflow)?;
             }
+            packed_total_bytes = Some(next_base);
             combined.initial = next_base.div_ceil(WASM_PAGE_SIZE).max(1);
             if let Some(max) = combined.maximum {
                 combined.maximum = Some(max.max(combined.initial));
@@ -304,6 +309,7 @@ impl Merger {
             // would be compact inside an uncompacted memory and `--pack-rebase`
             // would deliver none of its size benefit (SR-57).
             if self.pack_rebase {
+                packed_total_bytes = Some(next_base);
                 combined.initial = next_base.div_ceil(WASM_PAGE_SIZE).max(1);
                 if let Some(max) = combined.maximum {
                     combined.maximum = Some(max.max(combined.initial));
@@ -311,8 +317,34 @@ impl Merger {
             }
         }
 
+        let mut memory = convert_memory_type(&combined);
+        if self.memory_page_size == crate::MemoryPageSize::Byte {
+            // SR-107 / #530. Refused rather than guessed for anything that is
+            // not the packed extent: the page size of an imported memory must
+            // match the importer's, and a byte size is only meaningful when
+            // the planner computed a byte extent.
+            if import.is_some() {
+                return Err(Error::MemoryStrategyUnsupported(
+                    "--memory-page-size 1 cannot size an IMPORTED shared memory: the page size \
+                     of an import must match what the importer provides. Fuse components that \
+                     define their own memory."
+                        .to_string(),
+                ));
+            }
+            let Some(total) = packed_total_bytes else {
+                return Err(Error::MemoryStrategyUnsupported(
+                    "--memory-page-size 1 requires --pack-rebase (or --share-stack): a byte \
+                     size is only meaningful for the packed extent"
+                        .to_string(),
+                ));
+            };
+            memory.minimum = total;
+            memory.maximum = Some(total);
+            memory.page_size_log2 = Some(0);
+        }
+
         Ok(Some(SharedMemoryPlan {
-            memory: convert_memory_type(&combined),
+            memory,
             import,
             bases,
             shared_stack_top,

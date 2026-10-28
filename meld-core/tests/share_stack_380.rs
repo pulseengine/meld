@@ -951,3 +951,60 @@ fn share_stack_closes_the_f100_8kib_budget() {
         "--share-stack footprint {shared_top} B must fit the {F100_SRAM} B budget"
     );
 }
+
+/// SR-107 (#530): the `--share-stack` branch of the planner declares its memory
+/// at the byte extent too. The shared stack region is NOT a placement, so the
+/// total is `align16(max sp) + sum(reserved)`, not the plain stride sum.
+// rivet: verifies SWV-119
+#[test]
+fn share_stack_byte_pages_declare_stack_region_plus_strides() {
+    const SP: i32 = 2048;
+    const DATA_LEN: usize = 729;
+    let fuse = |page: meld_core::MemoryPageSize| {
+        let mut fuser = Fuser::new(FuserConfig {
+            memory_strategy: MemoryStrategy::SharedMemory,
+            share_stack: true,
+            memory_page_size: page,
+            ..Default::default()
+        });
+        for tag in ["a", "b", "c"] {
+            fuser
+                .add_component_named(&build_f100_provider(tag, SP, DATA_LEN), Some(tag))
+                .unwrap();
+        }
+        fuser.fuse_with_stats().expect("fusion")
+    };
+
+    let (bytes, stats) = fuse(meld_core::MemoryPageSize::Byte);
+    let stack_region = (SP as u64).next_multiple_of(16);
+    let strides: u64 = stats.placements.iter().map(|p| p.reserved).sum();
+    assert_eq!(stats.placements.len(), 3);
+    let expected = stack_region + strides;
+
+    let mut mems = Vec::new();
+    for payload in wasmparser::Parser::new(0).parse_all(&bytes) {
+        if let wasmparser::Payload::MemorySection(reader) = payload.expect("payload") {
+            for m in reader {
+                let m = m.expect("memory");
+                mems.push((m.initial, m.maximum, m.page_size_log2));
+            }
+        }
+    }
+    assert_eq!(
+        mems,
+        vec![(expected, Some(expected), Some(0))],
+        "one byte-sized memory: shared stack region + the three strides"
+    );
+    // The data sits above the shared stack and below the declared extent.
+    let top = fused_data_offsets(&bytes).into_iter().max().unwrap() as u64 + DATA_LEN as u64;
+    assert!(
+        top <= expected,
+        "data end {top} must fit the extent {expected}"
+    );
+    // The sub-page claim, in bytes: 2048 + 3 x 736 = 4256 B, not a 64 KiB page.
+    assert_eq!(expected, 4256);
+
+    // Control: without the flag the same fusion rounds up to a whole page.
+    let (paged, _) = fuse(meld_core::MemoryPageSize::Page);
+    assert_eq!(fused_memory_min_pages(&paged), 1);
+}

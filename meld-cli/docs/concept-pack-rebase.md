@@ -21,3 +21,27 @@ the region it silently addresses beyond its segments.
 The safe envelope is the "used extent": everything the component actually
 touches lies at or below its last data segment. Pack within that envelope and
 the layout is dense and sound; exceed it and it is neither.
+
+## Declaring the packed size in bytes — `--memory-page-size 1`
+
+By default the packed total is rounded up to whole 64 KiB pages when the memory
+is declared, so 7.4 KiB of packed data is declared as 64 KiB or 128 KiB.
+`--memory-page-size 1` declares each packed memory (one per `--domain`, or the
+single shared memory) with the custom-page-sizes proposal's `(pagesize 1)` and
+`minimum == maximum ==` the packed total in bytes: the same value the placements
+report, including the 7-byte guard and the 16-byte alignment. The default,
+`65536`, leaves the output unchanged.
+
+It is OPT-IN because a module that declares `(pagesize 1)` does not load in a
+runtime that has not enabled custom-page-sizes (wasmtime: `wasm_custom_page_sizes`).
+Any other value is a usage error (exit 2), as is using the flag without
+`--pack-rebase` (or `--share-stack`) or with `--component`, whose wrapper
+re-declares the memory in pages. An imported shared memory is refused: the page
+size of an import must match what the importer provides.
+
+`memory.size` and `memory.grow` count pages, so on a byte-sized memory they would
+silently change meaning. Fusion fails, naming the function, if the emitted module
+contains either on a byte-sized memory. It also fails if an active data segment
+of such a memory has a non-constant offset or ends past the declared extent. The
+page size is recorded in the attestation whenever it is not the default, and
+`--explain` lists each memory with its unit.

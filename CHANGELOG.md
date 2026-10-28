@@ -4,6 +4,33 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+- **`--memory-page-size 1` declares packed memories at their byte extent
+  (SR-107, #530).** With `--pack-rebase` (or `--share-stack`), each packed
+  memory (one per `--domain`, or the single shared memory) is declared with the
+  custom-page-sizes proposal's `(pagesize 1)` and `minimum == maximum ==` the
+  packed total in bytes (the placements' strides, including the pack guard),
+  instead of being rounded up to whole 64 KiB pages. The default, `65536`,
+  leaves the fused code and memories unchanged (for `--domain` the attestation
+  gains the placement entries below). Opt-in because a `(pagesize 1)` module does
+  not load in a runtime without custom-page-sizes. Refused (exit 2 on the CLI)
+  for other values, without `--memory shared --pack-rebase`, and with
+  `--component`; refused for an imported shared memory. Fusion fails, naming the function, if the
+  output has `memory.size` or `memory.grow` on a byte-sized memory, or a data
+  segment that does not fit the extent. Recorded in the attestation when not
+  the default; `--explain` shows each memory with its unit. Also refused with
+  resource re-exporters, whose handle tables are allocated in pages.
+
+### Fixed
+- **`--domain` now reports every domain's placements (#530).** The placement
+  records in `--explain` and in the attestation came from the first domain's
+  plan only, so the modules of every other domain were placed but missing from
+  the record. The fused bytes are unchanged; an attested `--domain` build now
+  lists every domain's entries, each with the `memory` it was placed in
+  (omitted when 0, so single-memory records are unchanged): every domain's
+  bases start at 0 in its own memory, and without the index two domains'
+  entries read as an overlap.
+
 ## [0.65.1] - 2026-10-22
 
 ### Added

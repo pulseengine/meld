@@ -19,8 +19,8 @@
 use anyhow::{Context, Result, anyhow};
 use clap::{Parser, Subcommand};
 use meld_core::{
-    DwarfHandling, ExportPolicy, Fuser, FuserConfig, FusionStats, MemoryStrategy, OutputFormat,
-    Profile,
+    DwarfHandling, ExportPolicy, Fuser, FuserConfig, FusionStats, MemoryPageSize, MemoryStrategy,
+    OutputFormat, Profile,
 };
 use std::fs;
 use std::path::Path;
@@ -255,6 +255,29 @@ enum Commands {
         #[arg(long)]
         component: bool,
 
+        /// Page size, in bytes, the packed memories are declared with (SR-107 /
+        /// #530). "65536" (default) is the core-wasm page, today's output,
+        /// unchanged. "1" declares every packed memory (one per --domain, or the
+        /// single shared memory) with the custom-page-sizes proposal's
+        /// `(pagesize 1)` and `minimum == maximum ==` the packed total in BYTES
+        /// (the --pack-rebase extent, including its 7-byte guard and 16-byte
+        /// alignment) instead of rounding up to whole 64 KiB pages. Requires
+        /// --pack-rebase (or --share-stack). OPT-IN because a `(pagesize 1)`
+        /// module does not load in a runtime that has not enabled
+        /// custom-page-sizes (wasmtime: `wasm_custom_page_sizes`). Refused for
+        /// an IMPORTED shared memory and with --component. Fusion fails if any
+        /// `memory.size` / `memory.grow` would address a byte-paged memory (its
+        /// unit would silently change from pages to bytes) or an active data
+        /// segment does not fit the byte extent. Recorded in the attestation
+        /// when not the default.
+        #[arg(
+            long,
+            value_name = "BYTES",
+            default_value = "65536",
+            value_parser = ["65536", "1"]
+        )]
+        memory_page_size: String,
+
         /// Write a JSON import map to the given path (for synth/kiln integration).
         ///
         /// Per function import: `index`, `kind`, `module`, `name`, plus (schema
@@ -367,6 +390,7 @@ fn main() -> Result<()> {
             explain,
             domain,
             exports,
+            memory_page_size,
         }) => {
             fuse_command(
                 inputs,
@@ -391,6 +415,7 @@ fn main() -> Result<()> {
                 component,
                 emit_import_map,
                 opaque_rep,
+                memory_page_size,
             )?;
         }
 
@@ -516,6 +541,7 @@ fn fuse_command(
     component: bool,
     emit_import_map: Option<String>,
     opaque_rep: Vec<String>,
+    memory_page_size: String,
 ) -> Result<()> {
     println!(
         "Meld v{} - Static Component Fusion",
@@ -673,6 +699,40 @@ fn fuse_command(
             .exit();
     }
 
+    // SR-107 / #530: byte-sized memories. clap has already limited the value to
+    // 65536 / 1; the combinations are refused here the same way (exit 2).
+    let memory_page_size = if memory_page_size == "1" {
+        MemoryPageSize::Byte
+    } else {
+        MemoryPageSize::Page
+    };
+    if memory_page_size == MemoryPageSize::Byte {
+        use clap::CommandFactory;
+        if !pack_rebase {
+            Cli::command()
+                .error(
+                    clap::error::ErrorKind::ArgumentConflict,
+                    "--memory-page-size 1 requires --pack-rebase (or --share-stack): a byte \
+                     size is only meaningful for the packed extent",
+                )
+                .exit();
+        }
+        if component {
+            Cli::command()
+                .error(
+                    clap::error::ErrorKind::ArgumentConflict,
+                    "--memory-page-size 1 cannot be combined with --component: the component \
+                     wrapper re-declares the memory in 64 KiB pages and would drop the byte \
+                     size. Emit the core module instead.",
+                )
+                .exit();
+        }
+        println!(
+            "Byte-sized memories (--memory-page-size 1): the output declares (pagesize 1) and \
+             needs a runtime with custom-page-sizes enabled"
+        );
+    }
+
     let config = FuserConfig {
         profile,
         memory_strategy,
@@ -689,6 +749,7 @@ fn fuse_command(
         dwarf_handling,
         domains,
         export_policy,
+        memory_page_size,
         ..Default::default()
     };
 
@@ -766,7 +827,7 @@ fn fuse_command(
         }
         // Before the write: a module that fails here must not become a file
         // somebody can pick up.
-        validate_wasm(&fused_bytes)?;
+        validate_wasm(&fused_bytes, memory_page_size == MemoryPageSize::Byte)?;
         println!("  Validation passed");
     }
 
@@ -787,6 +848,7 @@ fn fuse_command(
     // Show statistics
     if explain {
         print_boundaries(&stats);
+        print_memories(&stats);
     }
 
     if show_stats {
@@ -866,6 +928,33 @@ fn print_boundaries(stats: &FusionStats) {
     print_placements(stats);
 }
 
+/// SR-107 / #530: the memories as declared, so a byte-sized one is visible.
+fn print_memories(stats: &FusionStats) {
+    if stats.memories.is_empty() {
+        return;
+    }
+    println!();
+    println!("Memories");
+    println!("{}", "=".repeat(50));
+    println!();
+    for m in &stats.memories {
+        let max = m
+            .maximum
+            .map_or_else(|| "unbounded".to_string(), |v| v.to_string());
+        if m.page_size == 1 {
+            println!(
+                "  memory {}  (pagesize 1)  min {} B  max {} B",
+                m.index, m.minimum, max
+            );
+        } else {
+            println!(
+                "  memory {}  min {} pages  max {} pages",
+                m.index, m.minimum, max
+            );
+        }
+    }
+}
+
 /// SR-70: the memory-axis half of `--explain` — where each module landed in the
 /// fused address space and by which rule.
 fn print_placements(stats: &FusionStats) {
@@ -881,8 +970,8 @@ fn print_placements(stats: &FusionStats) {
     let mut total = 0u64;
     for p in &stats.placements {
         println!(
-            "  c{}m{}  base {:>10}  reserved {:>10} B  ({})",
-            p.component, p.module, p.base, p.reserved, p.strategy
+            "  c{}m{}  memory {}  base {:>10}  reserved {:>10} B  ({})",
+            p.component, p.module, p.memory, p.base, p.reserved, p.strategy
         );
         total += p.reserved;
     }
@@ -1246,14 +1335,19 @@ fn classify_import(module: &str, name: &str) -> &'static str {
 }
 
 /// Validate WASM bytes (supports both core modules and components)
-fn validate_wasm(bytes: &[u8]) -> Result<()> {
+fn validate_wasm(bytes: &[u8], custom_page_sizes: bool) -> Result<()> {
     use wasmparser::Validator;
 
-    let features = wasmparser::WasmFeatures::default()
+    let mut features = wasmparser::WasmFeatures::default()
         | wasmparser::WasmFeatures::COMPONENT_MODEL
         | wasmparser::WasmFeatures::MULTI_MEMORY
         | wasmparser::WasmFeatures::CM_ASYNC
         | wasmparser::WasmFeatures::CM_FIXED_LENGTH_LISTS;
+    // SR-107 / #530: scoped to the output of a fuse that asked for byte pages,
+    // so nothing else gains acceptance for a proposal meld does not handle.
+    if custom_page_sizes {
+        features |= wasmparser::WasmFeatures::CUSTOM_PAGE_SIZES;
+    }
 
     let mut validator = Validator::new_with_features(features);
     validator.validate_all(bytes).context("Validation failed")?;
