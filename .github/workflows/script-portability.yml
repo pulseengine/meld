@@ -4,6 +4,7 @@ name: Script portability
 # which is where most of the scripts this gate checks live, so a PR touching
 # only those would never run it.
 on:
+  merge_group:
   push:
     branches: [main]
   pull_request:
