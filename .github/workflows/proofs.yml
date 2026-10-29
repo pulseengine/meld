@@ -22,14 +22,14 @@ name: Rocq proofs
 # proof job rather than invented.
 
 on:
+  # NO `paths` on pull_request: `Rocq proofs` is required, and a workflow that
+  # does not start reports nothing. The `changes` job applies the same globs
+  # (scripts/ci/classify_changes.py PROOFS, kept equal to the push filter below
+  # by scripts/check_workflow_gates.py). This replaced proofs-stub.yml.
   pull_request:
-    paths:
-      - 'proofs/**'
-      - '.github/workflows/proofs.yml'
-      - 'MODULE.bazel'
-      - 'MODULE.bazel.lock'
-      - '.bazelrc'
-      - '.bazelversion'
+  # GitHub merge queue: this workflow emits a required context, so it must run
+  # on merge_group or a queued PR waits on a check nothing reports.
+  merge_group:
   push:
     branches: [main]
     paths:
@@ -59,8 +59,33 @@ permissions:
   contents: read
 
 jobs:
+  changes:
+    # Path classification moved here from the `pull_request` filter
+    # (scripts/ci/classify_changes.py, fails closed), replacing the stub
+    # workflow that posted trivially-green duplicates of the required contexts.
+    # Gated jobs skip by job-level `if:`, which still reports the context, and
+    # use `!cancelled()` so a FAILED classifier runs them instead.
+    name: Classify changed paths
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      proofs: ${{ steps.c.outputs.proofs }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Classifier can still discriminate
+        run: python3 scripts/ci/classify_changes.py --self-test
+      - id: c
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
+        run: python3 scripts/ci/classify_changes.py
+
   proofs:
     name: Rocq proofs
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.proofs != 'false' }}
     runs-on: ubuntu-latest
     # Measured, after #450 removed the one file that did not terminate.
     #

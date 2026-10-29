@@ -32,6 +32,10 @@ name: Release readiness
 on:
   pull_request:
     branches: [main]
+  # GitHub merge queue: this workflow emits a required context, so it must run
+  # on merge_group or a queued PR waits on a check nothing reports.
+  # A queue entry is resolved like a PR, against merge_group.base_sha.
+  merge_group:
   push:
     tags: ['v*']
   workflow_dispatch:
@@ -73,7 +77,7 @@ jobs:
           EVENT: ${{ github.event_name }}
           REF_NAME: ${{ github.ref_name }}
           INPUT_VERSION: ${{ inputs.version }}
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
         run: |
           set -euo pipefail
           version_of() {
@@ -100,7 +104,7 @@ jobs:
               echo "target=${REF_NAME}" >> "$GITHUB_OUTPUT"
               echo "reason=tag push (backstop)" >> "$GITHUB_OUTPUT"
               ;;
-            pull_request)
+            pull_request|merge_group)
               BASE_VER="$(version_of "$(git show "${BASE_SHA}:Cargo.toml")")"
               echo "workspace version at base: ${BASE_VER}"
               if [ "$HEAD_VER" = "$BASE_VER" ]; then

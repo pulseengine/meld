@@ -128,40 +128,106 @@ def extract_seq(text, key):
     return out or []
 
 
-def check_stub_alignment(fails):
-    """A required status check that never reports blocks a PR forever, so each
-    path-filtered required gate has a stub reporting the same context name on
-    the paths it ignores. Both pairs carry a "keep these byte-aligned" comment
-    and nothing enforced it — which is how the alignment drifts and either the
-    gate silently stops covering a path, or the stub stops reporting and
-    unrelated PRs become unmergeable.
-    """
-    pairs = [
-        (".github/workflows/proofs.yml", "paths",
-         ".github/workflows/proofs-stub.yml", "paths-ignore", "Rocq proofs"),
-        (".github/workflows/ci.yml", "paths-ignore",
-         ".github/workflows/ci-docs-stub.yml", "paths", "Test/Clippy/Format"),
-    ]
-    for real, real_key, stub, stub_key, ctx in pairs:
-        rp, sp = pathlib.Path(real), pathlib.Path(stub)
-        if not rp.exists() or not sp.exists():
-            fails.append(f"{ctx}: expected both {real} and {stub} to exist")
+def _top_level_on(text):
+    """The lines of the top-level `on:` block (stdlib, indentation-based)."""
+    lines, out, inside = text.splitlines(), [], False
+    for line in lines:
+        if re.match(r"^on:\s*$", line):
+            inside = True
             continue
-        a = extract_seq(rp.read_text(), real_key)
-        b = extract_seq(sp.read_text(), stub_key)
-        if not a or not b:
-            fails.append(
-                f"{ctx}: could not read {real_key} from {real} ({len(a)} items) or "
-                f"{stub_key} from {stub} ({len(b)} items) — the parse found nothing, "
-                "which is a failure and not an alignment"
-            )
-        elif a != b:
-            fails.append(
-                f"{ctx}: {real}:{real_key} and {stub}:{stub_key} have drifted — "
-                f"only in {real}: {sorted(set(a) - set(b))}; only in {stub}: "
-                f"{sorted(set(b) - set(a))}. Either the gate no longer covers a path, "
-                "or the stub no longer reports for one and unrelated PRs cannot merge."
-            )
+        if inside:
+            if line and not line[0].isspace() and not line.startswith("#"):
+                break
+            out.append(line)
+    return out
+
+
+def _trigger_block(on_lines, trigger):
+    """The lines under `  <trigger>:` inside the `on:` block, or None if absent."""
+    block, inside = None, False
+    for line in on_lines:
+        m = re.match(r"^  ([A-Za-z_]+):", line)
+        if m:
+            if inside:
+                break
+            if m.group(1) == trigger:
+                block, inside = [], True
+            continue
+        if inside:
+            block.append(line)
+    return block
+
+
+def check_queue_triggers(fails):
+    """Required contexts must report on every PR AND in the merge queue.
+
+    ci.yml and proofs.yml used to carry `pull_request` path filters, with stub
+    workflows (ci-docs-stub.yml, proofs-stub.yml) posting the same required
+    context names as instant successes on the complementary paths. In a merge
+    queue that pairing does not hold, so the filters moved into a `changes` job
+    (scripts/ci/classify_changes.py) and the stubs were deleted. What keeps
+    that safe is asserted here:
+
+    1. every workflow emitting a required context triggers on `merge_group`.
+       Without it the queue waits on a check nothing reports;
+    2. neither ci.yml nor proofs.yml puts `paths`/`paths-ignore` back on
+       `pull_request`, because a path-filtered required workflow never starts;
+    3. no stub reporting a required context's name comes back;
+    4. the classifier's glob lists equal the push filters, so the PR/queue path
+       and the push path cannot drift apart. This replaces the stub alignment
+       check, which asserted the same thing about the stubs.
+    """
+    required = {
+        ".github/workflows/ci.yml": "Test/Clippy/Format",
+        ".github/workflows/proofs.yml": "Rocq proofs",
+        ".github/workflows/verification-gate.yml": "LS-N verification gate",
+        ".github/workflows/release-readiness.yml": "Release readiness",
+        ".github/workflows/scry-gate.yml": "Scry sound-AI (fused meld output)",
+        ".github/workflows/witness-gate.yml": "Witness MC/DC (fused meld seam)",
+        ".github/workflows/mythos-gate.yml": "Mythos delta-pass gate",
+    }
+    for wf, ctx in required.items():
+        p = pathlib.Path(wf)
+        if not p.exists():
+            fails.append(f"{ctx}: {wf} is missing")
+            continue
+        on = _top_level_on(p.read_text())
+        if _trigger_block(on, "merge_group") is None:
+            fails.append(f"{ctx}: {wf} has no merge_group trigger -- the merge queue "
+                         "would wait on a context nothing reports")
+        if wf.endswith(("/ci.yml", "/proofs.yml")):
+            pr = _trigger_block(on, "pull_request")
+            if pr is None:
+                fails.append(f"{ctx}: {wf} has no pull_request trigger")
+            elif any(re.match(r"^\s+(paths|paths-ignore):", l) for l in pr):
+                fails.append(f"{ctx}: {wf} filters pull_request by path -- a required "
+                             "context then never reports on the other paths; gate by "
+                             "the `changes` job instead")
+    for stub in (".github/workflows/ci-docs-stub.yml", ".github/workflows/proofs-stub.yml"):
+        if pathlib.Path(stub).exists():
+            fails.append(f"{stub} is back -- it posts trivially-green duplicates of "
+                         "required contexts, which the merge queue cannot tell apart")
+
+    sys.path.insert(0, str(pathlib.Path("scripts/ci")))
+    try:
+        import classify_changes as cc
+    except Exception as e:  # noqa: BLE001 -- any import failure is a failure
+        fails.append(f"scripts/ci/classify_changes.py does not import: {e}")
+        return
+    for wf, key, lst, name in (
+        (".github/workflows/ci.yml", "paths-ignore", cc.DOCS_ONLY, "DOCS_ONLY"),
+        (".github/workflows/proofs.yml", "paths", cc.PROOFS, "PROOFS"),
+    ):
+        push = _trigger_block(_top_level_on(pathlib.Path(wf).read_text()), "push") or []
+        got = extract_seq("\n".join(push), key)
+        if not got or not lst:
+            fails.append(f"{wf}: could not read push.{key} ({len(got)} items) or "
+                         f"classify_changes.{name} ({len(lst)} items) -- the parse found "
+                         "nothing, which is a failure and not an alignment")
+        elif got != lst:
+            fails.append(f"{wf}: push.{key} and classify_changes.{name} have drifted -- "
+                         f"only in the workflow: {sorted(set(got) - set(lst))}; only in "
+                         f"the classifier: {sorted(set(lst) - set(got))}")
 
 
 def check(path=WORKFLOW):
@@ -221,7 +287,7 @@ def check(path=WORKFLOW):
     )
     want("gate-exclusions.txt" in cov, "coverage step no longer reads the exclusion list")
 
-    check_stub_alignment(fails)
+    check_queue_triggers(fails)
     check_traceability_gate(fails)
 
     return fails

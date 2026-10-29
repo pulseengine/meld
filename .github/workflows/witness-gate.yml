@@ -39,6 +39,9 @@ name: Witness MC/DC Gate
 on:
   pull_request:
     branches: [main]
+  # GitHub merge queue: this workflow emits a required context, so it must run
+  # on merge_group or a queued PR waits on a check nothing reports.
+  merge_group:
   workflow_dispatch:
 
 concurrency:
