@@ -58,7 +58,13 @@ import subprocess
 import sys
 import tarfile
 import tempfile
-import tomllib
+try:
+    import tomllib
+except ModuleNotFoundError:  # Python < 3.11, e.g. macOS /usr/bin/python3 (3.9)
+    try:
+        import tomli as tomllib
+    except ModuleNotFoundError:
+        sys.exit("build_wheels.py: needs Python 3.11+ (tomllib) or the tomli package")
 import zipfile
 
 HERE = pathlib.Path(__file__).resolve().parent
