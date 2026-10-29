@@ -47,7 +47,39 @@ wasmprinter.workspace = true
 # parse and validate the remapped DWARF in the fused output.
 gimli.workspace = true
 wat = "1.219"
-wasmtime = "50.0.0"
+# default-features = false + wasmtime 50.0.0's full default set MINUS `cache`.
+# `cache` (on-disk compiled-module cache) pulls wasmtime-internal-cache ->
+# zstd 0.13 / zstd-safe 7 / zstd-sys 2.0, which carry RUSTSEC-2026-0391,
+# -0398, -0403, -0410 (and a run of unsound advisories) with no fix
+# reachable on the 0.13 line. meld never configures a module cache.
+# Keep this list in sync with wasmtime's `default` on every wasmtime bump.
+wasmtime = { version = "50.0.0", default-features = false, features = [
+    "anyhow",
+    "async",
+    "backtrace",
+    "gc",
+    "gc-copying",
+    "gc-drc",
+    "gc-null",
+    "wat",
+    "profiling",
+    "parallel-compilation",
+    "cranelift",
+    "pooling-allocator",
+    "demangle",
+    "addr2line",
+    "coredump",
+    "debug-builtins",
+    "runtime",
+    "component-model",
+    "component-model-async",
+    "threads",
+    "stack-switching",
+    "std",
+    "debug",
+    "compile-time-builtins",
+    "wit-parser",
+] }
 wasmtime-wasi = "50.0.0"
 bitflags.workspace = true  # Required for wit-bindgen component bindings
 criterion.workspace = true

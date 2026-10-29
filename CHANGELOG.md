@@ -4,6 +4,16 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+- **zstd advisories removed from the dependency graph.** wasmtime's default
+  `cache` feature pulled `wasmtime-internal-cache` -> zstd 0.13 / zstd-safe 7 /
+  zstd-sys 2.0 (RUSTSEC-2026-0391, -0398, -0403, -0410, plus a run of unsound
+  advisories), with no fix reachable on that line. meld never configures a
+  module cache, so the (dev-only) wasmtime dependency now takes
+  `default-features = false` and wasmtime 50.0.0's full default feature set
+  minus `cache`; zstd is gone from `Cargo.lock`. tokio is bumped to 1.54.1
+  (RUSTSEC-2026-0384) and crossbeam-epoch to 0.9.21 (RUSTSEC-2026-0204).
+
 ## [0.66.0] - 2026-10-29
 
 ### Added
