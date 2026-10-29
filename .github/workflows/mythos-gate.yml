@@ -37,7 +37,10 @@ permissions:
 jobs:
   gate:
     name: Mythos delta-pass gate
-    runs-on: [self-hosted, linux, x64, light]
+    # Routes fork PRs to GitHub-hosted runners by default. This is NOT a security
+    # boundary: a fork PR can edit this file. Isolation is enforced by the org's
+    # smithy runner-group policy and fork-PR approval (pulseengine/warte#35).
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || fromJSON('["self-hosted","linux","x64","light"]') }}
     steps:
       - uses: actions/checkout@v4
         with:

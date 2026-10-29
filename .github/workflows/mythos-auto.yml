@@ -2,9 +2,15 @@ name: Mythos delta-pass (auto)
 
 # Runs the Mythos discover protocol automatically on every PR that
 # touches a Tier-5 file. Posts findings (or "NO FINDINGS") as a sticky
-# PR comment. Applies the `mythos-pass-done` label when all touched
-# files report NO FINDINGS, which clears the label-only gate in
+# PR comment. The verdict is advisory: this workflow never applies the
+# `mythos-pass-done` label. A maintainer reads the posted verdict and
+# applies the label by hand, which clears the label-only gate in
 # `mythos-gate.yml`.
+#
+# The model runs read-only (`--allowedTools "Read,Grep,Glob"`), and the
+# discover protocol it follows is read from the PR's BASE commit, not
+# from the PR head, so a PR cannot rewrite the instructions it is
+# judged by.
 #
 # Diff-scoped scanning (since v0.11.0): for each touched Tier-5 file the
 # scan step extracts the PR's diff for that file (merge-base...head) and
@@ -86,9 +92,11 @@ jobs:
     # Single-actor lock: both username AND immutable user id must
     # match. github.actor_id is a string in workflow context, so
     # quote the numeric literal.
+    # Same-repo PRs only: the scan job holds a secret.
     if: >-
       github.actor == 'avrabe' &&
-      github.actor_id == '10056645'
+      github.actor_id == '10056645' &&
+      github.event.pull_request.head.repo.fork != true
     runs-on: [self-hosted, linux, x64, light]
     outputs:
       files: ${{ steps.list.outputs.files }}
@@ -157,7 +165,7 @@ jobs:
   scan:
     name: Mythos pass (${{ matrix.file }})
     needs: detect
-    if: needs.detect.outputs.any == 'true'
+    if: needs.detect.outputs.any == 'true' && github.event.pull_request.head.repo.fork != true
     runs-on: [self-hosted, linux, x64, rust-cpu]
     timeout-minutes: 45
     strategy:
@@ -219,6 +227,19 @@ jobs:
             echo "Diff for $F: $size bytes."
           fi
 
+      # The protocol comes from the BASE commit: the PR head is the code
+      # under review, so it must not also supply the reviewer's
+      # instructions. Any PR-supplied file at this path is replaced.
+      - name: Stage discover.md from the base commit
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+          rm -rf .mythos-base
+          mkdir -p .mythos-base
+          git show "${BASE_SHA}:scripts/mythos/discover.md" > .mythos-base/discover.md
+          test -s .mythos-base/discover.md
+
       # The action's `oven-sh/setup-bun` step requires `unzip`, which
       # is not installed by default on rust-cpu runners. Best-effort
       # apt install; mirrors the action's own subprocess-isolation
@@ -254,7 +275,7 @@ jobs:
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           prompt: |
-            Read scripts/mythos/discover.md and apply it to the file
+            Read .mythos-base/discover.md and apply it to the file
             ${{ matrix.file }}. The {{file}} placeholder in
             discover.md resolves to ${{ matrix.file }}.
 
@@ -281,6 +302,7 @@ jobs:
             for the PR comment.
           claude_args: |
             --max-turns 30
+            --allowedTools "Read,Grep,Glob"
             --json-schema '{"type":"object","required":["verdict"],"properties":{"verdict":{"type":"string","enum":["NO_FINDINGS","FINDING"]},"file":{"type":"string"},"function":{"type":"string"},"hypothesis":{"type":"string"},"impact":{"type":"string"},"candidate_uca":{"type":"string"},"kani_harness":{"type":"string"},"poc_test":{"type":"string"}}}'
 
       - name: Save structured output as artifact
@@ -331,7 +353,7 @@ jobs:
           retention-days: 14
 
   aggregate:
-    name: Aggregate findings + label
+    name: Aggregate findings
     needs: [detect, scan]
     if: always() && needs.detect.outputs.any == 'true'
     runs-on: [self-hosted, linux, x64, light]
@@ -392,6 +414,9 @@ jobs:
 
           ${status}
 
+          This verdict is advisory. A maintainer applies \`mythos-pass-done\`
+          after reviewing it; this workflow does not apply the label.
+
           | File | Verdict | Hypothesis |
           |---|---|---|
           ${rows}
@@ -438,22 +463,6 @@ jobs:
               -d @/tmp/mythos-body.json >/dev/null
             echo "posted new comment"
           fi
-
-      - name: Apply mythos-pass-done label (PASS only)
-        if: steps.compose.outputs.verdict == 'PASS'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-          REPO: ${{ github.repository }}
-        run: |
-          # `curl` rather than `gh pr edit` — `gh` is absent on the
-          # light runner. The labels endpoint adds without clobbering
-          # existing labels.
-          curl -fsS -X POST \
-            -H "Authorization: Bearer ${GH_TOKEN}" \
-            -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/${REPO}/issues/${PR_NUMBER}/labels" \
-            -d '{"labels":["mythos-pass-done"]}' >/dev/null
 
       - name: Fail job on FINDING verdict
         if: steps.compose.outputs.verdict == 'FAIL'

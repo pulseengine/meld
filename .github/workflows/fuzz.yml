@@ -65,7 +65,10 @@ jobs:
     # queue slots on the shared rust-cpu pool for ~1.5-9 min of work each).
     # Every target still runs even if an earlier one fails.
     name: Fuzz smoke
-    runs-on: [self-hosted, linux, x64, rust-cpu]
+    # Routes fork PRs to GitHub-hosted runners by default. This is NOT a security
+    # boundary: a fork PR can edit this file. Isolation is enforced by the org's
+    # smithy runner-group policy and fork-PR approval (pulseengine/warte#35).
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || fromJSON('["self-hosted","linux","x64","rust-cpu"]') }}
     continue-on-error: true
     env:
       FUZZ_TARGETS: fuzz_parse_component fuzz_resolver_terminates fuzz_merger_idempotent fuzz_fusion_roundtrip
