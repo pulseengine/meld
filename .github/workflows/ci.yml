@@ -17,21 +17,49 @@ on:
       - 'safety/**'
       - 'scripts/mythos/**'
       - 'tools/*.py'
+  # NO `paths-ignore` on pull_request: Test/Clippy/Format are required, and
+  # a workflow that does not start reports nothing. The `changes` job applies
+  # the same globs (scripts/ci/classify_changes.py DOCS_ONLY, kept equal to the
+  # push filter above by scripts/check_workflow_gates.py) and the jobs skip by
+  # job-level `if:` instead. This replaced ci-docs-stub.yml.
   pull_request:
     branches: [main]
-    paths-ignore:
-      - '**/*.md'
-      - 'safety/**'
-      - 'scripts/mythos/**'
-      - 'tools/*.py'
+  # GitHub merge queue: this workflow emits a required context, so it must run
+  # on merge_group or a queued PR waits on a check nothing reports.
+  merge_group:
 
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
 
 jobs:
+  changes:
+    # Path classification moved here from the `pull_request` filter
+    # (scripts/ci/classify_changes.py, fails closed), replacing the stub
+    # workflow that posted trivially-green duplicates of the required contexts.
+    # Gated jobs skip by job-level `if:`, which still reports the context, and
+    # use `!cancelled()` so a FAILED classifier runs them instead.
+    name: Classify changed paths
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      docs_only: ${{ steps.c.outputs.docs_only }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Classifier can still discriminate
+        run: python3 scripts/ci/classify_changes.py --self-test
+      - id: c
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
+        run: python3 scripts/ci/classify_changes.py
+
   test:
     name: Test
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.docs_only != 'true' }}
     runs-on: [self-hosted, linux, x64, rust-cpu]
     steps:
       - uses: actions/checkout@v4
@@ -62,6 +90,9 @@ jobs:
 
   coverage:
     name: Coverage
+    # Advisory (not required): skipped in the merge queue.
+    needs: changes
+    if: ${{ !cancelled() && github.event_name != 'merge_group' && needs.changes.outputs.docs_only != 'true' }}
     runs-on: [self-hosted, linux, x64, rust-cpu]
     steps:
       - uses: actions/checkout@v4
@@ -101,7 +132,10 @@ jobs:
     # PR-only: every change reaches main through a PR that ran Clippy on the
     # same tree. Re-running it on the main push only occupied a shared
     # rust-cpu runner (measured: ~100 min queue per main push, 2026-10).
-    if: github.event_name == 'pull_request'
+    # It is required, so it also runs on merge_group: the queue commit is
+    # what lands, and is not a tree any PR ran Clippy on.
+    needs: changes
+    if: ${{ !cancelled() && (github.event_name == 'pull_request' || github.event_name == 'merge_group') && needs.changes.outputs.docs_only != 'true' }}
     runs-on: [self-hosted, linux, x64, rust-cpu]
     steps:
       - uses: actions/checkout@v4
@@ -131,6 +165,8 @@ jobs:
 
   fmt:
     name: Format
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.docs_only != 'true' }}
     runs-on: [self-hosted, linux, x64, light]
     steps:
       - uses: actions/checkout@v4

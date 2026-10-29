@@ -29,6 +29,13 @@ on:
   pull_request:
     branches: [main]
     types: [opened, synchronize, reopened, labeled, unlabeled]
+  # GitHub merge queue: `Mythos delta-pass gate` is required, so the workflow
+  # must start on merge_group or the queue waits on it. Its verdict is a human
+  # review recorded as a PR LABEL, which a merge_group event does not carry, so
+  # the job is SKIPPED in the queue (skipped counts as success). That does not
+  # bypass the gate: a PR enters the queue only after its required checks pass
+  # on the PR, and this one ran there, against the PR's own labels.
+  merge_group:
 
 permissions:
   contents: read
@@ -37,6 +44,7 @@ permissions:
 jobs:
   gate:
     name: Mythos delta-pass gate
+    if: github.event_name != 'merge_group'
     runs-on: [self-hosted, linux, x64, light]
     steps:
       - uses: actions/checkout@v4
