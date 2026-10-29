@@ -3803,7 +3803,7 @@ artifacts:
   - id: SR-107
     type: sw-req
     title: Packed memories can be declared at their byte extent with (pagesize 1), or fusion refuses
-    status: implemented
+    status: verified
     description: "meld rounded every packed memory up to whole 64 KiB pages, so a two-domain image that needs about 7.4 KiB was declared at 128 KiB or more, which no part gale targets can provide (#530). When --memory-page-size 1 is given together with --pack-rebase (or --share-stack), meld shall declare every packed memory (one per domain, or the single shared memory) with the custom-page-sizes proposal's (pagesize 1) and minimum equal to maximum equal to the packed total in bytes, being the value the pack planner computes (for --share-stack the shared stack region plus the stride sum), not a rounded page count. The default (65536) shall leave the output byte-identical. The option shall be refused, with an error, without --pack-rebase or --share-stack, with an imported shared memory (the page size of an import must match the importer), with --component (the wrapper re-declares the memory in pages), with resource re-exporters (their handle tables are allocated in pages), and for any value other than 1 or 65536. Because memory.size and memory.grow count pages, fusion shall fail, naming the function, if the emitted module contains either instruction on a memory declared with (pagesize 1), and shall fail if an active data segment of such a memory has a non-constant offset or ends past the memory's byte extent. The page size shall be recorded in the attestation whenever it is not the default, in every build configuration, and shown by --explain. A module with (pagesize 1) does not load in a runtime that has not enabled custom-page-sizes, so the option is opt-in; meld's own output validation enables that feature only for a fuse that asked for it. Known limits: the output guard's refusal is shown on hand-built modules, not through the pipeline, because the adapter emits memory.size only in its transcoding paths and a transcoding boundary through a call_indirect shim did not run in the test fixture even with page-sized memories; the real gale cores were not available to measure."
     links:
       - type: derives-from
@@ -3813,3 +3813,4 @@ artifacts:
       reviewed-by: avrabe
       model: claude-sonnet-5-5
       timestamp: 2026-10-28T13:54:56Z
+    release: v0.66.0

@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.66.0] - 2026-10-29
+
 ### Added
 - **`--memory-page-size 1` declares packed memories at their byte extent
   (SR-107, #530).** With `--pack-rebase` (or `--share-stack`), each packed
