@@ -38,7 +38,13 @@ import json
 import pathlib
 import re
 import sys
-import tomllib
+try:
+    import tomllib
+except ModuleNotFoundError:  # Python < 3.11, e.g. macOS /usr/bin/python3 (3.9)
+    try:
+        import tomli as tomllib
+    except ModuleNotFoundError:
+        sys.exit("check_release_targets.py: needs Python 3.11+ (tomllib) or the tomli package")
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 RELEASE = ROOT / ".github/workflows/release.yml"
