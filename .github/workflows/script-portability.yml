@@ -1,0 +1,79 @@
+name: Script portability
+
+# A workflow of its own, not a job in ci.yml: ci.yml ignores `tools/*.py`,
+# which is where most of the scripts this gate checks live, so a PR touching
+# only those would never run it.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  # Committed scripts get run on macOS, where /bin/bash is 3.2 and
+  # /usr/bin/python3 is 3.9, while every other job here runs newer tools, so
+  # nothing caught a script that only works on the newer ones. Both tools are
+  # pinned: shellcheck by sha256 into a job-local path (called as
+  # "$SHELLCHECK", never by PATH lookup), Python by setup-python's interpreter
+  # path. curl, not `gh`: self-hosted runners do not have the GitHub CLI.
+  script-portability:
+    name: Script portability (shellcheck + Python 3.9 floor)
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || fromJSON('["self-hosted","linux","x64","light"]') }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # SHELLCHECK_SHA256 is the release asset's `digest` for
+      # shellcheck-v0.11.0.linux.x86_64.tar.gz from
+      # https://github.com/koalaman/shellcheck/releases/tag/v0.11.0,
+      # re-hashed locally on 2026-10-29. .tar.gz, not .tar.xz: no xz needed.
+      - name: Install shellcheck (pinned by path and sha256)
+        env:
+          SHELLCHECK_VERSION: 0.11.0
+          SHELLCHECK_SHA256: b7af85e41cc99489dcc21d66c6d5f3685138f06d34651e6d34b42ec6d54fe6f6
+        run: |
+          set -euo pipefail
+          dir="$RUNNER_TEMP/shellcheck-$SHELLCHECK_VERSION"
+          asset="shellcheck-v$SHELLCHECK_VERSION.linux.x86_64.tar.gz"
+          rm -rf "$dir" && mkdir -p "$dir"
+          curl -fsSL --retry 3 -o "$dir/$asset" \
+            "https://github.com/koalaman/shellcheck/releases/download/v$SHELLCHECK_VERSION/$asset"
+          echo "$SHELLCHECK_SHA256  $dir/$asset" | sha256sum -c -
+          tar xzf "$dir/$asset" -C "$dir" --strip-components=1 "shellcheck-v$SHELLCHECK_VERSION/shellcheck"
+          got=$("$dir/shellcheck" --version | sed -n 's/^version: //p')
+          if [ "$got" != "$SHELLCHECK_VERSION" ]; then
+            echo "::error::pinned shellcheck reports '$got', expected '$SHELLCHECK_VERSION'"
+            exit 1
+          fi
+          echo "SHELLCHECK=$dir/shellcheck" >> "$GITHUB_ENV"
+
+      # Severity warning and up. Info-level findings (SC2086 and friends) are
+      # not gated.
+      - name: shellcheck tracked shell scripts
+        run: |
+          set -euo pipefail
+          git ls-files -z '*.sh' '*.bash' | xargs -0 -r "$SHELLCHECK" -S warning
+
+      - id: py39
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.9"
+
+      # Under 3.9 the compile step is the real 3.9 parser; the AST pass catches
+      # what parses on 3.9 but fails when it runs (unguarded tomllib, `X | None`
+      # annotations without `from __future__ import annotations`, ...). The
+      # self-test first: a checker only ever seen to pass could not fail.
+      - name: Python 3.9 floor
+        env:
+          PY39: ${{ steps.py39.outputs.python-path }}
+        run: |
+          set -euo pipefail
+          "$PY39" -c 'import sys; assert sys.version_info[:2] == (3, 9), sys.version'
+          "$PY39" tools/check_py_floor.py --self-test
+          git ls-files -z '*.py' | xargs -0 -r "$PY39" tools/check_py_floor.py
