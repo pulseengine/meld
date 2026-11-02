@@ -19,9 +19,11 @@ groups:
       - "wasmtime"
       - "wasmtime-*"
   github-actions-all:
-    package-ecosystem: github-actions
+    # groups cannot be scoped by package-ecosystem; action names are
+    # owner/name (contain a slash, never start with @), which cargo crates
+    # and unscoped npm packages never match.
     patterns:
-      - "*"
+      - "^[^@]+/"
 updates:
   - package-ecosystem: github-actions
     directory: /
