@@ -10,7 +10,16 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn fixture() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../tests/p3/issue_545/empty-wait.wasm")
+    let p = Path::new(env!("CARGO_MANIFEST_DIR")).join("../tests/p3/issue_545/empty-wait.wasm");
+    // #405: a missing fixture must fail the test, not pass it. Without this, a
+    // refused fusion of a file that does not exist satisfies the invariant
+    // below ("refused, nothing written") and the test runs on nothing.
+    assert!(
+        p.is_file(),
+        "fixture missing at {} -- it must be tracked in git (.gitignore exempts tests/p3)",
+        p.display()
+    );
+    p
 }
 
 fn validates(bytes: &[u8]) -> Result<(), String> {
@@ -35,6 +44,13 @@ fn exit_zero_implies_valid_output_under_every_strategy() {
             .arg(&out)
             .output()
             .expect("meld binary runs");
+        // The refusal, if any, must be meld's verdict on the module, not an
+        // unreadable input.
+        let stderr = String::from_utf8_lossy(&run.stderr);
+        assert!(
+            !stderr.contains("Failed to read") && !stderr.contains("not found"),
+            "--memory {strategy}: input could not be read: {stderr}"
+        );
         if run.status.success() {
             let bytes = std::fs::read(&out).expect("exit 0 must write the output");
             validates(&bytes).unwrap_or_else(|e| {
