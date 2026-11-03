@@ -13,8 +13,8 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 meld-core = { path = "../meld-core" }
-wasm-encoder = { version = "0.246", features = ["component-model"] }
-wasmparser = { version = "0.246", features = ["component-model"] }
+wasm-encoder = { version = "0.263", features = ["component-model"] }
+wasmparser = { version = "0.263", features = ["component-model"] }
 
 # Fuzz crate is a separate workspace by cargo-fuzz convention.
 # The root Cargo.toml lists "fuzz" in [workspace.exclude].

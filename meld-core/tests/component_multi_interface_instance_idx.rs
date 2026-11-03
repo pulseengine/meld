@@ -61,7 +61,7 @@ fn multi_interface_exports_reference_their_own_instance() {
                         let names = exs
                             .iter()
                             .filter(|e| e.kind == ComponentExternalKind::Func)
-                            .map(|e| e.name.0.to_string())
+                            .map(|e| e.name.name.to_string())
                             .collect();
                         instance_funcs.insert(next_instance, names);
                     }
@@ -72,7 +72,7 @@ fn multi_interface_exports_reference_their_own_instance() {
                 for e in r {
                     let e = e.unwrap();
                     if e.kind == ComponentExternalKind::Instance {
-                        iface_exports.push((e.name.0.to_string(), e.index));
+                        iface_exports.push((e.name.name.to_string(), e.index));
                         next_instance += 1; // an instance export binds a new instance index
                     }
                 }

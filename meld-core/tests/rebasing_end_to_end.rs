@@ -312,7 +312,8 @@ fn add_reloc_module_sections(module: &mut Module) {
     let zero_memarg = MemArg {
         offset: 0,
         align: 0,
-        memory_index: 0,
+        target: wasm_encoder::MemArgTarget::Memory(0),
+        ordering: None,
     };
 
     let mut code = CodeSection::new();
@@ -365,7 +366,10 @@ fn find_i32const_reloc_offsets(module_bytes: &[u8], flag_value: i32) -> Vec<u32>
     let mut offsets = Vec::new();
     for payload in wasmparser::Parser::new(0).parse_all(module_bytes) {
         match payload.expect("payload") {
-            wasmparser::Payload::CodeSectionStart { range, .. } => code_start = Some(range.start),
+            wasmparser::Payload::CodeSectionStart {
+                unchecked_range: range,
+                ..
+            } => code_start = Some(range.start),
             wasmparser::Payload::CodeSectionEntry(body) => {
                 let cs = code_start.expect("code section start seen first");
                 for item in body
@@ -693,7 +697,8 @@ fn build_arena_core_module(export_name: &str, sentinel: u8, with_linking: bool) 
     let memarg = MemArg {
         offset: 0,
         align: 0,
-        memory_index: 0,
+        target: wasm_encoder::MemArgTarget::Memory(0),
+        ordering: None,
     };
 
     let mut code = CodeSection::new();

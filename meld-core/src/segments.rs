@@ -542,7 +542,7 @@ pub fn parse_data_segments(module: &CoreModule) -> Result<Vec<ParsedDataSegment>
         // content (base-0 reader); the payload bytes are its final `len` bytes,
         // so their start is `range.end - len` — the data-section-content offset
         // that `reloc.DATA` sites are relative to.
-        let content_offset = (data.range.end - data.data.len()) as u32;
+        let content_offset = (data.range.end - data.data.len() as u64) as u32;
         segments.push(ParsedDataSegment {
             mode,
             data: data.data.to_vec(),
@@ -1515,7 +1515,7 @@ mod tests {
         let mut elem_range = None;
         for payload in wasmparser::Parser::new(0).parse_all(&module_bytes) {
             if let wasmparser::Payload::ElementSection(reader) = payload.expect("payload") {
-                elem_range = Some((reader.range().start, reader.range().end));
+                elem_range = Some((reader.range().start as usize, reader.range().end as usize));
             }
         }
         let elem_range = elem_range.expect("module has an element section");

@@ -117,7 +117,8 @@ fn build_callee_string_component() -> Vec<u8> {
             f.instruction(&Instruction::I32Load8U(wasm_encoder::MemArg {
                 offset: 0,
                 align: 0,
-                memory_index: 0,
+                target: wasm_encoder::MemArgTarget::Memory(0),
+                ordering: None,
             }));
             f.instruction(&Instruction::LocalGet(2));
             f.instruction(&Instruction::I32Add);
@@ -434,7 +435,7 @@ fn scan_fused(
                     break;
                 }
                 match reader.read_with_offset() {
-                    Ok(pair) => ops.push(pair),
+                    Ok(pair) => ops.push((pair.0, pair.1 as usize)),
                     Err(_) => break,
                 }
             }

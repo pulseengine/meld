@@ -68,7 +68,8 @@ fn mem8(memory_index: u32) -> MemArg {
     MemArg {
         offset: 0,
         align: 0,
-        memory_index,
+        target: wasm_encoder::MemArgTarget::Memory(memory_index),
+        ordering: None,
     }
 }
 

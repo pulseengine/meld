@@ -19,9 +19,9 @@ rust-version = "1.85"
 
 [workspace.dependencies]
 # WebAssembly parsing and encoding
-wasmparser = { version = "0.246", features = ["component-model"] }
-wasm-encoder = { version = "0.246", features = ["component-model"] }
-wasmprinter = "0.246"
+wasmparser = { version = "0.263", features = ["component-model"] }
+wasm-encoder = { version = "0.263", features = ["component-model"] }
+wasmprinter = "0.263"
 
 # DWARF read/write for address remapping (#143 Phase 2)
 gimli = "0.31"

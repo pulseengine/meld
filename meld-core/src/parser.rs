@@ -671,12 +671,90 @@ fn has_modules_recursive(component: &ParsedComponent) -> bool {
 /// rather than a process abort.
 ///
 /// See loss-scenario LS-P-5 (UCA-P-3 / H-1) and issue #118.
+/// `wasmparser::WasmFeatures::default()` as it was in wasmparser 0.246.
+///
+/// wasmparser 0.263 turned several proposals on by default (wide-arithmetic,
+/// compact-imports, component-model maps, component-model `implements`
+/// names). meld's validation gate must not widen as a side effect of a
+/// dependency bump, so those stay off here until meld handles them
+/// deliberately (#547). `CM_ASYNC` also became a default but every meld
+/// validation site already enables it explicitly.
+///
+/// One feature is turned ON to keep acceptance identical: 0.263 additionally
+/// gates *synchronous* `stream.read`/`stream.write`/`future.read`/
+/// `future.write` behind `CM_MORE_ASYNC_BUILTINS`, which 0.246 accepted with
+/// `CM_ASYNC` alone. The same flag also gates the `async` forms of
+/// `subtask.cancel` / `{stream,future}.cancel-{read,write}`, which 0.246
+/// refused; [`refuse_async_cancel_builtins`] restores that refusal so the set
+/// of accepted components is unchanged.
+pub fn baseline_wasm_features() -> wasmparser::WasmFeatures {
+    (wasmparser::WasmFeatures::default()
+        - wasmparser::WasmFeatures::WIDE_ARITHMETIC
+        - wasmparser::WasmFeatures::COMPACT_IMPORTS
+        - wasmparser::WasmFeatures::CM_MAP
+        - wasmparser::WasmFeatures::CM_IMPLEMENTS)
+        | wasmparser::WasmFeatures::CM_MORE_ASYNC_BUILTINS
+}
+
+/// Refuse the `async` cancel built-ins, exactly as wasmparser 0.246's
+/// validator did without `CM_ASYNC_BUILTINS` (see [`baseline_wasm_features`]).
+pub(crate) fn refuse_async_cancel_builtins(bytes: &[u8]) -> Result<()> {
+    for payload in Parser::new(0).parse_all(bytes) {
+        if let Payload::ComponentCanonicalSection(reader) = payload? {
+            for item in reader.into_iter_with_offsets() {
+                let (offset, canon) = item?;
+                let what = match canon {
+                    wasmparser::CanonicalFunction::SubtaskCancel { async_: true } => {
+                        "subtask.cancel"
+                    }
+                    wasmparser::CanonicalFunction::StreamCancelRead { async_: true, .. } => {
+                        "stream.cancel-read"
+                    }
+                    wasmparser::CanonicalFunction::StreamCancelWrite { async_: true, .. } => {
+                        "stream.cancel-write"
+                    }
+                    wasmparser::CanonicalFunction::FutureCancelRead { async_: true, .. } => {
+                        "future.cancel-read"
+                    }
+                    wasmparser::CanonicalFunction::FutureCancelWrite { async_: true, .. } => {
+                        "future.cancel-write"
+                    }
+                    _ => continue,
+                };
+                return Err(Error::ParseError(format!(
+                    "async `{what}` requires the component model async builtins feature \
+                     (at offset {offset:#x})"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The plain name of a component import/export.
+///
+/// wasmparser 0.263 decodes the `(implements ...)` / `(version-suffix ...)` /
+/// `(external-id ...)` name options that 0.246 rejected at parse time
+/// (leading byte 0x02). meld has never carried those options through fusion,
+/// so a name that has any of them is refused here instead of being silently
+/// reduced to its bare `name` — the same loud outcome 0.246 gave.
+pub(crate) fn plain_extern_name<'a>(name: &wasmparser::ComponentExternName<'a>) -> Result<&'a str> {
+    if name.implements.is_some() || name.version_suffix.is_some() || name.external_id.is_some() {
+        return Err(Error::ParseError(format!(
+            "component extern name {:?} carries implements/version-suffix/external-id \
+             options, which meld does not support",
+            name.name
+        )));
+    }
+    Ok(name.name)
+}
+
 fn checked_section_slice<'a>(
     full_bytes: &'a [u8],
-    range: &std::ops::Range<usize>,
+    range: &std::ops::Range<u64>,
     section: &'static str,
 ) -> Result<&'a [u8]> {
-    if range.start > range.end || range.end > full_bytes.len() {
+    if range.start > range.end || range.end > full_bytes.len() as u64 {
         return Err(Error::ParseError(format!(
             "{section} range out of bounds (start={}, end={}, input_len={})",
             range.start,
@@ -684,7 +762,8 @@ fn checked_section_slice<'a>(
             full_bytes.len()
         )));
     }
-    Ok(&full_bytes[range.start..range.end])
+    // Bounds checked above against `full_bytes.len()`, so both fit in `usize`.
+    Ok(&full_bytes[range.start as usize..range.end as usize])
 }
 
 impl ComponentParser {
@@ -719,11 +798,12 @@ impl ComponentParser {
         }
 
         if self.validate {
-            let features = wasmparser::WasmFeatures::default()
+            let features = baseline_wasm_features()
                 | wasmparser::WasmFeatures::CM_FIXED_LENGTH_LISTS
                 | wasmparser::WasmFeatures::CM_ASYNC;
             let mut validator = wasmparser::Validator::new_with_features(features);
             validator.validate_all(bytes)?;
+            refuse_async_cancel_builtins(bytes)?;
         }
 
         let mut component = ParsedComponent {
@@ -902,7 +982,7 @@ impl ComponentParser {
                         _ => {}
                     }
                     component.imports.push(ComponentImport {
-                        name: import.name.0.to_string(),
+                        name: plain_extern_name(&import.name)?.to_string(),
                         ty: import.ty,
                     });
                 }
@@ -949,7 +1029,7 @@ impl ComponentParser {
                             .push((component.component_instance_defs.len(), export.index));
                     }
                     component.exports.push(ComponentExport {
-                        name: export.name.0.to_string(),
+                        name: plain_extern_name(&export.name)?.to_string(),
                         kind: export.kind,
                         index: export.index,
                     });
@@ -1076,7 +1156,7 @@ impl ComponentParser {
                                             };
                                             if let Some(v) = &resolved {
                                                 component.instance_type_exports.insert(
-                                                    (ty_idx, name.0.to_string()),
+                                                    (ty_idx, plain_extern_name(name)?.to_string()),
                                                     v.clone(),
                                                 );
                                             }
@@ -1207,7 +1287,7 @@ impl ComponentParser {
                 for instance in reader {
                     let instance = instance?;
                     let inst_idx = component.component_instances.len();
-                    let entry = convert_component_instance(instance);
+                    let entry = convert_component_instance(instance)?;
                     component
                         .component_instance_defs
                         .push(ComponentInstanceDef::Instance(inst_idx));
@@ -1409,15 +1489,20 @@ impl ComponentParser {
 
                 Payload::ElementSection(reader) => {
                     module.element_count = reader.count();
-                    module.element_section_range = Some((reader.range().start, reader.range().end));
+                    module.element_section_range =
+                        Some((reader.range().start as usize, reader.range().end as usize));
                 }
 
-                Payload::CodeSectionStart { range, .. } => {
-                    module.code_section_range = Some((range.start, range.end));
+                Payload::CodeSectionStart {
+                    unchecked_range: range,
+                    ..
+                } => {
+                    module.code_section_range = Some((range.start as usize, range.end as usize));
                 }
 
                 Payload::DataSection(reader) => {
-                    module.data_section_range = Some((reader.range().start, reader.range().end));
+                    module.data_section_range =
+                        Some((reader.range().start as usize, reader.range().end as usize));
                 }
 
                 Payload::CustomSection(reader) => {
@@ -4019,9 +4104,6 @@ fn convert_canonical_function(
         wasmparser::CanonicalFunction::ThreadSpawnRef { func_ty_index } => {
             CanonicalEntry::ThreadSpawn { func_ty_index }
         }
-        wasmparser::CanonicalFunction::ResourceDropAsync { resource } => {
-            CanonicalEntry::ResourceDropAsync { resource }
-        }
         wasmparser::CanonicalFunction::BackpressureInc => CanonicalEntry::BackpressureInc,
         wasmparser::CanonicalFunction::BackpressureDec => CanonicalEntry::BackpressureDec,
         wasmparser::CanonicalFunction::TaskReturn { result, options } => {
@@ -4031,10 +4113,23 @@ fn convert_canonical_function(
             }
         }
         wasmparser::CanonicalFunction::TaskCancel => CanonicalEntry::TaskCancel,
-        wasmparser::CanonicalFunction::ContextGet(idx) => CanonicalEntry::ContextGet(idx),
-        wasmparser::CanonicalFunction::ContextSet(idx) => CanonicalEntry::ContextSet(idx),
-        wasmparser::CanonicalFunction::ThreadYield { cancellable } => {
-            CanonicalEntry::ThreadYield { cancellable }
+        // wasmparser 0.263 carries the context slot's value type; 0.246 only
+        // decoded `i32` (0x7f). Any other type goes to the unsupported
+        // fallback below, as every other built-in meld does not model.
+        wasmparser::CanonicalFunction::ContextGet {
+            ty: WasmValType::I32,
+            slot,
+        } => CanonicalEntry::ContextGet(slot),
+        wasmparser::CanonicalFunction::ContextSet {
+            ty: WasmValType::I32,
+            slot,
+        } => CanonicalEntry::ContextSet(slot),
+        // wasmparser 0.263 dropped the `cancellable` flag (component-model#716):
+        // the legacy byte must now be 0 or the section fails to decode, so
+        // `false` is exactly what 0.246 reported for every input that still
+        // decodes.
+        wasmparser::CanonicalFunction::ThreadYield => {
+            CanonicalEntry::ThreadYield { cancellable: false }
         }
         wasmparser::CanonicalFunction::SubtaskDrop => CanonicalEntry::SubtaskDrop,
         wasmparser::CanonicalFunction::SubtaskCancel { async_ } => {
@@ -4094,20 +4189,18 @@ fn convert_canonical_function(
         }
         wasmparser::CanonicalFunction::ErrorContextDrop => CanonicalEntry::ErrorContextDrop,
         wasmparser::CanonicalFunction::WaitableSetNew => CanonicalEntry::WaitableSetNew,
-        wasmparser::CanonicalFunction::WaitableSetWait {
-            cancellable,
-            memory,
-        } => CanonicalEntry::WaitableSetWait {
-            cancellable,
-            memory,
-        },
-        wasmparser::CanonicalFunction::WaitableSetPoll {
-            cancellable,
-            memory,
-        } => CanonicalEntry::WaitableSetPoll {
-            cancellable,
-            memory,
-        },
+        wasmparser::CanonicalFunction::WaitableSetWait { memory } => {
+            CanonicalEntry::WaitableSetWait {
+                cancellable: false,
+                memory,
+            }
+        }
+        wasmparser::CanonicalFunction::WaitableSetPoll { memory } => {
+            CanonicalEntry::WaitableSetPoll {
+                cancellable: false,
+                memory,
+            }
+        }
         wasmparser::CanonicalFunction::WaitableSetDrop => CanonicalEntry::WaitableSetDrop,
         wasmparser::CanonicalFunction::WaitableJoin => CanonicalEntry::WaitableJoin,
         // Truly unsupported variants (thread.index, thread.*indirect, etc.)
@@ -4159,7 +4252,7 @@ fn convert_component_alias(alias: wasmparser::ComponentAlias<'_>) -> Option<Comp
 /// Convert a `wasmparser::ComponentInstance` into our `ComponentLevelInstance`.
 fn convert_component_instance(
     instance: wasmparser::ComponentInstance<'_>,
-) -> ComponentLevelInstance {
+) -> Result<ComponentLevelInstance> {
     match instance {
         wasmparser::ComponentInstance::Instantiate {
             component_index,
@@ -4169,17 +4262,17 @@ fn convert_component_instance(
                 .iter()
                 .map(|arg| (arg.name.to_string(), arg.kind, arg.index))
                 .collect();
-            ComponentLevelInstance::Instantiate {
+            Ok(ComponentLevelInstance::Instantiate {
                 component_index,
                 args: parsed_args,
-            }
+            })
         }
         wasmparser::ComponentInstance::FromExports(exports) => {
             let parsed: Vec<_> = exports
                 .iter()
-                .map(|e| (e.name.0.to_string(), e.kind, e.index))
-                .collect();
-            ComponentLevelInstance::FromExports(parsed)
+                .map(|e| Ok((plain_extern_name(&e.name)?.to_string(), e.kind, e.index)))
+                .collect::<Result<_>>()?;
+            Ok(ComponentLevelInstance::FromExports(parsed))
         }
     }
 }
@@ -4226,6 +4319,33 @@ fn convert_ref_type(rt: wasmparser::RefType) -> ValType {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #546: wasmparser 0.263 gates the `async` cancel built-ins behind the
+    /// same flag as synchronous stream/future read/write. Meld enables the
+    /// flag (to keep accepting the latter, as under 0.246) and must therefore
+    /// refuse the former itself.
+    #[test]
+    fn async_subtask_cancel_is_still_refused_at_parse() {
+        let sync =
+            wat::parse_str("(component (core module) (core func (canon subtask.cancel)))").unwrap();
+        let sync_res = ComponentParser::new().parse(&sync);
+        assert!(
+            sync_res.is_ok(),
+            "sync subtask.cancel stays accepted: {:?}",
+            sync_res.err()
+        );
+        let asynch =
+            wat::parse_str("(component (core module) (core func (canon subtask.cancel async)))")
+                .unwrap();
+        let err = ComponentParser::new()
+            .parse(&asynch)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("async `subtask.cancel` requires the component model async builtins"),
+            "{err}"
+        );
+    }
 
     #[test]
     fn test_parser_rejects_core_module() {
@@ -4302,7 +4422,7 @@ mod tests {
                     _ => continue,
                 };
                 assert!(
-                    range.start <= range.end && range.end <= bytes.len(),
+                    range.start <= range.end && range.end <= bytes.len() as u64,
                     "wasmparser yielded a section with out-of-bounds \
                      range {:?} for a {}-byte buffer — parse_core_module \
                      would store this and the segments.rs slice would \

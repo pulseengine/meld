@@ -511,8 +511,12 @@ fn test_298_vestigial_grow_blocks_shared_rebase_fusion() {
     // runs; we mirror it so `extract_function_body` reads real bytes).
     let mut code_range = None;
     for payload in wasmparser::Parser::new(0).parse_all(&module_bytes) {
-        if let wasmparser::Payload::CodeSectionStart { range, .. } = payload.expect("payload") {
-            code_range = Some((range.start, range.end));
+        if let wasmparser::Payload::CodeSectionStart {
+            unchecked_range: range,
+            ..
+        } = payload.expect("payload")
+        {
+            code_range = Some((range.start as usize, range.end as usize));
         }
     }
     let code_range = code_range.expect("module has a code section");
@@ -686,8 +690,12 @@ fn test_298_fork_arena_realloc_fuses_under_shared_rebase_today() {
 
     let mut code_range = None;
     for payload in wasmparser::Parser::new(0).parse_all(&module_bytes) {
-        if let wasmparser::Payload::CodeSectionStart { range, .. } = payload.expect("payload") {
-            code_range = Some((range.start, range.end));
+        if let wasmparser::Payload::CodeSectionStart {
+            unchecked_range: range,
+            ..
+        } = payload.expect("payload")
+        {
+            code_range = Some((range.start as usize, range.end as usize));
         }
     }
     let code_range = code_range.expect("module has a code section");

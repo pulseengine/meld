@@ -201,7 +201,8 @@ fn bridge_arg(offset: u64, bridge_mem: u32) -> MemArg {
     MemArg {
         offset,
         align: 2,
-        memory_index: bridge_mem,
+        target: wasm_encoder::MemArgTarget::Memory(bridge_mem),
+        ordering: None,
     }
 }
 

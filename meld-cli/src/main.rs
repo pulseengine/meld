@@ -1338,7 +1338,7 @@ fn classify_import(module: &str, name: &str) -> &'static str {
 fn validate_wasm(bytes: &[u8], custom_page_sizes: bool) -> Result<()> {
     use wasmparser::Validator;
 
-    let mut features = wasmparser::WasmFeatures::default()
+    let mut features = meld_core::parser::baseline_wasm_features()
         | wasmparser::WasmFeatures::COMPONENT_MODEL
         | wasmparser::WasmFeatures::MULTI_MEMORY
         | wasmparser::WasmFeatures::CM_ASYNC

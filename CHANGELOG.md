@@ -4,6 +4,16 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+- **wasmparser / wasm-encoder 0.246 -> 0.263 (#546).** This is the
+  prerequisite for P3 cooperative threads. The old decoder read some current
+  thread built-ins as different ones, for example `thread.suspend-then-resume`
+  as `thread.resume-later`. Fused output is byte-identical on every fixture and
+  on the 504-component P3 corpus. One input class changes, from silent to loud:
+  a `thread.yield`, `waitable-set.wait` or `waitable-set.poll` with the legacy
+  `cancellable` byte set is now refused at parse (component-model#716 removed
+  it). meld 0.66.0 accepted it and dropped the flag.
+
 ### Fixed
 - **zstd advisories removed from the dependency graph.** wasmtime's default
   `cache` feature pulled `wasmtime-internal-cache` -> zstd 0.13 / zstd-safe 7 /

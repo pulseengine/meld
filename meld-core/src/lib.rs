@@ -3937,12 +3937,14 @@ fn generate_stabilizing_shim(
         let mem_arg_ptr = wasm_encoder::MemArg {
             offset: *offset as u64,
             align: 2,
-            memory_index: callee_memory,
+            target: wasm_encoder::MemArgTarget::Memory(callee_memory),
+            ordering: None,
         };
         let mem_arg_len = wasm_encoder::MemArg {
             offset: (*offset + 4) as u64,
             align: 2,
-            memory_index: callee_memory,
+            target: wasm_encoder::MemArgTarget::Memory(callee_memory),
+            ordering: None,
         };
 
         // old_str = mem.load(rec + offset)

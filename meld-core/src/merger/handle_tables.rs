@@ -89,7 +89,8 @@ impl Merger {
             let mem_arg = wasm_encoder::MemArg {
                 offset: 0,
                 align: 2, // 4-byte aligned
-                memory_index: memory_idx,
+                target: wasm_encoder::MemArgTarget::Memory(memory_idx),
+                ordering: None,
             };
 
             // Generate ht_new: store rep at next_ptr, return next_ptr, advance by 4

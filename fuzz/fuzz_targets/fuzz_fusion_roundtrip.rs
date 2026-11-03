@@ -41,7 +41,7 @@ fuzz_target!(|data: &[u8]| {
     // If validation fails, we have produced malformed wasm from a "successful"
     // fusion — that is a bug.
     let mut validator = wasmparser::Validator::new_with_features(
-        wasmparser::WasmFeatures::default()
+        meld_core::parser::baseline_wasm_features()
             | wasmparser::WasmFeatures::CM_FIXED_LENGTH_LISTS
             | wasmparser::WasmFeatures::CM_ASYNC,
     );

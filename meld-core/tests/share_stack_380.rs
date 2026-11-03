@@ -100,7 +100,10 @@ fn find_i32const_reloc_offsets(module_bytes: &[u8], flag_value: i32) -> Vec<u32>
     let mut offsets = Vec::new();
     for payload in wasmparser::Parser::new(0).parse_all(module_bytes) {
         match payload.expect("payload") {
-            wasmparser::Payload::CodeSectionStart { range, .. } => code_start = Some(range.start),
+            wasmparser::Payload::CodeSectionStart {
+                unchecked_range: range,
+                ..
+            } => code_start = Some(range.start),
             wasmparser::Payload::CodeSectionEntry(body) => {
                 let cs = code_start.expect("code section start seen first");
                 for item in body
@@ -166,12 +169,14 @@ fn build_stack_provider(
     let byte_memarg = MemArg {
         offset: 0,
         align: 0, // i32.load8_u — natural alignment of a 1-byte access is 0
-        memory_index: 0,
+        target: wasm_encoder::MemArgTarget::Memory(0),
+        ordering: None,
     };
     let word_memarg = MemArg {
         offset: 0,
         align: 2, // i32.load/store — natural alignment of a 4-byte access is 2
-        memory_index: 0,
+        target: wasm_encoder::MemArgTarget::Memory(0),
+        ordering: None,
     };
 
     let add_sections = |module: &mut Module| {
