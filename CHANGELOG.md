@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.67.0] - 2026-11-04
+
 ### Added
 - **P3 cooperative threads pass through to the host (SR-110, ADR-9, #547).**
   The nine built-ins (`thread.new-indirect`, `.index`, `.yield`, `.suspend`,
