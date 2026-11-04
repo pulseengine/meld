@@ -911,9 +911,10 @@ artifacts:
       In addition to the callback trampoline (shipped #128), meld shall
       emit a stackful lifting trampoline for components that declare
       `(canon lift ... async ...)` without a `(callback ...)` option.
-      The Phase 1 ABI surface (`pulseengine:async::thread_new`,
-      `thread_switch_to`, `thread_yield`, `thread_exit`) is reserved
-      for component-internal concurrency primitives. The shipped
+      The Phase 1 `pulseengine:async::thread_*` host intrinsics that
+      were once reserved for component-internal concurrency were
+      retired in #547 (P3 cooperative threads pass through in the
+      producer ABI instead, ADR-9). The shipped
       trampoline calls the lift function directly and relies on the
       runtime to treat the call as a fiber boundary (transparent
       suspension on `task.wait`). Cross-memory `(ptr, len)` result
@@ -3815,6 +3816,22 @@ artifacts:
       timestamp: 2026-10-28T13:54:56Z
     release: v0.66.0
 
+  - id: SR-110
+    type: sw-req
+    title: P3 cooperative threads pass through to the host in the producer ABI, with the identity of the start-function table
+    status: implemented
+    description: "P3 cooperative threads are in scope (ADR-9) because kiln runs them. meld shall not lower the nine cooperative built-ins (thread.new-indirect, thread.index, thread.yield, thread.suspend, thread.resume-later, thread.suspend-then-resume, thread.yield-then-resume, thread.suspend-then-promote, thread.yield-then-promote) to meld-defined intrinsics. Each shall become a core import of the fused module under exactly the module/field name and core type the producers emit ($root::[thread-new-indirect-v0] (i32 i32) -> i32, [thread-index] () -> i32, [thread-yield] () -> i32, [thread-suspend] () -> i32, [thread-resume-later] (i32) -> (), and the four [thread-{suspend,yield}-then-{resume,promote}] (i32) -> i32), the contract kiln#620 implements. Because thread.new-indirect takes an index into a funcref table, meld shall export that table from the fused module as __meld_thread_table and record it (fused index and export name) on the new-indirect entry of the import map and in the attestation; if two new-indirect canons name two different fused tables, or a table cannot be traced to a merged table, meld shall refuse with an error citing ADR-9. Enabling the threading feature shall not widen what meld accepts beyond these nine: every other canonical built-in meld does not model (thread.spawn-ref, thread.spawn-indirect, thread.available-parallelism, context.get/set with a non-zero slot or non-i32 type, and any built-in a later wasmparser adds) shall be an error naming the built-in, never a logged placeholder; shared memories and shared-everything threads stay refused (SR-108). Because a cooperative thread belongs to a component instance, --memory shared (which merges the same built-in from two components into one host import) shall refuse a fusion in which more than one component uses a cooperative-thread built-in other than thread.yield, citing ADR-9; under --memory multi the import map shall name the owning component of every thread import. A non-lower built-in reached through an alias chain shall be named after the built-in, not after the core module's own import name. The old pulseengine:async thread_new/thread_switch_to/thread_yield/thread_exit intrinsics, which no producer emits and nothing consumed, are retired. meld does not model scheduling: that the host switches threads only at the built-ins, not inside a generated adapter, is the host's obligation and is not verified here."
+    links:
+      - type: derives-from
+        target: SYS-3
+      - type: refines
+        target: SR-108
+    provenance:
+      created-by: ai-assisted
+      reviewed-by: avrabe
+      model: claude-opus-5-5
+      timestamp: 2026-11-04T09:00:00Z
+
   - id: SR-109
     type: sw-req
     title: Every memory strategy validates its own output by default
@@ -3835,7 +3852,7 @@ artifacts:
     type: sw-req
     title: "Threaded inputs are refused: no shared memories, and no cooperative-thread built-ins until they are lowered"
     status: implemented
-    description: "meld fuses components into a core module that assumes a single thread: each module keeps its own shadow stack, the generated adapters are not reentrant, and address rebasing and packing place every module at a fixed base. A threaded input -- wasi-threads (P1: wasi:thread-spawn with a shared linear memory) or shared-everything threads (thread.spawn-ref, thread.spawn-indirect, thread.available-parallelism, shared types) -- cannot be fused soundly. Both are out of scope (ADR-9, decided 2026-11-03). meld 0.66.0 refused shared-everything spawn only incidentally (its parser does not enable shared types) and FUSED a wasi-threads component at exit 0, keeping the shared memory and exporting wasi_thread_start. meld shall refuse any core module that defines or imports a shared memory, with an error that names ADR-9; every threads variant needs one. P3 cooperative threads (thread.new-indirect, thread.switch-to, thread.suspend, thread.resume-later, thread.yield-to, thread.index) are in scope for kiln but not yet implemented; until they are, meld shall keep refusing them rather than map them to an unsupported entry that is only logged. Plain P3 async, including thread.yield as an async yield, is unaffected."
+    description: "meld fuses components into a core module that assumes a single thread: each module keeps its own shadow stack, the generated adapters are not reentrant, and address rebasing and packing place every module at a fixed base. A threaded input -- wasi-threads (P1: wasi:thread-spawn with a shared linear memory) or shared-everything threads (thread.spawn-ref, thread.spawn-indirect, thread.available-parallelism, shared types) -- cannot be fused soundly. Both are out of scope (ADR-9, decided 2026-11-03). meld 0.66.0 refused shared-everything spawn only incidentally (its parser does not enable shared types) and FUSED a wasi-threads component at exit 0, keeping the shared memory and exporting wasi_thread_start. meld shall refuse any core module that defines or imports a shared memory, with an error that names ADR-9; every threads variant needs one. P3 cooperative threads are in scope for kiln and are supported by pass-through (#547, ADR-9); meld shall still refuse every other canonical built-in it does not model rather than map it to an entry that is only logged. Plain P3 async, including thread.yield as an async yield, is unaffected."
     links:
       - type: derives-from
         target: SYS-3

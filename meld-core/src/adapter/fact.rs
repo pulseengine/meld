@@ -12207,10 +12207,8 @@ impl FactStyleGenerator {
     /// )
     /// ```
     ///
-    /// The Phase 1 `thread::*` host-intrinsic ABI (thread_new,
-    /// thread_switch_to, thread_yield, thread_exit) remains valid for
-    /// component-internal concurrency but is **not** consumed by this
-    /// trampoline; see ADR-1's 2026-05-13 addendum.
+    /// The Phase 1 `thread::*` host-intrinsic ABI was never consumed by this
+    /// trampoline and was retired in #547; see ADR-1 and ADR-9.
     ///
     /// Result readback covers:
     /// - Push-results-onto-stack: caller expects direct results

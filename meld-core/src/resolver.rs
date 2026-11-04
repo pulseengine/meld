@@ -520,6 +520,14 @@ pub fn core_memory_sources(component: &ParsedComponent) -> HashMap<u32, (usize, 
     build_entity_provenance(component).memory_source
 }
 
+/// Which module export each component-level core TABLE came from.
+///
+/// `core_table_index -> (module_index, export_name)`. Used to find which fused
+/// table a `thread.new-indirect` canon indexes (#547).
+pub fn core_table_sources(component: &ParsedComponent) -> HashMap<u32, (usize, String)> {
+    build_entity_provenance(component).table_source
+}
+
 pub fn core_func_sources(component: &ParsedComponent) -> HashMap<u32, (usize, String)> {
     build_entity_provenance(component).func_source
 }
@@ -619,6 +627,115 @@ fn trace_core_func_to_lower(
         "core function alias chain starting at {func} does not terminate \
          (cyclic or malformed component)"
     )))
+}
+
+/// Follow a core func through every chain of `alias core export` re-exports to
+/// the core func that ENDS the chain (#547 Mythos finding).
+///
+/// Unlike [`trace_core_func_to_lower`] this does not stop at a `canon lower`
+/// and is not used for lower-site / memory-option resolution: it exists so a
+/// non-lower canonical built-in (`thread.*`, `context.*`, `waitable-set.*`, ...)
+/// reached through bag -> alias -> bag keeps its producer name instead of the
+/// importing module's own, possibly different, import name.
+///
+/// `Ok(end)`: the last core func of the chain (the argument itself when it is
+/// not an alias). `Err`: the chain is cyclic, or an alias names an instance
+/// that is neither an export bag nor an instantiated module, so the input is
+/// malformed and the module's own name must not be trusted.
+fn trace_core_func_to_chain_end(
+    mut func: u32,
+    aliases: &HashMap<u32, (u32, String)>,
+    bags: &HashMap<u32, Vec<(String, ExportKind, u32)>>,
+    instantiated: &std::collections::HashSet<u32>,
+) -> Result<u32> {
+    for _ in 0..=aliases.len() {
+        let Some((inst, name)) = aliases.get(&func) else {
+            return Ok(func);
+        };
+        let Some(bag) = bags.get(inst) else {
+            if instantiated.contains(inst) {
+                // An export of a real module: the chain ends at a module
+                // function, not at a canonical built-in.
+                return Ok(func);
+            }
+            return Err(Error::EncodingError(format!(
+                "core function alias {func} names core instance {inst}, which is neither an \
+                 export bag nor an instantiated module"
+            )));
+        };
+        let Some(next) = bag
+            .iter()
+            .find(|(n, k, _)| n == name && *k == ExportKind::Function)
+            .map(|(_, _, idx)| *idx)
+        else {
+            return Ok(func);
+        };
+        func = next;
+    }
+    Err(Error::EncodingError(format!(
+        "core function alias chain starting at {func} does not terminate \
+         (cyclic or malformed component)"
+    )))
+}
+
+/// `core func index -> canonical_functions index` for every core func defined
+/// by a canonical built-in that [`build_canon_import_names`] NAMES as a
+/// pass-through host import (`task.*`, `context.*`, `waitable*`, `subtask.*`,
+/// `backpressure.*`, `thread.*`). Only for these can a missing name be a
+/// bug; stream/future/error-context built-ins are lowered by other passes
+/// under the module's own import name and are left alone.
+fn core_builtin_canon_funcs(component: &ParsedComponent) -> HashMap<u32, usize> {
+    use crate::parser::{CanonicalEntry as E, ComponentAliasEntry, CoreEntityDef};
+    let mut out = HashMap::new();
+    let mut func_idx = 0u32;
+    for def in &component.core_entity_order {
+        match def {
+            CoreEntityDef::CanonicalFunction(i) => {
+                if matches!(
+                    component.canonical_functions.get(*i),
+                    Some(
+                        E::TaskReturn { .. }
+                            | E::TaskCancel
+                            | E::BackpressureInc
+                            | E::BackpressureDec
+                            | E::ContextGet(_)
+                            | E::ContextSet(_)
+                            | E::WaitableJoin
+                            | E::WaitableSetNew
+                            | E::WaitableSetDrop
+                            | E::WaitableSetPoll { .. }
+                            | E::WaitableSetWait { .. }
+                            | E::SubtaskDrop
+                            | E::SubtaskCancel { .. }
+                            | E::ThreadYield { .. }
+                            | E::ThreadIndex
+                            | E::ThreadNewIndirect { .. }
+                            | E::ThreadResumeLater
+                            | E::ThreadSuspend
+                            | E::ThreadSuspendThenResume
+                            | E::ThreadYieldThenResume
+                            | E::ThreadSuspendThenPromote
+                            | E::ThreadYieldThenPromote
+                    )
+                ) {
+                    out.insert(func_idx, *i);
+                }
+                func_idx += 1;
+            }
+            CoreEntityDef::CoreAlias(alias_idx) => {
+                if matches!(
+                    component.component_aliases.get(*alias_idx),
+                    Some(ComponentAliasEntry::CoreInstanceExport {
+                        kind: wasmparser::ExternalKind::Func,
+                        ..
+                    })
+                ) {
+                    func_idx += 1;
+                }
+            }
+        }
+    }
+    out
 }
 
 /// Build provenance map by replaying the core entity definition order.
@@ -1458,6 +1575,29 @@ fn build_canon_import_names(component: &ParsedComponent) -> HashMap<u32, (String
                                 core_func_idx,
                                 ("$root".to_string(), "[thread-yield]".to_string()),
                             );
+                        }
+                        // P3 cooperative threads (#547, ADR-9): pass-through
+                        // host imports named exactly as the producers
+                        // (wit-bindgen / wit-component) name them. The
+                        // strings are shared with `thread_builtins` so the
+                        // import map and the tests cannot drift from them.
+                        CanonicalEntry::ThreadIndex
+                        | CanonicalEntry::ThreadNewIndirect { .. }
+                        | CanonicalEntry::ThreadResumeLater
+                        | CanonicalEntry::ThreadSuspend
+                        | CanonicalEntry::ThreadSuspendThenResume
+                        | CanonicalEntry::ThreadYieldThenResume
+                        | CanonicalEntry::ThreadSuspendThenPromote
+                        | CanonicalEntry::ThreadYieldThenPromote => {
+                            if let Some(field) = crate::thread_builtins::producer_name(entry) {
+                                result.insert(
+                                    core_func_idx,
+                                    (
+                                        crate::thread_builtins::MODULE.to_string(),
+                                        field.to_string(),
+                                    ),
+                                );
+                            }
                         }
                         CanonicalEntry::ResourceDropAsync { resource } => {
                             if let Some((inst_idx, type_name)) =
@@ -2750,6 +2890,13 @@ impl Resolver {
         let canon_import_names = build_canon_import_names(component);
         let canon_lower_sites = core_lower_options(component);
         let core_func_aliases = core_func_alias_targets(component);
+        let builtin_canon_funcs = core_builtin_canon_funcs(component);
+        let instantiated_instances: std::collections::HashSet<u32> = component
+            .instances
+            .iter()
+            .filter(|i| matches!(i.kind, crate::parser::InstanceKind::Instantiate { .. }))
+            .map(|i| i.index)
+            .collect();
 
         // Step 1: Build instance content map.
         // For each instance, record what module it instantiates and how its
@@ -2931,11 +3078,39 @@ impl Resolver {
                                 // Look the WASI name up by the traced lower, so
                                 // a lower reached through alias re-exports
                                 // keeps its display name.
+                                //
+                                // A non-lower built-in (thread.*, context.*,
+                                // waitable-set.*, ...) reached through alias
+                                // chains has no lower to trace to, so follow the
+                                // chain to its end and look the name up THERE.
+                                // Otherwise the module keeps its own import
+                                // name, which can be another built-in's
+                                // producer name (#547).
+                                let named_idx = match lower_core_func {
+                                    Some(l) => l,
+                                    None => trace_core_func_to_chain_end(
+                                        *entity_idx,
+                                        &core_func_aliases,
+                                        &from_exports_infos,
+                                        &instantiated_instances,
+                                    )?,
+                                };
                                 if let Some((mod_name, field_name)) =
-                                    canon_import_names.get(&lower_core_func.unwrap_or(*entity_idx))
+                                    canon_import_names.get(&named_idx)
                                 {
                                     display_module = Some(mod_name.clone());
                                     display_field = Some(field_name.clone());
+                                } else if lower_core_func.is_none()
+                                    && builtin_canon_funcs.contains_key(&named_idx)
+                                {
+                                    return Err(Error::UnsupportedFeature(format!(
+                                        "core import {}::{} is wired to a canonical built-in \
+                                         (core func {named_idx}) through an alias chain, and \
+                                         meld cannot name that built-in; keeping the module's \
+                                         own import name could bind a different built-in in \
+                                         the host (ADR-9)",
+                                        import.module, import.name
+                                    )));
                                 }
                                 break;
                             }

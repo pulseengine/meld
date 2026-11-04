@@ -1225,6 +1225,9 @@ fn host_contract_json(e: &meld_core::import_map::ImportMapEntry) -> serde_json::
     if !e.also_components.is_empty() {
         v["also_components"] = json!(e.also_components);
     }
+    if let Some(t) = &e.thread_table {
+        v["thread_table"] = json!({ "index": t.index, "export": t.export });
+    }
     if let Some(r) = &e.resource {
         v["resource"] = json!({
             "operation": r.operation,
@@ -1323,6 +1326,10 @@ fn classify_import(module: &str, name: &str) -> &'static str {
             || name.starts_with("[backpressure-")
             || name.starts_with("[subtask-"))
     {
+        return "p3-builtin";
+    }
+    // P3 cooperative-thread built-ins (#547): the nine producer-ABI imports.
+    if meld_core::thread_builtins::is_builtin_import(module, name) {
         return "p3-builtin";
     }
     // WASI imports
@@ -1526,6 +1533,7 @@ mod tests {
             realloc: LowerOption::Absent,
             encoding: LowerOption::Present("utf16"),
             resource: None,
+            thread_table: None,
         };
         let mut g = entry(1, "g$1", 1);
         g.realloc = LowerOption::Present(ReallocRef {

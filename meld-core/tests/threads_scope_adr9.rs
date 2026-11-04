@@ -1,6 +1,7 @@
-//! ADR-9: shared-everything threads are out of scope; P3 cooperative threads
-//! are in scope (kiln) but not yet supported. Both must be REFUSED loudly --
-//! never fused with the built-in silently dropped or mapped to `Unsupported`.
+//! ADR-9: wasi-threads and shared-everything threads are out of scope and must
+//! be REFUSED loudly -- never fused with the built-in silently dropped. P3
+//! cooperative threads are in scope and pass through (#547): positive tests in
+//! `coop_threads_547.rs`.
 
 use meld_core::{Fuser, FuserConfig, MemoryStrategy};
 
@@ -42,11 +43,12 @@ fn shared_everything_thread_spawn_is_refused() {
     assert!(!err.is_empty(), "the refusal must say why");
 }
 
-/// P3 cooperative threads (ADR-9 path-T2, accepted, not yet implemented).
-/// When the lowering lands, replace this with positive fuse-and-run tests.
+/// P3 cooperative threads (ADR-9 path-T2, accepted, #547): the built-in passes
+/// through as a core import named exactly as the producers name it. The
+/// positive fuse-validate-and-run tests are in `coop_threads_547.rs`.
 // rivet: verifies SWV-120
 #[test]
-fn cooperative_thread_builtins_are_refused_until_supported() {
+fn cooperative_thread_builtins_pass_through_as_producer_imports() {
     let wat = r#"
 (component
   (core module $m
@@ -56,10 +58,40 @@ fn cooperative_thread_builtins_are_refused_until_supported() {
   (core instance $i (instantiate $m (with "" (instance (export "idx" (func $ti))))))
   (func (export "run") (result u32) (canon lift (core func $i "run"))))
 "#;
-    let err = fuse(wat).expect_err("ADR-9: cooperative threads are not supported yet");
+    let out = fuse(wat).expect("ADR-9: cooperative threads are supported (#547)");
+    let imports: Vec<(String, String)> = wasmparser::Parser::new(0)
+        .parse_all(&out)
+        .filter_map(|p| match p.unwrap() {
+            wasmparser::Payload::ImportSection(r) => Some(r),
+            _ => None,
+        })
+        .flat_map(|r| r.into_imports().map(|i| i.unwrap()))
+        .map(|i| (i.module.to_string(), i.name.to_string()))
+        .collect();
+    assert_eq!(
+        imports,
+        vec![("$root".to_string(), "[thread-index]".to_string())]
+    );
+}
+
+/// `thread.available-parallelism` is shared-everything threads (path-T1): it
+/// stays refused even though `thread.index` and friends are accepted.
+// rivet: verifies SWV-120
+#[test]
+fn thread_available_parallelism_is_refused() {
+    let wat = r#"
+(component
+  (core module $m
+    (import "" "p" (func $p (result i32)))
+    (func (export "run") (result i32) (call $p)))
+  (core func $ap (canon thread.available_parallelism))
+  (core instance $i (instantiate $m (with "" (instance (export "p" (func $ap))))))
+  (func (export "run") (result u32) (canon lift (core func $i "run"))))
+"#;
+    let err = fuse(wat).expect_err("ADR-9: shared-everything threads must be refused");
     assert!(
-        err.contains("thread"),
-        "the refusal must name threads: {err}"
+        err.contains("available-parallelism") || err.contains("shared"),
+        "the refusal must say why: {err}"
     );
 }
 

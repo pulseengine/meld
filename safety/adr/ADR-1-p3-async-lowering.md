@@ -122,7 +122,8 @@ Out of scope (deferred to follow-up sub-issues under #94):
   trampoline with this PR's `pulseengine:async` ABI is deferred.
 - **Stackful (task.wait/yield) async lifting mode** — issue #94
   identifies callback mode as preferred for embedded; the stackful
-  mode (`thread_new`/`thread_switch_to`) is fully out of scope.
+  mode is fully out of scope. (The `thread_new`/`thread_switch_to` host
+  intrinsics this once named were retired in #547, ADR-9.)
 - **Cross-component stream adapter** — when two fused components share
   a `stream<T>`, meld should generate a same-memory ring buffer or a
   multi-memory copy adapter. Neither is implemented.
@@ -257,8 +258,8 @@ the component has any `(canon lift ... async ...)` *without* a
 a per-lift basis; a single component may declare both kinds of lifts,
 in which case meld will emit both trampolines.
 
-**ABI surface.** Four new host-intrinsic imports under the existing
-`pulseengine:async` module:
+**ABI surface (RETIRED in #547, kept for the record).** Four host-intrinsic
+imports under the existing `pulseengine:async` module were declared:
 
 ```wasm
 (import "pulseengine:async" "thread_new"        (func (param i32 i32) (result i32)))
@@ -273,9 +274,10 @@ failure. `thread_switch_to` traps if the target thread is exited or
 unknown. `thread_yield` lets the runtime scheduler pick another fiber.
 `thread_exit` permanently releases the current fiber.
 
-These names and signatures are pinned by
-`p3_async::tests::stackful_intrinsic_signatures_pinned`. Changing them
-is a breaking change to `pulseengine:async` and requires a version bump.
+These names and signatures were pinned by
+`p3_async::tests::stackful_intrinsic_signatures_pinned`; the test and the
+intrinsics were deleted in #547 (see "Status of the Phase 1 `thread::*` ABI"
+below).
 
 **Emission policy.** Until the stackful trampoline emitter ships in a
 follow-up PR within the v0.8.0 milestone, meld surfaces a clear error
@@ -332,7 +334,7 @@ The dispatcher in `<impl AdapterGenerator>::generate` routes any
 **What the originally sketched design got wrong, and why.** The
 original sketch above ("creates a fresh fiber on each async
 invocation") proposed an adapter-driven scheduling loop using
-`thread_new` + `thread_switch_to` + `thread_yield`. Implementing it
+`thread_new` + `thread_switch_to` + `thread_yield` (since retired, #547). Implementing it
 literally requires:
 
 1. A per-export wrapper function whose `(i32 arg) -> ()` signature
@@ -353,14 +355,12 @@ suspending on `task.wait` and resuming on the awaited event. From the
 adapter's perspective the call looks synchronous; the fiber lifecycle
 is the runtime's concern.
 
-**Status of the Phase 1 `thread::*` ABI.** Unchanged. The four
-host-intrinsic imports remain part of the `pulseengine:async` surface
-and are pinned by `p3_async::tests::stackful_intrinsic_signatures_pinned`.
-They are reserved for component-internal concurrency primitives (a
-guest spawning parallel tasks via `wasi:thread` or similar) but are
-**not consumed** by the stackful trampoline. A runtime that supports
-stackful lift need not yet implement them; a runtime that wants to
-expose userspace threading to guests must.
+**Status of the Phase 1 `thread::*` ABI.** RETIRED (#547, ADR-9). The four
+host-intrinsic imports (`thread_new`, `thread_switch_to`, `thread_yield`,
+`thread_exit`) and their pinning test were deleted: nothing consumed them
+and no producer emits them. Cooperative threads are carried by the nine
+`$root::[thread-*]` producer-ABI built-ins instead (ADR-9). The stackful
+trampoline never used them.
 
 **Part (b) — in-body `task.wait` rewrites.** Still deferred. The shipped
 trampoline relies on the runtime's transparent suspension contract,
