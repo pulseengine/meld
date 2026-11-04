@@ -123,7 +123,7 @@ fn shared_memory_section() -> MemorySection {
         minimum: 1,
         maximum: Some(2),
         memory64: false,
-        shared: true,
+        shared: false,
         page_size_log2: None,
     });
     memory

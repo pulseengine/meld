@@ -24,7 +24,7 @@ use wasm_encoder::{
 };
 use wasmtime::{
     Config, Engine, Instance, Linker, MemoryType as RuntimeMemoryType, Module as RuntimeModule,
-    SharedMemory, Store,
+    Store,
 };
 
 /// Absolute address of each component's 1-byte sentinel data segment. Well
@@ -37,7 +37,7 @@ fn shared_memory_section() -> MemorySection {
         minimum: 1,
         maximum: Some(2),
         memory64: false,
-        shared: true,
+        shared: false,
         page_size_log2: None,
     });
     memory
@@ -653,7 +653,7 @@ fn build_arena_component(
                 minimum: 1,
                 maximum: Some(4),
                 memory64: false,
-                shared: true,
+                shared: false,
                 page_size_log2: None,
             });
             m
@@ -845,7 +845,7 @@ fn build_imported_arena_component(tag: &str, sentinel: u8, marker: Option<i32>) 
                 minimum: IMP_MEM_MIN_PAGES,
                 maximum: Some(IMP_MEM_MAX_PAGES),
                 memory64: false,
-                shared: true,
+                shared: false,
                 page_size_log2: None,
             }),
         );
@@ -980,16 +980,16 @@ fn run_imported_arena(marker: Option<i32>) {
     let engine = Engine::new(&engine_config).unwrap();
     let module = RuntimeModule::new(&engine, &fused).unwrap();
 
-    let shared = SharedMemory::new(
-        &engine,
-        RuntimeMemoryType::shared(min_pages as u32, max_pages as u32),
+    // ADR-9: an ordinary (non-`shared`) memory. These fixtures are about
+    // single-memory rebasing, not threads; meld refuses `shared` memories.
+    let mut store = Store::new(&engine, ());
+    let imported = wasmtime::Memory::new(
+        &mut store,
+        RuntimeMemoryType::new(min_pages as u32, Some(max_pages as u32)),
     )
     .unwrap();
-    let mut store = Store::new(&engine, ());
     let mut linker = Linker::new(&engine);
-    linker
-        .define(&store, "env", "memory", shared.clone())
-        .unwrap();
+    linker.define(&store, "env", "memory", imported).unwrap();
 
     let instance = linker.instantiate(&mut store, &module).unwrap();
 

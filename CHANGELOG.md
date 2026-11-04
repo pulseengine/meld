@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 ## [Unreleased]
 
 ### Changed
+- **Threaded inputs are refused (SR-108, ADR-9).** A core module that defines
+  or imports a `shared` memory is now refused with an error citing ADR-9.
+  wasi-threads (P1) and shared-everything threads are out of scope: the fused
+  module assumes one thread (a shadow stack per module, adapters that are not
+  reentrant, fixed placement). meld 0.66.0 fused a wasi-threads component at
+  exit 0. P3 cooperative threads are in scope for kiln but not yet supported,
+  and stay refused until they are. Plain P3 async is unaffected.
 - **Output is validated by default under every memory strategy (SR-109,
   #545).** Validation used to be implied only by `--memory shared`. Under
   `--memory multi`, 11 of 504 P3 corpus components fused at exit 0 into a
