@@ -66,7 +66,8 @@ fn build_module_a_with_memory() -> Module {
     get_value_fn.instruction(&Instruction::I32Load(wasm_encoder::MemArg {
         offset: 0,
         align: 2, // 4-byte alignment
-        memory_index: 0,
+        target: wasm_encoder::MemArgTarget::Memory(0),
+        ordering: None,
     }));
     get_value_fn.instruction(&Instruction::End);
     code.function(&get_value_fn);
@@ -169,7 +170,8 @@ fn build_single_module_component(func_export_name: &str, mem_export_name: &str) 
     func.instruction(&Instruction::I32Load(wasm_encoder::MemArg {
         offset: 0,
         align: 2,
-        memory_index: 0,
+        target: wasm_encoder::MemArgTarget::Memory(0),
+        ordering: None,
     }));
     func.instruction(&Instruction::End);
     code.function(&func);
@@ -557,7 +559,8 @@ fn build_result_copy_module() -> Vec<u8> {
         f.instruction(&Instruction::I32Load(wasm_encoder::MemArg {
             offset: 0,
             align: 2, // 4-byte alignment
-            memory_index: 0,
+            target: wasm_encoder::MemArgTarget::Memory(0),
+            ordering: None,
         }));
         f.instruction(&Instruction::End);
         code.function(&f);
@@ -681,7 +684,8 @@ fn build_grow_isolation_module() -> Vec<u8> {
         f.instruction(&Instruction::I32Store(wasm_encoder::MemArg {
             offset: 0,
             align: 2,
-            memory_index: 0,
+            target: wasm_encoder::MemArgTarget::Memory(0),
+            ordering: None,
         }));
         f.instruction(&Instruction::End);
         code.function(&f);
@@ -695,7 +699,8 @@ fn build_grow_isolation_module() -> Vec<u8> {
         f.instruction(&Instruction::I32Load(wasm_encoder::MemArg {
             offset: 0,
             align: 2,
-            memory_index: 1,
+            target: wasm_encoder::MemArgTarget::Memory(1),
+            ordering: None,
         }));
         f.instruction(&Instruction::End);
         code.function(&f);
@@ -879,7 +884,8 @@ fn build_string_copy_module() -> Vec<u8> {
         f.instruction(&Instruction::I32Load8U(wasm_encoder::MemArg {
             offset: 0,
             align: 0,
-            memory_index: 1,
+            target: wasm_encoder::MemArgTarget::Memory(1),
+            ordering: None,
         }));
         f.instruction(&Instruction::LocalGet(2)); // sum
         f.instruction(&Instruction::I32Add);

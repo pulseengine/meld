@@ -370,6 +370,7 @@ fn rewrite_operators(
         Some(relocs) if !relocs.is_empty() => {
             let ops: Vec<(Operator<'_>, usize)> = reader
                 .into_iter_with_offsets()
+                .map(|r| r.map(|(op, pos)| (op, pos as usize)))
                 .collect::<std::result::Result<Vec<_>, _>>()?;
             let ends: Vec<usize> = ops
                 .iter()
@@ -396,6 +397,7 @@ fn rewrite_operators(
         _ => {
             for res in reader.into_iter_with_offsets() {
                 let (op, old_pos) = res?;
+                let old_pos = old_pos as usize;
                 emit_operator(
                     op,
                     old_pos,
@@ -946,10 +948,22 @@ fn convert_memarg(ma: WpMemArg, maps: &IndexMaps, addr_reloc: bool) -> Result<Me
         .ok_or(Error::UnsupportedFeature(
             "memory offset overflow during rebasing".to_string(),
         ))?;
+    // wasmparser 0.263 generalised the memarg immediate (GC-array target,
+    // acquire-release ordering). wasmparser 0.246 could not decode either, so
+    // meld never saw them; keep refusing loudly rather than mis-encoding.
+    let memory = match (ma.target, ma.ordering) {
+        (wasmparser::MemArgTarget::Memory(m), None) => m,
+        _ => {
+            return Err(Error::UnsupportedFeature(
+                "memory instruction with GC-array target or atomic ordering immediate".to_string(),
+            ));
+        }
+    };
     Ok(MemArg {
         offset,
         align: ma.align as u32,
-        memory_index: maps.remap_memory(ma.memory),
+        target: wasm_encoder::MemArgTarget::Memory(maps.remap_memory(memory)),
+        ordering: None,
     })
 }
 
@@ -1480,7 +1494,8 @@ mod tests {
                     align: 2,
                     max_align: 2,
                     offset: 0,
-                    memory: 0,
+                    target: wasmparser::MemArgTarget::Memory(0),
+                    ordering: None,
                 },
             },
             &maps,
@@ -1491,7 +1506,8 @@ mod tests {
         match &instrs[0] {
             Instruction::I32Load(ma) => {
                 assert_eq!(
-                    ma.memory_index, 2,
+                    ma.target,
+                    wasm_encoder::MemArgTarget::Memory(2),
                     "I32Load memarg.memory_index should remap 0→2"
                 );
             }
@@ -1505,7 +1521,8 @@ mod tests {
                     align: 2,
                     max_align: 2,
                     offset: 4,
-                    memory: 0,
+                    target: wasmparser::MemArgTarget::Memory(0),
+                    ordering: None,
                 },
             },
             &maps,
@@ -1516,7 +1533,8 @@ mod tests {
         match &instrs[0] {
             Instruction::I32Store(ma) => {
                 assert_eq!(
-                    ma.memory_index, 2,
+                    ma.target,
+                    wasm_encoder::MemArgTarget::Memory(2),
                     "I32Store memarg.memory_index should remap 0→2"
                 );
                 assert_eq!(ma.offset, 4, "I32Store memarg.offset should be preserved");

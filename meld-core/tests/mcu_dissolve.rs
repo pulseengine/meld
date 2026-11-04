@@ -406,7 +406,8 @@ fn shared_stack_pointer_runtime_non_clobber() {
     let memarg = MemArg {
         offset: 0,
         align: 2,
-        memory_index: 0,
+        target: wasm_encoder::MemArgTarget::Memory(0),
+        ordering: None,
     };
 
     let mut m = merged_base();

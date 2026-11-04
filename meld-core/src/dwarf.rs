@@ -329,11 +329,14 @@ struct FnLayout {
 /// stripping DWARF rather than emitting a guessed address.
 fn module_function_layouts(module_bytes: &[u8]) -> Option<Vec<FnLayout>> {
     use wasmparser::{Parser, Payload};
-    let mut content_start: Option<usize> = None;
+    let mut content_start: Option<u64> = None;
     let mut layouts = Vec::new();
     for payload in Parser::new(0).parse_all(module_bytes) {
         match payload.ok()? {
-            Payload::CodeSectionStart { range, .. } => content_start = Some(range.start),
+            Payload::CodeSectionStart {
+                unchecked_range: range,
+                ..
+            } => content_start = Some(range.start),
             Payload::CodeSectionEntry(body) => {
                 let base = content_start?;
                 let r = body.range();

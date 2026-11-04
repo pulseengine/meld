@@ -65,7 +65,10 @@ fn find_i32const_reloc_offsets(module_bytes: &[u8], flag_value: i32) -> Vec<u32>
     let mut offsets = Vec::new();
     for payload in wasmparser::Parser::new(0).parse_all(module_bytes) {
         match payload.expect("payload") {
-            wasmparser::Payload::CodeSectionStart { range, .. } => code_start = Some(range.start),
+            wasmparser::Payload::CodeSectionStart {
+                unchecked_range: range,
+                ..
+            } => code_start = Some(range.start),
             wasmparser::Payload::CodeSectionEntry(body) => {
                 let cs = code_start.expect("code section start seen first");
                 for item in body
@@ -110,7 +113,8 @@ fn build_pack_component(tag: &str, sentinel: u8, export_memory: bool) -> Vec<u8>
     let zero_memarg = MemArg {
         offset: 0,
         align: 0,
-        memory_index: 0,
+        target: wasm_encoder::MemArgTarget::Memory(0),
+        ordering: None,
     };
 
     let add_sections = |module: &mut Module| {
@@ -281,7 +285,8 @@ fn build_passive_component(tag: &str, sentinel: u8, export_memory: bool) -> Vec<
     let zero_memarg = MemArg {
         offset: 0,
         align: 0,
-        memory_index: 0,
+        target: wasm_encoder::MemArgTarget::Memory(0),
+        ordering: None,
     };
 
     let add_sections = |module: &mut Module| {
@@ -421,7 +426,8 @@ fn build_nodata_component(tag: &str, sentinel: i32, export_memory: bool) -> Vec<
     let zero_memarg = MemArg {
         offset: 0,
         align: 0,
-        memory_index: 0,
+        target: wasm_encoder::MemArgTarget::Memory(0),
+        ordering: None,
     };
 
     let add_sections = |module: &mut Module| {
@@ -583,7 +589,8 @@ fn build_arena_component(
     let read_memarg = MemArg {
         offset: (ARENA_LEN - 1) as u64, // read the TOP byte of the arena
         align: 0,
-        memory_index: 0,
+        target: wasm_encoder::MemArgTarget::Memory(0),
+        ordering: None,
     };
 
     let add_sections = |module: &mut Module| {
@@ -827,7 +834,8 @@ fn build_imported_arena_component(tag: &str, sentinel: u8, marker: Option<i32>) 
     let zero_memarg = MemArg {
         offset: 0,
         align: 0,
-        memory_index: 0,
+        target: wasm_encoder::MemArgTarget::Memory(0),
+        ordering: None,
     };
 
     let add_sections = |module: &mut Module| {

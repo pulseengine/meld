@@ -108,7 +108,10 @@ fn merged_producers_is_superset_of_inputs() {
                 Payload::ModuleSection {
                     unchecked_range, ..
                 } => {
-                    stack.push(bytes[unchecked_range].to_vec());
+                    stack.push(
+                        bytes[unchecked_range.start as usize..unchecked_range.end as usize]
+                            .to_vec(),
+                    );
                 }
                 _ => {}
             }

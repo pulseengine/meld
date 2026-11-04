@@ -120,7 +120,8 @@ fn build_data_probe_component(fill: u32, export_name: &str) -> Vec<u8> {
     probe.instruction(&Instruction::I32Load(MemArg {
         offset: 0,
         align: 2,
-        memory_index: 0,
+        target: wasm_encoder::MemArgTarget::Memory(0),
+        ordering: None,
     }));
     probe.instruction(&Instruction::End);
     code.function(&probe);

@@ -1878,12 +1878,14 @@ pub fn build_utf8_to_utf16_transcode_test_module() -> Vec<u8> {
         let src_mem8 = MemArg {
             offset: 0,
             align: 0,
-            memory_index: 0,
+            target: wasm_encoder::MemArgTarget::Memory(0),
+            ordering: None,
         };
         let dst_mem16 = MemArg {
             offset: 0,
             align: 1,
-            memory_index: 1,
+            target: wasm_encoder::MemArgTarget::Memory(1),
+            ordering: None,
         };
         let mut f = Function::new([(8, ValType::I32)]);
         emit_utf8_to_utf16_transcode_param(
@@ -2051,12 +2053,14 @@ pub fn build_utf16_to_utf8_transcode_test_module() -> Vec<u8> {
         let src_mem16 = MemArg {
             offset: 0,
             align: 1,
-            memory_index: 0,
+            target: wasm_encoder::MemArgTarget::Memory(0),
+            ordering: None,
         };
         let dst_mem8 = MemArg {
             offset: 0,
             align: 0,
-            memory_index: 1,
+            target: wasm_encoder::MemArgTarget::Memory(1),
+            ordering: None,
         };
         let mut f = Function::new([(8, ValType::I32)]);
         emit_utf16_to_utf8_transcode_param(
@@ -2211,17 +2215,20 @@ pub fn build_latin1_to_utf16_transcode_test_module() -> Vec<u8> {
         let src_mem8 = MemArg {
             offset: 0,
             align: 0,
-            memory_index: 0,
+            target: wasm_encoder::MemArgTarget::Memory(0),
+            ordering: None,
         };
         let src_mem16 = MemArg {
             offset: 0,
             align: 1,
-            memory_index: 0,
+            target: wasm_encoder::MemArgTarget::Memory(0),
+            ordering: None,
         };
         let dst_mem16 = MemArg {
             offset: 0,
             align: 1,
-            memory_index: 1,
+            target: wasm_encoder::MemArgTarget::Memory(1),
+            ordering: None,
         };
         let mut f = Function::new([(7, ValType::I32)]);
         emit_latin1_to_utf16_transcode_param(
@@ -2374,17 +2381,20 @@ pub fn build_latin1_to_utf8_transcode_test_module() -> Vec<u8> {
         let src_mem8 = MemArg {
             offset: 0,
             align: 0,
-            memory_index: 0,
+            target: wasm_encoder::MemArgTarget::Memory(0),
+            ordering: None,
         };
         let src_mem16 = MemArg {
             offset: 0,
             align: 1,
-            memory_index: 0,
+            target: wasm_encoder::MemArgTarget::Memory(0),
+            ordering: None,
         };
         let dst_mem8 = MemArg {
             offset: 0,
             align: 0,
-            memory_index: 1,
+            target: wasm_encoder::MemArgTarget::Memory(1),
+            ordering: None,
         };
         let mut f = Function::new([(9, ValType::I32)]);
         emit_latin1_to_utf8_transcode_param(
@@ -2579,22 +2589,26 @@ fn build_x_to_latin1_transcode_test_module(utf16_source: bool) -> Vec<u8> {
         let src_mem8 = MemArg {
             offset: 0,
             align: 0,
-            memory_index: 0,
+            target: wasm_encoder::MemArgTarget::Memory(0),
+            ordering: None,
         };
         let src_mem16 = MemArg {
             offset: 0,
             align: 1,
-            memory_index: 0,
+            target: wasm_encoder::MemArgTarget::Memory(0),
+            ordering: None,
         };
         let dst_mem8 = MemArg {
             offset: 0,
             align: 0,
-            memory_index: 1,
+            target: wasm_encoder::MemArgTarget::Memory(1),
+            ordering: None,
         };
         let dst_mem16 = MemArg {
             offset: 0,
             align: 1,
-            memory_index: 1,
+            target: wasm_encoder::MemArgTarget::Memory(1),
+            ordering: None,
         };
         let mut f = Function::new([(7, ValType::I32)]);
         if utf16_source {
@@ -3073,24 +3087,28 @@ fn build_nested_list_result_test_module(
         let rec_mem = MemArg {
             offset: 0,
             align: 2,
-            memory_index: 0,
+            target: wasm_encoder::MemArgTarget::Memory(0),
+            ordering: None,
         };
         let rec_len_mem = MemArg {
             offset: 4,
             align: 2,
-            memory_index: 0,
+            target: wasm_encoder::MemArgTarget::Memory(0),
+            ordering: None,
         };
         // The summed inner buffer lives in caller memory 0 (transcoded UTF-16,
         // or the raw-copied `list<u8>` bytes).
         let inner_u16 = MemArg {
             offset: 0,
             align: 1,
-            memory_index: 0,
+            target: wasm_encoder::MemArgTarget::Memory(0),
+            ordering: None,
         };
         let inner_u8 = MemArg {
             offset: 0,
             align: 0,
-            memory_index: 0,
+            target: wasm_encoder::MemArgTarget::Memory(0),
+            ordering: None,
         };
 
         let l_first_scratch = 3u32;
@@ -3640,24 +3658,28 @@ fn build_nested_list_param_test_module(
         let rec_mem = MemArg {
             offset: 0,
             align: 2,
-            memory_index: 1,
+            target: wasm_encoder::MemArgTarget::Memory(1),
+            ordering: None,
         };
         let rec_len_mem = MemArg {
             offset: 4,
             align: 2,
-            memory_index: 1,
+            target: wasm_encoder::MemArgTarget::Memory(1),
+            ordering: None,
         };
         // The summed inner buffer lives in callee memory 1 (transcoded UTF-16,
         // or the deep-copied `list<u8>` bytes).
         let inner_u16 = MemArg {
             offset: 0,
             align: 1,
-            memory_index: 1,
+            target: wasm_encoder::MemArgTarget::Memory(1),
+            ordering: None,
         };
         let inner_u8 = MemArg {
             offset: 0,
             align: 0,
-            memory_index: 1,
+            target: wasm_encoder::MemArgTarget::Memory(1),
+            ordering: None,
         };
 
         let l_first_scratch = 2u32;
@@ -3843,17 +3865,20 @@ pub(crate) fn emit_conditional_guard_chain_byte(
             1 => body.instruction(&Instruction::I32Load8U(wasm_encoder::MemArg {
                 offset: offset as u64,
                 align: 0,
-                memory_index,
+                target: wasm_encoder::MemArgTarget::Memory(memory_index),
+                ordering: None,
             })),
             2 => body.instruction(&Instruction::I32Load16U(wasm_encoder::MemArg {
                 offset: offset as u64,
                 align: 1,
-                memory_index,
+                target: wasm_encoder::MemArgTarget::Memory(memory_index),
+                ordering: None,
             })),
             _ => body.instruction(&Instruction::I32Load(wasm_encoder::MemArg {
                 offset: offset as u64,
                 align: 2,
-                memory_index,
+                target: wasm_encoder::MemArgTarget::Memory(memory_index),
+                ordering: None,
             })),
         };
     }
@@ -4127,22 +4152,26 @@ fn emit_patch_nested_indirections(
         let dst_mem_arg_ptr = wasm_encoder::MemArg {
             offset: *offset as u64,
             align: 2,
-            memory_index: caller_memory,
+            target: wasm_encoder::MemArgTarget::Memory(caller_memory),
+            ordering: None,
         };
         let dst_mem_arg_len = wasm_encoder::MemArg {
             offset: (*offset + 4) as u64,
             align: 2,
-            memory_index: caller_memory,
+            target: wasm_encoder::MemArgTarget::Memory(caller_memory),
+            ordering: None,
         };
         let src_mem_arg_ptr = wasm_encoder::MemArg {
             offset: *offset as u64,
             align: 2,
-            memory_index: callee_memory,
+            target: wasm_encoder::MemArgTarget::Memory(callee_memory),
+            ordering: None,
         };
         let src_mem_arg_len = wasm_encoder::MemArg {
             offset: (*offset + 4) as u64,
             align: 2,
-            memory_index: callee_memory,
+            target: wasm_encoder::MemArgTarget::Memory(callee_memory),
+            ordering: None,
         };
 
         // Read original (ptr, len) DIRECTLY from callee memory at rec_src.
@@ -4179,22 +4208,26 @@ fn emit_patch_nested_indirections(
             let src_mem8 = wasm_encoder::MemArg {
                 offset: 0,
                 align: 0,
-                memory_index: callee_memory,
+                target: wasm_encoder::MemArgTarget::Memory(callee_memory),
+                ordering: None,
             };
             let src_mem16 = wasm_encoder::MemArg {
                 offset: 0,
                 align: 1,
-                memory_index: callee_memory,
+                target: wasm_encoder::MemArgTarget::Memory(callee_memory),
+                ordering: None,
             };
             let dst_mem8 = wasm_encoder::MemArg {
                 offset: 0,
                 align: 0,
-                memory_index: caller_memory,
+                target: wasm_encoder::MemArgTarget::Memory(caller_memory),
+                ordering: None,
             };
             let dst_mem16 = wasm_encoder::MemArg {
                 offset: 0,
                 align: 1,
-                memory_index: caller_memory,
+                target: wasm_encoder::MemArgTarget::Memory(caller_memory),
+                ordering: None,
             };
 
             if inner_transcode_utf8_to_utf16 {
@@ -4671,12 +4704,14 @@ fn emit_param_nested_indirections(
         let rec_mem_arg_ptr = wasm_encoder::MemArg {
             offset: *offset as u64,
             align: 2,
-            memory_index: callee_memory,
+            target: wasm_encoder::MemArgTarget::Memory(callee_memory),
+            ordering: None,
         };
         let rec_mem_arg_len = wasm_encoder::MemArg {
             offset: (*offset + 4) as u64,
             align: 2,
-            memory_index: callee_memory,
+            target: wasm_encoder::MemArgTarget::Memory(callee_memory),
+            ordering: None,
         };
 
         // Read the (ptr, len) the SHALLOW outer copy left in the callee record;
@@ -4713,22 +4748,26 @@ fn emit_param_nested_indirections(
             let src_mem8 = wasm_encoder::MemArg {
                 offset: 0,
                 align: 0,
-                memory_index: caller_memory,
+                target: wasm_encoder::MemArgTarget::Memory(caller_memory),
+                ordering: None,
             };
             let src_mem16 = wasm_encoder::MemArg {
                 offset: 0,
                 align: 1,
-                memory_index: caller_memory,
+                target: wasm_encoder::MemArgTarget::Memory(caller_memory),
+                ordering: None,
             };
             let dst_mem8 = wasm_encoder::MemArg {
                 offset: 0,
                 align: 0,
-                memory_index: callee_memory,
+                target: wasm_encoder::MemArgTarget::Memory(callee_memory),
+                ordering: None,
             };
             let dst_mem16 = wasm_encoder::MemArg {
                 offset: 0,
                 align: 1,
-                memory_index: callee_memory,
+                target: wasm_encoder::MemArgTarget::Memory(callee_memory),
+                ordering: None,
             };
 
             if inner_transcode_utf8_to_utf16 {
@@ -6736,7 +6775,8 @@ impl FactStyleGenerator {
                     func.instruction(&Instruction::I32Load(wasm_encoder::MemArg {
                         offset: byte_offset as u64,
                         align: 2,
-                        memory_index: options.callee_memory,
+                        target: wasm_encoder::MemArgTarget::Memory(options.callee_memory),
+                        ordering: None,
                     }));
                     // Stack: [addr_for_store, handle]
                     func.instruction(&Instruction::Call(rep_func));
@@ -6744,7 +6784,8 @@ impl FactStyleGenerator {
                     func.instruction(&Instruction::I32Store(wasm_encoder::MemArg {
                         offset: byte_offset as u64,
                         align: 2,
-                        memory_index: options.callee_memory,
+                        target: wasm_encoder::MemArgTarget::Memory(options.callee_memory),
+                        ordering: None,
                     }));
                     if guarded {
                         func.instruction(&Instruction::End); // end UCA-A-16 guard If
@@ -7118,7 +7159,8 @@ impl FactStyleGenerator {
             func.instruction(&Instruction::I32Load(wasm_encoder::MemArg {
                 offset: (byte_offset + 4) as u64,
                 align: 2,
-                memory_index: options.callee_memory,
+                target: wasm_encoder::MemArgTarget::Memory(options.callee_memory),
+                ordering: None,
             }));
             func.instruction(&Instruction::LocalSet(pair_len_local));
 
@@ -7146,7 +7188,8 @@ impl FactStyleGenerator {
             func.instruction(&Instruction::I32Load(wasm_encoder::MemArg {
                 offset: byte_offset as u64,
                 align: 2,
-                memory_index: options.callee_memory,
+                target: wasm_encoder::MemArgTarget::Memory(options.callee_memory),
+                ordering: None,
             })); // src (in caller mem)
             // Byte count from the stashed (still-tagged) length operand.
             emit_copy_byte_count(func, pair_len_local, byte_mult, is_compact_utf16);
@@ -7161,7 +7204,8 @@ impl FactStyleGenerator {
             func.instruction(&Instruction::I32Store(wasm_encoder::MemArg {
                 offset: byte_offset as u64,
                 align: 2,
-                memory_index: options.callee_memory,
+                target: wasm_encoder::MemArgTarget::Memory(options.callee_memory),
+                ordering: None,
             }));
 
             // Fix up inner resource handles in list elements.
@@ -7192,7 +7236,8 @@ impl FactStyleGenerator {
                 func.instruction(&Instruction::I32Load(wasm_encoder::MemArg {
                     offset: (byte_offset + 4) as u64,
                     align: 2,
-                    memory_index: options.callee_memory,
+                    target: wasm_encoder::MemArgTarget::Memory(options.callee_memory),
+                    ordering: None,
                 }));
                 func.instruction(&Instruction::I32GeU);
                 func.instruction(&Instruction::BrIf(1)); // break to $exit
@@ -7229,7 +7274,8 @@ impl FactStyleGenerator {
                         func.instruction(&Instruction::I32Load(wasm_encoder::MemArg {
                             offset: res_byte_offset as u64,
                             align: 2,
-                            memory_index: options.callee_memory,
+                            target: wasm_encoder::MemArgTarget::Memory(options.callee_memory),
+                            ordering: None,
                         }));
                         // Call [resource-rep](handle) → rep
                         func.instruction(&Instruction::Call(rep_func));
@@ -7237,7 +7283,8 @@ impl FactStyleGenerator {
                         func.instruction(&Instruction::I32Store(wasm_encoder::MemArg {
                             offset: res_byte_offset as u64,
                             align: 2,
-                            memory_index: options.callee_memory,
+                            target: wasm_encoder::MemArgTarget::Memory(options.callee_memory),
+                            ordering: None,
                         }));
                     }
                 }
@@ -7264,7 +7311,8 @@ impl FactStyleGenerator {
             func.instruction(&Instruction::I32Load(wasm_encoder::MemArg {
                 offset: fixup.byte_offset as u64,
                 align: 2,
-                memory_index: options.callee_memory,
+                target: wasm_encoder::MemArgTarget::Memory(options.callee_memory),
+                ordering: None,
             }));
             // Call [resource-rep](handle) → rep
             func.instruction(&Instruction::Call(fixup.rep_func));
@@ -7272,7 +7320,8 @@ impl FactStyleGenerator {
             func.instruction(&Instruction::I32Store(wasm_encoder::MemArg {
                 offset: fixup.byte_offset as u64,
                 align: 2,
-                memory_index: options.callee_memory,
+                target: wasm_encoder::MemArgTarget::Memory(options.callee_memory),
+                ordering: None,
             }));
         }
 
@@ -7657,13 +7706,15 @@ impl FactStyleGenerator {
                         func.instruction(&Instruction::I32Load(wasm_encoder::MemArg {
                             offset: byte_offset as u64,
                             align: 2,
-                            memory_index: options.callee_memory,
+                            target: wasm_encoder::MemArgTarget::Memory(options.callee_memory),
+                            ordering: None,
                         }));
                         func.instruction(&Instruction::Call(rep_func));
                         func.instruction(&Instruction::I32Store(wasm_encoder::MemArg {
                             offset: byte_offset as u64,
                             align: 2,
-                            memory_index: options.callee_memory,
+                            target: wasm_encoder::MemArgTarget::Memory(options.callee_memory),
+                            ordering: None,
                         }));
                         if guarded {
                             func.instruction(&Instruction::End); // end UCA-A-16 guard If
@@ -7805,7 +7856,8 @@ impl FactStyleGenerator {
                     func.instruction(&Instruction::I32Load(wasm_encoder::MemArg {
                         offset: ptr_offset as u64,
                         align: 2,
-                        memory_index: options.callee_memory,
+                        target: wasm_encoder::MemArgTarget::Memory(options.callee_memory),
+                        ordering: None,
                     }));
                     func.instruction(&Instruction::LocalSet(data_ptr_local));
 
@@ -7813,7 +7865,8 @@ impl FactStyleGenerator {
                     func.instruction(&Instruction::I32Load(wasm_encoder::MemArg {
                         offset: len_offset as u64,
                         align: 2,
-                        memory_index: options.callee_memory,
+                        target: wasm_encoder::MemArgTarget::Memory(options.callee_memory),
+                        ordering: None,
                     }));
                     func.instruction(&Instruction::LocalSet(data_len_local));
 
@@ -7873,7 +7926,8 @@ impl FactStyleGenerator {
                     func.instruction(&Instruction::I32Store(wasm_encoder::MemArg {
                         offset: ptr_offset as u64,
                         align: 2,
-                        memory_index: options.caller_memory,
+                        target: wasm_encoder::MemArgTarget::Memory(options.caller_memory),
+                        ordering: None,
                     }));
 
                     func.instruction(&Instruction::LocalGet(retptr_local));
@@ -7881,7 +7935,8 @@ impl FactStyleGenerator {
                     func.instruction(&Instruction::I32Store(wasm_encoder::MemArg {
                         offset: len_offset as u64,
                         align: 2,
-                        memory_index: options.caller_memory,
+                        target: wasm_encoder::MemArgTarget::Memory(options.caller_memory),
+                        ordering: None,
                     }));
 
                     result_pair_idx += 1;
@@ -7895,36 +7950,42 @@ impl FactStyleGenerator {
                             func.instruction(&Instruction::I64Load(wasm_encoder::MemArg {
                                 offset: byte_offset as u64,
                                 align: 3, // 2^3 = 8
-                                memory_index: options.callee_memory,
+                                target: wasm_encoder::MemArgTarget::Memory(options.callee_memory),
+                                ordering: None,
                             }));
                             func.instruction(&Instruction::I64Store(wasm_encoder::MemArg {
                                 offset: byte_offset as u64,
                                 align: 3,
-                                memory_index: options.caller_memory,
+                                target: wasm_encoder::MemArgTarget::Memory(options.caller_memory),
+                                ordering: None,
                             }));
                         }
                         2 => {
                             func.instruction(&Instruction::I32Load16U(wasm_encoder::MemArg {
                                 offset: byte_offset as u64,
                                 align: 1, // 2^1 = 2
-                                memory_index: options.callee_memory,
+                                target: wasm_encoder::MemArgTarget::Memory(options.callee_memory),
+                                ordering: None,
                             }));
                             func.instruction(&Instruction::I32Store16(wasm_encoder::MemArg {
                                 offset: byte_offset as u64,
                                 align: 1,
-                                memory_index: options.caller_memory,
+                                target: wasm_encoder::MemArgTarget::Memory(options.caller_memory),
+                                ordering: None,
                             }));
                         }
                         1 => {
                             func.instruction(&Instruction::I32Load8U(wasm_encoder::MemArg {
                                 offset: byte_offset as u64,
                                 align: 0, // 2^0 = 1
-                                memory_index: options.callee_memory,
+                                target: wasm_encoder::MemArgTarget::Memory(options.callee_memory),
+                                ordering: None,
                             }));
                             func.instruction(&Instruction::I32Store8(wasm_encoder::MemArg {
                                 offset: byte_offset as u64,
                                 align: 0,
-                                memory_index: options.caller_memory,
+                                target: wasm_encoder::MemArgTarget::Memory(options.caller_memory),
+                                ordering: None,
                             }));
                         }
                         _ => {
@@ -7932,12 +7993,14 @@ impl FactStyleGenerator {
                             func.instruction(&Instruction::I32Load(wasm_encoder::MemArg {
                                 offset: byte_offset as u64,
                                 align: 2, // 2^2 = 4
-                                memory_index: options.callee_memory,
+                                target: wasm_encoder::MemArgTarget::Memory(options.callee_memory),
+                                ordering: None,
                             }));
                             func.instruction(&Instruction::I32Store(wasm_encoder::MemArg {
                                 offset: byte_offset as u64,
                                 align: 2,
-                                memory_index: options.caller_memory,
+                                target: wasm_encoder::MemArgTarget::Memory(options.caller_memory),
+                                ordering: None,
                             }));
                         }
                     }
@@ -7980,7 +8043,8 @@ impl FactStyleGenerator {
                 func.instruction(&Instruction::I32Load(wasm_encoder::MemArg {
                     offset: ptr_offset as u64,
                     align: 2,
-                    memory_index: options.callee_memory,
+                    target: wasm_encoder::MemArgTarget::Memory(options.callee_memory),
+                    ordering: None,
                 }));
                 func.instruction(&Instruction::LocalSet(data_ptr_local));
 
@@ -7988,7 +8052,8 @@ impl FactStyleGenerator {
                 func.instruction(&Instruction::I32Load(wasm_encoder::MemArg {
                     offset: len_offset as u64,
                     align: 2,
-                    memory_index: options.callee_memory,
+                    target: wasm_encoder::MemArgTarget::Memory(options.callee_memory),
+                    ordering: None,
                 }));
                 func.instruction(&Instruction::LocalSet(data_len_local));
 
@@ -8040,7 +8105,8 @@ impl FactStyleGenerator {
                 func.instruction(&Instruction::I32Store(wasm_encoder::MemArg {
                     offset: ptr_offset as u64,
                     align: 2,
-                    memory_index: options.caller_memory,
+                    target: wasm_encoder::MemArgTarget::Memory(options.caller_memory),
+                    ordering: None,
                 }));
 
                 func.instruction(&Instruction::End);
@@ -8250,7 +8316,8 @@ impl FactStyleGenerator {
             let mem_arg = wasm_encoder::MemArg {
                 offset: guard.position as u64,
                 align: 0,
-                memory_index: dst_mem,
+                target: wasm_encoder::MemArgTarget::Memory(dst_mem),
+                ordering: None,
             };
             match guard.byte_size {
                 1 => func.instruction(&Instruction::I32Load8U(mem_arg)),
@@ -8365,7 +8432,8 @@ impl FactStyleGenerator {
                     let mem_arg = wasm_encoder::MemArg {
                         offset: guard.position as u64,
                         align: 0,
-                        memory_index: dst_mem,
+                        target: wasm_encoder::MemArgTarget::Memory(dst_mem),
+                        ordering: None,
                     };
                     match guard.byte_size {
                         1 => func.instruction(&Instruction::I32Load8U(mem_arg)),
@@ -8403,7 +8471,8 @@ impl FactStyleGenerator {
             func.instruction(&Instruction::I32Load(wasm_encoder::MemArg {
                 offset: 0,
                 align: 2,
-                memory_index: dst_mem,
+                target: wasm_encoder::MemArgTarget::Memory(dst_mem),
+                ordering: None,
             }));
             func.instruction(&Instruction::LocalSet(inner_ptr));
 
@@ -8418,7 +8487,8 @@ impl FactStyleGenerator {
             func.instruction(&Instruction::I32Load(wasm_encoder::MemArg {
                 offset: 0,
                 align: 2,
-                memory_index: dst_mem,
+                target: wasm_encoder::MemArgTarget::Memory(dst_mem),
+                ordering: None,
             }));
             func.instruction(&Instruction::LocalSet(inner_len));
 
@@ -8483,7 +8553,8 @@ impl FactStyleGenerator {
             func.instruction(&Instruction::I32Store(wasm_encoder::MemArg {
                 offset: 0,
                 align: 2,
-                memory_index: dst_mem,
+                target: wasm_encoder::MemArgTarget::Memory(dst_mem),
+                ordering: None,
             }));
             // len stays the same — no need to update it
 
@@ -8768,12 +8839,14 @@ impl FactStyleGenerator {
         let src_mem8 = wasm_encoder::MemArg {
             offset: 0,
             align: 0,
-            memory_index: options.caller_memory,
+            target: wasm_encoder::MemArgTarget::Memory(options.caller_memory),
+            ordering: None,
         };
         let dst_mem16 = wasm_encoder::MemArg {
             offset: 0,
             align: 1,
-            memory_index: options.callee_memory,
+            target: wasm_encoder::MemArgTarget::Memory(options.callee_memory),
+            ordering: None,
         };
 
         // Step 1: Allocate output buffer = 2 * input_len bytes via cabi_realloc
@@ -9302,12 +9375,14 @@ impl FactStyleGenerator {
         let src_mem16 = wasm_encoder::MemArg {
             offset: 0,
             align: 1,
-            memory_index: options.caller_memory,
+            target: wasm_encoder::MemArgTarget::Memory(options.caller_memory),
+            ordering: None,
         };
         let dst_mem8 = wasm_encoder::MemArg {
             offset: 0,
             align: 0,
-            memory_index: options.callee_memory,
+            target: wasm_encoder::MemArgTarget::Memory(options.callee_memory),
+            ordering: None,
         };
 
         // Step 1: Allocate output buffer = 3 * input_code_units bytes
@@ -9622,12 +9697,14 @@ impl FactStyleGenerator {
         let src_mem = wasm_encoder::MemArg {
             offset: 0,
             align: 0,
-            memory_index: options.caller_memory,
+            target: wasm_encoder::MemArgTarget::Memory(options.caller_memory),
+            ordering: None,
         };
         let dst_mem = wasm_encoder::MemArg {
             offset: 0,
             align: 0,
-            memory_index: options.callee_memory,
+            target: wasm_encoder::MemArgTarget::Memory(options.callee_memory),
+            ordering: None,
         };
 
         // Step 1: Allocate output buffer = 2 * input_len via cabi_realloc.
@@ -9835,12 +9912,14 @@ impl FactStyleGenerator {
         let src_mem16 = wasm_encoder::MemArg {
             offset: 0,
             align: 1,
-            memory_index: options.caller_memory,
+            target: wasm_encoder::MemArgTarget::Memory(options.caller_memory),
+            ordering: None,
         };
         let dst_mem16 = wasm_encoder::MemArg {
             offset: 0,
             align: 1,
-            memory_index: options.callee_memory,
+            target: wasm_encoder::MemArgTarget::Memory(options.callee_memory),
+            ordering: None,
         };
 
         // Allocate 2 * count bytes (LS-A-7: wrap guard + OOM guard).
@@ -9963,12 +10042,14 @@ impl FactStyleGenerator {
         let src_mem = wasm_encoder::MemArg {
             offset: 0,
             align: 0,
-            memory_index: options.caller_memory,
+            target: wasm_encoder::MemArgTarget::Memory(options.caller_memory),
+            ordering: None,
         };
         let dst_mem16 = wasm_encoder::MemArg {
             offset: 0,
             align: 1,
-            memory_index: options.callee_memory,
+            target: wasm_encoder::MemArgTarget::Memory(options.callee_memory),
+            ordering: None,
         };
 
         // Step 1: Allocate output buffer = 2 * byte_len via cabi_realloc (each
@@ -10109,17 +10190,20 @@ impl FactStyleGenerator {
         let src_mem8 = wasm_encoder::MemArg {
             offset: 0,
             align: 0,
-            memory_index: options.caller_memory,
+            target: wasm_encoder::MemArgTarget::Memory(options.caller_memory),
+            ordering: None,
         };
         let dst_mem8 = wasm_encoder::MemArg {
             offset: 0,
             align: 0,
-            memory_index: options.callee_memory,
+            target: wasm_encoder::MemArgTarget::Memory(options.callee_memory),
+            ordering: None,
         };
         let dst_mem16 = wasm_encoder::MemArg {
             offset: 0,
             align: 1,
-            memory_index: options.callee_memory,
+            target: wasm_encoder::MemArgTarget::Memory(options.callee_memory),
+            ordering: None,
         };
 
         // Allocate 2 * byte_len bytes (UTF-16 worst case; bounds Latin-1 too).
@@ -10319,17 +10403,20 @@ impl FactStyleGenerator {
         let src_mem16 = wasm_encoder::MemArg {
             offset: 0,
             align: 1,
-            memory_index: options.caller_memory,
+            target: wasm_encoder::MemArgTarget::Memory(options.caller_memory),
+            ordering: None,
         };
         let dst_mem8 = wasm_encoder::MemArg {
             offset: 0,
             align: 0,
-            memory_index: options.callee_memory,
+            target: wasm_encoder::MemArgTarget::Memory(options.callee_memory),
+            ordering: None,
         };
         let dst_mem16 = wasm_encoder::MemArg {
             offset: 0,
             align: 1,
-            memory_index: options.callee_memory,
+            target: wasm_encoder::MemArgTarget::Memory(options.callee_memory),
+            ordering: None,
         };
 
         // Allocate 2 * code_units bytes.
@@ -10814,7 +10901,8 @@ impl FactStyleGenerator {
             let mem_arg = wasm_encoder::MemArg {
                 offset: 0,
                 align: 2,
-                memory_index: callee_memory,
+                target: wasm_encoder::MemArgTarget::Memory(callee_memory),
+                ordering: None,
             };
             body.instruction(&Instruction::I32Const(0));
             body.instruction(&Instruction::I32Load(mem_arg));
@@ -10823,7 +10911,8 @@ impl FactStyleGenerator {
             let mem_arg_4 = wasm_encoder::MemArg {
                 offset: 4,
                 align: 2,
-                memory_index: callee_memory,
+                target: wasm_encoder::MemArgTarget::Memory(callee_memory),
+                ordering: None,
             };
             body.instruction(&Instruction::I32Const(0));
             body.instruction(&Instruction::I32Load(mem_arg_4));
@@ -10832,7 +10921,8 @@ impl FactStyleGenerator {
             let mem_arg_8 = wasm_encoder::MemArg {
                 offset: 8,
                 align: 2,
-                memory_index: callee_memory,
+                target: wasm_encoder::MemArgTarget::Memory(callee_memory),
+                ordering: None,
             };
             body.instruction(&Instruction::I32Const(0));
             body.instruction(&Instruction::I32Load(mem_arg_8));
@@ -11167,12 +11257,14 @@ impl FactStyleGenerator {
                 let src_mem8 = wasm_encoder::MemArg {
                     offset: 0,
                     align: 0,
-                    memory_index: caller_memory,
+                    target: wasm_encoder::MemArgTarget::Memory(caller_memory),
+                    ordering: None,
                 };
                 let dst_mem16 = wasm_encoder::MemArg {
                     offset: 0,
                     align: 1,
-                    memory_index: callee_memory,
+                    target: wasm_encoder::MemArgTarget::Memory(callee_memory),
+                    ordering: None,
                 };
                 emit_utf8_to_utf16_transcode_param(
                     body,
@@ -11213,12 +11305,14 @@ impl FactStyleGenerator {
                 let src_mem16 = wasm_encoder::MemArg {
                     offset: 0,
                     align: 1,
-                    memory_index: caller_memory,
+                    target: wasm_encoder::MemArgTarget::Memory(caller_memory),
+                    ordering: None,
                 };
                 let dst_mem8 = wasm_encoder::MemArg {
                     offset: 0,
                     align: 0,
-                    memory_index: callee_memory,
+                    target: wasm_encoder::MemArgTarget::Memory(callee_memory),
+                    ordering: None,
                 };
                 emit_utf16_to_utf8_transcode_param(
                     body,
@@ -11271,17 +11365,20 @@ impl FactStyleGenerator {
                 let src_mem8 = wasm_encoder::MemArg {
                     offset: 0,
                     align: 0,
-                    memory_index: caller_memory,
+                    target: wasm_encoder::MemArgTarget::Memory(caller_memory),
+                    ordering: None,
                 };
                 let src_mem16 = wasm_encoder::MemArg {
                     offset: 0,
                     align: 1,
-                    memory_index: caller_memory,
+                    target: wasm_encoder::MemArgTarget::Memory(caller_memory),
+                    ordering: None,
                 };
                 let dst_mem16 = wasm_encoder::MemArg {
                     offset: 0,
                     align: 1,
-                    memory_index: callee_memory,
+                    target: wasm_encoder::MemArgTarget::Memory(callee_memory),
+                    ordering: None,
                 };
                 emit_latin1_to_utf16_transcode_param(
                     body,
@@ -11304,17 +11401,20 @@ impl FactStyleGenerator {
                 let src_mem8 = wasm_encoder::MemArg {
                     offset: 0,
                     align: 0,
-                    memory_index: caller_memory,
+                    target: wasm_encoder::MemArgTarget::Memory(caller_memory),
+                    ordering: None,
                 };
                 let src_mem16 = wasm_encoder::MemArg {
                     offset: 0,
                     align: 1,
-                    memory_index: caller_memory,
+                    target: wasm_encoder::MemArgTarget::Memory(caller_memory),
+                    ordering: None,
                 };
                 let dst_mem8 = wasm_encoder::MemArg {
                     offset: 0,
                     align: 0,
-                    memory_index: callee_memory,
+                    target: wasm_encoder::MemArgTarget::Memory(callee_memory),
+                    ordering: None,
                 };
                 emit_latin1_to_utf8_transcode_param(
                     body,
@@ -11372,17 +11472,20 @@ impl FactStyleGenerator {
                 let src_mem8 = wasm_encoder::MemArg {
                     offset: 0,
                     align: 0,
-                    memory_index: caller_memory,
+                    target: wasm_encoder::MemArgTarget::Memory(caller_memory),
+                    ordering: None,
                 };
                 let dst_mem8 = wasm_encoder::MemArg {
                     offset: 0,
                     align: 0,
-                    memory_index: callee_memory,
+                    target: wasm_encoder::MemArgTarget::Memory(callee_memory),
+                    ordering: None,
                 };
                 let dst_mem16 = wasm_encoder::MemArg {
                     offset: 0,
                     align: 1,
-                    memory_index: callee_memory,
+                    target: wasm_encoder::MemArgTarget::Memory(callee_memory),
+                    ordering: None,
                 };
                 emit_utf8_to_latin1_transcode_param(
                     body,
@@ -11408,17 +11511,20 @@ impl FactStyleGenerator {
                 let src_mem16 = wasm_encoder::MemArg {
                     offset: 0,
                     align: 1,
-                    memory_index: caller_memory,
+                    target: wasm_encoder::MemArgTarget::Memory(caller_memory),
+                    ordering: None,
                 };
                 let dst_mem8 = wasm_encoder::MemArg {
                     offset: 0,
                     align: 0,
-                    memory_index: callee_memory,
+                    target: wasm_encoder::MemArgTarget::Memory(callee_memory),
+                    ordering: None,
                 };
                 let dst_mem16 = wasm_encoder::MemArg {
                     offset: 0,
                     align: 1,
-                    memory_index: callee_memory,
+                    target: wasm_encoder::MemArgTarget::Memory(callee_memory),
+                    ordering: None,
                 };
                 emit_utf16_to_latin1_transcode_param(
                     body,
@@ -11709,12 +11815,14 @@ impl FactStyleGenerator {
             let src_mem8 = wasm_encoder::MemArg {
                 offset: 0,
                 align: 0,
-                memory_index: callee_memory,
+                target: wasm_encoder::MemArgTarget::Memory(callee_memory),
+                ordering: None,
             };
             let dst_mem16 = wasm_encoder::MemArg {
                 offset: 0,
                 align: 1,
-                memory_index: caller_memory,
+                target: wasm_encoder::MemArgTarget::Memory(caller_memory),
+                ordering: None,
             };
             emit_utf8_to_utf16_transcode_param(
                 body,
@@ -11740,12 +11848,14 @@ impl FactStyleGenerator {
             let src_mem16 = wasm_encoder::MemArg {
                 offset: 0,
                 align: 1,
-                memory_index: callee_memory,
+                target: wasm_encoder::MemArgTarget::Memory(callee_memory),
+                ordering: None,
             };
             let dst_mem8 = wasm_encoder::MemArg {
                 offset: 0,
                 align: 0,
-                memory_index: caller_memory,
+                target: wasm_encoder::MemArgTarget::Memory(caller_memory),
+                ordering: None,
             };
             emit_utf16_to_utf8_transcode_param(
                 body,
@@ -11772,17 +11882,20 @@ impl FactStyleGenerator {
             let src_mem8 = wasm_encoder::MemArg {
                 offset: 0,
                 align: 0,
-                memory_index: callee_memory,
+                target: wasm_encoder::MemArgTarget::Memory(callee_memory),
+                ordering: None,
             };
             let src_mem16 = wasm_encoder::MemArg {
                 offset: 0,
                 align: 1,
-                memory_index: callee_memory,
+                target: wasm_encoder::MemArgTarget::Memory(callee_memory),
+                ordering: None,
             };
             let dst_mem16 = wasm_encoder::MemArg {
                 offset: 0,
                 align: 1,
-                memory_index: caller_memory,
+                target: wasm_encoder::MemArgTarget::Memory(caller_memory),
+                ordering: None,
             };
             emit_latin1_to_utf16_transcode_param(
                 body,
@@ -11806,17 +11919,20 @@ impl FactStyleGenerator {
             let src_mem8 = wasm_encoder::MemArg {
                 offset: 0,
                 align: 0,
-                memory_index: callee_memory,
+                target: wasm_encoder::MemArgTarget::Memory(callee_memory),
+                ordering: None,
             };
             let src_mem16 = wasm_encoder::MemArg {
                 offset: 0,
                 align: 1,
-                memory_index: callee_memory,
+                target: wasm_encoder::MemArgTarget::Memory(callee_memory),
+                ordering: None,
             };
             let dst_mem8 = wasm_encoder::MemArg {
                 offset: 0,
                 align: 0,
-                memory_index: caller_memory,
+                target: wasm_encoder::MemArgTarget::Memory(caller_memory),
+                ordering: None,
             };
             emit_latin1_to_utf8_transcode_param(
                 body,
@@ -11845,17 +11961,20 @@ impl FactStyleGenerator {
             let src_mem8 = wasm_encoder::MemArg {
                 offset: 0,
                 align: 0,
-                memory_index: callee_memory,
+                target: wasm_encoder::MemArgTarget::Memory(callee_memory),
+                ordering: None,
             };
             let dst_mem8 = wasm_encoder::MemArg {
                 offset: 0,
                 align: 0,
-                memory_index: caller_memory,
+                target: wasm_encoder::MemArgTarget::Memory(caller_memory),
+                ordering: None,
             };
             let dst_mem16 = wasm_encoder::MemArg {
                 offset: 0,
                 align: 1,
-                memory_index: caller_memory,
+                target: wasm_encoder::MemArgTarget::Memory(caller_memory),
+                ordering: None,
             };
             emit_utf8_to_latin1_transcode_param(
                 body,
@@ -11882,17 +12001,20 @@ impl FactStyleGenerator {
             let src_mem16 = wasm_encoder::MemArg {
                 offset: 0,
                 align: 1,
-                memory_index: callee_memory,
+                target: wasm_encoder::MemArgTarget::Memory(callee_memory),
+                ordering: None,
             };
             let dst_mem8 = wasm_encoder::MemArg {
                 offset: 0,
                 align: 0,
-                memory_index: caller_memory,
+                target: wasm_encoder::MemArgTarget::Memory(caller_memory),
+                ordering: None,
             };
             let dst_mem16 = wasm_encoder::MemArg {
                 offset: 0,
                 align: 1,
-                memory_index: caller_memory,
+                target: wasm_encoder::MemArgTarget::Memory(caller_memory),
+                ordering: None,
             };
             emit_utf16_to_latin1_transcode_param(
                 body,
@@ -11971,12 +12093,14 @@ impl FactStyleGenerator {
         let mem_arg_0 = wasm_encoder::MemArg {
             offset: 0,
             align: 2,
-            memory_index: caller_memory,
+            target: wasm_encoder::MemArgTarget::Memory(caller_memory),
+            ordering: None,
         };
         let mem_arg_4 = wasm_encoder::MemArg {
             offset: 4,
             align: 2,
-            memory_index: caller_memory,
+            target: wasm_encoder::MemArgTarget::Memory(caller_memory),
+            ordering: None,
         };
         body.instruction(&Instruction::LocalGet(retptr_local));
         body.instruction(&Instruction::LocalGet(l_dst_ptr));
@@ -12036,7 +12160,8 @@ impl FactStyleGenerator {
                     wasm_encoder::ValType::I64 | wasm_encoder::ValType::F64 => 3,
                     _ => 2,
                 },
-                memory_index: caller_memory,
+                target: wasm_encoder::MemArgTarget::Memory(caller_memory),
+                ordering: None,
             };
             match val_ty {
                 wasm_encoder::ValType::I32 => {
@@ -12952,6 +13077,15 @@ impl AdapterOptions {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Memory index of a decoded linear-memory `memarg` (wasmparser 0.263
+    /// replaced `MemArg::memory` with a `target` that can also name a GC array).
+    fn test_memarg_memory(memarg: &wasmparser::MemArg) -> u32 {
+        match memarg.target {
+            wasmparser::MemArgTarget::Memory(m) => m,
+            other => panic!("expected a linear-memory memarg, got {other:?}"),
+        }
+    }
 
     #[test]
     fn test_adapter_options_default() {
@@ -15086,10 +15220,14 @@ mod tests {
                 Operator::Call { function_index } => out.calls.push((i, function_index)),
                 Operator::I32Load { memarg }
                 | Operator::I32Load8U { memarg }
-                | Operator::I32Load16U { memarg } => out.loads.push((i, memarg.memory)),
+                | Operator::I32Load16U { memarg } => {
+                    out.loads.push((i, test_memarg_memory(&memarg)))
+                }
                 Operator::I32Store { memarg }
                 | Operator::I32Store8 { memarg }
-                | Operator::I32Store16 { memarg } => out.stores.push((i, memarg.memory)),
+                | Operator::I32Store16 { memarg } => {
+                    out.stores.push((i, test_memarg_memory(&memarg)))
+                }
                 _ => {}
             }
         }

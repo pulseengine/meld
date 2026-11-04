@@ -144,7 +144,8 @@ fn build_callee_string_component() -> Vec<u8> {
             f.instruction(&Instruction::I32Load8U(wasm_encoder::MemArg {
                 offset: 0,
                 align: 0,
-                memory_index: 0,
+                target: wasm_encoder::MemArgTarget::Memory(0),
+                ordering: None,
             }));
             f.instruction(&Instruction::LocalGet(2));
             f.instruction(&Instruction::I32Add);
@@ -564,7 +565,8 @@ fn build_callee_realloc_verify_component() -> Vec<u8> {
             f.instruction(&Instruction::I32Store8(wasm_encoder::MemArg {
                 offset: 0,
                 align: 0,
-                memory_index: 0,
+                target: wasm_encoder::MemArgTarget::Memory(0),
+                ordering: None,
             }));
             // Standard bump allocator
             f.instruction(&Instruction::GlobalGet(0));
@@ -584,7 +586,8 @@ fn build_callee_realloc_verify_component() -> Vec<u8> {
             f.instruction(&Instruction::I32Load8U(wasm_encoder::MemArg {
                 offset: 0,
                 align: 0,
-                memory_index: 0,
+                target: wasm_encoder::MemArgTarget::Memory(0),
+                ordering: None,
             }));
             f.instruction(&Instruction::End);
             code.function(&f);
@@ -973,7 +976,8 @@ fn build_callee_list_u32_component() -> Vec<u8> {
             f.instruction(&Instruction::I32Load(wasm_encoder::MemArg {
                 offset: 0,
                 align: 2,
-                memory_index: 0,
+                target: wasm_encoder::MemArgTarget::Memory(0),
+                ordering: None,
             }));
             f.instruction(&Instruction::LocalGet(2));
             f.instruction(&Instruction::I32Add);
@@ -1404,7 +1408,8 @@ fn build_callee_list_string_component() -> Vec<u8> {
             f.instruction(&Instruction::I32Load(wasm_encoder::MemArg {
                 offset: 0,
                 align: 2,
-                memory_index: 0,
+                target: wasm_encoder::MemArgTarget::Memory(0),
+                ordering: None,
             }));
             f.instruction(&Instruction::LocalSet(4)); // str_ptr
 
@@ -1417,7 +1422,8 @@ fn build_callee_list_string_component() -> Vec<u8> {
             f.instruction(&Instruction::I32Load(wasm_encoder::MemArg {
                 offset: 4,
                 align: 2,
-                memory_index: 0,
+                target: wasm_encoder::MemArgTarget::Memory(0),
+                ordering: None,
             }));
             f.instruction(&Instruction::LocalSet(5)); // str_len
 
@@ -1441,7 +1447,8 @@ fn build_callee_list_string_component() -> Vec<u8> {
             f.instruction(&Instruction::I32Load8U(wasm_encoder::MemArg {
                 offset: 0,
                 align: 0,
-                memory_index: 0,
+                target: wasm_encoder::MemArgTarget::Memory(0),
+                ordering: None,
             }));
             f.instruction(&Instruction::LocalGet(2));
             f.instruction(&Instruction::I32Add);
@@ -1920,7 +1927,8 @@ fn build_callee_codeunit_summing_component(lift_encoding: CanonicalOption) -> Ve
             f.instruction(&Instruction::I32Load16U(wasm_encoder::MemArg {
                 offset: 0,
                 align: 1, // 2-byte alignment
-                memory_index: 0,
+                target: wasm_encoder::MemArgTarget::Memory(0),
+                ordering: None,
             }));
             f.instruction(&Instruction::LocalGet(2));
             f.instruction(&Instruction::I32Add);
@@ -3388,7 +3396,8 @@ fn build_callee_compact_decoding_component() -> Vec<u8> {
                 f.instruction(&Instruction::I32Load16U(wasm_encoder::MemArg {
                     offset: 0,
                     align: 1,
-                    memory_index: 0,
+                    target: wasm_encoder::MemArgTarget::Memory(0),
+                    ordering: None,
                 }));
                 f.instruction(&Instruction::LocalGet(2));
                 f.instruction(&Instruction::I32Add);
@@ -3402,7 +3411,8 @@ fn build_callee_compact_decoding_component() -> Vec<u8> {
                 f.instruction(&Instruction::I32Load8U(wasm_encoder::MemArg {
                     offset: 0,
                     align: 0,
-                    memory_index: 0,
+                    target: wasm_encoder::MemArgTarget::Memory(0),
+                    ordering: None,
                 }));
                 f.instruction(&Instruction::LocalGet(2));
                 f.instruction(&Instruction::I32Add);

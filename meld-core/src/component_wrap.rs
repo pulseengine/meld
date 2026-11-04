@@ -725,11 +725,13 @@ fn convert_memory_to_import(original_bytes: &[u8], info: &FusedModuleInfo) -> Re
                 module.section(&functions);
             }
             wasmparser::Payload::TableSection(reader) => {
-                let raw = &original_bytes[reader.range().start..reader.range().end];
+                let raw =
+                    &original_bytes[reader.range().start as usize..reader.range().end as usize];
                 module.section(&RawSection { id: 4, data: raw });
             }
             wasmparser::Payload::GlobalSection(reader) => {
-                let raw = &original_bytes[reader.range().start..reader.range().end];
+                let raw =
+                    &original_bytes[reader.range().start as usize..reader.range().end as usize];
                 module.section(&RawSection { id: 6, data: raw });
             }
             wasmparser::Payload::ExportSection(reader) => {
@@ -755,7 +757,8 @@ fn convert_memory_to_import(original_bytes: &[u8], info: &FusedModuleInfo) -> Re
                     }
                     module.section(&exports);
                 } else {
-                    let raw = &original_bytes[reader.range().start..reader.range().end];
+                    let raw =
+                        &original_bytes[reader.range().start as usize..reader.range().end as usize];
                     module.section(&RawSection { id: 7, data: raw });
                 }
             }
@@ -764,18 +767,23 @@ fn convert_memory_to_import(original_bytes: &[u8], info: &FusedModuleInfo) -> Re
                 // after the indirect table is filled by the fixup module.
             }
             wasmparser::Payload::ElementSection(reader) => {
-                let raw = &original_bytes[reader.range().start..reader.range().end];
+                let raw =
+                    &original_bytes[reader.range().start as usize..reader.range().end as usize];
                 module.section(&RawSection { id: 9, data: raw });
             }
             wasmparser::Payload::DataCountSection { count, .. } => {
                 module.section(&wasm_encoder::DataCountSection { count });
             }
-            wasmparser::Payload::CodeSectionStart { range, .. } => {
-                let raw = &original_bytes[range.start..range.end];
+            wasmparser::Payload::CodeSectionStart {
+                unchecked_range: range,
+                ..
+            } => {
+                let raw = &original_bytes[range.start as usize..range.end as usize];
                 module.section(&RawSection { id: 10, data: raw });
             }
             wasmparser::Payload::DataSection(reader) => {
-                let raw = &original_bytes[reader.range().start..reader.range().end];
+                let raw =
+                    &original_bytes[reader.range().start as usize..reader.range().end as usize];
                 module.section(&RawSection { id: 11, data: raw });
             }
             wasmparser::Payload::CustomSection(reader) => {
@@ -888,7 +896,7 @@ fn assemble_component(
             for entry in reader {
                 let entry =
                     entry.map_err(|e| Error::EncodingError(format!("import entry: {e}")))?;
-                if dropped_import_names.contains(entry.name.0) {
+                if dropped_import_names.contains(crate::parser::plain_extern_name(&entry.name)?) {
                     continue;
                 }
                 let ty = match entry.ty {
@@ -914,7 +922,7 @@ fn assemble_component(
                 } else {
                     ty
                 };
-                imports.import(entry.name.0, ty);
+                imports.import(crate::parser::plain_extern_name(&entry.name)?, ty);
             }
             component.section(&imports);
         } else {
@@ -1875,10 +1883,10 @@ fn assemble_component(
                         canon.task_cancel();
                     }
                     P3BuiltinOp::ContextGet(slot) => {
-                        canon.context_get(*slot);
+                        canon.context_get(wasm_encoder::ValType::I32, *slot);
                     }
                     P3BuiltinOp::ContextSet(slot) => {
-                        canon.context_set(*slot);
+                        canon.context_set(wasm_encoder::ValType::I32, *slot);
                     }
                     P3BuiltinOp::WaitableJoin => {
                         canon.waitable_join();
@@ -1892,7 +1900,7 @@ fn assemble_component(
                     P3BuiltinOp::WaitableSetPoll => {
                         // waitable-set.poll requires async flag and memory index.
                         // Default: async_=false, memory=0
-                        canon.waitable_set_poll(false, memory_core_indices[0]);
+                        canon.waitable_set_poll(memory_core_indices[0]);
                     }
                     P3BuiltinOp::BackpressureInc => {
                         canon.backpressure_inc();

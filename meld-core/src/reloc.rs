@@ -585,6 +585,7 @@ pub fn first_misaligned_code_reloc(
             .map_err(|e| RelocError::CodeParse(e.to_string()))?;
         let items: Vec<(wasmparser::Operator<'_>, usize)> = ops
             .into_iter_with_offsets()
+            .map(|r| r.map(|(op, pos)| (op, pos as usize)))
             .collect::<std::result::Result<Vec<_>, _>>()
             .map_err(|e| RelocError::CodeParse(e.to_string()))?;
         let ends = items

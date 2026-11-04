@@ -46,7 +46,7 @@ wasmprinter.workspace = true
 # Re-declared for integration tests (tests/dwarf_remap_witness.rs) to
 # parse and validate the remapped DWARF in the fused output.
 gimli.workspace = true
-wat = "1.219"
+wat = "1.263"
 # default-features = false + wasmtime 50.0.0's full default set MINUS `cache`.
 # `cache` (on-disk compiled-module cache) pulls wasmtime-internal-cache ->
 # zstd 0.13 / zstd-safe 7 / zstd-sys 2.0, which carry RUSTSEC-2026-0391,

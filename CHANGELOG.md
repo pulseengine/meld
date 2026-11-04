@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 ## [Unreleased]
 
 ### Changed
+- **wasmparser / wasm-encoder 0.246 -> 0.263 (#546).** This is the
+  prerequisite for P3 cooperative threads. The old decoder read some current
+  thread built-ins as different ones, for example `thread.suspend-then-resume`
+  as `thread.resume-later`. Fused output is byte-identical on every fixture and
+  on the 504-component P3 corpus. One input class changes, from silent to loud:
+  a `thread.yield`, `waitable-set.wait` or `waitable-set.poll` with the legacy
+  `cancellable` byte set is now refused at parse (component-model#716 removed
+  it). meld 0.66.0 accepted it and dropped the flag.
 - **Threaded inputs are refused (SR-108, ADR-9).** A core module that defines
   or imports a `shared` memory is now refused with an error citing ADR-9.
   wasi-threads (P1) and shared-everything threads are out of scope: the fused

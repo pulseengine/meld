@@ -91,13 +91,16 @@ fn function_body_ranges(wasm: &[u8]) -> Vec<(u64, u64)> {
     let mut ranges = Vec::new();
     for payload in wasmparser::Parser::new(0).parse_all(wasm) {
         match payload.unwrap() {
-            wasmparser::Payload::CodeSectionStart { range, .. } => {
-                code_section_start = Some(range.start as u64);
+            wasmparser::Payload::CodeSectionStart {
+                unchecked_range: range,
+                ..
+            } => {
+                code_section_start = Some(range.start);
             }
             wasmparser::Payload::CodeSectionEntry(body) => {
                 let base = code_section_start.expect("code section started");
                 let r = body.range();
-                ranges.push((r.start as u64 - base, r.end as u64 - base));
+                ranges.push((r.start - base, r.end - base));
             }
             _ => {}
         }

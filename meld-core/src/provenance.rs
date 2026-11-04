@@ -300,11 +300,14 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
 /// with `merged.functions[i]` for `i < merged.functions.len()`.
 pub fn code_section_function_ranges(module_bytes: &[u8]) -> Vec<CodeRange> {
     let mut ranges = Vec::new();
-    let mut content_start: Option<usize> = None;
+    let mut content_start: Option<u64> = None;
     let parser = wasmparser::Parser::new(0);
     for payload in parser.parse_all(module_bytes) {
         match payload {
-            Ok(wasmparser::Payload::CodeSectionStart { range, .. }) => {
+            Ok(wasmparser::Payload::CodeSectionStart {
+                unchecked_range: range,
+                ..
+            }) => {
                 content_start = Some(range.start);
             }
             Ok(wasmparser::Payload::CodeSectionEntry(body)) => {
@@ -570,11 +573,14 @@ mod tests {
         let wasm = wat::parse_str(r#"(module (func nop) (func (result i32) i32.const 7))"#)
             .expect("wat parse");
 
-        let mut content_start = None;
+        let mut content_start: Option<u64> = None;
         let mut expected = Vec::new();
         for payload in wasmparser::Parser::new(0).parse_all(&wasm) {
             match payload.expect("parse") {
-                wasmparser::Payload::CodeSectionStart { range, .. } => {
+                wasmparser::Payload::CodeSectionStart {
+                    unchecked_range: range,
+                    ..
+                } => {
                     content_start = Some(range.start);
                 }
                 wasmparser::Payload::CodeSectionEntry(body) => {

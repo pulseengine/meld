@@ -516,8 +516,12 @@ fn code_section_len(bytes: &[u8]) -> Option<usize> {
     let parser = wasmparser::Parser::new(0);
     for payload in parser.parse_all(bytes) {
         let payload = payload.ok()?;
-        if let wasmparser::Payload::CodeSectionStart { range, .. } = payload {
-            return Some(range.end - range.start);
+        if let wasmparser::Payload::CodeSectionStart {
+            unchecked_range: range,
+            ..
+        } = payload
+        {
+            return Some((range.end - range.start) as usize);
         }
     }
     None
@@ -529,8 +533,12 @@ fn code_section_len_recursive(bytes: &[u8]) -> Option<usize> {
     let mut saw_any = false;
     for payload in parser.parse_all(bytes) {
         let payload = payload.ok()?;
-        if let wasmparser::Payload::CodeSectionStart { range, .. } = payload {
-            total = total.saturating_add(range.end - range.start);
+        if let wasmparser::Payload::CodeSectionStart {
+            unchecked_range: range,
+            ..
+        } = payload
+        {
+            total = total.saturating_add((range.end - range.start) as usize);
             saw_any = true;
         }
     }
