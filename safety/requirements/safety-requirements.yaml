@@ -3816,6 +3816,22 @@ artifacts:
       timestamp: 2026-10-28T13:54:56Z
     release: v0.66.0
 
+  - id: SR-111
+    type: sw-req
+    title: An async call between components that meld cannot fuse is refused at fuse time, and nothing meld leaves to the host carries a wrong or internal name
+    status: implemented
+    description: "A 504-component P3 corpus (#548) showed 26 natural caller/callee pairs fusing at exit 0 with zero fused calls between components: each caller lowers with the async option ([async-lower]f), meld only bridges a sync caller to an [async-lift] callee, and the call was left to the host. kiln refuses such a module at load (E21A0, 65 unresolved imports on the fused ping-pong pair). The design for fusing these calls is ADR-10 (meld data plane, kiln-async control, gale wake/time/isolation). Until its adapters land, the maintainer decided (2026-11-04, recorded in ADR-10 and kiln AD-ASYNC-001) that meld refuses at fuse time instead of exiting 0. meld shall: (1) refuse a fusion in which a core import [async-lower]f of one component resolves to an export f (plain or [async-lift]) of another fused component, with an error naming both components, the callee export and the caller import and citing #548 and ADR-10; (2) emit an async lowering that it leaves to the host under the producer's field name [async-lower]f, never the bare f, which a host would bind with the sync convention (#557); (3) refuse a core import wired to stream.read, stream.write, future.read or future.write for which meld has no producer name, instead of emitting wit-component's shim-internal name (actual::N), which no host can serve, naming the built-in and citing #558 (streams and futures pass through in ADR-10 step 6)."
+    links:
+      - type: derives-from
+        target: SYS-3
+      - type: refines
+        target: SR-109
+    provenance:
+      created-by: ai-assisted
+      model: claude-opus-5-5
+      timestamp: 2026-11-04T23:30:00Z
+    release: v0.68.0
+
   - id: SR-110
     type: sw-req
     title: P3 cooperative threads pass through to the host in the producer ABI, with the identity of the start-function table

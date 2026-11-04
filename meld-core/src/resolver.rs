@@ -685,39 +685,70 @@ fn trace_core_func_to_chain_end(
 /// bug; stream/future/error-context built-ins are lowered by other passes
 /// under the module's own import name and are left alone.
 fn core_builtin_canon_funcs(component: &ParsedComponent) -> HashMap<u32, usize> {
-    use crate::parser::{CanonicalEntry as E, ComponentAliasEntry, CoreEntityDef};
+    use crate::parser::CanonicalEntry as E;
+    core_canon_funcs_matching(component, |entry| {
+        matches!(
+            entry,
+            E::TaskReturn { .. }
+                | E::TaskCancel
+                | E::BackpressureInc
+                | E::BackpressureDec
+                | E::ContextGet(_)
+                | E::ContextSet(_)
+                | E::WaitableJoin
+                | E::WaitableSetNew
+                | E::WaitableSetDrop
+                | E::WaitableSetPoll { .. }
+                | E::WaitableSetWait { .. }
+                | E::SubtaskDrop
+                | E::SubtaskCancel { .. }
+                | E::ThreadYield { .. }
+                | E::ThreadIndex
+                | E::ThreadNewIndirect { .. }
+                | E::ThreadResumeLater
+                | E::ThreadSuspend
+                | E::ThreadSuspendThenResume
+                | E::ThreadYieldThenResume
+                | E::ThreadSuspendThenPromote
+                | E::ThreadYieldThenPromote
+        )
+    })
+}
+
+/// `core func index -> canonical_functions index` for every core func defined
+/// by `stream.read`, `stream.write`, `future.read` or `future.write` (#558).
+///
+/// These four take memory/realloc options, so wit-component always routes
+/// them through its indirect-call shim: the fixup module imports each one as
+/// `"actual" "<n>"`. meld has no producer name for them (ADR-10 step 6), so
+/// an import that reaches one of them must be refused rather than emitted
+/// under the shim's internal name, which no host can serve.
+fn core_stream_future_rw_funcs(component: &ParsedComponent) -> HashMap<u32, usize> {
+    use crate::parser::CanonicalEntry as E;
+    core_canon_funcs_matching(component, |entry| {
+        matches!(
+            entry,
+            E::StreamRead { .. }
+                | E::StreamWrite { .. }
+                | E::FutureRead { .. }
+                | E::FutureWrite { .. }
+        )
+    })
+}
+
+/// Replay `core_entity_order` and collect every core func defined by a
+/// canonical function for which `pred` holds.
+fn core_canon_funcs_matching(
+    component: &ParsedComponent,
+    pred: impl Fn(&crate::parser::CanonicalEntry) -> bool,
+) -> HashMap<u32, usize> {
+    use crate::parser::{ComponentAliasEntry, CoreEntityDef};
     let mut out = HashMap::new();
     let mut func_idx = 0u32;
     for def in &component.core_entity_order {
         match def {
             CoreEntityDef::CanonicalFunction(i) => {
-                if matches!(
-                    component.canonical_functions.get(*i),
-                    Some(
-                        E::TaskReturn { .. }
-                            | E::TaskCancel
-                            | E::BackpressureInc
-                            | E::BackpressureDec
-                            | E::ContextGet(_)
-                            | E::ContextSet(_)
-                            | E::WaitableJoin
-                            | E::WaitableSetNew
-                            | E::WaitableSetDrop
-                            | E::WaitableSetPoll { .. }
-                            | E::WaitableSetWait { .. }
-                            | E::SubtaskDrop
-                            | E::SubtaskCancel { .. }
-                            | E::ThreadYield { .. }
-                            | E::ThreadIndex
-                            | E::ThreadNewIndirect { .. }
-                            | E::ThreadResumeLater
-                            | E::ThreadSuspend
-                            | E::ThreadSuspendThenResume
-                            | E::ThreadYieldThenResume
-                            | E::ThreadSuspendThenPromote
-                            | E::ThreadYieldThenPromote
-                    )
-                ) {
+                if component.canonical_functions.get(*i).is_some_and(&pred) {
                     out.insert(func_idx, *i);
                 }
                 func_idx += 1;
@@ -1406,7 +1437,10 @@ fn build_canon_import_names(component: &ParsedComponent) -> HashMap<u32, (String
             CoreEntityDef::CanonicalFunction(canon_idx) => {
                 if let Some(entry) = component.canonical_functions.get(*canon_idx) {
                     match entry {
-                        CanonicalEntry::Lower { func_index, .. } => {
+                        CanonicalEntry::Lower {
+                            func_index,
+                            options,
+                        } => {
                             // Trace func_index to WASI name
                             if let Some((inst_idx, field_name)) =
                                 comp_func_to_instance_export.get(func_index)
@@ -1416,10 +1450,17 @@ fn build_canon_import_names(component: &ParsedComponent) -> HashMap<u32, (String
                                 if let Some(module_name) =
                                     comp_instance_to_import_name.get(inst_idx)
                                 {
-                                    result.insert(
-                                        core_func_idx,
-                                        (module_name.clone(), field_name.clone()),
-                                    );
+                                    // #557: an async lowering has the async calling
+                                    // convention (packed status, results through
+                                    // retptr, a subtask). Keep the producer's
+                                    // `[async-lower]` prefix so the host binds it as
+                                    // async; the bare name would bind a sync lowering.
+                                    let field = if options.async_ {
+                                        format!("[async-lower]{field_name}")
+                                    } else {
+                                        field_name.clone()
+                                    };
+                                    result.insert(core_func_idx, (module_name.clone(), field));
                                 }
                             } else if let Some(import_name) = comp_func_import_names.get(func_index)
                             {
@@ -2891,6 +2932,7 @@ impl Resolver {
         let canon_lower_sites = core_lower_options(component);
         let core_func_aliases = core_func_alias_targets(component);
         let builtin_canon_funcs = core_builtin_canon_funcs(component);
+        let stream_future_rw_funcs = core_stream_future_rw_funcs(component);
         let instantiated_instances: std::collections::HashSet<u32> = component
             .instances
             .iter()
@@ -3100,6 +3142,30 @@ impl Resolver {
                                 {
                                     display_module = Some(mod_name.clone());
                                     display_field = Some(field_name.clone());
+                                } else if lower_core_func.is_none()
+                                    && let Some(canon_idx) = stream_future_rw_funcs.get(&named_idx)
+                                {
+                                    let which = match component.canonical_functions.get(*canon_idx)
+                                    {
+                                        Some(crate::parser::CanonicalEntry::StreamRead {
+                                            ..
+                                        }) => "stream.read",
+                                        Some(crate::parser::CanonicalEntry::StreamWrite {
+                                            ..
+                                        }) => "stream.write",
+                                        Some(crate::parser::CanonicalEntry::FutureRead {
+                                            ..
+                                        }) => "future.read",
+                                        _ => "future.write",
+                                    };
+                                    return Err(Error::UnsupportedFeature(format!(
+                                        "core import {}::{} is wired to the canonical built-in \
+                                         `{which}`, which meld cannot fuse yet: it has no \
+                                         producer name for it, and emitting the shim's internal \
+                                         name would leave an import no host can serve (#558; \
+                                         streams and futures are ADR-10 step 6)",
+                                        import.module, import.name
+                                    )));
                                 } else if lower_core_func.is_none()
                                     && builtin_canon_funcs.contains_key(&named_idx)
                                 {
@@ -3484,6 +3550,33 @@ impl Resolver {
                         let callee_core_to_local = build_core_func_to_module_local(to_component);
 
                         for func_name in &interface_func_imports {
+                            // #548 / ADR-10: a caller that lowers with the async
+                            // option (`[async-lower]f`) expects STARTED + a
+                            // subtask and a later SUBTASK event. meld cannot
+                            // fuse that edge until the ADR-10 adapters exist,
+                            // and leaving it to the host only fails later, at
+                            // load. Refuse at fuse time, naming the edge.
+                            if let Some(base) = func_name.strip_prefix("[async-lower]") {
+                                let target = format!("{}#{}", export_name, base);
+                                let async_target = format!("[async-lift]{}", target);
+                                let callee_exports_it = to_component.core_modules.iter().any(|m| {
+                                    m.exports.iter().any(|e| {
+                                        e.kind == ExportKind::Function
+                                            && (e.name == target || e.name == async_target)
+                                    })
+                                });
+                                if callee_exports_it {
+                                    return Err(Error::UnsupportedFeature(format!(
+                                        "component {} calls `{}` (`{}::{}`) with the async \
+                                         calling convention, and component {} implements it. \
+                                         meld cannot fuse an async-lower call between \
+                                         components yet: it needs real subtasks run by the \
+                                         host scheduler (ADR-10, #548). Refusing instead of \
+                                         leaving the call unresolved",
+                                        from_comp, target, import_name, func_name, to_comp
+                                    )));
+                                }
+                            }
                             let qualified = format!("{}#{}", export_name, func_name);
                             let mut found = false;
 

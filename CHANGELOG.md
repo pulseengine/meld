@@ -4,6 +4,30 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+- **P3 async calls meld cannot fuse are refused at fuse time instead of exiting
+  0 (SR-111, ADR-10, #548, #557, #558).** Maintainer decision until the ADR-10
+  adapters land:
+  - **#548:** a caller that lowers with the async option (`[async-lower]f`)
+    and whose callee is another fused component is refused. The error names
+    the caller import, the callee export, #548 and ADR-10.
+  - **#557:** an async lowering left to the host keeps the producer's
+    `[async-lower]` prefix. v0.67.0 emitted it as plain `f` with the async core
+    type, so a host would bind it as a sync call.
+  - **#558:** `stream.read`/`write` and `future.read`/`write` that meld cannot
+    name are refused, naming the built-in. v0.67.0 emitted them under
+    wit-component's shim-internal `actual::N`, which no host serves.
+
+  Corpus effect (`--memory multi`, against the v0.67.0 release):
+  - of 906 single-component inputs, 446 fuse byte-identically;
+  - 25 change only in import names (the `[async-lower]` prefix);
+  - 220 are newly refused, all citing #558.
+
+  Every P3 caller/callee pair in the corpus is now refused (43), and all 42
+  non-P3 pairs fuse byte-identically. kiln already refused all of these modules
+  at load (E21A0). The #545 validation tests now use `reentrance-m6.wasm`,
+  because `empty-wait.wasm` is refused before validation runs.
+
 ## [0.67.0] - 2026-11-04
 
 ### Added

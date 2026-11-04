@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn fixture() -> PathBuf {
-    let p = Path::new(env!("CARGO_MANIFEST_DIR")).join("../tests/p3/issue_545/empty-wait.wasm");
+    let p = Path::new(env!("CARGO_MANIFEST_DIR")).join("../tests/p3/issue_545/reentrance-m6.wasm");
     // #405: a missing fixture must fail the test, not pass it. Without this, a
     // refused fusion of a file that does not exist satisfies the invariant
     // below ("refused, nothing written") and the test runs on nothing.
