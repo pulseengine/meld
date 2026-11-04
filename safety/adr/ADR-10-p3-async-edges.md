@@ -265,6 +265,7 @@ parser to the trusted code base for no gain.
 
 ## Open questions
 
+- gale's review of this draft (§4 and §5) is pending.
 
 ## Resolved
 
