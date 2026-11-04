@@ -90,6 +90,9 @@ pub struct ImportMapEntry {
     /// `utf8`, `utf16` or `latin1+utf16`.
     pub encoding: LowerOption<&'static str>,
     pub resource: Option<ResourceInfo>,
+    /// `[thread-new-indirect-v0]` only (#547): the fused table whose entries
+    /// the `fn_idx` argument indexes.
+    pub thread_table: Option<crate::thread_builtins::ThreadTable>,
 }
 
 /// What the final core module exposes, parsed from its own bytes so the names
@@ -216,6 +219,7 @@ pub fn build_import_map(
     components: &[ParsedComponent],
     merged: &MergedModule,
     core: &[u8],
+    thread_table: Option<&crate::thread_builtins::ThreadTable>,
 ) -> Vec<ImportMapEntry> {
     let view = core_view(core);
     let func_imports: Vec<&crate::merger::MergedImport> = merged
@@ -258,7 +262,11 @@ pub fn build_import_map(
                 realloc: LowerOption::Absent,
                 encoding: LowerOption::Absent,
                 resource: None,
+                thread_table: None,
             };
+            if crate::thread_builtins::is_new_indirect_import(module, name) {
+                entry.thread_table = thread_table.cloned();
+            }
             let unknown = |entry: &mut ImportMapEntry, why: String| {
                 entry.memory = LowerOption::Unknown(why.clone());
                 entry.realloc = LowerOption::Unknown(why.clone());
@@ -274,6 +282,12 @@ pub fn build_import_map(
             let own = func_imports[i];
             entry.component = own.component_idx;
             entry.resource = resource_info(&view, module, name, own.component_idx);
+            // A cooperative-thread built-in takes only opaque i32s (a table
+            // index, a closure word, a thread handle): no memory, realloc or
+            // string option, so `null` is the true answer, not "unknown".
+            if crate::thread_builtins::is_builtin_import(module, name) {
+                return entry;
+            }
             // A resource intrinsic is a canonical builtin, not a lower: it has
             // no memory, realloc or string option to report.
             if entry.resource.is_some() {

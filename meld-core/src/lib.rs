@@ -71,6 +71,7 @@ pub mod resource_graph;
 pub mod rewriter;
 pub mod segments;
 pub mod signature_manifest;
+pub mod thread_builtins;
 pub mod world_exports;
 
 pub use adapter::{AdapterConfig, AdapterGenerator};
@@ -792,6 +793,11 @@ pub struct FusionStats {
     /// source `canon lower`. Side-output only: nothing in the artifact or its
     /// attestation reads it.
     pub import_map: Vec<import_map::ImportMapEntry>,
+
+    /// #547 / ADR-9: the fused funcref table `thread.new-indirect`'s `fn_idx`
+    /// indexes, exported as `__meld_thread_table`. `None` when no component
+    /// creates a cooperative thread. Attested.
+    pub thread_table: Option<thread_builtins::ThreadTable>,
 }
 
 /// Main fuser interface for static component fusion
@@ -1609,6 +1615,31 @@ impl Fuser {
                 .retain(|e| !memory_probe::is_vestigial_realloc_export_name(&e.name));
         }
         stats.total_functions = merged.functions.len();
+        // #547 / ADR-9: `thread.new-indirect` takes a funcref-table index. The
+        // host cannot know which table that is unless the fused module says,
+        // so export it under a stable name -- or refuse.
+        let mut thread_table: Option<thread_builtins::ThreadTable> = None;
+        if let Some(index) = thread_builtins::resolve_thread_table(&self.components, &merged)? {
+            if merged
+                .exports
+                .iter()
+                .any(|e| e.name == thread_builtins::THREAD_TABLE_EXPORT)
+            {
+                return Err(Error::ConflictingExports {
+                    name: thread_builtins::THREAD_TABLE_EXPORT.to_string(),
+                });
+            }
+            merged.exports.push(merger::MergedExport {
+                name: thread_builtins::THREAD_TABLE_EXPORT.to_string(),
+                kind: wasm_encoder::ExportKind::Table,
+                index,
+            });
+            thread_table = Some(thread_builtins::ThreadTable {
+                index,
+                export: thread_builtins::THREAD_TABLE_EXPORT.to_string(),
+            });
+        }
+        stats.thread_table = thread_table.clone();
         // SR-70: carry the per-module placement decisions out for attestation.
         stats.placements = merged.placements.clone();
         stats.total_exports = merged.exports.len();
@@ -1886,7 +1917,8 @@ impl Fuser {
 
         // #513: the per-import host contract, read off the CORE module before
         // any component wrap. Side-output only.
-        stats.import_map = import_map::build_import_map(&self.components, &merged, &output);
+        stats.import_map =
+            import_map::build_import_map(&self.components, &merged, &output, thread_table.as_ref());
 
         // Optionally wrap the fused core module as a P2 component
         let output = if self.config.output_format == OutputFormat::Component {
@@ -3238,6 +3270,9 @@ impl Fuser {
             "placements".to_string(),
             serde_json::json!(stats.placements),
         );
+        if let Some(t) = &stats.thread_table {
+            metadata.insert("thread_table".to_string(), serde_json::json!(t));
+        }
         // 0.0 for a zero-size input keeps the recorded value unchanged (#414);
         // no parseable input is zero bytes.
         let size_reduction =

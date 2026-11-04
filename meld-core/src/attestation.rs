@@ -215,6 +215,13 @@ pub struct FusionMetadata {
     /// placement decision to record.
     #[serde(default)]
     pub placements: Vec<crate::PlacementRecord>,
+
+    /// #547 / ADR-9: for a fused P3 cooperative-thread component, the fused
+    /// funcref table `thread.new-indirect`'s start-function index refers to
+    /// (and the export it is under). Omitted when the artifact creates no
+    /// cooperative threads, so every other attestation is unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_table: Option<crate::thread_builtins::ThreadTable>,
 }
 
 /// Builder for creating fusion attestations
@@ -373,6 +380,7 @@ impl FusionAttestationBuilder {
                 parameters: self.parameters,
                 boundaries: stats.boundaries.clone(),
                 placements: stats.placements.clone(),
+                thread_table: stats.thread_table.clone(),
             },
         }
     }

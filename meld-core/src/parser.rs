@@ -540,10 +540,6 @@ pub enum CanonicalEntry {
     ResourceDrop { resource: u32 },
     /// Get representation of a resource handle
     ResourceRep { resource: u32 },
-    /// Spawn a new thread (via ref)
-    ThreadSpawn { func_ty_index: u32 },
-    /// Query hardware thread concurrency
-    ThreadHwConcurrency,
     /// Async drop of a resource handle
     ResourceDropAsync { resource: u32 },
     /// Increment backpressure counter
@@ -611,8 +607,28 @@ pub enum CanonicalEntry {
     WaitableSetDrop,
     /// Add an item to a waitable-set
     WaitableJoin,
-    /// Unsupported canonical function (thread.index, thread.*indirect, etc.)
-    Unsupported,
+    /// `thread.index` -- the calling cooperative thread's index (#547).
+    ThreadIndex,
+    /// `thread.new-indirect` -- create a cooperative thread whose start
+    /// function is `table[fn_idx]`. `func_ty_index` is the (component-level)
+    /// core type index of the start function (`(func (param i32))`);
+    /// `table_index` is the component-level core table the `fn_idx` indexes.
+    ThreadNewIndirect {
+        func_ty_index: u32,
+        table_index: u32,
+    },
+    /// `thread.resume-later`
+    ThreadResumeLater,
+    /// `thread.suspend`
+    ThreadSuspend,
+    /// `thread.suspend-then-resume`
+    ThreadSuspendThenResume,
+    /// `thread.yield-then-resume`
+    ThreadYieldThenResume,
+    /// `thread.suspend-then-promote`
+    ThreadSuspendThenPromote,
+    /// `thread.yield-then-promote`
+    ThreadYieldThenPromote,
 }
 
 /// Component instance
@@ -687,6 +703,15 @@ fn has_modules_recursive(component: &ParsedComponent) -> bool {
 /// `subtask.cancel` / `{stream,future}.cancel-{read,write}`, which 0.246
 /// refused; [`refuse_async_cancel_builtins`] restores that refusal so the set
 /// of accepted components is unchanged.
+///
+/// `CM_THREADING` is turned ON for P3 cooperative threads (#547, ADR-9): it is
+/// the flag wasmparser 0.263 requires for `thread.index`,
+/// `thread.new-indirect`, `thread.resume-later`, `thread.suspend` and the four
+/// `thread.{suspend,yield}-then-{resume,promote}` built-ins. It does NOT open
+/// shared-everything threads (`SHARED_EVERYTHING_THREADS`, shared types), and
+/// `thread.spawn-*` stays refused. The same flag also lets `context.get/set`
+/// take slot 1; [`convert_canonical_function`] keeps refusing that so
+/// acceptance does not widen beyond the nine built-ins.
 pub fn baseline_wasm_features() -> wasmparser::WasmFeatures {
     (wasmparser::WasmFeatures::default()
         - wasmparser::WasmFeatures::WIDE_ARITHMETIC
@@ -694,6 +719,7 @@ pub fn baseline_wasm_features() -> wasmparser::WasmFeatures {
         - wasmparser::WasmFeatures::CM_MAP
         - wasmparser::WasmFeatures::CM_IMPLEMENTS)
         | wasmparser::WasmFeatures::CM_MORE_ASYNC_BUILTINS
+        | wasmparser::WasmFeatures::CM_THREADING
 }
 
 /// Refuse the `async` cancel built-ins, exactly as wasmparser 0.246's
@@ -1211,7 +1237,7 @@ impl ComponentParser {
                         .push(convert_canonical_function(
                             canon,
                             &mut component.p3_async_features,
-                        ));
+                        )?);
                     if creates_core_func {
                         component
                             .core_entity_order
@@ -4093,8 +4119,8 @@ fn convert_canonical_options(
 fn convert_canonical_function(
     canon: wasmparser::CanonicalFunction,
     p3_async_features: &mut Vec<String>,
-) -> CanonicalEntry {
-    match canon {
+) -> Result<CanonicalEntry> {
+    Ok(match canon {
         wasmparser::CanonicalFunction::Lift {
             core_func_index,
             type_index,
@@ -4120,9 +4146,6 @@ fn convert_canonical_function(
         wasmparser::CanonicalFunction::ResourceRep { resource } => {
             CanonicalEntry::ResourceRep { resource }
         }
-        wasmparser::CanonicalFunction::ThreadSpawnRef { func_ty_index } => {
-            CanonicalEntry::ThreadSpawn { func_ty_index }
-        }
         wasmparser::CanonicalFunction::BackpressureInc => CanonicalEntry::BackpressureInc,
         wasmparser::CanonicalFunction::BackpressureDec => CanonicalEntry::BackpressureDec,
         wasmparser::CanonicalFunction::TaskReturn { result, options } => {
@@ -4135,13 +4158,15 @@ fn convert_canonical_function(
         // wasmparser 0.263 carries the context slot's value type; 0.246 only
         // decoded `i32` (0x7f). Any other type goes to the unsupported
         // fallback below, as every other built-in meld does not model.
+        // Slot 1 (thread-local context) needs CM_THREADING and is not part of
+        // the nine cooperative built-ins kiln#620 implements, so it is refused.
         wasmparser::CanonicalFunction::ContextGet {
             ty: WasmValType::I32,
-            slot,
+            slot: slot @ 0,
         } => CanonicalEntry::ContextGet(slot),
         wasmparser::CanonicalFunction::ContextSet {
             ty: WasmValType::I32,
-            slot,
+            slot: slot @ 0,
         } => CanonicalEntry::ContextSet(slot),
         // wasmparser 0.263 dropped the `cancellable` flag (component-model#716):
         // the legacy byte must now be 0 or the section fails to decode, so
@@ -4222,12 +4247,57 @@ fn convert_canonical_function(
         }
         wasmparser::CanonicalFunction::WaitableSetDrop => CanonicalEntry::WaitableSetDrop,
         wasmparser::CanonicalFunction::WaitableJoin => CanonicalEntry::WaitableJoin,
-        // Truly unsupported variants (thread.index, thread.*indirect, etc.)
-        other => {
-            let desc = format!("{other:?}");
-            p3_async_features.push(desc);
-            CanonicalEntry::Unsupported
+        // P3 cooperative threads (#547, ADR-9): modelled as pass-through
+        // host imports in the producer ABI.
+        wasmparser::CanonicalFunction::ThreadIndex => CanonicalEntry::ThreadIndex,
+        wasmparser::CanonicalFunction::ThreadNewIndirect {
+            func_ty_index,
+            table_index,
+        } => CanonicalEntry::ThreadNewIndirect {
+            func_ty_index,
+            table_index,
+        },
+        wasmparser::CanonicalFunction::ThreadResumeLater => CanonicalEntry::ThreadResumeLater,
+        wasmparser::CanonicalFunction::ThreadSuspend => CanonicalEntry::ThreadSuspend,
+        wasmparser::CanonicalFunction::ThreadSuspendThenResume => {
+            CanonicalEntry::ThreadSuspendThenResume
         }
+        wasmparser::CanonicalFunction::ThreadYieldThenResume => {
+            CanonicalEntry::ThreadYieldThenResume
+        }
+        wasmparser::CanonicalFunction::ThreadSuspendThenPromote => {
+            CanonicalEntry::ThreadSuspendThenPromote
+        }
+        wasmparser::CanonicalFunction::ThreadYieldThenPromote => {
+            CanonicalEntry::ThreadYieldThenPromote
+        }
+        // Everything else (shared-everything `thread.spawn-*` /
+        // `thread.available-parallelism`, `context.*` with a non-i32 slot
+        // type, and any built-in a future wasmparser adds) is NOT modelled.
+        // It used to be mapped to `CanonicalEntry::Unsupported` and only
+        // logged, which turned an unsupported feature into a silent
+        // pass-through the moment its validator gate opened (#547). Refuse
+        // by name instead.
+        other => {
+            return Err(Error::UnsupportedFeature(format!(
+                "unsupported canonical built-in `{}` (not modelled by meld; \
+                 see safety/adr/ADR-9-threads-scope.md)",
+                canonical_builtin_name(&other)
+            )));
+        }
+    })
+}
+
+/// Human-readable name of a canonical built-in, for refusal messages.
+fn canonical_builtin_name(canon: &wasmparser::CanonicalFunction) -> String {
+    use wasmparser::CanonicalFunction as C;
+    match canon {
+        C::ThreadSpawnRef { .. } => "thread.spawn-ref".to_string(),
+        C::ThreadSpawnIndirect { .. } => "thread.spawn-indirect".to_string(),
+        C::ThreadAvailableParallelism => "thread.available-parallelism".to_string(),
+        C::ContextGet { ty, slot } => format!("context.get (slot {slot}, type {ty:?})"),
+        C::ContextSet { ty, slot } => format!("context.set (slot {slot}, type {ty:?})"),
+        other => format!("{other:?}"),
     }
 }
 
@@ -4578,7 +4648,7 @@ mod tests {
             ]
             .into_boxed_slice(),
         };
-        let entry = convert_canonical_function(canon, &mut vec![]);
+        let entry = convert_canonical_function(canon, &mut vec![]).unwrap();
         match entry {
             CanonicalEntry::Lift {
                 core_func_index,
@@ -4596,13 +4666,97 @@ mod tests {
         }
     }
 
+    // rivet: verifies SWV-122
+    #[test]
+    fn test_convert_canonical_function_refuses_unmodelled_builtins() {
+        // #547: these used to be mapped to `CanonicalEntry::Unsupported` and
+        // only logged, i.e. silently passed through once a validator gate
+        // opened. They are errors that name the built-in.
+        for (canon, name) in [
+            (
+                wasmparser::CanonicalFunction::ThreadSpawnRef { func_ty_index: 0 },
+                "thread.spawn-ref",
+            ),
+            (
+                wasmparser::CanonicalFunction::ThreadSpawnIndirect {
+                    func_ty_index: 0,
+                    table_index: 0,
+                },
+                "thread.spawn-indirect",
+            ),
+            (
+                wasmparser::CanonicalFunction::ThreadAvailableParallelism,
+                "thread.available-parallelism",
+            ),
+            (
+                wasmparser::CanonicalFunction::ContextGet {
+                    ty: WasmValType::I32,
+                    slot: 1,
+                },
+                "context.get",
+            ),
+            (
+                wasmparser::CanonicalFunction::ContextSet {
+                    ty: WasmValType::I64,
+                    slot: 0,
+                },
+                "context.set",
+            ),
+        ] {
+            match convert_canonical_function(canon, &mut vec![]) {
+                Err(Error::UnsupportedFeature(msg)) => {
+                    assert!(msg.contains(name), "{name}: {msg}");
+                    assert!(msg.contains("ADR-9"), "{name}: {msg}");
+                }
+                other => panic!("{name}: expected UnsupportedFeature, got {other:?}"),
+            }
+        }
+    }
+
+    // rivet: verifies SWV-122
+    #[test]
+    fn test_convert_canonical_function_models_the_nine_cooperative_builtins() {
+        use wasmparser::CanonicalFunction as C;
+        let entries = [
+            C::ThreadIndex,
+            C::ThreadNewIndirect {
+                func_ty_index: 3,
+                table_index: 4,
+            },
+            C::ThreadYield,
+            C::ThreadSuspend,
+            C::ThreadResumeLater,
+            C::ThreadSuspendThenResume,
+            C::ThreadYieldThenResume,
+            C::ThreadSuspendThenPromote,
+            C::ThreadYieldThenPromote,
+        ]
+        .map(|c| convert_canonical_function(c, &mut vec![]).unwrap());
+        let names: Vec<_> = entries
+            .iter()
+            .map(|e| crate::thread_builtins::producer_name(e).expect("a producer name"))
+            .collect();
+        assert_eq!(names.len(), 9);
+        let mut dedup = names.clone();
+        dedup.sort_unstable();
+        dedup.dedup();
+        assert_eq!(dedup.len(), 9, "nine distinct producer names: {names:?}");
+        assert!(matches!(
+            entries[1],
+            CanonicalEntry::ThreadNewIndirect {
+                func_ty_index: 3,
+                table_index: 4
+            }
+        ));
+    }
+
     #[test]
     fn test_convert_canonical_function_lower() {
         let canon = wasmparser::CanonicalFunction::Lower {
             func_index: 3,
             options: vec![wasmparser::CanonicalOption::CompactUTF16].into_boxed_slice(),
         };
-        let entry = convert_canonical_function(canon, &mut vec![]);
+        let entry = convert_canonical_function(canon, &mut vec![]).unwrap();
         match entry {
             CanonicalEntry::Lower {
                 func_index,
@@ -5081,7 +5235,7 @@ mod tests {
             ]
             .into_boxed_slice(),
         };
-        let entry = convert_canonical_function(canon, &mut vec![]);
+        let entry = convert_canonical_function(canon, &mut vec![]).unwrap();
         match entry {
             CanonicalEntry::Lift { options, .. } => {
                 assert_eq!(
@@ -5106,7 +5260,7 @@ mod tests {
             ]
             .into_boxed_slice(),
         };
-        let entry = convert_canonical_function(canon, &mut vec![]);
+        let entry = convert_canonical_function(canon, &mut vec![]).unwrap();
         match entry {
             CanonicalEntry::Lower { options, .. } => {
                 assert_eq!(

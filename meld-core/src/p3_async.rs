@@ -222,53 +222,12 @@ pub mod stream {
     pub const DROP_WRITABLE: &str = "stream_drop_writable";
 }
 
-/// Names of all stackful-lifting host intrinsic imports.
-///
-/// P3 async exports come in two lifting modes:
-///
-/// * **Callback** (currently the only mode meld emits, see [`callback`]) —
-///   the component declares a `(callback ...)` option on its `canon lift`;
-///   meld emits a trampoline that re-enters the guest on every event.
-///   One shared stack per component. Preferred for embedded targets.
-/// * **Stackful** — the component uses `task.wait` / `task.yield` to
-///   suspend; the host saves and restores the wasm stack across the
-///   yield. One stack per in-flight async call. Natural for Rust /
-///   Go / Java guest async.
-///
-/// Issue #140 / SR-32 declares the stackful host-intrinsic ABI. The
-/// stackful trampoline emitter ships in a follow-up PR within the
-/// v0.8.0 milestone; until then components requiring stackful mode are
-/// detected and rejected with a clear "stackful lifting not yet
-/// emitted" error rather than silently producing a callback trampoline.
-pub mod thread {
-    /// `(start_fn: i32, arg: i32) -> i32` — create a new fiber.
-    ///
-    /// The runtime allocates a fresh stack and registers `start_fn`
-    /// (a core-wasm function index in the fused module) as its entry
-    /// point. `arg` is passed to `start_fn` on first switch-in.
-    ///
-    /// Returns a non-negative thread handle on success, or a negative
-    /// [`AbiError`] code (typically [`AbiError::Oom`]) on failure.
-    pub const NEW: &str = "thread_new";
-    /// `(thread: i32) -> ()` — yield the current fiber and resume the
-    /// fiber identified by `thread`.
-    ///
-    /// The caller's stack is saved by the runtime; the call returns
-    /// only when some other fiber switches back. Switching to a
-    /// non-existent or exited thread traps.
-    pub const SWITCH_TO: &str = "thread_switch_to";
-    /// `() -> ()` — yield the current fiber so the runtime can schedule
-    /// another runnable fiber. Equivalent to `thread_switch_to` to a
-    /// runtime-chosen target; control returns when the scheduler picks
-    /// this fiber again.
-    pub const YIELD: &str = "thread_yield";
-    /// `() -> ()` — exit the current fiber.
-    ///
-    /// Marks the fiber's stack for release and yields permanently.
-    /// Subsequent `thread_switch_to(<this fiber>)` traps. Hosts may
-    /// reclaim the stack synchronously or via a sweep.
-    pub const EXIT: &str = "thread_exit";
-}
+// The `thread_new` / `thread_switch_to` / `thread_yield` / `thread_exit`
+// host intrinsics that used to be declared here (SR-32 / #140) were retired in
+// #547: they matched nothing a producer emits and nothing consumed them. P3
+// cooperative threads pass through in the PRODUCER ABI instead
+// (`$root::[thread-*]`, see `crate::thread_builtins` and ADR-9). The stackful
+// trampoline does not use host fibers (ADR-1, 2026-05-13 addendum).
 
 /// Names of all future-related host intrinsic imports.
 pub mod future {
@@ -578,22 +537,6 @@ pub enum HostIntrinsic {
     /// value will arrive). Subsequent reads also return
     /// [`AbiError::Closed`].
     FutureDropWritable,
-    /// `(start_fn: i32, arg: i32) -> i32` — create a new fiber with
-    /// entry point `start_fn` (a core-wasm function index in the fused
-    /// module). See [`thread::NEW`].
-    ///
-    /// Part of the **stackful** lifting-mode ABI (SR-32, #140).
-    /// The stackful trampoline emitter that uses this intrinsic ships
-    /// in a follow-up PR; this enum variant is the foundation that
-    /// downstream tooling (kiln runtime) can already implement against.
-    ThreadNew,
-    /// `(thread: i32)` — yield the current fiber and resume `thread`.
-    /// See [`thread::SWITCH_TO`].
-    ThreadSwitchTo,
-    /// `()` — yield to the runtime scheduler. See [`thread::YIELD`].
-    ThreadYield,
-    /// `()` — terminate the current fiber. See [`thread::EXIT`].
-    ThreadExit,
 }
 
 impl HostIntrinsic {
@@ -614,10 +557,6 @@ impl HostIntrinsic {
             Self::FutureCancelWrite => future::CANCEL_WRITE,
             Self::FutureDropReadable => future::DROP_READABLE,
             Self::FutureDropWritable => future::DROP_WRITABLE,
-            Self::ThreadNew => thread::NEW,
-            Self::ThreadSwitchTo => thread::SWITCH_TO,
-            Self::ThreadYield => thread::YIELD,
-            Self::ThreadExit => thread::EXIT,
         }
     }
 
@@ -653,12 +592,6 @@ impl HostIntrinsic {
             | Self::StreamDropWritable
             | Self::FutureDropReadable
             | Self::FutureDropWritable => (vec![I32], vec![]),
-            // thread_new : (start_fn, arg) -> i32
-            Self::ThreadNew => (vec![I32, I32], vec![I32]),
-            // thread_switch_to : (thread) -> ()
-            Self::ThreadSwitchTo => (vec![I32], vec![]),
-            // thread_yield / thread_exit : () -> ()
-            Self::ThreadYield | Self::ThreadExit => (vec![], vec![]),
         }
     }
 
@@ -974,8 +907,8 @@ impl P3AsyncFeatures {
     /// `true` if any async lift in the component is **stackful** — i.e.
     /// uses `(canon lift ... async ...)` without a `(callback ...)` option.
     ///
-    /// Stackful mode requires the trampoline shape declared in [`thread`]
-    /// (`thread_new` / `thread_switch_to` / `thread_yield` / `thread_exit`).
+    /// Stackful mode is emitted as a trampoline in the fused module itself
+    /// (ADR-1); it does not use host fibers.
     ///
     /// The predicate is an **existential** over the component's lifts:
     /// it returns `true` if *any* lift is stackful, regardless of whether
@@ -1646,61 +1579,9 @@ mod tests {
             HostIntrinsic::FutureCancelWrite,
             HostIntrinsic::FutureDropReadable,
             HostIntrinsic::FutureDropWritable,
-            HostIntrinsic::ThreadNew,
-            HostIntrinsic::ThreadSwitchTo,
-            HostIntrinsic::ThreadYield,
-            HostIntrinsic::ThreadExit,
         ];
         let names: std::collections::HashSet<&'static str> = all.iter().map(|i| i.name()).collect();
         assert_eq!(names.len(), all.len(), "intrinsic names must be unique");
-    }
-
-    /// SR-32 / #140 — stackful lifting ABI shape pin.
-    ///
-    /// Changing the signature or name of any `Thread*` intrinsic is a
-    /// breaking change to the `pulseengine:async` ABI and requires a
-    /// version bump + ADR update.
-    #[test]
-    fn stackful_intrinsic_signatures_pinned() {
-        use wasm_encoder::ValType::I32;
-
-        assert_eq!(HostIntrinsic::ThreadNew.name(), "thread_new");
-        assert_eq!(
-            HostIntrinsic::ThreadNew.signature(),
-            (vec![I32, I32], vec![I32]),
-            "thread_new : (start_fn, arg) -> i32"
-        );
-
-        assert_eq!(HostIntrinsic::ThreadSwitchTo.name(), "thread_switch_to");
-        assert_eq!(
-            HostIntrinsic::ThreadSwitchTo.signature(),
-            (vec![I32], vec![]),
-            "thread_switch_to : (thread) -> ()"
-        );
-
-        assert_eq!(HostIntrinsic::ThreadYield.name(), "thread_yield");
-        assert_eq!(
-            HostIntrinsic::ThreadYield.signature(),
-            (vec![], vec![]),
-            "thread_yield : () -> ()"
-        );
-
-        assert_eq!(HostIntrinsic::ThreadExit.name(), "thread_exit");
-        assert_eq!(
-            HostIntrinsic::ThreadExit.signature(),
-            (vec![], vec![]),
-            "thread_exit : () -> ()"
-        );
-
-        // All four belong to the same import module as the data plane.
-        for v in [
-            HostIntrinsic::ThreadNew,
-            HostIntrinsic::ThreadSwitchTo,
-            HostIntrinsic::ThreadYield,
-            HostIntrinsic::ThreadExit,
-        ] {
-            assert_eq!(v.import().0, HOST_INTRINSIC_MODULE);
-        }
     }
 
     /// SR-32 / #140 — `P3AsyncFeatures::uses_stackful_lift()` derived flag.

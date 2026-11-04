@@ -4,7 +4,39 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+- **P3 cooperative threads pass through to the host (SR-110, ADR-9, #547).**
+  The nine built-ins (`thread.new-indirect`, `.index`, `.yield`, `.suspend`,
+  `.resume-later`, `.suspend-then-resume`, `.yield-then-resume`,
+  `.suspend-then-promote`, `.yield-then-promote`) become core imports of the
+  fused module under the names and types the producers emit (`$root`,
+  `[thread-new-indirect-v0]` `(i32 i32) -> i32`, `[thread-index]` `() -> i32`,
+  and so on; identical to the table in kiln#620). meld does not lower them: the
+  host implements them. The funcref table that `thread.new-indirect`'s `fn_idx`
+  indexes is exported as `__meld_thread_table`, recorded on the new-indirect
+  entry of `--emit-import-map` (`thread_table`) and in the attestation
+  (`metadata.thread_table`, absent when no thread is created). Two different
+  start-function tables are refused. The parser now enables `CM_THREADING`
+  and nothing else for this. On the 504-component P3 corpus (`--memory multi`,
+  vs origin/main): the 333 components that fused still do, byte-identical, none
+  that fused is refused, and 48 that were refused for threading now fuse and
+  validate; 19 stay refused for another named reason. Shared memories,
+  `thread.spawn-*` and `thread.available-parallelism` stay refused (ADR-9).
+  The host must strip a `$N` suffix from a second component's import under
+  `--memory multi`, as for every other built-in. `--component` output still
+  refuses host built-ins.
+
 ### Changed
+- **Unmodelled canonical built-ins are an error, not a logged placeholder
+  (#547).** `CanonicalEntry::Unsupported` is deleted; `thread.spawn-*`,
+  `thread.available-parallelism`, `stream.forward`/`future.forward`,
+  `context.get`/`context.set` with a non-zero slot or non-i32 type, and any
+  built-in a later wasmparser adds now fail the parse naming the built-in.
+  Opening the threading gate made the placeholder a silent pass-through hazard.
+  No component on the corpus that fused before is refused by this.
+- **The `pulseengine:async` `thread_new` / `thread_switch_to` / `thread_yield`
+  / `thread_exit` host intrinsics are retired (#547).** No producer emits them
+  and nothing consumed them; cooperative threads use the producer ABI above.
 - **wasmparser / wasm-encoder 0.246 -> 0.263 (#546).** This is the
   prerequisite for P3 cooperative threads. The old decoder read some current
   thread built-ins as different ones, for example `thread.suspend-then-resume`
@@ -18,8 +50,8 @@ All notable changes to this project will be documented in this file.
   wasi-threads (P1) and shared-everything threads are out of scope: the fused
   module assumes one thread (a shadow stack per module, adapters that are not
   reentrant, fixed placement). meld 0.66.0 fused a wasi-threads component at
-  exit 0. P3 cooperative threads are in scope for kiln but not yet supported,
-  and stay refused until they are. Plain P3 async is unaffected.
+  exit 0. P3 cooperative threads are in scope for kiln and are supported by
+  pass-through (see Added, SR-110). Plain P3 async is unaffected.
 - **Output is validated by default under every memory strategy (SR-109,
   #545).** Validation used to be implied only by `--memory shared`. Under
   `--memory multi`, 11 of 504 P3 corpus components fused at exit 0 into a

@@ -520,6 +520,14 @@ pub fn core_memory_sources(component: &ParsedComponent) -> HashMap<u32, (usize, 
     build_entity_provenance(component).memory_source
 }
 
+/// Which module export each component-level core TABLE came from.
+///
+/// `core_table_index -> (module_index, export_name)`. Used to find which fused
+/// table a `thread.new-indirect` canon indexes (#547).
+pub fn core_table_sources(component: &ParsedComponent) -> HashMap<u32, (usize, String)> {
+    build_entity_provenance(component).table_source
+}
+
 pub fn core_func_sources(component: &ParsedComponent) -> HashMap<u32, (usize, String)> {
     build_entity_provenance(component).func_source
 }
@@ -1458,6 +1466,29 @@ fn build_canon_import_names(component: &ParsedComponent) -> HashMap<u32, (String
                                 core_func_idx,
                                 ("$root".to_string(), "[thread-yield]".to_string()),
                             );
+                        }
+                        // P3 cooperative threads (#547, ADR-9): pass-through
+                        // host imports named exactly as the producers
+                        // (wit-bindgen / wit-component) name them. The
+                        // strings are shared with `thread_builtins` so the
+                        // import map and the tests cannot drift from them.
+                        CanonicalEntry::ThreadIndex
+                        | CanonicalEntry::ThreadNewIndirect { .. }
+                        | CanonicalEntry::ThreadResumeLater
+                        | CanonicalEntry::ThreadSuspend
+                        | CanonicalEntry::ThreadSuspendThenResume
+                        | CanonicalEntry::ThreadYieldThenResume
+                        | CanonicalEntry::ThreadSuspendThenPromote
+                        | CanonicalEntry::ThreadYieldThenPromote => {
+                            if let Some(field) = crate::thread_builtins::producer_name(entry) {
+                                result.insert(
+                                    core_func_idx,
+                                    (
+                                        crate::thread_builtins::MODULE.to_string(),
+                                        field.to_string(),
+                                    ),
+                                );
+                            }
                         }
                         CanonicalEntry::ResourceDropAsync { resource } => {
                             if let Some((inst_idx, type_name)) =
