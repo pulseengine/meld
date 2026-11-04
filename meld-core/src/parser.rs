@@ -1382,6 +1382,15 @@ impl ComponentParser {
                                 initial: t.initial,
                                 maximum: t.maximum,
                             }),
+                            wasmparser::TypeRef::Memory(m) if m.shared => {
+                                return Err(Error::UnsupportedFeature(
+                                    "shared memory (threads): meld does not fuse threaded modules -- wasi-threads \
+                                     (P1) and shared-everything threads are out of scope (ADR-9). Every \
+                                     threads variant needs a `shared` memory; the fused module assumes \
+                                     one thread (one shadow stack per module, non-reentrant adapters)."
+                                    .to_string(),
+                                ));
+                            }
                             wasmparser::TypeRef::Memory(m) => ImportKind::Memory(MemoryType {
                                 memory64: m.memory64,
                                 shared: m.shared,
@@ -1427,6 +1436,16 @@ impl ComponentParser {
                 Payload::MemorySection(reader) => {
                     for mem in reader {
                         let mem = mem?;
+                        // ADR-9: no threads of the shared-memory kind.
+                        if mem.shared {
+                            return Err(Error::UnsupportedFeature(
+                                "shared memory (threads): meld does not fuse threaded modules -- wasi-threads \
+                                 (P1) and shared-everything threads are out of scope (ADR-9). Every \
+                                 threads variant needs a `shared` memory; the fused module assumes \
+                                 one thread (one shadow stack per module, non-reentrant adapters)."
+                                .to_string(),
+                            ));
+                        }
                         module.memories.push(MemoryType {
                             memory64: mem.memory64,
                             shared: mem.shared,

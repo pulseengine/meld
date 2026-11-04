@@ -3830,3 +3830,17 @@ artifacts:
       reviewed-by: avrabe
       model: claude-opus-5-5
       timestamp: 2026-11-03T21:40:56Z
+
+  - id: SR-108
+    type: sw-req
+    title: "Threaded inputs are refused: no shared memories, and no cooperative-thread built-ins until they are lowered"
+    status: implemented
+    description: "meld fuses components into a core module that assumes a single thread: each module keeps its own shadow stack, the generated adapters are not reentrant, and address rebasing and packing place every module at a fixed base. A threaded input -- wasi-threads (P1: wasi:thread-spawn with a shared linear memory) or shared-everything threads (thread.spawn-ref, thread.spawn-indirect, thread.available-parallelism, shared types) -- cannot be fused soundly. Both are out of scope (ADR-9, decided 2026-11-03). meld 0.66.0 refused shared-everything spawn only incidentally (its parser does not enable shared types) and FUSED a wasi-threads component at exit 0, keeping the shared memory and exporting wasi_thread_start. meld shall refuse any core module that defines or imports a shared memory, with an error that names ADR-9; every threads variant needs one. P3 cooperative threads (thread.new-indirect, thread.switch-to, thread.suspend, thread.resume-later, thread.yield-to, thread.index) are in scope for kiln but not yet implemented; until they are, meld shall keep refusing them rather than map them to an unsupported entry that is only logged. Plain P3 async, including thread.yield as an async yield, is unaffected."
+    links:
+      - type: derives-from
+        target: SYS-3
+    provenance:
+      created-by: ai-assisted
+      reviewed-by: avrabe
+      model: claude-opus-5-5
+      timestamp: 2026-11-03T21:25:52Z

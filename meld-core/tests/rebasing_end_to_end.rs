@@ -21,7 +21,7 @@ fn shared_memory_section() -> MemorySection {
         minimum: 1,
         maximum: Some(2),
         memory64: false,
-        shared: true,
+        shared: false,
         page_size_log2: None,
     });
     memory
@@ -124,12 +124,15 @@ fn build_module_b() -> Module {
     module
 }
 
-fn read_shared(memory: &wasmtime::SharedMemory, offset: usize, len: usize) -> Vec<u8> {
-    let data = memory.data();
-    (0..len)
-        // Safe for this test: we read after all writes, with no concurrent access.
-        .map(|idx| unsafe { *data[offset + idx].get() })
-        .collect()
+// ADR-9: the fused memory is an ordinary (non-`shared`) memory; these tests are
+// about single-memory rebasing, not threads.
+fn read_shared(
+    memory: &wasmtime::Memory,
+    store: impl wasmtime::AsContext,
+    offset: usize,
+    len: usize,
+) -> Vec<u8> {
+    memory.data(&store)[offset..offset + len].to_vec()
 }
 
 #[test]
@@ -185,22 +188,22 @@ fn test_address_rebasing_end_to_end() {
     b_fill.call(&mut store, ()).unwrap();
 
     let memory = instance
-        .get_shared_memory(&mut store, "memory")
+        .get_memory(&mut store, "memory")
         .expect("shared memory export not found");
 
-    assert!(memory.data_size() >= 2 * WASM_PAGE_SIZE);
+    assert!(memory.data_size(&store) >= 2 * WASM_PAGE_SIZE);
 
-    let a_region = read_shared(&memory, 0, 4);
+    let a_region = read_shared(&memory, &store, 0, 4);
     assert_eq!(a_region, vec![0x11, 0x11, 0x11, 0x11]);
 
     let base = WASM_PAGE_SIZE;
-    let b_init_region = read_shared(&memory, base, 4);
+    let b_init_region = read_shared(&memory, &store, base, 4);
     assert_eq!(b_init_region, vec![1, 2, 3, 4]);
 
-    let b_copy_region = read_shared(&memory, base + 4, 4);
+    let b_copy_region = read_shared(&memory, &store, base + 4, 4);
     assert_eq!(b_copy_region, vec![1, 2, 3, 4]);
 
-    let b_fill_region = read_shared(&memory, base + 8, 4);
+    let b_fill_region = read_shared(&memory, &store, base + 8, 4);
     assert_eq!(b_fill_region, vec![0xBB, 0xBB, 0xBB, 0xBB]);
 }
 
@@ -512,7 +515,7 @@ fn test_326_reloc_const_rebasing_end_to_end() {
     b_store.call(&mut store, ()).unwrap();
 
     let memory = instance
-        .get_shared_memory(&mut store, "memory")
+        .get_memory(&mut store, "memory")
         .expect("shared memory export not found");
     let base = WASM_PAGE_SIZE; // component-b is placed at page 1
 
@@ -527,7 +530,7 @@ fn test_326_reloc_const_rebasing_end_to_end() {
     // DISCRIMINATOR 2 (behavioural): the address the module computes for BUF
     // must actually point at the byte `b_store` wrote. Pre-fix `addr` is 0x100
     // (component-a's window, never written) so this reads 0.
-    let via_addr = read_shared(&memory, addr as usize, 1);
+    let via_addr = read_shared(&memory, &store, addr as usize, 1);
     assert_eq!(
         via_addr,
         vec![RELOC_VAL as u8],
@@ -537,7 +540,7 @@ fn test_326_reloc_const_rebasing_end_to_end() {
     // Sanity: the store landed at the rebased window and `b_load` reads it back.
     // (These pass pre-fix too, via the legacy access-point memarg rebasing.)
     assert_eq!(
-        read_shared(&memory, base + RELOC_ADDR as usize, 1),
+        read_shared(&memory, &store, base + RELOC_ADDR as usize, 1),
         vec![RELOC_VAL as u8]
     );
     assert_eq!(b_load.call(&mut store, ()).unwrap(), RELOC_VAL);
@@ -879,12 +882,12 @@ fn test_301_embedder_arena_seam_survives_fusion_differential() {
             .unwrap();
         let ret_b = b_run.call(&mut store, ()).unwrap();
 
-        let mem_a = inst_a.get_shared_memory(&mut store, "memory").unwrap();
-        let mem_b = inst_b.get_shared_memory(&mut store, "memory").unwrap();
+        let mem_a = inst_a.get_memory(&mut store, "memory").unwrap();
+        let mem_b = inst_b.get_memory(&mut store, "memory").unwrap();
         let handed = store.data().handed_out.clone();
         assert_eq!(handed.len(), 2, "one allocation per component");
-        let byte_a = read_shared(&mem_a, handed[0] as usize, 1);
-        let byte_b = read_shared(&mem_b, handed[1] as usize, 1);
+        let byte_a = read_shared(&mem_a, &store, handed[0] as usize, 1);
+        let byte_b = read_shared(&mem_b, &store, handed[1] as usize, 1);
         (ret_a, ret_b, handed, byte_a, byte_b)
     };
 
@@ -919,20 +922,20 @@ fn test_301_embedder_arena_seam_survives_fusion_differential() {
             .unwrap();
         let ret_b = b_run.call(&mut store, ()).unwrap();
 
-        let mem = instance.get_shared_memory(&mut store, "memory").unwrap();
+        let mem = instance.get_memory(&mut store, "memory").unwrap();
         // Two 1-page modules stacked into separate windows ⟹ a ≥2-page merged
         // memory. This is the in-test evidence the modules did NOT both land at
         // base 0 — so module B sits at a non-zero base and the memarg-rebasing
         // hazard guarded below is live. A refactor collapsing the windows turns
         // this red instead of silently hollowing out the differential.
         assert!(
-            mem.data_size() >= 2 * WASM_PAGE_SIZE,
+            mem.data_size(&store) >= 2 * WASM_PAGE_SIZE,
             "fused shared memory must span both modules' windows (≥2 pages)"
         );
         let handed = store.data().handed_out.clone();
         assert_eq!(handed.len(), 2, "one allocation per fused export");
-        let byte_a = read_shared(&mem, handed[0] as usize, 1);
-        let byte_b = read_shared(&mem, handed[1] as usize, 1);
+        let byte_a = read_shared(&mem, &store, handed[0] as usize, 1);
+        let byte_b = read_shared(&mem, &store, handed[1] as usize, 1);
         (ret_a, ret_b, handed, byte_a, byte_b)
     };
 
