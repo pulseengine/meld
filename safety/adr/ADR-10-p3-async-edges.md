@@ -208,8 +208,11 @@ parser to the trusted code base for no gain.
   requirement.
 - **Wake seam.** It is the existing gust one, with no second readiness
   structure:
-  - `wake(h)`, also called from ISR context; kiln's REQ_ASYNC_EXTWAKE lands on
-    this;
+  - `wake(h)`, called **only from the main loop**. An ISR must not call it:
+    an interrupt in the middle of `poll_round` would set a ready bit inside the
+    poll (breaking obligation (a)) and race the loop (a lost wake-up). An ISR
+    instead does an atomic OR into the pending mask, which only the main loop
+    drains, between rounds. That is what kiln's REQ_ASYNC_EXTWAKE means;
   - `set_deadline(h, tick)`;
   - `next_deadline()`, which bounds how long the outer loop may sleep in
     `WFI`.
@@ -217,11 +220,21 @@ parser to the trusted code base for no gain.
   - (a) Bounded poll. Nothing sets a ready bit synchronously inside
     `poll_round`. Wake-ups from subtask completion and from event delivery are
     deferred into a pending mask, applied after `poll_round` returns.
-  - (b) No lost wake-ups. The pending mask is merged with `|=` and never
-    overwritten.
+  - (b) No lost wake-ups. The pending mask is merged with `|=` (atomically
+    from an ISR) and never overwritten. It is drained by calling `wake(h)` once
+    per set bit, **never** `ready |= pending`: `wake`'s verified contract sets
+    the bit only for a Pending slot, which keeps the ready-bit invariant every
+    proof rests on.
   - (c) Static capacity, refused loudly when full.
   - (d) No async, closures or trait objects in the verified core. Callback
     re-entry stays behind the unverified `poll_task` call.
+
+- **Seam and trusted base (gale-owned requirement, before step 4).** On gale's
+  path the `__p3_*` entry points become undefined symbols in the dissolved
+  object. gale's seam gate requires the undefined set to equal the declared
+  seam exactly, so gale extends its seam, and kiln-builtins joins gale's
+  unverified trusted base. Export names are not a problem: gale builds with
+  `--all-exports` and strips nothing.
 
 ### 5. Refusals meld adds (all loud, at fuse time)
 
@@ -265,7 +278,8 @@ parser to the trusted code base for no gain.
 
 ## Open questions
 
-- gale's review of this draft (§4 and §5) is pending.
+- None open. gale reviewed §4 and §5 (2026-11-04); its three corrections are
+  folded into §4.
 
 ## Resolved
 
