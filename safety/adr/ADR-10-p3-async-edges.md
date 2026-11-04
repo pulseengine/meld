@@ -216,7 +216,7 @@ parser to the trusted code base for no gain.
   - `set_deadline(h, tick)`;
   - `next_deadline()`, which bounds how long the outer loop may sleep in
     `WFI`.
-- **Proof obligations gale keeps.**
+- **Proof obligations gale keeps** (all in gale REQ-OS-P3-ASYNC-001).
   - (a) Bounded poll. Nothing sets a ready bit synchronously inside
     `poll_round`. Wake-ups from subtask completion and from event delivery are
     deferred into a pending mask, applied after `poll_round` returns.
@@ -229,7 +229,7 @@ parser to the trusted code base for no gain.
   - (d) No async, closures or trait objects in the verified core. Callback
     re-entry stays behind the unverified `poll_task` call.
 
-- **Seam and trusted base (gale-owned requirement, before step 4).** On gale's
+- **Seam and trusted base (gale REQ-OS-P3-ASYNC-001, proposed; before step 4).** On gale's
   path the `__p3_*` entry points become undefined symbols in the dissolved
   object. gale's seam gate requires the undefined set to equal the declared
   seam exactly, so gale extends its seam, and kiln-builtins joins gale's
