@@ -79,6 +79,7 @@ meld emits a custom section `pulseengine:async-edges`, `version: 1`, keyed by
 or malformed. The section has three entry kinds.
 
 - **Edge.** One per `[async-lower]` import that resolves to a fused callee.
+  Each edge has a **stable index** in the section (0..n, in section order).
   - The caller's original-instance index, and its exact import
     `(module, field)` including any `$N` suffix. The import is resolved to the
     edge at link time, never by guessing from its name.
@@ -89,6 +90,7 @@ or malformed. The section has three entry kinds.
   - The parameter shape (flat i32 count, or a params pointer) and the position
     of `retptr`. kiln stores `retptr` per subtask and passes it to the return
     adapter.
+  - The flat result types of the return adapter (see §2).
 - **Stream or future type.** One per element type crossing an instance. It
   names the copy adapter's export (preferred), or gives
   `{elem size, align, owning memory}`.
@@ -97,6 +99,23 @@ or malformed. The section has three entry kinds.
 
 The `$N` suffixes on `$root::[...]` built-ins decode through the same table to
 an owning instance, which is what kiln SR-81 needs.
+
+**Encoding.** Binary, in Wasm's own style: a LEB128 version **first** (unknown
+versions are refused), then counts, then length-prefixed UTF-8 names and u32
+indices. kiln-decoder already parses this format in no_std. CBOR would add a
+parser to the trusted code base for no gain.
+
+**Three consumers.**
+- **kiln interpreter.** It resolves the named exports at load.
+- **loom.** It must keep the section and every named export intact. A fixture
+  must prove that.
+- **synth (gale's path).** kiln-builtins cannot look up exports at run time:
+  synth-compiled code calls fixed `__p3_*` symbols. So synth reads the section
+  and turns each edge's adapter and callback names into a dispatch table, which
+  kiln-builtins receives at init. The lowered caller call therefore carries the
+  **edge index**, not a name. How the index is encoded in the caller's import
+  (for example, one renamed import per edge) is fixed in the v1 format
+  specification before step 3.
 
 ### 2. meld generates two copy adapters per edge, and no control flow
 
@@ -110,7 +129,11 @@ an owning instance, which is what kiln SR-81 needs.
     instance.
 - **Return adapter.** It is the target kiln routes the callee's
   `[task-return]` to, for this edge only. It copies the results into the
-  caller's memory at the stored `retptr`.
+  caller's memory at the stored `retptr`. Its signature is pinned:
+  `(retptr: i32, flat results...) -> ()`, with the flat result types listed in
+  the edge entry. kiln passes it exactly the `[task-return]` arguments and
+  checks arity and types at load, as it does for the start adapter's single
+  i32.
 - **`[task-return]` stays a runtime built-in.** meld does not rewire it
   statically: the same `[async-lift]` export can be the root task of a host
   call or a subtask of an edge, and only the runtime knows which task is
@@ -126,10 +149,19 @@ an owning instance, which is what kiln SR-81 needs.
   `[task-return]` during start then gives the caller `RETURNED`; otherwise the
   caller gets `STARTED | handle<<4`. **Both outcomes are legal on the first
   call.**
-- **Event order is part of the contract.** Events are delivered FIFO per
-  waitable set, and a subtask's `RETURNED` comes before any later event on the
-  same set. The interpreter and the synth path must deliver the same order, so
-  that fuel-bounded replay is deterministic.
+- **Event order is part of the contract.** Events raised while a task is being
+  polled are queued and become visible from the **next** round, on both the
+  interpreter and the synth path (this is the same deferral as gale's pending
+  mask, §4(a)). Within a waitable set, delivery is FIFO by a single global
+  enqueue sequence number. A subtask's own events are delivered in lifecycle
+  order (`STARTED` before `RETURNED`). Identical order on both paths is what
+  keeps fuel-bounded replay deterministic.
+- **Cancel and drop.** The caller's `[subtask-cancel]` and `[subtask-drop]`
+  pass through as `$root::[subtask-*]` built-ins and act on the edge's subtask.
+  kiln-async delivers a cancel to the callee through `[callback]` as a
+  task-cancelled event. The callee then finishes through `[task-return]` or
+  `[task-cancel]`. Dropping a subtask that has not returned is a **trap**, not
+  a silent leak.
 - Cooperative threads (ADR-9, kiln SR-82) use the **same** task table and
   ready queue. There is one arbiter.
 - **Callback ABI only.** An `[async-lift]` callee without `[callback]`
@@ -192,8 +224,13 @@ an owning instance, which is what kiln SR-81 needs.
 3. **meld:** the section format and refusals (§1, §5), plus the start and
    return adapters (§2), Tier-5 with Mythos. This retires the #555 trampoline.
 4. **kiln-async:** link it into the engine and kiln-builtins, and add the
-   subtask table (§3). gale: pending-mask
-   wake-ups (§4).
+   subtask table (§3). gale: pending-mask wake-ups (§4). **Gate: kiln design
+   decision accepted.** That decision reverses `rfc46:107-111` and sets kiln's
+   v0.8.0 scope; it needs kiln's maintainer's sign-off, which does not exist
+   yet. Steps 1 and 2 do not depend on it, and run in parallel. Step 2 is
+   expected to make any fused module fail loudly if it only "works" today
+   because `[waitable-set-poll]` returns 0; kiln measures that on the corpus
+   first.
 5. **Together:** run the 19 acceptance pairs fused on kiln and compare against
    wasmtime.
 6. **Last:** streams and futures through per-type copy adapters (§1).
@@ -202,7 +239,17 @@ an owning instance, which is what kiln SR-81 needs.
 
 - **Interim behaviour.** Until step 3 lands, should meld keep exiting 0 on an
   unfused `[async-lower]` edge, warn, or refuse? This is the maintainer's call.
-- **Section encoding.** Should it be a binary format or CBOR? It must be
-  readable by kiln's no_std loader and kept intact by loom.
-- **The 7 harness-only pairs.** Should they get a kiln-side host shim, or stay
-  outside the acceptance set?
+  One fact for it: kiln's `P3Builtin` does not handle `[async-lower]`, so kiln
+  should refuse such an import at load (E21A0, unresolved import). So far this
+  comes from reading kiln's code; kiln will confirm it on one of the 19 pairs.
+  If confirmed, exit 0 is silent only in meld's output, not on kiln at run
+  time.
+- **How the caller import carries the edge index** on the synth path (§1).
+
+## Resolved
+
+- **Section encoding:** binary, in Wasm's own style (§1).
+- **The 7 harness-only pairs:** they stay out of the acceptance set. kiln's
+  rules forbid simulated host functions outside test code, and a shim in a test
+  module would prove nothing about the product path. They are tracked as
+  pending real WASI host functions.
