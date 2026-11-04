@@ -40,6 +40,27 @@ accepted by the maintainer.
   - meld only bridges a **sync** caller to an `[async-lift]` callee, so these
     imports are left to the host. Neither `--explain` nor the attestation
     mentions them.
+  - **The fused output also drops the prefix.** The producer's core import is
+    `[async-lower]ping`, but meld emits it as plain `my:test/i::ping` with the
+    async-lower signature `(i32 i32 i32 i32) -> i32`. The name no longer says
+    the call is async. Under this ADR the edge table is keyed by the exact
+    emitted import, so the edge itself does not depend on the name. But any
+    import meld leaves to the host must keep the producer's field name. That is
+    a separate meld defect (being diagnosed).
+- **kiln on a real fused pair** (ping-pong, meld 21536f0, kiln 1adce1b4): it
+  refuses the module at load with E21A0, listing 65 of 102 imports as
+  unresolved:
+  - 2 async-lower leftovers;
+  - 21 WASI imports with a `$N` suffix (kiln SR-81);
+  - 1 WASI function kiln doesn't implement (`subscribe-duration`);
+  - 20 P3 built-ins kiln doesn't handle (future and stream families,
+    `[subtask-*]`);
+  - 8 unresolved `actual::0-5` shim imports (a separate meld defect, being
+    diagnosed);
+  - 13 `pulseengine:async` intrinsics (retired by §6).
+
+  So the module is refused loudly at run time; what is silent is meld's
+  exit 0.
 - **Completing inside the call is not valid (path-A1).** wit-bindgen
   `ping-pong/runner.rs` passes future `rx` into `ping` and writes `tx` only
   after `ping` has returned `STARTED` (`futures::join!(f1, f2)`). Driving
