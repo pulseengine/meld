@@ -395,7 +395,6 @@ verification-status:
       - meld-core/src/p3_async.rs
       - meld-core/src/adapter/fact.rs
     tests:
-      - p3_async::tests::stackful_intrinsic_signatures_pinned
       - p3_async::tests::stackful_lift_is_existential_over_lifts
       - adapter::fact::tests::sr32_has_callback_export_detects_companion
       - adapter::fact::tests::sr32_stackful_emitter_handles_no_shim_with_default_results
