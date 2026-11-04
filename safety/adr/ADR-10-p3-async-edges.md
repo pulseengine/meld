@@ -53,8 +53,10 @@ accepted by the maintainer.
   - 2 async-lower leftovers;
   - 21 WASI imports with a `$N` suffix (kiln SR-81);
   - 1 WASI function kiln doesn't implement (`subscribe-duration`);
-  - 20 P3 built-ins kiln doesn't handle (future and stream families,
-    `[subtask-*]`);
+  - 20 P3 built-ins kiln doesn't serve at all (future and stream families,
+    `[subtask-*]`), so they are refused at load. Subtasks are served from step
+    4, streams and futures from step 6. Step 2 covers a different set: the
+    built-ins kiln serves today but fakes;
   - 8 unresolved `actual::0-5` shim imports (a separate meld defect, being
     diagnosed);
   - 13 `pulseengine:async` intrinsics (retired by §6).
