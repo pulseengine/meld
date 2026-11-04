@@ -46,7 +46,7 @@ accepted by the maintainer.
     the call is async. Under this ADR the edge table is keyed by the exact
     emitted import, so the edge itself does not depend on the name. But any
     import meld leaves to the host must keep the producer's field name. That is
-    a separate meld defect (being diagnosed).
+    a separate meld defect (#557).
 - **kiln on a real fused pair** (ping-pong, meld 21536f0, kiln 1adce1b4): it
   refuses the module at load with E21A0, listing 65 of 102 imports as
   unresolved:
@@ -57,8 +57,7 @@ accepted by the maintainer.
     `[subtask-*]`), so they are refused at load. Subtasks are served from step
     4, streams and futures from step 6. Step 2 covers a different set: the
     built-ins kiln serves today but fakes;
-  - 8 unresolved `actual::0-5` shim imports (a separate meld defect, being
-    diagnosed);
+  - 8 unresolved `actual::0-5` shim imports (a separate meld defect, #558);
   - 13 `pulseengine:async` intrinsics (retired by §6).
 
   So the module is refused loudly at run time; what is silent is meld's
