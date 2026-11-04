@@ -265,16 +265,19 @@ parser to the trusted code base for no gain.
 
 ## Open questions
 
-- **Interim behaviour.** Until step 3 lands, should meld keep exiting 0 on an
-  unfused `[async-lower]` edge, warn, or refuse? This is the maintainer's call.
-  One fact for it, measured by kiln (main 1adce1b4, `kiln --wasi`) on minimal
-  core modules shaped like meld's leftover: an `[async-lower]ping` import (plain
-  or `$root::...$1`) gives exit 1 with E21A0 and names the import, before any
-  code runs. The control without the import exits 0. So exit 0 is silent only
-  in meld's output; kiln refuses the module at load. Confirmation on a real
-  fused corpus pair is pending.
 
 ## Resolved
+
+- **Interim behaviour (maintainer, 2026-11-04, recorded in kiln AD-ASYNC-001
+  on kiln PR #624).** Until the step-3 adapters land, meld **refuses** an
+  `[async-lower]` edge it cannot fuse, loudly and at fuse time. It no longer
+  exits 0. kiln already refuses such a module at load (E21A0, measured on the
+  fused ping-pong pair), so the refusal moves the same failure earlier and
+  names the edge.
+- **kiln's design gate (step 4) is met.** kiln AD-ASYNC-001 (approved) has the
+  interpreter reuse kiln-async and supersedes `rfc46:107-111`. kiln schedules
+  SR-81 and SR-83 (fake built-ins refuse) for v0.8.0, and SR-84 (kiln-async
+  wiring plus subtasks against this section) for v0.9.0, after meld step 3.
 
 - **Section encoding:** binary, in Wasm's own style (§1).
 - **Edge-index carriage:** in the table, keyed by the producer's exact import
