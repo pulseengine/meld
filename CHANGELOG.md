@@ -13,6 +13,13 @@ All notable changes to this project will be documented in this file.
   a `thread.yield`, `waitable-set.wait` or `waitable-set.poll` with the legacy
   `cancellable` byte set is now refused at parse (component-model#716 removed
   it). meld 0.66.0 accepted it and dropped the flag.
+- **Output is validated by default under every memory strategy (SR-109,
+  #545).** Validation used to be implied only by `--memory shared`. Under
+  `--memory multi`, 11 of 504 P3 corpus components fused at exit 0 into a
+  module that fails validation, the defects in meld's own adapters. meld now
+  validates before writing under every strategy and refuses instead of writing
+  an invalid module. `--no-validate` opts out. On the same corpus no previously
+  valid output is refused.
 
 ### Fixed
 - **zstd advisories removed from the dependency graph.** wasmtime's default
