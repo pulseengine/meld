@@ -1763,6 +1763,7 @@ artifacts:
         target: SR-110
     provenance:
       created-by: ai-assisted
+      reviewed-by: avrabe
       model: claude-opus-5-5
       timestamp: 2026-11-04T09:00:00Z
 
@@ -1790,5 +1791,6 @@ artifacts:
         target: SR-108
     provenance:
       created-by: ai-assisted
+      reviewed-by: avrabe
       model: claude-opus-5-5
       timestamp: 2026-11-03T21:25:52Z
