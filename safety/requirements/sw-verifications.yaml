@@ -1753,6 +1753,20 @@ artifacts:
       timestamp: 2026-10-28T13:54:56Z
     release: v0.66.0
 
+  - id: SWV-121
+    type: sw-verification
+    title: "Verification of SR-109: exit 0 implies a valid module under every strategy"
+    status: implemented
+    description: "Verifies SR-109. meld-cli/tests/validate_default_545.rs drives the real binary on tests/p3/issue_545/empty-wait.wasm (component-model spec test/async/empty-wait.wast, first component; sha256 and origin in its README), which meld 0.66.0 fused under --memory multi at exit 0 into a module failing validation inside <meld-adapter>. The test checks the invariant for --memory multi, auto and shared: if meld exits 0 the written module validates; if it refuses, no file is left behind. Potency: with validation restored to shared-only it fails with 'exit 0 but the output is invalid: values remaining on stack at end of block'; a second test checks --no-validate still writes the file. The CLI unit table validation_implication_table now expects validation on for all three strategies unless --no-validate. Corpus: of the 344 corpus components meld 0.66.0 fused at exit 0 under --memory multi, the 333 whose output validated still fuse (no false refusal) and all 11 whose output was invalid are now refused. Local gate with rustc 1.99.0 recorded in the PR."
+    links:
+      - type: verifies
+        target: SR-109
+    provenance:
+      created-by: ai-assisted
+      reviewed-by: avrabe
+      model: claude-opus-5-5
+      timestamp: 2026-11-03T21:40:56Z
+
   - id: SWV-120
     type: sw-verification
     title: "Verification of SR-108: threaded inputs are refused with a reason"

@@ -12,6 +12,13 @@ All notable changes to this project will be documented in this file.
   reentrant, fixed placement). meld 0.66.0 fused a wasi-threads component at
   exit 0. P3 cooperative threads are in scope for kiln but not yet supported,
   and stay refused until they are. Plain P3 async is unaffected.
+- **Output is validated by default under every memory strategy (SR-109,
+  #545).** Validation used to be implied only by `--memory shared`. Under
+  `--memory multi`, 11 of 504 P3 corpus components fused at exit 0 into a
+  module that fails validation, the defects in meld's own adapters. meld now
+  validates before writing under every strategy and refuses instead of writing
+  an invalid module. `--no-validate` opts out. On the same corpus no previously
+  valid output is refused.
 
 ### Fixed
 - **zstd advisories removed from the dependency graph.** wasmtime's default

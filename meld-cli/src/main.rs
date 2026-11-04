@@ -204,21 +204,19 @@ enum Commands {
         #[arg(long)]
         preserve_names: bool,
 
-        /// Validate output with wasmparser. Implied on the single-address-space
-        /// paths (`--memory shared`, and therefore `--address-rebase`,
-        /// `--pack-rebase`, `--share-stack`); pass this to force it elsewhere.
+        /// Validate output with wasmparser. This is the default under every
+        /// memory strategy (#545); the flag is kept for scripts that pass it.
         #[arg(long)]
         validate: bool,
 
-        /// Skip the validation that `--memory shared` implies.
+        /// Skip output validation, which is on by default.
         ///
-        /// Validation is on by default there because that is where meld does its
-        /// most invasive rewriting — rebasing addresses and bridging calling
-        /// conventions inside one address space — and a defect shows up as a
-        /// module that no runtime accepts. #390 and #393 both shipped as invalid
-        /// or wrong output at exit 0; the reporter noted they would have caught
-        /// the first months earlier had this been the default. The cost is one
-        /// wasmparser pass over an artifact just built.
+        /// A defect in meld's output shows up as a module that no runtime
+        /// accepts. #390 and #393 shipped as invalid or wrong output at exit 0
+        /// under `--memory shared`; #545 found 11 P3 components fused under
+        /// `--memory multi` into invalid modules at exit 0, the defects in
+        /// meld's own adapters. The cost is one wasmparser pass over an
+        /// artifact just built, before it is written.
         #[arg(long, conflicts_with = "validate")]
         no_validate: bool,
 
@@ -821,7 +819,7 @@ fn fuse_command(
     if validate || implied {
         println!();
         if implied && !validate {
-            println!("Validating output (implied by --memory shared; --no-validate to skip)...");
+            println!("Validating output (on by default; --no-validate to skip)...");
         } else {
             println!("Validating output...");
         }
@@ -1568,16 +1566,15 @@ mod tests {
 /// enumerated rather than reasoned about: three strategies x two opt-out states
 /// is six cases, all covered below. meld#397 makes the case that meld's own
 /// decision seams deserve this treatment; this is a small one, so it gets it.
-fn validation_is_implied(strategy: &MemoryStrategy, no_validate: bool) -> bool {
-    if no_validate {
-        return false;
-    }
-    // Shared memory is where meld rebases absolute addresses and bridges
-    // calling conventions inside one address space — the rewriting whose
-    // failures (#390, #393) reached consumers as invalid or wrong output.
-    // `--memory multi` leaves each module's memory alone, so its output is not
-    // exposed to that class and validation stays opt-in there.
-    matches!(strategy, MemoryStrategy::SharedMemory)
+fn validation_is_implied(_strategy: &MemoryStrategy, no_validate: bool) -> bool {
+    // #545: on for EVERY strategy. This used to be shared-memory only, on the
+    // reasoning that `--memory multi` leaves each module's memory alone and is
+    // not exposed to the #390/#393 rewriting class. A 504-component P3 corpus
+    // disproved that: 11 components fused at exit 0 under `--memory multi`
+    // into modules that fail validation, the defects sitting in meld's own
+    // adapters, which every strategy emits. One wasmparser pass is cheap;
+    // writing an invalid module at exit 0 is not.
+    !no_validate
 }
 
 #[cfg(test)]
@@ -1591,11 +1588,12 @@ mod validate_default_tests {
     fn validation_implication_table() {
         use MemoryStrategy::*;
         for (strategy, no_validate, expected) in [
+            // #545: validation is on by default under every strategy.
             (SharedMemory, false, true),
             (SharedMemory, true, false),
-            (MultiMemory, false, false),
+            (MultiMemory, false, true),
             (MultiMemory, true, false),
-            (Auto, false, false),
+            (Auto, false, true),
             (Auto, true, false),
         ] {
             assert_eq!(

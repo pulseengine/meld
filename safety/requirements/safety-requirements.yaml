@@ -3815,6 +3815,22 @@ artifacts:
       timestamp: 2026-10-28T13:54:56Z
     release: v0.66.0
 
+  - id: SR-109
+    type: sw-req
+    title: Every memory strategy validates its own output by default
+    status: implemented
+    description: "SR-73 made meld validate its output before writing it on the single-address-space paths, on the reasoning that --memory multi leaves each module's memory alone and is not exposed to the rewriting defects seen on the shared path. A 504-component P3 corpus (#545) disproved that: 11 components fused at exit 0 under --memory multi into core modules that fail validation, the defects in meld's own adapters, which every strategy emits. meld shall validate the fused module before writing it under every memory strategy, by default, and shall not write a module that fails validation. --no-validate remains the explicit opt-out; --validate is kept and is now redundant."
+    links:
+      - type: derives-from
+        target: SYS-3
+      - type: refines
+        target: SR-73
+    provenance:
+      created-by: ai-assisted
+      reviewed-by: avrabe
+      model: claude-opus-5-5
+      timestamp: 2026-11-03T21:40:56Z
+
   - id: SR-108
     type: sw-req
     title: "Threaded inputs are refused: no shared memories, and no cooperative-thread built-ins until they are lowered"
