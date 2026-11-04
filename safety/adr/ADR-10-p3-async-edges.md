@@ -1,0 +1,208 @@
+---
+id: ADR-10
+type: design-question
+title: P3 async calls between fused components -- meld owns data (edge table + copy adapters), kiln-async owns control (tasks, subtasks, waitables), gale owns time, wake and isolation
+status: open
+gating-fixtures:
+  # Planned; none exist yet. Names are fixed here so the record can cite them.
+  - p3_async_edges_548::async_lower_caller_produces_one_edge_per_import (planned)
+  - p3_async_edges_548::edge_section_is_versioned_and_names_exports (planned)
+  - p3_async_edges_548::start_adapter_returns_the_packed_code_unchanged (planned)
+  - p3_async_edges_548::cross_domain_async_edge_is_refused (planned)
+  - p3_async_edges_548::non_callback_async_lift_edge_is_refused (planned)
+  - p3_async_edges_548::share_stack_with_stackful_or_threads_is_refused (planned)
+  - p3_async_edges_548::corpus_19_pairs_fuse_with_edges_and_no_host_left_import (planned)
+  # Runtime acceptance (kiln side): the same 19 pairs, fused, run on the kiln
+  # interpreter with wasmtime 51-dev's unfused result.
+design-paths:
+  - path-A0 -- leave async-lower imports to the host (status quo at v0.67.0) (rejected -- silent, 26/26 corpus pairs unfused at exit 0)
+  - path-A1 -- drive the callee to completion inside the call and return RETURNED (rejected -- deadlocks ping-pong, see Context)
+  - path-A2 -- meld emits an in-module scheduler (virtual subtasks, waitable sets) (rejected -- duplicates the runtime's task model and adds a second arbiter for events)
+  - path-A3 -- meld emits a static edge table and copy adapters; the kiln-async runtime runs subtasks; gale provides wake, time and isolation (proposed -- joint meld/kiln/gale design 2026-11-04)
+---
+
+# ADR-10 -- P3 async calls between fused components
+
+**Status: open (draft for review by kiln and gale).** The design below was
+agreed in principle by the kiln and gale sessions on 2026-11-04. It is not yet
+accepted by the maintainer.
+
+## Context (measured)
+
+- **The defect (#548).** In a corpus of 504 P3 components (meld main 21536f0),
+  26 natural caller/callee pairs fuse at exit 0 with **zero** fused calls
+  between components. In every one, the caller lowers the import with
+  `canon lower ... async`.
+  - Its core import is `[async-lower]f`, with signature
+    `(flat params | params ptr, retptr) -> i32 status`.
+  - The caller expects `RETURNED`, or `STARTED | subtask<<4` and a later
+    `SUBTASK` event through `[waitable-set-wait]`.
+  - meld only bridges a **sync** caller to an `[async-lift]` callee, so these
+    imports are left to the host. Neither `--explain` nor the attestation
+    mentions them.
+- **Completing inside the call is not valid (path-A1).** wit-bindgen
+  `ping-pong/runner.rs` passes future `rx` into `ping` and writes `tx` only
+  after `ping` has returned `STARTED` (`futures::join!(f1, f2)`). Driving
+  `ping` to completion inside the call waits on a future its own caller has not
+  written yet. Subtasks have to outlive the call.
+- **Oracle.** 19 of the 26 pairs compose unfused (wac 0.12) and pass under
+  wasmtime 51-dev `-Wcomponent-model-async`. The other 7 need host functions
+  that only wasmtime's test harness provides.
+- **The existing sync→async trampoline is defective (#555).** It reads the
+  wait result in an outdated format, writes scratch data at address 0 of the
+  callee's memory, and picks the first `[waitable-set-poll]` import whatever
+  its owner. It has never run. gale treats the address-0 write as blocking for
+  any P3 use: under `--domain`/`--pack-rebase` it is a cross-domain write.
+- **kiln (main 1adce1b4).** kiln runs meld's core output. Its P3 built-ins are
+  stubs: `[waitable-set-poll]` returns 0, and `join`, `drop` and `task-cancel`
+  are no-ops. Those stubs live in the engine and in kiln-builtins.
+  `kiln-async` is no_std and further along than its header says: `poll_round`
+  and every P3 intrinsic have a real backing (task, future, waitable-set,
+  stream with credit backpressure, error-context; `kiln-async/src/intrinsics.rs:11-41`).
+  But nothing links it yet, and it has no subtask concept. The kiln work is
+  wiring it in and adding subtasks, not building it from scratch.
+- **gale (main 23dd0b4).** gale ships meld → loom → synth → native code. Its
+  gust executor is verified: `MAX_TASKS = 8`, a `ready` bitmask, `wake(h)`,
+  `set_deadline`, and `poll_round`, which terminates on ready-popcount.
+  `dispatch_one`'s `ready == old.ready` is **assumed**, not proven. Every gale
+  image uses `--share-stack`.
+
+## Decision (proposed): path-A3
+
+The split: **meld = data, kiln-async = control, gale = time, wake and
+isolation.**
+
+### 1. meld emits a static, versioned edge table
+
+meld emits a custom section `pulseengine:async-edges`, `version: 1`, keyed by
+**original instance**. kiln refuses to load a module whose section is missing
+or malformed. The section has three entry kinds.
+
+- **Edge.** One per `[async-lower]` import that resolves to a fused callee.
+  - The caller's original-instance index, and its exact import
+    `(module, field)` including any `$N` suffix. The import is resolved to the
+    edge at link time, never by guessing from its name.
+  - The callee's original-instance index.
+  - The **export names** of the start adapter, the callee's `[callback]` and
+    the return adapter. Names are used, not indices, because loom renumbers
+    functions on gale's path.
+  - The parameter shape (flat i32 count, or a params pointer) and the position
+    of `retptr`. kiln stores `retptr` per subtask and passes it to the return
+    adapter.
+- **Stream or future type.** One per element type crossing an instance. It
+  names the copy adapter's export (preferred), or gives
+  `{elem size, align, owning memory}`.
+- **Bounds.** Maximum edges, and maximum concurrent subtasks per instance.
+  kiln-async and gale use fixed-capacity tables, which refuse loudly when full.
+
+The `$N` suffixes on `$root::[...]` built-ins decode through the same table to
+an owning instance, which is what kiln SR-81 needs.
+
+### 2. meld generates two copy adapters per edge, and no control flow
+
+- **Start adapter.** It runs inside the callee's instance and uses the callee's
+  realloc. It copies the caller's parameters into the callee's memory,
+  transcoding if needed, calls `[async-lift]`, and returns the packed i32
+  **unchanged**: exactly one i32 result, checked at load.
+  - It does not decode the code, loop on `YIELD`, or call `[callback]`.
+    kiln-async is the only arbiter.
+  - The waitable-set index in `WAIT | set<<4` belongs to the **callee's**
+    instance.
+- **Return adapter.** It is the target kiln routes the callee's
+  `[task-return]` to, for this edge only. It copies the results into the
+  caller's memory at the stored `retptr`.
+- **`[task-return]` stays a runtime built-in.** meld does not rewire it
+  statically: the same `[async-lift]` export can be the root task of a host
+  call or a subtask of an edge, and only the runtime knows which task is
+  current.
+
+### 3. kiln-async runs tasks, subtasks and events
+
+- kiln-async is one library used by both paths: the kiln interpreter's
+  `P3Builtin` arms, and kiln-builtins' `__p3_*` on the synth/gale path.
+- It owns the subtask and waitable-set tables per original instance, event
+  delivery, re-entering `[callback]`, backpressure, and may-enter checks.
+- Before calling the start adapter, kiln marks the new subtask as current. A
+  `[task-return]` during start then gives the caller `RETURNED`; otherwise the
+  caller gets `STARTED | handle<<4`. **Both outcomes are legal on the first
+  call.**
+- **Event order is part of the contract.** Events are delivered FIFO per
+  waitable set, and a subtask's `RETURNED` comes before any later event on the
+  same set. The interpreter and the synth path must deliver the same order, so
+  that fuel-bounded replay is deterministic.
+- Cooperative threads (ADR-9, kiln SR-82) use the **same** task table and
+  ready queue. There is one arbiter.
+- **Callback ABI only.** An `[async-lift]` callee without `[callback]`
+  (stackful) needs fibers, which the synth path cannot provide without
+  `unsafe`. meld refuses such an edge loudly.
+
+### 4. gale provides wake, time and isolation
+
+- **Placement.** Subtask and waitable state lives in the partition that owns
+  the tasks, inside its MPU region.
+- **v1: no async edge across partitions or domains.** meld refuses an edge
+  whose caller and callee are in different `--domain`s. With `--domain`, the
+  Component Model boundary is gale's privilege boundary (gale#408), and handle
+  tables are unforgeable only across that boundary (#427). A later version may
+  map such an edge onto a supervisor-owned gale IPC object, under a new
+  requirement.
+- **Wake seam.** It is the existing gust one, with no second readiness
+  structure:
+  - `wake(h)`, also called from ISR context; kiln's REQ_ASYNC_EXTWAKE lands on
+    this;
+  - `set_deadline(h, tick)`;
+  - `next_deadline()`, which bounds how long the outer loop may sleep in
+    `WFI`.
+- **Proof obligations gale keeps.**
+  - (a) Bounded poll. Nothing sets a ready bit synchronously inside
+    `poll_round`. Wake-ups from subtask completion and from event delivery are
+    deferred into a pending mask, applied after `poll_round` returns.
+  - (b) No lost wake-ups. The pending mask is merged with `|=` and never
+    overwritten.
+  - (c) Static capacity, refused loudly when full.
+  - (d) No async, closures or trait objects in the verified core. Callback
+    re-entry stays behind the unverified `poll_task` call.
+
+### 5. Refusals meld adds (all loud, at fuse time)
+
+- An async edge across `--domain`s (gale, v1).
+- An `[async-lift]` callee without `[callback]` on an edge (kiln: no fibers).
+- `--share-stack` together with stackful async or cooperative threads. A live
+  stack across a suspension is silent memory corruption on gale's targets.
+  Stackless callback tasks unwind the shadow stack at `WAIT`, so they stay
+  allowed.
+
+### 6. Consequences for existing records
+
+- **ADR-1.** Its host-intrinsic ABI (`pulseengine:async`) for streams and
+  futures is superseded. Streams and futures pass through as the producer's
+  `$root::[stream-*]` / `[future-*]` imports, consistent with ADR-9 for threads
+  and with kiln#621's open question.
+- **The sync→async trampoline (#555)** is replaced by the same start/return
+  adapters, with kiln-async driving the callee. meld then emits no callback
+  loop at all.
+- **kiln.** This changes kiln's `rfc46-toolchain-architecture.md:107-111`,
+  which says the interpreter does no Component Model async. kiln records that
+  change as its own design decision.
+
+## Order of work (proposed)
+
+1. **kiln SR-81:** decode `$N` through the import map.
+2. **kiln:** change the stub built-ins to refuse loudly until they are real.
+3. **meld:** the section format and refusals (§1, §5), plus the start and
+   return adapters (§2), Tier-5 with Mythos. This retires the #555 trampoline.
+4. **kiln-async:** link it into the engine and kiln-builtins, and add the
+   subtask table (§3). gale: pending-mask
+   wake-ups (§4).
+5. **Together:** run the 19 acceptance pairs fused on kiln and compare against
+   wasmtime.
+6. **Last:** streams and futures through per-type copy adapters (§1).
+
+## Open questions
+
+- **Interim behaviour.** Until step 3 lands, should meld keep exiting 0 on an
+  unfused `[async-lower]` edge, warn, or refuse? This is the maintainer's call.
+- **Section encoding.** Should it be a binary format or CBOR? It must be
+  readable by kiln's no_std loader and kept intact by loom.
+- **The 7 harness-only pairs.** Should they get a kiln-side host shim, or stay
+  outside the acceptance set?
