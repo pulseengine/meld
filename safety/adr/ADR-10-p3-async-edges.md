@@ -112,10 +112,16 @@ parser to the trusted code base for no gain.
 - **synth (gale's path).** kiln-builtins cannot look up exports at run time:
   synth-compiled code calls fixed `__p3_*` symbols. So synth reads the section
   and turns each edge's adapter and callback names into a dispatch table, which
-  kiln-builtins receives at init. The lowered caller call therefore carries the
-  **edge index**, not a name. How the index is encoded in the caller's import
-  (for example, one renamed import per edge) is fixed in the v1 format
-  specification before step 3.
+  kiln-builtins receives at init.
+- **The edge index travels in the table, not in the import name.** The caller's
+  import keeps the producer's exact `(module, field)`, including any `$N`, and
+  each edge entry maps that import to its index. The interpreter resolves
+  import → edge once at load. synth resolves the same entry at compile time and
+  emits a per-edge stub that calls kiln-builtins with the constant index.
+  Renaming imports per edge would create a second naming scheme next to the
+  producer's (the reason `pulseengine:async` was rejected). It would also break
+  the rule that an import is resolved by an exact table match, never by parsing
+  its name.
 
 ### 2. meld generates two copy adapters per edge, and no control flow
 
@@ -239,16 +245,18 @@ parser to the trusted code base for no gain.
 
 - **Interim behaviour.** Until step 3 lands, should meld keep exiting 0 on an
   unfused `[async-lower]` edge, warn, or refuse? This is the maintainer's call.
-  One fact for it: kiln's `P3Builtin` does not handle `[async-lower]`, so kiln
-  should refuse such an import at load (E21A0, unresolved import). So far this
-  comes from reading kiln's code; kiln will confirm it on one of the 19 pairs.
-  If confirmed, exit 0 is silent only in meld's output, not on kiln at run
-  time.
-- **How the caller import carries the edge index** on the synth path (§1).
+  One fact for it, measured by kiln (main 1adce1b4, `kiln --wasi`) on minimal
+  core modules shaped like meld's leftover: an `[async-lower]ping` import (plain
+  or `$root::...$1`) gives exit 1 with E21A0 and names the import, before any
+  code runs. The control without the import exits 0. So exit 0 is silent only
+  in meld's output; kiln refuses the module at load. Confirmation on a real
+  fused corpus pair is pending.
 
 ## Resolved
 
 - **Section encoding:** binary, in Wasm's own style (§1).
+- **Edge-index carriage:** in the table, keyed by the producer's exact import
+  (§1).
 - **The 7 harness-only pairs:** they stay out of the acceptance set. kiln's
   rules forbid simulated host functions outside test code, and a shim in a test
   module would prove nothing about the product path. They are tracked as
