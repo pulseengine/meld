@@ -159,3 +159,23 @@ pub fn resolve_thread_table(
         ))),
     }
 }
+
+/// Indices of the components that declare any cooperative-thread built-in
+/// other than `thread.yield`.
+///
+/// `thread.yield` is left out on purpose: it is also the plain P3 async yield,
+/// predates #547, and components that use only it have always fused.
+pub fn components_using_cooperative_threads(
+    components: &[crate::parser::ParsedComponent],
+) -> Vec<usize> {
+    components
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| {
+            c.canonical_functions.iter().any(|e| {
+                producer_name(e).is_some() && !matches!(e, CanonicalEntry::ThreadYield { .. })
+            })
+        })
+        .map(|(i, _)| i)
+        .collect()
+}

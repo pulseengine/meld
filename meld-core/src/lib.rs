@@ -1592,6 +1592,23 @@ impl Fuser {
         // `--share-stack` builds on `--pack-rebase` (SR-66 / #380): it needs the
         // packed byte-granular stride, and rebasing underlies both.
         let pack_rebase = self.config.pack_rebase || self.config.share_stack;
+        // #547 / ADR-9: under one shared address space the host-import dedup
+        // merges the same built-in from two components into ONE import, and a
+        // cooperative thread's identity (its table, its index space) belongs
+        // to a component INSTANCE. A merged import cannot say which instance
+        // a call comes from, so refuse rather than fuse it silently.
+        if self.config.memory_strategy == MemoryStrategy::SharedMemory {
+            let users = thread_builtins::components_using_cooperative_threads(&self.components);
+            if users.len() > 1 {
+                return Err(Error::UnsupportedFeature(format!(
+                    "components {users:?} all use P3 cooperative-thread built-ins, and \
+                     --memory shared would merge them into one host import per built-in, \
+                     losing which component instance each call comes from; fuse them with \
+                     --memory multi or fuse one threaded component at a time (ADR-9)"
+                )));
+            }
+        }
+
         let address_rebasing = self.config.address_rebasing || pack_rebase;
         let merger = Merger::new(self.config.memory_strategy, address_rebasing)
             .with_domains(self.component_domains())

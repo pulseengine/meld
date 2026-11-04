@@ -78,9 +78,30 @@ Points a host must know:
   import is emitted as `[thread-index]$1` (the component index), exactly as for
   every other pass-through built-in, so that `(module, field)` stays unique. The
   suffix names which component's thread state the call belongs to; strip it to
-  get the built-in. Under `--memory shared` the same import from two components
-  is deduplicated into ONE import with no suffix (measured on a two-component
-  `thread.index` fixture), so the host cannot tell the components apart there.
+  get the built-in. The `$N` alone does not identify the owner (the unsuffixed
+  import belongs to whichever component imports it first, not necessarily
+  component 0): **hosts must attribute each thread import to its component from
+  the `--emit-import-map` `component` field**, which names the owning component
+  of every import including all nine thread built-ins. (The attestation records
+  the thread table, not a per-import owner.) A cooperative thread's identity and
+  table belong to a component INSTANCE, so this attribution is not optional.
+- **`--memory shared` refuses two threaded components.** Under one shared
+  address space the host-import dedup merges the same built-in from two
+  components into ONE import with no suffix, and the instance a call comes from
+  is lost (measured on a two-component `thread.index` fixture; the wasmtime test
+  `during-sync-call-no-sibling-resume` fused at exit 0 that way). meld therefore
+  refuses, citing this ADR, when more than one component in a shared fusion
+  declares any cooperative-thread built-in other than `thread.yield`
+  (`thread.yield` is also the plain P3 async yield, predates #547 and is left
+  alone). Single-component fusions and `--memory multi` are unchanged.
+- **Names reached through alias chains.** A built-in wired into a core module
+  through bag -> `alias core export` -> bag is named after the built-in, found by
+  following the alias chain to its end, not after whatever name the core module
+  imports it under (the module's name can be another built-in's producer name;
+  meld used to keep it, so a host would have bound the wrong built-in, for
+  `task.*`, `context.*`, `waitable*`, `subtask.*`, `backpressure.*` and `thread.*`
+  alike). An alias that names an instance that is neither an export bag nor an
+  instantiated module is refused.
 - **The names the old design used are gone.** `thread.switch-to` and
   `thread.yield-to` no longer exist in the canonical ABI (replaced by
   `thread.suspend-then-resume` / `thread.yield-then-resume` and the

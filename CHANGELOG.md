@@ -23,7 +23,12 @@ All notable changes to this project will be documented in this file.
   validate; 19 stay refused for another named reason. Shared memories,
   `thread.spawn-*` and `thread.available-parallelism` stay refused (ADR-9).
   The host must strip a `$N` suffix from a second component's import under
-  `--memory multi`, as for every other built-in. `--component` output still
+  `--memory multi`, as for every other built-in, and must take the owning
+  component of each thread import from the import map's `component` field (the
+  suffix alone does not identify it). `--memory shared` refuses a fusion in
+  which more than one component uses a cooperative-thread built-in (other than
+  `thread.yield`), because the shared fusion merges them into one host import
+  and loses the instance each call comes from. `--component` output still
   refuses host built-ins.
 
 ### Changed
@@ -61,6 +66,14 @@ All notable changes to this project will be documented in this file.
   valid output is refused.
 
 ### Fixed
+- **A built-in reached through an alias chain was named after the core module's
+  own import (#547).** A non-lower canonical built-in (`thread.*`, `context.*`,
+  `waitable*`, `subtask.*`, `backpressure.*`, `task.*`) wired into a core module
+  through bag -> `alias core export` -> bag kept the module's import name; if
+  that was another built-in's name, the host bound the wrong one (a
+  `thread.yield` imported as `[thread-index]`, a `context.get` as
+  `[waitable-set-new]`). The chain is now followed to its end. No corpus
+  output changed.
 - **zstd advisories removed from the dependency graph.** wasmtime's default
   `cache` feature pulled `wasmtime-internal-cache` -> zstd 0.13 / zstd-safe 7 /
   zstd-sys 2.0 (RUSTSEC-2026-0391, -0398, -0403, -0410, plus a run of unsound

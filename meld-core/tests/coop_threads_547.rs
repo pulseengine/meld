@@ -734,3 +734,156 @@ fn hand_written_builtins_surface_under_producer_names() {
     assert_eq!(got, want);
     assert_eq!(stats.thread_table.unwrap().export, "__meld_thread_table");
 }
+
+// ---- alias chains (Mythos finding) ------------------------------------------
+
+/// A non-lower built-in reached through bag -> alias -> bag must be named after
+/// the BUILT-IN, not after the import the core module happens to use. The
+/// module here imports it as `$root::[thread-index]`; it is `thread.yield`.
+// rivet: verifies SWV-122
+#[test]
+fn alias_chained_yield_keeps_its_own_name_and_semantics() {
+    let (core, _) = fuse(&fixture("alias_chain/yield_via_alias_chain.wasm")).unwrap();
+    validate(&core).unwrap();
+    let names: Vec<String> = func_imports(&core).into_iter().map(|i| i.1).collect();
+    assert!(names.contains(&"[thread-yield]".to_string()), "{names:?}");
+    assert!(
+        !names.contains(&"[thread-index]".to_string()),
+        "the module's own (wrong) name must not survive: {names:?}"
+    );
+    // composed on wasmtime 51-dev this component returns 7
+    assert_eq!(
+        run_with_host(&core, "__meld_thread_table"),
+        Ok(7),
+        "{names:?}"
+    );
+}
+
+// rivet: verifies SWV-122
+#[test]
+fn alias_chained_context_get_is_not_misnamed_as_waitable_set_new() {
+    let (core, _) = fuse(&fixture("alias_chain/context_get_via_alias_chain.wasm")).unwrap();
+    let names: Vec<String> = func_imports(&core).into_iter().map(|i| i.1).collect();
+    assert_eq!(names, vec!["[context-get-0]".to_string()]);
+}
+
+// ---- --memory shared -------------------------------------------------------
+
+/// Two components (`c` then `d`, as in the wasmtime threading-builtins test)
+/// where `d` always calls `thread.index` and `c` does only when `c_threaded`.
+fn two_component_threads(c_threaded: bool) -> Vec<u8> {
+    let (c_import, c_with, c_func) = if c_threaded {
+        (
+            r#"(import "" "thread.index" (func $ti (result i32)))"#,
+            r#"(core func $ti (canon thread.index))
+    (core instance (export "thread.index" (func $ti)))"#,
+            "call $ti",
+        )
+    } else {
+        ("", "", "i32.const 1")
+    };
+    let c_inst = if c_threaded {
+        r#"(core instance $m (instantiate $m (with "" (instance 0))))"#
+    } else {
+        "(core instance $m (instantiate $m))"
+    };
+    let wat = format!(
+        r#"(component
+  (component $c
+    (core module $m
+      {c_import}
+      (func (export "run") (result i32) {c_func}))
+    {c_with}
+    {c_inst}
+    (func (export "run") (result u32) (canon lift (core func $m "run"))))
+  (instance $c (instantiate $c))
+  (component $d
+    (type (instance (export "run" (func (result u32)))))
+    (import "c" (instance $c (type 0)))
+    (alias export $c "run" (func $crun))
+    (core func $run (canon lower (func $crun)))
+    (core module $m
+      (import "" "thread.index" (func $ti (result i32)))
+      (import "" "run" (func $run (result i32)))
+      (func (export "run") (result i32) call $ti drop call $run))
+    (core func $ti (canon thread.index))
+    (core instance $i (export "thread.index" (func $ti)) (export "run" (func $run)))
+    (core instance $m (instantiate $m (with "" (instance $i))))
+    (func (export "run") (result u32) (canon lift (core func $m "run"))))
+  (instance $d (instantiate $d (with "c" (instance $c))))
+  (alias export $d "run" (func $drun))
+  (export "run" (func $drun)))"#
+    );
+    wat::parse_str(&wat).unwrap_or_else(|e| panic!("{e}\n{wat}"))
+}
+
+/// Two components using cooperative-thread built-ins would be merged into one
+/// host import per built-in under one shared address space, losing the instance
+/// each call comes from: refused, citing ADR-9.
+// rivet: verifies SWV-122
+#[test]
+fn shared_memory_refuses_two_threaded_components() {
+    let bytes = two_component_threads(true);
+    let err = fuse_with(&[&bytes], MemoryStrategy::SharedMemory)
+        .expect_err("two threaded components under --memory shared must be refused");
+    assert!(
+        err.contains("ADR-9") && err.contains("cooperative"),
+        "{err}"
+    );
+    // the real wasmtime component, too
+    let err = fuse_with(
+        &[&fixture("corpus/wasmtime_threading-builtins_m5.wasm")],
+        MemoryStrategy::SharedMemory,
+    )
+    .expect_err("same for the wasmtime fixture");
+    assert!(err.contains("ADR-9"), "{err}");
+}
+
+/// Controls: the refusal is not a blanket one. --memory multi fuses the same
+/// input and names each import's owning component; one threaded component among
+/// two fuses under shared; a single threaded component fuses under shared.
+#[test]
+fn control_multi_attributes_components_and_single_threaded_shared_fuses() {
+    let both = two_component_threads(true);
+    let (core, stats) = fuse_with(&[&both], MemoryStrategy::MultiMemory).expect("multi fuses");
+    validate(&core).unwrap();
+    let mut owners: Vec<(String, Option<usize>)> = stats
+        .import_map
+        .iter()
+        .filter(|e| e.name.starts_with("[thread-"))
+        .map(|e| (e.name.clone(), e.component))
+        .collect();
+    owners.sort();
+    assert_eq!(owners.len(), 2, "{owners:?}");
+    // distinct owners, and the `$N` suffix names the owner
+    assert_ne!(owners[0].1, owners[1].1, "{owners:?}");
+    for (name, comp) in &owners {
+        if let Some(n) = name.split('$').nth(1) {
+            assert_eq!(comp, &Some(n.parse::<usize>().unwrap()), "{owners:?}");
+        }
+    }
+
+    // only `d` threaded: the import belongs to d, not to component 0
+    let only_d = two_component_threads(false);
+    let (core, stats) = fuse_with(&[&only_d], MemoryStrategy::MultiMemory).unwrap();
+    validate(&core).unwrap();
+    let threads: Vec<_> = stats
+        .import_map
+        .iter()
+        .filter(|e| e.name.starts_with("[thread-"))
+        .collect();
+    assert_eq!(threads.len(), 1);
+    assert_ne!(
+        threads[0].component,
+        Some(0),
+        "owned by the second component"
+    );
+    fuse_with(&[&only_d], MemoryStrategy::SharedMemory).expect("one threaded component is fine");
+
+    let (core, _) = fuse_with(
+        &[&fixture("t1_new_resume.wasm")],
+        MemoryStrategy::SharedMemory,
+    )
+    .expect("a single threaded component fuses under shared");
+    validate(&core).unwrap();
+}

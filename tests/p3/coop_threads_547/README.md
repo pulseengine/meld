@@ -37,3 +37,22 @@ wasmtime at commit 3cfc2d6 (`wasm-tools 1.263`, module N of the wast):
 | `corpus/wasmtime_promote-ready-threads_m0.wasm` | promote-ready-threads.wast#module0 | `913afabd3c16970289085924bd05b6b349272f4f313cf88cc4c5bd3dfcb88371` |
 | `corpus/wasmtime_threading-builtins_m5.wasm` | threading-builtins.wast#module5 (two components, both `thread.index`: the second import surfaces as `[thread-index]$1`) | `b2332687d6f6bfd487f41307edbefd0769b991058b979f7b514cfb44b8603185` |
 | `corpus/wasmtime_yield-cancellable_m0.wasm` | yield-cancellable.wast#module0 | `b8c563f3a98303106d06eaf54e1d099d73b6cceb820109005a6ce5a72ae139bc` |
+
+## Two alias-chain components (`alias_chain/`)
+
+Hand-written WAT, assembled with wasm-tools 1.263, from the Mythos review of
+this change. Each wires a NON-lower canonical built-in into a core module's
+import through bag -> `alias core export` -> bag, where the module's own import
+name belongs to a DIFFERENT built-in. meld used to keep the module's name, so a
+host would bind the wrong built-in.
+
+| file | built-in reached | name the module imports it under | sha256 |
+|---|---|---|---|
+| `alias_chain/yield_via_alias_chain.wasm` | `thread.yield` | `$root::[thread-index]` | `557b75c6c28660ac032d25f6854830dc67af6ab675e56fad602ce1c954d46057` |
+| `alias_chain/context_get_via_alias_chain.wasm` | `context.get i32 0` | `$root::[waitable-set-new]` | `f573a4a4a8331aaac8012fd04a70a8a3d2ba415dd3d9d1af791dc30fe3acede4` |
+
+`yield_via_alias_chain.wasm`'s `run` calls `thread.new-indirect(1, 7)`,
+`thread.resume-later`, then the aliased `thread.yield`, and returns a counter;
+the composed component returns 7 on wasmtime 51-dev. The fused module must
+import `[thread-yield]` and, on a host that resolves `fn_idx` through
+`__meld_thread_table`, return 7.
