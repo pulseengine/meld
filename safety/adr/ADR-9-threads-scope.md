@@ -81,10 +81,15 @@ Points a host must know:
   get the built-in. The `$N` alone does not identify the owner (the unsuffixed
   import belongs to whichever component imports it first, not necessarily
   component 0): **hosts must attribute each thread import to its component from
-  the `--emit-import-map` `component` field**, which names the owning component
-  of every import including all nine thread built-ins. (The attestation records
-  the thread table, not a per-import owner.) A cooperative thread's identity and
-  table belong to a component INSTANCE, so this attribution is not optional.
+  the `--emit-import-map` `component` field**. Under `--memory multi` that
+  field names the owning component of every thread import. Under `--memory
+  shared` a built-in that two components share is merged into one import
+  attributed to the first, with `also_components` empty. This is why shared
+  fusion of two threaded components is refused below. `thread.yield` is not
+  counted for that refusal, so two components' yields can still merge. (The
+  attestation records the thread table, not a per-import owner.) A cooperative
+  thread's identity and table belong to a component INSTANCE, so this
+  attribution is not optional.
 - **`--memory shared` refuses two threaded components.** Under one shared
   address space the host-import dedup merges the same built-in from two
   components into ONE import with no suffix, and the instance a call comes from
