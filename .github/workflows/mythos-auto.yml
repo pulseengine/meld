@@ -300,8 +300,14 @@ jobs:
             --json-schema. The "verdict" field is the only signal
             this workflow's gate logic consumes; everything else is
             for the PR comment.
+          # --max-turns 50, not 30: on PR #559 the resolver.rs pass hit 30
+          # turns before emitting a verdict, then needed 29 on the next run. A
+          # run that stops short is reported as a FINDING without a verdict,
+          # which blocks the gate on a run that checked nothing. 50 turns is
+          # about 14 min, inside the job's 45-minute timeout. (This comment sits
+          # outside the block scalar: inside `|` it would become arguments.)
           claude_args: |
-            --max-turns 30
+            --max-turns 50
             --allowedTools "Read,Grep,Glob"
             --json-schema '{"type":"object","required":["verdict"],"properties":{"verdict":{"type":"string","enum":["NO_FINDINGS","FINDING"]},"file":{"type":"string"},"function":{"type":"string"},"hypothesis":{"type":"string"},"impact":{"type":"string"},"candidate_uca":{"type":"string"},"kani_harness":{"type":"string"},"poc_test":{"type":"string"}}}'
 
