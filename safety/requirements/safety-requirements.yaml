@@ -3881,3 +3881,19 @@ artifacts:
       model: claude-opus-5-5
       timestamp: 2026-11-03T21:25:52Z
     release: v0.67.0
+
+  - id: SR-112
+    type: sw-req
+    title: An async lowering is recognised by its async option, not by its core import name, and a world-level async import is never left to the host under a sync name
+    status: implemented
+    release: v0.68.0
+    description: "SR-111 item 1 recognised a #548 edge only when the caller's core import field carried wit-component's [async-lower] prefix. The wasmtime and component-model test-suite producers, and hand-written WAT, name the core import without it (for example \"\" \"f\"), and a component nested in a composition reaches its sibling through flattening rather than through the per-function matcher. On the 504-component P3 corpus, 23 inputs that SR-111 let through were such edges: an async-lowered call wired directly to a sibling's [async-lift] export with no async adapter (--explain: N direct or memory-copy boundaries, 0 async-lift), at exit 0, identical on v0.67.0, so the caller received the callee's callback code as its status. Separately, an async lowering of a world-level func import that meld leaves to the host was emitted as (import \"f\" \"\") with the async core type, which a host binds as a sync call (#560). meld shall: (1) decide whether a core import is an async lowering from the canon lower it traces to (its async option), whatever the import's field name; (2) refuse a fusion in which such an import is wired to another fused component (an adapter site), or whose world-level component import is satisfied by another fused component, with an error naming both components and citing #548 and ADR-10; (3) refuse an async lowering of a world-level func import that is left to the host, naming the import and citing #560, until the host-side name is settled under ADR-10."
+    links:
+      - type: derives-from
+        target: SYS-3
+      - type: refines
+        target: SR-111
+    provenance:
+      created-by: ai-assisted
+      model: claude-opus-5-5
+      timestamp: 2026-11-05T06:00:57Z

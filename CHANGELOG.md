@@ -25,6 +25,16 @@ All notable changes to this project will be documented in this file.
   - 28 change only in import names (the `[async-lower]` prefix);
   - 157 are newly refused, all citing #558.
 
+  - **#548, by the async option (SR-112).** An async lowering is recognised
+    from its `canon lower` options, not from the `[async-lower]` text in the
+    core import name. The wasmtime and component-model test producers name
+    the import plainly, and 23 corpus inputs had such an edge wired straight to
+    a sibling's `[async-lift]` export at exit 0 (also on v0.67.0). They are now
+    refused, citing #548.
+  - **#560:** an async lowering of a world-level func import that would be left
+    to the host as `(import "f" "")` with the async core type is refused, until
+    its host-side name is settled under ADR-10.
+
   Every P3 caller/callee pair in the corpus is now refused (43), and all 42
   non-P3 pairs fuse byte-identically. kiln already refused all of these modules
   at load (E21A0). The #545 validation tests now use `reentrance-m6.wasm`,

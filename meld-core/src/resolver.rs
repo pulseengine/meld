@@ -1365,7 +1365,16 @@ fn collect_param_wit_types(
 /// and `$wasi:io/streams@0.2.6` is component instance 3 which came from
 /// component import `"wasi:io/streams@0.2.6"`, then the result is
 /// `("wasi:io/streams@0.2.6", "[method]output-stream.check-write")`.
-fn build_canon_import_names(component: &ParsedComponent) -> HashMap<u32, (String, String)> {
+/// Also returns the core funcs that lower a world-level func import with the
+/// async option (#560). meld has no field name for those (the instance-export
+/// arm's `[async-lower]` prefix needs a field), so they get no entry in the map,
+/// and the caller refuses an import that reaches one.
+fn build_canon_import_names(
+    component: &ParsedComponent,
+) -> (
+    HashMap<u32, (String, String)>,
+    std::collections::HashSet<u32>,
+) {
     use crate::parser::{
         CanonicalEntry, ComponentFuncDef, ComponentInstanceDef, ComponentTypeDef, CoreEntityDef,
     };
@@ -1434,6 +1443,7 @@ fn build_canon_import_names(component: &ParsedComponent) -> HashMap<u32, (String
     // Step 3: Walk core_entity_order to find canonical functions and their
     // core func indices. For each Lower entry, trace to WASI name.
     let mut result: HashMap<u32, (String, String)> = HashMap::new();
+    let mut async_world_lowers = std::collections::HashSet::new();
     let mut core_func_idx = 0u32;
 
     for def in &component.core_entity_order {
@@ -1471,6 +1481,12 @@ fn build_canon_import_names(component: &ParsedComponent) -> HashMap<u32, (String
                                 // The component function is a direct Func import.
                                 // Use the import name as both module and field.
                                 result.insert(core_func_idx, (import_name.clone(), String::new()));
+                                if options.async_ {
+                                    // #560: `(import, "")` drops the async marker
+                                    // while keeping the async core type; see
+                                    // `refuse_async_lowered_edges`.
+                                    async_world_lowers.insert(core_func_idx);
+                                }
                             }
                         }
                         CanonicalEntry::ResourceDrop { resource } => {
@@ -1673,7 +1689,7 @@ fn build_canon_import_names(component: &ParsedComponent) -> HashMap<u32, (String
         }
     }
 
-    result
+    (result, async_world_lowers)
 }
 
 /// Extract the resource name from a WASI import path.
@@ -2506,7 +2522,124 @@ impl Resolver {
         // add them as synthetic unresolved imports so the merger includes them.
         Self::synthesize_missing_resource_imports(components, &mut graph);
 
+        Self::refuse_async_lowered_edges(components, &graph)?;
+
         Ok(graph)
+    }
+
+    /// #548 / #560: refuse what meld cannot fuse or name for a core import
+    /// wired to a `canon lower ... async`.
+    ///
+    /// Decided from the lowering's async option, not from the import's field
+    /// name: producers other than wit-component (the wasmtime and
+    /// component-model test suites, hand-written WAT) name the core import
+    /// without the `[async-lower]` prefix, so a name-based check misses them.
+    ///
+    /// * An async-lowered import that the resolver wired to another fused
+    ///   component (an adapter site) is the #548 edge. It needs real subtasks
+    ///   (ADR-10); wired like a sync call, the caller receives the callee's
+    ///   callback code as its status.
+    /// * An async lowering of a world-level func import that is left to the
+    ///   host would be emitted as `(import "f" "")` with the async core type,
+    ///   which a host binds as a sync call (#560).
+    fn refuse_async_lowered_edges(
+        components: &[ParsedComponent],
+        graph: &DependencyGraph,
+    ) -> Result<()> {
+        type Lowers = (
+            HashMap<u32, crate::parser::CanonicalOptions>,
+            std::collections::HashSet<u32>,
+        );
+        let mut per_component: HashMap<usize, Lowers> = HashMap::new();
+        // (component, module) -> that module's async-lowered imports, each with
+        // whether the lowering is of a world-level func import.
+        let mut async_imports: HashMap<(usize, usize), Vec<(&UnresolvedImport, bool)>> =
+            HashMap::new();
+        for u in &graph.unresolved_imports {
+            let Some(lower) = u.lower_core_func else {
+                continue;
+            };
+            let Some(component) = components.get(u.component_idx) else {
+                continue;
+            };
+            let (lowers, world) = per_component.entry(u.component_idx).or_insert_with(|| {
+                (
+                    core_lower_options(component),
+                    build_canon_import_names(component).1,
+                )
+            });
+            if lowers.get(&lower).is_some_and(|o| o.async_) {
+                async_imports
+                    .entry((u.component_idx, u.module_idx))
+                    .or_default()
+                    .push((u, world.contains(&lower)));
+            }
+        }
+        if async_imports.is_empty() {
+            return Ok(());
+        }
+        // An adapter site names the caller import by its core names, its display
+        // names, or, for a world-level func import (display field empty), by
+        // the component-level import name as both module and field.
+        let names_match = |u: &UnresolvedImport, world: bool, module: &str, field: &str| {
+            (u.module_name == module && u.field_name == field)
+                || (u.display_module.as_deref() == Some(module)
+                    && u.display_field.as_deref() == Some(field))
+                || (world && u.display_module.as_deref() == Some(module) && module == field)
+        };
+        for site in &graph.adapter_sites {
+            let Some(list) = async_imports.get(&(site.from_component, site.from_module)) else {
+                continue;
+            };
+            if let Some((u, _)) = list
+                .iter()
+                .find(|(u, world)| names_match(u, *world, &site.import_module, &site.import_name))
+            {
+                return Err(Error::UnsupportedFeature(format!(
+                    "component {} calls `{}` (core import `{}::{}`) with the async calling \
+                     convention, and component {} implements it (`{}`). meld cannot fuse an \
+                     async-lower call between components yet: it needs real subtasks run by \
+                     the host scheduler (ADR-10, #548). Refusing instead of wiring it as a \
+                     sync call",
+                    site.from_component,
+                    site.import_name,
+                    u.module_name,
+                    u.field_name,
+                    site.to_component,
+                    site.export_name
+                )));
+            }
+        }
+        for list in async_imports.values() {
+            if let Some((u, _)) = list.iter().find(|(_, world)| *world) {
+                let host_name = u.display_module.as_deref().unwrap_or(&u.module_name);
+                // The component-level import is satisfied by another fused
+                // component, but no core call could be wired (the callee's
+                // core export is `[async-lift]f`): still the #548 edge.
+                if let Some((to_comp, export)) = graph
+                    .resolved_imports
+                    .get(&(u.component_idx, host_name.to_string()))
+                {
+                    return Err(Error::UnsupportedFeature(format!(
+                        "component {} calls `{host_name}` (core import `{}::{}`) with the async \
+                         calling convention, and component {to_comp} implements it (`{export}`). \
+                         meld cannot fuse an async-lower call between components yet: it needs \
+                         real subtasks run by the host scheduler (ADR-10, #548). Refusing \
+                         instead of leaving the call unresolved",
+                        u.component_idx, u.module_name, u.field_name
+                    )));
+                }
+                return Err(Error::UnsupportedFeature(format!(
+                    "core import {}::{} lowers the world-level function import `{host_name}` \
+                     with the async option, and meld has no name for it that keeps the async \
+                     calling convention: emitting it as `{host_name}` with an empty field would \
+                     let a host bind it as a sync call (#560; the name is settled with the host \
+                     under ADR-10)",
+                    u.module_name, u.field_name
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// Add synthetic unresolved imports for `[resource-rep]` / `[resource-new]`
@@ -2932,7 +3065,7 @@ impl Resolver {
         let provenance = build_entity_provenance(component);
 
         // Build canonical lower → WASI name mapping for renaming ""::N imports
-        let canon_import_names = build_canon_import_names(component);
+        let (canon_import_names, _) = build_canon_import_names(component);
         let canon_lower_sites = core_lower_options(component);
         let core_func_aliases = core_func_alias_targets(component);
         let builtin_canon_funcs = core_builtin_canon_funcs(component);

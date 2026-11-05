@@ -12,15 +12,19 @@ fails validation inside `<meld-adapter>`. It was one of 11 such components in a
 after the underlying adapter defect is fixed: if `meld fuse` exits 0, its output
 validates.
 
-## reentrance-m6.wasm (current fixture, since #558)
+## Fixture history: empty-wait.wasm is current again
 
-From #558 on, meld refuses `empty-wait.wasm` before validation runs: it wires a
-`future.read` that meld cannot name yet. A refusal still satisfies the
-invariant, but the potency check (`--no-validate` writes an invalid module)
-would no longer bite. So the tests now use `reentrance-m6.wasm`, module 6 of
-`test/async/reentrance.wast` from the same specification commit (38db7ee),
-extracted with wasm-tools 1.263, sha256
-`be6e806bfb32c17a1ba827dcce660f5ee75ab9abd8077296f2a079d16e6c2f87`. It is
-another of the 11 #545 components. It uses no stream or future read/write, and
-with `--no-validate` it still fuses into a module that fails validation
-("func 13 failed to validate"). `empty-wait.wasm` stays for provenance.
+- **First cut of #558 (PR #559, 00ecdaa).** meld refused `empty-wait.wasm`
+  before validation ran: its `future.read` was caught by the then over-broad
+  #558 refusal. A refusal still satisfies the invariant, but the potency check
+  (`--no-validate` writes an invalid module) no longer bit, so the tests moved
+  to `reentrance-m6.wasm`: module 6 of `test/async/reentrance.wast` from the
+  same specification commit (38db7ee), extracted with wasm-tools 1.263, sha256
+  `be6e806bfb32c17a1ba827dcce660f5ee75ab9abd8077296f2a079d16e6c2f87`.
+- **#558 narrowed (6cb3e63).** The refusal was limited to the shim's internal
+  name, and `empty-wait.wasm` again fuses with `--no-validate` into a module
+  that fails validation inside `<meld-adapter>`.
+- **#548 by the async option (#560).** `reentrance-m6.wasm` calls a sibling
+  component with an async lowering, so from #560 on it is refused as a #548 edge
+  before validation runs. The tests are back on `empty-wait.wasm`.
+  `reentrance-m6.wasm` stays for provenance.

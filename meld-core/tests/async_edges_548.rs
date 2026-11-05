@@ -195,3 +195,99 @@ fn producer_named_stream_read_is_not_refused() {
         "the producer-named import is kept: {imps:?}"
     );
 }
+
+/// #560: a world-level func import lowered with the async option. meld used
+/// to emit it as `(import "f" "")` with the async core type, which a host
+/// binds as a sync call.
+const WORLD_ASYNC_CALLER: &str = r#"
+(component
+  (import "f" (func $f async))
+  (core func $lf (canon lower (func $f) async))
+  (core module $m
+    (import "$root" "[async-lower]f" (func (result i32)))
+    (func (export "run")))
+  (core instance $imp (export "[async-lower]f" (func $lf)))
+  (core instance $ci (instantiate $m (with "$root" (instance $imp)))))
+"#;
+
+/// Control for #560: the same world-level import lowered synchronously keeps
+/// fusing under `(import "f" "")`.
+const WORLD_SYNC_CALLER: &str = r#"
+(component
+  (import "f" (func $f))
+  (core func $lf (canon lower (func $f)))
+  (core module $m
+    (import "$root" "f" (func))
+    (func (export "run")))
+  (core instance $imp (export "f" (func $lf)))
+  (core instance $ci (instantiate $m (with "$root" (instance $imp)))))
+"#;
+
+// rivet: verifies SWV-126
+#[test]
+fn async_lowered_world_func_import_is_refused() {
+    let err =
+        fuse(&[WORLD_ASYNC_CALLER]).expect_err("must be refused, not emitted as a sync import");
+    assert!(err.contains("#560"), "cites #560: {err}");
+    assert!(err.contains("[async-lower]f"), "names the import: {err}");
+}
+
+// rivet: verifies SWV-126
+#[test]
+fn sync_lowered_world_func_import_still_fuses() {
+    let core = fuse(&[WORLD_SYNC_CALLER]).expect("a sync world-level import is unaffected");
+    let imps = imports(&core);
+    assert!(
+        imps.iter().any(|(m, f)| m == "f" && f.is_empty()),
+        "keeps (import \"f\" \"\"): {imps:?}"
+    );
+}
+
+/// Callee exporting a WORLD-level `f: async func()`, lifted with the
+/// stackless callback ABI.
+const WORLD_CALLEE: &str = r#"
+(component
+  (core module $m
+    (func (export "[async-lift]f") (result i32) i32.const 0)
+    (func (export "[callback][async-lift]f") (param i32 i32 i32) (result i32) i32.const 0))
+  (core instance $ci (instantiate $m))
+  (type $ft (func async))
+  (func $f (type $ft)
+    (canon lift (core func $ci "[async-lift]f") async
+      (callback (core func $ci "[callback][async-lift]f"))))
+  (export "f" (func $f)))
+"#;
+
+// rivet: verifies SWV-126
+#[test]
+fn async_lowered_world_import_served_by_a_fused_component_is_the_548_edge() {
+    // The world-level async caller is wired to a fused callee: this is the
+    // #548 edge, not a host-bound #560 import, and must say so.
+    let err =
+        fuse(&[WORLD_ASYNC_CALLER, WORLD_CALLEE]).expect_err("an async-lower edge must be refused");
+    assert!(err.contains("#548"), "cites #548: {err}");
+    assert!(!err.contains("#560"), "not misattributed to #560: {err}");
+}
+
+/// The wasmtime / component-model test-suite naming: an instance-export
+/// lowering with the async option whose core import carries NO
+/// `[async-lower]` prefix. A name-based check misses it.
+const ASYNC_CALLER_UNPREFIXED: &str = r#"
+(component
+  (import "local:t/i" (instance $i (export "f" (func async))))
+  (alias export $i "f" (func $f))
+  (core func $lf (canon lower (func $f) async))
+  (core module $m
+    (import "local:t/i" "f" (func (result i32)))
+    (func (export "run")))
+  (core instance $imp (export "f" (func $lf)))
+  (core instance $ci (instantiate $m (with "local:t/i" (instance $imp)))))
+"#;
+
+// rivet: verifies SWV-126
+#[test]
+fn async_lower_edge_is_refused_whatever_the_core_import_is_named() {
+    let err = fuse(&[ASYNC_CALLER_UNPREFIXED, CALLEE])
+        .expect_err("the async option decides, not the field name");
+    assert!(err.contains("#548"), "cites #548: {err}");
+}
