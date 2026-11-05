@@ -2,7 +2,7 @@
 id: ADR-10
 type: design-question
 title: P3 async calls between fused components -- meld owns data (edge table + copy adapters), kiln-async owns control (tasks, subtasks, waitables), gale owns time, wake and isolation
-status: open
+status: resolved
 gating-fixtures:
   # Planned; none exist yet. Names are fixed here so the record can cite them.
   - p3_async_edges_548::async_lower_caller_produces_one_edge_per_import (planned)
@@ -18,14 +18,14 @@ design-paths:
   - path-A0 -- leave async-lower imports to the host (status quo at v0.67.0) (rejected -- silent, 26/26 corpus pairs unfused at exit 0)
   - path-A1 -- drive the callee to completion inside the call and return RETURNED (rejected -- deadlocks ping-pong, see Context)
   - path-A2 -- meld emits an in-module scheduler (virtual subtasks, waitable sets) (rejected -- duplicates the runtime's task model and adds a second arbiter for events)
-  - path-A3 -- meld emits a static edge table and copy adapters; the kiln-async runtime runs subtasks; gale provides wake, time and isolation (proposed -- joint meld/kiln/gale design 2026-11-04)
+  - path-A3 -- meld emits a static edge table and copy adapters; the kiln-async runtime runs subtasks; gale provides wake, time and isolation (accepted -- maintainer decision 2026-11-05; joint meld/kiln/gale design 2026-11-04)
 ---
 
 # ADR-10 -- P3 async calls between fused components
 
-**Status: open (draft for review by kiln and gale).** The design below was
-agreed in principle by the kiln and gale sessions on 2026-11-04. It is not yet
-accepted by the maintainer.
+**Status: resolved. Path A3 accepted by the maintainer on 2026-11-05.** The
+kiln and gale sessions agreed to the design on 2026-11-04, and their
+corrections are folded in below.
 
 ## Context (measured)
 
@@ -89,7 +89,7 @@ accepted by the maintainer.
   `dispatch_one`'s `ready == old.ready` is **assumed**, not proven. Every gale
   image uses `--share-stack`.
 
-## Decision (proposed): path-A3
+## Decision (2026-11-05): path-A3
 
 The split: **meld = data, kiln-async = control, gale = time, wake and
 isolation.**
@@ -258,7 +258,7 @@ parser to the trusted code base for no gain.
   which says the interpreter does no Component Model async. kiln records that
   change as its own design decision.
 
-## Order of work (proposed)
+## Order of work
 
 1. **kiln SR-81:** decode `$N` through the import map.
 2. **kiln:** change the stub built-ins to refuse loudly until they are real.
