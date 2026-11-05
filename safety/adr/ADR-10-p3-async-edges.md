@@ -12,8 +12,10 @@ gating-fixtures:
   - p3_async_edges_548::non_callback_async_lift_edge_is_refused (planned)
   - p3_async_edges_548::share_stack_with_stackful_or_threads_is_refused (planned)
   - p3_async_edges_548::corpus_19_pairs_fuse_with_edges_and_no_host_left_import (planned)
+  - p3_async_edges_548::reentrant_edge_fuses_with_no_per_edge_static_state (planned)
   # Runtime acceptance (kiln side): the same 19 pairs, fused, run on the kiln
-  # interpreter with wasmtime 51-dev's unfused result.
+  # interpreter with wasmtime 51-dev's unfused result, plus case 20: upstream
+  # component-model test/async/reentrance.wast at c818a1925e (kiln SR-84).
 design-paths:
   - path-A0 -- leave async-lower imports to the host (status quo at v0.67.0) (rejected -- silent, 26/26 corpus pairs unfused at exit 0)
   - path-A1 -- drive the callee to completion inside the call and return RETURNED (rejected -- deadlocks ping-pong, see Context)
@@ -157,7 +159,7 @@ parser to the trusted code base for no gain.
     instance.
 - **Return adapter.** It is the target kiln routes the callee's
   `[task-return]` to, for this edge only. It copies the results into the
-  caller's memory at the stored `retptr`. Its signature is pinned:
+  caller's memory at the `retptr` stored for that subtask. Its signature is pinned:
   `(retptr: i32, flat results...) -> ()`, with the flat result types listed in
   the edge entry. kiln passes it exactly the `[task-return]` arguments and
   checks arity and types at load, as it does for the start adapter's single
@@ -173,6 +175,16 @@ parser to the trusted code base for no gain.
   `P3Builtin` arms, and kiln-builtins' `__p3_*` on the synth/gale path.
 - It owns the subtask and waitable-set tables per original instance, event
   delivery, re-entering `[callback]`, backpressure, and may-enter checks.
+- **Re-entrance is legal (CM 0.3.1).** Upstream removed the recursion
+  restriction: a callee may call back into its caller, directly or through
+  donut wrapping, while the caller's call on the same edge is still
+  outstanding. Two consequences:
+  - The caller's `retptr` is stored **per subtask** in kiln-async's task
+    table, never per edge, in a global, or in static scratch. meld's adapters
+    keep their state in locals for the same reason; the retired #555
+    trampoline (fixed scratch at address 0) is the counter-example.
+  - The may-enter checks must not trap on a legal re-entry.
+  (Agreed with kiln, recorded in kiln SR-84, kiln PR #632.)
 - Before calling the start adapter, kiln marks the new subtask as current. A
   `[task-return]` during start then gives the caller `RETURNED`; otherwise the
   caller gets `STARTED | handle<<4`. **Both outcomes are legal on the first
@@ -272,7 +284,8 @@ parser to the trusted code base for no gain.
    expected to make any fused module fail loudly if it only "works" today
    because `[waitable-set-poll]` returns 0; kiln measures that on the corpus
    first.
-5. **Together:** run the 19 acceptance pairs fused on kiln and compare against
+5. **Together:** run the 19 acceptance pairs plus reentrance.wast (case 20)
+   fused on kiln and compare against
    wasmtime.
 6. **Last:** streams and futures through per-type copy adapters (§1).
 
