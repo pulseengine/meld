@@ -161,3 +161,37 @@ fn stream_read_through_the_shim_is_refused_not_leaked() {
     assert!(err.contains("stream.read"), "names the built-in: {err}");
     assert!(err.contains("#558"), "cites #558: {err}");
 }
+
+/// No shim: the payload needs no realloc and the module imports its memory,
+/// so wit-component hands `stream.read` to the module under its producer
+/// name. That import is host-servable and must pass through, not be refused.
+const DIRECT_STREAM_READ: &str = r#"
+(component
+  (core module $mm (memory (export "memory") 1))
+  (core instance $mi (instantiate $mm))
+  (alias core export $mi "memory" (core memory $mem))
+  (type $st (stream u8))
+  (canon stream.read $st async (memory $mem) (core func $sr))
+  (core instance $rootinst (export "[async-lower][stream-read-0]f" (func $sr)))
+  (core module $main
+    (import "env" "memory" (memory 1))
+    (import "$root" "[async-lower][stream-read-0]f" (func (param i32 i32 i32) (result i32)))
+    (func (export "run")))
+  (core instance $envinst (export "memory" (memory $mem)))
+  (core instance $ci (instantiate $main
+    (with "env" (instance $envinst)) (with "$root" (instance $rootinst)))))
+"#;
+
+// rivet: verifies SWV-125
+#[test]
+fn producer_named_stream_read_is_not_refused() {
+    // Negative control for the #558 refusal (found by the local Mythos pass
+    // on PR #559): the refusal must be limited to the shim's internal name.
+    let core = fuse(&[DIRECT_STREAM_READ]).expect("producer-named stream.read must pass through");
+    let imps = imports(&core);
+    assert!(
+        imps.iter()
+            .any(|(m, f)| m == "$root" && f == "[async-lower][stream-read-0]f"),
+        "the producer-named import is kept: {imps:?}"
+    );
+}

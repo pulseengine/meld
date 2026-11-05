@@ -718,11 +718,15 @@ fn core_builtin_canon_funcs(component: &ParsedComponent) -> HashMap<u32, usize> 
 /// `core func index -> canonical_functions index` for every core func defined
 /// by `stream.read`, `stream.write`, `future.read` or `future.write` (#558).
 ///
-/// These four take memory/realloc options, so wit-component always routes
+/// These four take memory/realloc options, so wit-component usually routes
 /// them through its indirect-call shim: the fixup module imports each one as
-/// `"actual" "<n>"`. meld has no producer name for them (ADR-10 step 6), so
-/// an import that reaches one of them must be refused rather than emitted
-/// under the shim's internal name, which no host can serve.
+/// `"actual" "<n>"`. meld has no producer name for those (ADR-10 step 6), so
+/// such an import must be refused rather than emitted under the shim's
+/// internal name, which no host can serve. When the payload needs no realloc
+/// and the module imports its memory, wit-component skips the shim and the
+/// module imports the built-in under its producer name; that import passes
+/// through unchanged. The caller tells the two apart by the shim's bare
+/// decimal field name.
 fn core_stream_future_rw_funcs(component: &ParsedComponent) -> HashMap<u32, usize> {
     use crate::parser::CanonicalEntry as E;
     core_canon_funcs_matching(component, |entry| {
@@ -3143,6 +3147,12 @@ impl Resolver {
                                     display_module = Some(mod_name.clone());
                                     display_field = Some(field_name.clone());
                                 } else if lower_core_func.is_none()
+                                    // Only the shim's internal name: wit-component names
+                                    // shim exports by bare decimal index. A producer-named
+                                    // import (`[async-lower][stream-read-0]f`, emitted when
+                                    // the payload needs no realloc and memory is imported)
+                                    // is host-servable and passes through unchanged.
+                                    && import.name.parse::<u32>().is_ok()
                                     && let Some(canon_idx) = stream_future_rw_funcs.get(&named_idx)
                                 {
                                     let which = match component.canonical_functions.get(*canon_idx)

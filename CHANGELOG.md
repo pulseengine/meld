@@ -14,14 +14,16 @@ All notable changes to this project will be documented in this file.
   - **#557:** an async lowering left to the host keeps the producer's
     `[async-lower]` prefix. v0.67.0 emitted it as plain `f` with the async core
     type, so a host would bind it as a sync call.
-  - **#558:** `stream.read`/`write` and `future.read`/`write` that meld cannot
-    name are refused, naming the built-in. v0.67.0 emitted them under
-    wit-component's shim-internal `actual::N`, which no host serves.
+  - **#558:** `stream.read`/`write` and `future.read`/`write` reached through
+    wit-component's shim, which meld cannot name, are refused, naming the
+    built-in. v0.67.0 emitted them under the shim-internal `actual::N`, which
+    no host serves. Ones the module imports under their producer name still
+    pass through.
 
   Corpus effect (`--memory multi`, against the v0.67.0 release):
-  - of 906 single-component inputs, 446 fuse byte-identically;
-  - 25 change only in import names (the `[async-lower]` prefix);
-  - 220 are newly refused, all citing #558.
+  - of 906 single-component inputs, 506 fuse byte-identically;
+  - 28 change only in import names (the `[async-lower]` prefix);
+  - 157 are newly refused, all citing #558.
 
   Every P3 caller/callee pair in the corpus is now refused (43), and all 42
   non-P3 pairs fuse byte-identically. kiln already refused all of these modules
