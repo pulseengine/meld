@@ -1,58 +1,42 @@
 version: 2
-# One PR per logical release across all directories: version-locked families
-# (wasm-tools, wasmtime) and all github-actions pins in / must not split into
-# one PR per directory. (Learned from loom/witness/mcp/relay/rules_wasm_component,
-# where one release arrived as 4-8 PRs.)
-groups:
-  wasm-tools-family:
-    patterns:
-      - "wasmparser"
-      - "wasm-encoder"
-      - "wasmprinter"
-      - "wit-component"
-      - "wit-parser"
-      - "wasm-metadata"
-      - "wat"
-      - "walrus"
-  wasmtime:
-    patterns:
-      - "wasmtime"
-      - "wasmtime-*"
-  github-actions-all:
-    # groups cannot be scoped by package-ecosystem; action names are
-    # owner/name (contain a slash, never start with @), which cargo crates
-    # and unscoped npm packages never match.
-    patterns:
-      - "^[^@]+/"
+# Groups live inside each updates entry: Dependabot rejects a top-level
+# `groups:` key and YAML aliases (&ref_0 / *ref_0), and with either one it
+# ignores the whole file. One cargo entry lists every directory, so a grouped
+# release opens one PR and not one per directory.
 updates:
   - package-ecosystem: github-actions
     directory: /
     schedule:
       interval: weekly
-    labels: &ref_0
+    labels:
       - dependencies
+    groups:
+      github-actions-all:
+        patterns:
+          - "*"
   - package-ecosystem: cargo
-    directory: /
+    directories:
+      - /
+      - /meld-cli
+      - /meld-core
+      - /tools/spec-sync
+      - /verification/verus-pilot
     schedule:
       interval: weekly
-    labels: *ref_0
-  - package-ecosystem: cargo
-    directory: /meld-cli
-    schedule:
-      interval: weekly
-    labels: *ref_0
-  - package-ecosystem: cargo
-    directory: /meld-core
-    schedule:
-      interval: weekly
-    labels: *ref_0
-  - package-ecosystem: cargo
-    directory: /tools/spec-sync
-    schedule:
-      interval: weekly
-    labels: *ref_0
-  - package-ecosystem: cargo
-    directory: /verification/verus-pilot
-    schedule:
-      interval: weekly
-    labels: *ref_0
+    labels:
+      - dependencies
+    groups:
+      wasm-tools-family:
+        patterns:
+          - "wasmparser"
+          - "wasm-encoder"
+          - "wasmprinter"
+          - "wit-component"
+          - "wit-parser"
+          - "wasm-metadata"
+          - "wat"
+          - "walrus"
+      wasmtime:
+        patterns:
+          - "wasmtime"
+          - "wasmtime-*"
