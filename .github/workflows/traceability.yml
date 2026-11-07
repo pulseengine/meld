@@ -63,7 +63,7 @@ jobs:
     steps:
       # fetch-depth: 0 because `--new-since` validates a WORKTREE of the base
       # ref, which needs that commit present.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
