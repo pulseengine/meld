@@ -1,0 +1,862 @@
+# #562 ratchet: meld's outcome for every component in the vendored
+# component-model test suite. Columns: wast, directive index, line,
+# kind, outcome, detail. Regenerate with MELD_BLESS=1 and review the diff.
+test/async/async-calls-sync.wast	0	12	component	refused	#390
+test/async/big-interleaving-test.wast	0	14	component-definition	refused	msg:failed to parse component: `stream.forward` requires the component model forward feature
+test/async/builtin-trap-poisons-instance.wast	0	3	component-definition	fused	-
+test/async/builtin-trap-poisons-instance.wast	4	12	component-definition	fused	-
+test/async/cancel-and-exclusive-lock.wast	0	10	component	refused	msg:failed to parse component: async `subtask.cancel` requires the component model async builtins feature
+test/async/cancel-delivery.wast	0	4	component	refused	msg:failed to parse component: async `subtask.cancel` requires the component model async builtins feature
+test/async/cancel-delivery.wast	2	382	component	refused	msg:failed to parse component: requires the component model async stackful feature
+test/async/cancel-not-delivered.wast	0	3	component	refused	msg:failed to parse component: requires the component model async stackful feature
+test/async/cancel-resumed-callback-switch.wast	0	10	component	refused	msg:failed to parse component: async `subtask.cancel` requires the component model async builtins feature
+test/async/cancel-resumed-callback-switch.wast	2	155	component	refused	msg:failed to parse component: requires the component model async stackful feature
+test/async/cancel-stream.wast	0	7	component	fused	-
+test/async/cancel-stream.wast	2	227	component-definition	refused	msg:failed to parse component: async `stream.cancel-read` requires the component model async builtins feature
+test/async/cancel-subtask.wast	0	8	component	refused	msg:failed to parse component: async `subtask.cancel` requires the component model async builtins feature
+test/async/cancel-subtask.wast	2	210	component	fused	-
+test/async/cancel-targeted-resume.wast	0	11	component	refused	msg:failed to parse component: async `subtask.cancel` requires the component model async builtins feature
+test/async/cancel-targeted-resume.wast	2	106	component	refused	msg:failed to parse component: requires the component model async stackful feature
+test/async/cancel-targeted-resume.wast	4	285	component	refused	msg:failed to parse component: async `subtask.cancel` requires the component model async builtins feature
+test/async/cancel-targeted-resume.wast	6	465	component	refused	msg:failed to parse component: async `subtask.cancel` requires the component model async builtins feature
+test/async/cancel-targeted-resume.wast	8	613	component	refused	msg:failed to parse component: async `subtask.cancel` requires the component model async builtins feature
+test/async/closed-stream.wast	0	4	component-definition	fused	-
+test/async/cross-abi-calls.wast	0	4	component-definition	fused	-
+test/async/cross-task-future.wast	0	2	component	fused	-
+test/async/deadlock.wast	0	4	component	fused	-
+test/async/dont-block-start.wast	0	3	assert_trap-instantiate	fused	-
+test/async/dont-block-start.wast	1	24	assert_trap-instantiate	refused	#390
+test/async/drop-cross-task-borrow.wast	0	9	component-definition	fused	-
+test/async/drop-stream.wast	0	7	component-definition	fused	-
+test/async/drop-subtask.wast	0	5	component	fused	-
+test/async/drop-waitable-set.wast	0	5	component	fused	-
+test/async/dtor-context-is-zero.wast	0	6	component	fused	-
+test/async/dtor-context-is-zero.wast	2	57	component	fused	-
+test/async/during-sync-call-blocking-ops.wast	0	6	component	fused	-
+test/async/during-sync-call-exclusive-resume.wast	0	9	component	fused	-
+test/async/during-sync-call-exclusive-resume.wast	3	65	component	fused	-
+test/async/during-sync-call-exclusive-resume.wast	6	107	component	fused	-
+test/async/during-sync-call-may-block-if-other-ready-threads.wast	0	12	component-definition	fused	-
+test/async/during-sync-call-may-block-if-other-ready-threads.wast	6	136	component	fused	-
+test/async/during-sync-call-no-sibling-resume.wast	0	16	component	refused	msg:unsupported component feature: thread.new-indirect uses two different funcref tables (fused table N from component N, fu
+test/async/during-sync-call-no-sibling-resume.wast	3	162	component	fused	-
+test/async/during-sync-scheduling-candidates.wast	0	19	component	fused	-
+test/async/during-sync-scheduling-candidates.wast	13	245	component-definition	fused	-
+test/async/during-sync-scheduling-candidates.wast	20	315	component-definition	refused	#390
+test/async/during-sync-scheduling-candidates.wast	27	414	component	fused	-
+test/async/during-sync-scheduling-candidates.wast	3	78	component	refused	msg:failed to parse component: requires the component model async stackful feature
+test/async/during-sync-scheduling-candidates.wast	8	144	component	fused	-
+test/async/empty-wait.wast	0	6	component	fused-invalid	msg:type mismatch: values remaining on stack at end of block
+test/async/forward.wast	0	3	component-definition	refused	msg:failed to parse component: `stream.forward` requires the component model forward feature
+test/async/forward.wast	83	1025	component-definition	refused	msg:failed to parse component: `stream.forward` requires the component model forward feature
+test/async/forward.wast	90	1197	component-definition	refused	msg:failed to parse component: `stream.forward` requires the component model forward feature
+test/async/forward.wast	93	1444	assert_invalid	invalid-refused	-
+test/async/forward.wast	94	1450	assert_invalid	invalid-refused	-
+test/async/future-completion-order.wast	0	2	component-definition	fused	-
+test/async/futures-must-write.wast	0	5	component	fused	-
+test/async/futures-must-write.wast	3	121	component-definition	refused	msg:failed to parse component: async `future.cancel-read` requires the component model async builtins feature
+test/async/idle-drop.wast	0	7	component-definition	fused	-
+test/async/idle-drop.wast	1	294	component-definition	fused	-
+test/async/partial-stream-copies.wast	0	7	component	fused-invalid	msg:type mismatch: values remaining on stack at end of block
+test/async/partial-stream-copies.wast	2	242	component-definition	fused	-
+test/async/passing-resources.wast	0	7	component	refused	#142
+test/async/reentrance.wast	0	4	component	fused	-
+test/async/reentrance.wast	11	202	component	fused	-
+test/async/reentrance.wast	13	242	component	fused-invalid	msg:type mismatch: values remaining on stack at end of block
+test/async/reentrance.wast	15	352	component	fused-invalid	msg:type mismatch: values remaining on stack at end of block
+test/async/reentrance.wast	17	441	component	refused	msg:failed to parse component: async `subtask.cancel` requires the component model async builtins feature
+test/async/reentrance.wast	19	530	component	refused	#390
+test/async/reentrance.wast	2	45	component	fused	-
+test/async/reentrance.wast	21	674	component	fused	-
+test/async/reentrance.wast	23	790	component	fused	-
+test/async/reentrance.wast	4	63	component	fused	-
+test/async/reentrance.wast	7	103	component	fused	-
+test/async/reentrance.wast	9	154	component	fused	-
+test/async/same-component-stream-future.wast	0	5	component-definition	fused	-
+test/async/self-switch-traps.wast	0	3	component-definition	fused	-
+test/async/switch-to-ready-callback.wast	0	16	component-definition	fused-invalid	msg:type mismatch: values remaining on stack at end of block
+test/async/sync-barges-in.wast	0	6	component-definition	refused	msg:failed to parse component: requires the component model async stackful feature
+test/async/sync-streams.wast	0	7	component	fused	-
+test/async/trap-if-block-and-sync.wast	0	5	component-definition	fused	-
+test/async/trap-if-done.wast	0	15	component-definition	fused	-
+test/async/trap-if-sync-and-waitable-set.wast	0	8	component-definition	refused	msg:failed to parse component: async `subtask.cancel` requires the component model async builtins feature
+test/async/trap-if-transfer-in-waitable-set.wast	0	6	component-definition	fused	-
+test/async/validate-no-async-abi-for-sync-type.wast	0	1	assert_invalid	invalid-refused	-
+test/async/validate-no-async-abi-for-sync-type.wast	1	11	assert_invalid	invalid-refused	-
+test/async/validate-no-async-abi-for-sync-type.wast	2	22	assert_invalid	invalid-refused	-
+test/async/validate-no-stream-char.wast	0	3	assert_invalid	invalid-refused	-
+test/async/validate-task-return.wast	0	3	assert_invalid	invalid-refused	-
+test/async/validate-task-return.wast	1	8	assert_invalid	invalid-refused	-
+test/async/validate-task-return.wast	2	14	component	refused	msg:no core modules found in component
+test/async/wait-during-callback.wast	0	2	component	fused	-
+test/async/zero-length.wast	0	7	component	fused-invalid	msg:type mismatch: expected iNN but nothing on stack
+test/async/zero-length.wast	2	227	component-definition	refused	msg:failed to parse component: async `stream.cancel-read` requires the component model async builtins feature
+test/async/zero-length.wast	27	538	component-definition	fused	-
+test/binary/binary.wast	0	7	component	refused	msg:no core modules found in component
+test/binary/binary.wast	1	8	component	refused	msg:no core modules found in component
+test/binary/binary.wast	10	17	assert_malformed	invalid-refused	-
+test/binary/binary.wast	100	1177	assert_malformed	invalid-refused	-
+test/binary/binary.wast	101	1186	assert_malformed	invalid-refused	-
+test/binary/binary.wast	102	1197	assert_malformed	invalid-refused	-
+test/binary/binary.wast	103	1219	assert_malformed	invalid-refused	-
+test/binary/binary.wast	104	1241	assert_malformed	invalid-refused	-
+test/binary/binary.wast	105	1250	assert_malformed	invalid-refused	-
+test/binary/binary.wast	106	1259	assert_malformed	invalid-refused	-
+test/binary/binary.wast	107	1268	assert_malformed	invalid-refused	-
+test/binary/binary.wast	108	1277	assert_malformed	invalid-refused	-
+test/binary/binary.wast	109	1286	assert_malformed	invalid-refused	-
+test/binary/binary.wast	11	18	assert_malformed	invalid-refused	-
+test/binary/binary.wast	110	1298	component-definition	refused	msg:failed to parse component: the `cm-implements` feature is not active
+test/binary/binary.wast	111	1317	component-definition	refused	msg:failed to parse component: the `cm-implements` feature is not active
+test/binary/binary.wast	112	1344	component-definition	refused	msg:no core modules found in component
+test/binary/binary.wast	113	1373	component	refused	msg:no core modules found in component
+test/binary/binary.wast	114	1387	assert_malformed	invalid-refused	-
+test/binary/binary.wast	115	1398	assert_malformed	invalid-refused	-
+test/binary/binary.wast	116	1412	assert_malformed	invalid-refused	-
+test/binary/binary.wast	117	1423	assert_malformed	invalid-refused	-
+test/binary/binary.wast	118	1434	assert_malformed	invalid-refused	-
+test/binary/binary.wast	119	1446	assert_malformed	invalid-refused	-
+test/binary/binary.wast	12	19	assert_malformed	invalid-refused	-
+test/binary/binary.wast	120	1456	assert_malformed	invalid-refused	-
+test/binary/binary.wast	121	1468	assert_invalid	invalid-refused	-
+test/binary/binary.wast	122	1482	assert_invalid	invalid-refused	-
+test/binary/binary.wast	123	1496	assert_malformed	invalid-refused	-
+test/binary/binary.wast	124	1516	component	fused	-
+test/binary/binary.wast	125	1550	component	fused	-
+test/binary/binary.wast	126	1561	assert_malformed	invalid-refused	-
+test/binary/binary.wast	127	1594	assert_malformed	invalid-refused	-
+test/binary/binary.wast	128	1630	component	refused	msg:no core modules found in component
+test/binary/binary.wast	129	1635	component	refused	msg:no core modules found in component
+test/binary/binary.wast	13	20	assert_malformed	invalid-refused	-
+test/binary/binary.wast	130	1645	assert_malformed	invalid-refused	-
+test/binary/binary.wast	131	1653	assert_malformed	invalid-refused	-
+test/binary/binary.wast	14	21	assert_malformed	invalid-refused	-
+test/binary/binary.wast	15	22	assert_malformed	invalid-refused	-
+test/binary/binary.wast	16	23	assert_malformed	invalid-refused	-
+test/binary/binary.wast	17	24	assert_malformed	invalid-refused	-
+test/binary/binary.wast	18	25	assert_malformed	invalid-refused	-
+test/binary/binary.wast	19	26	assert_malformed	invalid-refused	-
+test/binary/binary.wast	2	9	component	refused	msg:no core modules found in component
+test/binary/binary.wast	20	30	component	refused	msg:no core modules found in component
+test/binary/binary.wast	21	35	component	refused	msg:no core modules found in component
+test/binary/binary.wast	22	44	assert_malformed	invalid-refused	-
+test/binary/binary.wast	23	52	assert_malformed	invalid-refused	-
+test/binary/binary.wast	24	63	assert_malformed	invalid-refused	-
+test/binary/binary.wast	25	70	assert_malformed	invalid-refused	-
+test/binary/binary.wast	26	77	assert_malformed	invalid-refused	-
+test/binary/binary.wast	27	85	assert_malformed	invalid-refused	-
+test/binary/binary.wast	28	92	assert_malformed	invalid-refused	-
+test/binary/binary.wast	29	99	assert_malformed	invalid-refused	-
+test/binary/binary.wast	3	10	assert_malformed	invalid-refused	-
+test/binary/binary.wast	30	106	assert_malformed	invalid-refused	-
+test/binary/binary.wast	31	114	component	refused	msg:no core modules found in component
+test/binary/binary.wast	32	119	component	refused	msg:no core modules found in component
+test/binary/binary.wast	33	127	component	refused	msg:no core modules found in component
+test/binary/binary.wast	34	145	component	refused	msg:no core modules found in component
+test/binary/binary.wast	35	150	assert_malformed	invalid-refused	-
+test/binary/binary.wast	36	158	assert_malformed	invalid-refused	-
+test/binary/binary.wast	37	167	assert_malformed	invalid-refused	-
+test/binary/binary.wast	38	179	component	fused	-
+test/binary/binary.wast	39	184	component	fused	-
+test/binary/binary.wast	4	11	assert_malformed	invalid-refused	-
+test/binary/binary.wast	40	199	assert_malformed	invalid-refused	-
+test/binary/binary.wast	41	211	assert_malformed	invalid-refused	-
+test/binary/binary.wast	42	222	component	fused	-
+test/binary/binary.wast	43	246	component	fused	-
+test/binary/binary.wast	44	269	assert_malformed	invalid-refused	-
+test/binary/binary.wast	45	280	assert_malformed	invalid-refused	-
+test/binary/binary.wast	46	301	component-definition	refused	msg:no core modules found in component
+test/binary/binary.wast	47	336	assert_malformed	invalid-refused	-
+test/binary/binary.wast	48	348	component	fused	-
+test/binary/binary.wast	49	384	component	fused	-
+test/binary/binary.wast	5	12	assert_malformed	invalid-refused	-
+test/binary/binary.wast	50	404	component	refused	msg:no core modules found in component
+test/binary/binary.wast	51	421	assert_malformed	invalid-refused	-
+test/binary/binary.wast	52	433	assert_malformed	invalid-refused	-
+test/binary/binary.wast	53	442	assert_malformed	invalid-refused	-
+test/binary/binary.wast	54	451	assert_malformed	invalid-refused	-
+test/binary/binary.wast	55	461	assert_malformed	invalid-refused	-
+test/binary/binary.wast	56	473	assert_malformed	invalid-refused	-
+test/binary/binary.wast	57	483	assert_invalid	invalid-refused	-
+test/binary/binary.wast	58	495	assert_invalid	invalid-refused	-
+test/binary/binary.wast	59	507	assert_invalid	invalid-refused	-
+test/binary/binary.wast	6	13	assert_malformed	invalid-refused	-
+test/binary/binary.wast	60	520	assert_invalid	invalid-refused	-
+test/binary/binary.wast	61	538	component	refused	msg:no core modules found in component
+test/binary/binary.wast	62	557	component	refused	msg:no core modules found in component
+test/binary/binary.wast	63	596	assert_malformed	invalid-refused	-
+test/binary/binary.wast	64	605	assert_malformed	invalid-refused	-
+test/binary/binary.wast	65	614	assert_malformed	invalid-refused	-
+test/binary/binary.wast	66	624	assert_malformed	invalid-refused	-
+test/binary/binary.wast	67	637	assert_invalid	invalid-refused	-
+test/binary/binary.wast	68	646	assert_invalid	invalid-refused	-
+test/binary/binary.wast	69	655	assert_invalid	invalid-refused	-
+test/binary/binary.wast	7	14	assert_malformed	invalid-refused	-
+test/binary/binary.wast	70	664	assert_invalid	invalid-refused	-
+test/binary/binary.wast	71	673	assert_invalid	invalid-refused	-
+test/binary/binary.wast	72	682	assert_invalid	invalid-refused	-
+test/binary/binary.wast	73	724	assert_invalid	invalid-refused	-
+test/binary/binary.wast	74	733	assert_invalid	invalid-refused	-
+test/binary/binary.wast	75	743	assert_invalid	invalid-refused	-
+test/binary/binary.wast	76	755	component	refused	msg:no core modules found in component
+test/binary/binary.wast	77	766	assert_malformed	invalid-refused	-
+test/binary/binary.wast	78	776	assert_malformed	invalid-refused	-
+test/binary/binary.wast	79	789	component	fused	-
+test/binary/binary.wast	8	15	assert_malformed	invalid-refused	-
+test/binary/binary.wast	80	827	component	refused	msg:no core modules found in component
+test/binary/binary.wast	81	841	component	refused	msg:no core modules found in component
+test/binary/binary.wast	82	855	assert_malformed	invalid-refused	-
+test/binary/binary.wast	83	865	assert_malformed	invalid-refused	-
+test/binary/binary.wast	84	877	assert_invalid	invalid-refused	-
+test/binary/binary.wast	85	892	component	refused	msg:no core modules found in component
+test/binary/binary.wast	86	915	assert_malformed	invalid-refused	-
+test/binary/binary.wast	87	925	assert_malformed	invalid-refused	-
+test/binary/binary.wast	88	935	assert_malformed	invalid-refused	-
+test/binary/binary.wast	89	949	component	refused	msg:no core modules found in component
+test/binary/binary.wast	9	16	assert_malformed	invalid-refused	-
+test/binary/binary.wast	90	956	assert_malformed	invalid-refused	-
+test/binary/binary.wast	91	966	assert_malformed	invalid-refused	-
+test/binary/binary.wast	92	978	component	refused	msg:no core modules found in component
+test/binary/binary.wast	93	985	component	refused	msg:failed to parse component: Maps require the component model map feature
+test/binary/binary.wast	94	994	component	refused	msg:failed to parse component: async `subtask.cancel` requires the component model async builtins feature
+test/binary/binary.wast	95	1121	assert_malformed	invalid-refused	-
+test/binary/binary.wast	96	1130	assert_malformed	invalid-refused	-
+test/binary/binary.wast	97	1140	assert_malformed	invalid-refused	-
+test/binary/binary.wast	98	1149	assert_malformed	invalid-refused	-
+test/binary/binary.wast	99	1159	assert_malformed	invalid-refused	-
+test/linking/link-time-virtualization.wast	0	2	component	refused	msg:component N: core modules N and N both export `base` in the flat-name resolver path; ambiguous, and the previous behavio
+test/linking/shared-everything-dynamic-linking.wast	0	4	component	fused	-
+test/linking/shared-everything-dynamic-linking.wast	10	152	component	fused	-
+test/linking/tags.wast	0	7	component	refused	msg:unsupported component feature: exception handling tags
+test/linking/tags.wast	10	137	assert_invalid	invalid-refused	-
+test/linking/tags.wast	11	145	assert_invalid	invalid-refused	-
+test/linking/tags.wast	3	36	component	refused	msg:unsupported component feature: exception handling tags
+test/linking/tags.wast	5	64	component	refused	msg:unsupported component feature: exception handling tags
+test/linking/tags.wast	7	93	component	refused	msg:unsupported component feature: exception handling tags
+test/linking/unit.wast	0	7	component	fused	-
+test/linking/unit.wast	104	800	component	fused	-
+test/linking/unit.wast	109	873	component	fused	-
+test/linking/unit.wast	114	940	component	fused	-
+test/linking/unit.wast	119	1003	component	fused	-
+test/linking/unit.wast	125	1030	component	fused	-
+test/linking/unit.wast	130	1103	component	fused	-
+test/linking/unit.wast	139	1173	component	refused	msg:component N: core modules N and N both export `get` in the flat-name resolver path; ambiguous, and the previous behavior
+test/linking/unit.wast	142	1192	component	fused	-
+test/linking/unit.wast	145	1230	component	fused-invalid	msg:duplicate export name `step$N` already defined
+test/linking/unit.wast	147	1267	component	fused	-
+test/linking/unit.wast	15	78	component	fused	-
+test/linking/unit.wast	152	1318	component	fused-invalid	msg:duplicate export name `run$N` already defined
+test/linking/unit.wast	159	1362	component	fused	-
+test/linking/unit.wast	166	1418	component	fused	-
+test/linking/unit.wast	169	1468	component	fused	-
+test/linking/unit.wast	172	1535	component	fused	-
+test/linking/unit.wast	179	1569	component	fused	-
+test/linking/unit.wast	183	1595	component	fused	-
+test/linking/unit.wast	185	1613	component	fused	-
+test/linking/unit.wast	187	1639	component	fused	-
+test/linking/unit.wast	189	1661	component	fused	-
+test/linking/unit.wast	19	101	component	fused	-
+test/linking/unit.wast	191	1693	component	fused	-
+test/linking/unit.wast	195	1733	component	refused	msg:component N: core modules N and N both export `amount` in the flat-name resolver path; ambiguous, and the previous behav
+test/linking/unit.wast	198	1787	component	fused	-
+test/linking/unit.wast	202	1830	component	fused	-
+test/linking/unit.wast	204	1846	component	fused	-
+test/linking/unit.wast	208	1869	component	fused	-
+test/linking/unit.wast	212	1887	component	fused	-
+test/linking/unit.wast	215	1920	component	fused	-
+test/linking/unit.wast	219	1953	component	fused	-
+test/linking/unit.wast	22	124	component	fused	-
+test/linking/unit.wast	225	1990	component	fused	-
+test/linking/unit.wast	229	2018	component	fused	-
+test/linking/unit.wast	231	2050	component	refused	msg:component N: core modules N and N both export `get` in the flat-name resolver path; ambiguous, and the previous behavior
+test/linking/unit.wast	234	2076	component	fused	-
+test/linking/unit.wast	24	142	component	fused	-
+test/linking/unit.wast	26	159	component	fused	-
+test/linking/unit.wast	28	179	component	fused-invalid	msg:duplicate export name `id$N` already defined
+test/linking/unit.wast	33	220	component	fused	-
+test/linking/unit.wast	36	261	component	fused	-
+test/linking/unit.wast	45	308	component	fused	-
+test/linking/unit.wast	5	26	component	fused	-
+test/linking/unit.wast	54	355	component	fused	-
+test/linking/unit.wast	57	379	component	fused	-
+test/linking/unit.wast	60	403	component	fused	-
+test/linking/unit.wast	63	427	component	fused	-
+test/linking/unit.wast	65	447	component	fused	-
+test/linking/unit.wast	69	469	component	fused	-
+test/linking/unit.wast	73	501	component	fused	-
+test/linking/unit.wast	75	529	component	fused	-
+test/linking/unit.wast	79	556	component	fused	-
+test/linking/unit.wast	81	588	component	fused	-
+test/linking/unit.wast	86	616	component	fused	-
+test/linking/unit.wast	9	50	component	fused	-
+test/linking/unit.wast	90	655	component	fused	-
+test/linking/unit.wast	97	736	component	fused	-
+test/resources/borrows.wast	0	4	component-definition	fused	-
+test/resources/handle-table.wast	0	7	component	fused	-
+test/resources/handle-table.wast	19	217	component	fused	-
+test/resources/handle-table.wast	2	53	component	fused	-
+test/resources/handle-table.wast	22	265	component	fused	-
+test/resources/handle-table.wast	24	297	component-definition	fused	-
+test/resources/handle-table.wast	4	110	component-definition	fused	-
+test/resources/multiple-resources.wast	0	4	component	fused	-
+test/validation/abi.wast	0	4	assert_invalid	invalid-refused	-
+test/validation/abi.wast	1	11	assert_invalid	invalid-refused	-
+test/validation/abi.wast	10	109	component-definition	fused	-
+test/validation/abi.wast	11	133	assert_invalid	invalid-refused	-
+test/validation/abi.wast	12	139	assert_invalid	invalid-refused	-
+test/validation/abi.wast	13	145	assert_invalid	invalid-refused	-
+test/validation/abi.wast	14	154	assert_invalid	invalid-refused	-
+test/validation/abi.wast	15	164	assert_invalid	invalid-refused	-
+test/validation/abi.wast	16	179	assert_invalid	invalid-refused	-
+test/validation/abi.wast	17	200	assert_invalid	invalid-refused	-
+test/validation/abi.wast	18	214	assert_invalid	invalid-refused	-
+test/validation/abi.wast	19	231	assert_invalid	invalid-refused	-
+test/validation/abi.wast	2	22	component	fused	-
+test/validation/abi.wast	20	250	assert_invalid	invalid-refused	-
+test/validation/abi.wast	21	257	assert_invalid	invalid-refused	-
+test/validation/abi.wast	22	267	assert_invalid	invalid-refused	-
+test/validation/abi.wast	3	38	assert_invalid	invalid-refused	-
+test/validation/abi.wast	4	48	assert_invalid	invalid-refused	-
+test/validation/abi.wast	5	55	assert_invalid	invalid-refused	-
+test/validation/abi.wast	6	62	assert_invalid	invalid-refused	-
+test/validation/abi.wast	7	72	assert_invalid	invalid-refused	-
+test/validation/abi.wast	8	83	assert_invalid	invalid-refused	-
+test/validation/abi.wast	9	98	assert_invalid	invalid-refused	-
+test/validation/annotated-names.wast	0	8	component-definition	refused	msg:no core modules found in component
+test/validation/annotated-names.wast	1	17	assert_invalid	invalid-refused	-
+test/validation/annotated-names.wast	10	60	assert_invalid	invalid-refused	-
+test/validation/annotated-names.wast	11	64	assert_invalid	invalid-refused	-
+test/validation/annotated-names.wast	12	68	assert_invalid	invalid-refused	-
+test/validation/annotated-names.wast	13	72	assert_invalid	invalid-refused	-
+test/validation/annotated-names.wast	14	76	assert_invalid	invalid-refused	-
+test/validation/annotated-names.wast	15	80	assert_invalid	invalid-refused	-
+test/validation/annotated-names.wast	16	84	assert_invalid	invalid-refused	-
+test/validation/annotated-names.wast	17	88	assert_invalid	invalid-refused	-
+test/validation/annotated-names.wast	18	92	assert_invalid	invalid-refused	-
+test/validation/annotated-names.wast	19	101	component-definition	refused	msg:no core modules found in component
+test/validation/annotated-names.wast	2	21	assert_invalid	invalid-refused	-
+test/validation/annotated-names.wast	20	104	assert_invalid	invalid-refused	-
+test/validation/annotated-names.wast	21	108	assert_invalid	invalid-refused	-
+test/validation/annotated-names.wast	22	112	assert_invalid	invalid-refused	-
+test/validation/annotated-names.wast	23	116	assert_invalid	invalid-refused	-
+test/validation/annotated-names.wast	24	120	assert_invalid	invalid-refused	-
+test/validation/annotated-names.wast	25	124	assert_invalid	invalid-refused	-
+test/validation/annotated-names.wast	26	128	assert_invalid	invalid-refused	-
+test/validation/annotated-names.wast	27	137	component	refused	msg:no core modules found in component
+test/validation/annotated-names.wast	28	143	assert_invalid	invalid-refused	-
+test/validation/annotated-names.wast	29	153	assert_invalid	invalid-refused	-
+test/validation/annotated-names.wast	3	25	assert_invalid	invalid-refused	-
+test/validation/annotated-names.wast	30	164	component	refused	msg:no core modules found in component
+test/validation/annotated-names.wast	31	170	assert_invalid	invalid-refused	-
+test/validation/annotated-names.wast	32	176	assert_invalid	invalid-refused	-
+test/validation/annotated-names.wast	33	190	component-definition	refused	msg:no core modules found in component
+test/validation/annotated-names.wast	34	193	assert_invalid	invalid-refused	-
+test/validation/annotated-names.wast	35	198	assert_invalid	invalid-refused	-
+test/validation/annotated-names.wast	4	29	assert_invalid	invalid-refused	-
+test/validation/annotated-names.wast	5	34	assert_invalid	invalid-refused	-
+test/validation/annotated-names.wast	6	39	assert_invalid	invalid-refused	-
+test/validation/annotated-names.wast	7	44	assert_invalid	invalid-refused	-
+test/validation/annotated-names.wast	8	53	component-definition	refused	msg:no core modules found in component
+test/validation/annotated-names.wast	9	56	assert_invalid	invalid-refused	-
+test/validation/attributes.wast	0	2	component-definition	refused	msg:failed to parse component: the `cm-implements` feature is not active
+test/validation/attributes.wast	1	30	component-definition	refused	msg:failed to parse component: the `cm-implements` feature is not active
+test/validation/attributes.wast	10	118	assert_invalid	invalid-refused	-
+test/validation/attributes.wast	11	124	assert_invalid	invalid-refused	-
+test/validation/attributes.wast	12	130	assert_invalid	invalid-refused	-
+test/validation/attributes.wast	13	136	assert_invalid	invalid-refused	-
+test/validation/attributes.wast	14	144	assert_invalid	invalid-refused	-
+test/validation/attributes.wast	15	149	assert_invalid	invalid-refused	-
+test/validation/attributes.wast	16	157	assert_invalid	invalid-refused	-
+test/validation/attributes.wast	17	160	assert_invalid	invalid-refused	-
+test/validation/attributes.wast	18	163	assert_invalid	invalid-refused	-
+test/validation/attributes.wast	19	166	assert_invalid	invalid-refused	-
+test/validation/attributes.wast	2	77	assert_malformed	invalid-unencodable	-
+test/validation/attributes.wast	20	174	assert_invalid	invalid-refused	-
+test/validation/attributes.wast	21	179	assert_invalid	invalid-refused	-
+test/validation/attributes.wast	22	184	assert_invalid	invalid-refused	-
+test/validation/attributes.wast	23	188	assert_invalid	invalid-refused	-
+test/validation/attributes.wast	24	192	assert_invalid	invalid-refused	-
+test/validation/attributes.wast	25	202	component-definition	refused	msg:failed to parse component: the `cm-implements` feature is not active
+test/validation/attributes.wast	26	213	component-definition	refused	msg:failed to parse component: the `cm-implements` feature is not active
+test/validation/attributes.wast	27	226	assert_invalid	invalid-refused	-
+test/validation/attributes.wast	28	235	assert_invalid	invalid-refused	-
+test/validation/attributes.wast	3	81	assert_malformed	invalid-unencodable	-
+test/validation/attributes.wast	4	87	assert_malformed	invalid-unencodable	-
+test/validation/attributes.wast	5	91	assert_malformed	invalid-unencodable	-
+test/validation/attributes.wast	6	98	assert_invalid	invalid-refused	-
+test/validation/attributes.wast	7	101	assert_invalid	invalid-refused	-
+test/validation/attributes.wast	8	106	assert_invalid	invalid-refused	-
+test/validation/attributes.wast	9	112	assert_invalid	invalid-refused	-
+test/validation/core-modules.wast	0	7	component-definition	fused	-
+test/validation/core-modules.wast	1	24	assert_invalid	invalid-refused	-
+test/validation/core-modules.wast	10	110	assert_invalid	invalid-refused	-
+test/validation/core-modules.wast	2	36	assert_invalid	invalid-refused	-
+test/validation/core-modules.wast	3	43	assert_invalid	invalid-refused	-
+test/validation/core-modules.wast	4	51	assert_invalid	invalid-refused	-
+test/validation/core-modules.wast	5	62	assert_invalid	invalid-refused	-
+test/validation/core-modules.wast	6	72	assert_invalid	invalid-refused	-
+test/validation/core-modules.wast	7	86	assert_invalid	invalid-refused	-
+test/validation/core-modules.wast	8	94	assert_invalid	invalid-refused	-
+test/validation/core-modules.wast	9	102	assert_invalid	invalid-refused	-
+test/validation/defined-types.wast	0	8	component	refused	msg:no core modules found in component
+test/validation/defined-types.wast	1	31	assert_invalid	invalid-refused	-
+test/validation/defined-types.wast	10	61	assert_invalid	invalid-refused	-
+test/validation/defined-types.wast	11	64	assert_invalid	invalid-refused	-
+test/validation/defined-types.wast	12	70	assert_invalid	invalid-refused	-
+test/validation/defined-types.wast	13	73	assert_invalid	invalid-refused	-
+test/validation/defined-types.wast	14	76	assert_invalid	invalid-refused	-
+test/validation/defined-types.wast	15	79	assert_invalid	invalid-refused	-
+test/validation/defined-types.wast	16	85	assert_invalid	invalid-refused	-
+test/validation/defined-types.wast	17	88	assert_invalid	invalid-refused	-
+test/validation/defined-types.wast	18	91	assert_invalid	invalid-refused	-
+test/validation/defined-types.wast	19	94	assert_invalid	invalid-refused	-
+test/validation/defined-types.wast	2	34	assert_invalid	invalid-refused	-
+test/validation/defined-types.wast	20	97	assert_invalid	invalid-refused	-
+test/validation/defined-types.wast	21	103	component	refused	msg:no core modules found in component
+test/validation/defined-types.wast	22	110	assert_invalid	invalid-refused	-
+test/validation/defined-types.wast	23	121	assert_invalid	invalid-refused	-
+test/validation/defined-types.wast	24	126	assert_invalid	invalid-refused	-
+test/validation/defined-types.wast	25	131	assert_invalid	invalid-refused	-
+test/validation/defined-types.wast	26	139	assert_invalid	invalid-refused	-
+test/validation/defined-types.wast	27	142	assert_invalid	invalid-refused	-
+test/validation/defined-types.wast	28	145	assert_invalid	invalid-refused	-
+test/validation/defined-types.wast	29	148	assert_invalid	invalid-refused	-
+test/validation/defined-types.wast	3	37	assert_invalid	invalid-refused	-
+test/validation/defined-types.wast	30	151	assert_invalid	invalid-refused	-
+test/validation/defined-types.wast	31	154	assert_invalid	invalid-refused	-
+test/validation/defined-types.wast	32	161	assert_invalid	invalid-refused	-
+test/validation/defined-types.wast	33	164	assert_invalid	invalid-refused	-
+test/validation/defined-types.wast	34	170	assert_invalid	invalid-refused	-
+test/validation/defined-types.wast	35	173	assert_invalid	invalid-refused	-
+test/validation/defined-types.wast	36	179	assert_invalid	invalid-refused	-
+test/validation/defined-types.wast	37	184	assert_invalid	invalid-refused	-
+test/validation/defined-types.wast	38	192	assert_invalid	invalid-refused	-
+test/validation/defined-types.wast	39	198	assert_invalid	invalid-refused	-
+test/validation/defined-types.wast	4	40	assert_invalid	invalid-refused	-
+test/validation/defined-types.wast	40	204	assert_invalid	invalid-refused	-
+test/validation/defined-types.wast	41	214	assert_invalid	invalid-refused	-
+test/validation/defined-types.wast	42	219	assert_invalid	invalid-refused	-
+test/validation/defined-types.wast	43	225	assert_invalid	invalid-refused	-
+test/validation/defined-types.wast	44	234	assert_invalid	invalid-refused	-
+test/validation/defined-types.wast	45	239	assert_invalid	invalid-refused	-
+test/validation/defined-types.wast	46	245	assert_invalid	invalid-refused	-
+test/validation/defined-types.wast	5	43	assert_invalid	invalid-refused	-
+test/validation/defined-types.wast	6	49	assert_invalid	invalid-refused	-
+test/validation/defined-types.wast	7	52	assert_invalid	invalid-refused	-
+test/validation/defined-types.wast	8	55	assert_invalid	invalid-refused	-
+test/validation/defined-types.wast	9	58	assert_invalid	invalid-refused	-
+test/validation/extern-names.wast	0	8	component-definition	refused	msg:no core modules found in component
+test/validation/extern-names.wast	1	18	assert_invalid	invalid-refused	-
+test/validation/extern-names.wast	10	53	assert_invalid	invalid-refused	-
+test/validation/extern-names.wast	11	56	assert_invalid	invalid-refused	-
+test/validation/extern-names.wast	2	26	assert_invalid	invalid-refused	-
+test/validation/extern-names.wast	3	29	assert_invalid	invalid-refused	-
+test/validation/extern-names.wast	4	32	assert_invalid	invalid-refused	-
+test/validation/extern-names.wast	5	35	assert_invalid	invalid-refused	-
+test/validation/extern-names.wast	6	38	assert_invalid	invalid-refused	-
+test/validation/extern-names.wast	7	41	assert_invalid	invalid-refused	-
+test/validation/extern-names.wast	8	44	assert_invalid	invalid-refused	-
+test/validation/extern-names.wast	9	47	assert_invalid	invalid-refused	-
+test/validation/external-visibility.wast	0	5	component-definition	fused	-
+test/validation/external-visibility.wast	1	19	assert_invalid	invalid-refused	-
+test/validation/external-visibility.wast	10	103	component-definition	fused	-
+test/validation/external-visibility.wast	11	111	assert_invalid	invalid-refused	-
+test/validation/external-visibility.wast	12	122	component-definition	fused	-
+test/validation/external-visibility.wast	13	130	assert_invalid	invalid-refused	-
+test/validation/external-visibility.wast	14	141	component-definition	fused	-
+test/validation/external-visibility.wast	15	149	assert_invalid	invalid-refused	-
+test/validation/external-visibility.wast	16	160	component-definition	fused	-
+test/validation/external-visibility.wast	17	167	assert_invalid	invalid-refused	-
+test/validation/external-visibility.wast	18	176	component-definition	fused	-
+test/validation/external-visibility.wast	19	184	assert_invalid	invalid-refused	-
+test/validation/external-visibility.wast	2	28	assert_invalid	invalid-refused	-
+test/validation/external-visibility.wast	20	195	assert_invalid	invalid-refused	-
+test/validation/external-visibility.wast	21	208	assert_invalid	invalid-refused	-
+test/validation/external-visibility.wast	22	220	component-definition	refused	msg:no core modules found in component
+test/validation/external-visibility.wast	23	231	assert_invalid	invalid-refused	-
+test/validation/external-visibility.wast	24	238	assert_invalid	invalid-refused	-
+test/validation/external-visibility.wast	25	245	assert_invalid	invalid-refused	-
+test/validation/external-visibility.wast	26	252	assert_invalid	invalid-refused	-
+test/validation/external-visibility.wast	27	259	assert_invalid	invalid-refused	-
+test/validation/external-visibility.wast	28	266	assert_invalid	invalid-refused	-
+test/validation/external-visibility.wast	29	275	assert_invalid	invalid-refused	-
+test/validation/external-visibility.wast	3	38	assert_invalid	invalid-refused	-
+test/validation/external-visibility.wast	30	282	assert_invalid	invalid-refused	-
+test/validation/external-visibility.wast	31	289	assert_invalid	invalid-refused	-
+test/validation/external-visibility.wast	32	296	assert_invalid	invalid-refused	-
+test/validation/external-visibility.wast	33	306	component-definition	refused	msg:no core modules found in component
+test/validation/external-visibility.wast	34	312	assert_invalid	invalid-refused	-
+test/validation/external-visibility.wast	35	322	component-definition	refused	msg:no core modules found in component
+test/validation/external-visibility.wast	36	328	assert_invalid	invalid-refused	-
+test/validation/external-visibility.wast	37	337	assert_invalid	invalid-refused	-
+test/validation/external-visibility.wast	38	346	assert_invalid	invalid-refused	-
+test/validation/external-visibility.wast	39	353	assert_invalid	invalid-refused	-
+test/validation/external-visibility.wast	4	45	assert_invalid	invalid-refused	-
+test/validation/external-visibility.wast	40	363	component-definition	refused	msg:no core modules found in component
+test/validation/external-visibility.wast	41	368	assert_invalid	invalid-refused	-
+test/validation/external-visibility.wast	42	377	assert_invalid	invalid-refused	-
+test/validation/external-visibility.wast	43	384	assert_invalid	invalid-refused	-
+test/validation/external-visibility.wast	44	394	assert_invalid	invalid-refused	-
+test/validation/external-visibility.wast	45	402	component-definition	refused	msg:no core modules found in component
+test/validation/external-visibility.wast	46	410	component-definition	fused	-
+test/validation/external-visibility.wast	47	420	component-definition	fused	-
+test/validation/external-visibility.wast	48	432	assert_invalid	invalid-refused	-
+test/validation/external-visibility.wast	49	443	assert_invalid	invalid-refused	-
+test/validation/external-visibility.wast	5	53	component-definition	fused	-
+test/validation/external-visibility.wast	50	458	assert_invalid	invalid-refused	-
+test/validation/external-visibility.wast	51	475	component-definition	refused	msg:no core modules found in component
+test/validation/external-visibility.wast	52	489	assert_invalid	invalid-refused	-
+test/validation/external-visibility.wast	53	497	assert_invalid	invalid-refused	-
+test/validation/external-visibility.wast	54	511	component-definition	refused	msg:no core modules found in component
+test/validation/external-visibility.wast	55	520	component-definition	refused	msg:no core modules found in component
+test/validation/external-visibility.wast	56	531	component-definition	refused	msg:no core modules found in component
+test/validation/external-visibility.wast	57	543	component-definition	refused	msg:no core modules found in component
+test/validation/external-visibility.wast	58	563	component-definition	refused	msg:no core modules found in component
+test/validation/external-visibility.wast	59	580	component-definition	fused	-
+test/validation/external-visibility.wast	6	61	assert_invalid	invalid-refused	-
+test/validation/external-visibility.wast	60	587	assert_invalid	invalid-refused	-
+test/validation/external-visibility.wast	61	595	assert_invalid	invalid-refused	-
+test/validation/external-visibility.wast	7	70	assert_invalid	invalid-refused	-
+test/validation/external-visibility.wast	8	80	component-definition	fused	-
+test/validation/external-visibility.wast	9	90	assert_invalid	invalid-refused	-
+test/validation/indicies.wast	0	5	component	refused	msg:no core modules found in component
+test/validation/indicies.wast	1	60	component	fused	-
+test/validation/indicies.wast	10	280	component	refused	msg:no core modules found in component
+test/validation/indicies.wast	11	291	component	fused	-
+test/validation/indicies.wast	12	299	component	refused	msg:no core modules found in component
+test/validation/indicies.wast	13	311	component	refused	msg:no core modules found in component
+test/validation/indicies.wast	14	328	component	refused	msg:component N: core modules N and N both export `` in the flat-name resolver path; ambiguous, and the previous behavior si
+test/validation/indicies.wast	15	341	component	fused	-
+test/validation/indicies.wast	16	371	component	fused	-
+test/validation/indicies.wast	2	73	component	refused	msg:no core modules found in component
+test/validation/indicies.wast	3	85	component	fused	-
+test/validation/indicies.wast	4	152	component	fused	-
+test/validation/indicies.wast	5	210	component	fused	-
+test/validation/indicies.wast	6	223	component	refused	msg:no core modules found in component
+test/validation/indicies.wast	7	236	component	fused	-
+test/validation/indicies.wast	8	251	component	fused	-
+test/validation/indicies.wast	9	267	component	refused	msg:no core modules found in component
+test/validation/instantiation.wast	0	7	component	refused	msg:no core modules found in component
+test/validation/instantiation.wast	1	14	assert_invalid	invalid-refused	-
+test/validation/instantiation.wast	10	97	assert_invalid	invalid-refused	-
+test/validation/instantiation.wast	11	106	assert_invalid	invalid-refused	-
+test/validation/instantiation.wast	12	115	assert_invalid	invalid-refused	-
+test/validation/instantiation.wast	13	124	assert_invalid	invalid-refused	-
+test/validation/instantiation.wast	14	133	assert_invalid	invalid-refused	-
+test/validation/instantiation.wast	15	142	assert_invalid	invalid-refused	-
+test/validation/instantiation.wast	16	151	assert_invalid	invalid-refused	-
+test/validation/instantiation.wast	17	160	assert_invalid	invalid-refused	-
+test/validation/instantiation.wast	18	169	assert_invalid	invalid-refused	-
+test/validation/instantiation.wast	19	178	assert_invalid	invalid-refused	-
+test/validation/instantiation.wast	2	23	assert_invalid	invalid-refused	-
+test/validation/instantiation.wast	20	187	assert_invalid	invalid-refused	-
+test/validation/instantiation.wast	21	196	assert_invalid	invalid-refused	-
+test/validation/instantiation.wast	22	205	assert_invalid	invalid-refused	-
+test/validation/instantiation.wast	23	218	component-definition	refused	msg:no core modules found in component
+test/validation/instantiation.wast	24	223	assert_invalid	invalid-refused	-
+test/validation/instantiation.wast	25	230	assert_invalid	invalid-refused	-
+test/validation/instantiation.wast	26	237	assert_invalid	invalid-refused	-
+test/validation/instantiation.wast	27	244	assert_invalid	invalid-refused	-
+test/validation/instantiation.wast	28	251	assert_invalid	invalid-refused	-
+test/validation/instantiation.wast	29	262	component-definition	refused	msg:no core modules found in component
+test/validation/instantiation.wast	3	32	assert_invalid	invalid-refused	-
+test/validation/instantiation.wast	30	269	assert_invalid	invalid-refused	-
+test/validation/instantiation.wast	31	281	component	fused	-
+test/validation/instantiation.wast	32	289	component	fused	-
+test/validation/instantiation.wast	33	297	assert_invalid	invalid-refused	-
+test/validation/instantiation.wast	34	305	assert_invalid	invalid-refused	-
+test/validation/instantiation.wast	35	313	assert_invalid	invalid-refused	-
+test/validation/instantiation.wast	36	321	assert_invalid	invalid-refused	-
+test/validation/instantiation.wast	37	332	component	fused	-
+test/validation/instantiation.wast	38	342	component	fused	-
+test/validation/instantiation.wast	39	356	assert_invalid	invalid-refused	-
+test/validation/instantiation.wast	4	41	assert_invalid	invalid-refused	-
+test/validation/instantiation.wast	40	364	assert_invalid	invalid-refused	-
+test/validation/instantiation.wast	41	372	assert_invalid	invalid-refused	-
+test/validation/instantiation.wast	42	381	assert_invalid	invalid-refused	-
+test/validation/instantiation.wast	43	389	assert_invalid	invalid-refused	-
+test/validation/instantiation.wast	44	397	assert_invalid	invalid-refused	-
+test/validation/instantiation.wast	45	405	assert_invalid	invalid-refused	-
+test/validation/instantiation.wast	46	413	assert_invalid	invalid-refused	-
+test/validation/instantiation.wast	47	421	assert_invalid	invalid-refused	-
+test/validation/instantiation.wast	48	429	assert_invalid	invalid-refused	-
+test/validation/instantiation.wast	49	437	assert_invalid	invalid-refused	-
+test/validation/instantiation.wast	5	51	assert_invalid	invalid-refused	-
+test/validation/instantiation.wast	50	448	assert_invalid	invalid-refused	-
+test/validation/instantiation.wast	51	454	assert_invalid	invalid-refused	-
+test/validation/instantiation.wast	52	471	component	refused	msg:no core modules found in component
+test/validation/instantiation.wast	53	476	component	refused	msg:no core modules found in component
+test/validation/instantiation.wast	54	483	assert_invalid	invalid-refused	-
+test/validation/instantiation.wast	55	490	assert_invalid	invalid-refused	-
+test/validation/instantiation.wast	56	500	assert_invalid	invalid-refused	-
+test/validation/instantiation.wast	57	509	assert_invalid	invalid-refused	-
+test/validation/instantiation.wast	58	521	assert_invalid	invalid-refused	-
+test/validation/instantiation.wast	59	529	assert_invalid	invalid-refused	-
+test/validation/instantiation.wast	6	61	assert_invalid	invalid-refused	-
+test/validation/instantiation.wast	60	541	assert_invalid	invalid-refused	-
+test/validation/instantiation.wast	61	546	assert_invalid	invalid-refused	-
+test/validation/instantiation.wast	62	551	assert_invalid	invalid-refused	-
+test/validation/instantiation.wast	63	559	assert_invalid	invalid-refused	-
+test/validation/instantiation.wast	64	563	assert_invalid	invalid-refused	-
+test/validation/instantiation.wast	65	567	assert_invalid	invalid-refused	-
+test/validation/instantiation.wast	66	571	assert_invalid	invalid-refused	-
+test/validation/instantiation.wast	67	575	assert_invalid	invalid-refused	-
+test/validation/instantiation.wast	68	579	assert_invalid	invalid-refused	-
+test/validation/instantiation.wast	69	583	assert_invalid	invalid-refused	-
+test/validation/instantiation.wast	7	70	assert_invalid	invalid-refused	-
+test/validation/instantiation.wast	70	587	assert_invalid	invalid-refused	-
+test/validation/instantiation.wast	71	593	assert_invalid	invalid-refused	-
+test/validation/instantiation.wast	72	599	assert_invalid	invalid-refused	-
+test/validation/instantiation.wast	73	605	assert_invalid	invalid-refused	-
+test/validation/instantiation.wast	74	611	assert_invalid	invalid-refused	-
+test/validation/instantiation.wast	75	619	assert_invalid	invalid-refused	-
+test/validation/instantiation.wast	76	626	assert_invalid	invalid-refused	-
+test/validation/instantiation.wast	77	631	assert_invalid	invalid-refused	-
+test/validation/instantiation.wast	78	637	assert_invalid	invalid-refused	-
+test/validation/instantiation.wast	79	644	assert_invalid	invalid-refused	-
+test/validation/instantiation.wast	8	79	assert_invalid	invalid-refused	-
+test/validation/instantiation.wast	80	653	assert_invalid	invalid-refused	-
+test/validation/instantiation.wast	81	659	assert_invalid	invalid-refused	-
+test/validation/instantiation.wast	9	88	assert_invalid	invalid-refused	-
+test/validation/kebab.wast	0	4	component	refused	msg:no core modules found in component
+test/validation/kebab.wast	1	14	assert_invalid	invalid-refused	-
+test/validation/kebab.wast	10	50	assert_invalid	invalid-refused	-
+test/validation/kebab.wast	11	54	assert_invalid	invalid-refused	-
+test/validation/kebab.wast	12	58	assert_invalid	invalid-refused	-
+test/validation/kebab.wast	13	62	assert_invalid	invalid-refused	-
+test/validation/kebab.wast	14	66	assert_invalid	invalid-refused	-
+test/validation/kebab.wast	15	70	assert_invalid	invalid-refused	-
+test/validation/kebab.wast	16	74	assert_invalid	invalid-refused	-
+test/validation/kebab.wast	17	78	assert_invalid	invalid-refused	-
+test/validation/kebab.wast	18	82	assert_invalid	invalid-refused	-
+test/validation/kebab.wast	19	86	assert_invalid	invalid-refused	-
+test/validation/kebab.wast	2	18	assert_invalid	invalid-refused	-
+test/validation/kebab.wast	20	90	assert_invalid	invalid-refused	-
+test/validation/kebab.wast	21	96	assert_invalid	invalid-refused	-
+test/validation/kebab.wast	22	101	assert_invalid	invalid-refused	-
+test/validation/kebab.wast	23	105	assert_invalid	invalid-refused	-
+test/validation/kebab.wast	24	109	assert_invalid	invalid-refused	-
+test/validation/kebab.wast	25	113	assert_invalid	invalid-refused	-
+test/validation/kebab.wast	26	119	assert_invalid	invalid-refused	-
+test/validation/kebab.wast	27	125	assert_invalid	invalid-refused	-
+test/validation/kebab.wast	28	131	assert_invalid	invalid-refused	-
+test/validation/kebab.wast	29	137	assert_invalid	invalid-refused	-
+test/validation/kebab.wast	3	22	assert_invalid	invalid-refused	-
+test/validation/kebab.wast	30	143	assert_invalid	invalid-refused	-
+test/validation/kebab.wast	31	149	assert_invalid	invalid-refused	-
+test/validation/kebab.wast	32	154	assert_invalid	invalid-refused	-
+test/validation/kebab.wast	33	159	assert_invalid	invalid-refused	-
+test/validation/kebab.wast	34	164	assert_invalid	invalid-refused	-
+test/validation/kebab.wast	35	169	assert_invalid	invalid-refused	-
+test/validation/kebab.wast	4	26	assert_invalid	invalid-refused	-
+test/validation/kebab.wast	5	30	assert_invalid	invalid-refused	-
+test/validation/kebab.wast	6	34	assert_invalid	invalid-refused	-
+test/validation/kebab.wast	7	38	assert_invalid	invalid-refused	-
+test/validation/kebab.wast	8	42	assert_invalid	invalid-refused	-
+test/validation/kebab.wast	9	46	assert_invalid	invalid-refused	-
+test/validation/map.wast	0	3	component-definition	refused	msg:failed to parse component: Maps require the component model map feature
+test/validation/map.wast	1	33	assert_invalid	invalid-refused	-
+test/validation/map.wast	10	70	assert_invalid	invalid-refused	-
+test/validation/map.wast	11	76	assert_invalid	invalid-refused	-
+test/validation/map.wast	12	81	assert_invalid	invalid-refused	-
+test/validation/map.wast	2	36	assert_invalid	invalid-refused	-
+test/validation/map.wast	3	39	assert_invalid	invalid-refused	-
+test/validation/map.wast	4	42	assert_invalid	invalid-refused	-
+test/validation/map.wast	5	47	assert_invalid	invalid-refused	-
+test/validation/map.wast	6	52	assert_invalid	invalid-refused	-
+test/validation/map.wast	7	57	assert_invalid	invalid-refused	-
+test/validation/map.wast	8	61	assert_invalid	invalid-refused	-
+test/validation/map.wast	9	65	assert_invalid	invalid-refused	-
+test/validation/max-value-size.wast	0	6	component	refused	msg:failed to parse component: Maps require the component model map feature
+test/validation/max-value-size.wast	1	25	assert_invalid	invalid-refused	-
+test/validation/max-value-size.wast	2	31	assert_invalid	invalid-refused	-
+test/validation/max-value-size.wast	3	37	assert_invalid	invalid-refused	-
+test/validation/max-value-size.wast	4	43	assert_invalid	invalid-refused	-
+test/validation/max-value-size.wast	5	48	assert_invalid	invalid-refused	-
+test/validation/max-value-size.wast	6	57	assert_invalid	invalid-refused	-
+test/validation/max-value-size.wast	7	63	assert_invalid	invalid-refused	-
+test/validation/outer-alias.wast	0	7	component-definition	fused	-
+test/validation/outer-alias.wast	1	26	component-definition	fused	-
+test/validation/outer-alias.wast	10	106	component-definition	refused	msg:no core modules found in component
+test/validation/outer-alias.wast	11	121	component-definition	refused	msg:no core modules found in component
+test/validation/outer-alias.wast	12	132	component-definition	refused	msg:no core modules found in component
+test/validation/outer-alias.wast	13	156	component-definition	refused	msg:no core modules found in component
+test/validation/outer-alias.wast	14	173	assert_invalid	invalid-refused	-
+test/validation/outer-alias.wast	15	182	assert_invalid	invalid-refused	-
+test/validation/outer-alias.wast	16	189	assert_invalid	invalid-refused	-
+test/validation/outer-alias.wast	17	196	assert_invalid	invalid-refused	-
+test/validation/outer-alias.wast	18	205	assert_invalid	invalid-refused	-
+test/validation/outer-alias.wast	19	212	assert_invalid	invalid-refused	-
+test/validation/outer-alias.wast	2	39	assert_invalid	invalid-refused	-
+test/validation/outer-alias.wast	20	219	assert_invalid	invalid-refused	-
+test/validation/outer-alias.wast	21	226	assert_invalid	invalid-refused	-
+test/validation/outer-alias.wast	22	230	assert_invalid	invalid-refused	-
+test/validation/outer-alias.wast	23	239	assert_invalid	invalid-refused	-
+test/validation/outer-alias.wast	24	243	assert_invalid	invalid-refused	-
+test/validation/outer-alias.wast	25	247	assert_invalid	invalid-refused	-
+test/validation/outer-alias.wast	26	251	assert_invalid	invalid-refused	-
+test/validation/outer-alias.wast	27	255	assert_invalid	invalid-refused	-
+test/validation/outer-alias.wast	28	259	assert_invalid	invalid-refused	-
+test/validation/outer-alias.wast	29	265	component-definition	refused	msg:no core modules found in component
+test/validation/outer-alias.wast	3	46	assert_invalid	invalid-refused	-
+test/validation/outer-alias.wast	30	281	assert_malformed	invalid-unencodable	-
+test/validation/outer-alias.wast	4	54	assert_invalid	invalid-refused	-
+test/validation/outer-alias.wast	5	62	assert_invalid	invalid-refused	-
+test/validation/outer-alias.wast	6	69	assert_invalid	invalid-refused	-
+test/validation/outer-alias.wast	7	81	assert_invalid	invalid-refused	-
+test/validation/outer-alias.wast	8	89	assert_invalid	invalid-refused	-
+test/validation/outer-alias.wast	9	98	component-definition	refused	msg:no core modules found in component
+test/validation/resources.wast	0	6	assert_invalid	invalid-refused	-
+test/validation/resources.wast	1	19	component-definition	refused	msg:no core modules found in component
+test/validation/resources.wast	10	112	component-definition	refused	msg:no core modules found in component
+test/validation/resources.wast	11	157	component-definition	refused	msg:no core modules found in component
+test/validation/resources.wast	12	167	assert_invalid	invalid-refused	-
+test/validation/resources.wast	13	180	assert_invalid	invalid-refused	-
+test/validation/resources.wast	14	192	component-definition	refused	msg:no core modules found in component
+test/validation/resources.wast	15	200	assert_invalid	invalid-refused	-
+test/validation/resources.wast	16	211	assert_invalid	invalid-refused	-
+test/validation/resources.wast	17	222	assert_invalid	invalid-refused	-
+test/validation/resources.wast	18	233	component-definition	refused	msg:no core modules found in component
+test/validation/resources.wast	19	241	assert_invalid	invalid-refused	-
+test/validation/resources.wast	2	28	assert_invalid	invalid-refused	-
+test/validation/resources.wast	20	252	component-definition	refused	msg:no core modules found in component
+test/validation/resources.wast	21	260	assert_invalid	invalid-refused	-
+test/validation/resources.wast	22	271	component	refused	msg:no core modules found in component
+test/validation/resources.wast	23	280	assert_invalid	invalid-refused	-
+test/validation/resources.wast	24	292	component	refused	msg:no core modules found in component
+test/validation/resources.wast	25	301	assert_invalid	invalid-refused	-
+test/validation/resources.wast	26	313	component	refused	msg:no core modules found in component
+test/validation/resources.wast	27	355	component-definition	refused	msg:no core modules found in component
+test/validation/resources.wast	28	371	assert_invalid	invalid-refused	-
+test/validation/resources.wast	29	387	assert_invalid	invalid-refused	-
+test/validation/resources.wast	3	39	component-definition	refused	msg:no core modules found in component
+test/validation/resources.wast	30	404	component	refused	msg:no core modules found in component
+test/validation/resources.wast	31	417	assert_invalid	invalid-refused	-
+test/validation/resources.wast	32	427	component	refused	msg:no core modules found in component
+test/validation/resources.wast	33	434	assert_invalid	invalid-refused	-
+test/validation/resources.wast	34	446	component	refused	msg:no core modules found in component
+test/validation/resources.wast	35	461	assert_invalid	invalid-refused	-
+test/validation/resources.wast	36	479	assert_invalid	invalid-refused	-
+test/validation/resources.wast	37	494	assert_invalid	invalid-refused	-
+test/validation/resources.wast	38	508	assert_invalid	invalid-refused	-
+test/validation/resources.wast	39	531	component	refused	msg:no core modules found in component
+test/validation/resources.wast	4	48	component-definition	refused	msg:no core modules found in component
+test/validation/resources.wast	40	545	assert_invalid	invalid-refused	-
+test/validation/resources.wast	41	564	component	refused	msg:no core modules found in component
+test/validation/resources.wast	42	577	assert_invalid	invalid-refused	-
+test/validation/resources.wast	43	594	component	refused	msg:no core modules found in component
+test/validation/resources.wast	44	607	component	refused	msg:no core modules found in component
+test/validation/resources.wast	45	623	component	refused	msg:no core modules found in component
+test/validation/resources.wast	46	651	assert_invalid	invalid-refused	-
+test/validation/resources.wast	47	659	assert_invalid	invalid-refused	-
+test/validation/resources.wast	48	668	assert_invalid	invalid-refused	-
+test/validation/resources.wast	49	677	assert_invalid	invalid-refused	-
+test/validation/resources.wast	5	64	component-definition	refused	msg:no core modules found in component
+test/validation/resources.wast	50	682	assert_invalid	invalid-refused	-
+test/validation/resources.wast	51	687	assert_invalid	invalid-refused	-
+test/validation/resources.wast	52	693	assert_invalid	invalid-refused	-
+test/validation/resources.wast	53	701	assert_invalid	invalid-refused	-
+test/validation/resources.wast	54	707	assert_invalid	invalid-refused	-
+test/validation/resources.wast	55	713	assert_invalid	invalid-refused	-
+test/validation/resources.wast	56	719	assert_invalid	invalid-refused	-
+test/validation/resources.wast	57	729	assert_invalid	invalid-refused	-
+test/validation/resources.wast	58	735	assert_invalid	invalid-refused	-
+test/validation/resources.wast	59	743	component	fused	-
+test/validation/resources.wast	6	72	assert_invalid	invalid-refused	-
+test/validation/resources.wast	60	750	assert_invalid	invalid-refused	-
+test/validation/resources.wast	61	758	assert_invalid	invalid-refused	-
+test/validation/resources.wast	62	765	assert_invalid	invalid-refused	-
+test/validation/resources.wast	63	771	assert_invalid	invalid-refused	-
+test/validation/resources.wast	64	777	assert_invalid	invalid-refused	-
+test/validation/resources.wast	65	783	assert_invalid	invalid-refused	-
+test/validation/resources.wast	66	790	assert_invalid	invalid-refused	-
+test/validation/resources.wast	67	796	assert_invalid	invalid-refused	-
+test/validation/resources.wast	68	803	assert_invalid	invalid-refused	-
+test/validation/resources.wast	69	814	component	refused	msg:no core modules found in component
+test/validation/resources.wast	7	83	component-definition	refused	msg:no core modules found in component
+test/validation/resources.wast	70	824	component	refused	msg:no core modules found in component
+test/validation/resources.wast	71	836	component	refused	msg:no core modules found in component
+test/validation/resources.wast	8	91	assert_invalid	invalid-refused	-
+test/validation/resources.wast	9	102	assert_invalid	invalid-refused	-
+test/validation/version-suffix.wast	0	2	component-definition	refused	msg:failed to parse component: the `cm-implements` feature is not active
+test/validation/version-suffix.wast	1	21	assert_invalid	invalid-refused	-
+test/validation/version-suffix.wast	10	56	assert_invalid	invalid-refused	-
+test/validation/version-suffix.wast	11	61	assert_invalid	invalid-refused	-
+test/validation/version-suffix.wast	12	64	assert_invalid	invalid-refused	-
+test/validation/version-suffix.wast	13	69	assert_invalid	invalid-refused	-
+test/validation/version-suffix.wast	14	72	assert_invalid	invalid-refused	-
+test/validation/version-suffix.wast	15	75	assert_invalid	invalid-refused	-
+test/validation/version-suffix.wast	16	78	assert_invalid	invalid-refused	-
+test/validation/version-suffix.wast	17	81	assert_invalid	invalid-refused	-
+test/validation/version-suffix.wast	18	84	assert_invalid	invalid-refused	-
+test/validation/version-suffix.wast	19	87	assert_invalid	invalid-refused	-
+test/validation/version-suffix.wast	2	24	assert_invalid	invalid-refused	-
+test/validation/version-suffix.wast	20	90	assert_invalid	invalid-refused	-
+test/validation/version-suffix.wast	21	93	assert_invalid	invalid-refused	-
+test/validation/version-suffix.wast	22	98	assert_invalid	invalid-refused	-
+test/validation/version-suffix.wast	23	101	assert_invalid	invalid-refused	-
+test/validation/version-suffix.wast	24	106	assert_invalid	invalid-refused	-
+test/validation/version-suffix.wast	25	109	assert_invalid	invalid-refused	-
+test/validation/version-suffix.wast	26	112	assert_invalid	invalid-refused	-
+test/validation/version-suffix.wast	27	115	assert_invalid	invalid-refused	-
+test/validation/version-suffix.wast	28	120	component-definition	refused	msg:failed to parse component: the `cm-implements` feature is not active
+test/validation/version-suffix.wast	29	130	assert_invalid	invalid-refused	-
+test/validation/version-suffix.wast	3	27	assert_invalid	invalid-refused	-
+test/validation/version-suffix.wast	30	133	assert_invalid	invalid-refused	-
+test/validation/version-suffix.wast	31	136	assert_invalid	invalid-refused	-
+test/validation/version-suffix.wast	32	139	assert_invalid	invalid-refused	-
+test/validation/version-suffix.wast	33	142	assert_invalid	invalid-refused	-
+test/validation/version-suffix.wast	34	147	component-definition	refused	msg:failed to parse component: the `cm-implements` feature is not active
+test/validation/version-suffix.wast	35	153	component-definition	refused	msg:failed to parse component: the `cm-implements` feature is not active
+test/validation/version-suffix.wast	36	179	assert_invalid	invalid-refused	-
+test/validation/version-suffix.wast	37	184	assert_invalid	invalid-refused	-
+test/validation/version-suffix.wast	38	189	assert_invalid	invalid-refused	-
+test/validation/version-suffix.wast	39	197	component-definition	refused	msg:failed to parse component: the `cm-implements` feature is not active
+test/validation/version-suffix.wast	4	30	assert_invalid	invalid-refused	-
+test/validation/version-suffix.wast	40	208	assert_invalid	invalid-refused	-
+test/validation/version-suffix.wast	5	33	assert_invalid	invalid-refused	-
+test/validation/version-suffix.wast	6	39	component-definition	refused	msg:no core modules found in component
+test/validation/version-suffix.wast	7	47	assert_invalid	invalid-refused	-
+test/validation/version-suffix.wast	8	50	assert_invalid	invalid-refused	-
+test/validation/version-suffix.wast	9	53	assert_invalid	invalid-refused	-
+test/values/alignment.wast	0	5	component-definition	fused	-
+test/values/alignment.wast	12	114	component-definition	fused	-
+test/values/alignment.wast	15	143	component-definition	fused	-
+test/values/alignment.wast	20	177	component-definition	fused	-
+test/values/alignment.wast	3	30	component-definition	fused	-
+test/values/alignment.wast	6	56	component-definition	fused	-
+test/values/alignment.wast	9	85	component-definition	fused	-
+test/values/concat.wast	0	3	component	fused	-
+test/values/concat.wast	36	463	component	refused	msg:failed to parse component: Maps require the component model map feature
+test/values/numerics.wast	0	6	component	fused	-
+test/values/numerics.wast	11	132	component	fused	-
+test/values/numerics.wast	15	167	component-definition	fused	-
+test/values/numerics.wast	2	69	component	fused	-
+test/values/numerics.wast	22	202	component	fused	-
+test/values/numerics.wast	24	306	component	fused	-
+test/values/numerics.wast	9	87	component	fused	-
+test/values/post-return.wast	0	4	component-definition	refused	msg:failed to parse component: `stream.forward` requires the component model forward feature
+test/values/post-return.wast	61	276	component	fused	-
+test/values/post-return.wast	64	312	component	fused	-
+test/values/post-return.wast	67	350	component	fused	-
+test/values/post-return.wast	69	379	component	fused	-
+test/values/realloc.wast	0	6	component	fused	-
+test/values/realloc.wast	13	114	component-definition	fused	-
+test/values/realloc.wast	2	43	component-definition	fused	-
+test/values/realloc.wast	5	70	component-definition	fused	-
+test/values/realloc.wast	8	98	component-definition	fused	-
+test/values/strings.wast	0	1	component	fused	-
+test/values/strings.wast	11	88	component	fused	-
+test/values/strings.wast	13	104	component	fused	-
+test/values/strings.wast	15	122	component	fused	-
+test/values/strings.wast	3	27	component	fused	-
+test/values/strings.wast	5	42	component	fused	-
+test/values/strings.wast	7	57	component	fused	-
+test/values/strings.wast	9	72	component	fused	-
+test/values/transcode.wast	0	7	component	fused-invalid	msg:type mismatch: values remaining on stack at end of block
+test/values/transcode.wast	2	117	component	fused-invalid	msg:type mismatch: values remaining on stack at end of block
+test/values/transcode.wast	4	205	component	fused-invalid	msg:type mismatch: values remaining on stack at end of block
+test/values/transcode.wast	6	323	component	fused	-
+test/values/transcode.wast	8	437	component	fused-invalid	msg:type mismatch: values remaining on stack at end of block
+test/values/variants.wast	0	6	component-definition	fused	-
+test/values/variants.wast	9	83	component	refused	msg:failed to parse component: requires the component model async stackful feature
