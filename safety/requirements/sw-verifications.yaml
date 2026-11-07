@@ -1798,3 +1798,17 @@ artifacts:
       model: claude-opus-5-5
       timestamp: 2026-11-03T21:25:52Z
     release: v0.67.0
+
+  - id: SWV-127
+    type: sw-verification
+    title: "Verification of SR-113: the component-model reference suite fusion ratchet"
+    status: implemented
+    description: "meld-core/tests/cm_wast_ratchet.rs, vendored suite tests/spec/component-model at c818a1925e (78 WASTs). bazel_pin_matches_the_vendored_suite: MODULE.bazel's component_model_spec commit equals COMMIT. vendored_suite_matches_its_checksums: all 80 files match SHA256SUMS and there are exactly 78 WASTs; negative control: appending one line to test/async/forward.wast fails it. every_reference_component_matches_the_fuse_baseline: visits all 78 WASTs (asserted, not ran > 0) and compares 859 per-component outcomes with tests/spec/component-model-fuse-baseline.tsv: 182 fused, 145 refused, 13 fused-invalid, 514 invalid-refused, 5 invalid-unencodable, 0 invalid-fused, 0 panic (one fused and one refused entry are instantiation assertions). Negative control: forcing the callee string encoding to the caller's in generate_adapter (a broken lift/lower) flips 4 values/transcode.wast components from fused-invalid to fused and fails the test. Limit: an outcome-preserving semantic break (valid but wrong output) is not caught here; that needs the assertion run on kiln (kiln's oracle requirement, numbered 93 in kiln). The 13 fused-invalid components are all rejected by the meld CLI's default validation (exit 1), but the library API returns them as Ok; they are recorded on #545 (10, stack type mismatches in async and transcoding adapters) and #492 (3, duplicate $N exports in linking/unit.wast). The fuzz smoke classifier was checked on three logs: success, the #168 ToolExecError x86_64-linux-musl-g++ signature (skip with warning), and a Rust compile error (fail)."
+    links:
+      - type: verifies
+        target: SR-113
+    provenance:
+      created-by: ai-assisted
+      model: claude-opus-5-5
+      timestamp: 2026-11-07T04:52:56Z
+    release: v0.68.0
