@@ -3104,12 +3104,17 @@ impl Fuser {
         #[cfg(feature = "attestation")]
         {
             let attestation = self.build_wsc_attestation(output_bytes, stats);
-            let payload = attestation
-                .to_json_compact()
+            // Through `serde_json::Value`, not `to_json_compact`: wsc's
+            // `ToolInfo::parameters` is a `HashMap`, serialized in per-process
+            // hash order, so `--reproducible` gave different bytes on every
+            // run in this build. `Value`'s map is a BTreeMap (serde_json is
+            // built without `preserve_order`), so keys come out sorted.
+            // Found by SR-116's reproducibility test.
+            let payload = serde_json::to_value(&attestation)
+                .and_then(|v| serde_json::to_vec(&v))
                 .map_err(|e| {
                     Error::EncodingError(format!("attestation serialization failed: {e}"))
-                })?
-                .into_bytes();
+                })?;
             Ok((wsc_attestation::TRANSFORMATION_ATTESTATION_SECTION, payload))
         }
 
@@ -3166,7 +3171,8 @@ impl Fuser {
         let mut builder = FusionAttestationBuilder::new("meld", env!("CARGO_PKG_VERSION"))
             .memory_strategy(self.memory_strategy_label())
             .reproducible(self.config.reproducible)
-            .parameters(self.attestation_parameters());
+            .parameters(self.attestation_parameters())
+            .toolchain(attestation::toolchain_identity_from_env());
 
         // #341 / #413: see `attested_inputs`.
         for (name, module_count, hash, size) in self.attested_inputs() {
@@ -3189,6 +3195,11 @@ impl Fuser {
         };
 
         let output_hash = attestation::compute_sha256(output_bytes);
+        let toolchain = if self.config.reproducible {
+            attestation::ToolchainIdentity::default()
+        } else {
+            attestation::toolchain_identity_from_env()
+        };
         // #325: in reproducible mode, derive the id from the output content and
         // the timestamp from SOURCE_DATE_EPOCH so the fused artifact is
         // byte-stable across runs; otherwise keep the wall-clock/random id.
@@ -3315,12 +3326,11 @@ impl Fuser {
                 version: env!("CARGO_PKG_VERSION").to_string(),
                 tool_hash: None,
                 parameters: tool_parameters,
-                // wsc-attestation 0.12: varve layer identity. Left unset so
-                // the attestation does not depend on the ambient environment;
-                // both fields skip serialization when None, so the bytes are
-                // unchanged from 0.5.
-                toolchain: None,
-                toolchain_manifest_digest: None,
+                // SR-116: the varve layer identity, by the same predicate as
+                // the default attestation path, and likewise left out under
+                // --reproducible.
+                toolchain: toolchain.layer,
+                toolchain_manifest_digest: toolchain.manifest_digest,
             },
             attestation_signature: AttestationSignature {
                 algorithm: "unsigned".to_string(),
