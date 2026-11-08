@@ -6,6 +6,10 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- The reference-suite assertions now run on the fused output (SR-118).
+  - The ratchet replays each WAST command in order on wasmtime and compares the outcome with `tests/spec/component-model-exec-baseline.tsv`.
+  - Covered: scalar values, on exports the fused core module keeps.
+  - On main it records 25 passes, 15 missing validation traps (#586), and the #582 trap.
 - The upstream Component Model reference tests are now a fusion oracle (#562, SR-113).
   - `tests/spec/component-model/` vendors upstream `test/` at c818a1925e (78 WASTs), with its licence and a SHA-256 list. `MODULE.bazel` pins the same commit; it was deb0b0ac35, which predates the async and re-entrance tests.
   - `meld-core/tests/cm_wast_ratchet.rs` fuses each of the 859 components on its own and compares the outcome with `tests/spec/component-model-fuse-baseline.tsv`. A difference in either direction fails the test.
