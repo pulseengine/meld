@@ -1234,6 +1234,7 @@ dependencies = [
  "wasmtime",
  "wasmtime-environ",
  "wasmtime-wasi",
+ "wast 263.0.0",
  "wat",
  "wsc-attestation",
 ]

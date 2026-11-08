@@ -142,7 +142,7 @@ filegroup(
 git_repo(
     name = "component_model_spec",
     remote = "https://github.com/WebAssembly/component-model.git",
-    commit = "deb0b0a",
+    commit = "c818a1925e1c7e3d3c8bdecf2fba070b4e737b03",
     build_file_content = """
 package(default_visibility = ["//visibility:public"])
 
