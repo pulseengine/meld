@@ -853,10 +853,10 @@ test/values/strings.wast	3	27	component	fused	-
 test/values/strings.wast	5	42	component	fused	-
 test/values/strings.wast	7	57	component	fused	-
 test/values/strings.wast	9	72	component	fused	-
-test/values/transcode.wast	0	7	component	meld-invalid	msg:type mismatch: values remaining on stack at end of block
-test/values/transcode.wast	2	117	component	meld-invalid	msg:type mismatch: values remaining on stack at end of block
-test/values/transcode.wast	4	205	component	meld-invalid	msg:type mismatch: values remaining on stack at end of block
+test/values/transcode.wast	0	7	component	fused	-
+test/values/transcode.wast	2	117	component	fused	-
+test/values/transcode.wast	4	205	component	fused	-
 test/values/transcode.wast	6	323	component	fused	-
-test/values/transcode.wast	8	437	component	meld-invalid	msg:type mismatch: values remaining on stack at end of block
+test/values/transcode.wast	8	437	component	fused	-
 test/values/variants.wast	0	6	component-definition	fused	-
 test/values/variants.wast	9	83	component	refused	msg:failed to parse component: requires the component model async stackful feature

@@ -8577,6 +8577,174 @@ impl FactStyleGenerator {
         func.instruction(&Instruction::End); // end block
     }
 
+    /// The caller's merged type index when this site uses the retptr
+    /// convention (caller lowers `(params.., retptr) -> ()`, callee lifts
+    /// `(params..) -> i32`), else `None`. Same predicate the memory-copy
+    /// adapter uses ([`Self::is_retptr_call`]).
+    fn retptr_caller_type(
+        &self,
+        site: &AdapterSite,
+        merged: &MergedModule,
+        callee_type_idx: u32,
+    ) -> Option<u32> {
+        let callee_t = merged.types.get(callee_type_idx as usize)?;
+        let caller_type_idx = site.import_func_type_idx.and_then(|local_ti| {
+            merged
+                .type_index_map
+                .get(&(site.from_component, site.from_module, local_ti))
+                .copied()
+        })?;
+        let caller_t = merged.types.get(caller_type_idx as usize)?;
+        Self::is_retptr_call(
+            caller_t.params.len(),
+            callee_t.params.len(),
+            caller_t.results.len(),
+            callee_t.results.len(),
+            callee_t.results.first(),
+        )
+        .then_some(caller_type_idx)
+    }
+
+    /// #545: cross-encoding call whose result is one `string` / `list<T>`
+    /// returned through the retptr convention. Composed from the emitters the
+    /// async-lift adapters already use and test, so the sync path gets the
+    /// same per-direction coverage rather than a second implementation:
+    ///
+    /// 1. [`Self::guard_async_cross_encoding_strings`]: refuse any direction
+    ///    the emitters below would raw-copy instead of transcode.
+    /// 2. [`Self::emit_param_copy_step`]: transcode/copy each `(ptr, len)`
+    ///    param from caller memory into callee memory, rewriting the locals.
+    /// 3. Call the callee; it returns a pointer to its return area (callee
+    ///    memory), whose first 8 bytes are the result `(ptr, len)`.
+    /// 4. [`Self::emit_ptr_pair_result_writeback_from_locals`]: allocate in
+    ///    caller memory, transcode `callee_enc -> caller_enc` (or copy), walk
+    ///    nested indirections, store `(new_ptr, len)` at the caller's retptr.
+    /// 5. Post-return with the callee's return-area pointer.
+    ///
+    /// Any other result shape is refused, loudly: it is not emitted at all
+    /// rather than emitted wrong.
+    fn generate_transcoding_retptr_adapter(
+        &self,
+        site: &AdapterSite,
+        merged: &MergedModule,
+        options: &AdapterOptions,
+        target_func: u32,
+        callee_type_idx: u32,
+        caller_type_idx: u32,
+    ) -> Result<(u32, Function)> {
+        let refuse = |why: &str| {
+            Err(crate::Error::AdapterGeneration(format!(
+                "#545: cannot transcode the call to '{}' ({}): {why}. meld will not emit an \
+                 adapter it cannot make correct.",
+                site.export_name, site.import_module
+            )))
+        };
+        let callee_t = merged.types.get(callee_type_idx as usize).cloned();
+        let caller_t = merged.types.get(caller_type_idx as usize).cloned();
+        let (Some(callee_t), Some(caller_t)) = (callee_t, caller_t) else {
+            return refuse("its caller or callee core type is unknown");
+        };
+        let caller_param_count = caller_t.params.len();
+        let callee_param_count = callee_t.params.len();
+        if caller_param_count != callee_param_count + 1 {
+            return refuse("the caller lowers more than one extra (retptr) parameter");
+        }
+        let r = &site.requirements;
+        let result_type = match r.result_wit_types.as_slice() {
+            [
+                t @ (crate::parser::ComponentValType::String
+                | crate::parser::ComponentValType::List(_)),
+            ] => t.clone(),
+            _ => return refuse("its result is not a single string or list"),
+        };
+        if r.return_area_byte_size != Some(8) || r.result_pointer_pair_offsets != [0] {
+            return refuse("its return area is not exactly one (ptr, len) pair");
+        }
+        if !site.crosses_memory || options.caller_memory == options.callee_memory {
+            return refuse("caller and callee share a memory (see #361)");
+        }
+        // `emit_param_copy_step` resolves memories per component; the writeback
+        // below uses the site's resolved ones. They must be the same memories.
+        if crate::merger::component_memory_index(merged, site.from_component)
+            != options.caller_memory
+            || crate::merger::component_memory_index(merged, site.to_component)
+                != options.callee_memory
+        {
+            return refuse("its resolved memories disagree with the components' memories");
+        }
+        let Some(caller_realloc) = options.caller_realloc else {
+            return refuse("no caller realloc could be resolved for the result (#515)");
+        };
+        Self::guard_async_cross_encoding_strings(site)?;
+
+        // Locals: caller params, then the same 23-local scratch block the async
+        // stackful adapter uses (offsets documented there: +0 param-step
+        // new_ptr, +1..=+10 writeback + nested patch, +11..=+16 depth-1
+        // nested, +12 param transcode, +17..=+22 result transcode), then one
+        // more for the callee's return-area pointer.
+        let l_scratch = caller_param_count as u32;
+        let l_area = l_scratch + 23;
+        let retptr_local = callee_param_count as u32;
+        let mut body = Function::new([(24, wasm_encoder::ValType::I32)]);
+
+        emit_resource_borrow_phase0(&mut body, &options.resource_rep_calls);
+
+        self.emit_param_copy_step(
+            &mut body,
+            site,
+            merged,
+            &caller_t,
+            caller_param_count,
+            callee_param_count,
+            l_scratch,
+            l_scratch + 12,
+            options.callee_realloc,
+        );
+
+        for i in 0..callee_param_count {
+            body.instruction(&Instruction::LocalGet(i as u32));
+        }
+        body.instruction(&Instruction::Call(target_func));
+        body.instruction(&Instruction::LocalSet(l_area));
+
+        let area = |offset| wasm_encoder::MemArg {
+            offset,
+            align: 2,
+            target: wasm_encoder::MemArgTarget::Memory(options.callee_memory),
+            ordering: None,
+        };
+        body.instruction(&Instruction::LocalGet(l_area));
+        body.instruction(&Instruction::I32Load(area(0)));
+        body.instruction(&Instruction::LocalSet(l_scratch + 1));
+        body.instruction(&Instruction::LocalGet(l_area));
+        body.instruction(&Instruction::I32Load(area(4)));
+        body.instruction(&Instruction::LocalSet(l_scratch + 2));
+
+        self.emit_ptr_pair_result_writeback_from_locals(
+            &mut body,
+            Some(&result_type),
+            retptr_local,
+            caller_realloc,
+            options.caller_memory,
+            options.callee_memory,
+            l_scratch + 1,
+            l_scratch + 17,
+            r.caller_encoding,
+            r.callee_encoding,
+            matches!(
+                r.callee_encoding,
+                Some(crate::parser::CanonStringEncoding::CompactUtf16)
+            ),
+        );
+
+        if let Some(post_return) = options.callee_post_return {
+            body.instruction(&Instruction::LocalGet(l_area));
+            body.instruction(&Instruction::Call(post_return));
+        }
+        body.instruction(&Instruction::End);
+        Ok((caller_type_idx, body))
+    }
+
     /// Generate an adapter with string transcoding
     fn generate_transcoding_adapter(
         &self,
@@ -8608,6 +8776,23 @@ impl FactStyleGenerator {
             .defined_func(target_func)
             .map(|f| f.type_idx)
             .unwrap_or(0);
+
+        // #545: a string/list RESULT makes the caller lower with a retptr,
+        // `(params.., retptr) -> ()`, while the callee lifts `(params..) ->
+        // i32` (a pointer to its return area). The flat emitters below take
+        // the CALLEE's type and transcode params only, so they produced an
+        // adapter the caller cannot call (invalid module). Route that shape
+        // to the retptr emitter, which also transcodes the result back.
+        if let Some(caller_type_idx) = self.retptr_caller_type(site, merged, type_idx) {
+            return self.generate_transcoding_retptr_adapter(
+                site,
+                merged,
+                options,
+                target_func,
+                type_idx,
+                caller_type_idx,
+            );
+        }
 
         let func_type = merged.types.get(type_idx as usize);
         let param_count = func_type.map(|t| t.params.len()).unwrap_or(0);
@@ -10829,6 +11014,7 @@ impl FactStyleGenerator {
             callee_param_count,
             l_p2 + 4,
             l_p2 + 16,
+            crate::merger::component_realloc_index(merged, site.to_component),
         );
 
         // Step 1: Call [async-lift] entry with callee's params
@@ -11169,6 +11355,12 @@ impl FactStyleGenerator {
         callee_param_count: usize,
         scratch_local: u32,
         transcode_base: u32,
+        // #545: the callee realloc, chosen by the caller. The async emitters
+        // pass `component_realloc_index` (unchanged behaviour); the sync
+        // transcoding adapter passes the #515-traced `options.callee_realloc`,
+        // because the component-level lookup misses a realloc the `canon lift`
+        // names under another export name, and this step then SKIPS the copy.
+        callee_realloc: Option<u32>,
     ) {
         // `pointer_pair_positions` from the resolver are flat indices into
         // the component-type param list, computed by
@@ -11185,7 +11377,6 @@ impl FactStyleGenerator {
         // `cabi_realloc` + `memory.copy`, corrupting plain integer args at
         // the callee. Replaces that with the resolver's positions directly.
         let _ = (caller_type, caller_param_count, callee_param_count);
-        let callee_realloc = crate::merger::component_realloc_index(merged, site.to_component);
         let callee_memory = crate::merger::component_memory_index(merged, site.to_component);
         let caller_memory = crate::merger::component_memory_index(merged, site.from_component);
 
@@ -11693,12 +11884,56 @@ impl FactStyleGenerator {
         let (ptr_global, _) = info.result_globals[0];
         let (len_global, _) = info.result_globals[1];
 
+        // Read source ptr and len from shim globals into the writeback's
+        // first two scratch locals, then run the shared writeback.
+        body.instruction(&Instruction::GlobalGet(ptr_global));
+        body.instruction(&Instruction::LocalSet(scratch_base));
+        body.instruction(&Instruction::GlobalGet(len_global));
+        body.instruction(&Instruction::LocalSet(scratch_base + 1));
+        self.emit_ptr_pair_result_writeback_from_locals(
+            body,
+            info.result_type.as_ref(),
+            retptr_local,
+            caller_realloc_func,
+            caller_memory,
+            callee_memory,
+            scratch_base,
+            transcode_base,
+            caller_encoding,
+            callee_encoding,
+            callee_compact_utf16,
+        );
+    }
+
+    /// The memory-crossing half of [`Self::emit_ptr_pair_result_writeback`],
+    /// shared with the sync transcoding adapter (#545): the source `(ptr,
+    /// len)` is already in `scratch_base` / `scratch_base + 1` (CALLEE
+    /// memory), wherever it came from (the async shim globals, or a sync
+    /// callee's return area). Allocates in caller memory, copies or
+    /// transcodes (`callee_enc -> caller_enc`), walks nested indirections,
+    /// and writes `(new_ptr, len)` to the caller's retptr. Same scratch
+    /// contract as the wrapper.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn emit_ptr_pair_result_writeback_from_locals(
+        &self,
+        body: &mut Function,
+        result_type: Option<&crate::parser::ComponentValType>,
+        retptr_local: u32,
+        caller_realloc_func: u32,
+        caller_memory: u32,
+        callee_memory: u32,
+        scratch_base: u32,
+        transcode_base: u32,
+        caller_encoding: Option<crate::parser::CanonStringEncoding>,
+        callee_encoding: Option<crate::parser::CanonStringEncoding>,
+        callee_compact_utf16: bool,
+    ) {
         // Determine the per-element byte size and alignment from the
         // WIT result type. For string the element is 1 byte; for
         // list<u32> it's 4; for list<record{...}> it's the record's
         // CABI size. Without a known type we fall back to 1 (string-
         // like).
-        let (elem_size, elem_align, list_elem_ty) = match &info.result_type {
+        let (elem_size, elem_align, list_elem_ty) = match result_type {
             Some(crate::parser::ComponentValType::List(elem))
             | Some(crate::parser::ComponentValType::FixedSizeList(elem, _)) => {
                 let (s, a) = cabi_size_align(elem);
@@ -11712,12 +11947,6 @@ impl FactStyleGenerator {
         let l_src_len = scratch_base + 1;
         let l_dst_ptr = scratch_base + 2;
         let l_byte_count = scratch_base + 3;
-
-        // Read source ptr and len from shim globals
-        body.instruction(&Instruction::GlobalGet(ptr_global));
-        body.instruction(&Instruction::LocalSet(l_src_ptr));
-        body.instruction(&Instruction::GlobalGet(len_global));
-        body.instruction(&Instruction::LocalSet(l_src_len));
 
         // #272 inc 3: a TOP-LEVEL byte-granular RESULT string crossing memory
         // is TRANSCODED, for the utf8↔utf16 directions, instead of raw-copied.
@@ -12365,6 +12594,7 @@ impl FactStyleGenerator {
             callee_param_count,
             l_scratch,
             l_scratch + 12,
+            crate::merger::component_realloc_index(merged, site.to_component),
         );
 
         // Step 1: call [async-lift] entry. In stackful mode the runtime

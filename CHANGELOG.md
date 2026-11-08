@@ -22,6 +22,12 @@ All notable changes to this project will be documented in this file.
   - `meld_core::validate_output` is the one validation predicate, and the CLI uses it rather than keeping its own copy.
   - In the reference-suite baseline the 13 rows above are now `meld-invalid`, and `fused-invalid` is 0.
   - The adapter defects behind them are still open on #545 and #492.
+- Cross-encoding calls that return a string or list now fuse and run correctly (#545, SR-115).
+  - Before, meld built an adapter the caller couldn't call. It used the callee's core type and transcoded only the parameters.
+  - The adapter now transcodes the parameters, calls the callee, and transcodes the result back from the callee's return area into the caller's memory and encoding.
+  - It reuses the async adapters' emitters for each direction.
+  - Covered pairs: utf16→utf8, utf8→utf16, latin1+utf16→utf8, and `list<string>`.
+  - In the reference-suite baseline, the 4 `values/transcode.wast` rows are now `fused`. A wasmtime test checks that each returns its expected value.
 
 ## [0.67.0] - 2026-11-04
 
