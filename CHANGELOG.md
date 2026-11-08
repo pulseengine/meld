@@ -4,6 +4,15 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- The upstream Component Model reference tests are now a fusion oracle (#562, SR-113).
+  - `tests/spec/component-model/` vendors upstream `test/` at c818a1925e (78 WASTs), with its licence and a SHA-256 list. `MODULE.bazel` pins the same commit; it was deb0b0ac35, which predates the async and re-entrance tests.
+  - `meld-core/tests/cm_wast_ratchet.rs` fuses each of the 859 components on its own and compares the outcome with `tests/spec/component-model-fuse-baseline.tsv`. A difference in either direction fails the test.
+  - Every component in `assert_invalid`/`assert_malformed` is refused.
+  - `MELD_CM_WAST_OUT=<dir>` writes the inputs, the fused modules and a manifest. kiln uses the manifest to run the WAST assertions on fused output.
+- The baseline records 13 components that meld fuses into invalid output: 10 under #545, 3 under #492. The CLI's default validation refuses all 13 (exit 1).
+
 ### Changed
 - **P3 async calls meld cannot fuse are refused at fuse time instead of exiting
   0 (SR-111, ADR-10, #548, #557, #558).** Maintainer decision until the ADR-10
@@ -39,6 +48,13 @@ All notable changes to this project will be documented in this file.
   non-P3 pairs fuse byte-identically. kiln already refused all of these modules
   at load (E21A0). The #545 validation tests now use `reentrance-m6.wasm`,
   because `empty-wait.wasm` is refused before validation runs.
+
+  In the reference-suite baseline (SR-113), 10 async rows now refuse citing #548:
+  - 4 that fused: `cross-abi-calls` 0, `deadlock` 0, `dtor-context-is-zero` 2 and `sync-streams` 0;
+  - 3 that fused into invalid output (`partial-stream-copies` 0, `reentrance` 13 and 15), which leaves 10 such rows;
+  - 3 refusals that cited #390.
+
+- The fuzz smoke job fails on a crash (#562). Before, it was `continue-on-error`. Only the #168 runner build flake is excused, matched by its exact log signature.
 
 ## [0.67.0] - 2026-11-04
 

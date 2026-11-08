@@ -3898,3 +3898,17 @@ artifacts:
       reviewed-by: avrabe
       model: claude-opus-5-5
       timestamp: 2026-11-05T06:00:57Z
+  - id: SR-113
+    type: sw-req
+    title: "Every component in the pinned upstream Component Model reference suite has a recorded, ratcheted fusion outcome"
+    status: implemented
+    description: "The upstream WebAssembly/component-model test/ WASTs are the external oracle for fusion, but nothing consumed the pinned copy (#562): MODULE.bazel pinned deb0b0ac35 (2025-05-19), which predates the async, re-entrance, map, implements and stream.forward tests. meld shall (1) vendor the suite byte for byte at one commit, with upstream's licence, a per-file SHA-256 list, and a check that MODULE.bazel pins the same commit; (2) on every test run, fuse each component the WASTs define (component, component definition, assert_unlinkable, instantiation assertions) on its own and record one outcome per component: fused (valid output), refused (with the issues the error cites), fused-invalid or panic (bugs, never accepted silently); (3) require every component inside assert_invalid or assert_malformed to be rejected; (4) fail when any outcome differs from a checked-in baseline, in either direction; (5) on request, write every input and fused module plus a manifest mapping each WAST command (index, line, kind) to the component it targets, for kiln's runner (kiln's oracle requirement, numbered 93 in kiln), which executes the assertions. Executing assertions is out of scope here: meld emits a core module and the assertions name component exports. Also: the fuzz smoke job shall fail on a crash, excusing only the #168 runner build flake by its exact log signature."
+    links:
+      - type: derives-from
+        target: SYS-11
+    provenance:
+      created-by: ai-assisted
+      model: claude-opus-5-5
+      timestamp: 2026-11-07T04:52:56Z
+      reviewed-by: avrabe
+    release: v0.68.0
