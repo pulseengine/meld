@@ -9,9 +9,9 @@
 //! Validation alone cannot show the fix is right: a valid module that skips
 //! a transcode traps here.
 //!
-//! Component 3 (latin1+utf16 on both sides) is not in the table. It fuses
-//! and validates, but returns a wrong answer (the deflate case), tracked on
-//! #582.
+//! Component 3 (latin1+utf16 on both sides) validated before #582 but
+//! trapped: meld copied the string unchanged where the Canonical ABI deflates
+//! a utf16-tagged string that fits latin1.
 
 use std::path::Path;
 
@@ -85,6 +85,8 @@ fn transcoded_string_and_list_results_execute_correctly() {
         (0, "utf16 -> utf8, string result", 42),
         (1, "utf8 -> utf16, string result", 43),
         (2, "latin1+utf16 -> utf8, string result", 44),
+        // #582: same encoding, but a utf16-tagged "AB" must arrive deflated.
+        (3, "latin1+utf16 both sides, deflate", 45),
         (4, "utf16 -> utf8, list<string> param and result", 46),
     ];
     let mut failures = Vec::new();
@@ -119,5 +121,22 @@ fn list_u8_param_is_copied_not_transcoded() {
     match fuse_and_run(&input) {
         Ok(7) => {}
         other => panic!("list<u8> param across a utf16 -> utf8 call: {other:?}"),
+    }
+}
+
+/// #582 result side: component 3 never returns a utf16-tagged string that
+/// fits latin1, so this fixture does. The expectation (9) is checked unfused
+/// on wasmtime's component runtime first: deflating on the way back is the
+/// Canonical ABI's behaviour, not meld's reading of it.
+// rivet: verifies SR-117
+#[test]
+fn compact_utf16_result_is_deflated() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/transcode_545/compact_result_deflate.wat");
+    let input = wat::parse_file(&path).expect("fixture parses");
+    assert_eq!(run_unfused(&input), 9, "fixture: unfused component");
+    match fuse_and_run(&input) {
+        Ok(9) => {}
+        other => panic!("latin1+utf16 result deflation: {other:?}"),
     }
 }

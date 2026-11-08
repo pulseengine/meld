@@ -76,6 +76,11 @@ All notable changes to this project will be documented in this file.
   - It reuses the async adapters' emitters for each direction.
   - Covered pairs: utf16→utf8, utf8→utf16, latin1+utf16→utf8, and `list<string>`.
   - In the reference-suite baseline, the 4 `values/transcode.wast` rows are now `fused`. A wasmtime test checks that each returns its expected value.
+- A latin1+utf16 string sent to a latin1+utf16 component in another memory is now deflated, not copied unchanged (#582, SR-117).
+  - Following the Canonical ABI, a utf16-tagged string that fits latin1 now arrives as latin1.
+  - Before, the bytes were copied unchanged. Upstream `values/transcode.wast` component 3 fused to a valid module whose callee trapped: a silent wrong answer.
+  - This now covers top-level string parameters and a single string result.
+  - Other latin1+utf16 shapes that carry a string are refused, citing #582: nested strings, params areas, and async calls.
 
 ## [0.67.0] - 2026-11-04
 
