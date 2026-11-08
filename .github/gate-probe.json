@@ -2,18 +2,34 @@
   "version": 1,
   "detectors": [
     {
-      "command": ["scripts/ci/gate_detect.py"],
-      "outputs": ["ci"],
+      "command": [
+        "scripts/ci/gate_detect.py"
+      ],
+      "outputs": [
+        "ci"
+      ],
       "controls": [
         "safety/gate-probe-control.rs",
         "meld-cli/docs/gate-probe-control.md",
         "scripts/mythos/gate-probe-control.py"
+      ],
+      "negative_controls": [
+        "README.md",
+        "safety/requirements/gate-probe-negative-control.yaml"
       ]
     },
     {
-      "command": ["scripts/ci/gate_detect.py"],
-      "outputs": ["proofs"],
-      "controls": []
+      "command": [
+        "scripts/ci/gate_detect.py"
+      ],
+      "outputs": [
+        "proofs"
+      ],
+      "controls": [],
+      "negative_controls": [
+        "README.md",
+        "safety/requirements/gate-probe-negative-control.yaml"
+      ]
     }
   ]
 }
