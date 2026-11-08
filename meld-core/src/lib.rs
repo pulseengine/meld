@@ -3315,6 +3315,12 @@ impl Fuser {
                 version: env!("CARGO_PKG_VERSION").to_string(),
                 tool_hash: None,
                 parameters: tool_parameters,
+                // wsc-attestation 0.12: varve layer identity. Left unset so
+                // the attestation does not depend on the ambient environment;
+                // both fields skip serialization when None, so the bytes are
+                // unchanged from 0.5.
+                toolchain: None,
+                toolchain_manifest_digest: None,
             },
             attestation_signature: AttestationSignature {
                 algorithm: "unsigned".to_string(),
