@@ -1813,3 +1813,16 @@ artifacts:
       timestamp: 2026-11-07T04:52:56Z
       reviewed-by: avrabe
     release: v0.68.0
+  - id: SWV-128
+    type: sw-verification
+    title: "Verification of SR-114: the library refuses its own invalid output"
+    status: implemented
+    description: "meld-core/tests/library_validates_output_545.rs. library_refuses_invalid_output_by_default: the first component of the vendored test/async/empty-wait.wast (the #545 reproducer), fused under MultiMemory with defaults, returns Error::InvalidOutput carrying the validator's type-mismatch message; with validate_output = false the same input returns bytes that meld_core::validate_output rejects, so the refusal is the validation and the opt-out still works. library_validation_does_not_refuse_valid_output: test/async/cancel-stream.wast's first component (baseline: fused) still fuses and validates, so refuse-everything cannot pass. Reference-suite ratchet (cm_wast_ratchet.rs): the baseline gains outcome meld-invalid for Error::InvalidOutput; re-blessing moved exactly the 13 fused-invalid rows to meld-invalid and changed no other row; fused-invalid is now 0 and is kept as a guard, because the ratchet re-validates with every feature enabled. Negative control: disabling the validation call in fuse_with_stats turns both test files red (the ratchet with 13 rows back to fused-invalid; the direct test with 'invalid output returned as Ok'). CLI: the empty-wait input exits 1 under meld fuse --memory multi with 'fused output failed validation' and writes no file; with --no-validate it exits 0 and writes the module. cargo test --workspace --all-features: 1095 passed, 0 failed."
+    links:
+      - type: verifies
+        target: SR-114
+    provenance:
+      created-by: ai-assisted
+      model: claude-opus-5-5
+      timestamp: 2026-11-08T07:44:03Z
+    release: v0.68.0

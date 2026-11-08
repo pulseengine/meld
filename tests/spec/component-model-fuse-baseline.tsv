@@ -46,7 +46,7 @@ test/async/during-sync-scheduling-candidates.wast	20	315	component-definition	re
 test/async/during-sync-scheduling-candidates.wast	27	414	component	fused	-
 test/async/during-sync-scheduling-candidates.wast	3	78	component	refused	msg:failed to parse component: requires the component model async stackful feature
 test/async/during-sync-scheduling-candidates.wast	8	144	component	fused	-
-test/async/empty-wait.wast	0	6	component	fused-invalid	msg:type mismatch: values remaining on stack at end of block
+test/async/empty-wait.wast	0	6	component	meld-invalid	msg:type mismatch: values remaining on stack at end of block
 test/async/forward.wast	0	3	component-definition	refused	msg:failed to parse component: `stream.forward` requires the component model forward feature
 test/async/forward.wast	83	1025	component-definition	refused	msg:failed to parse component: `stream.forward` requires the component model forward feature
 test/async/forward.wast	90	1197	component-definition	refused	msg:failed to parse component: `stream.forward` requires the component model forward feature
@@ -57,13 +57,13 @@ test/async/futures-must-write.wast	0	5	component	fused	-
 test/async/futures-must-write.wast	3	121	component-definition	refused	msg:failed to parse component: async `future.cancel-read` requires the component model async builtins feature
 test/async/idle-drop.wast	0	7	component-definition	fused	-
 test/async/idle-drop.wast	1	294	component-definition	fused	-
-test/async/partial-stream-copies.wast	0	7	component	fused-invalid	msg:type mismatch: values remaining on stack at end of block
+test/async/partial-stream-copies.wast	0	7	component	meld-invalid	msg:type mismatch: values remaining on stack at end of block
 test/async/partial-stream-copies.wast	2	242	component-definition	fused	-
 test/async/passing-resources.wast	0	7	component	refused	#142
 test/async/reentrance.wast	0	4	component	fused	-
 test/async/reentrance.wast	11	202	component	fused	-
-test/async/reentrance.wast	13	242	component	fused-invalid	msg:type mismatch: values remaining on stack at end of block
-test/async/reentrance.wast	15	352	component	fused-invalid	msg:type mismatch: values remaining on stack at end of block
+test/async/reentrance.wast	13	242	component	meld-invalid	msg:type mismatch: values remaining on stack at end of block
+test/async/reentrance.wast	15	352	component	meld-invalid	msg:type mismatch: values remaining on stack at end of block
 test/async/reentrance.wast	17	441	component	refused	msg:failed to parse component: async `subtask.cancel` requires the component model async builtins feature
 test/async/reentrance.wast	19	530	component	refused	#390
 test/async/reentrance.wast	2	45	component	fused	-
@@ -74,7 +74,7 @@ test/async/reentrance.wast	7	103	component	fused	-
 test/async/reentrance.wast	9	154	component	fused	-
 test/async/same-component-stream-future.wast	0	5	component-definition	fused	-
 test/async/self-switch-traps.wast	0	3	component-definition	fused	-
-test/async/switch-to-ready-callback.wast	0	16	component-definition	fused-invalid	msg:type mismatch: values remaining on stack at end of block
+test/async/switch-to-ready-callback.wast	0	16	component-definition	meld-invalid	msg:type mismatch: values remaining on stack at end of block
 test/async/sync-barges-in.wast	0	6	component-definition	refused	msg:failed to parse component: requires the component model async stackful feature
 test/async/sync-streams.wast	0	7	component	fused	-
 test/async/trap-if-block-and-sync.wast	0	5	component-definition	fused	-
@@ -89,7 +89,7 @@ test/async/validate-task-return.wast	0	3	assert_invalid	invalid-refused	-
 test/async/validate-task-return.wast	1	8	assert_invalid	invalid-refused	-
 test/async/validate-task-return.wast	2	14	component	refused	msg:no core modules found in component
 test/async/wait-during-callback.wast	0	2	component	fused	-
-test/async/zero-length.wast	0	7	component	fused-invalid	msg:type mismatch: expected iNN but nothing on stack
+test/async/zero-length.wast	0	7	component	meld-invalid	msg:type mismatch: expected iNN but nothing on stack
 test/async/zero-length.wast	2	227	component-definition	refused	msg:failed to parse component: async `stream.cancel-read` requires the component model async builtins feature
 test/async/zero-length.wast	27	538	component-definition	fused	-
 test/binary/binary.wast	0	7	component	refused	msg:no core modules found in component
@@ -242,10 +242,10 @@ test/linking/unit.wast	125	1030	component	fused	-
 test/linking/unit.wast	130	1103	component	fused	-
 test/linking/unit.wast	139	1173	component	refused	msg:component N: core modules N and N both export `get` in the flat-name resolver path; ambiguous, and the previous behavior
 test/linking/unit.wast	142	1192	component	fused	-
-test/linking/unit.wast	145	1230	component	fused-invalid	msg:duplicate export name `step$N` already defined
+test/linking/unit.wast	145	1230	component	meld-invalid	msg:duplicate export name `step$N` already defined
 test/linking/unit.wast	147	1267	component	fused	-
 test/linking/unit.wast	15	78	component	fused	-
-test/linking/unit.wast	152	1318	component	fused-invalid	msg:duplicate export name `run$N` already defined
+test/linking/unit.wast	152	1318	component	meld-invalid	msg:duplicate export name `run$N` already defined
 test/linking/unit.wast	159	1362	component	fused	-
 test/linking/unit.wast	166	1418	component	fused	-
 test/linking/unit.wast	169	1468	component	fused	-
@@ -272,7 +272,7 @@ test/linking/unit.wast	231	2050	component	refused	msg:component N: core modules 
 test/linking/unit.wast	234	2076	component	fused	-
 test/linking/unit.wast	24	142	component	fused	-
 test/linking/unit.wast	26	159	component	fused	-
-test/linking/unit.wast	28	179	component	fused-invalid	msg:duplicate export name `id$N` already defined
+test/linking/unit.wast	28	179	component	meld-invalid	msg:duplicate export name `id$N` already defined
 test/linking/unit.wast	33	220	component	fused	-
 test/linking/unit.wast	36	261	component	fused	-
 test/linking/unit.wast	45	308	component	fused	-
@@ -853,10 +853,10 @@ test/values/strings.wast	3	27	component	fused	-
 test/values/strings.wast	5	42	component	fused	-
 test/values/strings.wast	7	57	component	fused	-
 test/values/strings.wast	9	72	component	fused	-
-test/values/transcode.wast	0	7	component	fused-invalid	msg:type mismatch: values remaining on stack at end of block
-test/values/transcode.wast	2	117	component	fused-invalid	msg:type mismatch: values remaining on stack at end of block
-test/values/transcode.wast	4	205	component	fused-invalid	msg:type mismatch: values remaining on stack at end of block
+test/values/transcode.wast	0	7	component	meld-invalid	msg:type mismatch: values remaining on stack at end of block
+test/values/transcode.wast	2	117	component	meld-invalid	msg:type mismatch: values remaining on stack at end of block
+test/values/transcode.wast	4	205	component	meld-invalid	msg:type mismatch: values remaining on stack at end of block
 test/values/transcode.wast	6	323	component	fused	-
-test/values/transcode.wast	8	437	component	fused-invalid	msg:type mismatch: values remaining on stack at end of block
+test/values/transcode.wast	8	437	component	meld-invalid	msg:type mismatch: values remaining on stack at end of block
 test/values/variants.wast	0	6	component-definition	fused	-
 test/values/variants.wast	9	83	component	refused	msg:failed to parse component: requires the component model async stackful feature

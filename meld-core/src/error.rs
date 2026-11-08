@@ -16,6 +16,12 @@ pub enum Error {
     #[error("invalid WebAssembly binary: {0}")]
     InvalidWasm(String),
 
+    /// The fused output failed validation (#545). meld built a module or
+    /// component that no runtime would accept; the defect is meld's, not the
+    /// input's, and the bytes are withheld rather than returned as success.
+    #[error("fused output failed validation (meld defect, please report): {0}")]
+    InvalidOutput(String),
+
     /// Input is not a WebAssembly component
     #[error("input is not a WebAssembly component (expected component, got core module)")]
     NotAComponent,
