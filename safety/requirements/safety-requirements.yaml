@@ -3879,3 +3879,19 @@ artifacts:
       timestamp: 2026-11-07T04:52:56Z
       reviewed-by: avrabe
     release: v0.68.0
+  - id: SR-116
+    type: sw-req
+    title: "The attestation names the varve toolchain layer meld ran from"
+    status: implemented
+    description: "An assessor holding only a fused artifact could see meld's version, not which qualified toolchain layer produced it. varve's dispatcher sets VARVE_LAYER and VARVE_LAYER_MANIFEST_DIGEST when it runs a tool, and wsc-attestation 0.12 added ToolInfo fields for both. When either variable is set and non-empty, meld shall record it in the attestation's tool object as toolchain and toolchain_manifest_digest, in both the default attestation (the one release builds embed) and the optional wsc path, by one predicate. When unset or empty, the keys shall be absent, so the record is unchanged. Under --reproducible both shall be absent and the output bytes shall not depend on these variables, so the reproducible record depends only on the inputs, the configuration and SOURCE_DATE_EPOCH. This is an owner decision (2026-11-08): fill the fields when set, and ignore them under --reproducible."
+    links:
+      - type: derives-from
+        target: SYS-3
+      - type: refines
+        target: SR-69
+    provenance:
+      created-by: ai-assisted
+      model: claude-opus-5-5
+      timestamp: 2026-11-08T11:03:19Z
+      reviewed-by: avrabe
+    release: v0.68.0
