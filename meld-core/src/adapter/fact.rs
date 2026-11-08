@@ -8675,6 +8675,11 @@ impl FactStyleGenerator {
         let Some(caller_realloc) = options.caller_realloc else {
             return refuse("no caller realloc could be resolved for the result (#515)");
         };
+        // Every param pointer pair needs its WIT type, so the copy step can
+        // tell a string (transcoded) from a `list<u8>` (copied verbatim).
+        if r.param_wit_types.len() < r.pointer_pair_positions.len() {
+            return refuse("the WIT type of a (ptr, len) parameter is unknown");
+        }
         Self::guard_async_cross_encoding_strings(site)?;
 
         // Locals: caller params, then the same 23-local scratch block the async
@@ -11422,6 +11427,22 @@ impl FactStyleGenerator {
                 site.requirements.caller_encoding,
                 Some(crate::parser::CanonStringEncoding::CompactUtf16)
             ) && byte_mult == 1;
+
+            // #545: a 1-byte element layout is shared by `string` and
+            // `list<u8>`. Only a string is text; a `list<u8>` is binary and must
+            // be copied byte for byte. The transcode branches below used to
+            // key on `byte_mult == 1` alone and transcoded a `list<u8>` as if
+            // it were UTF-8/UTF-16 text (silent corruption, found by
+            // `list_u8_param_is_copied_not_transcoded`). Decide from the
+            // recovered WIT type. An unknown type (no parallel
+            // `param_wit_types` entry) keeps the old reading, a string,
+            // because that is what the guard in front of the async path
+            // assumes. The sync caller refuses that case beforehand.
+            let is_top_level_string = byte_mult == 1
+                && !matches!(
+                    site.requirements.param_wit_types.get(pair_idx),
+                    Some(t) if !matches!(t, crate::parser::ComponentValType::String)
+                );
             let realloc_align = if is_compact_utf16 { 2 } else { 1 };
 
             // #272 inc 1: a TOP-LEVEL byte-granular (byte_mult == 1) string
@@ -11434,7 +11455,7 @@ impl FactStyleGenerator {
             // is either handled by the raw-copy path below or rejected by
             // `guard_async_cross_encoding_strings`. The guard is narrowed in
             // lockstep so ONLY this combo reaches this branch.
-            let transcode_utf8_to_utf16 = byte_mult == 1
+            let transcode_utf8_to_utf16 = is_top_level_string
                 && matches!(
                     site.requirements.caller_encoding,
                     Some(crate::parser::CanonStringEncoding::Utf8)
@@ -11482,7 +11503,7 @@ impl FactStyleGenerator {
             // units as UTF-8 bytes — the H-4.4 defect). The guard is narrowed
             // in lockstep so ONLY this combo (in addition to inc 1's) reaches
             // this branch.
-            let transcode_utf16_to_utf8 = byte_mult == 1
+            let transcode_utf16_to_utf8 = is_top_level_string
                 && matches!(
                     site.requirements.caller_encoding,
                     Some(crate::parser::CanonStringEncoding::Utf16)
@@ -11537,13 +11558,13 @@ impl FactStyleGenerator {
                 site.requirements.caller_encoding,
                 Some(crate::parser::CanonStringEncoding::CompactUtf16)
             );
-            let transcode_latin1_to_utf16 = byte_mult == 1
+            let transcode_latin1_to_utf16 = is_top_level_string
                 && caller_is_latin1
                 && matches!(
                     site.requirements.callee_encoding,
                     Some(crate::parser::CanonStringEncoding::Utf16)
                 );
-            let transcode_latin1_to_utf8 = byte_mult == 1
+            let transcode_latin1_to_utf8 = is_top_level_string
                 && caller_is_latin1
                 && matches!(
                     site.requirements.callee_encoding,
@@ -11643,13 +11664,13 @@ impl FactStyleGenerator {
                 site.requirements.callee_encoding,
                 Some(crate::parser::CanonStringEncoding::CompactUtf16)
             );
-            let transcode_utf8_to_latin1 = byte_mult == 1
+            let transcode_utf8_to_latin1 = is_top_level_string
                 && callee_is_latin1
                 && matches!(
                     site.requirements.caller_encoding,
                     Some(crate::parser::CanonStringEncoding::Utf8)
                 );
-            let transcode_utf16_to_latin1 = byte_mult == 1
+            let transcode_utf16_to_latin1 = is_top_level_string
                 && callee_is_latin1
                 && matches!(
                     site.requirements.caller_encoding,

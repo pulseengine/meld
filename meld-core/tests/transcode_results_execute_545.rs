@@ -40,6 +40,21 @@ fn components(rel: &str) -> Vec<Vec<u8>> {
     out
 }
 
+fn run_unfused(bytes: &[u8]) -> u32 {
+    let mut config = Config::new();
+    config.wasm_component_model(true);
+    config.wasm_multi_memory(true);
+    let engine = Engine::new(&config).unwrap();
+    let c = wasmtime::component::Component::new(&engine, bytes).unwrap();
+    let mut store = Store::new(&engine, ());
+    let linker = wasmtime::component::Linker::<()>::new(&engine);
+    let inst = linker.instantiate(&mut store, &c).unwrap();
+    let f = inst
+        .get_typed_func::<(), (u32,)>(&mut store, "run")
+        .unwrap();
+    f.call(&mut store, ()).unwrap().0
+}
+
 fn fuse_and_run(input: &[u8]) -> Result<u32, String> {
     let mut fuser = Fuser::new(FuserConfig {
         memory_strategy: MemoryStrategy::MultiMemory,
@@ -83,4 +98,26 @@ fn transcoded_string_and_list_results_execute_correctly() {
         }
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// A `list<u8>` is binary, not text: under a cross-encoding call it must be
+/// copied byte for byte, never transcoded. The copy emitters decide
+/// "string" from a 1-byte element layout, which a `list<u8>` shares. So this
+/// pins the case: utf16 caller, utf8 callee, `(param list<u8>) (result
+/// string)`. The callee checks the exact bytes `FF 00 41` and length 3, and
+/// the caller checks the transcoded result "ok". `run` returns 7 only if both
+/// hold.
+// rivet: verifies SR-115
+#[test]
+fn list_u8_param_is_copied_not_transcoded() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/transcode_545/list_u8_param_string_result.wat");
+    let input = wat::parse_file(&path).expect("fixture parses");
+    // The fixture is right only if the Canonical ABI as wasmtime implements
+    // it, independently of meld, gives 7 unfused.
+    assert_eq!(run_unfused(&input), 7, "fixture: unfused component");
+    match fuse_and_run(&input) {
+        Ok(7) => {}
+        other => panic!("list<u8> param across a utf16 -> utf8 call: {other:?}"),
+    }
 }
