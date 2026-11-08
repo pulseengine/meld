@@ -73,7 +73,7 @@ jobs:
     env:
       FUZZ_TARGETS: fuzz_parse_component fuzz_resolver_terminates fuzz_merger_idempotent fuzz_fusion_roundtrip
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # Do NOT install the `x86_64-unknown-linux-musl` toolchain target.
       # musl statically links libc, which is incompatible with the
@@ -96,7 +96,7 @@ jobs:
         run: cargo install cargo-fuzz --locked
 
       - name: Cache fuzz target build
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             fuzz/target/
@@ -158,7 +158,7 @@ jobs:
 
       - name: Upload crash artifacts on failure
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: fuzz-artifacts
           path: fuzz/artifacts/
