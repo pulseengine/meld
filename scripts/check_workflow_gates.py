@@ -117,6 +117,12 @@ def extract_seq(text, key):
             continue
         if not line.strip():
             continue
+        # A comment line inside the list is not its end. Stopping there made
+        # the stub-alignment check compare only the patterns above the first
+        # comment: after #581 commented ci.yml's paths-ignore, it compared
+        # one pattern of five.
+        if line.strip().startswith("#"):
+            continue
         cur = len(line) - len(line.lstrip())
         if cur <= indent:
             break
