@@ -1,0 +1,24 @@
+# temper's gate probe (temper docs/gate-probe.md, contract pinned at temper
+# a57e8135): runs scripts/ci/gate_detect.py against control paths and reports
+# whether each required-check path filter fails closed. Report-only: it is not
+# a required check, and making it one is a per-repo step that needs the owner's
+# approval. Expected today: the ci.yml filter fails closed, while the
+# proofs.yml allowlist fails open (#580), so this job is red until #580 is
+# decided.
+#
+# Deliberately no path filter, no `if:`, no continue-on-error and no
+# pull_request_target, as the contract requires. The check name `gate-probe`
+# must stay stable.
+name: gate-probe
+on:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  gate-probe:
+    runs-on: [self-hosted, linux, x64, light]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: pulseengine/temper/.github/actions/gate-probe@a57e81353acfad05bf1e4cf635281a7562253d36
