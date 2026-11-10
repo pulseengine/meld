@@ -37,7 +37,7 @@ serde.workspace = true
 serde_json.workspace = true
 
 # Optional: wsc-attestation integration
-wsc-attestation = { version = "0.5", optional = true }
+wsc-attestation = { version = "0.12", optional = true }
 petgraph = "0.8.3"
 
 [dev-dependencies]
@@ -49,13 +49,13 @@ gimli.workspace = true
 wat = "1.263"
 # #562: parse the vendored component-model WASTs (same version wat uses).
 wast = "263"
-# default-features = false + wasmtime 50.0.0's full default set MINUS `cache`.
+# default-features = false + wasmtime 50.0.1's full default set MINUS `cache`.
 # `cache` (on-disk compiled-module cache) pulls wasmtime-internal-cache ->
 # zstd 0.13 / zstd-safe 7 / zstd-sys 2.0, which carry RUSTSEC-2026-0391,
 # -0398, -0403, -0410 (and a run of unsound advisories) with no fix
 # reachable on the 0.13 line. meld never configures a module cache.
 # Keep this list in sync with wasmtime's `default` on every wasmtime bump.
-wasmtime = { version = "50.0.0", default-features = false, features = [
+wasmtime = { version = "50.0.1", default-features = false, features = [
     "anyhow",
     "async",
     "backtrace",
@@ -82,7 +82,7 @@ wasmtime = { version = "50.0.0", default-features = false, features = [
     "compile-time-builtins",
     "wit-parser",
 ] }
-wasmtime-wasi = "50.0.0"
+wasmtime-wasi = "50.0.1"
 bitflags.workspace = true  # Required for wit-bindgen component bindings
 criterion.workspace = true
 # SR-60 / #344: certificate-checked QF_BV SMT reference oracle for the
@@ -95,7 +95,7 @@ ordeal = { version = "0.22.1", default-features = false }
 # Pinned `=` to the exact version `wasmtime` above already pulls in, with the
 # features it already enables, so it adds no crate to the graph. Never a
 # runtime dependency; upgraded deliberately (see ADR-8).
-wasmtime-environ = { version = "=50.0.0", features = ["compile", "component-model"] }
+wasmtime-environ = { version = "=50.0.1", features = ["compile", "component-model"] }
 
 [features]
 default = []

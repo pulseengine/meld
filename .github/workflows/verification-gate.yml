@@ -122,7 +122,12 @@ jobs:
       # release either way; this makes it block earlier and more cheaply.
       - name: Shipped dependencies carry no known advisory
         run: |
-          cargo install --locked cargo-deny || true
+          # #571: no `|| true`. `cargo install` exits 0 when the binary is
+          # already current, so this fails only when the install itself fails,
+          # instead of falling back silently to a stale binary.
+          # (0.16.4 could not parse CVSS 4.0 advisories.)
+          cargo install --locked cargo-deny
+          cargo deny --version
           cargo deny check advisories
 
       - name: Verification matrix is up to date
