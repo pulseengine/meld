@@ -92,6 +92,45 @@ pub struct ToolInfo {
     /// Tool hash (for reproducibility)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_hash: Option<String>,
+
+    /// SR-116: the varve toolchain layer meld ran from (`VARVE_LAYER`), e.g.
+    /// "2026.08.2" — the qualified set, not just meld's own version. Same
+    /// field name as wsc-attestation 0.12's `ToolInfo`. Absent outside a
+    /// varve dispatch and under `--reproducible`.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub toolchain: Option<String>,
+
+    /// SR-116: digest of that layer's signed manifest
+    /// (`VARVE_LAYER_MANIFEST_DIGEST`), so the toolchain is identifiable
+    /// offline from the artifact alone. Same presence rule as `toolchain`.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub toolchain_manifest_digest: Option<String>,
+}
+
+/// SR-116: which varve toolchain layer this process runs from.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ToolchainIdentity {
+    /// `VARVE_LAYER`.
+    pub layer: Option<String>,
+    /// `VARVE_LAYER_MANIFEST_DIGEST`.
+    pub manifest_digest: Option<String>,
+}
+
+/// SR-116: read the toolchain identity through `get` (an environment
+/// lookup). Pure, so tests need not mutate the process environment. An
+/// empty value counts as unset, the rule `wsc_attestation::ToolInfo::
+/// with_varve_env` uses.
+pub fn toolchain_identity_from(get: impl Fn(&str) -> Option<String>) -> ToolchainIdentity {
+    let non_empty = |k: &str| get(k).filter(|v| !v.is_empty());
+    ToolchainIdentity {
+        layer: non_empty("VARVE_LAYER"),
+        manifest_digest: non_empty("VARVE_LAYER_MANIFEST_DIGEST"),
+    }
+}
+
+/// SR-116: [`toolchain_identity_from`] over the process environment.
+pub fn toolchain_identity_from_env() -> ToolchainIdentity {
+    toolchain_identity_from(|k| std::env::var(k).ok())
 }
 
 /// SR-28: the `FuserConfig` switches that shaped this artifact.
@@ -233,6 +272,7 @@ pub struct FusionAttestationBuilder {
     memory_strategy: String,
     reproducible: bool,
     parameters: FusionParameters,
+    toolchain: ToolchainIdentity,
 }
 
 impl FusionAttestationBuilder {
@@ -246,7 +286,16 @@ impl FusionAttestationBuilder {
             memory_strategy: "shared".to_string(),
             reproducible: false,
             parameters: FusionParameters::default(),
+            toolchain: ToolchainIdentity::default(),
         }
+    }
+
+    /// SR-116: record the varve toolchain layer. Ignored under
+    /// [`Self::reproducible`]: a reproducible attestation depends only on the
+    /// inputs, the configuration and `SOURCE_DATE_EPOCH`.
+    pub fn toolchain(mut self, toolchain: ToolchainIdentity) -> Self {
+        self.toolchain = toolchain;
+        self
     }
 
     /// Emit a byte-reproducible attestation (#325): derive the id from the
@@ -369,6 +418,12 @@ impl FusionAttestationBuilder {
                 name: self.tool_name,
                 version: self.tool_version,
                 tool_hash: self.tool_hash,
+                toolchain: (!self.reproducible)
+                    .then_some(self.toolchain.layer)
+                    .flatten(),
+                toolchain_manifest_digest: (!self.reproducible)
+                    .then_some(self.toolchain.manifest_digest)
+                    .flatten(),
             },
             metadata: FusionMetadata {
                 memory_strategy: self.memory_strategy,

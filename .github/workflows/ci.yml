@@ -14,15 +14,27 @@ on:
     # workflows themselves) still triggers.
     paths-ignore:
       - '**/*.md'
-      - 'safety/**'
-      - 'scripts/mythos/**'
+      # meld-cli/docs/*.md is compiled into the binary (include_str!) and the
+      # SR-82 claim checks in Test read it, so it is NOT docs-only.
+      - '!meld-cli/docs/**'
+      # By file type, not by directory: a fixture or test input dropped under
+      # safety/ must still run the real CI (cf. spar#384-A). scripts/mythos/
+      # holds only .md, which the first pattern already covers.
+      - 'safety/**/*.yaml'
+      - 'safety/**/*.json'
       - 'tools/*.py'
   pull_request:
     branches: [main]
     paths-ignore:
       - '**/*.md'
-      - 'safety/**'
-      - 'scripts/mythos/**'
+      # meld-cli/docs/*.md is compiled into the binary (include_str!) and the
+      # SR-82 claim checks in Test read it, so it is NOT docs-only.
+      - '!meld-cli/docs/**'
+      # By file type, not by directory: a fixture or test input dropped under
+      # safety/ must still run the real CI (cf. spar#384-A). scripts/mythos/
+      # holds only .md, which the first pattern already covers.
+      - 'safety/**/*.yaml'
+      - 'safety/**/*.json'
       - 'tools/*.py'
 
 env:
