@@ -3104,12 +3104,17 @@ impl Fuser {
         #[cfg(feature = "attestation")]
         {
             let attestation = self.build_wsc_attestation(output_bytes, stats);
-            let payload = attestation
-                .to_json_compact()
+            // Through `serde_json::Value`, not `to_json_compact`: wsc's
+            // `ToolInfo::parameters` is a `HashMap`, serialized in per-process
+            // hash order, so `--reproducible` gave different bytes on every
+            // run in this build. `Value`'s map is a BTreeMap (serde_json is
+            // built without `preserve_order`), so keys come out sorted.
+            // Found by SR-116's reproducibility test.
+            let payload = serde_json::to_value(&attestation)
+                .and_then(|v| serde_json::to_vec(&v))
                 .map_err(|e| {
                     Error::EncodingError(format!("attestation serialization failed: {e}"))
-                })?
-                .into_bytes();
+                })?;
             Ok((wsc_attestation::TRANSFORMATION_ATTESTATION_SECTION, payload))
         }
 
@@ -3166,7 +3171,8 @@ impl Fuser {
         let mut builder = FusionAttestationBuilder::new("meld", env!("CARGO_PKG_VERSION"))
             .memory_strategy(self.memory_strategy_label())
             .reproducible(self.config.reproducible)
-            .parameters(self.attestation_parameters());
+            .parameters(self.attestation_parameters())
+            .toolchain(attestation::toolchain_identity_from_env());
 
         // #341 / #413: see `attested_inputs`.
         for (name, module_count, hash, size) in self.attested_inputs() {
@@ -3189,6 +3195,11 @@ impl Fuser {
         };
 
         let output_hash = attestation::compute_sha256(output_bytes);
+        let toolchain = if self.config.reproducible {
+            attestation::ToolchainIdentity::default()
+        } else {
+            attestation::toolchain_identity_from_env()
+        };
         // #325: in reproducible mode, derive the id from the output content and
         // the timestamp from SOURCE_DATE_EPOCH so the fused artifact is
         // byte-stable across runs; otherwise keep the wall-clock/random id.
@@ -3315,6 +3326,11 @@ impl Fuser {
                 version: env!("CARGO_PKG_VERSION").to_string(),
                 tool_hash: None,
                 parameters: tool_parameters,
+                // SR-116: the varve layer identity, by the same predicate as
+                // the default attestation path, and likewise left out under
+                // --reproducible.
+                toolchain: toolchain.layer,
+                toolchain_manifest_digest: toolchain.manifest_digest,
             },
             attestation_signature: AttestationSignature {
                 algorithm: "unsigned".to_string(),
@@ -4431,30 +4447,14 @@ mod tests {
     /// random-UUID + wall-clock non-determinism is removed. The control
     /// (reproducible off) must differ, proving the flag is what fixes it.
     ///
-    /// Scoped to the default build (the shipped configuration). Under the
-    /// optional `attestation` (wsc) feature the emitted section additionally
-    /// carries `tool_parameters` / `metadata` as `wsc_attestation` `HashMap`
-    /// fields, whose serialization order meld cannot control from this side —
-    /// full byte-reproducibility on that path needs an upstream fix (sorted /
-    /// BTreeMap serialization). The default `FusionAttestationBuilder` path has
-    /// no such maps and is fully reproducible.
-    // Gated to the default build deliberately, and worth saying why, because
-    // "a determinism test compiled out of the configuration where determinism
-    // is doubted" reads like evasion (#408).
-    //
-    // Under the `attestation` feature the parameters go through
-    // `wsc-attestation`, whose parameter map is a `HashMap`. Rust seeds a
-    // `HashMap`'s iteration order ONCE PER PROCESS, so two fusions inside one
-    // test observe the SAME order and compare equal — the divergence only
-    // appears between separate processes. An inverted test asserting the wsc
-    // path is NOT byte-stable would therefore pass or fail on which process it
-    // happened to run in, which is worse than no test.
-    //
-    // What closes this properly is fixing the ordering upstream and deleting
-    // the split. Until then the claim is caveated where users read it, in
-    // meld-cli/docs/concept-attestation.md, and the feature is linted in CI so
-    // the path is at least not rotting unobserved.
-    #[cfg(not(feature = "attestation"))]
+    /// Runs on both attestation paths. On the wsc (`attestation` feature) path
+    /// this test cannot catch a parameter-order defect on its own: Rust seeds
+    /// a `HashMap`'s order once per process, so two fusions inside one test
+    /// agree. The cross-process check is
+    /// `meld-cli/tests/varve_toolchain_attestation_116.rs`
+    /// (`reproducible_output_does_not_depend_on_the_varve_environment`), which
+    /// found that path non-reproducible and is why its payload is now
+    /// serialized through `serde_json::Value` (sorted keys).
     #[test]
     fn test_reproducible_attestation_is_byte_stable() {
         use wasm_encoder::{
