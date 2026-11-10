@@ -1,5 +1,5 @@
 # temper's gate probe (temper docs/gate-probe.md, contract pinned at temper
-# a57e8135): runs scripts/ci/gate_detect.py against control paths and reports
+# 308848d1): runs scripts/ci/gate_detect.py against control paths and reports
 # whether each required-check path filter fails closed. Report-only: it is not
 # a required check, and making it one is a per-repo step that needs the owner's
 # approval. Expected today: the ci.yml filter fails closed, while the
@@ -20,8 +20,9 @@ jobs:
     # reach the self-hosted runners. It still runs, on a GitHub-hosted runner,
     # so it cannot be skipped. Same pattern as ci.yml.
     runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || fromJSON('["self-hosted","linux","x64","light"]') }}
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
-      - uses: pulseengine/temper/.github/actions/gate-probe@a57e81353acfad05bf1e4cf635281a7562253d36
+      - uses: pulseengine/temper/.github/actions/gate-probe@308848d151a0fdd0fc5eb8af0531addbf6f36ef4
