@@ -10,6 +10,21 @@
 registry   = "oci://ghcr.io/pulseengine/layers"
 trust-root = "7d3b892e6a33c70043becc708e08042e1cef0d54dd5ae6f23d7d4c68de1da1a0"
 
+# Roots this realm has retired (REQ-ROTATE-002). DIAGNOSTIC ONLY — nothing
+# verifies against these, ever. They exist so that a consumer whose pin was
+# signed by an old root is told WHICH root and WHEN, instead of getting
+# "No valid signatures", which is indistinguishable from a forgery.
+#
+# This is not key rotation and must not be read as one: nothing signs "this new
+# root replaces the old one" (`varve docs threat-model`). It only means the
+# failure explains itself.
+retired-roots = [
+  # Retired in v0.32.1. It existed ONLY as a write-only CI secret, so nobody
+  # could back it up, move it, or rotate with it — varve#110. Every layer from
+  # 2026.08.0 to 2026.09.1 was signed by it and none of them verify here.
+  { key = "4e771dc62a08be89e3450f8cd807da58ff70af4a4e124ebf2d2b71684cfd9973", retired = "2026-09-07", last-layer = "2026.09.1" },
+]
+
 # The realm that carries the bytecodealliance component-model tools —
 # wasm-tools, wac, wkg, wit-bindgen-wrpc.
 #
@@ -26,21 +41,6 @@ trust-root = "7d3b892e6a33c70043becc708e08042e1cef0d54dd5ae6f23d7d4c68de1da1a0"
 [realm.pulseengine-wasm]
 registry   = "oci://ghcr.io/pulseengine/wasm-layers"
 trust-root = "f1300acb791d330da9b81951d4137f5b1fb0c5efc50213deee4d7a981be28745"
-
-# Roots this realm has retired (REQ-ROTATE-002). DIAGNOSTIC ONLY — nothing
-# verifies against these, ever. They exist so that a consumer whose pin was
-# signed by an old root is told WHICH root and WHEN, instead of getting
-# "No valid signatures", which is indistinguishable from a forgery.
-#
-# This is not key rotation and must not be read as one: nothing signs "this new
-# root replaces the old one" (`varve docs threat-model`). It only means the
-# failure explains itself.
-retired-roots = [
-  # Retired in v0.32.1. It existed ONLY as a write-only CI secret, so nobody
-  # could back it up, move it, or rotate with it — varve#110. Every layer from
-  # 2026.08.0 to 2026.09.1 was signed by it and none of them verify here.
-  { key = "4e771dc62a08be89e3450f8cd807da58ff70af4a4e124ebf2d2b71684cfd9973", retired = "2026-09-07", last-layer = "2026.09.1" },
-]
 
 # The composing realm this project pins (pulseengine/covalent-layers). It
 # carries nothing of its own; its root signs only the pairing of the two
