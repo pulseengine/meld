@@ -1840,3 +1840,16 @@ artifacts:
       model: claude-opus-5-5
       timestamp: 2026-11-08T12:18:55Z
     release: v0.68.0
+  - id: SWV-133
+    type: sw-verification
+    title: "Verification of SR-119: the extract pins fail on source drift and on unpinned extract items"
+    status: implemented
+    release: v0.68.0
+    description: "meld-core/tests/proof_extract_pins_580.rs. extract_sources_match_their_pins hashes each pinned source function (from its fn line to the closing brace at the same indentation, which cargo fmt keeps) and compares with extract-pins.tsv; every_extract_item_is_pinned requires the set of public non-constructor extract functions to equal the set of pinned items; pin_check_can_fail checks the instrument on inline source: an edit inside the function changes the hash, an edit outside does not, a missing or duplicated function is an error, and a name prefix is not a match. Observed controls on the real tree: changing < to <= in MergedModule::defined_func (meld-core/src/merger/mod.rs) failed extract_sources_match_their_pins naming resolver_core::defined_func, and reverting passed; appending a pub fn to index_map.rs failed every_extract_item_is_pinned naming index_map::sneaky. Before the first bless each extract was read against its source: decompose_func_index and defined_func match decompose_component_core_func_index and MergedModule::defined_func, including saturating_add; merge_core_module assigns indices as import count plus the running count of earlier modules' items, as compute_offsets and build_function_index_map model; compute_shared_memory_plan_for places module bases as a checked running sum with a 32-bit bound, as compute_memory_layout and is_valid_32bit_base model."
+    links:
+      - type: verifies
+        target: SR-119
+    provenance:
+      created-by: ai-assisted
+      model: claude-opus-5-5
+      timestamp: 2026-11-11T05:59:16Z

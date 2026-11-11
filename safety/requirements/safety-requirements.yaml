@@ -3910,3 +3910,18 @@ artifacts:
       model: claude-opus-5-5
       timestamp: 2026-11-08T12:18:55Z
     release: v0.68.0
+  - id: SR-119
+    type: sw-req
+    title: A change to the code a Rocq extract models fails CI until the extract is re-checked
+    status: implemented
+    release: v0.68.0
+    description: "The Rocq proofs in proofs/rust_verified/ are about hand-written, simplified extracts (index_map.rs, merger_core.rs, resolver_core.rs) of meld-core functions. Rocq proofs (proofs.yml, SR-88) runs only on proofs/** and the bazel files, so a change to a modelled meld-core function never re-checks the proofs, and nothing compared the extracts with the code. The BUILD.bazel source comments still pointed at meld-core/src/merger.rs, which the #376 split removed. Owner decision (2026-11-11, #580): hash-pin rather than run the proofs on every meld-core change. proofs/rust_verified/extract-pins.tsv shall map every public, non-constructor extract function to the meld-core function(s) it models, with the sha256 of each function's text. A meld-core test (so it runs in Test, which fails closed on code changes) shall fail when a pinned function's text changes, when a pinned function is missing or defined more than once, when an extract function has no pin, or when a pin names no extract function. Re-blessing (MELD_BLESS=1) is the reviewable claim that the extract still models the source. Limits: a semantic change made in a helper the pinned function calls is not seen, and the extracts model the plain path (no --pack-rebase or --share-stack placement), which was already their scope. The proofs output of .github/gate-probe.json is exempted with this reason, because the allowlist in front of Rocq proofs is now complete for the proofs' own inputs."
+    links:
+      - type: derives-from
+        target: SYS-11
+      - type: refines
+        target: SR-88
+    provenance:
+      created-by: ai-assisted
+      model: claude-opus-5-5
+      timestamp: 2026-11-11T05:59:16Z
