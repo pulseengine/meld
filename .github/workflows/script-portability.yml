@@ -78,3 +78,10 @@ jobs:
           "$PY39" -c 'import sys; assert sys.version_info[:2] == (3, 9), sys.version'
           "$PY39" tools/check_py_floor.py --self-test
           git ls-files -z '*.py' | xargs -0 -r "$PY39" tools/check_py_floor.py
+
+      - name: Mythos gate decisions self-test
+        env:
+          PY39: ${{ steps.py39.outputs.python-path }}
+        run: |
+          set -euo pipefail
+          "$PY39" -I scripts/ci/mythos_decide.py --self-test

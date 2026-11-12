@@ -2,10 +2,12 @@ name: Mythos delta-pass (auto)
 
 # Runs the Mythos discover protocol automatically on every PR that
 # touches a Tier-5 file. Posts findings (or "NO FINDINGS") as a sticky
-# PR comment. The verdict is advisory: this workflow never applies the
-# `mythos-pass-done` label. A maintainer reads the posted verdict and
-# applies the label by hand, which clears the label-only gate in
-# `mythos-gate.yml`.
+# PR comment and records the verdict as commit status
+# `mythos/auto-verdict` on the head commit. `mythos-gate.yml` passes on a
+# success status: every touched Tier-5 file reviewed, NO FINDINGS. A
+# finding or an incomplete run leaves the gate red until a maintainer
+# applies `mythos-pass-done` as an override. This workflow never applies
+# the label.
 #
 # The model runs read-only (`--allowedTools "Read,Grep,Glob"`), and the
 # discover protocol it follows is read from the PR's BASE commit, not
@@ -361,10 +363,28 @@ jobs:
   aggregate:
     name: Aggregate findings
     needs: [detect, scan]
-    if: always() && needs.detect.outputs.any == 'true'
+    # `!cancelled()`, not `always()`: a run superseded by a newer push is
+    # cancelled, and its aggregate must not speak for code it never reviewed.
+    # On #594 the `always()` form posted "NO FINDINGS across 0 Tier-5
+    # file(s)" over four cancelled scans (#595). Failed scans still reach
+    # here, and the decision below calls them INCOMPLETE.
+    if: ${{ !cancelled() && needs.detect.outputs.any == 'true' }}
     runs-on: [self-hosted, linux, x64, light]
+    permissions:
+      contents: read
+      pull-requests: write
+      # The verdict is recorded as commit status `mythos/auto-verdict` on the
+      # PR head, so it is bound to the commit it reviewed; mythos-gate.yml
+      # reads it.
+      statuses: write
+      # To re-run the "Mythos delta-pass gate" check once the verdict exists.
+      actions: write
     steps:
+      # The decision script comes from the BASE commit, like the discover
+      # protocol: a PR cannot rewrite the rule its verdict is judged by.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
 
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
@@ -372,47 +392,42 @@ jobs:
           pattern: mythos-result-*
           merge-multiple: true
 
-      - name: Compose verdict + sticky comment
+      - name: Compose verdict + sticky comment + commit status
         id: compose
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           REPO: ${{ github.repository }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          EXPECTED: ${{ needs.detect.outputs.files }}
+          SCAN_RESULT: ${{ needs.scan.result }}
         run: |
           set -euo pipefail
-          # Aggregate every per-file JSON into a single verdict.
-          findings=0
-          no_findings=0
-          rows=""
-          for f in mythos-out/*.json; do
-            [ -e "$f" ] || continue
-            verdict=$(jq -r '.verdict' "$f")
-            file=$(jq -r '.file // ""' "$f")
-            # A nameless row is an unverifiable row: the table exists so a
-            # reviewer can confirm the files they care about were covered.
-            # Fail loudly rather than emit `| `` |` as this did for every clean
-            # file before the matrix stamp above.
-            if [ -z "$file" ]; then
-              echo "::error::$f carries no .file — the per-file result must name its file, or the verdict table cannot be checked"
-              exit 1
-            fi
-            hyp=$(jq -r '.hypothesis // ""' "$f")
-            if [ "$verdict" = "FINDING" ]; then
-              findings=$((findings + 1))
-              rows+="| \`$file\` | ❌ FINDING | ${hyp//|/\\|} |"$'\n'
-            else
-              no_findings=$((no_findings + 1))
-              rows+="| \`$file\` | ✅ NO FINDINGS | — |"$'\n'
-            fi
-          done
-
-          if [ "$findings" -gt 0 ]; then
-            status="❌ **${findings}** finding(s) across $((findings + no_findings)) Tier-5 file(s)"
-            verdict=FAIL
-          else
-            status="✅ **NO FINDINGS** across ${no_findings} Tier-5 file(s)"
-            verdict=PASS
-          fi
+          # One decision, tested by `mythos_decide.py --self-test` in Script
+          # portability: PASS only when every detected Tier-5 file has a
+          # NO_FINDINGS result and every scan job succeeded.
+          python3 -I scripts/ci/mythos_decide.py aggregate \
+            --expected "$EXPECTED" --results-dir mythos-out \
+            --scan-result "$SCAN_RESULT" > /tmp/mythos-verdict.json
+          verdict=$(jq -r '.verdict' /tmp/mythos-verdict.json)
+          n_reviewed=$(jq -r '.reviewed' /tmp/mythos-verdict.json)
+          n_expected=$(jq -r '.expected' /tmp/mythos-verdict.json)
+          findings=$(jq -r '.findings' /tmp/mythos-verdict.json)
+          # Table rows; hypothesis text is model-authored, so pipes are escaped.
+          rows=$(jq -r '.rows[] | "| `\(.file)` | \(if .verdict == "FINDING" then "❌ FINDING" elif .verdict == "NO_FINDINGS" then "✅ NO FINDINGS" else "⚠️ \(.verdict)" end) | \(if .verdict == "FINDING" then (.hypothesis | gsub("\\|"; "\\|")) else "—" end) |"' /tmp/mythos-verdict.json)
+          missing=$(jq -r '.missing[] | "| `\(.)` | ⚠️ NOT REVIEWED | — |"' /tmp/mythos-verdict.json)
+          short=${HEAD_SHA:0:7}
+          case "$verdict" in
+            PASS)
+              status="✅ **NO FINDINGS** across ${n_reviewed} of ${n_expected} Tier-5 file(s) at \`${short}\`. This clears the Mythos gate for this commit."
+              state=success; desc="NO FINDINGS, ${n_reviewed}/${n_expected} Tier-5 files" ;;
+            FAIL)
+              status="❌ **${findings}** finding(s) at \`${short}\`. The gate stays red unless a maintainer applies \`mythos-pass-done\` to override."
+              state=failure; desc="${findings} finding(s)" ;;
+            *)
+              status="⚠️ **INCOMPLETE**: ${n_reviewed} of ${n_expected} Tier-5 file(s) reviewed at \`${short}\` (scan jobs: ${SCAN_RESULT}). No verdict."
+              state=error; desc="INCOMPLETE, ${n_reviewed}/${n_expected} reviewed" ;;
+          esac
 
           body=$(cat <<MARKER
           <!-- mythos-auto-gate -->
@@ -420,16 +435,15 @@ jobs:
 
           ${status}
 
-          This verdict is advisory. A maintainer applies \`mythos-pass-done\`
-          after reviewing it; this workflow does not apply the label.
-
           | File | Verdict | Hypothesis |
           |---|---|---|
           ${rows}
+          ${missing}
 
           <sub>Auto-run via \`anthropics/claude-code-action@v1\`
           (SHA-pinned) on the touched Tier-5 files, using the
-          maintainer's Max-plan OAuth token. See
+          maintainer's Max-plan OAuth token. Recorded as commit status
+          \`mythos/auto-verdict\` on \`${short}\`. See
           \`.github/workflows/mythos-auto.yml\` and
           \`scripts/mythos/discover.md\`.</sub>
           MARKER
@@ -439,14 +453,9 @@ jobs:
           echo "verdict=$verdict" >> "$GITHUB_OUTPUT"
 
           # Sticky-comment upsert via the GitHub REST API with `curl`.
-          # `gh` (GitHub CLI) is NOT installed on the `light` runner —
-          # the prior `gh api` form exited 127. `curl` and `jq` are
-          # universally present. Marker is the literal HTML comment.
-          #
-          # `jq -Rs '{body: .}'` reads the whole markdown file as one
-          # raw string and JSON-encodes it — newlines, quotes, emoji,
-          # backticks are all escaped, so nothing in the model-authored
-          # hypothesis text can break out of the JSON request body.
+          # `gh` (GitHub CLI) is NOT installed on the `light` runner.
+          # `jq -Rs '{body: .}'` JSON-encodes the whole markdown, so nothing
+          # in the model-authored hypothesis text can break out of the body.
           marker='<!-- mythos-auto-gate -->'
           api="https://api.github.com"
           auth="Authorization: Bearer ${GH_TOKEN}"
@@ -470,8 +479,33 @@ jobs:
             echo "posted new comment"
           fi
 
-      - name: Fail job on FINDING verdict
-        if: steps.compose.outputs.verdict == 'FAIL'
+          # The verdict, bound to the commit it reviewed.
+          jq -n --arg s "$state" --arg d "$desc" \
+            '{state: $s, context: "mythos/auto-verdict", description: $d}' \
+            | curl -fsS -X POST -H "$auth" -H "$accept" \
+                "${api}/repos/${REPO}/statuses/${HEAD_SHA}" -d @- >/dev/null
+          echo "commit status mythos/auto-verdict=${state} on ${HEAD_SHA}"
+
+          # Re-run the gate check for this commit so it reads the new status.
+          # It runs on pull_request events; nothing else would wake it.
+          for _ in $(seq 1 20); do
+            run=$(curl -fsS -H "$auth" -H "$accept" \
+              "${api}/repos/${REPO}/actions/workflows/mythos-gate.yml/runs?head_sha=${HEAD_SHA}&per_page=1" \
+              | jq -r '.workflow_runs[0] | "\(.id) \(.status)"')
+            id=${run%% *}; st=${run#* }
+            if [ "$id" = "null" ] || [ -z "$id" ]; then echo "no gate run for ${HEAD_SHA}"; break; fi
+            if [ "$st" = "completed" ]; then
+              curl -fsS -X POST -H "$auth" -H "$accept" \
+                "${api}/repos/${REPO}/actions/runs/${id}/rerun" >/dev/null
+              echo "re-ran gate run $id"; break
+            fi
+            sleep 30
+          done
+
+      - name: Fail job unless the verdict is a complete NO FINDINGS
+        if: steps.compose.outputs.verdict != 'PASS'
+        env:
+          VERDICT: ${{ steps.compose.outputs.verdict }}
         run: |
-          echo "::error::Mythos discover reported at least one confirmed finding; see PR comment"
+          echo "::error::Mythos auto verdict is ${VERDICT}; see the PR comment"
           exit 1
