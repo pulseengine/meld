@@ -3895,3 +3895,35 @@ artifacts:
       timestamp: 2026-11-08T11:03:19Z
       reviewed-by: avrabe
     release: v0.68.0
+  - id: SR-118
+    type: sw-req
+    title: "The reference-suite assertions meld can run are executed on the fused output and ratcheted"
+    status: implemented
+    description: "The reference-suite ratchet records whether each component fuses and validates. A module that validates and computes the wrong thing passes it: #582 sat in the baseline as fused while its callee trapped. meld shall replay every vendored component-model WAST command, in order, on the fused core modules on wasmtime, with one live instance per fused component (so stateful sequences run as written; a component_instance directive starts a fresh one). Outcomes: pass; wrong:<values>, trap and no-trap, which are bugs; and no-export, unsupported (non-scalar values), imports, not-fused and inst-error, which mean nothing runnable here. These shall be checked against a second baseline, and any difference in either direction fails. Only scalar arguments and results are modelled, and only exports the fused core module keeps under the WAST's name. The full component-level assertion run on fused output remains kiln's (meld's manifest feeds it). This is an owner decision (2026-11-08): execute in a meld test, as a complement to kiln's runner."
+    links:
+      - type: derives-from
+        target: SYS-11
+      - type: refines
+        target: SR-113
+    provenance:
+      created-by: ai-assisted
+      reviewed-by: avrabe
+      model: claude-opus-5-5
+      timestamp: 2026-11-08T12:18:55Z
+    release: v0.68.0
+  - id: SR-119
+    type: sw-req
+    title: A change to the code a Rocq extract models fails CI until the extract is re-checked
+    status: implemented
+    release: v0.68.0
+    description: "The Rocq proofs in proofs/rust_verified/ are about hand-written, simplified extracts (index_map.rs, merger_core.rs, resolver_core.rs) of meld-core functions. Rocq proofs (proofs.yml, SR-88) runs only on proofs/** and the bazel files, so a change to a modelled meld-core function never re-checks the proofs, and nothing compared the extracts with the code. The BUILD.bazel source comments still pointed at meld-core/src/merger.rs, which the #376 split removed. Owner decision (2026-11-11, #580): hash-pin rather than run the proofs on every meld-core change. proofs/rust_verified/extract-pins.tsv shall map every public, non-constructor extract function to the meld-core function(s) it models, with the sha256 of each function's text. A meld-core test (so it runs in Test, which fails closed on code changes) shall fail when a pinned function's text changes, when a pinned function is missing or defined more than once, when an extract function has no pin, or when a pin names no extract function. Re-blessing (MELD_BLESS=1) is the reviewable claim that the extract still models the source. Limits: a semantic change made in a helper the pinned function calls is not seen, and the extracts model the plain path (no --pack-rebase or --share-stack placement), which was already their scope. The proofs output of .github/gate-probe.json is exempted with this reason, because the allowlist in front of Rocq proofs is now complete for the proofs' own inputs."
+    links:
+      - type: derives-from
+        target: SYS-11
+      - type: refines
+        target: SR-88
+    provenance:
+      created-by: ai-assisted
+      reviewed-by: avrabe
+      model: claude-opus-5-5
+      timestamp: 2026-11-11T05:59:16Z

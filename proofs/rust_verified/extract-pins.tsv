@@ -1,0 +1,17 @@
+# #580: Rocq extract -> the meld-core function(s) it models, with the sha256
+# of each function's text. meld-core/tests/proof_extract_pins_580.rs fails when
+# a pinned function changes. Re-read the extract against the source, update it
+# if the modelled arithmetic changed, then re-bless:
+#   MELD_BLESS=1 cargo test -p meld-core --test proof_extract_pins_580
+# One row per (extract item, source function). Columns are tab-separated:
+# extract item, source file, source function, sha256.
+index_map::IndexMap::map	meld-core/src/merger/merge_core.rs	merge_core_module	fd728c352d968a7bfc94d2a0d4e3b6024914e86f1444ad00801fc782cf1cae92
+merger_core::SpaceOffsets::advance	meld-core/src/merger/merge_core.rs	merge_core_module	fd728c352d968a7bfc94d2a0d4e3b6024914e86f1444ad00801fc782cf1cae92
+merger_core::compute_offsets	meld-core/src/merger/merge_core.rs	merge_core_module	fd728c352d968a7bfc94d2a0d4e3b6024914e86f1444ad00801fc782cf1cae92
+merger_core::compute_memory_layout	meld-core/src/merger/memory.rs	compute_shared_memory_plan_for	6c331ff9f9a551ceb6116d5b1902445c068d57a673f5fd1920f2c3662d960ed0
+merger_core::compute_total_memory_pages	meld-core/src/merger/memory.rs	combine_memory_types_rebased	6469e20c3790cfa5712f4163f59792096fe52d84aab2447134ab8f72ed5e2c7b
+merger_core::is_valid_32bit_base	meld-core/src/merger/memory.rs	combine_memory_types_rebased	6469e20c3790cfa5712f4163f59792096fe52d84aab2447134ab8f72ed5e2c7b
+resolver_core::decompose_func_index	meld-core/src/merger/index_maps.rs	decompose_component_core_func_index	0e642dbd5929ab260d1b2371ffcd5d8484d1d5ea5b4136e71f2953ba4019dc62
+resolver_core::reconstruct_func_index	meld-core/src/merger/index_maps.rs	decompose_component_core_func_index	0e642dbd5929ab260d1b2371ffcd5d8484d1d5ea5b4136e71f2953ba4019dc62
+resolver_core::build_function_index_map	meld-core/src/merger/merge_core.rs	merge_core_module	fd728c352d968a7bfc94d2a0d4e3b6024914e86f1444ad00801fc782cf1cae92
+resolver_core::defined_func	meld-core/src/merger/mod.rs	defined_func	995887ddefc20c642e44682ff6ec49f058464781e2dbb705b37d4bb5b55d1a6e
