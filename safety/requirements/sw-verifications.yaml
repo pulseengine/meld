@@ -1970,3 +1970,16 @@ artifacts:
       reviewed-by: avrabe
       model: claude-opus-5-5
       timestamp: 2026-11-11T13:20:09Z
+  - id: SWV-135
+    type: sw-verification
+    title: "Verification of SR-121: invalid flat char params trap in the adapter, valid ones pass"
+    status: implemented
+    release: v0.69.0
+    description: "char_param_check_traps_exactly_on_invalid_chars runs the spliced check on wasmtime at 0, 0xD7FF, 0xD800, 0xDBFF, 0xDC00, 0xDFFF, 0xE000, 0x10FFFF, 0x110000 and u32::MAX, and checks that the original body's locals and instructions survive the splice. Negative controls observed red: a 0xFFFFFC00 surrogate mask (0xDC00 passes) and a 0x110001 bound (0x110000 passes). The call-lowering truth table now covers 256 combinations, with has_value_checks forbidding inlining on its own. End to end, the execution ratchet's numerics.wast rows 194, 196 and 198 (run-d800, run-dfff, run-too-big) move from no-trap to pass, and no other row changes."
+    links:
+      - type: verifies
+        target: SR-121
+    provenance:
+      created-by: ai-assisted
+      model: claude-opus-5-5
+      timestamp: 2026-11-12T06:41:58Z

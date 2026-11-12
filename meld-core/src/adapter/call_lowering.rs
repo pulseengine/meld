@@ -80,6 +80,9 @@ pub struct BoundaryFacts {
     /// i32`. A boundary like that needs a *bridge*, so it is neither an
     /// identity forward nor inlinable.
     pub signatures_match: bool,
+    /// #586: the adapter must check a lifted value the Canonical ABI validates
+    /// (today: a flat `char` param). Bypassing the adapter would skip the trap.
+    pub has_value_checks: bool,
 }
 
 /// The resolved lowering decision for one boundary.
@@ -106,7 +109,7 @@ pub struct CallLoweringPlan {
 /// and `inline_eligible` iff inlining is on, the class is `Direct`, the call
 /// carries no resource conversions and no post-return, and the caller's and
 /// callee's signatures are identical (#390 — a convention bridge is not an
-/// identity forward).
+/// identity forward), and the adapter carries no value checks (#586).
 pub fn resolve_call_lowering_plan(facts: BoundaryFacts) -> Result<CallLoweringPlan> {
     // #361: transcoding is required whenever the encodings differ, regardless of
     // whether memory is crossed. Route to `Transcode`; the adapter reads from
@@ -139,7 +142,10 @@ pub fn resolve_call_lowering_plan(facts: BoundaryFacts) -> Result<CallLoweringPl
         // different types, `generate_direct_adapter` emits a return-area
         // bridge typed as the CALLER; wiring the caller straight to the
         // callee would skip that bridge and produce a type-invalid module.
-        && facts.signatures_match;
+        && facts.signatures_match
+        // #586: the adapter body carries the Canonical ABI's lift-time checks
+        // (a surrogate or out-of-range `char` traps); inlining would skip them.
+        && !facts.has_value_checks;
 
     Ok(CallLoweringPlan {
         class,
@@ -161,10 +167,11 @@ mod tests {
             has_resource_new_calls: false,
             has_post_return: false,
             signatures_match: true,
+            has_value_checks: false,
         }
     }
 
-    /// The whole truth table — all 128 combinations of the seven facts, checked
+    /// The whole truth table — all 256 combinations of the eight facts, checked
     /// against the DOCUMENTED rules rather than against the implementation.
     ///
     /// #397: this seam decides how every fused call is lowered, and it is where
@@ -177,7 +184,7 @@ mod tests {
     /// points, and this is the one that has already cost a release.
     #[test]
     fn every_combination_obeys_the_documented_rules() {
-        for bits in 0u8..128 {
+        for bits in 0u16..256 {
             let facts = BoundaryFacts {
                 crosses_memory: bits & 1 != 0,
                 needs_transcoding: bits & 2 != 0,
@@ -186,6 +193,7 @@ mod tests {
                 has_resource_new_calls: bits & 16 != 0,
                 has_post_return: bits & 32 != 0,
                 signatures_match: bits & 64 != 0,
+                has_value_checks: bits & 128 != 0,
             };
             let plan = resolve_call_lowering_plan(facts).unwrap();
 
@@ -211,7 +219,8 @@ mod tests {
                 && !facts.has_resource_rep_calls
                 && !facts.has_resource_new_calls
                 && !facts.has_post_return
-                && facts.signatures_match;
+                && facts.signatures_match
+                && !facts.has_value_checks;
             assert_eq!(
                 plan.inline_eligible, expected_inline,
                 "inline for {facts:?}"
@@ -241,6 +250,10 @@ mod tests {
                     !facts.has_resource_rep_calls && !facts.has_resource_new_calls,
                     "inlining would skip resource conversions: {facts:?}"
                 );
+                assert!(
+                    !facts.has_value_checks,
+                    "#586: inlining would skip the Canonical ABI value checks: {facts:?}"
+                );
             }
         }
     }
@@ -260,6 +273,7 @@ mod tests {
             has_resource_new_calls: false,
             has_post_return: false,
             signatures_match: true,
+            has_value_checks: false,
         };
         let baseline = resolve_call_lowering_plan(base).unwrap();
         assert!(
@@ -319,6 +333,12 @@ mod tests {
                  the seam ignores it and the truth table above proves nothing"
             );
         }
+        let plan = resolve_call_lowering_plan(BoundaryFacts {
+            has_value_checks: true,
+            ..base
+        })
+        .unwrap();
+        assert!(!plan.inline_eligible, "flipping `has_value_checks` alone");
         // `has_resource_new_calls` gets the same treatment; kept separate only
         // because the array above is already at its readable limit.
         let plan = resolve_call_lowering_plan(BoundaryFacts {
@@ -419,6 +439,7 @@ mod tests {
     fn direct_with_mismatched_signatures_not_eligible() {
         let plan = resolve_call_lowering_plan(BoundaryFacts {
             signatures_match: false,
+            has_value_checks: false,
             ..direct()
         })
         .unwrap();

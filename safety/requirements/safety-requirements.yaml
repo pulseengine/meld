@@ -4024,3 +4024,16 @@ artifacts:
       reviewed-by: avrabe
       model: claude-opus-5-5
       timestamp: 2026-11-11T13:20:09Z
+  - id: SR-121
+    type: sw-req
+    title: An adapter traps on an invalid char a caller passes in flat params, as the Canonical ABI's lift does
+    status: implemented
+    release: v0.69.0
+    description: "The Canonical ABI lifts a char only if it is a Unicode scalar value: a surrogate (0xD800..=0xDFFF) or a value above 0x10FFFF traps with 'invalid char bit pattern'. Inside a fused module the callee's lift is gone, so meld's adapter is the only place the check can happen; before #586 it passed the value through, and a Rust callee receiving it has undefined behaviour. For every adapter site whose flat params carry a char (top level, or inside a record, tuple or fixed-size list), the adapter shall trap on such a value before any copy, transcode or call, in every adapter class, and the site shall not be inlined away (the call-lowering seam's has_value_checks fact). Not yet covered, and tracked on #586: a char in a variant, option or result payload, in a list or the params-ptr area, in a result, or at an async site; the unaligned-pointer and string-bounds traps."
+    links:
+      - type: derives-from
+        target: SYS-3
+    provenance:
+      created-by: ai-assisted
+      model: claude-opus-5-5
+      timestamp: 2026-11-12T06:41:58Z

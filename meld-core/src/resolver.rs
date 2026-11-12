@@ -357,6 +357,11 @@ pub struct AdapterRequirements {
     /// Flat core param indices where (ptr, len) pairs start for string/list params.
     /// The adapter must copy data at each of these positions across memories.
     pub pointer_pair_positions: Vec<u32>,
+    /// #586: flat core param indices that carry a `char` (see
+    /// `ParsedComponent::char_param_flat_positions`). Empty under the
+    /// params-ptr convention. The adapter traps on a surrogate or a value
+    /// above 0x10FFFF at each, as the Canonical ABI's lift does.
+    pub char_param_flat_positions: Vec<u32>,
     /// Flat return-area byte offsets where (ptr, len) pairs start for string/list results.
     /// The adapter must copy pointed-to data and fix up pointers at these offsets.
     pub result_pointer_pair_offsets: Vec<u32>,
@@ -3880,6 +3885,13 @@ impl Resolver {
                                             // Detect params-ptr convention (flat params > 16)
                                             let total_flat =
                                                 to_component.total_flat_params(comp_params);
+                                            // #586: the caller's flat params reach the adapter unchanged only
+                                            // below the params-ptr threshold.
+                                            if total_flat <= 16 {
+                                                requirements.char_param_flat_positions =
+                                                    to_component
+                                                        .char_param_flat_positions(comp_params);
+                                            }
                                             if total_flat > 16 {
                                                 let psize =
                                                     to_component.params_area_byte_size(comp_params);
@@ -4221,6 +4233,12 @@ impl Resolver {
 
                                     // Detect params-ptr convention (flat params > 16)
                                     let total_flat = to_component.total_flat_params(comp_params);
+                                    // #586: the caller's flat params reach the adapter unchanged only
+                                    // below the params-ptr threshold.
+                                    if total_flat <= 16 {
+                                        requirements.char_param_flat_positions =
+                                            to_component.char_param_flat_positions(comp_params);
+                                    }
                                     if total_flat > 16 {
                                         let psize = to_component.params_area_byte_size(comp_params);
                                         requirements.params_area_byte_size = Some(psize);

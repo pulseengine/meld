@@ -2614,6 +2614,57 @@ impl ParsedComponent {
         positions
     }
 
+    /// #586: flat core indices of every `char` a caller hands over in FLAT
+    /// params — top level, or inside a record, tuple or fixed-size list (all
+    /// flatten field by field). The Canonical ABI traps when one of these is a
+    /// surrogate (0xD800..=0xDFFF) or above 0x10FFFF, so an adapter must check
+    /// them before the callee sees them.
+    ///
+    /// Not covered here: a `char` inside a variant, option or result payload
+    /// (its flat slot is shared with other cases and is only a `char` under one
+    /// discriminant), inside a `list` (in memory), or in the params-ptr area.
+    pub fn char_param_flat_positions(&self, params: &[(String, ComponentValType)]) -> Vec<u32> {
+        let mut positions = Vec::new();
+        let mut flat_idx = 0u32;
+        for (_, ty) in params {
+            self.collect_char_positions(ty, flat_idx, &mut positions);
+            flat_idx += self.flat_count(ty);
+        }
+        positions
+    }
+
+    fn collect_char_positions(&self, ty: &ComponentValType, base: u32, out: &mut Vec<u32>) {
+        match ty {
+            ComponentValType::Primitive(PrimitiveValType::Char) => out.push(base),
+            ComponentValType::FixedSizeList(elem, len) => {
+                let elem_flat = self.flat_count(elem);
+                for i in 0..*len {
+                    self.collect_char_positions(elem, base + i * elem_flat, out);
+                }
+            }
+            ComponentValType::Record(fields) => {
+                let mut offset = base;
+                for (_, field_ty) in fields {
+                    self.collect_char_positions(field_ty, offset, out);
+                    offset += self.flat_count(field_ty);
+                }
+            }
+            ComponentValType::Tuple(elems) => {
+                let mut offset = base;
+                for elem_ty in elems {
+                    self.collect_char_positions(elem_ty, offset, out);
+                    offset += self.flat_count(elem_ty);
+                }
+            }
+            ComponentValType::Type(idx) => {
+                if let Some(inner) = self.resolve_defined_val_type(*idx) {
+                    self.collect_char_positions(&inner, base, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
     /// Compute return-area byte offsets where (ptr, len) pairs start.
     ///
     /// Uses canonical ABI memory layout offsets (with alignment), matching

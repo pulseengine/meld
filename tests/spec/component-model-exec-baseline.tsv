@@ -630,9 +630,9 @@ test/values/numerics.wast	128	run	imports
 test/values/numerics.wast	161	run	pass
 test/values/numerics.wast	162	roundtrip	no-export
 test/values/numerics.wast	163	roundtrip	no-export
-test/values/numerics.wast	194	run-d800	no-trap
-test/values/numerics.wast	196	run-dfff	no-trap
-test/values/numerics.wast	198	run-too-big	no-trap
+test/values/numerics.wast	194	run-d800	pass
+test/values/numerics.wast	196	run-dfff	pass
+test/values/numerics.wast	198	run-too-big	pass
 test/values/numerics.wast	302	run	imports
 test/values/numerics.wast	313	junk-to-f9	no-export
 test/values/numerics.wast	65	run	imports
