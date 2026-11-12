@@ -5591,6 +5591,10 @@ impl FactStyleGenerator {
                     )));
                 }
             };
+            // #594: this path returns before the common splice below, so it
+            // applies the #586 `char` check itself (found by auto-Mythos).
+            let body =
+                prepend_char_param_checks(body, &site.requirements.char_param_flat_positions)?;
             return Ok(AdapterFunction {
                 name,
                 type_idx,
