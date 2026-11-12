@@ -1956,3 +1956,16 @@ artifacts:
       model: claude-opus-5-5
       timestamp: 2026-11-08T12:13:56Z
     release: v0.68.0
+  - id: SWV-134
+    type: sw-verification
+    title: "Verification of SR-120: an injected Axiom and an injected external_body each turn the checks red"
+    status: implemented
+    release: v0.69.0
+    description: "proofs/kernel_check.sh (proofs.yml step 'Kernel check') and meld-core/tests/proof_trust_ledger.rs. Clean tree, Rocq 9.0.1 via nix: 27 files compiled, coqchk checked 221 libraries (Stdlib included), Axioms <none>, exit 0; ledger test 2/2 pass. Controls: appending 'Axiom meld_injected_axiom : False.' to proofs/parser/parser.v made coqchk list Standalone.parser.meld_injected_axiom and the script exit 1, and made the ledger test fail naming (proofs/parser/parser.v, Axiom, meld_injected_axiom); adding #[verifier::external_body] fn injected_trusted() inside verification/verus-pilot's verus! block made the ledger test fail naming it; reverting both restored green. the_scan_can_fail checks the scanner on inline text: commented-out axioms, kani::assume and my_assume are not counted; Axiom, Parameter, Admitted (with its lemma), Conjecture, external_body, assume and admit are. The ledger test also fails if it finds no verus! file, so an empty Verus result cannot mean it looked nowhere. Positivity: an inductive declared with #[bypass_check(positivity)] in parser.v made coqchk list it under 'Inductives whose positivity is assumed' and the script exit 1, and made the ledger test fail naming (proofs/parser/parser.v, bypass_check, positivity); reverted, green. The script also fails on any coqchk summary line it does not judge, so a category a newer coqchk adds is not silently ignored (not exercised: no coqchk available prints one)."
+    links:
+      - type: verifies
+        target: SR-120
+    provenance:
+      created-by: ai-assisted
+      model: claude-opus-5-5
+      timestamp: 2026-11-11T13:20:09Z

@@ -4008,3 +4008,18 @@ artifacts:
       model: claude-opus-5-5
       timestamp: 2026-11-08T12:13:56Z
     release: v0.68.0
+  - id: SR-120
+    type: sw-req
+    title: Every trust escape in the proofs is listed, and the kernel accepts no axiom outside an allowlist
+    status: implemented
+    release: v0.69.0
+    description: "The Rocq proof census (proofs.yml) counted only the text 'Admitted.', so an Axiom, Parameter or Conjecture passed it, and nothing in CI counted Verus escapes. meld shall (1) kernel-check its gated Rocq proofs with coqchk -o after compiling them, and fail when coqchk reports an axiom outside proofs/kernel-axioms-allowlist.txt or any other trust assumption (impredicative Set, rewrite rules, type-in-type, unsafe (co)fixpoints, assumed positivity); a .v file the check cannot place under a logical prefix fails rather than being skipped; and (2) keep proofs/trust-escapes.tsv equal to a scan for Rocq Admitted/Axiom/Parameter/Conjecture, #[bypass_check(...)] and Unset Positivity\\/Guard\\/Universe Checking and, in files containing verus!, Verus external_body/external/assume/admit/assume_specification, so a new escape fails until the ledger names it and a removed one fails until its line is deleted. The ledger check runs in Test because proofs.yml does not run on verification/. Baseline: both empty (coqchk: Axioms <none> over 27 files). Not counted: kani::assume (harness input bounds, a vacuity question) and Section-local Variable/Hypothesis (discharged by the section). Whether this becomes a required check is the owner's decision."
+    links:
+      - type: derives-from
+        target: SYS-11
+      - type: refines
+        target: SR-88
+    provenance:
+      created-by: ai-assisted
+      model: claude-opus-5-5
+      timestamp: 2026-11-11T13:20:09Z

@@ -243,3 +243,15 @@ jobs:
               exit "$rc"
               ;;
           esac
+
+      # bazel test shows each proof compiles; it does not show what the proofs
+      # rest on. coqchk re-checks the compiled libraries in an independent
+      # kernel and lists every axiom they reach, including through a
+      # dependency. The census above counts only the text `Admitted.`, so an
+      # `Axiom` or `Parameter` passed it. Any axiom outside
+      # proofs/kernel-axioms-allowlist.txt (empty today), or any other trust
+      # assumption coqchk reports, fails here. The text-level ledger of Rocq
+      # and Verus escapes is meld-core/tests/proof_trust_ledger.rs, in Test,
+      # because this workflow does not run on verification/.
+      - name: Kernel check (coqchk, axiom allowlist)
+        run: nix-shell -p coq -p rocqPackages.stdlib --run proofs/kernel_check.sh

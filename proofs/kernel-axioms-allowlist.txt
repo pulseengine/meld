@@ -1,0 +1,4 @@
+# Axioms the Rocq kernel may report for meld's proofs (proofs/kernel_check.sh).
+# One fully qualified name per line. Empty today: coqchk -o reports
+# Axioms: <none> for every gated file. Adding a line is a decision the diff
+# has to explain.
