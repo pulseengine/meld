@@ -1160,7 +1160,6 @@ impl Merger {
     /// modules that import from them.  This ensures `function_index_map`
     /// entries exist when resolving intra-component imports.
     #[allow(clippy::too_many_arguments)]
-    #[allow(clippy::too_many_arguments)]
     fn merge_component(
         &self,
         comp_idx: usize,
