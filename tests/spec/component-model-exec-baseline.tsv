@@ -696,7 +696,7 @@ test/values/strings.wast	85	f	no-trap
 test/values/transcode.wast	113	run	pass
 test/values/transcode.wast	201	run	pass
 test/values/transcode.wast	319	run	pass
-test/values/transcode.wast	432	run	trap
+test/values/transcode.wast	432	run	pass
 test/values/transcode.wast	534	run	pass
 test/values/variants.wast	183	join-narrow	not-fused
 test/values/variants.wast	184	join-wide	not-fused

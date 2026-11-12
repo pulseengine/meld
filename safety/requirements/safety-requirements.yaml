@@ -4004,6 +4004,7 @@ artifacts:
         target: SR-115
     provenance:
       created-by: ai-assisted
+      reviewed-by: avrabe
       model: claude-opus-5-5
       timestamp: 2026-11-08T12:13:56Z
     release: v0.68.0
