@@ -46,6 +46,7 @@ fn fuse(bytes: &[u8], validate_output: bool) -> meld_core::Result<Vec<u8>> {
 }
 
 // rivet: verifies SR-114
+// rivet: verifies SWV-128
 #[test]
 fn library_refuses_invalid_output_by_default() {
     let input = first_component("async/empty-wait.wast");
@@ -69,6 +70,7 @@ fn library_refuses_invalid_output_by_default() {
 }
 
 // rivet: verifies SR-114
+// rivet: verifies SWV-128
 #[test]
 fn library_validation_does_not_refuse_valid_output() {
     // A component the baseline records as `fused`: validation on by default

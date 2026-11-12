@@ -77,6 +77,8 @@ fn fuse_and_run(input: &[u8]) -> Result<u32, String> {
 }
 
 // rivet: verifies SR-115
+// rivet: verifies SWV-129
+// rivet: verifies SWV-131
 #[test]
 fn transcoded_string_and_list_results_execute_correctly() {
     let comps = components("values/transcode.wast");
@@ -110,6 +112,7 @@ fn transcoded_string_and_list_results_execute_correctly() {
 /// the caller checks the transcoded result "ok". `run` returns 7 only if both
 /// hold.
 // rivet: verifies SR-115
+// rivet: verifies SWV-129
 #[test]
 fn list_u8_param_is_copied_not_transcoded() {
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -129,6 +132,7 @@ fn list_u8_param_is_copied_not_transcoded() {
 /// on wasmtime's component runtime first: deflating on the way back is the
 /// Canonical ABI's behaviour, not meld's reading of it.
 // rivet: verifies SR-117
+// rivet: verifies SWV-131
 #[test]
 fn compact_utf16_result_is_deflated() {
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))

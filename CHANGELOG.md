@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.68.0] - 2026-11-12
+
 ### Added
 
 - The attestation names the varve toolchain layer meld ran from (SR-116).
@@ -81,6 +83,17 @@ All notable changes to this project will be documented in this file.
   - Before, the bytes were copied unchanged. Upstream `values/transcode.wast` component 3 fused to a valid module whose callee trapped: a silent wrong answer.
   - This now covers top-level string parameters and a single string result.
   - Other latin1+utf16 shapes that carry a string are refused, citing #582: nested strings, params areas, and async calls.
+- A change to a meld-core function that a Rocq proof extract models now fails Test until the extract is re-checked (#580, SR-119).
+  - `proofs/rust_verified/extract-pins.tsv` maps each public extract function to the meld-core function(s) it models, with the sha256 of each one's text.
+  - `meld-core/tests/proof_extract_pins_580.rs` fails on a changed, missing or duplicated pinned function, an unpinned extract function, or a pin naming no extract function. `MELD_BLESS=1` re-blesses.
+  - Limit: a change inside a helper the pinned function calls is not seen.
+- CI: every tag-pinned GitHub Action is pinned to a commit SHA, with the tag as a comment (#541). `dtolnay/rust-toolchain@stable`/`@nightly` and `taiki-e/install-action@cargo-llvm-cov` stay branch refs.
+- CI: a failed `cargo-deny` install fails the LS-N gate instead of passing silently (#571).
+- CI: temper's gate-probe runs report-only, pinned to temper 308848d1.
+- ADR-10 (P3 async calls between fused components, #548) is accepted. This release ships its interim step: refuse at fuse time.
+
+### Security
+- Test-only: the wasmtime family goes 50.0.0 -> 50.0.1 and fastrand 2.4.0 -> 2.5.0 (RUSTSEC-2026-0420, -0422, -0423, -0424). wasmtime is a meld-core dev-dependency used by the test oracles; no meld binary links it.
 
 ## [0.67.0] - 2026-11-04
 

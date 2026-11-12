@@ -3819,7 +3819,7 @@ artifacts:
   - id: SR-111
     type: sw-req
     title: An async call between components that meld cannot fuse is refused at fuse time, and nothing meld leaves to the host carries a wrong or internal name
-    status: implemented
+    status: verified
     description: "A 504-component P3 corpus (#548) showed 26 natural caller/callee pairs fusing at exit 0 with zero fused calls between components: each caller lowers with the async option ([async-lower]f), meld only bridges a sync caller to an [async-lift] callee, and the call was left to the host. kiln refuses such a module at load (E21A0, 65 unresolved imports on the fused ping-pong pair). The design for fusing these calls is ADR-10 (meld data plane, kiln-async control, gale wake/time/isolation). Until its adapters land, the maintainer decided (2026-11-04, recorded in ADR-10 and kiln AD-ASYNC-001) that meld refuses at fuse time instead of exiting 0. meld shall: (1) refuse a fusion in which a core import [async-lower]f of one component resolves to an export f (plain or [async-lift]) of another fused component, with an error naming both components, the callee export and the caller import and citing #548 and ADR-10; (2) emit an async lowering that it leaves to the host under the producer's field name [async-lower]f, never the bare f, which a host would bind with the sync convention (#557); (3) refuse a core import wired to stream.read, stream.write, future.read or future.write through wit-component's indirect-call shim, for which meld has no producer name, instead of emitting the shim-internal name (actual::N), which no host can serve, naming the built-in and citing #558 (streams and futures pass through in ADR-10 step 6); such an import that the module already carries under its producer name passes through unchanged."
     links:
       - type: derives-from
@@ -3885,7 +3885,7 @@ artifacts:
   - id: SR-112
     type: sw-req
     title: An async lowering is recognised by its async option, not by its core import name, and a world-level async import is never left to the host under a sync name
-    status: implemented
+    status: verified
     release: v0.68.0
     description: "SR-111 item 1 recognised a #548 edge only when the caller's core import field carried wit-component's [async-lower] prefix. The wasmtime and component-model test-suite producers, and hand-written WAT, name the core import without it (for example \"\" \"f\"), and a component nested in a composition reaches its sibling through flattening rather than through the per-function matcher. On the 504-component P3 corpus, 23 inputs that SR-111 let through were such edges: an async-lowered call wired directly to a sibling's [async-lift] export with no async adapter (--explain: N direct or memory-copy boundaries, 0 async-lift), at exit 0, identical on v0.67.0, so the caller received the callee's callback code as its status. Separately, an async lowering of a world-level func import that meld leaves to the host was emitted as (import \"f\" \"\") with the async core type, which a host binds as a sync call (#560). meld shall: (1) decide whether a core import is an async lowering from the canon lower it traces to (its async option), whatever the import's field name; (2) refuse a fusion in which such an import is wired to another fused component (an adapter site), or whose world-level component import is satisfied by another fused component, with an error naming both components and citing #548 and ADR-10; (3) refuse an async lowering of a world-level func import that is left to the host, naming the import and citing #560, until the host-side name is settled under ADR-10."
     links:
@@ -3901,7 +3901,7 @@ artifacts:
   - id: SR-113
     type: sw-req
     title: "Every component in the pinned upstream Component Model reference suite has a recorded, ratcheted fusion outcome"
-    status: implemented
+    status: verified
     description: "The upstream WebAssembly/component-model test/ WASTs are the external oracle for fusion, but nothing consumed the pinned copy (#562): MODULE.bazel pinned deb0b0ac35 (2025-05-19), which predates the async, re-entrance, map, implements and stream.forward tests. meld shall (1) vendor the suite byte for byte at one commit, with upstream's licence, a per-file SHA-256 list, and a check that MODULE.bazel pins the same commit; (2) on every test run, fuse each component the WASTs define (component, component definition, assert_unlinkable, instantiation assertions) on its own and record one outcome per component: fused (valid output), refused (with the issues the error cites), fused-invalid or panic (bugs, never accepted silently); (3) require every component inside assert_invalid or assert_malformed to be rejected; (4) fail when any outcome differs from a checked-in baseline, in either direction; (5) on request, write every input and fused module plus a manifest mapping each WAST command (index, line, kind) to the component it targets, for kiln's runner (kiln's oracle requirement, numbered 93 in kiln), which executes the assertions. Executing assertions is out of scope here: meld emits a core module and the assertions name component exports. Also: the fuzz smoke job shall fail on a crash, excusing only the #168 runner build flake by its exact log signature."
     links:
       - type: derives-from
@@ -3915,7 +3915,7 @@ artifacts:
   - id: SR-116
     type: sw-req
     title: "The attestation names the varve toolchain layer meld ran from"
-    status: implemented
+    status: verified
     description: "An assessor holding only a fused artifact could see meld's version, not which qualified toolchain layer produced it. varve's dispatcher sets VARVE_LAYER and VARVE_LAYER_MANIFEST_DIGEST when it runs a tool, and wsc-attestation 0.12 added ToolInfo fields for both. When either variable is set and non-empty, meld shall record it in the attestation's tool object as toolchain and toolchain_manifest_digest, in both the default attestation (the one release builds embed) and the optional wsc path, by one predicate. When unset or empty, the keys shall be absent, so the record is unchanged. Under --reproducible both shall be absent and the output bytes shall not depend on these variables, so the reproducible record depends only on the inputs, the configuration and SOURCE_DATE_EPOCH. This is an owner decision (2026-11-08): fill the fields when set, and ignore them under --reproducible."
     links:
       - type: derives-from
@@ -3931,7 +3931,7 @@ artifacts:
   - id: SR-118
     type: sw-req
     title: "The reference-suite assertions meld can run are executed on the fused output and ratcheted"
-    status: implemented
+    status: verified
     description: "The reference-suite ratchet records whether each component fuses and validates. A module that validates and computes the wrong thing passes it: #582 sat in the baseline as fused while its callee trapped. meld shall replay every vendored component-model WAST command, in order, on the fused core modules on wasmtime, with one live instance per fused component (so stateful sequences run as written; a component_instance directive starts a fresh one). Outcomes: pass; wrong:<values>, trap and no-trap, which are bugs; and no-export, unsupported (non-scalar values), imports, not-fused and inst-error, which mean nothing runnable here. These shall be checked against a second baseline, and any difference in either direction fails. Only scalar arguments and results are modelled, and only exports the fused core module keeps under the WAST's name. The full component-level assertion run on fused output remains kiln's (meld's manifest feeds it). This is an owner decision (2026-11-08): execute in a meld test, as a complement to kiln's runner."
     links:
       - type: derives-from
@@ -3947,7 +3947,7 @@ artifacts:
   - id: SR-119
     type: sw-req
     title: A change to the code a Rocq extract models fails CI until the extract is re-checked
-    status: implemented
+    status: verified
     release: v0.68.0
     description: "The Rocq proofs in proofs/rust_verified/ are about hand-written, simplified extracts (index_map.rs, merger_core.rs, resolver_core.rs) of meld-core functions. Rocq proofs (proofs.yml, SR-88) runs only on proofs/** and the bazel files, so a change to a modelled meld-core function never re-checks the proofs, and nothing compared the extracts with the code. The BUILD.bazel source comments still pointed at meld-core/src/merger.rs, which the #376 split removed. Owner decision (2026-11-11, #580): hash-pin rather than run the proofs on every meld-core change. proofs/rust_verified/extract-pins.tsv shall map every public, non-constructor extract function to the meld-core function(s) it models, with the sha256 of each function's text. A meld-core test (so it runs in Test, which fails closed on code changes) shall fail when a pinned function's text changes, when a pinned function is missing or defined more than once, when an extract function has no pin, or when a pin names no extract function. Re-blessing (MELD_BLESS=1) is the reviewable claim that the extract still models the source. Limits: a semantic change made in a helper the pinned function calls is not seen, and the extracts model the plain path (no --pack-rebase or --share-stack placement), which was already their scope. The proofs output of .github/gate-probe.json is exempted with this reason, because the allowlist in front of Rocq proofs is now complete for the proofs' own inputs."
     links:
@@ -3963,7 +3963,7 @@ artifacts:
   - id: SR-114
     type: sw-req
     title: "The library API refuses its own invalid output, not just the CLI"
-    status: implemented
+    status: verified
     description: "SR-109 made the meld CLI validate every fused output by default. The library API did not: Fuser::fuse and Fuser::fuse_with_stats returned bytes that fail validation as Ok, so any embedder (a build rule, kiln's runner, a test harness) received an invalid module as success. The #562 reference-suite ratchet showed 13 such components (10 async and transcoding adapter stack defects, #545; 3 duplicate exports, #492). meld shall validate the fused output inside Fuser::fuse_with_stats, on every path including auto's shared-to-multi retry, and return Error::InvalidOutput rather than the bytes, by default (FuserConfig::validate_output = true). There shall be one validation predicate, meld_core::validate_output, used by both the library and the CLI, so they cannot drift. --no-validate (validate_output = false) remains the explicit opt-out. validate_output is not an attested build parameter: validation never changes the bytes, and validity can be re-checked from the artifact alone. Fixing the adapter defects themselves is out of scope here and stays on #545 and #492."
     links:
       - type: derives-from
@@ -3979,7 +3979,7 @@ artifacts:
   - id: SR-115
     type: sw-req
     title: "A cross-encoding call that returns a string or list is transcoded in both directions"
-    status: implemented
+    status: verified
     description: "When a string or list result makes the caller lower with a retptr ((params.., retptr) -> ()) while the callee lifts (params..) -> i32, the sync transcoding adapter took the callee's core type and transcoded parameters only. The adapter was uncallable: invalid output, refused by SR-114. Found by the reference-suite ratchet (cm_wast_ratchet.rs) on 4 of upstream values/transcode.wast's components (#545). For that shape meld shall: transcode each string/list parameter from caller to callee memory; call the callee; read the result (ptr, len) from the callee's return area; transcode it callee_enc -> caller_enc (or copy it, for a list of non-strings, walking nested strings) into memory allocated by the caller's realloc; write it at the caller's retptr; then call post-return. Each step reuses the emitters the async-lift adapters already use, per direction, and the same cross-encoding guard. The callee realloc is the #515-traced one, because the component-level lookup misses a realloc exported under another name and the copy step then skips the copy. A string parameter is told apart from a list<u8> by its WIT type, not by its 1-byte element layout, and a list<u8> is copied byte for byte, never transcoded. Any other result shape is refused, citing #545, rather than emitted. Out of scope: same-memory cross-encoding (#361), and latin1+utf16 on both sides (#582)."
     links:
       - type: derives-from
@@ -3995,7 +3995,7 @@ artifacts:
   - id: SR-117
     type: sw-req
     title: "A latin1+utf16 string passed to a latin1+utf16 component in another memory is deflated, not copied unchanged"
-    status: implemented
+    status: verified
     description: "With latin1+utf16 on both sides, meld planned the call as a same-encoding copy and copied a string's bytes unchanged. The Canonical ABI's store_string re-encodes instead: a utf16-tagged string whose code points all fit in latin1 arrives as latin1, tag clear. Upstream values/transcode.wast component 3 therefore fused to a valid module whose callee trapped (#582), a silent wrong answer that validation cannot catch. For a cross-memory call carrying a string with latin1+utf16 on both sides, meld shall: copy an untagged (latin1) string verbatim; transcode a tagged one with the utf16 -> latin1+utf16 loop, which deflates when it can and keeps it tagged utf16 otherwise; and forward the resulting tagged length. This applies to top-level string parameters (on the flat memory-copy path and in the retptr adapter) and to a single top-level string result (retptr adapter). Whether a value is a string is decided from its WIT type, never from a 1-byte layout, so a list<u8> is copied verbatim. Every other shape with a string under latin1+utf16 on both sides is refused, citing #582: a string inside a record, list or variant; a params area; a non-string result alongside a retptr; and any async call, whose emitters now deflate but are not yet covered by an async oracle."
     links:
       - type: derives-from
