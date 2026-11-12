@@ -61,12 +61,14 @@ jobs:
           - target: aarch64-unknown-linux-musl
             runner: ubuntu-latest
             use_cross: true
-          # Stays on macos-14: smithy is Linux x86_64 only.
+          # macos-15 (arm64); smithy is Linux x86_64 only. GitHub retired the
+          # macos-14 image: v0.68.0's darwin jobs failed with "The
+          # configuration 'macos-14-arm64-us-default' is not supported".
           - target: x86_64-apple-darwin
-            runner: macos-14
+            runner: macos-15
             use_cross: false
           - target: aarch64-apple-darwin
-            runner: macos-14
+            runner: macos-15
             use_cross: false
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -152,7 +154,7 @@ jobs:
           host_arch="$(uname -m)"
           host_os="$(uname -s)"
           # Darwin reports arm64 where the Rust triple says aarch64. Without
-          # this the one darwin target that CAN run natively on macos-14 falls
+          # this the one darwin target that CAN run natively on macos-15 falls
           # into the "cannot execute here" branch and quietly loses its check.
           case "$host_arch" in arm64) host_arch=aarch64 ;; esac
           case "$TARGET" in
