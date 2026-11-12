@@ -28,7 +28,7 @@ jobs:
     name: Script portability (shellcheck + Python 3.9 floor)
     runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || fromJSON('["self-hosted","linux","x64","light"]') }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       # SHELLCHECK_SHA256 is the release asset's `digest` for
       # shellcheck-v0.11.0.linux.x86_64.tar.gz from
