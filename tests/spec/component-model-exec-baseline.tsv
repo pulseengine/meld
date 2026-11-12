@@ -693,11 +693,11 @@ test/values/strings.wast	39	f	unsupported
 test/values/strings.wast	54	f	unsupported
 test/values/strings.wast	69	f	no-trap
 test/values/strings.wast	85	f	no-trap
-test/values/transcode.wast	113	run	not-fused
-test/values/transcode.wast	201	run	not-fused
-test/values/transcode.wast	319	run	not-fused
+test/values/transcode.wast	113	run	pass
+test/values/transcode.wast	201	run	pass
+test/values/transcode.wast	319	run	pass
 test/values/transcode.wast	432	run	trap
-test/values/transcode.wast	534	run	not-fused
+test/values/transcode.wast	534	run	pass
 test/values/variants.wast	183	join-narrow	not-fused
 test/values/variants.wast	184	join-wide	not-fused
 test/values/variants.wast	185	join-f32	not-fused
