@@ -42,7 +42,7 @@ jobs:
     # smithy runner-group policy and fork-PR approval (pulseengine/warte#35).
     runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || fromJSON('["self-hosted","linux","x64","light"]') }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           fetch-depth: 0
 
@@ -115,7 +115,7 @@ jobs:
 
       - name: Post / refresh sticky comment
         if: steps.detect.outputs.tier5_touched == 'true'
-        uses: marocchino/sticky-pull-request-comment@v3
+        uses: marocchino/sticky-pull-request-comment@5770ad5eb8f42dd2c4f34da00c94c5381e49af88 # v3
         with:
           header: mythos-gate
           message: |
