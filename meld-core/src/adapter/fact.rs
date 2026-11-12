@@ -5419,6 +5419,65 @@ fn emit_resource_new_results(
     }
 }
 
+/// #586: put the Canonical ABI's `char` validation in front of an adapter body.
+///
+/// A lifted `char` must be a Unicode scalar value; anything in
+/// 0xD800..=0xDFFF or above 0x10FFFF traps ("invalid `char` bit pattern").
+/// `positions` are flat param indices, which are the adapter's own param
+/// locals: every adapter class receives the caller's flat params unchanged
+/// (the params-ptr convention, where they are not, yields no positions).
+///
+/// Spliced in after the body's local declarations, so it applies to every
+/// adapter class without touching each generator, and runs before any copy,
+/// transcode or call.
+fn prepend_char_param_checks(body: Function, positions: &[u32]) -> Result<Function> {
+    if positions.is_empty() {
+        return Ok(body);
+    }
+    let raw = body.into_raw_body();
+    let fb = wasmparser::FunctionBody::new(wasmparser::BinaryReader::new(&raw, 0));
+    let mut locals = Vec::new();
+    let mut reader = fb
+        .get_locals_reader()
+        .map_err(|e| crate::Error::AdapterGeneration(format!("#586: adapter body locals: {e}")))?;
+    for _ in 0..reader.get_count() {
+        let (count, ty) = reader.read().map_err(|e| {
+            crate::Error::AdapterGeneration(format!("#586: adapter body locals: {e}"))
+        })?;
+        let ty = match ty {
+            wasmparser::ValType::I32 => wasm_encoder::ValType::I32,
+            wasmparser::ValType::I64 => wasm_encoder::ValType::I64,
+            wasmparser::ValType::F32 => wasm_encoder::ValType::F32,
+            wasmparser::ValType::F64 => wasm_encoder::ValType::F64,
+            other => {
+                return Err(crate::Error::AdapterGeneration(format!(
+                    "#586: unexpected adapter local type {other:?}"
+                )));
+            }
+        };
+        locals.push((count, ty));
+    }
+    let ops_start = reader.original_position() as usize;
+    let mut out = Function::new(locals);
+    for &p in positions {
+        // trap if (x >= 0x110000) | ((x & 0xFFFFF800) == 0xD800)
+        out.instruction(&Instruction::LocalGet(p));
+        out.instruction(&Instruction::I32Const(0x11_0000));
+        out.instruction(&Instruction::I32GeU);
+        out.instruction(&Instruction::LocalGet(p));
+        out.instruction(&Instruction::I32Const(0xFFFF_F800_u32 as i32));
+        out.instruction(&Instruction::I32And);
+        out.instruction(&Instruction::I32Const(0xD800));
+        out.instruction(&Instruction::I32Eq);
+        out.instruction(&Instruction::I32Or);
+        out.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+        out.instruction(&Instruction::Unreachable);
+        out.instruction(&Instruction::End);
+    }
+    out.raw(raw[ops_start..].iter().copied());
+    Ok(out)
+}
+
 /// FACT-style adapter generator
 pub struct FactStyleGenerator {
     #[allow(dead_code)]
@@ -5466,6 +5525,7 @@ impl FactStyleGenerator {
                 // within one memory. When it is, the Direct body is a bridge —
                 // not an identity forward — and must not be inlined away.
                 signatures_match: self.signatures_match(site, merged),
+                has_value_checks: !site.requirements.char_param_flat_positions.is_empty(),
             },
         )?;
         let class = plan.class;
@@ -5531,6 +5591,10 @@ impl FactStyleGenerator {
                     )));
                 }
             };
+            // #594: this path returns before the common splice below, so it
+            // applies the #586 `char` check itself (found by auto-Mythos).
+            let body =
+                prepend_char_param_checks(body, &site.requirements.char_param_flat_positions)?;
             return Ok(AdapterFunction {
                 name,
                 type_idx,
@@ -5561,6 +5625,7 @@ impl FactStyleGenerator {
                  is_async_lift branch in FactStyleGenerator::generate)"
             ),
         };
+        let body = prepend_char_param_checks(body, &site.requirements.char_param_flat_positions)?;
 
         let target_function = self.resolve_target_function(site, merged)?;
 
@@ -13609,6 +13674,66 @@ impl AdapterOptions {
 
 #[cfg(test)]
 mod tests {
+    /// #586: the spliced check traps exactly on non-scalar-value `char`s, and
+    /// leaves the original body (its locals and instructions) intact.
+    // rivet: verifies SR-121
+    // rivet: verifies SWV-135
+    #[test]
+    fn char_param_check_traps_exactly_on_invalid_chars() {
+        use wasm_encoder::{
+            CodeSection, ExportKind, ExportSection, Function, FunctionSection, Instruction, Module,
+            TypeSection, ValType,
+        };
+        // Original body: one i64 local, returns param 1 + 7 (so the splice
+        // must keep both the locals and the instructions after it).
+        let mut f = Function::new([(1, ValType::I64)]);
+        f.instruction(&Instruction::LocalGet(1));
+        f.instruction(&Instruction::I32Const(7));
+        f.instruction(&Instruction::I32Add);
+        f.instruction(&Instruction::End);
+        let body = super::prepend_char_param_checks(f, &[0]).unwrap();
+        let mut m = Module::new();
+        let mut ty = TypeSection::new();
+        ty.ty()
+            .function([ValType::I32, ValType::I32], [ValType::I32]);
+        let mut fs = FunctionSection::new();
+        fs.function(0);
+        let mut ex = ExportSection::new();
+        ex.export("f", ExportKind::Func, 0);
+        let mut code = CodeSection::new();
+        code.function(&body);
+        m.section(&ty).section(&fs).section(&ex).section(&code);
+        let bytes = m.finish();
+        wasmparser::Validator::new().validate_all(&bytes).unwrap();
+
+        let engine = wasmtime::Engine::default();
+        let module = wasmtime::Module::new(&engine, &bytes).unwrap();
+        let mut store = wasmtime::Store::new(&engine, ());
+        let inst = wasmtime::Instance::new(&mut store, &module, &[]).unwrap();
+        let run = inst
+            .get_typed_func::<(u32, i32), i32>(&mut store, "f")
+            .unwrap();
+        for (c, ok) in [
+            (0u32, true),
+            (0xD7FF, true),
+            (0xD800, false),
+            (0xDBFF, false),
+            (0xDC00, false),
+            (0xDFFF, false),
+            (0xE000, true),
+            (0x10_FFFF, true),
+            (0x11_0000, false),
+            (u32::MAX, false),
+        ] {
+            let r = run.call(&mut store, (c, 35));
+            if ok {
+                assert_eq!(r.unwrap(), 42, "{c:#x} is a scalar value and must pass");
+            } else {
+                assert!(r.is_err(), "{c:#x} is not a scalar value and must trap");
+            }
+        }
+    }
+
     use super::*;
 
     /// Memory index of a decoded linear-memory `memarg` (wasmparser 0.263

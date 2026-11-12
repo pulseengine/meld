@@ -144,3 +144,37 @@ fn compact_utf16_result_is_deflated() {
         other => panic!("latin1+utf16 result deflation: {other:?}"),
     }
 }
+
+/// #594 / #586: the #582 adapter path (two latin1+utf16 components, separate
+/// memories) returned before the `char` check was spliced in, so a `char`
+/// travelling next to a string reached the callee unchecked. Found by the
+/// auto-Mythos pass on #594. The fixture's callee returns the `char` it got.
+/// Both cases run unfused on wasmtime's component runtime first, so the
+/// expectation (0x41, and a trap for 0xD800) is the Canonical ABI's.
+// rivet: verifies SR-121
+// rivet: verifies SWV-135
+#[test]
+fn char_next_to_a_compact_string_is_checked() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/transcode_545/char_with_compact_string.wat");
+    let text = std::fs::read_to_string(&path).expect("fixture");
+    let marker = "(i32.const 0x41) ;; CHAR";
+    assert!(text.contains(marker), "fixture lost its CHAR marker");
+
+    let ok = wat::parse_str(&text).expect("fixture parses");
+    assert_eq!(run_unfused(&ok), 0x41, "unfused: a valid char passes");
+    assert_eq!(fuse_and_run(&ok), Ok(0x41), "fused: a valid char passes");
+
+    let bad =
+        wat::parse_str(text.replace(marker, "(i32.const 0xD800)")).expect("bad fixture parses");
+    assert!(
+        std::panic::catch_unwind(|| run_unfused(&bad)).is_err(),
+        "unfused: wasmtime's component runtime must trap on a surrogate char"
+    );
+    match fuse_and_run(&bad) {
+        Err(e) if e.starts_with("trap") => {}
+        other => {
+            panic!("fused: a surrogate char next to a latin1+utf16 string must trap, got {other:?}")
+        }
+    }
+}
