@@ -764,6 +764,7 @@ fn execute(res: &FileResult) -> Vec<(usize, String, String)> {
 }
 
 // rivet: verifies SR-118
+// rivet: verifies SWV-132
 #[test]
 fn every_reference_assertion_matches_the_exec_baseline() {
     let mut rows = Vec::new();

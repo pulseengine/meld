@@ -61,6 +61,7 @@ const LAYER: (&str, &str) = ("VARVE_LAYER", "2026.08.2");
 const DIGEST: (&str, &str) = ("VARVE_LAYER_MANIFEST_DIGEST", "sha256:5e1f00d");
 
 // rivet: verifies SR-116
+// rivet: verifies SWV-130
 #[test]
 fn varve_layer_is_recorded_when_set() {
     let t = tool(&fuse(&[LAYER, DIGEST], &[], "set"));
@@ -70,6 +71,7 @@ fn varve_layer_is_recorded_when_set() {
 }
 
 // rivet: verifies SR-116
+// rivet: verifies SWV-130
 #[test]
 fn no_toolchain_keys_outside_varve_or_when_empty() {
     for (tag, env) in [
@@ -89,6 +91,7 @@ fn no_toolchain_keys_outside_varve_or_when_empty() {
 }
 
 // rivet: verifies SR-116
+// rivet: verifies SWV-130
 #[test]
 fn reproducible_output_does_not_depend_on_the_varve_environment() {
     let with_env = fuse(&[LAYER, DIGEST], &["--reproducible"], "repro-set");

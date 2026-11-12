@@ -141,6 +141,7 @@ fn extract_items(root: &Path) -> BTreeSet<String> {
 }
 
 // rivet: verifies SR-119
+// rivet: verifies SWV-133
 #[test]
 fn extract_sources_match_their_pins() {
     let root = repo_root();
@@ -188,6 +189,7 @@ fn extract_sources_match_their_pins() {
 }
 
 // rivet: verifies SR-119
+// rivet: verifies SWV-133
 #[test]
 fn every_extract_item_is_pinned() {
     // Without this, a new extract function would model code nobody pins.
@@ -208,6 +210,7 @@ fn every_extract_item_is_pinned() {
 }
 
 // rivet: verifies SR-119
+// rivet: verifies SWV-133
 #[test]
 fn pin_check_can_fail() {
     // Negative controls for the instrument itself: a one-character edit

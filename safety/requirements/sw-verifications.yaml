@@ -1757,7 +1757,7 @@ artifacts:
   - id: SWV-123
     type: sw-verification
     title: "Verification of SR-111 (1): an async-lower call between fused components is refused"
-    status: implemented
+    status: verified
     description: "Verifies SR-111 item 1. meld-core/tests/async_edges_548.rs fuses two hand-built components (WAT in the test): a callee exporting local:t/i with f: async func() lifted with the stackless callback ABI ([async-lift]local:t/i#f + [callback]), and a caller lowering f with the async option (core import local:t/i::[async-lower]f). The fusion fails, with an error that cites #548 and ADR-10 and names local:t/i#f and [async-lower]f. Negative control: the same caller fused with a callee that exports a different interface fuses, and the caller's local:t/i::[async-lower]f import is left to the host. Corpus (meld v0.67.0 release binary vs this branch, --memory multi): of 906 single-component inputs (the 504-component P3 corpus plus meld's own fixtures and the other suites), 534 fuse under both, and 506 of those outputs are byte-identical (--reproducible --no-attestation). The other 28 differ only in import lines, each now carrying the [async-lower] prefix (custom sections stripped, all other lines identical). 157 that fused are now refused, every one citing #558; none is newly refused for another reason; 215 refused before stay refused. Of 91 caller/callee pairs, the 42 that are not P3 fuse byte-identically, and all 43 P3 pairs that fused are now refused citing #558, because every P3 producer in the corpus (wit-bindgen Rust/C runtimes, wasmtime test programs) routes stream.read through wit-component's shim. So on the corpus the #558 refusal fires before the #548 one; the #548 refusal is exercised by the hand-built fixture."
     links:
       - type: verifies
@@ -1772,7 +1772,7 @@ artifacts:
   - id: SWV-124
     type: sw-verification
     title: "Verification of SR-111 (2): a host-bound async lowering keeps the [async-lower] prefix"
-    status: implemented
+    status: verified
     description: "Verifies SR-111 item 2 (#557). meld-core/tests/async_edges_548.rs fuses the async caller alone and checks the output imports local:t/i::[async-lower]f and never the bare local:t/i::f. On v0.67.0 the same import was emitted as f with the async-lower core type. In the corpus, 25 outputs change, only in import lines, each gaining [async-lower] (for example [async-lower][method]thing.when-ready, the producer's own spelling). Where a component lowered the same function both sync and async, the old output deduplicated the two as f and f$0; they now have distinct names."
     links:
       - type: verifies
@@ -1787,7 +1787,7 @@ artifacts:
   - id: SWV-125
     type: sw-verification
     title: "Verification of SR-111 (3): unnamed stream/future read/write are refused, not leaked as actual::N"
-    status: implemented
+    status: verified
     description: "Verifies SR-111 item 3 (#558). meld-core/tests/async_edges_548.rs builds wit-component's shim pattern in miniature (stream.read with memory and realloc options, exported from a FromExports instance as 0 and imported by a fixup module as actual::0). The fusion fails, naming stream.read and citing #558. Negative control: a stream.read that the module imports under its producer name ($root::[async-lower][stream-read-0]f, the shape wit-component emits without a shim when the payload needs no realloc and the module imports its memory) fuses and keeps that import, so the refusal is limited to the shim's bare decimal field name. On the real wit-bindgen ping-pong pair the fusion now fails on actual::0 (future.read) instead of writing a module with 8 actual::N imports that kiln refuses at load. The #545 validation tests moved from empty-wait.wasm (now refused by this rule before validation runs) to reentrance-m6.wasm (tests/p3/issue_545/README.md), so their potency check still reaches an invalid module. Corpus (meld v0.67.0 release binary vs this branch, --memory multi): of 906 single-component inputs (the 504-component P3 corpus plus meld's own fixtures and the other suites), 534 fuse under both, and 506 of those outputs are byte-identical (--reproducible --no-attestation). The other 28 differ only in import lines, each now carrying the [async-lower] prefix (custom sections stripped, all other lines identical). 157 that fused are now refused, every one citing #558; none is newly refused for another reason; 215 refused before stay refused. Of 91 caller/callee pairs, the 42 that are not P3 fuse byte-identically, and all 43 P3 pairs that fused are now refused citing #558, because every P3 producer in the corpus (wit-bindgen Rust/C runtimes, wasmtime test programs) routes stream.read through wit-component's shim. So on the corpus the #558 refusal fires before the #548 one; the #548 refusal is exercised by the hand-built fixture. UPDATE 2026-11-05: a local Mythos delta-pass on PR #559 (substituting for the CI pass, which ran out of turns) found that the first cut refused producer-named stream/future imports too, which v0.67.0 passed through: a regression shown by a failing test on the branch that passed on main. The refusal now requires the shim's bare decimal field name, and the negative control above is that test. The corpus figures here are re-measured with the fix: 63 inputs the first cut refused fuse again, 60 byte-identical to v0.67.0 and 3 differing only by the [async-lower] prefix; the pair results are unchanged."
     links:
       - type: verifies
@@ -1847,7 +1847,7 @@ artifacts:
   - id: SWV-126
     type: sw-verification
     title: "Verification of SR-112: async lowerings recognised by option; world-level async imports not left to the host under a sync name"
-    status: implemented
+    status: verified
     release: v0.68.0
     description: "meld-core/tests/async_edges_548.rs. async_lower_edge_is_refused_whatever_the_core_import_is_named: an instance-export lowering with the async option whose core import is local:t/i::f (no prefix), fused with a callback-lifted callee, fails citing #548; on the PR #559 branch (6cb3e63) it fused. async_lowered_world_import_served_by_a_fused_component_is_the_548_edge: a world-level async caller fused with a callee exporting f fails citing #548, not #560. async_lowered_world_func_import_is_refused: the same caller alone fails citing #560 and naming [async-lower]f; sync_lowered_world_func_import_still_fuses is its control (import f with an empty field kept). Potency: with the resolver change reverted, the three refusal tests fail and the control passes. Real input: wasmtime misc_testsuite subtask-drop-exited m0 now fails citing #548 (before: 1 boundary, 1 direct, 0 async-lift, exit 0); async lower m0 fails citing #560 (before: (import \"host-echo-u32\" \"\") with type (i32 i32) -> i32). Corpus (PR #559 binary 6cb3e63 vs this branch, --memory multi, 906 single inputs): 507 fuse under both and all 507 are byte-identical (--reproducible --no-attestation); 27 that fused are now refused, 23 citing #548 and 4 citing #560; none newly refused for another reason; pairs unchanged (42 fuse, 49 refused). The #545 validation tests moved back to empty-wait.wasm, because reentrance-m6.wasm is itself a nested #548 edge (tests/p3/issue_545/README.md). Local gate rustc 1.99.0: cargo test --workspace --all-features 1099 passed, 0 failed."
     links:
@@ -1861,7 +1861,7 @@ artifacts:
   - id: SWV-127
     type: sw-verification
     title: "Verification of SR-113: the component-model reference suite fusion ratchet"
-    status: implemented
+    status: verified
     description: "meld-core/tests/cm_wast_ratchet.rs, vendored suite tests/spec/component-model at c818a1925e (78 WASTs). bazel_pin_matches_the_vendored_suite: MODULE.bazel's component_model_spec commit equals COMMIT. vendored_suite_matches_its_checksums: all 80 files match SHA256SUMS and there are exactly 78 WASTs; negative control: appending one line to test/async/forward.wast fails it. every_reference_component_matches_the_fuse_baseline: visits all 78 WASTs (asserted, not ran > 0) and compares 859 per-component outcomes with tests/spec/component-model-fuse-baseline.tsv: 182 fused, 145 refused, 13 fused-invalid, 514 invalid-refused, 5 invalid-unencodable, 0 invalid-fused, 0 panic (one fused and one refused entry are instantiation assertions). Negative control: forcing the callee string encoding to the caller's in generate_adapter (a broken lift/lower) flips 4 values/transcode.wast components from fused-invalid to fused and fails the test. Limit: an outcome-preserving semantic break (valid but wrong output) is not caught here; that needs the assertion run on kiln (kiln's oracle requirement, numbered 93 in kiln). The 13 fused-invalid components are all rejected by the meld CLI's default validation (exit 1), but the library API returns them as Ok; they are recorded on #545 (10, stack type mismatches in async and transcoding adapters) and #492 (3, duplicate $N exports in linking/unit.wast). The fuzz smoke classifier was checked on three logs: success, the #168 ToolExecError x86_64-linux-musl-g++ signature (skip with warning), and a Rust compile error (fail)."
     links:
       - type: verifies
@@ -1875,7 +1875,7 @@ artifacts:
   - id: SWV-130
     type: sw-verification
     title: "Verification of SR-116: the attestation records the varve layer, and only when it should"
-    status: implemented
+    status: verified
     description: "meld-cli/tests/varve_toolchain_attestation_116.rs runs the real meld binary in a child process with its own environment (the test process's environment is never changed) and reads the wsc.transformation.attestation section. varve_layer_is_recorded_when_set: with both variables set, tool.toolchain and tool.toolchain_manifest_digest carry their values. no_toolchain_keys_outside_varve_or_when_empty: unset, and set to empty strings, both keys are absent. reproducible_output_does_not_depend_on_the_varve_environment: under --reproducible the keys are absent and the output bytes equal those of the same run with both variables unset. Negative controls: dropping the builder's .toolchain() call fails the first test; recording the identity regardless of --reproducible fails the third. Runs on both attestation paths: the default one, and the wsc one under cargo test --workspace --all-features, which enables meld-core's attestation feature. On the wsc path the reproducible test first failed for a reason that predates SR-116: --reproducible gave different bytes on every run (6 runs, 6 hashes, no varve variables set), because wsc's ToolInfo::parameters is a HashMap serialized in per-process hash order. The payload is now serialized through serde_json::Value, whose map is ordered, and 6 runs alternating VARVE_LAYER set and unset gave one hash. cargo test -p meld-cli --all-features does not reach the wsc path, because meld-cli does not forward that feature."
     links:
       - type: verifies
@@ -1889,7 +1889,7 @@ artifacts:
   - id: SWV-132
     type: sw-verification
     title: "Verification of SR-118: the execution ratchet over the reference suite"
-    status: implemented
+    status: verified
     description: "meld-core/tests/cm_wast_ratchet.rs, every_reference_assertion_matches_the_exec_baseline, against tests/spec/component-model-exec-baseline.tsv: 704 commands across all 78 vendored WASTs (asserted). On main: 25 pass; 15 no-trap, which are Canonical ABI validation traps the adapters skip, filed as #586 (unaligned pointer 8, invalid char 3, out-of-bounds string 4); 1 trap, values/transcode.wast line 432, which is #582. 0 wrong. The remaining rows are not runnable here: 293 imports, 219 not-fused, 79 no-export, 44 unsupported, 28 inst-error. Negative control: substituting the adapter code from #583/#585 flips exactly the 5 values/transcode.wast rows (4 inst-error, 1 trap) to pass, so a behaviour change in fused output is a ratchet diff. The fuse-outcome baseline is unchanged by the refactor that shares the compare/bless step."
     links:
       - type: verifies
@@ -1903,7 +1903,7 @@ artifacts:
   - id: SWV-133
     type: sw-verification
     title: "Verification of SR-119: the extract pins fail on source drift and on unpinned extract items"
-    status: implemented
+    status: verified
     release: v0.68.0
     description: "meld-core/tests/proof_extract_pins_580.rs. extract_sources_match_their_pins hashes each pinned source function (from its fn line to the closing brace at the same indentation, which cargo fmt keeps) and compares with extract-pins.tsv; every_extract_item_is_pinned requires the set of public non-constructor extract functions to equal the set of pinned items; pin_check_can_fail checks the instrument on inline source: an edit inside the function changes the hash, an edit outside does not, a missing or duplicated function is an error, and a name prefix is not a match. Observed controls on the real tree: changing < to <= in MergedModule::defined_func (meld-core/src/merger/mod.rs) failed extract_sources_match_their_pins naming resolver_core::defined_func, and reverting passed; appending a pub fn to index_map.rs failed every_extract_item_is_pinned naming index_map::sneaky. Before the first bless each extract was read against its source: decompose_func_index and defined_func match decompose_component_core_func_index and MergedModule::defined_func, including saturating_add; merge_core_module assigns indices as import count plus the running count of earlier modules' items, as compute_offsets and build_function_index_map model; compute_shared_memory_plan_for places module bases as a checked running sum with a 32-bit bound, as compute_memory_layout and is_valid_32bit_base model."
     links:
@@ -1917,7 +1917,7 @@ artifacts:
   - id: SWV-128
     type: sw-verification
     title: "Verification of SR-114: the library refuses its own invalid output"
-    status: implemented
+    status: verified
     description: "meld-core/tests/library_validates_output_545.rs. library_refuses_invalid_output_by_default: the first component of the vendored test/async/empty-wait.wast (the #545 reproducer), fused under MultiMemory with defaults, returns Error::InvalidOutput carrying the validator's type-mismatch message; with validate_output = false the same input returns bytes that meld_core::validate_output rejects, so the refusal is the validation and the opt-out still works. library_validation_does_not_refuse_valid_output: test/async/cancel-stream.wast's first component (baseline: fused) still fuses and validates, so refuse-everything cannot pass. Reference-suite ratchet (cm_wast_ratchet.rs): the baseline gains outcome meld-invalid for Error::InvalidOutput; re-blessing moved exactly the 13 fused-invalid rows to meld-invalid and changed no other row; fused-invalid is now 0 and is kept as a guard, because the ratchet re-validates with every feature enabled. Negative control: disabling the validation call in fuse_with_stats turns both test files red (the ratchet with 13 rows back to fused-invalid; the direct test with 'invalid output returned as Ok'). CLI: the empty-wait input exits 1 under meld fuse --memory multi with 'fused output failed validation' and writes no file; with --no-validate it exits 0 and writes the module. cargo test --workspace --all-features: 1095 passed, 0 failed."
     links:
       - type: verifies
@@ -1931,7 +1931,7 @@ artifacts:
   - id: SWV-129
     type: sw-verification
     title: "Verification of SR-115: transcoded string and list results execute correctly"
-    status: implemented
+    status: verified
     description: "meld-core/tests/transcode_results_execute_545.rs, transcoded_string_and_list_results_execute_correctly: four components of the vendored upstream values/transcode.wast are fused under MultiMemory and executed on wasmtime with multi-memory enabled. Their run export returns the WAST's assert_return value only if every transcoded byte matches on both sides (the callee checks the argument, the caller checks the result); otherwise it traps. The four are component 0 (utf16 -> utf8, string result, 42), 1 (utf8 -> utf16, 43), 2 (latin1+utf16 -> utf8, 44) and 4 (list<string> param and result, 46). All pass. Negative controls: removing the retptr routing makes all four refuse (invalid output); making the result writeback raw-copy (callee encoding on both sides) makes components 0 and 1 trap in run. Reference-suite ratchet: re-blessing moved exactly the 4 values/transcode.wast rows from meld-invalid to fused and changed no other row, so the async adapters, which now pass their realloc explicitly, emit unchanged output across the suite. Component 3 (latin1+utf16 on both sides) is excluded: it fuses and validates but traps (#582). list_u8_param_is_copied_not_transcoded (added after review): a list<u8> parameter on a utf16 -> utf8 call, with a string result, must arrive byte for byte (FF 00 41, length 3). The fixture first runs unfused on wasmtime's component runtime (run = 7), so the expectation comes from an independent Canonical ABI. Fused, it trapped, because the param copy step transcoded any 1-byte-element pair as text. It now decides from the parameter's WIT type and passes. cargo test --workspace --all-features: 1097 passed, 0 failed."
     links:
       - type: verifies
@@ -1945,7 +1945,7 @@ artifacts:
   - id: SWV-131
     type: sw-verification
     title: "Verification of SR-117: latin1+utf16 strings are deflated across memories, in both directions"
-    status: implemented
+    status: verified
     description: "meld-core/tests/transcode_results_execute_545.rs. Parameter side: transcoded_string_and_list_results_execute_correctly now includes upstream values/transcode.wast component 3. Its caller passes \"AB\" tagged utf16, and the callee requires latin1, tag clear. Run unfused on wasmtime's component runtime it returns 45. Fused it trapped before this change and returns 45 after. Result side: compact_utf16_result_is_deflated uses a fixture whose callee returns \"AB\" tagged utf16. It returns 9 unfused on wasmtime's component runtime, so the expectation comes from an independent Canonical ABI implementation, and 9 fused. Negative controls: disabling the parameter-side deflate traps component 3; disabling the result-side deflate fails the result test. Existing same-encoding latin1+utf16 tests (adapter_safety ls_p_21_*: a tagged \"日本\" that does not fit latin1 stays utf16, and a tag-clear \"café\" is copied verbatim) still pass on the flat path. The reference-suite ratchet is unchanged (component 3 was already counted as fused). cargo test --workspace --all-features: 1098 passed, 0 failed."
     links:
       - type: verifies
