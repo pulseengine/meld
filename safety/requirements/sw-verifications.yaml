@@ -1942,3 +1942,17 @@ artifacts:
       timestamp: 2026-11-08T10:50:51Z
       reviewed-by: avrabe
     release: v0.68.0
+  - id: SWV-131
+    type: sw-verification
+    title: "Verification of SR-117: latin1+utf16 strings are deflated across memories, in both directions"
+    status: implemented
+    description: "meld-core/tests/transcode_results_execute_545.rs. Parameter side: transcoded_string_and_list_results_execute_correctly now includes upstream values/transcode.wast component 3. Its caller passes \"AB\" tagged utf16, and the callee requires latin1, tag clear. Run unfused on wasmtime's component runtime it returns 45. Fused it trapped before this change and returns 45 after. Result side: compact_utf16_result_is_deflated uses a fixture whose callee returns \"AB\" tagged utf16. It returns 9 unfused on wasmtime's component runtime, so the expectation comes from an independent Canonical ABI implementation, and 9 fused. Negative controls: disabling the parameter-side deflate traps component 3; disabling the result-side deflate fails the result test. Existing same-encoding latin1+utf16 tests (adapter_safety ls_p_21_*: a tagged \"日本\" that does not fit latin1 stays utf16, and a tag-clear \"café\" is copied verbatim) still pass on the flat path. The reference-suite ratchet is unchanged (component 3 was already counted as fused). cargo test --workspace --all-features: 1098 passed, 0 failed."
+    links:
+      - type: verifies
+        target: SR-117
+    provenance:
+      created-by: ai-assisted
+      reviewed-by: avrabe
+      model: claude-opus-5-5
+      timestamp: 2026-11-08T12:13:56Z
+    release: v0.68.0

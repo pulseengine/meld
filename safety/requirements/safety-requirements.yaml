@@ -3992,3 +3992,19 @@ artifacts:
       timestamp: 2026-11-08T10:50:51Z
       reviewed-by: avrabe
     release: v0.68.0
+  - id: SR-117
+    type: sw-req
+    title: "A latin1+utf16 string passed to a latin1+utf16 component in another memory is deflated, not copied unchanged"
+    status: implemented
+    description: "With latin1+utf16 on both sides, meld planned the call as a same-encoding copy and copied a string's bytes unchanged. The Canonical ABI's store_string re-encodes instead: a utf16-tagged string whose code points all fit in latin1 arrives as latin1, tag clear. Upstream values/transcode.wast component 3 therefore fused to a valid module whose callee trapped (#582), a silent wrong answer that validation cannot catch. For a cross-memory call carrying a string with latin1+utf16 on both sides, meld shall: copy an untagged (latin1) string verbatim; transcode a tagged one with the utf16 -> latin1+utf16 loop, which deflates when it can and keeps it tagged utf16 otherwise; and forward the resulting tagged length. This applies to top-level string parameters (on the flat memory-copy path and in the retptr adapter) and to a single top-level string result (retptr adapter). Whether a value is a string is decided from its WIT type, never from a 1-byte layout, so a list<u8> is copied verbatim. Every other shape with a string under latin1+utf16 on both sides is refused, citing #582: a string inside a record, list or variant; a params area; a non-string result alongside a retptr; and any async call, whose emitters now deflate but are not yet covered by an async oracle."
+    links:
+      - type: derives-from
+        target: SYS-3
+      - type: refines
+        target: SR-115
+    provenance:
+      created-by: ai-assisted
+      reviewed-by: avrabe
+      model: claude-opus-5-5
+      timestamp: 2026-11-08T12:13:56Z
+    release: v0.68.0

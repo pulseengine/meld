@@ -1582,6 +1582,123 @@ fn emit_utf8_to_latin1_transcode_param(
     body.instruction(&Instruction::End); // if/else
 }
 
+/// #582: may this WIT type carry a string anywhere inside it? An unresolved
+/// type reference counts as yes, so an unknown shape is refused rather than
+/// guessed at.
+fn wit_may_contain_string(t: &crate::parser::ComponentValType) -> bool {
+    use crate::parser::ComponentValType as T;
+    match t {
+        T::String | T::Type(_) => true,
+        T::List(e) | T::FixedSizeList(e, _) | T::Option(e) => wit_may_contain_string(e),
+        T::Record(fields) => fields.iter().any(|(_, t)| wit_may_contain_string(t)),
+        T::Tuple(ts) => ts.iter().any(wit_may_contain_string),
+        T::Variant(cases) => cases
+            .iter()
+            .any(|(_, t)| t.as_ref().is_some_and(wit_may_contain_string)),
+        T::Result { ok, err } => {
+            ok.as_deref().is_some_and(wit_may_contain_string)
+                || err.as_deref().is_some_and(wit_may_contain_string)
+        }
+        _ => false,
+    }
+}
+
+/// #582: a cross-memory call with `latin1+utf16` on BOTH sides that carries a
+/// string. Same encoding, but not a byte copy (see
+/// [`emit_compact_utf16_to_compact_utf16_copy_param`]).
+fn is_compact_utf16_both_sides_with_strings(site: &AdapterSite) -> bool {
+    use crate::parser::CanonStringEncoding::CompactUtf16;
+    let r = &site.requirements;
+    site.crosses_memory
+        && r.caller_encoding == Some(CompactUtf16)
+        && r.callee_encoding == Some(CompactUtf16)
+        && r.param_wit_types
+            .iter()
+            .chain(r.result_wit_types.iter())
+            .any(wit_may_contain_string)
+}
+
+/// #582: copy a top-level `latin1+utf16` string into a `latin1+utf16`
+/// destination across memories, as the Canonical ABI's `store_string` does.
+///
+/// Same encoding on both sides is not a byte copy. A source tagged utf16
+/// (`len & UTF16_TAG`) whose code points all fit in latin1 must arrive
+/// deflated to latin1, tag clear (`store_probably_utf16_to_latin1_or_utf16`).
+/// Otherwise it stays utf16, tag set. An untagged (latin1) source is copied
+/// verbatim. meld used to raw-copy both. The output validated, and a callee
+/// that relies on the deflation read the wrong representation.
+///
+/// Tagged: mask the length to a code-unit count, then run the existing
+/// utf16 -> latin1+utf16 loop ([`emit_utf16_to_latin1_transcode_param`]),
+/// which makes exactly that latin1-or-utf16 decision and rewrites
+/// `len_local` to the tagged output length. Untagged: realloc `len` bytes in
+/// the destination and `memory.copy`. In both arms `ptr_local` and
+/// `out_ptr_local` end up at the destination copy. Scratch: the 6 locals
+/// from `scratch_base`, as the dest-latin1 loops use.
+#[allow(clippy::too_many_arguments)]
+fn emit_compact_utf16_to_compact_utf16_copy_param(
+    body: &mut Function,
+    realloc_func: u32,
+    src_memory: u32,
+    dst_memory: u32,
+    ptr_local: u32,
+    len_local: u32,
+    out_ptr_local: u32,
+    scratch_base: u32,
+) {
+    let mem = |memory: u32, align: u32| wasm_encoder::MemArg {
+        offset: 0,
+        align,
+        target: wasm_encoder::MemArgTarget::Memory(memory),
+        ordering: None,
+    };
+    body.instruction(&Instruction::LocalGet(len_local));
+    body.instruction(&Instruction::I32Const(UTF16_TAG));
+    body.instruction(&Instruction::I32And);
+    body.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+    {
+        body.instruction(&Instruction::LocalGet(len_local));
+        body.instruction(&Instruction::I32Const(!UTF16_TAG));
+        body.instruction(&Instruction::I32And);
+        body.instruction(&Instruction::LocalSet(len_local));
+        emit_utf16_to_latin1_transcode_param(
+            body,
+            realloc_func,
+            2,
+            mem(src_memory, 1),
+            mem(dst_memory, 0),
+            mem(dst_memory, 1),
+            ptr_local,
+            len_local,
+            out_ptr_local,
+            scratch_base,
+            scratch_base + 1,
+            scratch_base + 2,
+            scratch_base + 3,
+            scratch_base + 4,
+            scratch_base + 5,
+        );
+    }
+    body.instruction(&Instruction::Else);
+    {
+        body.instruction(&Instruction::I32Const(0));
+        body.instruction(&Instruction::I32Const(0));
+        body.instruction(&Instruction::I32Const(2));
+        body.instruction(&Instruction::LocalGet(len_local));
+        emit_checked_realloc(body, realloc_func, out_ptr_local);
+        body.instruction(&Instruction::LocalGet(out_ptr_local));
+        body.instruction(&Instruction::LocalGet(ptr_local));
+        body.instruction(&Instruction::LocalGet(len_local));
+        body.instruction(&Instruction::MemoryCopy {
+            src_mem: src_memory,
+            dst_mem: dst_memory,
+        });
+        body.instruction(&Instruction::LocalGet(out_ptr_local));
+        body.instruction(&Instruction::LocalSet(ptr_local));
+    }
+    body.instruction(&Instruction::End);
+}
+
 /// Emit a UTF-16 → `latin1+utf16` (CompactUTF16) transcode of a single
 /// top-level `(ptr, len)` string param on the async-lift cross-memory copy path
 /// (#272 inc 4b).
@@ -5353,6 +5470,85 @@ impl FactStyleGenerator {
         )?;
         let class = plan.class;
 
+        // #582: latin1+utf16 on both sides with a string is planned as a
+        // same-encoding copy, which skips the deflation the Canonical ABI
+        // requires. The one shape with an emitter for it is a single string
+        // result through the retptr (the composed transcoding adapter, whose
+        // copy step and writeback now deflate). Every other shape is refused,
+        // because it would validate and hand the callee the wrong
+        // representation.
+        if class == AdapterClass::MemoryCopy && is_compact_utf16_both_sides_with_strings(site) {
+            let target_func = self.resolve_target_function(site, merged)?;
+            let callee_type_idx = merged
+                .defined_func(target_func)
+                .map(|f| f.type_idx)
+                .unwrap_or(0);
+            let routable = matches!(
+                site.requirements.result_wit_types.as_slice(),
+                [crate::parser::ComponentValType::String]
+            ) && site.requirements.param_wit_types.iter().all(|t| {
+                matches!(t, crate::parser::ComponentValType::String) || !wit_may_contain_string(t)
+            });
+            let caller_type_idx = self.retptr_caller_type(site, merged, callee_type_idx);
+            // The flat memory-copy path deflates top-level string PARAMS
+            // (its param loop). It is enough when no result carries a string,
+            // no param string is nested, and params are not spilled to a
+            // params area (a different emitter).
+            let flat_ok = caller_type_idx.is_none()
+                && site.requirements.params_area_byte_size.is_none()
+                && !site
+                    .requirements
+                    .result_wit_types
+                    .iter()
+                    .any(wit_may_contain_string)
+                && site.requirements.param_wit_types.iter().all(|t| {
+                    matches!(t, crate::parser::ComponentValType::String)
+                        || !wit_may_contain_string(t)
+                })
+                && site.requirements.param_wit_types.len()
+                    >= site.requirements.pointer_pair_positions.len();
+            let (type_idx, body) = match (routable, caller_type_idx) {
+                _ if flat_ok => {
+                    self.generate_memory_copy_adapter(site, merged, &options, resource_rep_imports)?
+                }
+                (true, Some(caller_type_idx)) => self.generate_transcoding_retptr_adapter(
+                    site,
+                    merged,
+                    &options,
+                    target_func,
+                    callee_type_idx,
+                    caller_type_idx,
+                )?,
+                _ => {
+                    return Err(crate::Error::AdapterGeneration(format!(
+                        "#582: the call to '{}' ({}) passes strings between two latin1+utf16 \
+                         components in different memories. The Canonical ABI deflates a \
+                         utf16-tagged string that fits latin1, and meld implements that only \
+                         for a single string result through the retptr. Refusing rather than \
+                         copying the bytes unchanged, which would give the callee the wrong \
+                         representation.",
+                        site.export_name, site.import_module
+                    )));
+                }
+            };
+            return Ok(AdapterFunction {
+                name,
+                type_idx,
+                body,
+                source_component: site.from_component,
+                source_module: site.from_module,
+                target_component: site.to_component,
+                target_module: site.to_module,
+                target_function: target_func,
+                class: if flat_ok {
+                    AdapterClass::MemoryCopy
+                } else {
+                    AdapterClass::Transcode
+                },
+                inline_target: None,
+            });
+        }
+
         // Generate the adapter function body for the resolved class.
         let (type_idx, body) = match class {
             AdapterClass::Transcode => self.generate_transcoding_adapter(site, merged, &options)?,
@@ -6619,6 +6815,17 @@ impl FactStyleGenerator {
         if own_result_scratch_count > 0 {
             local_decls.push((own_result_scratch_count as u32, wasm_encoder::ValType::I32));
         }
+        // #582: 6 scratch locals, last, for the latin1+utf16 deflating copy of
+        // a string param (`emit_compact_utf16_to_compact_utf16_copy_param`).
+        let deflate_params = is_compact_utf16_both_sides_with_strings(site);
+        // From the locals actually declared so far, not from the other bases:
+        // `own_result_scratch_base` counts the result-save slots even when
+        // `needs_result_save` is false and none were declared.
+        let deflate_scratch_base =
+            param_count as u32 + local_decls.iter().map(|(n, _)| *n).sum::<u32>();
+        if deflate_params {
+            local_decls.push((6, wasm_encoder::ValType::I32));
+        }
 
         let mut func = Function::new(local_decls);
 
@@ -6678,6 +6885,30 @@ impl FactStyleGenerator {
                 let is_compact_utf16 =
                     options.caller_string_encoding == StringEncoding::Latin1 && byte_mult == 1;
                 let realloc_align = if is_compact_utf16 { 2 } else { 1 };
+
+                // #582: a latin1+utf16 string into a latin1+utf16 callee is
+                // deflated when tagged utf16 and latin1-representable. The
+                // helper leaves the copy in `dest_local` and the (possibly
+                // re-tagged) length in `len_pos`, which is what is forwarded.
+                if deflate_params
+                    && byte_mult == 1
+                    && matches!(
+                        site.requirements.param_wit_types.get(pair_idx),
+                        Some(crate::parser::ComponentValType::String)
+                    )
+                {
+                    emit_compact_utf16_to_compact_utf16_copy_param(
+                        &mut func,
+                        callee_realloc,
+                        options.caller_memory,
+                        options.callee_memory,
+                        ptr_pos,
+                        len_pos,
+                        dest_local,
+                        deflate_scratch_base,
+                    );
+                    continue;
+                }
 
                 // Allocate: dest = cabi_realloc(0, 0, align, <byte count>)
                 emit_overflow_guard(&mut func, len_pos, byte_mult);
@@ -11455,6 +11686,31 @@ impl FactStyleGenerator {
             // is either handled by the raw-copy path below or rejected by
             // `guard_async_cross_encoding_strings`. The guard is narrowed in
             // lockstep so ONLY this combo reaches this branch.
+            // #582: latin1+utf16 on both sides is not a byte copy for a
+            // string: a utf16-tagged source that fits latin1 is deflated.
+            let copy_compact_to_compact = is_top_level_string
+                && matches!(
+                    site.requirements.caller_encoding,
+                    Some(crate::parser::CanonStringEncoding::CompactUtf16)
+                )
+                && matches!(
+                    site.requirements.callee_encoding,
+                    Some(crate::parser::CanonStringEncoding::CompactUtf16)
+                );
+            if copy_compact_to_compact {
+                emit_compact_utf16_to_compact_utf16_copy_param(
+                    body,
+                    realloc,
+                    caller_memory,
+                    callee_memory,
+                    ptr_local,
+                    len_local,
+                    l_new_ptr,
+                    transcode_base,
+                );
+                continue;
+            }
+
             let transcode_utf8_to_utf16 = is_top_level_string
                 && matches!(
                     site.requirements.caller_encoding,
@@ -12053,7 +12309,24 @@ impl FactStyleGenerator {
                 Some(crate::parser::CanonStringEncoding::Utf16)
             );
 
-        if result_transcode_utf8_to_utf16 {
+        // #582: latin1+utf16 on both sides: deflate a utf16-tagged result
+        // that fits latin1 (see `emit_compact_utf16_to_compact_utf16_copy_param`).
+        let result_copy_compact_to_compact = top_level_byte_string
+            && callee_is_latin1
+            && caller_is_latin1
+            && matches!(result_type, Some(crate::parser::ComponentValType::String));
+        if result_copy_compact_to_compact {
+            emit_compact_utf16_to_compact_utf16_copy_param(
+                body,
+                caller_realloc_func,
+                callee_memory,
+                caller_memory,
+                l_src_ptr,
+                l_src_len,
+                l_dst_ptr,
+                transcode_base,
+            );
+        } else if result_transcode_utf8_to_utf16 {
             // SOURCE = callee memory (UTF-8 bytes), DEST = caller memory
             // (UTF-16 code units). Realloc worst case 2*len bytes (each UTF-8
             // byte → ≤ 1 UTF-16 code unit) — handled by the loop fn (align 2,
@@ -13289,6 +13562,17 @@ impl AdapterGenerator for FactStyleGenerator {
                 // Full async transcoding is the tracked #272 capability; until
                 // then we FAIL LOUD rather than emit a silently-corrupting copy.
                 Self::guard_async_cross_encoding_strings(site)?;
+                // #582: the async copy step and writeback now deflate a
+                // latin1+utf16 string, but no async oracle covers that yet, so
+                // refuse until one does rather than claim it.
+                if is_compact_utf16_both_sides_with_strings(site) {
+                    return Err(crate::Error::AdapterGeneration(format!(
+                        "#582: the async call to '{}' ({}) passes strings between two \
+                         latin1+utf16 components in different memories; meld does not yet \
+                         verify the required deflation on the async path.",
+                        site.export_name, site.import_module
+                    )));
+                }
                 let adapter = if self.has_callback_export(site, merged) {
                     self.generate_async_callback_adapter(site, merged)?
                 } else {
