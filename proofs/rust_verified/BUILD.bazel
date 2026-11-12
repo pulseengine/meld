@@ -38,7 +38,7 @@ rocq_proof_test(
 )
 
 # Merger core: offset computation and memory layout logic
-# Source: meld-core/src/merger.rs (simplified extract)
+# Source: meld-core/src/merger/{merge_core,memory}.rs (simplified extract; pinned in extract-pins.tsv)
 # Spec: proofs/transformations/merge/{merge_defs,merge_layout,merge_remap,merge_correctness}.v
 
 coq_of_rust_library(
@@ -67,7 +67,7 @@ rocq_proof_test(
 )
 
 # Resolver core: index decomposition and function index map
-# Source: meld-core/src/merger.rs (decompose_component_core_func_index, build_function_index_map)
+# Source: meld-core/src/merger/{index_maps,merge_core,mod}.rs (pinned in extract-pins.tsv)
 # Spec: proofs/transformations/merge/{merge_defs,merge_remap}.v
 
 coq_of_rust_library(
