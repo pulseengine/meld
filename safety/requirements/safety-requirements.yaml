@@ -3816,6 +3816,23 @@ artifacts:
       timestamp: 2026-10-28T13:54:56Z
     release: v0.66.0
 
+  - id: SR-111
+    type: sw-req
+    title: An async call between components that meld cannot fuse is refused at fuse time, and nothing meld leaves to the host carries a wrong or internal name
+    status: implemented
+    description: "A 504-component P3 corpus (#548) showed 26 natural caller/callee pairs fusing at exit 0 with zero fused calls between components: each caller lowers with the async option ([async-lower]f), meld only bridges a sync caller to an [async-lift] callee, and the call was left to the host. kiln refuses such a module at load (E21A0, 65 unresolved imports on the fused ping-pong pair). The design for fusing these calls is ADR-10 (meld data plane, kiln-async control, gale wake/time/isolation). Until its adapters land, the maintainer decided (2026-11-04, recorded in ADR-10 and kiln AD-ASYNC-001) that meld refuses at fuse time instead of exiting 0. meld shall: (1) refuse a fusion in which a core import [async-lower]f of one component resolves to an export f (plain or [async-lift]) of another fused component, with an error naming both components, the callee export and the caller import and citing #548 and ADR-10; (2) emit an async lowering that it leaves to the host under the producer's field name [async-lower]f, never the bare f, which a host would bind with the sync convention (#557); (3) refuse a core import wired to stream.read, stream.write, future.read or future.write through wit-component's indirect-call shim, for which meld has no producer name, instead of emitting the shim-internal name (actual::N), which no host can serve, naming the built-in and citing #558 (streams and futures pass through in ADR-10 step 6); such an import that the module already carries under its producer name passes through unchanged."
+    links:
+      - type: derives-from
+        target: SYS-3
+      - type: refines
+        target: SR-109
+    provenance:
+      created-by: ai-assisted
+      reviewed-by: avrabe
+      model: claude-opus-5-5
+      timestamp: 2026-11-04T23:30:00Z
+    release: v0.68.0
+
   - id: SR-110
     type: sw-req
     title: P3 cooperative threads pass through to the host in the producer ABI, with the identity of the start-function table
@@ -3865,6 +3882,22 @@ artifacts:
       timestamp: 2026-11-03T21:25:52Z
     release: v0.67.0
 
+  - id: SR-112
+    type: sw-req
+    title: An async lowering is recognised by its async option, not by its core import name, and a world-level async import is never left to the host under a sync name
+    status: implemented
+    release: v0.68.0
+    description: "SR-111 item 1 recognised a #548 edge only when the caller's core import field carried wit-component's [async-lower] prefix. The wasmtime and component-model test-suite producers, and hand-written WAT, name the core import without it (for example \"\" \"f\"), and a component nested in a composition reaches its sibling through flattening rather than through the per-function matcher. On the 504-component P3 corpus, 23 inputs that SR-111 let through were such edges: an async-lowered call wired directly to a sibling's [async-lift] export with no async adapter (--explain: N direct or memory-copy boundaries, 0 async-lift), at exit 0, identical on v0.67.0, so the caller received the callee's callback code as its status. Separately, an async lowering of a world-level func import that meld leaves to the host was emitted as (import \"f\" \"\") with the async core type, which a host binds as a sync call (#560). meld shall: (1) decide whether a core import is an async lowering from the canon lower it traces to (its async option), whatever the import's field name; (2) refuse a fusion in which such an import is wired to another fused component (an adapter site), or whose world-level component import is satisfied by another fused component, with an error naming both components and citing #548 and ADR-10; (3) refuse an async lowering of a world-level func import that is left to the host, naming the import and citing #560, until the host-side name is settled under ADR-10."
+    links:
+      - type: derives-from
+        target: SYS-3
+      - type: refines
+        target: SR-111
+    provenance:
+      created-by: ai-assisted
+      reviewed-by: avrabe
+      model: claude-opus-5-5
+      timestamp: 2026-11-05T06:00:57Z
   - id: SR-113
     type: sw-req
     title: "Every component in the pinned upstream Component Model reference suite has a recorded, ratcheted fusion outcome"
