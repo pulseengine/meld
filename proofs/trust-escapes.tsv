@@ -1,0 +1,4 @@
+# Every trust escape in meld's proofs: path<TAB>kind<TAB>name.
+# Checked by meld-core/tests/proof_trust_ledger.rs, which must find exactly
+# these. Rocq: Admitted, Axiom, Parameter, Conjecture. Verus: external_body,
+# external, assume, admit, assume_specification. Empty today.
