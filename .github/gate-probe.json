@@ -1,0 +1,25 @@
+{
+  "version": 1,
+  "detectors": [
+    {
+      "command": [
+        "scripts/ci/gate_detect.py"
+      ],
+      "outputs": [
+        "ci"
+      ],
+      "controls": [
+        "safety/gate-probe-control.rs",
+        "meld-cli/docs/gate-probe-control.md",
+        "scripts/mythos/gate-probe-control.py"
+      ],
+      "negative_controls": [
+        "README.md",
+        "safety/requirements/gate-probe-negative-control.yaml"
+      ],
+      "exempt_outputs": {
+        "proofs": "Rocq proofs (proofs.yml) checks proofs/** and the bazel files, which are all of its inputs. The proofs' link to meld-core is the extract pins (SR-119, #580): meld-core/tests/proof_extract_pins_580.rs fails in Test, which fails closed, when a function an extract models changes (owner decision 2026-11-11)."
+      }
+    }
+  ]
+}

@@ -43,7 +43,7 @@ jobs:
       CARGO_TERM_COLOR: always
       CARGO_INCREMENTAL: 0
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
 
@@ -122,7 +122,12 @@ jobs:
       # release either way; this makes it block earlier and more cheaply.
       - name: Shipped dependencies carry no known advisory
         run: |
-          cargo install --locked cargo-deny || true
+          # #571: no `|| true`. `cargo install` exits 0 when the binary is
+          # already current, so this fails only when the install itself fails,
+          # instead of falling back silently to a stale binary.
+          # (0.16.4 could not parse CVSS 4.0 advisories.)
+          cargo install --locked cargo-deny
+          cargo deny --version
           cargo deny check advisories
 
       - name: Verification matrix is up to date
@@ -140,7 +145,7 @@ jobs:
 
       - name: Upload results artifact
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: verification-results
           path: verification-results.json

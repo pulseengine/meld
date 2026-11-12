@@ -18,6 +18,7 @@ bazel-*
 # and #461's regression test reproduces a memory-aliasing bug that only these
 # exact inputs trigger. A rule beats remembering a flag.
 !meld-core/tests/fixtures/**/*.wasm
+!meld-core/tests/fixtures/**/*.wat
 # P3 corpus regression fixtures (#545): tracked, or their tests run on nothing.
 !tests/p3/**/*.wasm
 

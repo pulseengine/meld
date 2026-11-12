@@ -1,0 +1,62 @@
+(component
+  (component $C
+    (core module $M
+      (memory (export "mem") 1)
+      (global $next (mut i32) (i32.const 1024))
+      (func (export "realloc") (param i32 i32 i32 i32) (result i32)
+        (local $r i32)
+        (global.set $next (i32.and (i32.add (global.get $next) (i32.const 7)) (i32.const -8)))
+        (local.set $r (global.get $next))
+        (global.set $next (i32.add (global.get $next) (local.get 3)))
+        (local.get $r))
+      (data (i32.const 64) "ok")
+      ;; expect list<u8> [FF 00 41] verbatim, len 3
+      (func (export "take") (param $ptr i32) (param $len i32) (result i32)
+        (if (i32.ne (local.get $len) (i32.const 3)) (then unreachable))
+        (if (i32.ne (i32.load8_u (local.get $ptr)) (i32.const 0xFF)) (then unreachable))
+        (if (i32.ne (i32.load8_u offset=1 (local.get $ptr)) (i32.const 0x00)) (then unreachable))
+        (if (i32.ne (i32.load8_u offset=2 (local.get $ptr)) (i32.const 0x41)) (then unreachable))
+        (i32.store (i32.const 0) (i32.const 64))
+        (i32.store (i32.const 4) (i32.const 2))
+        (i32.const 0))
+    )
+    (core instance $m (instantiate $M))
+    (func (export "take") (param "b" (list u8)) (result string)
+      (canon lift (core func $m "take") string-encoding=utf8
+        (memory (core memory $m "mem")) (realloc (core func $m "realloc"))))
+  )
+  (component $D
+    (import "take" (func $take (param "b" (list u8)) (result string)))
+    (core module $Libc
+      (memory (export "mem") 1)
+      (global $next (mut i32) (i32.const 1024))
+      (func (export "realloc") (param i32 i32 i32 i32) (result i32)
+        (local $r i32)
+        (global.set $next (i32.and (i32.add (global.get $next) (i32.const 7)) (i32.const -8)))
+        (local.set $r (global.get $next))
+        (global.set $next (i32.add (global.get $next) (local.get 3)))
+        (local.get $r)))
+    (core instance $libc (instantiate $Libc))
+    (core func $take' (canon lower (func $take) string-encoding=utf16
+      (memory (core memory $libc "mem")) (realloc (core func $libc "realloc"))))
+    (core module $Main
+      (import "" "mem" (memory 1))
+      (import "" "take" (func $take (param i32 i32 i32)))
+      (data (i32.const 16) "\ff\00\41")
+      (func (export "run") (result i32)
+        (local $p i32)
+        (call $take (i32.const 16) (i32.const 3) (i32.const 8))
+        ;; expect "ok" as utf16: 2 code units 006F 006B
+        (if (i32.ne (i32.load (i32.const 12)) (i32.const 2)) (then unreachable))
+        (local.set $p (i32.load (i32.const 8)))
+        (if (i32.ne (i32.load (local.get $p)) (i32.const 0x006B006F)) (then unreachable))
+        (i32.const 7))
+    )
+    (core instance $main (instantiate $Main
+      (with "" (instance (export "mem" (memory $libc "mem")) (export "take" (func $take'))))))
+    (func (export "run") (result u32) (canon lift (core func $main "run")))
+  )
+  (instance $c (instantiate $C))
+  (instance $d (instantiate $D (with "take" (func $c "take"))))
+  (export "run" (func $d "run"))
+)

@@ -6,6 +6,14 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- The attestation names the varve toolchain layer meld ran from (SR-116).
+  - Under a varve shim, the `tool` object gains `toolchain` (`VARVE_LAYER`) and `toolchain_manifest_digest` (`VARVE_LAYER_MANIFEST_DIGEST`). These are the same field names wsc-attestation 0.12 uses.
+  - Outside varve, or when the values are empty, the keys are absent.
+  - Under `--reproducible` they are always absent, so the output bytes don't depend on the environment.
+- The reference-suite assertions now run on the fused output (SR-118).
+  - The ratchet replays each WAST command in order on wasmtime and compares the outcome with `tests/spec/component-model-exec-baseline.tsv`.
+  - Covered: scalar values, on exports the fused core module keeps.
+  - On main it records 25 passes, 15 missing validation traps (#586), and the #582 trap.
 - The upstream Component Model reference tests are now a fusion oracle (#562, SR-113).
   - `tests/spec/component-model/` vendors upstream `test/` at c818a1925e (78 WASTs), with its licence and a SHA-256 list. `MODULE.bazel` pins the same commit; it was deb0b0ac35, which predates the async and re-entrance tests.
   - `meld-core/tests/cm_wast_ratchet.rs` fuses each of the 859 components on its own and compares the outcome with `tests/spec/component-model-fuse-baseline.tsv`. A difference in either direction fails the test.
@@ -14,7 +22,47 @@ All notable changes to this project will be documented in this file.
 - The baseline records 13 components that meld fuses into invalid output: 10 under #545, 3 under #492. The CLI's default validation refuses all 13 (exit 1).
 
 ### Changed
+- **P3 async calls meld cannot fuse are refused at fuse time instead of exiting
+  0 (SR-111, ADR-10, #548, #557, #558).** Maintainer decision until the ADR-10
+  adapters land:
+  - **#548:** a caller that lowers with the async option (`[async-lower]f`)
+    and whose callee is another fused component is refused. The error names
+    the caller import, the callee export, #548 and ADR-10.
+  - **#557:** an async lowering left to the host keeps the producer's
+    `[async-lower]` prefix. v0.67.0 emitted it as plain `f` with the async core
+    type, so a host would bind it as a sync call.
+  - **#558:** `stream.read`/`write` and `future.read`/`write` reached through
+    wit-component's shim, which meld cannot name, are refused, naming the
+    built-in. v0.67.0 emitted them under the shim-internal `actual::N`, which
+    no host serves. Ones the module imports under their producer name still
+    pass through.
 
+  Corpus effect (`--memory multi`, against the v0.67.0 release):
+  - of 906 single-component inputs, 506 fuse byte-identically;
+  - 28 change only in import names (the `[async-lower]` prefix);
+  - 157 are newly refused, all citing #558.
+
+  - **#548, by the async option (SR-112).** An async lowering is recognised
+    from its `canon lower` options, not from the `[async-lower]` text in the
+    core import name. The wasmtime and component-model test producers name
+    the import plainly, and 23 corpus inputs had such an edge wired straight to
+    a sibling's `[async-lift]` export at exit 0 (also on v0.67.0). They are now
+    refused, citing #548.
+  - **#560:** an async lowering of a world-level func import that would be left
+    to the host as `(import "f" "")` with the async core type is refused, until
+    its host-side name is settled under ADR-10.
+
+  Every P3 caller/callee pair in the corpus is now refused (43), and all 42
+  non-P3 pairs fuse byte-identically. kiln already refused all of these modules
+  at load (E21A0). The #545 validation tests now use `reentrance-m6.wasm`,
+  because `empty-wait.wasm` is refused before validation runs.
+
+  In the reference-suite baseline (SR-113), 10 async rows now refuse citing #548:
+  - 4 that fused: `cross-abi-calls` 0, `deadlock` 0, `dtor-context-is-zero` 2 and `sync-streams` 0;
+  - 3 that fused into invalid output (`partial-stream-copies` 0, `reentrance` 13 and 15), which leaves 10 such rows;
+  - 3 refusals that cited #390.
+
+- `--reproducible` is now byte-reproducible in builds with meld-core's optional `attestation` (wsc) feature. Release builds don't use this feature. Before, the attestation's parameters were written in per-process hash order, so the output differed on every run.
 - The fuzz smoke job fails on a crash (#562). Before, it was `continue-on-error`. Only the #168 runner build flake is excused, matched by its exact log signature.
 - The library refuses its own invalid output, as the CLI already did (#545, SR-114).
   - Before, `Fuser::fuse` and `Fuser::fuse_with_stats` returned output that fails validation as `Ok`.
