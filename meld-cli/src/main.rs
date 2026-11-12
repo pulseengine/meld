@@ -748,6 +748,10 @@ fn fuse_command(
         domains,
         export_policy,
         memory_page_size,
+        // #545: validation runs inside the library, so the CLI's decision
+        // (on by default, `--validate` forces, `--no-validate` opts out) is
+        // handed to it here instead of being re-implemented after the fuse.
+        validate_output: validate || validation_is_implied(&memory_strategy, no_validate),
         ..Default::default()
     };
 
@@ -823,9 +827,9 @@ fn fuse_command(
         } else {
             println!("Validating output...");
         }
-        // Before the write: a module that fails here must not become a file
-        // somebody can pick up.
-        validate_wasm(&fused_bytes, memory_page_size == MemoryPageSize::Byte)?;
+        // #545: the check itself ran inside `fuse_with_stats` (core's
+        // `validate_output`, the one predicate), before any bytes reached
+        // this point, so an invalid module never becomes a file.
         println!("  Validation passed");
     }
 
@@ -1337,26 +1341,6 @@ fn classify_import(module: &str, name: &str) -> &'static str {
         return "wasi";
     }
     "function"
-}
-
-/// Validate WASM bytes (supports both core modules and components)
-fn validate_wasm(bytes: &[u8], custom_page_sizes: bool) -> Result<()> {
-    use wasmparser::Validator;
-
-    let mut features = meld_core::parser::baseline_wasm_features()
-        | wasmparser::WasmFeatures::COMPONENT_MODEL
-        | wasmparser::WasmFeatures::MULTI_MEMORY
-        | wasmparser::WasmFeatures::CM_ASYNC
-        | wasmparser::WasmFeatures::CM_FIXED_LENGTH_LISTS;
-    // SR-107 / #530: scoped to the output of a fuse that asked for byte pages,
-    // so nothing else gains acceptance for a proposal meld does not handle.
-    if custom_page_sizes {
-        features |= wasmparser::WasmFeatures::CUSTOM_PAGE_SIZES;
-    }
-
-    let mut validator = Validator::new_with_features(features);
-    validator.validate_all(bytes).context("Validation failed")?;
-    Ok(())
 }
 
 #[cfg(test)]

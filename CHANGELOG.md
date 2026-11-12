@@ -64,6 +64,12 @@ All notable changes to this project will be documented in this file.
 
 - `--reproducible` is now byte-reproducible in builds with meld-core's optional `attestation` (wsc) feature. Release builds don't use this feature. Before, the attestation's parameters were written in per-process hash order, so the output differed on every run.
 - The fuzz smoke job fails on a crash (#562). Before, it was `continue-on-error`. Only the #168 runner build flake is excused, matched by its exact log signature.
+- The library refuses its own invalid output, as the CLI already did (#545, SR-114).
+  - Before, `Fuser::fuse` and `Fuser::fuse_with_stats` returned output that fails validation as `Ok`.
+  - Now they return `Error::InvalidOutput`. Set `FuserConfig::validate_output = false` (the CLI's `--no-validate`) to get the bytes unchecked.
+  - `meld_core::validate_output` is the one validation predicate, and the CLI uses it rather than keeping its own copy.
+  - In the reference-suite baseline the 13 rows above are now `meld-invalid`, and `fused-invalid` is 0.
+  - The adapter defects behind them are still open on #545 and #492.
 
 ## [0.67.0] - 2026-11-04
 

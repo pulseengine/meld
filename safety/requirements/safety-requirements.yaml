@@ -3960,3 +3960,19 @@ artifacts:
       reviewed-by: avrabe
       model: claude-opus-5-5
       timestamp: 2026-11-11T05:59:16Z
+  - id: SR-114
+    type: sw-req
+    title: "The library API refuses its own invalid output, not just the CLI"
+    status: implemented
+    description: "SR-109 made the meld CLI validate every fused output by default. The library API did not: Fuser::fuse and Fuser::fuse_with_stats returned bytes that fail validation as Ok, so any embedder (a build rule, kiln's runner, a test harness) received an invalid module as success. The #562 reference-suite ratchet showed 13 such components (10 async and transcoding adapter stack defects, #545; 3 duplicate exports, #492). meld shall validate the fused output inside Fuser::fuse_with_stats, on every path including auto's shared-to-multi retry, and return Error::InvalidOutput rather than the bytes, by default (FuserConfig::validate_output = true). There shall be one validation predicate, meld_core::validate_output, used by both the library and the CLI, so they cannot drift. --no-validate (validate_output = false) remains the explicit opt-out. validate_output is not an attested build parameter: validation never changes the bytes, and validity can be re-checked from the artifact alone. Fixing the adapter defects themselves is out of scope here and stays on #545 and #492."
+    links:
+      - type: derives-from
+        target: SYS-3
+      - type: refines
+        target: SR-109
+    provenance:
+      created-by: ai-assisted
+      model: claude-opus-5-5
+      timestamp: 2026-11-08T07:44:03Z
+      reviewed-by: avrabe
+    release: v0.68.0

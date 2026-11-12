@@ -11,8 +11,15 @@
 //! * `fused`: meld fuses it and the output validates.
 //! * `refused`: meld refuses it, loudly. The detail is the issues the error
 //!   cites, so a change in the reason for a refusal is also a diff.
+//! * `meld-invalid`: meld built output that fails validation and refused
+//!   to return it (#545, `Error::InvalidOutput`). Loud, so never shipped,
+//!   but still a meld bug, kept apart from `refused` so the count of
+//!   adapter defects stays visible. Fixing one moves its row to `fused`.
 //! * `fused-invalid`, `panic`: bugs. They are listed with their reason so
-//!   the baseline makes them visible; they are never "fine".
+//!   the baseline makes them visible; they are never "fine". Since #545
+//!   `fused-invalid` means the library's own validation let invalid output
+//!   through (this test re-validates with every feature enabled), so it
+//!   should stay at zero.
 //! * For components inside `assert_invalid` / `assert_malformed`:
 //!   `invalid-refused` (meld rejects it, as it must), `invalid-fused` (a
 //!   bug: meld accepted an invalid component), or `invalid-unencodable`
@@ -221,8 +228,13 @@ fn fuse_alone(bytes: &[u8]) -> (&'static str, String, Option<Vec<u8>>) {
             attestation: false,
             ..Default::default()
         });
-        fuser.add_component(&bytes).map_err(|e| e.to_string())?;
-        fuser.fuse().map_err(|e| e.to_string())
+        fuser
+            .add_component(&bytes)
+            .map_err(|e| (false, e.to_string()))?;
+        fuser.fuse().map_err(|e| match e {
+            meld_core::Error::InvalidOutput(msg) => (true, msg),
+            e => (false, e.to_string()),
+        })
     });
     match run {
         Err(p) => {
@@ -233,7 +245,8 @@ fn fuse_alone(bytes: &[u8]) -> (&'static str, String, Option<Vec<u8>>) {
                 .unwrap_or_default();
             ("panic", reason(&msg), None)
         }
-        Ok(Err(e)) => ("refused", reason(&e), None),
+        Ok(Err((true, e))) => ("meld-invalid", reason(&e), None),
+        Ok(Err((false, e))) => ("refused", reason(&e), None),
         Ok(Ok(out)) => {
             let mut v = wasmparser::Validator::new_with_features(wasmparser::WasmFeatures::all());
             match v.validate_all(&out) {

@@ -275,6 +275,38 @@ pub struct FuserConfig {
     /// `--share-stack`) is in effect, with an imported memory, and with
     /// `--component`.
     pub memory_page_size: MemoryPageSize,
+
+    /// Validate the fused output before returning it (#545). Default `true`:
+    /// [`Fuser::fuse`] and [`Fuser::fuse_with_stats`] return
+    /// [`Error::InvalidOutput`] instead of bytes that fail validation, so a
+    /// library caller gets the same refusal the CLI gives. `false` is the
+    /// CLI's `--no-validate`: the bytes come back unchecked.
+    pub validate_output: bool,
+}
+
+/// Validate fused output bytes, core module or component (#545).
+///
+/// The one predicate for "would a runtime accept what meld emitted": the
+/// library calls it at the end of [`Fuser::fuse_with_stats`] and the CLI's
+/// `--validate` relies on that rather than keeping its own copy. The feature
+/// set is meld's input baseline plus what fusion itself introduces: the
+/// component model, multi-memory, CM async and fixed-length lists, and the
+/// custom-page-sizes proposal only when the fuse asked for byte pages
+/// (SR-107 / #530), so nothing else gains acceptance for a proposal meld does
+/// not handle.
+pub fn validate_output(bytes: &[u8], custom_page_sizes: bool) -> Result<()> {
+    let mut features = crate::parser::baseline_wasm_features()
+        | wasmparser::WasmFeatures::COMPONENT_MODEL
+        | wasmparser::WasmFeatures::MULTI_MEMORY
+        | wasmparser::WasmFeatures::CM_ASYNC
+        | wasmparser::WasmFeatures::CM_FIXED_LENGTH_LISTS;
+    if custom_page_sizes {
+        features |= wasmparser::WasmFeatures::CUSTOM_PAGE_SIZES;
+    }
+    wasmparser::Validator::new_with_features(features)
+        .validate_all(bytes)
+        .map(|_| ())
+        .map_err(|e| Error::InvalidOutput(e.to_string()))
 }
 
 /// Page size a fused memory is declared with (SR-107 / #530).
@@ -349,6 +381,7 @@ impl Default for FuserConfig {
             opaque_resources: Vec::new(),
             export_policy: ExportPolicy::All,
             memory_page_size: MemoryPageSize::Page,
+            validate_output: true,
         }
     }
 }
@@ -1019,6 +1052,17 @@ impl Fuser {
     /// in place, to a concrete strategy before the pipeline runs (#172) —
     /// every later read of `self.config` then sees the resolved values.
     pub fn fuse_with_stats(&mut self) -> Result<(Vec<u8>, FusionStats)> {
+        let (bytes, stats) = self.fuse_with_stats_unvalidated()?;
+        // #545: every path above (auto's shared->multi retry included) ends
+        // here, so this is the one place the library refuses its own invalid
+        // output. Checked against the FINAL bytes, attestation section and all.
+        if self.config.validate_output {
+            validate_output(&bytes, self.config.memory_page_size == MemoryPageSize::Byte)?;
+        }
+        Ok((bytes, stats))
+    }
+
+    fn fuse_with_stats_unvalidated(&mut self) -> Result<(Vec<u8>, FusionStats)> {
         if self.components.is_empty() {
             return Err(Error::NoComponents);
         }
@@ -3410,6 +3454,12 @@ impl Fuser {
             // load it. Recorded only when not the default (byte-identical
             // default records), in the wsc build too.
             memory_page_size,
+            // #545: NOT a build parameter. Validation never changes the bytes:
+            // with it on, the artifact either exists and is valid or does not
+            // exist; with it off, a valid artifact is byte-identical. And
+            // validity is a decidable property of the artifact itself, which
+            // any reader can re-check, unlike the choices recorded above.
+            validate_output: _,
         } = &self.config;
 
         attestation::FusionParameters {
@@ -3498,6 +3548,8 @@ fn wsc_recorded_optionals(config: &FuserConfig) -> (Option<&'static str>, Option
         export_policy,
         // SR-107 / #530.
         memory_page_size,
+        // #545: not a build parameter (see `attestation_parameters`).
+        validate_output: _,
     } = config;
     (
         (*export_policy != ExportPolicy::All).then(|| export_policy.as_str()),
