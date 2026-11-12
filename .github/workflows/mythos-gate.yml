@@ -1,7 +1,8 @@
 name: Mythos delta-pass gate
 
-# Blocks merge of PRs that touch Tier-5 source files until a Mythos
-# delta-pass has been recorded on the PR (label `mythos-pass-done`).
+# Blocks merge of PRs that touch Tier-5 source files until the current
+# head commit has a complete Mythos delta-pass with no findings, or a
+# maintainer override.
 #
 # Why this exists: LS-A-10 (CABI alignment padding in async-lift retptr
 # writeback) was found by the v0.8.0 pre-release Mythos pass on
@@ -9,11 +10,17 @@ name: Mythos delta-pass gate
 # since #128 (~6 releases). A PR-time gate would have caught it then
 # instead of at release time.
 #
-# This is a gate, not an automated scan: the actual Mythos pass is run
-# by a human applying scripts/mythos/discover.md against the touched
-# file(s), then attaching the finding (or "no findings") as a PR
-# comment and adding the `mythos-pass-done` label. The gate fails until
-# the label is present.
+# The pass itself runs in mythos-auto.yml, which records its verdict as
+# commit status `mythos/auto-verdict` on the head commit and re-runs this
+# job. The gate passes when that status is success (every touched Tier-5
+# file reviewed, NO FINDINGS), or when `mythos-pass-done` is applied: the
+# override for a finding or an incomplete run a maintainer has judged.
+# A push removes the label. Until #595 the label was the only way through,
+# was not tied to a commit, and a cancelled run could post "NO FINDINGS
+# across 0 files" for a maintainer to sign off on.
+#
+# The decision is scripts/ci/mythos_decide.py (`gate`), read from the
+# base commit and tested by its --self-test in Script portability.
 #
 # Tier-5 set tracks scripts/mythos/rank.md. Path globs encode the
 # rubric's "5 (fusion correctness)" tier in concrete repo paths. Drift
@@ -33,6 +40,10 @@ on:
 permissions:
   contents: read
   pull-requests: write
+  # Removing a stale `mythos-pass-done` on push goes through the issues API.
+  issues: write
+  # Reads commit status `mythos/auto-verdict`, written by mythos-auto.yml.
+  statuses: read
 
 jobs:
   gate:
@@ -98,20 +109,60 @@ jobs:
           echo "Tier-5 files touched:"
           printf '  - %s\n' "${touched[@]}"
 
-      - name: Check for mythos-pass-done label
-        id: label-check
+      # Live state, not the event payload: mythos-auto.yml re-runs this job
+      # when it posts a verdict, and a re-run replays the original payload
+      # (labels as they were then).
+      - name: Decide (auto verdict for this commit, or maintainer override)
+        id: decide
         if: steps.detect.outputs.tier5_touched == 'true'
         env:
-          LABELS: ${{ toJSON(github.event.pull_request.labels) }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          ACTION: ${{ github.event.action }}
+          ATTEMPT: ${{ github.run_attempt }}
         run: |
           set -euo pipefail
-          if printf '%s' "$LABELS" | grep -q '"mythos-pass-done"'; then
-            echo "has_label=true" >> "$GITHUB_OUTPUT"
-            echo "Label mythos-pass-done present — gate passes."
-          else
-            echo "has_label=false" >> "$GITHUB_OUTPUT"
-            echo "Label mythos-pass-done missing — gate will fail."
+          api="https://api.github.com"
+          auth="Authorization: Bearer ${GH_TOKEN}"
+          accept="Accept: application/vnd.github+json"
+
+          # The override is per commit: a push clears it, so the label always
+          # refers to the code it was given for. Only on the push itself
+          # (attempt 1), never on a re-run.
+          if [ "$ACTION" = "synchronize" ] && [ "$ATTEMPT" = "1" ]; then
+            code=$(curl -sS -o /dev/null -w '%{http_code}' -X DELETE -H "$auth" -H "$accept" \
+              "${api}/repos/${REPO}/issues/${PR_NUMBER}/labels/mythos-pass-done")
+            if [ "$code" = "200" ]; then
+              echo "::notice::removed mythos-pass-done: new commits since it was applied"
+            fi
           fi
+
+          labels=$(curl -fsS -H "$auth" -H "$accept" \
+            "${api}/repos/${REPO}/issues/${PR_NUMBER}/labels?per_page=100" | jq -c '[.[].name]')
+          # Statuses come newest first; the first with our context is current.
+          status=$(curl -fsS -H "$auth" -H "$accept" \
+            "${api}/repos/${REPO}/commits/${HEAD_SHA}/statuses?per_page=100" \
+            | jq -r '[.[] | select(.context == "mythos/auto-verdict")][0].state // ""')
+          echo "labels=${labels} mythos/auto-verdict=${status:-none} on ${HEAD_SHA}"
+
+          # The decision script comes from the base commit, so a PR cannot
+          # rewrite the rule it is judged by.
+          if ! git show "${BASE_SHA}:scripts/ci/mythos_decide.py" > "$RUNNER_TEMP/mythos_decide.py" 2>/dev/null; then
+            echo "::error::the PR's base commit has no scripts/ci/mythos_decide.py; update the branch from main"
+            exit 1
+          fi
+          set +e
+          out=$(python3 -I "$RUNNER_TEMP/mythos_decide.py" gate --tier5 true --labels "$labels" --status "$status")
+          rc=$?
+          set -e
+          echo "$out"
+          {
+            echo "pass=$([ $rc -eq 0 ] && echo true || echo false)"
+            echo "reason=$(printf '%s\n' "$out" | sed -n 2p)"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Post / refresh sticky comment
         if: steps.detect.outputs.tier5_touched == 'true'
@@ -119,42 +170,37 @@ jobs:
         with:
           header: mythos-gate
           message: |
-            ## Mythos delta-pass required
+            ## Mythos delta-pass gate
 
-            This PR modifies one or more Tier-5 source files (per
+            This PR modifies Tier-5 source files (per
             [`scripts/mythos/rank.md`](../blob/main/scripts/mythos/rank.md)):
 
             ```
             ${{ steps.detect.outputs.files }}
             ```
 
-            **Before merge**, run the Mythos discover protocol on the
-            modified Tier-5 files:
+            **Status:** ${{ steps.decide.outputs.pass == 'true' && '✅' || '⏳/❌' }} ${{ steps.decide.outputs.reason }}
 
-            1. Follow [`scripts/mythos/discover.md`](../blob/main/scripts/mythos/discover.md)
-               — one fresh agent session per touched Tier-5 file.
-            2. For each finding, the agent must produce **both** a Kani
-               harness and a failing PoC test (per the protocol's
-               "if you cannot produce both, do not report" rule).
-            3. Attach a comment on this PR with either the findings
-               (formatted per `discover.md`'s output schema) or
-               **NO FINDINGS**.
-            4. Add the `mythos-pass-done` label to this PR.
+            How the gate passes, for the current head commit only:
+            1. **Automatically**, when `mythos-auto` reviewed every touched
+               Tier-5 file at this commit and found nothing (commit status
+               `mythos/auto-verdict` = success). No label needed.
+            2. **By override**, when a maintainer has read a finding or an
+               incomplete run and applies `mythos-pass-done`. A new push
+               removes the label, so it always refers to the code it was
+               given for.
 
             **Why this gate exists:** [LS-A-10](../blob/main/safety/stpa/loss-scenarios.yaml)
-            (CABI alignment padding in async-lift retptr writeback) was
-            found by the v0.8.0 pre-release Mythos pass — but it had
-            lived in the callback emitter since #128, across six
-            releases. A PR-time gate would have caught it at review
-            time instead of at the release boundary.
+            (CABI alignment padding in async-lift retptr writeback) lived in
+            the callback emitter from #128 for six releases before the v0.8.0
+            pre-release Mythos pass found it.
 
-            The gate check on this PR will pass once the label is
-            applied.
-
-      - name: Fail if label missing
+      - name: Fail unless the auto verdict or the override clears this commit
         if: >-
           steps.detect.outputs.tier5_touched == 'true' &&
-          steps.label-check.outputs.has_label != 'true'
+          steps.decide.outputs.pass != 'true'
+        env:
+          REASON: ${{ steps.decide.outputs.reason }}
         run: |
-          echo "::error::Mythos delta-pass gate: Tier-5 files modified but mythos-pass-done label is not applied. Run discover.md and attach findings, then add the label."
+          echo "::error::Mythos delta-pass gate: ${REASON}"
           exit 1
