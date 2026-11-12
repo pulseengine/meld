@@ -1754,6 +1754,51 @@ artifacts:
       timestamp: 2026-10-28T13:54:56Z
     release: v0.66.0
 
+  - id: SWV-123
+    type: sw-verification
+    title: "Verification of SR-111 (1): an async-lower call between fused components is refused"
+    status: implemented
+    description: "Verifies SR-111 item 1. meld-core/tests/async_edges_548.rs fuses two hand-built components (WAT in the test): a callee exporting local:t/i with f: async func() lifted with the stackless callback ABI ([async-lift]local:t/i#f + [callback]), and a caller lowering f with the async option (core import local:t/i::[async-lower]f). The fusion fails, with an error that cites #548 and ADR-10 and names local:t/i#f and [async-lower]f. Negative control: the same caller fused with a callee that exports a different interface fuses, and the caller's local:t/i::[async-lower]f import is left to the host. Corpus (meld v0.67.0 release binary vs this branch, --memory multi): of 906 single-component inputs (the 504-component P3 corpus plus meld's own fixtures and the other suites), 534 fuse under both, and 506 of those outputs are byte-identical (--reproducible --no-attestation). The other 28 differ only in import lines, each now carrying the [async-lower] prefix (custom sections stripped, all other lines identical). 157 that fused are now refused, every one citing #558; none is newly refused for another reason; 215 refused before stay refused. Of 91 caller/callee pairs, the 42 that are not P3 fuse byte-identically, and all 43 P3 pairs that fused are now refused citing #558, because every P3 producer in the corpus (wit-bindgen Rust/C runtimes, wasmtime test programs) routes stream.read through wit-component's shim. So on the corpus the #558 refusal fires before the #548 one; the #548 refusal is exercised by the hand-built fixture."
+    links:
+      - type: verifies
+        target: SR-111
+    provenance:
+      created-by: ai-assisted
+      reviewed-by: avrabe
+      model: claude-opus-5-5
+      timestamp: 2026-11-04T23:30:00Z
+    release: v0.68.0
+
+  - id: SWV-124
+    type: sw-verification
+    title: "Verification of SR-111 (2): a host-bound async lowering keeps the [async-lower] prefix"
+    status: implemented
+    description: "Verifies SR-111 item 2 (#557). meld-core/tests/async_edges_548.rs fuses the async caller alone and checks the output imports local:t/i::[async-lower]f and never the bare local:t/i::f. On v0.67.0 the same import was emitted as f with the async-lower core type. In the corpus, 25 outputs change, only in import lines, each gaining [async-lower] (for example [async-lower][method]thing.when-ready, the producer's own spelling). Where a component lowered the same function both sync and async, the old output deduplicated the two as f and f$0; they now have distinct names."
+    links:
+      - type: verifies
+        target: SR-111
+    provenance:
+      created-by: ai-assisted
+      reviewed-by: avrabe
+      model: claude-opus-5-5
+      timestamp: 2026-11-04T23:30:00Z
+    release: v0.68.0
+
+  - id: SWV-125
+    type: sw-verification
+    title: "Verification of SR-111 (3): unnamed stream/future read/write are refused, not leaked as actual::N"
+    status: implemented
+    description: "Verifies SR-111 item 3 (#558). meld-core/tests/async_edges_548.rs builds wit-component's shim pattern in miniature (stream.read with memory and realloc options, exported from a FromExports instance as 0 and imported by a fixup module as actual::0). The fusion fails, naming stream.read and citing #558. Negative control: a stream.read that the module imports under its producer name ($root::[async-lower][stream-read-0]f, the shape wit-component emits without a shim when the payload needs no realloc and the module imports its memory) fuses and keeps that import, so the refusal is limited to the shim's bare decimal field name. On the real wit-bindgen ping-pong pair the fusion now fails on actual::0 (future.read) instead of writing a module with 8 actual::N imports that kiln refuses at load. The #545 validation tests moved from empty-wait.wasm (now refused by this rule before validation runs) to reentrance-m6.wasm (tests/p3/issue_545/README.md), so their potency check still reaches an invalid module. Corpus (meld v0.67.0 release binary vs this branch, --memory multi): of 906 single-component inputs (the 504-component P3 corpus plus meld's own fixtures and the other suites), 534 fuse under both, and 506 of those outputs are byte-identical (--reproducible --no-attestation). The other 28 differ only in import lines, each now carrying the [async-lower] prefix (custom sections stripped, all other lines identical). 157 that fused are now refused, every one citing #558; none is newly refused for another reason; 215 refused before stay refused. Of 91 caller/callee pairs, the 42 that are not P3 fuse byte-identically, and all 43 P3 pairs that fused are now refused citing #558, because every P3 producer in the corpus (wit-bindgen Rust/C runtimes, wasmtime test programs) routes stream.read through wit-component's shim. So on the corpus the #558 refusal fires before the #548 one; the #548 refusal is exercised by the hand-built fixture. UPDATE 2026-11-05: a local Mythos delta-pass on PR #559 (substituting for the CI pass, which ran out of turns) found that the first cut refused producer-named stream/future imports too, which v0.67.0 passed through: a regression shown by a failing test on the branch that passed on main. The refusal now requires the shim's bare decimal field name, and the negative control above is that test. The corpus figures here are re-measured with the fix: 63 inputs the first cut refused fuse again, 60 byte-identical to v0.67.0 and 3 differing only by the [async-lower] prefix; the pair results are unchanged."
+    links:
+      - type: verifies
+        target: SR-111
+    provenance:
+      created-by: ai-assisted
+      reviewed-by: avrabe
+      model: claude-opus-5-5
+      timestamp: 2026-11-04T23:30:00Z
+    release: v0.68.0
+
   - id: SWV-122
     type: sw-verification
     title: "Verification of SR-110: cooperative threads pass through in the producer ABI"
@@ -1773,7 +1818,7 @@ artifacts:
     type: sw-verification
     title: "Verification of SR-109: exit 0 implies a valid module under every strategy"
     status: verified
-    description: "Verifies SR-109. meld-cli/tests/validate_default_545.rs drives the real binary on tests/p3/issue_545/empty-wait.wasm (component-model spec test/async/empty-wait.wast, first component; sha256 and origin in its README), which meld 0.66.0 fused under --memory multi at exit 0 into a module failing validation inside <meld-adapter>. The test checks the invariant for --memory multi, auto and shared: if meld exits 0 the written module validates; if it refuses, no file is left behind. Potency: with validation restored to shared-only it fails with 'exit 0 but the output is invalid: values remaining on stack at end of block'; a second test checks --no-validate still writes the file. The CLI unit table validation_implication_table now expects validation on for all three strategies unless --no-validate. Corpus: of the 344 corpus components meld 0.66.0 fused at exit 0 under --memory multi, the 333 whose output validated still fuse (no false refusal) and all 11 whose output was invalid are now refused. Local gate with rustc 1.99.0 recorded in the PR. UPDATE 2026-11-04: status implemented -> verified for v0.67.0, promoted with `rivet verify` (rivet 0.40.0) on its source markers. The tests above passed in the required CI of #550, run on a tree merged with main, and main's own CI succeeded on the merge commit. Independent review record (advisory, per REQ-INDEP-001 practice; not yet a blocking gate):  no independent agent review (the change touches no Tier-5 file, so no Mythos pass ran). Evidence is the corpus measurement: of 344 P3 corpus components meld 0.66.0 fused at exit 0 under --memory multi, the 333 with valid output still fuse and all 11 with invalid output are refused. Author of the change: claude-opus-5-5 (this session); human review recorded as provenance.reviewed-by."
+    description: "Verifies SR-109. meld-cli/tests/validate_default_545.rs drives the real binary on tests/p3/issue_545/empty-wait.wasm (component-model spec test/async/empty-wait.wast, first component; sha256 and origin in its README), which meld 0.66.0 fused under --memory multi at exit 0 into a module failing validation inside <meld-adapter>. The test checks the invariant for --memory multi, auto and shared: if meld exits 0 the written module validates; if it refuses, no file is left behind. Potency: with validation restored to shared-only it fails with 'exit 0 but the output is invalid: values remaining on stack at end of block'; a second test checks --no-validate still writes the file. The CLI unit table validation_implication_table now expects validation on for all three strategies unless --no-validate. Corpus: of the 344 corpus components meld 0.66.0 fused at exit 0 under --memory multi, the 333 whose output validated still fuse (no false refusal) and all 11 whose output was invalid are now refused. Local gate with rustc 1.99.0 recorded in the PR. UPDATE 2026-11-04: status implemented -> verified for v0.67.0, promoted with `rivet verify` (rivet 0.40.0) on its source markers. The tests above passed in the required CI of #550, run on a tree merged with main, and main's own CI succeeded on the merge commit. Independent review record (advisory, per REQ-INDEP-001 practice; not yet a blocking gate):  no independent agent review (the change touches no Tier-5 file, so no Mythos pass ran). Evidence is the corpus measurement: of 344 P3 corpus components meld 0.66.0 fused at exit 0 under --memory multi, the 333 with valid output still fuse and all 11 with invalid output are refused. Author of the change: claude-opus-5-5 (this session); human review recorded as provenance.reviewed-by. UPDATE 2026-11-04 (#558): empty-wait.wasm wires a future.read that meld now refuses before validation runs, so the tests switched to tests/p3/issue_545/reentrance-m6.wasm (test/async/reentrance.wast module 6, same spec commit 38db7ee, sha256 be6e806b...2f87). It is another of the 11 #545 components, uses no stream or future read/write, and still fuses under --no-validate into a module that fails validation (func 13), so the potency check still bites."
     links:
       - type: verifies
         target: SR-109
@@ -1799,6 +1844,20 @@ artifacts:
       timestamp: 2026-11-03T21:25:52Z
     release: v0.67.0
 
+  - id: SWV-126
+    type: sw-verification
+    title: "Verification of SR-112: async lowerings recognised by option; world-level async imports not left to the host under a sync name"
+    status: implemented
+    release: v0.68.0
+    description: "meld-core/tests/async_edges_548.rs. async_lower_edge_is_refused_whatever_the_core_import_is_named: an instance-export lowering with the async option whose core import is local:t/i::f (no prefix), fused with a callback-lifted callee, fails citing #548; on the PR #559 branch (6cb3e63) it fused. async_lowered_world_import_served_by_a_fused_component_is_the_548_edge: a world-level async caller fused with a callee exporting f fails citing #548, not #560. async_lowered_world_func_import_is_refused: the same caller alone fails citing #560 and naming [async-lower]f; sync_lowered_world_func_import_still_fuses is its control (import f with an empty field kept). Potency: with the resolver change reverted, the three refusal tests fail and the control passes. Real input: wasmtime misc_testsuite subtask-drop-exited m0 now fails citing #548 (before: 1 boundary, 1 direct, 0 async-lift, exit 0); async lower m0 fails citing #560 (before: (import \"host-echo-u32\" \"\") with type (i32 i32) -> i32). Corpus (PR #559 binary 6cb3e63 vs this branch, --memory multi, 906 single inputs): 507 fuse under both and all 507 are byte-identical (--reproducible --no-attestation); 27 that fused are now refused, 23 citing #548 and 4 citing #560; none newly refused for another reason; pairs unchanged (42 fuse, 49 refused). The #545 validation tests moved back to empty-wait.wasm, because reentrance-m6.wasm is itself a nested #548 edge (tests/p3/issue_545/README.md). Local gate rustc 1.99.0: cargo test --workspace --all-features 1099 passed, 0 failed."
+    links:
+      - type: verifies
+        target: SR-112
+    provenance:
+      created-by: ai-assisted
+      reviewed-by: avrabe
+      model: claude-opus-5-5
+      timestamp: 2026-11-05T06:00:57Z
   - id: SWV-127
     type: sw-verification
     title: "Verification of SR-113: the component-model reference suite fusion ratchet"
@@ -1827,6 +1886,34 @@ artifacts:
       timestamp: 2026-11-08T11:03:19Z
       reviewed-by: avrabe
     release: v0.68.0
+  - id: SWV-132
+    type: sw-verification
+    title: "Verification of SR-118: the execution ratchet over the reference suite"
+    status: implemented
+    description: "meld-core/tests/cm_wast_ratchet.rs, every_reference_assertion_matches_the_exec_baseline, against tests/spec/component-model-exec-baseline.tsv: 704 commands across all 78 vendored WASTs (asserted). On main: 25 pass; 15 no-trap, which are Canonical ABI validation traps the adapters skip, filed as #586 (unaligned pointer 8, invalid char 3, out-of-bounds string 4); 1 trap, values/transcode.wast line 432, which is #582. 0 wrong. The remaining rows are not runnable here: 293 imports, 219 not-fused, 79 no-export, 44 unsupported, 28 inst-error. Negative control: substituting the adapter code from #583/#585 flips exactly the 5 values/transcode.wast rows (4 inst-error, 1 trap) to pass, so a behaviour change in fused output is a ratchet diff. The fuse-outcome baseline is unchanged by the refactor that shares the compare/bless step."
+    links:
+      - type: verifies
+        target: SR-118
+    provenance:
+      created-by: ai-assisted
+      reviewed-by: avrabe
+      model: claude-opus-5-5
+      timestamp: 2026-11-08T12:18:55Z
+    release: v0.68.0
+  - id: SWV-133
+    type: sw-verification
+    title: "Verification of SR-119: the extract pins fail on source drift and on unpinned extract items"
+    status: implemented
+    release: v0.68.0
+    description: "meld-core/tests/proof_extract_pins_580.rs. extract_sources_match_their_pins hashes each pinned source function (from its fn line to the closing brace at the same indentation, which cargo fmt keeps) and compares with extract-pins.tsv; every_extract_item_is_pinned requires the set of public non-constructor extract functions to equal the set of pinned items; pin_check_can_fail checks the instrument on inline source: an edit inside the function changes the hash, an edit outside does not, a missing or duplicated function is an error, and a name prefix is not a match. Observed controls on the real tree: changing < to <= in MergedModule::defined_func (meld-core/src/merger/mod.rs) failed extract_sources_match_their_pins naming resolver_core::defined_func, and reverting passed; appending a pub fn to index_map.rs failed every_extract_item_is_pinned naming index_map::sneaky. Before the first bless each extract was read against its source: decompose_func_index and defined_func match decompose_component_core_func_index and MergedModule::defined_func, including saturating_add; merge_core_module assigns indices as import count plus the running count of earlier modules' items, as compute_offsets and build_function_index_map model; compute_shared_memory_plan_for places module bases as a checked running sum with a 32-bit bound, as compute_memory_layout and is_valid_32bit_base model."
+    links:
+      - type: verifies
+        target: SR-119
+    provenance:
+      created-by: ai-assisted
+      reviewed-by: avrabe
+      model: claude-opus-5-5
+      timestamp: 2026-11-11T05:59:16Z
   - id: SWV-128
     type: sw-verification
     title: "Verification of SR-114: the library refuses its own invalid output"

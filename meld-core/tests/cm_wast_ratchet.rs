@@ -109,6 +109,66 @@ struct Command {
     line: usize,
     kind: &'static str,
     target: Option<usize>,
+    exec: Option<Exec>,
+}
+
+/// What executing a command means, for the execution ratchet. Only scalar
+/// values are modelled: they lower to the same core values the fused core
+/// module's export takes and returns. Anything else is `None` (unsupported).
+struct Exec {
+    export: String,
+    args: Option<Vec<Scalar>>,
+    expect: Expect,
+}
+
+enum Expect {
+    /// `assert_return`: the expected results, if all are scalars.
+    Return(Option<Vec<Scalar>>),
+    /// `assert_trap`.
+    Trap,
+    /// A bare `invoke`: run for its effect on state.
+    Invoke,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Scalar {
+    I32(i32),
+    I64(i64),
+}
+
+fn scalar(v: &wast::component::WastVal<'_>) -> Option<Scalar> {
+    use wast::component::WastVal as V;
+    Some(match v {
+        V::Bool(b) => Scalar::I32(*b as i32),
+        V::U8(x) => Scalar::I32(*x as i32),
+        V::S8(x) => Scalar::I32(*x as i32),
+        V::U16(x) => Scalar::I32(*x as i32),
+        V::S16(x) => Scalar::I32(*x as i32),
+        V::U32(x) => Scalar::I32(*x as i32),
+        V::S32(x) => Scalar::I32(*x),
+        V::U64(x) => Scalar::I64(*x as i64),
+        V::S64(x) => Scalar::I64(*x),
+        V::Char(c) => Scalar::I32(*c as i32),
+        _ => return None,
+    })
+}
+
+fn scalars_of_args(args: &[wast::WastArg<'_>]) -> Option<Vec<Scalar>> {
+    args.iter()
+        .map(|a| match a {
+            wast::WastArg::Component(v) => scalar(v),
+            _ => None,
+        })
+        .collect()
+}
+
+fn scalars_of_rets(rets: &[wast::WastRet<'_>]) -> Option<Vec<Scalar>> {
+    rets.iter()
+        .map(|r| match r {
+            wast::WastRet::Component(v) => scalar(v),
+            _ => None,
+        })
+        .collect()
 }
 
 struct FileResult {
@@ -313,6 +373,7 @@ fn run_file(text: &str) -> FileResult {
                     line,
                     kind: "instance",
                     target: t,
+                    exec: None,
                 });
             }
             WastDirective::AssertInvalid { module, .. } if is_component(&module) => {
@@ -334,6 +395,7 @@ fn run_file(text: &str) -> FileResult {
                     line,
                     kind: "register",
                     target: t,
+                    exec: None,
                 });
             }
             WastDirective::Invoke(inv) => {
@@ -343,12 +405,31 @@ fn run_file(text: &str) -> FileResult {
                     line,
                     kind: "invoke",
                     target: t,
+                    exec: Some(Exec {
+                        export: inv.name.to_string(),
+                        args: scalars_of_args(&inv.args),
+                        expect: Expect::Invoke,
+                    }),
                 });
             }
-            WastDirective::AssertReturn { exec, .. }
-            | WastDirective::AssertTrap { exec, .. }
-            | WastDirective::AssertException { exec, .. }
-            | WastDirective::AssertSuspension { exec, .. } => {
+            ref d @ (WastDirective::AssertReturn { .. }
+            | WastDirective::AssertTrap { .. }
+            | WastDirective::AssertException { .. }
+            | WastDirective::AssertSuspension { .. }) => {
+                let expect = match d {
+                    WastDirective::AssertReturn { results, .. } => {
+                        Some(Expect::Return(scalars_of_rets(results)))
+                    }
+                    WastDirective::AssertTrap { .. } => Some(Expect::Trap),
+                    _ => None,
+                };
+                let exec = match directive {
+                    WastDirective::AssertReturn { exec, .. }
+                    | WastDirective::AssertTrap { exec, .. }
+                    | WastDirective::AssertException { exec, .. }
+                    | WastDirective::AssertSuspension { exec, .. } => exec,
+                    _ => unreachable!(),
+                };
                 let kind = "assert";
                 match exec {
                     WastExecute::Invoke(inv) => {
@@ -358,6 +439,11 @@ fn run_file(text: &str) -> FileResult {
                             line,
                             kind,
                             target: t,
+                            exec: expect.map(|expect| Exec {
+                                export: inv.name.to_string(),
+                                args: scalars_of_args(&inv.args),
+                                expect,
+                            }),
                         });
                     }
                     WastExecute::Wat(w) if matches!(w, Wat::Component(_)) => {
@@ -367,6 +453,7 @@ fn run_file(text: &str) -> FileResult {
                             line,
                             kind: "assert-instantiate",
                             target: Some(idx),
+                            exec: None,
                         });
                     }
                     _ => {}
@@ -379,6 +466,7 @@ fn run_file(text: &str) -> FileResult {
                     line,
                     kind: "assert",
                     target: t,
+                    exec: None,
                 });
             }
             // Core modules, threads and custom-section assertions are not
@@ -523,16 +611,27 @@ fn every_reference_component_matches_the_fuse_baseline() {
         .unwrap();
     }
 
-    rows.sort();
-    let actual = rows.join("\n") + "\n";
     let header = "# #562 ratchet: meld's outcome for every component in the vendored\n\
                   # component-model test suite. Columns: wast, directive index, line,\n\
                   # kind, outcome, detail. Regenerate with MELD_BLESS=1 and review the diff.\n";
+    ratchet(
+        &baseline_path(),
+        header,
+        rows,
+        "component-model fuse outcomes",
+    );
+}
+
+/// Compare `rows` with the checked-in baseline at `path` (or rewrite it under
+/// `MELD_BLESS=1`). Any difference, in either direction, fails.
+fn ratchet(path: &Path, header: &str, mut rows: Vec<String>, what: &str) {
+    rows.sort();
+    let actual = rows.join("\n") + "\n";
     if std::env::var_os("MELD_BLESS").is_some() {
-        std::fs::write(baseline_path(), format!("{header}{actual}")).unwrap();
+        std::fs::write(path, format!("{header}{actual}")).unwrap();
         return;
     }
-    let baseline = std::fs::read_to_string(baseline_path()).unwrap_or_default();
+    let baseline = std::fs::read_to_string(path).unwrap_or_default();
     let expected: Vec<&str> = baseline.lines().filter(|l| !l.starts_with('#')).collect();
     let got: Vec<&str> = actual.lines().collect();
     if expected != got {
@@ -541,8 +640,8 @@ fn every_reference_component_matches_the_fuse_baseline() {
         let gone: Vec<_> = exp.keys().filter(|l| !act.contains_key(*l)).collect();
         let new: Vec<_> = act.keys().filter(|l| !exp.contains_key(*l)).collect();
         panic!(
-            "component-model fuse outcomes differ from the baseline \
-             (MELD_BLESS=1 regenerates it).\n--- baseline only:\n{}\n+++ now:\n{}",
+            "{what} differ from the baseline (MELD_BLESS=1 regenerates it).\n\
+             --- baseline only:\n{}\n+++ now:\n{}",
             gone.iter()
                 .map(|s| s.to_string())
                 .collect::<Vec<_>>()
@@ -553,4 +652,142 @@ fn every_reference_component_matches_the_fuse_baseline() {
                 .join("\n"),
         );
     }
+}
+
+fn exec_baseline_path() -> PathBuf {
+    root().join("tests/spec/component-model-exec-baseline.tsv")
+}
+
+/// Replay one WAST's commands, in order, on the fused core modules.
+///
+/// One live instance per fused component, so state carries across commands
+/// exactly as the WAST intends (a second `run` sees what the first left
+/// behind). A `component_instance` directive starts a fresh one. Returns
+/// `(line, export, outcome)` per executable command:
+///
+/// * `pass`: the expected scalar results, or the expected trap.
+/// * `wrong:<got>`, `trap`, `no-trap`: a fused module that validated and did
+///   the wrong thing. These are bugs, and the reason this ratchet exists.
+/// * `no-export`: the fused core module does not export that name. Component
+///   exports reached through instances or renames are kiln's runner's job.
+/// * `unsupported`: non-scalar arguments or results.
+/// * `not-fused` / `imports` / `inst-error`: nothing to run here.
+fn execute(res: &FileResult) -> Vec<(usize, String, String)> {
+    use std::collections::HashMap as Map;
+    let mut config = wasmtime::Config::new();
+    config.wasm_multi_memory(true);
+    let engine = wasmtime::Engine::new(&config).expect("engine");
+    let mut live: Map<usize, (wasmtime::Store<()>, wasmtime::Instance)> = Map::new();
+    let mut out = Vec::new();
+    for c in &res.commands {
+        let Some(t) = c.target else { continue };
+        if c.kind == "instance" {
+            live.remove(&t);
+            continue;
+        }
+        let Some(exec) = &c.exec else { continue };
+        let outcome = (|| -> String {
+            let Some(fused) = &res.entries[t].fused else {
+                return "not-fused".into();
+            };
+            if let std::collections::hash_map::Entry::Vacant(slot) = live.entry(t) {
+                let module = match wasmtime::Module::new(&engine, fused) {
+                    Ok(m) => m,
+                    Err(_) => return "inst-error".into(),
+                };
+                if module.imports().len() > 0 {
+                    return "imports".into();
+                }
+                let mut store = wasmtime::Store::new(&engine, ());
+                match wasmtime::Instance::new(&mut store, &module, &[]) {
+                    Ok(i) => {
+                        slot.insert((store, i));
+                    }
+                    Err(_) => return "inst-error".into(),
+                }
+            }
+            let (store, inst) = live.get_mut(&t).unwrap();
+            let Some(func) = inst.get_func(&mut *store, &exec.export) else {
+                return "no-export".into();
+            };
+            let Some(args) = &exec.args else {
+                return "unsupported".into();
+            };
+            let ty = func.ty(&*store);
+            let args: Vec<wasmtime::Val> = args
+                .iter()
+                .map(|a| match a {
+                    Scalar::I32(x) => wasmtime::Val::I32(*x),
+                    Scalar::I64(x) => wasmtime::Val::I64(*x),
+                })
+                .collect();
+            if ty.params().len() != args.len() {
+                return "unsupported".into();
+            }
+            let mut results = vec![wasmtime::Val::I32(0); ty.results().len()];
+            let r = func.call(&mut *store, &args, &mut results);
+            match (&exec.expect, r) {
+                (Expect::Trap, Err(_)) => "pass".into(),
+                (Expect::Trap, Ok(())) => "no-trap".into(),
+                (_, Err(_)) => "trap".into(),
+                (Expect::Invoke, Ok(())) => "pass".into(),
+                (Expect::Return(None), Ok(())) => "unsupported".into(),
+                (Expect::Return(Some(want)), Ok(())) => {
+                    let got: Vec<Scalar> = results
+                        .iter()
+                        .filter_map(|v| match v {
+                            wasmtime::Val::I32(x) => Some(Scalar::I32(*x)),
+                            wasmtime::Val::I64(x) => Some(Scalar::I64(*x)),
+                            _ => None,
+                        })
+                        .collect();
+                    if got.len() != results.len() || got.len() != want.len() {
+                        "unsupported".into()
+                    } else if got == *want {
+                        "pass".into()
+                    } else {
+                        let shown: Vec<String> = got
+                            .iter()
+                            .map(|g| match g {
+                                Scalar::I32(x) => x.to_string(),
+                                Scalar::I64(x) => x.to_string(),
+                            })
+                            .collect();
+                        format!("wrong:{}", shown.join(","))
+                    }
+                }
+            }
+        })();
+        out.push((c.line, exec.export.clone(), outcome));
+    }
+    out
+}
+
+// rivet: verifies SR-118
+#[test]
+fn every_reference_assertion_matches_the_exec_baseline() {
+    let mut rows = Vec::new();
+    let mut seen_wasts = 0usize;
+    for (_, path) in vendored_files() {
+        if !path.ends_with(".wast") {
+            continue;
+        }
+        seen_wasts += 1;
+        let text = std::fs::read_to_string(suite_dir().join(&path)).expect("wast text");
+        let res = run_file(&text);
+        for (line, export, outcome) in execute(&res) {
+            rows.push(format!("{path}\t{line}\t{export}\t{outcome}"));
+        }
+    }
+    assert_eq!(seen_wasts, 78, "every vendored WAST was visited");
+    let header = "# Execution ratchet (SR-118): each WAST command replayed in order on\n\
+                  # meld's fused core module (wasmtime, one live instance per component).\n\
+                  # Columns: wast, line, export, outcome. wrong:/trap/no-trap are bugs.\n\
+                  # Regenerate with MELD_BLESS=1 and review the diff.\n";
+    ratchet(
+        &exec_baseline_path(),
+        header,
+        rows,
+        "component-model execution outcomes",
+    );
 }

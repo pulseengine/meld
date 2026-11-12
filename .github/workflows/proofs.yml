@@ -94,7 +94,7 @@ jobs:
     # progress line names a target's FIRST src, not the file in hand.
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       # The census runs BEFORE the proofs, so a suite that has quietly shrunk is
       # visible even when the build later fails for an unrelated reason.
@@ -154,12 +154,12 @@ jobs:
           [ "$fail" -eq 0 ]
 
       - name: Install Nix
-        uses: cachix/install-nix-action@v31
+        uses: cachix/install-nix-action@3dc140bfc76c49fbd4dd958429132e3746bcb086 # v31
         with:
           nix_path: nixpkgs=channel:nixos-unstable
 
       - name: Setup Bazel
-        uses: bazel-contrib/setup-bazel@0.19.0
+        uses: bazel-contrib/setup-bazel@104e3eea9447cdaa4b00d0fb46191a3985d26ab3 # 0.19.1
         with:
           bazelisk-cache: true
           disk-cache: ${{ github.workflow }}
