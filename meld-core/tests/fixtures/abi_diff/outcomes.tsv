@@ -6,6 +6,10 @@ issue598-utf16-copy	multi	wrong	#598
 issue598-utf16-copy	shared	match
 issue599-bool_2	multi	wrong	#599
 issue599-bool_2	shared	wrong	#599
+issue599-list-bool-in-memory	multi	wrong	#599
+issue599-list-bool-in-memory	shared	wrong	#599
+issue599-list-u8-in-memory-control	multi	match
+issue599-list-u8-in-memory-control	shared	match
 issue599-s16_40000	multi	wrong	#599
 issue599-s16_40000	shared	wrong	#599
 issue599-s8_200	multi	wrong	#599
