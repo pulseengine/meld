@@ -4068,3 +4068,17 @@ artifacts:
       reviewed-by: avrabe
       model: claude-opus-5-5
       timestamp: 2026-11-13T17:53:54Z
+
+  - id: SR-124
+    type: sw-req
+    title: "--component output exports the types an exported interface defines, under their WIT names, with enums kept as enums"
+    status: implemented
+    release: v0.69.0
+    description: "An exported interface may define its own record, variant, enum and flags types. wit-component exports them from the interface instance, re-exporting them through a nested component it instantiates with one import-type-<x> argument per type. meld's component wrapper shall export each type the interface defines itself from its interface instance, under the name the nested component exports it as (never the argument's dedupe-suffixed name). It shall bind the lifted functions' signatures to those exported types; a function's copy of a type binds only on a unique structural match. A WIT enum shall be emitted as an enum, not as the payload-less variant meld's ABI model uses for it. Types the interface uses from an imported interface stay named through that import and are not re-exported, since re-exporting the same identity would make the interface claim to define them. Real component-instance indices are translated through the instance-export slots the parser records. Not covered, still on #605: the exported instance type lacks the use re-exports (a consumer that imports the interface and expects the used type as an instance export would not typecheck), and a three-input fuse under --memory shared --address-rebase cannot reach the callee's own realloc."
+    links:
+      - type: derives-from
+        target: SYS-3
+    provenance:
+      created-by: ai-assisted
+      model: claude-opus-5-5
+      timestamp: 2026-11-13T18:23:23Z

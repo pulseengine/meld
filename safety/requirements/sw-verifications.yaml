@@ -2014,3 +2014,17 @@ artifacts:
       reviewed-by: avrabe
       model: claude-opus-5-5
       timestamp: 2026-11-13T17:53:54Z
+
+  - id: SWV-138
+    type: sw-verification
+    title: "Verification of SR-124: meld's three-input falcon fuse returns what the wac composition returns, with pilot's types exported"
+    status: implemented
+    release: v0.69.0
+    description: "three_input_component_matches_the_wac_composition fuses falcon-cascade v0.13.0's split, estimator and control (tests/fixtures/issue_605, from relay main 4836198) with --component under --memory multi. It then calls all six exported functions on wasmtime 50 with the same generated arguments as relay's wac plug composition and requires identical transcripts. That includes observer#read-state, whose estimator state is produced through the internal cross-component calls. pilot_types_are_exported_named_and_the_enum_stays_an_enum checks that the wrapped split's pilot instance exports pilot-command as an Enum and supervisor-config and sensor-calibration as Records. Red before: on the #476 branch the split failed with 'instance not valid to be used as export'. Negative control observed red: with the enum branch disabled, both tests fail (Enum vs Variant in the transcript; the enum assertion). Before binding the function signatures to the exported types, validation failed. Before skipping re-export of used types, wit-parser 0.243 panicked decoding the output's WIT."
+    links:
+      - type: verifies
+        target: SR-124
+    provenance:
+      created-by: ai-assisted
+      model: claude-opus-5-5
+      timestamp: 2026-11-13T18:23:23Z

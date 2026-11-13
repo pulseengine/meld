@@ -1518,6 +1518,7 @@ mod tests {
             component_func_defs,
             component_instance_defs: vec![],
             instance_export_slots: Vec::new(),
+            enum_types: Default::default(),
             component_type_defs: vec![],
             original_size: 0,
             original_hash: String::new(),

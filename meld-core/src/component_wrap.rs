@@ -2090,6 +2090,38 @@ fn assemble_component(
             None => continue,
         };
 
+        // #605: the named types this interface exports. wit-component builds
+        // an exported interface by instantiating a nested component with one
+        // `import-type-<name>` argument per type the interface names (its own
+        // records/enums and the ones it `use`s). The wrapper's inline instance
+        // must export them too: an exported instance's functions may only use
+        // types that instance exports or that are imported.
+        let mut type_exports: Vec<(String, u32)> = Vec::new();
+        let mut exported_src: Vec<(u32, u32)> = Vec::new();
+        for (name, src_idx) in interface_type_args(source, comp_export.index) {
+            // A type the interface `use`s is already named by the import it is
+            // aliased from; re-exporting that identity would make the
+            // interface claim to define it (wit-parser rejects the result).
+            if matches!(
+                source.component_type_defs.get(src_idx as usize),
+                Some(
+                    parser::ComponentTypeDef::InstanceExportAlias(_)
+                        | parser::ComponentTypeDef::Import(_)
+                )
+            ) {
+                continue;
+            }
+            let wrapper_idx = define_source_type_in_wrapper(
+                &mut component,
+                source,
+                src_idx,
+                &mut component_type_idx,
+                &mut type_remap,
+            )?;
+            type_exports.push((name, wrapper_idx));
+            exported_src.push((src_idx, wrapper_idx));
+        }
+
         let mut lifted_funcs: Vec<(String, u32)> = Vec::new();
 
         for func_info in funcs {
@@ -2133,6 +2165,11 @@ fn assemble_component(
             );
 
             // Define the component function type in our wrapper
+            if let Some((lift_comp, source_type_idx, _)) = &lift_info
+                && std::ptr::eq(*lift_comp, source)
+            {
+                bind_to_exported_types(source, *source_type_idx, &exported_src, &mut type_remap);
+            }
             let wrapper_func_type = if let Some((lift_comp, source_type_idx, _)) = &lift_info {
                 define_source_type_in_wrapper(
                     &mut component,
@@ -2296,9 +2333,14 @@ fn assemble_component(
 
         // Create a component instance wrapping the lifted functions
         let mut inst = ComponentInstanceSection::new();
-        let exports: Vec<_> = lifted_funcs
+        let exports: Vec<_> = type_exports
             .iter()
-            .map(|(name, idx)| (name.as_str(), ComponentExportKind::Func, *idx))
+            .map(|(name, idx)| (name.as_str(), ComponentExportKind::Type, *idx))
+            .chain(
+                lifted_funcs
+                    .iter()
+                    .map(|(name, idx)| (name.as_str(), ComponentExportKind::Func, *idx)),
+            )
             .collect();
         inst.export_items(exports);
         component.section(&inst);
@@ -3420,6 +3462,134 @@ fn core_func_name(c: &ParsedComponent, core_func_index: u32) -> Option<&str> {
     None
 }
 
+/// #605: wit-component gives a lifted function's signature its own copies of
+/// the interface's types, structurally equal to but distinct from the types
+/// the interface exports. An exported instance's functions must use the
+/// exported types themselves (identity, not structure), so each type the
+/// function references is bound to the exported type it equals. Only a
+/// unique structural match binds; anything else is left to the normal path.
+fn bind_to_exported_types(
+    source: &ParsedComponent,
+    func_type_idx: u32,
+    exported_src: &[(u32, u32)],
+    type_remap: &mut std::collections::HashMap<u32, u32>,
+) {
+    let key = |idx: u32| {
+        let resolved = resolve_component_val_type(&parser::ComponentValType::Type(idx), source);
+        let is_enum = source
+            .enum_types
+            .contains(&follow_export_aliases(source, idx));
+        format!("{is_enum}:{resolved:?}")
+    };
+    let exported_keys: Vec<(String, u32)> =
+        exported_src.iter().map(|&(s, w)| (key(s), w)).collect();
+    let Some(parser::ComponentType {
+        kind: parser::ComponentTypeKind::Function { params, results },
+    }) = source.get_type_definition(func_type_idx)
+    else {
+        return;
+    };
+    let mut refs = Vec::new();
+    fn collect(t: &parser::ComponentValType, out: &mut Vec<u32>) {
+        use parser::ComponentValType as V;
+        match t {
+            V::Type(i) => out.push(*i),
+            V::List(e) | V::FixedSizeList(e, _) | V::Option(e) => collect(e, out),
+            V::Record(fs) => fs.iter().for_each(|(_, t)| collect(t, out)),
+            V::Tuple(ts) => ts.iter().for_each(|t| collect(t, out)),
+            V::Variant(cs) => cs.iter().flat_map(|(_, t)| t).for_each(|t| collect(t, out)),
+            V::Result { ok, err } => ok.iter().chain(err.iter()).for_each(|t| collect(t, out)),
+            _ => {}
+        }
+    }
+    params.iter().for_each(|(_, t)| collect(t, &mut refs));
+    results.iter().for_each(|(_, t)| collect(t, &mut refs));
+    for idx in refs {
+        if type_remap.contains_key(&idx) {
+            continue;
+        }
+        let k = key(idx);
+        let mut hits = exported_keys.iter().filter(|(ek, _)| *ek == k);
+        if let (Some((_, w)), None) = (hits.next(), hits.next()) {
+            type_remap.insert(idx, *w);
+        }
+    }
+}
+
+/// Follow `(type (eq N))` export-alias hops to the index that defines a type.
+fn follow_export_aliases(c: &ParsedComponent, mut t: u32) -> u32 {
+    for _ in 0..c.component_type_defs.len() {
+        match c.component_type_defs.get(t as usize) {
+            Some(parser::ComponentTypeDef::ExportAlias(target)) => t = *target,
+            _ => break,
+        }
+    }
+    t
+}
+
+/// #605: the `(name, source type index)` pairs an exported interface
+/// instance exports as types. wit-component builds an exported interface by
+/// instantiating a nested component: each type the interface names (its own
+/// records/enums and the ones it `use`s) is passed in as an
+/// `import-type-<x>` argument and re-exported under its WIT name. The name is
+/// read from the nested component's type export, traced back to the import it
+/// re-exports and from there to the argument, so wit-component's dedupe
+/// suffixes (`sensor-frame0`) never leak into the output. Export-alias hops
+/// (`(type (eq N))`) are followed on both sides. Empty for any other shape.
+fn interface_type_args(source: &ParsedComponent, instance_index: u32) -> Vec<(String, u32)> {
+    let Some(parser::ComponentInstanceDef::Instance(i)) =
+        source.component_instance_def(instance_index)
+    else {
+        return Vec::new();
+    };
+    let Some(parser::ComponentLevelInstance::Instantiate {
+        component_index,
+        args,
+    }) = source.component_instances.get(*i)
+    else {
+        return Vec::new();
+    };
+    // The component index space is sub-components only when nothing imports a
+    // component; otherwise the mapping is not this simple, so do not guess.
+    if source
+        .imports
+        .iter()
+        .any(|imp| matches!(imp.ty, wasmparser::ComponentTypeRef::Component(_)))
+    {
+        return Vec::new();
+    }
+    let Some(nested) = source.sub_components.get(*component_index as usize) else {
+        return Vec::new();
+    };
+    let follow = follow_export_aliases;
+    let mut out = Vec::new();
+    for export in &nested.exports {
+        if export.kind != wasmparser::ComponentExternalKind::Type {
+            continue;
+        }
+        // A re-exported import names its argument directly; a type the
+        // interface defines itself is re-declared in the nested component and
+        // exported under its WIT name, so its argument is `import-type-<name>`.
+        let inner = follow(nested, export.index);
+        let arg_name = match nested.component_type_defs.get(inner as usize) {
+            Some(parser::ComponentTypeDef::Import(import_idx)) => {
+                match nested.imports.get(*import_idx) {
+                    Some(import) => import.name.clone(),
+                    None => continue,
+                }
+            }
+            _ => format!("import-type-{}", export.name),
+        };
+        let Some((_, _, outer)) = args.iter().find(|(name, kind, _)| {
+            *kind == wasmparser::ComponentExternalKind::Type && *name == arg_name
+        }) else {
+            continue;
+        };
+        out.push((export.name.clone(), follow(source, *outer)));
+    }
+    out
+}
+
 /// Define a source component's type in our wrapper, recursively defining
 /// any referenced sub-types. Returns the wrapper's type index.
 fn define_source_type_in_wrapper(
@@ -3456,6 +3626,24 @@ fn define_source_type_in_wrapper(
     let kind = type_def.kind.clone();
 
     match &kind {
+        parser::ComponentTypeKind::Defined(parser::ComponentValType::Variant(cases))
+            if source
+                .enum_types
+                .contains(&follow_export_aliases(source, source_type_idx)) =>
+        {
+            // #605: the ABI model keeps a WIT `enum` as a payload-less variant,
+            // but `enum` and `variant` are different component types; a
+            // consumer binding the WIT enum must see an enum.
+            let mut types = wasm_encoder::ComponentTypeSection::new();
+            types
+                .defined_type()
+                .enum_type(cases.iter().map(|(name, _)| name.as_str()));
+            component.section(&types);
+            let wrapper_idx = *component_type_idx;
+            *component_type_idx += 1;
+            type_remap.insert(source_type_idx, wrapper_idx);
+            Ok(wrapper_idx)
+        }
         parser::ComponentTypeKind::Defined(val_type) => {
             // Define the value type (result, list, option, etc.)
             emit_defined_type(component, source, val_type, component_type_idx, type_remap)
@@ -4228,6 +4416,7 @@ mod tests {
             component_func_defs: Vec::new(),
             component_instance_defs: vec![ComponentInstanceDef::Import(0)],
             instance_export_slots: Vec::new(),
+            enum_types: Default::default(),
             component_type_defs: Vec::new(),
             original_size: 0,
             original_hash: String::new(),
@@ -4296,6 +4485,7 @@ mod tests {
             component_func_defs: Vec::new(),
             component_instance_defs: vec![ComponentInstanceDef::Import(0)],
             instance_export_slots: Vec::new(),
+            enum_types: Default::default(),
             component_type_defs: Vec::new(),
             original_size: 0,
             original_hash: String::new(),
@@ -4356,6 +4546,7 @@ mod tests {
             component_func_defs: Vec::new(),
             component_instance_defs: vec![ComponentInstanceDef::Import(0)],
             instance_export_slots: Vec::new(),
+            enum_types: Default::default(),
             component_type_defs: Vec::new(),
             original_size: 0,
             original_hash: String::new(),
@@ -4399,6 +4590,7 @@ mod tests {
             component_func_defs: vec![],
             component_instance_defs: vec![],
             instance_export_slots: Vec::new(),
+            enum_types: Default::default(),
             component_type_defs: vec![],
             original_size: 0,
             original_hash: String::new(),
