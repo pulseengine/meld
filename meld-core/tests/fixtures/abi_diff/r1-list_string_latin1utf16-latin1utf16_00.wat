@@ -1,0 +1,86 @@
+(component
+  (component $C
+    (core module $M
+      (memory (export "mem") 1)
+      (global $next (mut i32) (i32.const 1024))
+      (func (export "realloc") (param $old i32) (param $osize i32) (param $align i32) (param $nsize i32) (result i32)
+        (local $r i32)
+        (if (i32.and (i32.ne (local.get $old) (i32.const 0))
+                     (i32.le_u (local.get $nsize) (local.get $osize)))
+          (then (return (local.get $old))))
+        (global.set $next (i32.and (i32.add (global.get $next) (i32.const 7)) (i32.const -8)))
+        (local.set $r (global.get $next))
+        (global.set $next (i32.add (global.get $next) (local.get $nsize)))
+        (if (i32.ne (local.get $old) (i32.const 0))
+          (then (memory.copy (local.get $r) (local.get $old) (local.get $osize))))
+        (local.get $r))
+      ;; (list ptr, list len) -> hash over len, every tagged len and every code unit
+      (func (export "uf") (param $p i32) (param $n i32) (result i32)
+        (local $i i32) (local $j i32) (local $h i32) (local $sp i32) (local $sl i32) (local $cnt i32)
+        (local.set $h (local.get $n))
+        (block $done (loop $outer
+          (br_if $done (i32.ge_u (local.get $i) (local.get $n)))
+          (local.set $sp (i32.load (i32.add (local.get $p) (i32.shl (local.get $i) (i32.const 3)))))
+          (local.set $sl (i32.load offset=4 (i32.add (local.get $p) (i32.shl (local.get $i) (i32.const 3)))))
+          (local.set $h (i32.add (i32.mul (local.get $h) (i32.const 31)) (local.get $sl)))
+          (local.set $cnt (i32.and (local.get $sl) (i32.const 0x7fffffff)))
+          (local.set $j (i32.const 0))
+          (block $sd (loop $inner
+            (br_if $sd (i32.ge_u (local.get $j) (local.get $cnt)))
+            (local.set $h (i32.add (i32.mul (local.get $h) (i32.const 31))
+              (if (result i32) (i32.and (local.get $sl) (i32.const 0x80000000))
+                (then (i32.load16_u (i32.add (local.get $sp) (i32.shl (local.get $j) (i32.const 1)))))
+                (else (i32.load8_u (i32.add (local.get $sp) (local.get $j)))))))
+            (local.set $j (i32.add (local.get $j) (i32.const 1)))
+            (br $inner)))
+          (local.set $i (i32.add (local.get $i) (i32.const 1)))
+          (br $outer)))
+        (local.get $h))
+    )
+    (core instance $m (instantiate $M))
+    (func (export "uf") (param "l" (list string)) (result u32)
+      (canon lift (core func $m "uf") string-encoding=latin1+utf16
+        (memory (core memory $m "mem")) (realloc (core func $m "realloc"))))
+  )
+  (component $D
+    (import "uf" (func $f (param "l" (list string)) (result u32)))
+    (core module $Libc
+      (memory (export "mem") 1)
+      (global $next (mut i32) (i32.const 1024))
+      (func (export "realloc") (param $old i32) (param $osize i32) (param $align i32) (param $nsize i32) (result i32)
+        (local $r i32)
+        (if (i32.and (i32.ne (local.get $old) (i32.const 0))
+                     (i32.le_u (local.get $nsize) (local.get $osize)))
+          (then (return (local.get $old))))
+        (global.set $next (i32.and (i32.add (global.get $next) (i32.const 7)) (i32.const -8)))
+        (local.set $r (global.get $next))
+        (global.set $next (i32.add (global.get $next) (local.get $nsize)))
+        (if (i32.ne (local.get $old) (i32.const 0))
+          (then (memory.copy (local.get $r) (local.get $old) (local.get $osize))))
+        (local.get $r))
+      ;; latin1 "caf\e9", empty, utf16 "a<euro><U+1F600>", latin1 "Hello, world"
+      (data (i32.const 64) "caf\e9")
+      (data (i32.const 96) "a\00\ac\20\3d\d8\00\de")
+      (data (i32.const 112) "Hello, world")
+      (data (i32.const 160)
+        "\40\00\00\00\04\00\00\00"
+        "\50\00\00\00\00\00\00\00"
+        "\60\00\00\00\04\00\00\80"
+        "\70\00\00\00\0c\00\00\00"))
+    (core instance $libc (instantiate $Libc))
+    (core func $f' (canon lower (func $f) string-encoding=latin1+utf16
+      (memory (core memory $libc "mem")) (realloc (core func $libc "realloc"))))
+    (core module $Main
+      (import "" "mem" (memory 1))
+      (import "" "uf" (func $f (param i32 i32) (result i32)))
+      (func (export "run") (result i32)
+        (call $f (i32.const 160) (i32.const 4)))
+    )
+    (core instance $main (instantiate $Main
+      (with "" (instance (export "mem" (memory $libc "mem")) (export "uf" (func $f'))))))
+    (func (export "run") (result u32) (canon lift (core func $main "run")))
+  )
+  (instance $c (instantiate $C))
+  (instance $d (instantiate $D (with "uf" (func $c "uf"))))
+  (export "run" (func $d "run"))
+)

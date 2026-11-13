@@ -4038,3 +4038,18 @@ artifacts:
       reviewed-by: avrabe
       model: claude-opus-5-5
       timestamp: 2026-11-12T06:41:58Z
+
+  - id: SR-122
+    type: sw-req
+    title: Every Canonical ABI differential fixture's outcome is pinned against wasmtime's unfused run, so any change is reviewed
+    status: implemented
+    release: v0.69.0
+    description: "A fused adapter is correct when the fused module returns what the same composition returns unfused on wasmtime's component runtime, which implements the Canonical ABI's lift, lower, transcode and validation traps. meld shall run every fixture in meld-core/tests/fixtures/abi_diff/ (two-component compositions over string encodings x value shapes, plus the reduced #597-#603 reproductions) unfused and fused under --memory multi and --memory shared without rebasing. It shall classify each pair as match, match-trap, wrong, fused-trap, accepts-invalid, refused, refused-defect or not-runnable, and fail when any classification differs from abi_diff/outcomes.tsv. A fix or a regression therefore lands together with the ledger rows it moves. The known-wrong rows are recorded, not accepted: they are #586 and #597-#603. Not covered: shared memory with --address-rebase (the fixtures carry no relocations), async calls, resources, and compositions of more than two components."
+    links:
+      - type: derives-from
+        target: SYS-3
+    provenance:
+      created-by: ai-assisted
+      reviewed-by: avrabe
+      model: claude-opus-5-5
+      timestamp: 2026-11-13T13:51:24Z
