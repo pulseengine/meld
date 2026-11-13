@@ -4,6 +4,29 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.69.0] - 2026-11-13
+
+### Fixed
+
+- An adapter traps on an invalid `char` a caller passes in flat params, as the Canonical ABI's lift does (#586, SR-121). Before, the value crossed the boundary.
+- `--component` keeps types a component uses from an imported interface named, and lifts spilled params (#476, SR-123). Before, the wrapper lost the type (`get_type_definition` returned `None` for an instance-export alias) and could not lift >16 flat params.
+- `--component` exports the types an exported interface defines under their WIT names, and keeps enums as enums instead of variants (#605 in part, SR-124). Fusing relay's split/estimator/control with `--memory multi` matches the wac composition on all 6 calls. Still open on #605: `use`d types are not re-exported in the exported instance type, and `--memory shared --rebase` on that fuse cannot reach the callee's realloc.
+
+### Added
+
+- A Canonical ABI differential test: 297 fixtures, each run unfused on wasmtime and fused by meld under `--memory multi` and `--memory shared`, with every outcome pinned in `meld-core/tests/fixtures/abi_diff/outcomes.tsv` (SR-122). The ledger records the known wrong answers (#597..#603) so a fix or a regression shows as a diff. `MELD_BLESS=1` re-blesses.
+- The Rocq proofs are kernel-checked with coqchk in CI, and every trust escape (Axiom, Admitted, `external_body`, `assume`, positivity bypass) in the Rocq and Verus trees is listed in a ledger the tests compare against (SR-120).
+
+### Changed
+
+- The Mythos gate passes on a complete NO FINDINGS verdict for the head commit (#595).
+- The LS-N verification gate fails closed and blocks merges (#608): a cargo error, a scenario with no `ls_<id>_` test outside the `safety/stpa/ls-missing-tests.txt` ledger, a stale ledger line, or zero checked scenarios each fail it; `implemented` and `verified` scenarios are checked as well as `approved`.
+- Release darwin targets build on macos-15; GitHub retired macos-14 (#592).
+
+### API
+
+- `ParsedComponent` (public fields, no `Default`) gains `enum_types`; code that builds one with a struct literal must set it (0.x minor).
+
 ## [0.68.0] - 2026-11-12
 
 ### Added

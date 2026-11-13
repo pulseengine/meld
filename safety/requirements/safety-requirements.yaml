@@ -4011,7 +4011,7 @@ artifacts:
   - id: SR-120
     type: sw-req
     title: Every trust escape in the proofs is listed, and the kernel accepts no axiom outside an allowlist
-    status: implemented
+    status: verified
     release: v0.69.0
     description: "The Rocq proof census (proofs.yml) counted only the text 'Admitted.', so an Axiom, Parameter or Conjecture passed it, and nothing in CI counted Verus escapes. meld shall (1) kernel-check its gated Rocq proofs with coqchk -o after compiling them, and fail when coqchk reports an axiom outside proofs/kernel-axioms-allowlist.txt or any other trust assumption (impredicative Set, rewrite rules, type-in-type, unsafe (co)fixpoints, assumed positivity); a .v file the check cannot place under a logical prefix fails rather than being skipped; and (2) keep proofs/trust-escapes.tsv equal to a scan for Rocq Admitted/Axiom/Parameter/Conjecture, #[bypass_check(...)] and Unset Positivity\\/Guard\\/Universe Checking and, in files containing verus!, Verus external_body/external/assume/admit/assume_specification, so a new escape fails until the ledger names it and a removed one fails until its line is deleted. The ledger check runs in Test because proofs.yml does not run on verification/. Baseline: both empty (coqchk: Axioms <none> over 27 files). Not counted: kani::assume (harness input bounds, a vacuity question) and Section-local Variable/Hypothesis (discharged by the section). Whether this becomes a required check is the owner's decision."
     links:
@@ -4027,7 +4027,7 @@ artifacts:
   - id: SR-121
     type: sw-req
     title: An adapter traps on an invalid char a caller passes in flat params, as the Canonical ABI's lift does
-    status: implemented
+    status: verified
     release: v0.69.0
     description: "The Canonical ABI lifts a char only if it is a Unicode scalar value: a surrogate (0xD800..=0xDFFF) or a value above 0x10FFFF traps with 'invalid char bit pattern'. Inside a fused module the callee's lift is gone, so meld's adapter is the only place the check can happen; before #586 it passed the value through, and a Rust callee receiving it has undefined behaviour. For every adapter site whose flat params carry a char (top level, or inside a record, tuple or fixed-size list), the adapter shall trap on such a value before any copy, transcode or call, in every adapter class, and the site shall not be inlined away (the call-lowering seam's has_value_checks fact). Not yet covered, and tracked on #586: a char in a variant, option or result payload, in a list or the params-ptr area, in a result, or at an async site; the unaligned-pointer and string-bounds traps."
     links:
@@ -4042,7 +4042,7 @@ artifacts:
   - id: SR-122
     type: sw-req
     title: Every Canonical ABI differential fixture's outcome is pinned against wasmtime's unfused run, so any change is reviewed
-    status: implemented
+    status: verified
     release: v0.69.0
     description: "A fused adapter is correct when the fused module returns what the same composition returns unfused on wasmtime's component runtime, which implements the Canonical ABI's lift, lower, transcode and validation traps. meld shall run every fixture in meld-core/tests/fixtures/abi_diff/ (two-component compositions over string encodings x value shapes, plus the reduced #597-#603 reproductions) unfused and fused under --memory multi and --memory shared without rebasing. It shall classify each pair as match, match-trap, wrong, fused-trap, accepts-invalid, refused, refused-defect or not-runnable, and fail when any classification differs from abi_diff/outcomes.tsv. A fix or a regression therefore lands together with the ledger rows it moves. The known-wrong rows are recorded, not accepted: they are #586 and #597-#603. Not covered: shared memory with --address-rebase (the fixtures carry no relocations), async calls, resources, and compositions of more than two components."
     links:
@@ -4057,7 +4057,7 @@ artifacts:
   - id: SR-123
     type: sw-req
     title: "--component output keeps types a component uses from an imported interface named, and computes what the input computes"
-    status: implemented
+    status: verified
     release: v0.69.0
     description: "A wit-bindgen component that uses a type from an imported interface refers to it as an alias export of that instance import. meld's component wrapper shall re-create each such alias against its replayed copy of the instance import, so the type stays named (an exported instance's functions may only use named record/variant types). For a type the depth-0 replay already carries, it shall map the type to its replayed index. It shall give each wrapper canon lift the memory and realloc options the source lift named, which a parameter list spilled to memory (more than 16 flat values) or a return area requires. The wrapped component shall return what the input returns for the same calls. Not covered, tracked on #605: an exported interface that defines its own record/enum types, the enum-to-variant change, and the realloc of a three-input fuse under shared memory."
     links:
@@ -4072,7 +4072,7 @@ artifacts:
   - id: SR-124
     type: sw-req
     title: "--component output exports the types an exported interface defines, under their WIT names, with enums kept as enums"
-    status: implemented
+    status: verified
     release: v0.69.0
     description: "An exported interface may define its own record, variant, enum and flags types. wit-component exports them from the interface instance, re-exporting them through a nested component it instantiates with one import-type-<x> argument per type. meld's component wrapper shall export each type the interface defines itself from its interface instance, under the name the nested component exports it as (never the argument's dedupe-suffixed name). It shall bind the lifted functions' signatures to those exported types; a function's copy of a type binds only on a unique structural match. A WIT enum shall be emitted as an enum, not as the payload-less variant meld's ABI model uses for it. Types the interface uses from an imported interface stay named through that import and are not re-exported, since re-exporting the same identity would make the interface claim to define them. Real component-instance indices are translated through the instance-export slots the parser records. Not covered, still on #605: the exported instance type lacks the use re-exports (a consumer that imports the interface and expects the used type as an instance export would not typecheck), and a three-input fuse under --memory shared --address-rebase cannot reach the callee's own realloc."
     links:

@@ -233,6 +233,8 @@ fn read_ledger(text: &str) -> BTreeSet<Entry> {
         .collect()
 }
 
+// rivet: verifies SR-120
+// rivet: verifies SWV-134
 #[test]
 fn trust_escapes_match_the_ledger() {
     let root = repo_root();
