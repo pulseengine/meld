@@ -138,8 +138,12 @@ jobs:
 
       - name: Run LS-N verification
         id: verify
-        continue-on-error: true
+        # #608: this step's exit code IS the gate. A failing test, a missing
+        # test not in safety/stpa/ls-missing-tests.txt, a stale ledger line,
+        # a cargo error, or zero checked scenarios all fail it. The artifact
+        # and comment steps below still run (if: always()).
         run: |
+          python3 tools/run_ls_verification.py --self-test
           python3 tools/run_ls_verification.py \
             --results-json verification-results.json
 
@@ -158,18 +162,3 @@ jobs:
           PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
           python3 tools/post_verification_comment.py "$PR_NUMBER"
-
-      - name: Fail job if any approved LS-N test failed
-        # Exit code 1 from run_ls_verification.py = a regression test
-        # for an approved LS entry failed. Exit 2 = missing tests only;
-        # treated as advisory. Exit 0 = all approved entries verified.
-        if: steps.verify.outcome == 'failure'
-        run: |
-          # Re-check: outcome == failure can mean exit 1 (real fail) or
-          # exit 2 (missing only). Inspect the JSON to decide.
-          failed=$(python3 -c "import json; print(json.load(open('verification-results.json'))['failed_count'])")
-          if [ "$failed" -gt 0 ]; then
-            echo "::error::$failed approved LS-N entries have failing regression tests; see PR comment"
-            exit 1
-          fi
-          echo "::warning::Some approved LS-N entries are missing regression tests (advisory only)"

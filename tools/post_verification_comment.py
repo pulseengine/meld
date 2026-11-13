@@ -59,7 +59,25 @@ def render_body(results: dict) -> str:
     failed_ids = results["failed"]
     missing_ids = results["missing"]
 
-    if failed == 0 and missing == 0:
+    # #608: errors, unledgered gaps and stale ledger lines fail the gate too.
+    blocking = (
+        len(results.get("errored", []))
+        + len(results.get("unledgered_missing", []))
+        + len(results.get("stale_ledger", []))
+    )
+    if failed == 0 and blocking == 0 and missing > 0:
+        status = (
+            f"✅ **{passed}/{total}** verified; **{missing}** known gap(s) "
+            "listed in `safety/stpa/ls-missing-tests.txt`"
+        )
+    elif blocking > 0 and failed == 0:
+        status = (
+            f"❌ **{passed}/{total}** verified; gate failed: "
+            f"errored {results.get('errored', [])}, unledgered missing "
+            f"{results.get('unledgered_missing', [])}, stale ledger "
+            f"{results.get('stale_ledger', [])}"
+        )
+    elif failed == 0 and missing == 0:
         status = f"✅ **{passed}/{total}** approved LS entries verified"
     elif failed == 0:
         status = (
