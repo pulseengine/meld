@@ -206,6 +206,11 @@ pub struct ParsedComponent {
     /// instance index `N`. Each of these binds a real instance index that has
     /// no slot in `component_instance_defs` (see `world_exports`).
     pub instance_export_slots: Vec<(usize, u32)>,
+    /// Component type indices whose definition is a WIT `enum` (#605). The
+    /// ABI model keeps an enum as a payload-less `Variant` (identical
+    /// layout); this records the distinction a re-encoder must preserve,
+    /// since `enum` and `variant` are different component types.
+    pub enum_types: std::collections::HashSet<u32>,
 
     /// Ordered sequence of component type definitions.
     /// Tracks what created each component type index (imports with Type refs,
@@ -848,6 +853,7 @@ impl ComponentParser {
             component_func_defs: Vec::new(),
             component_instance_defs: Vec::new(),
             instance_export_slots: Vec::new(),
+            enum_types: Default::default(),
             component_type_defs: Vec::new(),
             original_size: bytes.len(),
             original_hash: compute_sha256(bytes),
@@ -1110,6 +1116,12 @@ impl ComponentParser {
                 }
                 for ty in reader {
                     let ty = ty?;
+                    let is_enum = matches!(
+                        ty,
+                        wasmparser::ComponentType::Defined(wasmparser::ComponentDefinedType::Enum(
+                            _
+                        ))
+                    );
                     let kind = match ty {
                         wasmparser::ComponentType::Func(func_type) => {
                             let params = func_type
@@ -1217,6 +1229,11 @@ impl ComponentParser {
                     };
                     if let ComponentTypeKind::P3Async(ref desc) = kind {
                         component.p3_async_features.push(format!("{desc} type"));
+                    }
+                    if is_enum {
+                        component
+                            .enum_types
+                            .insert(component.component_type_defs.len() as u32);
                     }
                     component.types.push(ComponentType { kind });
                     component
@@ -1663,6 +1680,7 @@ impl ParsedComponent {
             component_func_defs: Vec::new(),
             component_instance_defs: Vec::new(),
             instance_export_slots: Vec::new(),
+            enum_types: Default::default(),
             component_type_defs: Vec::new(),
             original_size: 0,
             original_hash: String::new(),
@@ -1703,6 +1721,38 @@ impl ParsedComponent {
             }
         }
         map
+    }
+
+    /// The definition behind a REAL component-instance index (#605).
+    ///
+    /// An `Instance` export binds a new instance index (an export alias of the
+    /// exported instance), but `component_instance_defs` has no slot for it;
+    /// `instance_export_slots` records where each one falls (#463). This
+    /// translates a real index through those slots, following an export alias
+    /// to the instance it re-exports.
+    pub fn component_instance_def(&self, real_idx: u32) -> Option<&ComponentInstanceDef> {
+        let mut idx = real_idx;
+        // Bounded: each hop strictly lowers the index in valid components.
+        for _ in 0..=self.instance_export_slots.len() {
+            let mut shift = 0u32;
+            let mut alias_of = None;
+            for &(pos, target) in &self.instance_export_slots {
+                let real_pos = pos as u32 + shift;
+                if real_pos == idx {
+                    alias_of = Some(target);
+                    break;
+                }
+                if real_pos > idx {
+                    break;
+                }
+                shift += 1;
+            }
+            match alias_of {
+                Some(target) => idx = target,
+                None => return self.component_instance_defs.get((idx - shift) as usize),
+            }
+        }
+        None
     }
 
     /// Look up the type definition at a given component type index.
@@ -4852,6 +4902,7 @@ mod tests {
             component_func_defs: vec![],
             component_instance_defs: vec![],
             instance_export_slots: Vec::new(),
+            enum_types: Default::default(),
             component_type_defs: vec![],
             original_size: 0,
             original_hash: String::new(),
@@ -6551,6 +6602,7 @@ mod tests {
             component_func_defs: vec![],
             component_instance_defs: vec![],
             instance_export_slots: Vec::new(),
+            enum_types: Default::default(),
             component_type_defs: vec![],
             original_size: 0,
             original_hash: String::new(),

@@ -4305,6 +4305,7 @@ mod tests {
             component_func_defs: Vec::new(),
             component_instance_defs: Vec::new(),
             instance_export_slots: Vec::new(),
+            enum_types: Default::default(),
             component_type_defs: vec![crate::parser::ComponentTypeDef::Defined],
             original_size: 0,
             original_hash: String::new(),
