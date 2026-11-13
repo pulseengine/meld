@@ -1370,6 +1370,62 @@ fn assemble_component(
     // Shared between import resolution (P3 task-return types) and export lifting.
     let mut type_remap: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
 
+    // #476: a type the source `use`s from an imported interface is an
+    // `alias export <instance> "<name>"` placed after the first core module,
+    // so the depth-0 replay above does not carry it. Re-create each such alias
+    // against the wrapper's replayed copy of that instance import, so the type
+    // stays NAMED: an exported instance's functions may only use named
+    // (imported or exported) record/variant types, and inlining the structure
+    // instead fails validation ("instance not valid to be used as export").
+    {
+        let replayed = component_type_idx;
+        let mut aliases = ComponentAliasSection::new();
+        for (src_idx, def) in source.component_type_defs.iter().enumerate() {
+            let src_idx = src_idx as u32;
+            let parser::ComponentTypeDef::InstanceExportAlias(alias_idx) = def else {
+                continue;
+            };
+            if src_idx < replayed {
+                // Replayed verbatim in the depth-0 prefix, at the same index.
+                type_remap.insert(src_idx, src_idx);
+                continue;
+            }
+            let Some(parser::ComponentAliasEntry::InstanceExport {
+                instance_index,
+                name,
+                ..
+            }) = source.component_aliases.get(*alias_idx)
+            else {
+                continue;
+            };
+            let Some(parser::ComponentInstanceDef::Import(import_idx)) =
+                source.component_instance_defs.get(*instance_index as usize)
+            else {
+                continue;
+            };
+            // Ordinal of this import among the source's instance imports,
+            // which `instance_renum` maps to the wrapper's instance index
+            // (absent when the import was internalised and dropped).
+            let ordinal = source.imports[..*import_idx]
+                .iter()
+                .filter(|i| matches!(i.ty, wasmparser::ComponentTypeRef::Instance(_)))
+                .count() as u32;
+            let Some(&wrapper_instance) = instance_renum.get(&ordinal) else {
+                continue;
+            };
+            aliases.alias(Alias::InstanceExport {
+                instance: wrapper_instance,
+                kind: ComponentExportKind::Type,
+                name,
+            });
+            type_remap.insert(src_idx, component_type_idx);
+            component_type_idx += 1;
+        }
+        if !aliases.is_empty() {
+            component.section(&aliases);
+        }
+    }
+
     // Cache: (Option<component_idx>, resource_name) → component type index.
     //
     // STANDARD resources (Box-pattern wit-bindgen): keyed by `(None, name)`.
@@ -2135,6 +2191,59 @@ fn assemble_component(
                 if let Some(pr_idx) = post_return_core_idx {
                     lift_options.push(CanonicalOption::PostReturn(pr_idx));
                 }
+            }
+            // #476: a lift whose params spill to memory (> 16 flat values)
+            // or whose results come back through a return area needs
+            // `memory` even without post-return. Mirror the source lift: if
+            // it named a memory, the wrapper's lift does too.
+            if let Some((_, _, ref source_opts)) = lift_info
+                && source_opts.memory.is_some()
+                && !lift_options
+                    .iter()
+                    .any(|o| matches!(o, CanonicalOption::Memory(_)))
+            {
+                lift_options.push(CanonicalOption::Memory(lift_memory));
+            }
+            // #476: likewise `realloc`, which the lift uses to store spilled
+            // params. Resolved from the SOURCE lift's own realloc (#484 does
+            // the same for lowers), never guessed from the memory.
+            if let Some((lc, _, ref source_opts)) = lift_info
+                && let Some(src_realloc) = source_opts.realloc
+                && !lift_options
+                    .iter()
+                    .any(|o| matches!(o, CanonicalOption::Realloc(_)))
+            {
+                let fused_fn = resolve_lift_realloc(lc, all_components, merged, src_realloc)?;
+                let realloc_idx = match realloc_by_fused_func.get(&fused_fn) {
+                    Some(&c) => c,
+                    None => {
+                        let name = fused_info
+                            .exports
+                            .iter()
+                            .find(|(_, k, idx)| {
+                                *k == wasmparser::ExternalKind::Func && *idx == fused_fn
+                            })
+                            .map(|(n, _, _)| n.clone())
+                            .ok_or_else(|| {
+                                Error::EncodingError(format!(
+                                    "the realloc a canon lift names (fused function \
+                                     {fused_fn}) is not exported from the fused module"
+                                ))
+                            })?;
+                        let mut aliases = ComponentAliasSection::new();
+                        aliases.alias(Alias::CoreInstanceExport {
+                            instance: fused_instance,
+                            kind: ExportKind::Func,
+                            name: &name,
+                        });
+                        component.section(&aliases);
+                        let c = core_func_idx;
+                        core_func_idx += 1;
+                        realloc_by_fused_func.insert(fused_fn, c);
+                        c
+                    }
+                };
+                lift_options.push(CanonicalOption::Realloc(realloc_idx));
             }
             // Propagate P3 async/callback from source component's canon lift
             if let Some((_, _, ref source_opts)) = lift_info {
@@ -3030,6 +3139,56 @@ pub(crate) fn resolve_source_memory(
     }
 }
 
+/// The fused function a SOURCE `canon lift`'s `realloc` option names (#476).
+/// The lift's owner may be the un-flattened original rather than one of the
+/// flattened components the merger numbered, so the owner is located the way
+/// [`resolve_source_memory`] does it: by identity, else structurally, and the
+/// answer is accepted only when every candidate resolves to the same function.
+fn resolve_lift_realloc(
+    owner: &ParsedComponent,
+    all_components: &[ParsedComponent],
+    merged: &MergedModule,
+    realloc: u32,
+) -> Result<u32> {
+    let names = |c: &ParsedComponent| c.exports.iter().map(|e| e.name.clone()).collect::<Vec<_>>();
+    let mut candidates: Vec<usize> = all_components
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| std::ptr::eq(*c, owner))
+        .map(|(i, _)| i)
+        .collect();
+    if candidates.is_empty() {
+        candidates = all_components
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| {
+                c.name == owner.name
+                    && c.core_modules.len() == owner.core_modules.len()
+                    && c.canonical_functions.len() == owner.canonical_functions.len()
+                    && names(c) == names(owner)
+            })
+            .map(|(i, _)| i)
+            .collect();
+    }
+    let mut resolved: Vec<u32> = candidates
+        .iter()
+        .filter_map(|&ci| resolve_source_realloc(owner, ci, merged, realloc).ok())
+        .collect();
+    resolved.sort_unstable();
+    resolved.dedup();
+    match resolved.as_slice() {
+        [one] => Ok(*one),
+        [] => Err(Error::EncodingError(format!(
+            "cannot resolve the realloc named by a canon lift option (source core func \
+             {realloc}): no flattened component owning the lift maps it"
+        ))),
+        _ => Err(Error::EncodingError(format!(
+            "cannot resolve the realloc named by a canon lift option (source core func \
+             {realloc}): the owning component is ambiguous"
+        ))),
+    }
+}
+
 /// What a SOURCE `canon lower` asks of its fused replacement (#484).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct LowerSpec {
@@ -3275,12 +3434,23 @@ fn define_source_type_in_wrapper(
         return Ok(wrapper_idx);
     }
 
-    let type_def = source.get_type_definition(source_type_idx).ok_or_else(|| {
-        Error::EncodingError(format!(
-            "cannot find source type definition at index {}",
-            source_type_idx
-        ))
-    })?;
+    let Some(type_def) = source.get_type_definition(source_type_idx) else {
+        // #476: a type `use`d from an imported interface is an
+        // instance-export alias; its definition lives in the imported
+        // instance type, which `resolve_defined_val_type` follows (#393).
+        let val = source
+            .resolve_defined_val_type(source_type_idx)
+            .ok_or_else(|| {
+                Error::EncodingError(format!(
+                    "cannot find source type definition at index {}",
+                    source_type_idx
+                ))
+            })?;
+        let wrapper_idx =
+            emit_defined_type(component, source, &val, component_type_idx, type_remap)?;
+        type_remap.insert(source_type_idx, wrapper_idx);
+        return Ok(wrapper_idx);
+    };
 
     // Clone to avoid borrow issues
     let kind = type_def.kind.clone();

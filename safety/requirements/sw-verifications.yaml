@@ -1999,3 +1999,17 @@ artifacts:
       reviewed-by: avrabe
       model: claude-opus-5-5
       timestamp: 2026-11-13T13:51:24Z
+
+  - id: SWV-137
+    type: sw-verification
+    title: "Verification of SR-123: wrapped falcon components return what the originals return"
+    status: implemented
+    release: v0.69.0
+    description: "component_output_using_imported_interface_types_computes_the_same fuses tests/fixtures/issue_461/falcon_cascade_estimator_cm.wasm and falcon_cascade_control_cm.wasm with --component under --memory multi. It then calls every exported function of the original and of the wrapped component on wasmtime 50, in the same order and with the same generated arguments (records, options, enums and scalars, all non-zero), and requires identical transcripts. The estimator's step takes a sensor-frame of more than 16 flat values (spilled params, so memory and realloc are needed) and returns a 16-field nav-state, which matched field for field. Potency: at least 2 calls per component, and at least one record crossing the boundary. Red before the fix: each fixture failed with 'cannot find source type definition at index 1'. Removing the lift memory option gave 'canonical option memory is required', and removing realloc gave 'canonical option realloc is required'. split_with_imported_interfaces_wraps_and_validates covers falcon_cascade_split_cm.wasm, whose types are aliased before the first core module (the replay path)."
+    links:
+      - type: verifies
+        target: SR-123
+    provenance:
+      created-by: ai-assisted
+      model: claude-opus-5-5
+      timestamp: 2026-11-13T17:53:54Z

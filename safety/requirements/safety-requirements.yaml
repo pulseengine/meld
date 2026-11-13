@@ -4053,3 +4053,17 @@ artifacts:
       reviewed-by: avrabe
       model: claude-opus-5-5
       timestamp: 2026-11-13T13:51:24Z
+
+  - id: SR-123
+    type: sw-req
+    title: "--component output keeps types a component uses from an imported interface named, and computes what the input computes"
+    status: implemented
+    release: v0.69.0
+    description: "A wit-bindgen component that uses a type from an imported interface refers to it as an alias export of that instance import. meld's component wrapper shall re-create each such alias against its replayed copy of the instance import, so the type stays named (an exported instance's functions may only use named record/variant types). For a type the depth-0 replay already carries, it shall map the type to its replayed index. It shall give each wrapper canon lift the memory and realloc options the source lift named, which a parameter list spilled to memory (more than 16 flat values) or a return area requires. The wrapped component shall return what the input returns for the same calls. Not covered, tracked on #605: an exported interface that defines its own record/enum types, the enum-to-variant change, and the realloc of a three-input fuse under shared memory."
+    links:
+      - type: derives-from
+        target: SYS-3
+    provenance:
+      created-by: ai-assisted
+      model: claude-opus-5-5
+      timestamp: 2026-11-13T17:53:54Z
