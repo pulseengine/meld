@@ -1,12 +1,11 @@
-# rivet's toolchain pin: the `covalent` layer, which composes the PulseEngine
+# meld's toolchain pin: the `covalent` layer, which composes the PulseEngine
 # methodology toolchain (spar, witness, wsc, ...) with the component-model
 # tools (wasm-tools, wac, wkg, ...). Changing layers is a reviewed edit here.
 #
-# rivet itself is built from this workspace during development; the layer's
-# rivet is the released one. `varve which <tool>` says which runs where.
+# `varve which <tool>` says which layer each tool on PATH comes from.
 manifest-version = 1
 
 [toolchain]
 realm   = "covalent"
 channel = "rolling"
-layer   = "2026.11.1"
+layer   = "2026.11.10"
