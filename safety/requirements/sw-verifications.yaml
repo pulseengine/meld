@@ -1996,5 +1996,6 @@ artifacts:
         target: SR-122
     provenance:
       created-by: ai-assisted
+      reviewed-by: avrabe
       model: claude-opus-5-5
       timestamp: 2026-11-13T13:51:24Z
