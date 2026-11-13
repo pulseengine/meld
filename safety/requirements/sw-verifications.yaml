@@ -1984,3 +1984,17 @@ artifacts:
       reviewed-by: avrabe
       model: claude-opus-5-5
       timestamp: 2026-11-12T06:41:58Z
+
+  - id: SWV-136
+    type: sw-verification
+    title: "Verification of SR-122: the differential ledger matches, and it fails when an outcome moves"
+    status: implemented
+    release: v0.69.0
+    description: "canonical_abi_differential_matches_the_ledger runs 295 fixtures x 2 strategies (about 13 s) and compares against outcomes.tsv. At introduction (main f5afa11): multi has 89 match, 19 match-trap, 31 wrong, 9 fused-trap, 38 accepts-invalid, 84 refused, 24 refused-defect and 1 not-runnable; shared has 68 match, 9 match-trap, 14 wrong, 6 fused-trap, 21 accepts-invalid, 152 refused, 24 refused-defect and 1 not-runnable. A potency floor requires at least 100 match rows and at least 1 wrong row, so a run that compares nothing, or an oracle that cannot see a known bug, fails. Negative control observed red: editing issue599-bool_2/multi from wrong to match in the ledger fails with 'ledger match, now wrong'. classify_names_each_case covers all nine classifications."
+    links:
+      - type: verifies
+        target: SR-122
+    provenance:
+      created-by: ai-assisted
+      model: claude-opus-5-5
+      timestamp: 2026-11-13T13:51:24Z
