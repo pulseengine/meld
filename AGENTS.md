@@ -753,30 +753,39 @@ your own `CLAUDE_CODE_OAUTH_TOKEN` secret, and remove `avrabe`'s id.
 ### LS-N verification gate
 
 CI workflow `.github/workflows/verification-gate.yml` enforces the
-test-naming contract on every PR: each `status: approved` entry in
+test-naming contract on every PR: each loss scenario with status
+`approved`, `implemented` or `verified` in
 `safety/stpa/loss-scenarios.yaml` must have at least one `#[test] fn
 ls_<letter>_<num>_*` in `meld-core` (e.g. `LS-A-11` → `ls_a_11_*`).
+Promoting a scenario past `approved` does not drop it from the gate.
 
-The gate runs `tools/run_ls_verification.py`, which iterates approved
-LS IDs and invokes `cargo test --lib --no-fail-fast <prefix>` per
-entry, then posts a single sticky PR comment with passed / failed /
-missing counts via `tools/post_verification_comment.py`.
+The gate runs `tools/run_ls_verification.py`, which iterates those IDs
+and invokes `cargo test -p meld-core --no-fail-fast -- <prefix>` per
+entry. It then posts a single sticky PR comment with the counts via
+`tools/post_verification_comment.py`. The script's exit code is the
+gate (#608).
 
-Same script runs locally:
+Same script runs locally (needs rivet >= 0.40 on PATH, or `$RIVET`):
 
 ```bash
+python3 tools/run_ls_verification.py --self-test
 python3 tools/run_ls_verification.py --results-json /tmp/ls.json
 ```
 
-Buckets and gate behaviour:
+Buckets and gate behaviour. The gate fails closed: anything that is not
+evidence of a passing test fails it.
 
-- **Passed** — ≥1 matching test, all green. Approved entry is verified.
-- **Failed** — ≥1 matching test failed. **Hard-fails the gate** (block merge).
-- **Missing** — zero tests match the `ls_<letter>_<num>_*` prefix.
-  Advisory only; surfaces as a warning so older approved scenarios
-  with ad-hoc test names (e.g. PR #114's
-  `test_canonical_abi_size_fixed_size_list_saturates_on_overflow` for
-  LS-P-4) can be migrated incrementally rather than blocking every PR.
+- **Passed:** ≥1 matching test, all green.
+- **Failed:** ≥1 matching test failed. Fails the gate.
+- **Errored:** cargo exited non-zero with no failing test (a compile
+  error, a crashed harness). Fails the gate. Before #608 this read as
+  "missing", which was advisory, so a broken build passed.
+- **Missing:** zero tests match the prefix. Fails the gate unless the ID
+  is in `safety/stpa/ls-missing-tests.txt`, the exact ledger of known
+  gaps. A ledger line whose scenario now has a test also fails, so the
+  ledger stays exact. To close a gap, add the test and delete the line.
+- **Zero scenarios checked** fails the gate: an empty set is a vacuous
+  pass, not a clean one.
 
 Adapted from spar's rivet-driven verification gate
 (pulseengine/spar@ba329f3d), with meld's STPA loss-scenario artifacts

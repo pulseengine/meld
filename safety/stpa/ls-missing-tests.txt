@@ -1,0 +1,9 @@
+# Loss scenarios with status approved, implemented or verified that have no
+# `ls_<id>_*` regression test yet. tools/run_ls_verification.py (#608)
+# requires this list to be EXACT: a missing test not listed here fails the
+# gate, and a listed ID that now has a test fails too (delete its line).
+# Each entry is a known gap, not an exemption: add the test, then the line.
+
+# implemented via PR #20 (per-import Memory(N)/Realloc(N) WASI lowering) but no
+# test carries the ls_w_1_ prefix; invisible until #608 checked past `approved`.
+LS-W-1
