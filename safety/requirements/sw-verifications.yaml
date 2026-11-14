@@ -1959,7 +1959,7 @@ artifacts:
   - id: SWV-134
     type: sw-verification
     title: "Verification of SR-120: an injected Axiom and an injected external_body each turn the checks red"
-    status: implemented
+    status: verified
     release: v0.69.0
     description: "proofs/kernel_check.sh (proofs.yml step 'Kernel check') and meld-core/tests/proof_trust_ledger.rs. Clean tree, Rocq 9.0.1 via nix: 27 files compiled, coqchk checked 221 libraries (Stdlib included), Axioms <none>, exit 0; ledger test 2/2 pass. Controls: appending 'Axiom meld_injected_axiom : False.' to proofs/parser/parser.v made coqchk list Standalone.parser.meld_injected_axiom and the script exit 1, and made the ledger test fail naming (proofs/parser/parser.v, Axiom, meld_injected_axiom); adding #[verifier::external_body] fn injected_trusted() inside verification/verus-pilot's verus! block made the ledger test fail naming it; reverting both restored green. the_scan_can_fail checks the scanner on inline text: commented-out axioms, kani::assume and my_assume are not counted; Axiom, Parameter, Admitted (with its lemma), Conjecture, external_body, assume and admit are. The ledger test also fails if it finds no verus! file, so an empty Verus result cannot mean it looked nowhere. Positivity: an inductive declared with #[bypass_check(positivity)] in parser.v made coqchk list it under 'Inductives whose positivity is assumed' and the script exit 1, and made the ledger test fail naming (proofs/parser/parser.v, bypass_check, positivity); reverted, green. The script also fails on any coqchk summary line it does not judge, so a category a newer coqchk adds is not silently ignored (not exercised: no coqchk available prints one)."
     links:
@@ -1973,7 +1973,7 @@ artifacts:
   - id: SWV-135
     type: sw-verification
     title: "Verification of SR-121: invalid flat char params trap in the adapter, valid ones pass"
-    status: implemented
+    status: verified
     release: v0.69.0
     description: "char_param_check_traps_exactly_on_invalid_chars runs the spliced check on wasmtime at 0, 0xD7FF, 0xD800, 0xDBFF, 0xDC00, 0xDFFF, 0xE000, 0x10FFFF, 0x110000 and u32::MAX, and checks that the original body's locals and instructions survive the splice. Negative controls observed red: a 0xFFFFFC00 surrogate mask (0xDC00 passes) and a 0x110001 bound (0x110000 passes). The call-lowering truth table now covers 256 combinations, with has_value_checks forbidding inlining on its own. End to end, the execution ratchet's numerics.wast rows 194, 196 and 198 (run-d800, run-dfff, run-too-big) move from no-trap to pass, and no other row changes. char_next_to_a_compact_string_is_checked (added after review, from the auto-Mythos finding on #594): the #582 adapter path for two latin1+utf16 components in different memories returned before the splice, so a char passed next to a string was not checked. Fixture tests/fixtures/transcode_545/char_with_compact_string.wat; unfused on wasmtime's component runtime, 'A' returns 0x41 and 0xD800 traps. Fused before the fix: 0xD800 returned 55296 (red); after: it traps and 'A' still returns 0x41."
     links:
@@ -1988,7 +1988,7 @@ artifacts:
   - id: SWV-136
     type: sw-verification
     title: "Verification of SR-122: the differential ledger matches, and it fails when an outcome moves"
-    status: implemented
+    status: verified
     release: v0.69.0
     description: "canonical_abi_differential_matches_the_ledger runs 297 fixtures x 2 strategies (about 13 s) and compares against outcomes.tsv. At introduction (main f5afa11): multi has 90 match, 19 match-trap, 32 wrong, 9 fused-trap, 38 accepts-invalid, 84 refused, 24 refused-defect and 1 not-runnable; shared has 69 match, 9 match-trap, 15 wrong, 6 fused-trap, 21 accepts-invalid, 152 refused, 24 refused-defect and 1 not-runnable. A potency floor requires at least 100 match rows and at least 1 wrong row, so a run that compares nothing, or an oracle that cannot see a known bug, fails. Negative control observed red: editing issue599-bool_2/multi from wrong to match in the ledger fails with 'ledger match, now wrong'. classify_names_each_case covers all nine classifications."
     links:
@@ -2003,7 +2003,7 @@ artifacts:
   - id: SWV-137
     type: sw-verification
     title: "Verification of SR-123: wrapped falcon components return what the originals return"
-    status: implemented
+    status: verified
     release: v0.69.0
     description: "component_output_using_imported_interface_types_computes_the_same fuses tests/fixtures/issue_461/falcon_cascade_estimator_cm.wasm and falcon_cascade_control_cm.wasm with --component under --memory multi. It then calls every exported function of the original and of the wrapped component on wasmtime 50, in the same order and with the same generated arguments (records, options, enums and scalars, all non-zero), and requires identical transcripts. The estimator's step takes a sensor-frame of more than 16 flat values (spilled params, so memory and realloc are needed) and returns a 16-field nav-state, which matched field for field. Potency: at least 2 calls per component, and at least one record crossing the boundary. Red before the fix: each fixture failed with 'cannot find source type definition at index 1'. Removing the lift memory option gave 'canonical option memory is required', and removing realloc gave 'canonical option realloc is required'. split_with_imported_interfaces_wraps_and_validates covers falcon_cascade_split_cm.wasm, whose types are aliased before the first core module (the replay path)."
     links:
@@ -2018,7 +2018,7 @@ artifacts:
   - id: SWV-138
     type: sw-verification
     title: "Verification of SR-124: meld's three-input falcon fuse returns what the wac composition returns, with pilot's types exported"
-    status: implemented
+    status: verified
     release: v0.69.0
     description: "three_input_component_matches_the_wac_composition fuses falcon-cascade v0.13.0's split, estimator and control (tests/fixtures/issue_605, from relay main 4836198) with --component under --memory multi. It then calls all six exported functions on wasmtime 50 with the same generated arguments as relay's wac plug composition and requires identical transcripts. That includes observer#read-state, whose estimator state is produced through the internal cross-component calls. pilot_types_are_exported_named_and_the_enum_stays_an_enum checks that the wrapped split's pilot instance exports pilot-command as an Enum and supervisor-config and sensor-calibration as Records. Red before: on the #476 branch the split failed with 'instance not valid to be used as export'. Negative control observed red: with the enum branch disabled, both tests fail (Enum vs Variant in the transcript; the enum assertion). Before binding the function signatures to the exported types, validation failed. Before skipping re-export of used types, wit-parser 0.243 panicked decoding the output's WIT."
     links:
