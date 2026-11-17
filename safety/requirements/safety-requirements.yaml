@@ -4083,3 +4083,19 @@ artifacts:
       reviewed-by: avrabe
       model: claude-opus-5-5
       timestamp: 2026-11-13T18:23:23Z
+
+  - id: SR-125
+    type: sw-req
+    title: "An adapter accepts realloc returning 0 for a 0-byte request, and traps on a 0 result only for a nonzero request"
+    status: implemented
+    release: v0.70.0
+    description: "Every adapter call to a component's cabi_realloc shall trap when the result is 0 and the requested byte size is nonzero (LS-A-7 leg (b): a deliberate stricter-than-spec choice, since the Canonical ABI's reallocate traps only on misalignment and on ptr + new_byte_length > len(memory)). When the requested size is 0, a 0 result is valid and the adapter shall pass it on, as the unfused runtime does (#621). The size used for the check is the same emitted expression the call received, so the two cannot drift."
+    links:
+      - type: derives-from
+        target: SYS-3
+      - type: mitigates
+        target: LS-A-7
+    provenance:
+      created-by: ai-assisted
+      model: claude-opus-5-5
+      timestamp: 2026-11-17T12:30:00Z

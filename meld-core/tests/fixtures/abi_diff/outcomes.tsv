@@ -1,13 +1,13 @@
 # Canonical ABI differential outcomes (tests/abi_differential.rs).
 # fixture	strategy	outcome	note. Regenerate with MELD_BLESS=1.
-issue586-enum257-bad-discriminant	multi	accepts-invalid
-issue586-enum257-bad-discriminant	shared	accepts-invalid
+issue586-enum257-bad-discriminant	multi	accepts-invalid	#586
+issue586-enum257-bad-discriminant	shared	accepts-invalid	#586
 issue586-enum257-valid-control	multi	match
 issue586-enum257-valid-control	shared	match
-issue586-list-char-invalid	multi	accepts-invalid
-issue586-list-char-invalid	shared	accepts-invalid
-issue586-option-bad-discriminant	multi	accepts-invalid
-issue586-option-bad-discriminant	shared	accepts-invalid
+issue586-list-char-invalid	multi	accepts-invalid	#586
+issue586-list-char-invalid	shared	accepts-invalid	#586
+issue586-option-bad-discriminant	multi	accepts-invalid	#586
+issue586-option-bad-discriminant	shared	accepts-invalid	#586
 issue597-renamed-func	multi	not-runnable	#597
 issue597-renamed-func	shared	not-runnable	#597
 issue598-utf16-copy	multi	wrong	#598
@@ -26,8 +26,8 @@ issue599-u16_65536	multi	wrong	#599
 issue599-u16_65536	shared	wrong	#599
 issue599-u8_300	multi	wrong	#599
 issue599-u8_300	shared	wrong	#599
-issue600-list-option-string-utf8-to-utf16	multi	wrong
-issue600-list-option-string-utf8-to-utf16	shared	wrong
+issue600-list-option-string-utf8-to-utf16	multi	wrong	#600
+issue600-list-option-string-utf8-to-utf16	shared	wrong	#600
 issue600-list-string	multi	wrong	#600
 issue600-list-string	shared	wrong	#600
 issue601-compact	multi	match
@@ -46,22 +46,24 @@ issue603-record-string-same-encoding-control	multi	match
 issue603-record-string-same-encoding-control	shared	match
 issue619-flags9-clean-control	multi	match
 issue619-flags9-clean-control	shared	match
-issue619-flags9-highbits	multi	wrong
-issue619-flags9-highbits	shared	wrong
-issue620-char-utf16-to-utf8	multi	refused-defect
-issue620-char-utf16-to-utf8	shared	refused-defect
-issue620-char-utf8-to-utf16	multi	refused-defect
-issue620-char-utf8-to-utf16	shared	refused-defect
+issue619-flags9-highbits	multi	wrong	#619
+issue619-flags9-highbits	shared	wrong	#619
+issue620-char-utf16-to-utf8	multi	refused-defect	#620
+issue620-char-utf16-to-utf8	shared	refused-defect	#620
+issue620-char-utf8-to-utf16	multi	refused-defect	#620
+issue620-char-utf8-to-utf16	shared	refused-defect	#620
 issue620-char-utf8-to-utf8-control	multi	match
 issue620-char-utf8-to-utf8-control	shared	match
-issue621-realloc-null-size0	multi	fused-trap
+issue621-realloc-null-nonzero-stricter	multi	fused-trap	#621 LS-A-7: deliberate trap on NULL for a nonzero request (stricter than spec)
+issue621-realloc-null-nonzero-stricter	shared	match
+issue621-realloc-null-size0	multi	match
 issue621-realloc-null-size0	shared	match
 issue621-realloc-null-size1-control	multi	match
 issue621-realloc-null-size1-control	shared	match
 issue622-realloc-called	multi	match
-issue622-realloc-called	shared	wrong
+issue622-realloc-called	shared	wrong	#622
 issue622-realloc-oob	multi	match-trap
-issue622-realloc-oob	shared	accepts-invalid
+issue622-realloc-oob	shared	accepts-invalid	#622
 r1-char_na_00	multi	match
 r1-char_na_00	shared	match
 r1-char_na_01	multi	match

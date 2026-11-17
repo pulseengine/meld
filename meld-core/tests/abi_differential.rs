@@ -233,3 +233,29 @@ fn classify_names_each_case() {
     );
     assert_eq!(classify(&Run::Error("x".into()), &ok(1)), "unfused-invalid");
 }
+
+// rivet: verifies SR-125
+// rivet: verifies SWV-139
+#[test]
+fn realloc_null_traps_only_for_a_nonzero_request() {
+    let run = |name: &str| {
+        let bytes = wat::parse_file(dir().join(format!("{name}.wat"))).unwrap();
+        (
+            run_unfused(&bytes),
+            run_fused(&bytes, MemoryStrategy::MultiMemory),
+        )
+    };
+    // #621: realloc(0, 0, 1, 0) answered with 0 is valid; the call goes through.
+    let (unfused, fused) = run("issue621-realloc-null-size0");
+    assert!(matches!(unfused, Run::Ok(7)), "unfused reference moved");
+    assert!(
+        matches!(fused, Ok(Run::Ok(7))),
+        "a 0-byte request answered with NULL must not trap"
+    );
+    // LS-A-7 leg (b): NULL for a nonzero request still traps (stricter than spec).
+    let (_, fused) = run("issue621-realloc-null-nonzero-stricter");
+    assert!(
+        matches!(fused, Ok(Run::Trap)),
+        "NULL for a nonzero request must trap"
+    );
+}

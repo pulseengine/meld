@@ -2356,8 +2356,7 @@ loss-scenarios:
       corrupts callee memory at caller-chosen offsets [H-4.3] and covers
       address 0 on realloc failure [H-2]. Violates WebAssembly Component
       Model Canonical ABI (commit deb0b0a) Section 3.10 "Canonical
-      Built-in Definitions", which requires the host to trap when
-      realloc returns 0, and WebAssembly Core Specification Release 3.0
+      Built-in Definitions" and WebAssembly Core Specification Release 3.0
       Section 4.4.1 which defines i32.mul as modulo 2^32. Detected by
       Kani harness
       meld-core::adapter::fact::tests::kani_transcode_alloc_size_no_overflow_guard
@@ -2365,7 +2364,7 @@ loss-scenarios:
       meld-core::adapter::fact::tests::poc_transcode_adapter_emits_unchecked_mul
       which asserts presence of (a) I32Eqz/BrIf after the cabi_realloc
       Call and (b) a len upper-bound check before I32Mul; both
-      assertions fail on the current emitter.
+      assertions fail on the current emitter. Correction (#621, 2026-11-17): the Canonical ABI does not require a trap when realloc returns 0. Its reallocate (CanonicalABI.md at 16dccd94532f) traps only on a misaligned result and on ptr + new_byte_length > len(memory). meld's NULL trap is a deliberate stricter-than-spec choice for a nonzero request, where NULL signals OOM in common allocators and a copy at offset 0 would overwrite the callee's low memory. For a 0-byte request a 0 result is valid and nothing is written, so the adapter does not trap (#621).
     causal-factors:
       - Allocation size computed via I32Mul without widening len to i64
         or bounding len < u32::MAX / K before the multiply
