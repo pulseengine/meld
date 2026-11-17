@@ -2043,3 +2043,17 @@ artifacts:
       created-by: ai-assisted
       model: claude-opus-5-5
       timestamp: 2026-11-17T13:30:00Z
+
+  - id: SWV-140
+    type: sw-verification
+    title: "Verification of SR-126: fused calls see normalised flat params, as unfused ones do"
+    status: implemented
+    release: v0.70.0
+    description: "flat_params_are_normalised_as_lift_flat_does (tests/abi_differential.rs) runs six fixtures unfused on wasmtime and fused under --memory multi and --memory shared, and requires equal results: flags<9> passed 0x1FF05 (261), bool passed 2 (1), u8 passed 300 (44), u16 passed 65536 (0), s8 passed 200 and s16 passed 40000 (sign-extended). flat_param_lifts_mask_flags_and_narrow_ints (parser unit test) checks the slots and masks: flags<9> masks 0x1FF in word 0, flags<32> needs no mask, flags<40> masks 0xFF in word 1, and a record's bool/s8/u16/s16/u8/char fields map to their flat slots behind a u64. The differential ledger moved 7 fixtures from wrong to match on both strategies (5 #599 shapes, #619, r2-record_na_02) and no other row. Negative control observed red: storing nothing (drop instead of local.set) fails the run-level test on issue619-flags9-highbits."
+    links:
+      - type: verifies
+        target: SR-126
+    provenance:
+      created-by: ai-assisted
+      model: claude-opus-5-5
+      timestamp: 2026-11-17T15:00:00Z

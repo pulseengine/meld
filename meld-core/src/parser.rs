@@ -493,6 +493,27 @@ pub enum PrimitiveValType {
     Char,
 }
 
+/// What the Canonical ABI's `lift_flat` does to one flat i32 param slot
+/// beyond passing it through (#586/#599/#619). See
+/// [`ParsedComponent::flat_param_lifts`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FlatParamLift {
+    /// Trap unless the value is a Unicode scalar value.
+    Char,
+    /// `x != 0`.
+    Bool,
+    /// `x & 0xFF`.
+    U8,
+    /// `x & 0xFFFF`.
+    U16,
+    /// Sign-extend the low 8 bits.
+    S8,
+    /// Sign-extend the low 16 bits.
+    S16,
+    /// `x & mask`: the declared labels' bits in the last flags word.
+    FlagsMask(u32),
+}
+
 /// String encoding declared in canonical options
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CanonStringEncoding {
@@ -2664,51 +2685,84 @@ impl ParsedComponent {
         positions
     }
 
-    /// #586: flat core indices of every `char` a caller hands over in FLAT
-    /// params — top level, or inside a record, tuple or fixed-size list (all
-    /// flatten field by field). The Canonical ABI traps when one of these is a
-    /// surrogate (0xD800..=0xDFFF) or above 0x10FFFF, so an adapter must check
-    /// them before the callee sees them.
+    /// #586/#599/#619: flat core indices of every value whose Canonical ABI
+    /// `lift_flat` does more than pass the i32 through, with what it does:
+    /// `char` traps on a surrogate (0xD800..=0xDFFF) or a value above
+    /// 0x10FFFF; `bool` becomes `x != 0`; `u8`/`u16` keep their low 8/16 bits;
+    /// `s8`/`s16` sign-extend them; `flags` keep only the bits of declared
+    /// labels (in the last storage word when N is not a multiple of 32).
+    /// Covers values at the top level and inside a record, tuple or
+    /// fixed-size list (all flatten field by field).
     ///
-    /// Not covered here: a `char` inside a variant, option or result payload
-    /// (its flat slot is shared with other cases and is only a `char` under one
-    /// discriminant), inside a `list` (in memory), or in the params-ptr area.
-    pub fn char_param_flat_positions(&self, params: &[(String, ComponentValType)]) -> Vec<u32> {
-        let mut positions = Vec::new();
+    /// Not covered here: a value inside a variant, option or result payload
+    /// (its flat slot is shared with other cases and has this type only under
+    /// one discriminant), inside a `list` (in memory), or in the params-ptr
+    /// area.
+    pub fn flat_param_lifts(
+        &self,
+        params: &[(String, ComponentValType)],
+    ) -> Vec<(u32, FlatParamLift)> {
+        let mut out = Vec::new();
         let mut flat_idx = 0u32;
         for (_, ty) in params {
-            self.collect_char_positions(ty, flat_idx, &mut positions);
+            self.collect_flat_lifts(ty, flat_idx, &mut out);
             flat_idx += self.flat_count(ty);
         }
-        positions
+        out
     }
 
-    fn collect_char_positions(&self, ty: &ComponentValType, base: u32, out: &mut Vec<u32>) {
+    fn collect_flat_lifts(
+        &self,
+        ty: &ComponentValType,
+        base: u32,
+        out: &mut Vec<(u32, FlatParamLift)>,
+    ) {
         match ty {
-            ComponentValType::Primitive(PrimitiveValType::Char) => out.push(base),
+            ComponentValType::Primitive(p) => {
+                let lift = match p {
+                    PrimitiveValType::Char => FlatParamLift::Char,
+                    PrimitiveValType::Bool => FlatParamLift::Bool,
+                    PrimitiveValType::U8 => FlatParamLift::U8,
+                    PrimitiveValType::U16 => FlatParamLift::U16,
+                    PrimitiveValType::S8 => FlatParamLift::S8,
+                    PrimitiveValType::S16 => FlatParamLift::S16,
+                    _ => return,
+                };
+                out.push((base, lift));
+            }
+            ComponentValType::Flags(names) => {
+                let n = names.len() as u32;
+                if !n.is_multiple_of(32) {
+                    let last_word = n / 32;
+                    out.push((
+                        base + last_word,
+                        FlatParamLift::FlagsMask((1u32 << (n % 32)) - 1),
+                    ));
+                }
+            }
             ComponentValType::FixedSizeList(elem, len) => {
                 let elem_flat = self.flat_count(elem);
                 for i in 0..*len {
-                    self.collect_char_positions(elem, base + i * elem_flat, out);
+                    self.collect_flat_lifts(elem, base + i * elem_flat, out);
                 }
             }
             ComponentValType::Record(fields) => {
                 let mut offset = base;
                 for (_, field_ty) in fields {
-                    self.collect_char_positions(field_ty, offset, out);
+                    self.collect_flat_lifts(field_ty, offset, out);
                     offset += self.flat_count(field_ty);
                 }
             }
             ComponentValType::Tuple(elems) => {
                 let mut offset = base;
                 for elem_ty in elems {
-                    self.collect_char_positions(elem_ty, offset, out);
+                    self.collect_flat_lifts(elem_ty, offset, out);
                     offset += self.flat_count(elem_ty);
                 }
             }
             ComponentValType::Type(idx) => {
                 if let Some(inner) = self.resolve_defined_val_type(*idx) {
-                    self.collect_char_positions(&inner, base, out);
+                    self.collect_flat_lifts(&inner, base, out);
                 }
             }
             _ => {}
@@ -6613,6 +6667,73 @@ mod tests {
 
     fn flags_ty(n: usize) -> ComponentValType {
         ComponentValType::Flags((0..n).map(|i| format!("f{i}")).collect())
+    }
+
+    // rivet: verifies SR-126
+    // rivet: verifies SWV-140
+    #[test]
+    fn flat_param_lifts_mask_flags_and_narrow_ints() {
+        use crate::parser::FlatParamLift as L;
+        let c = empty_parsed_for_flags();
+        let p = |ty: ComponentValType| vec![("x".to_string(), ty)];
+        // flags<9>: one word, low 9 bits kept.
+        assert_eq!(
+            c.flat_param_lifts(&p(flags_ty(9))),
+            vec![(0, L::FlagsMask(0x1FF))]
+        );
+        // flags<32>: every bit is a label, nothing to mask.
+        assert_eq!(c.flat_param_lifts(&p(flags_ty(32))), vec![]);
+        // flags<40>: two words, only the second (8 labels) is masked.
+        assert_eq!(
+            c.flat_param_lifts(&p(flags_ty(40))),
+            vec![(1, L::FlagsMask(0xFF))]
+        );
+        // Narrow ints, bool and char in a record, behind a u64 (one flat i64 slot).
+        let rec = ComponentValType::Record(vec![
+            (
+                "a".into(),
+                ComponentValType::Primitive(PrimitiveValType::U64),
+            ),
+            (
+                "b".into(),
+                ComponentValType::Primitive(PrimitiveValType::Bool),
+            ),
+            (
+                "c".into(),
+                ComponentValType::Primitive(PrimitiveValType::S8),
+            ),
+            (
+                "d".into(),
+                ComponentValType::Primitive(PrimitiveValType::U16),
+            ),
+            (
+                "e".into(),
+                ComponentValType::Primitive(PrimitiveValType::U32),
+            ),
+            (
+                "f".into(),
+                ComponentValType::Primitive(PrimitiveValType::S16),
+            ),
+            (
+                "g".into(),
+                ComponentValType::Primitive(PrimitiveValType::U8),
+            ),
+            (
+                "h".into(),
+                ComponentValType::Primitive(PrimitiveValType::Char),
+            ),
+        ]);
+        assert_eq!(
+            c.flat_param_lifts(&p(rec)),
+            vec![
+                (1, L::Bool),
+                (2, L::S8),
+                (3, L::U16),
+                (5, L::S16),
+                (6, L::U8),
+                (7, L::Char)
+            ]
+        );
     }
 
     #[test]

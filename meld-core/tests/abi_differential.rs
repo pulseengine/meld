@@ -259,3 +259,28 @@ fn realloc_null_traps_only_for_a_nonzero_request() {
         "NULL for a nonzero request must trap"
     );
 }
+
+// rivet: verifies SR-126
+// rivet: verifies SWV-140
+#[test]
+fn flat_params_are_normalised_as_lift_flat_does() {
+    for name in [
+        "issue619-flags9-highbits",
+        "issue599-bool_2",
+        "issue599-u8_300",
+        "issue599-u16_65536",
+        "issue599-s8_200",
+        "issue599-s16_40000",
+    ] {
+        let bytes = wat::parse_file(dir().join(format!("{name}.wat"))).unwrap();
+        let Run::Ok(want) = run_unfused(&bytes) else {
+            panic!("{name}: unfused reference did not return a value");
+        };
+        for (label, strategy) in STRATEGIES {
+            match run_fused(&bytes, strategy) {
+                Ok(Run::Ok(got)) => assert_eq!(got, want, "{name} {label}"),
+                _ => panic!("{name} {label}: the fused run did not return a value"),
+            }
+        }
+    }
+}
