@@ -9366,21 +9366,13 @@ impl FactStyleGenerator {
         func.instruction(&Instruction::Unreachable);
         func.instruction(&Instruction::End);
 
-        func.instruction(&Instruction::I32Const(0)); // original_ptr
-        func.instruction(&Instruction::I32Const(0)); // original_size
-        func.instruction(&Instruction::I32Const(callee_align)); // alignment
-        func.instruction(&Instruction::LocalGet(1)); // input_len
-        func.instruction(&Instruction::I32Const(2));
-        func.instruction(&Instruction::I32Mul); // alloc_size = 2 * input_len
-        func.instruction(&Instruction::Call(callee_realloc));
-        func.instruction(&Instruction::LocalSet(out_ptr_local));
-
-        // Trap on null return from cabi_realloc (LS-A-7 leg b).
-        func.instruction(&Instruction::LocalGet(out_ptr_local));
-        func.instruction(&Instruction::I32Eqz);
-        func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
-        func.instruction(&Instruction::Unreachable);
-        func.instruction(&Instruction::End);
+        // #621: alloc_size = 2 * input_len; a NULL answer traps only when
+        // the request was nonzero (LS-A-7 leg b).
+        emit_checked_realloc(func, callee_realloc, out_ptr_local, callee_align, |b| {
+            b.instruction(&Instruction::LocalGet(1));
+            b.instruction(&Instruction::I32Const(2));
+            b.instruction(&Instruction::I32Mul);
+        });
 
         // Step 2: Initialize loop counters
         func.instruction(&Instruction::I32Const(0));
@@ -9898,21 +9890,13 @@ impl FactStyleGenerator {
         func.instruction(&Instruction::Unreachable);
         func.instruction(&Instruction::End);
 
-        func.instruction(&Instruction::I32Const(0)); // original_ptr
-        func.instruction(&Instruction::I32Const(0)); // original_size
-        func.instruction(&Instruction::I32Const(callee_align)); // alignment
-        func.instruction(&Instruction::LocalGet(1)); // input_len (code units)
-        func.instruction(&Instruction::I32Const(3));
-        func.instruction(&Instruction::I32Mul); // alloc_size = 3 * code_units
-        func.instruction(&Instruction::Call(callee_realloc));
-        func.instruction(&Instruction::LocalSet(out_ptr_local));
-
-        // Trap on null return from cabi_realloc (LS-A-7 leg b).
-        func.instruction(&Instruction::LocalGet(out_ptr_local));
-        func.instruction(&Instruction::I32Eqz);
-        func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
-        func.instruction(&Instruction::Unreachable);
-        func.instruction(&Instruction::End);
+        // #621: alloc_size = 3 * input_len; a NULL answer traps only when
+        // the request was nonzero (LS-A-7 leg b).
+        emit_checked_realloc(func, callee_realloc, out_ptr_local, callee_align, |b| {
+            b.instruction(&Instruction::LocalGet(1));
+            b.instruction(&Instruction::I32Const(3));
+            b.instruction(&Instruction::I32Mul);
+        });
 
         // Step 2: Initialize loop counters
         func.instruction(&Instruction::I32Const(0));
@@ -10219,21 +10203,13 @@ impl FactStyleGenerator {
         func.instruction(&Instruction::Unreachable);
         func.instruction(&Instruction::End);
 
-        func.instruction(&Instruction::I32Const(0)); // original_ptr
-        func.instruction(&Instruction::I32Const(0)); // original_size
-        func.instruction(&Instruction::I32Const(callee_align)); // alignment
-        func.instruction(&Instruction::LocalGet(1)); // input_len
-        func.instruction(&Instruction::I32Const(2));
-        func.instruction(&Instruction::I32Mul); // alloc_size = 2 * input_len
-        func.instruction(&Instruction::Call(callee_realloc));
-        func.instruction(&Instruction::LocalSet(out_ptr_local));
-
-        // Trap on null return from cabi_realloc (LS-A-7 leg b).
-        func.instruction(&Instruction::LocalGet(out_ptr_local));
-        func.instruction(&Instruction::I32Eqz);
-        func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
-        func.instruction(&Instruction::Unreachable);
-        func.instruction(&Instruction::End);
+        // #621: alloc_size = 2 * input_len; a NULL answer traps only when
+        // the request was nonzero (LS-A-7 leg b).
+        emit_checked_realloc(func, callee_realloc, out_ptr_local, callee_align, |b| {
+            b.instruction(&Instruction::LocalGet(1));
+            b.instruction(&Instruction::I32Const(2));
+            b.instruction(&Instruction::I32Mul);
+        });
 
         // Step 2: Initialize loop counters
         func.instruction(&Instruction::I32Const(0));
@@ -10432,20 +10408,13 @@ impl FactStyleGenerator {
         func.instruction(&Instruction::Unreachable);
         func.instruction(&Instruction::End);
 
-        func.instruction(&Instruction::I32Const(0));
-        func.instruction(&Instruction::I32Const(0));
-        func.instruction(&Instruction::I32Const(callee_align));
-        func.instruction(&Instruction::LocalGet(1));
-        func.instruction(&Instruction::I32Const(2));
-        func.instruction(&Instruction::I32Mul);
-        func.instruction(&Instruction::Call(callee_realloc));
-        func.instruction(&Instruction::LocalSet(out_ptr_local));
-
-        func.instruction(&Instruction::LocalGet(out_ptr_local));
-        func.instruction(&Instruction::I32Eqz);
-        func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
-        func.instruction(&Instruction::Unreachable);
-        func.instruction(&Instruction::End);
+        // #621: alloc_size = 2 * input_len; a NULL answer traps only when
+        // the request was nonzero (LS-A-7 leg b).
+        emit_checked_realloc(func, callee_realloc, out_ptr_local, callee_align, |b| {
+            b.instruction(&Instruction::LocalGet(1));
+            b.instruction(&Instruction::I32Const(2));
+            b.instruction(&Instruction::I32Mul);
+        });
 
         func.instruction(&Instruction::I32Const(0));
         func.instruction(&Instruction::LocalSet(idx_local));
@@ -10565,21 +10534,13 @@ impl FactStyleGenerator {
         func.instruction(&Instruction::Unreachable);
         func.instruction(&Instruction::End);
 
-        func.instruction(&Instruction::I32Const(0)); // original_ptr
-        func.instruction(&Instruction::I32Const(0)); // original_size
-        func.instruction(&Instruction::I32Const(callee_align)); // alignment
-        func.instruction(&Instruction::LocalGet(1)); // byte_len
-        func.instruction(&Instruction::I32Const(2));
-        func.instruction(&Instruction::I32Mul); // alloc_size = 2 * byte_len
-        func.instruction(&Instruction::Call(callee_realloc));
-        func.instruction(&Instruction::LocalSet(out_ptr_local));
-
-        // Trap on null return from cabi_realloc (LS-A-7 leg b).
-        func.instruction(&Instruction::LocalGet(out_ptr_local));
-        func.instruction(&Instruction::I32Eqz);
-        func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
-        func.instruction(&Instruction::Unreachable);
-        func.instruction(&Instruction::End);
+        // #621: alloc_size = 2 * input_len; a NULL answer traps only when
+        // the request was nonzero (LS-A-7 leg b).
+        emit_checked_realloc(func, callee_realloc, out_ptr_local, callee_align, |b| {
+            b.instruction(&Instruction::LocalGet(1));
+            b.instruction(&Instruction::I32Const(2));
+            b.instruction(&Instruction::I32Mul);
+        });
 
         // Step 2: Initialize loop counter.
         func.instruction(&Instruction::I32Const(0));
@@ -10716,20 +10677,13 @@ impl FactStyleGenerator {
         func.instruction(&Instruction::Unreachable);
         func.instruction(&Instruction::End);
 
-        func.instruction(&Instruction::I32Const(0));
-        func.instruction(&Instruction::I32Const(0));
-        func.instruction(&Instruction::I32Const(callee_align));
-        func.instruction(&Instruction::LocalGet(1));
-        func.instruction(&Instruction::I32Const(2));
-        func.instruction(&Instruction::I32Mul);
-        func.instruction(&Instruction::Call(callee_realloc));
-        func.instruction(&Instruction::LocalSet(out_ptr_local));
-
-        func.instruction(&Instruction::LocalGet(out_ptr_local));
-        func.instruction(&Instruction::I32Eqz);
-        func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
-        func.instruction(&Instruction::Unreachable);
-        func.instruction(&Instruction::End);
+        // #621: alloc_size = 2 * input_len; a NULL answer traps only when
+        // the request was nonzero (LS-A-7 leg b).
+        emit_checked_realloc(func, callee_realloc, out_ptr_local, callee_align, |b| {
+            b.instruction(&Instruction::LocalGet(1));
+            b.instruction(&Instruction::I32Const(2));
+            b.instruction(&Instruction::I32Mul);
+        });
 
         // --- Phase A: scan to decide latin1-vs-utf16. ---
         func.instruction(&Instruction::I32Const(0));
@@ -10929,20 +10883,13 @@ impl FactStyleGenerator {
         func.instruction(&Instruction::Unreachable);
         func.instruction(&Instruction::End);
 
-        func.instruction(&Instruction::I32Const(0));
-        func.instruction(&Instruction::I32Const(0));
-        func.instruction(&Instruction::I32Const(callee_align));
-        func.instruction(&Instruction::LocalGet(1));
-        func.instruction(&Instruction::I32Const(2));
-        func.instruction(&Instruction::I32Mul);
-        func.instruction(&Instruction::Call(callee_realloc));
-        func.instruction(&Instruction::LocalSet(out_ptr_local));
-
-        func.instruction(&Instruction::LocalGet(out_ptr_local));
-        func.instruction(&Instruction::I32Eqz);
-        func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
-        func.instruction(&Instruction::Unreachable);
-        func.instruction(&Instruction::End);
+        // #621: alloc_size = 2 * input_len; a NULL answer traps only when
+        // the request was nonzero (LS-A-7 leg b).
+        emit_checked_realloc(func, callee_realloc, out_ptr_local, callee_align, |b| {
+            b.instruction(&Instruction::LocalGet(1));
+            b.instruction(&Instruction::I32Const(2));
+            b.instruction(&Instruction::I32Mul);
+        });
 
         // --- Phase A: scan to decide latin1-vs-utf16. ---
         func.instruction(&Instruction::I32Const(0));
@@ -14263,14 +14210,20 @@ mod tests {
     // guards are present.
     // ---------------------------------------------------------------
 
-    /// Return `true` iff the byte-encoded function body `body` contains
-    /// an `i32.eqz; if; unreachable; end` sequence. The `if` block byte
-    /// is 0x04, `unreachable` is 0x00, `end` is 0x0B, `i32.eqz` is 0x45.
-    /// The block type that follows 0x04 is 0x40 (empty block type).
+    /// Return `true` iff the byte-encoded function body `body` contains the
+    /// #621 conditional NULL guard `emit_checked_realloc` emits:
+    /// `i32.eqz; <size expr>; i32.const 0; i32.ne; i32.and; if; unreachable;
+    /// end`, i.e. a NULL realloc result traps only for a nonzero request.
+    /// Opcodes: i32.eqz = 0x45, i32.const 0 = 0x41 0x00, i32.ne = 0x47,
+    /// i32.and = 0x71, if (empty) = 0x04 0x40, unreachable = 0x00, end = 0x0B.
+    /// The size expression between `i32.eqz` and the tail is at most 12 bytes.
     #[cfg(test)]
-    fn body_has_eqz_if_unreachable(body: &[u8]) -> bool {
-        // Pattern: 0x45 0x04 0x40 0x00 0x0B
-        body.windows(5).any(|w| w == [0x45, 0x04, 0x40, 0x00, 0x0B])
+    fn body_has_conditional_null_guard(body: &[u8]) -> bool {
+        const TAIL: [u8; 8] = [0x41, 0x00, 0x47, 0x71, 0x04, 0x40, 0x00, 0x0B];
+        body.windows(TAIL.len())
+            .enumerate()
+            .filter(|(_, w)| *w == TAIL)
+            .any(|(at, _)| body[at.saturating_sub(13)..at].contains(&0x45))
     }
 
     /// Return `true` iff the byte-encoded function body `body` contains
@@ -14339,9 +14292,9 @@ mod tests {
              (i32.gt_u; if; unreachable; end) before the i32.mul"
         );
         assert!(
-            body_has_eqz_if_unreachable(&body),
+            body_has_conditional_null_guard(&body),
             "LS-A-7: UTF-8→UTF-16 transcoder missing cabi_realloc null \
-             guard (i32.eqz; if; unreachable; end) after the call"
+             guard (i32.eqz; <size>; i32.const 0; i32.ne; i32.and; if; unreachable; end) after the call"
         );
     }
 
@@ -14356,7 +14309,7 @@ mod tests {
             "LS-A-7: UTF-16→UTF-8 transcoder missing overflow guard"
         );
         assert!(
-            body_has_eqz_if_unreachable(&body),
+            body_has_conditional_null_guard(&body),
             "LS-A-7: UTF-16→UTF-8 transcoder missing cabi_realloc null guard"
         );
     }
@@ -14372,7 +14325,7 @@ mod tests {
             "LS-A-7: Latin-1→UTF-8 transcoder missing overflow guard"
         );
         assert!(
-            body_has_eqz_if_unreachable(&body),
+            body_has_conditional_null_guard(&body),
             "LS-A-7: Latin-1→UTF-8 transcoder missing cabi_realloc null guard"
         );
     }

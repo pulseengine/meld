@@ -58,6 +58,18 @@ issue621-realloc-null-nonzero-stricter	multi	fused-trap	#621 LS-A-7: deliberate 
 issue621-realloc-null-nonzero-stricter	shared	match
 issue621-realloc-null-size0	multi	match
 issue621-realloc-null-size0	shared	match
+issue621-realloc-null-size0-latin1-to-utf16	multi	match	#621: transcoder realloc answering a 0-byte request with 0 must not trap
+issue621-realloc-null-size0-latin1-to-utf16	shared	match	#621: transcoder realloc answering a 0-byte request with 0 must not trap
+issue621-realloc-null-size0-latin1-to-utf8	multi	match	#621: transcoder realloc answering a 0-byte request with 0 must not trap
+issue621-realloc-null-size0-latin1-to-utf8	shared	match	#621: transcoder realloc answering a 0-byte request with 0 must not trap
+issue621-realloc-null-size0-utf16-to-latin1	multi	match	#621: transcoder realloc answering a 0-byte request with 0 must not trap
+issue621-realloc-null-size0-utf16-to-latin1	shared	match	#621: transcoder realloc answering a 0-byte request with 0 must not trap
+issue621-realloc-null-size0-utf16-to-utf8	multi	match	#621: transcoder realloc answering a 0-byte request with 0 must not trap
+issue621-realloc-null-size0-utf16-to-utf8	shared	match	#621: transcoder realloc answering a 0-byte request with 0 must not trap
+issue621-realloc-null-size0-utf8-to-latin1	multi	match	#621: transcoder realloc answering a 0-byte request with 0 must not trap
+issue621-realloc-null-size0-utf8-to-latin1	shared	match	#621: transcoder realloc answering a 0-byte request with 0 must not trap
+issue621-realloc-null-size0-utf8-to-utf16	multi	match	#621: transcoder realloc answering a 0-byte request with 0 must not trap
+issue621-realloc-null-size0-utf8-to-utf16	shared	match	#621: transcoder realloc answering a 0-byte request with 0 must not trap
 issue621-realloc-null-size1-control	multi	match
 issue621-realloc-null-size1-control	shared	match
 issue622-realloc-called	multi	match
