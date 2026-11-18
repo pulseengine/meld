@@ -5557,7 +5557,12 @@ impl FactStyleGenerator {
         let plan = crate::adapter::call_lowering::resolve_call_lowering_plan(
             crate::adapter::call_lowering::BoundaryFacts {
                 crosses_memory: site.crosses_memory,
-                needs_transcoding: options.needs_transcoding(),
+                // #620: differing `string-encoding` options matter only when a
+                // string can cross. A char-only call between a utf8 and a utf16
+                // component went to the string transcoder, which reads params 0
+                // and 1 as a (ptr, len) pair, and failed validation.
+                needs_transcoding: options.needs_transcoding()
+                    && !site.requirements.carries_no_string,
                 inline_adapters: self.config.inline_adapters,
                 has_resource_rep_calls: !options.resource_rep_calls.is_empty(),
                 has_resource_new_calls: !options.resource_new_calls.is_empty(),

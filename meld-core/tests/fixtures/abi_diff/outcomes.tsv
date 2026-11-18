@@ -48,10 +48,14 @@ issue619-flags9-clean-control	multi	match
 issue619-flags9-clean-control	shared	match
 issue619-flags9-highbits	multi	match
 issue619-flags9-highbits	shared	match
-issue620-char-utf16-to-utf8	multi	refused-defect	#620
-issue620-char-utf16-to-utf8	shared	refused-defect	#620
-issue620-char-utf8-to-utf16	multi	refused-defect	#620
-issue620-char-utf8-to-utf16	shared	refused-defect	#620
+issue620-char-utf16-to-utf8	multi	match
+issue620-char-utf16-to-utf8	shared	match
+issue620-char-utf16-to-utf8-invalid	multi	match-trap
+issue620-char-utf16-to-utf8-invalid	shared	match-trap
+issue620-char-utf8-to-utf16	multi	match
+issue620-char-utf8-to-utf16	shared	match
+issue620-char-utf8-to-utf16-invalid	multi	match-trap
+issue620-char-utf8-to-utf16-invalid	shared	match-trap
 issue620-char-utf8-to-utf8-control	multi	match
 issue620-char-utf8-to-utf8-control	shared	match
 issue621-realloc-null-nonzero-stricter	multi	fused-trap	#621 LS-A-7: deliberate trap on NULL for a nonzero request (stricter than spec)

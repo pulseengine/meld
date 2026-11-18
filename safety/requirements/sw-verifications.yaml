@@ -2057,3 +2057,16 @@ artifacts:
       created-by: ai-assisted
       model: claude-opus-5-5
       timestamp: 2026-11-17T15:00:00Z
+  - id: SWV-141
+    type: sw-verification
+    title: "Verification of SR-127: char-only calls between encodings fuse, and a surrogate char still traps"
+    status: implemented
+    release: v0.70.0
+    description: "char_only_calls_between_encodings_fuse_and_keep_the_char_check (tests/abi_differential.rs) runs issue620-char-utf8-to-utf16 and issue620-char-utf16-to-utf8 unfused on wasmtime and fused under --memory multi and --memory shared, and requires equal results (65); the -invalid twins pass the surrogate 0xD800 and must trap both unfused and fused. may_carry_string_is_false_only_when_no_string_can_cross (parser unit test) checks char, list<u8> and flags answer false, string inside option, variant and result answers true, and an unresolvable alias answers true. The differential ledger moved the 4 issue620 rows from refused-defect to match and no other row; the 4 -invalid rows are match-trap. Negative control observed red: with the class choice back on options.needs_transcoding() alone, the run-level test fails (issue620-char-utf8-to-utf16 multi: the fused run did not return a value)."
+    links:
+      - type: verifies
+        target: SR-127
+    provenance:
+      created-by: ai-assisted
+      model: claude-opus-5-5
+      timestamp: 2026-11-18T01:00:00Z

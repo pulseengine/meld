@@ -4113,3 +4113,16 @@ artifacts:
       created-by: ai-assisted
       model: claude-opus-5-5
       timestamp: 2026-11-17T15:00:00Z
+  - id: SR-127
+    type: sw-req
+    title: "A call whose types cannot carry a string fuses without a string transcode, whatever the string-encoding options say"
+    status: implemented
+    release: v0.70.0
+    description: "When the caller's and callee's string-encoding options differ, the adapter shall transcode only if a param or result of the resolved function type may carry a string (following use aliases; an unresolved alias counts as may). Otherwise the call is lowered as if the encodings matched, and the flat value checks (char validity, narrow-int and flags normalisation) still apply. A char-only call between a utf8 and a utf16 component previously went to the string transcoder, which reads params 0 and 1 as a (ptr, len) pair, and the fused module failed validation (#620)."
+    links:
+      - type: derives-from
+        target: SYS-3
+    provenance:
+      created-by: ai-assisted
+      model: claude-opus-5-5
+      timestamp: 2026-11-18T01:00:00Z

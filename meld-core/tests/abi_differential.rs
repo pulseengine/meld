@@ -284,3 +284,33 @@ fn flat_params_are_normalised_as_lift_flat_does() {
         }
     }
 }
+
+// rivet: verifies SR-127
+// rivet: verifies SWV-141
+#[test]
+fn char_only_calls_between_encodings_fuse_and_keep_the_char_check() {
+    for name in ["issue620-char-utf8-to-utf16", "issue620-char-utf16-to-utf8"] {
+        let bytes = wat::parse_file(dir().join(format!("{name}.wat"))).unwrap();
+        let Run::Ok(want) = run_unfused(&bytes) else {
+            panic!("{name}: unfused reference did not return a value");
+        };
+        for (label, strategy) in STRATEGIES {
+            match run_fused(&bytes, strategy) {
+                Ok(Run::Ok(got)) => assert_eq!(got, want, "{name} {label}"),
+                _ => panic!("{name} {label}: the fused run did not return a value"),
+            }
+        }
+        let bad = format!("{name}-invalid");
+        let bytes = wat::parse_file(dir().join(format!("{bad}.wat"))).unwrap();
+        assert!(
+            matches!(run_unfused(&bytes), Run::Trap),
+            "{bad}: unfused must trap"
+        );
+        for (label, strategy) in STRATEGIES {
+            assert!(
+                matches!(run_fused(&bytes, strategy), Ok(Run::Trap)),
+                "{bad} {label}: a surrogate char must still trap after fusion"
+            );
+        }
+    }
+}
