@@ -29,11 +29,12 @@
 use std::path::Path;
 use std::time::Duration;
 
-use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use meld_core::{
     ComponentParser, CustomSectionHandling, Fuser, FuserConfig, MemoryStrategy, OutputFormat,
     ParsedComponent, WiringHints, merger::Merger, resolver::Resolver,
 };
+use std::hint::black_box;
 
 const FIXTURES_DIR: &str = "../tests/wit_bindgen/fixtures";
 
