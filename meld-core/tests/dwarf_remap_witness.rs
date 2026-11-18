@@ -123,11 +123,10 @@ fn subprogram_low_pcs(sections: &std::collections::HashMap<String, Vec<u8>>) -> 
     while let Some(header) = units.next().expect("unit header") {
         let unit = dwarf.unit(header).expect("parse unit");
         let mut entries = unit.entries();
-        while let Some((_, entry)) = entries.next_dfs().expect("dfs walk") {
+        while let Some(entry) = entries.next_dfs().expect("dfs walk") {
             if entry.tag() == gimli::constants::DW_TAG_subprogram
-                && let Some(gimli::AttributeValue::Addr(a)) = entry
-                    .attr_value(gimli::constants::DW_AT_low_pc)
-                    .expect("low_pc attr")
+                && let Some(gimli::AttributeValue::Addr(a)) =
+                    entry.attr_value(gimli::constants::DW_AT_low_pc)
             {
                 low_pcs.push(a);
             }
@@ -242,22 +241,18 @@ fn inc2_die_ranges_stay_within_enclosing_subprogram() {
     while let Some(header) = units.next().expect("unit header") {
         let unit = dwarf.unit(header).expect("parse unit");
         let mut entries = unit.entries();
-        let mut depth = 0isize;
         // Stack of enclosing subprogram ranges: (die_depth, low, end).
         let mut encl: Vec<(isize, u64, u64)> = Vec::new();
-        while let Some((delta, entry)) = entries.next_dfs().expect("dfs walk") {
-            depth += delta;
+        while let Some(entry) = entries.next_dfs().expect("dfs walk") {
+            let depth = entry.depth();
             while matches!(encl.last(), Some(&(d, _, _)) if d >= depth) {
                 encl.pop();
             }
             if entry.tag() == gimli::constants::DW_TAG_subprogram
-                && let Some(gimli::AttributeValue::Addr(low)) = entry
-                    .attr_value(gimli::constants::DW_AT_low_pc)
-                    .expect("low_pc")
+                && let Some(gimli::AttributeValue::Addr(low)) =
+                    entry.attr_value(gimli::constants::DW_AT_low_pc)
                 && low != TOMBSTONE
-                && let Some(hp) = entry
-                    .attr_value(gimli::constants::DW_AT_high_pc)
-                    .expect("high_pc")
+                && let Some(hp) = entry.attr_value(gimli::constants::DW_AT_high_pc)
             {
                 let end = match hp {
                     gimli::AttributeValue::Udata(len) => low + len,
@@ -268,10 +263,7 @@ fn inc2_die_ranges_stay_within_enclosing_subprogram() {
             }
             // A DIE carrying a range LIST, checked against its enclosing
             // subprogram (the class that escaped in #319).
-            if entry
-                .attr_value(gimli::constants::DW_AT_ranges)
-                .expect("ranges attr")
-                .is_some()
+            if entry.attr_value(gimli::constants::DW_AT_ranges).is_some()
                 && let Some(&(_, plow, pend)) = encl.last()
             {
                 let mut ranges = dwarf.die_ranges(&unit, entry).expect("die_ranges");
@@ -341,11 +333,8 @@ fn inc3_location_list_ranges_stay_in_module() {
     while let Some(header) = units.next().expect("unit header") {
         let unit = dwarf.unit(header).expect("parse unit");
         let mut entries = unit.entries();
-        while let Some((_, entry)) = entries.next_dfs().expect("dfs walk") {
-            let Some(loc) = entry
-                .attr_value(gimli::constants::DW_AT_location)
-                .expect("location attr")
-            else {
+        while let Some(entry) = entries.next_dfs().expect("dfs walk") {
+            let Some(loc) = entry.attr_value(gimli::constants::DW_AT_location) else {
                 continue;
             };
             // Only location LISTS (a bare exprloc → None).

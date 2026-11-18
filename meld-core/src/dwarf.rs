@@ -727,7 +727,7 @@ fn correct_die_ranges<R: gimli::read::Reader<Offset = usize>>(
 
         let mut entries = unit.entries();
         let mut wi = 0usize;
-        while let Ok(Some((_, entry))) = entries.next_dfs() {
+        while let Ok(Some(entry)) = entries.next_dfs() {
             if wi >= write_ids.len() {
                 break;
             }
@@ -737,7 +737,7 @@ fn correct_die_ranges<R: gimli::read::Reader<Offset = usize>>(
             // Only DIEs that carry a range LIST (not low/high — those are the
             // inc-1 path). `die_ranges` would otherwise synthesize a single
             // range from low/high and we'd wrongly convert a subprogram.
-            if entry.attr_value(DW_AT_ranges).ok().flatten().is_none() {
+            if entry.attr_value(DW_AT_ranges).is_none() {
                 continue;
             }
 
@@ -843,7 +843,7 @@ fn correct_die_locations<R: gimli::read::Reader<Offset = usize>>(
 
         let mut entries = unit.entries();
         let mut wi = 0usize;
-        while let Ok(Some((_, entry))) = entries.next_dfs() {
+        while let Ok(Some(entry)) = entries.next_dfs() {
             if wi >= write_ids.len() {
                 break;
             }
@@ -851,7 +851,7 @@ fn correct_die_locations<R: gimli::read::Reader<Offset = usize>>(
             wi += 1;
 
             let loc_attr = match entry.attr_value(DW_AT_location) {
-                Ok(Some(v)) => v,
+                Some(v) => v,
                 _ => continue,
             };
             // `attr_locations` returns `None` for a bare exprloc (not a list).
@@ -987,6 +987,7 @@ fn correct_line_programs<R: gimli::read::Reader<Offset = usize>>(
             encoding,
             line_encoding,
             LineString::String(comp_dir),
+            None,
             LineString::String(comp_name),
             None,
         );
@@ -1305,7 +1306,7 @@ fn relocate_debug_info(
             );
             return None;
         }
-        let unit_base = header.offset().as_debug_info_offset()?.0;
+        let unit_base = header.offset().to_debug_info_offset(&header)?.0;
         // CU header: length(4) version(2) abbrev_offset(4) addr_size(1)
         patch(&mut info, unit_base + 6, bases.abbrev)?;
 
@@ -1738,6 +1739,7 @@ fn append_adapter_unit(dwarf: &mut gimli::write::Dwarf, spans: &[AdapterSpan]) -
         encoding,
         line_encoding,
         LineString::String(comp_dir.clone()),
+        None,
         LineString::String(ADAPTER_SOURCE_NAME.as_bytes().to_vec()),
         None,
     );
@@ -2079,11 +2081,10 @@ mod tests {
         let unit = dwarf.unit(header).expect("parse unit");
         let mut entries = unit.entries();
         let mut low_pc = None;
-        while let Some((_, entry)) = entries.next_dfs().expect("dfs walk") {
+        while let Some(entry) = entries.next_dfs().expect("dfs walk") {
             if entry.tag() == constants::DW_TAG_subprogram
-                && let Some(gimli::AttributeValue::Addr(a)) = entry
-                    .attr_value(constants::DW_AT_low_pc)
-                    .expect("read low_pc attr")
+                && let Some(gimli::AttributeValue::Addr(a)) =
+                    entry.attr_value(constants::DW_AT_low_pc)
             {
                 low_pc = Some(a);
             }
@@ -2389,6 +2390,7 @@ mod tests {
                 encoding,
                 LineEncoding::default(),
                 LineString::String(b"/src".to_vec()),
+                None,
                 LineString::String(file.as_bytes().to_vec()),
                 None,
             );
@@ -2514,8 +2516,8 @@ mod tests {
             // relocation for the second unit.
             {
                 let mut entries = unit.entries();
-                if let Some((_, root)) = entries.next_dfs().expect("root")
-                    && let Some(attr) = root.attr(constants::DW_AT_producer).expect("attr read")
+                if let Some(root) = entries.next_dfs().expect("root")
+                    && let Some(attr) = root.attr(constants::DW_AT_producer)
                     && let Ok(sref) = dwarf.attr_string(&unit, attr.value())
                 {
                     producers.push(String::from_utf8_lossy(sref.slice()).into_owned());
@@ -2650,6 +2652,7 @@ mod tests {
             encoding,
             LineEncoding::default(),
             LineString::String(b"/src".to_vec()),
+            None,
             LineString::String(b"orig.rs".to_vec()),
             None,
         );
