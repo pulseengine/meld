@@ -285,6 +285,40 @@ fn flat_params_are_normalised_as_lift_flat_does() {
     }
 }
 
+// rivet: verifies SR-128
+// rivet: verifies SWV-142
+#[test]
+fn cross_encoding_shapes_the_flat_transcoder_cannot_handle_are_refused() {
+    // Each of these fused at exit 0 and handed the callee the caller's
+    // pointers (#600, #603). A refusal is loud; a wrong answer was not.
+    for name in [
+        "issue600-list-string",
+        "issue600-list-option-string-utf8-to-utf16",
+        "issue603-record-string-id64",
+    ] {
+        let bytes = wat::parse_file(dir().join(format!("{name}.wat"))).unwrap();
+        for (label, strategy) in STRATEGIES {
+            match run_fused(&bytes, strategy) {
+                Err(msg) => assert!(msg.contains("#600"), "{name} {label}: {msg}"),
+                Ok(_) => panic!("{name} {label}: fused instead of refusing"),
+            }
+        }
+    }
+    // Control: one top-level string param, scalar result, still fuses and
+    // matches the unfused reference.
+    let name = "r1-string_utf8-utf16_02";
+    let bytes = wat::parse_file(dir().join(format!("{name}.wat"))).unwrap();
+    let Run::Ok(want) = run_unfused(&bytes) else {
+        panic!("{name}: unfused reference did not return a value");
+    };
+    for (label, strategy) in STRATEGIES {
+        match run_fused(&bytes, strategy) {
+            Ok(Run::Ok(got)) => assert_eq!(got, want, "{name} {label}"),
+            _ => panic!("{name} {label}: the fused run did not return a value"),
+        }
+    }
+}
+
 // rivet: verifies SR-127
 // rivet: verifies SWV-141
 #[test]

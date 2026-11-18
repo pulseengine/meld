@@ -26,22 +26,22 @@ issue599-u16_65536	multi	match
 issue599-u16_65536	shared	match
 issue599-u8_300	multi	match
 issue599-u8_300	shared	match
-issue600-list-option-string-utf8-to-utf16	multi	wrong	#600
-issue600-list-option-string-utf8-to-utf16	shared	wrong	#600
-issue600-list-string	multi	wrong	#600
-issue600-list-string	shared	wrong	#600
+issue600-list-option-string-utf8-to-utf16	multi	refused	#600: refused (no per-element transcoding yet), was wrong
+issue600-list-option-string-utf8-to-utf16	shared	refused	#600: refused (no per-element transcoding yet), was wrong
+issue600-list-string	multi	refused	#600: refused (no per-element transcoding yet), was wrong
+issue600-list-string	shared	refused	#600: refused (no per-element transcoding yet), was wrong
 issue601-compact	multi	match
 issue601-compact	shared	wrong	#601
-issue602-params-ptr-utf16-utf8	multi	refused-defect	#602
-issue602-params-ptr-utf16-utf8	shared	refused-defect	#602
-issue602-params-ptr-utf8-utf16	multi	refused-defect	#602
-issue602-params-ptr-utf8-utf16	shared	refused-defect	#602
+issue602-params-ptr-utf16-utf8	multi	refused	#602
+issue602-params-ptr-utf16-utf8	shared	refused	#602
+issue602-params-ptr-utf8-utf16	multi	refused	#602
+issue602-params-ptr-utf8-utf16	shared	refused	#602
 issue602-params-ptr-utf8-utf8-control	multi	match
 issue602-params-ptr-utf8-utf8-control	shared	match
-issue603-record-string	multi	fused-trap	#603
-issue603-record-string	shared	fused-trap	#603
-issue603-record-string-id64	multi	wrong	#603
-issue603-record-string-id64	shared	wrong	#603
+issue603-record-string	multi	refused	#603
+issue603-record-string	shared	refused	#603
+issue603-record-string-id64	multi	refused	#603
+issue603-record-string-id64	shared	refused	#603
 issue603-record-string-same-encoding-control	multi	match
 issue603-record-string-same-encoding-control	shared	match
 issue619-flags9-clean-control	multi	match
@@ -126,36 +126,36 @@ r1-list_string_latin1utf16-latin1utf16_06	multi	refused
 r1-list_string_latin1utf16-latin1utf16_06	shared	accepts-invalid
 r1-list_string_latin1utf16-latin1utf16_07	multi	refused
 r1-list_string_latin1utf16-latin1utf16_07	shared	refused
-r1-list_string_latin1utf16-utf8_00	multi	refused-defect
-r1-list_string_latin1utf16-utf8_00	shared	refused-defect
+r1-list_string_latin1utf16-utf8_00	multi	refused
+r1-list_string_latin1utf16-utf8_00	shared	refused
 r1-list_string_latin1utf16-utf8_01	multi	refused
 r1-list_string_latin1utf16-utf8_01	shared	refused
 r1-list_string_latin1utf16-utf8_02	multi	refused
 r1-list_string_latin1utf16-utf8_02	shared	refused
-r1-list_string_latin1utf16-utf8_03	multi	wrong
-r1-list_string_latin1utf16-utf8_03	shared	wrong
+r1-list_string_latin1utf16-utf8_03	multi	refused
+r1-list_string_latin1utf16-utf8_03	shared	refused
 r1-list_string_latin1utf16-utf8_04	multi	refused
 r1-list_string_latin1utf16-utf8_04	shared	refused
-r1-list_string_latin1utf16-utf8_06	multi	wrong
-r1-list_string_latin1utf16-utf8_06	shared	wrong
+r1-list_string_latin1utf16-utf8_06	multi	refused
+r1-list_string_latin1utf16-utf8_06	shared	refused
 r1-list_string_latin1utf16-utf8_07	multi	refused
 r1-list_string_latin1utf16-utf8_07	shared	refused
 r1-list_string_utf16-latin1utf16_00	multi	refused
 r1-list_string_utf16-latin1utf16_00	shared	refused
-r1-list_string_utf16-latin1utf16_01	multi	refused-defect
-r1-list_string_utf16-latin1utf16_01	shared	refused-defect
+r1-list_string_utf16-latin1utf16_01	multi	refused
+r1-list_string_utf16-latin1utf16_01	shared	refused
 r1-list_string_utf16-latin1utf16_02	multi	refused
 r1-list_string_utf16-latin1utf16_02	shared	refused
 r1-list_string_utf16-latin1utf16_03	multi	refused
 r1-list_string_utf16-latin1utf16_03	shared	refused
-r1-list_string_utf16-latin1utf16_04	multi	refused-defect
-r1-list_string_utf16-latin1utf16_04	shared	refused-defect
+r1-list_string_utf16-latin1utf16_04	multi	refused
+r1-list_string_utf16-latin1utf16_04	shared	refused
 r1-list_string_utf16-latin1utf16_05	multi	refused
 r1-list_string_utf16-latin1utf16_05	shared	refused
 r1-list_string_utf16-latin1utf16_06	multi	refused
 r1-list_string_utf16-latin1utf16_06	shared	refused
-r1-list_string_utf16-latin1utf16_07	multi	accepts-invalid
-r1-list_string_utf16-latin1utf16_07	shared	accepts-invalid
+r1-list_string_utf16-latin1utf16_07	multi	refused
+r1-list_string_utf16-latin1utf16_07	shared	refused
 r1-list_string_utf16-utf16_00	multi	refused
 r1-list_string_utf16-utf16_00	shared	refused
 r1-list_string_utf16-utf16_01	multi	refused
@@ -174,30 +174,30 @@ r1-list_string_utf16-utf16_07	multi	wrong
 r1-list_string_utf16-utf16_07	shared	match
 r1-list_string_utf16-utf8_00	multi	refused
 r1-list_string_utf16-utf8_00	shared	refused
-r1-list_string_utf16-utf8_01	multi	fused-trap
-r1-list_string_utf16-utf8_01	shared	fused-trap
+r1-list_string_utf16-utf8_01	multi	refused
+r1-list_string_utf16-utf8_01	shared	refused
 r1-list_string_utf16-utf8_02	multi	refused
 r1-list_string_utf16-utf8_02	shared	refused
 r1-list_string_utf16-utf8_03	multi	refused
 r1-list_string_utf16-utf8_03	shared	refused
-r1-list_string_utf16-utf8_04	multi	fused-trap
-r1-list_string_utf16-utf8_04	shared	fused-trap
+r1-list_string_utf16-utf8_04	multi	refused
+r1-list_string_utf16-utf8_04	shared	refused
 r1-list_string_utf16-utf8_05	multi	refused
 r1-list_string_utf16-utf8_05	shared	refused
-r1-list_string_utf16-utf8_07	multi	refused-defect
-r1-list_string_utf16-utf8_07	shared	refused-defect
+r1-list_string_utf16-utf8_07	multi	refused
+r1-list_string_utf16-utf8_07	shared	refused
 r1-list_string_utf8-latin1utf16_00	multi	refused
 r1-list_string_utf8-latin1utf16_00	shared	refused
 r1-list_string_utf8-latin1utf16_01	multi	refused
 r1-list_string_utf8-latin1utf16_01	shared	refused
-r1-list_string_utf8-latin1utf16_02	multi	refused-defect
-r1-list_string_utf8-latin1utf16_02	shared	refused-defect
+r1-list_string_utf8-latin1utf16_02	multi	refused
+r1-list_string_utf8-latin1utf16_02	shared	refused
 r1-list_string_utf8-latin1utf16_03	multi	refused
 r1-list_string_utf8-latin1utf16_03	shared	refused
 r1-list_string_utf8-latin1utf16_04	multi	refused
 r1-list_string_utf8-latin1utf16_04	shared	refused
-r1-list_string_utf8-latin1utf16_05	multi	fused-trap
-r1-list_string_utf8-latin1utf16_05	shared	fused-trap
+r1-list_string_utf8-latin1utf16_05	multi	refused
+r1-list_string_utf8-latin1utf16_05	shared	refused
 r1-list_string_utf8-latin1utf16_06	multi	refused
 r1-list_string_utf8-latin1utf16_06	shared	refused
 r1-list_string_utf8-latin1utf16_07	multi	refused
@@ -206,12 +206,12 @@ r1-list_string_utf8-utf16_00	multi	refused
 r1-list_string_utf8-utf16_00	shared	refused
 r1-list_string_utf8-utf16_01	multi	refused
 r1-list_string_utf8-utf16_01	shared	refused
-r1-list_string_utf8-utf16_02	multi	accepts-invalid
-r1-list_string_utf8-utf16_02	shared	accepts-invalid
+r1-list_string_utf8-utf16_02	multi	refused
+r1-list_string_utf8-utf16_02	shared	refused
 r1-list_string_utf8-utf16_03	multi	refused
 r1-list_string_utf8-utf16_03	shared	refused
-r1-list_string_utf8-utf16_05	multi	refused-defect
-r1-list_string_utf8-utf16_05	shared	refused-defect
+r1-list_string_utf8-utf16_05	multi	refused
+r1-list_string_utf8-utf16_05	shared	refused
 r1-list_string_utf8-utf16_06	multi	refused
 r1-list_string_utf8-utf16_06	shared	refused
 r1-list_string_utf8-utf16_07	multi	refused
@@ -312,14 +312,14 @@ r1-string_char_latin1utf16-latin1utf16_07	multi	refused
 r1-string_char_latin1utf16-latin1utf16_07	shared	match
 r1-string_char_latin1utf16-utf8_00	multi	refused
 r1-string_char_latin1utf16-utf8_00	shared	refused
-r1-string_char_latin1utf16-utf8_01	multi	refused-defect
-r1-string_char_latin1utf16-utf8_01	shared	refused-defect
+r1-string_char_latin1utf16-utf8_01	multi	refused
+r1-string_char_latin1utf16-utf8_01	shared	refused
 r1-string_char_latin1utf16-utf8_02	multi	refused
 r1-string_char_latin1utf16-utf8_02	shared	refused
 r1-string_char_latin1utf16-utf8_03	multi	refused
 r1-string_char_latin1utf16-utf8_03	shared	refused
-r1-string_char_latin1utf16-utf8_04	multi	refused-defect
-r1-string_char_latin1utf16-utf8_04	shared	refused-defect
+r1-string_char_latin1utf16-utf8_04	multi	refused
+r1-string_char_latin1utf16-utf8_04	shared	refused
 r1-string_char_latin1utf16-utf8_05	multi	refused
 r1-string_char_latin1utf16-utf8_05	shared	refused
 r1-string_char_latin1utf16-utf8_07	multi	match-trap
@@ -334,8 +334,8 @@ r1-string_char_utf16-latin1utf16_03	multi	refused
 r1-string_char_utf16-latin1utf16_03	shared	refused
 r1-string_char_utf16-latin1utf16_04	multi	refused
 r1-string_char_utf16-latin1utf16_04	shared	refused
-r1-string_char_utf16-latin1utf16_05	multi	refused-defect
-r1-string_char_utf16-latin1utf16_05	shared	refused-defect
+r1-string_char_utf16-latin1utf16_05	multi	refused
+r1-string_char_utf16-latin1utf16_05	shared	refused
 r1-string_char_utf16-latin1utf16_06	multi	refused
 r1-string_char_utf16-latin1utf16_06	shared	refused
 r1-string_char_utf16-latin1utf16_07	multi	refused
@@ -360,8 +360,8 @@ r1-string_char_utf16-utf8_00	multi	refused
 r1-string_char_utf16-utf8_00	shared	refused
 r1-string_char_utf16-utf8_01	multi	refused
 r1-string_char_utf16-utf8_01	shared	refused
-r1-string_char_utf16-utf8_02	multi	refused-defect
-r1-string_char_utf16-utf8_02	shared	refused-defect
+r1-string_char_utf16-utf8_02	multi	refused
+r1-string_char_utf16-utf8_02	shared	refused
 r1-string_char_utf16-utf8_03	multi	refused
 r1-string_char_utf16-utf8_03	shared	refused
 r1-string_char_utf16-utf8_04	multi	refused
@@ -376,16 +376,16 @@ r1-string_char_utf8-latin1utf16_01	multi	refused
 r1-string_char_utf8-latin1utf16_01	shared	refused
 r1-string_char_utf8-latin1utf16_02	multi	refused
 r1-string_char_utf8-latin1utf16_02	shared	refused
-r1-string_char_utf8-latin1utf16_03	multi	refused-defect
-r1-string_char_utf8-latin1utf16_03	shared	refused-defect
+r1-string_char_utf8-latin1utf16_03	multi	refused
+r1-string_char_utf8-latin1utf16_03	shared	refused
 r1-string_char_utf8-latin1utf16_04	multi	refused
 r1-string_char_utf8-latin1utf16_04	shared	refused
-r1-string_char_utf8-latin1utf16_06	multi	refused-defect
-r1-string_char_utf8-latin1utf16_06	shared	refused-defect
+r1-string_char_utf8-latin1utf16_06	multi	refused
+r1-string_char_utf8-latin1utf16_06	shared	refused
 r1-string_char_utf8-latin1utf16_07	multi	refused
 r1-string_char_utf8-latin1utf16_07	shared	refused
-r1-string_char_utf8-utf16_00	multi	refused-defect
-r1-string_char_utf8-utf16_00	shared	refused-defect
+r1-string_char_utf8-utf16_00	multi	refused
+r1-string_char_utf8-utf16_00	shared	refused
 r1-string_char_utf8-utf16_01	multi	refused
 r1-string_char_utf8-utf16_01	shared	refused
 r1-string_char_utf8-utf16_02	multi	refused
@@ -446,14 +446,14 @@ r1-string_latin1utf16-utf8_07	multi	match
 r1-string_latin1utf16-utf8_07	shared	refused
 r1-string_utf16-latin1utf16_00	multi	match-trap
 r1-string_utf16-latin1utf16_00	shared	refused
-r1-string_utf16-latin1utf16_01	multi	refused-defect
-r1-string_utf16-latin1utf16_01	shared	refused-defect
+r1-string_utf16-latin1utf16_01	multi	refused
+r1-string_utf16-latin1utf16_01	shared	refused
 r1-string_utf16-latin1utf16_02	multi	match
 r1-string_utf16-latin1utf16_02	shared	refused
 r1-string_utf16-latin1utf16_03	multi	accepts-invalid
 r1-string_utf16-latin1utf16_03	shared	refused
-r1-string_utf16-latin1utf16_04	multi	refused-defect
-r1-string_utf16-latin1utf16_04	shared	refused-defect
+r1-string_utf16-latin1utf16_04	multi	refused
+r1-string_utf16-latin1utf16_04	shared	refused
 r1-string_utf16-latin1utf16_05	multi	match
 r1-string_utf16-latin1utf16_05	shared	refused
 r1-string_utf16-latin1utf16_06	multi	accepts-invalid
@@ -488,12 +488,12 @@ r1-string_utf16-utf8_05	multi	match
 r1-string_utf16-utf8_05	shared	refused
 r1-string_utf16-utf8_06	multi	refused
 r1-string_utf16-utf8_06	shared	refused
-r1-string_utf16-utf8_07	multi	refused-defect
-r1-string_utf16-utf8_07	shared	refused-defect
+r1-string_utf16-utf8_07	multi	refused
+r1-string_utf16-utf8_07	shared	refused
 r1-string_utf8-latin1utf16_00	multi	accepts-invalid
 r1-string_utf8-latin1utf16_00	shared	refused
-r1-string_utf8-latin1utf16_02	multi	refused-defect
-r1-string_utf8-latin1utf16_02	shared	refused-defect
+r1-string_utf8-latin1utf16_02	multi	refused
+r1-string_utf8-latin1utf16_02	shared	refused
 r1-string_utf8-latin1utf16_03	multi	accepts-invalid
 r1-string_utf8-latin1utf16_03	shared	refused
 r1-string_utf8-latin1utf16_04	multi	match
@@ -514,8 +514,8 @@ r1-string_utf8-utf16_03	multi	match
 r1-string_utf8-utf16_03	shared	refused
 r1-string_utf8-utf16_04	multi	accepts-invalid
 r1-string_utf8-utf16_04	shared	refused
-r1-string_utf8-utf16_05	multi	refused-defect
-r1-string_utf8-utf16_05	shared	refused-defect
+r1-string_utf8-utf16_05	multi	refused
+r1-string_utf8-utf16_05	shared	refused
 r1-string_utf8-utf16_06	multi	match
 r1-string_utf8-utf16_06	shared	refused
 r1-string_utf8-utf16_07	multi	accepts-invalid
@@ -572,48 +572,48 @@ r2-record_string_latin1utf16-latin1utf16_02	multi	refused
 r2-record_string_latin1utf16-latin1utf16_02	shared	accepts-invalid
 r2-record_string_latin1utf16-latin1utf16_04	multi	refused
 r2-record_string_latin1utf16-latin1utf16_04	shared	refused
-r2-record_string_latin1utf16-utf8_02	multi	fused-trap
-r2-record_string_latin1utf16-utf8_02	shared	fused-trap
+r2-record_string_latin1utf16-utf8_02	multi	refused
+r2-record_string_latin1utf16-utf8_02	shared	refused
 r2-record_string_latin1utf16-utf8_03	multi	refused
 r2-record_string_latin1utf16-utf8_03	shared	refused
-r2-record_string_utf16-latin1utf16_00	multi	refused-defect
-r2-record_string_utf16-latin1utf16_00	shared	refused-defect
+r2-record_string_utf16-latin1utf16_00	multi	refused
+r2-record_string_utf16-latin1utf16_00	shared	refused
 r2-record_string_utf16-latin1utf16_01	multi	refused
 r2-record_string_utf16-latin1utf16_01	shared	refused
 r2-record_string_utf16-latin1utf16_04	multi	refused
 r2-record_string_utf16-latin1utf16_04	shared	refused
 r2-record_string_utf16-latin1utf16_05	multi	refused
 r2-record_string_utf16-latin1utf16_05	shared	refused
-r2-record_string_utf16-latin1utf16_06	multi	match-trap
-r2-record_string_utf16-latin1utf16_06	shared	match-trap
+r2-record_string_utf16-latin1utf16_06	multi	refused
+r2-record_string_utf16-latin1utf16_06	shared	refused
 r2-record_string_utf16-utf16_00	multi	wrong
 r2-record_string_utf16-utf16_00	shared	match
 r2-record_string_utf16-utf16_05	multi	match-trap
 r2-record_string_utf16-utf16_05	shared	refused
 r2-record_string_utf16-utf16_07	multi	wrong
 r2-record_string_utf16-utf16_07	shared	refused
-r2-record_string_utf16-utf8_00	multi	fused-trap
-r2-record_string_utf16-utf8_00	shared	fused-trap
+r2-record_string_utf16-utf8_00	multi	refused
+r2-record_string_utf16-utf8_00	shared	refused
 r2-record_string_utf16-utf8_01	multi	refused
 r2-record_string_utf16-utf8_01	shared	refused
 r2-record_string_utf16-utf8_05	multi	refused
 r2-record_string_utf16-utf8_05	shared	refused
-r2-record_string_utf16-utf8_06	multi	refused-defect
-r2-record_string_utf16-utf8_06	shared	refused-defect
+r2-record_string_utf16-utf8_06	multi	refused
+r2-record_string_utf16-utf8_06	shared	refused
 r2-record_string_utf8-latin1utf16_00	multi	refused
 r2-record_string_utf8-latin1utf16_00	shared	refused
-r2-record_string_utf8-latin1utf16_01	multi	match-trap
-r2-record_string_utf8-latin1utf16_01	shared	match-trap
+r2-record_string_utf8-latin1utf16_01	multi	refused
+r2-record_string_utf8-latin1utf16_01	shared	refused
 r2-record_string_utf8-latin1utf16_02	multi	refused
 r2-record_string_utf8-latin1utf16_02	shared	refused
-r2-record_string_utf8-latin1utf16_04	multi	match-trap
-r2-record_string_utf8-latin1utf16_04	shared	match-trap
+r2-record_string_utf8-latin1utf16_04	multi	refused
+r2-record_string_utf8-latin1utf16_04	shared	refused
 r2-record_string_utf8-latin1utf16_05	multi	refused
 r2-record_string_utf8-latin1utf16_05	shared	refused
 r2-record_string_utf8-utf16_00	multi	refused
 r2-record_string_utf8-utf16_00	shared	refused
-r2-record_string_utf8-utf16_01	multi	refused-defect
-r2-record_string_utf8-utf16_01	shared	refused-defect
+r2-record_string_utf8-utf16_01	multi	refused
+r2-record_string_utf8-utf16_01	shared	refused
 r2-record_string_utf8-utf16_05	multi	refused
 r2-record_string_utf8-utf16_05	shared	refused
 r2-record_string_utf8-utf8_00	multi	match-trap
@@ -624,8 +624,8 @@ r2-record_string_utf8-utf8_05	multi	match
 r2-record_string_utf8-utf8_05	shared	refused
 r2-record_string_utf8-utf8_06	multi	match-trap
 r2-record_string_utf8-utf8_06	shared	refused
-r2-string_latin1utf16-utf8_00	multi	refused-defect
-r2-string_latin1utf16-utf8_00	shared	refused-defect
+r2-string_latin1utf16-utf8_00	multi	refused
+r2-string_latin1utf16-utf8_00	shared	refused
 r2-string_utf16-utf16_00	multi	wrong
 r2-string_utf16-utf16_00	shared	refused
 r2-string_utf8-latin1utf16_01	multi	refused
