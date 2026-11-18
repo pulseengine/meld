@@ -2041,6 +2041,7 @@ artifacts:
         target: SR-125
     provenance:
       created-by: ai-assisted
+      reviewed-by: avrabe
       model: claude-opus-5-5
       timestamp: 2026-11-17T13:30:00Z
 
@@ -2055,6 +2056,7 @@ artifacts:
         target: SR-126
     provenance:
       created-by: ai-assisted
+      reviewed-by: avrabe
       model: claude-opus-5-5
       timestamp: 2026-11-17T15:00:00Z
   - id: SWV-141
@@ -2068,6 +2070,7 @@ artifacts:
         target: SR-127
     provenance:
       created-by: ai-assisted
+      reviewed-by: avrabe
       model: claude-opus-5-5
       timestamp: 2026-11-18T01:00:00Z
   - id: SWV-142
@@ -2081,5 +2084,20 @@ artifacts:
         target: SR-128
     provenance:
       created-by: ai-assisted
+      reviewed-by: avrabe
       model: claude-opus-5-5
       timestamp: 2026-11-18T03:30:00Z
+  - id: SWV-143
+    type: sw-verification
+    title: "Verification of SR-129: an out-of-range flat case index traps after fusion"
+    status: implemented
+    release: v0.70.0
+    description: "a_bad_flat_discriminant_traps_after_fusion (tests/abi_differential.rs) runs issue586-enum257-bad-discriminant and issue586-option-bad-discriminant unfused on wasmtime and fused under --memory multi and --memory shared, and requires a trap in all three; the control issue586-enum257-valid-control must fuse and equal the unfused result. flat_param_lifts_check_variant_discriminants (parser unit test) checks the case count and flat slot for a 257-case enum, option, result, and an option behind a u32. Negative control observed red: before the check the ledger classed both bad-discriminant fixtures as accepts-invalid under both strategies. The ledger moved those 4 rows to match-trap and no other row."
+    links:
+      - type: verifies
+        target: SR-129
+    provenance:
+      created-by: ai-assisted
+      reviewed-by: avrabe
+      model: claude-opus-5-5
+      timestamp: 2026-11-18T06:00:00Z

@@ -1,13 +1,13 @@
 # Canonical ABI differential outcomes (tests/abi_differential.rs).
 # fixture	strategy	outcome	note. Regenerate with MELD_BLESS=1.
-issue586-enum257-bad-discriminant	multi	accepts-invalid	#586
-issue586-enum257-bad-discriminant	shared	accepts-invalid	#586
+issue586-enum257-bad-discriminant	multi	match-trap	#586: case index checked
+issue586-enum257-bad-discriminant	shared	match-trap	#586: case index checked
 issue586-enum257-valid-control	multi	match
 issue586-enum257-valid-control	shared	match
 issue586-list-char-invalid	multi	accepts-invalid	#586
 issue586-list-char-invalid	shared	accepts-invalid	#586
-issue586-option-bad-discriminant	multi	accepts-invalid	#586
-issue586-option-bad-discriminant	shared	accepts-invalid	#586
+issue586-option-bad-discriminant	multi	match-trap	#586: case index checked
+issue586-option-bad-discriminant	shared	match-trap	#586: case index checked
 issue597-renamed-func	multi	not-runnable	#597
 issue597-renamed-func	shared	not-runnable	#597
 issue598-utf16-copy	multi	wrong	#598

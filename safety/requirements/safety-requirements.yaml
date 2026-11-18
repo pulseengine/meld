@@ -4097,6 +4097,7 @@ artifacts:
         target: LS-A-7
     provenance:
       created-by: ai-assisted
+      reviewed-by: avrabe
       model: claude-opus-5-5
       timestamp: 2026-11-17T12:30:00Z
 
@@ -4111,6 +4112,7 @@ artifacts:
         target: SYS-3
     provenance:
       created-by: ai-assisted
+      reviewed-by: avrabe
       model: claude-opus-5-5
       timestamp: 2026-11-17T15:00:00Z
   - id: SR-127
@@ -4124,6 +4126,7 @@ artifacts:
         target: SYS-3
     provenance:
       created-by: ai-assisted
+      reviewed-by: avrabe
       model: claude-opus-5-5
       timestamp: 2026-11-18T01:00:00Z
   - id: SR-128
@@ -4137,5 +4140,20 @@ artifacts:
         target: SYS-3
     provenance:
       created-by: ai-assisted
+      reviewed-by: avrabe
       model: claude-opus-5-5
       timestamp: 2026-11-18T03:30:00Z
+  - id: SR-129
+    type: sw-req
+    title: "An adapter traps on an out-of-range variant, enum, option or result case index in flat params"
+    status: implemented
+    release: v0.70.0
+    description: "For each flat param slot that holds the case index of a variant, enum, option or result (at the top level or inside a record, tuple or fixed-size list), the adapter shall trap when the index is not below the case count, as the Canonical ABI's lift_flat_variant does. The check applies at the same splice point as the flat char check, for every adapter class. Before, an enum of 257 cases given index 257 and an option given index 2 crossed the boundary and the callee ran on an invalid value (#586). Not covered: case indices inside a variant payload, in memory, or in results."
+    links:
+      - type: derives-from
+        target: SYS-3
+    provenance:
+      created-by: ai-assisted
+      reviewed-by: avrabe
+      model: claude-opus-5-5
+      timestamp: 2026-11-18T06:00:00Z

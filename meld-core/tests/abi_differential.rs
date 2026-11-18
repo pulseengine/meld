@@ -285,6 +285,40 @@ fn flat_params_are_normalised_as_lift_flat_does() {
     }
 }
 
+// rivet: verifies SR-129
+// rivet: verifies SWV-143
+#[test]
+fn a_bad_flat_discriminant_traps_after_fusion() {
+    for name in [
+        "issue586-enum257-bad-discriminant",
+        "issue586-option-bad-discriminant",
+    ] {
+        let bytes = wat::parse_file(dir().join(format!("{name}.wat"))).unwrap();
+        assert!(
+            matches!(run_unfused(&bytes), Run::Trap),
+            "{name}: unfused must trap"
+        );
+        for (label, strategy) in STRATEGIES {
+            assert!(
+                matches!(run_fused(&bytes, strategy), Ok(Run::Trap)),
+                "{name} {label}: an out-of-range case index must trap after fusion"
+            );
+        }
+    }
+    // Control: the same 257-case enum with an in-range index runs and matches.
+    let name = "issue586-enum257-valid-control";
+    let bytes = wat::parse_file(dir().join(format!("{name}.wat"))).unwrap();
+    let Run::Ok(want) = run_unfused(&bytes) else {
+        panic!("{name}: unfused reference did not return a value");
+    };
+    for (label, strategy) in STRATEGIES {
+        match run_fused(&bytes, strategy) {
+            Ok(Run::Ok(got)) => assert_eq!(got, want, "{name} {label}"),
+            _ => panic!("{name} {label}: the fused run did not return a value"),
+        }
+    }
+}
+
 // rivet: verifies SR-128
 // rivet: verifies SWV-142
 #[test]
