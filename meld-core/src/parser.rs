@@ -512,6 +512,9 @@ pub enum FlatParamLift {
     S16,
     /// `x & mask`: the declared labels' bits in the last flags word.
     FlagsMask(u32),
+    /// Trap unless the case index is below the case count (variant, enum,
+    /// option, result).
+    Discriminant(u32),
 }
 
 /// String encoding declared in canonical options
@@ -2775,6 +2778,14 @@ impl ParsedComponent {
                         FlatParamLift::FlagsMask((1u32 << (n % 32)) - 1),
                     ));
                 }
+            }
+            // #586: lift_flat_variant traps when the case index is not below
+            // the case count. The payload slots are not covered (see above).
+            ComponentValType::Variant(cases) => {
+                out.push((base, FlatParamLift::Discriminant(cases.len() as u32)));
+            }
+            ComponentValType::Option(_) | ComponentValType::Result { .. } => {
+                out.push((base, FlatParamLift::Discriminant(2)));
             }
             ComponentValType::FixedSizeList(elem, len) => {
                 let elem_flat = self.flat_count(elem);
@@ -6727,6 +6738,41 @@ mod tests {
         }));
         // An alias this component cannot resolve may be a string: answer true.
         assert!(c.may_carry_string(&T::Type(9999)));
+    }
+
+    // rivet: verifies SR-129
+    // rivet: verifies SWV-143
+    #[test]
+    fn flat_param_lifts_check_variant_discriminants() {
+        use crate::parser::FlatParamLift as L;
+        type T = ComponentValType;
+        let c = empty_parsed_for_flags();
+        let p = |ty: T| vec![("x".to_string(), ty)];
+        let u32_ = || Box::new(T::Primitive(PrimitiveValType::U32));
+        // An enum of 257 cases: the case index must be below 257.
+        let e257 = T::Variant((0..257).map(|i| (format!("c{i}"), None)).collect());
+        assert_eq!(
+            c.flat_param_lifts(&p(e257)),
+            vec![(0, L::Discriminant(257))]
+        );
+        // option and result have two cases.
+        assert_eq!(
+            c.flat_param_lifts(&p(T::Option(u32_()))),
+            vec![(0, L::Discriminant(2))]
+        );
+        assert_eq!(
+            c.flat_param_lifts(&p(T::Result {
+                ok: Some(u32_()),
+                err: None
+            })),
+            vec![(0, L::Discriminant(2))]
+        );
+        // Behind a u32 param, the discriminant is at flat slot 1.
+        let two = vec![
+            ("a".to_string(), T::Primitive(PrimitiveValType::U32)),
+            ("b".to_string(), T::Option(u32_())),
+        ];
+        assert_eq!(c.flat_param_lifts(&two), vec![(1, L::Discriminant(2))]);
     }
 
     // rivet: verifies SR-126

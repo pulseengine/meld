@@ -5488,6 +5488,16 @@ fn prepend_flat_param_lifts(
                 out.instruction(&Instruction::End);
                 continue;
             }
+            L::Discriminant(n) => {
+                // trap if x >=u n
+                out.instruction(&Instruction::LocalGet(p));
+                out.instruction(&Instruction::I32Const(n as i32));
+                out.instruction(&Instruction::I32GeU);
+                out.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+                out.instruction(&Instruction::Unreachable);
+                out.instruction(&Instruction::End);
+                continue;
+            }
             L::Bool => {
                 out.instruction(&Instruction::LocalGet(p));
                 out.instruction(&Instruction::I32Const(0));
