@@ -56,7 +56,7 @@ permissions:
 jobs:
   no-new-diagnostics:
     name: Traceability (no new diagnostics)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     env:
       RIVET_VERSION: "0.40.0"

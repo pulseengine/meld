@@ -42,18 +42,18 @@ on:
 jobs:
   test-stub:
     name: Test
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - run: echo "docs/safety-only change — code CI not applicable (see ci.yml paths-ignore)"
 
   clippy-stub:
     name: Clippy
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - run: echo "docs/safety-only change — code CI not applicable (see ci.yml paths-ignore)"
 
   format-stub:
     name: Format
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - run: echo "docs/safety-only change — code CI not applicable (see ci.yml paths-ignore)"
