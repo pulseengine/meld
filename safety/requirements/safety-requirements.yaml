@@ -4113,3 +4113,29 @@ artifacts:
       created-by: ai-assisted
       model: claude-opus-5-5
       timestamp: 2026-11-17T15:00:00Z
+  - id: SR-127
+    type: sw-req
+    title: "A call whose types cannot carry a string fuses without a string transcode, whatever the string-encoding options say"
+    status: implemented
+    release: v0.70.0
+    description: "When the caller's and callee's string-encoding options differ, the adapter shall transcode only if a param or result of the resolved function type may carry a string (following use aliases; an unresolved alias counts as may). Otherwise the call is lowered as if the encodings matched, and the flat value checks (char validity, narrow-int and flags normalisation) still apply. A char-only call between a utf8 and a utf16 component previously went to the string transcoder, which reads params 0 and 1 as a (ptr, len) pair, and the fused module failed validation (#620)."
+    links:
+      - type: derives-from
+        target: SYS-3
+    provenance:
+      created-by: ai-assisted
+      model: claude-opus-5-5
+      timestamp: 2026-11-18T01:00:00Z
+  - id: SR-128
+    type: sw-req
+    title: "A cross-encoding call whose string shape the flat transcoder does not handle is refused"
+    status: implemented
+    release: v0.70.0
+    description: "When the caller's and callee's string-encoding options differ and the call takes the flat (non-retptr) transcode path, fusion shall succeed only if the single (ptr, len) pair is a top-level string in params 0 and 1, no other param may carry a string, and the params are not spilled to a params area. Every other shape shall be refused with an error. A list<string>, a list<option<string>> and a record holding a string previously fused at exit 0, validated, and handed the callee the caller's pointers (#600, #603)."
+    links:
+      - type: derives-from
+        target: SYS-3
+    provenance:
+      created-by: ai-assisted
+      model: claude-opus-5-5
+      timestamp: 2026-11-18T03:30:00Z

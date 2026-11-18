@@ -5557,7 +5557,12 @@ impl FactStyleGenerator {
         let plan = crate::adapter::call_lowering::resolve_call_lowering_plan(
             crate::adapter::call_lowering::BoundaryFacts {
                 crosses_memory: site.crosses_memory,
-                needs_transcoding: options.needs_transcoding(),
+                // #620: differing `string-encoding` options matter only when a
+                // string can cross. A char-only call between a utf8 and a utf16
+                // component went to the string transcoder, which reads params 0
+                // and 1 as a (ptr, len) pair, and failed validation.
+                needs_transcoding: options.needs_transcoding()
+                    && !site.requirements.carries_no_string,
                 inline_adapters: self.config.inline_adapters,
                 has_resource_rep_calls: !options.resource_rep_calls.is_empty(),
                 has_resource_new_calls: !options.resource_new_calls.is_empty(),
@@ -9145,6 +9150,34 @@ impl FactStyleGenerator {
                 type_idx,
                 caller_type_idx,
             );
+        }
+
+        // #600: the flat emitters below transcode exactly one buffer, the
+        // (ptr, len) pair in params 0 and 1, and forward every other param
+        // unchanged. Any other shape (a `list<string>`, a second string or
+        // list, a string inside a record, a spilled params area) reached them
+        // too: the callee got the caller's pointers, with no error. Refuse
+        // every shape the emitters do not transcode.
+        let r = &site.requirements;
+        if options.caller_string_encoding != options.callee_string_encoding
+            && !(r.params_area_byte_size.is_none()
+                && r.pointer_pair_positions.as_slice() == [0]
+                && matches!(
+                    r.param_wit_types.first(),
+                    Some(crate::parser::ComponentValType::String)
+                )
+                && !r.param_wit_types[1..].iter().any(wit_may_contain_string))
+        {
+            return Err(crate::Error::AdapterGeneration(format!(
+                "#600: the call to '{}' ({}) passes strings between components with \
+                 different string encodings ({:?} -> {:?}), in a shape meld does not \
+                 transcode: it transcodes a single top-level string parameter only. \
+                 Refusing rather than handing the callee the caller's pointers.",
+                site.export_name,
+                site.import_module,
+                options.caller_string_encoding,
+                options.callee_string_encoding
+            )));
         }
 
         let func_type = merged.types.get(type_idx as usize);

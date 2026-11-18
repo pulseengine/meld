@@ -362,6 +362,11 @@ pub struct AdapterRequirements {
     /// `ParsedComponent::flat_param_lifts`). Empty under the params-ptr
     /// convention. The adapter applies each before the callee sees it.
     pub flat_param_lifts: Vec<(u32, crate::parser::FlatParamLift)>,
+    /// #620: the callee's resolved function type has no param or result that
+    /// may carry a `string` (`ParsedComponent::may_carry_string`). Only then
+    /// does a difference in `string-encoding` options not require a transcode.
+    /// `false` when the type was not resolved.
+    pub carries_no_string: bool,
     /// Flat return-area byte offsets where (ptr, len) pairs start for string/list results.
     /// The adapter must copy pointed-to data and fix up pointers at these offsets.
     pub result_pointer_pair_offsets: Vec<u32>,
@@ -3808,6 +3813,11 @@ impl Resolver {
                                             if exact && size > 0 {
                                                 requirements.return_area_byte_size = Some(size);
                                             }
+                                            requirements.carries_no_string = !comp_params
+                                                .iter()
+                                                .map(|(_, t)| t)
+                                                .chain(results.iter().map(|(_, t)| t))
+                                                .any(|t| to_component.may_carry_string(t));
                                             requirements.pointer_pair_positions = to_component
                                                 .pointer_pair_param_positions(comp_params);
                                             log::debug!(
@@ -4193,6 +4203,11 @@ impl Resolver {
                                     if exact && size > 0 {
                                         requirements.return_area_byte_size = Some(size);
                                     }
+                                    requirements.carries_no_string = !comp_params
+                                        .iter()
+                                        .map(|(_, t)| t)
+                                        .chain(results.iter().map(|(_, t)| t))
+                                        .any(|t| to_component.may_carry_string(t));
                                     requirements.pointer_pair_positions =
                                         to_component.pointer_pair_param_positions(comp_params);
                                     requirements.result_pointer_pair_offsets =

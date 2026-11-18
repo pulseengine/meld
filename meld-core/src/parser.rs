@@ -1776,6 +1776,42 @@ impl ParsedComponent {
         None
     }
 
+    /// #620: whether a value of `ty` may carry a `string`, following `use`
+    /// aliases. An alias that does not resolve, or a chain deeper than 64,
+    /// answers `true`: the caller only skips transcoding on a `false`, so
+    /// unknown must mean "may".
+    pub fn may_carry_string(&self, ty: &ComponentValType) -> bool {
+        self.may_carry_string_at(ty, 0)
+    }
+
+    fn may_carry_string_at(&self, ty: &ComponentValType, depth: u32) -> bool {
+        use ComponentValType as T;
+        if depth > 64 {
+            return true;
+        }
+        let d = depth + 1;
+        match ty {
+            T::String => true,
+            T::Primitive(_) | T::Flags(_) | T::Own(_) | T::Borrow(_) => false,
+            T::List(e) | T::FixedSizeList(e, _) | T::Option(e) => self.may_carry_string_at(e, d),
+            T::Record(fields) => fields.iter().any(|(_, t)| self.may_carry_string_at(t, d)),
+            T::Tuple(ts) => ts.iter().any(|t| self.may_carry_string_at(t, d)),
+            T::Variant(cases) => cases
+                .iter()
+                .any(|(_, t)| t.as_ref().is_some_and(|t| self.may_carry_string_at(t, d))),
+            T::Result { ok, err } => {
+                ok.as_deref()
+                    .is_some_and(|t| self.may_carry_string_at(t, d))
+                    || err
+                        .as_deref()
+                        .is_some_and(|t| self.may_carry_string_at(t, d))
+            }
+            T::Type(idx) => self
+                .resolve_defined_val_type(*idx)
+                .is_none_or(|t| self.may_carry_string_at(&t, d)),
+        }
+    }
+
     /// Look up the type definition at a given component type index.
     ///
     /// Follows `ExportAlias` chains to resolve type aliases created by
@@ -6667,6 +6703,30 @@ mod tests {
 
     fn flags_ty(n: usize) -> ComponentValType {
         ComponentValType::Flags((0..n).map(|i| format!("f{i}")).collect())
+    }
+
+    // rivet: verifies SR-127
+    // rivet: verifies SWV-141
+    #[test]
+    fn may_carry_string_is_false_only_when_no_string_can_cross() {
+        use ComponentValType as T;
+        let c = empty_parsed_for_flags();
+        let b = |t: T| Box::new(t);
+        assert!(!c.may_carry_string(&T::Primitive(PrimitiveValType::Char)));
+        assert!(!c.may_carry_string(&T::List(b(T::Primitive(PrimitiveValType::U8)))));
+        assert!(!c.may_carry_string(&flags_ty(9)));
+        assert!(c.may_carry_string(&T::String));
+        assert!(c.may_carry_string(&T::Option(b(T::String))));
+        assert!(c.may_carry_string(&T::Variant(vec![
+            ("a".into(), None),
+            ("b".into(), Some(T::List(b(T::String)))),
+        ])));
+        assert!(c.may_carry_string(&T::Result {
+            ok: None,
+            err: Some(b(T::String)),
+        }));
+        // An alias this component cannot resolve may be a string: answer true.
+        assert!(c.may_carry_string(&T::Type(9999)));
     }
 
     // rivet: verifies SR-126
