@@ -47,7 +47,7 @@ jobs:
     # Routes fork PRs to GitHub-hosted runners by default. This is NOT a security
     # boundary: a fork PR can edit this file. Isolation is enforced by the org's
     # smithy runner-group policy and fork-PR approval (pulseengine/warte#35).
-    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-24.04' || fromJSON('["self-hosted","linux","x64","rust-cpu"]') }}
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","linux","x64","rust-cpu"]') || 'ubuntu-24.04' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
@@ -77,7 +77,7 @@ jobs:
 
   coverage:
     name: Coverage
-    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-24.04' || fromJSON('["self-hosted","linux","x64","rust-cpu"]') }}
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","linux","x64","rust-cpu"]') || 'ubuntu-24.04' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
@@ -117,7 +117,7 @@ jobs:
     # same tree. Re-running it on the main push only occupied a shared
     # rust-cpu runner (measured: ~100 min queue per main push, 2026-10).
     if: github.event_name == 'pull_request'
-    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-24.04' || fromJSON('["self-hosted","linux","x64","rust-cpu"]') }}
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","linux","x64","rust-cpu"]') || 'ubuntu-24.04' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
@@ -146,7 +146,7 @@ jobs:
 
   fmt:
     name: Format
-    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-24.04' || fromJSON('["self-hosted","linux","x64","light"]') }}
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","linux","x64","light"]') || 'ubuntu-24.04' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
@@ -159,3 +159,28 @@ jobs:
 
       - name: Check formatting
         run: cargo fmt --all -- --check
+
+      # No fork PR reaches a self-hosted runner. Every self-hosted runs-on uses
+      # the fail-closed same-repo form, so a fork, or a deleted fork whose
+      # head.repo is null, falls to the hosted runner. No self-hosted job sits
+      # under a trigger a fork can cause (pull_request_target, workflow_run, ...).
+      # The checker is copied from pulseengine/relay. Its unit tests run first,
+      # then a planted plain self-hosted job must fail it, then the real tree
+      # must pass.
+      - name: Self-hosted fork guard (fail-closed runs-on)
+        run: |
+          rustc --edition 2021 --test scripts/check-selfhosted-fork-guard.rs -o "$RUNNER_TEMP/csfg-test"
+          "$RUNNER_TEMP/csfg-test"
+          rustc --edition 2021 -O scripts/check-selfhosted-fork-guard.rs -o "$RUNNER_TEMP/csfg"
+          plant="$RUNNER_TEMP/csfg-plant"
+          rm -rf "$plant" && mkdir -p "$plant/.github"
+          cp -r .github/workflows "$plant/.github/"
+          printf '  planted:\n    runs-on: [self-hosted, linux, x64, light]\n    steps:\n      - run: true\n' \
+            >> "$plant/.github/workflows/gate-probe.yml"
+          rc=0
+          (cd "$plant" && "$RUNNER_TEMP/csfg") || rc=$?
+          if [ "$rc" -ne 1 ]; then
+            echo "::error::negative control: a planted plain self-hosted job must fail the guard (exit 1), got $rc"
+            exit 1
+          fi
+          "$RUNNER_TEMP/csfg"
