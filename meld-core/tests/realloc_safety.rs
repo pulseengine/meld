@@ -463,23 +463,43 @@ fn scan_fused(
 }
 
 /// Return true iff within the next `GUARD_WINDOW` operators after position
-/// `call_idx` (exclusive) the sequence `I32Eqz; If { .. }; Unreachable; End`
-/// appears.  Other operators between the call and the I32Eqz (e.g. the
-/// canonical `LocalSet; LocalGet` that plumbs the result into a local) are
-/// allowed — only the contiguous 4-op trap pattern is required.
+/// `call_idx` (exclusive) the null guard appears. Since #621 the guard traps
+/// only for a NULL result on a NONZERO request:
+/// `I32Eqz; <size expr>; I32Const 0; I32Ne; I32And; If { .. }; Unreachable; End`.
+/// The `<size expr>` is a short run (at most `MAX_SIZE_EXPR` operators) with no
+/// control flow; the tail `I32Const 0; I32Ne; I32And; If; Unreachable; End`
+/// is required contiguously. Other operators between the call and the I32Eqz
+/// (e.g. the canonical `LocalSet; LocalGet`) are allowed.
 fn has_null_guard(ops: &[(wasmparser::Operator, usize)], call_idx: usize) -> bool {
+    use wasmparser::Operator as O;
+    const MAX_SIZE_EXPR: usize = 6;
     let start = call_idx + 1;
     let end = (start + GUARD_WINDOW).min(ops.len());
-    if end < start + 4 {
-        return false;
-    }
-    for i in start..=end.saturating_sub(4) {
-        let is_eqz = matches!(ops[i].0, wasmparser::Operator::I32Eqz);
-        let is_if = matches!(ops[i + 1].0, wasmparser::Operator::If { .. });
-        let is_unreach = matches!(ops[i + 2].0, wasmparser::Operator::Unreachable);
-        let is_end = matches!(ops[i + 3].0, wasmparser::Operator::End);
-        if is_eqz && is_if && is_unreach && is_end {
-            return true;
+    for i in start..end {
+        if !matches!(ops[i].0, O::I32Eqz) {
+            continue;
+        }
+        // Find the tail after a short, control-flow-free size expression.
+        for len in 1..=MAX_SIZE_EXPR {
+            let t = i + 1 + len;
+            if t + 6 > ops.len() {
+                break;
+            }
+            if matches!(
+                ops[i + 1 + len - 1].0,
+                O::If { .. } | O::Else | O::End | O::Call { .. } | O::Br { .. } | O::BrIf { .. }
+            ) {
+                break;
+            }
+            if matches!(ops[t].0, O::I32Const { value: 0 })
+                && matches!(ops[t + 1].0, O::I32Ne)
+                && matches!(ops[t + 2].0, O::I32And)
+                && matches!(ops[t + 3].0, O::If { .. })
+                && matches!(ops[t + 4].0, O::Unreachable)
+                && matches!(ops[t + 5].0, O::End)
+            {
+                return true;
+            }
         }
     }
     false

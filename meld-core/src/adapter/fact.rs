@@ -84,19 +84,38 @@ fn alignment_for_encoding(encoding: StringEncoding) -> i32 {
 
 /// Build a lookup from `(module, field)` → merged function index for resource imports.
 ///
-/// Emit a safe `cabi_realloc` call: traps via `unreachable` if the returned
-/// pointer is 0 (OOM). Caller must have pushed the 4 realloc arguments onto
-/// the stack (`old_ptr`, `old_size`, `align`, `new_size`) immediately before
-/// calling this helper. After the call, the (checked, non-null) pointer is
-/// stored in `result_local`.
+/// Emit a safe `cabi_realloc` call `realloc(0, 0, align, size)`. The result is
+/// stored in `result_local`; the emitted code traps via `unreachable` only if
+/// that result is NULL (0) AND the requested size is nonzero.
+///
+/// `size` emits the new-size expression onto the stack. It is emitted twice
+/// (once as the realloc argument, once for the check), so it must be pure and
+/// must not read `result_local`.
 ///
 /// This is the fix for LS-A-7 leg (b): an unchecked realloc return lets the
-/// transcode/copy loop write into callee memory offset 0 on OOM.
-pub(crate) fn emit_checked_realloc(body: &mut Function, realloc_func: u32, result_local: u32) {
+/// transcode/copy loop write into callee memory offset 0 on OOM. The trap on a
+/// NULL result for a nonzero request is a deliberate stricter-than-spec choice
+/// (the Canonical ABI only checks alignment and bounds). A 0-byte request
+/// answered with 0 is valid per the Canonical ABI and must not trap (#621).
+pub(crate) fn emit_checked_realloc(
+    body: &mut Function,
+    realloc_func: u32,
+    result_local: u32,
+    align: i32,
+    size: impl Fn(&mut Function),
+) {
+    body.instruction(&Instruction::I32Const(0)); // old_ptr
+    body.instruction(&Instruction::I32Const(0)); // old_size
+    body.instruction(&Instruction::I32Const(align));
+    size(body);
     body.instruction(&Instruction::Call(realloc_func));
     body.instruction(&Instruction::LocalSet(result_local));
     body.instruction(&Instruction::LocalGet(result_local));
     body.instruction(&Instruction::I32Eqz);
+    size(body);
+    body.instruction(&Instruction::I32Const(0));
+    body.instruction(&Instruction::I32Ne);
+    body.instruction(&Instruction::I32And);
     body.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
     body.instruction(&Instruction::Unreachable);
     body.instruction(&Instruction::End);
@@ -918,13 +937,11 @@ fn emit_utf8_to_utf16_transcode_param(
     // code unit = 2 bytes). LS-A-7 leg (a): guard the *2 against i32 wrap;
     // leg (b): emit_checked_realloc traps on a null return.
     emit_overflow_guard(body, len_local, 2);
-    body.instruction(&Instruction::I32Const(0)); // old_ptr
-    body.instruction(&Instruction::I32Const(0)); // old_size
-    body.instruction(&Instruction::I32Const(2)); // align (utf16)
-    body.instruction(&Instruction::LocalGet(len_local));
-    body.instruction(&Instruction::I32Const(2));
-    body.instruction(&Instruction::I32Mul); // new_size = 2 * len
-    emit_checked_realloc(body, realloc_func, out_ptr_local);
+    emit_checked_realloc(body, realloc_func, out_ptr_local, 2, |b| {
+        b.instruction(&Instruction::LocalGet(len_local));
+        b.instruction(&Instruction::I32Const(2));
+        b.instruction(&Instruction::I32Mul);
+    });
 
     // src_idx = 0; dst_idx = 0 (dst_idx is the running output code-unit count).
     body.instruction(&Instruction::I32Const(0));
@@ -1019,13 +1036,11 @@ fn emit_utf16_to_utf8_transcode_param(
     // (a): guard the *3 against i32 wrap; leg (b): emit_checked_realloc traps on
     // a null return.
     emit_overflow_guard(body, len_local, 3);
-    body.instruction(&Instruction::I32Const(0)); // old_ptr
-    body.instruction(&Instruction::I32Const(0)); // old_size
-    body.instruction(&Instruction::I32Const(realloc_align)); // align
-    body.instruction(&Instruction::LocalGet(len_local));
-    body.instruction(&Instruction::I32Const(3));
-    body.instruction(&Instruction::I32Mul); // new_size = 3 * len
-    emit_checked_realloc(body, realloc_func, out_ptr_local);
+    emit_checked_realloc(body, realloc_func, out_ptr_local, realloc_align, |b| {
+        b.instruction(&Instruction::LocalGet(len_local));
+        b.instruction(&Instruction::I32Const(3));
+        b.instruction(&Instruction::I32Mul);
+    });
 
     // src_idx = 0 (code units); dst_idx = 0 (the running output BYTE count).
     body.instruction(&Instruction::I32Const(0));
@@ -1140,13 +1155,11 @@ fn emit_latin1_to_utf16_transcode_param(
     // unit). LS-A-7 leg (a): guard the *2 against i32 wrap; leg (b):
     // emit_checked_realloc traps on a null return.
     emit_overflow_guard(body, count_local, 2);
-    body.instruction(&Instruction::I32Const(0)); // old_ptr
-    body.instruction(&Instruction::I32Const(0)); // old_size
-    body.instruction(&Instruction::I32Const(2)); // align (utf16)
-    body.instruction(&Instruction::LocalGet(count_local));
-    body.instruction(&Instruction::I32Const(2));
-    body.instruction(&Instruction::I32Mul); // new_size = 2 * count
-    emit_checked_realloc(body, realloc_func, out_ptr_local);
+    emit_checked_realloc(body, realloc_func, out_ptr_local, 2, |b| {
+        b.instruction(&Instruction::LocalGet(count_local));
+        b.instruction(&Instruction::I32Const(2));
+        b.instruction(&Instruction::I32Mul);
+    });
 
     // idx = 0 (code-unit index, identical for src and dst in both arms).
     body.instruction(&Instruction::I32Const(0));
@@ -1300,13 +1313,11 @@ fn emit_latin1_to_utf8_transcode_param(
     // guard the *3 against i32 wrap; leg (b): emit_checked_realloc traps on a
     // null return.
     emit_overflow_guard(body, len_local, 3);
-    body.instruction(&Instruction::I32Const(0)); // old_ptr
-    body.instruction(&Instruction::I32Const(0)); // old_size
-    body.instruction(&Instruction::I32Const(realloc_align)); // align
-    body.instruction(&Instruction::LocalGet(len_local));
-    body.instruction(&Instruction::I32Const(3));
-    body.instruction(&Instruction::I32Mul); // new_size = 3 * count
-    emit_checked_realloc(body, realloc_func, out_ptr_local);
+    emit_checked_realloc(body, realloc_func, out_ptr_local, realloc_align, |b| {
+        b.instruction(&Instruction::LocalGet(len_local));
+        b.instruction(&Instruction::I32Const(3));
+        b.instruction(&Instruction::I32Mul);
+    });
 
     // src_idx = 0; dst_idx = 0 (the running output BYTE count).
     body.instruction(&Instruction::I32Const(0));
@@ -1454,13 +1465,11 @@ fn emit_utf8_to_latin1_transcode_param(
     // which also bounds the 1-byte-per-char Latin-1 arm). LS-A-7 leg (a): guard
     // the *2 against i32 wrap; leg (b): emit_checked_realloc traps on null.
     emit_overflow_guard(body, len_local, 2);
-    body.instruction(&Instruction::I32Const(0)); // old_ptr
-    body.instruction(&Instruction::I32Const(0)); // old_size
-    body.instruction(&Instruction::I32Const(realloc_align)); // align (utf16: 2)
-    body.instruction(&Instruction::LocalGet(len_local));
-    body.instruction(&Instruction::I32Const(2));
-    body.instruction(&Instruction::I32Mul); // new_size = 2 * len
-    emit_checked_realloc(body, realloc_func, out_ptr_local);
+    emit_checked_realloc(body, realloc_func, out_ptr_local, realloc_align, |b| {
+        b.instruction(&Instruction::LocalGet(len_local));
+        b.instruction(&Instruction::I32Const(2));
+        b.instruction(&Instruction::I32Mul);
+    });
 
     // --- Phase A: scan to decide latin1-vs-utf16. ---
     body.instruction(&Instruction::I32Const(0));
@@ -1681,11 +1690,9 @@ fn emit_compact_utf16_to_compact_utf16_copy_param(
     }
     body.instruction(&Instruction::Else);
     {
-        body.instruction(&Instruction::I32Const(0));
-        body.instruction(&Instruction::I32Const(0));
-        body.instruction(&Instruction::I32Const(2));
-        body.instruction(&Instruction::LocalGet(len_local));
-        emit_checked_realloc(body, realloc_func, out_ptr_local);
+        emit_checked_realloc(body, realloc_func, out_ptr_local, 2, |b| {
+            b.instruction(&Instruction::LocalGet(len_local));
+        });
         body.instruction(&Instruction::LocalGet(out_ptr_local));
         body.instruction(&Instruction::LocalGet(ptr_local));
         body.instruction(&Instruction::LocalGet(len_local));
@@ -1750,13 +1757,11 @@ fn emit_utf16_to_latin1_transcode_param(
     // Allocate output buffer = 2 * code_units bytes (UTF-16-verbatim worst
     // case). LS-A-7 leg (a): guard *2; leg (b): null-check the realloc.
     emit_overflow_guard(body, len_local, 2);
-    body.instruction(&Instruction::I32Const(0)); // old_ptr
-    body.instruction(&Instruction::I32Const(0)); // old_size
-    body.instruction(&Instruction::I32Const(realloc_align)); // align (utf16: 2)
-    body.instruction(&Instruction::LocalGet(len_local));
-    body.instruction(&Instruction::I32Const(2));
-    body.instruction(&Instruction::I32Mul); // new_size = 2 * code_units
-    emit_checked_realloc(body, realloc_func, out_ptr_local);
+    emit_checked_realloc(body, realloc_func, out_ptr_local, realloc_align, |b| {
+        b.instruction(&Instruction::LocalGet(len_local));
+        b.instruction(&Instruction::I32Const(2));
+        b.instruction(&Instruction::I32Mul);
+    });
 
     // --- Phase A: scan to decide latin1-vs-utf16. ---
     body.instruction(&Instruction::I32Const(0));
@@ -4528,15 +4533,13 @@ fn emit_patch_nested_indirections(
 
                 // new_ptr = realloc(0, 0, inner_align, count*sub_elem_size) in
                 // caller memory; bulk-copy the inner array callee→caller.
-                body.instruction(&Instruction::I32Const(0));
-                body.instruction(&Instruction::I32Const(0));
-                body.instruction(&Instruction::I32Const(inner_align as i32));
-                body.instruction(&Instruction::LocalGet(l_buf_len));
-                if *sub_elem_size != 1 {
-                    body.instruction(&Instruction::I32Const(*sub_elem_size as i32));
-                    body.instruction(&Instruction::I32Mul);
-                }
-                emit_checked_realloc(body, realloc_func, l_new_ptr);
+                emit_checked_realloc(body, realloc_func, l_new_ptr, inner_align as i32, |b| {
+                    b.instruction(&Instruction::LocalGet(l_buf_len));
+                    if *sub_elem_size != 1 {
+                        b.instruction(&Instruction::I32Const(*sub_elem_size as i32));
+                        b.instruction(&Instruction::I32Mul);
+                    }
+                });
 
                 body.instruction(&Instruction::LocalGet(l_new_ptr));
                 body.instruction(&Instruction::LocalGet(l_old_ptr));
@@ -4624,15 +4627,15 @@ fn emit_patch_nested_indirections(
         // new_ptr = realloc(0, 0, align, buf_len) in caller memory.
         // align 2 for a compact-utf16 inner string (the buffer may hold a
         // UTF-16 payload), else 1 — matching the other tag-aware copy sites.
-        body.instruction(&Instruction::I32Const(0));
-        body.instruction(&Instruction::I32Const(0));
-        body.instruction(&Instruction::I32Const(if inner_compact_utf16 {
-            2
-        } else {
-            1
-        }));
-        body.instruction(&Instruction::LocalGet(l_buf_len));
-        emit_checked_realloc(body, realloc_func, l_new_ptr);
+        emit_checked_realloc(
+            body,
+            realloc_func,
+            l_new_ptr,
+            if inner_compact_utf16 { 2 } else { 1 },
+            |b| {
+                b.instruction(&Instruction::LocalGet(l_buf_len));
+            },
+        );
 
         // memory.copy new_ptr <- old_ptr (callee → caller)
         body.instruction(&Instruction::LocalGet(l_new_ptr));
@@ -5064,15 +5067,13 @@ fn emit_param_nested_indirections(
 
                 // new_ptr = realloc(0, 0, inner_align, count*sub_elem_size) in
                 // CALLEE memory; bulk-copy the inner array caller→callee.
-                body.instruction(&Instruction::I32Const(0));
-                body.instruction(&Instruction::I32Const(0));
-                body.instruction(&Instruction::I32Const(inner_align as i32));
-                body.instruction(&Instruction::LocalGet(l_buf_len));
-                if *sub_elem_size != 1 {
-                    body.instruction(&Instruction::I32Const(*sub_elem_size as i32));
-                    body.instruction(&Instruction::I32Mul);
-                }
-                emit_checked_realloc(body, realloc_func, l_new_ptr);
+                emit_checked_realloc(body, realloc_func, l_new_ptr, inner_align as i32, |b| {
+                    b.instruction(&Instruction::LocalGet(l_buf_len));
+                    if *sub_elem_size != 1 {
+                        b.instruction(&Instruction::I32Const(*sub_elem_size as i32));
+                        b.instruction(&Instruction::I32Mul);
+                    }
+                });
 
                 body.instruction(&Instruction::LocalGet(l_new_ptr));
                 body.instruction(&Instruction::LocalGet(l_old_ptr));
@@ -5177,17 +5178,19 @@ fn emit_param_nested_indirections(
         // new_ptr = realloc(0, 0, align, buf_len) in CALLEE memory. align 2 for a
         // UTF-16 / CompactUtf16 inner string (the buffer may hold a UTF-16
         // payload), else 1 — matching the result-side deep-copy align choice.
-        body.instruction(&Instruction::I32Const(0));
-        body.instruction(&Instruction::I32Const(0));
-        body.instruction(&Instruction::I32Const(
+        emit_checked_realloc(
+            body,
+            realloc_func,
+            l_new_ptr,
             if inner_compact_utf16 || inner_utf16 {
                 2
             } else {
                 1
             },
-        ));
-        body.instruction(&Instruction::LocalGet(l_buf_len));
-        emit_checked_realloc(body, realloc_func, l_new_ptr);
+            |b| {
+                b.instruction(&Instruction::LocalGet(l_buf_len));
+            },
+        );
 
         // memory.copy new_ptr <- old_ptr (caller → callee)
         body.instruction(&Instruction::LocalGet(l_new_ptr));
@@ -6977,11 +6980,9 @@ impl FactStyleGenerator {
 
                 // Allocate: dest = cabi_realloc(0, 0, align, <byte count>)
                 emit_overflow_guard(&mut func, len_pos, byte_mult);
-                func.instruction(&Instruction::I32Const(0));
-                func.instruction(&Instruction::I32Const(0));
-                func.instruction(&Instruction::I32Const(realloc_align));
-                emit_copy_byte_count(&mut func, len_pos, byte_mult, is_compact_utf16);
-                emit_checked_realloc(&mut func, callee_realloc, dest_local);
+                emit_checked_realloc(&mut func, callee_realloc, dest_local, realloc_align, |b| {
+                    emit_copy_byte_count(b, len_pos, byte_mult, is_compact_utf16);
+                });
 
                 // Copy: memory.copy callee_mem caller_mem (dest, src, <byte count>)
                 func.instruction(&Instruction::LocalGet(dest_local));
@@ -7180,11 +7181,13 @@ impl FactStyleGenerator {
 
             // Allocate in caller's memory:
             //   caller_new_ptr = cabi_realloc(0, 0, align, <byte count>)
-            func.instruction(&Instruction::I32Const(0)); // original_ptr
-            func.instruction(&Instruction::I32Const(0)); // original_size
-            func.instruction(&Instruction::I32Const(result_realloc_align)); // alignment
-            emit_copy_byte_count(&mut func, callee_ret_len_local, 1, result_is_compact_utf16);
-            emit_checked_realloc(&mut func, caller_realloc, caller_new_ptr_local);
+            emit_checked_realloc(
+                &mut func,
+                caller_realloc,
+                caller_new_ptr_local,
+                result_realloc_align,
+                |b| emit_copy_byte_count(b, callee_ret_len_local, 1, result_is_compact_utf16),
+            );
 
             // Copy data from callee's memory to caller's memory:
             //   memory.copy $caller_mem $callee_mem (caller_new_ptr, callee_ret_ptr, <byte count>)
@@ -7273,11 +7276,15 @@ impl FactStyleGenerator {
 
                     // Allocate in caller memory
                     emit_overflow_guard(&mut func, len_local, byte_mult);
-                    func.instruction(&Instruction::I32Const(0));
-                    func.instruction(&Instruction::I32Const(0));
-                    func.instruction(&Instruction::I32Const(realloc_align));
-                    emit_copy_byte_count(&mut func, len_local, byte_mult, is_compact_utf16);
-                    emit_checked_realloc(&mut func, caller_realloc, dest_ptr_local);
+                    emit_checked_realloc(
+                        &mut func,
+                        caller_realloc,
+                        dest_ptr_local,
+                        realloc_align,
+                        |b| {
+                            emit_copy_byte_count(b, len_local, byte_mult, is_compact_utf16);
+                        },
+                    );
 
                     // Copy from callee memory to caller memory
                     func.instruction(&Instruction::LocalGet(dest_ptr_local));
@@ -7413,11 +7420,15 @@ impl FactStyleGenerator {
 
         // --- Phase 1: Allocate buffer in callee's memory ---
         // callee_ptr = cabi_realloc(0, 0, align, size)
-        func.instruction(&Instruction::I32Const(0)); // original_ptr
-        func.instruction(&Instruction::I32Const(0)); // original_size
-        func.instruction(&Instruction::I32Const(params_area_align as i32)); // alignment
-        func.instruction(&Instruction::I32Const(params_area_size as i32)); // new_size
-        emit_checked_realloc(func, callee_realloc, callee_ptr_local);
+        emit_checked_realloc(
+            func,
+            callee_realloc,
+            callee_ptr_local,
+            params_area_align as i32,
+            |b| {
+                b.instruction(&Instruction::I32Const(params_area_size as i32));
+            },
+        );
 
         // --- Phase 2: Bulk copy the entire params buffer ---
         // memory.copy $callee_mem $caller_mem (callee_ptr, params_ptr, size)
@@ -7470,11 +7481,9 @@ impl FactStyleGenerator {
 
             // Allocate: new_ptr = cabi_realloc(0, 0, align, <byte count>)
             emit_overflow_guard(func, pair_len_local, byte_mult);
-            func.instruction(&Instruction::I32Const(0));
-            func.instruction(&Instruction::I32Const(0));
-            func.instruction(&Instruction::I32Const(realloc_align));
-            emit_copy_byte_count(func, pair_len_local, byte_mult, is_compact_utf16);
-            emit_checked_realloc(func, callee_realloc, dest_local);
+            emit_checked_realloc(func, callee_realloc, dest_local, realloc_align, |b| {
+                emit_copy_byte_count(b, pair_len_local, byte_mult, is_compact_utf16);
+            });
 
             // Copy data: memory.copy callee caller (new_ptr, old_ptr, <byte count>)
             func.instruction(&Instruction::LocalGet(dest_local)); // dst (in callee mem)
@@ -7915,11 +7924,9 @@ impl FactStyleGenerator {
 
                 // Allocate: dest = cabi_realloc(0, 0, align, <byte count>)
                 emit_overflow_guard(&mut func, len_pos, byte_mult);
-                func.instruction(&Instruction::I32Const(0));
-                func.instruction(&Instruction::I32Const(0));
-                func.instruction(&Instruction::I32Const(realloc_align));
-                emit_copy_byte_count(&mut func, len_pos, byte_mult, is_compact_utf16);
-                emit_checked_realloc(&mut func, callee_realloc, dest_local);
+                emit_checked_realloc(&mut func, callee_realloc, dest_local, realloc_align, |b| {
+                    emit_copy_byte_count(b, len_pos, byte_mult, is_compact_utf16);
+                });
 
                 // Copy: memory.copy callee_mem caller_mem (dest, src, <byte count>)
                 func.instruction(&Instruction::LocalGet(dest_local));
@@ -8052,11 +8059,15 @@ impl FactStyleGenerator {
 
                 // Allocate in callee memory
                 emit_overflow_guard(&mut func, len_local, byte_mult);
-                func.instruction(&Instruction::I32Const(0));
-                func.instruction(&Instruction::I32Const(0));
-                func.instruction(&Instruction::I32Const(realloc_align));
-                emit_copy_byte_count(&mut func, len_local, byte_mult, is_compact_utf16);
-                emit_checked_realloc(&mut func, callee_realloc, cond_dest_ptr_local);
+                emit_checked_realloc(
+                    &mut func,
+                    callee_realloc,
+                    cond_dest_ptr_local,
+                    realloc_align,
+                    |b| {
+                        emit_copy_byte_count(b, len_local, byte_mult, is_compact_utf16);
+                    },
+                );
 
                 // Copy from caller to callee memory
                 func.instruction(&Instruction::LocalGet(cond_dest_ptr_local));
@@ -8177,11 +8188,15 @@ impl FactStyleGenerator {
 
                     // Allocate in caller's memory: <byte count> bytes
                     emit_overflow_guard(&mut func, data_len_local, byte_mult);
-                    func.instruction(&Instruction::I32Const(0));
-                    func.instruction(&Instruction::I32Const(0));
-                    func.instruction(&Instruction::I32Const(realloc_align));
-                    emit_copy_byte_count(&mut func, data_len_local, byte_mult, is_compact_utf16);
-                    emit_checked_realloc(&mut func, caller_realloc, caller_new_ptr_local);
+                    emit_checked_realloc(
+                        &mut func,
+                        caller_realloc,
+                        caller_new_ptr_local,
+                        realloc_align,
+                        |b| {
+                            emit_copy_byte_count(b, data_len_local, byte_mult, is_compact_utf16);
+                        },
+                    );
 
                     // Copy data bytes from callee → caller
                     func.instruction(&Instruction::LocalGet(caller_new_ptr_local));
@@ -8362,11 +8377,15 @@ impl FactStyleGenerator {
 
                 // Allocate in caller memory
                 emit_overflow_guard(&mut func, data_len_local, byte_mult);
-                func.instruction(&Instruction::I32Const(0));
-                func.instruction(&Instruction::I32Const(0));
-                func.instruction(&Instruction::I32Const(realloc_align));
-                emit_copy_byte_count(&mut func, data_len_local, byte_mult, is_compact_utf16);
-                emit_checked_realloc(&mut func, caller_realloc, caller_new_ptr_local);
+                emit_checked_realloc(
+                    &mut func,
+                    caller_realloc,
+                    caller_new_ptr_local,
+                    realloc_align,
+                    |b| {
+                        emit_copy_byte_count(b, data_len_local, byte_mult, is_compact_utf16);
+                    },
+                );
 
                 // Copy data from callee → caller
                 func.instruction(&Instruction::LocalGet(caller_new_ptr_local));
@@ -8546,11 +8565,9 @@ impl FactStyleGenerator {
 
             // Allocate: new_ptr = cabi_realloc(0, 0, align, <byte count>)
             emit_overflow_guard(func, len_local, byte_mult);
-            func.instruction(&Instruction::I32Const(0));
-            func.instruction(&Instruction::I32Const(0));
-            func.instruction(&Instruction::I32Const(realloc_align));
-            emit_copy_byte_count(func, len_local, byte_mult, is_compact_utf16);
-            emit_checked_realloc(func, callee_realloc, dest_ptr_local);
+            emit_checked_realloc(func, callee_realloc, dest_ptr_local, realloc_align, |b| {
+                emit_copy_byte_count(b, len_local, byte_mult, is_compact_utf16);
+            });
 
             // Copy: memory.copy callee caller (dest, src, <byte count>)
             func.instruction(&Instruction::LocalGet(dest_ptr_local));
@@ -8795,15 +8812,13 @@ impl FactStyleGenerator {
 
             // Allocate inner data in dst memory: new_ptr = realloc(0, 0, align, <byte count>)
             emit_overflow_guard(func, inner_len, byte_mult);
-            func.instruction(&Instruction::I32Const(0));
-            func.instruction(&Instruction::I32Const(0));
-            func.instruction(&Instruction::I32Const(if inner_is_compact_utf16 {
-                2
-            } else {
-                1
-            }));
-            emit_copy_byte_count(func, inner_len, byte_mult, inner_is_compact_utf16);
-            emit_checked_realloc(func, realloc_func, new_ptr);
+            emit_checked_realloc(
+                func,
+                realloc_func,
+                new_ptr,
+                if inner_is_compact_utf16 { 2 } else { 1 },
+                |b| emit_copy_byte_count(b, inner_len, byte_mult, inner_is_compact_utf16),
+            );
 
             // Copy data from src memory to dst memory
             // memory.copy dst_mem src_mem (new_ptr, inner_ptr, <byte count>)
@@ -9351,21 +9366,13 @@ impl FactStyleGenerator {
         func.instruction(&Instruction::Unreachable);
         func.instruction(&Instruction::End);
 
-        func.instruction(&Instruction::I32Const(0)); // original_ptr
-        func.instruction(&Instruction::I32Const(0)); // original_size
-        func.instruction(&Instruction::I32Const(callee_align)); // alignment
-        func.instruction(&Instruction::LocalGet(1)); // input_len
-        func.instruction(&Instruction::I32Const(2));
-        func.instruction(&Instruction::I32Mul); // alloc_size = 2 * input_len
-        func.instruction(&Instruction::Call(callee_realloc));
-        func.instruction(&Instruction::LocalSet(out_ptr_local));
-
-        // Trap on null return from cabi_realloc (LS-A-7 leg b).
-        func.instruction(&Instruction::LocalGet(out_ptr_local));
-        func.instruction(&Instruction::I32Eqz);
-        func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
-        func.instruction(&Instruction::Unreachable);
-        func.instruction(&Instruction::End);
+        // #621: alloc_size = 2 * input_len; a NULL answer traps only when
+        // the request was nonzero (LS-A-7 leg b).
+        emit_checked_realloc(func, callee_realloc, out_ptr_local, callee_align, |b| {
+            b.instruction(&Instruction::LocalGet(1));
+            b.instruction(&Instruction::I32Const(2));
+            b.instruction(&Instruction::I32Mul);
+        });
 
         // Step 2: Initialize loop counters
         func.instruction(&Instruction::I32Const(0));
@@ -9883,21 +9890,13 @@ impl FactStyleGenerator {
         func.instruction(&Instruction::Unreachable);
         func.instruction(&Instruction::End);
 
-        func.instruction(&Instruction::I32Const(0)); // original_ptr
-        func.instruction(&Instruction::I32Const(0)); // original_size
-        func.instruction(&Instruction::I32Const(callee_align)); // alignment
-        func.instruction(&Instruction::LocalGet(1)); // input_len (code units)
-        func.instruction(&Instruction::I32Const(3));
-        func.instruction(&Instruction::I32Mul); // alloc_size = 3 * code_units
-        func.instruction(&Instruction::Call(callee_realloc));
-        func.instruction(&Instruction::LocalSet(out_ptr_local));
-
-        // Trap on null return from cabi_realloc (LS-A-7 leg b).
-        func.instruction(&Instruction::LocalGet(out_ptr_local));
-        func.instruction(&Instruction::I32Eqz);
-        func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
-        func.instruction(&Instruction::Unreachable);
-        func.instruction(&Instruction::End);
+        // #621: alloc_size = 3 * input_len; a NULL answer traps only when
+        // the request was nonzero (LS-A-7 leg b).
+        emit_checked_realloc(func, callee_realloc, out_ptr_local, callee_align, |b| {
+            b.instruction(&Instruction::LocalGet(1));
+            b.instruction(&Instruction::I32Const(3));
+            b.instruction(&Instruction::I32Mul);
+        });
 
         // Step 2: Initialize loop counters
         func.instruction(&Instruction::I32Const(0));
@@ -10204,21 +10203,13 @@ impl FactStyleGenerator {
         func.instruction(&Instruction::Unreachable);
         func.instruction(&Instruction::End);
 
-        func.instruction(&Instruction::I32Const(0)); // original_ptr
-        func.instruction(&Instruction::I32Const(0)); // original_size
-        func.instruction(&Instruction::I32Const(callee_align)); // alignment
-        func.instruction(&Instruction::LocalGet(1)); // input_len
-        func.instruction(&Instruction::I32Const(2));
-        func.instruction(&Instruction::I32Mul); // alloc_size = 2 * input_len
-        func.instruction(&Instruction::Call(callee_realloc));
-        func.instruction(&Instruction::LocalSet(out_ptr_local));
-
-        // Trap on null return from cabi_realloc (LS-A-7 leg b).
-        func.instruction(&Instruction::LocalGet(out_ptr_local));
-        func.instruction(&Instruction::I32Eqz);
-        func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
-        func.instruction(&Instruction::Unreachable);
-        func.instruction(&Instruction::End);
+        // #621: alloc_size = 2 * input_len; a NULL answer traps only when
+        // the request was nonzero (LS-A-7 leg b).
+        emit_checked_realloc(func, callee_realloc, out_ptr_local, callee_align, |b| {
+            b.instruction(&Instruction::LocalGet(1));
+            b.instruction(&Instruction::I32Const(2));
+            b.instruction(&Instruction::I32Mul);
+        });
 
         // Step 2: Initialize loop counters
         func.instruction(&Instruction::I32Const(0));
@@ -10417,20 +10408,13 @@ impl FactStyleGenerator {
         func.instruction(&Instruction::Unreachable);
         func.instruction(&Instruction::End);
 
-        func.instruction(&Instruction::I32Const(0));
-        func.instruction(&Instruction::I32Const(0));
-        func.instruction(&Instruction::I32Const(callee_align));
-        func.instruction(&Instruction::LocalGet(1));
-        func.instruction(&Instruction::I32Const(2));
-        func.instruction(&Instruction::I32Mul);
-        func.instruction(&Instruction::Call(callee_realloc));
-        func.instruction(&Instruction::LocalSet(out_ptr_local));
-
-        func.instruction(&Instruction::LocalGet(out_ptr_local));
-        func.instruction(&Instruction::I32Eqz);
-        func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
-        func.instruction(&Instruction::Unreachable);
-        func.instruction(&Instruction::End);
+        // #621: alloc_size = 2 * input_len; a NULL answer traps only when
+        // the request was nonzero (LS-A-7 leg b).
+        emit_checked_realloc(func, callee_realloc, out_ptr_local, callee_align, |b| {
+            b.instruction(&Instruction::LocalGet(1));
+            b.instruction(&Instruction::I32Const(2));
+            b.instruction(&Instruction::I32Mul);
+        });
 
         func.instruction(&Instruction::I32Const(0));
         func.instruction(&Instruction::LocalSet(idx_local));
@@ -10550,21 +10534,13 @@ impl FactStyleGenerator {
         func.instruction(&Instruction::Unreachable);
         func.instruction(&Instruction::End);
 
-        func.instruction(&Instruction::I32Const(0)); // original_ptr
-        func.instruction(&Instruction::I32Const(0)); // original_size
-        func.instruction(&Instruction::I32Const(callee_align)); // alignment
-        func.instruction(&Instruction::LocalGet(1)); // byte_len
-        func.instruction(&Instruction::I32Const(2));
-        func.instruction(&Instruction::I32Mul); // alloc_size = 2 * byte_len
-        func.instruction(&Instruction::Call(callee_realloc));
-        func.instruction(&Instruction::LocalSet(out_ptr_local));
-
-        // Trap on null return from cabi_realloc (LS-A-7 leg b).
-        func.instruction(&Instruction::LocalGet(out_ptr_local));
-        func.instruction(&Instruction::I32Eqz);
-        func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
-        func.instruction(&Instruction::Unreachable);
-        func.instruction(&Instruction::End);
+        // #621: alloc_size = 2 * input_len; a NULL answer traps only when
+        // the request was nonzero (LS-A-7 leg b).
+        emit_checked_realloc(func, callee_realloc, out_ptr_local, callee_align, |b| {
+            b.instruction(&Instruction::LocalGet(1));
+            b.instruction(&Instruction::I32Const(2));
+            b.instruction(&Instruction::I32Mul);
+        });
 
         // Step 2: Initialize loop counter.
         func.instruction(&Instruction::I32Const(0));
@@ -10701,20 +10677,13 @@ impl FactStyleGenerator {
         func.instruction(&Instruction::Unreachable);
         func.instruction(&Instruction::End);
 
-        func.instruction(&Instruction::I32Const(0));
-        func.instruction(&Instruction::I32Const(0));
-        func.instruction(&Instruction::I32Const(callee_align));
-        func.instruction(&Instruction::LocalGet(1));
-        func.instruction(&Instruction::I32Const(2));
-        func.instruction(&Instruction::I32Mul);
-        func.instruction(&Instruction::Call(callee_realloc));
-        func.instruction(&Instruction::LocalSet(out_ptr_local));
-
-        func.instruction(&Instruction::LocalGet(out_ptr_local));
-        func.instruction(&Instruction::I32Eqz);
-        func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
-        func.instruction(&Instruction::Unreachable);
-        func.instruction(&Instruction::End);
+        // #621: alloc_size = 2 * input_len; a NULL answer traps only when
+        // the request was nonzero (LS-A-7 leg b).
+        emit_checked_realloc(func, callee_realloc, out_ptr_local, callee_align, |b| {
+            b.instruction(&Instruction::LocalGet(1));
+            b.instruction(&Instruction::I32Const(2));
+            b.instruction(&Instruction::I32Mul);
+        });
 
         // --- Phase A: scan to decide latin1-vs-utf16. ---
         func.instruction(&Instruction::I32Const(0));
@@ -10914,20 +10883,13 @@ impl FactStyleGenerator {
         func.instruction(&Instruction::Unreachable);
         func.instruction(&Instruction::End);
 
-        func.instruction(&Instruction::I32Const(0));
-        func.instruction(&Instruction::I32Const(0));
-        func.instruction(&Instruction::I32Const(callee_align));
-        func.instruction(&Instruction::LocalGet(1));
-        func.instruction(&Instruction::I32Const(2));
-        func.instruction(&Instruction::I32Mul);
-        func.instruction(&Instruction::Call(callee_realloc));
-        func.instruction(&Instruction::LocalSet(out_ptr_local));
-
-        func.instruction(&Instruction::LocalGet(out_ptr_local));
-        func.instruction(&Instruction::I32Eqz);
-        func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
-        func.instruction(&Instruction::Unreachable);
-        func.instruction(&Instruction::End);
+        // #621: alloc_size = 2 * input_len; a NULL answer traps only when
+        // the request was nonzero (LS-A-7 leg b).
+        emit_checked_realloc(func, callee_realloc, out_ptr_local, callee_align, |b| {
+            b.instruction(&Instruction::LocalGet(1));
+            b.instruction(&Instruction::I32Const(2));
+            b.instruction(&Instruction::I32Mul);
+        });
 
         // --- Phase A: scan to decide latin1-vs-utf16. ---
         func.instruction(&Instruction::I32Const(0));
@@ -12081,11 +12043,9 @@ impl FactStyleGenerator {
 
             // Allocate: cabi_realloc(0, 0, align, <byte count>)
             emit_overflow_guard(body, len_local, byte_mult);
-            body.instruction(&Instruction::I32Const(0));
-            body.instruction(&Instruction::I32Const(0));
-            body.instruction(&Instruction::I32Const(realloc_align));
-            emit_copy_byte_count(body, len_local, byte_mult, is_compact_utf16);
-            emit_checked_realloc(body, realloc, l_new_ptr);
+            emit_checked_realloc(body, realloc, l_new_ptr, realloc_align, |b| {
+                emit_copy_byte_count(b, len_local, byte_mult, is_compact_utf16);
+            });
 
             // Copy: memory.copy new_ptr <- old_ptr, <byte count>
             body.instruction(&Instruction::LocalGet(l_new_ptr));
@@ -12633,11 +12593,15 @@ impl FactStyleGenerator {
             // Allocate in caller memory: cabi_realloc(0, 0, align, byte_count).
             // A utf16 payload needs 2-byte alignment.
             let realloc_align = if top_compact_utf16 { 2 } else { elem_align };
-            body.instruction(&Instruction::I32Const(0)); // old_ptr
-            body.instruction(&Instruction::I32Const(0)); // old_size
-            body.instruction(&Instruction::I32Const(realloc_align as i32));
-            body.instruction(&Instruction::LocalGet(l_byte_count));
-            emit_checked_realloc(body, caller_realloc_func, l_dst_ptr);
+            emit_checked_realloc(
+                body,
+                caller_realloc_func,
+                l_dst_ptr,
+                realloc_align as i32,
+                |b| {
+                    b.instruction(&Instruction::LocalGet(l_byte_count));
+                },
+            );
 
             // Copy from callee memory to caller memory
             body.instruction(&Instruction::LocalGet(l_dst_ptr));
@@ -14246,14 +14210,20 @@ mod tests {
     // guards are present.
     // ---------------------------------------------------------------
 
-    /// Return `true` iff the byte-encoded function body `body` contains
-    /// an `i32.eqz; if; unreachable; end` sequence. The `if` block byte
-    /// is 0x04, `unreachable` is 0x00, `end` is 0x0B, `i32.eqz` is 0x45.
-    /// The block type that follows 0x04 is 0x40 (empty block type).
+    /// Return `true` iff the byte-encoded function body `body` contains the
+    /// #621 conditional NULL guard `emit_checked_realloc` emits:
+    /// `i32.eqz; <size expr>; i32.const 0; i32.ne; i32.and; if; unreachable;
+    /// end`, i.e. a NULL realloc result traps only for a nonzero request.
+    /// Opcodes: i32.eqz = 0x45, i32.const 0 = 0x41 0x00, i32.ne = 0x47,
+    /// i32.and = 0x71, if (empty) = 0x04 0x40, unreachable = 0x00, end = 0x0B.
+    /// The size expression between `i32.eqz` and the tail is at most 12 bytes.
     #[cfg(test)]
-    fn body_has_eqz_if_unreachable(body: &[u8]) -> bool {
-        // Pattern: 0x45 0x04 0x40 0x00 0x0B
-        body.windows(5).any(|w| w == [0x45, 0x04, 0x40, 0x00, 0x0B])
+    fn body_has_conditional_null_guard(body: &[u8]) -> bool {
+        const TAIL: [u8; 8] = [0x41, 0x00, 0x47, 0x71, 0x04, 0x40, 0x00, 0x0B];
+        body.windows(TAIL.len())
+            .enumerate()
+            .filter(|(_, w)| *w == TAIL)
+            .any(|(at, _)| body[at.saturating_sub(13)..at].contains(&0x45))
     }
 
     /// Return `true` iff the byte-encoded function body `body` contains
@@ -14322,9 +14292,9 @@ mod tests {
              (i32.gt_u; if; unreachable; end) before the i32.mul"
         );
         assert!(
-            body_has_eqz_if_unreachable(&body),
+            body_has_conditional_null_guard(&body),
             "LS-A-7: UTF-8→UTF-16 transcoder missing cabi_realloc null \
-             guard (i32.eqz; if; unreachable; end) after the call"
+             guard (i32.eqz; <size>; i32.const 0; i32.ne; i32.and; if; unreachable; end) after the call"
         );
     }
 
@@ -14339,7 +14309,7 @@ mod tests {
             "LS-A-7: UTF-16→UTF-8 transcoder missing overflow guard"
         );
         assert!(
-            body_has_eqz_if_unreachable(&body),
+            body_has_conditional_null_guard(&body),
             "LS-A-7: UTF-16→UTF-8 transcoder missing cabi_realloc null guard"
         );
     }
@@ -14355,7 +14325,7 @@ mod tests {
             "LS-A-7: Latin-1→UTF-8 transcoder missing overflow guard"
         );
         assert!(
-            body_has_eqz_if_unreachable(&body),
+            body_has_conditional_null_guard(&body),
             "LS-A-7: Latin-1→UTF-8 transcoder missing cabi_realloc null guard"
         );
     }

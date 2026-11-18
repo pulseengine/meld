@@ -4011,11 +4011,15 @@ fn generate_stabilizing_shim(
     body.instruction(&Instruction::LocalSet(l_byte_count));
 
     // stable_records = realloc(0, 0, elem_align, byte_count)
-    body.instruction(&Instruction::I32Const(0));
-    body.instruction(&Instruction::I32Const(0));
-    body.instruction(&Instruction::I32Const(elem_align as i32));
-    body.instruction(&Instruction::LocalGet(l_byte_count));
-    crate::adapter::fact::emit_checked_realloc(&mut body, realloc_func, l_stable);
+    crate::adapter::fact::emit_checked_realloc(
+        &mut body,
+        realloc_func,
+        l_stable,
+        elem_align as i32,
+        |b| {
+            b.instruction(&Instruction::LocalGet(l_byte_count));
+        },
+    );
 
     // memory.copy stable_records <- ptr, byte_count (intra-callee, mem 0)
     body.instruction(&Instruction::LocalGet(l_stable));
@@ -4087,11 +4091,9 @@ fn generate_stabilizing_shim(
         body.instruction(&Instruction::LocalSet(l_str_len));
 
         // stable_str = realloc(0, 0, 1, str_len)
-        body.instruction(&Instruction::I32Const(0));
-        body.instruction(&Instruction::I32Const(0));
-        body.instruction(&Instruction::I32Const(1));
-        body.instruction(&Instruction::LocalGet(l_str_len));
-        crate::adapter::fact::emit_checked_realloc(&mut body, realloc_func, l_stable_str);
+        crate::adapter::fact::emit_checked_realloc(&mut body, realloc_func, l_stable_str, 1, |b| {
+            b.instruction(&Instruction::LocalGet(l_str_len));
+        });
 
         // memory.copy stable_str <- old_str, str_len (intra-callee)
         body.instruction(&Instruction::LocalGet(l_stable_str));
