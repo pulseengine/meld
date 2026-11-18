@@ -2041,6 +2041,7 @@ artifacts:
         target: SR-125
     provenance:
       created-by: ai-assisted
+      reviewed-by: avrabe
       model: claude-opus-5-5
       timestamp: 2026-11-17T13:30:00Z
 
@@ -2055,6 +2056,7 @@ artifacts:
         target: SR-126
     provenance:
       created-by: ai-assisted
+      reviewed-by: avrabe
       model: claude-opus-5-5
       timestamp: 2026-11-17T15:00:00Z
   - id: SWV-141
@@ -2068,6 +2070,7 @@ artifacts:
         target: SR-127
     provenance:
       created-by: ai-assisted
+      reviewed-by: avrabe
       model: claude-opus-5-5
       timestamp: 2026-11-18T01:00:00Z
   - id: SWV-142
@@ -2081,6 +2084,7 @@ artifacts:
         target: SR-128
     provenance:
       created-by: ai-assisted
+      reviewed-by: avrabe
       model: claude-opus-5-5
       timestamp: 2026-11-18T03:30:00Z
   - id: SWV-143
@@ -2094,5 +2098,6 @@ artifacts:
         target: SR-129
     provenance:
       created-by: ai-assisted
+      reviewed-by: avrabe
       model: claude-opus-5-5
       timestamp: 2026-11-18T06:00:00Z
