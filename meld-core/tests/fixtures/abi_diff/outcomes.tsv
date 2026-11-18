@@ -12,20 +12,20 @@ issue597-renamed-func	multi	not-runnable	#597
 issue597-renamed-func	shared	not-runnable	#597
 issue598-utf16-copy	multi	wrong	#598
 issue598-utf16-copy	shared	match
-issue599-bool_2	multi	wrong	#599
-issue599-bool_2	shared	wrong	#599
+issue599-bool_2	multi	match
+issue599-bool_2	shared	match
 issue599-list-bool-in-memory	multi	wrong	#599
 issue599-list-bool-in-memory	shared	wrong	#599
 issue599-list-u8-in-memory-control	multi	match
 issue599-list-u8-in-memory-control	shared	match
-issue599-s16_40000	multi	wrong	#599
-issue599-s16_40000	shared	wrong	#599
-issue599-s8_200	multi	wrong	#599
-issue599-s8_200	shared	wrong	#599
-issue599-u16_65536	multi	wrong	#599
-issue599-u16_65536	shared	wrong	#599
-issue599-u8_300	multi	wrong	#599
-issue599-u8_300	shared	wrong	#599
+issue599-s16_40000	multi	match
+issue599-s16_40000	shared	match
+issue599-s8_200	multi	match
+issue599-s8_200	shared	match
+issue599-u16_65536	multi	match
+issue599-u16_65536	shared	match
+issue599-u8_300	multi	match
+issue599-u8_300	shared	match
 issue600-list-option-string-utf8-to-utf16	multi	wrong	#600
 issue600-list-option-string-utf8-to-utf16	shared	wrong	#600
 issue600-list-string	multi	wrong	#600
@@ -46,8 +46,8 @@ issue603-record-string-same-encoding-control	multi	match
 issue603-record-string-same-encoding-control	shared	match
 issue619-flags9-clean-control	multi	match
 issue619-flags9-clean-control	shared	match
-issue619-flags9-highbits	multi	wrong	#619
-issue619-flags9-highbits	shared	wrong	#619
+issue619-flags9-highbits	multi	match
+issue619-flags9-highbits	shared	match
 issue620-char-utf16-to-utf8	multi	refused-defect	#620
 issue620-char-utf16-to-utf8	shared	refused-defect	#620
 issue620-char-utf8-to-utf16	multi	refused-defect	#620
@@ -558,8 +558,8 @@ r2-list_record_na_07	multi	match
 r2-list_record_na_07	shared	match
 r2-list_string_utf16-utf8_06	multi	refused
 r2-list_string_utf16-utf8_06	shared	refused
-r2-record_na_02	multi	wrong
-r2-record_na_02	shared	wrong
+r2-record_na_02	multi	match
+r2-record_na_02	shared	match
 r2-record_na_05	multi	wrong
 r2-record_na_05	shared	wrong
 r2-record_na_06	multi	match

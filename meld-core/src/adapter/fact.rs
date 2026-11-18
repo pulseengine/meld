@@ -5422,19 +5422,26 @@ fn emit_resource_new_results(
     }
 }
 
-/// #586: put the Canonical ABI's `char` validation in front of an adapter body.
+/// #586/#599/#619: put the Canonical ABI's flat-param lifts in front of an
+/// adapter body.
 ///
 /// A lifted `char` must be a Unicode scalar value; anything in
 /// 0xD800..=0xDFFF or above 0x10FFFF traps ("invalid `char` bit pattern").
-/// `positions` are flat param indices, which are the adapter's own param
+/// `bool`, `u8`, `u16`, `s8`, `s16` and `flags` are normalised in place as
+/// `lift_flat` does (`!= 0`, mask, sign-extend, mask to the declared labels),
+/// so the callee never sees bits the caller's i32 carried beyond the type.
+/// `lifts` are flat param indices, which are the adapter's own param
 /// locals: every adapter class receives the caller's flat params unchanged
 /// (the params-ptr convention, where they are not, yields no positions).
 ///
 /// Spliced in after the body's local declarations, so it applies to every
 /// adapter class without touching each generator, and runs before any copy,
 /// transcode or call.
-fn prepend_char_param_checks(body: Function, positions: &[u32]) -> Result<Function> {
-    if positions.is_empty() {
+fn prepend_flat_param_lifts(
+    body: Function,
+    lifts: &[(u32, crate::parser::FlatParamLift)],
+) -> Result<Function> {
+    if lifts.is_empty() {
         return Ok(body);
     }
     let raw = body.into_raw_body();
@@ -5462,20 +5469,51 @@ fn prepend_char_param_checks(body: Function, positions: &[u32]) -> Result<Functi
     }
     let ops_start = reader.original_position() as usize;
     let mut out = Function::new(locals);
-    for &p in positions {
-        // trap if (x >= 0x110000) | ((x & 0xFFFFF800) == 0xD800)
-        out.instruction(&Instruction::LocalGet(p));
-        out.instruction(&Instruction::I32Const(0x11_0000));
-        out.instruction(&Instruction::I32GeU);
-        out.instruction(&Instruction::LocalGet(p));
-        out.instruction(&Instruction::I32Const(0xFFFF_F800_u32 as i32));
-        out.instruction(&Instruction::I32And);
-        out.instruction(&Instruction::I32Const(0xD800));
-        out.instruction(&Instruction::I32Eq);
-        out.instruction(&Instruction::I32Or);
-        out.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
-        out.instruction(&Instruction::Unreachable);
-        out.instruction(&Instruction::End);
+    for &(p, lift) in lifts {
+        use crate::parser::FlatParamLift as L;
+        match lift {
+            L::Char => {
+                // trap if (x >= 0x110000) | ((x & 0xFFFFF800) == 0xD800)
+                out.instruction(&Instruction::LocalGet(p));
+                out.instruction(&Instruction::I32Const(0x11_0000));
+                out.instruction(&Instruction::I32GeU);
+                out.instruction(&Instruction::LocalGet(p));
+                out.instruction(&Instruction::I32Const(0xFFFF_F800_u32 as i32));
+                out.instruction(&Instruction::I32And);
+                out.instruction(&Instruction::I32Const(0xD800));
+                out.instruction(&Instruction::I32Eq);
+                out.instruction(&Instruction::I32Or);
+                out.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+                out.instruction(&Instruction::Unreachable);
+                out.instruction(&Instruction::End);
+                continue;
+            }
+            L::Bool => {
+                out.instruction(&Instruction::LocalGet(p));
+                out.instruction(&Instruction::I32Const(0));
+                out.instruction(&Instruction::I32Ne);
+            }
+            L::U8 | L::U16 | L::FlagsMask(_) => {
+                let mask = match lift {
+                    L::U8 => 0xFF,
+                    L::U16 => 0xFFFF,
+                    L::FlagsMask(m) => m,
+                    _ => unreachable!(),
+                };
+                out.instruction(&Instruction::LocalGet(p));
+                out.instruction(&Instruction::I32Const(mask as i32));
+                out.instruction(&Instruction::I32And);
+            }
+            L::S8 => {
+                out.instruction(&Instruction::LocalGet(p));
+                out.instruction(&Instruction::I32Extend8S);
+            }
+            L::S16 => {
+                out.instruction(&Instruction::LocalGet(p));
+                out.instruction(&Instruction::I32Extend16S);
+            }
+        }
+        out.instruction(&Instruction::LocalSet(p));
     }
     out.raw(raw[ops_start..].iter().copied());
     Ok(out)
@@ -5528,7 +5566,7 @@ impl FactStyleGenerator {
                 // within one memory. When it is, the Direct body is a bridge —
                 // not an identity forward — and must not be inlined away.
                 signatures_match: self.signatures_match(site, merged),
-                has_value_checks: !site.requirements.char_param_flat_positions.is_empty(),
+                has_value_checks: !site.requirements.flat_param_lifts.is_empty(),
             },
         )?;
         let class = plan.class;
@@ -5596,8 +5634,7 @@ impl FactStyleGenerator {
             };
             // #594: this path returns before the common splice below, so it
             // applies the #586 `char` check itself (found by auto-Mythos).
-            let body =
-                prepend_char_param_checks(body, &site.requirements.char_param_flat_positions)?;
+            let body = prepend_flat_param_lifts(body, &site.requirements.flat_param_lifts)?;
             return Ok(AdapterFunction {
                 name,
                 type_idx,
@@ -5628,7 +5665,7 @@ impl FactStyleGenerator {
                  is_async_lift branch in FactStyleGenerator::generate)"
             ),
         };
-        let body = prepend_char_param_checks(body, &site.requirements.char_param_flat_positions)?;
+        let body = prepend_flat_param_lifts(body, &site.requirements.flat_param_lifts)?;
 
         let target_function = self.resolve_target_function(site, merged)?;
 
@@ -13655,7 +13692,8 @@ mod tests {
         f.instruction(&Instruction::I32Const(7));
         f.instruction(&Instruction::I32Add);
         f.instruction(&Instruction::End);
-        let body = super::prepend_char_param_checks(f, &[0]).unwrap();
+        let body =
+            super::prepend_flat_param_lifts(f, &[(0, crate::parser::FlatParamLift::Char)]).unwrap();
         let mut m = Module::new();
         let mut ty = TypeSection::new();
         ty.ty()
