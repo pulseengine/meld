@@ -98,8 +98,8 @@ jobs:
     if: >-
       github.actor == 'avrabe' &&
       github.actor_id == '10056645' &&
-      github.event.pull_request.head.repo.fork != true
-    runs-on: [self-hosted, linux, x64, light]
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","linux","x64","light"]') || 'ubuntu-24.04' }}
     outputs:
       files: ${{ steps.list.outputs.files }}
       any: ${{ steps.list.outputs.any }}
@@ -167,8 +167,8 @@ jobs:
   scan:
     name: Mythos pass (${{ matrix.file }})
     needs: detect
-    if: needs.detect.outputs.any == 'true' && github.event.pull_request.head.repo.fork != true
-    runs-on: [self-hosted, linux, x64, rust-cpu]
+    if: needs.detect.outputs.any == 'true' && github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","linux","x64","rust-cpu"]') || 'ubuntu-24.04' }}
     timeout-minutes: 45
     strategy:
       fail-fast: false
@@ -369,7 +369,7 @@ jobs:
     # file(s)" over four cancelled scans (#595). Failed scans still reach
     # here, and the decision below calls them INCOMPLETE.
     if: ${{ !cancelled() && needs.detect.outputs.any == 'true' }}
-    runs-on: [self-hosted, linux, x64, light]
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","linux","x64","light"]') || 'ubuntu-24.04' }}
     permissions:
       contents: read
       pull-requests: write
