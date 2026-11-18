@@ -4105,7 +4105,7 @@ artifacts:
     title: "An adapter normalises flat bool, u8, u16, s8, s16 and flags params as the Canonical ABI's lift does"
     status: implemented
     release: v0.70.0
-    description: "For each flat param slot that carries a bool, u8, u16, s8, s16 or flags value (at the top level or inside a record, tuple or fixed-size list), the adapter shall replace the caller's i32 with what lift_flat produces before the callee sees it: bool becomes x != 0, u8 and u16 keep their low 8 and 16 bits, s8 and s16 sign-extend those bits, and flags keep only the bits of declared labels (in the last storage word when the label count is not a multiple of 32). This is the same splice point as the char check (SR-121) and applies to every adapter class. Not covered: such values inside a variant, option or result payload, in memory (lists, the params-ptr area), and in results; #599 stays open for the in-memory case."
+    description: "For each flat param slot that carries a bool, u8, u16, s8, s16 or flags value (at the top level or inside a record, tuple or fixed-size list), the adapter shall replace the caller's i32 with what lift_flat produces before the callee sees it: bool becomes x != 0, u8 and u16 keep their low 8 and 16 bits, s8 and s16 sign-extend those bits, and flags keep only the bits of declared labels (in the last storage word when the label count is not a multiple of 32). This is the same splice point as the flat char check and applies to every adapter class. Not covered: such values inside a variant, option or result payload, in memory (lists, the params-ptr area), and in results; #599 stays open for the in-memory case."
     links:
       - type: derives-from
         target: SYS-3
