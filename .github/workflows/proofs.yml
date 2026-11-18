@@ -17,7 +17,7 @@ name: Rocq proofs
 # (a requirement claiming `rivet validate` "mechanically enforces" something no
 # workflow ran).
 #
-# Runs on ubuntu-latest, not the self-hosted fleet: `rules_rocq_rust` needs Nix,
+# Runs on hosted ubuntu-24.04, not the self-hosted fleet: `rules_rocq_rust` needs Nix,
 # which smithy does not provision. Provisioning copied from synth's working
 # proof job rather than invented.
 
@@ -61,7 +61,7 @@ permissions:
 jobs:
   proofs:
     name: Rocq proofs
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # Measured, after #450 removed the one file that did not terminate.
     #
     # The green run 37569422631, step by step:

@@ -50,6 +50,6 @@ permissions:
 jobs:
   proofs-stub:
     name: Rocq proofs
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - run: echo "no proofs/ or bazel/toolchain files touched — the Rocq proof gate is not applicable to this change (see proofs.yml paths)"

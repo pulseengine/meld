@@ -43,10 +43,10 @@ jobs:
           - target: x86_64-unknown-linux-gnu
             runner: [self-hosted, linux, x64, rust-cpu]
             use_cross: false
-          # Stays on ubuntu-latest: `cross` launches a Docker container;
+          # Stays on a hosted runner (ubuntu-24.04): `cross` launches a Docker container;
           # podman-docker compat shim on smithy is untested for cross images.
           - target: aarch64-unknown-linux-gnu
-            runner: ubuntu-latest
+            runner: ubuntu-24.04
             use_cross: true
           # musl, statically linked (#432): the gnu assets carry a GLIBC_2.34
           # floor, which excludes Alpine, distroless-static, RHEL 8 and
@@ -56,10 +56,10 @@ jobs:
           # the same reason aarch64-gnu is: it launches a Docker image, and the
           # podman shim on the self-hosted runner is untested for those.
           - target: x86_64-unknown-linux-musl
-            runner: ubuntu-latest
+            runner: ubuntu-24.04
             use_cross: true
           - target: aarch64-unknown-linux-musl
-            runner: ubuntu-latest
+            runner: ubuntu-24.04
             use_cross: true
           # macos-15 (arm64); smithy is Linux x86_64 only. GitHub retired the
           # macos-14 image: v0.68.0's darwin jobs failed with "The
@@ -219,7 +219,7 @@ jobs:
   create-release:
     name: Create GitHub Release
     needs: [build-binaries]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       # Keyless signing + provenance need an OIDC token; release-asset
       # upload needs contents: write; build provenance attestation
