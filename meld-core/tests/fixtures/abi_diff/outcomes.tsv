@@ -88,8 +88,8 @@ r1-char_na_03	multi	match
 r1-char_na_03	shared	match
 r1-char_na_04	multi	match
 r1-char_na_04	shared	match
-r1-char_na_05	multi	accepts-invalid
-r1-char_na_05	shared	accepts-invalid
+r1-char_na_05	multi	match-trap	#599: returned value checked
+r1-char_na_05	shared	match-trap	#599: returned value checked
 r1-char_na_06	multi	match
 r1-char_na_06	shared	match
 r1-char_na_07	multi	match
@@ -266,36 +266,36 @@ r1-list_u8_na_07	multi	match
 r1-list_u8_na_07	shared	refused
 r1-option_na_00	multi	match
 r1-option_na_00	shared	match
-r1-option_na_01	multi	accepts-invalid
-r1-option_na_01	shared	accepts-invalid
+r1-option_na_01	multi	match-trap	#599: returned value checked
+r1-option_na_01	shared	match-trap	#599: returned value checked
 r1-option_na_02	multi	match
 r1-option_na_02	shared	match
 r1-option_na_03	multi	match
 r1-option_na_03	shared	match
-r1-option_na_04	multi	accepts-invalid
-r1-option_na_04	shared	accepts-invalid
+r1-option_na_04	multi	match-trap	#599: returned value checked
+r1-option_na_04	shared	match-trap	#599: returned value checked
 r1-option_na_05	multi	match
 r1-option_na_05	shared	match
 r1-option_na_06	multi	match
 r1-option_na_06	shared	match
-r1-option_na_07	multi	accepts-invalid
-r1-option_na_07	shared	accepts-invalid
+r1-option_na_07	multi	match-trap	#599: returned value checked
+r1-option_na_07	shared	match-trap	#599: returned value checked
 r1-result_na_00	multi	match
 r1-result_na_00	shared	match
-r1-result_na_01	multi	accepts-invalid
-r1-result_na_01	shared	accepts-invalid
+r1-result_na_01	multi	match-trap	#599: returned value checked
+r1-result_na_01	shared	match-trap	#599: returned value checked
 r1-result_na_02	multi	match
 r1-result_na_02	shared	match
 r1-result_na_03	multi	match
 r1-result_na_03	shared	match
-r1-result_na_04	multi	accepts-invalid
-r1-result_na_04	shared	accepts-invalid
+r1-result_na_04	multi	match-trap	#599: returned value checked
+r1-result_na_04	shared	match-trap	#599: returned value checked
 r1-result_na_05	multi	match
 r1-result_na_05	shared	match
 r1-result_na_06	multi	match
 r1-result_na_06	shared	match
-r1-result_na_07	multi	accepts-invalid
-r1-result_na_07	shared	accepts-invalid
+r1-result_na_07	multi	match-trap	#599: returned value checked
+r1-result_na_07	shared	match-trap	#599: returned value checked
 r1-string_char_latin1utf16-latin1utf16_01	multi	match
 r1-string_char_latin1utf16-latin1utf16_01	shared	match
 r1-string_char_latin1utf16-latin1utf16_02	multi	refused
@@ -410,7 +410,7 @@ r1-string_char_utf8-utf8_03	multi	match
 r1-string_char_utf8-utf8_03	shared	match
 r1-string_char_utf8-utf8_04	multi	match
 r1-string_char_utf8-utf8_04	shared	refused
-r1-string_char_utf8-utf8_05	multi	accepts-invalid
+r1-string_char_utf8-utf8_05	multi	match-trap	#599: returned value checked
 r1-string_char_utf8-utf8_05	shared	refused
 r1-string_char_utf8-utf8_06	multi	match
 r1-string_char_utf8-utf8_06	shared	match
@@ -538,20 +538,20 @@ r1-tuple_na_00	multi	match
 r1-tuple_na_00	shared	match
 r1-tuple_na_01	multi	match
 r1-tuple_na_01	shared	match
-r1-tuple_na_02	multi	accepts-invalid
-r1-tuple_na_02	shared	accepts-invalid
+r1-tuple_na_02	multi	match-trap	#599: returned value checked
+r1-tuple_na_02	shared	match-trap	#599: returned value checked
 r1-tuple_na_03	multi	match
 r1-tuple_na_03	shared	match
 r1-tuple_na_04	multi	match
 r1-tuple_na_04	shared	match
-r1-tuple_na_05	multi	accepts-invalid
-r1-tuple_na_05	shared	accepts-invalid
+r1-tuple_na_05	multi	match-trap	#599: returned value checked
+r1-tuple_na_05	shared	match-trap	#599: returned value checked
 r1-tuple_na_06	multi	match
 r1-tuple_na_06	shared	match
 r1-tuple_na_07	multi	match
 r1-tuple_na_07	shared	match
-r2-char_na_02	multi	accepts-invalid
-r2-char_na_02	shared	accepts-invalid
+r2-char_na_02	multi	match-trap	#599: returned value checked
+r2-char_na_02	shared	match-trap	#599: returned value checked
 r2-list_record_na_00	multi	accepts-invalid
 r2-list_record_na_00	shared	refused
 r2-list_record_na_01	multi	match

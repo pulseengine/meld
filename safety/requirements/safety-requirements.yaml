@@ -4157,3 +4157,17 @@ artifacts:
       reviewed-by: avrabe
       model: claude-opus-5-5
       timestamp: 2026-11-18T06:00:00Z
+  - id: SR-130
+    type: sw-req
+    title: "An adapter traps on an invalid char or case index in the results a callee returns through its return area"
+    status: implemented
+    release: v0.70.0
+    description: "When a callee returns more than one flat result, so that its results are stored in a return area, the adapter shall check that area after the call as the Canonical ABI's load does. A char shall be a Unicode scalar value. A variant, enum, option or result case index shall be below the case count, and the selected case's payload is checked in turn. These checks apply at the top level and inside records, tuples and fixed-size lists. The check reads callee memory only and writes nothing, and it applies to every synchronous adapter class. Before, an invalid returned char or case index reached the caller (#599, #586). Not covered: values reached through a list pointer, normalising bool, narrow ints and flags in memory, and async adapters."
+    links:
+      - type: derives-from
+        target: SYS-3
+    provenance:
+      created-by: ai-assisted
+      reviewed-by: avrabe
+      model: claude-opus-5-5
+      timestamp: 2026-11-19T09:00:00Z

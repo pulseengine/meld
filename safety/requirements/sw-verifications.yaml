@@ -2101,3 +2101,17 @@ artifacts:
       reviewed-by: avrabe
       model: claude-opus-5-5
       timestamp: 2026-11-18T06:00:00Z
+  - id: SWV-144
+    type: sw-verification
+    title: "Verification of SR-130: an invalid value in a returned area traps after fusion"
+    status: implemented
+    release: v0.70.0
+    description: "an_invalid_value_in_the_return_area_traps_after_fusion (tests/abi_differential.rs) runs r1-char_na_05, r1-option_na_01, r1-result_na_01, r1-tuple_na_02 and r2-char_na_02 unfused on wasmtime and fused under --memory multi and --memory shared, and requires a trap in all three. result_area_check_traps_exactly_on_invalid_loaded_values (fact.rs unit test) runs the emitted check on a hand-built module. A valid area passes, and an invalid payload of an unselected case passes. A surrogate char, a char above 0x10FFFF, case index 2 of 2, and an invalid payload of the selected case each trap. A body that never calls the target is refused. result_memory_checks_follow_the_return_area_layout (parser unit test) checks offsets for a tuple, an option payload aligned to 8, and a result without payload checks, and checks that a single flat result yields no checks. Negative control observed red: before the check, the ledger classed 21 rows as accepts-invalid (r1-char/option/result/tuple_na, r2-char_na, r1-string_char_utf8-utf8_05). Those moved to match-trap and no other row moved."
+    links:
+      - type: verifies
+        target: SR-130
+    provenance:
+      created-by: ai-assisted
+      reviewed-by: avrabe
+      model: claude-opus-5-5
+      timestamp: 2026-11-19T09:00:00Z

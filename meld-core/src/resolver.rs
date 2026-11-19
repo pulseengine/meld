@@ -362,6 +362,10 @@ pub struct AdapterRequirements {
     /// `ParsedComponent::flat_param_lifts`). Empty under the params-ptr
     /// convention. The adapter applies each before the callee sees it.
     pub flat_param_lifts: Vec<(u32, crate::parser::FlatParamLift)>,
+    /// #599: checks on the results the callee returns through its return area
+    /// (see `ParsedComponent::result_memory_checks`). The adapter applies them
+    /// to the area the callee's returned pointer names, in callee memory.
+    pub result_memory_checks: Vec<crate::parser::MemCheck>,
     /// #620: the callee's resolved function type has no param or result that
     /// may carry a `string` (`ParsedComponent::may_carry_string`). Only then
     /// does a difference in `string-encoding` options not require a transcode.
@@ -3849,6 +3853,8 @@ impl Resolver {
                                             // string-ness via `collect_indirections`.
                                             requirements.result_wit_types =
                                                 results.iter().map(|(_, ty)| ty.clone()).collect();
+                                            requirements.result_memory_checks =
+                                                to_component.result_memory_checks(results);
                                             // #272 inc 5c-a: stash the WIT param types so the
                                             // async cross-encoding guard + `emit_param_copy_step`
                                             // nested-param walk recover string-ness via
@@ -4219,6 +4225,8 @@ impl Resolver {
                                     // #272 inc 5a: stash WIT result types (see above).
                                     requirements.result_wit_types =
                                         results.iter().map(|(_, ty)| ty.clone()).collect();
+                                    requirements.result_memory_checks =
+                                        to_component.result_memory_checks(results);
                                     // #272 inc 5c-a: stash WIT param types (param-side
                                     // mirror), PER-POINTER-PAIR in lockstep with
                                     // `param_copy_layouts` / `pointer_pair_positions` so the
