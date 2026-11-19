@@ -4213,3 +4213,81 @@ artifacts:
       reviewed-by: avrabe
       model: claude-opus-5-5
       timestamp: 2026-11-19T19:00:00Z
+  - id: SR-134
+    type: sw-req
+    title: "No differential row is silently wrong, and an outsider can re-derive the ledger"
+    status: draft
+    release: v0.71.0
+    description: "Serves North Star O3 (summary; indicator unmoved). Every Canonical ABI differential row that is wrong or accepts-invalid moves to match, match-trap or a loud refusal (wrong 20 -> 0, accepts-invalid 30 -> 0 from main 370d82b). The deliberate fused-trap rows form a capped list of at most 8 that may only shrink. A re-check kit (fixtures, ledger, one script) ships as a signed release asset. Negative controls: the kit reports drift against v0.69.0, and a planted wrong ledger row fails the job. Plan: docs/plans/v0.71.0.md, bet 1."
+    links:
+      - type: derives-from
+        target: SYS-3
+    provenance:
+      created-by: ai-assisted
+      model: claude-fable-5-2
+      timestamp: 2026-11-19T21:00:00Z
+  - id: SR-135
+    type: sw-req
+    title: "Every refused differential row records the refusal reason"
+    status: draft
+    release: v0.71.0
+    description: "Serves North Star O3 (summary; indicator unmoved). The differential ledger gains a refusal-reason column taken from the typed error, and the ledger test fails on a refused row without a reason. Negative control: a planted reason-less row fails the test. This is the precondition for halving the refusals (bet 2b). Plan: docs/plans/v0.71.0.md, bet 2a."
+    links:
+      - type: derives-from
+        target: SYS-3
+    provenance:
+      created-by: ai-assisted
+      model: claude-fable-5-2
+      timestamp: 2026-11-19T21:00:00Z
+  - id: SR-136
+    type: sw-req
+    title: "The upstream component-model WAST suite runs as a required check with host imports"
+    status: draft
+    release: v0.71.0
+    description: "Serves North Star O3 (summary; indicator unmoved; external corpus). A host-import harness lets the imports commands execute (266 not executed -> at most 60), and cm_wast_ratchet becomes a required check. It fails on any meld-invalid (6 -> 0) or no-trap (9 -> 0) row and on pass below 150 (from 36). Negative control: a planted no-trap row fails the check. Kill: if fewer than 114 additional assertions pass because of async/P3 semantics, the pass target moves to v0.72; the meld-invalid and no-trap targets stay. Plan: docs/plans/v0.71.0.md, bet 3."
+    links:
+      - type: derives-from
+        target: SYS-3
+    provenance:
+      created-by: ai-assisted
+      model: claude-fable-5-2
+      timestamp: 2026-11-19T21:00:00Z
+  - id: SR-137
+    type: sw-req
+    title: "Stretch: fused shapes that are refused today are implemented, halving the refusals"
+    status: draft
+    release: v0.71.0
+    description: "Serves North Star O1/O5 (summaries, indirectly; indicators unmoved). Driven by the refusal-reason histogram (bet 2a): refused 316 -> at most 160, with wrong and accepts-invalid not rising. Kill: if no single cause accounts for at least 40% of refusals, re-plan from the histogram. Plan: docs/plans/v0.71.0.md, bet 2b."
+    links:
+      - type: derives-from
+        target: SYS-3
+    provenance:
+      created-by: ai-assisted
+      model: claude-fable-5-2
+      timestamp: 2026-11-19T21:00:00Z
+  - id: SR-138
+    type: sw-req
+    title: "Stretch: meld ships as a signed WASI component whose output matches native meld byte for byte"
+    status: draft
+    release: v0.71.0
+    description: "Toward North Star O5 (does not count: the indicator needs kiln execution, blocked on kiln's WASI gap). meld is built for wasm32-wasip2, fused by meld, signed by wsc and published as meld.wasm (#539). CI requires byte-identical --reproducible output against native meld over the fixture corpus. Negative control: a one-byte-altered output fails the job. Kill: no wasip2 build without forking a dependency, or a slowdown above 10x. Plan: docs/plans/v0.71.0.md, bet 5a."
+    links:
+      - type: derives-from
+        target: SYS-3
+    provenance:
+      created-by: ai-assisted
+      model: claude-fable-5-2
+      timestamp: 2026-11-19T21:00:00Z
+  - id: SR-139
+    type: sw-req
+    title: "Stretch: a required synth static-data gate runs on a meld-fused composite"
+    status: draft
+    release: v0.71.0
+    description: "Seam gate with synth (#479); no O1 claim, since there is no hardware run. Precondition, checked first: the gale inputs are usable in public CI. The gate runs pinned synth's VCR-VER-003 validation on a fused gale composite. Negative control: the meld 0.62.0 composite must fail it. Plan: docs/plans/v0.71.0.md, bet 5b."
+    links:
+      - type: derives-from
+        target: SYS-3
+    provenance:
+      created-by: ai-assisted
+      model: claude-fable-5-2
+      timestamp: 2026-11-19T21:00:00Z
