@@ -515,6 +515,13 @@ pub enum FlatParamLift {
     /// Trap unless the case index is below the case count (variant, enum,
     /// option, result).
     Discriminant(u32),
+    /// #599: the `(ptr, len)` of a `list` in this slot and the next: trap
+    /// unless `ptr` is a multiple of `align` and `ptr + len * size` lies
+    /// within the caller's memory.
+    List { align: u32, size: u32 },
+    /// #599: the `(ptr, len)` of a `string` in this slot and the next: the
+    /// same alignment and bounds checks, by the caller's string encoding.
+    String,
 }
 
 /// #599: a check the Canonical ABI's `load` performs on a value read from
@@ -531,6 +538,28 @@ pub enum MemCheck {
         size: u32,
         count: u32,
         payloads: Vec<(u32, Vec<MemCheck>)>,
+    },
+    /// The `(ptr, len)` at `offset` names `len` elements of `elem_size` bytes;
+    /// run `elem` on each, with offsets from the element's start.
+    List {
+        offset: u32,
+        elem_size: u32,
+        elem: Vec<MemCheck>,
+    },
+}
+
+/// #599: checks on the values a callee receives, before the call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ParamCheck {
+    /// More than 16 flat params: the callee's single param points at the
+    /// params area; run these checks on it.
+    Area(Vec<MemCheck>),
+    /// A flat `list` param whose `(ptr, len)` sit in flat slots `ptr_slot` and
+    /// `ptr_slot + 1`; run `elem` on each element.
+    FlatList {
+        ptr_slot: u32,
+        elem_size: u32,
+        elem: Vec<MemCheck>,
     },
 }
 
@@ -2804,6 +2833,16 @@ impl ParsedComponent {
             ComponentValType::Option(_) | ComponentValType::Result { .. } => {
                 out.push((base, FlatParamLift::Discriminant(2)));
             }
+            ComponentValType::List(elem) => {
+                out.push((
+                    base,
+                    FlatParamLift::List {
+                        align: self.canonical_abi_align(elem),
+                        size: self.canonical_abi_element_size(elem),
+                    },
+                ));
+            }
+            ComponentValType::String => out.push((base, FlatParamLift::String)),
             ComponentValType::FixedSizeList(elem, len) => {
                 let elem_flat = self.flat_count(elem);
                 for i in 0..*len {
@@ -2907,9 +2946,94 @@ impl ParsedComponent {
             ComponentValType::Result { ok, err } => {
                 self.push_case_check(&[ok.as_deref(), err.as_deref()], base, d, out);
             }
+            ComponentValType::List(elem) => {
+                let mut inner = Vec::new();
+                self.collect_mem_checks(elem, 0, d, &mut inner);
+                if !inner.is_empty() {
+                    out.push(MemCheck::List {
+                        offset: base,
+                        elem_size: self.canonical_abi_element_size(elem),
+                        elem: inner,
+                    });
+                }
+            }
             ComponentValType::Type(idx) => {
                 if let Some(inner) = self.resolve_defined_val_type(*idx) {
                     self.collect_mem_checks(&inner, base, depth, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// #599: the checks the Canonical ABI's lift applies to values the callee
+    /// receives in memory. Above 16 flat params, the whole params area (laid
+    /// out as a record of the params). Otherwise, the elements of each `list`
+    /// param at the top level or flattened inside a record or tuple. The flat
+    /// values themselves are [`Self::flat_param_lifts`]'s.
+    pub fn param_value_checks(&self, params: &[(String, ComponentValType)]) -> Vec<ParamCheck> {
+        if self.total_flat_params(params) > 16 {
+            let mut checks = Vec::new();
+            let mut off = 0u32;
+            for (_, ty) in params {
+                off = align_up(off, self.canonical_abi_align(ty));
+                self.collect_mem_checks(ty, off, 0, &mut checks);
+                off += self.canonical_abi_element_size(ty);
+            }
+            return if checks.is_empty() {
+                Vec::new()
+            } else {
+                vec![ParamCheck::Area(checks)]
+            };
+        }
+        let mut out = Vec::new();
+        let mut slot = 0u32;
+        for (_, ty) in params {
+            self.collect_flat_list_checks(ty, slot, 0, &mut out);
+            slot += self.flat_count(ty);
+        }
+        out
+    }
+
+    fn collect_flat_list_checks(
+        &self,
+        ty: &ComponentValType,
+        slot: u32,
+        depth: u32,
+        out: &mut Vec<ParamCheck>,
+    ) {
+        if depth > 64 {
+            return;
+        }
+        match ty {
+            ComponentValType::List(elem) => {
+                let mut inner = Vec::new();
+                self.collect_mem_checks(elem, 0, depth + 1, &mut inner);
+                if !inner.is_empty() {
+                    out.push(ParamCheck::FlatList {
+                        ptr_slot: slot,
+                        elem_size: self.canonical_abi_element_size(elem),
+                        elem: inner,
+                    });
+                }
+            }
+            ComponentValType::Record(fields) => {
+                let mut s = slot;
+                for (_, t) in fields {
+                    self.collect_flat_list_checks(t, s, depth + 1, out);
+                    s += self.flat_count(t);
+                }
+            }
+            ComponentValType::Tuple(ts) => {
+                let mut s = slot;
+                for t in ts {
+                    self.collect_flat_list_checks(t, s, depth + 1, out);
+                    s += self.flat_count(t);
+                }
+            }
+            ComponentValType::Type(idx) => {
+                if let Some(inner) = self.resolve_defined_val_type(*idx) {
+                    self.collect_flat_list_checks(&inner, slot, depth, out);
                 }
             }
             _ => {}

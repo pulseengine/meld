@@ -285,6 +285,46 @@ fn flat_params_are_normalised_as_lift_flat_does() {
     }
 }
 
+// rivet: verifies SR-132
+// rivet: verifies SWV-146
+#[test]
+fn a_misplaced_list_pointer_traps_after_fusion() {
+    // A list<u32> whose (ptr, len) the Canonical ABI's lift rejects: fused
+    // and returned normally before #599 step 3.
+    let name = "r1-list_u32_na_00";
+    let bytes = wat::parse_file(dir().join(format!("{name}.wat"))).unwrap();
+    assert!(
+        matches!(run_unfused(&bytes), Run::Trap),
+        "{name}: unfused must trap"
+    );
+    for (label, strategy) in STRATEGIES {
+        assert!(
+            matches!(run_fused(&bytes, strategy), Ok(Run::Trap)),
+            "{name} {label}: a misplaced list pointer must trap after fusion"
+        );
+    }
+}
+
+// rivet: verifies SR-131
+// rivet: verifies SWV-145
+#[test]
+fn an_invalid_list_element_traps_after_fusion() {
+    // A list<char> param with a surrogate element, crossing to a sibling
+    // component: fused and returned normally before #599 step 2.
+    let name = "issue586-list-char-invalid";
+    let bytes = wat::parse_file(dir().join(format!("{name}.wat"))).unwrap();
+    assert!(
+        matches!(run_unfused(&bytes), Run::Trap),
+        "{name}: unfused must trap"
+    );
+    for (label, strategy) in STRATEGIES {
+        assert!(
+            matches!(run_fused(&bytes, strategy), Ok(Run::Trap)),
+            "{name} {label}: an invalid list element must trap after fusion"
+        );
+    }
+}
+
 // rivet: verifies SR-130
 // rivet: verifies SWV-144
 #[test]

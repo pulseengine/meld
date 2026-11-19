@@ -574,9 +574,9 @@ test/resources/handle-table.wast	324	return-R1-as-R2	imports
 test/resources/handle-table.wast	49	run	imports
 test/resources/multiple-resources.wast	170	run	imports
 test/values/alignment.wast	111	run	no-trap
-test/values/alignment.wast	139	run	no-trap
-test/values/alignment.wast	171	run-latin1	no-trap
-test/values/alignment.wast	173	run-utf16	no-trap
+test/values/alignment.wast	139	run	pass
+test/values/alignment.wast	171	run-latin1	pass
+test/values/alignment.wast	173	run-utf16	pass
 test/values/alignment.wast	205	run-ptr-oob	pass
 test/values/alignment.wast	207	run-len-oob	pass
 test/values/alignment.wast	27	run	no-trap

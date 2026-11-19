@@ -5440,6 +5440,8 @@ fn emit_resource_new_results(
 fn prepend_flat_param_lifts(
     body: Function,
     lifts: &[(u32, crate::parser::FlatParamLift)],
+    caller_memory: u32,
+    caller_encoding: StringEncoding,
 ) -> Result<Function> {
     if lifts.is_empty() {
         return Ok(body);
@@ -5488,6 +5490,53 @@ fn prepend_flat_param_lifts(
                 out.instruction(&Instruction::End);
                 continue;
             }
+            L::List { align, size } => {
+                emit_ptr_len_check(&mut out, p, align, caller_memory, |f| {
+                    f.instruction(&Instruction::LocalGet(p + 1));
+                    f.instruction(&Instruction::I64ExtendI32U);
+                    f.instruction(&Instruction::I64Const(size as i64));
+                    f.instruction(&Instruction::I64Mul);
+                });
+                continue;
+            }
+            L::String => {
+                let align = match caller_encoding {
+                    StringEncoding::Utf8 => 1,
+                    StringEncoding::Utf16 | StringEncoding::Latin1 => 2,
+                };
+                emit_ptr_len_check(
+                    &mut out,
+                    p,
+                    align,
+                    caller_memory,
+                    |f| match caller_encoding {
+                        StringEncoding::Utf8 => {
+                            f.instruction(&Instruction::LocalGet(p + 1));
+                            f.instruction(&Instruction::I64ExtendI32U);
+                        }
+                        StringEncoding::Utf16 => {
+                            f.instruction(&Instruction::LocalGet(p + 1));
+                            f.instruction(&Instruction::I64ExtendI32U);
+                            f.instruction(&Instruction::I64Const(2));
+                            f.instruction(&Instruction::I64Mul);
+                        }
+                        StringEncoding::Latin1 => {
+                            // latin1+utf16: the high bit tags utf16 (2 bytes per
+                            // unit); otherwise one byte per unit.
+                            f.instruction(&Instruction::LocalGet(p + 1));
+                            f.instruction(&Instruction::I32Const(0x7FFF_FFFF));
+                            f.instruction(&Instruction::I32And);
+                            f.instruction(&Instruction::I64ExtendI32U);
+                            f.instruction(&Instruction::LocalGet(p + 1));
+                            f.instruction(&Instruction::I32Const(31));
+                            f.instruction(&Instruction::I32ShrU);
+                            f.instruction(&Instruction::I64ExtendI32U);
+                            f.instruction(&Instruction::I64Shl);
+                        }
+                    },
+                );
+                continue;
+            }
             L::Discriminant(n) => {
                 // trap if x >=u n
                 out.instruction(&Instruction::LocalGet(p));
@@ -5529,25 +5578,67 @@ fn prepend_flat_param_lifts(
     Ok(out)
 }
 
-/// #599: after every `call target` in an adapter body, check the results the
-/// callee returned through its return area, as the Canonical ABI's `load`
-/// does: a `char` must be a Unicode scalar value and a case index must be
-/// below the case count (with the selected case's payload checked in turn).
-/// The call leaves the area's pointer (in callee memory) on the stack; the
-/// splice tees it into a fresh local and traps on an invalid value, so every
-/// adapter class gets the check without touching each generator. Trap-only:
-/// nothing is written.
+/// #599: `lift`'s pointer checks on a `(ptr, len)` in param slots `p` and
+/// `p + 1`: trap unless `ptr` is a multiple of `align` and `ptr + bytes` (in
+/// u64, so it cannot wrap) is within `memory`. `bytes` pushes the byte count
+/// as an i64.
+fn emit_ptr_len_check(
+    f: &mut Function,
+    p: u32,
+    align: u32,
+    memory: u32,
+    bytes: impl Fn(&mut Function),
+) {
+    if align > 1 {
+        f.instruction(&Instruction::LocalGet(p));
+        f.instruction(&Instruction::I32Const(align as i32 - 1));
+        f.instruction(&Instruction::I32And);
+        f.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+        f.instruction(&Instruction::Unreachable);
+        f.instruction(&Instruction::End);
+    }
+    f.instruction(&Instruction::LocalGet(p));
+    f.instruction(&Instruction::I64ExtendI32U);
+    bytes(f);
+    f.instruction(&Instruction::I64Add);
+    f.instruction(&Instruction::MemorySize(memory));
+    f.instruction(&Instruction::I64ExtendI32U);
+    f.instruction(&Instruction::I64Const(16));
+    f.instruction(&Instruction::I64Shl);
+    f.instruction(&Instruction::I64GtU);
+    f.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+    f.instruction(&Instruction::Unreachable);
+    f.instruction(&Instruction::End);
+}
+
+/// #599: around every `call target` in an adapter body, check the values the
+/// callee receives and returns in memory, as the Canonical ABI's lift and
+/// load do: a `char` must be a Unicode scalar value, a case index must be
+/// below the case count (with the selected case's payload checked in turn),
+/// and each element of a list is checked the same way.
+///
+/// Before the call, the callee's args are spilled to fresh locals, the
+/// [`crate::parser::ParamCheck`]s run against them (the params area, or flat
+/// list params), and the args are pushed back. After the call, the returned
+/// return-area pointer is teed into a fresh local and the result checks run
+/// on it. Both read callee memory: in multi-memory the adapter has already
+/// copied the values there, and under `--memory shared` it is the one memory.
+/// Every synchronous adapter class gets the checks without touching each
+/// generator. Trap-only: nothing is written.
 ///
 /// Fails closed: a body that never calls `target` while checks are owed is an
 /// error, not a silently unchecked adapter.
-fn append_result_memory_checks(
+fn splice_call_checks(
     body: Function,
-    param_count: u32,
+    adapter_param_count: u32,
+    callee_params: &[wasm_encoder::ValType],
     target: u32,
-    checks: &[crate::parser::MemCheck],
+    param_checks: &[crate::parser::ParamCheck],
+    result_checks: &[crate::parser::MemCheck],
     callee_memory: u32,
 ) -> Result<Function> {
-    if checks.is_empty() {
+    use crate::parser::ParamCheck;
+    if param_checks.is_empty() && result_checks.is_empty() {
         return Ok(body);
     }
     let err = |e: String| crate::Error::AdapterGeneration(format!("#599: adapter body: {e}"));
@@ -5568,41 +5659,178 @@ fn append_result_memory_checks(
         declared += count;
         locals.push((count, ty));
     }
-    let area = param_count + declared;
-    let scratch = area + 1;
-    locals.push((2, wasm_encoder::ValType::I32));
+    // New locals: area, scratch, two per list nesting level, then one per
+    // callee arg (only when param checks are owed).
+    let depth = param_checks
+        .iter()
+        .map(|c| match c {
+            ParamCheck::Area(m) => mem_check_depth(m),
+            ParamCheck::FlatList { elem, .. } => 1 + mem_check_depth(elem),
+        })
+        .chain(std::iter::once(mem_check_depth(result_checks)))
+        .max()
+        .unwrap_or(0);
+    let first = adapter_param_count + declared;
+    let ctx = CheckLocals {
+        scratch: first + 1,
+        loops: first + 2,
+        memory: callee_memory,
+    };
+    let area = first;
+    let args_base = first + 2 + 2 * depth;
+    locals.push((2 + 2 * depth, wasm_encoder::ValType::I32));
+    if !param_checks.is_empty() {
+        for ty in callee_params {
+            locals.push((1, *ty));
+        }
+    }
     let mut ops = fb.get_operators_reader().map_err(|e| err(e.to_string()))?;
     let mut out = Function::new(locals);
     let mut last = ops.original_position() as usize;
     let mut spliced = 0usize;
     while !ops.eof() {
+        let start = ops.original_position() as usize;
         let op = ops.read().map_err(|e| err(e.to_string()))?;
         let end = ops.original_position() as usize;
-        if matches!(op, wasmparser::Operator::Call { function_index } if function_index == target) {
-            out.raw(raw[last..end].iter().copied());
-            out.instruction(&Instruction::LocalTee(area));
-            emit_mem_checks(&mut out, checks, area, scratch, callee_memory);
-            last = end;
-            spliced += 1;
+        if !matches!(op, wasmparser::Operator::Call { function_index } if function_index == target)
+        {
+            continue;
         }
+        out.raw(raw[last..start].iter().copied());
+        if !param_checks.is_empty() {
+            let n = callee_params.len() as u32;
+            for i in (0..n).rev() {
+                out.instruction(&Instruction::LocalSet(args_base + i));
+            }
+            for c in param_checks {
+                match c {
+                    ParamCheck::Area(m) => {
+                        if n != 1 {
+                            return Err(err(format!(
+                                "params-area checks need a single params pointer, the callee takes {n}"
+                            )));
+                        }
+                        emit_mem_checks(&mut out, m, args_base, &ctx, 0);
+                    }
+                    ParamCheck::FlatList {
+                        ptr_slot,
+                        elem_size,
+                        elem,
+                    } => {
+                        if ptr_slot + 1 >= n {
+                            return Err(err(format!(
+                                "list param at flat slot {ptr_slot} is past the callee's {n} params"
+                            )));
+                        }
+                        emit_list_loop(
+                            &mut out,
+                            |f| {
+                                f.instruction(&Instruction::LocalGet(args_base + ptr_slot));
+                            },
+                            |f| {
+                                f.instruction(&Instruction::LocalGet(args_base + ptr_slot + 1));
+                            },
+                            *elem_size,
+                            elem,
+                            &ctx,
+                            0,
+                        );
+                    }
+                }
+            }
+            for i in 0..n {
+                out.instruction(&Instruction::LocalGet(args_base + i));
+            }
+        }
+        out.raw(raw[start..end].iter().copied());
+        if !result_checks.is_empty() {
+            out.instruction(&Instruction::LocalTee(area));
+            emit_mem_checks(&mut out, result_checks, area, &ctx, 0);
+        }
+        last = end;
+        spliced += 1;
     }
     out.raw(raw[last..].iter().copied());
     if spliced == 0 {
         return Err(err(format!(
-            "result checks are owed but the body never calls the target (function {target})"
+            "value checks are owed but the body never calls the target (function {target})"
         )));
     }
     Ok(out)
 }
 
+/// Locals the check emitter uses: one scratch, and a (cursor, end) pair per
+/// list nesting level starting at `loops`.
+struct CheckLocals {
+    scratch: u32,
+    loops: u32,
+    memory: u32,
+}
+
+fn mem_check_depth(checks: &[crate::parser::MemCheck]) -> u32 {
+    use crate::parser::MemCheck;
+    checks
+        .iter()
+        .map(|c| match c {
+            MemCheck::Char { .. } => 0,
+            MemCheck::Case { payloads, .. } => payloads
+                .iter()
+                .map(|(_, p)| mem_check_depth(p))
+                .max()
+                .unwrap_or(0),
+            MemCheck::List { elem, .. } => 1 + mem_check_depth(elem),
+        })
+        .max()
+        .unwrap_or(0)
+}
+
+/// Loop over `len` elements of `elem_size` bytes starting at `ptr`, running
+/// `elem` on each with the element's address as the base.
+#[allow(clippy::too_many_arguments)]
+fn emit_list_loop(
+    f: &mut Function,
+    ptr: impl Fn(&mut Function),
+    len: impl Fn(&mut Function),
+    elem_size: u32,
+    elem: &[crate::parser::MemCheck],
+    ctx: &CheckLocals,
+    level: u32,
+) {
+    let cur = ctx.loops + 2 * level;
+    let end = cur + 1;
+    ptr(f);
+    f.instruction(&Instruction::LocalTee(cur));
+    len(f);
+    f.instruction(&Instruction::I32Const(elem_size as i32));
+    f.instruction(&Instruction::I32Mul);
+    f.instruction(&Instruction::I32Add);
+    f.instruction(&Instruction::LocalSet(end));
+    f.instruction(&Instruction::Block(wasm_encoder::BlockType::Empty));
+    f.instruction(&Instruction::Loop(wasm_encoder::BlockType::Empty));
+    f.instruction(&Instruction::LocalGet(cur));
+    f.instruction(&Instruction::LocalGet(end));
+    f.instruction(&Instruction::I32Eq);
+    f.instruction(&Instruction::BrIf(1));
+    emit_mem_checks(f, elem, cur, ctx, level + 1);
+    f.instruction(&Instruction::LocalGet(cur));
+    f.instruction(&Instruction::I32Const(elem_size as i32));
+    f.instruction(&Instruction::I32Add);
+    f.instruction(&Instruction::LocalSet(cur));
+    f.instruction(&Instruction::Br(0));
+    f.instruction(&Instruction::End);
+    f.instruction(&Instruction::End);
+}
+
 fn emit_mem_checks(
     f: &mut Function,
     checks: &[crate::parser::MemCheck],
-    area: u32,
-    scratch: u32,
-    memory: u32,
+    base: u32,
+    ctx: &CheckLocals,
+    level: u32,
 ) {
     use crate::parser::MemCheck;
+    let memory = ctx.memory;
+    let scratch = ctx.scratch;
     let arg = |offset: u32| wasm_encoder::MemArg {
         offset: offset as u64,
         align: 0,
@@ -5610,7 +5838,7 @@ fn emit_mem_checks(
         ordering: None,
     };
     let load = |f: &mut Function, offset: u32, size: u32| {
-        f.instruction(&Instruction::LocalGet(area));
+        f.instruction(&Instruction::LocalGet(base));
         match size {
             1 => f.instruction(&Instruction::I32Load8U(arg(offset))),
             2 => f.instruction(&Instruction::I32Load16U(arg(offset))),
@@ -5652,9 +5880,31 @@ fn emit_mem_checks(
                     f.instruction(&Instruction::I32Const(*case as i32));
                     f.instruction(&Instruction::I32Eq);
                     f.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
-                    emit_mem_checks(f, inner, area, scratch, memory);
+                    emit_mem_checks(f, inner, base, ctx, level);
                     f.instruction(&Instruction::End);
                 }
+            }
+            MemCheck::List {
+                offset,
+                elem_size,
+                elem,
+            } => {
+                let o = *offset;
+                emit_list_loop(
+                    f,
+                    |f| {
+                        f.instruction(&Instruction::LocalGet(base));
+                        f.instruction(&Instruction::I32Load(arg(o)));
+                    },
+                    |f| {
+                        f.instruction(&Instruction::LocalGet(base));
+                        f.instruction(&Instruction::I32Load(arg(o + 4)));
+                    },
+                    *elem_size,
+                    elem,
+                    ctx,
+                    level,
+                );
             }
         }
     }
@@ -5713,7 +5963,8 @@ impl FactStyleGenerator {
                 // not an identity forward — and must not be inlined away.
                 signatures_match: self.signatures_match(site, merged),
                 has_value_checks: !site.requirements.flat_param_lifts.is_empty()
-                    || !site.requirements.result_memory_checks.is_empty(),
+                    || !site.requirements.result_memory_checks.is_empty()
+                    || !site.requirements.param_value_checks.is_empty(),
             },
         )?;
         let class = plan.class;
@@ -5781,14 +6032,25 @@ impl FactStyleGenerator {
             };
             // #594: this path returns before the common splice below, so it
             // applies the #586 `char` check itself (found by auto-Mythos).
-            let body = prepend_flat_param_lifts(body, &site.requirements.flat_param_lifts)?;
-            let body = append_result_memory_checks(
+            let body = prepend_flat_param_lifts(
+                body,
+                &site.requirements.flat_param_lifts,
+                options.caller_memory,
+                options.caller_string_encoding,
+            )?;
+            let body = splice_call_checks(
                 body,
                 merged
                     .types
                     .get(type_idx as usize)
                     .map_or(0, |t| t.params.len() as u32),
+                &merged
+                    .defined_func(target_func)
+                    .and_then(|f| merged.types.get(f.type_idx as usize))
+                    .map(|t| t.params.clone())
+                    .unwrap_or_default(),
                 target_func,
+                &site.requirements.param_value_checks,
                 &site.requirements.result_memory_checks,
                 options.callee_memory,
             )?;
@@ -5822,16 +6084,27 @@ impl FactStyleGenerator {
                  is_async_lift branch in FactStyleGenerator::generate)"
             ),
         };
-        let body = prepend_flat_param_lifts(body, &site.requirements.flat_param_lifts)?;
+        let body = prepend_flat_param_lifts(
+            body,
+            &site.requirements.flat_param_lifts,
+            options.caller_memory,
+            options.caller_string_encoding,
+        )?;
 
         let target_function = self.resolve_target_function(site, merged)?;
-        let body = append_result_memory_checks(
+        let body = splice_call_checks(
             body,
             merged
                 .types
                 .get(type_idx as usize)
                 .map_or(0, |t| t.params.len() as u32),
+            &merged
+                .defined_func(target_function)
+                .and_then(|f| merged.types.get(f.type_idx as usize))
+                .map(|t| t.params.clone())
+                .unwrap_or_default(),
             target_function,
+            &site.requirements.param_value_checks,
             &site.requirements.result_memory_checks,
             options.callee_memory,
         )?;
@@ -13899,7 +14172,7 @@ mod tests {
                 payloads: vec![(1, vec![MemCheck::Char { offset: 8 }])],
             },
         ];
-        let adapter = super::append_result_memory_checks(adapter, 0, 0, &checks, 0).unwrap();
+        let adapter = super::splice_call_checks(adapter, 0, &[], 0, &[], &checks, 0).unwrap();
         let mut m = Module::new();
         let mut ty = TypeSection::new();
         ty.ty().function([], [ValType::I32]);
@@ -13960,7 +14233,206 @@ mod tests {
         let mut no_call = Function::new([]);
         no_call.instruction(&Instruction::I32Const(0));
         no_call.instruction(&Instruction::End);
-        assert!(super::append_result_memory_checks(no_call, 0, 0, &checks, 0).is_err());
+        assert!(super::splice_call_checks(no_call, 0, &[], 0, &[], &checks, 0).is_err());
+    }
+
+    /// #599 step 2: the param checks run before the call on the callee's args:
+    /// each element of a flat `list<char>`, and a params-area case index.
+    // rivet: verifies SR-131
+    // rivet: verifies SWV-145
+    #[test]
+    fn param_checks_loop_over_list_elements_and_the_params_area() {
+        use crate::parser::{MemCheck, ParamCheck};
+        use wasm_encoder::{
+            CodeSection, ExportKind, ExportSection, Function, FunctionSection, Instruction,
+            MemorySection, MemoryType, Module, TypeSection, ValType,
+        };
+        let build = |checks: Vec<ParamCheck>, nparams: u32| {
+            let params: Vec<ValType> = (0..nparams).map(|_| ValType::I32).collect();
+            // func 0: callee, returns 7. func 1: adapter forwarding its params.
+            let mut callee = Function::new([]);
+            callee.instruction(&Instruction::I32Const(7));
+            callee.instruction(&Instruction::End);
+            let mut adapter = Function::new([]);
+            for i in 0..nparams {
+                adapter.instruction(&Instruction::LocalGet(i));
+            }
+            adapter.instruction(&Instruction::Call(0));
+            adapter.instruction(&Instruction::End);
+            let adapter =
+                super::splice_call_checks(adapter, nparams, &params, 0, &checks, &[], 0).unwrap();
+            let mut m = Module::new();
+            let mut ty = TypeSection::new();
+            ty.ty().function(params.clone(), [ValType::I32]);
+            let mut fs = FunctionSection::new();
+            fs.function(0);
+            fs.function(0);
+            let mut mem = MemorySection::new();
+            mem.memory(MemoryType {
+                minimum: 1,
+                maximum: None,
+                memory64: false,
+                shared: false,
+                page_size_log2: None,
+            });
+            let mut ex = ExportSection::new();
+            ex.export("f", ExportKind::Func, 1);
+            ex.export("mem", ExportKind::Memory, 0);
+            let mut code = CodeSection::new();
+            code.function(&callee);
+            code.function(&adapter);
+            m.section(&ty)
+                .section(&fs)
+                .section(&mem)
+                .section(&ex)
+                .section(&code);
+            let bytes = m.finish();
+            wasmparser::Validator::new().validate_all(&bytes).unwrap();
+            bytes
+        };
+        let engine = wasmtime::Engine::default();
+        let call = |bytes: &[u8], mem: &[(usize, u32)], args: &[i32]| -> Option<i32> {
+            let module = wasmtime::Module::new(&engine, bytes).unwrap();
+            let mut store = wasmtime::Store::new(&engine, ());
+            let inst = wasmtime::Instance::new(&mut store, &module, &[]).unwrap();
+            let memory = inst.get_memory(&mut store, "mem").unwrap();
+            for &(at, v) in mem {
+                memory.write(&mut store, at, &v.to_le_bytes()).unwrap();
+            }
+            let f = inst.get_func(&mut store, "f").unwrap();
+            let args: Vec<wasmtime::Val> = args.iter().map(|&a| wasmtime::Val::I32(a)).collect();
+            let mut out = [wasmtime::Val::I32(0)];
+            f.call(&mut store, &args, &mut out)
+                .ok()
+                .map(|_| out[0].unwrap_i32())
+        };
+        // list<char> at flat slots (0, 1): three chars at 64.
+        let list = build(
+            vec![ParamCheck::FlatList {
+                ptr_slot: 0,
+                elem_size: 4,
+                elem: vec![MemCheck::Char { offset: 0 }],
+            }],
+            2,
+        );
+        let chars = |c: u32| vec![(64, 0x41), (68, c), (72, 0x43)];
+        assert_eq!(
+            call(&list, &chars(0x42), &[64, 3]),
+            Some(7),
+            "valid list passes"
+        );
+        assert_eq!(
+            call(&list, &chars(0xD800), &[64, 3]),
+            None,
+            "a surrogate element traps"
+        );
+        assert_eq!(
+            call(&list, &chars(0xD800), &[64, 1]),
+            Some(7),
+            "elements past len are not read"
+        );
+        assert_eq!(call(&list, &[], &[64, 0]), Some(7), "an empty list passes");
+        // params area: a 3-case enum's index at byte 4 of the area at 128.
+        let area = build(
+            vec![ParamCheck::Area(vec![MemCheck::Case {
+                offset: 4,
+                size: 1,
+                count: 3,
+                payloads: vec![],
+            }])],
+            1,
+        );
+        assert_eq!(
+            call(&area, &[(132, 2)], &[128]),
+            Some(7),
+            "case 2 of 3 passes"
+        );
+        assert_eq!(call(&area, &[(132, 3)], &[128]), None, "case 3 of 3 traps");
+    }
+
+    /// #599 step 3: a list or string `(ptr, len)` traps when `ptr` is
+    /// misaligned or `ptr + bytes` passes the end of the caller's memory,
+    /// computed without wrapping; the exact end of memory is in bounds.
+    // rivet: verifies SR-132
+    // rivet: verifies SWV-146
+    #[test]
+    fn pointer_checks_trap_on_misalignment_and_out_of_bounds() {
+        use crate::parser::FlatParamLift as L;
+        use wasm_encoder::{
+            CodeSection, ExportKind, ExportSection, Function, FunctionSection, Instruction,
+            MemorySection, MemoryType, Module, TypeSection, ValType,
+        };
+        let build = |lift: L, enc: super::StringEncoding| {
+            let mut f = Function::new([]);
+            f.instruction(&Instruction::I32Const(7));
+            f.instruction(&Instruction::End);
+            let body = super::prepend_flat_param_lifts(f, &[(0, lift)], 0, enc).unwrap();
+            let mut m = Module::new();
+            let mut ty = TypeSection::new();
+            ty.ty()
+                .function([ValType::I32, ValType::I32], [ValType::I32]);
+            let mut fs = FunctionSection::new();
+            fs.function(0);
+            let mut mem = MemorySection::new();
+            mem.memory(MemoryType {
+                minimum: 1,
+                maximum: None,
+                memory64: false,
+                shared: false,
+                page_size_log2: None,
+            });
+            let mut ex = ExportSection::new();
+            ex.export("f", ExportKind::Func, 0);
+            let mut code = CodeSection::new();
+            code.function(&body);
+            m.section(&ty)
+                .section(&fs)
+                .section(&mem)
+                .section(&ex)
+                .section(&code);
+            let bytes = m.finish();
+            wasmparser::Validator::new().validate_all(&bytes).unwrap();
+            bytes
+        };
+        let engine = wasmtime::Engine::default();
+        let ok = |bytes: &[u8], ptr: u32, len: u32| -> bool {
+            let module = wasmtime::Module::new(&engine, bytes).unwrap();
+            let mut store = wasmtime::Store::new(&engine, ());
+            let inst = wasmtime::Instance::new(&mut store, &module, &[]).unwrap();
+            let f = inst
+                .get_typed_func::<(u32, u32), i32>(&mut store, "f")
+                .unwrap();
+            f.call(&mut store, (ptr, len)).is_ok()
+        };
+        // list<u32>: align 4, 4 bytes per element; memory is 65536 bytes.
+        let list = build(L::List { align: 4, size: 4 }, super::StringEncoding::Utf8);
+        assert!(ok(&list, 64, 3), "aligned and in bounds");
+        assert!(
+            ok(&list, 65536 - 8, 2),
+            "ending exactly at the end of memory"
+        );
+        assert!(!ok(&list, 66, 1), "misaligned pointer traps");
+        assert!(!ok(&list, 65536 - 8, 3), "one element past the end traps");
+        assert!(
+            !ok(&list, 64, 0x4000_0000),
+            "len * 4 wrapping 2^32 still traps"
+        );
+        // utf16 string: align 2, 2 bytes per unit.
+        let s16 = build(L::String, super::StringEncoding::Utf16);
+        assert!(ok(&s16, 64, 10));
+        assert!(!ok(&s16, 65, 1), "odd utf16 pointer traps");
+        assert!(!ok(&s16, 65536 - 2, 2), "utf16 units past the end trap");
+        // latin1+utf16: tag bit set means 2 bytes per unit.
+        let s1 = build(L::String, super::StringEncoding::Latin1);
+        assert!(ok(&s1, 65536 - 4, 4), "latin1 (untagged) 4 bytes fit");
+        assert!(
+            !ok(&s1, 65536 - 4, 0x8000_0004),
+            "tagged utf16 needs 8 bytes and traps"
+        );
+        // utf8: align 1.
+        let s8 = build(L::String, super::StringEncoding::Utf8);
+        assert!(ok(&s8, 65535, 1));
+        assert!(!ok(&s8, 65535, 2));
     }
 
     /// #586: the spliced check traps exactly on non-scalar-value `char`s, and
@@ -13980,8 +14452,13 @@ mod tests {
         f.instruction(&Instruction::I32Const(7));
         f.instruction(&Instruction::I32Add);
         f.instruction(&Instruction::End);
-        let body =
-            super::prepend_flat_param_lifts(f, &[(0, crate::parser::FlatParamLift::Char)]).unwrap();
+        let body = super::prepend_flat_param_lifts(
+            f,
+            &[(0, crate::parser::FlatParamLift::Char)],
+            0,
+            super::StringEncoding::Utf8,
+        )
+        .unwrap();
         let mut m = Module::new();
         let mut ty = TypeSection::new();
         ty.ty()

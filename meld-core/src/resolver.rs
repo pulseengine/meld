@@ -366,6 +366,11 @@ pub struct AdapterRequirements {
     /// (see `ParsedComponent::result_memory_checks`). The adapter applies them
     /// to the area the callee's returned pointer names, in callee memory.
     pub result_memory_checks: Vec<crate::parser::MemCheck>,
+    /// #599: checks on the values the callee receives in memory (the params
+    /// area, or flat list params' elements); see
+    /// `ParsedComponent::param_value_checks`. Applied before the call, in
+    /// callee memory.
+    pub param_value_checks: Vec<crate::parser::ParamCheck>,
     /// #620: the callee's resolved function type has no param or result that
     /// may carry a `string` (`ParsedComponent::may_carry_string`). Only then
     /// does a difference in `string-encoding` options not require a transcode.
@@ -3907,6 +3912,8 @@ impl Resolver {
                                                 requirements.flat_param_lifts =
                                                     to_component.flat_param_lifts(comp_params);
                                             }
+                                            requirements.param_value_checks =
+                                                to_component.param_value_checks(comp_params);
                                             if total_flat > 16 {
                                                 let psize =
                                                     to_component.params_area_byte_size(comp_params);
@@ -4261,6 +4268,8 @@ impl Resolver {
                                         requirements.flat_param_lifts =
                                             to_component.flat_param_lifts(comp_params);
                                     }
+                                    requirements.param_value_checks =
+                                        to_component.param_value_checks(comp_params);
                                     if total_flat > 16 {
                                         let psize = to_component.params_area_byte_size(comp_params);
                                         requirements.params_area_byte_size = Some(psize);

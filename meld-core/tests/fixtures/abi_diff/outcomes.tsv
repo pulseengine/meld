@@ -4,8 +4,8 @@ issue586-enum257-bad-discriminant	multi	match-trap	#586: case index checked
 issue586-enum257-bad-discriminant	shared	match-trap	#586: case index checked
 issue586-enum257-valid-control	multi	match
 issue586-enum257-valid-control	shared	match
-issue586-list-char-invalid	multi	accepts-invalid	#586
-issue586-list-char-invalid	shared	accepts-invalid	#586
+issue586-list-char-invalid	multi	match-trap	#599: list element or params value checked
+issue586-list-char-invalid	shared	match-trap	#599: list element or params value checked
 issue586-option-bad-discriminant	multi	match-trap	#586: case index checked
 issue586-option-bad-discriminant	shared	match-trap	#586: case index checked
 issue597-renamed-func	multi	not-runnable	#597
@@ -232,8 +232,8 @@ r1-list_string_utf8-utf8_06	multi	accepts-invalid
 r1-list_string_utf8-utf8_06	shared	refused
 r1-list_string_utf8-utf8_07	multi	refused
 r1-list_string_utf8-utf8_07	shared	refused
-r1-list_u32_na_00	multi	accepts-invalid
-r1-list_u32_na_00	shared	accepts-invalid
+r1-list_u32_na_00	multi	match-trap	#599: pointer alignment and bounds checked
+r1-list_u32_na_00	shared	match-trap	#599: pointer alignment and bounds checked
 r1-list_u32_na_01	multi	match
 r1-list_u32_na_01	shared	refused
 r1-list_u32_na_02	multi	match
@@ -344,8 +344,8 @@ r1-string_char_utf16-utf16_00	multi	wrong
 r1-string_char_utf16-utf16_00	shared	refused
 r1-string_char_utf16-utf16_01	multi	wrong
 r1-string_char_utf16-utf16_01	shared	refused
-r1-string_char_utf16-utf16_02	multi	accepts-invalid
-r1-string_char_utf16-utf16_02	shared	match-trap
+r1-string_char_utf16-utf16_02	multi	match-trap	#599: pointer alignment and bounds checked
+r1-string_char_utf16-utf16_02	shared	match-trap	#599: pointer alignment and bounds checked
 r1-string_char_utf16-utf16_03	multi	wrong
 r1-string_char_utf16-utf16_03	shared	refused
 r1-string_char_utf16-utf16_04	multi	wrong
@@ -552,7 +552,7 @@ r1-tuple_na_07	multi	match
 r1-tuple_na_07	shared	match
 r2-char_na_02	multi	match-trap	#599: returned value checked
 r2-char_na_02	shared	match-trap	#599: returned value checked
-r2-list_record_na_00	multi	accepts-invalid
+r2-list_record_na_00	multi	match-trap	#599: list element or params value checked
 r2-list_record_na_00	shared	refused
 r2-list_record_na_01	multi	match
 r2-list_record_na_01	shared	match
@@ -569,7 +569,7 @@ r2-record_na_05	shared	wrong
 r2-record_na_06	multi	match
 r2-record_na_06	shared	match
 r2-record_string_latin1utf16-latin1utf16_02	multi	refused
-r2-record_string_latin1utf16-latin1utf16_02	shared	accepts-invalid
+r2-record_string_latin1utf16-latin1utf16_02	shared	match-trap	#599: list element or params value checked
 r2-record_string_latin1utf16-latin1utf16_04	multi	refused
 r2-record_string_latin1utf16-latin1utf16_04	shared	refused
 r2-record_string_latin1utf16-utf8_02	multi	refused

@@ -2115,3 +2115,29 @@ artifacts:
       reviewed-by: avrabe
       model: claude-opus-5-5
       timestamp: 2026-11-19T09:00:00Z
+  - id: SWV-145
+    type: sw-verification
+    title: "Verification of SR-131: invalid list elements and params-area values trap"
+    status: implemented
+    release: v0.70.0
+    description: "an_invalid_list_element_traps_after_fusion (tests/abi_differential.rs) runs issue586-list-char-invalid unfused and fused under --memory multi and --memory shared, and requires a trap in all three. param_checks_loop_over_list_elements_and_the_params_area (fact.rs unit test) runs the emitted checks on a hand-built module. A valid list<char> passes, and so do an empty list and an invalid element past len. A surrogate element traps. In the params area, case 2 of 3 passes and case 3 of 3 traps. Negative control observed red: before the check, the ledger classed 4 rows as accepts-invalid (issue586-list-char-invalid under both strategies, r2-list_record_na_00 multi, r2-record_string_latin1utf16-latin1utf16_02 shared). Those moved to match-trap and no other row moved."
+    links:
+      - type: verifies
+        target: SR-131
+    provenance:
+      created-by: ai-assisted
+      model: claude-opus-5-5
+      timestamp: 2026-11-19T12:00:00Z
+  - id: SWV-146
+    type: sw-verification
+    title: "Verification of SR-132: misaligned and out-of-bounds flat pointers trap"
+    status: implemented
+    release: v0.70.0
+    description: "a_misplaced_list_pointer_traps_after_fusion (tests/abi_differential.rs) runs r1-list_u32_na_00 unfused and fused under --memory multi and --memory shared, and requires a trap in all three. pointer_checks_trap_on_misalignment_and_out_of_bounds (fact.rs unit test) runs the emitted check on a hand-built module. An aligned in-bounds list passes, and so does one ending exactly at the end of memory. A misaligned pointer traps, one element past the end traps, and a length whose byte count wraps 2^32 traps. utf16 traps on an odd pointer and past the end. latin1+utf16 counts 2 bytes per unit only when the tag bit is set. utf8 counts one byte per unit. Negative control observed red: before the check, the differential ledger classed r1-list_u32_na_00 (both strategies) and r1-string_char_utf16-utf16_02 multi as accepts-invalid, and the component-model exec baseline recorded test/values/alignment.wast lines 139, 171 and 173 as no-trap. All three ledger rows moved to match-trap and the three assertions to pass; no other row or assertion moved."
+    links:
+      - type: verifies
+        target: SR-132
+    provenance:
+      created-by: ai-assisted
+      model: claude-opus-5-5
+      timestamp: 2026-11-19T15:00:00Z
