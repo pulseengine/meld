@@ -4,6 +4,38 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.70.0] - 2026-11-19
+
+### Security
+
+- Self-hosted CI runners are chosen only through the fail-closed same-repo form. A PR whose fork head was deleted (null `head.repo`) no longer reaches them (#628). `scripts/check-selfhosted-fork-guard.rs` runs in the required Format check, with a planted plain self-hosted job as its negative control.
+
+### Fixed
+
+Canonical ABI checks the fused adapters skipped, found by the 297-fixture differential (SR-122). Each fix moved ledger rows to `match` or `match-trap`, and no row left `match`.
+
+- A `realloc` that answers a 0-byte request with 0 no longer traps; only a 0 result for a nonzero request does (#621, SR-125). This covers every transcoder.
+- Flat `bool`, `u8`, `u16`, `s8`, `s16` and `flags` params are normalised as `lift_flat` does (#619, SR-126).
+- A call whose types cannot carry a string fuses without the string transcoder, whatever the `string-encoding` options say (#620, SR-127). Before, a char-only call between a utf8 and a utf16 component produced an invalid module.
+- A cross-encoding call that passes strings in a shape the transcoder does not handle is refused instead of handing the callee the caller's pointers (#600, #603, SR-128). That covers `list<string>`, a string inside a record, a second string, and a spilled params area.
+- An out-of-range variant, enum, option or result case index in flat params traps (#586, SR-129).
+- An invalid `char` or case index in a callee's returned area traps (#599, SR-130).
+- An invalid `char` or case index in a list element, or in the params area, traps before the call (#599, SR-131).
+- A misaligned or out-of-bounds list or string pointer traps before any copy (#599, SR-132). Upstream `alignment.wast` lines 139, 171 and 173 now pass.
+- A `bool` or `flags` value held in memory is normalised under `--memory multi`. Under `--memory shared` the adapter does not write into the caller's bytes; a malformed value traps instead, which is stricter than the spec (#599, SR-133).
+
+### Changed
+
+- Hosted CI jobs are pinned to `ubuntu-24.04` (#627).
+- The scry and witness gate checkouts are pinned to commit SHAs, and the covalent toolchain layer is 2026.11.16, which carries loom 1.5.4 (#632, #633).
+- wasmtime 50.0.2 (#624); gimli 0.33, sha2 0.11 and criterion 0.8 (#630).
+
+### API
+
+- `parser::FlatParamLift` gains `Discriminant`, `List` and `String`. The new `parser::MemCheck` and `parser::ParamCheck` describe value checks in memory. An exhaustive `match` on `FlatParamLift` must add the new arms (0.x minor).
+- `resolver::AdapterRequirements` gains `carries_no_string`, `result_memory_checks` and `param_value_checks`.
+- `ParsedComponent` gains `may_carry_string`, `result_memory_checks` and `param_value_checks`.
+
 ## [0.69.0] - 2026-11-13
 
 ### Fixed
