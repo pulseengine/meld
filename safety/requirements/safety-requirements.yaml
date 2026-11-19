@@ -4182,6 +4182,7 @@ artifacts:
         target: SYS-3
     provenance:
       created-by: ai-assisted
+      reviewed-by: avrabe
       model: claude-opus-5-5
       timestamp: 2026-11-19T12:00:00Z
   - id: SR-132
@@ -4195,5 +4196,6 @@ artifacts:
         target: SYS-3
     provenance:
       created-by: ai-assisted
+      reviewed-by: avrabe
       model: claude-opus-5-5
       timestamp: 2026-11-19T15:00:00Z
