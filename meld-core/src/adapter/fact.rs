@@ -5628,6 +5628,7 @@ fn emit_ptr_len_check(
 ///
 /// Fails closed: a body that never calls `target` while checks are owed is an
 /// error, not a silently unchecked adapter.
+#[allow(clippy::too_many_arguments)]
 fn splice_call_checks(
     body: Function,
     adapter_param_count: u32,
@@ -5636,12 +5637,21 @@ fn splice_call_checks(
     param_checks: &[crate::parser::ParamCheck],
     result_checks: &[crate::parser::MemCheck],
     callee_memory: u32,
+    crosses_memory: bool,
 ) -> Result<Function> {
     use crate::parser::ParamCheck;
     if param_checks.is_empty() && result_checks.is_empty() {
         return Ok(body);
     }
     let err = |e: String| crate::Error::AdapterGeneration(format!("#599: adapter body: {e}"));
+    // #599 step 4 (owner decisions 2026-11-19): normalising a bool or flags
+    // value in memory is a write. Under multi-memory it lands on the
+    // callee-side copy (params) or the callee's return area before the
+    // adapter copies it out (results). Under --memory shared those bytes are
+    // the caller's, so the adapter does not write: it traps on a bool byte
+    // above 1 or a flags word with undeclared bits instead. That is stricter
+    // than the spec (which would lift them); every well-formed producer
+    // writes 0/1 and declared bits only.
     let raw = body.into_raw_body();
     let fb = wasmparser::FunctionBody::new(wasmparser::BinaryReader::new(&raw, 0));
     let mut locals = Vec::new();
@@ -5675,6 +5685,7 @@ fn splice_call_checks(
         scratch: first + 1,
         loops: first + 2,
         memory: callee_memory,
+        normalise: crosses_memory,
     };
     let area = first;
     let args_base = first + 2 + 2 * depth;
@@ -5765,6 +5776,9 @@ struct CheckLocals {
     scratch: u32,
     loops: u32,
     memory: u32,
+    /// Write normalised bool/flags values (multi-memory); otherwise trap on
+    /// a value that would need normalising (--memory shared).
+    normalise: bool,
 }
 
 fn mem_check_depth(checks: &[crate::parser::MemCheck]) -> u32 {
@@ -5772,7 +5786,7 @@ fn mem_check_depth(checks: &[crate::parser::MemCheck]) -> u32 {
     checks
         .iter()
         .map(|c| match c {
-            MemCheck::Char { .. } => 0,
+            MemCheck::Char { .. } | MemCheck::Bool { .. } | MemCheck::FlagsMask { .. } => 0,
             MemCheck::Case { payloads, .. } => payloads
                 .iter()
                 .map(|(_, p)| mem_check_depth(p))
@@ -5862,6 +5876,43 @@ fn emit_mem_checks(
                 f.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
                 f.instruction(&Instruction::Unreachable);
                 f.instruction(&Instruction::End);
+            }
+            MemCheck::Bool { offset } if !ctx.normalise => {
+                // trap if load8_u(base + offset) > 1
+                load(f, *offset, 1);
+                f.instruction(&Instruction::I32Const(1));
+                f.instruction(&Instruction::I32GtU);
+                f.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+                f.instruction(&Instruction::Unreachable);
+                f.instruction(&Instruction::End);
+            }
+            MemCheck::FlagsMask { offset, size, mask } if !ctx.normalise => {
+                // trap if the word carries a bit outside the declared labels
+                load(f, *offset, *size);
+                f.instruction(&Instruction::I32Const(!*mask as i32));
+                f.instruction(&Instruction::I32And);
+                f.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+                f.instruction(&Instruction::Unreachable);
+                f.instruction(&Instruction::End);
+            }
+            MemCheck::Bool { offset } => {
+                // store8(base + offset, load8_u(base + offset) != 0)
+                f.instruction(&Instruction::LocalGet(base));
+                load(f, *offset, 1);
+                f.instruction(&Instruction::I32Const(0));
+                f.instruction(&Instruction::I32Ne);
+                f.instruction(&Instruction::I32Store8(arg(*offset)));
+            }
+            MemCheck::FlagsMask { offset, size, mask } => {
+                f.instruction(&Instruction::LocalGet(base));
+                load(f, *offset, *size);
+                f.instruction(&Instruction::I32Const(*mask as i32));
+                f.instruction(&Instruction::I32And);
+                match size {
+                    1 => f.instruction(&Instruction::I32Store8(arg(*offset))),
+                    2 => f.instruction(&Instruction::I32Store16(arg(*offset))),
+                    _ => f.instruction(&Instruction::I32Store(arg(*offset))),
+                };
             }
             MemCheck::Case {
                 offset,
@@ -6053,6 +6104,7 @@ impl FactStyleGenerator {
                 &site.requirements.param_value_checks,
                 &site.requirements.result_memory_checks,
                 options.callee_memory,
+                options.caller_memory != options.callee_memory,
             )?;
             return Ok(AdapterFunction {
                 name,
@@ -6107,6 +6159,7 @@ impl FactStyleGenerator {
             &site.requirements.param_value_checks,
             &site.requirements.result_memory_checks,
             options.callee_memory,
+            options.caller_memory != options.callee_memory,
         )?;
 
         // #304: wire the caller straight to the target when the seam judged this
@@ -14172,7 +14225,7 @@ mod tests {
                 payloads: vec![(1, vec![MemCheck::Char { offset: 8 }])],
             },
         ];
-        let adapter = super::splice_call_checks(adapter, 0, &[], 0, &[], &checks, 0).unwrap();
+        let adapter = super::splice_call_checks(adapter, 0, &[], 0, &[], &checks, 0, true).unwrap();
         let mut m = Module::new();
         let mut ty = TypeSection::new();
         ty.ty().function([], [ValType::I32]);
@@ -14233,7 +14286,7 @@ mod tests {
         let mut no_call = Function::new([]);
         no_call.instruction(&Instruction::I32Const(0));
         no_call.instruction(&Instruction::End);
-        assert!(super::splice_call_checks(no_call, 0, &[], 0, &[], &checks, 0).is_err());
+        assert!(super::splice_call_checks(no_call, 0, &[], 0, &[], &checks, 0, true).is_err());
     }
 
     /// #599 step 2: the param checks run before the call on the callee's args:
@@ -14260,7 +14313,8 @@ mod tests {
             adapter.instruction(&Instruction::Call(0));
             adapter.instruction(&Instruction::End);
             let adapter =
-                super::splice_call_checks(adapter, nparams, &params, 0, &checks, &[], 0).unwrap();
+                super::splice_call_checks(adapter, nparams, &params, 0, &checks, &[], 0, true)
+                    .unwrap();
             let mut m = Module::new();
             let mut ty = TypeSection::new();
             ty.ty().function(params.clone(), [ValType::I32]);
@@ -14433,6 +14487,104 @@ mod tests {
         let s8 = build(L::String, super::StringEncoding::Utf8);
         assert!(ok(&s8, 65535, 1));
         assert!(!ok(&s8, 65535, 2));
+    }
+
+    /// #599 step 4: under multi-memory, a bool byte is rewritten to 0/1 and a
+    /// flags word loses undeclared bits; under --memory shared nothing is
+    /// written and such a value traps instead.
+    // rivet: verifies SR-133
+    // rivet: verifies SWV-147
+    #[test]
+    fn memory_normalisation_writes_under_multi_and_traps_under_shared() {
+        use crate::parser::MemCheck;
+        use wasm_encoder::{
+            CodeSection, ExportKind, ExportSection, Function, FunctionSection, Instruction,
+            MemorySection, MemoryType, Module, TypeSection, ValType,
+        };
+        let checks = vec![
+            MemCheck::Bool { offset: 0 },
+            MemCheck::FlagsMask {
+                offset: 2,
+                size: 2,
+                mask: 0x1FF,
+            },
+        ];
+        let build = |crosses_memory: bool| {
+            let mut adapter = Function::new([]);
+            adapter.instruction(&Instruction::Call(0));
+            adapter.instruction(&Instruction::End);
+            let body =
+                super::splice_call_checks(adapter, 0, &[], 0, &[], &checks, 0, crosses_memory)
+                    .unwrap();
+            let mut callee = Function::new([]);
+            callee.instruction(&Instruction::I32Const(16));
+            callee.instruction(&Instruction::End);
+            let mut m = Module::new();
+            let mut ty = TypeSection::new();
+            ty.ty().function([], [ValType::I32]);
+            let mut fs = FunctionSection::new();
+            fs.function(0);
+            fs.function(0);
+            let mut mem = MemorySection::new();
+            mem.memory(MemoryType {
+                minimum: 1,
+                maximum: None,
+                memory64: false,
+                shared: false,
+                page_size_log2: None,
+            });
+            let mut ex = ExportSection::new();
+            ex.export("f", ExportKind::Func, 1);
+            ex.export("mem", ExportKind::Memory, 0);
+            let mut code = CodeSection::new();
+            code.function(&callee);
+            code.function(&body);
+            m.section(&ty)
+                .section(&fs)
+                .section(&mem)
+                .section(&ex)
+                .section(&code);
+            let bytes = m.finish();
+            wasmparser::Validator::new().validate_all(&bytes).unwrap();
+            bytes
+        };
+        let engine = wasmtime::Engine::default();
+        let run = |bytes: &[u8], b: u8, flags: u16| -> Option<(u8, u16)> {
+            let module = wasmtime::Module::new(&engine, bytes).unwrap();
+            let mut store = wasmtime::Store::new(&engine, ());
+            let inst = wasmtime::Instance::new(&mut store, &module, &[]).unwrap();
+            let memory = inst.get_memory(&mut store, "mem").unwrap();
+            memory.write(&mut store, 16, &[b]).unwrap();
+            memory.write(&mut store, 18, &flags.to_le_bytes()).unwrap();
+            let f = inst.get_typed_func::<(), i32>(&mut store, "f").unwrap();
+            f.call(&mut store, ()).ok()?;
+            let mut out = [0u8; 4];
+            memory.read(&store, 16, &mut out).unwrap();
+            Some((out[0], u16::from_le_bytes([out[2], out[3]])))
+        };
+        // Multi-memory: normalise in place.
+        let m = build(true);
+        assert_eq!(
+            run(&m, 0, 0x0105),
+            Some((0, 0x0105)),
+            "valid values are unchanged"
+        );
+        assert_eq!(run(&m, 1, 0x01FF), Some((1, 0x01FF)));
+        assert_eq!(
+            run(&m, 2, 0xFF05),
+            Some((1, 0x0105)),
+            "bool 2 becomes 1, undeclared bits drop"
+        );
+        assert_eq!(run(&m, 0xFF, 0xFE00), Some((1, 0x0000)));
+        // --memory shared: never write; trap on a value that needs normalising.
+        let s = build(false);
+        assert_eq!(
+            run(&s, 1, 0x01FF),
+            Some((1, 0x01FF)),
+            "valid values pass untouched"
+        );
+        assert_eq!(run(&s, 2, 0x0105), None, "bool 2 traps");
+        assert_eq!(run(&s, 0, 0x0305), None, "an undeclared flag bit traps");
     }
 
     /// #586: the spliced check traps exactly on non-scalar-value `char`s, and

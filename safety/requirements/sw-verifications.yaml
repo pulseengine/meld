@@ -2126,6 +2126,7 @@ artifacts:
         target: SR-131
     provenance:
       created-by: ai-assisted
+      reviewed-by: avrabe
       model: claude-opus-5-5
       timestamp: 2026-11-19T12:00:00Z
   - id: SWV-146
@@ -2139,5 +2140,20 @@ artifacts:
         target: SR-132
     provenance:
       created-by: ai-assisted
+      reviewed-by: avrabe
       model: claude-opus-5-5
       timestamp: 2026-11-19T15:00:00Z
+  - id: SWV-147
+    type: sw-verification
+    title: "Verification of SR-133: bools and flags in memory are normalised under multi and trap under shared"
+    status: implemented
+    release: v0.70.0
+    description: "bools_in_memory_are_normalised_under_multi_and_trap_under_shared (tests/abi_differential.rs) runs issue599-list-bool-in-memory unfused. Fused under --memory multi it must return the unfused value; under --memory shared it must trap. memory_normalisation_writes_under_multi_and_traps_under_shared (fact.rs unit test) runs the emitted code on a hand-built module. Under multi, valid values are unchanged, bool 2 and 0xFF become 1, and flags<9> drops bits above 9. Under shared, valid values pass untouched, and bool 2 and an undeclared flag bit each trap. Negative control observed red: before the change the ledger classed issue599-list-bool-in-memory, r1-fixed_list_na_02, r1-fixed_list_na_05 and r2-record_na_05 as wrong under both strategies. Under multi they moved to match, and under shared to fused-trap. No match row moved. The component-model WAST baselines did not move. The first version refused these calls under shared; that broke 14 existing shared-memory tests and was replaced by the trap."
+    links:
+      - type: verifies
+        target: SR-133
+    provenance:
+      created-by: ai-assisted
+      reviewed-by: avrabe
+      model: claude-opus-5-5
+      timestamp: 2026-11-19T19:00:00Z
