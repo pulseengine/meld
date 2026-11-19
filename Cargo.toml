@@ -24,7 +24,7 @@ wasm-encoder = { version = "0.263", features = ["component-model"] }
 wasmprinter = "0.263"
 
 # DWARF read/write for address remapping (#143 Phase 2)
-gimli = "0.31"
+gimli = "0.33"
 
 # CLI
 clap = { version = "4.5", features = ["derive", "cargo"] }
@@ -38,7 +38,7 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 
 # Hashing
-sha2 = "0.10"
+sha2 = "0.11"
 hex = "0.4"
 
 # Logging
@@ -47,7 +47,7 @@ env_logger = "0.11"
 
 # Testing
 proptest = "1.5"
-criterion = { version = "0.5", features = ["html_reports"] }
+criterion = { version = "0.8", features = ["html_reports"] }
 
 # Required for wit-bindgen component bindings (WASI filesystem interfaces)
 bitflags = "2.6"

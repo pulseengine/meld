@@ -508,7 +508,7 @@ fn vendored_suite_matches_its_checksums() {
     assert_eq!(wasts, 78, "the vendored suite at c818a1925e has 78 WASTs");
     for (hash, path) in &files {
         let bytes = std::fs::read(suite_dir().join(path)).unwrap_or_else(|e| panic!("{path}: {e}"));
-        let got = format!("{:x}", Sha256::digest(&bytes));
+        let got = hex::encode(Sha256::digest(&bytes));
         assert_eq!(&got, hash, "{path} differs from SHA256SUMS");
     }
 }
