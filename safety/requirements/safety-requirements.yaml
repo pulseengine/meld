@@ -4171,3 +4171,16 @@ artifacts:
       reviewed-by: avrabe
       model: claude-opus-5-5
       timestamp: 2026-11-19T09:00:00Z
+  - id: SR-131
+    type: sw-req
+    title: "An adapter traps on an invalid char or case index in a list element or the params area the callee receives"
+    status: implemented
+    release: v0.70.0
+    description: "Before the call, the adapter shall check the values the callee receives in memory, as the Canonical ABI's lift does. These are each element of a list param (at the top level, or flattened inside a record or tuple), and the whole params area when the call has more than 16 flat params. Each element gets the same char and case-index checks as a returned value. Lists nested inside these values are checked element by element in turn. The checks read callee memory and write nothing, for every synchronous adapter class. Before, a list<char> holding a surrogate reached the callee (#586, #599). Not covered: types that meld cannot resolve, such as a variant imported into the component; pointer bounds and alignment; normalisation of bool, narrow ints and flags held in memory."
+    links:
+      - type: derives-from
+        target: SYS-3
+    provenance:
+      created-by: ai-assisted
+      model: claude-opus-5-5
+      timestamp: 2026-11-19T12:00:00Z

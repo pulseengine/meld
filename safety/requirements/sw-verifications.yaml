@@ -2115,3 +2115,16 @@ artifacts:
       reviewed-by: avrabe
       model: claude-opus-5-5
       timestamp: 2026-11-19T09:00:00Z
+  - id: SWV-145
+    type: sw-verification
+    title: "Verification of SR-131: invalid list elements and params-area values trap"
+    status: implemented
+    release: v0.70.0
+    description: "an_invalid_list_element_traps_after_fusion (tests/abi_differential.rs) runs issue586-list-char-invalid unfused and fused under --memory multi and --memory shared, and requires a trap in all three. param_checks_loop_over_list_elements_and_the_params_area (fact.rs unit test) runs the emitted checks on a hand-built module. A valid list<char> passes, and so do an empty list and an invalid element past len. A surrogate element traps. In the params area, case 2 of 3 passes and case 3 of 3 traps. Negative control observed red: before the check, the ledger classed 4 rows as accepts-invalid (issue586-list-char-invalid under both strategies, r2-list_record_na_00 multi, r2-record_string_latin1utf16-latin1utf16_02 shared). Those moved to match-trap and no other row moved."
+    links:
+      - type: verifies
+        target: SR-131
+    provenance:
+      created-by: ai-assisted
+      model: claude-opus-5-5
+      timestamp: 2026-11-19T12:00:00Z
