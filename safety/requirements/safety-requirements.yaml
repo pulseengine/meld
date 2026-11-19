@@ -4087,7 +4087,7 @@ artifacts:
   - id: SR-125
     type: sw-req
     title: "An adapter accepts realloc returning 0 for a 0-byte request, and traps on a 0 result only for a nonzero request"
-    status: implemented
+    status: verified
     release: v0.70.0
     description: "Every adapter call to a component's cabi_realloc shall trap when the result is 0 and the requested byte size is nonzero (LS-A-7 leg (b): a deliberate stricter-than-spec choice, since the Canonical ABI's reallocate traps only on misalignment and on ptr + new_byte_length > len(memory)). When the requested size is 0, a 0 result is valid and the adapter shall pass it on, as the unfused runtime does (#621). The size used for the check is the same emitted expression the call received, so the two cannot drift."
     links:
@@ -4104,7 +4104,7 @@ artifacts:
   - id: SR-126
     type: sw-req
     title: "An adapter normalises flat bool, u8, u16, s8, s16 and flags params as the Canonical ABI's lift does"
-    status: implemented
+    status: verified
     release: v0.70.0
     description: "For each flat param slot that carries a bool, u8, u16, s8, s16 or flags value (at the top level or inside a record, tuple or fixed-size list), the adapter shall replace the caller's i32 with what lift_flat produces before the callee sees it: bool becomes x != 0, u8 and u16 keep their low 8 and 16 bits, s8 and s16 sign-extend those bits, and flags keep only the bits of declared labels (in the last storage word when the label count is not a multiple of 32). This is the same splice point as the flat char check and applies to every adapter class. Not covered: such values inside a variant, option or result payload, in memory (lists, the params-ptr area), and in results; #599 stays open for the in-memory case."
     links:
@@ -4118,7 +4118,7 @@ artifacts:
   - id: SR-127
     type: sw-req
     title: "A call whose types cannot carry a string fuses without a string transcode, whatever the string-encoding options say"
-    status: implemented
+    status: verified
     release: v0.70.0
     description: "When the caller's and callee's string-encoding options differ, the adapter shall transcode only if a param or result of the resolved function type may carry a string (following use aliases; an unresolved alias counts as may). Otherwise the call is lowered as if the encodings matched, and the flat value checks (char validity, narrow-int and flags normalisation) still apply. A char-only call between a utf8 and a utf16 component previously went to the string transcoder, which reads params 0 and 1 as a (ptr, len) pair, and the fused module failed validation (#620)."
     links:
@@ -4132,7 +4132,7 @@ artifacts:
   - id: SR-128
     type: sw-req
     title: "A cross-encoding call whose string shape the flat transcoder does not handle is refused"
-    status: implemented
+    status: verified
     release: v0.70.0
     description: "When the caller's and callee's string-encoding options differ and the call takes the flat (non-retptr) transcode path, fusion shall succeed only if the single (ptr, len) pair is a top-level string in params 0 and 1, no other param may carry a string, and the params are not spilled to a params area. Every other shape shall be refused with an error. A list<string>, a list<option<string>> and a record holding a string previously fused at exit 0, validated, and handed the callee the caller's pointers (#600, #603)."
     links:
@@ -4146,7 +4146,7 @@ artifacts:
   - id: SR-129
     type: sw-req
     title: "An adapter traps on an out-of-range variant, enum, option or result case index in flat params"
-    status: implemented
+    status: verified
     release: v0.70.0
     description: "For each flat param slot that holds the case index of a variant, enum, option or result (at the top level or inside a record, tuple or fixed-size list), the adapter shall trap when the index is not below the case count, as the Canonical ABI's lift_flat_variant does. The check applies at the same splice point as the flat char check, for every adapter class. Before, an enum of 257 cases given index 257 and an option given index 2 crossed the boundary and the callee ran on an invalid value (#586). Not covered: case indices inside a variant payload, in memory, or in results."
     links:
@@ -4160,7 +4160,7 @@ artifacts:
   - id: SR-130
     type: sw-req
     title: "An adapter traps on an invalid char or case index in the results a callee returns through its return area"
-    status: implemented
+    status: verified
     release: v0.70.0
     description: "When a callee returns more than one flat result, so that its results are stored in a return area, the adapter shall check that area after the call as the Canonical ABI's load does. A char shall be a Unicode scalar value. A variant, enum, option or result case index shall be below the case count, and the selected case's payload is checked in turn. These checks apply at the top level and inside records, tuples and fixed-size lists. The check reads callee memory only and writes nothing, and it applies to every synchronous adapter class. Before, an invalid returned char or case index reached the caller (#599, #586). Not covered: values reached through a list pointer, normalising bool, narrow ints and flags in memory, and async adapters."
     links:
@@ -4174,7 +4174,7 @@ artifacts:
   - id: SR-131
     type: sw-req
     title: "An adapter traps on an invalid char or case index in a list element or the params area the callee receives"
-    status: implemented
+    status: verified
     release: v0.70.0
     description: "Before the call, the adapter shall check the values the callee receives in memory, as the Canonical ABI's lift does. These are each element of a list param (at the top level, or flattened inside a record or tuple), and the whole params area when the call has more than 16 flat params. Each element gets the same char and case-index checks as a returned value. Lists nested inside these values are checked element by element in turn. The checks read callee memory and write nothing, for every synchronous adapter class. Before, a list<char> holding a surrogate reached the callee (#586, #599). Not covered: types that meld cannot resolve, such as a variant imported into the component; pointer bounds and alignment; normalisation of bool, narrow ints and flags held in memory."
     links:
@@ -4188,7 +4188,7 @@ artifacts:
   - id: SR-132
     type: sw-req
     title: "An adapter traps on a misaligned or out-of-bounds list or string pointer the caller passes in flat params"
-    status: implemented
+    status: verified
     release: v0.70.0
     description: "For each list or string param passed flat (at the top level or flattened inside a record or tuple), the adapter shall trap before any copy or call unless the pointer is a multiple of the element's alignment and pointer plus byte length lies within the caller's memory, as the Canonical ABI's lift does. The byte length is len times the element size for a list. For a string it follows the caller's string encoding: utf8 counts len bytes; utf16 counts 2 bytes per unit with alignment 2; latin1+utf16 counts 2 bytes per unit when the length's high bit is set, else 1, with alignment 2. The sum is computed in 64 bits so that it cannot wrap. Before, a misaligned list pointer crossed the boundary (#586, #599). Not covered: lists nested in memory, the params area, and results."
     links:
@@ -4202,7 +4202,7 @@ artifacts:
   - id: SR-133
     type: sw-req
     title: "An adapter normalises bool and flags values in memory under multi-memory, and traps on a malformed one under --memory shared"
-    status: implemented
+    status: verified
     release: v0.70.0
     description: "For a bool or flags value that the callee receives or returns in memory (a list element, the params area, or the return area), the adapter shall deliver the value the Canonical ABI's load produces: a bool byte becomes 0 or 1, and a flags word keeps only the declared labels' bits. Under multi-memory the adapter writes the normalised value to the callee-side copy of the params, or to the callee's return area before it copies the area out. Under --memory shared those bytes belong to the caller, so the adapter shall not write. It shall trap on a bool byte above 1 or a flags word with undeclared bits. That is stricter than the Canonical ABI, which would lift them; every well-formed producer writes 0 or 1 and declared bits only (owner decision, 2026-11-19, which replaced an earlier refusal that broke 14 existing shared-memory programs). Before, a list<bool> holding a byte 2 reached the callee as 2 instead of 1, and the program answered wrong (#599)."
     links:
