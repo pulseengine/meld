@@ -51,7 +51,7 @@ permissions:
 env:
   # Pinned to the witness release tested against locally (v0.41; 2/2 branch
   # coverage, 0 gap). Bump via PR.
-  WITNESS_REF: v0.41.0
+  WITNESS_REF: 908732b10367354158b1762d7b252a1d01c926ff # v0.41.0
 
 jobs:
   witness:

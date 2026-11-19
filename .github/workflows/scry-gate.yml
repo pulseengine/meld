@@ -28,7 +28,7 @@ permissions:
 env:
   # Pinned to the scry release tested against locally (586 functions, exit 0).
   # Bump via PR.
-  SCRY_REF: v3.2.4
+  SCRY_REF: 91c858c225ac9a2677294127371527a9aab50928 # v3.2.4
 
 jobs:
   scry:
