@@ -232,8 +232,8 @@ r1-list_string_utf8-utf8_06	multi	accepts-invalid
 r1-list_string_utf8-utf8_06	shared	refused
 r1-list_string_utf8-utf8_07	multi	refused
 r1-list_string_utf8-utf8_07	shared	refused
-r1-list_u32_na_00	multi	accepts-invalid
-r1-list_u32_na_00	shared	accepts-invalid
+r1-list_u32_na_00	multi	match-trap	#599: pointer alignment and bounds checked
+r1-list_u32_na_00	shared	match-trap	#599: pointer alignment and bounds checked
 r1-list_u32_na_01	multi	match
 r1-list_u32_na_01	shared	refused
 r1-list_u32_na_02	multi	match
@@ -344,8 +344,8 @@ r1-string_char_utf16-utf16_00	multi	wrong
 r1-string_char_utf16-utf16_00	shared	refused
 r1-string_char_utf16-utf16_01	multi	wrong
 r1-string_char_utf16-utf16_01	shared	refused
-r1-string_char_utf16-utf16_02	multi	accepts-invalid
-r1-string_char_utf16-utf16_02	shared	match-trap
+r1-string_char_utf16-utf16_02	multi	match-trap	#599: pointer alignment and bounds checked
+r1-string_char_utf16-utf16_02	shared	match-trap	#599: pointer alignment and bounds checked
 r1-string_char_utf16-utf16_03	multi	wrong
 r1-string_char_utf16-utf16_03	shared	refused
 r1-string_char_utf16-utf16_04	multi	wrong

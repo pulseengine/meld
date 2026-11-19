@@ -515,6 +515,13 @@ pub enum FlatParamLift {
     /// Trap unless the case index is below the case count (variant, enum,
     /// option, result).
     Discriminant(u32),
+    /// #599: the `(ptr, len)` of a `list` in this slot and the next: trap
+    /// unless `ptr` is a multiple of `align` and `ptr + len * size` lies
+    /// within the caller's memory.
+    List { align: u32, size: u32 },
+    /// #599: the `(ptr, len)` of a `string` in this slot and the next: the
+    /// same alignment and bounds checks, by the caller's string encoding.
+    String,
 }
 
 /// #599: a check the Canonical ABI's `load` performs on a value read from
@@ -2826,6 +2833,16 @@ impl ParsedComponent {
             ComponentValType::Option(_) | ComponentValType::Result { .. } => {
                 out.push((base, FlatParamLift::Discriminant(2)));
             }
+            ComponentValType::List(elem) => {
+                out.push((
+                    base,
+                    FlatParamLift::List {
+                        align: self.canonical_abi_align(elem),
+                        size: self.canonical_abi_element_size(elem),
+                    },
+                ));
+            }
+            ComponentValType::String => out.push((base, FlatParamLift::String)),
             ComponentValType::FixedSizeList(elem, len) => {
                 let elem_flat = self.flat_count(elem);
                 for i in 0..*len {

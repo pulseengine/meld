@@ -5440,6 +5440,8 @@ fn emit_resource_new_results(
 fn prepend_flat_param_lifts(
     body: Function,
     lifts: &[(u32, crate::parser::FlatParamLift)],
+    caller_memory: u32,
+    caller_encoding: StringEncoding,
 ) -> Result<Function> {
     if lifts.is_empty() {
         return Ok(body);
@@ -5488,6 +5490,53 @@ fn prepend_flat_param_lifts(
                 out.instruction(&Instruction::End);
                 continue;
             }
+            L::List { align, size } => {
+                emit_ptr_len_check(&mut out, p, align, caller_memory, |f| {
+                    f.instruction(&Instruction::LocalGet(p + 1));
+                    f.instruction(&Instruction::I64ExtendI32U);
+                    f.instruction(&Instruction::I64Const(size as i64));
+                    f.instruction(&Instruction::I64Mul);
+                });
+                continue;
+            }
+            L::String => {
+                let align = match caller_encoding {
+                    StringEncoding::Utf8 => 1,
+                    StringEncoding::Utf16 | StringEncoding::Latin1 => 2,
+                };
+                emit_ptr_len_check(
+                    &mut out,
+                    p,
+                    align,
+                    caller_memory,
+                    |f| match caller_encoding {
+                        StringEncoding::Utf8 => {
+                            f.instruction(&Instruction::LocalGet(p + 1));
+                            f.instruction(&Instruction::I64ExtendI32U);
+                        }
+                        StringEncoding::Utf16 => {
+                            f.instruction(&Instruction::LocalGet(p + 1));
+                            f.instruction(&Instruction::I64ExtendI32U);
+                            f.instruction(&Instruction::I64Const(2));
+                            f.instruction(&Instruction::I64Mul);
+                        }
+                        StringEncoding::Latin1 => {
+                            // latin1+utf16: the high bit tags utf16 (2 bytes per
+                            // unit); otherwise one byte per unit.
+                            f.instruction(&Instruction::LocalGet(p + 1));
+                            f.instruction(&Instruction::I32Const(0x7FFF_FFFF));
+                            f.instruction(&Instruction::I32And);
+                            f.instruction(&Instruction::I64ExtendI32U);
+                            f.instruction(&Instruction::LocalGet(p + 1));
+                            f.instruction(&Instruction::I32Const(31));
+                            f.instruction(&Instruction::I32ShrU);
+                            f.instruction(&Instruction::I64ExtendI32U);
+                            f.instruction(&Instruction::I64Shl);
+                        }
+                    },
+                );
+                continue;
+            }
             L::Discriminant(n) => {
                 // trap if x >=u n
                 out.instruction(&Instruction::LocalGet(p));
@@ -5527,6 +5576,39 @@ fn prepend_flat_param_lifts(
     }
     out.raw(raw[ops_start..].iter().copied());
     Ok(out)
+}
+
+/// #599: `lift`'s pointer checks on a `(ptr, len)` in param slots `p` and
+/// `p + 1`: trap unless `ptr` is a multiple of `align` and `ptr + bytes` (in
+/// u64, so it cannot wrap) is within `memory`. `bytes` pushes the byte count
+/// as an i64.
+fn emit_ptr_len_check(
+    f: &mut Function,
+    p: u32,
+    align: u32,
+    memory: u32,
+    bytes: impl Fn(&mut Function),
+) {
+    if align > 1 {
+        f.instruction(&Instruction::LocalGet(p));
+        f.instruction(&Instruction::I32Const(align as i32 - 1));
+        f.instruction(&Instruction::I32And);
+        f.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+        f.instruction(&Instruction::Unreachable);
+        f.instruction(&Instruction::End);
+    }
+    f.instruction(&Instruction::LocalGet(p));
+    f.instruction(&Instruction::I64ExtendI32U);
+    bytes(f);
+    f.instruction(&Instruction::I64Add);
+    f.instruction(&Instruction::MemorySize(memory));
+    f.instruction(&Instruction::I64ExtendI32U);
+    f.instruction(&Instruction::I64Const(16));
+    f.instruction(&Instruction::I64Shl);
+    f.instruction(&Instruction::I64GtU);
+    f.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+    f.instruction(&Instruction::Unreachable);
+    f.instruction(&Instruction::End);
 }
 
 /// #599: around every `call target` in an adapter body, check the values the
@@ -5950,7 +6032,12 @@ impl FactStyleGenerator {
             };
             // #594: this path returns before the common splice below, so it
             // applies the #586 `char` check itself (found by auto-Mythos).
-            let body = prepend_flat_param_lifts(body, &site.requirements.flat_param_lifts)?;
+            let body = prepend_flat_param_lifts(
+                body,
+                &site.requirements.flat_param_lifts,
+                options.caller_memory,
+                options.caller_string_encoding,
+            )?;
             let body = splice_call_checks(
                 body,
                 merged
@@ -5997,7 +6084,12 @@ impl FactStyleGenerator {
                  is_async_lift branch in FactStyleGenerator::generate)"
             ),
         };
-        let body = prepend_flat_param_lifts(body, &site.requirements.flat_param_lifts)?;
+        let body = prepend_flat_param_lifts(
+            body,
+            &site.requirements.flat_param_lifts,
+            options.caller_memory,
+            options.caller_string_encoding,
+        )?;
 
         let target_function = self.resolve_target_function(site, merged)?;
         let body = splice_call_checks(
@@ -14258,6 +14350,91 @@ mod tests {
         assert_eq!(call(&area, &[(132, 3)], &[128]), None, "case 3 of 3 traps");
     }
 
+    /// #599 step 3: a list or string `(ptr, len)` traps when `ptr` is
+    /// misaligned or `ptr + bytes` passes the end of the caller's memory,
+    /// computed without wrapping; the exact end of memory is in bounds.
+    // rivet: verifies SR-132
+    // rivet: verifies SWV-146
+    #[test]
+    fn pointer_checks_trap_on_misalignment_and_out_of_bounds() {
+        use crate::parser::FlatParamLift as L;
+        use wasm_encoder::{
+            CodeSection, ExportKind, ExportSection, Function, FunctionSection, Instruction,
+            MemorySection, MemoryType, Module, TypeSection, ValType,
+        };
+        let build = |lift: L, enc: super::StringEncoding| {
+            let mut f = Function::new([]);
+            f.instruction(&Instruction::I32Const(7));
+            f.instruction(&Instruction::End);
+            let body = super::prepend_flat_param_lifts(f, &[(0, lift)], 0, enc).unwrap();
+            let mut m = Module::new();
+            let mut ty = TypeSection::new();
+            ty.ty()
+                .function([ValType::I32, ValType::I32], [ValType::I32]);
+            let mut fs = FunctionSection::new();
+            fs.function(0);
+            let mut mem = MemorySection::new();
+            mem.memory(MemoryType {
+                minimum: 1,
+                maximum: None,
+                memory64: false,
+                shared: false,
+                page_size_log2: None,
+            });
+            let mut ex = ExportSection::new();
+            ex.export("f", ExportKind::Func, 0);
+            let mut code = CodeSection::new();
+            code.function(&body);
+            m.section(&ty)
+                .section(&fs)
+                .section(&mem)
+                .section(&ex)
+                .section(&code);
+            let bytes = m.finish();
+            wasmparser::Validator::new().validate_all(&bytes).unwrap();
+            bytes
+        };
+        let engine = wasmtime::Engine::default();
+        let ok = |bytes: &[u8], ptr: u32, len: u32| -> bool {
+            let module = wasmtime::Module::new(&engine, bytes).unwrap();
+            let mut store = wasmtime::Store::new(&engine, ());
+            let inst = wasmtime::Instance::new(&mut store, &module, &[]).unwrap();
+            let f = inst
+                .get_typed_func::<(u32, u32), i32>(&mut store, "f")
+                .unwrap();
+            f.call(&mut store, (ptr, len)).is_ok()
+        };
+        // list<u32>: align 4, 4 bytes per element; memory is 65536 bytes.
+        let list = build(L::List { align: 4, size: 4 }, super::StringEncoding::Utf8);
+        assert!(ok(&list, 64, 3), "aligned and in bounds");
+        assert!(
+            ok(&list, 65536 - 8, 2),
+            "ending exactly at the end of memory"
+        );
+        assert!(!ok(&list, 66, 1), "misaligned pointer traps");
+        assert!(!ok(&list, 65536 - 8, 3), "one element past the end traps");
+        assert!(
+            !ok(&list, 64, 0x4000_0000),
+            "len * 4 wrapping 2^32 still traps"
+        );
+        // utf16 string: align 2, 2 bytes per unit.
+        let s16 = build(L::String, super::StringEncoding::Utf16);
+        assert!(ok(&s16, 64, 10));
+        assert!(!ok(&s16, 65, 1), "odd utf16 pointer traps");
+        assert!(!ok(&s16, 65536 - 2, 2), "utf16 units past the end trap");
+        // latin1+utf16: tag bit set means 2 bytes per unit.
+        let s1 = build(L::String, super::StringEncoding::Latin1);
+        assert!(ok(&s1, 65536 - 4, 4), "latin1 (untagged) 4 bytes fit");
+        assert!(
+            !ok(&s1, 65536 - 4, 0x8000_0004),
+            "tagged utf16 needs 8 bytes and traps"
+        );
+        // utf8: align 1.
+        let s8 = build(L::String, super::StringEncoding::Utf8);
+        assert!(ok(&s8, 65535, 1));
+        assert!(!ok(&s8, 65535, 2));
+    }
+
     /// #586: the spliced check traps exactly on non-scalar-value `char`s, and
     /// leaves the original body (its locals and instructions) intact.
     // rivet: verifies SR-121
@@ -14275,8 +14452,13 @@ mod tests {
         f.instruction(&Instruction::I32Const(7));
         f.instruction(&Instruction::I32Add);
         f.instruction(&Instruction::End);
-        let body =
-            super::prepend_flat_param_lifts(f, &[(0, crate::parser::FlatParamLift::Char)]).unwrap();
+        let body = super::prepend_flat_param_lifts(
+            f,
+            &[(0, crate::parser::FlatParamLift::Char)],
+            0,
+            super::StringEncoding::Utf8,
+        )
+        .unwrap();
         let mut m = Module::new();
         let mut ty = TypeSection::new();
         ty.ty()

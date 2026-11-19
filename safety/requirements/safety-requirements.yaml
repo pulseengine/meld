@@ -4184,3 +4184,16 @@ artifacts:
       created-by: ai-assisted
       model: claude-opus-5-5
       timestamp: 2026-11-19T12:00:00Z
+  - id: SR-132
+    type: sw-req
+    title: "An adapter traps on a misaligned or out-of-bounds list or string pointer the caller passes in flat params"
+    status: implemented
+    release: v0.70.0
+    description: "For each list or string param passed flat (at the top level or flattened inside a record or tuple), the adapter shall trap before any copy or call unless the pointer is a multiple of the element's alignment and pointer plus byte length lies within the caller's memory, as the Canonical ABI's lift does. The byte length is len times the element size for a list. For a string it follows the caller's string encoding: utf8 counts len bytes; utf16 counts 2 bytes per unit with alignment 2; latin1+utf16 counts 2 bytes per unit when the length's high bit is set, else 1, with alignment 2. The sum is computed in 64 bits so that it cannot wrap. Before, a misaligned list pointer crossed the boundary (#586, #599). Not covered: lists nested in memory, the params area, and results."
+    links:
+      - type: derives-from
+        target: SYS-3
+    provenance:
+      created-by: ai-assisted
+      model: claude-opus-5-5
+      timestamp: 2026-11-19T15:00:00Z
