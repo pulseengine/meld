@@ -14,8 +14,8 @@ issue598-utf16-copy	multi	wrong	#598
 issue598-utf16-copy	shared	match
 issue599-bool_2	multi	match
 issue599-bool_2	shared	match
-issue599-list-bool-in-memory	multi	wrong	#599
-issue599-list-bool-in-memory	shared	wrong	#599
+issue599-list-bool-in-memory	multi	match	#599: bool/flags normalised in memory
+issue599-list-bool-in-memory	shared	fused-trap	#599: a malformed bool byte traps under shared (stricter than spec, owner decision)
 issue599-list-u8-in-memory-control	multi	match
 issue599-list-u8-in-memory-control	shared	match
 issue599-s16_40000	multi	match
@@ -98,14 +98,14 @@ r1-fixed_list_na_00	multi	match
 r1-fixed_list_na_00	shared	match
 r1-fixed_list_na_01	multi	match
 r1-fixed_list_na_01	shared	match
-r1-fixed_list_na_02	multi	wrong
-r1-fixed_list_na_02	shared	wrong
+r1-fixed_list_na_02	multi	match	#599: bool/flags normalised in memory
+r1-fixed_list_na_02	shared	fused-trap	#599: a malformed bool byte traps under shared (stricter than spec, owner decision)
 r1-fixed_list_na_03	multi	match
 r1-fixed_list_na_03	shared	match
 r1-fixed_list_na_04	multi	match
 r1-fixed_list_na_04	shared	match
-r1-fixed_list_na_05	multi	wrong
-r1-fixed_list_na_05	shared	wrong
+r1-fixed_list_na_05	multi	match	#599: bool/flags normalised in memory
+r1-fixed_list_na_05	shared	fused-trap	#599: a malformed bool byte traps under shared (stricter than spec, owner decision)
 r1-fixed_list_na_06	multi	match
 r1-fixed_list_na_06	shared	match
 r1-fixed_list_na_07	multi	match
@@ -564,8 +564,8 @@ r2-list_string_utf16-utf8_06	multi	refused
 r2-list_string_utf16-utf8_06	shared	refused
 r2-record_na_02	multi	match
 r2-record_na_02	shared	match
-r2-record_na_05	multi	wrong
-r2-record_na_05	shared	wrong
+r2-record_na_05	multi	match	#599: bool/flags normalised in memory
+r2-record_na_05	shared	fused-trap	#599: a malformed bool byte traps under shared (stricter than spec, owner decision)
 r2-record_na_06	multi	match
 r2-record_na_06	shared	match
 r2-record_string_latin1utf16-latin1utf16_02	multi	refused

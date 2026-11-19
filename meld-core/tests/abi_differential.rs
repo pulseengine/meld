@@ -285,6 +285,33 @@ fn flat_params_are_normalised_as_lift_flat_does() {
     }
 }
 
+// rivet: verifies SR-133
+// rivet: verifies SWV-147
+#[test]
+fn bools_in_memory_are_normalised_under_multi_and_trap_under_shared() {
+    // A list<bool> param holding a byte 2: the unfused runtime lifts it to
+    // true (1). Before #599 step 4 the callee saw the raw 2 and answered
+    // differently.
+    let name = "issue599-list-bool-in-memory";
+    let bytes = wat::parse_file(dir().join(format!("{name}.wat"))).unwrap();
+    let Run::Ok(want) = run_unfused(&bytes) else {
+        panic!("{name}: unfused reference did not return a value");
+    };
+    match run_fused(&bytes, MemoryStrategy::MultiMemory) {
+        Ok(Run::Ok(got)) => assert_eq!(got, want, "{name} multi"),
+        _ => panic!("{name} multi: the fused run did not return a value"),
+    }
+    // --memory shared: the adapter does not write into the caller's bytes; a
+    // bool byte above 1 traps instead (stricter than the spec, by decision).
+    assert!(
+        matches!(
+            run_fused(&bytes, MemoryStrategy::SharedMemory),
+            Ok(Run::Trap)
+        ),
+        "{name} shared: a bool byte of 2 must trap"
+    );
+}
+
 // rivet: verifies SR-132
 // rivet: verifies SWV-146
 #[test]

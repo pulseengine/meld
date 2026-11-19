@@ -539,6 +539,12 @@ pub enum MemCheck {
         count: u32,
         payloads: Vec<(u32, Vec<MemCheck>)>,
     },
+    /// Normalise the `bool` byte at `offset` to `x != 0`, as `load` lifts it.
+    /// A WRITE: emitted only when the values are a copy the adapter owns.
+    Bool { offset: u32 },
+    /// Keep only the declared labels' bits in the `size`-byte flags word at
+    /// `offset`. A WRITE, like [`MemCheck::Bool`].
+    FlagsMask { offset: u32, size: u32, mask: u32 },
     /// The `(ptr, len)` at `offset` names `len` elements of `elem_size` bytes;
     /// run `elem` on each, with offsets from the element's start.
     List {
@@ -2912,6 +2918,28 @@ impl ParsedComponent {
         match ty {
             ComponentValType::Primitive(PrimitiveValType::Char) => {
                 out.push(MemCheck::Char { offset: base })
+            }
+            ComponentValType::Primitive(PrimitiveValType::Bool) => {
+                out.push(MemCheck::Bool { offset: base })
+            }
+            ComponentValType::Flags(names) => {
+                let n = names.len() as u32;
+                let (offset, size, bits) = match n {
+                    0 => return,
+                    1..=8 => (base, 1, n),
+                    9..=16 => (base, 2, n),
+                    _ => {
+                        let words = n.div_ceil(32);
+                        (base + 4 * (words - 1), 4, n - 32 * (words - 1))
+                    }
+                };
+                if bits < size * 8 {
+                    out.push(MemCheck::FlagsMask {
+                        offset,
+                        size,
+                        mask: (1u32 << bits) - 1,
+                    });
+                }
             }
             ComponentValType::Record(fields) => {
                 let mut off = base;
