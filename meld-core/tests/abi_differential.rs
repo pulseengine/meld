@@ -285,6 +285,34 @@ fn flat_params_are_normalised_as_lift_flat_does() {
     }
 }
 
+// rivet: verifies SR-130
+// rivet: verifies SWV-144
+#[test]
+fn an_invalid_value_in_the_return_area_traps_after_fusion() {
+    // Each returns through the callee's return area: an invalid char, or an
+    // out-of-range option/result/variant case index. All fused and returned
+    // normally before #599 step 1.
+    for name in [
+        "r1-char_na_05",
+        "r1-option_na_01",
+        "r1-result_na_01",
+        "r1-tuple_na_02",
+        "r2-char_na_02",
+    ] {
+        let bytes = wat::parse_file(dir().join(format!("{name}.wat"))).unwrap();
+        assert!(
+            matches!(run_unfused(&bytes), Run::Trap),
+            "{name}: unfused must trap"
+        );
+        for (label, strategy) in STRATEGIES {
+            assert!(
+                matches!(run_fused(&bytes, strategy), Ok(Run::Trap)),
+                "{name} {label}: an invalid returned value must trap after fusion"
+            );
+        }
+    }
+}
+
 // rivet: verifies SR-129
 // rivet: verifies SWV-143
 #[test]

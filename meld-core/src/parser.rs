@@ -517,6 +517,23 @@ pub enum FlatParamLift {
     Discriminant(u32),
 }
 
+/// #599: a check the Canonical ABI's `load` performs on a value read from
+/// memory, at a byte offset from the start of the area. Trap-only: none of
+/// these writes. See [`ParsedComponent::result_memory_checks`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MemCheck {
+    /// Trap unless the u32 at `offset` is a Unicode scalar value.
+    Char { offset: u32 },
+    /// Trap unless the `size`-byte case index at `offset` is below `count`;
+    /// then, for each listed case, run its checks when that case is selected.
+    Case {
+        offset: u32,
+        size: u32,
+        count: u32,
+        payloads: Vec<(u32, Vec<MemCheck>)>,
+    },
+}
+
 /// String encoding declared in canonical options
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CanonStringEncoding {
@@ -2814,6 +2831,122 @@ impl ParsedComponent {
             }
             _ => {}
         }
+    }
+
+    /// #599: the checks the Canonical ABI's `load` applies to the results a
+    /// callee returns through its return area (more than one flat result):
+    /// a `char` must be a Unicode scalar value, and a variant, enum, option or
+    /// result case index must be below the case count, with the selected
+    /// case's payload checked in turn. Offsets are from the area's start.
+    /// Empty when the results are returned flat. Values reached through a
+    /// list pointer and normalising writes (bool, narrow ints, flags) are not
+    /// covered.
+    pub fn result_memory_checks(
+        &self,
+        results: &[(Option<String>, ComponentValType)],
+    ) -> Vec<MemCheck> {
+        let flat: u32 = results.iter().map(|(_, t)| self.flat_count(t)).sum();
+        if flat <= 1 {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        let mut off = 0u32;
+        for (_, ty) in results {
+            off = align_up(off, self.canonical_abi_align(ty));
+            self.collect_mem_checks(ty, off, 0, &mut out);
+            off += self.canonical_abi_element_size(ty);
+        }
+        out
+    }
+
+    fn collect_mem_checks(
+        &self,
+        ty: &ComponentValType,
+        base: u32,
+        depth: u32,
+        out: &mut Vec<MemCheck>,
+    ) {
+        if depth > 64 {
+            return;
+        }
+        let d = depth + 1;
+        match ty {
+            ComponentValType::Primitive(PrimitiveValType::Char) => {
+                out.push(MemCheck::Char { offset: base })
+            }
+            ComponentValType::Record(fields) => {
+                let mut off = base;
+                for (_, t) in fields {
+                    off = align_up(off, self.canonical_abi_align(t));
+                    self.collect_mem_checks(t, off, d, out);
+                    off += self.canonical_abi_element_size(t);
+                }
+            }
+            ComponentValType::Tuple(ts) => {
+                let mut off = base;
+                for t in ts {
+                    off = align_up(off, self.canonical_abi_align(t));
+                    self.collect_mem_checks(t, off, d, out);
+                    off += self.canonical_abi_element_size(t);
+                }
+            }
+            ComponentValType::FixedSizeList(elem, len) => {
+                let size = self.canonical_abi_element_size(elem);
+                for i in 0..*len {
+                    self.collect_mem_checks(elem, base + i * size, d, out);
+                }
+            }
+            ComponentValType::Variant(cases) => {
+                let cases: Vec<Option<&ComponentValType>> =
+                    cases.iter().map(|(_, t)| t.as_ref()).collect();
+                self.push_case_check(&cases, base, d, out);
+            }
+            ComponentValType::Option(inner) => {
+                self.push_case_check(&[None, Some(inner.as_ref())], base, d, out);
+            }
+            ComponentValType::Result { ok, err } => {
+                self.push_case_check(&[ok.as_deref(), err.as_deref()], base, d, out);
+            }
+            ComponentValType::Type(idx) => {
+                if let Some(inner) = self.resolve_defined_val_type(*idx) {
+                    self.collect_mem_checks(&inner, base, depth, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn push_case_check(
+        &self,
+        cases: &[Option<&ComponentValType>],
+        base: u32,
+        depth: u32,
+        out: &mut Vec<MemCheck>,
+    ) {
+        let size = disc_size(cases.len());
+        let max_align = cases
+            .iter()
+            .flatten()
+            .map(|t| self.canonical_abi_align(t))
+            .max()
+            .unwrap_or(1);
+        let payload_off = base + align_up(size, max_align);
+        let mut payloads = Vec::new();
+        for (k, t) in cases.iter().enumerate() {
+            if let Some(t) = t {
+                let mut inner = Vec::new();
+                self.collect_mem_checks(t, payload_off, depth, &mut inner);
+                if !inner.is_empty() {
+                    payloads.push((k as u32, inner));
+                }
+            }
+        }
+        out.push(MemCheck::Case {
+            offset: base,
+            size,
+            count: cases.len() as u32,
+            payloads,
+        });
     }
 
     /// Compute return-area byte offsets where (ptr, len) pairs start.
@@ -6738,6 +6871,48 @@ mod tests {
         }));
         // An alias this component cannot resolve may be a string: answer true.
         assert!(c.may_carry_string(&T::Type(9999)));
+    }
+
+    // rivet: verifies SR-130
+    // rivet: verifies SWV-144
+    #[test]
+    fn result_memory_checks_follow_the_return_area_layout() {
+        use crate::parser::MemCheck;
+        type T = ComponentValType;
+        let c = empty_parsed_for_flags();
+        let r = |ts: Vec<T>| ts.into_iter().map(|t| (None, t)).collect::<Vec<_>>();
+        let ch = || T::Primitive(PrimitiveValType::Char);
+        let u32_ = || T::Primitive(PrimitiveValType::U32);
+        // A single flat result is returned flat: nothing to check in memory.
+        assert_eq!(c.result_memory_checks(&r(vec![ch()])), vec![]);
+        // (tuple u32 char): the char is at byte 4 of the area.
+        assert_eq!(
+            c.result_memory_checks(&r(vec![T::Tuple(vec![u32_(), ch()])])),
+            vec![MemCheck::Char { offset: 4 }]
+        );
+        // option<char> behind a u32: case byte at 4, payload aligned to 8.
+        assert_eq!(
+            c.result_memory_checks(&r(vec![T::Tuple(vec![u32_(), T::Option(Box::new(ch()))])])),
+            vec![MemCheck::Case {
+                offset: 4,
+                size: 1,
+                count: 2,
+                payloads: vec![(1, vec![MemCheck::Char { offset: 8 }])],
+            }]
+        );
+        // result<u32, u32> has no payload checks but still bounds the case index.
+        assert_eq!(
+            c.result_memory_checks(&r(vec![T::Result {
+                ok: Some(Box::new(u32_())),
+                err: Some(Box::new(u32_())),
+            }])),
+            vec![MemCheck::Case {
+                offset: 0,
+                size: 1,
+                count: 2,
+                payloads: vec![]
+            }]
+        );
     }
 
     // rivet: verifies SR-129
