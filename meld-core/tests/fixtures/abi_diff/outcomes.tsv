@@ -59,7 +59,7 @@ issue620-char-utf8-to-utf16-invalid	shared	match-trap	-
 issue620-char-utf8-to-utf8-control	multi	match	-
 issue620-char-utf8-to-utf8-control	shared	match	-
 issue621-realloc-null-nonzero-stricter	multi	fused-trap	-	#621 LS-A-7: deliberate trap on NULL for a nonzero request (stricter than spec)
-issue621-realloc-null-nonzero-stricter	shared	match	-
+issue621-realloc-null-nonzero-stricter	shared	fused-trap	-	#621 LS-A-7: deliberate trap on NULL for a nonzero request (stricter than spec)
 issue621-realloc-null-size0	multi	match	-
 issue621-realloc-null-size0	shared	match	-
 issue621-realloc-null-size0-latin1-to-utf16	multi	match	-	#621: transcoder realloc answering a 0-byte request with 0 must not trap
@@ -77,9 +77,9 @@ issue621-realloc-null-size0-utf8-to-utf16	shared	match	-	#621: transcoder reallo
 issue621-realloc-null-size1-control	multi	match	-
 issue621-realloc-null-size1-control	shared	match	-
 issue622-realloc-called	multi	match	-
-issue622-realloc-called	shared	wrong	-	#622
+issue622-realloc-called	shared	match	-
 issue622-realloc-oob	multi	match-trap	-
-issue622-realloc-oob	shared	accepts-invalid	-	#622
+issue622-realloc-oob	shared	match-trap	-
 r1-char_na_00	multi	match	-
 r1-char_na_00	shared	match	-
 r1-char_na_01	multi	match	-
@@ -113,19 +113,19 @@ r1-fixed_list_na_07	shared	match	-
 r1-list_string_latin1utf16-latin1utf16_00	multi	refused	AdapterGeneration #582
 r1-list_string_latin1utf16-latin1utf16_00	shared	match	-
 r1-list_string_latin1utf16-latin1utf16_01	multi	refused	AdapterGeneration #582
-r1-list_string_latin1utf16-latin1utf16_01	shared	refused	AdapterGeneration #390
+r1-list_string_latin1utf16-latin1utf16_01	shared	match	-
 r1-list_string_latin1utf16-latin1utf16_02	multi	refused	AdapterGeneration #582
-r1-list_string_latin1utf16-latin1utf16_02	shared	refused	AdapterGeneration #390
+r1-list_string_latin1utf16-latin1utf16_02	shared	refused	AdapterGeneration
 r1-list_string_latin1utf16-latin1utf16_03	multi	refused	AdapterGeneration #582
-r1-list_string_latin1utf16-latin1utf16_03	shared	match	-
+r1-list_string_latin1utf16-latin1utf16_03	shared	refused	AdapterGeneration
 r1-list_string_latin1utf16-latin1utf16_04	multi	refused	AdapterGeneration #582
-r1-list_string_latin1utf16-latin1utf16_04	shared	refused	AdapterGeneration #390
+r1-list_string_latin1utf16-latin1utf16_04	shared	wrong	-	#622: both bump allocators start at 1024 in the one shared memory, so the callee buffer aliases caller data (match with the callee heap moved to 16384)
 r1-list_string_latin1utf16-latin1utf16_05	multi	refused	AdapterGeneration #582
-r1-list_string_latin1utf16-latin1utf16_05	shared	refused	AdapterGeneration #390
+r1-list_string_latin1utf16-latin1utf16_05	shared	match-trap	-
 r1-list_string_latin1utf16-latin1utf16_06	multi	refused	AdapterGeneration #582
-r1-list_string_latin1utf16-latin1utf16_06	shared	match-trap	-
+r1-list_string_latin1utf16-latin1utf16_06	shared	refused	AdapterGeneration
 r1-list_string_latin1utf16-latin1utf16_07	multi	refused	AdapterGeneration #582
-r1-list_string_latin1utf16-latin1utf16_07	shared	refused	AdapterGeneration #390
+r1-list_string_latin1utf16-latin1utf16_07	shared	wrong	-	#622: both bump allocators start at 1024 in the one shared memory, so the callee buffer aliases caller data (match with the callee heap moved to 16384)
 r1-list_string_latin1utf16-utf8_00	multi	refused	AdapterGeneration #600
 r1-list_string_latin1utf16-utf8_00	shared	refused	AdapterGeneration #600
 r1-list_string_latin1utf16-utf8_01	multi	refused	AdapterGeneration #545
@@ -157,19 +157,19 @@ r1-list_string_utf16-latin1utf16_06	shared	refused	AdapterGeneration #545
 r1-list_string_utf16-latin1utf16_07	multi	refused	AdapterGeneration #600
 r1-list_string_utf16-latin1utf16_07	shared	refused	AdapterGeneration #600
 r1-list_string_utf16-utf16_00	multi	refused	AdapterGeneration
-r1-list_string_utf16-utf16_00	shared	refused	AdapterGeneration #390
+r1-list_string_utf16-utf16_00	shared	refused	AdapterGeneration
 r1-list_string_utf16-utf16_01	multi	refused	AdapterGeneration
-r1-list_string_utf16-utf16_01	shared	match	-
+r1-list_string_utf16-utf16_01	shared	refused	AdapterGeneration
 r1-list_string_utf16-utf16_02	multi	match	-
-r1-list_string_utf16-utf16_02	shared	refused	AdapterGeneration #390
+r1-list_string_utf16-utf16_02	shared	match	-
 r1-list_string_utf16-utf16_03	multi	match-trap	-
-r1-list_string_utf16-utf16_03	shared	refused	AdapterGeneration #390
+r1-list_string_utf16-utf16_03	shared	match-trap	-
 r1-list_string_utf16-utf16_04	multi	refused	AdapterGeneration
-r1-list_string_utf16-utf16_04	shared	match	-
+r1-list_string_utf16-utf16_04	shared	refused	AdapterGeneration
 r1-list_string_utf16-utf16_05	multi	match	-
-r1-list_string_utf16-utf16_05	shared	refused	AdapterGeneration #390
+r1-list_string_utf16-utf16_05	shared	match	-
 r1-list_string_utf16-utf16_06	multi	match-trap	-
-r1-list_string_utf16-utf16_06	shared	refused	AdapterGeneration #390
+r1-list_string_utf16-utf16_06	shared	match-trap	-
 r1-list_string_utf16-utf16_07	multi	match	-
 r1-list_string_utf16-utf16_07	shared	match	-
 r1-list_string_utf16-utf8_00	multi	refused	AdapterGeneration #545
@@ -217,53 +217,53 @@ r1-list_string_utf8-utf16_06	shared	refused	AdapterGeneration #545
 r1-list_string_utf8-utf16_07	multi	refused	AdapterGeneration #545
 r1-list_string_utf8-utf16_07	shared	refused	AdapterGeneration #545
 r1-list_string_utf8-utf8_00	multi	match-trap	-
-r1-list_string_utf8-utf8_00	shared	refused	AdapterGeneration #390
+r1-list_string_utf8-utf8_00	shared	match-trap	-
 r1-list_string_utf8-utf8_01	multi	match	-
-r1-list_string_utf8-utf8_01	shared	refused	AdapterGeneration #390
+r1-list_string_utf8-utf8_01	shared	refused	OverlappingDataSegments
 r1-list_string_utf8-utf8_02	multi	refused	AdapterGeneration
-r1-list_string_utf8-utf8_02	shared	match	-
+r1-list_string_utf8-utf8_02	shared	refused	AdapterGeneration
 r1-list_string_utf8-utf8_03	multi	match-trap	-
-r1-list_string_utf8-utf8_03	shared	refused	AdapterGeneration #390
+r1-list_string_utf8-utf8_03	shared	match-trap	-
 r1-list_string_utf8-utf8_04	multi	match	-
-r1-list_string_utf8-utf8_04	shared	refused	AdapterGeneration #390
+r1-list_string_utf8-utf8_04	shared	refused	OverlappingDataSegments
 r1-list_string_utf8-utf8_05	multi	match	-
 r1-list_string_utf8-utf8_05	shared	match	-
 r1-list_string_utf8-utf8_06	multi	match-trap	-
-r1-list_string_utf8-utf8_06	shared	refused	AdapterGeneration #390
+r1-list_string_utf8-utf8_06	shared	match-trap	-
 r1-list_string_utf8-utf8_07	multi	refused	AdapterGeneration
-r1-list_string_utf8-utf8_07	shared	refused	AdapterGeneration #390
+r1-list_string_utf8-utf8_07	shared	refused	AdapterGeneration
 r1-list_u32_na_00	multi	match-trap	-	#599: pointer alignment and bounds checked
 r1-list_u32_na_00	shared	match-trap	-	#599: pointer alignment and bounds checked
 r1-list_u32_na_01	multi	match	-
-r1-list_u32_na_01	shared	refused	AdapterGeneration #390
+r1-list_u32_na_01	shared	match	-
 r1-list_u32_na_02	multi	match	-
-r1-list_u32_na_02	shared	refused	AdapterGeneration #390
+r1-list_u32_na_02	shared	match	-
 r1-list_u32_na_03	multi	match-trap	-
 r1-list_u32_na_03	shared	match-trap	-
 r1-list_u32_na_04	multi	match	-
-r1-list_u32_na_04	shared	refused	AdapterGeneration #390
+r1-list_u32_na_04	shared	match	-
 r1-list_u32_na_05	multi	match	-
-r1-list_u32_na_05	shared	refused	AdapterGeneration #390
+r1-list_u32_na_05	shared	match	-
 r1-list_u32_na_06	multi	match-trap	-
 r1-list_u32_na_06	shared	match-trap	-
 r1-list_u32_na_07	multi	match	-
-r1-list_u32_na_07	shared	refused	AdapterGeneration #390
+r1-list_u32_na_07	shared	match	-
 r1-list_u8_na_00	multi	match-trap	-
-r1-list_u8_na_00	shared	refused	AdapterGeneration #390
+r1-list_u8_na_00	shared	match-trap	-
 r1-list_u8_na_01	multi	match	-
-r1-list_u8_na_01	shared	refused	AdapterGeneration #390
+r1-list_u8_na_01	shared	match	-
 r1-list_u8_na_02	multi	match	-
 r1-list_u8_na_02	shared	match	-
 r1-list_u8_na_03	multi	match-trap	-
-r1-list_u8_na_03	shared	refused	AdapterGeneration #390
+r1-list_u8_na_03	shared	match-trap	-
 r1-list_u8_na_04	multi	match	-
-r1-list_u8_na_04	shared	refused	AdapterGeneration #390
+r1-list_u8_na_04	shared	match	-
 r1-list_u8_na_05	multi	match	-
 r1-list_u8_na_05	shared	match	-
 r1-list_u8_na_06	multi	match-trap	-
-r1-list_u8_na_06	shared	refused	AdapterGeneration #390
+r1-list_u8_na_06	shared	match-trap	-
 r1-list_u8_na_07	multi	match	-
-r1-list_u8_na_07	shared	refused	AdapterGeneration #390
+r1-list_u8_na_07	shared	match	-
 r1-option_na_00	multi	match	-
 r1-option_na_00	shared	match	-
 r1-option_na_01	multi	match-trap	-	#599: returned value checked
@@ -299,15 +299,15 @@ r1-result_na_07	shared	match-trap	-	#599: returned value checked
 r1-string_char_latin1utf16-latin1utf16_01	multi	match	-
 r1-string_char_latin1utf16-latin1utf16_01	shared	match	-
 r1-string_char_latin1utf16-latin1utf16_02	multi	refused	AdapterGeneration #582
-r1-string_char_latin1utf16-latin1utf16_02	shared	refused	AdapterGeneration #390
+r1-string_char_latin1utf16-latin1utf16_02	shared	match-trap	-
 r1-string_char_latin1utf16-latin1utf16_03	multi	refused	AdapterGeneration #582
-r1-string_char_latin1utf16-latin1utf16_03	shared	refused	AdapterGeneration #390
+r1-string_char_latin1utf16-latin1utf16_03	shared	match	-
 r1-string_char_latin1utf16-latin1utf16_04	multi	match	-
 r1-string_char_latin1utf16-latin1utf16_04	shared	match	-
 r1-string_char_latin1utf16-latin1utf16_05	multi	refused	AdapterGeneration #582
-r1-string_char_latin1utf16-latin1utf16_05	shared	refused	AdapterGeneration #390
+r1-string_char_latin1utf16-latin1utf16_05	shared	match-trap	-
 r1-string_char_latin1utf16-latin1utf16_06	multi	refused	AdapterGeneration #582
-r1-string_char_latin1utf16-latin1utf16_06	shared	refused	AdapterGeneration #390
+r1-string_char_latin1utf16-latin1utf16_06	shared	match	-
 r1-string_char_latin1utf16-latin1utf16_07	multi	refused	AdapterGeneration #582
 r1-string_char_latin1utf16-latin1utf16_07	shared	match	-
 r1-string_char_latin1utf16-utf8_00	multi	refused	AdapterGeneration #545
@@ -341,21 +341,21 @@ r1-string_char_utf16-latin1utf16_06	shared	refused	AdapterGeneration #545
 r1-string_char_utf16-latin1utf16_07	multi	refused	AdapterGeneration #545
 r1-string_char_utf16-latin1utf16_07	shared	refused	AdapterGeneration #545
 r1-string_char_utf16-utf16_00	multi	match	-
-r1-string_char_utf16-utf16_00	shared	refused	AdapterGeneration #390
+r1-string_char_utf16-utf16_00	shared	match	-
 r1-string_char_utf16-utf16_01	multi	match	-
-r1-string_char_utf16-utf16_01	shared	refused	AdapterGeneration #390
+r1-string_char_utf16-utf16_01	shared	match	-
 r1-string_char_utf16-utf16_02	multi	match-trap	-	#599: pointer alignment and bounds checked
 r1-string_char_utf16-utf16_02	shared	match-trap	-	#599: pointer alignment and bounds checked
 r1-string_char_utf16-utf16_03	multi	match	-
-r1-string_char_utf16-utf16_03	shared	refused	AdapterGeneration #390
+r1-string_char_utf16-utf16_03	shared	match	-
 r1-string_char_utf16-utf16_04	multi	match	-
-r1-string_char_utf16-utf16_04	shared	refused	AdapterGeneration #390
+r1-string_char_utf16-utf16_04	shared	match	-
 r1-string_char_utf16-utf16_05	multi	match-trap	-
 r1-string_char_utf16-utf16_05	shared	match-trap	-
 r1-string_char_utf16-utf16_06	multi	match	-
-r1-string_char_utf16-utf16_06	shared	refused	AdapterGeneration #390
+r1-string_char_utf16-utf16_06	shared	wrong	-	#622: both bump allocators start at 1024 in the one shared memory, so the callee buffer aliases caller data (match with the callee heap moved to 16384)
 r1-string_char_utf16-utf16_07	multi	match	-
-r1-string_char_utf16-utf16_07	shared	refused	AdapterGeneration #390
+r1-string_char_utf16-utf16_07	shared	match	-
 r1-string_char_utf16-utf8_00	multi	refused	AdapterGeneration #545
 r1-string_char_utf16-utf8_00	shared	refused	AdapterGeneration #545
 r1-string_char_utf16-utf8_01	multi	refused	AdapterGeneration #545
@@ -403,33 +403,33 @@ r1-string_char_utf8-utf16_07	shared	refused	AdapterGeneration #545
 r1-string_char_utf8-utf8_00	multi	match	-
 r1-string_char_utf8-utf8_00	shared	match	-
 r1-string_char_utf8-utf8_01	multi	match	-
-r1-string_char_utf8-utf8_01	shared	refused	AdapterGeneration #390
+r1-string_char_utf8-utf8_01	shared	wrong	-	#622: both bump allocators start at 1024 in the one shared memory, so the callee buffer aliases caller data (match with the callee heap moved to 16384)
 r1-string_char_utf8-utf8_02	multi	match-trap	-
-r1-string_char_utf8-utf8_02	shared	refused	AdapterGeneration #390
+r1-string_char_utf8-utf8_02	shared	match-trap	-
 r1-string_char_utf8-utf8_03	multi	match	-
 r1-string_char_utf8-utf8_03	shared	match	-
 r1-string_char_utf8-utf8_04	multi	match	-
-r1-string_char_utf8-utf8_04	shared	refused	AdapterGeneration #390
+r1-string_char_utf8-utf8_04	shared	wrong	-	#622: both bump allocators start at 1024 in the one shared memory, so the callee buffer aliases caller data (match with the callee heap moved to 16384)
 r1-string_char_utf8-utf8_05	multi	match-trap	-	#599: returned value checked
-r1-string_char_utf8-utf8_05	shared	refused	AdapterGeneration #390
+r1-string_char_utf8-utf8_05	shared	match-trap	-
 r1-string_char_utf8-utf8_06	multi	match	-
 r1-string_char_utf8-utf8_06	shared	match	-
 r1-string_char_utf8-utf8_07	multi	match	-
-r1-string_char_utf8-utf8_07	shared	refused	AdapterGeneration #390
+r1-string_char_utf8-utf8_07	shared	match	-
 r1-string_latin1utf16-latin1utf16_00	multi	match	-
 r1-string_latin1utf16-latin1utf16_00	shared	match	-
 r1-string_latin1utf16-latin1utf16_01	multi	match-trap	-
-r1-string_latin1utf16-latin1utf16_01	shared	refused	AdapterGeneration #390
+r1-string_latin1utf16-latin1utf16_01	shared	match-trap	-
 r1-string_latin1utf16-latin1utf16_03	multi	refused	AdapterGeneration #582
 r1-string_latin1utf16-latin1utf16_03	shared	match	-
 r1-string_latin1utf16-latin1utf16_04	multi	match-trap	-
-r1-string_latin1utf16-latin1utf16_04	shared	refused	AdapterGeneration #390
+r1-string_latin1utf16-latin1utf16_04	shared	match-trap	-
 r1-string_latin1utf16-latin1utf16_05	multi	match	-
-r1-string_latin1utf16-latin1utf16_05	shared	refused	AdapterGeneration #390
+r1-string_latin1utf16-latin1utf16_05	shared	match	-
 r1-string_latin1utf16-latin1utf16_06	multi	refused	AdapterGeneration #582
 r1-string_latin1utf16-latin1utf16_06	shared	match	-
 r1-string_latin1utf16-latin1utf16_07	multi	match-trap	-
-r1-string_latin1utf16-latin1utf16_07	shared	refused	AdapterGeneration #390
+r1-string_latin1utf16-latin1utf16_07	shared	match-trap	-
 r1-string_latin1utf16-utf8_01	multi	match	-
 r1-string_latin1utf16-utf8_01	shared	refused	AdapterGeneration #545
 r1-string_latin1utf16-utf8_02	multi	match	-
@@ -463,15 +463,15 @@ r1-string_utf16-latin1utf16_07	shared	match	-
 r1-string_utf16-utf16_01	multi	match	-
 r1-string_utf16-utf16_01	shared	match	-
 r1-string_utf16-utf16_02	multi	match-trap	-
-r1-string_utf16-utf16_02	shared	refused	AdapterGeneration #390
+r1-string_utf16-utf16_02	shared	match-trap	-
 r1-string_utf16-utf16_03	multi	match	-
-r1-string_utf16-utf16_03	shared	refused	AdapterGeneration #390
+r1-string_utf16-utf16_03	shared	match	-
 r1-string_utf16-utf16_04	multi	match	-
 r1-string_utf16-utf16_04	shared	match	-
 r1-string_utf16-utf16_05	multi	match-trap	-
-r1-string_utf16-utf16_05	shared	refused	AdapterGeneration #390
+r1-string_utf16-utf16_05	shared	match-trap	-
 r1-string_utf16-utf16_06	multi	match	-
-r1-string_utf16-utf16_06	shared	refused	AdapterGeneration #390
+r1-string_utf16-utf16_06	shared	match	-
 r1-string_utf16-utf16_07	multi	match	-
 r1-string_utf16-utf16_07	shared	match	-
 r1-string_utf16-utf8_00	multi	match	-
@@ -521,19 +521,19 @@ r1-string_utf8-utf16_06	shared	refused	AdapterGeneration #545
 r1-string_utf8-utf16_07	multi	match-trap	-
 r1-string_utf8-utf16_07	shared	refused	AdapterGeneration #545
 r1-string_utf8-utf8_00	multi	match	-
-r1-string_utf8-utf8_00	shared	refused	AdapterGeneration #390
+r1-string_utf8-utf8_00	shared	match	-
 r1-string_utf8-utf8_01	multi	match	-
-r1-string_utf8-utf8_01	shared	refused	AdapterGeneration #390
+r1-string_utf8-utf8_01	shared	match	-
 r1-string_utf8-utf8_02	multi	match-trap	-
 r1-string_utf8-utf8_02	shared	match-trap	-
 r1-string_utf8-utf8_03	multi	match	-
-r1-string_utf8-utf8_03	shared	refused	AdapterGeneration #390
+r1-string_utf8-utf8_03	shared	match	-
 r1-string_utf8-utf8_04	multi	match	-
-r1-string_utf8-utf8_04	shared	refused	AdapterGeneration #390
+r1-string_utf8-utf8_04	shared	match	-
 r1-string_utf8-utf8_06	multi	match	-
-r1-string_utf8-utf8_06	shared	refused	AdapterGeneration #390
+r1-string_utf8-utf8_06	shared	match	-
 r1-string_utf8-utf8_07	multi	match	-
-r1-string_utf8-utf8_07	shared	refused	AdapterGeneration #390
+r1-string_utf8-utf8_07	shared	match	-
 r1-tuple_na_00	multi	match	-
 r1-tuple_na_00	shared	match	-
 r1-tuple_na_01	multi	match	-
@@ -553,7 +553,7 @@ r1-tuple_na_07	shared	match	-
 r2-char_na_02	multi	match-trap	-	#599: returned value checked
 r2-char_na_02	shared	match-trap	-	#599: returned value checked
 r2-list_record_na_00	multi	match-trap	-	#599: list element or params value checked
-r2-list_record_na_00	shared	refused	AdapterGeneration #390
+r2-list_record_na_00	shared	match-trap	-
 r2-list_record_na_01	multi	match	-
 r2-list_record_na_01	shared	match	-
 r2-list_record_na_04	multi	match	-
@@ -571,7 +571,7 @@ r2-record_na_06	shared	match	-
 r2-record_string_latin1utf16-latin1utf16_02	multi	refused	AdapterGeneration #582
 r2-record_string_latin1utf16-latin1utf16_02	shared	match-trap	-	#599: list element or params value checked
 r2-record_string_latin1utf16-latin1utf16_04	multi	refused	AdapterGeneration #582
-r2-record_string_latin1utf16-latin1utf16_04	shared	refused	AdapterGeneration #390
+r2-record_string_latin1utf16-latin1utf16_04	shared	match	-
 r2-record_string_latin1utf16-utf8_02	multi	refused	AdapterGeneration #600
 r2-record_string_latin1utf16-utf8_02	shared	refused	AdapterGeneration #600
 r2-record_string_latin1utf16-utf8_03	multi	refused	AdapterGeneration #545
@@ -589,9 +589,9 @@ r2-record_string_utf16-latin1utf16_06	shared	refused	AdapterGeneration #600
 r2-record_string_utf16-utf16_00	multi	match	-
 r2-record_string_utf16-utf16_00	shared	match	-
 r2-record_string_utf16-utf16_05	multi	match-trap	-
-r2-record_string_utf16-utf16_05	shared	refused	AdapterGeneration #390
+r2-record_string_utf16-utf16_05	shared	match-trap	-
 r2-record_string_utf16-utf16_07	multi	match	-
-r2-record_string_utf16-utf16_07	shared	refused	AdapterGeneration #390
+r2-record_string_utf16-utf16_07	shared	wrong	-	#622: both bump allocators start at 1024 in the one shared memory, so the callee buffer aliases caller data (match with the callee heap moved to 16384)
 r2-record_string_utf16-utf8_00	multi	refused	AdapterGeneration #600
 r2-record_string_utf16-utf8_00	shared	refused	AdapterGeneration #600
 r2-record_string_utf16-utf8_01	multi	refused	AdapterGeneration #545
@@ -617,17 +617,17 @@ r2-record_string_utf8-utf16_01	shared	refused	AdapterGeneration #600
 r2-record_string_utf8-utf16_05	multi	refused	AdapterGeneration #545
 r2-record_string_utf8-utf16_05	shared	refused	AdapterGeneration #545
 r2-record_string_utf8-utf8_00	multi	match-trap	-
-r2-record_string_utf8-utf8_00	shared	refused	AdapterGeneration #390
+r2-record_string_utf8-utf8_00	shared	match-trap	-
 r2-record_string_utf8-utf8_03	multi	match-trap	-
-r2-record_string_utf8-utf8_03	shared	refused	AdapterGeneration #390
+r2-record_string_utf8-utf8_03	shared	match-trap	-
 r2-record_string_utf8-utf8_05	multi	match	-
-r2-record_string_utf8-utf8_05	shared	refused	AdapterGeneration #390
+r2-record_string_utf8-utf8_05	shared	wrong	-	#622: both bump allocators start at 1024 in the one shared memory, so the callee buffer aliases caller data (match with the callee heap moved to 16384)
 r2-record_string_utf8-utf8_06	multi	match-trap	-
-r2-record_string_utf8-utf8_06	shared	refused	AdapterGeneration #390
+r2-record_string_utf8-utf8_06	shared	match-trap	-
 r2-string_latin1utf16-utf8_00	multi	refused	AdapterGeneration #600
 r2-string_latin1utf16-utf8_00	shared	refused	AdapterGeneration #600
 r2-string_utf16-utf16_00	multi	match	-
-r2-string_utf16-utf16_00	shared	refused	AdapterGeneration #390
+r2-string_utf16-utf16_00	shared	match	-
 r2-string_utf8-latin1utf16_01	multi	refused	AdapterGeneration #545
 r2-string_utf8-latin1utf16_01	shared	refused	AdapterGeneration #545
 r2-variant_na_00	multi	match	-

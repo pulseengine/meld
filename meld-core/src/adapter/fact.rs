@@ -1599,6 +1599,19 @@ fn wit_may_contain_string(t: &crate::parser::ComponentValType) -> bool {
     }
 }
 
+/// #622: the call moves pointer data (a string or list, at the top level, in a
+/// variant payload, or in the params area) in either direction, so the callee
+/// must receive a buffer from its own realloc.
+fn carries_pointer_data(site: &AdapterSite) -> bool {
+    let r = &site.requirements;
+    !r.param_copy_layouts.is_empty()
+        || !r.result_copy_layouts.is_empty()
+        || !r.conditional_pointer_pairs.is_empty()
+        || !r.conditional_result_pointer_pairs.is_empty()
+        || !r.conditional_result_flat_pairs.is_empty()
+        || !r.params_area_pointer_pair_offsets.is_empty()
+}
+
 /// #582: a cross-memory call with `latin1+utf16` on BOTH sides that carries a
 /// string. Same encoding, but not a byte copy (see
 /// [`emit_compact_utf16_to_compact_utf16_copy_param`]).
@@ -6174,8 +6187,10 @@ impl FactStyleGenerator {
         );
 
         // Determine adapter options based on call site
-        let options =
+        let mut options =
             self.analyze_call_site(site, merged, resource_rep_imports, resource_new_imports);
+        // #622: a pointer-carrying call within one memory still copies.
+        options.copy_within_memory = !site.crosses_memory && carries_pointer_data(site);
 
         // Resolve how this boundary is lowered (ADR-7 path-H inc 2): the class
         // and the #304 inline-eligibility are decided together in the
@@ -6184,7 +6199,12 @@ impl FactStyleGenerator {
         // `generate` before `generate_adapter`).
         let plan = crate::adapter::call_lowering::resolve_call_lowering_plan(
             crate::adapter::call_lowering::BoundaryFacts {
-                crosses_memory: site.crosses_memory,
+                // #622 (owner decision 2026-11-20): under `--memory shared` a
+                // call that passes or returns a string or list is planned as a
+                // copy within the one memory. The callee's realloc is called and
+                // the data copied, as unfused and under multi, instead of the
+                // callee receiving the caller's buffer.
+                crosses_memory: site.crosses_memory || carries_pointer_data(site),
                 // #620: differing `string-encoding` options matter only when a
                 // string can cross. A char-only call between a utf8 and a utf16
                 // component went to the string transcoder, which reads params 0
@@ -7307,7 +7327,7 @@ impl FactStyleGenerator {
                 site.export_name, site.import_module
             )));
         }
-        if options.caller_memory == options.callee_memory {
+        if options.caller_memory == options.callee_memory && !options.copy_within_memory {
             return Ok(());
         }
         if copies_result && options.caller_realloc.is_none() {
@@ -7422,7 +7442,9 @@ impl FactStyleGenerator {
         // When memories differ, the adapter must copy the buffer across.
         let uses_params_ptr = site.requirements.params_area_byte_size.is_some();
 
-        if uses_params_ptr && options.caller_memory != options.callee_memory {
+        if uses_params_ptr
+            && (options.caller_memory != options.callee_memory || options.copy_within_memory)
+        {
             log::debug!(
                 "params-ptr adapter: generating for import={} (buffer={}B, {} ptr pairs, {} borrow fixups)",
                 site.import_name,
@@ -7451,8 +7473,9 @@ impl FactStyleGenerator {
         let result_count = callee_result_count;
         let result_types = callee_result_types;
 
-        // If memories are the same, just do direct call (with post-return if needed)
-        if options.caller_memory == options.callee_memory {
+        // If memories are the same and nothing is copied (#622), just do a
+        // direct call (with post-return if needed).
+        if options.caller_memory == options.callee_memory && !options.copy_within_memory {
             let has_post_return = options.callee_post_return.is_some();
             let has_resource_ops = !options.resource_rep_calls.is_empty();
 
@@ -8522,7 +8545,7 @@ impl FactStyleGenerator {
         // copy (Phase 0/1/1b) is meaningless here and MUST be skipped — indexing
         // those flat positions as locals would corrupt scratch/retptr locals.
         let uses_params_area = site.requirements.params_area_byte_size.is_some()
-            && options.caller_memory != options.callee_memory;
+            && (options.caller_memory != options.callee_memory || options.copy_within_memory);
 
         if uses_params_area {
             // Fail LOUD rather than emit silently-wrong code for shapes the
