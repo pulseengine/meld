@@ -165,6 +165,19 @@ jobs:
           disk-cache: ${{ github.workflow }}
           repository-cache: true
 
+      # .bazelrc sets `common --lockfile_mode=error`, so every bazel command
+      # below already refuses a stale MODULE.bazel.lock. This step runs first
+      # so a stale lock fails with its own name instead of inside the census
+      # or the proof run. Planted control (2026-11-20): one added bazel_dep
+      # without regenerating gave exit 2, "Missing checksum for registry
+      # file ... not permitted with --lockfile_mode=error".
+      - name: MODULE.bazel.lock is current
+        run: |
+          grep -qx 'common --lockfile_mode=error' .bazelrc \
+            || { echo "::error::.bazelrc no longer sets --lockfile_mode=error"; exit 1; }
+          bazel mod deps --lockfile_mode=error >/dev/null \
+            || { echo "::error::MODULE.bazel.lock is stale; regenerate with: bazel mod deps --lockfile_mode=update"; exit 1; }
+
       # A census COUNTS files; it does not show that anything CHECKS them.
       # These two numbers have to agree, or the census reports proofs as
       # evidence which the gate never builds — the #447 defect one level down,
