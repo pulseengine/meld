@@ -1618,7 +1618,8 @@ fn carries_pointer_data(site: &AdapterSite) -> bool {
 fn is_compact_utf16_both_sides_with_strings(site: &AdapterSite) -> bool {
     use crate::parser::CanonStringEncoding::CompactUtf16;
     let r = &site.requirements;
-    site.crosses_memory
+    // #601: a copy within one memory (#622) deflates as well.
+    (site.crosses_memory || carries_pointer_data(site))
         && r.caller_encoding == Some(CompactUtf16)
         && r.callee_encoding == Some(CompactUtf16)
         && r.param_wit_types
