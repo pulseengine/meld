@@ -80,13 +80,6 @@ npm-os = "linux"
 npm-cpu = "arm64"
 npm-libc = "musl"
 
-[tool.meld-dist.targets."x86_64-apple-darwin"]
-os = "macos"
-wheel-arch = "x86_64"
-npm-platform = "darwin-x64"
-npm-os = "darwin"
-npm-cpu = "x64"
-
 [tool.meld-dist.targets."aarch64-apple-darwin"]
 os = "macos"
 wheel-arch = "arm64"
