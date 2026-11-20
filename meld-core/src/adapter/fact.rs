@@ -7465,9 +7465,8 @@ impl FactStyleGenerator {
                 let dest_local = dest_ptr_local + pair_idx as u32;
                 let byte_mult = param_layouts
                     .get(pair_idx)
-                    .map(|cl| match cl {
-                        crate::resolver::CopyLayout::Bulk { byte_multiplier } => *byte_multiplier,
-                        crate::resolver::CopyLayout::Elements { element_size, .. } => *element_size,
+                    .map(|cl| {
+                        cl.unit_bytes(options.caller_string_encoding == StringEncoding::Utf16)
                     })
                     .unwrap_or(1);
 
@@ -7482,7 +7481,13 @@ impl FactStyleGenerator {
                 // so the tag bit is clear and the tag-aware path returns `len`.
                 let is_compact_utf16 =
                     options.caller_string_encoding == StringEncoding::Latin1 && byte_mult == 1;
-                let realloc_align = if is_compact_utf16 { 2 } else { 1 };
+                let realloc_align = if is_compact_utf16
+                    || (options.caller_string_encoding == StringEncoding::Utf16 && byte_mult == 2)
+                {
+                    2
+                } else {
+                    1
+                };
 
                 // #582: a latin1+utf16 string into a latin1+utf16 callee is
                 // deflated when tagged utf16 and latin1-representable. The
@@ -7544,7 +7549,7 @@ impl FactStyleGenerator {
                         callee_realloc,
                         fixup_base,
                         // Param-side: governed by the caller's string encoding.
-                        options.caller_string_encoding == StringEncoding::Latin1,
+                        options.caller_string_encoding,
                     );
                 }
             } // end for each pointer pair
@@ -7788,16 +7793,22 @@ impl FactStyleGenerator {
                 for cond in &site.requirements.conditional_result_flat_pairs {
                     let ptr_local = result_save_base + cond.ptr_position;
                     let len_local = result_save_base + cond.ptr_position + 1;
-                    let byte_mult = match &cond.copy_layout {
-                        crate::resolver::CopyLayout::Bulk { byte_multiplier } => *byte_multiplier,
-                        crate::resolver::CopyLayout::Elements { element_size, .. } => *element_size,
-                    };
+                    let byte_mult = cond
+                        .copy_layout
+                        .unit_bytes(options.callee_string_encoding == StringEncoding::Utf16);
                     // Result-side (callee → caller) string: tag-encoding is
                     // governed by `callee_string_encoding` (the callee produced
                     // it). See the unconditional result-copy above.
                     let is_compact_utf16 =
                         options.callee_string_encoding == StringEncoding::Latin1 && byte_mult == 1;
-                    let realloc_align = if is_compact_utf16 { 2 } else { 1 };
+                    let realloc_align = if is_compact_utf16
+                        || (options.callee_string_encoding == StringEncoding::Utf16
+                            && byte_mult == 2)
+                    {
+                        2
+                    } else {
+                        1
+                    };
 
                     // if (all guards in chain hold) { allocate in caller,
                     // copy, replace ptr } — outer-guard ANDing per LS-P-10.
@@ -7981,10 +7992,7 @@ impl FactStyleGenerator {
             let dest_local = pair_dest_base + pair_idx as u32;
             let byte_mult = copy_layouts
                 .get(pair_idx)
-                .map(|cl| match cl {
-                    crate::resolver::CopyLayout::Bulk { byte_multiplier } => *byte_multiplier,
-                    crate::resolver::CopyLayout::Elements { element_size, .. } => *element_size,
-                })
+                .map(|cl| cl.unit_bytes(options.caller_string_encoding == StringEncoding::Utf16))
                 .unwrap_or(1);
 
             // Read old_ptr from callee's buffer: i32.load callee_mem (callee_ptr + byte_offset)
@@ -8007,7 +8015,13 @@ impl FactStyleGenerator {
             // case; a plain list<u8> stays unaffected (count < 2^31 ⇒ tag clear).
             let is_compact_utf16 =
                 options.caller_string_encoding == StringEncoding::Latin1 && byte_mult == 1;
-            let realloc_align = if is_compact_utf16 { 2 } else { 1 };
+            let realloc_align = if is_compact_utf16
+                || (options.caller_string_encoding == StringEncoding::Utf16 && byte_mult == 2)
+            {
+                2
+            } else {
+                1
+            };
 
             // Allocate: new_ptr = cabi_realloc(0, 0, align, <byte count>)
             emit_overflow_guard(func, pair_len_local, byte_mult);
@@ -8438,9 +8452,8 @@ impl FactStyleGenerator {
                 let dest_local = dest_ptr_base + pair_idx as u32;
                 let byte_mult = param_layouts
                     .get(pair_idx)
-                    .map(|cl| match cl {
-                        crate::resolver::CopyLayout::Bulk { byte_multiplier } => *byte_multiplier,
-                        crate::resolver::CopyLayout::Elements { element_size, .. } => *element_size,
+                    .map(|cl| {
+                        cl.unit_bytes(options.caller_string_encoding == StringEncoding::Utf16)
                     })
                     .unwrap_or(1);
 
@@ -8450,7 +8463,13 @@ impl FactStyleGenerator {
                 // adapter's param-copy loop for the full reasoning.
                 let is_compact_utf16 =
                     options.caller_string_encoding == StringEncoding::Latin1 && byte_mult == 1;
-                let realloc_align = if is_compact_utf16 { 2 } else { 1 };
+                let realloc_align = if is_compact_utf16
+                    || (options.caller_string_encoding == StringEncoding::Utf16 && byte_mult == 2)
+                {
+                    2
+                } else {
+                    1
+                };
 
                 // Allocate: dest = cabi_realloc(0, 0, align, <byte count>)
                 emit_overflow_guard(&mut func, len_pos, byte_mult);
@@ -8487,7 +8506,7 @@ impl FactStyleGenerator {
                         callee_realloc,
                         fixup_locals_base,
                         // Param-side: governed by the caller's string encoding.
-                        options.caller_string_encoding == StringEncoding::Latin1,
+                        options.caller_string_encoding,
                     );
                 }
 
@@ -8574,14 +8593,19 @@ impl FactStyleGenerator {
             for cond in &site.requirements.conditional_pointer_pairs {
                 let ptr_local = cond.ptr_position;
                 let len_local = cond.ptr_position + 1;
-                let byte_mult = match &cond.copy_layout {
-                    crate::resolver::CopyLayout::Bulk { byte_multiplier } => *byte_multiplier,
-                    crate::resolver::CopyLayout::Elements { element_size, .. } => *element_size,
-                };
+                let byte_mult = cond
+                    .copy_layout
+                    .unit_bytes(options.caller_string_encoding == StringEncoding::Utf16);
                 // Param-side (caller → callee) tagged latin1+utf16 string.
                 let is_compact_utf16 =
                     options.caller_string_encoding == StringEncoding::Latin1 && byte_mult == 1;
-                let realloc_align = if is_compact_utf16 { 2 } else { 1 };
+                let realloc_align = if is_compact_utf16
+                    || (options.caller_string_encoding == StringEncoding::Utf16 && byte_mult == 2)
+                {
+                    2
+                } else {
+                    1
+                };
 
                 // Outer-guard AND-chain (LS-P-10) before firing the copy.
                 emit_conditional_guard_chain_flat(&mut func, cond, 0);
@@ -8621,7 +8645,7 @@ impl FactStyleGenerator {
                     callee_realloc,
                     fixup_locals_base,
                     // Param-side: governed by the caller's string encoding.
-                    options.caller_string_encoding == StringEncoding::Latin1,
+                    options.caller_string_encoding,
                 );
 
                 // Replace ptr with callee's copy
@@ -8678,13 +8702,8 @@ impl FactStyleGenerator {
                     let len_offset = slot.byte_offset + 4;
                     let byte_mult = result_layouts
                         .get(result_pair_idx)
-                        .map(|cl| match cl {
-                            crate::resolver::CopyLayout::Bulk { byte_multiplier } => {
-                                *byte_multiplier
-                            }
-                            crate::resolver::CopyLayout::Elements { element_size, .. } => {
-                                *element_size
-                            }
+                        .map(|cl| {
+                            cl.unit_bytes(options.callee_string_encoding == StringEncoding::Utf16)
                         })
                         .unwrap_or(1);
 
@@ -8714,7 +8733,14 @@ impl FactStyleGenerator {
                     // stays tagged (only the byte count is masked here).
                     let is_compact_utf16 =
                         options.callee_string_encoding == StringEncoding::Latin1 && byte_mult == 1;
-                    let realloc_align = if is_compact_utf16 { 2 } else { 1 };
+                    let realloc_align = if is_compact_utf16
+                        || (options.callee_string_encoding == StringEncoding::Utf16
+                            && byte_mult == 2)
+                    {
+                        2
+                    } else {
+                        1
+                    };
 
                     // Allocate in caller's memory: <byte count> bytes
                     emit_overflow_guard(&mut func, data_len_local, byte_mult);
@@ -8757,7 +8783,7 @@ impl FactStyleGenerator {
                             caller_realloc,
                             fixup_locals_base,
                             // Result-side: governed by the callee's string encoding.
-                            options.callee_string_encoding == StringEncoding::Latin1,
+                            options.callee_string_encoding,
                         );
                     }
 
@@ -8863,10 +8889,9 @@ impl FactStyleGenerator {
             for cond in &site.requirements.conditional_result_pointer_pairs {
                 let ptr_offset = cond.ptr_position;
                 let len_offset = cond.ptr_position + 4;
-                let byte_mult = match &cond.copy_layout {
-                    crate::resolver::CopyLayout::Bulk { byte_multiplier } => *byte_multiplier,
-                    crate::resolver::CopyLayout::Elements { element_size, .. } => *element_size,
-                };
+                let byte_mult = cond
+                    .copy_layout
+                    .unit_bytes(options.callee_string_encoding == StringEncoding::Utf16);
 
                 // Outer-guard AND-chain (LS-P-10) before firing the copy.
                 // Each guard's discriminant is loaded from the callee's
@@ -8903,7 +8928,13 @@ impl FactStyleGenerator {
                 // list<u8>; the length written back to the retptr stays tagged.
                 let is_compact_utf16 =
                     options.callee_string_encoding == StringEncoding::Latin1 && byte_mult == 1;
-                let realloc_align = if is_compact_utf16 { 2 } else { 1 };
+                let realloc_align = if is_compact_utf16
+                    || (options.callee_string_encoding == StringEncoding::Utf16 && byte_mult == 2)
+                {
+                    2
+                } else {
+                    1
+                };
 
                 // Allocate in caller memory
                 emit_overflow_guard(&mut func, data_len_local, byte_mult);
@@ -8941,7 +8972,7 @@ impl FactStyleGenerator {
                     caller_realloc,
                     fixup_locals_base,
                     // Result-side: governed by the callee's string encoding.
-                    options.callee_string_encoding == StringEncoding::Latin1,
+                    options.callee_string_encoding,
                 );
 
                 // Write fixed-up ptr to caller's retptr
@@ -9032,7 +9063,7 @@ impl FactStyleGenerator {
         dst_mem: u32,
         realloc_func: u32,
         locals_base: u32,
-        is_compact_utf16: bool,
+        string_encoding: StringEncoding,
     ) {
         if let crate::resolver::CopyLayout::Elements {
             element_size,
@@ -9052,7 +9083,7 @@ impl FactStyleGenerator {
                 dst_mem,
                 realloc_func,
                 locals_base,
-                is_compact_utf16,
+                string_encoding,
             );
         }
     }
@@ -9076,15 +9107,20 @@ impl FactStyleGenerator {
         for cond in &site.requirements.conditional_pointer_pairs {
             let ptr_local = cond.ptr_position;
             let len_local = cond.ptr_position + 1;
-            let byte_mult = match &cond.copy_layout {
-                crate::resolver::CopyLayout::Bulk { byte_multiplier } => *byte_multiplier,
-                crate::resolver::CopyLayout::Elements { element_size, .. } => *element_size,
-            };
+            let byte_mult = cond
+                .copy_layout
+                .unit_bytes(options.caller_string_encoding == StringEncoding::Utf16);
             // Param-side (caller → callee) tagged latin1+utf16 string: see
             // the unconditional param-copy loop in the memory-copy adapter.
             let is_compact_utf16 =
                 options.caller_string_encoding == StringEncoding::Latin1 && byte_mult == 1;
-            let realloc_align = if is_compact_utf16 { 2 } else { 1 };
+            let realloc_align = if is_compact_utf16
+                || (options.caller_string_encoding == StringEncoding::Utf16 && byte_mult == 2)
+            {
+                2
+            } else {
+                1
+            };
 
             // if (all guards in chain hold) { copy and replace ptr }
             // — outer-guard ANDing matters for nested option/result/variant
@@ -9119,7 +9155,7 @@ impl FactStyleGenerator {
                 options.callee_memory,
                 callee_realloc,
                 scratch_base + 1,
-                options.caller_string_encoding == StringEncoding::Latin1,
+                options.caller_string_encoding,
             );
 
             // Replace the original ptr with the new ptr in callee memory
@@ -9221,7 +9257,7 @@ impl FactStyleGenerator {
         // a nested `list<u8>`, but the latter is unaffected: a legitimate
         // list<u8> count is < 2^31, so its tag bit is clear and the tag-aware
         // path returns `len` unchanged (see `emit_copy_byte_count`).
-        is_compact_utf16: bool,
+        string_encoding: StringEncoding,
     ) {
         if inner_pointers.is_empty() {
             return;
@@ -9249,10 +9285,7 @@ impl FactStyleGenerator {
         for ip in inner_pointers {
             let inner_offset = ip.byte_offset;
             let inner_layout = &ip.copy_layout;
-            let byte_mult = match inner_layout {
-                crate::resolver::CopyLayout::Bulk { byte_multiplier } => *byte_multiplier,
-                crate::resolver::CopyLayout::Elements { element_size, .. } => *element_size,
-            };
+            let byte_mult = inner_layout.unit_bytes(string_encoding == StringEncoding::Utf16);
 
             // LS-P-12: AND-evaluate this descriptor's per-element discriminant
             // guards. Empty guards → unconditional fixup (the historic
@@ -9338,7 +9371,13 @@ impl FactStyleGenerator {
             // A byte-granular inner buffer in a latin1+utf16 component is a
             // tag-encoded string; mask/double its byte count. Non-byte-granular
             // inner buffers and list<u8> are handled by the plain path.
-            let inner_is_compact_utf16 = is_compact_utf16 && byte_mult == 1;
+            let inner_is_compact_utf16 =
+                string_encoding == StringEncoding::Latin1 && byte_mult == 1;
+            let inner_utf16_string = string_encoding == StringEncoding::Utf16
+                && matches!(
+                    inner_layout,
+                    crate::resolver::CopyLayout::Bulk { string: true, .. }
+                );
 
             // Allocate inner data in dst memory: new_ptr = realloc(0, 0, align, <byte count>)
             emit_overflow_guard(func, inner_len, byte_mult);
@@ -9346,7 +9385,11 @@ impl FactStyleGenerator {
                 func,
                 realloc_func,
                 new_ptr,
-                if inner_is_compact_utf16 { 2 } else { 1 },
+                if inner_is_compact_utf16 || inner_utf16_string {
+                    2
+                } else {
+                    1
+                },
                 |b| emit_copy_byte_count(b, inner_len, byte_mult, inner_is_compact_utf16),
             );
 
@@ -9378,7 +9421,7 @@ impl FactStyleGenerator {
                     dst_mem,
                     realloc_func,
                     locals_base + 4, // next level gets next 4 scratch locals
-                    is_compact_utf16,
+                    string_encoding,
                 );
             }
 
@@ -12227,7 +12270,9 @@ impl FactStyleGenerator {
             let byte_mult = param_layouts
                 .get(pair_idx)
                 .map(|cl| match cl {
-                    crate::resolver::CopyLayout::Bulk { byte_multiplier } => *byte_multiplier,
+                    crate::resolver::CopyLayout::Bulk {
+                        byte_multiplier, ..
+                    } => *byte_multiplier,
                     crate::resolver::CopyLayout::Elements { element_size, .. } => *element_size,
                 })
                 .unwrap_or(1);
@@ -14097,7 +14142,13 @@ impl FactStyleGenerator {
     /// `Bulk` byte_mult==1 string shape. Treated conservatively as NOT
     /// top-level-string so it cannot widen the allow-through.
     fn layout_is_top_level_byte_granular(cl: &crate::resolver::CopyLayout) -> bool {
-        matches!(cl, crate::resolver::CopyLayout::Bulk { byte_multiplier: 1 })
+        matches!(
+            cl,
+            crate::resolver::CopyLayout::Bulk {
+                byte_multiplier: 1,
+                ..
+            }
+        )
     }
 
     /// Recursively: does this copy layout carry a byte-granular `(ptr, len)`
@@ -14111,7 +14162,9 @@ impl FactStyleGenerator {
     /// under-trips the guard and silently mis-transcodes (LS-F-27).
     fn layout_bears_byte_granular_buffer(cl: &crate::resolver::CopyLayout) -> bool {
         match cl {
-            crate::resolver::CopyLayout::Bulk { byte_multiplier } => *byte_multiplier == 1,
+            crate::resolver::CopyLayout::Bulk {
+                byte_multiplier, ..
+            } => *byte_multiplier == 1,
             crate::resolver::CopyLayout::Elements {
                 element_size,
                 inner_pointers,
@@ -15459,7 +15512,10 @@ mod tests {
             element_size: 8,
             inner_pointers: vec![crate::resolver::InnerPointer::unconditional(
                 0,
-                crate::resolver::CopyLayout::Bulk { byte_multiplier: 1 },
+                crate::resolver::CopyLayout::Bulk {
+                    byte_multiplier: 1,
+                    string: false,
+                },
             )],
             inner_resources: Vec::new(),
         }
@@ -15557,13 +15613,18 @@ mod tests {
         let sig = (vec![I32; 5], vec![I32]);
         let (merged, mut site) = issue512_cross_memory_site(sig.clone(), sig);
         site.requirements.pointer_pair_positions = vec![0];
-        site.requirements.param_copy_layouts =
-            vec![crate::resolver::CopyLayout::Bulk { byte_multiplier: 1 }];
+        site.requirements.param_copy_layouts = vec![crate::resolver::CopyLayout::Bulk {
+            byte_multiplier: 1,
+            string: false,
+        }];
         site.requirements.conditional_pointer_pairs = vec![issue512_cond_pair(
             2,
             3,
             4,
-            crate::resolver::CopyLayout::Bulk { byte_multiplier: 1 },
+            crate::resolver::CopyLayout::Bulk {
+                byte_multiplier: 1,
+                string: false,
+            },
         )];
         assert_eq!(
             issue512_realloc_calls(&merged, &site, 2, "#512 memcopy mixed params"),
@@ -15738,8 +15799,10 @@ mod tests {
         let mut site = async_lift_site("[async-lift]greet");
         site.crosses_memory = true;
         site.requirements.pointer_pair_positions = vec![0];
-        site.requirements.param_copy_layouts =
-            vec![crate::resolver::CopyLayout::Bulk { byte_multiplier: 1 }];
+        site.requirements.param_copy_layouts = vec![crate::resolver::CopyLayout::Bulk {
+            byte_multiplier: 1,
+            string: false,
+        }];
         site.requirements.caller_encoding = Some(caller);
         site.requirements.callee_encoding = Some(callee);
         site
@@ -15756,7 +15819,10 @@ mod tests {
             element_size: 8,
             inner_pointers: vec![InnerPointer::unconditional(
                 0,
-                CopyLayout::Bulk { byte_multiplier: 1 },
+                CopyLayout::Bulk {
+                    byte_multiplier: 1,
+                    string: false,
+                },
             )],
             inner_resources: vec![],
         };
@@ -15937,8 +16003,10 @@ mod tests {
         let mut site = async_lift_site("[async-lift]greet");
         site.crosses_memory = true;
         site.requirements.result_pointer_pair_offsets = vec![0];
-        site.requirements.result_copy_layouts =
-            vec![crate::resolver::CopyLayout::Bulk { byte_multiplier: 1 }];
+        site.requirements.result_copy_layouts = vec![crate::resolver::CopyLayout::Bulk {
+            byte_multiplier: 1,
+            string: false,
+        }];
         // caller=Utf8, callee=CompactUtf16 ⇒ result dir (callee→caller) =
         // latin1→utf8, now transcoded by the result writeback.
         site.requirements.caller_encoding = Some(CanonStringEncoding::Utf8);
@@ -15962,7 +16030,10 @@ mod tests {
             element_size: 8,
             inner_pointers: vec![InnerPointer::unconditional(
                 0,
-                CopyLayout::Bulk { byte_multiplier: 1 },
+                CopyLayout::Bulk {
+                    byte_multiplier: 1,
+                    string: false,
+                },
             )],
             inner_resources: vec![],
         };
@@ -15992,7 +16063,10 @@ mod tests {
             element_size: 8,
             inner_pointers: vec![InnerPointer::unconditional(
                 0,
-                CopyLayout::Bulk { byte_multiplier: 1 },
+                CopyLayout::Bulk {
+                    byte_multiplier: 1,
+                    string: false,
+                },
             )],
             inner_resources: vec![],
         };
@@ -16026,7 +16100,10 @@ mod tests {
             element_size: 8,
             inner_pointers: vec![InnerPointer::unconditional(
                 0,
-                CopyLayout::Bulk { byte_multiplier: 1 },
+                CopyLayout::Bulk {
+                    byte_multiplier: 1,
+                    string: false,
+                },
             )],
             inner_resources: vec![],
         };
@@ -16064,8 +16141,10 @@ mod tests {
         let mut site = async_lift_site("[async-lift]greet");
         site.crosses_memory = true;
         site.requirements.result_pointer_pair_offsets = vec![0];
-        site.requirements.result_copy_layouts =
-            vec![crate::resolver::CopyLayout::Bulk { byte_multiplier: 1 }];
+        site.requirements.result_copy_layouts = vec![crate::resolver::CopyLayout::Bulk {
+            byte_multiplier: 1,
+            string: false,
+        }];
         site.requirements.caller_encoding = Some(CanonStringEncoding::Utf16);
         site.requirements.callee_encoding = Some(CanonStringEncoding::CompactUtf16);
         assert!(
@@ -16091,8 +16170,10 @@ mod tests {
         let mut site = async_lift_site("[async-lift]greet");
         site.crosses_memory = true;
         site.requirements.result_pointer_pair_offsets = vec![0];
-        site.requirements.result_copy_layouts =
-            vec![crate::resolver::CopyLayout::Bulk { byte_multiplier: 1 }];
+        site.requirements.result_copy_layouts = vec![crate::resolver::CopyLayout::Bulk {
+            byte_multiplier: 1,
+            string: false,
+        }];
         // caller=Utf16, callee=Utf8 ⇒ result dir (callee→caller) = Utf8→Utf16.
         site.requirements.caller_encoding = Some(CanonStringEncoding::Utf16);
         site.requirements.callee_encoding = Some(CanonStringEncoding::Utf8);
@@ -16107,8 +16188,10 @@ mod tests {
         let mut mirror = async_lift_site("[async-lift]greet");
         mirror.crosses_memory = true;
         mirror.requirements.result_pointer_pair_offsets = vec![0];
-        mirror.requirements.result_copy_layouts =
-            vec![crate::resolver::CopyLayout::Bulk { byte_multiplier: 1 }];
+        mirror.requirements.result_copy_layouts = vec![crate::resolver::CopyLayout::Bulk {
+            byte_multiplier: 1,
+            string: false,
+        }];
         mirror.requirements.caller_encoding = Some(CanonStringEncoding::Utf8);
         mirror.requirements.callee_encoding = Some(CanonStringEncoding::Utf16);
         assert!(
@@ -16133,8 +16216,10 @@ mod tests {
         let mut utf8_to_latin1 = async_lift_site("[async-lift]greet");
         utf8_to_latin1.crosses_memory = true;
         utf8_to_latin1.requirements.result_pointer_pair_offsets = vec![0];
-        utf8_to_latin1.requirements.result_copy_layouts =
-            vec![crate::resolver::CopyLayout::Bulk { byte_multiplier: 1 }];
+        utf8_to_latin1.requirements.result_copy_layouts = vec![crate::resolver::CopyLayout::Bulk {
+            byte_multiplier: 1,
+            string: false,
+        }];
         utf8_to_latin1.requirements.caller_encoding = Some(CanonStringEncoding::CompactUtf16);
         utf8_to_latin1.requirements.callee_encoding = Some(CanonStringEncoding::Utf8);
         assert!(
@@ -16148,7 +16233,10 @@ mod tests {
         utf16_to_latin1.crosses_memory = true;
         utf16_to_latin1.requirements.result_pointer_pair_offsets = vec![0];
         utf16_to_latin1.requirements.result_copy_layouts =
-            vec![crate::resolver::CopyLayout::Bulk { byte_multiplier: 1 }];
+            vec![crate::resolver::CopyLayout::Bulk {
+                byte_multiplier: 1,
+                string: false,
+            }];
         utf16_to_latin1.requirements.caller_encoding = Some(CanonStringEncoding::CompactUtf16);
         utf16_to_latin1.requirements.callee_encoding = Some(CanonStringEncoding::Utf16);
         assert!(
@@ -16475,8 +16563,10 @@ mod tests {
         site.crosses_memory = true;
         // String param at flat position 0; caller UTF-8, callee UTF-16.
         site.requirements.pointer_pair_positions = vec![0];
-        site.requirements.param_copy_layouts =
-            vec![crate::resolver::CopyLayout::Bulk { byte_multiplier: 1 }];
+        site.requirements.param_copy_layouts = vec![crate::resolver::CopyLayout::Bulk {
+            byte_multiplier: 1,
+            string: false,
+        }];
         site.requirements.caller_encoding = Some(crate::parser::CanonStringEncoding::Utf8);
         site.requirements.callee_encoding = Some(crate::parser::CanonStringEncoding::Utf16);
 
@@ -16747,8 +16837,10 @@ mod tests {
         // `i32.load`(callee) / `i32.store`(caller) directions of SR-14.
         site.requirements.return_area_byte_size = Some(8);
         site.requirements.result_pointer_pair_offsets = vec![0];
-        site.requirements.result_copy_layouts =
-            vec![crate::resolver::CopyLayout::Bulk { byte_multiplier: 1 }];
+        site.requirements.result_copy_layouts = vec![crate::resolver::CopyLayout::Bulk {
+            byte_multiplier: 1,
+            string: false,
+        }];
         site.requirements.return_area_slots = vec![crate::resolver::ReturnAreaSlot {
             byte_offset: 0,
             byte_size: 4,
@@ -16993,8 +17085,10 @@ mod tests {
             requirements: Default::default(),
         };
         site.requirements.pointer_pair_positions = vec![0];
-        site.requirements.param_copy_layouts =
-            vec![crate::resolver::CopyLayout::Bulk { byte_multiplier: 1 }];
+        site.requirements.param_copy_layouts = vec![crate::resolver::CopyLayout::Bulk {
+            byte_multiplier: 1,
+            string: false,
+        }];
         site.requirements.caller_encoding = Some(crate::parser::CanonStringEncoding::Utf8);
         site.requirements.callee_encoding = Some(crate::parser::CanonStringEncoding::Utf16);
 
@@ -17180,8 +17274,10 @@ mod tests {
         site.import_func_type_idx = Some(0); // caller type (retptr) → 1 param
         site.crosses_memory = true;
         site.requirements.result_pointer_pair_offsets = vec![0];
-        site.requirements.result_copy_layouts =
-            vec![crate::resolver::CopyLayout::Bulk { byte_multiplier: 1 }];
+        site.requirements.result_copy_layouts = vec![crate::resolver::CopyLayout::Bulk {
+            byte_multiplier: 1,
+            string: false,
+        }];
         site.requirements.caller_encoding = Some(caller_enc);
         site.requirements.callee_encoding = Some(callee_enc);
         (merged, site)
@@ -17458,7 +17554,10 @@ mod tests {
             element_size: 8,
             inner_pointers: vec![crate::resolver::InnerPointer::unconditional(
                 0,
-                crate::resolver::CopyLayout::Bulk { byte_multiplier: 1 },
+                crate::resolver::CopyLayout::Bulk {
+                    byte_multiplier: 1,
+                    string: false,
+                },
             )],
             inner_resources: Vec::new(),
         }];
@@ -17662,7 +17761,10 @@ mod tests {
             element_size: 8,
             inner_pointers: vec![crate::resolver::InnerPointer::unconditional(
                 0,
-                crate::resolver::CopyLayout::Bulk { byte_multiplier: 1 },
+                crate::resolver::CopyLayout::Bulk {
+                    byte_multiplier: 1,
+                    string: false,
+                },
             )],
             inner_resources: Vec::new(),
         }];
@@ -17720,7 +17822,10 @@ mod tests {
             element_size: 8,
             inner_pointers: vec![crate::resolver::InnerPointer::unconditional(
                 0,
-                crate::resolver::CopyLayout::Bulk { byte_multiplier: 1 },
+                crate::resolver::CopyLayout::Bulk {
+                    byte_multiplier: 1,
+                    string: false,
+                },
             )],
             inner_resources: Vec::new(),
         }];
@@ -17767,7 +17872,10 @@ mod tests {
                 element_size: 8,
                 inner_pointers: vec![crate::resolver::InnerPointer::unconditional(
                     0,
-                    crate::resolver::CopyLayout::Bulk { byte_multiplier: 1 },
+                    crate::resolver::CopyLayout::Bulk {
+                        byte_multiplier: 1,
+                        string: false,
+                    },
                 )],
                 inner_resources: Vec::new(),
             }];
@@ -18030,8 +18138,10 @@ mod tests {
         site.import_func_type_idx = Some(1); // caller type (i32,i32) → 2 params
         site.crosses_memory = true;
         site.requirements.pointer_pair_positions = vec![0];
-        site.requirements.param_copy_layouts =
-            vec![crate::resolver::CopyLayout::Bulk { byte_multiplier: 1 }];
+        site.requirements.param_copy_layouts = vec![crate::resolver::CopyLayout::Bulk {
+            byte_multiplier: 1,
+            string: false,
+        }];
         site.requirements.caller_encoding = Some(crate::parser::CanonStringEncoding::Utf8);
         site.requirements.callee_encoding = Some(crate::parser::CanonStringEncoding::Utf16);
 
@@ -18179,7 +18289,10 @@ mod tests {
             element_size: 8,
             inner_pointers: vec![crate::resolver::InnerPointer::unconditional(
                 0,
-                crate::resolver::CopyLayout::Bulk { byte_multiplier: 1 },
+                crate::resolver::CopyLayout::Bulk {
+                    byte_multiplier: 1,
+                    string: false,
+                },
             )],
             inner_resources: Vec::new(),
         }];
@@ -18848,8 +18961,10 @@ mod tests {
         site.import_func_type_idx = Some(1); // caller type (i32,i32) → 2 params
         site.crosses_memory = true;
         site.requirements.pointer_pair_positions = vec![0];
-        site.requirements.param_copy_layouts =
-            vec![crate::resolver::CopyLayout::Bulk { byte_multiplier: 1 }];
+        site.requirements.param_copy_layouts = vec![crate::resolver::CopyLayout::Bulk {
+            byte_multiplier: 1,
+            string: false,
+        }];
         site.requirements.caller_encoding = Some(caller_enc);
         site.requirements.callee_encoding = Some(callee_enc);
         (merged, site)
