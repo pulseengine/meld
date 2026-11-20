@@ -4229,7 +4229,7 @@ artifacts:
   - id: SR-135
     type: sw-req
     title: "Every refused differential row records the refusal reason"
-    status: draft
+    status: implemented
     release: v0.71.0
     description: "Serves North Star O3 (summary; indicator unmoved). The differential ledger gains a refusal-reason column taken from the typed error, and the ledger test fails on a refused row without a reason. Negative control: a planted reason-less row fails the test. This is the precondition for halving the refusals (bet 2b). Plan: docs/plans/v0.71.0.md, bet 2a."
     links:
@@ -4244,7 +4244,7 @@ artifacts:
     title: "The upstream component-model WAST suite runs as a required check with host imports"
     status: draft
     release: v0.71.0
-    description: "Serves North Star O3 (summary; indicator unmoved; external corpus). A host-import harness lets the imports commands execute (266 not executed -> at most 60), and cm_wast_ratchet becomes a required check. It fails on any meld-invalid (6 -> 0) or no-trap (9 -> 0) row and on pass below 150 (from 36). Negative control: a planted no-trap row fails the check. Kill: if fewer than 114 additional assertions pass because of async/P3 semantics, the pass target moves to v0.72; the meld-invalid and no-trap targets stay. Plan: docs/plans/v0.71.0.md, bet 3."
+    description: "Serves North Star O3 (summary; indicator unmoved; external corpus). A host-import harness lets the imports commands execute (266 not executed -> at most 60), and cm_wast_ratchet becomes a required check. It fails on any meld-invalid (6 -> 0) or no-trap (9 -> 0) row. Negative control: a planted no-trap row fails the check. The pass target (36 -> at least 150) was falsified at planning: the imports commands need a component runtime for async/stream/thread builtins (#638), so it moves to v0.72 with P3. Plan: docs/plans/v0.71.0.md, bet 3."
     links:
       - type: derives-from
         target: SYS-3

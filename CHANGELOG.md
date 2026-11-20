@@ -4,6 +4,10 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Falsified
+
+- v0.71.0 bet 3's pass target (upstream component-model WAST, 36 → at least 150 passing) was falsified at planning. The 266 commands not executed today come from 83 fused modules whose imports are Canonical ABI async, stream, future and thread builtins. Executing them needs a component runtime, not a test harness (#638). The target moves to v0.72 with P3. Bet 3 keeps meld-invalid 6 → 0, no-trap 9 → 0 and the required check.
+
 ## [0.70.0] - 2026-11-19
 
 ### Security
