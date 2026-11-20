@@ -90,7 +90,7 @@ jobs:
       # `runner.os` is GitHub-provided runner metadata.
       # See pulseengine/meld#168 for the recurring failure pattern.
       - name: Install nightly Rust
-        uses: dtolnay/rust-toolchain@nightly
+        uses: dtolnay/rust-toolchain@6a52aad76a94a5fbc50d567bb5be24419801c1fb # nightly
 
       - name: Install cargo-fuzz
         run: cargo install cargo-fuzz --locked
