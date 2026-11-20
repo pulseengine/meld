@@ -168,7 +168,7 @@ r1-list_string_utf16-utf16_04	multi	refused	AdapterGeneration
 r1-list_string_utf16-utf16_04	shared	match	-
 r1-list_string_utf16-utf16_05	multi	match	-
 r1-list_string_utf16-utf16_05	shared	refused	AdapterGeneration #390
-r1-list_string_utf16-utf16_06	multi	accepts-invalid	-
+r1-list_string_utf16-utf16_06	multi	match-trap	-
 r1-list_string_utf16-utf16_06	shared	refused	AdapterGeneration #390
 r1-list_string_utf16-utf16_07	multi	match	-
 r1-list_string_utf16-utf16_07	shared	match	-
@@ -228,7 +228,7 @@ r1-list_string_utf8-utf8_04	multi	match	-
 r1-list_string_utf8-utf8_04	shared	refused	AdapterGeneration #390
 r1-list_string_utf8-utf8_05	multi	match	-
 r1-list_string_utf8-utf8_05	shared	match	-
-r1-list_string_utf8-utf8_06	multi	accepts-invalid	-
+r1-list_string_utf8-utf8_06	multi	match-trap	-
 r1-list_string_utf8-utf8_06	shared	refused	AdapterGeneration #390
 r1-list_string_utf8-utf8_07	multi	refused	AdapterGeneration
 r1-list_string_utf8-utf8_07	shared	refused	AdapterGeneration #390
@@ -422,7 +422,7 @@ r1-string_latin1utf16-latin1utf16_01	multi	match-trap	-
 r1-string_latin1utf16-latin1utf16_01	shared	refused	AdapterGeneration #390
 r1-string_latin1utf16-latin1utf16_03	multi	refused	AdapterGeneration #582
 r1-string_latin1utf16-latin1utf16_03	shared	match	-
-r1-string_latin1utf16-latin1utf16_04	multi	accepts-invalid	-
+r1-string_latin1utf16-latin1utf16_04	multi	match-trap	-
 r1-string_latin1utf16-latin1utf16_04	shared	refused	AdapterGeneration #390
 r1-string_latin1utf16-latin1utf16_05	multi	match	-
 r1-string_latin1utf16-latin1utf16_05	shared	refused	AdapterGeneration #390
@@ -462,7 +462,7 @@ r1-string_utf16-latin1utf16_07	multi	match	-
 r1-string_utf16-latin1utf16_07	shared	match	-
 r1-string_utf16-utf16_01	multi	match	-
 r1-string_utf16-utf16_01	shared	match	-
-r1-string_utf16-utf16_02	multi	accepts-invalid	-
+r1-string_utf16-utf16_02	multi	match-trap	-
 r1-string_utf16-utf16_02	shared	refused	AdapterGeneration #390
 r1-string_utf16-utf16_03	multi	match	-
 r1-string_utf16-utf16_03	shared	refused	AdapterGeneration #390
@@ -632,8 +632,8 @@ r2-string_utf8-latin1utf16_01	multi	refused	AdapterGeneration #545
 r2-string_utf8-latin1utf16_01	shared	refused	AdapterGeneration #545
 r2-variant_na_00	multi	match	-
 r2-variant_na_00	shared	match	-
-r2-variant_na_01	multi	accepts-invalid	-
-r2-variant_na_01	shared	accepts-invalid	-
+r2-variant_na_01	multi	match-trap	-
+r2-variant_na_01	shared	match-trap	-
 r2-variant_na_02	multi	match	-
 r2-variant_na_02	shared	match	-
 r2-variant_na_03	multi	match	-

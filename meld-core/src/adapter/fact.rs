@@ -5584,17 +5584,41 @@ fn emit_ptr_len_check(
         f.instruction(&Instruction::Unreachable);
         f.instruction(&Instruction::End);
     }
-    f.instruction(&Instruction::LocalGet(p));
-    f.instruction(&Instruction::I64ExtendI32U);
-    bytes(f);
-    f.instruction(&Instruction::I64Add);
-    f.instruction(&Instruction::MemorySize(memory));
-    f.instruction(&Instruction::I64ExtendI32U);
-    f.instruction(&Instruction::I64Const(16));
-    f.instruction(&Instruction::I64Shl);
+    emit_end_probe(f, memory, |f| {
+        f.instruction(&Instruction::LocalGet(p));
+        f.instruction(&Instruction::I64ExtendI32U);
+        bytes(f);
+        f.instruction(&Instruction::I64Add);
+    });
+}
+
+/// Trap unless `end` (an i64 pushed by `push_end`) is at most the size of
+/// `memory`: trap if it does not fit in u32, else, when `end > 0`, load the
+/// byte at `end - 1`, which traps if out of bounds. Probing instead of
+/// comparing with `memory.size` keeps the check right for any page size
+/// (`--memory-page-size 1` refuses `memory.size`).
+fn emit_end_probe(f: &mut Function, memory: u32, push_end: impl Fn(&mut Function)) {
+    push_end(f);
+    f.instruction(&Instruction::I64Const(0xFFFF_FFFF));
     f.instruction(&Instruction::I64GtU);
     f.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
     f.instruction(&Instruction::Unreachable);
+    f.instruction(&Instruction::End);
+    push_end(f);
+    f.instruction(&Instruction::I64Eqz);
+    f.instruction(&Instruction::I32Eqz);
+    f.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+    push_end(f);
+    f.instruction(&Instruction::I64Const(1));
+    f.instruction(&Instruction::I64Sub);
+    f.instruction(&Instruction::I32WrapI64);
+    f.instruction(&Instruction::I32Load8U(wasm_encoder::MemArg {
+        offset: 0,
+        align: 0,
+        target: wasm_encoder::MemArgTarget::Memory(memory),
+        ordering: None,
+    }));
+    f.instruction(&Instruction::Drop);
     f.instruction(&Instruction::End);
 }
 
@@ -5625,6 +5649,7 @@ fn splice_call_checks(
     result_checks: &[crate::parser::MemCheck],
     callee_memory: u32,
     crosses_memory: bool,
+    result_encoding: StringEncoding,
 ) -> Result<Function> {
     use crate::parser::ParamCheck;
     if param_checks.is_empty() && result_checks.is_empty() {
@@ -5673,6 +5698,7 @@ fn splice_call_checks(
         loops: first + 2,
         memory: callee_memory,
         normalise: crosses_memory,
+        string_encoding: result_encoding,
     };
     let area = first;
     let args_base = first + 2 + 2 * depth;
@@ -5766,6 +5792,8 @@ struct CheckLocals {
     /// Write normalised bool/flags values (multi-memory); otherwise trap on
     /// a value that would need normalising (--memory shared).
     normalise: bool,
+    /// The lifting side's string encoding, for [`crate::parser::MemCheck::Str`].
+    string_encoding: StringEncoding,
 }
 
 fn mem_check_depth(checks: &[crate::parser::MemCheck]) -> u32 {
@@ -5780,6 +5808,7 @@ fn mem_check_depth(checks: &[crate::parser::MemCheck]) -> u32 {
                 .max()
                 .unwrap_or(0),
             MemCheck::List { elem, .. } => 1 + mem_check_depth(elem),
+            MemCheck::Ptr { .. } | MemCheck::Str { .. } => 0,
         })
         .max()
         .unwrap_or(0)
@@ -5944,8 +5973,89 @@ fn emit_mem_checks(
                     level,
                 );
             }
+            MemCheck::Ptr {
+                offset,
+                align,
+                elem_size,
+            } => {
+                let (o, size) = (*offset, *elem_size);
+                emit_area_ptr_check(f, base, o, *align, memory, |f| {
+                    f.instruction(&Instruction::LocalGet(base));
+                    f.instruction(&Instruction::I32Load(arg(o + 4)));
+                    f.instruction(&Instruction::I64ExtendI32U);
+                    f.instruction(&Instruction::I64Const(size as i64));
+                    f.instruction(&Instruction::I64Mul);
+                });
+            }
+            MemCheck::Str { offset } => {
+                let o = *offset;
+                let enc = ctx.string_encoding;
+                let align = if enc == StringEncoding::Utf8 { 1 } else { 2 };
+                emit_area_ptr_check(f, base, o, align, memory, |f| {
+                    f.instruction(&Instruction::LocalGet(base));
+                    f.instruction(&Instruction::I32Load(arg(o + 4)));
+                    match enc {
+                        StringEncoding::Utf8 => {
+                            f.instruction(&Instruction::I64ExtendI32U);
+                        }
+                        StringEncoding::Utf16 => {
+                            f.instruction(&Instruction::I64ExtendI32U);
+                            f.instruction(&Instruction::I64Const(2));
+                            f.instruction(&Instruction::I64Mul);
+                        }
+                        StringEncoding::Latin1 => {
+                            // latin1+utf16: the tag bit selects 2 bytes per unit.
+                            f.instruction(&Instruction::I32Const(0x7FFF_FFFF));
+                            f.instruction(&Instruction::I32And);
+                            f.instruction(&Instruction::I64ExtendI32U);
+                            f.instruction(&Instruction::LocalGet(base));
+                            f.instruction(&Instruction::I32Load(arg(o + 4)));
+                            f.instruction(&Instruction::I32Const(31));
+                            f.instruction(&Instruction::I32ShrU);
+                            f.instruction(&Instruction::I64ExtendI32U);
+                            f.instruction(&Instruction::I64Shl);
+                        }
+                    }
+                });
+            }
         }
     }
+}
+
+/// #599 / SR-134: the `trap_if`s `load_list_from_range` and
+/// `load_string_from_range` apply to a `(ptr, len)` stored at `base + offset`:
+/// `ptr` must be a multiple of `align`, and `ptr + bytes` (u64, so it cannot
+/// wrap) must be within `memory` (see [`emit_end_probe`]). `bytes` pushes the byte count as an i64.
+fn emit_area_ptr_check(
+    f: &mut Function,
+    base: u32,
+    offset: u32,
+    align: u32,
+    memory: u32,
+    bytes: impl Fn(&mut Function),
+) {
+    let arg = wasm_encoder::MemArg {
+        offset: offset as u64,
+        align: 0,
+        target: wasm_encoder::MemArgTarget::Memory(memory),
+        ordering: None,
+    };
+    if align > 1 {
+        f.instruction(&Instruction::LocalGet(base));
+        f.instruction(&Instruction::I32Load(arg));
+        f.instruction(&Instruction::I32Const(align as i32 - 1));
+        f.instruction(&Instruction::I32And);
+        f.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+        f.instruction(&Instruction::Unreachable);
+        f.instruction(&Instruction::End);
+    }
+    emit_end_probe(f, memory, |f| {
+        f.instruction(&Instruction::LocalGet(base));
+        f.instruction(&Instruction::I32Load(arg));
+        f.instruction(&Instruction::I64ExtendI32U);
+        bytes(f);
+        f.instruction(&Instruction::I64Add);
+    });
 }
 
 /// FACT-style adapter generator
@@ -6092,6 +6202,7 @@ impl FactStyleGenerator {
                 &site.requirements.result_memory_checks,
                 options.callee_memory,
                 options.caller_memory != options.callee_memory,
+                options.callee_string_encoding,
             )?;
             return Ok(AdapterFunction {
                 name,
@@ -6147,6 +6258,7 @@ impl FactStyleGenerator {
             &site.requirements.result_memory_checks,
             options.callee_memory,
             options.caller_memory != options.callee_memory,
+            options.callee_string_encoding,
         )?;
 
         // #304: wire the caller straight to the target when the seam judged this
@@ -14228,7 +14340,18 @@ mod tests {
                 payloads: vec![(1, vec![MemCheck::Char { offset: 8 }])],
             },
         ];
-        let adapter = super::splice_call_checks(adapter, 0, &[], 0, &[], &checks, 0, true).unwrap();
+        let adapter = super::splice_call_checks(
+            adapter,
+            0,
+            &[],
+            0,
+            &[],
+            &checks,
+            0,
+            true,
+            super::StringEncoding::Utf8,
+        )
+        .unwrap();
         let mut m = Module::new();
         let mut ty = TypeSection::new();
         ty.ty().function([], [ValType::I32]);
@@ -14289,7 +14412,20 @@ mod tests {
         let mut no_call = Function::new([]);
         no_call.instruction(&Instruction::I32Const(0));
         no_call.instruction(&Instruction::End);
-        assert!(super::splice_call_checks(no_call, 0, &[], 0, &[], &checks, 0, true).is_err());
+        assert!(
+            super::splice_call_checks(
+                no_call,
+                0,
+                &[],
+                0,
+                &[],
+                &checks,
+                0,
+                true,
+                super::StringEncoding::Utf8
+            )
+            .is_err()
+        );
     }
 
     /// #599 step 2: the param checks run before the call on the callee's args:
@@ -14315,9 +14451,18 @@ mod tests {
             }
             adapter.instruction(&Instruction::Call(0));
             adapter.instruction(&Instruction::End);
-            let adapter =
-                super::splice_call_checks(adapter, nparams, &params, 0, &checks, &[], 0, true)
-                    .unwrap();
+            let adapter = super::splice_call_checks(
+                adapter,
+                nparams,
+                &params,
+                0,
+                &checks,
+                &[],
+                0,
+                true,
+                super::StringEncoding::Utf8,
+            )
+            .unwrap();
             let mut m = Module::new();
             let mut ty = TypeSection::new();
             ty.ty().function(params.clone(), [ValType::I32]);
@@ -14516,9 +14661,18 @@ mod tests {
             let mut adapter = Function::new([]);
             adapter.instruction(&Instruction::Call(0));
             adapter.instruction(&Instruction::End);
-            let body =
-                super::splice_call_checks(adapter, 0, &[], 0, &[], &checks, 0, crosses_memory)
-                    .unwrap();
+            let body = super::splice_call_checks(
+                adapter,
+                0,
+                &[],
+                0,
+                &[],
+                &checks,
+                0,
+                crosses_memory,
+                super::StringEncoding::Utf8,
+            )
+            .unwrap();
             let mut callee = Function::new([]);
             callee.instruction(&Instruction::I32Const(16));
             callee.instruction(&Instruction::End);
