@@ -4229,7 +4229,7 @@ artifacts:
   - id: SR-135
     type: sw-req
     title: "Every refused differential row records the refusal reason"
-    status: draft
+    status: implemented
     release: v0.71.0
     description: "Serves North Star O3 (summary; indicator unmoved). The differential ledger gains a refusal-reason column taken from the typed error, and the ledger test fails on a refused row without a reason. Negative control: a planted reason-less row fails the test. This is the precondition for halving the refusals (bet 2b). Plan: docs/plans/v0.71.0.md, bet 2a."
     links:

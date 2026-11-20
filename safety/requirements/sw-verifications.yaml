@@ -2157,3 +2157,16 @@ artifacts:
       reviewed-by: avrabe
       model: claude-opus-5-5
       timestamp: 2026-11-19T19:00:00Z
+  - id: SWV-148
+    type: sw-verification
+    title: "Verification of SR-135: every refused differential row records its reason"
+    status: implemented
+    release: v0.71.0
+    description: "canonical_abi_differential_matches_the_ledger (tests/abi_differential.rs) now reads a reason column and fails if any refused or refused-defect row in outcomes.tsv has none. The reason a run produces must equal the ledger's, so a refusal changing cause shows as a diff. refused_rows_must_carry_a_reason checks the helper: refused and refused-defect rows with a reason pass, and match rows need none. Negative control: a planted refused row without a reason is reported. The same test pins refusal_reason, which is the error variant plus the first issue or requirement tag (for example AdapterGeneration #600, or NoComponents when the message names no tag). At first measurement (main 7f17f25) all 316 refused rows carry a reason: AdapterGeneration #545 (149), #600 (80), #390 (65), #582 (17), and untagged AdapterGeneration (5). Outcome counts did not change."
+    links:
+      - type: verifies
+        target: SR-135
+    provenance:
+      created-by: ai-assisted
+      model: claude-opus-5-5
+      timestamp: 2026-11-20T04:30:00Z

@@ -76,8 +76,8 @@ fn run_fused(bytes: &[u8], strategy: MemoryStrategy) -> Result<Run, String> {
         attestation: false,
         ..Default::default()
     });
-    fuser.add_component(bytes).map_err(|e| e.to_string())?;
-    let out = fuser.fuse().map_err(|e| e.to_string())?;
+    fuser.add_component(bytes).map_err(|e| refusal(&e))?;
+    let out = fuser.fuse().map_err(|e| refusal(&e))?;
     let mut c = Config::new();
     c.wasm_multi_memory(true);
     let engine = Engine::new(&c).unwrap();
@@ -99,6 +99,59 @@ fn run_fused(bytes: &[u8], strategy: MemoryStrategy) -> Result<Run, String> {
     })
 }
 
+/// SR-135: a refusal message prefixed with its reason, separated by U+001F.
+/// The reason is the error variant plus the first issue or requirement tag
+/// the message names (`#600`, `SR-56`, `LS-A-7`), e.g. `AdapterGeneration #600`.
+fn refusal(e: &meld_core::Error) -> String {
+    format!("{}\u{1f}{e}", refusal_reason(e))
+}
+
+fn refusal_reason(e: &meld_core::Error) -> String {
+    let debug = format!("{e:?}");
+    let variant: String = debug
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+        .collect();
+    let msg = e.to_string();
+    let tag = msg
+        .split(|c: char| c.is_whitespace() || matches!(c, ':' | ',' | '(' | ')' | ';' | '.'))
+        .find(|w| {
+            let w = w.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '#' && c != '-');
+            (w.len() > 1 && w.starts_with('#') && w[1..].chars().all(|c| c.is_ascii_digit()))
+                || ((w.starts_with("SR-") || w.starts_with("LS-"))
+                    && w.len() > 3
+                    && w[3..]
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '-'))
+        })
+        .map(|w| w.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '#' && c != '-'));
+    match tag {
+        Some(t) => format!("{variant} {t}"),
+        None => variant,
+    }
+}
+
+/// The reason part of a `run_fused` refusal; empty when it carries none.
+fn reason_of(fused: &Result<Run, String>) -> String {
+    match fused {
+        Err(m) => m
+            .split('\u{1f}')
+            .next()
+            .filter(|_| m.contains('\u{1f}'))
+            .unwrap_or("")
+            .to_string(),
+        Ok(_) => String::new(),
+    }
+}
+
+/// SR-135: every `refused` / `refused-defect` row names its reason.
+fn rows_missing_reasons(rows: &BTreeMap<(String, String), (String, String)>) -> Vec<String> {
+    rows.iter()
+        .filter(|(_, (o, r))| o.starts_with("refused") && r.trim().is_empty())
+        .map(|(k, _)| format!("{} {}", k.0, k.1))
+        .collect()
+}
+
 /// One word per (reference, fused) pair; these are the ledger's vocabulary.
 fn classify(unfused: &Run, fused: &Result<Run, String>) -> &'static str {
     match (unfused, fused) {
@@ -114,7 +167,7 @@ fn classify(unfused: &Run, fused: &Result<Run, String>) -> &'static str {
     }
 }
 
-fn outcomes() -> BTreeMap<(String, String), &'static str> {
+fn outcomes() -> BTreeMap<(String, String), (&'static str, String)> {
     let mut names: Vec<_> = std::fs::read_dir(dir())
         .expect("abi_diff fixtures")
         .flatten()
@@ -131,7 +184,7 @@ fn outcomes() -> BTreeMap<(String, String), &'static str> {
             let fused = run_fused(&bytes, strategy);
             out.insert(
                 (stem.clone(), label.to_string()),
-                classify(&reference, &fused),
+                (classify(&reference, &fused), reason_of(&fused)),
             );
         }
     }
@@ -152,12 +205,12 @@ fn canonical_abi_differential_matches_the_ledger() {
     {
         let c: Vec<&str> = l.split('\t').collect();
         assert!(
-            c.len() >= 3,
-            "outcomes.tsv: want fixture<TAB>strategy<TAB>outcome[<TAB>note]: {l:?}"
+            c.len() >= 4,
+            "outcomes.tsv: want fixture<TAB>strategy<TAB>outcome<TAB>reason[<TAB>note]: {l:?}"
         );
         let key = (c[0].to_string(), c[1].to_string());
-        ledger.insert(key.clone(), c[2].to_string());
-        if let Some(n) = c.get(3) {
+        ledger.insert(key.clone(), (c[2].to_string(), c[3].to_string()));
+        if let Some(n) = c.get(4) {
             notes.insert(key, n.to_string());
         }
     }
@@ -167,7 +220,7 @@ fn canonical_abi_differential_matches_the_ledger() {
     // Potency floor: the differential must actually compare things, and both
     // kinds of verdict must be reachable, or "all rows match the ledger"
     // could mean "nothing ran".
-    let count = |o: &str| got.values().filter(|v| **v == o).count();
+    let count = |o: &str| got.values().filter(|v| v.0 == o).count();
     assert!(
         count("match") >= 100,
         "only {} matching runs",
@@ -181,25 +234,46 @@ fn canonical_abi_differential_matches_the_ledger() {
     if std::env::var_os("MELD_BLESS").is_some() {
         let mut body = String::from(
             "# Canonical ABI differential outcomes (tests/abi_differential.rs).\n\
-             # fixture\tstrategy\toutcome\tnote. Regenerate with MELD_BLESS=1.\n",
+             # fixture\tstrategy\toutcome\treason\tnote. reason is - unless refused (SR-135). Regenerate with MELD_BLESS=1.\n",
         );
-        for (k, v) in &got {
+        for (k, (v, r)) in &got {
             let note = match (ledger.get(k), notes.get(k)) {
-                (Some(old), Some(n)) if old == v => format!("\t{n}"),
+                (Some((old, _)), Some(n)) if old == v => format!("\t{n}"),
                 _ => String::new(),
             };
-            body.push_str(&format!("{}\t{}\t{v}{note}\n", k.0, k.1));
+            let r = if r.is_empty() { "-" } else { r.as_str() };
+            body.push_str(&format!("{}\t{}\t{v}\t{r}{note}\n", k.0, k.1));
         }
         std::fs::write(&ledger_path, body).unwrap();
         return;
     }
 
+    // SR-135: a refusal without a reason fails, in the ledger and in the run.
+    let ledger_rows: BTreeMap<_, _> = ledger
+        .iter()
+        .map(|(k, (o, r))| {
+            (
+                k.clone(),
+                (o.clone(), if r == "-" { String::new() } else { r.clone() }),
+            )
+        })
+        .collect();
+    let missing = rows_missing_reasons(&ledger_rows);
+    assert!(
+        missing.is_empty(),
+        "refused rows without a reason (SR-135): {missing:?}"
+    );
+
     let mut diffs = Vec::new();
-    for (k, v) in &got {
+    for (k, (v, r)) in &got {
+        let r = if r.is_empty() { "-" } else { r.as_str() };
         match ledger.get(k) {
-            Some(old) if old == v => {}
-            Some(old) => diffs.push(format!("{} {}: ledger {old}, now {v}", k.0, k.1)),
-            None => diffs.push(format!("{} {}: not in ledger, now {v}", k.0, k.1)),
+            Some((old, old_r)) if old == v && old_r == r => {}
+            Some((old, old_r)) => diffs.push(format!(
+                "{} {}: ledger {old} ({old_r}), now {v} ({r})",
+                k.0, k.1
+            )),
+            None => diffs.push(format!("{} {}: not in ledger, now {v} ({r})", k.0, k.1)),
         }
     }
     for k in ledger.keys().filter(|k| !got.contains_key(*k)) {
@@ -212,6 +286,34 @@ fn canonical_abi_differential_matches_the_ledger() {
         diffs.len(),
         diffs.join("\n")
     );
+}
+
+// rivet: verifies SR-135
+// rivet: verifies SWV-148
+#[test]
+fn refused_rows_must_carry_a_reason() {
+    let row = |o: &str, r: &str| (o.to_string(), r.to_string());
+    let mut rows = BTreeMap::new();
+    rows.insert(
+        ("a".into(), "multi".into()),
+        row("refused", "AdapterGeneration #600"),
+    );
+    rows.insert(("b".into(), "shared".into()), row("match", ""));
+    rows.insert(
+        ("c".into(), "multi".into()),
+        row("refused-defect", "EncodingError"),
+    );
+    assert!(rows_missing_reasons(&rows).is_empty());
+    // Negative control: a planted refusal without a reason is reported.
+    rows.insert(("d".into(), "shared".into()), row("refused", ""));
+    assert_eq!(rows_missing_reasons(&rows), vec!["d shared".to_string()]);
+    // The reason is the error variant plus the first tag its message names.
+    let e = meld_core::Error::AdapterGeneration("#600: the call to 'f' passes strings".into());
+    assert_eq!(refusal_reason(&e), "AdapterGeneration #600");
+    let e = meld_core::Error::AdapterGeneration("see SR-56, overlapping".into());
+    assert_eq!(refusal_reason(&e), "AdapterGeneration SR-56");
+    let e = meld_core::Error::NoComponents;
+    assert_eq!(refusal_reason(&e), "NoComponents");
 }
 
 #[test]
