@@ -169,7 +169,12 @@ impl InnerResource {
 pub enum CopyLayout {
     /// Bulk copy: `len * byte_multiplier` bytes, no inner pointers.
     /// Used for strings (multiplier=1) and lists of scalars.
-    Bulk { byte_multiplier: u32 },
+    Bulk {
+        byte_multiplier: u32,
+        /// The pair is a `string`: its count is in code units of the string
+        /// encoding, so a UTF-16 copy moves two bytes per unit (#598).
+        string: bool,
+    },
     /// Element-wise copy: `len` elements of `element_size` bytes each.
     /// `inner_pointers` lists the per-element pointer-pair fixup
     /// descriptors (offset + sub-layout + optional discriminant guards
@@ -181,6 +186,23 @@ pub enum CopyLayout {
         inner_pointers: Vec<InnerPointer>,
         inner_resources: Vec<InnerResource>,
     },
+}
+
+impl CopyLayout {
+    /// Bytes per counted unit when this pair is copied across memories.
+    ///
+    /// A `string` count is in code units of the string encoding: one byte for
+    /// UTF-8 and for latin1+utf16 (whose tagged UTF-16 case is handled by
+    /// `emit_copy_byte_count`), two bytes for UTF-16 (#598).
+    pub(crate) fn unit_bytes(&self, utf16: bool) -> u32 {
+        match self {
+            CopyLayout::Bulk { string: true, .. } if utf16 => 2,
+            CopyLayout::Bulk {
+                byte_multiplier, ..
+            } => *byte_multiplier,
+            CopyLayout::Elements { element_size, .. } => *element_size,
+        }
+    }
 }
 
 /// Per-element inner pointer descriptor for `CopyLayout::Elements`.
@@ -4834,6 +4856,24 @@ impl Default for Resolver {
 mod tests {
     use super::*;
 
+    /// #598: a `string` pair copied under UTF-16 moves two bytes per code unit;
+    /// under any other encoding, and for a `list<u8>` under UTF-16, one.
+    // rivet: partially-verifies SR-134
+    #[test]
+    fn utf16_string_copies_two_bytes_per_unit() {
+        let string = CopyLayout::Bulk {
+            byte_multiplier: 1,
+            string: true,
+        };
+        let bytes = CopyLayout::Bulk {
+            byte_multiplier: 1,
+            string: false,
+        };
+        assert_eq!(string.unit_bytes(true), 2);
+        assert_eq!(string.unit_bytes(false), 1);
+        assert_eq!(bytes.unit_bytes(true), 1);
+    }
+
     /// Mythos finding B (PR #220): an unresolved `MemoryStrategy::Auto`
     /// reaching `Resolver::with_strategy` directly must normalize to
     /// MultiMemory, mirroring `Merger::new` so the two can never disagree.
@@ -5392,7 +5432,9 @@ mod tests {
             ComponentValType::List(Box::new(ComponentValType::Primitive(PrimitiveValType::U32)));
         let layout = pc.copy_layout(&ty);
         match layout {
-            CopyLayout::Bulk { byte_multiplier } => {
+            CopyLayout::Bulk {
+                byte_multiplier, ..
+            } => {
                 assert_eq!(byte_multiplier, 4, "u32 element should be 4 bytes");
             }
             CopyLayout::Elements { .. } => {
@@ -5428,7 +5470,9 @@ mod tests {
                 assert_eq!(offset, 0, "string pointer pair starts at byte offset 0");
                 // Inner layout for a string is Bulk { byte_multiplier: 1 }
                 match inner_layout {
-                    CopyLayout::Bulk { byte_multiplier } => {
+                    CopyLayout::Bulk {
+                        byte_multiplier, ..
+                    } => {
                         assert_eq!(*byte_multiplier, 1, "string data is byte-granular");
                     }
                     _ => panic!("inner layout for string should be Bulk"),
@@ -5482,7 +5526,9 @@ mod tests {
                     "string field starts at byte offset 0 in the record"
                 );
                 match inner_layout {
-                    CopyLayout::Bulk { byte_multiplier } => {
+                    CopyLayout::Bulk {
+                        byte_multiplier, ..
+                    } => {
                         assert_eq!(*byte_multiplier, 1, "string data is byte-granular");
                     }
                     _ => panic!("inner layout for string should be Bulk"),
@@ -5526,7 +5572,9 @@ mod tests {
                 assert_eq!(offset, 0, "inner list pointer pair starts at byte offset 0");
                 // Inner layout for list<u8> is Bulk { byte_multiplier: 1 }
                 match inner_layout {
-                    CopyLayout::Bulk { byte_multiplier } => {
+                    CopyLayout::Bulk {
+                        byte_multiplier, ..
+                    } => {
                         assert_eq!(*byte_multiplier, 1, "list<u8> element is 1 byte");
                     }
                     _ => panic!("inner layout for list<u8> should be Bulk"),
@@ -5556,7 +5604,9 @@ mod tests {
         let ty = ComponentValType::List(Box::new(record_ty));
         let layout = pc.copy_layout(&ty);
         match layout {
-            CopyLayout::Bulk { byte_multiplier } => {
+            CopyLayout::Bulk {
+                byte_multiplier, ..
+            } => {
                 assert_eq!(
                     byte_multiplier, 8,
                     "record{{a: u32, b: u32}} should be 8 bytes (4 + 4)"
@@ -5773,7 +5823,9 @@ mod tests {
         let ty = ComponentValType::String;
         let layout = pc.copy_layout(&ty);
         match layout {
-            CopyLayout::Bulk { byte_multiplier } => {
+            CopyLayout::Bulk {
+                byte_multiplier, ..
+            } => {
                 assert_eq!(
                     byte_multiplier, 1,
                     "SR-17: string CopyLayout byte_multiplier should always be 1"
@@ -5797,7 +5849,9 @@ mod tests {
             "SR-17: one string param should produce one copy layout"
         );
         match &layouts[0] {
-            CopyLayout::Bulk { byte_multiplier } => {
+            CopyLayout::Bulk {
+                byte_multiplier, ..
+            } => {
                 assert_eq!(*byte_multiplier, 1);
             }
             _ => panic!("SR-17: string param should produce Bulk layout"),
@@ -6778,7 +6832,13 @@ mod tests {
         );
         for layout in &layouts {
             assert!(
-                matches!(layout, CopyLayout::Bulk { byte_multiplier: 8 }),
+                matches!(
+                    layout,
+                    CopyLayout::Bulk {
+                        byte_multiplier: 8,
+                        ..
+                    }
+                ),
                 "each list<u64> leaf must copy 8 bytes/element, not the \
                  byte_multiplier=1 fallback; got {layout:?}"
             );

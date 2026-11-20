@@ -4064,7 +4064,10 @@ impl ParsedComponent {
     pub fn copy_layout(&self, ty: &ComponentValType) -> crate::resolver::CopyLayout {
         use crate::resolver::CopyLayout;
         match ty {
-            ComponentValType::String => CopyLayout::Bulk { byte_multiplier: 1 },
+            ComponentValType::String => CopyLayout::Bulk {
+                byte_multiplier: 1,
+                string: true,
+            },
             ComponentValType::List(inner) => {
                 // LS-P-12 / LS-P-18 (v0.11.0): `element_inner_pointers` now
                 // emits Option / Result / Variant payload pointers with a
@@ -4082,6 +4085,7 @@ impl ParsedComponent {
                 if inner_ptrs.is_empty() && inner_res.is_empty() {
                     CopyLayout::Bulk {
                         byte_multiplier: element_size,
+                        string: false,
                     }
                 } else {
                     CopyLayout::Elements {
@@ -4092,7 +4096,10 @@ impl ParsedComponent {
                 }
             }
             // For non-list/string types, treat as bulk with 1x multiplier
-            _ => CopyLayout::Bulk { byte_multiplier: 1 },
+            _ => CopyLayout::Bulk {
+                byte_multiplier: 1,
+                string: false,
+            },
         }
     }
 
@@ -4116,7 +4123,10 @@ impl ParsedComponent {
             ComponentValType::String => {
                 result.push(InnerPointer {
                     byte_offset: base,
-                    copy_layout: CopyLayout::Bulk { byte_multiplier: 1 },
+                    copy_layout: CopyLayout::Bulk {
+                        byte_multiplier: 1,
+                        string: true,
+                    },
                     guards: outer_guards.to_vec(),
                 });
             }
@@ -5803,7 +5813,9 @@ mod tests {
         let ty = ComponentValType::String;
         let layout = pc.copy_layout(&ty);
         match layout {
-            crate::resolver::CopyLayout::Bulk { byte_multiplier } => {
+            crate::resolver::CopyLayout::Bulk {
+                byte_multiplier, ..
+            } => {
                 assert_eq!(
                     byte_multiplier, 1,
                     "SR-17: string copy layout byte_multiplier should be 1"
@@ -6200,7 +6212,9 @@ mod tests {
         let flat_pairs = pc.conditional_pointer_pair_positions(&[("p".to_string(), opt_param)]);
         assert_eq!(flat_pairs.len(), 1, "expected one conditional pointer pair");
         match &flat_pairs[0].copy_layout {
-            CopyLayout::Bulk { byte_multiplier } => assert_eq!(
+            CopyLayout::Bulk {
+                byte_multiplier, ..
+            } => assert_eq!(
                 *byte_multiplier, expect_mult,
                 "list<u64> leaf inside a tuple payload must keep its 8x \
                  multiplier, not inherit the composite's Bulk{{1}} fallback",
@@ -6219,7 +6233,9 @@ mod tests {
         let byte_pairs = pc.conditional_pointer_pair_result_positions(&[(None, res_ty)]);
         assert_eq!(byte_pairs.len(), 1, "expected one conditional pointer pair");
         match &byte_pairs[0].copy_layout {
-            CopyLayout::Bulk { byte_multiplier } => assert_eq!(
+            CopyLayout::Bulk {
+                byte_multiplier, ..
+            } => assert_eq!(
                 *byte_multiplier, expect_mult,
                 "list<u64> leaf inside a record payload must keep its 8x \
                  multiplier in the retptr path too",

@@ -8,6 +8,10 @@ All notable changes to this project will be documented in this file.
 
 - No x86_64-apple-darwin (Intel macOS) assets or wheels from this release on. Intel Mac users: build from source. The npm launcher reports darwin/x64 as an unsupported platform (owner decision 2026-11-20, fleet-wide).
 
+### Fixed
+
+- A UTF-16 string copied between two memories (`--memory multi`) moved one byte per code unit instead of two, so its second half arrived as zeros at exit 0 (#598). The copy now sizes UTF-16 strings at two bytes per unit, top level and nested in lists, records and variant payloads, and asks `cabi_realloc` for 2-byte alignment. Differential ledger: wrong 20 → 2, accepts-invalid 30 → 29.
+
 ### Falsified
 
 - v0.71.0 bet 3's pass target (upstream component-model WAST, 36 → at least 150 passing) was falsified at planning. The 266 commands not executed today come from 83 fused modules whose imports are Canonical ABI async, stream, future and thread builtins. Executing them needs a component runtime, not a test harness (#638). The target moves to v0.72 with P3. Bet 3 keeps meld-invalid 6 → 0, no-trap 9 → 0 and the required check.
