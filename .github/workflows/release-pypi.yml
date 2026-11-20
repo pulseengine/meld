@@ -181,7 +181,6 @@ jobs:
           - { name: linux-arm64-glibc, runner: ubuntu-24.04-arm, docker: '',                expect: manylinux }
           - { name: linux-x64-musl,   runner: ubuntu-24.04,     docker: 'python:3.12-alpine',   expect: musllinux }
           - { name: linux-arm64-musl, runner: ubuntu-24.04-arm, docker: 'python:3.12-alpine',   expect: musllinux }
-          - { name: macos-x64,        runner: macos-15-intel,   docker: '',                 expect: macosx }
           - { name: macos-arm64,      runner: macos-15,         docker: '',                 expect: macosx }
     steps:
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2

@@ -61,12 +61,10 @@ jobs:
           - target: aarch64-unknown-linux-musl
             runner: ubuntu-24.04
             use_cross: true
-          # macos-15 (arm64); smithy is Linux x86_64 only. GitHub retired the
+          # macos-15 (arm64). No Intel macOS build since 2026-11-20 (owner
+          # decision, fleet-wide). smithy is Linux x86_64 only. GitHub retired the
           # macos-14 image: v0.68.0's darwin jobs failed with "The
           # configuration 'macos-14-arm64-us-default' is not supported".
-          - target: x86_64-apple-darwin
-            runner: macos-15
-            use_cross: false
           - target: aarch64-apple-darwin
             runner: macos-15
             use_cross: false

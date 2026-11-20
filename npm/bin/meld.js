@@ -27,7 +27,8 @@ function isMusl() {
 function candidates() {
   const arch = { x64: "x64", arm64: "arm64" }[process.arch];
   if (!arch) return [];
-  if (process.platform === "darwin") return [`darwin-${arch}`];
+  // No Intel macOS package since 2026-11-20: darwin/x64 is unsupported.
+  if (process.platform === "darwin") return arch === "arm64" ? ["darwin-arm64"] : [];
   if (process.platform === "linux") {
     // The musl build is fully static, so it is a valid fallback on glibc hosts.
     return isMusl() ? [`linux-${arch}-musl`] : [`linux-${arch}-gnu`, `linux-${arch}-musl`];
@@ -54,7 +55,8 @@ function findBinary() {
     tried.length
       ? `meld: no installed platform package for ${where} (looked for ${tried.join(", ")}).\n` +
           `Reinstall without --omit=optional / --no-optional.`
-      : `meld: unsupported platform ${where}. Supported: macOS and Linux on x64 and arm64.`
+      : `meld: unsupported platform ${where}. Supported: macOS on arm64, Linux on x64 and arm64. ` +
+          `Intel Mac users: build from source (see the meld README).`
   );
   process.exit(1);
 }
