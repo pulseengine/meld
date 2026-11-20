@@ -5426,6 +5426,7 @@ fn emit_resource_new_results(
 /// transcode or call.
 fn prepend_flat_param_lifts(
     body: Function,
+    param_count: u32,
     lifts: &[(u32, crate::parser::FlatParamLift)],
     caller_memory: u32,
     caller_encoding: StringEncoding,
@@ -5457,6 +5458,13 @@ fn prepend_flat_param_lifts(
         locals.push((count, ty));
     }
     let ops_start = reader.original_position() as usize;
+    let str_scratch = param_count + locals.iter().map(|(n, _)| *n).sum::<u32>();
+    if lifts
+        .iter()
+        .any(|(_, l)| matches!(l, crate::parser::FlatParamLift::String))
+    {
+        locals.push((5, wasm_encoder::ValType::I32));
+    }
     let mut out = Function::new(locals);
     for &(p, lift) in lifts {
         use crate::parser::FlatParamLift as L;
@@ -5521,6 +5529,14 @@ fn prepend_flat_param_lifts(
                             f.instruction(&Instruction::I64Shl);
                         }
                     },
+                );
+                emit_string_validate(
+                    &mut out,
+                    caller_memory,
+                    caller_encoding,
+                    p,
+                    p + 1,
+                    str_scratch,
                 );
                 continue;
             }
@@ -5622,6 +5638,59 @@ fn emit_end_probe(f: &mut Function, memory: u32, push_end: impl Fn(&mut Function
     f.instruction(&Instruction::End);
 }
 
+/// SR-134: decode the string at `ptr_local`/`len_local` in `memory` and
+/// discard it, so invalid input traps as `load_string_from_range` does
+/// (`except UnicodeError: trap()`). A same-encoding copy or a shared-memory
+/// pass-through moves the bytes unchanged and would otherwise accept them.
+/// Uses five scratch i32 locals from `scratch`. Latin-1 is always valid, so a
+/// latin1+utf16 string is decoded only when its tag selects UTF-16.
+fn emit_string_validate(
+    f: &mut Function,
+    memory: u32,
+    enc: StringEncoding,
+    ptr_local: u32,
+    len_local: u32,
+    scratch: u32,
+) {
+    let (idx, count, a, b, c) = (scratch, scratch + 1, scratch + 2, scratch + 3, scratch + 4);
+    let tagged = enc == StringEncoding::Latin1;
+    f.instruction(&Instruction::LocalGet(len_local));
+    if tagged {
+        f.instruction(&Instruction::I32Const(UTF16_TAG));
+        f.instruction(&Instruction::I32And);
+        f.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+        f.instruction(&Instruction::LocalGet(len_local));
+        f.instruction(&Instruction::I32Const(!UTF16_TAG));
+        f.instruction(&Instruction::I32And);
+    }
+    f.instruction(&Instruction::LocalSet(count));
+    f.instruction(&Instruction::I32Const(0));
+    f.instruction(&Instruction::LocalSet(idx));
+    f.instruction(&Instruction::Block(wasm_encoder::BlockType::Empty));
+    f.instruction(&Instruction::Loop(wasm_encoder::BlockType::Empty));
+    f.instruction(&Instruction::LocalGet(idx));
+    f.instruction(&Instruction::LocalGet(count));
+    f.instruction(&Instruction::I32GeU);
+    f.instruction(&Instruction::BrIf(1));
+    let arg = |align: u32| wasm_encoder::MemArg {
+        offset: 0,
+        align,
+        target: wasm_encoder::MemArgTarget::Memory(memory),
+        ordering: None,
+    };
+    if enc == StringEncoding::Utf8 {
+        emit_utf8_decode_codepoint(f, arg(0), ptr_local, idx, count, a, b, c);
+    } else {
+        emit_utf16_decode_codepoint(f, arg(1), ptr_local, idx, count, a, b, c);
+    }
+    f.instruction(&Instruction::Br(0));
+    f.instruction(&Instruction::End);
+    f.instruction(&Instruction::End);
+    if tagged {
+        f.instruction(&Instruction::End);
+    }
+}
+
 /// #599: around every `call target` in an adapter body, check the values the
 /// callee receives and returns in memory, as the Canonical ABI's lift and
 /// load do: a `char` must be a Unicode scalar value, a case index must be
@@ -5649,6 +5718,7 @@ fn splice_call_checks(
     result_checks: &[crate::parser::MemCheck],
     callee_memory: u32,
     crosses_memory: bool,
+    param_encoding: StringEncoding,
     result_encoding: StringEncoding,
 ) -> Result<Function> {
     use crate::parser::ParamCheck;
@@ -5699,10 +5769,18 @@ fn splice_call_checks(
         memory: callee_memory,
         normalise: crosses_memory,
         string_encoding: result_encoding,
+        strs: first + 2 + 2 * depth,
+    };
+    // Params are lifted by the caller's lower, so strings in them decode in
+    // the caller's encoding.
+    let pctx = CheckLocals {
+        string_encoding: param_encoding,
+        ..ctx
     };
     let area = first;
-    let args_base = first + 2 + 2 * depth;
-    locals.push((2 + 2 * depth, wasm_encoder::ValType::I32));
+    // 7 locals after the loop counters for `MemCheck::Str` validation.
+    let args_base = first + 2 + 2 * depth + 7;
+    locals.push((2 + 2 * depth + 7, wasm_encoder::ValType::I32));
     if !param_checks.is_empty() {
         for ty in callee_params {
             locals.push((1, *ty));
@@ -5734,7 +5812,7 @@ fn splice_call_checks(
                                 "params-area checks need a single params pointer, the callee takes {n}"
                             )));
                         }
-                        emit_mem_checks(&mut out, m, args_base, &ctx, 0);
+                        emit_mem_checks(&mut out, m, args_base, &pctx, 0);
                     }
                     ParamCheck::FlatList {
                         ptr_slot,
@@ -5756,7 +5834,7 @@ fn splice_call_checks(
                             },
                             *elem_size,
                             elem,
-                            &ctx,
+                            &pctx,
                             0,
                         );
                     }
@@ -5785,6 +5863,7 @@ fn splice_call_checks(
 
 /// Locals the check emitter uses: one scratch, and a (cursor, end) pair per
 /// list nesting level starting at `loops`.
+#[derive(Clone, Copy)]
 struct CheckLocals {
     scratch: u32,
     loops: u32,
@@ -5794,6 +5873,9 @@ struct CheckLocals {
     normalise: bool,
     /// The lifting side's string encoding, for [`crate::parser::MemCheck::Str`].
     string_encoding: StringEncoding,
+    /// Seven scratch locals for [`crate::parser::MemCheck::Str`]: the
+    /// pointer, the length, and [`emit_string_validate`]'s five.
+    strs: u32,
 }
 
 fn mem_check_depth(checks: &[crate::parser::MemCheck]) -> u32 {
@@ -6017,6 +6099,13 @@ fn emit_mem_checks(
                         }
                     }
                 });
+                f.instruction(&Instruction::LocalGet(base));
+                f.instruction(&Instruction::I32Load(arg(o)));
+                f.instruction(&Instruction::LocalSet(ctx.strs));
+                f.instruction(&Instruction::LocalGet(base));
+                f.instruction(&Instruction::I32Load(arg(o + 4)));
+                f.instruction(&Instruction::LocalSet(ctx.strs + 1));
+                emit_string_validate(f, memory, enc, ctx.strs, ctx.strs + 1, ctx.strs + 2);
             }
         }
     }
@@ -6182,6 +6271,10 @@ impl FactStyleGenerator {
             // applies the #586 `char` check itself (found by auto-Mythos).
             let body = prepend_flat_param_lifts(
                 body,
+                merged
+                    .types
+                    .get(type_idx as usize)
+                    .map_or(0, |t| t.params.len() as u32),
                 &site.requirements.flat_param_lifts,
                 options.caller_memory,
                 options.caller_string_encoding,
@@ -6202,6 +6295,7 @@ impl FactStyleGenerator {
                 &site.requirements.result_memory_checks,
                 options.callee_memory,
                 options.caller_memory != options.callee_memory,
+                options.caller_string_encoding,
                 options.callee_string_encoding,
             )?;
             return Ok(AdapterFunction {
@@ -6236,6 +6330,10 @@ impl FactStyleGenerator {
         };
         let body = prepend_flat_param_lifts(
             body,
+            merged
+                .types
+                .get(type_idx as usize)
+                .map_or(0, |t| t.params.len() as u32),
             &site.requirements.flat_param_lifts,
             options.caller_memory,
             options.caller_string_encoding,
@@ -6258,6 +6356,7 @@ impl FactStyleGenerator {
             &site.requirements.result_memory_checks,
             options.callee_memory,
             options.caller_memory != options.callee_memory,
+            options.caller_string_encoding,
             options.callee_string_encoding,
         )?;
 
@@ -14350,6 +14449,7 @@ mod tests {
             0,
             true,
             super::StringEncoding::Utf8,
+            super::StringEncoding::Utf8,
         )
         .unwrap();
         let mut m = Module::new();
@@ -14422,7 +14522,8 @@ mod tests {
                 &checks,
                 0,
                 true,
-                super::StringEncoding::Utf8
+                super::StringEncoding::Utf8,
+                super::StringEncoding::Utf8,
             )
             .is_err()
         );
@@ -14460,6 +14561,7 @@ mod tests {
                 &[],
                 0,
                 true,
+                super::StringEncoding::Utf8,
                 super::StringEncoding::Utf8,
             )
             .unwrap();
@@ -14568,7 +14670,7 @@ mod tests {
             let mut f = Function::new([]);
             f.instruction(&Instruction::I32Const(7));
             f.instruction(&Instruction::End);
-            let body = super::prepend_flat_param_lifts(f, &[(0, lift)], 0, enc).unwrap();
+            let body = super::prepend_flat_param_lifts(f, 2, &[(0, lift)], 0, enc).unwrap();
             let mut m = Module::new();
             let mut ty = TypeSection::new();
             ty.ty()
@@ -14671,6 +14773,7 @@ mod tests {
                 0,
                 crosses_memory,
                 super::StringEncoding::Utf8,
+                super::StringEncoding::Utf8,
             )
             .unwrap();
             let mut callee = Function::new([]);
@@ -14763,6 +14866,7 @@ mod tests {
         f.instruction(&Instruction::End);
         let body = super::prepend_flat_param_lifts(
             f,
+            2,
             &[(0, crate::parser::FlatParamLift::Char)],
             0,
             super::StringEncoding::Utf8,

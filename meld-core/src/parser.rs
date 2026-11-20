@@ -554,14 +554,14 @@ pub enum MemCheck {
     },
     /// The list `(ptr, len)` at `offset`: trap unless `ptr` is a multiple of
     /// `align` and `len * elem_size` bytes from `ptr` fit in memory, as
-    /// `load_list_from_range` checks. Results only.
+    /// `load_list_from_range` checks.
     Ptr {
         offset: u32,
         align: u32,
         elem_size: u32,
     },
     /// The string `(ptr, len)` at `offset`: the same checks for the lifting
-    /// side's string encoding, as `load_string_from_range` does. Results only.
+    /// side's string encoding, as `load_string_from_range` does, and decode it.
     Str { offset: u32 },
 }
 
@@ -2916,7 +2916,7 @@ impl ParsedComponent {
         let mut off = 0u32;
         for (_, ty) in results {
             off = align_up(off, self.canonical_abi_align(ty));
-            self.collect_mem_checks(ty, off, 0, true, &mut out);
+            self.collect_mem_checks(ty, off, 0, &mut out);
             off += self.canonical_abi_element_size(ty);
         }
         out
@@ -2927,7 +2927,6 @@ impl ParsedComponent {
         ty: &ComponentValType,
         base: u32,
         depth: u32,
-        ptrs: bool,
         out: &mut Vec<MemCheck>,
     ) {
         if depth > 64 {
@@ -2964,7 +2963,7 @@ impl ParsedComponent {
                 let mut off = base;
                 for (_, t) in fields {
                     off = align_up(off, self.canonical_abi_align(t));
-                    self.collect_mem_checks(t, off, d, ptrs, out);
+                    self.collect_mem_checks(t, off, d, out);
                     off += self.canonical_abi_element_size(t);
                 }
             }
@@ -2972,38 +2971,36 @@ impl ParsedComponent {
                 let mut off = base;
                 for t in ts {
                     off = align_up(off, self.canonical_abi_align(t));
-                    self.collect_mem_checks(t, off, d, ptrs, out);
+                    self.collect_mem_checks(t, off, d, out);
                     off += self.canonical_abi_element_size(t);
                 }
             }
             ComponentValType::FixedSizeList(elem, len) => {
                 let size = self.canonical_abi_element_size(elem);
                 for i in 0..*len {
-                    self.collect_mem_checks(elem, base + i * size, d, ptrs, out);
+                    self.collect_mem_checks(elem, base + i * size, d, out);
                 }
             }
             ComponentValType::Variant(cases) => {
                 let cases: Vec<Option<&ComponentValType>> =
                     cases.iter().map(|(_, t)| t.as_ref()).collect();
-                self.push_case_check(&cases, base, d, ptrs, out);
+                self.push_case_check(&cases, base, d, out);
             }
             ComponentValType::Option(inner) => {
-                self.push_case_check(&[None, Some(inner.as_ref())], base, d, ptrs, out);
+                self.push_case_check(&[None, Some(inner.as_ref())], base, d, out);
             }
             ComponentValType::Result { ok, err } => {
-                self.push_case_check(&[ok.as_deref(), err.as_deref()], base, d, ptrs, out);
+                self.push_case_check(&[ok.as_deref(), err.as_deref()], base, d, out);
             }
-            ComponentValType::String if ptrs => out.push(MemCheck::Str { offset: base }),
+            ComponentValType::String => out.push(MemCheck::Str { offset: base }),
             ComponentValType::List(elem) => {
-                if ptrs {
-                    out.push(MemCheck::Ptr {
-                        offset: base,
-                        align: self.canonical_abi_align(elem),
-                        elem_size: self.canonical_abi_element_size(elem),
-                    });
-                }
+                out.push(MemCheck::Ptr {
+                    offset: base,
+                    align: self.canonical_abi_align(elem),
+                    elem_size: self.canonical_abi_element_size(elem),
+                });
                 let mut inner = Vec::new();
-                self.collect_mem_checks(elem, 0, d, ptrs, &mut inner);
+                self.collect_mem_checks(elem, 0, d, &mut inner);
                 if !inner.is_empty() {
                     out.push(MemCheck::List {
                         offset: base,
@@ -3014,7 +3011,7 @@ impl ParsedComponent {
             }
             ComponentValType::Type(idx) => {
                 if let Some(inner) = self.resolve_defined_val_type(*idx) {
-                    self.collect_mem_checks(&inner, base, depth, ptrs, out);
+                    self.collect_mem_checks(&inner, base, depth, out);
                 }
             }
             _ => {}
@@ -3032,7 +3029,7 @@ impl ParsedComponent {
             let mut off = 0u32;
             for (_, ty) in params {
                 off = align_up(off, self.canonical_abi_align(ty));
-                self.collect_mem_checks(ty, off, 0, false, &mut checks);
+                self.collect_mem_checks(ty, off, 0, &mut checks);
                 off += self.canonical_abi_element_size(ty);
             }
             return if checks.is_empty() {
@@ -3063,7 +3060,7 @@ impl ParsedComponent {
         match ty {
             ComponentValType::List(elem) => {
                 let mut inner = Vec::new();
-                self.collect_mem_checks(elem, 0, depth + 1, false, &mut inner);
+                self.collect_mem_checks(elem, 0, depth + 1, &mut inner);
                 if !inner.is_empty() {
                     out.push(ParamCheck::FlatList {
                         ptr_slot: slot,
@@ -3100,7 +3097,6 @@ impl ParsedComponent {
         cases: &[Option<&ComponentValType>],
         base: u32,
         depth: u32,
-        ptrs: bool,
         out: &mut Vec<MemCheck>,
     ) {
         let size = disc_size(cases.len());
@@ -3115,7 +3111,7 @@ impl ParsedComponent {
         for (k, t) in cases.iter().enumerate() {
             if let Some(t) = t {
                 let mut inner = Vec::new();
-                self.collect_mem_checks(t, payload_off, depth, ptrs, &mut inner);
+                self.collect_mem_checks(t, payload_off, depth, &mut inner);
                 if !inner.is_empty() {
                     payloads.push((k as u32, inner));
                 }
