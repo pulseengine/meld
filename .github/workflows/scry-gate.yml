@@ -56,7 +56,7 @@ jobs:
       - name: Build scry-viz
         run: cargo build --release -p scry-sai-viz --bin scry-viz --manifest-path scry/Cargo.toml
       - name: Build meld
-        run: cargo build --release --bin meld --manifest-path meld/Cargo.toml
+        run: cargo build --locked --release --bin meld --manifest-path meld/Cargo.toml
       - name: Scry robustness gate on a fused meld output
         env:
           MELD: ${{ github.workspace }}/meld/target/release/meld

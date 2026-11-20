@@ -36,7 +36,7 @@ fi
 BUILD_TARGET_DIR="${CARGO_TARGET_DIR:-$(mktemp -d)}"
 RUSTFLAGS="${RUSTFLAGS:-} --remap-path-prefix=${SCRIPT_DIR}=leap_mcdc" \
     CARGO_TARGET_DIR="$BUILD_TARGET_DIR" \
-    cargo build --release --target "$TARGET"
+    cargo build --locked --release --target "$TARGET"
 
 CORE="$BUILD_TARGET_DIR/${TARGET}/release/leap_mcdc.wasm"
 [ -f "$CORE" ] || { echo "build did not produce $CORE" >&2; exit 1; }

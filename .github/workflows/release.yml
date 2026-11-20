@@ -91,7 +91,7 @@ jobs:
           if [ "$USE_CROSS" = "true" ]; then
             cross build --release --target "$TARGET"
           else
-            cargo build --release --target "$TARGET"
+            cargo build --locked --release --target "$TARGET"
           fi
 
       - name: Strip binary (release builds)
