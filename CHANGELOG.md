@@ -4,6 +4,10 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Security
+
+- wasmtime, wasmtime-wasi and the dev-only wasmtime-environ oracle move from 50.0.2 to 50.0.3, fixing RUSTSEC-2026-0587 (WASI filesystem sandbox escape on Windows through a drive-prefixed path component). All three are dev-dependencies of meld-core; the shipped `meld` binary does not link wasmtime (`cargo tree -p meld-cli -e normal` has no wasmtime crate). `cargo audit` now reports 0 vulnerabilities.
+
 ### Removed
 
 - No x86_64-apple-darwin (Intel macOS) assets or wheels from this release on. Intel Mac users: build from source. The npm launcher reports darwin/x64 as an unsupported platform (owner decision 2026-11-20, fleet-wide).
