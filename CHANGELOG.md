@@ -14,6 +14,7 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- A string that is not valid in its declared encoding (a lone UTF-16 surrogate, or invalid, truncated or overlong UTF-8) is now a trap when it crosses a fused boundary, as `load_string_from_range` in the Canonical ABI specifies and wasmtime does. meld used to substitute U+FFFD and return a value, and LS-P-16, LS-P-19 and LS-P-20 wrongly said the spec required that. Differential ledger: accepts-invalid 29 → 11, 18 rows → match-trap.
 - A UTF-16 string copied between two memories (`--memory multi`) moved one byte per code unit instead of two, so its second half arrived as zeros at exit 0 (#598). The copy now sizes UTF-16 strings at two bytes per unit, top level and nested in lists, records and variant payloads, and asks `cabi_realloc` for 2-byte alignment. Differential ledger: wrong 20 → 2, accepts-invalid 30 → 29.
 
 ### Falsified

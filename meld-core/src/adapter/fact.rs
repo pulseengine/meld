@@ -195,8 +195,8 @@ fn emit_copy_byte_count(
 /// UTF-8 sequence into `cp_local`, and advances `src_idx_local` past the bytes
 /// consumed. `len_local` bounds the buffer. Malformed input (truncation,
 /// invalid continuation, overlong, surrogate, out-of-range, lone continuation)
-/// is replaced with U+FFFD, consuming only the lead byte (the #251/#249/LS-P-19
-/// Canonical-ABI lossy-replacement convention). `byte_local` and `cont_local`
+/// traps (`unreachable`), as the Canonical ABI's `load_string_from_range`
+/// does on `UnicodeError` (#598 / SR-134). `byte_local` and `cont_local`
 /// are scratch. `ptr_local` is the local holding the source base pointer
 /// (param 0 for the standard caller-string layout).
 ///
@@ -221,14 +221,10 @@ fn emit_utf8_decode_codepoint(
     func.instruction(&Instruction::I32Load8U(src_mem8));
     func.instruction(&Instruction::LocalSet(byte_local));
 
-    // Emit: cp = U+FFFD; src_idx += 1 (replacement, consume lead only).
-    let emit_fffd_consume_lead = |func: &mut Function| {
-        func.instruction(&Instruction::I32Const(0xFFFD));
-        func.instruction(&Instruction::LocalSet(cp_local));
-        func.instruction(&Instruction::LocalGet(src_idx_local));
-        func.instruction(&Instruction::I32Const(1));
-        func.instruction(&Instruction::I32Add);
-        func.instruction(&Instruction::LocalSet(src_idx_local));
+    // Emit: trap on invalid UTF-8.
+    let emit_invalid_trap = |func: &mut Function| {
+        // Invalid encoding traps, as `load_string_from_range` does (#598 / SR-134).
+        func.instruction(&Instruction::Unreachable);
     };
     // Push mem8[ptr + src_idx + off] onto the stack (a continuation byte).
     let push_byte_at = |func: &mut Function, off: i32| {
@@ -263,13 +259,13 @@ fn emit_utf8_decode_codepoint(
     }
     func.instruction(&Instruction::Else);
     {
-        // if byte < 0xC2: invalid lead → U+FFFD, consume lead only.
+        // if byte < 0xC2: invalid lead → trap.
         func.instruction(&Instruction::LocalGet(byte_local));
         func.instruction(&Instruction::I32Const(0xC2));
         func.instruction(&Instruction::I32LtU);
         func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
         {
-            emit_fffd_consume_lead(func);
+            emit_invalid_trap(func);
         }
         func.instruction(&Instruction::Else);
         {
@@ -287,7 +283,7 @@ fn emit_utf8_decode_codepoint(
                 func.instruction(&Instruction::I32GeU);
                 func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
                 {
-                    emit_fffd_consume_lead(func);
+                    emit_invalid_trap(func);
                 }
                 func.instruction(&Instruction::Else);
                 {
@@ -296,7 +292,7 @@ fn emit_utf8_decode_codepoint(
                     push_not_continuation(func);
                     func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
                     {
-                        emit_fffd_consume_lead(func);
+                        emit_invalid_trap(func);
                     }
                     func.instruction(&Instruction::Else);
                     {
@@ -335,7 +331,7 @@ fn emit_utf8_decode_codepoint(
                     func.instruction(&Instruction::I32GeU);
                     func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
                     {
-                        emit_fffd_consume_lead(func);
+                        emit_invalid_trap(func);
                     }
                     func.instruction(&Instruction::Else);
                     {
@@ -348,7 +344,7 @@ fn emit_utf8_decode_codepoint(
                         func.instruction(&Instruction::I32Or);
                         func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
                         {
-                            emit_fffd_consume_lead(func);
+                            emit_invalid_trap(func);
                         }
                         func.instruction(&Instruction::Else);
                         {
@@ -382,7 +378,7 @@ fn emit_utf8_decode_codepoint(
                             func.instruction(&Instruction::I32Or);
                             func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
                             {
-                                emit_fffd_consume_lead(func);
+                                emit_invalid_trap(func);
                             }
                             func.instruction(&Instruction::Else);
                             {
@@ -405,7 +401,7 @@ fn emit_utf8_decode_codepoint(
                     func.instruction(&Instruction::I32GeU);
                     func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
                     {
-                        emit_fffd_consume_lead(func);
+                        emit_invalid_trap(func);
                     }
                     func.instruction(&Instruction::Else);
                     {
@@ -416,7 +412,7 @@ fn emit_utf8_decode_codepoint(
                         func.instruction(&Instruction::I32GeU);
                         func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
                         {
-                            emit_fffd_consume_lead(func);
+                            emit_invalid_trap(func);
                         }
                         func.instruction(&Instruction::Else);
                         {
@@ -433,7 +429,7 @@ fn emit_utf8_decode_codepoint(
                             func.instruction(&Instruction::I32Or);
                             func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
                             {
-                                emit_fffd_consume_lead(func);
+                                emit_invalid_trap(func);
                             }
                             func.instruction(&Instruction::Else);
                             {
@@ -469,7 +465,7 @@ fn emit_utf8_decode_codepoint(
                                 func.instruction(&Instruction::I32Or);
                                 func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
                                 {
-                                    emit_fffd_consume_lead(func);
+                                    emit_invalid_trap(func);
                                 }
                                 func.instruction(&Instruction::Else);
                                 {
@@ -499,10 +495,10 @@ fn emit_utf8_decode_codepoint(
 ///
 /// Reads the code unit at `mem16[ptr_local + src_idx_local*2]`, decodes a full
 /// scalar value into `cp_local`, and advances `src_idx_local` (by 1 for a BMP
-/// scalar / replaced lone surrogate, by 2 for a valid surrogate pair).
+/// scalar, by 2 for a valid surrogate pair).
 /// `len_local` bounds the buffer (code-unit count). Lone surrogates (high at
-/// EOF, high not followed by low, or lone low) are replaced with U+FFFD per the
-/// Canonical ABI, mirroring `emit_utf16_to_utf8_transcode`. `cu2_local` is
+/// EOF, high not followed by low, or lone low) trap per the
+/// Canonical ABI's `load_string_from_range` (#598 / SR-134), mirroring `emit_utf16_to_utf8_transcode`. `cu2_local` is
 /// scratch. Extracted for #253 so the UTF-16 → Latin-1 scan/write phases share
 /// one validated decoder.
 #[allow(clippy::too_many_arguments)]
@@ -535,7 +531,7 @@ fn emit_utf16_decode_codepoint(
     func.instruction(&Instruction::I32And);
     func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
     {
-        // High surrogate. If it's the last unit → U+FFFD, consume 1.
+        // High surrogate. If it's the last unit → trap.
         func.instruction(&Instruction::LocalGet(src_idx_local));
         func.instruction(&Instruction::I32Const(1));
         func.instruction(&Instruction::I32Add);
@@ -543,12 +539,8 @@ fn emit_utf16_decode_codepoint(
         func.instruction(&Instruction::I32GeU);
         func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
         {
-            func.instruction(&Instruction::I32Const(0xFFFD));
-            func.instruction(&Instruction::LocalSet(cp_local));
-            func.instruction(&Instruction::LocalGet(src_idx_local));
-            func.instruction(&Instruction::I32Const(1));
-            func.instruction(&Instruction::I32Add);
-            func.instruction(&Instruction::LocalSet(src_idx_local));
+            // Invalid encoding traps, as `load_string_from_range` does (#598 / SR-134).
+            func.instruction(&Instruction::Unreachable);
         }
         func.instruction(&Instruction::Else);
         {
@@ -592,13 +584,8 @@ fn emit_utf16_decode_codepoint(
             }
             func.instruction(&Instruction::Else);
             {
-                // Mid-string lone high surrogate → U+FFFD, consume 1.
-                func.instruction(&Instruction::I32Const(0xFFFD));
-                func.instruction(&Instruction::LocalSet(cp_local));
-                func.instruction(&Instruction::LocalGet(src_idx_local));
-                func.instruction(&Instruction::I32Const(1));
-                func.instruction(&Instruction::I32Add);
-                func.instruction(&Instruction::LocalSet(src_idx_local));
+                // Invalid encoding traps, as `load_string_from_range` does (#598 / SR-134).
+                func.instruction(&Instruction::Unreachable);
             }
             func.instruction(&Instruction::End);
         }
@@ -606,7 +593,7 @@ fn emit_utf16_decode_codepoint(
     }
     func.instruction(&Instruction::Else);
     {
-        // Not a high surrogate. Lone low surrogate → U+FFFD, else cp = cu.
+        // Not a high surrogate. Lone low surrogate → trap, else cp = cu.
         func.instruction(&Instruction::LocalGet(cu_local));
         func.instruction(&Instruction::I32Const(0xDC00_u32 as i32));
         func.instruction(&Instruction::I32GeU);
@@ -616,8 +603,8 @@ fn emit_utf16_decode_codepoint(
         func.instruction(&Instruction::I32And);
         func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
         {
-            func.instruction(&Instruction::I32Const(0xFFFD));
-            func.instruction(&Instruction::LocalSet(cp_local));
+            // Invalid encoding traps, as `load_string_from_range` does (#598 / SR-134).
+            func.instruction(&Instruction::Unreachable);
         }
         func.instruction(&Instruction::Else);
         {
@@ -1056,8 +1043,8 @@ fn emit_utf16_to_utf8_transcode_param(
     body.instruction(&Instruction::LocalGet(len_local));
     body.instruction(&Instruction::I32GeU);
     body.instruction(&Instruction::BrIf(1));
-    // cp = decode_utf16(src); src_idx advances by 1 or 2 code units (lossy
-    // U+FFFD for lone surrogates).
+    // cp = decode_utf16(src); src_idx advances by 1 or 2 code units (lone
+    // surrogates trap).
     emit_utf16_decode_codepoint(
         body,
         src_mem16,
@@ -1256,7 +1243,7 @@ fn emit_latin1_to_utf16_transcode_param(
 /// * tag **CLEAR** → pure Latin-1: each byte 0x00–0x7F → 1 UTF-8 byte,
 ///   0x80–0xFF → 2 UTF-8 bytes (≤ 2 bytes per source byte).
 /// * tag **SET** → UTF-16 source: full UTF-16 → UTF-8 transcode (surrogate
-///   pairs, lossy U+FFFD for lone surrogates) via the shared decode+encode
+///   pairs, lone surrogates trap) via the shared decode+encode
 ///   helpers (≤ 3 UTF-8 bytes per code unit; a surrogate pair is 2 units → 4
 ///   bytes = 2 bytes/unit).
 ///
@@ -1335,8 +1322,8 @@ fn emit_latin1_to_utf8_transcode_param(
         body.instruction(&Instruction::LocalGet(len_local));
         body.instruction(&Instruction::I32GeU);
         body.instruction(&Instruction::BrIf(1));
-        // cp = decode_utf16(src); src_idx advances by 1 or 2 units (lossy
-        // U+FFFD for lone surrogates).
+        // cp = decode_utf16(src); src_idx advances by 1 or 2 units (lone
+        // surrogates trap).
         emit_utf16_decode_codepoint(
             body,
             src_mem16,
@@ -1719,10 +1706,10 @@ fn emit_compact_utf16_to_compact_utf16_copy_param(
 ///
 /// The source length operand (`len_local`) is a UTF-16 **code-unit count**.
 /// Phase A decodes the code units (surrogate pairs combined, lone surrogates
-/// normalised to U+FFFD) to decide latin1-vs-utf16; phase B re-decodes and
+/// trap) to decide latin1-vs-utf16; phase B re-decodes and
 /// writes the chosen representation. The UTF-16 arm re-decodes and re-encodes
-/// (rather than verbatim-copying) so lone surrogates normalise to U+FFFD
-/// consistently with phase A's decision, exactly like the sync emitter.
+/// (rather than verbatim-copying) so a lone surrogate traps
+/// consistently with phase A, exactly like the sync emitter.
 ///
 /// Contract / output length: identical to [`emit_utf8_to_latin1_transcode_param`]
 /// — `len_local` is rewritten to the tagged output length (Latin-1 char count,
@@ -1801,7 +1788,7 @@ fn emit_utf16_to_latin1_transcode_param(
     body.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
     {
         // UTF-16 representation (tag set): re-decode + UTF-16-encode so lone
-        // surrogates normalise to U+FFFD consistently with phase A.
+        // surrogates trap consistently with phase A.
         body.instruction(&Instruction::I32Const(0));
         body.instruction(&Instruction::LocalSet(src_idx_local));
         body.instruction(&Instruction::I32Const(0));
@@ -10002,26 +9989,17 @@ impl FactStyleGenerator {
         //
         // #251 malformed-UTF-8 hardening. The decode arms below validate the
         // *content* of every multi-byte sequence, not just (LS-P-19)
-        // truncation. The Canonical ABI mandates lossy U+FFFD replacement for
-        // any ill-formed UTF-8 (H-4.4 incorrect transcoding); on detection we
-        // follow the established LS-P-19 convention of emitting U+FFFD (one
-        // UTF-16 code unit) and consuming ONLY the lead byte (src_idx += 1),
-        // so the offending continuation/trailing byte is reprocessed on the
-        // next iteration. This always makes progress (>= 1 byte consumed) and
-        // is consistent with the existing truncation handling. It can emit
-        // more U+FFFDs than the strict Unicode "maximal subpart" rule for
-        // some multi-continuation cases, but never decodes to a wrong scalar.
+        // truncation. The Canonical ABI's `load_string_from_range` traps on
+        // any ill-formed UTF-8 (`except UnicodeError: trap()`; H-4.4
+        // incorrect transcoding), so every invalid case below emits
+        // `unreachable` (#598 / SR-134).
         //
         // Helper closures keep the repeated WASM emission DRY:
 
-        // Emit: cp = U+FFFD; src_idx += 1 (replacement, consume lead only).
-        let emit_fffd_consume_lead = |func: &mut Function| {
-            func.instruction(&Instruction::I32Const(0xFFFD));
-            func.instruction(&Instruction::LocalSet(cp_local));
-            func.instruction(&Instruction::LocalGet(src_idx_local));
-            func.instruction(&Instruction::I32Const(1));
-            func.instruction(&Instruction::I32Add);
-            func.instruction(&Instruction::LocalSet(src_idx_local));
+        // Emit: trap on invalid UTF-8.
+        let emit_invalid_trap = |func: &mut Function| {
+            // Invalid encoding traps, as `load_string_from_range` does (#598 / SR-134).
+            func.instruction(&Instruction::Unreachable);
         };
 
         // Push mem8[ptr + src_idx + off] onto the stack (a continuation byte).
@@ -10063,13 +10041,13 @@ impl FactStyleGenerator {
             // if byte < 0xC2: invalid lead — a lone continuation byte
             // (0x80–0xBF) masquerading as a lead, or an overlong 2-byte lead
             // (0xC0, 0xC1). #251 case 2. Reject before the 2-byte arm so these
-            // never enter the decoder. → U+FFFD, consume lead only.
+            // never enter the decoder. → trap.
             func.instruction(&Instruction::LocalGet(byte_local));
             func.instruction(&Instruction::I32Const(0xC2));
             func.instruction(&Instruction::I32LtU);
             func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
             {
-                emit_fffd_consume_lead(func);
+                emit_invalid_trap(func);
             }
             func.instruction(&Instruction::Else);
             {
@@ -10079,15 +10057,9 @@ impl FactStyleGenerator {
                 func.instruction(&Instruction::I32LtU);
                 func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
                 {
-                    // LS-P-19: emit U+FFFD when the 2-byte sequence's
-                    // continuation byte would be read past the end of input
-                    // (truncated multi-byte lead). Pre-v0.11 trapped via
-                    // `unreachable`; the Canonical-ABI-correct behaviour is
-                    // lossy replacement with U+FFFD (a single UTF-16 code
-                    // unit), consuming only the lead byte. The continuations
-                    // would have started a valid sequence in another world;
-                    // by not consuming bytes past the lead we leave that
-                    // possibility open for the next iteration.
+                    // LS-P-19: trap when the 2-byte sequence's continuation
+                    // byte would be read past the end of input (truncated
+                    // multi-byte lead), as `load_string_from_range` does.
                     func.instruction(&Instruction::LocalGet(src_idx_local));
                     func.instruction(&Instruction::I32Const(1));
                     func.instruction(&Instruction::I32Add);
@@ -10095,8 +10067,8 @@ impl FactStyleGenerator {
                     func.instruction(&Instruction::I32GeU);
                     func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
                     {
-                        // Truncated 2-byte lead → U+FFFD.
-                        emit_fffd_consume_lead(func);
+                        // Truncated 2-byte lead → trap.
+                        emit_invalid_trap(func);
                     }
                     func.instruction(&Instruction::Else);
                     {
@@ -10106,8 +10078,8 @@ impl FactStyleGenerator {
                         push_not_continuation(func);
                         func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
                         {
-                            // b1 is not a continuation byte → U+FFFD, consume lead.
-                            emit_fffd_consume_lead(func);
+                            // b1 is not a continuation byte → trap.
+                            emit_invalid_trap(func);
                         }
                         func.instruction(&Instruction::Else);
                         {
@@ -10143,11 +10115,9 @@ impl FactStyleGenerator {
                     func.instruction(&Instruction::I32LtU);
                     func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
                     {
-                        // LS-P-19: emit U+FFFD when the 3-byte sequence's
+                        // LS-P-19: trap when the 3-byte sequence's
                         // continuation bytes would extend past the end of
-                        // input. Pre-v0.11 trapped; now substitutes the
-                        // truncated lead with U+FFFD and consumes only the
-                        // lead byte.
+                        // input (`load_string_from_range`).
                         func.instruction(&Instruction::LocalGet(src_idx_local));
                         func.instruction(&Instruction::I32Const(2));
                         func.instruction(&Instruction::I32Add);
@@ -10155,8 +10125,8 @@ impl FactStyleGenerator {
                         func.instruction(&Instruction::I32GeU);
                         func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
                         {
-                            // Truncated 3-byte lead → U+FFFD.
-                            emit_fffd_consume_lead(func);
+                            // Truncated 3-byte lead → trap.
+                            emit_invalid_trap(func);
                         }
                         func.instruction(&Instruction::Else);
                         {
@@ -10171,8 +10141,8 @@ impl FactStyleGenerator {
                             func.instruction(&Instruction::I32Or);
                             func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
                             {
-                                // A continuation byte is not 10xxxxxx → U+FFFD.
-                                emit_fffd_consume_lead(func);
+                                // A continuation byte is not 10xxxxxx → trap.
+                                emit_invalid_trap(func);
                             }
                             func.instruction(&Instruction::Else);
                             {
@@ -10211,8 +10181,8 @@ impl FactStyleGenerator {
                                 func.instruction(&Instruction::I32Or);
                                 func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
                                 {
-                                    // Overlong or surrogate → U+FFFD, consume lead.
-                                    emit_fffd_consume_lead(func);
+                                    // Overlong or surrogate → trap.
+                                    emit_invalid_trap(func);
                                 }
                                 func.instruction(&Instruction::Else);
                                 {
@@ -10239,18 +10209,16 @@ impl FactStyleGenerator {
                         func.instruction(&Instruction::I32GeU);
                         func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
                         {
-                            emit_fffd_consume_lead(func);
+                            emit_invalid_trap(func);
                         }
                         func.instruction(&Instruction::Else);
                         {
-                            // LS-P-19: emit U+FFFD when the 4-byte sequence's
+                            // LS-P-19: trap when the 4-byte sequence's
                             // continuation bytes would extend past the end of
-                            // input — without this guard a truncated 4-byte
-                            // lead at the buffer tail reads up to 3 bytes of
-                            // attacker-adjacent caller memory and folds them
-                            // into the encoded code point. Pre-v0.11 trapped;
-                            // now substitutes the truncated lead with U+FFFD
-                            // and consumes only the lead byte.
+                            // input (`load_string_from_range`) — without this
+                            // guard a truncated 4-byte lead at the buffer tail
+                            // reads up to 3 bytes of attacker-adjacent caller
+                            // memory.
                             func.instruction(&Instruction::LocalGet(src_idx_local));
                             func.instruction(&Instruction::I32Const(3));
                             func.instruction(&Instruction::I32Add);
@@ -10258,8 +10226,8 @@ impl FactStyleGenerator {
                             func.instruction(&Instruction::I32GeU);
                             func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
                             {
-                                // Truncated 4-byte lead → U+FFFD.
-                                emit_fffd_consume_lead(func);
+                                // Truncated 4-byte lead → trap.
+                                emit_invalid_trap(func);
                             }
                             func.instruction(&Instruction::Else);
                             {
@@ -10277,8 +10245,8 @@ impl FactStyleGenerator {
                                 func.instruction(&Instruction::I32Or);
                                 func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
                                 {
-                                    // A continuation byte is not 10xxxxxx → U+FFFD.
-                                    emit_fffd_consume_lead(func);
+                                    // A continuation byte is not 10xxxxxx → trap.
+                                    emit_invalid_trap(func);
                                 }
                                 func.instruction(&Instruction::Else);
                                 {
@@ -10322,8 +10290,8 @@ impl FactStyleGenerator {
                                         wasm_encoder::BlockType::Empty,
                                     ));
                                     {
-                                        // Overlong or out-of-range → U+FFFD, consume lead.
-                                        emit_fffd_consume_lead(func);
+                                        // Overlong or out-of-range → trap.
+                                        emit_invalid_trap(func);
                                     }
                                     func.instruction(&Instruction::Else);
                                     {
@@ -10535,19 +10503,13 @@ impl FactStyleGenerator {
         func.instruction(&Instruction::I32And);
         func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
         {
-            // LS-P-16: emit U+FFFD replacement when a lone high surrogate
-            // sits at the last code unit of the input. Pre-v0.11, this site
-            // trapped via `unreachable` (the conservative mitigation that
-            // closed a 2-byte OOB read into adjacent caller linear memory).
-            // The Canonical ABI's correct behaviour for malformed UTF-16 is
-            // **lossy replacement**, not abort — so we now substitute the
-            // lone high surrogate with the Unicode replacement character
-            // U+FFFD (3-byte UTF-8 `EF BF BD`) and continue. The existing
-            // 3-byte UTF-8 encoder below handles `cp = 0xFFFD` directly
-            // (it lives in the BMP), so the only restructure here is to
-            // turn the trap into an `If/Else`: when `src_idx + 1 >=
-            // input_len`, take the replacement path; otherwise read the
-            // low surrogate and compute the full code point.
+            // LS-P-16: trap when a lone high surrogate sits at the last code
+            // unit of the input (this also closes a 2-byte OOB read into
+            // adjacent caller linear memory). `load_string_from_range`
+            // traps on malformed UTF-16 (`except UnicodeError: trap()`),
+            // #598 / SR-134. When `src_idx + 1 >= input_len` take the trap
+            // path; otherwise read the low surrogate and compute the full
+            // code point.
             func.instruction(&Instruction::LocalGet(src_idx_local));
             func.instruction(&Instruction::I32Const(1));
             func.instruction(&Instruction::I32Add);
@@ -10555,14 +10517,8 @@ impl FactStyleGenerator {
             func.instruction(&Instruction::I32GeU);
             func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
             {
-                // Lone high surrogate at end of input → U+FFFD replacement.
-                func.instruction(&Instruction::I32Const(0xFFFD));
-                func.instruction(&Instruction::LocalSet(cp_local));
-                // Consume only the lone high surrogate.
-                func.instruction(&Instruction::LocalGet(src_idx_local));
-                func.instruction(&Instruction::I32Const(1));
-                func.instruction(&Instruction::I32Add);
-                func.instruction(&Instruction::LocalSet(src_idx_local));
+                // Invalid encoding traps, as `load_string_from_range` does (#598 / SR-134).
+                func.instruction(&Instruction::Unreachable);
             }
             func.instruction(&Instruction::Else);
             {
@@ -10573,7 +10529,7 @@ impl FactStyleGenerator {
                 // followed by an ASCII char) underflows `cu2 - 0xDC00` and
                 // yields a garbage code point that the 4-byte encoder writes
                 // into callee memory (H-4.4 incorrect transcoding). The
-                // Canonical ABI mandates lossy U+FFFD replacement instead.
+                // The Canonical ABI traps on it instead.
                 // cu2 = mem16[ptr + (src_idx + 1) * 2]
                 func.instruction(&Instruction::LocalGet(0));
                 func.instruction(&Instruction::LocalGet(src_idx_local));
@@ -10617,15 +10573,9 @@ impl FactStyleGenerator {
                 }
                 func.instruction(&Instruction::Else);
                 {
-                    // Mid-string lone high surrogate → U+FFFD, consuming only
-                    // the high surrogate so the next unit is reprocessed
-                    // normally on the following iteration.
-                    func.instruction(&Instruction::I32Const(0xFFFD));
-                    func.instruction(&Instruction::LocalSet(cp_local));
-                    func.instruction(&Instruction::LocalGet(src_idx_local));
-                    func.instruction(&Instruction::I32Const(1));
-                    func.instruction(&Instruction::I32Add);
-                    func.instruction(&Instruction::LocalSet(src_idx_local));
+                    // Mid-string lone high surrogate → trap.
+                    // Invalid encoding traps, as `load_string_from_range` does (#598 / SR-134).
+                    func.instruction(&Instruction::Unreachable);
                 }
                 func.instruction(&Instruction::End); // end low-surrogate validation
             }
@@ -10637,12 +10587,12 @@ impl FactStyleGenerator {
             // [0xDC00, 0xE000)) cannot legitimately appear unpaired here —
             // the high-surrogate arm above consumes both halves of every
             // valid pair, so any low surrogate reaching this branch is
-            // malformed input. Replace it with U+FFFD per the Canonical
-            // ABI (#249) rather than emitting the malformed 3-byte UTF-8 of
-            // a surrogate code point (ED B0 80 .. ED BF BF). Any other unit
-            // is a genuine BMP scalar value, encoded directly. Either way
+            // malformed input. Trap per `load_string_from_range` (#249,
+            // #598 / SR-134) rather than emitting the malformed 3-byte UTF-8
+            // of a surrogate code point (ED B0 80 .. ED BF BF). Any other
+            // unit is a genuine BMP scalar value, encoded directly and
             // exactly one code unit is consumed.
-            // cp = is_low_surrogate(cu) ? 0xFFFD : cu
+            // if is_low_surrogate(cu) { trap } else { cp = cu }
             func.instruction(&Instruction::LocalGet(cu_local));
             func.instruction(&Instruction::I32Const(0xDC00_u32 as i32));
             func.instruction(&Instruction::I32GeU);
@@ -10652,8 +10602,8 @@ impl FactStyleGenerator {
             func.instruction(&Instruction::I32And);
             func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
             {
-                func.instruction(&Instruction::I32Const(0xFFFD));
-                func.instruction(&Instruction::LocalSet(cp_local));
+                // Invalid encoding traps, as `load_string_from_range` does (#598 / SR-134).
+                func.instruction(&Instruction::Unreachable);
             }
             func.instruction(&Instruction::Else);
             {
@@ -10699,7 +10649,7 @@ impl FactStyleGenerator {
     ///   the path the pre-#253 implementation always took.
     /// - tag **set** → the source is UTF-16 (`count = len & !UTF16_TAG` code
     ///   units); the correct behaviour is a full UTF-16 → UTF-8 transcode
-    ///   (surrogate pairs, lossy U+FFFD for malformed units — the exact
+    ///   (surrogate pairs; a malformed unit traps — the exact
     ///   semantics of [`Self::emit_utf16_to_utf8_transcode`]).
     ///
     /// We dispatch at runtime on the tag. The two arms share the destination
@@ -11206,8 +11156,8 @@ impl FactStyleGenerator {
     ///
     /// Two-phase:
     /// - **Phase A (scan):** decode the UTF-8 source; set `needs_utf16` if any
-    ///   decoded code point exceeds 0xFF (malformed input decodes to U+FFFD,
-    ///   which is > 0xFF, so it forces the UTF-16 representation).
+    ///   decoded code point exceeds 0xFF (malformed input traps in the shared
+    ///   decoder, so it never reaches this check).
     /// - **Phase B (write):**
     ///   - tag clear: decode again, write each code point as one Latin-1 byte;
     ///     length = char count (no tag).
@@ -11421,7 +11371,7 @@ impl FactStyleGenerator {
     /// The mirror of [`Self::emit_utf8_to_latin1_transcode`] for a UTF-16
     /// source. The source length operand (local 1) is a code-unit count.
     /// Two-phase: scan the UTF-16 code units (decoding surrogate pairs and
-    /// replacing lone surrogates with U+FFFD per the Canonical ABI) to decide
+    /// trapping on lone surrogates per `load_string_from_range`) to decide
     /// latin1-vs-utf16; then write the chosen representation. The output buffer
     /// is `2 * code_units` bytes (the UTF-16-verbatim worst case).
     fn emit_utf16_to_latin1_transcode(
@@ -11532,7 +11482,7 @@ impl FactStyleGenerator {
         func.instruction(&Instruction::If(block_ty));
         {
             // UTF-16 representation (tag set). Re-decode and re-encode rather
-            // than verbatim-copy so lone surrogates are normalised to U+FFFD
+            // than verbatim-copy so a lone surrogate traps
             // consistently with phase A's decision.
             func.instruction(&Instruction::I32Const(0));
             func.instruction(&Instruction::LocalSet(src_idx_local));
@@ -14810,91 +14760,88 @@ mod tests {
         assert_eq!(nested_u8.len(), 1);
     }
 
-    /// LS-P-19 — `emit_utf8_to_utf16_transcode` must replace truncated
-    /// multi-byte UTF-8 sequences with U+FFFD instead of reading past the
-    /// end of the input buffer.
+    /// LS-P-19 — `emit_utf8_to_utf16_transcode` must TRAP on truncated
+    /// multi-byte UTF-8 sequences instead of reading past the end of the
+    /// input buffer.
     ///
-    /// The mirror of LS-P-16 on the UTF-8→UTF-16 direction. Before the
-    /// v0.10 mitigation, each multi-byte branch (2-byte, 3-byte, 4-byte)
-    /// unconditionally read continuation bytes at `src_idx + 1`, `+2`,
-    /// `+3` via `I32Load8U` without checking against `input_len` — a
-    /// UTF-8 string ending on a truncated multi-byte lead byte caused
-    /// the adapter to load 1–3 bytes of attacker-adjacent caller memory,
-    /// incorporate them into a synthesized code point, and emit the
-    /// result as UTF-16 in the callee. v0.10 trapped via `unreachable`
-    /// (conservative). **v0.11.0 substitutes U+FFFD per the Canonical
-    /// ABI's lossy-replacement rule**: when the continuation bytes are
-    /// out of range, set `cp = 0xFFFD` and consume only the lead byte;
-    /// the loop continues with the next byte as a potential new lead.
+    /// The mirror of LS-P-16 on the UTF-8→UTF-16 direction. Each multi-byte
+    /// branch (2-byte, 3-byte, 4-byte) reads continuation bytes at
+    /// `src_idx + 1`, `+2`, `+3`; without a bounds guard a string ending on
+    /// a truncated lead byte would load 1–3 bytes of attacker-adjacent
+    /// caller memory. The guard now emits `unreachable`: the Canonical ABI's
+    /// `load_string_from_range` does `memory[ptr:ptr+byte_length]
+    /// .decode(encoding)` with `except UnicodeError: trap()`, and wasmtime
+    /// traps on such input (#598 / SR-134). U+FFFD substitution is NOT
+    /// spec-conformant.
     ///
-    /// Pinned structurally: the LS-P-19 marker must appear at all three
-    /// branches AND the U+FFFD code point must be emitted at each.
+    /// Pinned structurally: the LS-P-19 trap marker must appear at all three
+    /// branches AND no `I32Const(0xFFFD)` may be emitted outside test code.
     #[test]
-    fn ls_p_19_utf8_to_utf16_continuation_byte_emits_replacement() {
+    fn ls_p_19_utf8_to_utf16_continuation_byte_traps() {
         const SRC: &str = include_str!("fact.rs");
-        let marker = "LS-P-19: emit U+FFFD when the";
-        let marker_count = SRC.matches(marker).count();
+        let non_test = SRC.split("\n#[cfg(test)]\nmod ").next().unwrap();
+        let marker = "LS-P-19: trap when the";
+        let marker_count = non_test.matches(marker).count();
         assert!(
             marker_count >= 3,
-            "fact.rs must retain LS-P-19 U+FFFD markers for all three \
+            "fact.rs must retain LS-P-19 trap markers for all three \
              multi-byte branches (2-byte, 3-byte, 4-byte) in \
              emit_utf8_to_utf16_transcode; found {marker_count}",
         );
-        // The Canonical ABI's replacement character is U+FFFD (decimal
-        // 65533). The emitter sets `cp_local = 0xFFFD` at each of the
-        // three multi-byte truncation paths, plus once at the LS-P-16
-        // lone-high-surrogate path in emit_utf16_to_utf8_transcode →
-        // at least 4 occurrences of `I32Const(0xFFFD)` in fact.rs.
-        let fffd_count = SRC.matches("I32Const(0xFFFD)").count();
+        let fffd_count = non_test.matches("I32Const(0xFFFD)").count();
+        assert_eq!(
+            fffd_count, 0,
+            "U+FFFD substitution contradicts `load_string_from_range` \
+             (`except UnicodeError: trap()`); found {fffd_count} \
+             I32Const(0xFFFD) emissions outside test code",
+        );
         assert!(
-            fffd_count >= 4,
-            "expected at least 4 I32Const(0xFFFD) emissions in fact.rs \
-             (LS-P-16 + LS-P-19 replacement paths); found {fffd_count}",
+            non_test
+                .matches("Invalid encoding traps, as `load_string_from_range` does")
+                .count()
+                >= 8,
+            "every invalid-encoding site must emit the trap",
         );
     }
 
-    /// LS-P-16 — `emit_utf16_to_utf8_transcode` must replace a lone high
-    /// surrogate at end-of-input with U+FFFD rather than reading past the
-    /// buffer.
+    /// LS-P-16 — `emit_utf16_to_utf8_transcode` must TRAP on a lone high
+    /// surrogate at end-of-input rather than reading past the buffer or
+    /// substituting U+FFFD.
     ///
-    /// Before the v0.10 mitigation, the surrogate-pair `If` arm
-    /// unconditionally emitted a second `I32Load16U` at `mem16[ptr +
-    /// (src_idx + 1) * 2]` — for an input whose last code unit is a high
-    /// surrogate, that read 2 bytes past the buffer. v0.10 added a
-    /// `src_idx + 1 >= input_len` trap (conservative mitigation).
-    /// **v0.11.0 substitutes U+FFFD** (3-byte UTF-8 `EF BF BD`) per the
-    /// Canonical ABI's lossy-replacement rule, consuming only the lone
-    /// high surrogate and continuing the loop. The existing 3-byte UTF-8
-    /// encoder handles `cp = 0xFFFD` directly (it lives in the BMP).
+    /// The surrogate-pair `If` arm reads a second `I32Load16U` at
+    /// `mem16[ptr + (src_idx + 1) * 2]`; for an input whose last code unit
+    /// is a high surrogate that is 2 bytes past the buffer, so the arm is
+    /// gated on `src_idx + 1 >= input_len` and that path emits
+    /// `unreachable`. The Canonical ABI's `load_string_from_range` does
+    /// `.decode(encoding)` with `except UnicodeError: trap()`, and wasmtime
+    /// traps on the unfused component (#598 / SR-134).
     ///
-    /// Pinned structurally: the LS-P-16 U+FFFD marker must remain in the
-    /// source AND `cp_local` must be set to `0xFFFD` in the bounds-
-    /// failure path. A refactor that drops the marker or the replacement
-    /// code point is caught here.
+    /// Pinned structurally: after the LS-P-16 marker the bounds-failure path
+    /// must emit `Instruction::Unreachable` and no `I32Const(0xFFFD)`.
     #[test]
-    fn ls_p_16_utf16_lone_high_surrogate_emits_replacement() {
+    fn ls_p_16_utf16_lone_high_surrogate_traps() {
         const SRC: &str = include_str!("fact.rs");
-        let marker = "LS-P-16: emit U+FFFD replacement";
-        let pos = SRC.find(marker).unwrap_or_else(|| {
+        let non_test = SRC.split("\n#[cfg(test)]\nmod ").next().unwrap();
+        let marker = "LS-P-16: trap when a lone high surrogate";
+        let pos = non_test.find(marker).unwrap_or_else(|| {
             panic!(
-                "fact.rs must retain the LS-P-16 U+FFFD marker `{marker}`; \
-                 without the replacement, the surrogate-pair If arm reads \
+                "fact.rs must retain the LS-P-16 marker `{marker}`; \
+                 without the guard, the surrogate-pair If arm reads \
                  2 bytes past the UTF-16 input buffer when input ends on a \
                  lone high surrogate",
             )
         });
-        // The replacement-code-point emission lives within ~2000 bytes of
-        // the marker; assert U+FFFD is set there.
-        let after = &SRC[pos..];
+        let after = &non_test[pos..];
         let block = &after[..after.len().min(3000)];
         assert!(
-            block.contains("I32Const(0xFFFD)"),
-            "LS-P-16 replacement path must set cp_local = 0xFFFD via \
-             I32Const(0xFFFD); the segment after the LS-P-16 marker is \
-             missing the replacement code point",
+            block.contains("Instruction::Unreachable"),
+            "LS-P-16 bounds-failure path must emit Instruction::Unreachable",
         );
-        // Bounds-check still has to be there — the replacement path is
-        // gated on `src_idx + 1 >= input_len`.
+        assert!(
+            !block.contains("I32Const(0xFFFD)"),
+            "LS-P-16 path must not substitute U+FFFD",
+        );
+        // The trap path is gated on `src_idx + 1 >= input_len`.
         assert!(
             block.contains("I32GeU"),
             "LS-P-16 path must still gate on an I32GeU comparison against \

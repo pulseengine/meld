@@ -54,6 +54,20 @@ const UTF16_TAG: i32 = 1 << 31;
 /// 0, call `transcode_and_sum(0, src_bytes.len())`, and return the summed
 /// UTF-16 code units the transcode produced in callee memory 1.
 fn transcode_and_sum(src_bytes: &[u8]) -> i32 {
+    try_transcode_and_sum(src_bytes).expect("transcode_and_sum runs")
+}
+
+/// Assert `err` is a wasm trap (not a host error or link failure).
+fn assert_is_trap(err: &wasmtime::Error, ctx: &str) {
+    assert!(
+        err.downcast_ref::<wasmtime::Trap>().is_some(),
+        "{ctx}: expected a wasm trap, got a non-trap error: {err:?}"
+    );
+}
+
+/// Like [`transcode_and_sum`] but returns the call result so invalid input can
+/// be asserted to trap.
+fn try_transcode_and_sum(src_bytes: &[u8]) -> Result<i32, wasmtime::Error> {
     let wasm = build_utf8_to_utf16_transcode_test_module();
 
     // Sanity: the emitted module must be valid wasm.
@@ -81,7 +95,6 @@ fn transcode_and_sum(src_bytes: &[u8]) -> i32 {
         .get_typed_func::<(i32, i32), i32>(&mut store, "transcode_and_sum")
         .expect("oracle module exports transcode_and_sum");
     f.call(&mut store, (0, src_bytes.len() as i32))
-        .expect("transcode_and_sum runs")
 }
 
 /// #272 inc 1 (positive, ASCII): "Hello" UTF-8 → UTF-16 yields code units
@@ -115,18 +128,17 @@ fn inc1_async_utf8_to_utf16_param_transcodes_supplementary_plane() {
     );
 }
 
-/// #272 inc 1 (positive, malformed UTF-8 → U+FFFD): a lone continuation byte
-/// 0x80 must decode to one U+FFFD code unit (Canonical-ABI lossy replacement),
-/// not be raw-copied. "A" + 0x80 + "B" → [0x0041, 0xFFFD, 0x0042], sum =
-/// 65 + 65533 + 66 = 65664. Confirms the async path uses the hardened shared
-/// decoder rather than a verbatim copy.
+/// #272 inc 1 / #598 SR-134 (negative, malformed UTF-8 → trap): a lone
+/// continuation byte 0x80 must TRAP, not be raw-copied and not be replaced
+/// with U+FFFD. The Canonical ABI's `load_string_from_range` does
+/// `memory[ptr:ptr+byte_length].decode(encoding)` with
+/// `except UnicodeError: trap()`, and wasmtime traps on the unfused
+/// component. Confirms the async path uses the hardened shared decoder.
 #[test]
-fn inc1_async_utf8_to_utf16_param_replaces_malformed_with_fffd() {
-    assert_eq!(
-        transcode_and_sum(&[0x41, 0x80, 0x42]),
-        65664,
-        "#272 inc1: malformed lead 0x80 must become U+FFFD (sum 65664)"
-    );
+fn inc1_async_utf8_to_utf16_param_malformed_traps() {
+    let err = try_transcode_and_sum(&[0x41, 0x80, 0x42])
+        .expect_err("#598: malformed lead 0x80 must trap, not transcode");
+    assert_is_trap(&err, "#598 inc1: malformed lead 0x80");
 }
 
 /// #272 inc 1 (positive, empty string): zero-length source transcodes to zero
@@ -157,6 +169,12 @@ fn inc1_async_utf8_to_utf16_param_empty_string() {
 /// memory 0 at offset 0, call `transcode_and_sum(0, src_units.len())`, and
 /// return the summed UTF-8 output bytes the transcode produced in memory 1.
 fn transcode_utf16_to_utf8_and_sum(src_units: &[u16]) -> i32 {
+    try_transcode_utf16_to_utf8_and_sum(src_units).expect("transcode_and_sum runs")
+}
+
+/// Like [`transcode_utf16_to_utf8_and_sum`] but returns the call result so
+/// invalid input can be asserted to trap.
+fn try_transcode_utf16_to_utf8_and_sum(src_units: &[u16]) -> Result<i32, wasmtime::Error> {
     let wasm = build_utf16_to_utf8_transcode_test_module();
 
     // Sanity: the emitted module must be valid wasm.
@@ -189,7 +207,6 @@ fn transcode_utf16_to_utf8_and_sum(src_units: &[u16]) -> i32 {
         .expect("oracle module exports transcode_and_sum");
     // The second arg is the source CODE-UNIT count (not a byte count).
     f.call(&mut store, (0, src_units.len() as i32))
-        .expect("transcode_and_sum runs")
 }
 
 /// #272 inc 2 (positive, ASCII): "Hello" UTF-16 → UTF-8 yields the bytes
@@ -238,19 +255,17 @@ fn inc2_async_utf16_to_utf8_param_transcodes_supplementary_plane() {
     );
 }
 
-/// #272 inc 2 (positive, lone surrogate → U+FFFD): a lone high surrogate
-/// 0xD800 with no following low surrogate must be replaced with U+FFFD
-/// (Canonical-ABI lossy replacement) → UTF-8 `EF BF BD`, not raw-copied. Sum =
-/// 0xEF + 0xBF + 0xBD = 239 + 191 + 189 = 619. Confirms the async path uses the
-/// hardened shared UTF-16 decoder.
+/// #272 inc 2 / #598 SR-134 (negative, lone surrogate → trap): a lone high
+/// surrogate 0xD800 with no following low surrogate must TRAP, not be raw-copied
+/// and not be replaced with U+FFFD. The Canonical ABI's
+/// `load_string_from_range` does `.decode(encoding)` with
+/// `except UnicodeError: trap()`, and wasmtime traps on the unfused component.
+/// Confirms the async path uses the hardened shared UTF-16 decoder.
 #[test]
-fn inc2_async_utf16_to_utf8_param_replaces_lone_surrogate_with_fffd() {
-    assert_eq!(
-        transcode_utf16_to_utf8_and_sum(&[0xD800]),
-        619,
-        "#272 inc2: lone high surrogate 0xD800 must become U+FFFD UTF-8 \
-         EF BF BD (sum 619)"
-    );
+fn inc2_async_utf16_to_utf8_param_lone_surrogate_traps() {
+    let err = try_transcode_utf16_to_utf8_and_sum(&[0xD800])
+        .expect_err("#598: lone high surrogate 0xD800 must trap, not transcode");
+    assert_is_trap(&err, "#598 inc2: lone high surrogate 0xD800");
 }
 
 /// #272 inc 2 (positive, empty string): zero-length source transcodes to zero

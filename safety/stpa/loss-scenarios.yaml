@@ -929,9 +929,8 @@ loss-scenarios:
       clean-room verified. This commit is the conservative
       mitigation: inject a `src_idx + 1 >= input_len` check inside
       the surrogate-pair `If` arm and `unreachable`-trap on failure.
-      The Canonical-ABI-correct behaviour is to replace the lone
-      surrogate with U+FFFD (3-byte UTF-8 `EF BF BD`) and continue
-      — that upgrade is tracked as a separate structural follow-up.
+      The Canonical ABI traps on a lone surrogate (`load_string_from_range`),
+      so the trap is also the spec behaviour (see the 2026-11-20 correction below).
       Trap converts silent cross-memory leak into a loud
       adapter-runtime trap. Confirmed by PoC
       `meld-core::adapter::fact::tests::ls_p_16_utf16_lone_high_surrogate_oob_guard_emitted`,
@@ -961,15 +960,25 @@ loss-scenarios:
       The model was "high-surrogate detection implies a valid
       surrogate pair," but UTF-16 strings legitimately end on a lone
       high surrogate (e.g., malformed input from JS, broken
-      truncation). The Canonical ABI mandates lossy replacement, not
+      truncation). The Canonical ABI traps on it, not an
       OOB read.
+      Corrected 2026-11-20:
+      The U+FFFD substitution recorded below was a spec deviation, not the
+      Canonical ABI rule. `load_string_from_range` decodes with
+      `memory[ptr : ptr+byte_length].decode(encoding)` and
+      `except UnicodeError: trap()`, and wasmtime traps on the unfused
+      component. Since v0.71.0 every invalid-encoding path emits
+      `unreachable` instead, so the out-of-bounds read stays mitigated and
+      the fused result matches the reference (differential ledger rows
+      accepts-invalid -> match-trap). The runtime oracles were renamed to
+      *_traps and assert a wasmtime trap.
     status: approved
     priority: high
     follow-up-closed: >
       The structural-follow-up upgrade (trap → Canonical-ABI lossy
       U+FFFD replacement) shipped in v0.11; as of 2026-06-13 it also
       has an executing RUNTIME oracle:
-      adapter_safety::test_sr17_utf16_to_utf8_lone_high_surrogate_replacement
+      adapter_safety::test_sr17_utf16_to_utf8_lone_high_surrogate_traps
       fuses a UTF-16-lowering caller passing [0x0041, 0xD800] (a lone
       trailing high surrogate) into a UTF-8 callee and asserts under
       wasmtime that the output is 'A' + U+FFFD (UTF-8 EF BF BD, byte
@@ -985,7 +994,7 @@ loss-scenarios:
       [0xD800, 0x0041] produced a garbage code point from
       `0x0041 - 0xDC00` (u32 underflow) and emitted wrong UTF-8
       (run() == 500); after, it is U+FFFD + 'A' (sum 684). Runtime
-      oracle: test_sr17_utf16_to_utf8_midstring_lone_surrogate_replacement.
+      oracle: test_sr17_utf16_to_utf8_midstring_lone_surrogate_traps.
       All causal factors of LS-P-16 are now mitigated and runtime-pinned.
       Extended 2026-06-13 (#249): the symmetric LOW-surrogate gap is also
       closed — a lone low surrogate (cu in [0xDC00, 0xE000) reaching the
@@ -994,7 +1003,7 @@ loss-scenarios:
       emitted as the malformed 3-byte UTF-8 of a surrogate code point
       (ED B0 80 .. ED BF BF); it is now replaced with U+FFFD. The whole
       malformed-UTF-16 class for emit_utf16_to_utf8_transcode is pinned
-      by test_sr17_utf16_to_utf8_malformed_surrogate_matrix (lone low at
+      by test_sr17_utf16_to_utf8_malformed_surrogate_traps_matrix (lone low at
       leading/trailing/mid positions, consecutive lone lows, consecutive
       lone highs, valid pair, and lone-surrogate-adjacent-to-valid-pair).
 
@@ -1088,9 +1097,8 @@ loss-scenarios:
       delta-pass on PR #179. Conservative mitigation prepends a
       `src_idx + N >= input_len` `unreachable` trap to each multi-byte
       branch (N = 1 for the 2-byte case, 2 for 3-byte, 3 for 4-byte).
-      The Canonical-ABI-correct upgrade replaces truncated sequences
-      with the U+FFFD replacement character (tracked alongside the
-      LS-P-16 upgrade). Trap converts silent leak into loud
+      The Canonical ABI also traps on a truncated sequence
+      (`load_string_from_range`; see the LS-P-16 2026-11-20 correction). Trap converts silent leak into loud
       adapter-runtime trap. Confirmed by PoC
       `meld-core::adapter::fact::tests::ls_p_19_utf8_to_utf16_continuation_byte_oob_guard_emitted`,
       a structural test pinning the LS-P-19 marker at all three
@@ -1113,6 +1121,16 @@ loss-scenarios:
       continuation bytes must also be in-range," but the lead byte's
       classification does not constrain the buffer end — a truncated
       multi-byte sequence is the obvious counterexample.
+      Corrected 2026-11-20:
+      The U+FFFD substitution recorded below was a spec deviation, not the
+      Canonical ABI rule. `load_string_from_range` decodes with
+      `memory[ptr : ptr+byte_length].decode(encoding)` and
+      `except UnicodeError: trap()`, and wasmtime traps on the unfused
+      component. Since v0.71.0 every invalid-encoding path emits
+      `unreachable` instead, so the out-of-bounds read stays mitigated and
+      the fused result matches the reference (differential ledger rows
+      accepts-invalid -> match-trap). The runtime oracles were renamed to
+      *_traps and assert a wasmtime trap.
     status: approved
     priority: high
 
@@ -1157,7 +1175,17 @@ loss-scenarios:
       The decoder assumed well-formed UTF-8 (mirroring the pre-fix
       UTF-16 side's "high surrogate implies a valid pair" flaw); fused
       adapters consume untrusted caller buffers where every malformed
-      form is reachable. The Canonical ABI mandates U+FFFD replacement.
+      form is reachable. The Canonical ABI traps on every malformed form.
+      Corrected 2026-11-20:
+      The U+FFFD substitution recorded below was a spec deviation, not the
+      Canonical ABI rule. `load_string_from_range` decodes with
+      `memory[ptr : ptr+byte_length].decode(encoding)` and
+      `except UnicodeError: trap()`, and wasmtime traps on the unfused
+      component. Since v0.71.0 every invalid-encoding path emits
+      `unreachable` instead, so the out-of-bounds read stays mitigated and
+      the fused result matches the reference (differential ledger rows
+      accepts-invalid -> match-trap). The runtime oracles were renamed to
+      *_traps and assert a wasmtime trap.
     status: approved
     priority: high
     fix: >

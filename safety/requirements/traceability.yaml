@@ -191,10 +191,10 @@ verification-status:
       - adapter_safety::test_sr17_utf8_to_utf16_string_transcoding
       - adapter_safety::test_sr17_utf8_to_utf16_supplementary_plane_transcoding
       - adapter_safety::test_sr17_utf16_to_utf8_supplementary_plane_transcoding
-      - adapter_safety::test_sr17_utf16_to_utf8_lone_high_surrogate_replacement
-      - adapter_safety::test_sr17_utf16_to_utf8_midstring_lone_surrogate_replacement
-      - adapter_safety::test_sr17_utf16_to_utf8_malformed_surrogate_matrix
-      - adapter_safety::ls_p_20_test_sr17_utf8_to_utf16_malformed_matrix
+      - adapter_safety::test_sr17_utf16_to_utf8_lone_high_surrogate_traps
+      - adapter_safety::test_sr17_utf16_to_utf8_midstring_lone_surrogate_traps
+      - adapter_safety::test_sr17_utf16_to_utf8_malformed_surrogate_traps_matrix
+      - adapter_safety::ls_p_20_test_sr17_utf8_to_utf16_malformed_traps_matrix
       - adapter_safety::test_sr17_latin1_to_utf16_transcoding
       - adapter_safety::test_253_read_latin1_tagclear_to_utf16
       - adapter_safety::test_253_read_latin1_tagclear_to_utf8
@@ -218,16 +218,17 @@ verification-status:
       — plus the ASCII round-trip and the resolver transcoding-
       requirement matrix. The LS-P-16 lone-surrogate path now also has
       a runtime assertion
-      (test_sr17_utf16_to_utf8_lone_high_surrogate_replacement: a lone
-      trailing high surrogate → U+FFFD, byte sum 684). SR-17 verified.
+      (test_sr17_utf16_to_utf8_lone_high_surrogate_traps: a lone
+      trailing high surrogate traps, as the Canonical ABI does;
+      v0.71.0 replaced the earlier U+FFFD substitution). SR-17 verified.
       The MID-string lone surrogate (high surrogate followed by a
       non-low unit) is also handled: emit_utf16_to_utf8_transcode
       (fact.rs:3901-3964) validates the second unit is a low surrogate
       in [0xDC00, 0xE000) before treating it as a pair, and otherwise
-      emits U+FFFD consuming only the high surrogate — pinned by
-      test_sr17_utf16_to_utf8_midstring_lone_surrogate_replacement.
+      traps — pinned by
+      test_sr17_utf16_to_utf8_midstring_lone_surrogate_traps.
       The lone LOW surrogate reaching the non-high arm is likewise
-      replaced with U+FFFD (#249, fact.rs:3968+). No residual gap;
+      a trap (#249, then v0.71.0). No residual gap;
       all four UTF-16 malformity cases (lone-high-at-end,
       mid-string-high+non-low, valid pair, lone-low) have explicit
       arms and runtime oracles.
@@ -717,8 +718,8 @@ gaps:
       tests/adapter_safety.rs fuses and executes under wasmtime —
       test_sr17_utf8_to_utf16_supplementary_plane_transcoding (#244),
       test_sr17_utf16_to_utf8_supplementary_plane_transcoding (#245/#246),
-      test_sr17_utf16_to_utf8_lone_high_surrogate_replacement (LS-P-16),
-      test_sr17_utf16_to_utf8_midstring_lone_surrogate_replacement,
+      test_sr17_utf16_to_utf8_lone_high_surrogate_traps (LS-P-16),
+      test_sr17_utf16_to_utf8_midstring_lone_surrogate_traps,
       and the malformed-surrogate matrices both directions;
       resolver::tests::test_sr17_all_encoding_pairs_transcoding_matrix
       pins the requirement-derivation matrix; parser covers the

@@ -418,7 +418,7 @@ r1-string_char_utf8-utf8_07	multi	match	-
 r1-string_char_utf8-utf8_07	shared	refused	AdapterGeneration #390
 r1-string_latin1utf16-latin1utf16_00	multi	match	-
 r1-string_latin1utf16-latin1utf16_00	shared	match	-
-r1-string_latin1utf16-latin1utf16_01	multi	accepts-invalid	-
+r1-string_latin1utf16-latin1utf16_01	multi	match-trap	-
 r1-string_latin1utf16-latin1utf16_01	shared	refused	AdapterGeneration #390
 r1-string_latin1utf16-latin1utf16_03	multi	refused	AdapterGeneration #582
 r1-string_latin1utf16-latin1utf16_03	shared	match	-
@@ -428,20 +428,20 @@ r1-string_latin1utf16-latin1utf16_05	multi	match	-
 r1-string_latin1utf16-latin1utf16_05	shared	refused	AdapterGeneration #390
 r1-string_latin1utf16-latin1utf16_06	multi	refused	AdapterGeneration #582
 r1-string_latin1utf16-latin1utf16_06	shared	match	-
-r1-string_latin1utf16-latin1utf16_07	multi	accepts-invalid	-
+r1-string_latin1utf16-latin1utf16_07	multi	match-trap	-
 r1-string_latin1utf16-latin1utf16_07	shared	refused	AdapterGeneration #390
 r1-string_latin1utf16-utf8_01	multi	match	-
 r1-string_latin1utf16-utf8_01	shared	refused	AdapterGeneration #545
 r1-string_latin1utf16-utf8_02	multi	match	-
 r1-string_latin1utf16-utf8_02	shared	refused	AdapterGeneration #545
-r1-string_latin1utf16-utf8_03	multi	accepts-invalid	-
-r1-string_latin1utf16-utf8_03	shared	accepts-invalid	-
+r1-string_latin1utf16-utf8_03	multi	match-trap	-
+r1-string_latin1utf16-utf8_03	shared	match-trap	-
 r1-string_latin1utf16-utf8_04	multi	match	-
 r1-string_latin1utf16-utf8_04	shared	refused	AdapterGeneration #545
 r1-string_latin1utf16-utf8_05	multi	fused-trap	-
 r1-string_latin1utf16-utf8_05	shared	refused	AdapterGeneration #545
-r1-string_latin1utf16-utf8_06	multi	accepts-invalid	-
-r1-string_latin1utf16-utf8_06	shared	accepts-invalid	-
+r1-string_latin1utf16-utf8_06	multi	match-trap	-
+r1-string_latin1utf16-utf8_06	shared	match-trap	-
 r1-string_latin1utf16-utf8_07	multi	match	-
 r1-string_latin1utf16-utf8_07	shared	refused	AdapterGeneration #545
 r1-string_utf16-latin1utf16_00	multi	match-trap	-
@@ -450,13 +450,13 @@ r1-string_utf16-latin1utf16_01	multi	refused	AdapterGeneration #600
 r1-string_utf16-latin1utf16_01	shared	refused	AdapterGeneration #600
 r1-string_utf16-latin1utf16_02	multi	match	-
 r1-string_utf16-latin1utf16_02	shared	refused	AdapterGeneration #545
-r1-string_utf16-latin1utf16_03	multi	accepts-invalid	-
+r1-string_utf16-latin1utf16_03	multi	match-trap	-
 r1-string_utf16-latin1utf16_03	shared	refused	AdapterGeneration #545
 r1-string_utf16-latin1utf16_04	multi	refused	AdapterGeneration #600
 r1-string_utf16-latin1utf16_04	shared	refused	AdapterGeneration #600
 r1-string_utf16-latin1utf16_05	multi	match	-
 r1-string_utf16-latin1utf16_05	shared	refused	AdapterGeneration #545
-r1-string_utf16-latin1utf16_06	multi	accepts-invalid	-
+r1-string_utf16-latin1utf16_06	multi	match-trap	-
 r1-string_utf16-latin1utf16_06	shared	refused	AdapterGeneration #545
 r1-string_utf16-latin1utf16_07	multi	match	-
 r1-string_utf16-latin1utf16_07	shared	match	-
@@ -476,49 +476,49 @@ r1-string_utf16-utf16_07	multi	match	-
 r1-string_utf16-utf16_07	shared	match	-
 r1-string_utf16-utf8_00	multi	match	-
 r1-string_utf16-utf8_00	shared	refused	AdapterGeneration #545
-r1-string_utf16-utf8_01	multi	accepts-invalid	-
-r1-string_utf16-utf8_01	shared	accepts-invalid	-
+r1-string_utf16-utf8_01	multi	match-trap	-
+r1-string_utf16-utf8_01	shared	match-trap	-
 r1-string_utf16-utf8_02	multi	match	-
 r1-string_utf16-utf8_02	shared	refused	AdapterGeneration #545
 r1-string_utf16-utf8_03	multi	fused-trap	-
 r1-string_utf16-utf8_03	shared	refused	AdapterGeneration #545
-r1-string_utf16-utf8_04	multi	accepts-invalid	-
-r1-string_utf16-utf8_04	shared	accepts-invalid	-
+r1-string_utf16-utf8_04	multi	match-trap	-
+r1-string_utf16-utf8_04	shared	match-trap	-
 r1-string_utf16-utf8_05	multi	match	-
 r1-string_utf16-utf8_05	shared	refused	AdapterGeneration #545
 r1-string_utf16-utf8_06	multi	refused	AdapterGeneration #545
 r1-string_utf16-utf8_06	shared	refused	AdapterGeneration #545
 r1-string_utf16-utf8_07	multi	refused	AdapterGeneration #600
 r1-string_utf16-utf8_07	shared	refused	AdapterGeneration #600
-r1-string_utf8-latin1utf16_00	multi	accepts-invalid	-
+r1-string_utf8-latin1utf16_00	multi	match-trap	-
 r1-string_utf8-latin1utf16_00	shared	refused	AdapterGeneration #545
 r1-string_utf8-latin1utf16_02	multi	refused	AdapterGeneration #600
 r1-string_utf8-latin1utf16_02	shared	refused	AdapterGeneration #600
-r1-string_utf8-latin1utf16_03	multi	accepts-invalid	-
+r1-string_utf8-latin1utf16_03	multi	match-trap	-
 r1-string_utf8-latin1utf16_03	shared	refused	AdapterGeneration #545
 r1-string_utf8-latin1utf16_04	multi	match	-
 r1-string_utf8-latin1utf16_04	shared	refused	AdapterGeneration #545
 r1-string_utf8-latin1utf16_05	multi	match	-
 r1-string_utf8-latin1utf16_05	shared	match	-
-r1-string_utf8-latin1utf16_06	multi	accepts-invalid	-
+r1-string_utf8-latin1utf16_06	multi	match-trap	-
 r1-string_utf8-latin1utf16_06	shared	refused	AdapterGeneration #545
 r1-string_utf8-latin1utf16_07	multi	fused-trap	-
 r1-string_utf8-latin1utf16_07	shared	refused	AdapterGeneration #545
 r1-string_utf8-utf16_00	multi	match	-
 r1-string_utf8-utf16_00	shared	refused	AdapterGeneration #545
-r1-string_utf8-utf16_01	multi	accepts-invalid	-
+r1-string_utf8-utf16_01	multi	match-trap	-
 r1-string_utf8-utf16_01	shared	refused	AdapterGeneration #545
 r1-string_utf8-utf16_02	multi	match	-
 r1-string_utf8-utf16_02	shared	match	-
 r1-string_utf8-utf16_03	multi	match	-
 r1-string_utf8-utf16_03	shared	refused	AdapterGeneration #545
-r1-string_utf8-utf16_04	multi	accepts-invalid	-
+r1-string_utf8-utf16_04	multi	match-trap	-
 r1-string_utf8-utf16_04	shared	refused	AdapterGeneration #545
 r1-string_utf8-utf16_05	multi	refused	AdapterGeneration #600
 r1-string_utf8-utf16_05	shared	refused	AdapterGeneration #600
 r1-string_utf8-utf16_06	multi	match	-
 r1-string_utf8-utf16_06	shared	refused	AdapterGeneration #545
-r1-string_utf8-utf16_07	multi	accepts-invalid	-
+r1-string_utf8-utf16_07	multi	match-trap	-
 r1-string_utf8-utf16_07	shared	refused	AdapterGeneration #545
 r1-string_utf8-utf8_00	multi	match	-
 r1-string_utf8-utf8_00	shared	refused	AdapterGeneration #390
