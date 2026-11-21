@@ -46,7 +46,7 @@ jobs:
         # Held at v0.22.0: the v0.40.0 action fails the job when `rivet validate`
         # fails, and 0.40 rejects meld's multi-citation cited-source lists (43
         # diagnostics on SR-32..SR-74). Bump once pulseengine/rivet#1106 lands.
-        uses: pulseengine/rivet/.github/actions/compliance@29ca43828c8060af135fcd47ecff4c48662d1567 # v0.41.1
+        uses: pulseengine/rivet/.github/actions/compliance@a712e840b213825922066021e526968bec9a3e72 # v0.42.2
         with:
           theme: dark
           rivet-version: v0.22.0
