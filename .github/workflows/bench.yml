@@ -66,4 +66,4 @@ jobs:
           restore-keys: ${{ runner.os }}-cargo-bench-
 
       - name: Compile benches (no run)
-        run: cargo bench -p meld-core --no-run
+        run: cargo bench --locked -p meld-core --no-run

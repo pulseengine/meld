@@ -130,6 +130,26 @@ jobs:
           cargo deny --version
           cargo deny check advisories
 
+      # Lockfile sweep (2026-11-20): the step above audits the root workspace
+      # only. Every other committed Cargo.lock (fuzz, tools, test fixtures)
+      # was audited by nothing, so an advisory there could not turn anything
+      # red. Each nested lock is audited against the same deny.toml, --locked
+      # so a stale lock fails rather than being re-resolved first.
+      - name: Nested Cargo.locks carry no known advisory
+        run: |
+          set -euo pipefail
+          locks=$(git ls-files '*Cargo.lock' | grep -v '^Cargo.lock$' || true)
+          [ -n "$locks" ] || { echo "::error::no nested Cargo.lock found; the audit would be vacuous"; exit 1; }
+          fail=0
+          for lock in $locks; do
+            m="$(dirname "$lock")/Cargo.toml"
+            echo "::group::$lock"
+            cargo deny --manifest-path "$m" --config deny.toml --locked check advisories || { echo "::error::$lock has a known advisory"; fail=1; }
+            echo "::endgroup::"
+          done
+          echo "audited $(echo "$locks" | wc -l | tr -d ' ') nested lockfiles"
+          exit "$fail"
+
       - name: Verification matrix is up to date
         run: |
           python3 scripts/gen-verification-matrix.py

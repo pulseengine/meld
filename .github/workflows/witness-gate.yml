@@ -79,7 +79,7 @@ jobs:
       - name: Build witness
         run: cargo build --release -p witness-mcdc --bin witness --manifest-path witness/Cargo.toml
       - name: Build meld
-        run: cargo build --release --bin meld --manifest-path meld/Cargo.toml
+        run: cargo build --locked --release --bin meld --manifest-path meld/Cargo.toml
       - name: Witness MC/DC gate on a fused meld seam (WAT seam, branch coverage)
         env:
           MELD: ${{ github.workspace }}/meld/target/release/meld
