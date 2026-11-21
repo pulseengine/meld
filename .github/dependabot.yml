@@ -4,8 +4,10 @@ version: 2
 # ignores the whole file. One cargo entry lists every directory, so a grouped
 # release opens one PR and not one per directory.
 updates:
+  # PAUSED 2026-11-21 under the fleet CI hold; restore the previous limits when it lifts.
   - package-ecosystem: github-actions
     directory: /
+    open-pull-requests-limit: 0
     schedule:
       interval: weekly
     labels:
@@ -21,6 +23,7 @@ updates:
       - /meld-core
       - /tools/spec-sync
       - /verification/verus-pilot
+    open-pull-requests-limit: 0
     schedule:
       interval: weekly
     labels:
