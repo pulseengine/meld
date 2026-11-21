@@ -477,12 +477,13 @@ artifacts:
         direction is covered by a non-BMP runtime round-trip
         (test_sr17_utf16_to_utf8_supplementary_plane_transcoding —
         U+1F600 surrogate pair D83D DE00 → UTF-8 F0 9F 98 80) and the
-        Canonical-ABI lossy lone-surrogate U+FFFD substitution by
-        test_sr17_utf16_to_utf8_lone_high_surrogate_replacement and
-        test_sr17_utf16_to_utf8_midstring_lone_surrogate_replacement
-        (lone high surrogate, terminal and mid-string, → U+FFFD
-        EF BF BD), with malformed-input coverage in
-        test_sr17_utf16_to_utf8_malformed_surrogate_matrix. The async
+        Canonical ABI trap on a lone surrogate (`load_string_from_range`,
+        v0.71.0) by
+        test_sr17_utf16_to_utf8_lone_high_surrogate_traps and
+        test_sr17_utf16_to_utf8_midstring_lone_surrogate_traps
+        (lone high surrogate, terminal and mid-string, → wasmtime
+        trap), with malformed-input coverage in
+        test_sr17_utf16_to_utf8_malformed_surrogate_traps_matrix. The async
         cross-encoding path reuses the same shared decode/encode helpers
         and is independently exercised over the supplementary plane and
         a lone surrogate by inc2_async_utf16_to_utf8_param_* in

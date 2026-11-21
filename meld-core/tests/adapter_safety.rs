@@ -34,6 +34,14 @@ use wasm_encoder::{
 };
 use wasmtime::{Config, Engine, Instance, Module as RuntimeModule, Store};
 
+/// Assert `err` is a wasm trap (not a host error or link failure).
+fn assert_is_trap(err: &wasmtime::Error, ctx: &str) {
+    assert!(
+        err.downcast_ref::<wasmtime::Trap>().is_some(),
+        "{ctx}: expected a wasm trap, got a non-trap error: {err:?}"
+    );
+}
+
 // ===========================================================================
 // Shared helper: build a core module with cabi_realloc (bump allocator)
 // ===========================================================================
@@ -2821,20 +2829,19 @@ fn test_sr17_utf16_to_utf8_supplementary_plane_transcoding() {
     );
 }
 
-/// LS-P-16 (runtime): a **lone high surrogate at end of input** must be
-/// lossily replaced with U+FFFD during UTF-16 → UTF-8 transcoding, not
-/// trapped (the pre-v0.11 behaviour) and not read past the buffer (the
-/// 2-byte OOB this scenario originally guarded). Until now LS-P-16 was
-/// covered only structurally; this is its first executing oracle, reusing
-/// the UTF-16-lowering caller landed with #246.
+/// LS-P-16 (runtime, #598 / SR-134): a **lone high surrogate at end of
+/// input** must TRAP during UTF-16 → UTF-8 transcoding — not be replaced
+/// with U+FFFD and not read past the buffer (the 2-byte OOB this scenario
+/// originally guarded). The Canonical ABI's `load_string_from_range` does
+/// `memory[ptr:ptr+byte_length].decode(encoding)` with
+/// `except UnicodeError: trap()`, and wasmtime traps on the unfused
+/// component.
 ///
 /// Input UTF-16 code units [0x0041, 0xD800]: 'A' then a high surrogate
-/// with no following low surrogate (it is the last unit). The transcoder
-/// must emit 'A' (0x41) then U+FFFD (UTF-8 `EF BF BD`). The callee sums
-/// received UTF-8 bytes: 0x41 + 0xEF + 0xBF + 0xBD = 65 + 239 + 191 + 189
-/// = 684. A trap or OOB read would not return 684.
+/// with no following low surrogate (it is the last unit). The fused `run`
+/// call must return a wasm trap.
 #[test]
-fn test_sr17_utf16_to_utf8_lone_high_surrogate_replacement() {
+fn test_sr17_utf16_to_utf8_lone_high_surrogate_traps() {
     let callee = build_callee_string_component(); // UTF-8 lift, sums bytes
     let caller = build_caller_utf16_lowering_component(&[0x0041, 0xD800]);
 
@@ -2882,30 +2889,24 @@ fn test_sr17_utf16_to_utf8_lone_high_surrogate_replacement() {
     let run = instance
         .get_typed_func::<(), i32>(&mut store, "run")
         .expect("LS-P-16: fused module should export 'run'");
-    let result = run.call(&mut store, ()).unwrap();
-
-    assert_eq!(
-        result, 684,
-        "LS-P-16: a lone trailing high surrogate [.., 0xD800] must become \
-         U+FFFD (UTF-8 EF BF BD), so 'A' + U+FFFD sums to 684. A trap, OOB \
-         read, or a wrong replacement would not produce 684."
-    );
+    let err = run
+        .call(&mut store, ())
+        .expect_err("LS-P-16: a lone trailing high surrogate [.., 0xD800] must trap");
+    assert_is_trap(&err, "LS-P-16 lone trailing high surrogate");
 }
 
-/// LS-P-16 (mid-string, runtime): a high surrogate NOT at end-of-input,
-/// followed by a unit that is **not** a low surrogate, is still a lone
-/// surrogate and must be replaced with U+FFFD — the second unit then
-/// reprocessed on its own. The v0.11 mitigation only handled the
-/// end-of-input case; the unvalidated-second-unit causal factor recorded
-/// in LS-P-16 stayed open until this fix. Before it, `[0xD800, 0x0041]`
+/// LS-P-16 (mid-string, runtime, #598 / SR-134): a high surrogate NOT at
+/// end-of-input, followed by a unit that is **not** a low surrogate, is
+/// still a lone surrogate and must TRAP, as `load_string_from_range` does
+/// (`.decode(encoding)` with `except UnicodeError: trap()`; wasmtime traps
+/// on the unfused component). Before the validation fix, `[0xD800, 0x0041]`
 /// computed a garbage code point from `0x0041 - 0xDC00` (u32 underflow)
 /// and emitted wrong UTF-8 (observed run() == 500).
 ///
-/// Input [0xD800, 0x0041]: lone high surrogate then 'A'. Correct output
-/// is U+FFFD (UTF-8 EF BF BD) then 'A' (0x41). The callee sums received
-/// UTF-8 bytes: 0xEF + 0xBF + 0xBD + 0x41 = 239 + 191 + 189 + 65 = 684.
+/// Input [0xD800, 0x0041]: lone high surrogate then 'A'. The fused `run`
+/// call must return a wasm trap.
 #[test]
-fn test_sr17_utf16_to_utf8_midstring_lone_surrogate_replacement() {
+fn test_sr17_utf16_to_utf8_midstring_lone_surrogate_traps() {
     let callee = build_callee_string_component(); // UTF-8 lift, sums bytes
     let caller = build_caller_utf16_lowering_component(&[0xD800, 0x0041]);
 
@@ -2953,52 +2954,47 @@ fn test_sr17_utf16_to_utf8_midstring_lone_surrogate_replacement() {
     let run = instance
         .get_typed_func::<(), i32>(&mut store, "run")
         .expect("LS-P-16 mid-string: fused module should export 'run'");
-    let result = run.call(&mut store, ()).unwrap();
-
-    assert_eq!(
-        result, 684,
-        "LS-P-16 mid-string: [0xD800, 0x0041] must transcode to U+FFFD + 'A' \
-         (UTF-8 EF BF BD 41, sum 684). Pre-fix this returned 500 (garbage \
-         code point from the unvalidated second unit)."
-    );
+    let err = run
+        .call(&mut store, ())
+        .expect_err("LS-P-16 mid-string: [0xD800, 0x0041] must trap");
+    assert_is_trap(&err, "LS-P-16 mid-string lone high surrogate");
 }
 
 /// Comprehensive malformed-UTF-16 matrix for UTF-16 → UTF-8 transcoding
-/// (#249): every unpaired surrogate, at every position, must become U+FFFD
-/// (UTF-8 `EF BF BD`, byte sum 619), and valid pairs must still decode.
-/// The callee sums received UTF-8 bytes; expected sums are hand-computed
-/// from: U+FFFD=619, 'A'=0x41=65, 'B'=0x42=66, U+1F600 → `F0 9F 98 80`=679.
+/// (#249, #598 / SR-134): every unpaired surrogate, at every position, must
+/// TRAP, and a valid pair must still decode. The Canonical ABI's
+/// `load_string_from_range` does `.decode(encoding)` with
+/// `except UnicodeError: trap()`, and wasmtime traps on the unfused
+/// component; U+FFFD substitution is not spec-conformant. The callee sums
+/// received UTF-8 bytes; the one valid case's sum is hand-computed from
+/// U+1F600 → `F0 9F 98 80` = 679. `None` means the fused call must trap.
 ///
-/// This closes the lone-LOW-surrogate gap (#249, surfaced by PR #248's
-/// Mythos pass) alongside the lone-HIGH cases fixed in v0.11 / #248, and
-/// pins the whole class so a regression in any single arm is caught.
+/// This covers the lone-LOW-surrogate gap (#249, surfaced by PR #248's
+/// Mythos pass) alongside the lone-HIGH cases, and pins the whole class so
+/// a regression in any single arm is caught.
 #[test]
-fn test_sr17_utf16_to_utf8_malformed_surrogate_matrix() {
-    // (input UTF-16 code units, expected callee byte-sum, label)
-    let cases: &[(&[u16], i32, &str)] = &[
-        (&[0xDC00, 0x0041], 684, "leading lone low → FFFD + A"),
-        (&[0x0041, 0xDC00], 684, "trailing lone low → A + FFFD"),
+fn test_sr17_utf16_to_utf8_malformed_surrogate_traps_matrix() {
+    // (input UTF-16 code units, Some(expected callee byte-sum) | None = trap, label)
+    let cases: &[(&[u16], Option<i32>, &str)] = &[
+        (&[0xDC00, 0x0041], None, "leading lone low → trap"),
+        (&[0x0041, 0xDC00], None, "trailing lone low → trap"),
+        (&[0x0041, 0xDC00, 0x0042], None, "mid lone low → trap"),
+        (&[0xDC00, 0xDC00], None, "consecutive lone lows → trap"),
+        (&[0xDFFF], None, "last low surrogate value alone → trap"),
         (
-            &[0x0041, 0xDC00, 0x0042],
-            750,
-            "mid lone low → A + FFFD + B",
+            &[0xD83D, 0xDE00],
+            Some(679),
+            "valid pair U+1F600 still decodes",
         ),
-        (
-            &[0xDC00, 0xDC00],
-            1238,
-            "consecutive lone lows → FFFD + FFFD",
-        ),
-        (&[0xDFFF], 619, "last low surrogate value alone → FFFD"),
-        (&[0xD83D, 0xDE00], 679, "valid pair U+1F600 still decodes"),
         (
             &[0xDC00, 0xD83D, 0xDE00],
-            1298,
-            "lone low then valid pair → FFFD + U+1F600",
+            None,
+            "lone low then valid pair → trap",
         ),
         (
             &[0xD800, 0xD800, 0x0041],
-            1303,
-            "consecutive lone highs → FFFD + FFFD + A",
+            None,
+            "consecutive lone highs → trap",
         ),
     ];
 
@@ -3046,62 +3042,40 @@ fn test_sr17_utf16_to_utf8_malformed_surrogate_matrix() {
         let run = instance
             .get_typed_func::<(), i32>(&mut store, "run")
             .unwrap();
-        let result = run.call(&mut store, ()).unwrap();
-        assert_eq!(
-            result, *expected,
-            "#249 [{label}]: input {units:#06x?} expected byte-sum {expected}, got {result}"
-        );
+        match expected {
+            Some(expected) => {
+                let result = run.call(&mut store, ()).unwrap();
+                assert_eq!(
+                    result, *expected,
+                    "#249 [{label}]: input {units:#06x?} expected byte-sum {expected}, got {result}"
+                );
+            }
+            None => {
+                let err = run
+                    .call(&mut store, ())
+                    .expect_err(&format!("#598 [{label}]: input {units:#06x?} must trap"));
+                assert_is_trap(&err, &format!("#598 [{label}]"));
+            }
+        }
     }
 }
 
 /// Comprehensive malformed-UTF-8 matrix for UTF-8 → UTF-16 transcoding
-/// (#251): the forward-direction analogue of the #249 reverse matrix above.
-/// Every ill-formed UTF-8 sequence — invalid continuation, invalid lead
-/// (lone continuation / overlong 2-byte lead / out-of-range lead), overlong
-/// encoding, UTF-8-encoded surrogate, and out-of-range 4-byte code point —
-/// must transcode to U+FFFD (one UTF-16 code unit, 0xFFFD = 65533) per the
-/// Canonical ABI, never to a wrong scalar. Valid inputs must be unchanged.
+/// (#251, #598 / SR-134): the forward-direction analogue of the #249 reverse
+/// matrix above. Every ill-formed UTF-8 sequence — invalid continuation,
+/// invalid lead (lone continuation / overlong 2-byte lead / out-of-range
+/// lead), overlong encoding, UTF-8-encoded surrogate, and out-of-range
+/// 4-byte code point — must TRAP, never transcode to a wrong scalar and
+/// never to U+FFFD. The Canonical ABI's `load_string_from_range` does
+/// `memory[ptr:ptr+byte_length].decode(encoding)` with
+/// `except UnicodeError: trap()`, and wasmtime traps on the unfused
+/// component. Valid inputs must be unchanged.
 ///
-/// The callee sums received UTF-16 code units. Constants: U+FFFD = 65533,
-/// 'A' = 0x41 = 65. Expected sums are hand-derived under the codebase's
-/// established LS-P-19 "emit U+FFFD, consume ONLY the lead byte" convention:
-/// on malformed detection src_idx advances by 1, so any trailing
-/// continuation byte (0x80–0xBF) is reprocessed and — being a lone
-/// continuation acting as a lead — itself becomes another U+FFFD. This makes
-/// several cases emit MORE than one U+FFFD; the per-case derivations spell
-/// out the exact count.
+/// The callee sums received UTF-16 code units; `None` means the fused call
+/// must trap. Valid controls keep their exact sums.
 #[test]
-fn ls_p_20_test_sr17_utf8_to_utf16_malformed_matrix() {
-    // (input UTF-8 bytes, expected callee code-unit-sum, label)
-    //
-    // Hand-derivations for the malformed cases (FFFD = 65533):
-    //   [0xC2,0x41]            2-byte lead, 0x41 not a continuation
-    //                          → FFFD (consume lead 0xC2), then 0x41 = 'A' = 65
-    //                          → 65533 + 65 = 65598
-    //   [0x80,0x41]            0x80 is a lone continuation < 0xC2 → invalid lead
-    //                          → FFFD (consume 1), then 0x41 = 65
-    //                          → 65533 + 65 = 65598
-    //   [0xC0,0x80]            0xC0 < 0xC2 → invalid (overlong) lead → FFFD
-    //                          (consume 1); reprocess 0x80, a lone continuation
-    //                          < 0xC2 → invalid lead → FFFD (consume 1)
-    //                          → 65533 + 65533 = 131066
-    //   [0xED,0xA0,0x80]       0xED is a 3-byte lead; conts 0xA0,0x80 are valid
-    //                          continuation bytes, decoding to cp = 0xD800 (a
-    //                          UTF-8-encoded surrogate) → rejected → FFFD,
-    //                          consume ONLY the lead. src_idx now 1: reprocess
-    //                          0xA0 (lone cont) → FFFD, consume 1. src_idx 2:
-    //                          reprocess 0x80 (lone cont) → FFFD, consume 1.
-    //                          THREE U+FFFD → 65533 * 3 = 196599
-    //   [0xF5,0x80,0x80,0x80]  0xF5 >= 0xF5 → out-of-range lead → FFFD,
-    //                          consume 1; the three trailing 0x80 are each lone
-    //                          continuations → FFFD each. FOUR U+FFFD
-    //                          → 65533 * 4 = 262132
-    //   [0xF4,0x90,0x80,0x80]  0xF4 is an in-range 4-byte lead; conts valid,
-    //                          cp = 0x110000 > U+10FFFF (out of range) →
-    //                          rejected → FFFD, consume ONLY the lead. The
-    //                          three trailing bytes 0x90,0x80,0x80 are then
-    //                          each lone continuations → FFFD each. FOUR U+FFFD
-    //                          → 65533 * 4 = 262132
+fn ls_p_20_test_sr17_utf8_to_utf16_malformed_traps_matrix() {
+    // (input UTF-8 bytes, Some(expected callee code-unit-sum) | None = trap, label)
     //
     // Valid controls (must be byte-for-byte unchanged from the fast paths):
     //   [0x41]                 'A' = 65
@@ -3109,37 +3083,29 @@ fn ls_p_20_test_sr17_utf8_to_utf16_malformed_matrix() {
     //   [0xE2,0x82,0xAC]       € = U+20AC = 8364
     //   [0xF0,0x9F,0x98,0x80]  😀 = U+1F600 → surrogate pair 0xD83D + 0xDE00
     //                          = 55357 + 56832 = 112189
-    let cases: &[(&[u8], i32, &str)] = &[
-        // Malformed.
-        (&[0xC2, 0x41], 65598, "2-byte bad continuation → FFFD + A"),
-        (&[0x80, 0x41], 65598, "lone continuation as lead → FFFD + A"),
-        (
-            &[0xC0, 0x80],
-            131066,
-            "overlong 2-byte lead 0xC0 + lone cont → FFFD + FFFD",
-        ),
+    let cases: &[(&[u8], Option<i32>, &str)] = &[
+        // Malformed → trap.
+        (&[0xC2, 0x41], None, "2-byte bad continuation → trap"),
+        (&[0x80, 0x41], None, "lone continuation as lead → trap"),
+        (&[0xC0, 0x80], None, "overlong 2-byte lead 0xC0 → trap"),
         (
             &[0xED, 0xA0, 0x80],
-            196599,
-            "UTF-8-encoded surrogate U+D800 → FFFD x3 (lead + 2 reprocessed conts)",
+            None,
+            "UTF-8-encoded surrogate U+D800 → trap",
         ),
         (
             &[0xF5, 0x80, 0x80, 0x80],
-            262132,
-            "out-of-range lead 0xF5 → FFFD x4",
+            None,
+            "out-of-range lead 0xF5 → trap",
         ),
-        (
-            &[0xF4, 0x90, 0x80, 0x80],
-            262132,
-            "4-byte > U+10FFFF → FFFD x4 (lead + 3 reprocessed conts)",
-        ),
+        (&[0xF4, 0x90, 0x80, 0x80], None, "4-byte > U+10FFFF → trap"),
         // Valid controls.
-        (&[0x41], 65, "valid ASCII 'A'"),
-        (&[0xC3, 0xA9], 233, "valid 2-byte é U+00E9"),
-        (&[0xE2, 0x82, 0xAC], 8364, "valid 3-byte € U+20AC"),
+        (&[0x41], Some(65), "valid ASCII 'A'"),
+        (&[0xC3, 0xA9], Some(233), "valid 2-byte é U+00E9"),
+        (&[0xE2, 0x82, 0xAC], Some(8364), "valid 3-byte € U+20AC"),
         (
             &[0xF0, 0x9F, 0x98, 0x80],
-            112189,
+            Some(112189),
             "valid 4-byte 😀 U+1F600 → surrogate pair",
         ),
     ];
@@ -3188,11 +3154,21 @@ fn ls_p_20_test_sr17_utf8_to_utf16_malformed_matrix() {
         let run = instance
             .get_typed_func::<(), i32>(&mut store, "run")
             .unwrap();
-        let result = run.call(&mut store, ()).unwrap();
-        assert_eq!(
-            result, *expected,
-            "#251 [{label}]: input {bytes:#04x?} expected code-unit-sum {expected}, got {result}"
-        );
+        match expected {
+            Some(expected) => {
+                let result = run.call(&mut store, ()).unwrap();
+                assert_eq!(
+                    result, *expected,
+                    "#251 [{label}]: input {bytes:#04x?} expected code-unit-sum {expected}, got {result}"
+                );
+            }
+            None => {
+                let err = run
+                    .call(&mut store, ())
+                    .expect_err(&format!("#598 [{label}]: input {bytes:#04x?} must trap"));
+                assert_is_trap(&err, &format!("#598 [{label}]"));
+            }
+        }
     }
 }
 

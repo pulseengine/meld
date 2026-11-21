@@ -219,6 +219,10 @@ pub enum StringEncoding {
 #[derive(Debug, Clone)]
 pub struct AdapterOptions {
     /// String encoding on the caller side
+    /// #622: the call carries strings or lists and caller and callee share
+    /// one memory (`--memory shared`). The adapter still calls the callee's
+    /// realloc and copies, as the Canonical ABI does.
+    pub copy_within_memory: bool,
     pub caller_string_encoding: StringEncoding,
 
     /// String encoding on the callee side
@@ -338,6 +342,7 @@ pub struct ResourceOwnResultTransfer {
 impl Default for AdapterOptions {
     fn default() -> Self {
         Self {
+            copy_within_memory: false,
             caller_string_encoding: StringEncoding::Utf8,
             callee_string_encoding: StringEncoding::Utf8,
             caller_memory: 0,

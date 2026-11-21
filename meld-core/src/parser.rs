@@ -552,6 +552,17 @@ pub enum MemCheck {
         elem_size: u32,
         elem: Vec<MemCheck>,
     },
+    /// The list `(ptr, len)` at `offset`: trap unless `ptr` is a multiple of
+    /// `align` and `len * elem_size` bytes from `ptr` fit in memory, as
+    /// `load_list_from_range` checks.
+    Ptr {
+        offset: u32,
+        align: u32,
+        elem_size: u32,
+    },
+    /// The string `(ptr, len)` at `offset`: the same checks for the lifting
+    /// side's string encoding, as `load_string_from_range` does, and decode it.
+    Str { offset: u32 },
 }
 
 /// #599: checks on the values a callee receives, before the call.
@@ -1927,7 +1938,14 @@ impl ParsedComponent {
                         .get(&(inst_ty_idx, name.clone()))
                         .cloned();
                 }
-                ComponentTypeDef::Import(_) => return None,
+                // An imported type with an `(eq N)` bound is type N (#586:
+                // without this, a value of that type got no lift check).
+                ComponentTypeDef::Import(import_idx) => match self.imports.get(*import_idx)?.ty {
+                    wasmparser::ComponentTypeRef::Type(wasmparser::TypeBounds::Eq(target)) => {
+                        idx = target
+                    }
+                    _ => return None,
+                },
             }
         }
         None
@@ -2974,7 +2992,13 @@ impl ParsedComponent {
             ComponentValType::Result { ok, err } => {
                 self.push_case_check(&[ok.as_deref(), err.as_deref()], base, d, out);
             }
+            ComponentValType::String => out.push(MemCheck::Str { offset: base }),
             ComponentValType::List(elem) => {
+                out.push(MemCheck::Ptr {
+                    offset: base,
+                    align: self.canonical_abi_align(elem),
+                    elem_size: self.canonical_abi_element_size(elem),
+                });
                 let mut inner = Vec::new();
                 self.collect_mem_checks(elem, 0, d, &mut inner);
                 if !inner.is_empty() {
