@@ -221,22 +221,13 @@ use_repo(rust, "rust_toolchains")
 register_toolchains("@rust_toolchains//:all")
 
 ###############################################################################
-# Crate Universe (Cargo Dependencies)
+# Crate Universe: removed (2026-11-20, lockfile sweep)
 ###############################################################################
 
-crate = use_extension("@rules_rust//crate_universe:extension.bzl", "crate")
-crate.from_cargo(
-    name = "meld_deps",
-    cargo_lockfile = "//:Cargo.lock",
-    manifests = ["//:Cargo.toml"],
-    supported_platform_triples = [
-        "aarch64-apple-darwin",
-        "x86_64-apple-darwin",
-        "x86_64-unknown-linux-gnu",
-        "aarch64-unknown-linux-gnu",
-        "wasm32-wasip2",
-        "wasm32-unknown-unknown",
-    ],
-)
-
-use_repo(crate, "meld_deps")
+# A `crate.from_cargo(name = "meld_deps", ...)` extension lived here. No target
+# referenced @meld_deps (nothing under BUILD.bazel compiles Rust since #444), so
+# it only cost: its splice failed outright once the workspace grew more
+# manifests ("Some manifests are not being tracked"), which blocked
+# regenerating MODULE.bazel.lock, and it made every Cargo.lock change a
+# MODULE.bazel.lock change under --lockfile_mode=error. Cargo builds Rust;
+# Bazel checks proofs.

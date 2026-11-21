@@ -5,6 +5,12 @@
 # Enable Bzlmod (modern dependency management)
 common --enable_bzlmod
 
+# The committed MODULE.bazel.lock is the dependency record, not a cache.
+# Fail when resolution disagrees with it instead of rewriting it silently
+# (lockfile sweep, 2026-11-20). Regenerate deliberately with
+#   bazel mod deps --lockfile_mode=update
+common --lockfile_mode=error
+
 # Strict action environment for reproducibility
 build --incompatible_strict_action_env
 build --enable_platform_specific_config
