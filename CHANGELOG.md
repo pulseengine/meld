@@ -8,6 +8,11 @@ All notable changes to this project will be documented in this file.
 
 - wasmtime, wasmtime-wasi and the dev-only wasmtime-environ oracle move from 50.0.2 to 50.0.3, fixing RUSTSEC-2026-0587 (WASI filesystem sandbox escape on Windows through a drive-prefixed path component). All three are dev-dependencies of meld-core; the shipped `meld` binary does not link wasmtime (`cargo tree -p meld-cli -e normal` has no wasmtime crate). `cargo audit` now reports 0 vulnerabilities.
 
+### Changed
+
+- Runtime floor for components built with Rust 1.100: **wasmtime 46.0.0 or later** (owner decision 2026-11-21, fleet-wide). Rust 1.100's std makes every wasip2 component import `wasi:cli/exit@0.2.12` `exit-with-code`, hello-world included, and wasmtime 45.0.0 and older refuse such a component at instantiation (measured in ordeal#309; the wasmtime 41.0.0 CLI reports "instance export `exit-with-code` has the wrong type"). Fusion keeps that import: `meld-core/tests/wasip2_exit_import_1100.rs` fuses a Rust 1.100 fixture, checks that the output still imports `exit-with-code`, and runs it under wasmtime 50.0.3 with the original's stdout and exit code 7. meld's own wasmtime uses are above the floor: the dev-only test oracles at 50.0.3, and the fixtures CLI at 49.0.2.
+- CI builds with exact Rust 1.100.0 instead of floating `stable`. Every `dtolnay/rust-toolchain` step names `toolchain: 1.100.0` on a SHA-pinned action, and the four `actions-rs/toolchain` steps (archived upstream) are replaced. The fuzz job stays on nightly, which `cargo fuzz` requires.
+
 ### Removed
 
 - No x86_64-apple-darwin (Intel macOS) assets or wheels from this release on. Intel Mac users: build from source. The npm launcher reports darwin/x64 as an unsupported platform (owner decision 2026-11-20, fleet-wide).

@@ -178,6 +178,32 @@ jobs:
           bazel mod deps --lockfile_mode=error >/dev/null \
             || { echo "::error::MODULE.bazel.lock is stale; regenerate with: bazel mod deps --lockfile_mode=update"; exit 1; }
 
+      # The step above has only ever been seen to pass in CI. This plants one
+      # bazel_dep the committed lock does not cover, in a copy of the tree, and
+      # requires the refusal Bazel prints for it. Matching the message matters:
+      # on a stale lock Bazel 8.0.0 can also crash (rc 37, "Cannot fetch a file
+      # without a checksum in ENFORCE mode"), and a crash must not count as the
+      # check working.
+      - name: "Planted control: an unlocked bazel_dep fails the lock check"
+        run: |
+          set -uo pipefail
+          ctl="$RUNNER_TEMP/lockfile-control"
+          log="$RUNNER_TEMP/lockfile-control.log"
+          rm -rf "$ctl" && mkdir -p "$ctl"
+          git archive HEAD | tar -x -C "$ctl"
+          printf '\nbazel_dep(name = "rules_shell", version = "0.4.1")\n' >> "$ctl/MODULE.bazel"
+          rc=0
+          (cd "$ctl" && bazel mod deps --lockfile_mode=error) >"$log" 2>&1 || rc=$?
+          (cd "$ctl" && bazel shutdown) >/dev/null 2>&1 || echo "control tree: bazel shutdown rc=$?"
+          if [ "$rc" -eq 0 ]; then
+            echo "::error::control: an unlocked bazel_dep passed the lock check"; exit 1
+          fi
+          if ! grep -q 'Missing checksum' "$log"; then
+            tail -20 "$log"
+            echo "::error::control: lock check exited $rc without 'Missing checksum'; that is not the expected refusal"; exit 1
+          fi
+          echo "control: unlocked bazel_dep fails (rc=$rc)"
+
       # A census COUNTS files; it does not show that anything CHECKS them.
       # These two numbers have to agree, or the census reports proofs as
       # evidence which the gate never builds — the #447 defect one level down,
