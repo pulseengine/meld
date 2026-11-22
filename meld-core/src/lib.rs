@@ -932,7 +932,18 @@ impl Fuser {
 
     /// Add a component with a name for better error messages
     pub fn add_component_named(&mut self, bytes: &[u8], name: Option<&str>) -> Result<()> {
-        let parser = ComponentParser::new();
+        self.add_component_with(&ComponentParser::new(), bytes, name)
+    }
+
+    /// `add_component_named` with a chosen parser. Only the library's own
+    /// tests pass `ComponentParser::without_validation()`, to reach the
+    /// output validation with an input meld would otherwise refuse (SR-114).
+    fn add_component_with(
+        &mut self,
+        parser: &ComponentParser,
+        bytes: &[u8],
+        name: Option<&str>,
+    ) -> Result<()> {
         let mut parsed = parser.parse(bytes)?;
 
         if let Some(n) = name {
@@ -4861,6 +4872,64 @@ mod tests {
             !provenance_payloads[0].is_empty(),
             "`{}` section payload must not be empty",
             provenance::SECTION_NAME
+        );
+    }
+
+    // ---- SR-114 / #545: the library refuses its own invalid output -------
+    //
+    // The end-to-end reproducers are gone: the upstream async/empty-wait.wast
+    // component fuses correctly since the start wrapper is rebuilt after the
+    // P3 import shift (SR-136), and every other known invalid shape is now
+    // fixed or refused earlier. So the input is built to be invalid: a core
+    // function whose body leaves no value for its i32 result. Only this
+    // module can skip input validation (`ComponentParser::without_validation`,
+    // through the private `add_component_with`), so the invalid body reaches
+    // the fused output and the output validation in `fuse_with_stats`.
+    const INVALID_BODY_COMPONENT: &str = r#"
+        (component
+          (core module $M (func (export "f") (result i32)))
+          (core instance $m (instantiate $M))
+          (func (export "f") (result u32) (canon lift (core func $m "f"))))
+    "#;
+
+    fn fuse_unvalidated_input(validate_output: bool) -> Result<Vec<u8>> {
+        let bytes = wat::parse_str(INVALID_BODY_COMPONENT).expect("wat");
+        let mut fuser = Fuser::new(FuserConfig {
+            memory_strategy: MemoryStrategy::MultiMemory,
+            attestation: false,
+            validate_output,
+            ..Default::default()
+        });
+        fuser.add_component_with(&ComponentParser::without_validation(), &bytes, None)?;
+        fuser.fuse()
+    }
+
+    // rivet: verifies SR-114
+    // rivet: verifies SWV-128
+    #[test]
+    fn sr114_library_refuses_invalid_output_by_default() {
+        // The public path refuses this input before fusing: input validation.
+        let bytes = wat::parse_str(INVALID_BODY_COMPONENT).expect("wat");
+        assert!(
+            Fuser::new(FuserConfig::default())
+                .add_component(&bytes)
+                .is_err(),
+            "the public add_component must refuse the invalid input"
+        );
+        match fuse_unvalidated_input(true) {
+            Err(Error::InvalidOutput(msg)) => assert!(
+                msg.contains("type mismatch"),
+                "expected the validator's type mismatch, got: {msg}"
+            ),
+            Err(e) => panic!("expected InvalidOutput, got a different refusal: {e}"),
+            Ok(_) => panic!("#545 regressed: invalid output returned as Ok"),
+        }
+        // The opt-out returns bytes, and they are the invalid module: the
+        // refusal above is the output validation, not an earlier failure.
+        let unchecked = fuse_unvalidated_input(false).expect("opt-out returns the bytes");
+        assert!(
+            validate_output(&unchecked, false).is_err(),
+            "with validation off the output should be the invalid module"
         );
     }
 }

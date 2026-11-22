@@ -904,6 +904,24 @@ impl Merger {
             } else {
                 export.name.clone()
             };
+            // Two modules of ONE component can export the same name (the
+            // component-model linking/unit.wast instantiates three modules
+            // that each export `id`), and `name$comp_idx` is then taken too:
+            // the output failed validation with "duplicate export name".
+            // Add the module index, then a counter, until the name is free.
+            // The first `name$comp_idx` keeps its spelling, which the
+            // component wrapper looks up.
+            let export_name = if merged.exports.iter().any(|e| e.name == export_name) {
+                let mut candidate = format!("{export_name}${mod_idx}");
+                let mut n = 1u32;
+                while merged.exports.iter().any(|e| e.name == candidate) {
+                    candidate = format!("{export_name}${mod_idx}${n}");
+                    n += 1;
+                }
+                candidate
+            } else {
+                export_name
+            };
 
             // #504: a function export that re-exports one of this module's own
             // imports must follow that import if a later pass re-points it.
