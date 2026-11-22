@@ -174,6 +174,10 @@ pub enum CopyLayout {
         /// The pair is a `string`: its count is in code units of the string
         /// encoding, so a UTF-16 copy moves two bytes per unit (#598).
         string: bool,
+        /// Canonical ABI alignment of one list element: what a copy asks
+        /// `cabi_realloc` for. Unused for strings, whose alignment follows
+        /// the string encoding.
+        element_align: u32,
     },
     /// Element-wise copy: `len` elements of `element_size` bytes each.
     /// `inner_pointers` lists the per-element pointer-pair fixup
@@ -183,9 +187,22 @@ pub enum CopyLayout {
     /// need conversion after bulk copy.
     Elements {
         element_size: u32,
+        /// Canonical ABI alignment of one list element (see `Bulk`).
+        element_align: u32,
         inner_pointers: Vec<InnerPointer>,
         inner_resources: Vec<InnerResource>,
     },
+}
+
+/// Test helper: the natural alignment of a scalar list element of `size`
+/// bytes (the largest power of two dividing it, at most 8).
+#[cfg(test)]
+pub(crate) fn natural_align(size: u32) -> u32 {
+    if size == 0 {
+        1
+    } else {
+        (1u32 << size.trailing_zeros()).min(8)
+    }
 }
 
 impl CopyLayout {
@@ -194,6 +211,18 @@ impl CopyLayout {
     /// A `string` count is in code units of the string encoding: one byte for
     /// UTF-8 and for latin1+utf16 (whose tagged UTF-16 case is handled by
     /// `emit_copy_byte_count`), two bytes for UTF-16 (#598).
+    /// The alignment a cross-memory copy of a non-string list must ask
+    /// `cabi_realloc` for: the Canonical ABI alignment of one element.
+    /// `None` for a string, whose alignment follows its encoding.
+    pub(crate) fn list_element_align(&self) -> Option<i32> {
+        match self {
+            CopyLayout::Bulk { string: true, .. } => None,
+            CopyLayout::Bulk { element_align, .. } | CopyLayout::Elements { element_align, .. } => {
+                Some(*element_align as i32)
+            }
+        }
+    }
+
     pub(crate) fn unit_bytes(&self, utf16: bool) -> u32 {
         match self {
             CopyLayout::Bulk { string: true, .. } if utf16 => 2,
@@ -376,6 +405,10 @@ pub struct AdapterRequirements {
     /// Byte size of the callee's return area when using retptr convention.
     /// Computed from the component function type's flat result layout.
     pub return_area_byte_size: Option<u32>,
+    /// Canonical ABI alignment of the return area (the results tuple): both
+    /// the callee's returned pointer and the caller's retptr must be
+    /// aligned to it. 0 when unknown (no check).
+    pub return_area_max_align: u32,
     /// Flat core param indices where (ptr, len) pairs start for string/list params.
     /// The adapter must copy data at each of these positions across memories.
     pub pointer_pair_positions: Vec<u32>,
@@ -3843,6 +3876,8 @@ impl Resolver {
                                                 .all(|(_, t)| to_component.can_size_exactly(t));
                                             if exact && size > 0 {
                                                 requirements.return_area_byte_size = Some(size);
+                                                requirements.return_area_max_align =
+                                                    to_component.return_area_max_align(results);
                                             }
                                             requirements.carries_no_string = !comp_params
                                                 .iter()
@@ -4237,6 +4272,8 @@ impl Resolver {
                                         .all(|(_, t)| to_component.can_size_exactly(t));
                                     if exact && size > 0 {
                                         requirements.return_area_byte_size = Some(size);
+                                        requirements.return_area_max_align =
+                                            to_component.return_area_max_align(results);
                                     }
                                     requirements.carries_no_string = !comp_params
                                         .iter()
@@ -4864,10 +4901,12 @@ mod tests {
         let string = CopyLayout::Bulk {
             byte_multiplier: 1,
             string: true,
+            element_align: crate::resolver::natural_align(1),
         };
         let bytes = CopyLayout::Bulk {
             byte_multiplier: 1,
             string: false,
+            element_align: crate::resolver::natural_align(1),
         };
         assert_eq!(string.unit_bytes(true), 2);
         assert_eq!(string.unit_bytes(false), 1);

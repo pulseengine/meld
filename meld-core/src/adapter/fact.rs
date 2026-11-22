@@ -119,6 +119,42 @@ pub(crate) fn emit_checked_realloc(
     body.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
     body.instruction(&Instruction::Unreachable);
     body.instruction(&Instruction::End);
+    // The Canonical ABI traps when realloc's result is not aligned to the
+    // alignment it was asked for ("unaligned pointer"; component-model
+    // test/values/realloc.wast and alignment.wast). The check uses the same
+    // `align` constant passed to realloc above, so a realloc that honours
+    // its request never trips it.
+    if align > 1 {
+        debug_assert!(
+            (align as u32).is_power_of_two(),
+            "realloc alignment {align} is not a power of two"
+        );
+        body.instruction(&Instruction::LocalGet(result_local));
+        body.instruction(&Instruction::I32Const(align - 1));
+        body.instruction(&Instruction::I32And);
+        body.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+        body.instruction(&Instruction::Unreachable);
+        body.instruction(&Instruction::End);
+    }
+}
+
+/// Emit a Canonical ABI alignment check: trap (`unreachable`) unless the i32
+/// pointer in `ptr_local` is a multiple of `align` ("unaligned pointer").
+/// No-op for `align <= 1`.
+pub(crate) fn emit_align_check(body: &mut Function, ptr_local: u32, align: u32) {
+    if align <= 1 {
+        return;
+    }
+    debug_assert!(
+        align.is_power_of_two(),
+        "alignment {align} is not a power of two"
+    );
+    body.instruction(&Instruction::LocalGet(ptr_local));
+    body.instruction(&Instruction::I32Const((align - 1) as i32));
+    body.instruction(&Instruction::I32And);
+    body.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+    body.instruction(&Instruction::Unreachable);
+    body.instruction(&Instruction::End);
 }
 
 /// Emit an overflow guard: traps via `unreachable` if `len_local * k` would
@@ -7710,6 +7746,11 @@ impl FactStyleGenerator {
                 } else {
                     1
                 };
+                // A non-string list asks for its element alignment (Canonical ABI).
+                let realloc_align = param_layouts
+                    .get(pair_idx)
+                    .and_then(|cl| cl.list_element_align())
+                    .unwrap_or(realloc_align);
 
                 // #582: a latin1+utf16 string into a latin1+utf16 callee is
                 // deflated when tagged utf16 and latin1-representable. The
@@ -8031,6 +8072,11 @@ impl FactStyleGenerator {
                     } else {
                         1
                     };
+                    // A non-string list asks for its element alignment (Canonical ABI).
+                    let realloc_align = cond
+                        .copy_layout
+                        .list_element_align()
+                        .unwrap_or(realloc_align);
 
                     // if (all guards in chain hold) { allocate in caller,
                     // copy, replace ptr } — outer-guard ANDing per LS-P-10.
@@ -8126,6 +8172,9 @@ impl FactStyleGenerator {
     ) -> Result<u32> {
         let params_area_size = site.requirements.params_area_byte_size.unwrap_or(0);
         let params_area_align = site.requirements.params_area_max_align.max(1);
+        // The caller's params pointer must be aligned to the params tuple
+        // (Canonical ABI "unaligned pointer"; component-model alignment.wast).
+        emit_align_check(func, params_ptr_local, params_area_align);
         let ptr_pair_offsets = &site.requirements.params_area_pointer_pair_offsets;
         let copy_layouts = &site.requirements.params_area_copy_layouts;
 
@@ -8244,6 +8293,11 @@ impl FactStyleGenerator {
             } else {
                 1
             };
+            // A non-string list asks for its element alignment (Canonical ABI).
+            let realloc_align = copy_layouts
+                .get(pair_idx)
+                .and_then(|cl| cl.list_element_align())
+                .unwrap_or(realloc_align);
 
             // Allocate: new_ptr = cabi_realloc(0, 0, align, <byte count>)
             emit_overflow_guard(func, pair_len_local, byte_mult);
@@ -8692,6 +8746,11 @@ impl FactStyleGenerator {
                 } else {
                     1
                 };
+                // A non-string list asks for its element alignment (Canonical ABI).
+                let realloc_align = param_layouts
+                    .get(pair_idx)
+                    .and_then(|cl| cl.list_element_align())
+                    .unwrap_or(realloc_align);
 
                 // Allocate: dest = cabi_realloc(0, 0, align, <byte count>)
                 emit_overflow_guard(&mut func, len_pos, byte_mult);
@@ -8828,6 +8887,11 @@ impl FactStyleGenerator {
                 } else {
                     1
                 };
+                // A non-string list asks for its element alignment (Canonical ABI).
+                let realloc_align = cond
+                    .copy_layout
+                    .list_element_align()
+                    .unwrap_or(realloc_align);
 
                 // Outer-guard AND-chain (LS-P-10) before firing the copy.
                 emit_conditional_guard_chain_flat(&mut func, cond, 0);
@@ -8901,6 +8965,12 @@ impl FactStyleGenerator {
         // --- Phase 2: Call callee → get return area pointer ---
         func.instruction(&Instruction::Call(target_func));
         func.instruction(&Instruction::LocalSet(result_ptr_local));
+        // Canonical ABI "unaligned pointer": the callee's return-area pointer
+        // is checked when its results are lifted, then the caller's retptr
+        // when they are stored (component-model alignment.wast).
+        let return_area_align = site.requirements.return_area_max_align;
+        emit_align_check(&mut func, result_ptr_local, return_area_align);
+        emit_align_check(&mut func, retptr_local, return_area_align);
 
         // --- Phase 3+4+5: Process return area and write to retptr ---
         // For each result pointer pair, copy the pointed-to data and fix up.
@@ -8963,6 +9033,11 @@ impl FactStyleGenerator {
                     } else {
                         1
                     };
+                    // A non-string list asks for its element alignment (Canonical ABI).
+                    let realloc_align = result_layouts
+                        .get(result_pair_idx)
+                        .and_then(|cl| cl.list_element_align())
+                        .unwrap_or(realloc_align);
 
                     // Allocate in caller's memory: <byte count> bytes
                     emit_overflow_guard(&mut func, data_len_local, byte_mult);
@@ -9157,6 +9232,11 @@ impl FactStyleGenerator {
                 } else {
                     1
                 };
+                // A non-string list asks for its element alignment (Canonical ABI).
+                let realloc_align = cond
+                    .copy_layout
+                    .list_element_align()
+                    .unwrap_or(realloc_align);
 
                 // Allocate in caller memory
                 emit_overflow_guard(&mut func, data_len_local, byte_mult);
@@ -9343,6 +9423,11 @@ impl FactStyleGenerator {
             } else {
                 1
             };
+            // A non-string list asks for its element alignment (Canonical ABI).
+            let realloc_align = cond
+                .copy_layout
+                .list_element_align()
+                .unwrap_or(realloc_align);
 
             // if (all guards in chain hold) { copy and replace ptr }
             // — outer-guard ANDing matters for nested option/result/variant
@@ -12490,6 +12575,11 @@ impl FactStyleGenerator {
                     Some(t) if !matches!(t, crate::parser::ComponentValType::String)
                 );
             let realloc_align = if is_compact_utf16 { 2 } else { 1 };
+            // A non-string list asks for its element alignment (Canonical ABI).
+            let realloc_align = param_layouts
+                .get(pair_idx)
+                .and_then(|cl| cl.list_element_align())
+                .unwrap_or(realloc_align);
 
             // #272 inc 1: a TOP-LEVEL byte-granular (byte_mult == 1) string
             // param crossing memory from a UTF-8 caller to a UTF-16 callee is
@@ -15744,9 +15834,11 @@ mod tests {
                 crate::resolver::CopyLayout::Bulk {
                     byte_multiplier: 1,
                     string: false,
+                    element_align: crate::resolver::natural_align(1),
                 },
             )],
             inner_resources: Vec::new(),
+            element_align: crate::resolver::natural_align(8),
         }
     }
 
@@ -15845,6 +15937,7 @@ mod tests {
         site.requirements.param_copy_layouts = vec![crate::resolver::CopyLayout::Bulk {
             byte_multiplier: 1,
             string: false,
+            element_align: crate::resolver::natural_align(1),
         }];
         site.requirements.conditional_pointer_pairs = vec![issue512_cond_pair(
             2,
@@ -15853,6 +15946,7 @@ mod tests {
             crate::resolver::CopyLayout::Bulk {
                 byte_multiplier: 1,
                 string: false,
+                element_align: crate::resolver::natural_align(1),
             },
         )];
         assert_eq!(
@@ -16031,6 +16125,7 @@ mod tests {
         site.requirements.param_copy_layouts = vec![crate::resolver::CopyLayout::Bulk {
             byte_multiplier: 1,
             string: false,
+            element_align: crate::resolver::natural_align(1),
         }];
         site.requirements.caller_encoding = Some(caller);
         site.requirements.callee_encoding = Some(callee);
@@ -16051,9 +16146,11 @@ mod tests {
                 CopyLayout::Bulk {
                     byte_multiplier: 1,
                     string: false,
+                    element_align: crate::resolver::natural_align(1),
                 },
             )],
             inner_resources: vec![],
+            element_align: crate::resolver::natural_align(8),
         };
         let mut site = async_lift_site("[async-lift]greet");
         site.crosses_memory = true;
@@ -16104,9 +16201,11 @@ mod tests {
                     element_size: 4,
                     inner_pointers: vec![],
                     inner_resources: vec![],
+                    element_align: crate::resolver::natural_align(4),
                 },
             )],
             inner_resources: vec![],
+            element_align: crate::resolver::natural_align(8),
         };
         let mut site = async_lift_site("[async-lift]f");
         site.crosses_memory = true;
@@ -16235,6 +16334,7 @@ mod tests {
         site.requirements.result_copy_layouts = vec![crate::resolver::CopyLayout::Bulk {
             byte_multiplier: 1,
             string: false,
+            element_align: crate::resolver::natural_align(1),
         }];
         // caller=Utf8, callee=CompactUtf16 ⇒ result dir (callee→caller) =
         // latin1→utf8, now transcoded by the result writeback.
@@ -16262,9 +16362,11 @@ mod tests {
                 CopyLayout::Bulk {
                     byte_multiplier: 1,
                     string: false,
+                    element_align: crate::resolver::natural_align(1),
                 },
             )],
             inner_resources: vec![],
+            element_align: crate::resolver::natural_align(8),
         };
         let mut site = async_lift_site("[async-lift]greet");
         site.crosses_memory = true;
@@ -16295,9 +16397,11 @@ mod tests {
                 CopyLayout::Bulk {
                     byte_multiplier: 1,
                     string: false,
+                    element_align: crate::resolver::natural_align(1),
                 },
             )],
             inner_resources: vec![],
+            element_align: crate::resolver::natural_align(8),
         };
         let mut site = async_lift_site("[async-lift]greet");
         site.crosses_memory = true;
@@ -16332,9 +16436,11 @@ mod tests {
                 CopyLayout::Bulk {
                     byte_multiplier: 1,
                     string: false,
+                    element_align: crate::resolver::natural_align(1),
                 },
             )],
             inner_resources: vec![],
+            element_align: crate::resolver::natural_align(8),
         };
         let mut site = async_lift_site("[async-lift]greet");
         site.crosses_memory = true;
@@ -16373,6 +16479,7 @@ mod tests {
         site.requirements.result_copy_layouts = vec![crate::resolver::CopyLayout::Bulk {
             byte_multiplier: 1,
             string: false,
+            element_align: crate::resolver::natural_align(1),
         }];
         site.requirements.caller_encoding = Some(CanonStringEncoding::Utf16);
         site.requirements.callee_encoding = Some(CanonStringEncoding::CompactUtf16);
@@ -16402,6 +16509,7 @@ mod tests {
         site.requirements.result_copy_layouts = vec![crate::resolver::CopyLayout::Bulk {
             byte_multiplier: 1,
             string: false,
+            element_align: crate::resolver::natural_align(1),
         }];
         // caller=Utf16, callee=Utf8 ⇒ result dir (callee→caller) = Utf8→Utf16.
         site.requirements.caller_encoding = Some(CanonStringEncoding::Utf16);
@@ -16420,6 +16528,7 @@ mod tests {
         mirror.requirements.result_copy_layouts = vec![crate::resolver::CopyLayout::Bulk {
             byte_multiplier: 1,
             string: false,
+            element_align: crate::resolver::natural_align(1),
         }];
         mirror.requirements.caller_encoding = Some(CanonStringEncoding::Utf8);
         mirror.requirements.callee_encoding = Some(CanonStringEncoding::Utf16);
@@ -16448,6 +16557,7 @@ mod tests {
         utf8_to_latin1.requirements.result_copy_layouts = vec![crate::resolver::CopyLayout::Bulk {
             byte_multiplier: 1,
             string: false,
+            element_align: crate::resolver::natural_align(1),
         }];
         utf8_to_latin1.requirements.caller_encoding = Some(CanonStringEncoding::CompactUtf16);
         utf8_to_latin1.requirements.callee_encoding = Some(CanonStringEncoding::Utf8);
@@ -16465,6 +16575,7 @@ mod tests {
             vec![crate::resolver::CopyLayout::Bulk {
                 byte_multiplier: 1,
                 string: false,
+                element_align: crate::resolver::natural_align(1),
             }];
         utf16_to_latin1.requirements.caller_encoding = Some(CanonStringEncoding::CompactUtf16);
         utf16_to_latin1.requirements.callee_encoding = Some(CanonStringEncoding::Utf16);
@@ -16502,6 +16613,7 @@ mod tests {
             element_size: 4,
             inner_pointers: Vec::new(),
             inner_resources: Vec::new(),
+            element_align: crate::resolver::natural_align(4),
         }];
         site.requirements.caller_encoding = Some(CanonStringEncoding::Utf8);
         site.requirements.callee_encoding = Some(CanonStringEncoding::Utf16);
@@ -16795,6 +16907,7 @@ mod tests {
         site.requirements.param_copy_layouts = vec![crate::resolver::CopyLayout::Bulk {
             byte_multiplier: 1,
             string: false,
+            element_align: crate::resolver::natural_align(1),
         }];
         site.requirements.caller_encoding = Some(crate::parser::CanonStringEncoding::Utf8);
         site.requirements.callee_encoding = Some(crate::parser::CanonStringEncoding::Utf16);
@@ -17069,6 +17182,7 @@ mod tests {
         site.requirements.result_copy_layouts = vec![crate::resolver::CopyLayout::Bulk {
             byte_multiplier: 1,
             string: false,
+            element_align: crate::resolver::natural_align(1),
         }];
         site.requirements.return_area_slots = vec![crate::resolver::ReturnAreaSlot {
             byte_offset: 0,
@@ -17317,6 +17431,7 @@ mod tests {
         site.requirements.param_copy_layouts = vec![crate::resolver::CopyLayout::Bulk {
             byte_multiplier: 1,
             string: false,
+            element_align: crate::resolver::natural_align(1),
         }];
         site.requirements.caller_encoding = Some(crate::parser::CanonStringEncoding::Utf8);
         site.requirements.callee_encoding = Some(crate::parser::CanonStringEncoding::Utf16);
@@ -17506,6 +17621,7 @@ mod tests {
         site.requirements.result_copy_layouts = vec![crate::resolver::CopyLayout::Bulk {
             byte_multiplier: 1,
             string: false,
+            element_align: crate::resolver::natural_align(1),
         }];
         site.requirements.caller_encoding = Some(caller_enc);
         site.requirements.callee_encoding = Some(callee_enc);
@@ -17786,9 +17902,11 @@ mod tests {
                 crate::resolver::CopyLayout::Bulk {
                     byte_multiplier: 1,
                     string: false,
+                    element_align: crate::resolver::natural_align(1),
                 },
             )],
             inner_resources: Vec::new(),
+            element_align: crate::resolver::natural_align(8),
         }];
         site.requirements.result_wit_types = vec![list_string];
         site.requirements.caller_encoding = Some(caller_enc);
@@ -17993,9 +18111,11 @@ mod tests {
                 crate::resolver::CopyLayout::Bulk {
                     byte_multiplier: 1,
                     string: false,
+                    element_align: crate::resolver::natural_align(1),
                 },
             )],
             inner_resources: Vec::new(),
+            element_align: crate::resolver::natural_align(8),
         }];
         let err = FactStyleGenerator::guard_async_cross_encoding_strings(&site)
             .expect_err("#272 inc-5a: a nested list<u8> result must stay FAIL-LOUD");
@@ -18054,9 +18174,11 @@ mod tests {
                 crate::resolver::CopyLayout::Bulk {
                     byte_multiplier: 1,
                     string: false,
+                    element_align: crate::resolver::natural_align(1),
                 },
             )],
             inner_resources: Vec::new(),
+            element_align: crate::resolver::natural_align(8),
         }];
         site.requirements.caller_encoding = Some(CanonStringEncoding::Utf8);
         site.requirements.callee_encoding = Some(CanonStringEncoding::Utf16);
@@ -18104,9 +18226,11 @@ mod tests {
                     crate::resolver::CopyLayout::Bulk {
                         byte_multiplier: 1,
                         string: false,
+                        element_align: crate::resolver::natural_align(1),
                     },
                 )],
                 inner_resources: Vec::new(),
+                element_align: crate::resolver::natural_align(8),
             }];
             let err = FactStyleGenerator::guard_async_cross_encoding_strings(&site).unwrap_err();
             assert!(
@@ -18370,6 +18494,7 @@ mod tests {
         site.requirements.param_copy_layouts = vec![crate::resolver::CopyLayout::Bulk {
             byte_multiplier: 1,
             string: false,
+            element_align: crate::resolver::natural_align(1),
         }];
         site.requirements.caller_encoding = Some(crate::parser::CanonStringEncoding::Utf8);
         site.requirements.callee_encoding = Some(crate::parser::CanonStringEncoding::Utf16);
@@ -18521,9 +18646,11 @@ mod tests {
                 crate::resolver::CopyLayout::Bulk {
                     byte_multiplier: 1,
                     string: false,
+                    element_align: crate::resolver::natural_align(1),
                 },
             )],
             inner_resources: Vec::new(),
+            element_align: crate::resolver::natural_align(8),
         }];
         site.requirements.param_wit_types = vec![list_string];
         site.requirements.caller_encoding = Some(caller_enc);
@@ -19193,6 +19320,7 @@ mod tests {
         site.requirements.param_copy_layouts = vec![crate::resolver::CopyLayout::Bulk {
             byte_multiplier: 1,
             string: false,
+            element_align: crate::resolver::natural_align(1),
         }];
         site.requirements.caller_encoding = Some(caller_enc);
         site.requirements.callee_encoding = Some(callee_enc);
@@ -19602,6 +19730,7 @@ mod tests {
             element_size: 8,
             inner_pointers: Vec::new(),
             inner_resources: vec![inner_a, inner_b],
+            element_align: crate::resolver::natural_align(8),
         };
 
         let requirements = AdapterRequirements {
@@ -19682,6 +19811,7 @@ mod tests {
                 element_size: 4,
                 inner_pointers: Vec::new(),
                 inner_resources: vec![inner],
+                element_align: crate::resolver::natural_align(4),
             }],
             ..Default::default()
         };

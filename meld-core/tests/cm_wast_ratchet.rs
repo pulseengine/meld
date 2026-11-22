@@ -658,6 +658,35 @@ fn exec_baseline_path() -> PathBuf {
     root().join("tests/spec/component-model-exec-baseline.tsv")
 }
 
+/// Whether the component's export `name` takes and returns only scalars
+/// (the values a core module export carries unchanged). `None` when the
+/// component or the export cannot be read.
+fn export_is_scalar(engine: &wasmtime::Engine, input: Option<&[u8]>, name: &str) -> Option<bool> {
+    use wasmtime::component::types::{ComponentItem, Type};
+    let component = wasmtime::component::Component::new(engine, input?).ok()?;
+    let ty = component.component_type();
+    let func = ty.exports(engine).find_map(|(n, item)| match item.ty {
+        ComponentItem::ComponentFunc(f) if n == name => Some(f),
+        _ => None,
+    })?;
+    let scalar = |t: Type| {
+        matches!(
+            t,
+            Type::Bool
+                | Type::S8
+                | Type::U8
+                | Type::S16
+                | Type::U16
+                | Type::S32
+                | Type::U32
+                | Type::S64
+                | Type::U64
+                | Type::Char
+        )
+    };
+    Some(func.params().all(|(_, t)| scalar(t)) && func.results().all(scalar))
+}
+
 /// Replay one WAST's commands, in order, on the fused core modules.
 ///
 /// One live instance per fused component, so state carries across commands
@@ -670,13 +699,22 @@ fn exec_baseline_path() -> PathBuf {
 ///   the wrong thing. These are bugs, and the reason this ratchet exists.
 /// * `no-export`: the fused core module does not export that name. Component
 ///   exports reached through instances or renames are kiln's runner's job.
-/// * `unsupported`: non-scalar arguments or results.
+/// * `unsupported`: non-scalar arguments or results. That includes an
+///   expected trap on an export whose signature carries a non-scalar value
+///   (a string or list result lifted to the host): the host raises that trap
+///   when it lifts or lowers the value, and meld's core output leaves the
+///   outer boundary to the embedder, as it does for `assert_return` on the
+///   same export.
 /// * `not-fused` / `imports` / `inst-error`: nothing to run here.
 fn execute(res: &FileResult) -> Vec<(usize, String, String)> {
     use std::collections::HashMap as Map;
     let mut config = wasmtime::Config::new();
     config.wasm_multi_memory(true);
     let engine = wasmtime::Engine::new(&config).expect("engine");
+    let mut cm_config = wasmtime::Config::new();
+    cm_config.wasm_component_model(true);
+    cm_config.wasm_multi_memory(true);
+    let cm_engine = wasmtime::Engine::new(&cm_config).expect("component engine");
     let mut live: Map<usize, (wasmtime::Store<()>, wasmtime::Instance)> = Map::new();
     let mut out = Vec::new();
     for c in &res.commands {
@@ -713,6 +751,12 @@ fn execute(res: &FileResult) -> Vec<(usize, String, String)> {
             let Some(args) = &exec.args else {
                 return "unsupported".into();
             };
+            if matches!(exec.expect, Expect::Trap)
+                && export_is_scalar(&cm_engine, res.entries[t].input.as_deref(), &exec.export)
+                    == Some(false)
+            {
+                return "unsupported".into();
+            }
             let ty = func.ty(&*store);
             let args: Vec<wasmtime::Val> = args
                 .iter()

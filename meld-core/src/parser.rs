@@ -2219,6 +2219,16 @@ impl ParsedComponent {
     }
 
     /// Compute the maximum alignment of the params area.
+    /// Canonical ABI alignment of the return area: the largest alignment of
+    /// any result (the results tuple's alignment).
+    pub fn return_area_max_align(&self, results: &[(Option<String>, ComponentValType)]) -> u32 {
+        results
+            .iter()
+            .map(|(_, ty)| self.canonical_abi_align(ty))
+            .max()
+            .unwrap_or(1)
+    }
+
     pub fn params_area_max_align(&self, params: &[(String, ComponentValType)]) -> u32 {
         params
             .iter()
@@ -4091,6 +4101,7 @@ impl ParsedComponent {
             ComponentValType::String => CopyLayout::Bulk {
                 byte_multiplier: 1,
                 string: true,
+                element_align: 1,
             },
             ComponentValType::List(inner) => {
                 // LS-P-12 / LS-P-18 (v0.11.0): `element_inner_pointers` now
@@ -4104,16 +4115,19 @@ impl ParsedComponent {
                 // the v0.10 defensive panic. The
                 // `has_pointer_bearing_conditional` check + panic is gone.
                 let element_size = self.canonical_abi_element_size(inner);
+                let element_align = self.canonical_abi_align(inner);
                 let inner_ptrs = self.element_inner_pointers(inner, 0, &[]);
                 let inner_res = self.element_inner_resources(inner, 0, &[]);
                 if inner_ptrs.is_empty() && inner_res.is_empty() {
                     CopyLayout::Bulk {
                         byte_multiplier: element_size,
                         string: false,
+                        element_align,
                     }
                 } else {
                     CopyLayout::Elements {
                         element_size,
+                        element_align,
                         inner_pointers: inner_ptrs,
                         inner_resources: inner_res,
                     }
@@ -4123,6 +4137,7 @@ impl ParsedComponent {
             _ => CopyLayout::Bulk {
                 byte_multiplier: 1,
                 string: false,
+                element_align: 1,
             },
         }
     }
@@ -4150,6 +4165,7 @@ impl ParsedComponent {
                     copy_layout: CopyLayout::Bulk {
                         byte_multiplier: 1,
                         string: true,
+                        element_align: 1,
                     },
                     guards: outer_guards.to_vec(),
                 });
