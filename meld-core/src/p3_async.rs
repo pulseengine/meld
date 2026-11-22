@@ -1217,6 +1217,24 @@ fn shift_function_indices(
     if let Some(s) = merged.start_function.as_mut() {
         *s = bump(*s);
     }
+    // The synthetic start wrapper calls every input start function. Its body
+    // has no origin module, so the re-extraction below never reaches it, and
+    // its `call`s kept the pre-shift indices: they called the imports this
+    // shift prepends (component-model async/empty-wait, zero-length,
+    // switch-to-ready-callback failed validation). Rebuild it from the
+    // already-shifted `function_index_map`.
+    if merged
+        .functions
+        .iter()
+        .any(|f| f.synthetic_kind == Some(crate::merger::SyntheticKind::StartWrapper))
+    {
+        let start_funcs = crate::merger::collect_start_functions(components, merged);
+        for f in merged.functions.iter_mut() {
+            if f.synthetic_kind == Some(crate::merger::SyntheticKind::StartWrapper) {
+                f.body = crate::merger::start_wrapper_body(&start_funcs);
+            }
+        }
+    }
 
     // global initialisers: a `ref.func` init names a fused function index and
     // must shift like every other function reference (#482). Recorded

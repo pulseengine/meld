@@ -1319,20 +1319,7 @@ impl Merger {
         components: &[ParsedComponent],
         merged: &mut MergedModule,
     ) -> Result<()> {
-        // Collect all start functions
-        let mut start_funcs = Vec::new();
-        for (comp_idx, component) in components.iter().enumerate() {
-            for (mod_idx, module) in component.core_modules.iter().enumerate() {
-                if let Some(start_idx) = module.start {
-                    if let Some(&new_idx) = merged
-                        .function_index_map
-                        .get(&(comp_idx, mod_idx, start_idx))
-                    {
-                        start_funcs.push(new_idx);
-                    }
-                }
-            }
-        }
+        let start_funcs = collect_start_functions(components, merged);
 
         if start_funcs.len() == 1 {
             merged.start_function = Some(start_funcs[0]);
@@ -1354,11 +1341,7 @@ impl Merger {
                     idx
                 }) as u32;
 
-            let mut wrapper = Function::new(vec![]);
-            for &func_idx in &start_funcs {
-                wrapper.instruction(&wasm_encoder::Instruction::Call(func_idx));
-            }
-            wrapper.instruction(&wasm_encoder::Instruction::End);
+            let wrapper = start_wrapper_body(&start_funcs);
 
             // The wrapper's function index = import_func_count + functions.len()
             let wrapper_idx = merged.import_counts.func + merged.functions.len() as u32;
@@ -1647,4 +1630,36 @@ mod kani_proofs {
             assert_eq!(model_defined_func(import_count, below), None);
         }
     }
+}
+
+/// Every input module's start function, as a fused function index, in
+/// component then module order. Reads `function_index_map`, so it is
+/// correct again after a pass that shifts function indices.
+pub(crate) fn collect_start_functions(
+    components: &[ParsedComponent],
+    merged: &MergedModule,
+) -> Vec<u32> {
+    let mut start_funcs = Vec::new();
+    for (comp_idx, component) in components.iter().enumerate() {
+        for (mod_idx, module) in component.core_modules.iter().enumerate() {
+            if let Some(start_idx) = module.start
+                && let Some(&new_idx) = merged
+                    .function_index_map
+                    .get(&(comp_idx, mod_idx, start_idx))
+            {
+                start_funcs.push(new_idx);
+            }
+        }
+    }
+    start_funcs
+}
+
+/// The body of the synthetic start wrapper: call each start function in order.
+pub(crate) fn start_wrapper_body(start_funcs: &[u32]) -> Function {
+    let mut wrapper = Function::new(vec![]);
+    for &func_idx in start_funcs {
+        wrapper.instruction(&wasm_encoder::Instruction::Call(func_idx));
+    }
+    wrapper.instruction(&wasm_encoder::Instruction::End);
+    wrapper
 }

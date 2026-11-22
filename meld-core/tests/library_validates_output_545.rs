@@ -1,19 +1,21 @@
 //! #545: the library refuses its own invalid output.
 //!
 //! `Fuser::fuse` used to return bytes that fail validation as `Ok`. Only
-//! the CLI checked them. The reproducer from the issue is the first
-//! component of the upstream `test/async/empty-wait.wast`. Fused under
-//! `--memory multi` it produces an adapter that leaves values on the stack.
+//! the CLI checked them. The reproducer from the issue was the first
+//! component of the upstream `test/async/empty-wait.wast`.
 //!
-//! Both halves are asserted. With `validate_output` on (the default) the
-//! library returns `Error::InvalidOutput`. With it off, the same input comes
-//! back as bytes that fail validation. The second half shows the refusal comes
-//! from the validation and not from somewhere else, and that `--no-validate`
-//! still means what it says.
+//! That component now fuses to a valid module: its start wrapper called the
+//! imports the P3 shift prepends, and is now rebuilt after the shift
+//! (SR-136). No known input still produces invalid output, so the refusal
+//! itself is tested in `meld-core/src/lib.rs`
+//! (`sr114_library_refuses_invalid_output_by_default`), with a component
+//! built to be invalid that only the library can feed past input validation.
+//! This file keeps the former reproducer as a regression test, and checks
+//! that validation leaves valid output alone.
 
 use std::path::Path;
 
-use meld_core::{Error, Fuser, FuserConfig, MemoryStrategy};
+use meld_core::{Fuser, FuserConfig, MemoryStrategy};
 use wast::parser::{self, ParseBuffer};
 use wast::{QuoteWat, Wast, WastDirective, Wat};
 
@@ -45,28 +47,15 @@ fn fuse(bytes: &[u8], validate_output: bool) -> meld_core::Result<Vec<u8>> {
     fuser.fuse()
 }
 
-// rivet: verifies SR-114
-// rivet: verifies SWV-128
 #[test]
-fn library_refuses_invalid_output_by_default() {
+fn former_545_reproducer_now_fuses_to_valid_output() {
+    // async/empty-wait.wast's first component: two start functions, so a
+    // start wrapper, plus stream built-ins, so the P3 import shift. The
+    // wrapper used to call two of the prepended imports and leave a value on
+    // the stack.
     let input = first_component("async/empty-wait.wast");
-
-    match fuse(&input, true) {
-        Err(Error::InvalidOutput(msg)) => assert!(
-            msg.contains("type mismatch"),
-            "expected the adapter stack defect, got: {msg}"
-        ),
-        Err(e) => panic!("expected InvalidOutput, got a different refusal: {e}"),
-        Ok(_) => panic!("#545 regressed: invalid output returned as Ok"),
-    }
-
-    // The opt-out returns the very bytes the default refused, and they are
-    // invalid: the refusal above is the validation, not an earlier failure.
-    let unchecked = fuse(&input, false).expect("opt-out returns the bytes");
-    assert!(
-        meld_core::validate_output(&unchecked, false).is_err(),
-        "with validation off the output should be the invalid module"
-    );
+    let out = fuse(&input, true).expect("fuses with validation on");
+    meld_core::validate_output(&out, false).expect("and the output validates");
 }
 
 // rivet: verifies SR-114
