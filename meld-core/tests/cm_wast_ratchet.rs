@@ -614,6 +614,7 @@ fn every_reference_component_matches_the_fuse_baseline() {
     let header = "# #562 ratchet: meld's outcome for every component in the vendored\n\
                   # component-model test suite. Columns: wast, directive index, line,\n\
                   # kind, outcome, detail. Regenerate with MELD_BLESS=1 and review the diff.\n";
+    assert_no_bug_rows(&rows, FUSE_OUTCOME_COL, is_fuse_bug, "fuse");
     ratchet(
         &baseline_path(),
         header,
@@ -624,6 +625,78 @@ fn every_reference_component_matches_the_fuse_baseline() {
 
 /// Compare `rows` with the checked-in baseline at `path` (or rewrite it under
 /// `MELD_BLESS=1`). Any difference, in either direction, fails.
+// SR-136: outcomes that are meld bugs whatever the baseline says. The
+// ratchet compares with a checked-in baseline, and `MELD_BLESS=1` rewrites
+// it, so a bug row could be blessed in. This guard runs first, also under
+// `MELD_BLESS`, and fails on any such row, so meld-invalid 0 and no-trap 0
+// hold as absolutes. `planted_bug_rows_fail_the_guard` is its control.
+const FUSE_OUTCOME_COL: usize = 4;
+const EXEC_OUTCOME_COL: usize = 3;
+
+fn is_fuse_bug(outcome: &str) -> bool {
+    matches!(
+        outcome,
+        "meld-invalid" | "fused-invalid" | "panic" | "invalid-fused"
+    )
+}
+
+fn is_exec_bug(outcome: &str) -> bool {
+    outcome == "no-trap" || outcome == "trap" || outcome.starts_with("wrong:")
+}
+
+fn bug_rows(rows: &[String], col: usize, is_bug: fn(&str) -> bool) -> Vec<&String> {
+    rows.iter()
+        .filter(|r| r.split('\t').nth(col).is_some_and(is_bug))
+        .collect()
+}
+
+fn assert_no_bug_rows(rows: &[String], col: usize, is_bug: fn(&str) -> bool, what: &str) {
+    let bugs = bug_rows(rows, col, is_bug);
+    assert!(
+        bugs.is_empty(),
+        "SR-136: {} {what} row(s) with a bug outcome; fix them, do not bless them:\n{}",
+        bugs.len(),
+        bugs.iter()
+            .map(|s| s.as_str())
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+}
+
+// rivet: verifies SR-136
+#[test]
+fn planted_bug_rows_fail_the_guard() {
+    // Control for the guard: one planted bug row per class must be caught,
+    // and the clean rows around it must not be.
+    let exec: Vec<String> = [
+        "test/x.wast\t10\trun\tpass",
+        "test/x.wast\t11\trun\tno-trap",
+        "test/x.wast\t12\trun\twrong:7",
+        "test/x.wast\t13\trun\tunsupported",
+    ]
+    .map(String::from)
+    .to_vec();
+    let caught = bug_rows(&exec, EXEC_OUTCOME_COL, is_exec_bug);
+    assert_eq!(caught.len(), 2, "exec guard caught {caught:?}");
+    assert!(caught[0].ends_with("no-trap") && caught[1].ends_with("wrong:7"));
+    let planted = std::panic::catch_unwind(|| {
+        assert_no_bug_rows(&exec, EXEC_OUTCOME_COL, is_exec_bug, "exec")
+    });
+    assert!(
+        planted.is_err(),
+        "a planted no-trap row must fail the guard"
+    );
+
+    let fuse: Vec<String> = [
+        "test/x.wast\t0\t5\tcomponent\tfused\t-",
+        "test/x.wast\t1\t9\tcomponent\tmeld-invalid\tmsg:type mismatch",
+    ]
+    .map(String::from)
+    .to_vec();
+    assert_eq!(bug_rows(&fuse, FUSE_OUTCOME_COL, is_fuse_bug).len(), 1);
+    assert!(bug_rows(&fuse[..1], FUSE_OUTCOME_COL, is_fuse_bug).is_empty());
+}
+
 fn ratchet(path: &Path, header: &str, mut rows: Vec<String>, what: &str) {
     rows.sort();
     let actual = rows.join("\n") + "\n";
@@ -829,6 +902,7 @@ fn every_reference_assertion_matches_the_exec_baseline() {
                   # meld's fused core module (wasmtime, one live instance per component).\n\
                   # Columns: wast, line, export, outcome. wrong:/trap/no-trap are bugs.\n\
                   # Regenerate with MELD_BLESS=1 and review the diff.\n";
+    assert_no_bug_rows(&rows, EXEC_OUTCOME_COL, is_exec_bug, "exec");
     ratchet(
         &exec_baseline_path(),
         header,
