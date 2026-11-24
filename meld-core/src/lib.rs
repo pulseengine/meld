@@ -1559,6 +1559,56 @@ impl Fuser {
             ));
         }
 
+        // #665: P3 built-ins are per instance (handle tables, waitable sets,
+        // element types). The shared-memory import dedup merges same-named
+        // imports across components, so two components' `stream.new` became
+        // one import a host cannot attribute. Refused when two or more
+        // components carry them, as ADR-9 does for the cooperative-thread
+        // built-ins (which keep ADR-9's own check, so they are skipped here).
+        // A single component has nothing to merge with.
+        if self.config.memory_strategy == MemoryStrategy::SharedMemory {
+            use crate::parser::CanonicalEntry as C;
+            let users: Vec<(usize, String)> = self
+                .components
+                .iter()
+                .enumerate()
+                .filter_map(|(idx, comp)| {
+                    let entry = comp.canonical_functions.iter().find(|e| {
+                        !matches!(
+                            e,
+                            C::Lift { .. }
+                                | C::Lower { .. }
+                                | C::ResourceNew { .. }
+                                | C::ResourceDrop { .. }
+                                | C::ResourceRep { .. }
+                        ) && crate::thread_builtins::producer_name(e).is_none()
+                    })?;
+                    let name = format!("{entry:?}");
+                    let name = name.split([' ', '{', '(']).next().unwrap_or("").to_string();
+                    Some((idx, name))
+                })
+                .collect();
+            if users.len() >= 2 {
+                let named: Vec<String> = users
+                    .iter()
+                    .map(|(idx, b)| {
+                        let n = self.components[*idx].name.as_deref();
+                        format!(
+                            "'{}' ({b})",
+                            n.map_or(format!("component {idx}"), str::to_string)
+                        )
+                    })
+                    .collect();
+                return Err(Error::MemoryStrategyUnsupported(format!(
+                    "{} components use P3 built-ins, which are per component instance: {}. \
+                     --memory shared would merge same-named built-ins of different components \
+                     into one import that a host cannot attribute (#665). Use --memory multi",
+                    users.len(),
+                    named.join(", ")
+                )));
+            }
+        }
+
         // Log P3 async feature usage (informational, no longer a rejection).
         for (idx, comp) in self.components.iter().enumerate() {
             if !comp.p3_async_features.is_empty() {
