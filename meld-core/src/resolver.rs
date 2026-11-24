@@ -816,6 +816,78 @@ fn core_stream_future_rw_funcs(component: &ParsedComponent) -> HashMap<u32, usiz
 
 /// Replay `core_entity_order` and collect every core func defined by a
 /// canonical function for which `pred` holds.
+/// #666: the first `stream`/`future` type reachable from a component type
+/// reference (function params and results, instance exports, defined
+/// composite types), as its descriptor. Depth-bounded against cyclic or
+/// pathological type graphs.
+fn p3_handle_in_typeref(
+    comp: &ParsedComponent,
+    ty_ref: &wasmparser::ComponentTypeRef,
+    depth: u32,
+) -> Option<String> {
+    use wasmparser::{ComponentTypeRef as Ref, TypeBounds};
+    match ty_ref {
+        Ref::Func(idx) | Ref::Instance(idx) | Ref::Type(TypeBounds::Eq(idx)) => {
+            p3_handle_in_type(comp, *idx, depth)
+        }
+        _ => None,
+    }
+}
+
+fn p3_handle_in_type(comp: &ParsedComponent, idx: u32, depth: u32) -> Option<String> {
+    if depth > 64 {
+        return None;
+    }
+    match &comp.get_type_definition(idx)?.kind {
+        ComponentTypeKind::P3Async(desc) => {
+            let d = desc.trim();
+            (d.starts_with("stream") || d.starts_with("future")).then(|| d.to_string())
+        }
+        ComponentTypeKind::Function { params, results } => params
+            .iter()
+            .map(|(_, v)| v)
+            .chain(results.iter().map(|(_, v)| v))
+            .find_map(|v| p3_handle_in_valtype(comp, v, depth + 1)),
+        ComponentTypeKind::Instance { exports } => exports
+            .iter()
+            .find_map(|(_, r)| p3_handle_in_typeref(comp, r, depth + 1)),
+        ComponentTypeKind::Defined(v) => p3_handle_in_valtype(comp, v, depth + 1),
+        ComponentTypeKind::Other => None,
+    }
+}
+
+fn p3_handle_in_valtype(
+    comp: &ParsedComponent,
+    vt: &crate::parser::ComponentValType,
+    depth: u32,
+) -> Option<String> {
+    use crate::parser::ComponentValType as V;
+    if depth > 64 {
+        return None;
+    }
+    match vt {
+        V::Type(idx) => p3_handle_in_type(comp, *idx, depth + 1),
+        V::List(inner) | V::Option(inner) | V::FixedSizeList(inner, _) => {
+            p3_handle_in_valtype(comp, inner, depth + 1)
+        }
+        V::Record(fields) => fields
+            .iter()
+            .find_map(|(_, v)| p3_handle_in_valtype(comp, v, depth + 1)),
+        V::Variant(arms) => arms
+            .iter()
+            .filter_map(|(_, v)| v.as_ref())
+            .find_map(|v| p3_handle_in_valtype(comp, v, depth + 1)),
+        V::Tuple(items) => items
+            .iter()
+            .find_map(|v| p3_handle_in_valtype(comp, v, depth + 1)),
+        V::Result { ok, err } => ok
+            .iter()
+            .chain(err.iter())
+            .find_map(|v| p3_handle_in_valtype(comp, v, depth + 1)),
+        _ => None,
+    }
+}
+
 /// The producer-name family of a canonical built-in: its variant name in
 /// kebab case (`StreamDropReadable` -> `stream-drop-readable`), which is the
 /// bracketed part of the producer's field name without index suffixes
@@ -2687,8 +2759,74 @@ impl Resolver {
         Self::refuse_async_lowered_edges(components, &graph)?;
         Self::refuse_async_lift_mismatch(components, &graph)?;
         Self::refuse_unlifted_callee_export(components, &graph)?;
+        Self::refuse_stream_future_across_fused_edge(components, &graph)?;
 
         Ok(graph)
+    }
+
+    /// #666: refuse a fused cross-component call whose function signature
+    /// carries a `stream` or `future` handle.
+    ///
+    /// The Canonical ABI transfers such a handle into the receiving
+    /// instance's table, where it gets a new index. A fused call passes the
+    /// sender's index raw, so the receiver's built-in calls name a handle in
+    /// the wrong table. Per-type copy adapters are ADR-10 step 6; until then
+    /// refuse. The signature is read from the callee's `canon lift` of the
+    /// site's core function (its type index is in the component's own type
+    /// scope); `refuse_unlifted_callee_export` has already refused sites no
+    /// lift reaches.
+    fn refuse_stream_future_across_fused_edge(
+        components: &[ParsedComponent],
+        graph: &DependencyGraph,
+    ) -> Result<()> {
+        let mut per_component: HashMap<usize, HashMap<(usize, u32), Vec<u32>>> = HashMap::new();
+        for site in &graph.adapter_sites {
+            if site.from_component == site.to_component {
+                continue;
+            }
+            let Some(component) = components.get(site.to_component) else {
+                continue;
+            };
+            let lift_types = per_component.entry(site.to_component).or_insert_with(|| {
+                let source = build_entity_provenance(component).func_source;
+                let mut map: HashMap<(usize, u32), Vec<u32>> = HashMap::new();
+                for entry in &component.canonical_functions {
+                    if let crate::parser::CanonicalEntry::Lift {
+                        core_func_index,
+                        type_index,
+                        ..
+                    } = entry
+                        && let Some((m, name)) = source.get(core_func_index)
+                        && let Some(export) = component.core_modules.get(*m).and_then(|module| {
+                            module
+                                .exports
+                                .iter()
+                                .find(|e| e.kind == ExportKind::Function && e.name == *name)
+                        })
+                    {
+                        map.entry((*m, export.index)).or_default().push(*type_index);
+                    }
+                }
+                map
+            });
+            let Some(types) = lift_types.get(&(site.to_module, site.export_func_idx)) else {
+                continue;
+            };
+            if let Some(desc) = types
+                .iter()
+                .find_map(|t| p3_handle_in_type(component, *t, 0))
+            {
+                return Err(Error::UnsupportedFeature(format!(
+                    "component {} calls `{}` in component {} (core export `{}`), and its \
+                     signature carries a `{desc}` handle. The Canonical ABI moves that handle \
+                     into the receiving instance's table under a new index; a fused call would \
+                     pass the sender's index raw. meld cannot fuse stream or future values \
+                     across components until ADR-10 step 6 (#666)",
+                    site.from_component, site.import_name, site.to_component, site.export_name
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// #565: refuse a cross-component adapter site whose callee core function
