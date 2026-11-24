@@ -1232,6 +1232,13 @@ fn host_contract_json(e: &meld_core::import_map::ImportMapEntry) -> serde_json::
     if let Some(t) = &e.thread_table {
         v["thread_table"] = json!({ "index": t.index, "export": t.export });
     }
+    if let Some(b) = &e.builtin {
+        v["builtin"] = json!({
+            "kind": b.kind,
+            "element": b.element.map(|(size, align)| json!({ "size": size, "align": align })),
+            "async": b.async_,
+        });
+    }
     if let Some(r) = &e.resource {
         v["resource"] = json!({
             "operation": r.operation,
@@ -1518,6 +1525,7 @@ mod tests {
             encoding: LowerOption::Present("utf16"),
             resource: None,
             thread_table: None,
+            builtin: None,
         };
         let mut g = entry(1, "g$1", 1);
         g.realloc = LowerOption::Present(ReallocRef {

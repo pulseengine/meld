@@ -1,0 +1,10 @@
+(module
+  (import "[export]test:x/api" "[stream-new-0]get" (func $snew (result i64)))
+  (import "[export]test:x/api" "[async-lower][stream-write-0]get" (func $swrite (param i32 i32 i32) (result i32)))
+  (memory (export "memory") 1)
+  (func (export "_initialize"))
+  (func (export "test:x/api#get") (result i32)
+    (local $p i64)
+    (local.set $p (call $snew))
+    (drop (call $swrite (i32.wrap_i64 (i64.shr_u (local.get $p) (i64.const 32))) (i32.const 16) (i32.const 1)))
+    (i32.wrap_i64 (local.get $p))))

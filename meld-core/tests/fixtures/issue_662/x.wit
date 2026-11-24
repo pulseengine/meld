@@ -1,0 +1,3 @@
+package test:x;
+interface api { get: func() -> stream<u32>; }
+world a { export api; }

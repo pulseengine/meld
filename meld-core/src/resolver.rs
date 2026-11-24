@@ -75,6 +75,11 @@ pub struct UnresolvedImport {
     /// (memory, realloc, string encoding) are the ones the P2 wrapper must
     /// reproduce on the fused import; `None` when untraceable.
     pub lower_core_func: Option<u32>,
+    /// #662: the source component's core function index of the canonical
+    /// built-in (not a `canon lower`) wired to this import, when the instance
+    /// graph traced one. The import map reports its kind, element type and
+    /// canonical options from it.
+    pub builtin_core_func: Option<u32>,
 }
 
 /// A cross-component call that needs an adapter
@@ -952,6 +957,45 @@ const BUILTIN_FAMILIES: &[&str] = &[
     "thread-yield-then-promote",
 ];
 
+/// #662: the producer name for a wit-component fixup import `"<n>"`.
+///
+/// `bag` is the export bag the fixup module is instantiated with. Its
+/// `$imports` table is the shim module's table (traced through provenance),
+/// and the shim's export `"<n>"` is what the real module imports under the
+/// producer name. `None` when the bag carries no such table or the shim
+/// export is imported under no name, or under more than one.
+fn shim_producer_name(
+    bag: &[(String, ExportKind, u32)],
+    slot: &str,
+    provenance: &EntityProvenance,
+    producer_of: &HashMap<(usize, String), Option<(String, String)>>,
+) -> Option<(String, String)> {
+    let table = bag
+        .iter()
+        .find(|(n, k, _)| n == "$imports" && *k == ExportKind::Table)
+        .map(|(_, _, t)| *t)?;
+    let (shim_mod, _) = provenance.table_source.get(&table)?;
+    producer_of.get(&(*shim_mod, slot.to_string()))?.clone()
+}
+
+/// The built-in family a producer field name names, if any (see
+/// [`builtin_name_mismatch`]).
+fn field_builtin_family(field: &str) -> Option<&'static str> {
+    let rest = field.strip_prefix("[async-lower]").unwrap_or(field);
+    let bracket = rest.strip_prefix('[')?.split(']').next()?;
+    let in_family = |fam: &str| {
+        bracket == fam
+            || bracket
+                .strip_prefix(fam)
+                .is_some_and(|tail| tail.starts_with('-'))
+    };
+    BUILTIN_FAMILIES
+        .iter()
+        .filter(|f| in_family(f))
+        .max_by_key(|f| f.len())
+        .copied()
+}
+
 /// `Some(name)` when the field name names a built-in family other than the
 /// one `entry` is. `"x"` and `"x-..."` (index or encoding suffixes such as
 /// `stream-new-0`, `error-context-new-utf8`) belong to family `x`; the
@@ -961,19 +1005,36 @@ fn builtin_name_mismatch(
     entry: &crate::parser::CanonicalEntry,
     field: &str,
 ) -> Option<&'static str> {
-    let rest = field.strip_prefix("[async-lower]").unwrap_or(field);
-    let bracket = rest.strip_prefix('[')?.split(']').next()?;
-    let in_family = |fam: &str| {
-        bracket == fam
-            || bracket
-                .strip_prefix(fam)
-                .is_some_and(|tail| tail.starts_with('-'))
-    };
-    let named = BUILTIN_FAMILIES
-        .iter()
-        .filter(|f| in_family(f))
-        .max_by_key(|f| f.len())?;
-    (*named != builtin_family(entry)).then_some(*named)
+    let named = field_builtin_family(field)?;
+    (named != builtin_family(entry)).then_some(named)
+}
+
+/// #662: the canonical built-in (anything but lift, lower and the resource
+/// intrinsics) that defines core function `core_func` of `component`.
+pub(crate) fn core_builtin_entry(
+    component: &ParsedComponent,
+    core_func: u32,
+) -> Option<&crate::parser::CanonicalEntry> {
+    use crate::parser::CanonicalEntry as E;
+    let canon = *core_canon_funcs_matching(component, |e| {
+        !matches!(
+            e,
+            E::Lift { .. }
+                | E::Lower { .. }
+                | E::ResourceNew { .. }
+                | E::ResourceDrop { .. }
+                | E::ResourceDropAsync { .. }
+                | E::ResourceRep { .. }
+        )
+    })
+    .get(&core_func)?;
+    component.canonical_functions.get(canon)
+}
+
+/// #662: the producer-name family of a built-in (`stream-write`), for the
+/// import map.
+pub(crate) fn builtin_kind(entry: &crate::parser::CanonicalEntry) -> String {
+    builtin_family(entry)
 }
 
 fn core_canon_funcs_matching(
@@ -3214,6 +3275,7 @@ impl Resolver {
                 display_module: Some(module.clone()),
                 display_field: Some(field.clone()),
                 lower_core_func: None,
+                builtin_core_func: None,
             });
 
             added.insert(key);
@@ -3460,6 +3522,7 @@ impl Resolver {
                         display_module: None,
                         display_field: None,
                         lower_core_func: None,
+                        builtin_core_func: None,
                     });
                 }
             }
@@ -3577,6 +3640,48 @@ impl Resolver {
             module_to_instance.insert(info.module_idx, *inst_idx);
         }
 
+        // #662: (source module, export name) -> the `(module, field)` a module
+        // imports it under, through an export bag. wit-component's indirect
+        // shim exports a stream/future built-in as `"<n>"`; the real module
+        // imports that export under the producer name
+        // (`[async-lower][stream-write-0]get`), which is the name a host can
+        // serve. Ambiguous entries (one export imported under two names) are
+        // dropped so no name is guessed.
+        let mut producer_of: HashMap<(usize, String), Option<(String, String)>> = HashMap::new();
+        for info in instantiate_infos.values() {
+            let Some(module) = component.core_modules.get(info.module_idx as usize) else {
+                continue;
+            };
+            for import in &module.imports {
+                if !matches!(import.kind, ImportKind::Function(_)) {
+                    continue;
+                }
+                let Some(bag) = info
+                    .arg_map
+                    .get(&import.module)
+                    .and_then(|i| from_exports_infos.get(i))
+                else {
+                    continue;
+                };
+                let Some(source) = bag
+                    .iter()
+                    .find(|(n, k, _)| *n == import.name && *k == ExportKind::Function)
+                    .and_then(|(_, _, f)| provenance.func_source.get(f))
+                else {
+                    continue;
+                };
+                let name = (import.module.clone(), import.name.clone());
+                producer_of
+                    .entry(source.clone())
+                    .and_modify(|seen| {
+                        if seen.as_ref() != Some(&name) {
+                            *seen = None;
+                        }
+                    })
+                    .or_insert(Some(name));
+            }
+        }
+
         // Step 3: For each module's imports, trace through the instance graph.
         for (from_mod_idx, module) in component.core_modules.iter().enumerate() {
             let from_mod_u32 = from_mod_idx as u32;
@@ -3596,6 +3701,7 @@ impl Resolver {
                             display_module: None,
                             display_field: None,
                             lower_core_func: None,
+                            builtin_core_func: None,
                         });
                     }
                     continue;
@@ -3644,6 +3750,7 @@ impl Resolver {
                             display_module: None,
                             display_field: None,
                             lower_core_func: None,
+                            builtin_core_func: None,
                         });
                         continue;
                     }
@@ -3681,6 +3788,7 @@ impl Resolver {
                     let mut display_module = None;
                     let mut display_field = None;
                     let mut lower_core_func = None;
+                    let mut builtin_core_func = None;
 
                     if let Some(fe_exports) = from_exports_infos.get(&source_inst_idx) {
                         for (name, kind, entity_idx) in fe_exports {
@@ -3711,6 +3819,11 @@ impl Resolver {
                                         &instantiated_instances,
                                     )?,
                                 };
+                                if lower_core_func.is_none()
+                                    && all_builtin_funcs.contains_key(&named_idx)
+                                {
+                                    builtin_core_func = Some(named_idx);
+                                }
                                 // #552: the built-in is the one the instantiation
                                 // supplies, whatever the module calls its import.
                                 // When meld can name the built-in it renames the
@@ -3739,6 +3852,28 @@ impl Resolver {
                                 {
                                     display_module = Some(mod_name.clone());
                                     display_field = Some(field_name.clone());
+                                } else if lower_core_func.is_none()
+                                    && import.name.parse::<u32>().is_ok()
+                                    && let Some(entry) = stream_future_rw_funcs
+                                        .get(&named_idx)
+                                        .and_then(|c| component.canonical_functions.get(*c))
+                                    && let Some((mod_name, field_name)) = shim_producer_name(
+                                        fe_exports,
+                                        &import.name,
+                                        &provenance,
+                                        &producer_of,
+                                    )
+                                    && field_builtin_family(&field_name)
+                                        == Some(builtin_family(entry).as_str())
+                                {
+                                    // #662: the fixup's `"<n>"` import fills slot
+                                    // `<n>` of the shim table it receives as
+                                    // `$imports`; the real module imports the shim's
+                                    // export `"<n>"` under the producer name. Emit
+                                    // the built-in under that name, checked against
+                                    // the wired built-in's family.
+                                    display_module = Some(mod_name);
+                                    display_field = Some(field_name);
                                 } else if lower_core_func.is_none()
                                     // Only the shim's internal name: wit-component names
                                     // shim exports by bare decimal index. A producer-named
@@ -3795,6 +3930,7 @@ impl Resolver {
                         display_module,
                         display_field,
                         lower_core_func,
+                        builtin_core_func,
                     });
                 }
             }
@@ -5845,6 +5981,7 @@ mod tests {
             original_hash: String::new(),
             depth_0_sections: Vec::new(),
             p3_async_features: Vec::new(),
+            p3_elements: Default::default(),
         }
     }
 

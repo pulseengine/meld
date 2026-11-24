@@ -87,6 +87,7 @@ fn test_import_memory_and_realloc_indices_populated() {
             original_hash: String::new(),
             depth_0_sections: Vec::new(),
             p3_async_features: Vec::new(),
+            p3_elements: Default::default(),
         }
     };
 
@@ -111,6 +112,7 @@ fn test_import_memory_and_realloc_indices_populated() {
                 display_module: Some("wasi:cli/stderr@0.2.6".to_string()),
                 display_field: Some("get-stderr".to_string()),
                 lower_core_func: None,
+                builtin_core_func: None,
             },
             UnresolvedImport {
                 component_idx: 1,
@@ -121,6 +123,7 @@ fn test_import_memory_and_realloc_indices_populated() {
                 display_module: Some("wasi:cli/stderr@0.2.6".to_string()),
                 display_field: Some("get-stderr".to_string()),
                 lower_core_func: None,
+                builtin_core_func: None,
             },
         ],
     };
@@ -251,6 +254,7 @@ fn test_cabi_realloc_suffixed_exports_generated() {
             original_hash: String::new(),
             depth_0_sections: Vec::new(),
             p3_async_features: Vec::new(),
+            p3_elements: Default::default(),
         }
     };
 
@@ -275,6 +279,7 @@ fn test_cabi_realloc_suffixed_exports_generated() {
                 display_module: Some("wasi:io/error@0.2.6".to_string()),
                 display_field: Some("drop".to_string()),
                 lower_core_func: None,
+                builtin_core_func: None,
             },
             UnresolvedImport {
                 component_idx: 1,
@@ -285,6 +290,7 @@ fn test_cabi_realloc_suffixed_exports_generated() {
                 display_module: Some("wasi:io/error@0.2.6".to_string()),
                 display_field: Some("drop".to_string()),
                 lower_core_func: None,
+                builtin_core_func: None,
             },
             UnresolvedImport {
                 component_idx: 2,
@@ -295,6 +301,7 @@ fn test_cabi_realloc_suffixed_exports_generated() {
                 display_module: Some("wasi:io/error@0.2.6".to_string()),
                 display_field: Some("drop".to_string()),
                 lower_core_func: None,
+                builtin_core_func: None,
             },
         ],
     };
@@ -409,6 +416,7 @@ fn test_shared_memory_no_suffixed_realloc_exports() {
             original_hash: String::new(),
             depth_0_sections: Vec::new(),
             p3_async_features: Vec::new(),
+            p3_elements: Default::default(),
         }
     };
 
@@ -433,6 +441,7 @@ fn test_shared_memory_no_suffixed_realloc_exports() {
                 display_module: Some("wasi:io/error@0.2.6".to_string()),
                 display_field: Some("drop".to_string()),
                 lower_core_func: None,
+                builtin_core_func: None,
             },
             UnresolvedImport {
                 component_idx: 1,
@@ -443,6 +452,7 @@ fn test_shared_memory_no_suffixed_realloc_exports() {
                 display_module: Some("wasi:io/error@0.2.6".to_string()),
                 display_field: Some("drop".to_string()),
                 lower_core_func: None,
+                builtin_core_func: None,
             },
         ],
     };
@@ -591,6 +601,7 @@ fn test_298_vestigial_grow_blocks_shared_rebase_fusion() {
             original_hash: String::new(),
             depth_0_sections: Vec::new(),
             p3_async_features: Vec::new(),
+            p3_elements: Default::default(),
         }
     };
 
@@ -615,6 +626,7 @@ fn test_298_vestigial_grow_blocks_shared_rebase_fusion() {
                 display_module: Some("wasi:io/error@0.2.6".to_string()),
                 display_field: Some("drop".to_string()),
                 lower_core_func: None,
+                builtin_core_func: None,
             },
             UnresolvedImport {
                 component_idx: 1,
@@ -625,6 +637,7 @@ fn test_298_vestigial_grow_blocks_shared_rebase_fusion() {
                 display_module: Some("wasi:io/error@0.2.6".to_string()),
                 display_field: Some("drop".to_string()),
                 lower_core_func: None,
+                builtin_core_func: None,
             },
         ],
     };
@@ -765,6 +778,7 @@ fn test_298_fork_arena_realloc_fuses_under_shared_rebase_today() {
             original_hash: String::new(),
             depth_0_sections: Vec::new(),
             p3_async_features: Vec::new(),
+            p3_elements: Default::default(),
         }
     };
 
@@ -791,6 +805,7 @@ fn test_298_fork_arena_realloc_fuses_under_shared_rebase_today() {
                 display_module: Some("pulseengine:embedder/arena".to_string()),
                 display_field: Some("__cabi_arena_realloc".to_string()),
                 lower_core_func: None,
+                builtin_core_func: None,
             },
             UnresolvedImport {
                 component_idx: 1,
@@ -801,6 +816,7 @@ fn test_298_fork_arena_realloc_fuses_under_shared_rebase_today() {
                 display_module: Some("pulseengine:embedder/arena".to_string()),
                 display_field: Some("__cabi_arena_realloc".to_string()),
                 lower_core_func: None,
+                builtin_core_func: None,
             },
         ],
     };
@@ -895,6 +911,7 @@ fn make_component_with_instances(
         original_hash: String::new(),
         depth_0_sections: vec![],
         p3_async_features: vec![],
+        p3_elements: Default::default(),
     }
 }
 

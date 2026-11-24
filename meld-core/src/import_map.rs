@@ -73,6 +73,20 @@ pub struct ResourceInfo {
     pub dtor_candidates: Vec<String>,
 }
 
+/// #662: the canonical built-in a fused import is, when it is one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BuiltinInfo {
+    /// Producer-name family, e.g. `stream-write`, `waitable-set-poll`.
+    pub kind: String,
+    /// Canonical-ABI `(size, align)` in bytes of the stream or future element
+    /// type the built-in is for (`stream<u32>`: `(4, 4)`). `None` for a
+    /// built-in without a type, an untyped stream/future, or an element whose
+    /// layout meld cannot size exactly.
+    pub element: Option<(u32, u32)>,
+    /// The built-in was declared with the `async` option.
+    pub async_: bool,
+}
+
 /// Everything a host needs to know about one fused function import.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImportMapEntry {
@@ -93,6 +107,10 @@ pub struct ImportMapEntry {
     /// `[thread-new-indirect-v0]` only (#547): the fused table whose entries
     /// the `fn_idx` argument indexes.
     pub thread_table: Option<crate::thread_builtins::ThreadTable>,
+    /// #662: set when the import is a canonical built-in (stream, future,
+    /// waitable-set, task, ...). Its `memory` / `realloc` / `encoding` then
+    /// come from the built-in's own canonical options.
+    pub builtin: Option<BuiltinInfo>,
 }
 
 /// What the final core module exposes, parsed from its own bytes so the names
@@ -215,6 +233,117 @@ fn resource_info(
 /// Build the per-import map for the fused core module `core`.
 ///
 /// `components` is the flattened component list the merger numbered.
+/// #662: fill `entry.builtin` and the built-in's own canonical options.
+///
+/// Every built-in merged into the import must be the same kind with the same
+/// options; otherwise the options are `unknown`, never one of them guessed.
+fn builtin_entry(
+    entry: &mut ImportMapEntry,
+    components: &[ParsedComponent],
+    merged: &MergedModule,
+    view: &CoreView,
+    comp_idx: usize,
+    core_func: u32,
+    slot: &crate::merger::LowerSlot,
+) {
+    use crate::parser::CanonicalEntry as E;
+    let Some(owner) = components.get(comp_idx) else {
+        return;
+    };
+    let Some(builtin) = crate::resolver::core_builtin_entry(owner, core_func) else {
+        return;
+    };
+    let (ty, options, async_) = match builtin {
+        E::StreamRead { ty, options }
+        | E::StreamWrite { ty, options }
+        | E::FutureRead { ty, options }
+        | E::FutureWrite { ty, options } => (Some(*ty), Some(options), options.async_),
+        E::StreamNew { ty }
+        | E::StreamDropReadable { ty }
+        | E::StreamDropWritable { ty }
+        | E::FutureNew { ty }
+        | E::FutureDropReadable { ty }
+        | E::FutureDropWritable { ty } => (Some(*ty), None, false),
+        E::StreamCancelRead { ty, async_ }
+        | E::StreamCancelWrite { ty, async_ }
+        | E::FutureCancelRead { ty, async_ }
+        | E::FutureCancelWrite { ty, async_ } => (Some(*ty), None, *async_),
+        E::TaskReturn { options, .. }
+        | E::ErrorContextNew { options }
+        | E::ErrorContextDebugMessage { options } => (None, Some(options), options.async_),
+        _ => (None, None, false),
+    };
+    entry.builtin = Some(BuiltinInfo {
+        kind: crate::resolver::builtin_kind(builtin),
+        element: ty
+            .and_then(|t| owner.p3_element_type(t))
+            .filter(|e| owner.can_size_exactly(e))
+            .map(|e| {
+                (
+                    owner.canonical_abi_element_size(e),
+                    owner.canonical_abi_align(e),
+                )
+            }),
+        async_,
+    });
+    let others_agree = slot.builtins.iter().all(|&(c, f)| {
+        components
+            .get(c)
+            .and_then(|o| crate::resolver::core_builtin_entry(o, f))
+            .is_some_and(|b| format!("{b:?}") == format!("{builtin:?}"))
+    });
+    if !others_agree {
+        let why = "this import merges built-ins with different options".to_string();
+        entry.memory = LowerOption::Unknown(why.clone());
+        entry.realloc = LowerOption::Unknown(why.clone());
+        entry.encoding = LowerOption::Unknown(why);
+        return;
+    }
+    let Some(options) = options else {
+        // No canonical options: it cannot touch a memory, allocate or carry
+        // strings, so `null` is the true answer.
+        return;
+    };
+    entry.memory = match options.memory {
+        None => LowerOption::Absent,
+        Some(m) => match crate::component_wrap::resolve_source_memory(
+            owner,
+            components,
+            merged,
+            view.memory_count,
+            m,
+        ) {
+            Ok(index) => LowerOption::Present(MemoryRef {
+                index,
+                export: view
+                    .memory_exports
+                    .iter()
+                    .find(|(_, i)| *i == index)
+                    .map(|(n, _)| n.clone()),
+            }),
+            Err(e) => LowerOption::Unknown(e.to_string()),
+        },
+    };
+    entry.realloc = match options.realloc {
+        None => LowerOption::Absent,
+        Some(r) => {
+            match crate::component_wrap::resolve_source_realloc(owner, comp_idx, merged, r) {
+                Ok(func) => LowerOption::Present(ReallocRef {
+                    func,
+                    export: view
+                        .func_exports
+                        .iter()
+                        .find(|(n, i)| *i == func && n.starts_with("cabi_realloc"))
+                        .or_else(|| view.func_exports.iter().find(|(_, i)| *i == func))
+                        .map(|(n, _)| n.clone()),
+                }),
+                Err(e) => LowerOption::Unknown(e.to_string()),
+            }
+        }
+    };
+    entry.encoding = LowerOption::Present(encoding_name(options.string_encoding));
+}
+
 pub fn build_import_map(
     components: &[ParsedComponent],
     merged: &MergedModule,
@@ -263,6 +392,7 @@ pub fn build_import_map(
                 encoding: LowerOption::Absent,
                 resource: None,
                 thread_table: None,
+                builtin: None,
             };
             if crate::thread_builtins::is_new_indirect_import(module, name) {
                 entry.thread_table = thread_table.cloned();
@@ -297,6 +427,12 @@ pub fn build_import_map(
                 unknown(&mut entry, "no lower was recorded for this import".into());
                 return entry;
             };
+            if let Some(&(c, core_func)) = slot.builtins.first() {
+                builtin_entry(&mut entry, components, merged, &view, c, core_func, slot);
+                if entry.builtin.is_some() {
+                    return entry;
+                }
+            }
             for &(c, _) in &slot.sites {
                 if Some(c) != entry.component && !entry.also_components.contains(&c) {
                     entry.also_components.push(c);
