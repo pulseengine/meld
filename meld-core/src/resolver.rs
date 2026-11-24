@@ -2598,8 +2598,71 @@ impl Resolver {
 
         Self::refuse_async_lowered_edges(components, &graph)?;
         Self::refuse_async_lift_mismatch(components, &graph)?;
+        Self::refuse_unlifted_callee_export(components, &graph)?;
 
         Ok(graph)
+    }
+
+    /// #565: refuse a cross-component adapter site whose callee core function
+    /// no `canon lift` of the callee component reaches.
+    ///
+    /// The resolver matches a callee by core export name (`iface#f`). The
+    /// component's function is whatever its `canon lift` names, which can be
+    /// a different core function: wasm32-wasip3's fixup lifts `hook0`, which
+    /// runs `__wasm_task_hook` around the raw `iface#f`. Calling the raw
+    /// export skips that wrapper; in the #565 fixture `go()` returns 3 where
+    /// the lift gives 1003. Lifts are compared by (module, function index),
+    /// so a lift of another export name for the same function still counts.
+    /// Until the resolver traces the component export to its lift, refuse.
+    /// A callee with no lift that resolves to a core module export is not
+    /// judged.
+    fn refuse_unlifted_callee_export(
+        components: &[ParsedComponent],
+        graph: &DependencyGraph,
+    ) -> Result<()> {
+        let mut per_component: HashMap<usize, std::collections::HashSet<(usize, u32)>> =
+            HashMap::new();
+        for site in &graph.adapter_sites {
+            if site.from_component == site.to_component {
+                continue;
+            }
+            let Some(component) = components.get(site.to_component) else {
+                continue;
+            };
+            let lifted = per_component.entry(site.to_component).or_insert_with(|| {
+                let source = build_entity_provenance(component).func_source;
+                component
+                    .canonical_functions
+                    .iter()
+                    .filter_map(|entry| match entry {
+                        crate::parser::CanonicalEntry::Lift {
+                            core_func_index, ..
+                        } => source.get(core_func_index),
+                        _ => None,
+                    })
+                    .filter_map(|(m, name)| {
+                        let export = component
+                            .core_modules
+                            .get(*m)?
+                            .exports
+                            .iter()
+                            .find(|e| e.kind == ExportKind::Function && e.name == *name)?;
+                        Some((*m, export.index))
+                    })
+                    .collect()
+            });
+            if lifted.is_empty() || lifted.contains(&(site.to_module, site.export_func_idx)) {
+                continue;
+            }
+            return Err(Error::UnsupportedFeature(format!(
+                "component {} calls `{}`, which meld matched by name to core export `{}` of \
+                 component {}, but no `canon lift` of that component names this function: \
+                 the component's function is a different core function (for example a \
+                 wasm32-wasip3 task-hook wrapper). Refusing rather than calling past it (#565)",
+                site.from_component, site.import_name, site.export_name, site.to_component
+            )));
+        }
+        Ok(())
     }
 
     /// #664: refuse an adapter site whose callee calling convention, as the
