@@ -2597,8 +2597,70 @@ impl Resolver {
         Self::synthesize_missing_resource_imports(components, &mut graph);
 
         Self::refuse_async_lowered_edges(components, &graph)?;
+        Self::refuse_async_lift_mismatch(components, &graph)?;
 
         Ok(graph)
+    }
+
+    /// #664: refuse an adapter site whose callee calling convention, as the
+    /// `canon lift` options say, differs from the one meld inferred from the
+    /// core export name.
+    ///
+    /// The adapter generators choose the async path from the `[async-lift]`
+    /// prefix (`AdapterSite::is_async_lift`). A producer may lift a plainly
+    /// named core export with `async`; wired direct, the caller receives the
+    /// callback status code (0 = EXIT) as its result. The opposite case, an
+    /// `[async-lift]`-named export lifted without `async`, would drive a
+    /// callback loop over a sync function. Both are refused until the adapter
+    /// takes the convention from the lift options (the lift-side twin of
+    /// SR-112). Sites whose core export no `canon lift` reaches are not
+    /// judged here.
+    fn refuse_async_lift_mismatch(
+        components: &[ParsedComponent],
+        graph: &DependencyGraph,
+    ) -> Result<()> {
+        // component -> (module, core export name) -> async option of every
+        // `canon lift` of that core function.
+        let mut per_component: HashMap<usize, HashMap<(usize, String), Vec<bool>>> = HashMap::new();
+        for site in &graph.adapter_sites {
+            let Some(component) = components.get(site.to_component) else {
+                continue;
+            };
+            let lifts = per_component.entry(site.to_component).or_insert_with(|| {
+                let export_of = build_entity_provenance(component).func_source;
+                let mut map: HashMap<(usize, String), Vec<bool>> = HashMap::new();
+                for entry in &component.canonical_functions {
+                    if let crate::parser::CanonicalEntry::Lift {
+                        core_func_index,
+                        options,
+                        ..
+                    } = entry
+                        && let Some(src) = export_of.get(core_func_index)
+                    {
+                        map.entry(src.clone()).or_default().push(options.async_);
+                    }
+                }
+                map
+            });
+            let Some(asyncs) = lifts.get(&(site.to_module, site.export_name.clone())) else {
+                continue;
+            };
+            if asyncs.iter().any(|a| *a != site.is_async_lift) {
+                let (said, named) = if site.is_async_lift {
+                    ("without the async option", "async")
+                } else {
+                    ("with the async option", "sync")
+                };
+                return Err(Error::UnsupportedFeature(format!(
+                    "component {} calls `{}`, which component {} lifts {said} from core \
+                     export `{}`, but meld picks the calling convention from the export name \
+                     and would wire it as {named}. Refusing rather than handing the caller the \
+                     wrong result (#664)",
+                    site.from_component, site.import_name, site.to_component, site.export_name
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// #548 / #560: refuse what meld cannot fuse or name for a core import
