@@ -157,6 +157,17 @@ pub(crate) fn emit_align_check(body: &mut Function, ptr_local: u32, align: u32) 
     body.instruction(&Instruction::End);
 }
 
+/// #663: the error for an async adapter that cannot find the callee's
+/// task.return shim, so it has no source for the call's result.
+fn no_task_return_shim(site: &AdapterSite, func_name: &str) -> crate::Error {
+    crate::Error::AdapterGeneration(format!(
+        "#663: the call to '{}' ({}) reaches an async-lifted export, but meld found no \
+         task.return shim for '{func_name}' in component {}, so it has no way to read the \
+         result. Refusing rather than returning zeros.",
+        site.export_name, site.import_module, site.to_component
+    ))
+}
+
 /// Emit an overflow guard: traps via `unreachable` if `len_local * k` would
 /// wrap in 32-bit unsigned arithmetic. Caller supplies the local holding the
 /// untrusted length and the constant multiplier `k`. No-op when `k <= 1`.
@@ -12418,7 +12429,13 @@ impl FactStyleGenerator {
                 }
             }
         } else {
-            // Fallback: return default values if no matching shim found
+            // #663: with no matching task.return shim the adapter has no way
+            // to read the callee's result. Returning zeros gave the caller 0
+            // at exit 0. Refuse when the caller expects a result; a call
+            // without one has nothing to read and stays valid.
+            if !caller_type.results.is_empty() || uses_retptr {
+                return Err(no_task_return_shim(site, adapter_func_name));
+            }
             for result_ty in &caller_type.results {
                 match result_ty {
                     wasm_encoder::ValType::I32 => {
@@ -13929,11 +13946,10 @@ impl FactStyleGenerator {
             // function. The merger should always wire shims for
             // async-lifted exports, so reaching here implies a parse-
             // time invariant violation; logging keeps the path visible.
-            log::warn!(
-                "stackful adapter '{}': no task.return shim found; \
-                 emitting default results",
-                site.export_name,
-            );
+            // #663: refuse rather than hand the caller zeros at exit 0.
+            if !caller_type.results.is_empty() || uses_retptr {
+                return Err(no_task_return_shim(site, adapter_func_name));
+            }
             for result_ty in &caller_type.results {
                 match result_ty {
                     wasm_encoder::ValType::I32 => {
@@ -16094,6 +16110,71 @@ mod tests {
         );
     }
 
+    /// #663: the async adapters refuse when the callee has no task.return
+    /// shim and the caller expects a result. Unit tests that build a bare
+    /// `MergedModule` for other properties (locals budget, dispatch) register
+    /// the shim a real fusion would have: one i32 global per caller result.
+    fn with_tr_shim(
+        merged: &crate::merger::MergedModule,
+        site: &crate::resolver::AdapterSite,
+    ) -> crate::merger::MergedModule {
+        let mut m = merged.clone();
+        let func_name = site
+            .export_name
+            .rsplit_once('#')
+            .map(|(_, n)| n)
+            .unwrap_or(&site.export_name)
+            .to_string();
+        if m.task_return_shims
+            .values()
+            .any(|i| i.component_idx == site.to_component && i.original_func_name == func_name)
+        {
+            return m;
+        }
+        let results = site
+            .import_func_type_idx
+            .and_then(|t| m.types.get(t as usize))
+            .map(|t| t.results.clone())
+            .unwrap_or_default();
+        let mut result_globals = Vec::new();
+        for ty in results {
+            let idx = m.import_counts.global + m.globals.len() as u32;
+            m.globals.push(crate::merger::MergedGlobal {
+                ty: wasm_encoder::GlobalType {
+                    val_type: ty,
+                    mutable: true,
+                    shared: false,
+                },
+                init_expr: match ty {
+                    wasm_encoder::ValType::I64 => wasm_encoder::ConstExpr::i64_const(0),
+                    wasm_encoder::ValType::F32 => {
+                        wasm_encoder::ConstExpr::f32_const(0.0_f32.into())
+                    }
+                    wasm_encoder::ValType::F64 => {
+                        wasm_encoder::ConstExpr::f64_const(0.0_f64.into())
+                    }
+                    _ => wasm_encoder::ConstExpr::i32_const(0),
+                },
+                init_ref_func: None,
+                init_ref_origin: None,
+            });
+            result_globals.push((idx, ty));
+        }
+        let key = u32::MAX - m.task_return_shims.len() as u32;
+        m.task_return_shims.insert(
+            key,
+            crate::merger::TaskReturnShimInfo {
+                shim_func: 0,
+                result_globals,
+                component_idx: site.to_component,
+                import_name: "[task-return]0".into(),
+                original_func_name: func_name,
+                result_type: None,
+            },
+        );
+        m
+    }
+
     fn async_lift_site(export_name: &str) -> crate::resolver::AdapterSite {
         use crate::resolver::AdapterSite;
         AdapterSite {
@@ -16728,7 +16809,7 @@ mod tests {
         merged.function_index_map.insert((1, 0, 0), 0);
 
         let adapter = gen_
-            .generate_async_stackful_adapter(&site, &merged)
+            .generate_async_stackful_adapter(&site, &with_tr_shim(&merged, &site))
             .expect("stackful emitter must succeed for trivial site");
         assert_eq!(
             adapter.name, "$async_stackful_adapter_0_to_1",
@@ -16804,7 +16885,7 @@ mod tests {
         site.crosses_memory = false;
 
         let adapter = gen_
-            .generate_async_stackful_adapter(&site, &merged)
+            .generate_async_stackful_adapter(&site, &with_tr_shim(&merged, &site))
             .expect("stackful emitter must succeed");
 
         let body = adapter.body.into_raw_body();
@@ -16913,7 +16994,7 @@ mod tests {
         site.requirements.callee_encoding = Some(crate::parser::CanonStringEncoding::Utf16);
 
         let adapter = gen_
-            .generate_async_stackful_adapter(&site, &merged)
+            .generate_async_stackful_adapter(&site, &with_tr_shim(&merged, &site))
             .expect("pre-fix: async emitter raw-copies cross-encoding string");
         let body = adapter.body.into_raw_body();
         let has_memcopy = body.windows(2).any(|w| w == [0xFC, 0x0A]);
@@ -17004,7 +17085,7 @@ mod tests {
         site.crosses_memory = true;
 
         let adapter = gen_
-            .generate_async_stackful_adapter(&site, &merged)
+            .generate_async_stackful_adapter(&site, &with_tr_shim(&merged, &site))
             .expect("stackful emitter must succeed for ptr-pair return");
 
         let body = adapter.body.into_raw_body();
@@ -17644,7 +17725,7 @@ mod tests {
             CanonStringEncoding::Utf8,
         );
         let adapter = gen_
-            .generate_async_callback_adapter(&site, &merged)
+            .generate_async_callback_adapter(&site, &with_tr_shim(&merged, &site))
             .expect("callback emitter must succeed for the inc-3 result-string site");
         let cpc = site_caller_param_count(&site, &merged);
         assert_locals_within_budget(adapter.body, cpc, "#272 inc-3 callback result");
@@ -17666,7 +17747,7 @@ mod tests {
         // companion so `generate_async_stackful_adapter` is under test.
         merged.exports[0].name = site.export_name.clone();
         let adapter = gen_
-            .generate_async_stackful_adapter(&site, &merged)
+            .generate_async_stackful_adapter(&site, &with_tr_shim(&merged, &site))
             .expect("stackful emitter must succeed for the inc-3 result-string site");
         let cpc = site_caller_param_count(&site, &merged);
         assert_locals_within_budget(adapter.body, cpc, "#272 inc-3 stackful result");
@@ -17695,7 +17776,7 @@ mod tests {
             CanonStringEncoding::CompactUtf16,
         );
         let adapter_src = gen_
-            .generate_async_callback_adapter(&site_src, &merged_src)
+            .generate_async_callback_adapter(&site_src, &with_tr_shim(&merged_src, &site_src))
             .expect("callback emitter must succeed for the inc-4c latin1-source result site");
         let cpc_src = site_caller_param_count(&site_src, &merged_src);
         assert_locals_within_budget(
@@ -17711,7 +17792,7 @@ mod tests {
             CanonStringEncoding::Utf8,
         );
         let adapter_dst = gen_
-            .generate_async_callback_adapter(&site_dst, &merged_dst)
+            .generate_async_callback_adapter(&site_dst, &with_tr_shim(&merged_dst, &site_dst))
             .expect("callback emitter must succeed for the inc-4c dest-latin1 result site");
         let cpc_dst = site_caller_param_count(&site_dst, &merged_dst);
         assert_locals_within_budget(
@@ -17739,7 +17820,7 @@ mod tests {
         );
         merged_src.exports[0].name = site_src.export_name.clone();
         let adapter_src = gen_
-            .generate_async_stackful_adapter(&site_src, &merged_src)
+            .generate_async_stackful_adapter(&site_src, &with_tr_shim(&merged_src, &site_src))
             .expect("stackful emitter must succeed for the inc-4c latin1-source result site");
         let cpc_src = site_caller_param_count(&site_src, &merged_src);
         assert_locals_within_budget(
@@ -17755,7 +17836,7 @@ mod tests {
         );
         merged_dst.exports[0].name = site_dst.export_name.clone();
         let adapter_dst = gen_
-            .generate_async_stackful_adapter(&site_dst, &merged_dst)
+            .generate_async_stackful_adapter(&site_dst, &with_tr_shim(&merged_dst, &site_dst))
             .expect("stackful emitter must succeed for the inc-4c dest-latin1 result site");
         let cpc_dst = site_caller_param_count(&site_dst, &merged_dst);
         assert_locals_within_budget(
@@ -17934,7 +18015,7 @@ mod tests {
             CanonStringEncoding::Utf8,
         );
         let adapter = gen_
-            .generate_async_callback_adapter(&site, &merged)
+            .generate_async_callback_adapter(&site, &with_tr_shim(&merged, &site))
             .expect("callback emitter must succeed for the inc-5a list<string> result site");
         let cpc = site_caller_param_count(&site, &merged);
         assert_locals_within_budget(adapter.body, cpc, "#272 inc-5a callback nested result");
@@ -17957,7 +18038,7 @@ mod tests {
         // companion so `generate_async_stackful_adapter` is under test.
         merged.exports[0].name = site.export_name.clone();
         let adapter = gen_
-            .generate_async_stackful_adapter(&site, &merged)
+            .generate_async_stackful_adapter(&site, &with_tr_shim(&merged, &site))
             .expect("stackful emitter must succeed for the inc-5a list<string> result site");
         let cpc = site_caller_param_count(&site, &merged);
         assert_locals_within_budget(adapter.body, cpc, "#272 inc-5a stackful nested result");
@@ -17980,7 +18061,7 @@ mod tests {
             CanonStringEncoding::Utf8,
         );
         let adapter = gen_
-            .generate_async_callback_adapter(&site, &merged)
+            .generate_async_callback_adapter(&site, &with_tr_shim(&merged, &site))
             .expect("callback emitter must succeed for the #286 5d list<list<string>> result");
         let cpc = site_caller_param_count(&site, &merged);
         assert_locals_within_budget(adapter.body, cpc, "#286 5d callback depth-2 nested result");
@@ -18002,7 +18083,7 @@ mod tests {
         );
         merged.exports[0].name = site.export_name.clone();
         let adapter = gen_
-            .generate_async_stackful_adapter(&site, &merged)
+            .generate_async_stackful_adapter(&site, &with_tr_shim(&merged, &site))
             .expect("stackful emitter must succeed for the #286 5d list<list<string>> result");
         let cpc = site_caller_param_count(&site, &merged);
         assert_locals_within_budget(adapter.body, cpc, "#286 5d stackful depth-2 nested result");
@@ -18258,7 +18339,7 @@ mod tests {
             CanonStringEncoding::Utf16,
         );
         let adapter = gen_
-            .generate_async_callback_adapter(&site, &merged)
+            .generate_async_callback_adapter(&site, &with_tr_shim(&merged, &site))
             .expect("callback emitter must succeed for the inc-5b dest-latin1 result site");
         let cpc = site_caller_param_count(&site, &merged);
         assert_locals_within_budget(
@@ -18285,7 +18366,7 @@ mod tests {
         // Rename the companion export so the stackful path is under test.
         merged.exports[0].name = site.export_name.clone();
         let adapter = gen_
-            .generate_async_stackful_adapter(&site, &merged)
+            .generate_async_stackful_adapter(&site, &with_tr_shim(&merged, &site))
             .expect("stackful emitter must succeed for the inc-5b dest-latin1 result site");
         let cpc = site_caller_param_count(&site, &merged);
         assert_locals_within_budget(
@@ -18363,7 +18444,7 @@ mod tests {
         site.crosses_memory = false;
 
         let adapter = gen_
-            .generate_async_stackful_adapter(&site, &merged)
+            .generate_async_stackful_adapter(&site, &with_tr_shim(&merged, &site))
             .expect("stackful emitter must succeed");
 
         let raw = adapter.body.into_raw_body();
@@ -18500,7 +18581,7 @@ mod tests {
         site.requirements.callee_encoding = Some(crate::parser::CanonStringEncoding::Utf16);
 
         let adapter = gen_
-            .generate_async_callback_adapter(&site, &merged)
+            .generate_async_callback_adapter(&site, &with_tr_shim(&merged, &site))
             .expect("callback emitter must succeed for the inc-1 utf8→utf16 string-param site");
 
         let caller_param_count = 2u32; // type 1 has two i32 params
@@ -18754,8 +18835,11 @@ mod tests {
              must be ALLOWED — the emitter transcodes the inner strings",
         );
         let mixed_ops = count_ops(
-            gen_.generate_async_callback_adapter(&mixed_site, &mixed_merged)
-                .expect("callback emitter must succeed for the mixed param site"),
+            gen_.generate_async_callback_adapter(
+                &mixed_site,
+                &with_tr_shim(&mixed_merged, &mixed_site),
+            )
+            .expect("callback emitter must succeed for the mixed param site"),
         );
 
         // Reference: the single `list<string>` param (pointer pair at index 0)
@@ -18765,8 +18849,11 @@ mod tests {
             CanonStringEncoding::Utf16,
         );
         let single_ops = count_ops(
-            gen_.generate_async_callback_adapter(&single_site, &single_merged)
-                .expect("callback emitter must succeed for the single param site"),
+            gen_.generate_async_callback_adapter(
+                &single_site,
+                &with_tr_shim(&single_merged, &single_site),
+            )
+            .expect("callback emitter must succeed for the single param site"),
         );
 
         assert_eq!(
@@ -18800,16 +18887,22 @@ mod tests {
              must be ALLOWED — the emitter transcodes the inner strings",
         );
         let mixed_ops = count_ops(
-            gen_.generate_async_callback_adapter(&mixed_site, &mixed_merged)
-                .expect("callback emitter must succeed for the mixed param site (utf16→utf8)"),
+            gen_.generate_async_callback_adapter(
+                &mixed_site,
+                &with_tr_shim(&mixed_merged, &mixed_site),
+            )
+            .expect("callback emitter must succeed for the mixed param site (utf16→utf8)"),
         );
         let (single_merged, single_site) = xenc_list_string_param_merged_and_site(
             CanonStringEncoding::Utf16,
             CanonStringEncoding::Utf8,
         );
         let single_ops = count_ops(
-            gen_.generate_async_callback_adapter(&single_site, &single_merged)
-                .expect("callback emitter must succeed for the single param site (utf16→utf8)"),
+            gen_.generate_async_callback_adapter(
+                &single_site,
+                &with_tr_shim(&single_merged, &single_site),
+            )
+            .expect("callback emitter must succeed for the single param site (utf16→utf8)"),
         );
         assert_eq!(
             mixed_ops, single_ops,
@@ -18834,7 +18927,7 @@ mod tests {
             CanonStringEncoding::Utf8,
         );
         let adapter = gen_
-            .generate_async_callback_adapter(&site, &merged)
+            .generate_async_callback_adapter(&site, &with_tr_shim(&merged, &site))
             .expect("callback emitter must succeed for the same-encoding mixed param site");
         let memcopies = count_memcopies(adapter);
         assert_eq!(
@@ -18862,7 +18955,7 @@ mod tests {
             CanonStringEncoding::Utf8,
         );
         let adapter = gen_
-            .generate_async_callback_adapter(&site, &merged)
+            .generate_async_callback_adapter(&site, &with_tr_shim(&merged, &site))
             .expect("callback emitter must succeed for the list<string> param site");
         let raw = adapter.body.into_raw_body();
         let fb = wasmparser::FunctionBody::new(wasmparser::BinaryReader::new(&raw, 0));
@@ -18905,7 +18998,7 @@ mod tests {
             CanonStringEncoding::Utf16,
         );
         let adapter = gen_
-            .generate_async_callback_adapter(&site, &merged)
+            .generate_async_callback_adapter(&site, &with_tr_shim(&merged, &site))
             .expect("callback emitter must succeed for the inc-5c-a list<string> param site");
         let cpc = site_caller_param_count(&site, &merged);
         assert_locals_within_budget(adapter.body, cpc, "#272 inc-5c-a callback nested param");
@@ -18928,7 +19021,7 @@ mod tests {
         // companion so `generate_async_stackful_adapter` is under test.
         merged.exports[0].name = site.export_name.clone();
         let adapter = gen_
-            .generate_async_stackful_adapter(&site, &merged)
+            .generate_async_stackful_adapter(&site, &with_tr_shim(&merged, &site))
             .expect("stackful emitter must succeed for the inc-5c-a list<string> param site");
         let cpc = site_caller_param_count(&site, &merged);
         assert_locals_within_budget(adapter.body, cpc, "#272 inc-5c-a stackful nested param");
@@ -18952,7 +19045,7 @@ mod tests {
             CanonStringEncoding::Utf16,
         );
         let adapter = gen_
-            .generate_async_callback_adapter(&site, &merged)
+            .generate_async_callback_adapter(&site, &with_tr_shim(&merged, &site))
             .expect("callback emitter must succeed for the #286 5d list<list<string>> param");
         let cpc = site_caller_param_count(&site, &merged);
         assert_locals_within_budget(adapter.body, cpc, "#286 5d callback depth-2 nested param");
@@ -18974,7 +19067,7 @@ mod tests {
         );
         merged.exports[0].name = site.export_name.clone();
         let adapter = gen_
-            .generate_async_stackful_adapter(&site, &merged)
+            .generate_async_stackful_adapter(&site, &with_tr_shim(&merged, &site))
             .expect("stackful emitter must succeed for the #286 5d list<list<string>> param");
         let cpc = site_caller_param_count(&site, &merged);
         assert_locals_within_budget(adapter.body, cpc, "#286 5d stackful depth-2 nested param");
@@ -19135,9 +19228,11 @@ mod tests {
             CanonStringEncoding::Utf8,
             CanonStringEncoding::CompactUtf16,
         );
-        let adapter = gen_.generate_async_callback_adapter(&site, &merged).expect(
-            "callback emitter must succeed for the inc-5c-b dest-latin1 list<string> param",
-        );
+        let adapter = gen_
+            .generate_async_callback_adapter(&site, &with_tr_shim(&merged, &site))
+            .expect(
+                "callback emitter must succeed for the inc-5c-b dest-latin1 list<string> param",
+            );
         let cpc = site_caller_param_count(&site, &merged);
         assert_locals_within_budget(
             adapter.body,
@@ -19161,9 +19256,11 @@ mod tests {
             CanonStringEncoding::CompactUtf16,
         );
         merged.exports[0].name = site.export_name.clone();
-        let adapter = gen_.generate_async_stackful_adapter(&site, &merged).expect(
-            "stackful emitter must succeed for the inc-5c-b dest-latin1 list<string> param",
-        );
+        let adapter = gen_
+            .generate_async_stackful_adapter(&site, &with_tr_shim(&merged, &site))
+            .expect(
+                "stackful emitter must succeed for the inc-5c-b dest-latin1 list<string> param",
+            );
         let cpc = site_caller_param_count(&site, &merged);
         assert_locals_within_budget(
             adapter.body,
@@ -19410,7 +19507,7 @@ mod tests {
             CanonStringEncoding::Utf8,
         );
         let adapter = gen_
-            .generate_async_callback_adapter(&site, &merged)
+            .generate_async_callback_adapter(&site, &with_tr_shim(&merged, &site))
             .expect("callback emitter must succeed for the inc-2 utf16→utf8 string-param site");
         let cpc = site_caller_param_count(&site, &merged);
         assert_locals_within_budget(adapter.body, cpc, "#272 inc-2 callback");
@@ -19436,7 +19533,7 @@ mod tests {
         site.requirements.caller_encoding = Some(CanonStringEncoding::Utf16);
         site.requirements.callee_encoding = Some(CanonStringEncoding::Utf8);
         let adapter = gen_
-            .generate_async_stackful_adapter(&site, &merged)
+            .generate_async_stackful_adapter(&site, &with_tr_shim(&merged, &site))
             .expect("stackful emitter must succeed for the inc-2 utf16→utf8 string-param site");
         let cpc = site_caller_param_count(&site, &merged);
         assert_locals_within_budget(adapter.body, cpc, "#272 inc-2 stackful");
@@ -19462,7 +19559,7 @@ mod tests {
             CanonStringEncoding::Utf8,
         );
         let adapter8 = gen_
-            .generate_async_callback_adapter(&site8, &merged8)
+            .generate_async_callback_adapter(&site8, &with_tr_shim(&merged8, &site8))
             .expect("callback emitter must succeed for the inc-4a latin1→utf8 string-param site");
         let cpc8 = site_caller_param_count(&site8, &merged8);
         assert_locals_within_budget(adapter8.body, cpc8, "#272 inc-4a callback latin1→utf8");
@@ -19472,7 +19569,7 @@ mod tests {
             CanonStringEncoding::Utf16,
         );
         let adapter16 = gen_
-            .generate_async_callback_adapter(&site16, &merged16)
+            .generate_async_callback_adapter(&site16, &with_tr_shim(&merged16, &site16))
             .expect("callback emitter must succeed for the inc-4a latin1→utf16 string-param site");
         let cpc16 = site_caller_param_count(&site16, &merged16);
         assert_locals_within_budget(adapter16.body, cpc16, "#272 inc-4a callback latin1→utf16");
@@ -19496,7 +19593,7 @@ mod tests {
         // Stackful dispatches on a non-`[callback]` export; rename the companion.
         merged8.exports[0].name = site8.export_name.clone();
         let adapter8 = gen_
-            .generate_async_stackful_adapter(&site8, &merged8)
+            .generate_async_stackful_adapter(&site8, &with_tr_shim(&merged8, &site8))
             .expect("stackful emitter must succeed for the inc-4a latin1→utf8 string-param site");
         let cpc8 = site_caller_param_count(&site8, &merged8);
         assert_locals_within_budget(adapter8.body, cpc8, "#272 inc-4a stackful latin1→utf8");
@@ -19507,7 +19604,7 @@ mod tests {
         );
         merged16.exports[0].name = site16.export_name.clone();
         let adapter16 = gen_
-            .generate_async_stackful_adapter(&site16, &merged16)
+            .generate_async_stackful_adapter(&site16, &with_tr_shim(&merged16, &site16))
             .expect("stackful emitter must succeed for the inc-4a latin1→utf16 string-param site");
         let cpc16 = site_caller_param_count(&site16, &merged16);
         assert_locals_within_budget(adapter16.body, cpc16, "#272 inc-4a stackful latin1→utf16");
@@ -19532,7 +19629,7 @@ mod tests {
             CanonStringEncoding::CompactUtf16,
         );
         let adapter8 = gen_
-            .generate_async_callback_adapter(&site8, &merged8)
+            .generate_async_callback_adapter(&site8, &with_tr_shim(&merged8, &site8))
             .expect("callback emitter must succeed for the inc-4b utf8→latin1 string-param site");
         let cpc8 = site_caller_param_count(&site8, &merged8);
         assert_locals_within_budget(adapter8.body, cpc8, "#272 inc-4b callback utf8→latin1");
@@ -19543,7 +19640,7 @@ mod tests {
             CanonStringEncoding::CompactUtf16,
         );
         let adapter16 = gen_
-            .generate_async_callback_adapter(&site16, &merged16)
+            .generate_async_callback_adapter(&site16, &with_tr_shim(&merged16, &site16))
             .expect("callback emitter must succeed for the inc-4b utf16→latin1 string-param site");
         let cpc16 = site_caller_param_count(&site16, &merged16);
         assert_locals_within_budget(adapter16.body, cpc16, "#272 inc-4b callback utf16→latin1");
@@ -19566,7 +19663,7 @@ mod tests {
         // Stackful dispatches on a non-`[callback]` export; rename the companion.
         merged8.exports[0].name = site8.export_name.clone();
         let adapter8 = gen_
-            .generate_async_stackful_adapter(&site8, &merged8)
+            .generate_async_stackful_adapter(&site8, &with_tr_shim(&merged8, &site8))
             .expect("stackful emitter must succeed for the inc-4b utf8→latin1 string-param site");
         let cpc8 = site_caller_param_count(&site8, &merged8);
         assert_locals_within_budget(adapter8.body, cpc8, "#272 inc-4b stackful utf8→latin1");
@@ -19577,7 +19674,7 @@ mod tests {
         );
         merged16.exports[0].name = site16.export_name.clone();
         let adapter16 = gen_
-            .generate_async_stackful_adapter(&site16, &merged16)
+            .generate_async_stackful_adapter(&site16, &with_tr_shim(&merged16, &site16))
             .expect("stackful emitter must succeed for the inc-4b utf16→latin1 string-param site");
         let cpc16 = site_caller_param_count(&site16, &merged16);
         assert_locals_within_budget(adapter16.body, cpc16, "#272 inc-4b stackful utf16→latin1");
@@ -19627,7 +19724,7 @@ mod tests {
         site.crosses_memory = false;
 
         let adapter = gen_
-            .generate_async_callback_adapter(&site, &merged)
+            .generate_async_callback_adapter(&site, &with_tr_shim(&merged, &site))
             .expect("callback emitter must succeed with [callback] + [waitable-set-poll] wired");
 
         let body = adapter.body.into_raw_body();

@@ -2489,7 +2489,15 @@ impl Fuser {
         let mut func_name_to_elem_position: HashMap<(usize, String), usize> = HashMap::new();
         for &comp_idx in &async_callee_components {
             let component = &self.components[comp_idx];
-            if let Some(module) = component.core_modules.first() {
+            // #663: the main module is the one that imports `[task-return]`,
+            // which need not be module 0.
+            let main = component.core_modules.iter().position(|m| {
+                m.imports.iter().any(|i| {
+                    matches!(i.kind, parser::ImportKind::Function(_))
+                        && i.name.starts_with("[task-return]")
+                })
+            });
+            if let Some((main_idx, module)) = main.map(|i| (i, &component.core_modules[i])) {
                 let mut elem_position = 0usize;
                 let mut func_idx = 0u32;
                 for module_imp in &module.imports {
@@ -2501,7 +2509,7 @@ impl Fuser {
                         // (goes to a forwarding function, not a merged import)
                         let is_forwarding = merged
                             .function_index_map
-                            .get(&(comp_idx, 0, func_idx))
+                            .get(&(comp_idx, main_idx, func_idx))
                             .map(|&idx| idx >= merged.import_counts.func)
                             .unwrap_or(false);
 
@@ -2552,14 +2560,21 @@ impl Fuser {
                 .count() as u32;
             let mut original_func_name = imp.name.clone();
             let component = &self.components[comp_idx];
-            if let Some(module) = component.core_modules.first() {
+            // #663: the `[task-return]` import can live in any core module of
+            // the callee, not only the first (a memory-only module may come
+            // first). Searching module 0 alone left the name unrecovered, and
+            // the adapter then returned zeros.
+            for (mod_idx, module) in component.core_modules.iter().enumerate() {
                 let mut fidx = 0u32;
                 for mimp in &module.imports {
                     if !matches!(mimp.kind, parser::ImportKind::Function(_)) {
                         continue;
                     }
                     if mimp.name.starts_with("[task-return]")
-                        && merged.function_index_map.get(&(comp_idx, 0, fidx)).copied()
+                        && merged
+                            .function_index_map
+                            .get(&(comp_idx, mod_idx, fidx))
+                            .copied()
                             == Some(merged_func_idx)
                     {
                         original_func_name = mimp
