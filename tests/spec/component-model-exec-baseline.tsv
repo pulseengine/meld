@@ -328,7 +328,7 @@ test/async/trap-if-sync-and-waitable-set.wast	327	subtask-cancel-async-when-in-s
 test/async/trap-if-transfer-in-waitable-set.wast	49	return-future-in-set	imports
 test/async/trap-if-transfer-in-waitable-set.wast	51	return-stream-in-set	imports
 test/async/wait-during-callback.wast	77	run	imports
-test/async/zero-length.wast	223	run	imports
+test/async/zero-length.wast	223	run	not-fused
 test/async/zero-length.wast	511	zero-write-then-zero-read	not-fused
 test/async/zero-length.wast	513	zero-read-then-zero-write	not-fused
 test/async/zero-length.wast	515	zero-read-then-write	not-fused
