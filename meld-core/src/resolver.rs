@@ -816,6 +816,94 @@ fn core_stream_future_rw_funcs(component: &ParsedComponent) -> HashMap<u32, usiz
 
 /// Replay `core_entity_order` and collect every core func defined by a
 /// canonical function for which `pred` holds.
+/// The producer-name family of a canonical built-in: its variant name in
+/// kebab case (`StreamDropReadable` -> `stream-drop-readable`), which is the
+/// bracketed part of the producer's field name without index suffixes
+/// (`[stream-drop-readable-0]x`).
+fn builtin_family(entry: &crate::parser::CanonicalEntry) -> String {
+    let debug = format!("{entry:?}");
+    let variant = debug.split([' ', '{', '(']).next().unwrap_or("");
+    let mut out = String::new();
+    for (i, ch) in variant.chars().enumerate() {
+        if ch.is_ascii_uppercase() {
+            if i > 0 {
+                out.push('-');
+            }
+            out.push(ch.to_ascii_lowercase());
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
+/// Every built-in family a producer field name can carry (#552).
+const BUILTIN_FAMILIES: &[&str] = &[
+    "backpressure-inc",
+    "backpressure-dec",
+    "task-return",
+    "task-cancel",
+    "context-get",
+    "context-set",
+    "thread-yield",
+    "subtask-drop",
+    "subtask-cancel",
+    "stream-new",
+    "stream-read",
+    "stream-write",
+    "stream-cancel-read",
+    "stream-cancel-write",
+    "stream-drop-readable",
+    "stream-drop-writable",
+    "future-new",
+    "future-read",
+    "future-write",
+    "future-cancel-read",
+    "future-cancel-write",
+    "future-drop-readable",
+    "future-drop-writable",
+    "error-context-new",
+    "error-context-debug-message",
+    "error-context-drop",
+    "waitable-set-new",
+    "waitable-set-wait",
+    "waitable-set-poll",
+    "waitable-set-drop",
+    "waitable-join",
+    "thread-index",
+    "thread-new-indirect",
+    "thread-resume-later",
+    "thread-suspend",
+    "thread-suspend-then-resume",
+    "thread-yield-then-resume",
+    "thread-suspend-then-promote",
+    "thread-yield-then-promote",
+];
+
+/// `Some(name)` when the field name names a built-in family other than the
+/// one `entry` is. `"x"` and `"x-..."` (index or encoding suffixes such as
+/// `stream-new-0`, `error-context-new-utf8`) belong to family `x`; the
+/// longest matching family wins. Field names that name no known family
+/// (shim indices, plain names) are not judged.
+fn builtin_name_mismatch(
+    entry: &crate::parser::CanonicalEntry,
+    field: &str,
+) -> Option<&'static str> {
+    let rest = field.strip_prefix("[async-lower]").unwrap_or(field);
+    let bracket = rest.strip_prefix('[')?.split(']').next()?;
+    let in_family = |fam: &str| {
+        bracket == fam
+            || bracket
+                .strip_prefix(fam)
+                .is_some_and(|tail| tail.starts_with('-'))
+    };
+    let named = BUILTIN_FAMILIES
+        .iter()
+        .filter(|f| in_family(f))
+        .max_by_key(|f| f.len())?;
+    (*named != builtin_family(entry)).then_some(*named)
+}
+
 fn core_canon_funcs_matching(
     component: &ParsedComponent,
     pred: impl Fn(&crate::parser::CanonicalEntry) -> bool,
@@ -3268,6 +3356,18 @@ impl Resolver {
         let canon_lower_sites = core_lower_options(component);
         let core_func_aliases = core_func_alias_targets(component);
         let builtin_canon_funcs = core_builtin_canon_funcs(component);
+        let all_builtin_funcs = core_canon_funcs_matching(component, |e| {
+            use crate::parser::CanonicalEntry as E;
+            !matches!(
+                e,
+                E::Lift { .. }
+                    | E::Lower { .. }
+                    | E::ResourceNew { .. }
+                    | E::ResourceDrop { .. }
+                    | E::ResourceDropAsync { .. }
+                    | E::ResourceRep { .. }
+            )
+        });
         let stream_future_rw_funcs = core_stream_future_rw_funcs(component);
         let instantiated_instances: std::collections::HashSet<u32> = component
             .instances
@@ -3473,6 +3573,29 @@ impl Resolver {
                                         &instantiated_instances,
                                     )?,
                                 };
+                                // #552: the built-in is the one the instantiation
+                                // supplies, whatever the module calls its import.
+                                // When meld can name the built-in it renames the
+                                // import below (#547). When it cannot, the module's
+                                // own name is emitted; if that names a different
+                                // built-in, the host (and the import dedup) binds
+                                // it as that one.
+                                if lower_core_func.is_none()
+                                    && !canon_import_names.contains_key(&named_idx)
+                                    && let Some(entry) = all_builtin_funcs
+                                        .get(&named_idx)
+                                        .and_then(|c| component.canonical_functions.get(*c))
+                                    && let Some(named) = builtin_name_mismatch(entry, &import.name)
+                                {
+                                    return Err(Error::UnsupportedFeature(format!(
+                                        "core import {}::{} names the built-in `{named}`, but \
+                                         the instantiation wires it to `{}`. meld would bind \
+                                         it by name to the wrong built-in; refusing (#552)",
+                                        import.module,
+                                        import.name,
+                                        builtin_family(entry)
+                                    )));
+                                }
                                 if let Some((mod_name, field_name)) =
                                     canon_import_names.get(&named_idx)
                                 {
@@ -7239,5 +7362,52 @@ mod trace_core_func_tests {
         bags.insert(10, bag(&[("f", 2)]));
         bags.insert(11, bag(&[("f", 1)]));
         assert!(trace_core_func_to_lower(1, &lowers, &aliases, &bags).is_err());
+    }
+}
+
+#[cfg(test)]
+mod builtin_name_552 {
+    use super::{BUILTIN_FAMILIES, builtin_family, builtin_name_mismatch};
+    use crate::parser::CanonicalEntry as E;
+
+    #[test]
+    fn producer_names_match_their_builtin() {
+        for (entry, field) in [
+            (E::WaitableSetDrop, "[waitable-set-drop]"),
+            (E::ContextGet(0), "[context-get-0]"),
+            (E::ThreadYieldThenResume, "[thread-yield-then-resume]"),
+            (E::ThreadIndex, "[thread-index]"),
+            (E::SubtaskDrop, "[subtask-drop]"),
+        ] {
+            assert_eq!(builtin_name_mismatch(&entry, field), None, "{field}");
+        }
+        // shim indices and plain names are not judged
+        assert_eq!(builtin_name_mismatch(&E::WaitableSetDrop, "3"), None);
+        assert_eq!(builtin_name_mismatch(&E::WaitableSetDrop, "drop"), None);
+    }
+
+    #[test]
+    fn another_builtins_name_is_a_mismatch() {
+        assert_eq!(
+            builtin_name_mismatch(&E::WaitableSetDrop, "[stream-drop-readable-0]x"),
+            Some("stream-drop-readable")
+        );
+        // longest family wins: thread-yield-then-resume is not thread-yield
+        assert_eq!(
+            builtin_name_mismatch(&E::ThreadYieldThenResume, "[thread-yield]"),
+            Some("thread-yield")
+        );
+    }
+
+    #[test]
+    fn every_family_is_a_variant_name() {
+        for fam in [
+            builtin_family(&E::WaitableSetDrop),
+            builtin_family(&E::ContextSet(1)),
+            builtin_family(&E::ThreadSuspendThenPromote),
+            builtin_family(&E::BackpressureDec),
+        ] {
+            assert!(BUILTIN_FAMILIES.contains(&fam.as_str()), "{fam}");
+        }
     }
 }
