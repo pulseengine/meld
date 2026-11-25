@@ -37,13 +37,17 @@
 //!
 //! A name is a uleb32 byte length followed by UTF-8.
 //!
-//! Increment 1 carries primitive parameters (at most four, so both sides pass
-//! them flat) and at most one primitive result. The resolver refuses every
-//! other signature (`Resolver::extract_async_edges`).
+//! An edge carries primitives, UTF-8 strings and lists of primitives, at most
+//! four flat parameter values (so both sides pass them flat) and at most one
+//! result. A string or list is copied: the start adapter allocates in the
+//! callee's memory with the callee's realloc and copies the bytes there; the
+//! return adapter allocates in the caller's memory with the caller's realloc,
+//! copies, and writes `(ptr, len)` at retptr. The resolver refuses every other
+//! signature (`Resolver::extract_async_edges`).
 
 use crate::merger::{self, MergedExport, MergedFunction, MergedModule, SyntheticKind};
 use crate::parser::{ParsedComponent, PrimitiveValType};
-use crate::resolver::{AsyncEdge, DependencyGraph};
+use crate::resolver::{AsyncEdge, DependencyGraph, EdgeValue};
 use crate::{Error, Result};
 use wasm_encoder::{Function, Instruction, MemArg, ValType};
 
@@ -231,7 +235,7 @@ fn emit_one(
     }
 
     // Core signatures.
-    let params: Vec<ValType> = edge.params.iter().copied().map(flat).collect();
+    let params: Vec<ValType> = edge.params.iter().flat_map(|v| flat_of(*v)).collect();
     let retptr = edge.result.is_some();
     let mut import_params = params.clone();
     if retptr {
@@ -263,11 +267,107 @@ fn emit_one(
     )?;
     let callback = lookup(edge.callback.0, edge.callback.1, "[callback] function")?;
 
-    // Start adapter: params -> [async-lift] -> the packed i32, unchanged.
+    // The memories and allocators a copy needs, resolved only when one is.
+    let is_bytes = |v: &EdgeValue| matches!(v, EdgeValue::Bytes { .. });
+    let params_copy = edge.params.iter().any(is_bytes);
+    let result_copy = edge.result.as_ref().is_some_and(is_bytes);
+    let lower = crate::resolver::core_lower_options(&components[caller])
+        .get(&edge.lower_core_func)
+        .cloned()
+        .ok_or_else(|| refuse("the caller's lowering options were not found".into()))?;
+    let caller_mem = if params_copy || retptr {
+        let mem = lower.memory.ok_or_else(|| {
+            refuse("the caller's async lowering passes pointers but names no memory".into())
+        })?;
+        Some(
+            crate::component_wrap::resolve_source_memory(
+                &components[caller],
+                components,
+                merged,
+                merged.memories.len(),
+                mem,
+            )
+            .map_err(|e| refuse(e.to_string()))?,
+        )
+    } else {
+        None
+    };
+    let callee_mem = if params_copy || result_copy {
+        let mem = edge.callee_memory.ok_or_else(|| {
+            refuse("the callee's lift passes a string or list but names no memory".into())
+        })?;
+        Some(
+            crate::component_wrap::resolve_source_memory(
+                &components[site.to_component],
+                components,
+                merged,
+                merged.memories.len(),
+                mem,
+            )
+            .map_err(|e| refuse(e.to_string()))?,
+        )
+    } else {
+        None
+    };
+    let realloc = |owner: usize, idx: Option<u32>, who: &str| -> Result<u32> {
+        let idx = idx.ok_or_else(|| {
+            refuse(format!(
+                "a string or list is copied into the {who}, whose options name no realloc"
+            ))
+        })?;
+        crate::component_wrap::resolve_source_realloc(&components[owner], owner, merged, idx)
+            .map_err(|e| refuse(e.to_string()))
+    };
+    let callee_realloc = if params_copy {
+        Some(realloc(site.to_component, edge.callee_realloc, "callee")?)
+    } else {
+        None
+    };
+    let caller_realloc = if result_copy {
+        Some(realloc(caller, lower.realloc, "caller")?)
+    } else {
+        None
+    };
+
+    // Start adapter: params (strings and lists copied into the callee's
+    // memory with the callee's realloc) -> [async-lift] -> the packed i32,
+    // unchanged.
     let start_ty = merger::Merger::find_or_add_type(&mut merged.types, &params, &[ValType::I32]);
-    let mut start = Function::new([]);
-    for i in 0..params.len() as u32 {
-        start.instruction(&Instruction::LocalGet(i));
+    let n_copies = edge.params.iter().filter(|v| is_bytes(v)).count() as u32;
+    let mut start = Function::new([(n_copies, ValType::I32)]);
+    let mut slot = 0u32;
+    let mut scratch = params.len() as u32;
+    let mut args: Vec<u32> = Vec::new();
+    for v in &edge.params {
+        match *v {
+            EdgeValue::Prim(_) => {
+                args.push(slot);
+                slot += 1;
+            }
+            EdgeValue::Bytes { elem_size, align } => {
+                let (ptr, len, new) = (slot, slot + 1, scratch);
+                emit_copy(
+                    &mut start,
+                    Copy {
+                        src_ptr: ptr,
+                        len,
+                        dst: new,
+                        elem_size,
+                        align,
+                        realloc: callee_realloc.expect("resolved for params_copy"),
+                        src_mem: caller_mem.expect("resolved for params_copy"),
+                        dst_mem: callee_mem.expect("resolved for params_copy"),
+                    },
+                );
+                args.push(new);
+                args.push(len);
+                slot += 2;
+                scratch += 1;
+            }
+        }
+    }
+    for a in args {
+        start.instruction(&Instruction::LocalGet(a));
     }
     start.instruction(&Instruction::Call(lift));
     start.instruction(&Instruction::End);
@@ -280,17 +380,50 @@ fn emit_one(
     });
 
     // Return adapter: (retptr, flat results...) -> (), storing into the
-    // caller's memory at retptr.
-    let results: Vec<ValType> = edge.result.into_iter().map(flat).collect();
+    // caller's memory at retptr (a string or list first copied into the
+    // caller's memory with the caller's realloc).
+    let results: Vec<ValType> = edge.result.into_iter().flat_map(flat_of).collect();
     let mut ret_params = vec![ValType::I32];
     ret_params.extend(results.iter().copied());
     let ret_ty = merger::Merger::find_or_add_type(&mut merged.types, &ret_params, &[]);
-    let mut ret = Function::new([]);
-    if let Some(p) = edge.result {
-        let memory = caller_memory(merged, components, edge).map_err(|e| refuse(e.to_string()))?;
-        ret.instruction(&Instruction::LocalGet(0));
-        ret.instruction(&Instruction::LocalGet(1));
-        ret.instruction(&store(p, memory));
+    let mut ret = Function::new([(u32::from(result_copy), ValType::I32)]);
+    match edge.result {
+        None => {}
+        Some(EdgeValue::Prim(p)) => {
+            let memory = caller_mem.expect("resolved for retptr");
+            ret.instruction(&Instruction::LocalGet(0));
+            ret.instruction(&Instruction::LocalGet(1));
+            ret.instruction(&store(p, memory));
+        }
+        Some(EdgeValue::Bytes { elem_size, align }) => {
+            let memory = caller_mem.expect("resolved for retptr");
+            // locals: 0 retptr, 1 ptr, 2 len, 3 new ptr
+            emit_copy(
+                &mut ret,
+                Copy {
+                    src_ptr: 1,
+                    len: 2,
+                    dst: 3,
+                    elem_size,
+                    align,
+                    realloc: caller_realloc.expect("resolved for result_copy"),
+                    src_mem: callee_mem.expect("resolved for result_copy"),
+                    dst_mem: memory,
+                },
+            );
+            let at = |offset| MemArg {
+                offset,
+                align: 2,
+                target: wasm_encoder::MemArgTarget::Memory(memory),
+                ordering: None,
+            };
+            ret.instruction(&Instruction::LocalGet(0));
+            ret.instruction(&Instruction::LocalGet(3));
+            ret.instruction(&Instruction::I32Store(at(0)));
+            ret.instruction(&Instruction::LocalGet(0));
+            ret.instruction(&Instruction::LocalGet(2));
+            ret.instruction(&Instruction::I32Store(at(4)));
+        }
     }
     ret.instruction(&Instruction::End);
     let ret_idx = merged.import_counts.func + merged.functions.len() as u32;
@@ -316,28 +449,60 @@ fn emit_one(
     })
 }
 
-/// The fused memory the caller's `canon lower ... async` names.
-fn caller_memory(
-    merged: &MergedModule,
-    components: &[ParsedComponent],
-    edge: &AsyncEdge,
-) -> Result<u32> {
-    let owner = &components[edge.site.from_component];
-    let mem = crate::resolver::core_lower_options(owner)
-        .get(&edge.lower_core_func)
-        .and_then(|o| o.memory)
-        .ok_or_else(|| {
-            Error::UnsupportedFeature(
-                "the caller's async lowering returns a result but names no memory".into(),
-            )
-        })?;
-    crate::component_wrap::resolve_source_memory(
-        owner,
-        components,
-        merged,
-        merged.memories.len(),
-        mem,
-    )
+/// The flat core values of an edge value.
+fn flat_of(v: EdgeValue) -> Vec<ValType> {
+    match v {
+        EdgeValue::Prim(p) => vec![flat(p)],
+        EdgeValue::Bytes { .. } => vec![ValType::I32, ValType::I32],
+    }
+}
+
+/// One `(ptr, len)` copy between memories: locals and fused indices.
+struct Copy {
+    src_ptr: u32,
+    len: u32,
+    /// Local that receives the new pointer.
+    dst: u32,
+    elem_size: u32,
+    align: u32,
+    realloc: u32,
+    src_mem: u32,
+    dst_mem: u32,
+}
+
+/// Allocate `len * elem_size` bytes with `realloc` in the destination
+/// memory, copy them from the source memory, and leave the new pointer in
+/// `c.dst`. Traps when the byte length overflows u32, as the Canonical ABI
+/// does.
+fn emit_copy(f: &mut Function, c: Copy) {
+    if c.elem_size > 1 {
+        f.instruction(&Instruction::LocalGet(c.len));
+        f.instruction(&Instruction::I32Const((u32::MAX / c.elem_size) as i32));
+        f.instruction(&Instruction::I32GtU);
+        f.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+        f.instruction(&Instruction::Unreachable);
+        f.instruction(&Instruction::End);
+    }
+    let byte_len = |f: &mut Function| {
+        f.instruction(&Instruction::LocalGet(c.len));
+        if c.elem_size > 1 {
+            f.instruction(&Instruction::I32Const(c.elem_size as i32));
+            f.instruction(&Instruction::I32Mul);
+        }
+    };
+    f.instruction(&Instruction::I32Const(0));
+    f.instruction(&Instruction::I32Const(0));
+    f.instruction(&Instruction::I32Const(c.align as i32));
+    byte_len(f);
+    f.instruction(&Instruction::Call(c.realloc));
+    f.instruction(&Instruction::LocalSet(c.dst));
+    f.instruction(&Instruction::LocalGet(c.dst));
+    f.instruction(&Instruction::LocalGet(c.src_ptr));
+    byte_len(f);
+    f.instruction(&Instruction::MemoryCopy {
+        src_mem: c.src_mem,
+        dst_mem: c.dst_mem,
+    });
 }
 
 impl AsyncEdgePlan {
@@ -397,7 +562,7 @@ fn valtype_byte(v: ValType) -> u8 {
         ValType::I64 => 0x7e,
         ValType::F32 => 0x7d,
         ValType::F64 => 0x7c,
-        // Increment 1 only produces the four numeric types.
+        // Edge values flatten to the four numeric types only.
         other => unreachable!("async edge result type {other:?}"),
     }
 }

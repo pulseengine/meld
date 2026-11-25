@@ -2184,3 +2184,17 @@ artifacts:
       created-by: ai-assisted
       model: claude-opus-5-5
       timestamp: 2026-11-25T03:30:00Z
+
+  - id: SWV-150
+    type: sw-verification
+    title: "Verification of SR-140 (increment 2): strings and lists cross an async edge by copy"
+    status: implemented
+    release: v0.71.0
+    description: "meld-core/tests/p3_async_edges_548.rs fuses a caller and a callee of echo: async func(s: string) -> string, each with its own memory and bump realloc (caller from 1024, callee from 2048), and runs the adapters under wasmtime. string_param_and_result_are_copied_between_memories: the section records 2 flat params, retptr and results (i32, i32). start(100, 5) with \"hello\" at 100 in the caller's memory returns 0; the callee's task.return receives (2048, 5), so the copy went through the callee's realloc, and the callee's memory holds \"hello\" at 2048. return(200, 2048, 5) leaves (1024, 5) at 200 in the caller's memory, allocated by the caller's realloc, and \"hello\" at 1024. list_of_u32_is_copied_with_its_element_size repeats this for list<u32> [7, 8, 0xdeadbeef]: the length stays an element count, all 12 bytes come back, and a length of 0x40000000 (byte size overflows u32) traps. string_edge_fuses_under_shared_memory fuses and validates under --memory shared. tuple_param_is_still_refused: a composite parameter is refused citing #548. Negative controls: swapping the copy's source and destination memories fails both copy tests; removing the overflow guard fails the list test."
+    links:
+      - type: verifies
+        target: SR-140
+    provenance:
+      created-by: ai-assisted
+      model: claude-opus-5-5
+      timestamp: 2026-11-25T05:00:00Z

@@ -70,12 +70,94 @@ pub struct AsyncEdge {
     /// The callee's `[callback]` core function: (module index, function
     /// index in that module).
     pub callback: (usize, u32),
-    /// The function's parameters. Increment 1: primitives only, at most
-    /// four (`MAX_FLAT_ASYNC_PARAMS`), so the caller and the callee both
-    /// pass them flat and unchanged.
-    pub params: Vec<crate::parser::PrimitiveValType>,
-    /// The function's result. Increment 1: none or one primitive.
-    pub result: Option<crate::parser::PrimitiveValType>,
+    /// The function's parameters, at most four flat values
+    /// (`MAX_FLAT_ASYNC_PARAMS`), so the caller and the callee both pass
+    /// them flat.
+    pub params: Vec<EdgeValue>,
+    /// The function's result: none or one value.
+    pub result: Option<EdgeValue>,
+    /// The callee lift's `memory` option (component core memory index).
+    pub callee_memory: Option<u32>,
+    /// The callee lift's `realloc` option (component core func index).
+    pub callee_realloc: Option<u32>,
+}
+
+/// A value an async edge carries (ADR-10 step 3).
+#[derive(Debug, Clone, Copy)]
+pub enum EdgeValue {
+    /// A primitive: one flat value, passed unchanged.
+    Prim(crate::parser::PrimitiveValType),
+    /// A UTF-8 `string` or a `list<primitive>`: a `(ptr, len)` pair whose
+    /// `len * elem_size` bytes are copied into the receiving component's
+    /// memory.
+    Bytes { elem_size: u32, align: u32 },
+}
+
+impl EdgeValue {
+    /// Flat core values this takes.
+    pub fn flat_count(self) -> usize {
+        match self {
+            EdgeValue::Prim(_) => 1,
+            EdgeValue::Bytes { .. } => 2,
+        }
+    }
+
+    /// The edge value for a component value type, following type aliases;
+    /// `None` for a type increment 2 does not carry.
+    pub fn classify(
+        component: &ParsedComponent,
+        ty: &crate::parser::ComponentValType,
+    ) -> Option<Self> {
+        use crate::parser::{ComponentValType as V, PrimitiveValType as P};
+        let size = |p: P| match p {
+            P::Bool | P::S8 | P::U8 => 1,
+            P::S16 | P::U16 => 2,
+            P::S32 | P::U32 | P::F32 | P::Char => 4,
+            P::S64 | P::U64 | P::F64 => 8,
+        };
+        let mut ty = ty;
+        // Bounded: an alias chain longer than the type table is malformed.
+        for _ in 0..=component.types.len() {
+            match ty {
+                V::Primitive(p) => return Some(EdgeValue::Prim(*p)),
+                V::String => {
+                    return Some(EdgeValue::Bytes {
+                        elem_size: 1,
+                        align: 1,
+                    });
+                }
+                V::List(inner) => {
+                    let mut inner = inner.as_ref();
+                    for _ in 0..=component.types.len() {
+                        match inner {
+                            V::Primitive(p) => {
+                                return Some(EdgeValue::Bytes {
+                                    elem_size: size(*p),
+                                    align: size(*p),
+                                });
+                            }
+                            V::Type(idx) => match component.get_type_definition(*idx) {
+                                Some(crate::parser::ComponentType {
+                                    kind: ComponentTypeKind::Defined(d),
+                                }) => inner = d,
+                                _ => return None,
+                            },
+                            _ => return None,
+                        }
+                    }
+                    return None;
+                }
+                V::Type(idx) => match component.get_type_definition(*idx) {
+                    Some(crate::parser::ComponentType {
+                        kind: ComponentTypeKind::Defined(d),
+                    }) => ty = d,
+                    _ => return None,
+                },
+                _ => return None,
+            }
+        }
+        None
+    }
 }
 
 /// An import that couldn't be resolved within the component set
@@ -3262,28 +3344,53 @@ impl Resolver {
             else {
                 return Err(refuse("the callee's function type could not be resolved"));
             };
-            let prim = |v: &ComponentValType| match v {
-                ComponentValType::Primitive(p) => Some(*p),
-                _ => None,
-            };
-            let params: Option<Vec<_>> = params.iter().map(|(_, v)| prim(v)).collect();
+            let classify = |v: &ComponentValType| EdgeValue::classify(callee, v);
+            let params: Option<Vec<_>> = params.iter().map(|(_, v)| classify(v)).collect();
             let result = match results.as_slice() {
                 [] => Some(None),
-                [(_, v)] => prim(v).map(Some),
+                [(_, v)] => classify(v).map(Some),
                 _ => None,
             };
             let (Some(params), Some(result)) = (params, result) else {
                 return Err(refuse(
-                    "meld carries primitive parameters and at most one primitive result on an \
-                     async edge so far; strings, lists, records and other types need copy \
-                     adapters that are not implemented yet",
+                    "meld carries primitives, UTF-8 strings and lists of primitives, and at \
+                     most one result, on an async edge so far; records, variants, nested \
+                     lists, resources and other types need copy adapters that are not \
+                     implemented yet",
                 ));
             };
-            if params.len() > 4 {
+            if params.iter().map(|p| p.flat_count()).sum::<usize>() > 4 {
                 return Err(refuse(
-                    "more than four parameters travel through a params pointer, which meld \
-                     does not copy on an async edge yet",
+                    "the parameters take more than four flat values, so they travel through \
+                     a params pointer, which meld does not copy on an async edge yet",
                 ));
+            }
+            let copies = params
+                .iter()
+                .chain(result.iter())
+                .any(|v| matches!(v, EdgeValue::Bytes { .. }));
+            if copies {
+                use crate::parser::CanonStringEncoding as Enc;
+                let caller_utf8 = components
+                    .get(site.from_component)
+                    .and_then(|c| core_lower_options(c).get(&lower).cloned())
+                    .is_some_and(|o| matches!(o.string_encoding, Enc::Utf8));
+                if !caller_utf8 || !matches!(options.string_encoding, Enc::Utf8) {
+                    return Err(refuse(
+                        "a string or list crosses the edge and one side does not use the \
+                         UTF-8 string encoding; transcoding on an async edge is not \
+                         implemented yet",
+                    ));
+                }
+                if lifts
+                    .iter()
+                    .any(|(_, o)| o.memory != options.memory || o.realloc != options.realloc)
+                {
+                    return Err(refuse(
+                        "the callee's core export is lifted more than once with different \
+                         memory or realloc options",
+                    ));
+                }
             }
             if !seen.insert((site.from_component, lower)) {
                 continue;
@@ -3294,6 +3401,8 @@ impl Resolver {
                 callback: (cb_mod, cb_idx),
                 params,
                 result,
+                callee_memory: options.memory,
+                callee_realloc: options.realloc,
             });
         }
         for (idx, _) in edges.iter().rev() {
