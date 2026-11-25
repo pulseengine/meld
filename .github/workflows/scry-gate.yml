@@ -48,7 +48,7 @@ jobs:
           path: scry
           ref: ${{ env.SCRY_REF }}
           fetch-depth: 0
-      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable branch, toolchain pinned
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master, toolchain pinned
         with:
           toolchain: 1.100.0
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2

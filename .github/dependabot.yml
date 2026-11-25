@@ -1,15 +1,28 @@
 version: 2
+# Grouped monthly updates (fleet template, owner decision 2026-11-21).
+# One entry per ecosystem, its directories in one `directories:` list, so a
+# release opens one PR and not one per directory. Every entry runs monthly
+# (the 1st, 02:00 UTC), keeps at most 2 PRs open, and waits 7 days after a
+# release (cooldown). Lockstep groups come first because Dependabot puts a
+# dependency in the FIRST group it matches; then one minor-patch group.
+# Majors stay ungrouped, one PR each, so a breaking change is read on its own.
+# Security updates ignore the schedule and the limit.
+#
 # Groups live inside each updates entry: Dependabot rejects a top-level
 # `groups:` key and YAML aliases (&ref_0 / *ref_0), and with either one it
-# ignores the whole file. One cargo entry lists every directory, so a grouped
-# release opens one PR and not one per directory.
+# ignores the whole file.
+#
+# npm/ and python/ declare no dependencies, so they have no entry.
 updates:
-  # PAUSED 2026-11-21 under the fleet CI hold; restore the previous limits when it lifts.
   - package-ecosystem: github-actions
     directory: /
-    open-pull-requests-limit: 0
     schedule:
-      interval: weekly
+      interval: monthly
+      time: "02:00"
+      timezone: Etc/UTC
+    open-pull-requests-limit: 2
+    cooldown:
+      default-days: 7
     labels:
       - dependencies
     groups:
@@ -19,13 +32,18 @@ updates:
   - package-ecosystem: cargo
     directories:
       - /
+      - /fuzz
       - /meld-cli
       - /meld-core
       - /tools/spec-sync
       - /verification/verus-pilot
-    open-pull-requests-limit: 0
     schedule:
-      interval: weekly
+      interval: monthly
+      time: "02:00"
+      timezone: Etc/UTC
+    open-pull-requests-limit: 2
+    cooldown:
+      default-days: 7
     labels:
       - dependencies
     groups:
@@ -43,3 +61,7 @@ updates:
         patterns:
           - "wasmtime"
           - "wasmtime-*"
+      minor-patch:
+        update-types:
+          - minor
+          - patch
