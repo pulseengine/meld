@@ -207,7 +207,7 @@ Step 2 proves the checksum file came from this repo's `release.yml`; step 3 ties
 
 ## Formal Verification
 
-Meld's **core** transformations carry mechanized Rocq proofs — 357 closed proofs (`Qed`) across the resolver, merger, adapter, and specification layers (see [`proofs/STATUS.md`](proofs/STATUS.md) for the per-stage coverage matrix). This is real, substantial verification on the core; it is **not** yet a whole-pipeline proof: the parser, rewriter, segments, and attestation stages are specified but their proofs are placeholders, orchestration (`lib.rs`) is unproven, and the semantic-preservation result is a **forward** simulation (the fused module simulates the original graph step-by-step; the reverse direction and the backward half of trap-equivalence are not yet proved).
+Meld's **core** transformations carry mechanized Rocq proofs — at least 357 closed proofs (`Qed`, a floor the proofs workflow enforces) across the resolver, merger, adapter, and specification layers (see [`proofs/STATUS.md`](proofs/STATUS.md) for the per-stage coverage matrix). This is real, substantial verification on the core; it is **not** yet a whole-pipeline proof: the parser, rewriter, segments, and attestation stages are specified but their proofs are placeholders, orchestration (`lib.rs`) is unproven, and the semantic-preservation result is a **forward** simulation (the fused module simulates the original graph step-by-step; the reverse direction and the backward half of trap-equivalence are not yet proved).
 
 Proven properties (Rocq):
 - **Merge correctness** — Index remapping preserves function/memory/table references (injectivity, completeness, boundedness); memory-layout disjointness.
