@@ -1444,6 +1444,7 @@ mod topology_tests {
 
     fn graph_sites(adapter_sites: Vec<AdapterSite>) -> DependencyGraph {
         DependencyGraph {
+            async_edges: Vec::new(),
             instantiation_order: Vec::new(),
             resolved_imports: HashMap::new(),
             unresolved_imports: Vec::new(),

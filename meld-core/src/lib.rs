@@ -49,6 +49,7 @@
 pub mod abi_proofs;
 pub mod adapter;
 pub mod address_strategy;
+pub mod async_edges;
 pub mod attestation;
 pub mod byte_pages;
 pub mod component_wrap;
@@ -222,6 +223,12 @@ pub struct FuserConfig {
     /// one-live-at-a-time; no baked-in constant address into `[0, sp)`.
     pub share_stack: bool,
 
+    /// ADR-10 step 3: the capacities written into the `pulseengine:async-edges`
+    /// section header (`--async-subtasks`, `--async-waitable-sets`,
+    /// `--async-events`). Used only when the fusion has async edges; each must
+    /// be non-zero.
+    pub async_bounds: async_edges::AsyncBounds,
+
     /// Whether to preserve debug names
     pub preserve_names: bool,
 
@@ -374,6 +381,7 @@ impl Default for FuserConfig {
             address_rebasing: false,
             pack_rebase: false,
             share_stack: false,
+            async_bounds: async_edges::AsyncBounds::default(),
             preserve_names: false,
             custom_sections: CustomSectionHandling::Merge,
             dwarf_handling: DwarfHandling::Remap,
@@ -778,6 +786,10 @@ pub struct FusionStats {
 
     /// Number of adapter functions generated
     pub adapter_functions: usize,
+
+    /// ADR-10 step 3: async-lower calls between fused components emitted as
+    /// `pulseengine:async-edges` entries.
+    pub async_edges: usize,
 
     /// Number of identity-trampoline adapters inlined away (#304): the caller's
     /// import was wired directly to the target instead of through the thunk, so
@@ -1802,6 +1814,18 @@ impl Fuser {
             p3_bridge::emit_stream_bridge(&mut merged, &self.components, stream_pairs)?;
         }
 
+        // Step 2.7: ADR-10 step 3 async edges. The start and return adapters are
+        // plain merged functions, added after every pass that adds imports and
+        // before adapter generation (adapters are placed after
+        // `merged.functions`). Their exports are added after `--exports world`
+        // pruning, below.
+        let async_edge_plan = async_edges::emit_adapters(
+            &mut merged,
+            &self.components,
+            &graph,
+            self.config.async_bounds,
+        )?;
+
         // Step 3: Generate adapters
         log::info!("Generating adapters");
         let adapter_config = AdapterConfig {
@@ -1873,6 +1897,9 @@ impl Fuser {
         } else {
             None
         };
+        async_edge_plan.push_exports(&mut merged)?;
+        stats.total_exports = merged.exports.len();
+        stats.async_edges = async_edge_plan.edges.len();
 
         // Step 4: Encode output module.
         //
@@ -1925,7 +1952,15 @@ impl Fuser {
                 page_size: m.page_size_log2.map_or(65536, |l| 1u64 << l),
             })
             .collect();
-        let bytes_for_remap = self.encode_output(&merged, &adapters, &[], &[])?;
+        // ADR-10 step 3: the edge table is part of what the module means, so it
+        // is encoded in every pass and sits inside the bytes the attestation and
+        // provenance hashes cover (first after DWARF, before the meld-metadata
+        // extras that are stripped before verifying).
+        let edge_sections: Vec<(&str, Vec<u8>)> = async_edge_plan
+            .section_bytes()
+            .map(|b| vec![(async_edges::SECTION_NAME, b)])
+            .unwrap_or_default();
+        let bytes_for_remap = self.encode_output(&merged, &adapters, &edge_sections, &[])?;
 
         // Build the remapped `.debug_*` sections (only under Remap; a
         // miss or unsupported shape returns no sections → DWARF stripped).
@@ -1955,10 +1990,10 @@ impl Fuser {
                 "Embedding {} remapped DWARF section(s)",
                 dwarf_sections.len()
             );
-            self.encode_output(&merged, &adapters, &[], &dwarf_sections)?
+            self.encode_output(&merged, &adapters, &edge_sections, &dwarf_sections)?
         };
 
-        let mut extra_sections: Vec<(&str, Vec<u8>)> = Vec::new();
+        let mut extra_sections: Vec<(&str, Vec<u8>)> = edge_sections.clone();
 
         if self.config.attestation {
             let mut attestation_stats = stats.clone();
@@ -3521,7 +3556,11 @@ impl Fuser {
             component_provenance: _,
             signature_manifest: _,
             opaque_resources: _,
-            // #463: the export policy changes what the artifact exports, so a
+            // ADR-10 step 3: written into the `pulseengine:async-edges` section,
+            // which carries them itself when present (as the signature manifest
+            // carries its own version) and is absent when there are no edges.
+            async_bounds: _,
+            // #463: the export policy) changes what the artifact exports, so a
             // reader holding only the artifact needs to know the shorter list
             // was deliberate. Recorded only when not the default, so default
             // records stay byte-identical.
@@ -3620,6 +3659,7 @@ fn wsc_recorded_optionals(config: &FuserConfig) -> (Option<&'static str>, Option
         component_provenance: _,
         signature_manifest: _,
         opaque_resources: _,
+        async_bounds: _,
         // #463.
         export_policy,
         // SR-107 / #530.
@@ -4341,6 +4381,7 @@ mod tests {
 
     fn empty_graph_298() -> crate::resolver::DependencyGraph {
         crate::resolver::DependencyGraph {
+            async_edges: Vec::new(),
             instantiation_order: Vec::new(),
             resolved_imports: std::collections::HashMap::new(),
             adapter_sites: Vec::new(),

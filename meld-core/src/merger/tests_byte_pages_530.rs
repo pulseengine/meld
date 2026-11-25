@@ -10,6 +10,7 @@ fn byte_pages_are_refused_with_resource_reexporters() {
     // A re-exporter's handle table is allocated in 64 KiB pages of the memory
     // (`allocate_handle_tables`), the wrong unit on a (pagesize 1) memory.
     let graph = DependencyGraph {
+        async_edges: Vec::new(),
         instantiation_order: Vec::new(),
         resolved_imports: std::collections::HashMap::new(),
         adapter_sites: Vec::new(),

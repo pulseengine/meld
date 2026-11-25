@@ -417,6 +417,8 @@ pub enum SyntheticKind {
     /// bridge ring memory and forwards host handles to the retained
     /// `pulseengine:async` imports.
     StreamBridge,
+    /// ADR-10 step 3: an async edge's start or return adapter (`crate::async_edges`).
+    AsyncEdgeAdapter,
     /// `unreachable` stub standing in an `elem` slot for a function import
     /// that no resolution step mapped (#462).
     TrapStub,

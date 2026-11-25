@@ -4,12 +4,13 @@ type: design-question
 title: P3 async calls between fused components -- meld owns data (edge table + copy adapters), kiln-async owns control (tasks, subtasks, waitables), gale owns time, wake and isolation
 status: resolved
 gating-fixtures:
-  # Planned; none exist yet. Names are fixed here so the record can cite them.
+  # Names fixed here so the record can cite them; "(planned)" marks the ones
+  # not written yet. Step 3 increment 1 (2026-11-25) wrote the unmarked ones.
   - p3_async_edges_548::async_lower_caller_produces_one_edge_per_import (planned)
-  - p3_async_edges_548::edge_section_is_versioned_and_names_exports (planned)
-  - p3_async_edges_548::start_adapter_returns_the_packed_code_unchanged (planned)
-  - p3_async_edges_548::cross_domain_async_edge_is_refused (planned)
-  - p3_async_edges_548::non_callback_async_lift_edge_is_refused (planned)
+  - p3_async_edges_548::edge_section_is_versioned_and_names_exports
+  - p3_async_edges_548::start_adapter_returns_the_packed_code_unchanged
+  - p3_async_edges_548::cross_domain_async_edge_is_refused
+  - p3_async_edges_548::non_callback_async_lift_edge_is_refused
   - p3_async_edges_548::share_stack_with_stackful_or_threads_is_refused (planned)
   - p3_async_edges_548::corpus_19_pairs_fuse_with_edges_and_no_host_left_import (planned)
   - p3_async_edges_548::reentrant_edge_fuses_with_no_per_edge_static_state (planned)
@@ -307,7 +308,10 @@ parser to the trusted code base for no gain.
   SR-81 and SR-83 (fake built-ins refuse) for v0.8.0, and SR-84 (kiln-async
   wiring plus subtasks against this section) for v0.9.0, after meld step 3.
 
-- **Section encoding:** binary, in Wasm's own style (§1).
+- **Section encoding:** binary, in Wasm's own style (§1). The v1 byte layout, with three non-zero capacities in the header
+  (subtasks, waitable sets, events per set), was agreed with kiln on meld#548
+  (seam `meld-kiln/async-edges`, 2026-11-25) and is implemented in
+  `meld-core/src/async_edges.rs`.
 - **Edge-index carriage:** in the table, keyed by the producer's exact import
   (§1).
 - **The 7 harness-only pairs:** they stay out of the acceptance set. kiln's
