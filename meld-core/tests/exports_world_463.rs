@@ -869,6 +869,14 @@ fn across_the_whole_corpus_a_world_keeps_what_its_imports_and_resources_need() {
         .collect();
     paths.sort();
     assert!(paths.len() >= 49, "the corpus is {} files", paths.len());
+    for (listed, _) in EXPECTED_REFUSALS {
+        assert!(
+            paths
+                .iter()
+                .any(|p| p.file_name().is_some_and(|f| f == *listed)),
+            "{listed} is in EXPECTED_REFUSALS but not in the corpus"
+        );
+    }
 
     // 98 debug-build fusions: spread them over a few threads.
     let per_thread = paths.len().div_ceil(8);
@@ -897,6 +905,73 @@ fn across_the_whole_corpus_a_world_keeps_what_its_imports_and_resources_need() {
     );
 }
 
+/// Corpus fixtures meld refuses on purpose under the default `all` policy,
+/// each with the text its error must carry.
+/// wit-bindgen 0.63's Rust async runtime imports `stream.read` or
+/// `future.read` into every async guest, and meld refuses those built-ins
+/// until streams and futures land (#558, ADR-10 step 6). `map` needs the
+/// component-model map feature, which meld's parser does not enable.
+const EXPECTED_REFUSALS: &[(&str, &str)] = &[
+    (
+        "async-immediate-yield.wasm",
+        "canonical built-in `stream.read`",
+    ),
+    ("cancel-import.wasm", "canonical built-in `future.read`"),
+    ("future-cancel-read.wasm", "canonical built-in `"),
+    ("future-cancel-write-then-read.wasm", "canonical built-in `"),
+    ("future-cancel-write.wasm", "canonical built-in `"),
+    (
+        "future-close-after-coming-back.wasm",
+        "canonical built-in `",
+    ),
+    (
+        "future-close-then-receive-read.wasm",
+        "canonical built-in `",
+    ),
+    ("future-closes-with-error.wasm", "canonical built-in `"),
+    (
+        "future-write-then-read-comes-back.wasm",
+        "canonical built-in `",
+    ),
+    ("future-write-then-read-remote.wasm", "canonical built-in `"),
+    ("map.wasm", "map feature"),
+    ("nested-future-stream.wasm", "canonical built-in `"),
+    ("pending-import.wasm", "canonical built-in `future.read`"),
+    ("ping-pong.wasm", "canonical built-in `future.read`"),
+    ("rust-async-and-block-on.wasm", "canonical built-in `"),
+    ("rust-cancel-wake.wasm", "canonical built-in `"),
+    ("rust-cross-task-wakeup.wasm", "canonical built-in `"),
+    ("rust-lowered-send.wasm", "canonical built-in `"),
+    ("rust-spawn-and-await.wasm", "canonical built-in `"),
+    (
+        "simple-call-import.wasm",
+        "canonical built-in `stream.read`",
+    ),
+    ("simple-future.wasm", "canonical built-in `"),
+    (
+        "simple-import-params-results.wasm",
+        "canonical built-in `stream.read`",
+    ),
+    ("simple-pending-import.wasm", "canonical built-in `"),
+    ("simple-stream-payload.wasm", "canonical built-in `"),
+    ("simple-yield.wasm", "canonical built-in `stream.read`"),
+    ("stream-to-futures-stream.wasm", "canonical built-in `"),
+    ("stream-write-cancel.wasm", "canonical built-in `"),
+    // Refused under `all` only: `world` prunes the export that reaches the
+    // built-in.
+    (
+        "yield-loop-receives-events.wasm",
+        "canonical built-in `stream.read`",
+    ),
+];
+
+fn expected_refusal(name: &str) -> Option<&'static str> {
+    EXPECTED_REFUSALS
+        .iter()
+        .find(|(n, _)| *n == name)
+        .map(|(_, r)| *r)
+}
+
 /// Returns (fixtures needing a memory, fixtures needing a realloc, dtors checked).
 fn check_corpus_chunk(paths: &[std::path::PathBuf]) -> (usize, usize, usize) {
     let mut needing_memory = 0;
@@ -905,6 +980,28 @@ fn check_corpus_chunk(paths: &[std::path::PathBuf]) -> (usize, usize, usize) {
     for path in paths {
         let bytes = std::fs::read(path).unwrap();
         let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        if let Some(reason) = expected_refusal(&name) {
+            // A listed fixture must still be refused, and for the listed
+            // reason; one that starts fusing has to leave the list.
+            let mut fuser = Fuser::new(FuserConfig {
+                attestation: false,
+                reproducible: true,
+                export_policy: ExportPolicy::All,
+                ..Default::default()
+            });
+            let err = match fuser.add_component_named(&bytes, Some("input")) {
+                Err(e) => e.to_string(),
+                Ok(_) => match fuser.fuse() {
+                    Err(e) => e.to_string(),
+                    Ok(_) => panic!("{name} now fuses: drop it from EXPECTED_REFUSALS"),
+                },
+            };
+            assert!(
+                err.contains(reason),
+                "{name}: refused for another reason than `{reason}`: {err}"
+            );
+            continue;
+        }
         let all = fuse_bytes(&bytes, ExportPolicy::All);
         let world = fuse_bytes(&bytes, ExportPolicy::World);
         validate(&world);
