@@ -239,6 +239,13 @@ jobs:
           # index holds exactly what should be committed.
           git checkout -B "$BRANCH"
           git commit -q -m "fix(tests): update wit-bindgen fixtures to v${WIT_BINDGEN_VERSION}"
+          # The checkout fetched main only, so there is no tracking ref for
+          # $BRANCH and a bare --force-with-lease rejects the push as "stale
+          # info" whenever the branch already exists. Fetch it (absent on the
+          # first run) so the lease compares against what is really there.
+          if git ls-remote --exit-code --heads origin "$BRANCH" >/dev/null; then
+            git fetch -q --depth=1 origin "+refs/heads/$BRANCH:refs/remotes/origin/$BRANCH"
+          fi
           git push -q --force-with-lease origin "$BRANCH"
           # Open a PR only when one is not already open for this branch, so a
           # weekly re-push updates the existing PR instead of erroring or
