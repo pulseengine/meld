@@ -774,6 +774,17 @@ fn correct_die_ranges<R: gimli::read::Reader<Offset = usize>>(
                     .get_mut(die_id)
                     .delete(DW_AT_ranges);
             } else {
+                // The offsets are relative to the output CU base. gimli 0.34
+                // refuses an OffsetPair when the unit's low_pc is the constant
+                // 0 (it reads that as "no base address"), and a wasm CU base
+                // is 0. Name the base explicitly: same meaning, and valid
+                // whatever the CU's low_pc is.
+                new_ranges.insert(
+                    0,
+                    Range::BaseAddress {
+                        address: Address::Constant(u64::from(out_cu_base)),
+                    },
+                );
                 let rid = write_dwarf
                     .units
                     .get_mut(uid)
@@ -895,6 +906,13 @@ fn correct_die_locations<R: gimli::read::Reader<Offset = usize>>(
                     .get_mut(die_id)
                     .delete(DW_AT_location);
             } else {
+                // Explicit base, as in `correct_die_ranges` (gimli 0.34).
+                new_locs.insert(
+                    0,
+                    Location::BaseAddress {
+                        address: Address::Constant(u64::from(out_cu_base)),
+                    },
+                );
                 let lid = write_dwarf
                     .units
                     .get_mut(uid)
