@@ -539,6 +539,7 @@ fn test_import_order_invariant_holds() {
     };
 
     let graph = DependencyGraph {
+        async_edges: Vec::new(),
         instantiation_order: vec![0],
         resolved_imports: HashMap::new(),
         adapter_sites: Vec::new(),
@@ -761,6 +762,7 @@ fn sr8_function_base_offset_is_cumulative() {
     ];
 
     let graph = DependencyGraph {
+        async_edges: Vec::new(),
         instantiation_order: vec![0, 1, 2],
         resolved_imports: HashMap::new(),
         adapter_sites: Vec::new(),
@@ -951,6 +953,7 @@ fn test_import_dedup_exact_match() {
 
     // Two imports with identical effective (module, field) should dedup
     let graph = DependencyGraph {
+        async_edges: Vec::new(),
         instantiation_order: vec![0],
         resolved_imports: HashMap::new(),
         adapter_sites: Vec::new(),
@@ -1008,6 +1011,7 @@ fn test_import_dedup_version_mismatch() {
 
     // Two imports for the same WASI function but different versions
     let graph = DependencyGraph {
+        async_edges: Vec::new(),
         instantiation_order: vec![0],
         resolved_imports: HashMap::new(),
         adapter_sites: Vec::new(),
@@ -1073,6 +1077,7 @@ fn test_import_dedup_different_fields_not_deduped() {
 
     // Same module, different field — should NOT dedup
     let graph = DependencyGraph {
+        async_edges: Vec::new(),
         instantiation_order: vec![0],
         resolved_imports: HashMap::new(),
         adapter_sites: Vec::new(),
@@ -1129,6 +1134,7 @@ fn test_multi_memory_dedup_separates_components() {
     use crate::resolver::{DependencyGraph, UnresolvedImport};
 
     let graph = DependencyGraph {
+        async_edges: Vec::new(),
         instantiation_order: vec![0, 1],
         resolved_imports: HashMap::new(),
         adapter_sites: Vec::new(),
@@ -1189,6 +1195,7 @@ fn test_shared_memory_dedup_merges_components() {
     use crate::resolver::{DependencyGraph, UnresolvedImport};
 
     let graph = DependencyGraph {
+        async_edges: Vec::new(),
         instantiation_order: vec![0, 1],
         resolved_imports: HashMap::new(),
         adapter_sites: Vec::new(),
@@ -1251,6 +1258,7 @@ fn ls_m_10_test_global_import_type_mismatch_not_deduped() {
     use crate::resolver::{DependencyGraph, UnresolvedImport};
 
     let graph = DependencyGraph {
+        async_edges: Vec::new(),
         instantiation_order: vec![0, 1],
         resolved_imports: HashMap::new(),
         adapter_sites: Vec::new(),
@@ -1324,6 +1332,7 @@ fn test_table_import_type_mismatch_not_deduped() {
     use crate::resolver::{DependencyGraph, UnresolvedImport};
 
     let graph = DependencyGraph {
+        async_edges: Vec::new(),
         instantiation_order: vec![0, 1],
         resolved_imports: HashMap::new(),
         adapter_sites: Vec::new(),
@@ -1410,6 +1419,7 @@ fn test_global_import_same_type_still_deduped() {
     };
 
     let graph = DependencyGraph {
+        async_edges: Vec::new(),
         instantiation_order: vec![0, 1],
         resolved_imports: HashMap::new(),
         adapter_sites: Vec::new(),
@@ -1460,6 +1470,7 @@ fn test_table_import_same_type_still_deduped() {
     };
 
     let graph = DependencyGraph {
+        async_edges: Vec::new(),
         instantiation_order: vec![0, 1],
         resolved_imports: HashMap::new(),
         adapter_sites: Vec::new(),

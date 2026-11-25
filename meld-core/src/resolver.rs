@@ -49,6 +49,33 @@ pub struct DependencyGraph {
     /// (component, resource) pair so handle table allocation and routing can
     /// discriminate per-resource rather than per-component.
     pub reexporter_resources: Vec<(usize, String, String)>,
+
+    /// ADR-10 step 3: async-lower calls between fused components. Each was
+    /// an adapter site; it is moved here, its caller import stays an import,
+    /// and the runtime drives it through the `pulseengine:async-edges` table.
+    pub async_edges: Vec<AsyncEdge>,
+}
+
+/// ADR-10 step 3: an `[async-lower]` call from one fused component to a
+/// callback-ABI `[async-lift]` export of another.
+#[derive(Debug, Clone)]
+pub struct AsyncEdge {
+    /// The adapter site the resolver built for the call (caller import,
+    /// callee export).
+    pub site: AdapterSite,
+    /// The caller's `canon lower ... async` core function (component-level
+    /// index). It identifies the emitted import through
+    /// `MergedModule::import_lower_sites`.
+    pub lower_core_func: u32,
+    /// The callee's `[callback]` core function: (module index, function
+    /// index in that module).
+    pub callback: (usize, u32),
+    /// The function's parameters. Increment 1: primitives only, at most
+    /// four (`MAX_FLAT_ASYNC_PARAMS`), so the caller and the callee both
+    /// pass them flat and unchanged.
+    pub params: Vec<crate::parser::PrimitiveValType>,
+    /// The function's result. Increment 1: none or one primitive.
+    pub result: Option<crate::parser::PrimitiveValType>,
 }
 
 /// An import that couldn't be resolved within the component set
@@ -2542,6 +2569,7 @@ impl Resolver {
         wiring_hints: &HashMap<(usize, String), usize>,
     ) -> Result<DependencyGraph> {
         let mut graph = DependencyGraph {
+            async_edges: Vec::new(),
             instantiation_order: Vec::new(),
             resolved_imports: HashMap::new(),
             unresolved_imports: Vec::new(),
@@ -2817,10 +2845,11 @@ impl Resolver {
         // add them as synthetic unresolved imports so the merger includes them.
         Self::synthesize_missing_resource_imports(components, &mut graph);
 
-        Self::refuse_async_lowered_edges(components, &graph)?;
+        let edges = Self::refuse_async_lowered_edges(components, &graph)?;
         Self::refuse_async_lift_mismatch(components, &graph)?;
         Self::refuse_unlifted_callee_export(components, &graph)?;
         Self::refuse_stream_future_across_fused_edge(components, &graph)?;
+        self.extract_async_edges(components, &mut graph, edges)?;
 
         Ok(graph)
     }
@@ -3031,7 +3060,7 @@ impl Resolver {
     fn refuse_async_lowered_edges(
         components: &[ParsedComponent],
         graph: &DependencyGraph,
-    ) -> Result<()> {
+    ) -> Result<Vec<(usize, u32)>> {
         type Lowers = (
             HashMap<u32, crate::parser::CanonicalOptions>,
             std::collections::HashSet<u32>,
@@ -3062,7 +3091,7 @@ impl Resolver {
             }
         }
         if async_imports.is_empty() {
-            return Ok(());
+            return Ok(Vec::new());
         }
         // An adapter site names the caller import by its core names, its display
         // names, or, for a world-level func import (display field empty), by
@@ -3073,31 +3102,39 @@ impl Resolver {
                     && u.display_field.as_deref() == Some(field))
                 || (world && u.display_module.as_deref() == Some(module) && module == field)
         };
-        for site in &graph.adapter_sites {
+        // ADR-10 step 3: an async-lowered import wired to another fused
+        // component is an async edge. It is returned here and judged by
+        // `extract_async_edges` once the per-site refusals have run.
+        let mut edges: Vec<(usize, u32)> = Vec::new();
+        let mut on_edge: HashSet<(usize, u32)> = HashSet::new();
+        for (idx, site) in graph.adapter_sites.iter().enumerate() {
             let Some(list) = async_imports.get(&(site.from_component, site.from_module)) else {
                 continue;
             };
-            if let Some((u, _)) = list
+            if let Some((u, world)) = list
                 .iter()
                 .find(|(u, world)| names_match(u, *world, &site.import_module, &site.import_name))
             {
-                return Err(Error::UnsupportedFeature(format!(
-                    "component {} calls `{}` (core import `{}::{}`) with the async calling \
-                     convention, and component {} implements it (`{}`). meld cannot fuse an \
-                     async-lower call between components yet: it needs real subtasks run by \
-                     the host scheduler (ADR-10, #548). Refusing instead of wiring it as a \
-                     sync call",
-                    site.from_component,
-                    site.import_name,
-                    u.module_name,
-                    u.field_name,
-                    site.to_component,
-                    site.export_name
-                )));
+                let Some(lower) = u.lower_core_func.filter(|_| !*world) else {
+                    return Err(Error::UnsupportedFeature(format!(
+                        "component {} calls the world-level function `{}` with the async \
+                         calling convention, and component {} implements it (`{}`). meld fuses \
+                         an async-lower call between components only for an interface \
+                         function so far (ADR-10 step 3, #548)",
+                        site.from_component, site.import_name, site.to_component, site.export_name
+                    )));
+                };
+                edges.push((idx, lower));
+                on_edge.insert((u.component_idx, lower));
             }
         }
         for list in async_imports.values() {
-            if let Some((u, _)) = list.iter().find(|(_, world)| *world) {
+            if let Some((u, _)) = list.iter().find(|(u, world)| {
+                *world
+                    && !u
+                        .lower_core_func
+                        .is_some_and(|l| on_edge.contains(&(u.component_idx, l)))
+            }) {
                 let host_name = u.display_module.as_deref().unwrap_or(&u.module_name);
                 // The component-level import is satisfied by another fused
                 // component, but no core call could be wired (the callee's
@@ -3125,6 +3162,144 @@ impl Resolver {
                 )));
             }
         }
+        Ok(edges)
+    }
+
+    /// ADR-10 step 3: turn each async-lower adapter site found by
+    /// [`Self::refuse_async_lowered_edges`] into an [`AsyncEdge`], or refuse
+    /// it (ADR-10 §3, §4 and the increment-1 scope).
+    ///
+    /// The site is removed from `adapter_sites`, so the merger keeps the
+    /// caller's core import under its producer name and wires no direct call.
+    fn extract_async_edges(
+        &self,
+        components: &[ParsedComponent],
+        graph: &mut DependencyGraph,
+        mut edges: Vec<(usize, u32)>,
+    ) -> Result<()> {
+        use crate::parser::{CanonicalEntry, ComponentValType};
+        if edges.is_empty() {
+            return Ok(());
+        }
+        edges.sort_unstable_by_key(|(idx, _)| *idx);
+        let mut seen: HashSet<(usize, u32)> = HashSet::new();
+        let mut found = Vec::new();
+        for &(idx, lower) in &edges {
+            let site = &graph.adapter_sites[idx];
+            let refuse = |why: &str| {
+                Error::UnsupportedFeature(format!(
+                    "component {} calls `{}` with the async calling convention, and component \
+                     {} implements it (`{}`): {why} (ADR-10 step 3, #548)",
+                    site.from_component, site.import_name, site.to_component, site.export_name
+                ))
+            };
+            if self.domain_of(site.from_component) != self.domain_of(site.to_component) {
+                return Err(refuse(
+                    "the two components are in different --domain groups, and an async edge \
+                     may not cross a domain boundary (ADR-10 §4)",
+                ));
+            }
+            let callee = components
+                .get(site.to_component)
+                .ok_or_else(|| refuse("the callee component is missing"))?;
+            let prov = build_entity_provenance(callee);
+            let target = (site.to_module, site.export_name.clone());
+            let lifts: Vec<(u32, &crate::parser::CanonicalOptions)> = callee
+                .canonical_functions
+                .iter()
+                .filter_map(|e| match e {
+                    CanonicalEntry::Lift {
+                        core_func_index,
+                        type_index,
+                        options,
+                    } if prov.func_source.get(core_func_index) == Some(&target) => {
+                        Some((*type_index, options))
+                    }
+                    _ => None,
+                })
+                .collect();
+            let Some(&(type_index, options)) = lifts.first() else {
+                return Err(refuse(
+                    "no canon lift of the callee's core export was found",
+                ));
+            };
+            if lifts.iter().any(|(t, o)| {
+                *t != type_index || o.async_ != options.async_ || o.callback != options.callback
+            }) {
+                return Err(refuse(
+                    "the callee's core export is lifted more than once with different options",
+                ));
+            }
+            if !options.async_ {
+                return Err(refuse(
+                    "the callee lifts it without the async option, and a sync callee on an \
+                     async edge is not supported yet",
+                ));
+            }
+            let Some(cb) = options.callback else {
+                return Err(refuse(
+                    "the callee lifts it without a callback (stackful async), which the \
+                     runtime cannot drive without fibers (ADR-10 §3)",
+                ));
+            };
+            let (cb_mod, cb_name) = prov
+                .func_source
+                .get(&cb)
+                .cloned()
+                .ok_or_else(|| refuse("the callee's callback is not a core module export"))?;
+            let cb_idx = callee
+                .core_modules
+                .get(cb_mod)
+                .and_then(|m| {
+                    m.exports
+                        .iter()
+                        .find(|e| e.name == cb_name && e.kind == ExportKind::Function)
+                })
+                .map(|e| e.index)
+                .ok_or_else(|| refuse("the callee's callback export was not found"))?;
+            let Some(ComponentTypeKind::Function { params, results }) =
+                callee.get_type_definition(type_index).map(|t| &t.kind)
+            else {
+                return Err(refuse("the callee's function type could not be resolved"));
+            };
+            let prim = |v: &ComponentValType| match v {
+                ComponentValType::Primitive(p) => Some(*p),
+                _ => None,
+            };
+            let params: Option<Vec<_>> = params.iter().map(|(_, v)| prim(v)).collect();
+            let result = match results.as_slice() {
+                [] => Some(None),
+                [(_, v)] => prim(v).map(Some),
+                _ => None,
+            };
+            let (Some(params), Some(result)) = (params, result) else {
+                return Err(refuse(
+                    "meld carries primitive parameters and at most one primitive result on an \
+                     async edge so far; strings, lists, records and other types need copy \
+                     adapters that are not implemented yet",
+                ));
+            };
+            if params.len() > 4 {
+                return Err(refuse(
+                    "more than four parameters travel through a params pointer, which meld \
+                     does not copy on an async edge yet",
+                ));
+            }
+            if !seen.insert((site.from_component, lower)) {
+                continue;
+            }
+            found.push(AsyncEdge {
+                site: site.clone(),
+                lower_core_func: lower,
+                callback: (cb_mod, cb_idx),
+                params,
+                result,
+            });
+        }
+        for (idx, _) in edges.iter().rev() {
+            graph.adapter_sites.remove(*idx);
+        }
+        graph.async_edges = found;
         Ok(())
     }
 
@@ -4289,34 +4464,13 @@ impl Resolver {
                         let callee_core_to_local = build_core_func_to_module_local(to_component);
 
                         for func_name in &interface_func_imports {
-                            // #548 / ADR-10: a caller that lowers with the async
-                            // option (`[async-lower]f`) expects STARTED + a
-                            // subtask and a later SUBTASK event. meld cannot
-                            // fuse that edge until the ADR-10 adapters exist,
-                            // and leaving it to the host only fails later, at
-                            // load. Refuse at fuse time, naming the edge.
-                            if let Some(base) = func_name.strip_prefix("[async-lower]") {
-                                let target = format!("{}#{}", export_name, base);
-                                let async_target = format!("[async-lift]{}", target);
-                                let callee_exports_it = to_component.core_modules.iter().any(|m| {
-                                    m.exports.iter().any(|e| {
-                                        e.kind == ExportKind::Function
-                                            && (e.name == target || e.name == async_target)
-                                    })
-                                });
-                                if callee_exports_it {
-                                    return Err(Error::UnsupportedFeature(format!(
-                                        "component {} calls `{}` (`{}::{}`) with the async \
-                                         calling convention, and component {} implements it. \
-                                         meld cannot fuse an async-lower call between \
-                                         components yet: it needs real subtasks run by the \
-                                         host scheduler (ADR-10, #548). Refusing instead of \
-                                         leaving the call unresolved",
-                                        from_comp, target, import_name, func_name, to_comp
-                                    )));
-                                }
-                            }
-                            let qualified = format!("{}#{}", export_name, func_name);
+                            // ADR-10 step 3 (#548): an `[async-lower]f` import is
+                            // matched to the callee's `f` like any other; the site
+                            // keeps the full field name, and
+                            // `refuse_async_lowered_edges` turns it into an async
+                            // edge from the lowering's async option.
+                            let base = func_name.strip_prefix("[async-lower]").unwrap_or(func_name);
+                            let qualified = format!("{}#{}", export_name, base);
                             let mut found = false;
 
                             // Look up the caller's import type index for this function
@@ -7289,6 +7443,7 @@ mod tests {
         // Two pre-resolved module-level imports (caller is module 2,
         // callees are modules 0 and 1, both export "f").
         let mut graph = DependencyGraph {
+            async_edges: Vec::new(),
             instantiation_order: vec![0],
             resolved_imports: HashMap::new(),
             unresolved_imports: Vec::new(),

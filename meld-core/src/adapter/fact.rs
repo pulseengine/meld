@@ -16748,6 +16748,7 @@ mod tests {
             CanonStringEncoding::CompactUtf16,
         );
         let graph = crate::resolver::DependencyGraph {
+            async_edges: Vec::new(),
             instantiation_order: vec![0, 1],
             resolved_imports: std::collections::HashMap::new(),
             unresolved_imports: Vec::new(),

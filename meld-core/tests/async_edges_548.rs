@@ -88,20 +88,24 @@ const OTHER_CALLEE: &str = r#"
   (export "local:t/other" (instance $inst)))
 "#;
 
-// rivet: verifies SWV-123
+// rivet: verifies SWV-149
 #[test]
-fn async_lower_edge_between_fused_components_is_refused() {
-    let err = fuse(&[ASYNC_CALLER, CALLEE]).expect_err("an async-lower edge must be refused");
-    assert!(err.contains("#548"), "error cites #548: {err}");
-    assert!(err.contains("ADR-10"), "error cites ADR-10: {err}");
+fn async_lower_edge_between_fused_components_becomes_an_edge() {
+    // ADR-10 step 3: no longer refused. The caller's import stays an import
+    // under its producer name, and the edge is described in the section
+    // (byte-level checks: p3_async_edges_548.rs).
+    let core = fuse(&[ASYNC_CALLER, CALLEE]).expect("an async-lower edge fuses");
     assert!(
-        err.contains("local:t/i#f"),
-        "error names the callee export: {err}"
+        imports(&core)
+            .iter()
+            .any(|(m, f)| m == "local:t/i" && f == "[async-lower]f"),
+        "the caller's import stays: {:?}",
+        imports(&core)
     );
-    assert!(
-        err.contains("[async-lower]f"),
-        "error names the caller import: {err}"
-    );
+    let has_section = wasmparser::Parser::new(0).parse_all(&core).any(|p| {
+        matches!(p, Ok(wasmparser::Payload::CustomSection(c)) if c.name() == "pulseengine:async-edges")
+    });
+    assert!(has_section, "the edge table is emitted");
 }
 
 // rivet: verifies SWV-123
@@ -286,8 +290,25 @@ const ASYNC_CALLER_UNPREFIXED: &str = r#"
 
 // rivet: verifies SWV-126
 #[test]
-fn async_lower_edge_is_refused_whatever_the_core_import_is_named() {
-    let err = fuse(&[ASYNC_CALLER_UNPREFIXED, CALLEE])
-        .expect_err("the async option decides, not the field name");
-    assert!(err.contains("#548"), "cites #548: {err}");
+fn async_lower_edge_is_an_edge_whatever_the_core_import_is_named() {
+    // The async option decides, not the field name: the unprefixed import is
+    // an edge too, and the edge table names it exactly as emitted.
+    let core = fuse(&[ASYNC_CALLER_UNPREFIXED, CALLEE]).expect("an edge fuses");
+    let data = wasmparser::Parser::new(0)
+        .parse_all(&core)
+        .find_map(|p| match p {
+            Ok(wasmparser::Payload::CustomSection(c)) if c.name() == "pulseengine:async-edges" => {
+                Some(c.data().to_vec())
+            }
+            _ => None,
+        })
+        .expect("the edge table is emitted for the unprefixed import");
+    // meld emits an async lowering with the `[async-lower]` prefix (#557)
+    // whatever the producer called it, and the table carries the emitted name.
+    let needle = b"\x09local:t/i\x0e[async-lower]f";
+    assert!(
+        data.windows(needle.len()).any(|w| w == needle),
+        "the edge names import `local:t/i` `[async-lower]f`"
+    );
+    assert!(imports(&core).contains(&("local:t/i".into(), "[async-lower]f".into())));
 }

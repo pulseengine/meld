@@ -94,6 +94,7 @@ fn test_import_memory_and_realloc_indices_populated() {
     let components = vec![make_component(0), make_component(1)];
 
     let graph = DependencyGraph {
+        async_edges: Vec::new(),
         instantiation_order: vec![0, 1],
         resolved_imports: HashMap::new(),
         adapter_sites: Vec::new(),
@@ -261,6 +262,7 @@ fn test_cabi_realloc_suffixed_exports_generated() {
     let components = vec![make_component(0), make_component(1), make_component(2)];
 
     let graph = DependencyGraph {
+        async_edges: Vec::new(),
         instantiation_order: vec![0, 1, 2],
         resolved_imports: HashMap::new(),
         adapter_sites: Vec::new(),
@@ -423,6 +425,7 @@ fn test_shared_memory_no_suffixed_realloc_exports() {
     let components = vec![make_component(0), make_component(1)];
 
     let graph = DependencyGraph {
+        async_edges: Vec::new(),
         instantiation_order: vec![0, 1],
         resolved_imports: HashMap::new(),
         adapter_sites: Vec::new(),
@@ -608,6 +611,7 @@ fn test_298_vestigial_grow_blocks_shared_rebase_fusion() {
     let components = vec![make_component(make_module()), make_component(make_module())];
 
     let graph = DependencyGraph {
+        async_edges: Vec::new(),
         instantiation_order: vec![0, 1],
         resolved_imports: HashMap::new(),
         adapter_sites: Vec::new(),
@@ -785,6 +789,7 @@ fn test_298_fork_arena_realloc_fuses_under_shared_rebase_today() {
     let components = vec![make_component(make_module()), make_component(make_module())];
 
     let graph = DependencyGraph {
+        async_edges: Vec::new(),
         instantiation_order: vec![0, 1],
         resolved_imports: HashMap::new(),
         adapter_sites: Vec::new(),

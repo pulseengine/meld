@@ -118,6 +118,7 @@ fn merge_synthetic(use_: Use) -> Result<MergedModule> {
         .parse(&comp.finish())
         .expect("synthetic component must parse");
     let graph = crate::resolver::DependencyGraph {
+        async_edges: Vec::new(),
         instantiation_order: vec![0],
         resolved_imports: HashMap::new(),
         adapter_sites: Vec::new(),
@@ -205,6 +206,7 @@ pub(super) fn site(from: usize, to: usize) -> crate::resolver::AdapterSite {
 
 pub(super) fn graph_with(sites: Vec<crate::resolver::AdapterSite>) -> DependencyGraph {
     DependencyGraph {
+        async_edges: Vec::new(),
         instantiation_order: vec![0],
         resolved_imports: HashMap::new(),
         adapter_sites: sites,

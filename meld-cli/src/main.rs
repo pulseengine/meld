@@ -119,6 +119,21 @@ enum Commands {
         #[arg(long)]
         share_stack: bool,
 
+        /// ADR-10 step 3: concurrent subtasks per instance, written into the
+        /// `pulseengine:async-edges` section when the fusion has async edges
+        /// (async-lower calls between fused components). The runtime sizes a
+        /// fixed table from it and refuses 0.
+        #[arg(long, default_value_t = 8)]
+        async_subtasks: u32,
+
+        /// ADR-10 step 3: waitable sets per instance (see --async-subtasks).
+        #[arg(long, default_value_t = 4)]
+        async_waitable_sets: u32,
+
+        /// ADR-10 step 3: queued events per waitable set (see --async-subtasks).
+        #[arg(long, default_value_t = 16)]
+        async_events: u32,
+
         /// SR-86 / #427: group inputs into memory domains — fuse within a
         /// domain, keep the Canonical ABI between. Repeat once per domain:
         ///
@@ -384,6 +399,9 @@ fn main() -> Result<()> {
             opaque_rep,
             pack_rebase,
             share_stack,
+            async_subtasks,
+            async_waitable_sets,
+            async_events,
             profile,
             explain,
             domain,
@@ -401,6 +419,11 @@ fn main() -> Result<()> {
                 address_rebase,
                 pack_rebase,
                 share_stack,
+                meld_core::async_edges::AsyncBounds {
+                    subtasks: async_subtasks,
+                    waitable_sets: async_waitable_sets,
+                    events_per_set: async_events,
+                },
                 stats,
                 no_attestation,
                 reproducible,
@@ -527,6 +550,7 @@ fn fuse_command(
     address_rebase: bool,
     pack_rebase: bool,
     share_stack: bool,
+    async_bounds: meld_core::async_edges::AsyncBounds,
     show_stats: bool,
     no_attestation: bool,
     reproducible: bool,
@@ -741,6 +765,7 @@ fn fuse_command(
         address_rebasing: address_rebase,
         pack_rebase,
         share_stack,
+        async_bounds,
         preserve_names,
         output_format,
         opaque_resources,
