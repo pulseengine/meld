@@ -8,7 +8,7 @@ version = "0.26.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "59317f77929f0e679d39364702289274de2f0f0b22cbf50b2b8cff2169a0b27a"
 dependencies = [
- "gimli",
+ "gimli 0.33.0",
 ]
 
 [[package]]
@@ -448,7 +448,7 @@ dependencies = [
  "cranelift-control",
  "cranelift-entity",
  "cranelift-isle",
- "gimli",
+ "gimli 0.33.0",
  "hashbrown 0.17.1",
  "libm",
  "log",
@@ -908,6 +908,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "gimli"
+version = "0.34.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1033caf0b349c518623b5396bfb2cf0bddf44f0306d543a250e5743297aafd10"
+dependencies = [
+ "fnv",
+ "hashbrown 0.17.1",
+ "indexmap",
+ "stable_deref_trait",
+]
+
+[[package]]
 name = "half"
 version = "2.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1264,7 +1276,7 @@ dependencies = [
  "anyhow",
  "bitflags",
  "criterion",
- "gimli",
+ "gimli 0.34.0",
  "hex",
  "log",
  "ordeal",
@@ -1273,7 +1285,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.11.1",
- "thiserror 1.0.69",
+ "thiserror 2.0.18",
  "wasm-encoder 0.263.0",
  "wasmparser 0.263.0",
  "wasmprinter 0.263.0",
@@ -1352,18 +1364,28 @@ checksum = "d6790f58c7ff633d8771f42965289203411a5e5c68388703c06e14f24770b41e"
 
 [[package]]
 name = "ordeal"
-version = "0.22.1"
+version = "0.37.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "24bb24f9e0384b07ebe853b7c2989e51d2e62350f6a0e4598456e8703ddc5734"
+checksum = "8b01c103a1be868fffadd51db0436120a440ad4c56e521b999616acba3a39f8f"
+dependencies = [
+ "ordeal-cert",
+ "ordeal-lrat",
+]
+
+[[package]]
+name = "ordeal-cert"
+version = "0.37.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d5246fabe3bbe421d13045debd10a0227496891b1faf478be84528e4627ca988"
 dependencies = [
  "ordeal-lrat",
 ]
 
 [[package]]
 name = "ordeal-lrat"
-version = "0.22.1"
+version = "0.37.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "94517729726a2296249916d0012599f2b6b9fb748495fdc0b3fb19541fd0befc"
+checksum = "13d2f8d5ac4a277e9103fcd2aca7f851e8641a8fd113bac0a30f8e0469afc0a1"
 
 [[package]]
 name = "page_size"
@@ -2334,7 +2356,7 @@ dependencies = [
  "encoding_rs",
  "futures",
  "fxprof-processed-profile",
- "gimli",
+ "gimli 0.33.0",
  "ittapi",
  "libc",
  "log",
@@ -2382,7 +2404,7 @@ dependencies = [
  "cranelift-bforest",
  "cranelift-bitset",
  "cranelift-entity",
- "gimli",
+ "gimli 0.33.0",
  "hashbrown 0.17.1",
  "indexmap",
  "log",
@@ -2445,7 +2467,7 @@ dependencies = [
  "cranelift-entity",
  "cranelift-frontend",
  "cranelift-native",
- "gimli",
+ "gimli 0.33.0",
  "itertools 0.14.0",
  "log",
  "object",
