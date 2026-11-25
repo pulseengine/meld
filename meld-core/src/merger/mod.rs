@@ -132,6 +132,9 @@ pub struct LowerSlot {
     pub members: usize,
     /// Display names of merged imports whose lower could not be traced.
     pub untraced: Vec<String>,
+    /// #662: `(component_idx, core func index)` of each canonical built-in
+    /// (not a `canon lower`) wired to a merged import.
+    pub builtins: Vec<(usize, u32)>,
 }
 
 /// A merged WebAssembly module ready for encoding

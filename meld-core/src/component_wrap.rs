@@ -4422,6 +4422,7 @@ mod tests {
             original_hash: String::new(),
             depth_0_sections: Vec::new(),
             p3_async_features: Vec::new(),
+            p3_elements: Default::default(),
         };
 
         // Build an instance_func_map with the base field name (no suffix)
@@ -4491,6 +4492,7 @@ mod tests {
             original_hash: String::new(),
             depth_0_sections: Vec::new(),
             p3_async_features: Vec::new(),
+            p3_elements: Default::default(),
         };
 
         let mut instance_func_map = std::collections::HashMap::new();
@@ -4552,6 +4554,7 @@ mod tests {
             original_hash: String::new(),
             depth_0_sections: Vec::new(),
             p3_async_features: Vec::new(),
+            p3_elements: Default::default(),
         };
 
         let instance_func_map = std::collections::HashMap::new();
@@ -4596,6 +4599,7 @@ mod tests {
             original_hash: String::new(),
             depth_0_sections: vec![],
             p3_async_features: vec![],
+            p3_elements: Default::default(),
         }
     }
 

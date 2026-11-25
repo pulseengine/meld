@@ -190,6 +190,9 @@ impl Merger {
                         if let Some(&slot) = func_lower_slot.get(&dedup_key) {
                             let s = &mut merged.import_lower_sites[slot];
                             s.members += 1;
+                            if let Some(b) = unresolved.builtin_core_func {
+                                s.builtins.push((unresolved.component_idx, b));
+                            }
                             match unresolved.lower_core_func {
                                 Some(core_func) => {
                                     s.sites.push((unresolved.component_idx, core_func))
@@ -305,6 +308,9 @@ impl Merger {
                             unresolved.module_name,
                             unresolved.field_name
                         )),
+                    }
+                    if let Some(b) = unresolved.builtin_core_func {
+                        slot.builtins.push((unresolved.component_idx, b));
                     }
                     merged.import_lower_sites.push(slot);
 

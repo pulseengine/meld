@@ -1380,6 +1380,7 @@ mod tests {
             original_hash: String::new(),
             depth_0_sections: vec![],
             p3_async_features: vec![],
+            p3_elements: Default::default(),
         }
     }
 
@@ -1694,6 +1695,7 @@ mod tests {
             original_hash: String::new(),
             depth_0_sections: vec![],
             p3_async_features: vec![],
+            p3_elements: Default::default(),
         };
         // Suppress unused-let warning if the visibility test grows.
         let _ = &mut comp;
@@ -1771,6 +1773,7 @@ mod tests {
             original_hash: String::new(),
             depth_0_sections: vec![],
             p3_async_features: vec![],
+            p3_elements: Default::default(),
         };
         let feats = detect_features(&comp);
         assert_eq!(

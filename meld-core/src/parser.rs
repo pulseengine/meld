@@ -241,6 +241,9 @@ pub struct ParsedComponent {
     /// Non-empty means the component uses P3 async features that meld
     /// cannot yet fuse correctly.
     pub p3_async_features: Vec<String>,
+    /// #662: the element value type of each `stream<T>` / `future<T>` type,
+    /// keyed by its position in `types` (see [`Self::p3_element_type`]).
+    pub p3_elements: std::collections::HashMap<usize, ComponentValType>,
 }
 
 /// A core WebAssembly module extracted from a component
@@ -946,6 +949,7 @@ impl ComponentParser {
             original_hash: compute_sha256(bytes),
             depth_0_sections: Vec::new(),
             p3_async_features: Vec::new(),
+            p3_elements: Default::default(),
         };
 
         let parser = Parser::new(0);
@@ -1209,6 +1213,13 @@ impl ComponentParser {
                             _
                         ))
                     );
+                    let p3_element = match &ty {
+                        wasmparser::ComponentType::Defined(
+                            wasmparser::ComponentDefinedType::Stream(Some(t))
+                            | wasmparser::ComponentDefinedType::Future(Some(t)),
+                        ) => Some(convert_wp_component_val_type(t)),
+                        _ => None,
+                    };
                     let kind = match ty {
                         wasmparser::ComponentType::Func(func_type) => {
                             let params = func_type
@@ -1321,6 +1332,9 @@ impl ComponentParser {
                         component
                             .enum_types
                             .insert(component.component_type_defs.len() as u32);
+                    }
+                    if let Some(e) = p3_element {
+                        component.p3_elements.insert(component.types.len(), e);
                     }
                     component.types.push(ComponentType { kind });
                     component
@@ -1773,6 +1787,7 @@ impl ParsedComponent {
             original_hash: String::new(),
             depth_0_sections: Vec::new(),
             p3_async_features: Vec::new(),
+            p3_elements: Default::default(),
         }
     }
 
@@ -1951,27 +1966,38 @@ impl ParsedComponent {
         None
     }
 
-    pub fn get_type_definition(&self, type_idx: u32) -> Option<&ComponentType> {
+    /// Position in `types` of component type `type_idx`, following export
+    /// aliases.
+    fn type_definition_offset(&self, type_idx: u32) -> Option<usize> {
         let mut idx = type_idx;
         // Follow ExportAlias chains (bounded to prevent infinite loops)
         for _ in 0..self.component_type_defs.len() {
-            let def = self.component_type_defs.get(idx as usize)?;
-            match def {
+            match self.component_type_defs.get(idx as usize)? {
                 ComponentTypeDef::Defined => {
                     // The Nth Defined entry in component_type_defs corresponds to types[N]
-                    let def_offset = self.component_type_defs[..idx as usize]
-                        .iter()
-                        .filter(|d| matches!(d, ComponentTypeDef::Defined))
-                        .count();
-                    return self.types.get(def_offset);
+                    return Some(
+                        self.component_type_defs[..idx as usize]
+                            .iter()
+                            .filter(|d| matches!(d, ComponentTypeDef::Defined))
+                            .count(),
+                    );
                 }
-                ComponentTypeDef::ExportAlias(target) => {
-                    idx = *target;
-                }
+                ComponentTypeDef::ExportAlias(target) => idx = *target,
                 _ => return None,
             }
         }
         None
+    }
+
+    pub fn get_type_definition(&self, type_idx: u32) -> Option<&ComponentType> {
+        self.types.get(self.type_definition_offset(type_idx)?)
+    }
+
+    /// #662: the element type of the `stream<T>` / `future<T>` component type
+    /// `type_idx`; `None` for an untyped stream/future or another type.
+    pub fn p3_element_type(&self, type_idx: u32) -> Option<&ComponentValType> {
+        self.p3_elements
+            .get(&self.type_definition_offset(type_idx)?)
     }
 
     /// Build a map from core function index → (component type index, canonical options)
@@ -5344,6 +5370,7 @@ mod tests {
             original_hash: String::new(),
             depth_0_sections: vec![],
             p3_async_features: vec![],
+            p3_elements: Default::default(),
         }
     }
 
@@ -7050,6 +7077,7 @@ mod tests {
             original_hash: String::new(),
             depth_0_sections: vec![],
             p3_async_features: vec![],
+            p3_elements: Default::default(),
         }
     }
 
