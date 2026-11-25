@@ -12,7 +12,9 @@
 //! memory and encoding from the built-in's own canonical options.
 //!
 //! `stream_write_via_shim.wat` is the reporter's 510-byte component
-//! (`x.wit` + `a.core.wat`, printed). `stream_write_misnamed_read.wat` is the
+//! (`x.wit` + `a.core.wat`, printed), built with wasm-tools 1.243.
+//! `stream_write_via_shim_wt1263.wat` is the same input built with
+//! wasm-tools 1.263, whose fixup instantiation has another shape. `stream_write_misnamed_read.wat` is the
 //! same component with the producer name changed to `stream-read`: the name
 //! no longer matches the wired `stream.write`, so meld still refuses.
 
@@ -40,7 +42,20 @@ fn fuse(bytes: &[u8]) -> meld_core::Result<(Vec<u8>, meld_core::FusionStats)> {
 
 #[test]
 fn shim_routed_stream_write_gets_its_producer_name() {
-    let (fused, stats) = fuse(&fixture("stream_write_via_shim.wat")).expect("fuses");
+    check_producer_named("stream_write_via_shim.wat");
+}
+
+/// The same component built with wasm-tools 1.263 / wit-component 0.263,
+/// whose fixup takes the slot, the shim instance and the main instance as
+/// three separate args (`actual`, `shim`, `main`) instead of one export bag
+/// (cpetig, 2026-11-25). `$imports` comes from the shim instance itself.
+#[test]
+fn shim_routed_stream_write_gets_its_producer_name_wit_component_0263() {
+    check_producer_named("stream_write_via_shim_wt1263.wat");
+}
+
+fn check_producer_named(file: &str) {
+    let (fused, stats) = fuse(&fixture(file)).expect("fuses");
     wasmparser::Validator::new_with_features(wasmparser::WasmFeatures::all())
         .validate_all(&fused)
         .expect("fused module validates");

@@ -1068,23 +1068,50 @@ const BUILTIN_FAMILIES: &[&str] = &[
 
 /// #662: the producer name for a wit-component fixup import `"<n>"`.
 ///
-/// `bag` is the export bag the fixup module is instantiated with. Its
-/// `$imports` table is the shim module's table (traced through provenance),
-/// and the shim's export `"<n>"` is what the real module imports under the
-/// producer name. `None` when the bag carries no such table or the shim
-/// export is imported under no name, or under more than one.
+/// The fixup module imports the shim's table as `$imports` and fills slot
+/// `<n>` of it; the real module imports the shim's export `"<n>"` under the
+/// producer name. The table reaches the fixup in one of two layouts:
+///
+/// * wit-component 0.243: one export bag carries both the slot and the
+///   table (`(with "" (instance $fixup-args))`), and the bag's `$imports` is
+///   the shim module's table, traced through provenance;
+/// * wit-component 0.263: separate args, the table coming from the shim
+///   instance itself (`(with "shim" (instance $wit-component-shim-instance))`),
+///   so the shim module is the module that instance instantiates.
+///
+/// `None` when no shim module is found or the shim export is imported under
+/// no name, or under more than one.
+#[allow(clippy::too_many_arguments)]
 fn shim_producer_name(
-    bag: &[(String, ExportKind, u32)],
+    fixup: &crate::parser::CoreModule,
+    arg_map: &HashMap<String, u32>,
+    from_exports_infos: &HashMap<u32, Vec<(String, ExportKind, u32)>>,
+    instantiate_infos: &HashMap<u32, InstanceInstantiateInfo>,
+    component: &ParsedComponent,
     slot: &str,
     provenance: &EntityProvenance,
     producer_of: &HashMap<(usize, String), Option<(String, String)>>,
 ) -> Option<(String, String)> {
-    let table = bag
+    let table_import = fixup
+        .imports
         .iter()
-        .find(|(n, k, _)| n == "$imports" && *k == ExportKind::Table)
-        .map(|(_, _, t)| *t)?;
-    let (shim_mod, _) = provenance.table_source.get(&table)?;
-    producer_of.get(&(*shim_mod, slot.to_string()))?.clone()
+        .find(|i| i.name == "$imports" && matches!(i.kind, ImportKind::Table(_)))?;
+    let source = *arg_map.get(&table_import.module)?;
+    let shim_mod = if let Some(bag) = from_exports_infos.get(&source) {
+        let table = bag
+            .iter()
+            .find(|(n, k, _)| n == "$imports" && *k == ExportKind::Table)
+            .map(|(_, _, t)| *t)?;
+        provenance.table_source.get(&table)?.0
+    } else {
+        let shim_mod = instantiate_infos.get(&source)?.module_idx as usize;
+        let shim = component.core_modules.get(shim_mod)?;
+        shim.exports
+            .iter()
+            .any(|e| e.name == "$imports" && e.kind == ExportKind::Table)
+            .then_some(shim_mod)?
+    };
+    producer_of.get(&(shim_mod, slot.to_string()))?.clone()
 }
 
 /// The built-in family a producer field name names, if any (see
@@ -4142,7 +4169,11 @@ impl Resolver {
                                         .get(&named_idx)
                                         .and_then(|c| component.canonical_functions.get(*c))
                                     && let Some((mod_name, field_name)) = shim_producer_name(
-                                        fe_exports,
+                                        module,
+                                        &inst_info.arg_map,
+                                        &from_exports_infos,
+                                        &instantiate_infos,
+                                        component,
                                         &import.name,
                                         &provenance,
                                         &producer_of,

@@ -12423,6 +12423,20 @@ impl FactStyleGenerator {
                     );
                 }
             } else {
+                // The globals the matched task.return shim stores must be the
+                // caller's flat results, or the adapter returns too few or
+                // too many values and the module is invalid. Refuse here,
+                // naming the function, rather than fail validation later.
+                let stored: Vec<_> = info.result_globals.iter().map(|(_, t)| *t).collect();
+                if stored != caller_type.results {
+                    return Err(crate::Error::UnsupportedFeature(format!(
+                        "the async callee `{}` (component {}) returns through a task.return \
+                         shim that stores {:?}, but the caller expects {:?}; meld matched no \
+                         task.return shim of the right shape and refuses rather than emit an \
+                         invalid adapter",
+                        site.export_name, site.to_component, stored, caller_type.results
+                    )));
+                }
                 // Push result values onto the stack
                 for (global_idx, _) in &info.result_globals {
                     body.instruction(&Instruction::GlobalGet(*global_idx));
@@ -16131,9 +16145,19 @@ mod tests {
         {
             return m;
         }
-        let results = site
+        // The caller's type as the emitter resolves it: the local type index
+        // mapped through `type_index_map`, falling back to merged type 0.
+        let caller_ti = site
             .import_func_type_idx
-            .and_then(|t| m.types.get(t as usize))
+            .and_then(|t| {
+                m.type_index_map
+                    .get(&(site.from_component, site.from_module, t))
+                    .copied()
+            })
+            .unwrap_or(0);
+        let results = m
+            .types
+            .get(caller_ti as usize)
             .map(|t| t.results.clone())
             .unwrap_or_default();
         let mut result_globals = Vec::new();
