@@ -359,3 +359,264 @@ fn zero_bound_is_refused() {
 fn edge_output_is_deterministic() {
     assert_eq!(fuse(&[CALLER, CALLEE]), fuse(&[CALLER, CALLEE]));
 }
+
+/// Callee for the copy tests: `echo: async func(s: string) -> string`. The
+/// lift hands its argument straight to `task.return`, so the bytes the start
+/// adapter copied in are the bytes the return adapter copies out.
+const ECHO_CALLEE: &str = r#"
+(component
+  (core module $mm
+    (memory (export "cmem") 1)
+    (global $next (mut i32) (i32.const 2048))
+    (func (export "cabi_realloc") (param i32 i32 i32 i32) (result i32)
+      (local $p i32)
+      (local.set $p (global.get $next))
+      (global.set $next (i32.add (global.get $next) (local.get 3)))
+      (local.get $p)))
+  (core instance $mi (instantiate $mm))
+  (alias core export $mi "cmem" (core memory $cmem))
+  (alias core export $mi "cabi_realloc" (core func $crealloc))
+  (core func $tr (canon task.return (result string) (memory $cmem)))
+  (core module $m
+    (import "" "task-return" (func $tr (param i32 i32)))
+    (func (export "[async-lift]local:t/i#echo") (param i32 i32) (result i32)
+      (call $tr (local.get 0) (local.get 1))
+      i32.const 0)
+    (func (export "[callback][async-lift]local:t/i#echo")
+      (param i32 i32 i32) (result i32) i32.const 0))
+  (core instance $trs (export "task-return" (func $tr)))
+  (core instance $ci (instantiate $m (with "" (instance $trs))))
+  (type $ft (func async (param "s" string) (result string)))
+  (func $f (type $ft)
+    (canon lift (core func $ci "[async-lift]local:t/i#echo") async
+      (memory $cmem) (realloc $crealloc)
+      (callback (core func $ci "[callback][async-lift]local:t/i#echo"))))
+  (instance $inst (export "echo" (func $f)))
+  (export "local:t/i" (instance $inst)))
+"#;
+
+/// Caller for the copy tests: lowers `echo` with the async option. Core
+/// import `[async-lower]echo: (ptr, len, retptr) -> status`.
+const ECHO_CALLER: &str = r#"
+(component
+  (import "local:t/i" (instance $i
+    (export "echo" (func async (param "s" string) (result string)))))
+  (alias export $i "echo" (func $f))
+  (core module $mm
+    (memory (export "mem") 1)
+    (global $next (mut i32) (i32.const 1024))
+    (func (export "cabi_realloc") (param i32 i32 i32 i32) (result i32)
+      (local $p i32)
+      (local.set $p (global.get $next))
+      (global.set $next (i32.add (global.get $next) (local.get 3)))
+      (local.get $p)))
+  (core instance $mi (instantiate $mm))
+  (alias core export $mi "mem" (core memory $mem))
+  (alias core export $mi "cabi_realloc" (core func $realloc))
+  (core func $lf (canon lower (func $f) async (memory $mem) (realloc $realloc)))
+  (core module $m
+    (import "local:t/i" "[async-lower]echo" (func (param i32 i32 i32) (result i32)))
+    (func (export "run")))
+  (core instance $imp (export "[async-lower]echo" (func $lf)))
+  (core instance $ci (instantiate $m (with "local:t/i" (instance $imp)))))
+"#;
+
+/// The fused module instantiated under wasmtime, with every import trapping
+/// except `[task-return]`, which records its arguments.
+type Returned = Arc<Mutex<Vec<Vec<i32>>>>;
+
+fn instantiate(core: &[u8]) -> (wasmtime::Store<()>, wasmtime::Instance, Returned) {
+    use wasmtime::{Config, Engine, Linker, Module, Store};
+    let mut config = Config::new();
+    config.wasm_multi_memory(true);
+    let engine = Engine::new(&config).unwrap();
+    let module = Module::new(&engine, core).unwrap();
+    let returned: Arc<Mutex<Vec<Vec<i32>>>> = Arc::default();
+    let mut linker: Linker<()> = Linker::new(&engine);
+    for imp in module.imports() {
+        let wasmtime::ExternType::Func(ty) = imp.ty() else {
+            panic!(
+                "unexpected non-function import {}::{}",
+                imp.module(),
+                imp.name()
+            );
+        };
+        let name = format!("{}::{}", imp.module(), imp.name());
+        let record = name.contains("task-return");
+        let returned = returned.clone();
+        linker
+            .func_new(imp.module(), imp.name(), ty, move |_, args, _| {
+                if record {
+                    returned
+                        .lock()
+                        .unwrap()
+                        .push(args.iter().map(|a| a.unwrap_i32()).collect());
+                    Ok(())
+                } else {
+                    Err(wasmtime::Error::msg(format!("unexpected call to {name}")))
+                }
+            })
+            .unwrap();
+    }
+    let mut store = Store::new(&engine, ());
+    let instance = linker.instantiate(&mut store, &module).unwrap();
+    (store, instance, returned)
+}
+
+// rivet: verifies SWV-150
+#[test]
+fn string_param_and_result_are_copied_between_memories() {
+    use wasmtime::Val;
+
+    let core = fuse(&[ECHO_CALLER, ECHO_CALLEE]).expect("fuses");
+    wasmparser::Validator::new_with_features(wasmparser::WasmFeatures::all())
+        .validate_all(&core)
+        .expect("fused module validates");
+    let (_, edges, _) = decode(&section(&core).expect("section present"));
+    assert_eq!(
+        (
+            edges[0].param_count,
+            edges[0].retptr,
+            edges[0].results.clone()
+        ),
+        (2, 1, vec![0x7f, 0x7f]),
+        "string param = 2 flat values, string result = (ptr, len)"
+    );
+
+    let (mut store, instance, returned) = instantiate(&core);
+    let memory = |store: &mut wasmtime::Store<()>, name: &str| {
+        instance
+            .get_memory(&mut *store, name)
+            .unwrap_or_else(|| panic!("memory `{name}` exported"))
+    };
+    let caller_mem = memory(&mut store, "mem");
+    let callee_mem = instance
+        .exports(&mut store)
+        .filter_map(|e| e.into_memory())
+        .collect::<Vec<_>>()
+        .into_iter()
+        .find(|m| m.data(&store).as_ptr() != caller_mem.data(&store).as_ptr())
+        .expect("a second exported memory (the callee's)");
+
+    // The caller's argument lives at 100 in the caller's memory.
+    caller_mem.write(&mut store, 100, b"hello").unwrap();
+    let start = instance
+        .get_func(&mut store, "pulseengine:async-edge/0/start")
+        .unwrap();
+    let mut out = [Val::I32(-1)];
+    start
+        .call(&mut store, &[Val::I32(100), Val::I32(5)], &mut out)
+        .unwrap();
+    assert_eq!(out[0].unwrap_i32(), 0, "the callee's EXIT code, unchanged");
+    let got = returned.lock().unwrap().clone();
+    assert_eq!(got.len(), 1, "task.return called once: {got:?}");
+    let (cptr, clen) = (got[0][0], got[0][1]);
+    assert_eq!(clen, 5);
+    assert_eq!(cptr, 2048, "the copy went through the callee's realloc");
+    let mut buf = [0u8; 5];
+    callee_mem.read(&store, cptr as usize, &mut buf).unwrap();
+    assert_eq!(
+        &buf, b"hello",
+        "the bytes were copied into the callee's memory"
+    );
+
+    // The return adapter copies the callee's bytes into the caller's memory
+    // with the caller's realloc and writes (ptr, len) at retptr.
+    let ret = instance
+        .get_func(&mut store, "pulseengine:async-edge/0/return")
+        .unwrap();
+    ret.call(
+        &mut store,
+        &[Val::I32(200), Val::I32(cptr), Val::I32(clen)],
+        &mut [],
+    )
+    .unwrap();
+    let mut pair = [0u8; 8];
+    caller_mem.read(&store, 200, &mut pair).unwrap();
+    let rptr = i32::from_le_bytes(pair[..4].try_into().unwrap());
+    let rlen = i32::from_le_bytes(pair[4..].try_into().unwrap());
+    assert_eq!((rptr, rlen), (1024, 5), "allocated by the caller's realloc");
+    caller_mem.read(&store, rptr as usize, &mut buf).unwrap();
+    assert_eq!(&buf, b"hello");
+}
+
+// rivet: verifies SWV-150
+#[test]
+fn list_of_u32_is_copied_with_its_element_size() {
+    use wasmtime::Val;
+
+    let list = |s: &str| s.replace("string", "(list u32)");
+    let core = fuse(&[&list(ECHO_CALLER), &list(ECHO_CALLEE)]).expect("fuses");
+    let (mut store, instance, returned) = instantiate(&core);
+    let caller_mem = instance.get_memory(&mut store, "mem").unwrap();
+    let words: Vec<u8> = [7u32, 8, 0xdead_beef]
+        .iter()
+        .flat_map(|w| w.to_le_bytes())
+        .collect();
+    caller_mem.write(&mut store, 100, &words).unwrap();
+    let start = instance
+        .get_func(&mut store, "pulseengine:async-edge/0/start")
+        .unwrap();
+    let mut out = [Val::I32(-1)];
+    start
+        .call(&mut store, &[Val::I32(100), Val::I32(3)], &mut out)
+        .unwrap();
+    let got = returned.lock().unwrap().clone();
+    assert_eq!(got[0][1], 3, "the length stays an element count");
+    let ret = instance
+        .get_func(&mut store, "pulseengine:async-edge/0/return")
+        .unwrap();
+    ret.call(
+        &mut store,
+        &[Val::I32(200), Val::I32(got[0][0]), Val::I32(3)],
+        &mut [],
+    )
+    .unwrap();
+    let mut pair = [0u8; 8];
+    caller_mem.read(&store, 200, &mut pair).unwrap();
+    let rptr = i32::from_le_bytes(pair[..4].try_into().unwrap()) as usize;
+    let mut back = vec![0u8; 12];
+    caller_mem.read(&store, rptr, &mut back).unwrap();
+    assert_eq!(back, words, "all 12 bytes came back");
+
+    // A length whose byte size overflows u32 traps instead of copying a
+    // truncated length.
+    let mut out = [Val::I32(-1)];
+    assert!(
+        start
+            .call(
+                &mut store,
+                &[Val::I32(100), Val::I32(0x4000_0000)],
+                &mut out
+            )
+            .is_err(),
+        "len * 4 overflows u32 and must trap"
+    );
+}
+
+// rivet: verifies SWV-150
+#[test]
+fn string_edge_fuses_under_shared_memory() {
+    let core = fuse_with(
+        FuserConfig {
+            memory_strategy: MemoryStrategy::SharedMemory,
+            ..Default::default()
+        },
+        &[ECHO_CALLER, ECHO_CALLEE],
+    )
+    .expect("fuses under --memory shared");
+    wasmparser::Validator::new_with_features(wasmparser::WasmFeatures::all())
+        .validate_all(&core)
+        .expect("fused module validates");
+    assert!(section(&core).is_some());
+}
+
+// rivet: verifies SWV-150
+#[test]
+fn tuple_param_is_still_refused() {
+    // An anonymous tuple stands in for the composite types (a record would
+    // need a named type export in the import).
+    let tup = |s: &str| s.replace("string", "(tuple u32 u32)");
+    let err = fuse(&[&tup(ECHO_CALLER), &tup(ECHO_CALLEE)]).expect_err("composites are refused");
+    assert!(err.contains("#548") && err.contains("records"), "{err}");
+}
