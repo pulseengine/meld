@@ -1,7 +1,9 @@
 name: Update wit-bindgen Fixtures
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.run_id }}
+  # Every run writes the same branch ref, so runs must not overlap: two
+  # concurrent dispatches raced the ref create and one got a 422.
+  group: ${{ github.workflow }}
   cancel-in-progress: false
 
 on:
