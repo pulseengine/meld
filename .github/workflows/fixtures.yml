@@ -172,19 +172,37 @@ jobs:
       # The remaps make the corpus reproducible. Without them the binaries
       # embed the self-hosted runner's own paths (toolchain sources, the
       # cargo registry and the runner temp dir, all under the runner's
-      # own home), so two runs on different runners differ in
-      # every fixture and each weekly run pushed a byte-noise corpus.
+      # own home), so two runs on different runners differ in every fixture
+      # and each weekly run pushed a byte-noise corpus. They go into a
+      # `rustc` wrapper first on PATH, not RUSTFLAGS: `wit-bindgen test`
+      # runs `rustc` directly for the test crates (with -Cdebuginfo=1), and
+      # those invocations never read RUSTFLAGS. Setting RUSTFLAGS alone left
+      # 35 runner paths in a fixture and the corpus still differed per runner.
       - name: Generate test artifacts
         working-directory: ${{ runner.temp }}/wit-bindgen
+        env:
+          RUSTFLAGS: --cap-lints=warn
         run: |
+          real_rustc=$(command -v rustc)
           sysroot=$(rustc --print sysroot)
           cargo_home=${CARGO_HOME:-$HOME/.cargo}
-          RUSTFLAGS="--cap-lints=warn"
-          RUSTFLAGS+=" --remap-path-prefix=$sysroot=/rust-sysroot"
-          RUSTFLAGS+=" --remap-path-prefix=$cargo_home=/cargo-home"
-          RUSTFLAGS+=" --remap-path-prefix=$RUNNER_TEMP=/build"
-          export RUSTFLAGS
+          wrap="$RUNNER_TEMP/rustc-remap"
+          mkdir -p "$wrap"
+          cat > "$wrap/rustc" <<EOF
+          #!/bin/sh
+          exec "$real_rustc" "\$@" \\
+            --remap-path-prefix="$sysroot=/rust-sysroot" \\
+            --remap-path-prefix="$cargo_home=/cargo-home" \\
+            --remap-path-prefix="$RUNNER_TEMP=/build"
+          EOF
+          chmod +x "$wrap/rustc"
+          export PATH="$wrap:$PATH"
           wit-bindgen test --languages rust --artifacts artifacts tests/runtime
+          # Fail here, not in review, if a runner path survived.
+          if grep -rlaF "$HOME" artifacts --include='composed-*.wasm' | head -1 | grep -q .; then
+            echo "::error::a generated fixture still embeds the runner home $HOME"
+            exit 1
+          fi
 
       - name: Copy fixtures
         run: |
