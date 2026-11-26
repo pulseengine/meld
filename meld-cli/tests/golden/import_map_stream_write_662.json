@@ -12,7 +12,7 @@
       "component": 0,
       "encoding": null,
       "index": 0,
-      "kind": "function",
+      "kind": "p3-builtin",
       "memory": null,
       "module": "[export]test:x/api",
       "name": "[stream-new-0]get",
@@ -30,7 +30,7 @@
       "component": 0,
       "encoding": "utf8",
       "index": 1,
-      "kind": "function",
+      "kind": "p3-builtin",
       "memory": {
         "export": "memory",
         "index": 0

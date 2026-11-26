@@ -85,6 +85,10 @@ fn every_builtin_object_spells_exactly_kind_element_async() {
         let Some(builtin) = entry.get("builtin") else {
             continue;
         };
+        assert_eq!(
+            entry["kind"], "p3-builtin",
+            "a built-in's entry kind must not fall back to the name-prefix guess: {entry}"
+        );
         let obj = builtin.as_object().expect("builtin is an object");
         let keys: BTreeSet<&str> = obj.keys().map(String::as_str).collect();
         assert_eq!(keys, want, "builtin keys of {entry}");
