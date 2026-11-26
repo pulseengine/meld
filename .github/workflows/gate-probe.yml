@@ -25,4 +25,4 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: pulseengine/temper/.github/actions/gate-probe@32bed3ade7a04defb3f7afa14ce3ed5bd7fec23e
+      - uses: pulseengine/temper/.github/actions/gate-probe@0dee66391757115812e0606224fded8b524df51e
