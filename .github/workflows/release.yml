@@ -74,7 +74,7 @@ jobs:
           ref: ${{ inputs.tag || github.ref }}
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable branch, toolchain pinned
+        uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master, toolchain pinned
         with:
           toolchain: 1.100.0
           targets: ${{ matrix.target }}
@@ -250,7 +250,7 @@ jobs:
       # transitively covers the SBOM. Adapts the synth reference manifest
       # path: meld's main crate is `meld-cli` (binary name `meld`).
       - name: Install Rust (for cargo-cyclonedx)
-        uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable branch, toolchain pinned
+        uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master, toolchain pinned
         with:
           toolchain: 1.100.0
 
