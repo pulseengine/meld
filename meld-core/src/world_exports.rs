@@ -70,8 +70,10 @@ use crate::{Error, Result};
 /// What pruning decided, for the signature manifest to follow.
 #[derive(Debug, Default)]
 pub struct WorldPlan {
-    /// `(flattened component, core func of the lift)` -> world export name, for
-    /// every lift that implements a world function.
+    /// `(flattened component, core func of the lift)` -> the name the fused
+    /// module exports it under, for every lift that implements a world
+    /// function: the world name, or for an async lift `[async-lift]<name>` /
+    /// `[async-lift-stackful]<name>` (#684).
     pub lifts: HashMap<(usize, u32), String>,
 }
 
@@ -396,6 +398,22 @@ fn unsupported_item(parent: &str, name: &str, kind: ComponentExternalKind) -> Er
 ///
 /// `component_to_input` maps each flattened component to the input it came
 /// from, which gives each input's first flattened index.
+/// The source core memory and realloc a canonical built-in names (#684).
+fn builtin_memory_and_realloc(entry: &CanonicalEntry) -> (Option<u32>, Option<u32>) {
+    match entry {
+        CanonicalEntry::TaskReturn { options, .. }
+        | CanonicalEntry::StreamRead { options, .. }
+        | CanonicalEntry::StreamWrite { options, .. }
+        | CanonicalEntry::FutureRead { options, .. }
+        | CanonicalEntry::FutureWrite { options, .. }
+        | CanonicalEntry::ErrorContextNew { options }
+        | CanonicalEntry::ErrorContextDebugMessage { options } => (options.memory, options.realloc),
+        CanonicalEntry::WaitableSetWait { memory, .. }
+        | CanonicalEntry::WaitableSetPoll { memory, .. } => (Some(*memory), None),
+        _ => (None, None),
+    }
+}
+
 pub fn prune_to_world(
     merged: &mut MergedModule,
     components: &[ParsedComponent],
@@ -513,15 +531,39 @@ pub fn prune_to_world(
                 "world function `{name}` has no counterpart in the fused module"
             ))
         })?;
-        if let Some(prev) = targets.insert(name.clone(), fused)
-            && prev != fused
-        {
-            return Err(refuse(format!(
-                "world function `{name}` is implemented by two different functions \
-                 ({prev} and {fused}); refusing to pick one"
-            )));
+        // #684: an async lift keeps the core export names that carry its
+        // calling convention, the ones `--exports all` emits: under the bare
+        // world name an embedder would call it as a sync function. A callback
+        // lift also keeps its `[callback]` export.
+        let mut exported: Vec<(String, u32)> = Vec::new();
+        let export_name = if lift.options.async_ {
+            match lift.options.callback {
+                Some(cb) => {
+                    let fcb =
+                        crate::component_wrap::resolve_source_realloc(owner, lift.flat, merged, cb)
+                            .map_err(|e| {
+                                refuse(format!("world function `{name}`: callback: {e}"))
+                            })?;
+                    exported.push((format!("[callback][async-lift]{name}"), fcb));
+                    format!("[async-lift]{name}")
+                }
+                None => format!("[async-lift-stackful]{name}"),
+            }
+        } else {
+            name.clone()
+        };
+        exported.insert(0, (export_name.clone(), fused));
+        for (ename, findex) in exported {
+            if let Some(prev) = targets.insert(ename.clone(), findex)
+                && prev != findex
+            {
+                return Err(refuse(format!(
+                    "world function `{ename}` is implemented by two different functions \
+                     ({prev} and {findex}); refusing to pick one"
+                )));
+            }
         }
-        plan.lifts.insert((lift.flat, lift.core_func), name.clone());
+        plan.lifts.insert((lift.flat, lift.core_func), export_name);
 
         if let Some(mem) = lift.options.memory {
             let fused_mem = crate::component_wrap::resolve_source_memory(
@@ -585,6 +627,46 @@ pub fn prune_to_world(
         // Resource intrinsics are not `canon lower`s of a function: nothing to
         // trace, and no memory or realloc to keep.
         if import.name.starts_with("[resource-") {
+            continue;
+        }
+        // #684: a P3 canonical built-in (`task.return`, `subtask.cancel`,
+        // `waitable-set.wait`, ...) is not a `canon lower` and has nothing to
+        // trace. When every untraced member of the slot is one, keep the
+        // memory and realloc each names; the import map reports the same
+        // built-ins to the embedder that services them.
+        if slot.sites.is_empty()
+            && !slot.builtins.is_empty()
+            && slot.builtins.len() == slot.untraced.len()
+        {
+            for &(c, core_func) in &slot.builtins {
+                let owner = components.get(c).ok_or_else(|| {
+                    refuse(format!("import {who}: built-in in unknown component {c}"))
+                })?;
+                let entry =
+                    crate::resolver::core_builtin_entry(owner, core_func).ok_or_else(|| {
+                        refuse(format!(
+                            "import {who}: core function {core_func} of component {c} is not a \
+                         canonical built-in"
+                        ))
+                    })?;
+                let (memory, realloc) = builtin_memory_and_realloc(entry);
+                if let Some(m) = memory {
+                    let fused = crate::component_wrap::resolve_source_memory(
+                        owner,
+                        components,
+                        merged,
+                        fused_memory_count,
+                        m,
+                    )
+                    .map_err(|e| refuse(format!("import {who}: {e}")))?;
+                    needed_memories.insert(fused);
+                }
+                if let Some(r) = realloc {
+                    let fused = crate::component_wrap::resolve_source_realloc(owner, c, merged, r)
+                        .map_err(|e| refuse(format!("import {who}: {e}")))?;
+                    needed_reallocs.insert((c, fused));
+                }
+            }
             continue;
         }
         if let Some(first) = slot.untraced.first() {
