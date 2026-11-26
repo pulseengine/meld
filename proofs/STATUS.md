@@ -10,7 +10,7 @@ Counts refreshed 2026-10-14 (v0.62.0).
 |--------|-------|
 | Rocq `.v` files | 28 |
 | Rocq lines (total) | 14,640 |
-| Closed proofs (Qed) | 357 |
+| Closed proofs (Qed) | at least 357 (the floor in `.github/workflows/proofs.yml`) |
 | Admitted proofs | 0 |
 | Rust lines (`meld-core/src`, recursive, incl. inline tests) | 65,443 |
 | Proof-to-code ratio | 0.22x |
