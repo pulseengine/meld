@@ -869,12 +869,12 @@ fn across_the_whole_corpus_a_world_keeps_what_its_imports_and_resources_need() {
         .collect();
     paths.sort();
     assert!(paths.len() >= 49, "the corpus is {} files", paths.len());
-    for (listed, _) in EXPECTED_REFUSALS {
+    for (listed, _) in EXPECTED_REFUSALS.iter().chain(WORLD_REFUSALS) {
         assert!(
             paths
                 .iter()
                 .any(|p| p.file_name().is_some_and(|f| f == *listed)),
-            "{listed} is in EXPECTED_REFUSALS but not in the corpus"
+            "{listed} is listed as refused but is not in the corpus"
         );
     }
 
@@ -907,63 +907,52 @@ fn across_the_whole_corpus_a_world_keeps_what_its_imports_and_resources_need() {
 
 /// Corpus fixtures meld refuses on purpose under the default `all` policy,
 /// each with the text its error must carry.
-/// wit-bindgen 0.63's Rust async runtime imports `stream.read` or
-/// `future.read` into every async guest, and meld refuses those built-ins
-/// until streams and futures land (#558, ADR-10 step 6). `map` needs the
-/// component-model map feature, which meld's parser does not enable.
+/// Most pass a `stream` or `future` handle across a fused call, which meld
+/// refuses until streams and futures cross components (#666, ADR-10 step 6).
+/// `stream-write-cancel` carries a resource handle as a stream element
+/// (#142 iv). Two async callees return through a task.return shim whose
+/// stored results do not match the caller's type, which meld refuses rather
+/// than emit an invalid adapter (#680). `map` needs the component-model map
+/// feature, which meld's parser does not enable (#567).
+const STREAM_OR_FUTURE: &str = "and its signature carries a";
+const TASK_RETURN_SHAPE: &str = "returns through a task.return shim";
 const EXPECTED_REFUSALS: &[(&str, &str)] = &[
-    (
-        "async-immediate-yield.wasm",
-        "canonical built-in `stream.read`",
-    ),
-    ("cancel-import.wasm", "canonical built-in `future.read`"),
-    ("future-cancel-read.wasm", "canonical built-in `"),
-    ("future-cancel-write-then-read.wasm", "canonical built-in `"),
-    ("future-cancel-write.wasm", "canonical built-in `"),
-    (
-        "future-close-after-coming-back.wasm",
-        "canonical built-in `",
-    ),
-    (
-        "future-close-then-receive-read.wasm",
-        "canonical built-in `",
-    ),
-    ("future-closes-with-error.wasm", "canonical built-in `"),
-    (
-        "future-write-then-read-comes-back.wasm",
-        "canonical built-in `",
-    ),
-    ("future-write-then-read-remote.wasm", "canonical built-in `"),
+    ("cancel-import.wasm", STREAM_OR_FUTURE),
+    ("future-cancel-read.wasm", STREAM_OR_FUTURE),
+    ("future-cancel-write-then-read.wasm", STREAM_OR_FUTURE),
+    ("future-cancel-write.wasm", STREAM_OR_FUTURE),
+    ("future-close-after-coming-back.wasm", STREAM_OR_FUTURE),
+    ("future-close-then-receive-read.wasm", STREAM_OR_FUTURE),
+    ("future-closes-with-error.wasm", STREAM_OR_FUTURE),
+    ("future-write-then-read-comes-back.wasm", STREAM_OR_FUTURE),
+    ("future-write-then-read-remote.wasm", STREAM_OR_FUTURE),
     ("map.wasm", "map feature"),
-    ("nested-future-stream.wasm", "canonical built-in `"),
-    ("pending-import.wasm", "canonical built-in `future.read`"),
-    ("ping-pong.wasm", "canonical built-in `future.read`"),
-    ("rust-async-and-block-on.wasm", "canonical built-in `"),
-    ("rust-cancel-wake.wasm", "canonical built-in `"),
-    ("rust-cross-task-wakeup.wasm", "canonical built-in `"),
-    ("rust-lowered-send.wasm", "canonical built-in `"),
-    ("rust-spawn-and-await.wasm", "canonical built-in `"),
-    (
-        "simple-call-import.wasm",
-        "canonical built-in `stream.read`",
-    ),
-    ("simple-future.wasm", "canonical built-in `"),
-    (
-        "simple-import-params-results.wasm",
-        "canonical built-in `stream.read`",
-    ),
-    ("simple-pending-import.wasm", "canonical built-in `"),
-    ("simple-stream-payload.wasm", "canonical built-in `"),
-    ("simple-yield.wasm", "canonical built-in `stream.read`"),
-    ("stream-to-futures-stream.wasm", "canonical built-in `"),
-    ("stream-write-cancel.wasm", "canonical built-in `"),
-    // Refused under `all` only: `world` prunes the export that reaches the
-    // built-in.
-    (
-        "yield-loop-receives-events.wasm",
-        "canonical built-in `stream.read`",
-    ),
+    ("nested-future-stream.wasm", STREAM_OR_FUTURE),
+    ("pending-import.wasm", STREAM_OR_FUTURE),
+    ("ping-pong.wasm", STREAM_OR_FUTURE),
+    ("rust-async-and-block-on.wasm", STREAM_OR_FUTURE),
+    ("rust-cancel-wake.wasm", STREAM_OR_FUTURE),
+    ("rust-lowered-send.wasm", TASK_RETURN_SHAPE),
+    ("rust-spawn-and-await.wasm", TASK_RETURN_SHAPE),
+    ("simple-future.wasm", STREAM_OR_FUTURE),
+    ("simple-stream-payload.wasm", STREAM_OR_FUTURE),
+    ("stream-to-futures-stream.wasm", STREAM_OR_FUTURE),
+    ("stream-write-cancel.wasm", "as a `stream<"),
 ];
+
+/// Corpus fixtures that fuse under `all` but that `world` refuses, each with
+/// the text the `world` error must carry. The world-export tracer treats a
+/// `[task-return]` import as an untraced `canon lower` (#684).
+const WORLD_REFUSALS: &[(&str, &str)] = &[
+    ("async-immediate-yield.wasm", UNTRACED_TASK_RETURN),
+    ("rust-cross-task-wakeup.wasm", UNTRACED_TASK_RETURN),
+    ("simple-call-import.wasm", UNTRACED_TASK_RETURN),
+    ("simple-import-params-results.wasm", UNTRACED_TASK_RETURN),
+    ("simple-pending-import.wasm", UNTRACED_TASK_RETURN),
+    ("simple-yield.wasm", UNTRACED_TASK_RETURN),
+    ("yield-loop-receives-events.wasm", UNTRACED_TASK_RETURN),
+];
+const UNTRACED_TASK_RETURN: &str = "[task-return]";
 
 fn expected_refusal(name: &str) -> Option<&'static str> {
     EXPECTED_REFUSALS
@@ -1000,6 +989,29 @@ fn check_corpus_chunk(paths: &[std::path::PathBuf]) -> (usize, usize, usize) {
                 err.contains(reason),
                 "{name}: refused for another reason than `{reason}`: {err}"
             );
+            continue;
+        }
+        if let Some((_, reason)) = WORLD_REFUSALS.iter().find(|(n, _)| *n == name) {
+            // It must fuse under `all` and validate, and `world` must refuse
+            // it for the listed reason; one that starts fusing under `world`
+            // has to leave the list.
+            validate(&fuse_bytes(&bytes, ExportPolicy::All));
+            let mut fuser = Fuser::new(FuserConfig {
+                attestation: false,
+                reproducible: true,
+                export_policy: ExportPolicy::World,
+                ..Default::default()
+            });
+            fuser
+                .add_component_named(&bytes, Some("input"))
+                .expect("parses");
+            match fuser.fuse() {
+                Ok(_) => panic!("{name} now fuses under world: drop it from WORLD_REFUSALS"),
+                Err(e) => assert!(
+                    e.to_string().contains(reason),
+                    "{name}: world refused it for another reason than `{reason}`: {e}"
+                ),
+            }
             continue;
         }
         let all = fuse_bytes(&bytes, ExportPolicy::All);
