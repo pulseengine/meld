@@ -1,7 +1,9 @@
 name: Update wit-bindgen Fixtures
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.run_id }}
+  # Every run writes the same branch ref, so runs must not overlap: two
+  # concurrent dispatches raced the ref create and one got a 422.
+  group: ${{ github.workflow }}
   cancel-in-progress: false
 
 on:
@@ -168,11 +170,41 @@ jobs:
       # Note `--cap-lints` is normally a dependency-only tool; it is applied
       # deliberately to the whole invocation, which is what downgrades the
       # crate-level `deny` that a bare `-A deprecated` would lose to.
+      #
+      # The remaps make the corpus reproducible. Without them the binaries
+      # embed the self-hosted runner's own paths (toolchain sources, the
+      # cargo registry and the runner temp dir, all under the runner's
+      # own home), so two runs on different runners differ in every fixture
+      # and each weekly run pushed a byte-noise corpus. They go into a
+      # `rustc` wrapper first on PATH, not RUSTFLAGS: `wit-bindgen test`
+      # runs `rustc` directly for the test crates (with -Cdebuginfo=1), and
+      # those invocations never read RUSTFLAGS. Setting RUSTFLAGS alone left
+      # 35 runner paths in a fixture and the corpus still differed per runner.
       - name: Generate test artifacts
         working-directory: ${{ runner.temp }}/wit-bindgen
         env:
           RUSTFLAGS: --cap-lints=warn
-        run: wit-bindgen test --languages rust --artifacts artifacts tests/runtime
+        run: |
+          real_rustc=$(command -v rustc)
+          sysroot=$(rustc --print sysroot)
+          cargo_home=${CARGO_HOME:-$HOME/.cargo}
+          wrap="$RUNNER_TEMP/rustc-remap"
+          mkdir -p "$wrap"
+          cat > "$wrap/rustc" <<EOF
+          #!/bin/sh
+          exec "$real_rustc" "\$@" \\
+            --remap-path-prefix="$sysroot=/rust-sysroot" \\
+            --remap-path-prefix="$cargo_home=/cargo-home" \\
+            --remap-path-prefix="$RUNNER_TEMP=/build"
+          EOF
+          chmod +x "$wrap/rustc"
+          export PATH="$wrap:$PATH"
+          wit-bindgen test --languages rust --artifacts artifacts tests/runtime
+          # Fail here, not in review, if a runner path survived.
+          if grep -rlaF "$HOME" artifacts --include='composed-*.wasm' | head -1 | grep -q .; then
+            echo "::error::a generated fixture still embeds the runner home $HOME"
+            exit 1
+          fi
 
       - name: Copy fixtures
         run: |
@@ -218,10 +250,10 @@ jobs:
       # Conflict** while the ORGANISATION forbids it. The org policy has since
       # been changed, so `GITHUB_TOKEN` can open PRs here again.
       #
-      # The push is kept as an explicit `git push` rather than handed back to
-      # the action: it is the step that does the real work, it is readable, and
-      # if PR creation ever breaks again the corpus still lands on a branch
-      # with a compare link in the summary.
+      # The commit is built through the git data API rather than handed back
+      # to the action or pushed with git: GitHub signs API commits, which
+      # main requires, and if PR creation is refused the corpus still lands
+      # on a branch with a compare link in the summary.
       #
       # `curl` rather than `gh`: the CLI is not installed on every self-hosted
       # label in this fleet (mythos-auto.yml records hitting exit 127 on the
@@ -233,27 +265,60 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          # The diff step has already force-added the fixture paths, so the
-          # index holds exactly what should be committed.
-          git checkout -B "$BRANCH"
-          git commit -q -m "fix(tests): update wit-bindgen fixtures to v${WIT_BINDGEN_VERSION}"
-          # The checkout fetched main only, so there is no tracking ref for
-          # $BRANCH and a bare --force-with-lease rejects the push as "stale
-          # info" whenever the branch already exists. Fetch it (absent on the
-          # first run) so the lease compares against what is really there.
-          if git ls-remote --exit-code --heads origin "$BRANCH" >/dev/null; then
-            git fetch -q --depth=1 origin "+refs/heads/$BRANCH:refs/remotes/origin/$BRANCH"
+          api="https://api.github.com/repos/$GITHUB_REPOSITORY"
+          gh_api() {
+            # gh_api METHOD PATH [BODY_FILE]: one authenticated REST call.
+            local method=$1 path=$2
+            if [ $# -ge 3 ]; then
+              curl -fsS -X "$method" -H "Authorization: Bearer $GH_TOKEN" \
+                -H "Accept: application/vnd.github+json" \
+                --data-binary @"$3" "$api/$path"
+            else
+              curl -fsS -X "$method" -H "Authorization: Bearer $GH_TOKEN" \
+                -H "Accept: application/vnd.github+json" "$api/$path"
+            fi
+          }
+          # main requires signed commits and a `git push` from the runner is
+          # unsigned, so every corpus PR used to sit BLOCKED until a
+          # maintainer re-signed it. A commit created through the git data
+          # API with GITHUB_TOKEN is signed by GitHub, so build it there:
+          # one blob per changed fixture, a tree on top of main's, a commit,
+          # then point the branch at it. The diff step has already
+          # force-added the fixture paths, so the index lists them.
+          base=$(git rev-parse HEAD)
+          base_tree=$(git rev-parse 'HEAD^{tree}')
+          tmp=$(mktemp -d)
+          entries="$tmp/entries.jsonl"
+          : > "$entries"
+          while IFS= read -r path; do
+            { printf '{"encoding":"base64","content":"'
+              base64 -w0 "$path"
+              printf '"}'; } > "$tmp/blob.json"
+            sha=$(gh_api POST git/blobs "$tmp/blob.json" | jq -r .sha)
+            jq -nc --arg p "$path" --arg s "$sha" \
+              '{path:$p, mode:"100644", type:"blob", sha:$s}' >> "$entries"
+          done < <(git diff --cached --name-only --diff-filter=AM)
+          jq -s --arg b "$base_tree" '{base_tree:$b, tree:.}' "$entries" > "$tmp/tree.json"
+          tree=$(gh_api POST git/trees "$tmp/tree.json" | jq -r .sha)
+          jq -n --arg m "fix(tests): update wit-bindgen fixtures to v${WIT_BINDGEN_VERSION}" \
+                --arg t "$tree" --arg p "$base" \
+                '{message:$m, tree:$t, parents:[$p]}' > "$tmp/commit.json"
+          commit=$(gh_api POST git/commits "$tmp/commit.json" | jq -r .sha)
+          verified=$(gh_api GET "git/commits/$commit" | jq -r '.verification.verified')
+          echo "corpus commit $commit, GitHub signature verified: $verified"
+          # The branch belongs to this job: each run regenerates the whole
+          # corpus from main, so it replaces whatever the branch held.
+          if gh_api GET "git/ref/heads/$BRANCH" >/dev/null 2>&1; then
+            jq -n --arg s "$commit" '{sha:$s, force:true}' > "$tmp/ref.json"
+            gh_api PATCH "git/refs/heads/$BRANCH" "$tmp/ref.json" >/dev/null
+          else
+            jq -n --arg r "refs/heads/$BRANCH" --arg s "$commit" '{ref:$r, sha:$s}' > "$tmp/ref.json"
+            gh_api POST git/refs "$tmp/ref.json" >/dev/null
           fi
-          git push -q --force-with-lease origin "$BRANCH"
           # Open a PR only when one is not already open for this branch, so a
           # weekly re-push updates the existing PR instead of erroring or
           # opening duplicates.
-          api="https://api.github.com/repos/$GITHUB_REPOSITORY"
-          open_count=$(curl -fsS -H "Authorization: Bearer $GH_TOKEN" \
-            -H "Accept: application/vnd.github+json" \
-            "$api/pulls?state=open&head=${GITHUB_REPOSITORY%%/*}:$BRANCH" | jq 'length')
+          open_count=$(gh_api GET "pulls?state=open&head=${GITHUB_REPOSITORY%%/*}:$BRANCH" | jq 'length')
           pr_url=""
           # The org forbids Actions from creating PRs, so the POST below
           # returns 403. Under pipefail a bare curl -f would end the step
@@ -278,7 +343,7 @@ jobs:
             else
               printf 'PR creation did not return a URL. Open one here: https://github.com/%s/compare/main...%s?expand=1\n' "$GITHUB_REPOSITORY" "$BRANCH"
             fi
-            printf '\nThis commit is unsigned and main requires signed commits, so the PR stays blocked until a maintainer re-signs it: `git rebase --force-rebase -S origin/main` on the branch, then a leased force-push.\n'
+            printf '\nCommit `%s`, created through the git data API; GitHub signature verified: `%s`.\n' "$commit" "$verified"
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Say so when nothing drifted
