@@ -128,7 +128,14 @@ jobs:
           key: ${{ runner.os }}-cargo-cov-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-cov-
 
+      # Coverage reads llvm-cov's own mapping sections, not DWARF. With the dev
+      # profile's `debug = true`, each of the ~100 instrumented integration-test
+      # binaries carried full debug info (~0.4 GB each on Linux, ~40 GB per job),
+      # which nearly filled the shared runner volume (smithy#296).
       - name: Generate coverage
+        env:
+          CARGO_PROFILE_DEV_DEBUG: "0"
+          CARGO_PROFILE_TEST_DEBUG: "0"
         run: cargo llvm-cov --locked --all-features --workspace --lcov --output-path lcov.info
 
       - name: Upload to Codecov
@@ -136,6 +143,16 @@ jobs:
         with:
           files: lcov.info
           fail_ci_if_error: false
+
+      # Self-hosted runners keep the workspace between jobs. Remove the
+      # workspace's instrumented artifacts (the test binaries); dependency
+      # builds stay for the next run. Runs on failure and cancellation too.
+      - name: Remove instrumented test binaries
+        if: always()
+        run: |
+          du -sh target 2>/dev/null || true
+          cargo llvm-cov clean --workspace
+          du -sh target 2>/dev/null || true
 
   # Run what we build: meld as a wasip2 component. meld.wasm fuses fixtures
   # (and itself) under wasmtime, and every output must equal native meld's
