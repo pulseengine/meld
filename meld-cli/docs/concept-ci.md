@@ -79,7 +79,7 @@ produce identical bytes).
 
 The output carries a `wsc.transformation.attestation` section: meld's
 version, the inputs and their sha256, the parameters, and `output.hash`.
-From releases after 0.71.0, `output.hash` covers every byte except that
+From v0.72.0, `output.hash` covers every byte except that
 section, so a wsc that checks the binding (sigil#395) accepts the artifact
 with `wsc verify-chain -i fused.wasm` and refuses it if any other byte,
 `component-provenance` included, changed after fusion. The meld 0.70.0 in
@@ -89,7 +89,7 @@ relying on the check. See
 
 ## meld as a component
 
-Releases after 0.71.0 also attach `meld-<tag>-wasm32-wasip2.wasm`, listed in
+From v0.72.0, releases also attach `meld-<tag>-wasm32-wasip2.wasm`, listed in
 the signed `SHA256SUMS.txt`. A runner with a WASI 0.2 host and no native meld
 can run it; it produces the same bytes as native meld:
 

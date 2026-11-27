@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.72.0] - 2026-11-27
+
 ### Added
 
 - CI job `meld.wasm component`: builds meld-cli for wasm32-wasip2 and runs it under wasmtime 41. meld.wasm fuses five wit-bindgen fixtures and itself with `--reproducible`, and each output must equal native meld's byte for byte. Two planted controls (different inputs; one flipped byte) must compare unequal, and exit codes must match native (0 / 2 / 1). meld.wasm is uploaded as a build artifact.
