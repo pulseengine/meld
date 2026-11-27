@@ -80,6 +80,11 @@ pub const TOPICS: &[Topic] = &[
         "Provenance — mapping fused functions back to their component",
         "concept-provenance.md"
     ),
+    topic!(
+        "ci",
+        "Calling meld in CI — pinned, reproducible, then run",
+        "concept-ci.md"
+    ),
     // ── one per CLI subcommand (slug == clap name) ────────────────────
     topic!(
         "fuse",
