@@ -19,12 +19,13 @@ manifest-version = 1
 [toolchain]
 realm   = "covalent"      # or "pulseengine"; the realm names the trust root
 channel = "rolling"
-layer   = "2026.11.16"
+layer   = "2026.11.28"
 ```
 
-Pick a layer that carries the meld and kiln versions you need; `varve
-inspect` lists every tool in the pinned layer with its version, and `varve
-outdated` lists newer layers. Commit `varve-realms.toml` next to it (it ships as an asset of every varve
+The fleet standard is the covalent realm: pin covalent 2026.11.28 or later.
+That layer carries meld 0.70.0, kiln 0.9.0 and wsc 0.12.2; `varve inspect`
+lists every tool in the pinned layer with its version, and `varve outdated`
+lists newer layers. Commit `varve-realms.toml` next to it (it ships as an asset of every varve
 release), then in the job:
 
 ```sh
@@ -81,7 +82,9 @@ version, the inputs and their sha256, the parameters, and `output.hash`.
 From releases after 0.71.0, `output.hash` covers every byte except that
 section, so a wsc that checks the binding (sigil#395) accepts the artifact
 with `wsc verify-chain -i fused.wasm` and refuses it if any other byte,
-`component-provenance` included, changed after fusion. See
+`component-provenance` included, changed after fusion. The meld 0.70.0 in
+covalent 2026.11.28 predates this; take a layer with a later meld before
+relying on the check. See
 `meld docs attestation`.
 
 ## meld as a component
@@ -102,15 +105,18 @@ Exit codes are the same as native meld: 0 on success, 2 for a usage error,
 
 kiln 0.9.0 and later runs a meld-fused wasm32-wasip2 command component built
 by Rust 1.100; older kiln refuses it at the `wasi:cli/exit@0.2.12` import
-(kiln v0.9.0 release notes). Take kiln from the same varve layer, and check
-that the layer carries 0.9.0 or later: `varve inspect` lists each tool's
-version (layer 2026.11.16 carries kiln 0.7.3).
+(kiln v0.9.0 release notes). Take kiln from the same varve layer: covalent
+2026.11.28 and later carry 0.9.0 (layer 2026.11.16 carries kiln 0.7.3).
 
 ```sh
 varve which kiln
 kiln --version
-kiln --wasi --component --dir . fused.wasm [guest args...]
+timeout 300 kiln --wasi --component --dir . fused.wasm [guest args...]
 ```
+
+Put a timeout on the kiln run. kiln 0.9.0 can print nothing and never exit
+on x86_64 Linux for a larger fused tool that finishes in seconds on aarch64
+macOS (kiln#748; the fix, kiln#737, is merged and ships after 0.9.0).
 
 kiln's options go before the module and everything after it is the guest's
 argv, as with `wasmtime run`. For a `--memory multi` module whose host
