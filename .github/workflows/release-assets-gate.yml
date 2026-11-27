@@ -74,6 +74,8 @@ jobs:
           do
             require "$target.tar.gz"
           done
+          # meld as a wasip2 component (#697), built outside the matrix.
+          require "wasm32-wasip2.wasm"
           require "SHA256SUMS.txt"
           require "SHA256SUMS.txt.cosign.bundle"
           # Supply-chain documents (#433). Required for the same reason the
