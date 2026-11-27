@@ -4218,7 +4218,7 @@ artifacts:
     type: sw-req
     title: "No differential row is silently wrong, and an outsider can re-derive the ledger"
     status: draft
-    release: v0.72.0
+    release: v0.73.0
     description: "Serves North Star O3 (summary; indicator unmoved). Every Canonical ABI differential row that is wrong or accepts-invalid moves to match, match-trap or a loud refusal (wrong 20 -> 0, accepts-invalid 30 -> 0 from main 370d82b). The deliberate fused-trap rows form a capped list of at most 8 that may only shrink. A re-check kit (fixtures, ledger, one script) ships as a signed release asset. Negative controls: the kit reports drift against v0.69.0, and a planted wrong ledger row fails the job. Plan: docs/plans/v0.71.0.md, bet 1."
     links:
       - type: derives-from
@@ -4244,7 +4244,7 @@ artifacts:
     type: sw-req
     title: "The upstream component-model WAST suite runs as a required check with host imports"
     status: draft
-    release: v0.72.0
+    release: v0.73.0
     description: "Serves North Star O3 (summary; indicator unmoved; external corpus). A host-import harness lets the imports commands execute (266 not executed -> at most 60), and cm_wast_ratchet becomes a required check. It fails on any meld-invalid (6 -> 0) or no-trap (9 -> 0) row. Negative control: a planted no-trap row fails the check. The pass target (36 -> at least 150) was falsified at planning: the imports commands need a component runtime for async/stream/thread builtins (#638), so it moves to v0.72 with P3. Plan: docs/plans/v0.71.0.md, bet 3."
     links:
       - type: derives-from
@@ -4257,7 +4257,7 @@ artifacts:
     type: sw-req
     title: "Stretch: fused shapes that are refused today are implemented, halving the refusals"
     status: draft
-    release: v0.72.0
+    release: v0.73.0
     description: "Serves North Star O1/O5 (summaries, indirectly; indicators unmoved). Driven by the refusal-reason histogram (bet 2a): refused 316 -> at most 160, with wrong and accepts-invalid not rising. Kill: if no single cause accounts for at least 40% of refusals, re-plan from the histogram. Plan: docs/plans/v0.71.0.md, bet 2b."
     links:
       - type: derives-from
@@ -4270,8 +4270,8 @@ artifacts:
     type: sw-req
     title: "Stretch: meld ships as a signed WASI component whose output matches native meld byte for byte"
     status: draft
-    release: v0.72.0
-    description: "Toward North Star O5 (does not count: the indicator needs kiln execution, blocked on kiln's WASI gap). meld is built for wasm32-wasip2, fused by meld, signed by wsc and published as meld.wasm (#539). CI requires byte-identical --reproducible output against native meld over the fixture corpus. Negative control: a one-byte-altered output fails the job. Kill: no wasip2 build without forking a dependency, or a slowdown above 10x. Plan: docs/plans/v0.71.0.md, bet 5a."
+    release: v0.73.0
+    description: "Toward North Star O5 (does not count: the indicator needs kiln execution, blocked on kiln's WASI gap). meld is built for wasm32-wasip2, fused by meld, signed by wsc and published as meld.wasm (#539). CI requires byte-identical --reproducible output against native meld over the fixture corpus. Negative control: a one-byte-altered output fails the job. Kill: no wasip2 build without forking a dependency, or a slowdown above 10x. Plan: docs/plans/v0.71.0.md, bet 5a. UPDATE 2026-11-27 (v0.72.0 cut, owner decision): moved to v0.73.0. Delivered so far: #698 builds meld-cli for wasm32-wasip2 and requires byte-identical --reproducible output against native meld (five fixtures and meld itself, with planted controls); #700 ships meld-<tag>-wasm32-wasip2.wasm as a cosign-signed release asset. Remaining: meld.wasm fused by meld and signed by wsc."
     links:
       - type: derives-from
         target: SYS-3
@@ -4283,7 +4283,7 @@ artifacts:
     type: sw-req
     title: "Stretch: a required synth static-data gate runs on a meld-fused composite"
     status: draft
-    release: v0.72.0
+    release: v0.73.0
     description: "Seam gate with synth (#479); no O1 claim, since there is no hardware run. Precondition, checked first: the gale inputs are usable in public CI. The gate runs pinned synth's VCR-VER-003 validation on a fused gale composite. Negative control: the meld 0.62.0 composite must fail it. Plan: docs/plans/v0.71.0.md, bet 5b."
     links:
       - type: derives-from
@@ -4311,7 +4311,7 @@ artifacts:
   - id: SR-141
     type: sw-req
     title: "The attestation's output.hash covers every byte of the output except the attestation section"
-    status: implemented
+    status: verified
     release: v0.72.0
     description: "Refines SR-30 (#699, sigil#396 option A). meld shall build every other metadata section (component-provenance, meld.signature-manifest, pulseengine:async-edges) before the attestation, compute output.hash and output.size over the complete module without the attestation, and append exactly one wsc.transformation.attestation section as the last section of the output, so that removing that one section and re-serializing the module with minimal-LEB128 section sizes, as wsc's verify_attestation_binds_module does, yields the hashed bytes. A change to any other byte, metadata included, shall fail that binding. Provenance's fused_module_sha256 keeps covering the module without meld's metadata sections."
     links:

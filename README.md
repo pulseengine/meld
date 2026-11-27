@@ -69,7 +69,7 @@ Verify what you downloaded before running it — see
 
 ### As a WebAssembly component
 
-From the first release after v0.71.0, each release also carries
+From v0.72.0, each release also carries
 `meld-<tag>-wasm32-wasip2.wasm`: meld built as a WASI 0.2 component. It is
 listed in the signed `SHA256SUMS.txt`, and CI holds its output byte-identical
 to native meld's under `--reproducible`. wasmtime 41 needs
