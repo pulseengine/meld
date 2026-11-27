@@ -4321,6 +4321,15 @@ artifacts:
         target: SR-30
       - type: mitigates
         target: H-6
+    fields:
+      verification-criteria: >
+        Fails if, for a fuse with attestation, provenance and the signature
+        manifest on, removing the first wsc.transformation.attestation section
+        and re-serializing with minimal-LEB128 section sizes gives a SHA-256
+        other than output.hash; if the attestation is not the single last
+        section; or if flipping one byte of component-provenance,
+        meld.signature-manifest or the code section leaves that SHA-256 equal
+        to output.hash.
     provenance:
       created-by: ai-assisted
       model: claude-opus-5-5
