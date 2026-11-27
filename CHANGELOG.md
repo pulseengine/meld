@@ -4,6 +4,14 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- CI job `meld.wasm component`: builds meld-cli for wasm32-wasip2 and runs it under wasmtime 41. meld.wasm fuses five wit-bindgen fixtures and itself with `--reproducible`, and each output must equal native meld's byte for byte. Two planted controls (different inputs; one flipped byte) must compare unequal, and exit codes must match native (0 / 2 / 1). meld.wasm is uploaded as a build artifact.
+
+### Fixed
+
+- `component-provenance` no longer depends on the host word size. A fully synthetic function's sentinel index was formatted as `usize`, so meld.wasm wrote `component-4294967295` where native meld writes `component-18446744073709551615`, and `--reproducible` gave different bytes on 32- and 64-bit hosts. It is now always the `u64::MAX` form; 64-bit output is byte-identical to v0.71.0.
+
 ## [0.71.0] - 2026-11-27
 
 ### Security

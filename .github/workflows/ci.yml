@@ -137,6 +137,105 @@ jobs:
           files: lcov.info
           fail_ci_if_error: false
 
+  # Run what we build: meld as a wasip2 component. meld.wasm fuses fixtures
+  # (and itself) under wasmtime, and every output must equal native meld's
+  # output byte for byte under --reproducible. A word-size-dependent byte
+  # (the provenance sentinel id, fixed with this job) fails it. A planted
+  # control proves the comparison can fail, and exit codes must match native.
+  wasm-component:
+    name: meld.wasm component
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","linux","x64","rust-cpu"]') || 'ubuntu-24.04' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master, toolchain pinned
+        with:
+          toolchain: 1.100.0
+          targets: wasm32-wasip2
+
+      - name: Install wasmtime
+        uses: taiki-e/install-action@75a7c0f87bd666af3cdb75c5b9e9d03ab6044e6f # v2.90.6
+        with:
+          tool: wasmtime@41.0.0
+
+      - name: Cache cargo
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-wasm-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-wasm-
+
+      - name: Build meld natively and as a wasip2 component
+        run: |
+          cargo build --locked --release -p meld-cli
+          cargo build --locked --release -p meld-cli --target wasm32-wasip2
+
+      - name: meld.wasm output equals native output
+        run: |
+          set -euo pipefail
+          native=target/release/meld
+          wasm=target/wasm32-wasip2/release/meld.wasm
+          run_wasm() { wasmtime run -S cli-exit-with-code=y --dir "$work::/w" "$wasm" "$@"; }
+          work=$(mktemp -d)
+          cp "$wasm" "$work/meld.wasm"
+          inputs="meld.wasm"
+          for f in records flavorful lists resource_alias numbers; do
+            cp "tests/wit_bindgen/fixtures/$f.wasm" "$work/"
+            inputs="$inputs $f.wasm"
+          done
+          n=0
+          for f in $inputs; do
+            run_wasm fuse --reproducible "/w/$f" -o "/w/$f.from-wasm" >/dev/null
+            "$native" fuse --reproducible "$work/$f" -o "$work/$f.from-native" >/dev/null
+            [ -s "$work/$f.from-native" ] || { echo "::error::native produced no output for $f"; exit 1; }
+            if ! cmp "$work/$f.from-wasm" "$work/$f.from-native"; then
+              echo "::error::meld.wasm and native meld disagree on $f"; exit 1
+            fi
+            n=$((n + 1))
+          done
+          # Planted controls: the comparison above must be able to fail.
+          # (1) outputs of two different inputs compare unequal;
+          # (2) one flipped byte in a copy of a matched output compares unequal.
+          if cmp -s "$work/records.wasm.from-wasm" "$work/flavorful.wasm.from-native"; then
+            echo "::error::control: outputs of different inputs compare equal"; exit 1
+          fi
+          cp "$work/records.wasm.from-wasm" "$work/tampered"
+          byte=$(od -An -tu1 -j 100 -N 1 "$work/tampered" | tr -d ' ')
+          printf "\\$(printf '%03o' $(( (byte + 1) % 256 )))" \
+            | dd of="$work/tampered" bs=1 seek=100 conv=notrunc 2>/dev/null
+          if cmp -s "$work/tampered" "$work/records.wasm.from-native"; then
+            echo "::error::control: a flipped byte went undetected"; exit 1
+          fi
+          echo "meld.wasm matched native on $n inputs; control differed"
+
+      - name: meld.wasm exit codes equal native
+        run: |
+          set -euo pipefail
+          native=target/release/meld
+          wasm=target/wasm32-wasip2/release/meld.wasm
+          check() {
+            want=$1; shift
+            rn=0; "$native" "$@" >/dev/null 2>&1 || rn=$?
+            rw=0; wasmtime run -S cli-exit-with-code=y "$wasm" "$@" >/dev/null 2>&1 || rw=$?
+            echo "meld $*: native=$rn wasm=$rw want=$want"
+            [ "$rn" = "$want" ] && [ "$rw" = "$want" ]
+          }
+          check 0 --version
+          check 2 --no-such-flag
+          check 1 fuse /no/such/input.wasm -o /no/such/out.wasm
+
+      - name: Upload meld.wasm
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: meld-wasm32-wasip2
+          path: target/wasm32-wasip2/release/meld.wasm
+          if-no-files-found: error
+
   clippy:
     name: Clippy
     # PR-only: every change reaches main through a PR that ran Clippy on the

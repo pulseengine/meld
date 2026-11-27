@@ -325,6 +325,40 @@ pub fn code_section_function_ranges(module_bytes: &[u8]) -> Vec<CodeRange> {
     ranges
 }
 
+/// `component_id` for a function whose merger origin names `comp_idx`.
+///
+/// A fully synthetic function carries the sentinel `usize::MAX` (see
+/// `dwarf::is_generated_origin`). Formatting that index printed
+/// `component-18446744073709551615` on a 64-bit host and
+/// `component-4294967295` from meld.wasm (wasm32), so the same input gave
+/// different provenance bytes, and a different sha, depending on the host
+/// word size. The sentinel is now always printed as `u64::MAX`: the 64-bit
+/// output stays byte-identical, and the id keeps the `component-<digits>`
+/// shape scry relies on (tests/component_provenance.rs).
+fn component_id(
+    components: &[crate::parser::ParsedComponent],
+    comp_idx: usize,
+    reproducible: bool,
+) -> String {
+    if comp_idx == usize::MAX {
+        return SYNTHETIC_COMPONENT_ID.to_string();
+    }
+    // #341: under `--reproducible` the component_id must not carry the
+    // caller-supplied path (else byte-identical inputs at different
+    // paths produce different provenance bytes → different sha).
+    if reproducible {
+        return format!("component-{comp_idx}");
+    }
+    components
+        .get(comp_idx)
+        .and_then(|c| c.name.clone())
+        .unwrap_or_else(|| format!("component-{comp_idx}"))
+}
+
+/// The `component_id` of a function meld generated that belongs to no input
+/// component, on every host word size.
+pub const SYNTHETIC_COMPONENT_ID: &str = "component-18446744073709551615";
+
 /// Build a [`ComponentProvenance`] from the merged module + the
 /// component slice. The hash binds the section to the fused module
 /// without the section (call this with bytes that don't yet include
@@ -351,17 +385,7 @@ pub fn build(
         .enumerate()
         .map(|(defined_idx, mf)| {
             let (comp_idx, _mod_idx, func_idx) = mf.origin;
-            // #341: under `--reproducible` the component_id must not carry the
-            // caller-supplied path (else byte-identical inputs at different
-            // paths produce different provenance bytes → different sha).
-            let component_id = if reproducible {
-                format!("component-{comp_idx}")
-            } else {
-                components
-                    .get(comp_idx)
-                    .and_then(|c| c.name.clone())
-                    .unwrap_or_else(|| format!("component-{comp_idx}"))
-            };
+            let component_id = component_id(components, comp_idx, reproducible);
             Entry {
                 fused_func_idx: import_count + defined_idx as u32,
                 component_id,
@@ -386,6 +410,17 @@ pub fn build(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_fully_synthetic_function_gets_a_fixed_id_on_every_word_size() {
+        for reproducible in [false, true] {
+            let id = component_id(&[], usize::MAX, reproducible);
+            assert_eq!(id, SYNTHETIC_COMPONENT_ID);
+            assert_eq!(id, format!("component-{}", u64::MAX));
+        }
+        assert_eq!(component_id(&[], 0, true), "component-0");
+        assert_eq!(component_id(&[], 3, false), "component-3");
+    }
 
     fn sample(bounded: bool, closed: bool) -> ComponentProvenance {
         ComponentProvenance {
