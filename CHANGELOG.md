@@ -4,9 +4,12 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.71.0] - 2026-11-27
+
 ### Security
 
 - wasmtime, wasmtime-wasi and the dev-only wasmtime-environ oracle move from 50.0.2 to 50.0.3, fixing RUSTSEC-2026-0587 (WASI filesystem sandbox escape on Windows through a drive-prefixed path component). All three are dev-dependencies of meld-core; the shipped `meld` binary does not link wasmtime (`cargo tree -p meld-cli -e normal` has no wasmtime crate). `cargo audit` now reports 0 vulnerabilities.
+- url 2.5.8 → 2.5.9 for RUSTSEC-2026-0592 (stack overflow in `Url::origin()` on nested `blob:` URLs), lockfile only. url reaches meld only through the dev-dependency wasmtime-wasi; the shipped binary does not link it (`cargo tree -i url -e normal` is empty).
 
 ### Added
 
@@ -26,6 +29,9 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- `--exports world` refused every async guest that `--exports all` fuses: it treated a canonical built-in import (`[task-return]`, `[subtask-cancel]`, `[waitable-set-poll]`, ...) as an untraced canon lower (#684). The memory and realloc each such built-in names are now kept. That exposed a silent drop: an async-lifted world function was exported under its bare name and its `[callback][async-lift]` export removed, so an embedder would call it as a sync function. It is now exported as `[async-lift]<name>` with its callback, or `[async-lift-stackful]<name>` (SR-100 amended). `meld-core/tests/exports_world_463.rs` covers both halves.
+- `--emit-import-map` gave a canonical built-in imported from an interface (`[export]<iface>`, not `$root`) the entry-level `kind` `"function"`, because the kind was guessed from the name prefix. An entry with a `builtin` object now always says `"p3-builtin"`; the map stays version 2. `meld-cli/tests/import_map_schema_692.rs` pins the map's JSON spellings against a golden file (#692).
+- The #662 fix did not find the shim table in components built by wit-component 0.263, which passes the fixup module its actual, shim and main arguments separately and folds the start in. meld now follows that shape too (#687).
 - `stream.read`/`stream.write`/`future.read`/`future.write` routed through wit-component's indirect-call shim were refused since 0.68 (#558), because the fixup module imports them as `"" "<n>"` (or `"actual" "<n>"`), a name no host can serve (#662). meld now recovers the producer name from the component: the fixup is instantiated with the shim module's `$imports` table, and the real module imports the shim's export `"<n>"` under the producer name (`[async-lower][stream-write-0]get`). The built-in is emitted under that name when it names the same built-in family as the wired canonical function, otherwise the #558 refusal stands. The reporter's component fuses again under `--memory multi` and `--memory shared`. `meld-core/tests/stream_builtin_names_662.rs` covers it, with a misnamed variant that stays refused.
 - A `stream` or `future` handle crossing a fused cross-component call was passed as the sender's table index; the Canonical ABI transfers it into the receiver's table under a new index, so the receiver's built-ins named the wrong handle, at exit 0 (#666). meld now refuses a fused call whose signature, read from the callee's `canon lift` type, carries a stream or future anywhere (params, results, nested composite types), until per-type copy adapters exist (ADR-10 step 6). `meld-core/tests/stream_future_edge_666.rs` covers a stream returned by a world-level function and a future passed to an interface function, with a scalar control (fuses, `run()` = 42).
 - A core import wired to a canonical built-in that meld cannot name (stream, future and error-context built-ins) kept the module's own field name, and when that name was another built-in's producer name the host and the import dedup bound it as that built-in: in the #552 fixture `stream.drop-readable` and `waitable-set.drop` reached the single import `$root::[waitable-set-drop]`, at exit 0. meld now refuses an import whose own field name names a different built-in family than the one wired to it, when it has no producer name to rename it to (built-ins it can name are still renamed, #547). `meld-core/tests/builtin_binding_552.rs` covers the swapped fixture and a matching control (two imports kept).
