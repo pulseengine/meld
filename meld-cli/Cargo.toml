@@ -40,5 +40,7 @@ wasmparser.workspace = true
 [dev-dependencies]
 # For testing with WAT files
 wasmprinter.workspace = true
+# #692: the import-map golden test builds its input from WAT
+wat = "1.263"
 # For building test modules
 wasm-encoder.workspace = true

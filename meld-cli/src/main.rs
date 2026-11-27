@@ -1329,6 +1329,12 @@ fn write_import_map(
                     };
                     if let (Some(dst), Some(src)) = (entry.as_object_mut(), contract.as_object()) {
                         dst.extend(src.iter().map(|(k, v)| (k.clone(), v.clone())));
+                        // The name-prefix guess above only knows `$root`
+                        // built-ins; a canonical built-in under
+                        // `[export]<iface>` came out as "function" (#692).
+                        if dst.get("builtin").is_some_and(|b| !b.is_null()) {
+                            dst.insert("kind".into(), "p3-builtin".into());
+                        }
                     }
                     imports.push(entry);
                     func_index += 1;

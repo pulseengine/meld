@@ -1,0 +1,76 @@
+{
+  "imports": [
+    {
+      "builtin": {
+        "async": false,
+        "element": {
+          "align": 4,
+          "size": 4
+        },
+        "kind": "stream-new"
+      },
+      "component": 0,
+      "encoding": null,
+      "index": 0,
+      "kind": "p3-builtin",
+      "memory": null,
+      "module": "[export]test:x/api",
+      "name": "[stream-new-0]get",
+      "realloc": null
+    },
+    {
+      "builtin": {
+        "async": true,
+        "element": {
+          "align": 4,
+          "size": 4
+        },
+        "kind": "stream-write"
+      },
+      "component": 0,
+      "encoding": "utf8",
+      "index": 1,
+      "kind": "p3-builtin",
+      "memory": {
+        "export": "memory",
+        "index": 0
+      },
+      "module": "[export]test:x/api",
+      "name": "[async-lower][stream-write-0]get",
+      "realloc": null
+    },
+    {
+      "component": null,
+      "encoding": {
+        "unknown": "not a canon lower (a synthesized builtin); its options are not recorded"
+      },
+      "index": 2,
+      "kind": "function",
+      "memory": {
+        "unknown": "not a canon lower (a synthesized builtin); its options are not recorded"
+      },
+      "module": "pulseengine:async",
+      "name": "stream_new",
+      "realloc": {
+        "unknown": "not a canon lower (a synthesized builtin); its options are not recorded"
+      }
+    },
+    {
+      "component": null,
+      "encoding": {
+        "unknown": "not a canon lower (a synthesized builtin); its options are not recorded"
+      },
+      "index": 3,
+      "kind": "function",
+      "memory": {
+        "unknown": "not a canon lower (a synthesized builtin); its options are not recorded"
+      },
+      "module": "pulseengine:async",
+      "name": "stream_write",
+      "realloc": {
+        "unknown": "not a canon lower (a synthesized builtin); its options are not recorded"
+      }
+    }
+  ],
+  "version": 2
+}
