@@ -7,6 +7,7 @@ All notable changes to this project will be documented in this file.
 ### Added
 
 - CI job `meld.wasm component`: builds meld-cli for wasm32-wasip2 and runs it under wasmtime 41. meld.wasm fuses five wit-bindgen fixtures and itself with `--reproducible`, and each output must equal native meld's byte for byte. Two planted controls (different inputs; one flipped byte) must compare unequal, and exit codes must match native (0 / 2 / 1). meld.wasm is uploaded as a build artifact.
+- `meld docs ci`: how to call meld in CI. It covers pinning meld through a varve layer (`varve which meld` names the layer and manifest digest), `--reproducible` with an explicit `--memory`, checking that two fusions are byte-identical, checking the attestation with `wsc verify-chain`, running `meld.wasm` under wasmtime, and running the result on kiln 0.9.0 or later.
 - Releases carry `meld-<tag>-wasm32-wasip2.wasm`, meld built as a WASI 0.2 component (#697). It is smoke-tested under wasmtime 41 (`--version` must print the tag), listed in the cosign-signed `SHA256SUMS.txt`, covered by the SLSA provenance, and required by the release-assets gate.
 
 ### Changed
