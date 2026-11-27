@@ -941,18 +941,10 @@ const EXPECTED_REFUSALS: &[(&str, &str)] = &[
 ];
 
 /// Corpus fixtures that fuse under `all` but that `world` refuses, each with
-/// the text the `world` error must carry. The world-export tracer treats a
-/// `[task-return]` import as an untraced `canon lower` (#684).
-const WORLD_REFUSALS: &[(&str, &str)] = &[
-    ("async-immediate-yield.wasm", UNTRACED_TASK_RETURN),
-    ("rust-cross-task-wakeup.wasm", UNTRACED_TASK_RETURN),
-    ("simple-call-import.wasm", UNTRACED_TASK_RETURN),
-    ("simple-import-params-results.wasm", UNTRACED_TASK_RETURN),
-    ("simple-pending-import.wasm", UNTRACED_TASK_RETURN),
-    ("simple-yield.wasm", UNTRACED_TASK_RETURN),
-    ("yield-loop-receives-events.wasm", UNTRACED_TASK_RETURN),
-];
-const UNTRACED_TASK_RETURN: &str = "[task-return]";
+/// the text the `world` error must carry. Empty since #684: the seven async
+/// guests whose `[task-return]` imports the tracer refused now fuse under
+/// `world` too. A new entry needs an issue.
+const WORLD_REFUSALS: &[(&str, &str)] = &[];
 
 fn expected_refusal(name: &str) -> Option<&'static str> {
     EXPECTED_REFUSALS
@@ -1038,7 +1030,11 @@ fn check_corpus_chunk(paths: &[std::path::PathBuf]) -> (usize, usize, usize) {
             out: &mut Vec<&'a meld_core::parser::CanonicalOptions>,
         ) {
             for e in &c.canonical_functions {
-                if let meld_core::parser::CanonicalEntry::Lower { options, .. } = e {
+                // #684: a `canon task.return` that names a memory needs it
+                // exported as much as a lower does.
+                if let meld_core::parser::CanonicalEntry::Lower { options, .. }
+                | meld_core::parser::CanonicalEntry::TaskReturn { options, .. } = e
+                {
                     out.push(options);
                 }
             }
@@ -1138,4 +1134,53 @@ fn without_a_manifest_a_kept_lifts_allocator_is_still_exported_and_usable() {
         .collect();
     let unfused = run_unfused().map(f32::to_bits);
     assert_eq!(got, unfused.to_vec());
+}
+
+/// #684: an async world function whose core module imports a `canon
+/// waitable-set.poll` naming a memory, and a `canon task.return`. The lift
+/// names no memory, so only the built-in keeps `mem` needed.
+const P3_BUILTIN_NAMES_A_MEMORY: &str = r#"
+(component
+  (core module $M (memory (export "mem") 1))
+  (core instance $mi (instantiate $M))
+  (alias core export $mi "mem" (core memory $mem))
+  (core func $tr (canon task.return))
+  (core func $poll (canon waitable-set.poll (memory $mem)))
+  (core module $Main
+    (import "m" "mem" (memory 1))
+    (import "[export]$root" "[task-return]run" (func $tr))
+    (import "$root" "[waitable-set-poll]" (func $poll (param i32 i32) (result i32)))
+    (func (export "[async-lift]run") (result i32)
+      (call $tr)
+      (i32.const 0))
+    (func (export "[callback][async-lift]run") (param i32 i32 i32) (result i32)
+      (drop (call $poll (local.get 1) (i32.const 16)))
+      (i32.const 0)))
+  (core instance $main (instantiate $Main
+    (with "m" (instance $mi))
+    (with "[export]$root" (instance (export "[task-return]run" (func $tr))))
+    (with "$root" (instance (export "[waitable-set-poll]" (func $poll))))))
+  (type $t (func async))
+  (func (export "run") (type $t)
+    (canon lift (core func $main "[async-lift]run") async
+      (callback (core func $main "[callback][async-lift]run"))))
+)
+"#;
+
+#[test]
+fn a_p3_builtin_that_names_a_memory_keeps_it_and_an_async_lift_keeps_its_abi_names() {
+    let bytes = wat::parse_str(P3_BUILTIN_NAMES_A_MEMORY).expect("wat parses");
+    let world = fuse_bytes(&bytes, ExportPolicy::World);
+    validate(&world);
+    let exports = export_set(&world);
+    // The host services `waitable-set.poll` against this memory.
+    assert!(exports.contains("memory:mem"), "{exports:?}");
+    // Under the bare world name `run` an embedder would call the async lift
+    // as a sync function and never drive its callback.
+    assert!(exports.contains("func:[async-lift]run"), "{exports:?}");
+    assert!(
+        exports.contains("func:[callback][async-lift]run"),
+        "{exports:?}"
+    );
+    assert!(!exports.contains("func:run"), "{exports:?}");
 }
