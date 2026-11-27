@@ -238,9 +238,9 @@ pub struct FusionMetadata {
     /// the aggregate counts. Emitted in `adapter_sites` order, which the resolver
     /// sorts into a total order, so it is stable under `--reproducible`.
     ///
-    /// Note this section sits OUTSIDE the bytes covered by `output.hash` (the
-    /// hash is taken over the module with the attestation and provenance
-    /// sections stripped), so enriching it does not perturb artifact hashes.
+    /// The attestation section is the one part of the output that
+    /// `output.hash` does not cover (#699), so enriching it does not perturb
+    /// the hash.
     ///
     /// `#[serde(default)]` so attestations written by older meld versions still
     /// deserialize.

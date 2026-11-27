@@ -1903,12 +1903,11 @@ impl Fuser {
 
         // Step 4: Encode output module.
         //
-        // Two-pass dance: first encode without any self-referential
-        // custom sections, then build attestation (#wsc) and
-        // provenance (#192) over THAT byte sequence and re-encode
-        // with both as extras. Both sections' SHA-256 hashes refer
-        // to the bytes-without-extras, so consumers strip both
-        // sections before verifying.
+        // First encode without meld's metadata sections. Provenance (#192)
+        // hashes THAT byte sequence (`fused_module_sha256`). The signature
+        // manifest and provenance are then encoded in, and the attestation
+        // hashes the result (`output.hash`) and is appended last (#699), so
+        // a verifier removes only the attestation section before hashing.
         log::info!("Encoding fused module");
         // Pass A: encode without DWARF and without meld-extras. Its
         // code-section offsets are what the DWARF remap targets (trailing
@@ -1982,7 +1981,8 @@ impl Fuser {
             };
 
         // Pass B: re-encode with the remapped DWARF embedded. These are
-        // the bytes the attestation/provenance hashes cover.
+        // the bytes provenance's `fused_module_sha256` covers; `output.hash`
+        // covers these plus the metadata sections (#699).
         let output_without_extras = if dwarf_sections.is_empty() {
             bytes_for_remap
         } else {
@@ -1994,14 +1994,6 @@ impl Fuser {
         };
 
         let mut extra_sections: Vec<(&str, Vec<u8>)> = edge_sections.clone();
-
-        if self.config.attestation {
-            let mut attestation_stats = stats.clone();
-            attestation_stats.output_size = output_without_extras.len();
-            let (section_name, payload) =
-                self.build_attestation_payload(&output_without_extras, &attestation_stats)?;
-            extra_sections.push((section_name, payload));
-        }
 
         if self.config.component_provenance {
             let provenance = provenance::build(
@@ -2037,10 +2029,28 @@ impl Fuser {
             }
         }
 
-        let output = if extra_sections.is_empty() {
+        // #699 / sigil#396: `output.hash` covers every byte of the output
+        // except the one attestation section. Provenance and the signature
+        // manifest are built first and encoded into the covered bytes; the
+        // attestation is appended last, as raw bytes, so removing it gives
+        // back exactly the hashed bytes. wsc's binding check
+        // (`verify_attestation_binds_module`) recomputes the hash that way.
+        let covered = if extra_sections.is_empty() {
             output_without_extras
         } else {
             self.encode_output(&merged, &adapters, &extra_sections, &dwarf_sections)?
+        };
+
+        let output = if self.config.attestation {
+            let mut attestation_stats = stats.clone();
+            attestation_stats.output_size = covered.len();
+            let (section_name, payload) =
+                self.build_attestation_payload(&covered, &attestation_stats)?;
+            let mut output = covered;
+            output.extend_from_slice(&encode_custom_section(section_name, &payload));
+            output
+        } else {
+            covered
         };
 
         // SR-56 / LS-M-12 (#370): reject overlapping active data segments in
@@ -3232,8 +3242,8 @@ impl Fuser {
         // whose code addresses target the fused code section, replacing
         // the per-input sections skipped above. Emitted before the
         // meld-metadata extras so they sit at a stable byte offset
-        // across the encode passes (the attestation/provenance hash
-        // covers these bytes; the extras are stripped before verifying).
+        // across the encode passes (provenance's `fused_module_sha256`
+        // covers these bytes; the extras are stripped before verifying it).
         for (name, contents) in dwarf_sections {
             module.section(&wasm_encoder::CustomSection {
                 name: std::borrow::Cow::Borrowed(name),
@@ -4366,6 +4376,20 @@ mod reloc_risk_tests {
         assert!(!module_reloc_risk(&module(true, true)));
         assert!(!module_reloc_risk(&module(false, true)));
     }
+}
+
+/// One custom section as it appears in a module: id 0, the LEB128 size, the
+/// name and the payload. wasm-encoder writes the size in minimal LEB128,
+/// which is what wsc writes when it re-serializes a module to check the
+/// attestation binding (#699).
+fn encode_custom_section(name: &str, data: &[u8]) -> Vec<u8> {
+    let mut module = wasm_encoder::Module::new();
+    module.section(&wasm_encoder::CustomSection {
+        name: std::borrow::Cow::Borrowed(name),
+        data: std::borrow::Cow::Borrowed(data),
+    });
+    // Drop the 8-byte module header (magic + version).
+    module.finish().split_off(8)
 }
 
 #[cfg(test)]
