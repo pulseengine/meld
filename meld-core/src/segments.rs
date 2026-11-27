@@ -417,9 +417,9 @@ pub enum ReindexedElementItems {
     Functions(Vec<u32>),
     /// Expressions (reindexed). Held in STRUCTURED `ParsedConstExpr` form —
     /// already remapped by the merger via [`reindex_element_segment`] — rather
-    /// than opaque encoded `ConstExpr` bytes, so that a later pass (notably the
-    /// P3-async function-index shift, see `p3_async::shift_function_indices`)
-    /// can still read and bump the `ref.func` index inside the expression.
+    /// than opaque encoded `ConstExpr` bytes, so that a later pass that moves
+    /// function indices can still read the `ref.func` index inside the
+    /// expression (LS-M-9).
     /// Encoded to `ConstExpr` only at final emit (see [`encode_element_segment`]).
     Expressions(Vec<ParsedConstExpr>),
 }

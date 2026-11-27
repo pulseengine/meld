@@ -961,8 +961,8 @@ artifacts:
       #141 design comment + ADR-3 amendment): one bridge ring memory +
       per-component dispatch shims with hardwired memory immediates;
       handles minted in-module carry bit 31 (LOCAL_TAG) and route to the
-      ring, host handles keep routing to the retained pulseengine:async
-      imports. Same-memory fusion is the identical codegen with caller-
+      ring, host handles keep routing to the producer module's own
+      pulseengine:async imports (meld adds none since #693). Same-memory fusion is the identical codegen with caller-
       memory immediates 0 — the original "zero-copy same-memory ring"
       claim is amended to "no host crossing, single copy", because the
       ABI's caller-buffer contract (stream_read(handle, buf_ptr, …))
@@ -4334,3 +4334,23 @@ artifacts:
       created-by: ai-assisted
       model: claude-opus-5-5
       timestamp: 2026-11-27T14:00:00Z
+
+  - id: SR-142
+    type: sw-req
+    title: "meld adds no pulseengine:async imports to a fused module"
+    status: implemented
+    release: v0.73.0
+    description: "Retires the P3 lowering pass (#693, ADR-10 section 6, ADR-1 amended). meld shall not add a pulseengine:async import for a canonical stream or future built-in: core modules reach those built-ins through their own producer-named imports, which pass through, and the added imports had no call site and no element-segment reference, yet a host had to bind every one of them. An input core module that imports pulseengine:async itself keeps that import."
+    links:
+      - type: derives-from
+        target: SYS-4
+    fields:
+      verification-criteria: >
+        Fails if any fused output of the #662 stream fixtures or the
+        wit-bindgen runtime corpus imports pulseengine:async while its input
+        does not, or if stream_write_via_shim_wt1263.wat or
+        simple-call-import.wasm is not among the inputs that fuse.
+    provenance:
+      created-by: ai-assisted
+      model: claude-opus-5-5
+      timestamp: 2026-11-27T19:00:00Z

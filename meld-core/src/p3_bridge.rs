@@ -230,8 +230,8 @@ pub fn emit_stream_bridge(
     // ── 1. Locate the host intrinsic imports in the merged module. ────
     //
     // `intrinsic_imports` maps EVERY merged function-import index that is
-    // a bridged stream intrinsic to its op (the merger's dedup and the
-    // lowering pass can each contribute an import of the same name);
+    // a bridged stream intrinsic to its op (the merger's dedup can leave
+    // several imports of the same name);
     // `host_idx` records one canonical index per op — the shims' foreign-
     // handle fallback target.
     let mut intrinsic_imports: HashMap<u32, StreamOp> = HashMap::new();

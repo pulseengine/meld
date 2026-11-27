@@ -107,11 +107,20 @@ The rewrite half of the pipeline is now implemented as
    to wire `call N` instructions to specific intrinsics without
    re-parsing the output.
 
-Coverage: `stream<T>` and `future<T>` symmetric (see
-`p3_async_lowering::stream_u8_lowering_emits_pulseengine_async_imports`
-and `…::future_s32_lowering_emits_pulseengine_async_imports`). The
+Coverage: `stream<T>` and `future<T>` symmetric. The
 73-test `wit_bindgen_runtime` suite stays green because the pass is a
 no-op when `required_intrinsics` is empty.
+
+**Retired (#693, ADR-10 section 6, SR-142).** No fused code ever called
+the imports this pass added: core modules reach the canonical stream and
+future built-ins through their own producer-named imports, which pass
+through. On the test corpus, 9 of 61 fused outputs carried the dead
+imports, and every host had to bind them. The pass and its index shift
+are removed. `p3_async_lowering::stream_u8_fusion_emits_no_pulseengine_async_imports`,
+`…::future_s32_fusion_emits_no_pulseengine_async_imports` and
+`no_async_host_imports_693` now assert that meld adds no
+`pulseengine:async` import. The host-intrinsic ABI table stays
+documented for input modules that import `pulseengine:async` themselves.
 
 Out of scope (deferred to follow-up sub-issues under #94):
 

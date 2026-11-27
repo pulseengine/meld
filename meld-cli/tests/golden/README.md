@@ -5,8 +5,8 @@
 kiln read its key spellings, so `import_map_schema_692.rs` compares it byte for
 byte (#692).
 
-It still lists two `pulseengine:async` imports with `unknown` options. They are
-dead (#693), and the file changes when #693 removes them.
+Since #693 it lists no `pulseengine:async` imports; the two that meld used to
+add were never called.
 
 Regenerate it only for an intended change:
 

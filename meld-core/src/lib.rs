@@ -1778,14 +1778,11 @@ impl Fuser {
         stats.placements = merged.placements.clone();
         stats.total_exports = merged.exports.len();
 
-        // Step 2.4: Lower P3 async canonical built-ins to `pulseengine:async`
-        // core-module imports. This adds one import per distinct intrinsic
-        // (stream.new, stream.read, …, future.drop-writable) and shifts
-        // every reference to defined functions up to make room. No-op when
-        // the components contain no P3 async data-plane constructs (e.g.
-        // the wit_bindgen_runtime suite). See `p3_async::lower_p3_async_intrinsics`
-        // and ADR-1 for the full design.
-        let _p3_lowering_plan = p3_async::lower_p3_async_intrinsics(&mut merged, &self.components)?;
+        // Step 2.4 (retired, #693, ADR-10 section 6): meld used to add one
+        // `pulseengine:async` import per P3 stream/future canonical built-in.
+        // No fused code called them; the core modules reach those built-ins
+        // through their own producer-named imports, which pass through. A
+        // host had to bind every one of them anyway, so the step is gone.
 
         // Step 2.5: Generate task.return shims for internal fused async calls.
         //

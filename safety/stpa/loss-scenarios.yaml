@@ -3621,6 +3621,13 @@ loss-scenarios:
       code (non-vacuity confirmed). Mythos-verified: the deferred encode is
       byte-identical to the prior eager path across all ParsedConstExpr
       kinds × all segment modes, and only RefFunc is bumped.
+      UPDATE 2026-11-27 (#693): the P3 lowering pass and
+      `shift_function_indices` are removed, so the shift this
+      scenario describes no longer exists. The test
+      `ls_m_9_p3_shift_relocates_expr_form_elem_ref_func` keeps the
+      end-to-end property (the elem ref.func equals `$b`'s exported index
+      in a fused P3 component) and now also asserts that nothing is
+      prepended.
 
   - id: LS-M-10
     title: Global/table import dedup collapses type-incompatible imports into one slot
